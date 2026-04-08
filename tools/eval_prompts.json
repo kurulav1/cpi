@@ -1,0 +1,31 @@
+[
+  {
+    "id": "who_are_you",
+    "prompt": "Who are you?",
+    "min_words": 3
+  },
+  {
+    "id": "cuda_checklist",
+    "prompt": "Write exactly five numbered CUDA crash debugging steps, one sentence each.",
+    "require_numbered_steps": 5,
+    "require_keywords": ["CUDA", "debug"]
+  },
+  {
+    "id": "summarize_bug",
+    "prompt": "Summarize this bug report in two sentences: The CUDA kernel fails only on Windows when max-context is above 256 and output text becomes garbled.",
+    "max_sentences": 3,
+    "require_keywords": ["CUDA", "Windows"]
+  },
+  {
+    "id": "short_answer",
+    "prompt": "Answer briefly: what does OOM stand for in GPU inference?",
+    "require_keywords": ["out", "memory"],
+    "max_words": 24
+  },
+  {
+    "id": "code_review",
+    "prompt": "Give three practical tips to make a CUDA inference engine faster without changing model quality.",
+    "require_keywords": ["CUDA", "inference"],
+    "require_numbered_steps": 3
+  }
+]

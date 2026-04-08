@@ -1,0 +1,24 @@
+{
+  "name": "cpi-chat-ui",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -k -n api,ui -c green,cyan \"node --watch server/index.mjs\" \"vite --host 0.0.0.0\"",
+    "build": "vite build",
+    "start": "node server/index.mjs"
+  },
+  "dependencies": {
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.2.1",
+    "@vitejs/plugin-react": "^4.7.0",
+    "concurrently": "^9.2.1",
+    "tailwindcss": "^4.2.1",
+    "vite": "^5.4.21",
+    "vite-plugin-pwa": "^1.2.0"
+  }
+}

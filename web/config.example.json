@@ -1,0 +1,33 @@
+{
+  "_comment": "Copy this file to config.json and edit it. Values here are overridden by environment variables.",
+
+  "port": 3001,
+
+  "inferBin": "",
+  "_inferBin_note": "Leave empty to auto-detect: build/Release/llama_infer.exe on Windows, build/llama_infer on Linux/macOS. Set explicitly if the binary is elsewhere.",
+
+  "modelDirs": [
+    "../artifacts"
+  ],
+
+  "modelPath": "",
+  "tokenizerPath": "",
+
+  "chatTemplate": "",
+
+  "systemPrompt": "You are a helpful assistant.",
+
+  "maxNewTokens": 256,
+  "maxContext": 2048,
+  "temperature": 0.7,
+  "topK": 40,
+  "topP": 0.9,
+  "repeatPenalty": 1.05,
+  "maxCpuPercent": 85,
+  "maxMemoryPercent": 85,
+  "resourceSampleMs": 250,
+  "resourceSustainMs": 5000,
+  "resourceThrottleMs": 50,
+
+  "extraArgs": ""
+}

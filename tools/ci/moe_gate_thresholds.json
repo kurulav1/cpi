@@ -1,0 +1,18 @@
+{
+  "parity": {
+    "int8_max_mean_abs": 1.0,
+    "int4_max_mean_abs": 2.5,
+    "int8_min_overlap": 0.5,
+    "int4_min_overlap": 0.35
+  },
+  "perf": {
+    "min_decode_ratio": {
+      "int8_vs_fp16": 1.05,
+      "int4_vs_fp16": 1.20,
+      "int4_vs_int8": 1.10
+    },
+    "max_decode_regression_pct_vs_baseline": 25.0,
+    "baseline_decode_tok_per_s": {}
+  }
+}
+

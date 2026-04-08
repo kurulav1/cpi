@@ -1,0 +1,64 @@
+name: CUDA MoE Regression
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  cuda-build-moe-gates:
+    runs-on: [self-hosted, cuda]
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Configure
+        shell: pwsh
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --config Release -j 6
+
+      - name: Run deterministic MoE kernel parity test
+        shell: pwsh
+        run: ctest --test-dir build -C Release -R moe_kernel_parity_test --output-on-failure
+
+      - name: Download and convert Mixtral checkpoint (CI-sized)
+        shell: pwsh
+        run: |
+          python tools/hf_download.py download TitanML/tiny-mixtral --family mixtral --output-dir artifacts/ci_mixtral
+
+      - name: Quantize Mixtral int8/int4
+        shell: pwsh
+        run: |
+          python tools/quantize_ll2c_streaming.py --input artifacts/ci_mixtral/tiny-mixtral.ll2c --output artifacts/ci_mixtral/tiny-mixtral-int8.ll2c --mode int8 --overwrite
+          python tools/quantize_ll2c_streaming.py --input artifacts/ci_mixtral/tiny-mixtral.ll2c --output artifacts/ci_mixtral/tiny-mixtral-int4.ll2c --mode int4 --overwrite
+
+      - name: Run MoE perf/parity CI gate
+        shell: pwsh
+        run: |
+          python tools/ci/moe_regression_gate.py `
+            --llama-infer build/Release/llama_infer.exe `
+            --tokenizer artifacts/ci_mixtral/hf/tokenizer.model `
+            --fp16-model artifacts/ci_mixtral/tiny-mixtral.ll2c `
+            --int8-model artifacts/ci_mixtral/tiny-mixtral-int8.ll2c `
+            --int4-model artifacts/ci_mixtral/tiny-mixtral-int4.ll2c `
+            --thresholds tools/ci/moe_gate_thresholds.json `
+            --result-json artifacts/ci_moe_gate_result.json
+
+      - name: Upload MoE gate artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-moe-gate-result
+          path: artifacts/ci_moe_gate_result.json
+

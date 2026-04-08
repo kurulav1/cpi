@@ -1,0 +1,11 @@
+{
+  "profileId": "",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Reply in one short sentence: what is CUDA?"
+    }
+  ],
+  "maxNewTokens": 64,
+  "temperature": 0.2
+}

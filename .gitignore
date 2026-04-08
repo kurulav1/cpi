@@ -1,0 +1,107 @@
+# ------------------------------
+# Secrets and local config
+# ------------------------------
+.env
+.env.*
+!.env.example
+!.env.template
+web/.env
+web/.env.*
+!web/.env.example
+web/config.json
+
+# ------------------------------
+# Build and generated outputs
+# ------------------------------
+/build/
+/build-*/
+/out/
+/bin/
+/obj/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+install_manifest.txt
+compile_commands.json
+_deps/
+
+# Visual Studio / MSBuild / CMake generators
+*.sln
+*.vcxproj*
+*.vcproj*
+*.filters
+*.user
+*.recipe
+*.tlog
+*.lastbuildstate
+*.idb
+*.ilk
+*.exp
+*.pdb
+*.ipdb
+*.iobj
+*.obj
+*.lib
+*.cache
+*.deps
+
+# ------------------------------
+# Language/tool caches
+# ------------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage*
+htmlcov/
+
+web/node_modules/
+web/dist/
+web/.vite/
+web/.cache/
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# ------------------------------
+# Runtime artifacts and logs
+# ------------------------------
+*.log
+*.tmp
+*.bak
+*.swp
+*.orig
+eval_report*.json
+artifacts/
+newuser/
+
+# Model and checkpoint binaries
+*.ll2c
+*.safetensors
+*.safetensors.tmp
+*.gguf
+*.pt
+*.pth
+*.onnx
+
+# ------------------------------
+# Third-party generated state
+# ------------------------------
+third_party/vcpkg/buildtrees/
+third_party/vcpkg/downloads/
+third_party/vcpkg/packages/
+third_party/vcpkg/installed/
+
+# ------------------------------
+# Local tooling / OS files
+# ------------------------------
+.claude/
+.DS_Store
+Thumbs.db
