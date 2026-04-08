@@ -1,10 +1,19 @@
 # CPI — Cross-Platform Inference
 
-Memory-aware, cross-platform CUDA inference engine for LLaMA-family decoder models.
+LLM inference engine with support for mainly LlaMA family of models.
+
+## Main features
+
+- Command line inference
+- API
+- Web UI
+- Quantization handling (very much WIP)
+- HuggingFace browser + downloader
+- .. and more
 
 ## Highlights
 
-- C++20 + CUDA + cuBLAS.
+- Optimized for CPU and GPU (CUDA) inference
 - Cross-platform weight memory mapping (`mmap`/`MapViewOfFile`).
 - Full decoder block execution per layer:
   - RMSNorm
@@ -13,7 +22,7 @@ Memory-aware, cross-platform CUDA inference engine for LLaMA-family decoder mode
   - causal attention with KV cache
   - MLP (SwiGLU)
   - residual connections
-- Runtime-safe design for 12 GB GPUs using streamed per-layer weights.
+- Runtime-safe design using streamed per-layer weights.
 - Default fp16 decode path uses fused device-side `QKV` / `w1+w3` projections,
   cached cuBLASLt matmul plans, a warp-tiled exact online-softmax decode attention kernel, and a true chunked prompt-prefill path to reduce prompt overhead
   without changing model outputs.
@@ -33,12 +42,6 @@ Memory-aware, cross-platform CUDA inference engine for LLaMA-family decoder mode
 - `include/engine/*`, `src/engine/*`: inference orchestration.
 - `tools/convert_hf_to_bins.py`: extract all needed tensors from HF safetensors.
 - `tools/pack_ll2c.py`: pack tensors into `.ll2c` format.
-
-## Release Hygiene
-
-- Keep secrets in local `.env` only (ignored by git).
-- Use `.env.example` as the committed template.
-- Run the pre-release checks in `RELEASE_CHECKLIST.md` before tagging.
 
 ## Build
 
