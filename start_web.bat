@@ -4,9 +4,9 @@ setlocal EnableExtensions
 if /I "%~1"=="--help" goto :help
 if /I "%~1"=="/?" goto :help
 
-set "REPO_DIR=%~dp0"
-set "WEB_DIR=%REPO_DIR%web"
-set "INFER_BIN=%REPO_DIR%build\Release\llama_infer.exe"
+for %%I in ("%~dp0.") do set "REPO_DIR=%%~fI"
+set "WEB_DIR=%REPO_DIR%\web"
+set "INFER_BIN=%REPO_DIR%\build\Release\llama_infer.exe"
 
 if not exist "%WEB_DIR%\package.json" (
   echo [start_web] Could not find web\package.json.
@@ -41,13 +41,13 @@ if not exist "%INFER_BIN%" (
 pushd "%WEB_DIR%"
 
 if not exist "node_modules" (
-  if exist "package-lock.json" (
-    echo [start_web] Installing web dependencies with npm ci...
-    call npm ci
-  ) else (
-    echo [start_web] Installing web dependencies with npm install...
-    call npm install
+  if not exist "package-lock.json" (
+    echo [start_web] package-lock.json is missing, cannot run npm ci.
+    popd
+    exit /b 1
   )
+  echo [start_web] Installing web dependencies with npm ci...
+  call npm ci
   if errorlevel 1 (
     popd
     exit /b 1

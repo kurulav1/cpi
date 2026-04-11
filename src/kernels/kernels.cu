@@ -6,8 +6,10 @@
 // RoPE, and prefill-attention kernels.
 
 #include "runtime/kernels.cuh"
+#include "runtime/cuda_utils.cuh"
 
 #include <cstdint>
+#include <vector>
 #include <cuda_fp16.h>
 
 namespace kernels {
@@ -98,6 +100,48 @@ __global__ void rmsnorm_kernel(const half* x,
   }
 }
 
+__global__ void rmsnorm_kernel_simple(const half* x,
+                                      const half* w,
+                                      half* y,
+                                      int cols,
+                                      float eps) {
+  const int row = blockIdx.x;
+  const int tid = threadIdx.x;
+  const half* x_row =
+      x + static_cast<std::size_t>(row) * static_cast<std::size_t>(cols);
+  half* y_row =
+      y + static_cast<std::size_t>(row) * static_cast<std::size_t>(cols);
+  __shared__ float sum_sq[256];
+  __shared__ float inv_shared;
+
+  float local = 0.0f;
+  for (int col = tid; col < cols; col += blockDim.x) {
+    const float v = __half2float(x_row[col]);
+    local += v * v;
+  }
+  sum_sq[tid] = local;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      sum_sq[tid] += sum_sq[tid + stride];
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    inv_shared = rsqrtf(sum_sq[0] / static_cast<float>(cols) + eps);
+  }
+  __syncthreads();
+
+  const float inv = inv_shared;
+  for (int col = tid; col < cols; col += blockDim.x) {
+    const float xv = __half2float(x_row[col]);
+    const float ww = __half2float(w[col]);
+    y_row[col] = __float2half(xv * inv * ww);
+  }
+}
+
 __global__ void layernorm_kernel(const half* x,
                                  const half* w,
                                  const half* b,
@@ -164,26 +208,6 @@ __global__ void embedding_lookup_kernel(const half* embedding,
   const int token = token_ids[token_idx];
   const half* src = embedding + static_cast<std::size_t>(token) * static_cast<std::size_t>(hidden);
   half* dst = out + static_cast<std::size_t>(token_idx) * static_cast<std::size_t>(hidden);
-
-  if ((hidden & 7) == 0) {
-    const int vec_count = hidden / 8;
-    const int4* src4 = reinterpret_cast<const int4*>(src);
-    int4* dst4 = reinterpret_cast<int4*>(dst);
-    for (int i = threadIdx.x; i < vec_count; i += blockDim.x) {
-      dst4[i] = src4[i];
-    }
-    return;
-  }
-
-  if ((hidden & 1) == 0) {
-    const int vec_count = hidden / 2;
-    const half2* src2 = reinterpret_cast<const half2*>(src);
-    half2* dst2 = reinterpret_cast<half2*>(dst);
-    for (int i = threadIdx.x; i < vec_count; i += blockDim.x) {
-      dst2[i] = src2[i];
-    }
-    return;
-  }
 
   for (int col = threadIdx.x; col < hidden; col += blockDim.x) {
     dst[col] = src[col];
@@ -547,7 +571,7 @@ void launch_rmsnorm(const half* x,
                     float eps,
                     cudaStream_t stream) {
   const int threads = choose_rmsnorm_threads(cols);
-  rmsnorm_kernel<<<rows, threads, 0, stream>>>(x, weight, y, cols, eps);
+  rmsnorm_kernel_simple<<<rows, threads, 0, stream>>>(x, weight, y, cols, eps);
 }
 
 void launch_layernorm(const half* x,
@@ -568,8 +592,12 @@ void launch_embedding_lookup(const half* embedding,
                              int num_tokens,
                              int hidden,
                              cudaStream_t stream) {
-  const int threads = choose_copy_threads(hidden);
-  embedding_lookup_kernel<<<num_tokens, threads, 0, stream>>>(embedding, token_ids, out, hidden);
+  if (num_tokens <= 0 || hidden <= 0) {
+    return;
+  }
+  constexpr int threads = 256;
+  embedding_lookup_kernel<<<num_tokens, threads, 0, stream>>>(
+      embedding, token_ids, out, hidden);
 }
 
 void launch_rope_inplace(half* q,

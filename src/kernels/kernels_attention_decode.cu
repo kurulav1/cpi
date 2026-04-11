@@ -5,6 +5,7 @@
 
 #include "runtime/kernels.cuh"
 
+#include <cstdlib>
 #include <cstddef>
 #include <cstdint>
 
@@ -1049,6 +1050,23 @@ void launch_attention_step(const half* q,
                            float* scratch_o,
                            int scratch_chunks,
                            bool allow_split) {
+  const bool force_fallback =
+      std::getenv("LLAMA_INFER_FORCE_FALLBACK_DECODE_ATTENTION") != nullptr;
+  if (force_fallback) {
+    constexpr int threads = 128;
+    const std::size_t smem = static_cast<std::size_t>(head_dim) * sizeof(half) +
+                             static_cast<std::size_t>(threads + 3) * sizeof(float);
+    attention_step_kernel_fallback<<<num_heads, threads, smem, stream>>>(
+        q,
+        k_cache,
+        v_cache,
+        out,
+        seq_len,
+        num_heads,
+        num_kv_heads,
+        head_dim);
+    return;
+  }
   // GQA fused: one block per KV head, group_size warps share K/V loads.
   // Gives group_size× KV-bandwidth reduction vs. per-Q-head kernels.
   // Dispatched before split-K so GQA models always take this path.
@@ -1146,6 +1164,23 @@ void launch_attention_step_device_pos(const half* q,
                                       float* scratch_o,
                                       int scratch_chunks,
                                       bool allow_split) {
+  const bool force_fallback =
+      std::getenv("LLAMA_INFER_FORCE_FALLBACK_DECODE_ATTENTION") != nullptr;
+  if (force_fallback) {
+    constexpr int threads = 128;
+    const std::size_t smem = static_cast<std::size_t>(head_dim) * sizeof(half) +
+                             static_cast<std::size_t>(threads + 3) * sizeof(float);
+    attention_step_kernel_fallback_device_pos<<<num_heads, threads, smem, stream>>>(
+        q,
+        k_cache,
+        v_cache,
+        out,
+        position,
+        num_heads,
+        num_kv_heads,
+        head_dim);
+    return;
+  }
   // GQA fused dispatch (device-position variant for CUDA graph capture).
   if (num_kv_heads > 0 && num_heads > num_kv_heads &&
       (num_heads % num_kv_heads) == 0 && head_dim == 128) {

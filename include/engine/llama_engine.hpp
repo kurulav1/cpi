@@ -27,6 +27,7 @@
 #include <string>
 #include <vector>
 
+#include "engine/engine_types.hpp"
 #include "model/weight_loader.hpp"
 
 namespace engine {
@@ -57,73 +58,6 @@ struct LtMatmulPlan {
   cublasLtMatrixLayout_t c_desc = nullptr;        // Layout descriptor for the C (output) matrix.
   cublasLtMatmulHeuristicResult_t heuristic{};    // Algorithm selected by the cuBLASLt heuristic.
   bool ready = false;                             // True once the plan has been fully initialised.
-};
-
-// Runtime configuration options passed to LlamaEngine::initialize().
-// All fields have conservative defaults suitable for single-sequence inference
-// on a GPU with at least 16 GB of VRAM.
-struct EngineOptions {
-  std::string model_path;                          // Path to the compiled .bin weight file.
-  int max_batch = 1;                               // Maximum number of sequences processed simultaneously.
-  int max_context = 2048;                          // Maximum total sequence length (prompt + generated tokens).
-  int tensor_parallel = 1;                         // Number of tensor-parallel GPU shards (reserved, currently 1).
-  std::size_t vram_safety_margin_mb = 1024;        // VRAM headroom kept free when auto-sizing buffers (MiB).
-  int gpu_cache_layers = -1;                       // Number of layers to keep permanently on GPU (-1 = auto).
-  std::size_t gpu_cache_limit_mb = 0;              // Hard cap on GPU layer-cache memory (0 = unlimited).
-  bool gpu_cache_all = false;                      // When true, all layers are kept resident on GPU.
-  int top_k = 40;                                  // Top-K sampling: number of candidates to keep.
-  float top_p = 0.9f;                              // Top-P (nucleus) sampling threshold.
-  float repetition_penalty = 1.0f;                 // Multiplicative penalty applied to recently generated tokens.
-  int no_repeat_ngram_size = 0;                    // Block repeated n-grams of this length (0 = disabled).
-  bool int8_streaming = false;                     // Enable low-bit streaming MLP path (legacy flag name kept for compatibility).
-  int streaming_quant_bits = 8;                    // Bit-width for regular streaming quantization (supported: 4, 8).
-  bool profile_decode_phases = false;              // Emit per-phase timing into BenchmarkStats after each decode step.
-  bool disable_split_attention = false;            // Force single-pass attention even for long sequences.
-  bool loop_guard = true;                          // Abort generation when a repeated token loop is detected.
-  bool paged_kv_cache = false;                     // Use the paged KV-cache manager instead of the flat cache.
-  bool kv_cache_int4 = false;                      // Store KV cache as packed INT4 (4x less VRAM bandwidth, ~4x attention speedup).
-  bool enable_tq_cached = false;                   // Opt-in: allow cached/resident TurboQuant paths after preflight checks.
-  std::string tq_mode = "auto";                    // TurboQuant objective override: auto|mse|prod.
-  bool verbose = true;                             // Print engine startup/runtime diagnostics to stdout.
-  float rope_theta = 0.0f;                          // RoPE base frequency override (0 = read from model file / family default).
-  bool enable_host_resource_limits = true;         // Enforce host CPU/RAM guardrails during startup and generation.
-  double max_cpu_percent = 85.0;                   // Host CPU usage hard ceiling (%).
-  double max_memory_percent = 85.0;                // Host physical memory usage hard ceiling (%).
-  int resource_sample_interval_ms = 250;           // Min interval between host resource samples.
-  int resource_sustain_ms = 5000;                  // Abort after this much sustained over-limit time.
-  int resource_throttle_sleep_ms = 50;             // Sleep duration used while over limit before abort.
-  int tq_cached_init_timeout_ms = 180000;          // Timeout budget for cached TurboQuant layer init.
-  int tq_first_token_timeout_ms = 120000;          // Timeout budget for first decode token in TurboQuant cached mode.
-  int eos_token_id = 2;                            // EOS token used by engine-level decode stop check (-1 disables).
-};
-
-// Timing and token-count statistics collected during the most recent generate()
-// or generate_stream() call.  All *_ms fields are wall-clock milliseconds.
-struct BenchmarkStats {
-  double prefill_ms = 0.0;           // Total time spent processing the prompt (prefill phase).
-  double decode_ms = 0.0;            // Total time spent in the autoregressive decode loop.
-  double transfer_ms = 0.0;          // Total time spent streaming layer weights from host to device.
-  double decode_rmsnorm_ms = 0.0;    // Cumulative time for RMSNorm kernels during decode.
-  double decode_qkv_ms = 0.0;        // Cumulative time for QKV projection during decode.
-  double decode_kv_store_ms = 0.0;   // Cumulative time for writing new KV entries to the cache.
-  double decode_attention_ms = 0.0;  // Cumulative time for the attention score + softmax kernels.
-  double decode_wo_ms = 0.0;         // Cumulative time for the output projection (Wo) during decode.
-  double decode_mlp_ms = 0.0;        // Cumulative time for the MLP block during decode.
-  double decode_moe_router_ms = 0.0; // Cumulative time for MoE router logits + top-k selection.
-  double decode_moe_expert_ms = 0.0; // Cumulative time for MoE expert matvec compute.
-  double decode_moe_merge_ms = 0.0;  // Cumulative time for MoE weighted merge kernels.
-  double decode_lm_head_ms = 0.0;    // Cumulative time for the final LM-head projection + sampling.
-  int prompt_tokens = 0;             // Number of tokens in the input prompt.
-  int generated_tokens = 0;          // Number of tokens produced during decode.
-  int streamed_layer_copies = 0;     // Number of layer weight transfers triggered during this run.
-  int tq3_cached_active = 0;         // 1 when full resident TurboQuant cached path is active, else 0.
-  // MoE routing snapshot for the most recent decoded token.
-  // Flattened layout: [layer0_e0, layer0_e1, ..., layerN_e(top_k-1)].
-  int moe_topk_layers = 0;
-  int moe_topk_k = 0;
-  std::vector<int> moe_topk_indices{};
-  std::vector<float> moe_topk_probs{};
-  std::string moe_quant_mode = "none"; // "fp16", "int8", "int4", or "none" for non-MoE.
 };
 
 // Main inference engine for LLaMA-family models.

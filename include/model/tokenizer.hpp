@@ -62,6 +62,7 @@ class Tokenizer {
   std::string tokenizer_json_path_;  // Resolved path to tokenizer.json, if present.
   std::string spm_encode_exe_;       // Path to the spm_encode helper binary (SPM backend).
   std::string spm_decode_exe_;       // Path to the spm_decode helper binary (SPM backend).
+  std::string spm_python_cmd_;       // Python command for the bundled SentencePiece helper, if available.
   int bos_id_ = -1;                  // Cached BOS token ID from the active backend.
   int eos_id_ = -1;                  // Cached EOS token ID from the active backend.
   int unk_id_ = -1;                  // Cached UNK token ID from the active backend.

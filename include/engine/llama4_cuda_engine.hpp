@@ -19,7 +19,7 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 
-#include "engine/llama_engine.hpp"
+#include "engine/engine_types.hpp"
 #include "model/safetensors_loader.hpp"
 
 namespace engine {

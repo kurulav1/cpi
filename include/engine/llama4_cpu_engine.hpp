@@ -14,7 +14,7 @@
 #include <utility>
 #include <vector>
 
-#include "engine/llama_engine.hpp"   // EngineOptions, BenchmarkStats
+#include "engine/engine_types.hpp"
 #include "model/safetensors_loader.hpp"
 
 namespace engine {

@@ -1,0 +1,4 @@
+numpy
+huggingface_hub
+tokenizers
+sentencepiece

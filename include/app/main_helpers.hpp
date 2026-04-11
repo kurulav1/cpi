@@ -42,6 +42,7 @@ std::string build_chat_prompt(const std::string& chat_template,
 std::vector<std::string> default_stop_texts_for_template(const std::string& chat_template);
 
 std::string sanitize_stream_text(std::string s);
+std::string normalize_final_response_text(const std::string& text);
 std::size_t find_first_stop_pos(const std::string& text, const std::vector<std::string>& stops);
 bool has_complete_sentence(const std::string& text);
 

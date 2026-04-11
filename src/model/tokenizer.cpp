@@ -19,8 +19,8 @@
 //      tokenizer.json files directly, requiring no external tools at runtime.
 //   2. SentencePiece   — the reference libsentencepiece library (optional; gated
 //      by LLAMA_ENGINE_HAS_SENTENCEPIECE), or, when the library is absent, a
-//      subprocess-based fallback that shells out to the spm_encode/spm_decode
-//      command-line programs found either on PATH or in the vcpkg tools tree.
+//      subprocess-based fallback that first tries the bundled Python helper and
+//      then shells out to spm_encode/spm_decode command-line programs.
 //
 // The subprocess fallback exists so that inference can still run on machines
 // where sentencepiece cannot be compiled (e.g. MSVC with limited CMake config)
@@ -41,6 +41,80 @@ std::string default_tool_path(const char* exe_name) {
   const std::filesystem::path p = std::filesystem::path(exe_name);
 #endif
   return p.string();
+}
+
+std::filesystem::path python_sentencepiece_script_path() {
+  return std::filesystem::path("tools") / "sentencepiece_cli.py";
+}
+
+std::string quote_shell_arg(const std::filesystem::path& p) {
+  const std::string raw = p.string();
+  if (raw.find('"') != std::string::npos) {
+    throw std::runtime_error("path contains unsupported quote character: " + raw);
+  }
+  return "\"" + raw + "\"";
+}
+
+std::string quote_shell_arg(const std::string& value) {
+  if (value.find('"') != std::string::npos) {
+    throw std::runtime_error("argument contains unsupported quote character: " + value);
+  }
+  return "\"" + value + "\"";
+}
+
+std::vector<std::string> python_command_candidates() {
+  std::vector<std::string> out;
+#ifdef _WIN32
+  char* env_buf = nullptr;
+  std::size_t env_len = 0;
+  if (_dupenv_s(&env_buf, &env_len, "LLAMA_PYTHON_EXE") == 0 && env_buf != nullptr) {
+    std::string value(env_buf);
+    if (!value.empty()) {
+      out.push_back(value);
+    }
+  }
+  if (env_buf) {
+    free(env_buf);
+  }
+  out.push_back("python");
+  out.push_back("py -3");
+#else
+  if (const char* python = std::getenv("LLAMA_PYTHON_EXE")) {
+    if (*python) {
+      out.push_back(python);
+    }
+  }
+  out.push_back("python3");
+  out.push_back("python");
+#endif
+  out.erase(std::unique(out.begin(), out.end()), out.end());
+  return out;
+}
+
+bool parse_special_id_line(const std::string& line,
+                           const std::string& key,
+                           int* out_value) {
+  if (!out_value) {
+    return false;
+  }
+  if (line.rfind(key + " ", 0) != 0) {
+    return false;
+  }
+  *out_value = std::stoi(line.substr(key.size() + 1));
+  return true;
+}
+
+std::vector<int> parse_special_ids_line(const std::string& line) {
+  if (line.rfind("special_ids ", 0) != 0) {
+    return {};
+  }
+  std::stringstream ss(line.substr(std::string("special_ids ").size()));
+  std::vector<int> ids;
+  int id = 0;
+  while (ss >> id) {
+    ids.push_back(id);
+  }
+  return ids;
 }
 
 // Reads the entire contents of a file into a string using binary mode so that
@@ -92,6 +166,7 @@ Tokenizer::~Tokenizer() {
 void Tokenizer::load(const std::string& path) {
   model_path_ = path;
   tokenizer_json_path_.clear();
+  spm_python_cmd_.clear();
   bos_id_ = -1;
   eos_id_ = -1;
   unk_id_ = -1;
@@ -159,6 +234,52 @@ void Tokenizer::load(const std::string& path) {
   if (unk_id_ >= 0) special_ids_.push_back(unk_id_);
 #endif
 
+  if (special_ids_.empty()) {
+    const std::filesystem::path helper_script = python_sentencepiece_script_path();
+    if (std::filesystem::exists(helper_script)) {
+      const auto tmp_dir = std::filesystem::temp_directory_path();
+      const auto out_path = tmp_dir / "llama_spm_special_ids.txt";
+      for (const std::string& python_cmd : python_command_candidates()) {
+        const std::string cmd = python_cmd + " " +
+                                quote_shell_arg(helper_script) +
+                                " special-ids --model " + quote_shell_arg(model_path_) +
+                                " --output " + quote_shell_arg(out_path);
+        const int rc = std::system(cmd.c_str());
+        if (rc != 0 || !std::filesystem::exists(out_path)) {
+          continue;
+        }
+        std::stringstream ss(read_text_file(out_path));
+        std::string line;
+        std::vector<int> parsed_special_ids;
+        int parsed_bos = -1;
+        int parsed_eos = -1;
+        int parsed_unk = -1;
+        while (std::getline(ss, line)) {
+          if (parse_special_id_line(line, "bos_id", &parsed_bos) ||
+              parse_special_id_line(line, "eos_id", &parsed_eos) ||
+              parse_special_id_line(line, "unk_id", &parsed_unk)) {
+            continue;
+          }
+          const std::vector<int> ids = parse_special_ids_line(line);
+          if (!ids.empty()) {
+            parsed_special_ids = ids;
+          }
+        }
+        if (parsed_special_ids.empty()) {
+          if (parsed_bos >= 0) parsed_special_ids.push_back(parsed_bos);
+          if (parsed_eos >= 0) parsed_special_ids.push_back(parsed_eos);
+          if (parsed_unk >= 0) parsed_special_ids.push_back(parsed_unk);
+        }
+        bos_id_ = parsed_bos;
+        eos_id_ = parsed_eos;
+        unk_id_ = parsed_unk;
+        special_ids_ = parsed_special_ids;
+        spm_python_cmd_ = python_cmd;
+        break;
+      }
+    }
+  }
+
   // If no backend populated the special token ids (e.g. sentencepiece was not
   // compiled in and the subprocess path is being used), fall back to the
   // conventional LLaMA token id assignments so generation stop logic works.
@@ -209,23 +330,38 @@ std::vector<int> Tokenizer::encode(const std::string& text, bool add_bos) const 
     throw std::runtime_error("tokenizer is not loaded");
   }
 
-  if (!std::filesystem::exists(spm_encode_exe_)) {
-    throw std::runtime_error("spm_encode executable not found: " + spm_encode_exe_);
-  }
-
   const auto tmp_dir = std::filesystem::temp_directory_path();
   const auto in_path = tmp_dir / "llama_spm_in.txt";
   const auto out_path = tmp_dir / "llama_spm_out.txt";
 
   write_text_file(in_path, text);
-  const std::string cmd = spm_encode_exe_ + " --model=" + model_path_ +
-                          " --output_format=id --input=" + in_path.string() +
-                          " --output=" + out_path.string();
-  const int rc = std::system(cmd.c_str());
-  if (rc != 0) {
-    // A non-zero exit code means spm_encode could not tokenize the input;
-    // include the full command string to aid diagnosis.
-    throw std::runtime_error("spm_encode command failed: " + cmd);
+  if (!spm_python_cmd_.empty()) {
+    const std::filesystem::path helper_script = python_sentencepiece_script_path();
+    const std::string cmd = spm_python_cmd_ + " " +
+                            quote_shell_arg(helper_script) +
+                            " encode --model " + quote_shell_arg(model_path_) +
+                            " --input " + quote_shell_arg(in_path) +
+                            " --output " + quote_shell_arg(out_path) +
+                            (add_bos ? " --add-bos" : "");
+    const int rc = std::system(cmd.c_str());
+    if (rc != 0) {
+      throw std::runtime_error("sentencepiece python encode failed: " + cmd);
+    }
+  } else {
+    if (!std::filesystem::exists(spm_encode_exe_)) {
+      throw std::runtime_error("spm_encode executable not found: " + spm_encode_exe_);
+    }
+
+    const std::string cmd = quote_shell_arg(spm_encode_exe_) +
+                            " --model=" + quote_shell_arg(model_path_) +
+                            " --output_format=id --input=" + quote_shell_arg(in_path) +
+                            " --output=" + quote_shell_arg(out_path);
+    const int rc = std::system(cmd.c_str());
+    if (rc != 0) {
+      // A non-zero exit code means spm_encode could not tokenize the input;
+      // include the full command string to aid diagnosis.
+      throw std::runtime_error("spm_encode command failed: " + cmd);
+    }
   }
 
   std::vector<int> ids;
@@ -276,10 +412,6 @@ std::string Tokenizer::decode(const std::vector<int>& ids) const {
   if (model_path_.empty()) {
     throw std::runtime_error("tokenizer is not loaded");
   }
-  if (!std::filesystem::exists(spm_decode_exe_)) {
-    throw std::runtime_error("spm_decode executable not found: " + spm_decode_exe_);
-  }
-
   const auto tmp_dir = std::filesystem::temp_directory_path();
   const auto in_path = tmp_dir / "llama_spm_ids.txt";
   const auto out_path = tmp_dir / "llama_spm_text.txt";
@@ -293,12 +425,30 @@ std::string Tokenizer::decode(const std::vector<int>& ids) const {
   }
   write_text_file(in_path, id_stream.str());
 
-  const std::string cmd = spm_decode_exe_ + " --model=" + model_path_ +
-                          " --input_format=id --input=" + in_path.string() +
-                          " --output=" + out_path.string();
-  const int rc = std::system(cmd.c_str());
-  if (rc != 0) {
-    throw std::runtime_error("spm_decode command failed: " + cmd);
+  if (!spm_python_cmd_.empty()) {
+    const std::filesystem::path helper_script = python_sentencepiece_script_path();
+    const std::string cmd = spm_python_cmd_ + " " +
+                            quote_shell_arg(helper_script) +
+                            " decode --model " + quote_shell_arg(model_path_) +
+                            " --input " + quote_shell_arg(in_path) +
+                            " --output " + quote_shell_arg(out_path);
+    const int rc = std::system(cmd.c_str());
+    if (rc != 0) {
+      throw std::runtime_error("sentencepiece python decode failed: " + cmd);
+    }
+  } else {
+    if (!std::filesystem::exists(spm_decode_exe_)) {
+      throw std::runtime_error("spm_decode executable not found: " + spm_decode_exe_);
+    }
+
+    const std::string cmd = quote_shell_arg(spm_decode_exe_) +
+                            " --model=" + quote_shell_arg(model_path_) +
+                            " --input_format=id --input=" + quote_shell_arg(in_path) +
+                            " --output=" + quote_shell_arg(out_path);
+    const int rc = std::system(cmd.c_str());
+    if (rc != 0) {
+      throw std::runtime_error("spm_decode command failed: " + cmd);
+    }
   }
 
   std::string result = read_text_file(out_path);

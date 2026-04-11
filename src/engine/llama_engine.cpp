@@ -204,18 +204,19 @@ void linear_rowmajor_weight(cublasHandle_t handle,
                             int in_features,
                             int batch_size,
                             cudaDataType_t output_type) {
-  if (lt_handle && linear_rowmajor_weight_lt(lt_handle,
-                                             lt_cache,
-                                             lt_workspace,
-                                             lt_workspace_bytes,
-                                             stream,
-                                             d_w_rowmajor,
-                                             d_x,
-                                             d_y,
-                                             out_features,
-                                             in_features,
-                                             batch_size,
-                                             output_type)) {
+  const bool allow_lt = output_type != CUDA_R_32F;
+  if (allow_lt && lt_handle && linear_rowmajor_weight_lt(lt_handle,
+                                                         lt_cache,
+                                                         lt_workspace,
+                                                         lt_workspace_bytes,
+                                                         stream,
+                                                         d_w_rowmajor,
+                                                         d_x,
+                                                         d_y,
+                                                         out_features,
+                                                         in_features,
+                                                         batch_size,
+                                                         output_type)) {
     return;
   }
 

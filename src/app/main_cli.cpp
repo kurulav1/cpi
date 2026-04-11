@@ -1,6 +1,7 @@
 #include "app/main_cli.hpp"
 
 #include <cstdlib>
+#include <ostream>
 #include <stdexcept>
 
 #include "app/main_helpers.hpp"

@@ -51,13 +51,12 @@ fi
 cd "$WEB_DIR"
 
 if [[ ! -d node_modules ]]; then
-  if [[ -f package-lock.json ]]; then
-    echo "[start_web] Installing web dependencies with npm ci..."
-    npm ci
-  else
-    echo "[start_web] Installing web dependencies with npm install..."
-    npm install
+  if [[ ! -f package-lock.json ]]; then
+    echo "[start_web] package-lock.json is missing, cannot run npm ci." >&2
+    exit 1
   fi
+  echo "[start_web] Installing web dependencies with npm ci..."
+  npm ci
 fi
 
 echo "[start_web] Starting dev server:"

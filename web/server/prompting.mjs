@@ -1,7 +1,7 @@
 const STOP_SEQUENCES = {
   tinyllama:        ["</s>", "\nUser:"],
   "tinyllama-chatml": ["</s>", "<|user|>", "<|system|>", "<|assistant|>", "\nUser:"],
-  llama2:   ["</s>", "[INST]", "<<SYS>>", "</", "<|"],
+  llama2:   ["</s>", "[INST]", "<<SYS>>", "<</SYS>>", "\nRelevant context:", "\nCurrent user message:", "\nUser:", "\nAssistant:", "<|"],
   llama3:   ["<|eot_id|>", "<|start_header_id|>", "<|end_header_id|>"],
   llama4:   ["<|eot_id|>", "<|start_header_id|>", "<|end_header_id|>", "<|begin_of_text|>"],
   mistral:  ["</s>", "[INST]"],
@@ -14,6 +14,18 @@ function sanitizeContent(value) {
   return String(value ?? "")
     .replace(/\r/g, "")
     .trim();
+}
+
+function normalizeUserContent(value, options = {}) {
+  let text = sanitizeContent(value);
+  if (options.template === "tinyllama" || options.template === "tinyllama-chatml") {
+    text = text.replace(/^\s*whos\b/i, "Who is");
+    text = text.replace(/^\s*whats\b/i, "What is");
+    if (/^\s*(?:who|what)\s+is\b/i.test(text) && /\.\s*$/.test(text)) {
+      text = text.replace(/\.\s*$/, "?");
+    }
+  }
+  return text;
 }
 
 function trimConversation(messages, maxChars = 9000) {
@@ -32,6 +44,195 @@ function trimConversation(messages, maxChars = 9000) {
   return safeMessages;
 }
 
+function wordCount(text = "") {
+  return String(text || "").trim().split(/\s+/).filter(Boolean).length;
+}
+
+function significantTokens(text = "") {
+  const stopwords = new Set([
+    "a",
+    "an",
+    "and",
+    "are",
+    "about",
+    "for",
+    "from",
+    "how",
+    "i",
+    "is",
+    "it",
+    "me",
+    "my",
+    "of",
+    "or",
+    "please",
+    "tell",
+    "the",
+    "to",
+    "what",
+    "when",
+    "where",
+    "who",
+    "whos",
+    "why",
+    "you"
+  ]);
+
+  return String(text || "")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/i)
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 2 && !stopwords.has(token));
+}
+
+function isIdentityQuestion(text = "") {
+  return /^\s*(?:who(?:'s|\sis)?|whos)\b/i.test(String(text || "").trim());
+}
+
+function isDirectAssistantQuestion(text = "") {
+  return /^\s*(?:who|what)\s+are\s+you\b/i.test(String(text || "").trim());
+}
+
+function shouldKeepTinyLlamaContext(text = "") {
+  const raw = String(text || "").trim();
+  if (!raw) return false;
+  if (isIdentityQuestion(raw) || isDirectAssistantQuestion(raw)) return false;
+  if (
+    /^\s*(?:and|also|then|so|but|continue|go on|elaborate|tell me more|what about|how about)\b/i.test(raw)
+  ) {
+    return true;
+  }
+  if (/^\s*(?:why|how|when|where)\b/i.test(raw)) {
+    return true;
+  }
+
+  const tokens = significantTokens(raw);
+  return wordCount(raw) <= 2 || tokens.length === 0;
+}
+
+function compactAssistantHistory(text = "", maxChars = 220) {
+  const clean = sanitizeContent(text).replace(/\s+/g, " ");
+  if (!clean) return "";
+
+  const sentences = clean.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [clean];
+  let compact = "";
+
+  for (const sentence of sentences) {
+    const normalized = sentence.replace(/\s+/g, " ").trim();
+    if (!normalized) continue;
+    const next = compact ? `${compact} ${normalized}` : normalized;
+    if (next.length > maxChars && compact) {
+      break;
+    }
+    compact = next;
+    if (compact.length >= Math.min(140, maxChars)) {
+      break;
+    }
+  }
+
+  if (!compact) {
+    compact = clean;
+  }
+
+  if (compact.length <= maxChars) {
+    return compact;
+  }
+
+  return compact.slice(0, maxChars).replace(/\s+\S*$/, "").trim();
+}
+
+function compactUserHistory(text = "", maxChars = 120) {
+  const clean = sanitizeContent(text).replace(/\s+/g, " ");
+  if (!clean) return "";
+  if (clean.length <= maxChars) return clean;
+
+  const sentence = (clean.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [clean])[0]
+    .replace(/\s+/g, " ")
+    .trim();
+  if (sentence.length <= maxChars) {
+    return sentence;
+  }
+
+  return clean.slice(0, maxChars).replace(/\s+\S*$/, "").trim();
+}
+
+function isGreetingOnly(text = "") {
+  return /^(?:hey|hi|hello|hullo|yo|good\s+(?:morning|afternoon|evening))\b[!.?,\s]*$/i.test(
+    String(text || "").trim()
+  );
+}
+
+function looksGreetingReply(text = "") {
+  return /^\s*(?:hey|hi|hello|greetings|good\s+(?:morning|afternoon|evening))\b/i.test(
+    String(text || "").trim()
+  );
+}
+
+function selectLlama2Messages(messages) {
+  const turns = toTurns(messages, { maxTurns: 12 });
+  if (turns.length === 0) {
+    return messages;
+  }
+
+  const latestTurn = turns[turns.length - 1];
+  const completedTurns = turns
+    .slice(0, -1)
+    .filter((turn) => turn.assistant)
+    .filter(
+      (turn) => !(isGreetingOnly(turn.user) && looksGreetingReply(turn.assistant))
+    )
+    .slice(-3);
+
+  const focusedMessages = messages.filter((message) => message.role === "system").slice(-1);
+  for (const turn of completedTurns) {
+    focusedMessages.push({ role: "user", content: turn.user });
+    focusedMessages.push({ role: "assistant", content: turn.assistant });
+  }
+  focusedMessages.push({ role: "user", content: latestTurn.user });
+  if (latestTurn.assistant) {
+    focusedMessages.push({ role: "assistant", content: latestTurn.assistant });
+  }
+
+  return focusedMessages;
+}
+
+function selectTinyLlamaMessages(messages) {
+  const turns = toTurns(messages, { maxTurns: 32 });
+  if (turns.length === 0) {
+    return messages;
+  }
+
+  const latestTurn = turns[turns.length - 1];
+  const includeContext = shouldKeepTinyLlamaContext(latestTurn.user);
+  const selectedTurns = includeContext ? turns.slice(-2) : [latestTurn];
+  const focusedMessages = messages.filter((message) => message.role === "system").slice(-1);
+
+  for (const [index, turn] of selectedTurns.entries()) {
+    focusedMessages.push({ role: "user", content: turn.user });
+    if (turn.assistant) {
+      focusedMessages.push({
+        role: "assistant",
+        content:
+          index === selectedTurns.length - 1
+            ? turn.assistant
+            : compactAssistantHistory(turn.assistant)
+      });
+    }
+  }
+
+  return focusedMessages;
+}
+
+function selectHistory(messages, options = {}) {
+  if (options.historyStrategy === "tinyllama-focused") {
+    return selectTinyLlamaMessages(messages);
+  }
+  if (options.historyStrategy === "llama2-summary") {
+    return selectLlama2Messages(messages);
+  }
+  return messages;
+}
+
 function normalizeMessages(messages, options = {}) {
   if (!Array.isArray(messages)) {
     return [];
@@ -44,11 +245,14 @@ function normalizeMessages(messages, options = {}) {
   const cleaned = messages
     .map((message) => ({
       role: allowedRoles.has(message?.role) ? message.role : "user",
-      content: sanitizeContent(message?.content)
+      content:
+        (allowedRoles.has(message?.role) ? message.role : "user") === "user"
+          ? normalizeUserContent(message?.content, options)
+          : sanitizeContent(message?.content)
     }))
     .filter((message) => message.content.length > 0);
 
-  return trimConversation(cleaned, maxChars);
+  return trimConversation(selectHistory(cleaned, options), maxChars);
 }
 
 function toTurns(messages, options = {}) {
@@ -90,7 +294,11 @@ function toTurns(messages, options = {}) {
 }
 
 function formatTinyLlama(turns, systemPrompt) {
-  const lines = [systemPrompt];
+  const lines = [];
+
+  if (systemPrompt) {
+    lines.push(systemPrompt);
+  }
 
   for (const turn of turns) {
     lines.push(`User: ${turn.user}`);
@@ -105,14 +313,18 @@ function formatTinyLlama(turns, systemPrompt) {
 }
 
 function formatChatMl(turns, systemPrompt) {
-  const blocks = [`<|system|>\n${systemPrompt}</s>`];
+  const blocks = [];
+
+  if (systemPrompt) {
+    blocks.push(`<|system|>\n${systemPrompt}</s>`);
+  }
 
   for (const turn of turns) {
     blocks.push(`<|user|>\n${turn.user}</s>`);
     if (turn.assistant) {
       blocks.push(`<|assistant|>\n${turn.assistant}</s>`);
     } else {
-      blocks.push("<|assistant|>\n");
+      blocks.push("<|assistant|>");
     }
   }
 
@@ -120,25 +332,28 @@ function formatChatMl(turns, systemPrompt) {
 }
 
 function formatLlama2(turns, systemPrompt) {
-  if (turns.length === 0) {
-    return `[INST] <<SYS>>\n${systemPrompt}\n<</SYS>>\n\nHello [/INST]`;
-  }
+  const defaultSystemPrompt =
+    "You are a helpful assistant. Reply naturally to the user's latest message only. Use the recent context if it helps answer the latest message. Do not continue the transcript or add meta explanation unless the user asks for it.";
 
-  const [firstTurn, ...rest] = turns;
-  let prompt = `<s>[INST] <<SYS>>\n${systemPrompt}\n<</SYS>>\n\n${firstTurn.user} [/INST]`;
+  const effectiveSystemPrompt = systemPrompt || defaultSystemPrompt;
+  const currentTurn = turns[turns.length - 1] || { user: "Hello" };
+  const contextTurns = turns
+    .slice(0, -1)
+    .filter((turn) => turn.assistant)
+    .slice(-3);
 
-  if (firstTurn.assistant) {
-    prompt += ` ${firstTurn.assistant} </s>`;
-  }
-
-  for (const turn of rest) {
-    prompt += ` <s>[INST] ${turn.user} [/INST]`;
-    if (turn.assistant) {
-      prompt += ` ${turn.assistant} </s>`;
+  const userBlocks = [];
+  if (contextTurns.length > 0) {
+    userBlocks.push("Relevant context:");
+    for (const turn of contextTurns) {
+      userBlocks.push(`- User: ${compactUserHistory(turn.user)}`);
+      userBlocks.push(`- Assistant: ${compactAssistantHistory(turn.assistant, 160)}`);
     }
   }
+  userBlocks.push(`Current user message: ${compactUserHistory(currentTurn.user, 220)}`);
+  userBlocks.push("Respond with only the assistant's answer.");
 
-  return prompt.trim();
+  return `[INST] <<SYS>>\n${effectiveSystemPrompt}\n<</SYS>>\n\n${userBlocks.join("\n")}\n[/INST]`;
 }
 
 function formatLlama4(turns, systemPrompt) {
@@ -228,9 +443,12 @@ export function buildPromptPackage(messages, options = {}) {
   const normalized = normalizeMessages(messages, options);
   const turns = toTurns(normalized, options);
   const template = options.template || "tinyllama";
-  const systemPrompt =
-    sanitizeContent(options.systemPrompt) ||
-    "You are a helpful assistant.";
+  const hasExplicitSystemPrompt =
+    Object.prototype.hasOwnProperty.call(options, "systemPrompt");
+  const systemPrompt = sanitizeContent(options.systemPrompt);
+  const effectiveSystemPrompt = hasExplicitSystemPrompt
+    ? systemPrompt
+    : (template === "tinyllama" ? "" : "You are a helpful assistant.");
 
   if (turns.length === 0) {
     return {
@@ -245,27 +463,27 @@ export function buildPromptPackage(messages, options = {}) {
   if (template === "tinyllama-chatml") {
     return {
       messages: normalized,
-      prompt: formatChatMl(turns, systemPrompt),
+      prompt: formatChatMl(turns, effectiveSystemPrompt),
       template,
       stopTexts: STOP_SEQUENCES[template],
-      addBos: false
+      addBos: true
     };
   }
 
   if (template === "llama2") {
     return {
       messages: normalized,
-      prompt: formatLlama2(turns, systemPrompt),
+      prompt: formatLlama2(turns, effectiveSystemPrompt),
       template,
       stopTexts: STOP_SEQUENCES[template],
-      addBos: false
+      addBos: true
     };
   }
 
   if (template === "llama3") {
     return {
       messages: normalized,
-      prompt: formatLlama3(turns, systemPrompt),
+      prompt: formatLlama3(turns, effectiveSystemPrompt),
       template,
       stopTexts: STOP_SEQUENCES.llama3,
       addBos: false
@@ -275,7 +493,7 @@ export function buildPromptPackage(messages, options = {}) {
   if (template === "llama4") {
     return {
       messages: normalized,
-      prompt: formatLlama4(turns, systemPrompt),
+      prompt: formatLlama4(turns, effectiveSystemPrompt),
       template,
       stopTexts: STOP_SEQUENCES.llama4,
       addBos: false
@@ -285,7 +503,7 @@ export function buildPromptPackage(messages, options = {}) {
   if (template === "mistral") {
     return {
       messages: normalized,
-      prompt: formatMistral(turns, systemPrompt),
+      prompt: formatMistral(turns, effectiveSystemPrompt),
       template,
       stopTexts: STOP_SEQUENCES.mistral,
       addBos: false
@@ -295,7 +513,7 @@ export function buildPromptPackage(messages, options = {}) {
   if (template === "phi3") {
     return {
       messages: normalized,
-      prompt: formatPhi3(turns, systemPrompt),
+      prompt: formatPhi3(turns, effectiveSystemPrompt),
       template,
       stopTexts: STOP_SEQUENCES.phi3,
       addBos: false
@@ -305,7 +523,7 @@ export function buildPromptPackage(messages, options = {}) {
   if (template === "qwen2") {
     return {
       messages: normalized,
-      prompt: formatQwen2(turns, systemPrompt),
+      prompt: formatQwen2(turns, effectiveSystemPrompt),
       template,
       stopTexts: STOP_SEQUENCES.qwen2,
       addBos: false
@@ -315,7 +533,7 @@ export function buildPromptPackage(messages, options = {}) {
   if (template === "plain") {
     return {
       messages: normalized,
-      prompt: formatPlain(turns, systemPrompt),
+      prompt: formatPlain(turns, effectiveSystemPrompt),
       template,
       stopTexts: STOP_SEQUENCES[template],
       addBos: true
@@ -324,7 +542,7 @@ export function buildPromptPackage(messages, options = {}) {
 
   return {
     messages: normalized,
-    prompt: formatTinyLlama(turns, systemPrompt),
+    prompt: formatTinyLlama(turns, effectiveSystemPrompt),
     template: "tinyllama",
     stopTexts: STOP_SEQUENCES.tinyllama,
     addBos: false

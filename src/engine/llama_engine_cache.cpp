@@ -378,8 +378,9 @@ void LlamaEngine::init_layer_cache() {
     const bool use_cached_int8 = cached_int8_mlp_enabled_ && can_cache_layer_mlp_as_lowbit(weights_, layer, quant_bits);
     const bool use_cached_int4 = use_cached_int8 && (quant_bits == 4);
     lw_i8.mlp_int4 = use_cached_int4;
-    // TQ3 path owns wqkv/wo/w13 via packed weights; skip fp16 and int8-proj alloc for those.
-    const bool use_proj_int8 = !tq3_enabled_;
+    // TQ3 path owns wqkv/wo/w13 via packed weights. Otherwise, only cache
+    // projection weights in low-bit form when low-bit streaming was requested.
+    const bool use_proj_int8 = !tq3_enabled_ && lowbit_streaming_enabled(options_);
     const bool use_proj_int4 = use_proj_int8 && (quant_bits == 4) && enable_proj_int4;
     lw_i8.proj_int4 = use_proj_int4;
     const std::size_t w1_bytes = use_cached_int4
@@ -540,6 +541,65 @@ void LlamaEngine::init_layer_cache() {
     auto* tmp_i8 = lowbit_streaming_enabled(options_) ? &streaming_layer_weights_i8_[0] : nullptr;
     auto* wqkv_base = static_cast<__half*>(lw.wqkv);
     auto* w13_base = static_cast<__half*>(lw.w13);
+    const bool plain_fp16_cached_layer = !tq3_enabled_ && !use_proj_int8 && !use_cached_int8;
+
+    const auto copy_fp16_direct = [&](const std::string& name, void* dst, std::size_t bytes) {
+      if (!dst) {
+        return;
+      }
+      if (!weights_.has_tensor(name)) {
+        LLAMA_ENGINE_THROW("missing tensor: " + name);
+      }
+      CUDA_CHECK(cudaMemcpyAsync(dst, weights_.tensor_data(name), bytes, cudaMemcpyHostToDevice, transfer_stream_));
+    };
+    const auto copy_optional_fp16_direct = [&](const std::string& name, void* dst, std::size_t bytes) {
+      if (!dst) {
+        return;
+      }
+      if (weights_.has_tensor(name)) {
+        CUDA_CHECK(cudaMemcpyAsync(dst, weights_.tensor_data(name), bytes, cudaMemcpyHostToDevice, transfer_stream_));
+      } else {
+        CUDA_CHECK(cudaMemsetAsync(dst, 0, bytes, transfer_stream_));
+      }
+    };
+
+    if (plain_fp16_cached_layer) {
+      copy_fp16_direct(p + ".attention_norm.weight", lw.norm_att, bytes_for_matrix(1, hidden));
+      copy_optional_fp16_direct(p + ".attention_norm.bias", lw.norm_att_bias, bytes_for_matrix(1, hidden));
+      copy_fp16_direct(p + ".attention.wq", wqkv_base, bytes_for_matrix(q_hidden, hidden));
+      copy_fp16_direct(p + ".attention.wk",
+                       wqkv_base + static_cast<std::size_t>(q_hidden) * static_cast<std::size_t>(hidden),
+                       bytes_for_matrix(kv_hidden, hidden));
+      copy_fp16_direct(p + ".attention.wv",
+                       wqkv_base + static_cast<std::size_t>(q_hidden + kv_hidden) * static_cast<std::size_t>(hidden),
+                       bytes_for_matrix(kv_hidden, hidden));
+      copy_fp16_direct(p + ".attention.wo", lw.wo, bytes_for_matrix(hidden, q_hidden));
+      copy_optional_fp16_direct(p + ".attention.bo", lw.bo, bytes_for_matrix(1, hidden));
+      if (cfg.has_qkv_bias && weights_.has_tensor(p + ".attention.bqkv")) {
+        const std::size_t bias_bytes = bytes_for_matrix(1, q_hidden + 2 * kv_hidden);
+        if (!lw.bqkv && cudaMalloc(&lw.bqkv, bias_bytes) == cudaSuccess) {
+          CUDA_CHECK(cudaMemcpyAsync(lw.bqkv,
+                                     weights_.tensor_data(p + ".attention.bqkv"),
+                                     bias_bytes,
+                                     cudaMemcpyHostToDevice,
+                                     transfer_stream_));
+        }
+      }
+      copy_fp16_direct(p + ".ffn_norm.weight", lw.norm_ffn, bytes_for_matrix(1, hidden));
+      copy_optional_fp16_direct(p + ".ffn_norm.bias", lw.norm_ffn_bias, bytes_for_matrix(1, hidden));
+      copy_fp16_direct(p + ".feed_forward.w1", w13_base, bytes_for_matrix(inter, hidden));
+      copy_fp16_direct(p + ".feed_forward.w3",
+                       w13_base + static_cast<std::size_t>(inter) * static_cast<std::size_t>(hidden),
+                       bytes_for_matrix(inter, hidden));
+      copy_fp16_direct(p + ".feed_forward.w2", lw.w2, bytes_for_matrix(hidden, inter));
+
+      CUDA_CHECK(cudaStreamSynchronize(transfer_stream_));
+      CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
+      built++;
+      enforce_host_resource_limits("cache_init.layer_end");
+      check_tq_cached_init_timeout(cache_init_start, layer);
+      continue;
+    }
 
     // Load norm_att always; wqkv/wo skipped for TQ3 (covered by packed weights loaded later).
     load_async(p + ".attention_norm.weight", lw.norm_att, bytes_for_matrix(1, hidden), nullptr, nullptr, 1, hidden);
@@ -764,7 +824,7 @@ void LlamaEngine::init_layer_cache() {
   }
 
   cached_layer_count_ = built;
-  cached_int8_proj_enabled_ = !tq3_enabled_ && (built > 0);
+  cached_int8_proj_enabled_ = !tq3_enabled_ && lowbit_streaming_enabled(options_) && (built > 0);
   layer_cache_.resize(static_cast<std::size_t>(cached_layer_count_));
   layer_cache_i8_.resize(static_cast<std::size_t>(cached_layer_count_));
 

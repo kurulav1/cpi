@@ -26,6 +26,7 @@ using app::main_helpers::json_get_float;
 using app::main_helpers::json_get_int;
 using app::main_helpers::json_get_string;
 using app::main_helpers::json_get_string_array;
+using app::main_helpers::normalize_final_response_text;
 using app::main_helpers::sanitize_stream_text;
 
 }  // namespace
@@ -239,6 +240,7 @@ void execute_engine_modes(const RunExecutionOptions& options,
         if (stop_pos != std::string::npos) {
           final_text = final_text.substr(0, stop_pos);
         }
+        final_text = normalize_final_response_text(final_text);
         const auto req_end = std::chrono::steady_clock::now();
         const auto elapsed_ms =
             std::chrono::duration_cast<std::chrono::milliseconds>(req_end - req_start).count();
@@ -518,12 +520,13 @@ void execute_engine_modes(const RunExecutionOptions& options,
       const auto prompt_n = static_cast<std::vector<int>::difference_type>(prompt_tokens.size());
       generated_only.assign(out.begin() + prompt_n, out.end());
     }
-    std::string final_text = sanitize_stream_text(tokenizer->decode(generated_only));
-    const std::size_t stop_pos = find_first_stop_pos(final_text, stop_texts);
-    if (stop_pos != std::string::npos) {
-      final_text = final_text.substr(0, stop_pos);
-    }
-    if (!generated_only.empty()) {
+      std::string final_text = sanitize_stream_text(tokenizer->decode(generated_only));
+      const std::size_t stop_pos = find_first_stop_pos(final_text, stop_texts);
+      if (stop_pos != std::string::npos) {
+        final_text = final_text.substr(0, stop_pos);
+      }
+      final_text = normalize_final_response_text(final_text);
+      if (!generated_only.empty()) {
       std::size_t special_count = 0;
       const auto& specials = tokenizer->special_ids();
       for (int id : generated_only) {

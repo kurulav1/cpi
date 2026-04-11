@@ -1,0 +1,54 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 24,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "binaryDir": "${sourceDir}/build/${presetName}"
+    },
+    {
+      "name": "cpu-release",
+      "displayName": "CPU-only Release",
+      "description": "Configure a release build that does not require CUDA.",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "LLAMA_ENGINE_ENABLE_CUDA": "OFF"
+      }
+    },
+    {
+      "name": "cuda-distributable-release",
+      "displayName": "CUDA Distributable Release",
+      "description": "Release build with explicit multi-arch CUDA fatbins for shared binaries.",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "LLAMA_ENGINE_ENABLE_CUDA": "ON",
+        "CMAKE_CUDA_ARCHITECTURES": "75;80;86;89;90"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "cpu-release",
+      "configurePreset": "cpu-release",
+      "targets": [
+        "llama_infer"
+      ]
+    },
+    {
+      "name": "cuda-distributable-release",
+      "configurePreset": "cuda-distributable-release",
+      "targets": [
+        "llama_infer",
+        "cuda_bandwidth_bench",
+        "moe_kernel_parity_test"
+      ]
+    }
+  ]
+}

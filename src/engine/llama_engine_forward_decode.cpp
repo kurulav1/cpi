@@ -278,19 +278,14 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
 
       launch_norm(d_x_, lw->norm_att, lw->norm_att_bias, d_x_norm_, 1, hidden);
 
-      detail::dispatch_linear_rowmajor_weight(cublas_,
-                                              matmul_lt,
-                                              &lt_plan_cache_,
-                                              lt_workspace_,
-                                              lt_workspace_bytes_,
-                                              compute_stream_,
-                                              lw->wqkv,
-                                              d_x_norm_,
-                                              d_q_,
-                                              q_hidden + 2 * kv_hidden,
-                                              hidden,
-                                              1,
-                                              CUDA_R_16F);
+      resident_projection_half(lw->wqkv,
+                               d_x_norm_,
+                               d_q_,
+                               q_hidden + 2 * kv_hidden,
+                               hidden,
+                               resident_qkv_warps_,
+                               resident_qkv_tile_pairs_,
+                               resident_qkv_rows_per_warp_);
       if (lw->bqkv && cfg.has_qkv_bias && weights_.has_tensor(p + ".attention.bqkv")) {
         kernels::launch_add_inplace(static_cast<__half*>(d_q_),
                                     static_cast<const __half*>(lw->bqkv),
@@ -376,19 +371,14 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
         }
       }
 
-      detail::dispatch_linear_rowmajor_weight(cublas_,
-                                              matmul_lt,
-                                              &lt_plan_cache_,
-                                              lt_workspace_,
-                                              lt_workspace_bytes_,
-                                              compute_stream_,
-                                              lw->wo,
-                                              d_att_,
-                                              d_ff3_,
-                                              hidden,
-                                              q_hidden,
-                                              1,
-                                              CUDA_R_16F);
+      resident_projection_half(lw->wo,
+                               d_att_,
+                               d_ff3_,
+                               hidden,
+                               q_hidden,
+                               resident_wo_warps_,
+                               resident_wo_tile_pairs_,
+                               resident_wo_rows_per_warp_);
       maybe_add_half_bias(d_ff3_, lw->bo, 1, hidden);
       kernels::launch_add_inplace(static_cast<__half*>(d_x_),
                                   static_cast<const __half*>(d_ff3_),
@@ -538,19 +528,14 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
                                                      resident_int8_qkv_warps_per_row_);
       }
     } else {
-      detail::dispatch_linear_rowmajor_weight(cublas_,
-                             matmul_lt,
-                             &lt_plan_cache_,
-                             lt_workspace_,
-                             lt_workspace_bytes_,
-                             compute_stream_,
-                             lw->wqkv,
-                             d_x_norm_,
-                             d_q_,
-                             q_hidden + 2 * kv_hidden,
-                             hidden,
-                             1,
-                             CUDA_R_16F);
+      resident_projection_half(lw->wqkv,
+                               d_x_norm_,
+                               d_q_,
+                               q_hidden + 2 * kv_hidden,
+                               hidden,
+                               resident_qkv_warps_,
+                               resident_qkv_tile_pairs_,
+                               resident_qkv_rows_per_warp_);
     }
     if (lw->bqkv) {
       kernels::launch_add_inplace(static_cast<__half*>(d_q_),
@@ -647,19 +632,14 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
                                                      resident_int8_wo_warps_per_row_);
       }
     } else {
-      detail::dispatch_linear_rowmajor_weight(cublas_,
-                             matmul_lt,
-                             &lt_plan_cache_,
-                             lt_workspace_,
-                             lt_workspace_bytes_,
-                             compute_stream_,
-                             lw->wo,
-                             d_att_,
-                             d_ff3_,
-                             hidden,
-                             q_hidden,
-                             1,
-                             CUDA_R_16F);
+      resident_projection_half(lw->wo,
+                               d_att_,
+                               d_ff3_,
+                               hidden,
+                               q_hidden,
+                               resident_wo_warps_,
+                               resident_wo_tile_pairs_,
+                               resident_wo_rows_per_warp_);
     }
     maybe_add_half_bias(d_ff3_, lw->bo, 1, hidden);
 
@@ -683,19 +663,14 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
             lw_i8->w3, lw_i8->s_w3, static_cast<const __half*>(d_x_norm_), static_cast<__half*>(d_ff2_), inter, hidden, compute_stream_);
       }
     } else {
-       detail::dispatch_linear_rowmajor_weight(cublas_,
-                              matmul_lt,
-                              &lt_plan_cache_,
-                              lt_workspace_,
-                              lt_workspace_bytes_,
-                              compute_stream_,
-                              lw->w13,
-                             d_x_norm_,
-                              d_ff1_,
-                              2 * inter,
-                              hidden,
-                              1,
-                              CUDA_R_16F);
+      resident_projection_half(lw->w13,
+                               d_x_norm_,
+                               d_ff1_,
+                               2 * inter,
+                               hidden,
+                               resident_qkv_warps_,
+                               resident_qkv_tile_pairs_,
+                               resident_qkv_rows_per_warp_);
     }
 
     kernels::launch_silu_mul(static_cast<const __half*>(d_ff1_),
@@ -713,19 +688,14 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
             lw_i8->w2, lw_i8->s_w2, static_cast<const __half*>(d_ff2_), static_cast<__half*>(d_ff3_), hidden, inter, compute_stream_);
       }
     } else {
-      detail::dispatch_linear_rowmajor_weight(cublas_,
-                             matmul_lt,
-                             &lt_plan_cache_,
-                             lt_workspace_,
-                             lt_workspace_bytes_,
-                             compute_stream_,
-                             lw->w2,
-                             d_ff2_,
-                             d_ff3_,
-                             hidden,
-                             inter,
-                             1,
-                             CUDA_R_16F);
+      resident_projection_half(lw->w2,
+                               d_ff2_,
+                               d_ff3_,
+                               hidden,
+                               inter,
+                               resident_wo_warps_,
+                               resident_wo_tile_pairs_,
+                               resident_wo_rows_per_warp_);
     }
 
     kernels::launch_add_inplace(static_cast<__half*>(d_x_),
@@ -751,19 +721,14 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
             resident_qkv_tile_pairs_,
             resident_qkv_rows_per_warp_);
       } else {
-        detail::dispatch_linear_rowmajor_weight(cublas_,
-                               matmul_lt,
-                               &lt_plan_cache_,
-                               lt_workspace_,
-                               lt_workspace_bytes_,
-                               compute_stream_,
-                               lw->wqkv,
-                               d_x_norm_,
-                               d_q_,
-                               q_hidden + 2 * kv_hidden,
-                               hidden,
-                               1,
-                               CUDA_R_16F);
+        resident_projection_half(lw->wqkv,
+                                 d_x_norm_,
+                                 d_q_,
+                                 q_hidden + 2 * kv_hidden,
+                                 hidden,
+                                 resident_qkv_warps_,
+                                 resident_qkv_tile_pairs_,
+                                 resident_qkv_rows_per_warp_);
       }
     });
 
@@ -820,19 +785,14 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
         resident_projection_half(
             lw->wo, d_att_, d_ff3_, hidden, q_hidden, resident_wo_warps_, resident_wo_tile_pairs_, resident_wo_rows_per_warp_);
       } else {
-        detail::dispatch_linear_rowmajor_weight(cublas_,
-                               matmul_lt,
-                               &lt_plan_cache_,
-                               lt_workspace_,
-                               lt_workspace_bytes_,
-                               compute_stream_,
-                               lw->wo,
-                               d_att_,
-                               d_ff3_,
-                               hidden,
-                               q_hidden,
-                               1,
-                               CUDA_R_16F);
+        resident_projection_half(lw->wo,
+                                 d_att_,
+                                 d_ff3_,
+                                 hidden,
+                                 q_hidden,
+                                 resident_wo_warps_,
+                                 resident_wo_tile_pairs_,
+                                 resident_wo_rows_per_warp_);
       }
       maybe_add_half_bias(d_ff3_, lw->bo, 1, hidden);
       kernels::launch_add_inplace(static_cast<__half*>(d_x_),
@@ -846,19 +806,14 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
     });
 
     run_profiled(last_benchmark_stats_.decode_mlp_ms, [&] {
-      detail::dispatch_linear_rowmajor_weight(cublas_,
-                             matmul_lt,
-                             &lt_plan_cache_,
-                             lt_workspace_,
-                             lt_workspace_bytes_,
-                             compute_stream_,
-                             lw->w13,
-                             d_x_norm_,
-                             d_ff1_,
-                             2 * inter,
-                             hidden,
-                             1,
-                             CUDA_R_16F);
+      resident_projection_half(lw->w13,
+                               d_x_norm_,
+                               d_ff1_,
+                               2 * inter,
+                               hidden,
+                               resident_qkv_warps_,
+                               resident_qkv_tile_pairs_,
+                               resident_qkv_rows_per_warp_);
 
       kernels::launch_silu_mul(static_cast<const __half*>(d_ff1_),
                                static_cast<const __half*>(d_ff2_),
@@ -866,19 +821,14 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
                                inter,
                                compute_stream_);
 
-      detail::dispatch_linear_rowmajor_weight(cublas_,
-                             matmul_lt,
-                             &lt_plan_cache_,
-                             lt_workspace_,
-                             lt_workspace_bytes_,
-                             compute_stream_,
-                             lw->w2,
-                             d_ff2_,
-                             d_ff3_,
-                             hidden,
-                             inter,
-                             1,
-                             CUDA_R_16F);
+      resident_projection_half(lw->w2,
+                               d_ff2_,
+                               d_ff3_,
+                               hidden,
+                               inter,
+                               resident_wo_warps_,
+                               resident_wo_tile_pairs_,
+                               resident_wo_rows_per_warp_);
 
       kernels::launch_add_inplace(static_cast<__half*>(d_x_),
                                   static_cast<const __half*>(d_ff3_),
@@ -1240,8 +1190,13 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
 
     kernels::launch_rope_inplace_table(static_cast<__half*>(d_q_),
                                        static_cast<__half*>(d_k_),
-                                       cfg.num_heads, cfg.num_kv_heads, head_dim,
-                                       position, d_rope_cos_, d_rope_sin_, compute_stream_);
+                                       cfg.num_heads,
+                                       cfg.num_kv_heads,
+                                       head_dim,
+                                       position,
+                                       d_rope_cos_,
+                                       d_rope_sin_,
+                                       compute_stream_);
 
     run_profiled(last_benchmark_stats_.decode_kv_store_ms, [&] {
       const std::size_t kv_bytes    = bytes_for_matrix(1, kv_hidden);

@@ -29,6 +29,7 @@ const API_ROUTES = Object.freeze({
   quantJobs: "/api/quant/jobs",
   quantStatus: "/api/quant/status",
   pickFolder: "/api/system/pick-folder",
+  modelDir: "/api/system/model-dir",
   hubSearch: "/api/hub/search",
   hubDownload: "/api/hub/download",
   hubJob: "/api/hub/jobs"
@@ -78,7 +79,7 @@ function createMsg(role, content, extra = {}) {
 }
 
 function tailPath(v) {
-  if (!v) return "ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â";
+  if (!v) return "-";
   const parts = v.split(/[/\\]/).filter(Boolean);
   return parts.length <= 3 ? v : `.../${parts.slice(-3).join("/")}`;
 }
@@ -130,9 +131,9 @@ function defaultQuantForProfile(profile) {
 }
 
 // Render assistant text with smart newline handling:
-//   \n\n  ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ paragraph break (two <br>s, via empty part)
-//   \n before a list/code/empty line ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ hard break
-//   \n mid-prose ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ space (prevents tokens landing on their own lines)
+//   \n\n   paragraph break (two <br>s, via empty part)
+//   \n before a list/code/empty line  hard break
+//   \n mid-prose  space (prevents tokens landing on their own lines)
 function MsgContent({ text }) {
   const clean = text.replace(/^\n+/, '').replace(/\n{3,}/g, '\n\n');
   const parts = clean.split('\n');
@@ -142,13 +143,13 @@ function MsgContent({ text }) {
     elems.push(<span key={i}>{line}</span>);
     if (i < parts.length - 1) {
       const next = parts[i + 1];
-      // Empty line (from \n\n split) ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ paragraph break
+      // Empty line (from \n\n split)  paragraph break
       if (line === '' || next === '') {
         elems.push(<br key={`br-${i}`} />);
-      // List markers, blockquote, code fence ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ hard break
+      // List markers, blockquote, code fence  hard break
       } else if (/^[-*>]|\d+\.|^```/.test(next.trimStart())) {
         elems.push(<br key={`br-${i}`} />);
-      // Mid-prose \n ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ soft space
+      // Mid-prose \n  soft space
       } else {
         elems.push(' ');
       }
@@ -161,7 +162,7 @@ function normalise(msgs) {
   return msgs.filter((m) => !m.seed).map((m) => ({ role: m.role, content: m.content }));
 }
 
-// ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ Job row ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬
+//  Job row 
 
 function JobRow({ jobId, repoId, onDone }) {
   const [lines,    setLines]    = useState([]);
@@ -224,7 +225,7 @@ function JobRow({ jobId, repoId, onDone }) {
 
       {ll2cPath && (
         <p style={{ marginTop:"0.2rem", fontSize:"0.68rem", color:"var(--text-3)", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
-          ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ {ll2cPath}
+          Path: {ll2cPath}
         </p>
       )}
 
@@ -237,10 +238,10 @@ function JobRow({ jobId, repoId, onDone }) {
             <span style={{ flexShrink:0, fontFamily:"var(--mono)" }}>
               {progress.pct >= 0 ? `${progress.pct}%` : ""}
               {progress.total > 0
-                ? ` Ãƒâ€šÃ‚Â· ${fmtBytes(progress.downloaded)} / ${fmtBytes(progress.total)}`
-                : ` Ãƒâ€šÃ‚Â· ${fmtBytes(progress.downloaded)}`}
-              {progress.speed > 0 ? ` Ãƒâ€šÃ‚Â· ${fmtBytes(progress.speed)}/s` : ""}
-              {progress.eta   > 0 ? ` Ãƒâ€šÃ‚Â· ${progress.eta < 60 ? `${progress.eta}s` : `${Math.round(progress.eta/60)}m`}` : ""}
+                ? ` - ${fmtBytes(progress.downloaded)} / ${fmtBytes(progress.total)}`
+                : ` - ${fmtBytes(progress.downloaded)}`}
+              {progress.speed > 0 ? ` - ${fmtBytes(progress.speed)}/s` : ""}
+              {progress.eta   > 0 ? ` - ${progress.eta < 60 ? `${progress.eta}s` : `${Math.round(progress.eta/60)}m`}` : ""}
             </span>
           </div>
           <div className="progress-track">
@@ -251,7 +252,7 @@ function JobRow({ jobId, repoId, onDone }) {
 
       <div className="log-box">
         {lines.length === 0
-          ? <span style={{ color:"var(--text-3)", fontStyle:"italic" }}>StartingÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦</span>
+          ? <span style={{ color:"var(--text-3)", fontStyle:"italic" }}>Starting...</span>
           : lines.map((l, i) => (
             <div key={i} style={{ color: l.kind === "error" ? "#fca5a5" : undefined }}>{l.text}</div>
           ))
@@ -329,7 +330,7 @@ function QuantJobRow({ jobId, label, initialStatus = "running", initialOutPath =
 
       {outPath && (
         <p style={{ marginTop:"0.2rem", fontSize:"0.68rem", color:"var(--text-3)", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
-          ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ {outPath}
+          Path: {outPath}
         </p>
       )}
 
@@ -351,7 +352,7 @@ function QuantJobRow({ jobId, label, initialStatus = "running", initialOutPath =
 
       <div className="log-box">
         {lines.length === 0
-          ? <span style={{ color:"var(--text-3)", fontStyle:"italic" }}>StartingÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦</span>
+          ? <span style={{ color:"var(--text-3)", fontStyle:"italic" }}>Starting...</span>
           : lines.slice(-50).map((l, i) => (
             <div key={i} style={{ color: l.kind === "error" ? "#fca5a5" : undefined }}>{l.text}</div>
           ))
@@ -361,7 +362,7 @@ function QuantJobRow({ jobId, label, initialStatus = "running", initialOutPath =
   );
 }
 
-// ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ Hub panel ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬
+//  Hub panel 
 
 function HubPanel() {
   const [query,      setQuery]      = useState("");
@@ -394,6 +395,23 @@ function HubPanel() {
       .catch(() => {});
   }, []);
 
+  const syncModelDir = useCallback(async (dir) => {
+    const payload = await fetchJson(API_ROUTES.modelDir, {
+      method: "POST",
+      headers: { "Content-Type":"application/json" },
+      body: JSON.stringify({ dir })
+    });
+    if (Array.isArray(payload.models)) {
+      setLocal(payload.models);
+    } else {
+      refreshLocalModels();
+    }
+  }, [refreshLocalModels]);
+
+  useEffect(() => {
+    void syncModelDir(outputDir.trim());
+  }, [outputDir, syncModelDir]);
+
   useEffect(() => {
     refreshLocalModels();
   }, [refreshLocalModels]);
@@ -405,7 +423,7 @@ function HubPanel() {
         setQuantJobs(
           jobsFromApi.map((j) => ({
             jobId: j.jobId,
-            label: j.modelLabel ? `${j.modelLabel} ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ ${quantLabel(j.quantMode)}` : (j.path ? tailPath(j.path) : j.jobId),
+            label: j.modelLabel ? `${j.modelLabel} - ${quantLabel(j.quantMode)}` : (j.path ? tailPath(j.path) : j.jobId),
             profileId: j.profileId || "",
             mode: j.quantMode || "",
             status: j.status || "running",
@@ -497,7 +515,7 @@ function HubPanel() {
         headers: { "Content-Type":"application/json" },
         body: JSON.stringify({ profileId, quantMode: mode })
       });
-      const entryLabel = `${label} ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ ${quantLabel(mode)}`;
+      const entryLabel = `${label} - ${quantLabel(mode)}`;
       setQuantJobs((prev) => [{
         jobId: data.jobId,
         label: entryLabel,
@@ -561,10 +579,10 @@ function HubPanel() {
         <div className="hub-card">
           <p className="hub-card-label">Search Hugging Face</p>
           <form style={{ display:"flex", gap:"0.5rem" }} onSubmit={doSearch}>
-            <input className="field-ctrl" type="text" placeholder="Qwen2-1.5B, Mistral-7B, TinyLlamaÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦"
+            <input className="field-ctrl" type="text" placeholder="Qwen2-1.5B, Mistral-7B, TinyLlama..."
               value={query} onChange={(e) => setQuery(e.target.value)} />
             <button type="submit" className="btn btn-primary" style={{ flexShrink:0 }} disabled={searching || !query.trim()}>
-              {searching ? "ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦" : "Search"}
+              {searching ? "..." : "Search"}
             </button>
           </form>
 
@@ -610,7 +628,7 @@ function HubPanel() {
 
           <div className="field" style={{ marginTop:"0.5rem" }}>
             <label className="field-label">HF Token (optional)</label>
-            <input className="field-ctrl" type="password" placeholder="hf_ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦"
+            <input className="field-ctrl" type="password" placeholder="hf_..."
               style={{ fontFamily:"var(--mono)", fontSize:"0.76rem" }}
               value={hfToken}
               onChange={(e) => { setHfToken(e.target.value); safeStorageSet(STORAGE_KEYS.hubToken, e.target.value); }} />
@@ -632,7 +650,7 @@ function HubPanel() {
                   <div style={{ minWidth:0, flex:1 }}>
                     <p style={{ fontFamily:"var(--mono)", fontSize:"0.78rem", color:"var(--text)", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{m.id}</p>
                     <p style={{ fontSize:"0.68rem", color:"var(--text-3)", marginTop:"0.1rem" }}>
-                      ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬Å“ {fmtDl(m.downloads)}{m.likes ? ` Ãƒâ€šÃ‚Â· ÃƒÂ¢Ã¢â€žÂ¢Ã‚Â¥ ${m.likes}` : ""}{m.gated ? " Ãƒâ€šÃ‚Â· gated" : ""}
+                      Downloads {fmtDl(m.downloads)}{m.likes ? ` - Likes ${m.likes}` : ""}{m.gated ? " - gated" : ""}
                     </p>
                     {dlStatus[m.id]?.state === "error" && dlStatus[m.id]?.error && (
                       <p style={{ fontSize:"0.66rem", color:"var(--red)", marginTop:"0.15rem", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
@@ -674,7 +692,7 @@ function HubPanel() {
                   <p style={{ fontSize:"0.67rem", color:"var(--text-3)", fontFamily:"var(--mono)", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap", marginTop:"0.1rem" }}>{m.modelPath}</p>
                   {m.quant && (
                     <p style={{ fontSize:"0.66rem", color:"var(--text-2)", marginTop:"0.2rem" }}>
-                      q: default {quantLabel(m.quant.effectiveMode)} Ãƒâ€šÃ‚Â· packed {m.quant.packed.int8 ? "INT8" : "ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â"}/{m.quant.packed.int4 ? "INT4" : "ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â"}{m.quant.packed.tq3 ? " Ãƒâ€šÃ‚Â· TQ3" : ""}
+                      q: default {quantLabel(m.quant.effectiveMode)} - packed {m.quant.packed.int8 ? "INT8" : "-"}/{m.quant.packed.int4 ? "INT4" : "-"}{m.quant.packed.tq3 ? " - TQ3" : ""}
                     </p>
                   )}
                 </div>
@@ -686,7 +704,7 @@ function HubPanel() {
                       disabled={quantSet.has(`${m.id}|int8`)}
                       onClick={() => doQuantConvert(m.id, "int8", m.label)}
                     >
-                      {quantSet.has(`${m.id}|int8`) ? "INT8ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦" : "Pack INT8"}
+                      {quantSet.has(`${m.id}|int8`) ? "INT8..." : "Pack INT8"}
                     </button>
                   )}
                   {m.quant?.conversion?.int4?.state === "available" && (
@@ -696,7 +714,7 @@ function HubPanel() {
                       disabled={quantSet.has(`${m.id}|int4`)}
                       onClick={() => doQuantConvert(m.id, "int4", m.label)}
                     >
-                      {quantSet.has(`${m.id}|int4`) ? "INT4ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦" : "Pack INT4"}
+                      {quantSet.has(`${m.id}|int4`) ? "INT4..." : "Pack INT4"}
                     </button>
                   )}
                   <span className={`badge ${m.ready ? "badge-green" : "badge-amber"}`}>{m.ready ? "ready" : m.status}</span>
@@ -711,7 +729,7 @@ function HubPanel() {
   );
 }
 
-// ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ App ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬
+//  App 
 
 export default function App() {
   const [view,     setView]     = useState("chat");
@@ -735,12 +753,13 @@ export default function App() {
   const [error,    setError]    = useState("");
   const [runMeta,  setRunMeta]  = useState(null);
   const [warmup,   setWarmup]   = useState({ state:"idle", workerKey:"", error:"" });
-  const [stamp,    setStamp]    = useState("ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦");
+  const [stamp,    setStamp]    = useState("...");
   const [quantState, setQuantState] = useState(null);
 
   const scrollRef   = useRef(null);
   const taRef       = useRef(null);
   const abortRef    = useRef(null);
+  const messagesRef = useRef(messages);
   const warmupAbortRef = useRef(null);
   const warmupSeqRef = useRef(0);
   const deltaQueueRef = useRef("");
@@ -918,6 +937,9 @@ export default function App() {
 
   useEffect(() => () => warmupAbortRef.current?.abort(), []);
   useEffect(() => () => stopDeltaPump(), []);
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
 
   // Auto-scroll
   useEffect(() => {
@@ -944,6 +966,25 @@ export default function App() {
     requestAnimationFrame(() => { growTa(text); taRef.current?.focus(); });
   }
 
+  function updateMessages(updater) {
+    setMessages((cur) => {
+      const next = typeof updater === "function" ? updater(cur) : updater;
+      messagesRef.current = next;
+      return next;
+    });
+  }
+
+  function snapshotMessages() {
+    const queued = deltaQueueRef.current;
+    const targetId = deltaTargetRef.current;
+    if (!queued || !targetId) {
+      return messagesRef.current;
+    }
+    return messagesRef.current.map((m) =>
+      m.id === targetId ? { ...m, content: `${m.content}${queued}` } : m
+    );
+  }
+
   function stopDeltaPump() {
     if (deltaRafRef.current) {
       cancelAnimationFrame(deltaRafRef.current);
@@ -958,7 +999,7 @@ export default function App() {
     deltaTargetRef.current = "";
     stopDeltaPump();
     if (!rest || !targetId) return;
-    setMessages((cur) =>
+    updateMessages((cur) =>
       cur.map((m) =>
         m.id === targetId ? { ...m, content: `${m.content}${rest}`, streaming: true } : m
       )
@@ -991,7 +1032,7 @@ export default function App() {
 
       const chunk = queued.slice(0, take);
       deltaQueueRef.current = queued.slice(take);
-      setMessages((cur) =>
+      updateMessages((cur) =>
         cur.map((m) =>
           m.id === targetId ? { ...m, content: `${m.content}${chunk}`, streaming: true } : m
         )
@@ -1017,12 +1058,12 @@ export default function App() {
 
     const userMsg = createMsg("user", text);
     const asstMsg = createMsg("assistant", "", { streaming:true });
-    const thread  = normalise([...messages, userMsg]);
+    const thread  = normalise([...snapshotMessages(), userMsg]);
     const ctrl    = new AbortController();
 
     setError(""); setRunMeta({ state:"starting" }); setStreaming(true);
     abortRef.current = ctrl;
-    setMessages((cur) => [...cur, userMsg, asstMsg]);
+    updateMessages((cur) => [...cur, userMsg, asstMsg]);
     setDraft(""); requestAnimationFrame(() => growTa(""));
 
     try {
@@ -1043,7 +1084,12 @@ export default function App() {
         },
       });
       flushDeltaQueue();
-      setMessages((cur) => cur.map((m) => m.id === asstMsg.id ? { ...m, streaming:false } : m));
+      const finalMessage = typeof done?.message === "string" ? done.message : "";
+      updateMessages((cur) => cur.map((m) =>
+        m.id === asstMsg.id
+          ? { ...m, content: finalMessage || m.content, streaming:false }
+          : m
+      ));
       setRunMeta({
         state: done?.type === "aborted" ? "stopped" : "done",
         elapsedMs: done?.elapsedMs ?? 0,
@@ -1055,8 +1101,8 @@ export default function App() {
       flushDeltaQueue();
       const aborted = e.name === "AbortError";
       const errMsg = (e?.message || "No response from engine.").trim();
-      const briefErr = errMsg.length > 220 ? `${errMsg.slice(0, 220)}ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦` : errMsg;
-      setMessages((cur) => cur.map((m) =>
+      const briefErr = errMsg.length > 220 ? `${errMsg.slice(0, 220)}...` : errMsg;
+      updateMessages((cur) => cur.map((m) =>
         m.id === asstMsg.id
           ? { ...m, content: m.content || (aborted ? "Stopped." : `Engine error: ${briefErr}`), streaming:false }
           : m
@@ -1074,7 +1120,7 @@ export default function App() {
   return (
     <div className="shell">
 
-      {/* ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ Topbar ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ */}
+      {/*  Topbar  */}
       <header className="topbar">
         <span className="topbar-brand">CPI</span>
         <span className="topbar-sep" />
@@ -1103,7 +1149,7 @@ export default function App() {
           title="Model"
         >
           {readyProfiles.length === 0 && (
-            <option value="">{health.config ? "No models found" : "LoadingÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦"}</option>
+            <option value="">{health.config ? "No models found" : "Loading"}</option>
           )}
           {readyProfiles.map((p) => (
             <option key={p.id} value={p.id}>
@@ -1158,7 +1204,7 @@ export default function App() {
             <span className="badge badge-red">Worker Q {quantLabel(activeWorkerQuantMode)}</span>
           )}
           {settings.performanceMode && <span className="badge badge-blue">Perf</span>}
-          <span className="topbar-model">{selProfile?.label || "ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â"}</span>
+          <span className="topbar-model">{selProfile?.label || "-"}</span>
         </span>
 
         <span style={{ fontSize:"0.7rem", color:"var(--text-3)", marginLeft:"0.4rem", flexShrink:0 }}>{stamp}</span>
@@ -1175,11 +1221,11 @@ export default function App() {
 
         {/* Settings */}
         <button type="button" className="topbar-icon" title="Settings" onClick={() => setShowCfg(true)}>
-          ÃƒÂ¢Ã…Â¡Ã¢â€žÂ¢
+          Cfg
         </button>
       </header>
 
-      {/* ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ Content ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ */}
+      {/*  Content  */}
       <div className="content">
 
         {view === "hub" ? (
@@ -1208,7 +1254,7 @@ export default function App() {
             )}
             {!selectedQuantJobRunning && selectedQuantJob?.status === "error" && (
               <div className="notice notice-warn">
-                Latest {quantLabel(settings.quantMode)} conversion failed. Check Model Hub ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ Quantization Jobs logs.
+                Latest {quantLabel(settings.quantMode)} conversion failed. Check Model Hub - Quantization Jobs logs.
               </div>
             )}
             {!health.ready && (
@@ -1270,14 +1316,14 @@ export default function App() {
                     className="composer-ta"
                     value={draft}
                     rows={1}
-                    placeholder="MessageÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦"
+                    placeholder="Message..."
                     onChange={(e) => { setDraft(e.target.value); growTa(e.target.value); }}
                     onKeyDown={(e) => {
                       if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submit(); }
                     }}
                   />
                   <div className="composer-foot">
-                    <span className="composer-hint">Enter to send Ãƒâ€šÃ‚Â· Shift+Enter for newline</span>
+                    <span className="composer-hint">Enter to send - Shift+Enter for newline</span>
                     <div className="composer-acts">
                       {streaming && (
                         <button type="button" className="btn btn-ghost" onClick={() => abortRef.current?.abort()}>Stop</button>
@@ -1298,13 +1344,13 @@ export default function App() {
           </>
         )}
 
-        {/* ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ Settings drawer ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ */}
+        {/*  Settings drawer  */}
         {showCfg && (
           <div className="overlay" onClick={() => setShowCfg(false)}>
             <div className="drawer" onClick={(e) => e.stopPropagation()}>
               <div className="drawer-head">
                 <span className="drawer-title">Settings</span>
-                <button type="button" className="drawer-close" onClick={() => setShowCfg(false)}>ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¢</button>
+                <button type="button" className="drawer-close" onClick={() => setShowCfg(false)}>X</button>
               </div>
 
               <div className="drawer-body">
@@ -1397,7 +1443,7 @@ export default function App() {
                       <span className="kv-key">Conversion Job</span>
                       <span className="kv-val">
                         {selectedQuantJob.status}
-                        {selectedQuantJob?.progress?.pct != null ? ` Ãƒâ€šÃ‚Â· ${selectedQuantJob.progress.pct}%` : ""}
+                        {selectedQuantJob?.progress?.pct != null ? ` - ${selectedQuantJob.progress.pct}%` : ""}
                       </span>
                     </div>
                   )}
@@ -1405,7 +1451,7 @@ export default function App() {
                     <div className="kv">
                       <span className="kv-key">Packed</span>
                       <span className="kv-val">
-                        INT8 {selProfile.quant.packed?.int8 ? "yes" : "no"} Â· INT4 {selProfile.quant.packed?.int4 ? "yes" : "no"}{selProfile.quant.packed?.tq3 ? " Â· TQ3 yes" : ""}
+                        INT8 {selProfile.quant.packed?.int8 ? "yes" : "no"} - INT4 {selProfile.quant.packed?.int4 ? "yes" : "no"}{selProfile.quant.packed?.tq3 ? " - TQ3 yes" : ""}
                       </span>
                     </div>
                   )}
@@ -1413,15 +1459,15 @@ export default function App() {
                     <div className="kv">
                       <span className="kv-key">MoE</span>
                       <span className="kv-val">
-                        experts {selProfile.moe.numLocalExperts} Ã‚Â· top-k {selProfile.moe.numExpertsPerTok || 2}
-                        {selProfile.moe.expertIntermediateSize ? ` Ã‚Â· inter ${selProfile.moe.expertIntermediateSize}` : ""}
+                        experts {selProfile.moe.numLocalExperts} - top-k {selProfile.moe.numExpertsPerTok || 2}
+                        {selProfile.moe.expertIntermediateSize ? ` - inter ${selProfile.moe.expertIntermediateSize}` : ""}
                       </span>
                     </div>
                   )}
 
                   <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:"0.5rem", marginTop:"0.2rem" }}>
                     {[
-                      ["Context",  health.config?.maxContext ?? "ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â"],
+                      ["Context",  health.config?.maxContext ?? "-"],
                       ["Models",   readyProfiles.length],
                     ].map(([k, v]) => (
                       <div key={k} style={{ background:"var(--surface-2)", border:"1px solid var(--border)", borderRadius:"0.4rem", padding:"0.5rem 0.65rem" }}>

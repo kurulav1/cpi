@@ -18,8 +18,10 @@
 #include "app/main_modes.hpp"
 #include "engine/cpu_engine.hpp"
 #include "engine/llama4_cpu_engine.hpp"
+#if LLAMA_ENGINE_HAS_CUDA
 #include "engine/llama4_cuda_engine.hpp"
 #include "engine/llama_engine.hpp"
+#endif
 #include "model/tokenizer.hpp"
 
 #ifdef _WIN32
@@ -129,7 +131,7 @@ int main(int argc, char** argv) {
 
         const std::string formatted_prompt = build_chat_prompt(cli.chat_template, cli.prompt_text, tinyllama_plain_fallback);
         bool add_bos = (cli.chat_template != "tinyllama") || tinyllama_plain_fallback;
-        if (cli.chat_template == "tinyllama" || cli.chat_template == "tinyllama-chatml" || cli.chat_template == "llama4") {
+        if (cli.chat_template == "tinyllama" || cli.chat_template == "llama4") {
           add_bos = false;
         }
         if (cli.force_no_bos) {
@@ -166,11 +168,19 @@ int main(int argc, char** argv) {
     }
 
     // --- Engine initialization: auto-detect GPU, fall back to CPU ---
+#if LLAMA_ENGINE_HAS_CUDA
     int cuda_device_count = 0;
     cudaGetDeviceCount(&cuda_device_count);
+#else
+    const int cuda_device_count = 0;
+#endif
     const bool is_llama4_model = is_safetensors_model_dir(cli.opts.model_path);
     const bool use_llama4_cpu_engine = is_llama4_model && (cli.force_cpu || cuda_device_count == 0);
+#if LLAMA_ENGINE_HAS_CUDA
     const bool use_llama4_cuda_engine = is_llama4_model && !cli.force_cpu && cuda_device_count > 0;
+#else
+    const bool use_llama4_cuda_engine = false;
+#endif
     const bool use_cpu_engine = use_llama4_cpu_engine || (!is_llama4_model && (cli.force_cpu || cuda_device_count == 0));
     if (!quiet_output) {
       if (use_llama4_cuda_engine) {
@@ -178,8 +188,14 @@ int main(int argc, char** argv) {
       } else if (use_llama4_cpu_engine) {
         std::cout << "[info] Detected a safetensors model. Using the Llama4 CPU engine.\n";
       } else if (use_cpu_engine) {
+#if LLAMA_ENGINE_HAS_CUDA
         std::cout << "[info] " << (cli.force_cpu ? "CPU engine forced via --cpu flag." : "No CUDA device found.")
                   << " Using CPU inference engine.\n";
+#else
+        std::cout << "[info] "
+                  << (cli.force_cpu ? "CPU engine forced via --cpu flag." : "This binary was built without CUDA support.")
+                  << " Using CPU inference engine.\n";
+#endif
       }
     }
 
@@ -201,11 +217,13 @@ int main(int argc, char** argv) {
 
     auto run_with_engine = [&](auto& eng) {
       eng.initialize(cli.opts);
+#if LLAMA_ENGINE_HAS_CUDA
       if constexpr (std::is_same_v<std::decay_t<decltype(eng)>, engine::LlamaEngine>) {
         if (cli.parity_check) {
           eng.run_parity_check(prompt_tokens);
         }
       }
+#endif
 
       app::main_modes::execute_engine_modes(
           run_opts,
@@ -230,18 +248,26 @@ int main(int argc, char** argv) {
           });
     };
 
+#if LLAMA_ENGINE_HAS_CUDA
     if (use_llama4_cuda_engine) {
       engine::Llama4CudaEngine llama4_cuda_eng;
       run_with_engine(llama4_cuda_eng);
     } else if (use_llama4_cpu_engine) {
+#else
+    if (use_llama4_cpu_engine) {
+#endif
       engine::Llama4CpuEngine llama4_cpu_eng;
       run_with_engine(llama4_cpu_eng);
     } else if (use_cpu_engine) {
       engine::CpuLlamaEngine cpu_eng;
       run_with_engine(cpu_eng);
     } else {
+#if LLAMA_ENGINE_HAS_CUDA
       engine::LlamaEngine gpu_eng;
       run_with_engine(gpu_eng);
+#else
+      throw std::runtime_error("CUDA inference was requested, but this binary was built without CUDA support");
+#endif
     }
   } catch (const std::exception& e) {
     std::cerr << "Fatal: " << e.what() << "\n";

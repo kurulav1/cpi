@@ -164,6 +164,7 @@ void LlamaEngine::tune_resident_projection_backends() {
   resident_mlp_w2_warps_ = 8;
   resident_mlp_w2_tile_packed4_ = 256;
   resident_mlp_w2_warps_per_row_ = 2;
+  return;
 
   const auto& cfg = weights_.config();
   if (cached_layer_count_ != cfg.num_layers || options_.paged_kv_cache || layer_cache_.empty()) {

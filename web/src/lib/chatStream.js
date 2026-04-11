@@ -3,6 +3,27 @@ const API_ROUTES = Object.freeze({
   stream: "/api/chat/stream"
 });
 
+let requestSeq = 0;
+
+function logDevRequest(payload) {
+  if (!import.meta.env.DEV) return;
+  requestSeq += 1;
+  console.debug(`[cpi][chat:${requestSeq}] request`, {
+    profileId: payload.profileId,
+    template: payload.template,
+    temperature: payload.temperature,
+    maxNewTokens: payload.maxNewTokens,
+    performanceMode: payload.performanceMode,
+    quantMode: payload.quantMode,
+    messages: payload.messages
+  });
+}
+
+function logDevResponse(finalEvent) {
+  if (!import.meta.env.DEV || !finalEvent) return;
+  console.debug("[cpi][chat] response", finalEvent);
+}
+
 export async function fetchHealth() {
   const response = await fetch(API_ROUTES.health);
   if (!response.ok) {
@@ -12,21 +33,24 @@ export async function fetchHealth() {
 }
 
 export async function streamChat({ messages, settings, signal, onEvent }) {
+  const payload = {
+    messages,
+    profileId: settings.profileId,
+    template: settings.template,
+    systemPrompt: settings.systemPrompt,
+    temperature: settings.temperature,
+    maxNewTokens: settings.maxNewTokens,
+    performanceMode: Boolean(settings.performanceMode),
+    quantMode: settings.quantMode || "none"
+  };
+  logDevRequest(payload);
+
   const response = await fetch(API_ROUTES.stream, {
     method: "POST",
     headers: {
       "Content-Type": "application/json"
     },
-    body: JSON.stringify({
-      messages,
-      profileId: settings.profileId,
-      template: settings.template,
-      systemPrompt: settings.systemPrompt,
-      temperature: settings.temperature,
-      maxNewTokens: settings.maxNewTokens,
-      performanceMode: Boolean(settings.performanceMode),
-      quantMode: settings.quantMode || "none"
-    }),
+    body: JSON.stringify(payload),
     signal
   });
 
@@ -89,5 +113,6 @@ export async function streamChat({ messages, settings, signal, onEvent }) {
     }
   }
 
+  logDevResponse(finalEvent);
   return finalEvent;
 }

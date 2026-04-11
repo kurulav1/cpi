@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <regex>
 #include <sstream>
 #include <stdexcept>
 
@@ -135,6 +136,12 @@ std::string build_llama3_style_prompt(const std::string& prompt_text) {
          std::string(kDefaultSystemPrompt) +
          "<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n" +
          prompt_text + "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n";
+}
+
+std::string build_llama2_style_prompt(const std::string& prompt_text) {
+  return "[INST] <<SYS>>\n" + std::string(kDefaultSystemPrompt) +
+         "\nReply naturally to the user's latest request only. Do not add explanation unless asked.\n<</SYS>>\n\n" +
+         prompt_text + " [/INST]";
 }
 
 std::string to_lower_copy(std::string s) {
@@ -375,8 +382,7 @@ std::string build_chat_prompt(const std::string& chat_template,
            prompt_text + "</s>\n<|assistant|>\n";
   }
   if (chat_template == "llama2") {
-    return "[INST] <<SYS>>\n" + std::string(kDefaultSystemPrompt) + "\n<</SYS>>\n\n" +
-           prompt_text + " [/INST]";
+    return build_llama2_style_prompt(prompt_text);
   }
   if (chat_template == "llama3") {
     return build_llama3_style_prompt(prompt_text);
@@ -402,7 +408,8 @@ std::string build_chat_prompt(const std::string& chat_template,
 std::vector<std::string> default_stop_texts_for_template(
     const std::string& chat_template) {
   if (chat_template == "llama2") {
-    return {"</s>", "[INST]", "<<SYS>>", "</", "<|"};
+    return {"</s>", "[INST]", "[/INST]", "<<SYS>>", "<</SYS>>", "\nQuestion:",
+            "\nUser:", "\nSystem:", "\nAssistant:", "\nExplanation:", "</", "<|"};
   }
   if (chat_template == "llama3") {
     return {"<|eot_id|>", "<|start_header_id|>", "<|end_header_id|>"};
@@ -432,6 +439,178 @@ std::vector<std::string> default_stop_texts_for_template(
 std::string sanitize_stream_text(std::string s) {
   s.erase(std::remove(s.begin(), s.end(), '\r'), s.end());
   return s;
+}
+
+std::string normalize_whitespace(std::string text) {
+  text = std::regex_replace(text, std::regex("\\s{2,}"), " ");
+  while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front()))) {
+    text.erase(text.begin());
+  }
+  while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back()))) {
+    text.pop_back();
+  }
+  return text;
+}
+
+std::string cleanup_repeated_words(std::string text) {
+  static const std::regex repeated_word(R"(\b([A-Za-z][A-Za-z'-]*)\b(?:\s+\1\b)+)",
+                                        std::regex_constants::icase);
+  static const std::regex repeated_segment(R"(\b([A-Za-z]{3,})\1\b)",
+                                           std::regex_constants::icase);
+  static const std::regex repeated_letter(R"(([A-Za-z])\1{4,})");
+  static const std::regex repeated_punct(R"(([!?.,])\1+)");
+
+  for (int i = 0; i < 4; ++i) {
+    const std::string next = std::regex_replace(text, repeated_word, "$1");
+    if (next == text) {
+      break;
+    }
+    text = next;
+  }
+  for (int i = 0; i < 4; ++i) {
+    const std::string next = std::regex_replace(text, repeated_segment, "$1");
+    if (next == text) {
+      break;
+    }
+    text = next;
+  }
+  text = std::regex_replace(text, repeated_letter, "$1");
+  text = std::regex_replace(text, repeated_punct, "$1");
+  return normalize_whitespace(text);
+}
+
+std::string normalized_alpha_token(const std::string& token) {
+  std::string out;
+  for (unsigned char ch : token) {
+    if (std::isalpha(ch)) {
+      out.push_back(static_cast<char>(std::tolower(ch)));
+    }
+  }
+  return out;
+}
+
+bool is_prefix_like_duplicate(const std::string& left, const std::string& right) {
+  if (left.size() < 3 || right.size() < 3) {
+    return false;
+  }
+  if (left == right) {
+    return true;
+  }
+  return (right.starts_with(left) || left.starts_with(right));
+}
+
+std::string collapse_adjacent_near_duplicate_words(const std::string& text) {
+  std::stringstream ss(text);
+  std::vector<std::string> tokens;
+  std::string token;
+  while (ss >> token) {
+    if (!tokens.empty()) {
+      const std::string prev_norm = normalized_alpha_token(tokens.back());
+      const std::string cur_norm = normalized_alpha_token(token);
+      if (is_prefix_like_duplicate(prev_norm, cur_norm)) {
+        if (cur_norm.size() >= prev_norm.size()) {
+          tokens.back() = token;
+        }
+        continue;
+      }
+    }
+    tokens.push_back(token);
+  }
+
+  std::ostringstream joined;
+  for (std::size_t i = 0; i < tokens.size(); ++i) {
+    if (i > 0) {
+      joined << ' ';
+    }
+    joined << tokens[i];
+  }
+  return normalize_whitespace(joined.str());
+}
+
+std::string trim_incomplete_trailing_tail(std::string text) {
+  const std::size_t last_period = text.find_last_of('.');
+  const std::size_t last_exclaim = text.find_last_of('!');
+  const std::size_t last_question = text.find_last_of('?');
+  std::size_t last_terminal = last_period;
+  if (last_exclaim != std::string::npos &&
+      (last_terminal == std::string::npos || last_exclaim > last_terminal)) {
+    last_terminal = last_exclaim;
+  }
+  if (last_question != std::string::npos &&
+      (last_terminal == std::string::npos || last_question > last_terminal)) {
+    last_terminal = last_question;
+  }
+  if (last_terminal == std::string::npos || last_terminal + 1 >= text.size()) {
+    return normalize_whitespace(text);
+  }
+  const std::string trailing = normalize_whitespace(text.substr(last_terminal + 1));
+  if (!trailing.empty() && trailing.find_first_of(".!?") == std::string::npos) {
+    text.resize(last_terminal + 1);
+  }
+  return normalize_whitespace(text);
+}
+
+std::string cleanup_repeated_sentences(const std::string& text) {
+  static const std::regex sentence_re(R"([^.!?]+[.!?]+|[^.!?]+$)");
+  std::sregex_iterator it(text.begin(), text.end(), sentence_re);
+  std::sregex_iterator end;
+  std::vector<std::string> deduped;
+  std::string previous_key;
+
+  for (; it != end; ++it) {
+    std::string sentence = normalize_whitespace(it->str());
+    if (sentence.empty()) {
+      continue;
+    }
+    const std::string key = to_lower_copy(sentence);
+    if (key == previous_key) {
+      continue;
+    }
+    deduped.push_back(sentence);
+    previous_key = key;
+  }
+
+  if (deduped.empty()) {
+    return normalize_whitespace(text);
+  }
+
+  std::ostringstream joined;
+  for (std::size_t i = 0; i < deduped.size(); ++i) {
+    if (i > 0) {
+      joined << ' ';
+    }
+    joined << deduped[i];
+  }
+  return normalize_whitespace(joined.str());
+}
+
+std::string normalize_final_response_text(const std::string& text) {
+  std::string cleaned = sanitize_stream_text(text);
+  const std::vector<std::regex> cut_markers = {
+      std::regex(R"((?:^|\n)\s*Explanation\s*:)", std::regex_constants::icase),
+      std::regex(R"((?:^|\n)\s*Question\s*:)", std::regex_constants::icase),
+      std::regex(R"((?:^|\n)\s*User\s*:)", std::regex_constants::icase),
+      std::regex(R"((?:^|\n)\s*System\s*:)", std::regex_constants::icase),
+      std::regex(R"(\[INST\])", std::regex_constants::icase),
+      std::regex(R"(<<SYS>>)", std::regex_constants::icase),
+      std::regex(R"(<</SYS>>)", std::regex_constants::icase),
+  };
+  for (const auto& marker : cut_markers) {
+    std::smatch match;
+    if (std::regex_search(cleaned, match, marker) && match.position() > 0) {
+      cleaned = cleaned.substr(0, static_cast<std::size_t>(match.position()));
+      break;
+    }
+  }
+
+  cleaned = std::regex_replace(cleaned, std::regex(R"(^\s*Assistant\s*:?\s*)", std::regex_constants::icase), "");
+  cleaned = std::regex_replace(cleaned, std::regex(R"(^\s*Answer\s*:?\s*)", std::regex_constants::icase), "");
+  cleaned = std::regex_replace(cleaned, std::regex(R"(^\s*(?:\[/?INST\]|<<\/?SYS>>|</?s>)\s*)", std::regex_constants::icase), "");
+
+  return cleanup_repeated_sentences(
+      trim_incomplete_trailing_tail(
+          collapse_adjacent_near_duplicate_words(
+              cleanup_repeated_words(normalize_whitespace(cleaned)))));
 }
 
 std::size_t find_first_stop_pos(const std::string& text,

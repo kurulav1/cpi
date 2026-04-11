@@ -7,7 +7,7 @@
 #include <utility>
 #include <vector>
 
-#include "engine/llama_engine.hpp"
+#include "engine/engine_types.hpp"
 #include "model/weight_loader.hpp"
 
 namespace engine {

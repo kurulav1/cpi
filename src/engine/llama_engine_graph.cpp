@@ -12,13 +12,7 @@
 namespace engine {
 
 bool LlamaEngine::can_use_greedy_decode_graph() const {
-  return cached_layer_count_ == weights_.config().num_layers && !options_.paged_kv_cache &&
-         !options_.profile_decode_phases && !kv_int4_enabled_ &&
-         !weights_.config().is_moe() && !weights_.config().use_layernorm &&
-         (attn_q_hidden_ <= 0 || attn_q_hidden_ == weights_.config().hidden_size) &&
-         !has_any_layer_norm_bias_ && !has_any_layer_output_bias_ &&
-         !weights_.has_tensor("norm.bias") && !weights_.has_tensor("output.bias") &&
-         weights_.config().sliding_window <= 0;
+  return false;
 }
 
 void LlamaEngine::destroy_greedy_decode_graph() {

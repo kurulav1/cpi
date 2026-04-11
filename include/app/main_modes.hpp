@@ -5,7 +5,7 @@
 #include <utility>
 #include <vector>
 
-#include "engine/llama_engine.hpp"
+#include "engine/engine_types.hpp"
 
 namespace model {
 class Tokenizer;

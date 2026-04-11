@@ -74,31 +74,15 @@ void LlamaEngine::forward_token(int token,
   });
 
   run_profiled(last_benchmark_stats_.decode_lm_head_ms, [&] {
-    if (resident_fast_path && resident_custom_lm_head_) {
-      resident_projection_float(
-          d_lm_head_,
-          d_x_norm_,
-          d_logits_,
-          cfg.vocab_size,
-          hidden,
-          resident_lm_head_warps_,
-          resident_lm_head_tile_pairs_,
-          resident_lm_head_rows_per_warp_);
-    } else {
-      detail::dispatch_linear_rowmajor_weight(cublas_,
-                             matmul_lt,
-                             &lt_plan_cache_,
-                             lt_workspace_,
-                             lt_workspace_bytes_,
-                             compute_stream_,
-                             d_lm_head_,
-                             d_x_norm_,
-                             d_logits_,
-                             cfg.vocab_size,
-                             hidden,
-                             1,
-                             CUDA_R_32F);
-    }
+    resident_projection_float(
+        d_lm_head_,
+        d_x_norm_,
+        d_logits_,
+        cfg.vocab_size,
+        hidden,
+        resident_lm_head_warps_,
+        resident_lm_head_tile_pairs_,
+        resident_lm_head_rows_per_warp_);
     if (d_lm_head_bias_) {
       kernels::launch_add_bias_inplace_float_from_half(static_cast<float*>(d_logits_),
                                                        static_cast<const __half*>(d_lm_head_bias_),

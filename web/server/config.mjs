@@ -7,6 +7,8 @@ const __dirname = path.dirname(__filename);
 const webRoot = path.resolve(__dirname, "..");
 const repoRoot = path.resolve(webRoot, "..");
 const artifactsRoot = path.resolve(repoRoot, "artifacts");
+const runtimeStatePath = path.resolve(artifactsRoot, "runtime-state.json");
+const legacyRuntimeStatePath = path.resolve(webRoot, ".runtime-state.json");
 
 // ── file config (web/config.json) ─────────────────────────────────────────────
 
@@ -26,6 +28,66 @@ function loadFileConfig() {
 
 const FILE_CONFIG = loadFileConfig();
 
+function loadRuntimeState() {
+  const sourcePath = fs.existsSync(runtimeStatePath)
+    ? runtimeStatePath
+    : legacyRuntimeStatePath;
+  if (!fs.existsSync(sourcePath)) {
+    return {};
+  }
+  try {
+    const raw = JSON.parse(fs.readFileSync(sourcePath, "utf8"));
+    return typeof raw === "object" && raw !== null ? raw : {};
+  } catch (err) {
+    console.warn(`[config] Failed to parse runtime state: ${err.message}`);
+    return {};
+  }
+}
+
+function saveRuntimeState(nextState) {
+  const safeState =
+    typeof nextState === "object" && nextState !== null ? nextState : {};
+  fs.mkdirSync(path.dirname(runtimeStatePath), { recursive: true });
+  fs.writeFileSync(runtimeStatePath, JSON.stringify(safeState, null, 2));
+}
+
+function sameStoredPath(leftPath, rightPath) {
+  if (!leftPath && !rightPath) {
+    return true;
+  }
+  if (!leftPath || !rightPath) {
+    return false;
+  }
+  return normalizeKey(leftPath) === normalizeKey(rightPath);
+}
+
+export function setPreferredModelDir(inputPath) {
+  const trimmed = String(inputPath || "").trim();
+  const state = loadRuntimeState();
+  if (!trimmed) {
+    if (!state.preferredModelDir) {
+      return "";
+    }
+    delete state.preferredModelDir;
+    saveRuntimeState(state);
+    return "";
+  }
+  const resolved = resolveExistingPath(trimmed);
+  if (sameStoredPath(state.preferredModelDir, resolved)) {
+    return resolved;
+  }
+  state.preferredModelDir = resolved;
+  saveRuntimeState(state);
+  return resolved;
+}
+
+export function getPreferredModelDir() {
+  const state = loadRuntimeState();
+  return typeof state.preferredModelDir === "string"
+    ? resolveExistingPath(state.preferredModelDir)
+    : "";
+}
+
 // env var wins over config.json wins over hardcoded default
 function pick(envKey, fileKey, fallback) {
   if (process.env[envKey] !== undefined && process.env[envKey] !== "") {
@@ -37,10 +99,21 @@ function pick(envKey, fileKey, fallback) {
   return fallback !== undefined ? String(fallback) : "";
 }
 
+function pickRaw(envKey, fileKey) {
+  if (process.env[envKey] !== undefined) {
+    return String(process.env[envKey]);
+  }
+  if (FILE_CONFIG[fileKey] !== undefined) {
+    return String(FILE_CONFIG[fileKey]);
+  }
+  return undefined;
+}
+
 const DEFAULT_RUNTIME = Object.freeze({
   port: 3001,
   template: "tinyllama",
   systemPrompt: "You are a helpful assistant.",
+  forceCpu: false,
   maxNewTokens: 256,
   maxContext: 2048,
   temperature: 0.7,
@@ -77,6 +150,20 @@ function parseFloatValue(rawValue, fallback) {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function parseBooleanValue(rawValue, fallback) {
+  if (typeof rawValue === "boolean") {
+    return rawValue;
+  }
+  const normalized = String(rawValue ?? "").trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) {
+    return true;
+  }
+  if (["0", "false", "no", "off"].includes(normalized)) {
+    return false;
+  }
+  return fallback;
+}
+
 function readIntSetting(envKey, fileKey, defaultValue, min, max) {
   const parsed = parseInteger(
     pick(envKey, fileKey, String(defaultValue)),
@@ -95,6 +182,17 @@ function readFloatSetting(envKey, fileKey, defaultValue, min, max) {
   const minValue = Number.isFinite(min) ? min : Number.NEGATIVE_INFINITY;
   const maxValue = Number.isFinite(max) ? max : Number.POSITIVE_INFINITY;
   return Math.min(maxValue, Math.max(minValue, parsed));
+}
+
+function readBoolSetting(envKey, fileKey, defaultValue) {
+  const envValue = process.env[envKey];
+  if (envValue !== undefined && envValue !== "") {
+    return parseBooleanValue(envValue, defaultValue);
+  }
+  if (FILE_CONFIG[fileKey] !== undefined && FILE_CONFIG[fileKey] !== "") {
+    return parseBooleanValue(FILE_CONFIG[fileKey], defaultValue);
+  }
+  return defaultValue;
 }
 
 function splitArgs(rawValue) {
@@ -137,7 +235,13 @@ function splitArgs(rawValue) {
 }
 
 function splitPathList(rawValue) {
-  if (!rawValue?.trim()) {
+  if (!rawValue) {
+    return [];
+  }
+  if (Array.isArray(rawValue) && rawValue.length === 0) {
+    return [];
+  }
+  if (!Array.isArray(rawValue) && !String(rawValue).trim()) {
     return [];
   }
   // Support both array (from config.json) and path-delimiter string (from env)
@@ -599,6 +703,83 @@ function readHfModelConfig(modelPath) {
   return result;
 }
 
+function tokenizerConfigCandidates(modelPath, tokenizerPath) {
+  const candidates = [];
+  const push = (value) => {
+    if (!value) return;
+    const resolved = path.resolve(value);
+    if (!candidates.some((item) => normalizeKey(item) === normalizeKey(resolved))) {
+      candidates.push(resolved);
+    }
+  };
+
+  if (tokenizerPath) {
+    const tokenizerDir = fs.existsSync(tokenizerPath) && fs.statSync(tokenizerPath).isDirectory()
+      ? tokenizerPath
+      : path.dirname(tokenizerPath);
+    push(path.join(tokenizerDir, "tokenizer_config.json"));
+  }
+
+  if (modelPath) {
+    if (fs.existsSync(modelPath) && fs.statSync(modelPath).isDirectory()) {
+      push(path.join(modelPath, "tokenizer_config.json"));
+    } else {
+      const modelDir = path.dirname(modelPath);
+      push(path.join(modelDir, "tokenizer_config.json"));
+      push(path.join(modelDir, "hf", "tokenizer_config.json"));
+    }
+  }
+
+  return candidates;
+}
+
+function readHfTokenizerConfig(modelPath, tokenizerPath) {
+  for (const candidate of tokenizerConfigCandidates(modelPath, tokenizerPath)) {
+    if (!fs.existsSync(candidate)) continue;
+    try {
+      const raw = JSON.parse(fs.readFileSync(candidate, "utf8"));
+      if (!raw || typeof raw !== "object") {
+        continue;
+      }
+      return {
+        path: candidate,
+        chatTemplate:
+          typeof raw.chat_template === "string" ? raw.chat_template : "",
+        useDefaultSystemPrompt:
+          typeof raw.use_default_system_prompt === "boolean"
+            ? raw.use_default_system_prompt
+            : null
+      };
+    } catch (err) {
+      console.warn(`[config] Failed to parse tokenizer config ${candidate}: ${err.message}`);
+    }
+  }
+  return null;
+}
+
+function inferTemplateFromChatTemplate(chatTemplate) {
+  const raw = String(chatTemplate || "").trim();
+  if (!raw) return "";
+
+  if (raw.includes("<|start_header_id|>") && raw.includes("<|eot_id|>")) {
+    return raw.includes("<|begin_of_text|>") ? "llama4" : "llama3";
+  }
+  if (raw.includes("<|im_start|>") && raw.includes("<|im_end|>")) {
+    return "qwen2";
+  }
+  if (raw.includes("<|system|>") && raw.includes("<|user|>") && raw.includes("<|assistant|>")) {
+    return "tinyllama-chatml";
+  }
+  if (raw.includes("<|user|>") && raw.includes("<|assistant|>") && raw.includes("<|end|>")) {
+    return "phi3";
+  }
+  if (raw.includes("[INST]") && raw.includes("[/INST]")) {
+    return raw.includes("<<SYS>>") ? "llama2" : "mistral";
+  }
+
+  return "";
+}
+
 // Infer RoPE theta from model path and optional HF config.
 function inferRopeTheta(modelPath, hfConfig) {
   // Explicit from HF config
@@ -634,10 +815,16 @@ function modelFamilyName(value) {
   return "generic";
 }
 
-function inferTemplate(modelPath, tokenizerPath, fallbackTemplate, hfConfig) {
+function inferTemplate(modelPath, tokenizerPath, fallbackTemplate, hfConfig, hfTokenizerConfig) {
   const family = modelFamilyName(path.basename(modelPath));
   const tokenizerExt = path.extname(tokenizerPath || "").toLowerCase();
-  const lowerModelName = path.basename(modelPath).toLowerCase();
+  const templateFromTokenizerConfig = inferTemplateFromChatTemplate(
+    hfTokenizerConfig?.chatTemplate
+  );
+
+  if (templateFromTokenizerConfig) {
+    return templateFromTokenizerConfig;
+  }
 
   // HF config model_type override
   const modelType = hfConfig?.modelType || "";
@@ -652,9 +839,7 @@ function inferTemplate(modelPath, tokenizerPath, fallbackTemplate, hfConfig) {
   }
 
   if (family === "tinyllama") {
-    // TinyLlama-1.1B-Chat-v1.0 and most "chat" variants use ChatML format
-    const isChatMl = lowerModelName.includes("chatml") || lowerModelName.includes("chat");
-    return isChatMl ? "tinyllama-chatml" : "tinyllama";
+    return "tinyllama";
   }
   if (family === "llama2") return "llama2";
   if (family === "llama3") return "llama3";
@@ -799,7 +984,14 @@ function discoverSafetensorsModelDirs(scanRoots) {
 
 function buildProfile(modelPath, tokenizerPath, baseConfig, source = "discovered") {
   const hfConfig = readHfModelConfig(modelPath);
-  const template = inferTemplate(modelPath, tokenizerPath, baseConfig.template, hfConfig);
+  const hfTokenizerConfig = readHfTokenizerConfig(modelPath, tokenizerPath);
+  const template = inferTemplate(
+    modelPath,
+    tokenizerPath,
+    baseConfig.template,
+    hfConfig,
+    hfTokenizerConfig
+  );
   const modelType = String(hfConfig?.modelType || "").toLowerCase();
   const family = modelType.includes("mixtral")
     ? "mixtral"
@@ -856,6 +1048,9 @@ function buildProfile(modelPath, tokenizerPath, baseConfig, source = "discovered
     tokenizerPath,
     tokenizerFormat,
     template,
+    tokenizerChatTemplatePath: hfTokenizerConfig?.path || "",
+    tokenizerUsesDefaultSystemPrompt:
+      hfTokenizerConfig?.useDefaultSystemPrompt,
     extraArgs,
     ropeTheta,
     maxPositionEmbeddings: hfConfig?.maxPositionEmbeddings ?? null,
@@ -876,6 +1071,8 @@ function publicModelProfile(profile) {
     tokenizerPath: profile.tokenizerPath,
     tokenizerFormat: profile.tokenizerFormat,
     template: profile.template,
+    tokenizerChatTemplatePath: profile.tokenizerChatTemplatePath,
+    tokenizerUsesDefaultSystemPrompt: profile.tokenizerUsesDefaultSystemPrompt,
     extraArgs: profile.extraArgs,
     ropeTheta: profile.ropeTheta,
     maxPositionEmbeddings: profile.maxPositionEmbeddings,
@@ -887,8 +1084,10 @@ function publicModelProfile(profile) {
 }
 
 function discoverModelProfiles(baseConfig) {
+  const preferredModelDir = getPreferredModelDir();
   const scanRoots = uniquePaths([
     ...splitPathList(process.env.LLAMA_MODEL_DIRS || FILE_CONFIG.modelDirs || ""),
+    ensureDirectory(preferredModelDir),
     ensureDirectory(baseConfig.modelPath),
     ensureDirectory(baseConfig.tokenizerPath),
     artifactsRoot
@@ -977,11 +1176,15 @@ export function getRuntimeConfig() {
   const configuredTokenizerPath = resolveExistingPath(
     pick("LLAMA_TOKENIZER_PATH", "tokenizerPath", "")
   );
-  const template = pick(
-    "LLAMA_CHAT_TEMPLATE",
-    "chatTemplate",
-    DEFAULT_RUNTIME.template
-  );
+  const explicitTemplateRaw = pickRaw("LLAMA_CHAT_TEMPLATE", "chatTemplate");
+  const hasExplicitTemplate = explicitTemplateRaw !== undefined && explicitTemplateRaw !== "";
+  const explicitTemplate = hasExplicitTemplate ? explicitTemplateRaw : "";
+  const explicitSystemPromptRaw = pickRaw("LLAMA_SYSTEM_PROMPT", "systemPrompt");
+  const hasExplicitSystemPrompt = explicitSystemPromptRaw !== undefined;
+  const explicitSystemPrompt = hasExplicitSystemPrompt ? explicitSystemPromptRaw : "";
+  const template = hasExplicitTemplate
+    ? explicitTemplate
+    : DEFAULT_RUNTIME.template;
 
   const baseConfig = {
     port: readIntSetting("PORT", "port", DEFAULT_RUNTIME.port, 1, 65535),
@@ -991,11 +1194,14 @@ export function getRuntimeConfig() {
     modelPath: configuredModelPath,
     tokenizerPath: configuredTokenizerPath,
     template,
-    systemPrompt: pick(
-      "LLAMA_SYSTEM_PROMPT",
-      "systemPrompt",
-      DEFAULT_RUNTIME.systemPrompt
+    forceCpu: readBoolSetting(
+      "LLAMA_FORCE_CPU",
+      "forceCpu",
+      DEFAULT_RUNTIME.forceCpu
     ),
+    systemPrompt: hasExplicitSystemPrompt
+      ? explicitSystemPrompt
+      : DEFAULT_RUNTIME.systemPrompt,
     maxNewTokens: readIntSetting(
       "LLAMA_MAX_NEW",
       "maxNewTokens",
@@ -1060,19 +1266,30 @@ export function getRuntimeConfig() {
   };
 
   const availableProfiles = discoverModelProfiles(baseConfig);
+  const preferredModelDir = getPreferredModelDir();
   const selectedProfile = chooseSelectedProfile(
     availableProfiles,
     configuredModelPath
   );
+  const systemPrompt = hasExplicitSystemPrompt
+    ? explicitSystemPrompt
+    : (
+        selectedProfile?.tokenizerUsesDefaultSystemPrompt === false &&
+        !hasExplicitSystemPrompt
+      )
+        ? ""
+        : baseConfig.systemPrompt;
 
   return {
     ...baseConfig,
+    preferredModelDir,
     availableProfiles,
     selectedProfileId: selectedProfile?.id ?? "",
     selectedProfile,
     modelPath: selectedProfile?.modelPath ?? configuredModelPath,
     tokenizerPath: selectedProfile?.tokenizerPath ?? configuredTokenizerPath,
-    template: selectedProfile?.template ?? template,
+    template: hasExplicitTemplate ? template : (selectedProfile?.template ?? template),
+    systemPrompt,
     ready: fs.existsSync(inferBin) && Boolean(selectedProfile?.ready)
   };
 }
@@ -1085,12 +1302,14 @@ export function publicRuntimeSummary(config) {
     tokenizerPath: config.tokenizerPath,
     template: config.template,
     systemPrompt: config.systemPrompt,
+    forceCpu: config.forceCpu,
     maxNewTokens: config.maxNewTokens,
     maxContext: config.maxContext,
     temperature: config.temperature,
     topK: config.topK,
     topP: config.topP,
     repeatPenalty: config.repeatPenalty,
+    preferredModelDir: config.preferredModelDir,
     maxCpuPercent: config.maxCpuPercent,
     maxMemoryPercent: config.maxMemoryPercent,
     resourceSampleMs: config.resourceSampleMs,

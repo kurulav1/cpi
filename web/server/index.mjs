@@ -7,7 +7,7 @@ import { spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { randomUUID } from "node:crypto";
 
-import { getRuntimeConfig, publicRuntimeSummary } from "./config.mjs";
+import { getRuntimeConfig, publicRuntimeSummary, setPreferredModelDir } from "./config.mjs";
 import { buildPromptPackage } from "./prompting.mjs";
 
 dotenv.config();
@@ -20,6 +20,7 @@ app.use(express.json({ limit: "4mb" }));
 // warm across requests and restarted only when the selected profile changes.
 let activeRequest = null;
 let interactiveWorker = null;
+let preferredHfWorker = null;
 const quantOverrides = new Map(); // profileId -> "none" | "int8" | "int4"
 
 // â”€â”€ helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -30,6 +31,331 @@ function writeNdjson(response, payload) {
 
 function writeSse(response, data) {
   response.write(`data: ${JSON.stringify(data)}\n\n`);
+}
+
+function generationPolicy(profile, template = "") {
+  const family = String(profile?.family || "").toLowerCase();
+  const normalizedTemplate = String(template || "").toLowerCase();
+
+  if (family === "llama2" || normalizedTemplate === "llama2") {
+    return {
+      streamTextDeltas: false,
+      historyStrategy: "llama2-summary",
+      finalResponseExtractor: "llama2-answer-only"
+    };
+  }
+
+  if (family === "tinyllama" || normalizedTemplate === "tinyllama" || normalizedTemplate === "tinyllama-chatml") {
+    return {
+      streamTextDeltas: true,
+      historyStrategy: "tinyllama-focused",
+      finalResponseExtractor: "default"
+    };
+  }
+
+  return {
+    streamTextDeltas: true,
+    historyStrategy: "default",
+    finalResponseExtractor: "default"
+  };
+}
+
+function expandStopTexts(template, stopTexts = []) {
+  const expanded = new Set(stopTexts);
+  if (
+    template === "tinyllama" ||
+    template === "tinyllama-chatml" ||
+    template === "plain"
+  ) {
+    for (const marker of [
+      "\nUser:",
+      "\nuser:",
+      "\nUSER:",
+      "\nBot:",
+      "\nbot:",
+      "\nassistant|>",
+      "\nAssistant|>",
+      "\nAssistant:",
+      "\nassistant:",
+      "\nASSISTANT:",
+      "Bot:",
+      "bot:",
+      "assistant|>",
+      "Assistant|>",
+      "user:",
+      "User:",
+      "assistant:",
+      "Assistant:"
+    ]) {
+      expanded.add(marker);
+    }
+  }
+  return [...expanded];
+}
+
+function normalizeGeneratedChatText(text, template) {
+  let cleaned = String(text || "").replace(/\r/g, "");
+
+  if (
+    template === "tinyllama" ||
+    template === "tinyllama-chatml" ||
+    template === "plain"
+  ) {
+    cleaned = cleaned.replace(
+      /^\s*(?:>\s*)?(?:<\|assistant\|>\s*|assistant\|+\>\s*|assistant\|>\s*|assistant\s*:)?\s*/i,
+      ""
+    );
+
+    const roleMarker =
+      /(?:^|\n)\s*(?:>\s*)?(?:<\|user\|>|<\|system\|>|<\|assistant\|>|assistant\|+\>|assistant\|>|user\s*:|assistant\s*:|system\s*:|bot\s*:)/i;
+    const match = cleaned.match(roleMarker);
+    if (match && typeof match.index === "number") {
+      cleaned = cleaned.slice(0, match.index);
+    }
+  }
+
+  if (template === "llama2") {
+    const answerMatches = [...cleaned.matchAll(/(?:^|\n)\s*Answer:\s*/gi)];
+    if (answerMatches.length > 0) {
+      const lastAnswer = answerMatches[answerMatches.length - 1];
+      const answerStart = (lastAnswer.index ?? 0) + lastAnswer[0].length;
+      cleaned = cleaned.slice(answerStart);
+    } else if (/(?:^|\n)\s*Question:\s*/i.test(cleaned)) {
+      cleaned = "";
+    }
+
+    const followupMarker = /(?:^|\n)\s*(?:Question:|User:|System:)/i;
+    const match = cleaned.match(followupMarker);
+    if (match && typeof match.index === "number" && match.index >= 0) {
+      cleaned = cleaned.slice(0, match.index);
+    }
+
+    cleaned = cleaned.replace(
+      /\n\s*(?:Q(?:u(?:e(?:s(?:t(?:i(?:o(?:n?)?)?)?)?)?)?)?|U(?:s(?:e(?:r?)?)?)?|S(?:y(?:s(?:t(?:e(?:m?)?)?)?)?)?)\s*$/i,
+      ""
+    );
+  }
+
+  // Tiny models often drift into a second sentence and then get cut mid-phrase.
+  // If we have at least one complete sentence, drop any trailing incomplete tail.
+  const lastTerminal = Math.max(
+    cleaned.lastIndexOf("."),
+    cleaned.lastIndexOf("!"),
+    cleaned.lastIndexOf("?")
+  );
+  if (lastTerminal >= 0 && lastTerminal + 1 < cleaned.length) {
+    const trailing = cleaned.slice(lastTerminal + 1).trim();
+    if (trailing && !/[.!?]$/.test(trailing)) {
+      cleaned = cleaned.slice(0, lastTerminal + 1);
+    }
+  }
+
+  return cleaned.trim();
+}
+
+function cleanupRepeatedWords(text) {
+  let cleaned = String(text || "");
+  for (let i = 0; i < 4; i += 1) {
+    const next = cleaned.replace(/\b([A-Za-z][A-Za-z'-]*)\b(?:\s+\1\b)+/gi, "$1");
+    if (next === cleaned) break;
+    cleaned = next;
+  }
+  for (let i = 0; i < 4; i += 1) {
+    const next = cleaned.replace(/\b([A-Za-z]{3,})\1\b/gi, "$1");
+    if (next === cleaned) break;
+    cleaned = next;
+  }
+  cleaned = cleaned.replace(/([A-Za-z])\1{4,}/g, "$1");
+  cleaned = cleaned.replace(/([!?.,])\1+/g, "$1");
+  cleaned = cleaned.replace(/\s{2,}/g, " ").trim();
+  cleaned = cleaned.replace(/^["'`]+|["'`]+$/g, "").trim();
+  return cleaned;
+}
+
+function cleanupRepeatedSentences(text) {
+  const cleaned = String(text || "").trim();
+  if (!cleaned) return "";
+
+  const sentences = cleaned.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [cleaned];
+  const deduped = [];
+  let previousKey = "";
+
+  for (const sentence of sentences) {
+    const normalized = sentence.replace(/\s+/g, " ").trim();
+    if (!normalized) continue;
+    const key = normalized.toLowerCase();
+    if (key === previousKey) {
+      continue;
+    }
+    deduped.push(normalized);
+    previousKey = key;
+  }
+
+  return deduped.join(" ").trim();
+}
+
+function normalizeWhitespace(text = "") {
+  return String(text || "").replace(/\s+/g, " ").trim();
+}
+
+function collapseAdjacentNearDuplicateWords(text = "") {
+  const tokens = String(text || "").trim().split(/\s+/).filter(Boolean);
+  const normalizedAlpha = (token) => token.toLowerCase().replace(/[^a-z]/g, "");
+  const deduped = [];
+
+  for (const token of tokens) {
+    if (deduped.length === 0) {
+      deduped.push(token);
+      continue;
+    }
+
+    const prev = deduped[deduped.length - 1];
+    const prevNorm = normalizedAlpha(prev);
+    const tokenNorm = normalizedAlpha(token);
+    const prefixLike =
+      prevNorm.length >= 3 &&
+      tokenNorm.length >= 3 &&
+      (prevNorm === tokenNorm ||
+        prevNorm.startsWith(tokenNorm) ||
+        tokenNorm.startsWith(prevNorm));
+
+    if (!prefixLike) {
+      deduped.push(token);
+      continue;
+    }
+
+    if (tokenNorm.length >= prevNorm.length) {
+      deduped[deduped.length - 1] = token;
+    }
+  }
+
+  return deduped.join(" ").trim();
+}
+
+function trimIncompleteTrailingTail(text = "") {
+  const cleaned = String(text || "").trim();
+  const lastTerminal = Math.max(
+    cleaned.lastIndexOf("."),
+    cleaned.lastIndexOf("!"),
+    cleaned.lastIndexOf("?")
+  );
+  if (lastTerminal < 0 || lastTerminal + 1 >= cleaned.length) {
+    return cleaned;
+  }
+
+  const trailing = cleaned.slice(lastTerminal + 1).trim();
+  if (trailing && !/[.!?]$/.test(trailing)) {
+    return cleaned.slice(0, lastTerminal + 1).trim();
+  }
+  return cleaned;
+}
+
+function extractLlama2AnswerOnly(text = "") {
+  let cleaned = String(text || "").replace(/\r/g, "").trim();
+  if (!cleaned) return "";
+
+  const instMarker = cleaned.lastIndexOf("[/INST]");
+  if (instMarker >= 0) {
+    cleaned = cleaned.slice(instMarker + "[/INST]".length).trim();
+  }
+
+  const promptEcho = cleaned.match(
+    /(?:^|\n)\s*(?:Relevant context:|Current user message:|Current question:|Question:|Instructions:|\[INST\]|<<SYS>>)/i
+  );
+  if (promptEcho && typeof promptEcho.index === "number" && promptEcho.index === 0) {
+    cleaned = "";
+  }
+
+  cleaned = cleaned.replace(/^\s*(?:Answer|Assistant)\s*:?\s*/i, "");
+  cleaned = cleaned.replace(/^\s*(?:<\/?s>|<<SYS>>|<<\/SYS>>|\[INST\]|\[\/INST\])\s*/gi, "");
+  cleaned = cleaned.replace(/^[\s:;,.!?-]+/, "");
+
+  const followupMarker = cleaned.match(
+    /(?:^|\n)\s*(?:Relevant context:|Current user message:|Current question:|Question:|User:|System:|Instructions:|Explanation\s*:|Answer\s*:|\[INST\]|<<SYS>>)/i
+  );
+  if (followupMarker && typeof followupMarker.index === "number" && followupMarker.index > 0) {
+    cleaned = cleaned.slice(0, followupMarker.index).trim();
+  }
+
+  cleaned = cleaned.replace(
+    /\n\s*(?:Relevant|Current|Question|User|System|Instructions|Explanation|Answer|Assistant)\s*:?.*$/i,
+    ""
+  );
+  cleaned = cleanupRepeatedWords(cleaned);
+  cleaned = collapseAdjacentNearDuplicateWords(cleaned);
+  cleaned = cleanupRepeatedSentences(cleaned);
+  cleaned = trimIncompleteTrailingTail(cleaned);
+  return normalizeWhitespace(cleaned);
+}
+
+function normalizeFinalResponseText(text, template, policy = null) {
+  const effectivePolicy = policy ?? generationPolicy(null, template);
+  if (effectivePolicy.finalResponseExtractor === "llama2-answer-only") {
+    return extractLlama2AnswerOnly(text);
+  }
+  return cleanupRepeatedSentences(
+    cleanupRepeatedWords(normalizeGeneratedChatText(text, template))
+  );
+}
+
+function isTinyLlamaFamily(cliConfig) {
+  return cliConfig?.profile?.family === "tinyllama";
+}
+
+function prefersHfChatBackend(target) {
+  void target;
+  return false;
+}
+
+function shouldStreamTextDeltas(cliConfigOrTemplate) {
+  if (typeof cliConfigOrTemplate === "string") {
+    return generationPolicy(null, cliConfigOrTemplate).streamTextDeltas;
+  }
+  if (
+    cliConfigOrTemplate &&
+    typeof cliConfigOrTemplate === "object" &&
+    Object.prototype.hasOwnProperty.call(cliConfigOrTemplate, "streamTextDeltas")
+  ) {
+    return cliConfigOrTemplate.streamTextDeltas !== false;
+  }
+  return generationPolicy(
+    cliConfigOrTemplate?.profile,
+    cliConfigOrTemplate?.meta?.template || cliConfigOrTemplate?.template || ""
+  ).streamTextDeltas;
+}
+
+function isGreetingPrompt(text = "") {
+  return /^(?:hey|hi|hello|hullo|yo)\b/i.test(String(text || "").trim());
+}
+
+function looksLikeGreetingReply(text = "") {
+  return /\b(?:hey|hi|hello|greetings)\b/i.test(String(text || "").trim());
+}
+
+function wordCount(text = "") {
+  return String(text || "").trim().split(/\s+/).filter(Boolean).length;
+}
+
+function hasRoleLeakage(text = "") {
+  return /<\|(?:user|assistant|system)\|>|(?:^|\n)\s*(?:user|assistant|system|bot)\s*:/i.test(
+    String(text || "")
+  );
+}
+
+function looksMalformedTinyLlamaReply(text = "") {
+  const cleaned = String(text || "").trim();
+  if (!cleaned) return true;
+  if (/[|<>]{2,}/.test(cleaned)) return true;
+  if (/[A-Za-z]\|[A-Za-z]/.test(cleaned)) return true;
+  if (/^(?:[:;>|.\-]{2,}|\W{3,})/.test(cleaned)) return true;
+  return false;
+}
+
+function tinyLlamaRetrySystemPrompt(userMessage = "") {
+  if (isGreetingPrompt(userMessage)) {
+    return "Reply to the user's greeting with exactly one short greeting sentence.";
+  }
+  return "Answer the user's last message in one short factual sentence. Focus only on the latest user question. Do not use role labels.";
 }
 
 function clampNumber(value, min, max, fallback) {
@@ -218,10 +544,17 @@ function buildCliArgs(config, body) {
   const performanceMode = isTruthyFlag(body.performanceMode);
   const quantMode = resolveQuantModeForProfile(selectedProfile, body.quantMode);
   const profileExtraArgs = buildProfileExtraArgs(selectedProfile, quantMode);
+  const forceCpu = isTruthyFlag(body.forceCpu) || config.forceCpu;
+  const requestTemplate = body.template || selectedProfile.template || config.template;
+  const requestSystemPrompt = body.systemPrompt !== undefined
+    ? body.systemPrompt
+    : (requestTemplate === "tinyllama" ? "" : config.systemPrompt);
+  const policy = generationPolicy(selectedProfile, requestTemplate);
 
   const promptPackage = buildPromptPackage(body.messages, {
-    template: body.template || selectedProfile.template || config.template,
-    systemPrompt: body.systemPrompt || config.systemPrompt,
+    template: requestTemplate,
+    systemPrompt: requestSystemPrompt,
+    historyStrategy: policy.historyStrategy,
     // Reduce prefill in perf mode so token-1 starts sooner in longer chats.
     maxTurns: performanceMode ? 4 : 8,
     maxChars: performanceMode ? 3500 : 9000
@@ -242,12 +575,15 @@ function buildCliArgs(config, body) {
     profile: selectedProfile,
     profileExtraArgs,
     quantMode,
+    messages: promptPackage.messages,
     prompt: promptPackage.prompt,
     addBos: promptPackage.addBos,
-    stopTexts: promptPackage.stopTexts,
+    stopTexts: expandStopTexts(promptPackage.template, promptPackage.stopTexts),
+    policy,
     noResourceLimits,
     performanceMode,
-    workerKey: `${selectedProfile.id}|perf:${performanceMode ? 1 : 0}|q:${quantMode}`,
+    forceCpu,
+    workerKey: `${selectedProfile.id}|perf:${performanceMode ? 1 : 0}|q:${quantMode}|cpu:${forceCpu ? 1 : 0}`,
     meta: {
       profileId: selectedProfile.id,
       modelLabel: selectedProfile.label,
@@ -256,7 +592,8 @@ function buildCliArgs(config, body) {
       maxNewTokens,
       temperature,
       performanceMode,
-      quantMode
+      quantMode,
+      forceCpu
     }
   };
 }
@@ -265,15 +602,19 @@ function buildWorkerCliConfig(profile, options = {}) {
   const performanceMode = isTruthyFlag(options.performanceMode);
   const quantMode = resolveQuantModeForProfile(profile, options.quantMode);
   const profileExtraArgs = buildProfileExtraArgs(profile, quantMode);
+  const policy = generationPolicy(profile, profile?.template || "");
   const noResourceLimits =
     performanceMode || profileExtraArgs.includes("--no-resource-limits");
+  const forceCpu = isTruthyFlag(options.forceCpu);
   return {
     profile,
     profileExtraArgs,
     quantMode,
+    policy,
     noResourceLimits,
     performanceMode,
-    workerKey: `${profile.id}|perf:${performanceMode ? 1 : 0}|q:${quantMode}`,
+    forceCpu,
+    workerKey: `${profile.id}|perf:${performanceMode ? 1 : 0}|q:${quantMode}|cpu:${forceCpu ? 1 : 0}`,
     meta: {
       profileId: profile.id,
       modelLabel: profile.label,
@@ -282,7 +623,8 @@ function buildWorkerCliConfig(profile, options = {}) {
       maxNewTokens: 0,
       temperature: 0,
       performanceMode,
-      quantMode
+      quantMode,
+      forceCpu
     }
   };
 }
@@ -299,6 +641,7 @@ function buildInteractiveLaunchArgs(config, cliConfig) {
   const noResourceLimits =
     cliConfig.noResourceLimits ||
     profileExtraArgs.includes("--no-resource-limits");
+  const forceCpu = cliConfig.forceCpu || config.forceCpu;
   return [
     selectedProfile.modelPath,
     "--tokenizer", selectedProfile.tokenizerPath,
@@ -309,6 +652,7 @@ function buildInteractiveLaunchArgs(config, cliConfig) {
     "--interactive",
     "--web",
     "--runtime-metrics",
+    ...(forceCpu ? ["--cpu"] : []),
     ...(noResourceLimits
       ? ["--no-resource-limits"]
       : [
@@ -336,6 +680,217 @@ function killWorker(worker, force = false) {
   }
 }
 
+function resolvePreferredHfModelDir(profile) {
+  const modelPath = profile?.modelPath;
+  if (!modelPath) return "";
+
+  const candidate = path.resolve(path.dirname(modelPath), "hf");
+  const hasConfig = fs.existsSync(path.join(candidate, "config.json"));
+  const hasTokenizer = ["tokenizer.json", "tokenizer.model"]
+    .some((file) => fs.existsSync(path.join(candidate, file)));
+  const hasWeights = [
+    "model.safetensors",
+    "model.safetensors.index.json",
+    "pytorch_model.bin",
+    "pytorch_model.bin.index.json"
+  ].some((file) => fs.existsSync(path.join(candidate, file)));
+
+  return hasConfig && hasTokenizer && hasWeights
+    ? candidate
+    : "";
+}
+
+function parsePreferredHfStdout(worker) {
+  let nl = worker.stdoutBuffer.indexOf("\n");
+  while (nl !== -1) {
+    const line = worker.stdoutBuffer.slice(0, nl).trim();
+    worker.stdoutBuffer = worker.stdoutBuffer.slice(nl + 1);
+
+    if (line) {
+      let event = null;
+      try {
+        event = JSON.parse(line);
+      } catch {
+        event = null;
+      }
+
+      if (event?.type === "ready") {
+        worker.ready = true;
+        worker.readyResolve?.();
+      } else if (worker.pending && event) {
+        const pending = worker.pending;
+        if (event.id && event.id !== pending.id) {
+          // Ignore stale output from a previous request.
+        } else if (event.type === "done") {
+          worker.pending = null;
+          pending.resolve({
+            text: typeof event.text === "string" ? event.text : "",
+            elapsedMs: Number.isFinite(Number(event.elapsed_ms))
+              ? Number(event.elapsed_ms)
+              : Date.now() - pending.startedAt,
+            generatedTokens: Number.isFinite(Number(event.generated_tokens))
+              ? Number(event.generated_tokens)
+              : null,
+            tokPerS: Number.isFinite(Number(event.tok_per_s))
+              ? Number(event.tok_per_s)
+              : null,
+            metrics: null,
+            ...pending.meta
+          });
+        } else if (event.type === "error") {
+          worker.pending = null;
+          pending.reject(event.error || "hf worker error");
+        }
+      }
+    }
+
+    nl = worker.stdoutBuffer.indexOf("\n");
+  }
+}
+
+function spawnPreferredHfWorker(config, cliConfig) {
+  const modelDir = resolvePreferredHfModelDir(cliConfig.profile);
+  const scriptPath = path.resolve(config.repoRoot, "tools", "hf_chat_worker.py");
+  const child = spawn(pythonBin(), [scriptPath, "--model-dir", modelDir], {
+    cwd: config.repoRoot,
+    env: {
+      ...process.env,
+      PYTHONUTF8: "1"
+    }
+  });
+
+  let readyResolve = null;
+  let readyReject = null;
+  const readyPromise = new Promise((resolve, reject) => {
+    readyResolve = resolve;
+    readyReject = reject;
+  });
+
+  const worker = {
+    modelDir,
+    child,
+    ready: false,
+    readyPromise,
+    readyResolve,
+    readyReject,
+    stdoutDecoder: new StringDecoder("utf8"),
+    stderrDecoder: new StringDecoder("utf8"),
+    stdoutBuffer: "",
+    stderrText: "",
+    pending: null
+  };
+
+  child.stdout.on("data", (chunk) => {
+    worker.stdoutBuffer += worker.stdoutDecoder.write(chunk);
+      parsePreferredHfStdout(worker);
+  });
+
+  child.stderr.on("data", (chunk) => {
+    worker.stderrText += worker.stderrDecoder.write(chunk);
+  });
+
+  child.stdin.on("error", (err) => {
+    if (!worker.pending) return;
+    const pending = worker.pending;
+    worker.pending = null;
+    pending.reject(`Failed to send request to HF worker: ${err.message}`);
+  });
+
+  child.on("close", (code, signal) => {
+    worker.stdoutBuffer += worker.stdoutDecoder.end();
+    parsePreferredHfStdout(worker);
+    worker.stderrText += worker.stderrDecoder.end();
+
+    if (!worker.ready) {
+      worker.readyReject?.(
+        worker.stderrText.trim() ||
+        `HF worker exited with code ${code}${signal ? ` (${signal})` : ""}.`
+      );
+    }
+
+    if (worker.pending) {
+      const pending = worker.pending;
+      worker.pending = null;
+      pending.reject(
+        worker.stderrText.trim() ||
+        `HF worker exited with code ${code}${signal ? ` (${signal})` : ""}.`
+      );
+    }
+
+      if (preferredHfWorker === worker) {
+        preferredHfWorker = null;
+      }
+  });
+
+  child.on("error", (err) => {
+    if (!worker.ready) {
+      worker.readyReject?.(`Failed to launch HF worker: ${err.message}`);
+    }
+    if (worker.pending) {
+      const pending = worker.pending;
+      worker.pending = null;
+      pending.reject(`Failed to launch HF worker: ${err.message}`);
+    }
+      if (preferredHfWorker === worker) {
+        preferredHfWorker = null;
+      }
+  });
+
+  return worker;
+}
+
+async function ensurePreferredHfWorker(config, cliConfig) {
+  const modelDir = resolvePreferredHfModelDir(cliConfig.profile);
+  if (!modelDir) {
+    return null;
+  }
+
+  if (!preferredHfWorker || preferredHfWorker.modelDir !== modelDir) {
+    killWorker(preferredHfWorker, true);
+    preferredHfWorker = spawnPreferredHfWorker(config, cliConfig);
+  }
+
+  await preferredHfWorker.readyPromise;
+  return preferredHfWorker;
+}
+
+async function runPreferredHfGeneration(config, cliConfig) {
+  const worker = await ensurePreferredHfWorker(config, cliConfig);
+  if (!worker) {
+    throw new Error("Preferred HF backend is not available.");
+  }
+  if (worker.pending) {
+    throw new Error("Preferred HF worker is busy.");
+  }
+
+  const requestId = randomUUID();
+  const startedAt = Date.now();
+  return new Promise((resolve, reject) => {
+    worker.pending = {
+      id: requestId,
+      startedAt,
+      meta: cliConfig.meta,
+      resolve,
+      reject
+    };
+
+    const payload = {
+      id: requestId,
+      messages: cliConfig.messages,
+      max_new: cliConfig.meta.maxNewTokens,
+      temperature: cliConfig.meta.temperature
+    };
+
+    worker.child.stdin.write(`${JSON.stringify(payload)}\n`, (err) => {
+      if (!err) return;
+      if (worker.pending?.id === requestId) {
+        worker.pending = null;
+      }
+      reject(new Error(`Failed to send request to HF worker: ${err.message}`));
+    });
+  });
+}
+
 function parseWorkerStdout(worker) {
   let nl = worker.stdoutBuffer.indexOf("\n");
   while (nl !== -1) {
@@ -355,7 +910,28 @@ function parseWorkerStdout(worker) {
         if (event.id && event.id !== pending.id) {
           // Ignore stale output from a previous request.
         } else if (event.type === "delta") {
-          if (event.delta) pending.onDelta?.(event.delta);
+          if (event.delta) {
+            pending.rawText = `${pending.rawText || ""}${event.delta}`;
+            if (!shouldStreamTextDeltas(pending.policy || pending.meta?.template)) {
+              nl = worker.stdoutBuffer.indexOf("\n");
+              continue;
+            }
+            const cleaned = normalizeGeneratedChatText(
+              pending.rawText,
+              pending.meta?.template
+            );
+            const emitted = pending.emittedText || "";
+            if (cleaned.startsWith(emitted)) {
+              const nextDelta = cleaned.slice(emitted.length);
+              pending.emittedText = cleaned;
+              if (nextDelta) {
+                pending.onDelta?.(nextDelta);
+              }
+            } else if (cleaned && cleaned !== emitted) {
+              pending.emittedText = cleaned;
+              pending.onDelta?.(cleaned);
+            }
+          }
         } else if (event.type === "metrics") {
           const metrics =
             event.metrics && typeof event.metrics === "object" ? event.metrics : null;
@@ -406,7 +982,9 @@ function spawnInteractiveWorker(config, cliConfig) {
   });
 
   const worker = {
-    workerKey: cliConfig.workerKey ?? `${cliConfig.meta.profileId}|perf:0|q:${cliConfig.meta.quantMode || "none"}`,
+    workerKey:
+      cliConfig.workerKey ??
+      `${cliConfig.meta.profileId}|perf:0|q:${cliConfig.meta.quantMode || "none"}|cpu:${cliConfig.meta.forceCpu ? 1 : 0}`,
     child,
     ready: false,
     lastMetrics: null,
@@ -469,7 +1047,8 @@ function spawnInteractiveWorker(config, cliConfig) {
 
 function ensureInteractiveWorker(config, cliConfig) {
   const targetWorkerKey =
-    cliConfig.workerKey ?? `${cliConfig.meta.profileId}|perf:0|q:${cliConfig.meta.quantMode || "none"}`;
+    cliConfig.workerKey ??
+    `${cliConfig.meta.profileId}|perf:0|q:${cliConfig.meta.quantMode || "none"}|cpu:${cliConfig.meta.forceCpu ? 1 : 0}`;
   if (
     interactiveWorker &&
     interactiveWorker.workerKey === targetWorkerKey &&
@@ -505,6 +1084,16 @@ async function warmupProfileWorker(config, profileId, options = {}) {
   const profile = resolveWarmupProfile(config, profileId);
 
   const workerCliConfig = buildWorkerCliConfig(profile, options);
+  if (prefersHfChatBackend(profile) && resolvePreferredHfModelDir(profile)) {
+    activeRequest = { kind: "warmup", cancel: () => {} };
+    try {
+      await ensurePreferredHfWorker(config, workerCliConfig);
+      return profile;
+    } finally {
+      activeRequest = null;
+    }
+  }
+
   const worker = ensureInteractiveWorker(config, workerCliConfig);
   if (worker.ready) {
     return profile;
@@ -532,6 +1121,18 @@ async function warmupProfileWorker(config, profileId, options = {}) {
   });
 
   return profile;
+}
+
+async function generatePreferredFamilyResponse(config, cliConfig) {
+  if (isTinyLlamaFamily(cliConfig)) {
+    return generateWithTinyLlamaRetry(config, cliConfig);
+  }
+
+  const result = await runPreferredFamilyGenerationOnce(config, cliConfig, "generation");
+  return {
+    ...result,
+    text: normalizeFinalResponseText(result.text, cliConfig.meta.template, cliConfig.policy)
+  };
 }
 
 function runGeneration(
@@ -584,9 +1185,22 @@ function runGeneration(
     id: requestId,
     startedAt: Date.now(),
     meta: cliConfig.meta,
+    policy: cliConfig.policy,
+    rawText: "",
+    emittedText: "",
     onDelta,
     onMetrics,
-    resolve: (result) => settle(() => onDone(result)),
+    resolve: (result) =>
+      settle(() =>
+        onDone({
+          ...result,
+          text: normalizeFinalResponseText(
+            result.text,
+            cliConfig.meta.template,
+            cliConfig.policy
+          )
+        })
+      ),
     reject: (msg) => settle(() => onError(msg))
   };
 
@@ -596,7 +1210,11 @@ function runGeneration(
     max_new: cliConfig.meta.maxNewTokens,
     temp: cliConfig.meta.temperature,
     stop_texts: cliConfig.stopTexts,
-    add_bos: cliConfig.addBos
+    add_bos: cliConfig.addBos,
+    // TinyLlama often starts with a short lead-in sentence before the real
+    // answer. Cutting on the first sentence boundary turns sane answers into
+    // fragments like "Sure, who is Elon Musk?".
+    sentence_stop: false
   };
 
   const sampleMs = Math.max(0, config.resourceSampleMs || 250);
@@ -665,6 +1283,91 @@ function runGeneration(
   };
 }
 
+function runGenerationOnce(config, cliConfig, requestKind = "generation") {
+  return new Promise((resolve, reject) => {
+    runGeneration(config, cliConfig, {
+      requestKind,
+      onStart: () => {},
+      onDelta: () => {},
+      onMetrics: () => {},
+      onDone: (result) => resolve(result),
+      onError: (msg) => reject(new Error(msg))
+    });
+  });
+}
+
+async function runPreferredFamilyGenerationOnce(config, cliConfig, requestKind = "generation") {
+  const hfModelDir =
+    prefersHfChatBackend(cliConfig) ? resolvePreferredHfModelDir(cliConfig.profile) : "";
+  if (hfModelDir) {
+    try {
+      return await runPreferredHfGeneration(config, cliConfig);
+    } catch (err) {
+      const family = String(cliConfig?.profile?.family || cliConfig?.meta?.template || "model");
+      console.warn(`[${family}] HF backend failed, using llama_infer: ${err.message}`);
+    }
+  }
+
+  return runGenerationOnce(config, cliConfig, requestKind);
+}
+
+async function generateWithTinyLlamaRetry(config, cliConfig) {
+  const lastUserMessage =
+    [...(cliConfig.messages || [])].reverse().find((message) => message.role === "user")?.content || "";
+  const greetingPrompt = isGreetingPrompt(lastUserMessage);
+  const firstResult = await runPreferredFamilyGenerationOnce(config, cliConfig, "generation");
+  const firstText = normalizeFinalResponseText(firstResult.text, cliConfig.meta.template);
+  const needsRetry =
+    isTinyLlamaFamily(cliConfig) &&
+    (
+      !firstText ||
+      hasRoleLeakage(firstText) ||
+      looksMalformedTinyLlamaReply(firstText) ||
+      (greetingPrompt && (!looksLikeGreetingReply(firstText) || wordCount(firstText) > 12))
+    );
+
+  if (!needsRetry) {
+    return { ...firstResult, text: firstText };
+  }
+
+  if (interactiveWorker) {
+    killWorker(interactiveWorker, true);
+    interactiveWorker = null;
+    sleepMs(120);
+  }
+
+  const retryPackage = buildPromptPackage(cliConfig.messages || [], {
+    template: cliConfig.meta.template,
+    systemPrompt: tinyLlamaRetrySystemPrompt(lastUserMessage),
+    historyStrategy: "tinyllama-focused",
+    maxTurns: cliConfig.performanceMode ? 4 : 8,
+    maxChars: cliConfig.performanceMode ? 3500 : 9000
+  });
+  const retryCliConfig = {
+    ...cliConfig,
+    prompt: retryPackage.prompt,
+    addBos: retryPackage.addBos,
+    stopTexts: expandStopTexts(retryPackage.template, retryPackage.stopTexts),
+    messages: retryPackage.messages,
+    meta: {
+      ...cliConfig.meta,
+      maxNewTokens: Math.min(
+        cliConfig.meta.maxNewTokens,
+        greetingPrompt ? 24 : 64
+      )
+    }
+  };
+  const retryResult = await runPreferredFamilyGenerationOnce(config, retryCliConfig, "generation");
+  const retryText = normalizeFinalResponseText(retryResult.text, retryCliConfig.meta.template);
+  if (greetingPrompt && (!looksLikeGreetingReply(retryText) || wordCount(retryText) > 12)) {
+    return { ...retryResult, text: "Hello!" };
+  }
+  return {
+    ...retryResult,
+    text: retryText
+  };
+}
+
 // â”€â”€ request guards â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 function guardReady(config, res) {
@@ -711,12 +1414,13 @@ function onDisconnect(req, res, cancel) {
 
 function parseWorkerKey(workerKey) {
   if (!workerKey || typeof workerKey !== "string") {
-    return { profileId: "", performanceMode: false, quantMode: "none" };
+    return { profileId: "", performanceMode: false, quantMode: "none", forceCpu: false };
   }
   const parts = workerKey.split("|");
   const profileId = parts[0] || "";
   let performanceMode = false;
   let quantMode = "none";
+  let forceCpu = false;
   for (let i = 1; i < parts.length; i += 1) {
     const part = parts[i];
     if (part.startsWith("perf:")) {
@@ -725,9 +1429,13 @@ function parseWorkerKey(workerKey) {
     }
     if (part.startsWith("q:")) {
       quantMode = normalizeQuantMode(part.slice(2));
+      continue;
+    }
+    if (part.startsWith("cpu:")) {
+      forceCpu = part.slice(4) === "1";
     }
   }
-  return { profileId, performanceMode, quantMode };
+  return { profileId, performanceMode, quantMode, forceCpu };
 }
 
 function findLatestQuantJobForProfile(profileId, quantMode = "") {
@@ -982,9 +1690,19 @@ app.post("/api/generate", async (req, res) => {
     return;
   }
 
+  if (prefersHfChatBackend(cliConfig)) {
+    try {
+      const result = await generatePreferredFamilyResponse(config, cliConfig);
+      res.json({ ...result, ...cliConfig.meta });
+    } catch (err) {
+      if (!res.headersSent) res.status(500).json({ error: err.message || String(err) });
+    }
+    return;
+  }
+
   const { cancel } = runGeneration(config, cliConfig, {
     onDelta: () => {},
-    onDone: (result) => res.json(result),
+    onDone: (result) => res.json({ ...result, ...cliConfig.meta }),
     onError: (msg) => {
       if (!res.headersSent) res.status(500).json({ error: msg });
     }
@@ -1016,6 +1734,28 @@ app.post("/api/chat/stream", async (req, res) => {
   }
 
   setStreamingHeaders(res, "application/x-ndjson; charset=utf-8");
+
+  if (prefersHfChatBackend(cliConfig)) {
+    writeNdjson(res, { type: "start", ...cliConfig.meta });
+    try {
+      const result = await generatePreferredFamilyResponse(config, cliConfig);
+      if (shouldStreamTextDeltas(cliConfig.policy) && result.text) {
+        writeNdjson(res, { type: "delta", delta: result.text });
+      }
+      writeNdjson(res, {
+        type: "done",
+        elapsedMs: result.elapsedMs,
+        generatedTokens: result.generatedTokens,
+        tokPerS: result.tokPerS,
+        metrics: result.metrics || null,
+        message: result.text
+      });
+    } catch (err) {
+      writeNdjson(res, { type: "error", error: err.message || String(err) });
+    }
+    res.end();
+    return;
+  }
 
   const { cancel } = runGeneration(config, cliConfig, {
     onStart: (meta) => writeNdjson(res, { type: "start", ...meta }),
@@ -1090,16 +1830,18 @@ app.post("/v1/chat/completions", async (req, res) => {
       choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }]
     });
 
-    const { cancel } = runGeneration(config, cliConfig, {
-      onDelta: (delta) =>
-        writeSse(res, {
-          id: completionId,
-          object: "chat.completion.chunk",
-          created,
-          model: modelName,
-          choices: [{ index: 0, delta: { content: delta }, finish_reason: null }]
-        }),
-      onDone: () => {
+    if (prefersHfChatBackend(cliConfig)) {
+      try {
+        const result = await generatePreferredFamilyResponse(config, cliConfig);
+        if (shouldStreamTextDeltas(cliConfig.policy) && result.text) {
+          writeSse(res, {
+            id: completionId,
+            object: "chat.completion.chunk",
+            created,
+            model: modelName,
+            choices: [{ index: 0, delta: { content: result.text }, finish_reason: null }]
+          });
+        }
         writeSse(res, {
           id: completionId,
           object: "chat.completion.chunk",
@@ -1109,18 +1851,45 @@ app.post("/v1/chat/completions", async (req, res) => {
         });
         res.write("data: [DONE]\n\n");
         res.end();
-      },
-      onError: (msg) => {
-        writeSse(res, { error: { message: msg, type: "server_error" } });
+      } catch (err) {
+        writeSse(res, {
+          error: { message: err.message || String(err), type: "server_error" }
+        });
         res.end();
       }
-    });
+    } else {
+      const { cancel } = runGeneration(config, cliConfig, {
+        onDelta: (delta) =>
+          writeSse(res, {
+            id: completionId,
+            object: "chat.completion.chunk",
+            created,
+            model: modelName,
+            choices: [{ index: 0, delta: { content: delta }, finish_reason: null }]
+          }),
+        onDone: () => {
+          writeSse(res, {
+            id: completionId,
+            object: "chat.completion.chunk",
+            created,
+            model: modelName,
+            choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
+          });
+          res.write("data: [DONE]\n\n");
+          res.end();
+        },
+        onError: (msg) => {
+          writeSse(res, { error: { message: msg, type: "server_error" } });
+          res.end();
+        }
+      });
 
-    onDisconnect(req, res, cancel);
+      onDisconnect(req, res, cancel);
+    }
   } else {
-    const { cancel } = runGeneration(config, cliConfig, {
-      onDelta: () => {},
-      onDone: ({ text }) =>
+    if (prefersHfChatBackend(cliConfig)) {
+      try {
+        const { text } = await generatePreferredFamilyResponse(config, cliConfig);
         res.json({
           id: completionId,
           object: "chat.completion",
@@ -1134,16 +1903,41 @@ app.post("/v1/chat/completions", async (req, res) => {
             }
           ],
           usage: null
-        }),
-      onError: (msg) => {
+        });
+      } catch (err) {
         if (!res.headersSent)
           res.status(500).json({
-            error: { message: msg, type: "server_error" }
+            error: { message: err.message || String(err), type: "server_error" }
           });
       }
-    });
+    } else {
+      const { cancel } = runGeneration(config, cliConfig, {
+        onDelta: () => {},
+        onDone: ({ text }) =>
+          res.json({
+            id: completionId,
+            object: "chat.completion",
+            created,
+            model: modelName,
+            choices: [
+              {
+                index: 0,
+                message: { role: "assistant", content: text },
+                finish_reason: "stop"
+              }
+            ],
+            usage: null
+          }),
+        onError: (msg) => {
+          if (!res.headersSent)
+            res.status(500).json({
+              error: { message: msg, type: "server_error" }
+            });
+        }
+      });
 
-    onDisconnect(req, res, cancel);
+      onDisconnect(req, res, cancel);
+    }
   }
 });
 
@@ -1484,6 +2278,23 @@ app.post("/api/system/pick-folder", async (req, res) => {
   }
 });
 
+// POST /api/system/model-dir
+app.post("/api/system/model-dir", (req, res) => {
+  try {
+    const { dir } = requestBody(req);
+    const preferredModelDir =
+      typeof dir === "string" ? setPreferredModelDir(dir) : setPreferredModelDir("");
+    const config = getRuntimeConfig();
+    res.json({
+      ok: true,
+      preferredModelDir,
+      models: publicRuntimeSummary(config).availableProfiles
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message || "Unable to update model directory." });
+  }
+});
+
 // GET /api/hub/search
 app.get("/api/hub/search", (req, res) => {
   const q = (req.query.q || "").trim();
@@ -1538,7 +2349,10 @@ app.post("/api/hub/download", (req, res) => {
   const config = getRuntimeConfig();
   const scriptPath = path.resolve(config.repoRoot, "tools", "hf_download.py");
   const args = [scriptPath, "download", repoId.trim()];
-  if (outputDir) args.push("--output-dir", outputDir);
+  if (outputDir) {
+    setPreferredModelDir(outputDir);
+    args.push("--output-dir", outputDir);
+  }
   if (family) args.push("--family", family);
   if (hfToken) args.push("--token", hfToken);
 

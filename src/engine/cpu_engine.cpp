@@ -54,6 +54,12 @@
 namespace engine {
 namespace {
 
+#if defined(_MSC_VER)
+#  define CPI_RESTRICT __restrict
+#else
+#  define CPI_RESTRICT __restrict__
+#endif
+
 // ============================================================
 // Platform-portable prefetch
 // ============================================================
@@ -131,9 +137,9 @@ inline float hsum256(__m256 v) {
 //
 // Requires M to be a multiple of 4 and N to be a multiple of 8.
 // The caller (gemv_fp16) pads if necessary.
-static void gemv_fp16_impl(const uint16_t* __restrict__ W,
-                           const float*    __restrict__ x,
-                           float*          __restrict__ y,
+static void gemv_fp16_impl(const uint16_t* CPI_RESTRICT W,
+                           const float* CPI_RESTRICT x,
+                           float* CPI_RESTRICT y,
                            int M, int N) {
 #if defined(__AVX2__) && defined(CPU_ENGINE_HAVE_F16C)
   // --- AVX2 + F16C fast path ---
@@ -251,9 +257,9 @@ static void gemv_fp16_impl(const uint16_t* __restrict__ W,
 
 // gemv_fp32_impl Ã¢â‚¬â€ same blocking/prefetch structure as gemv_fp16_impl but for
 // weights already stored as FP32 (e.g. dequantised INT8 MLP weights).
-static void gemv_fp32_impl(const float* __restrict__ W,
-                           const float* __restrict__ x,
-                           float*       __restrict__ y,
+static void gemv_fp32_impl(const float* CPI_RESTRICT W,
+                           const float* CPI_RESTRICT x,
+                           float* CPI_RESTRICT y,
                            int M, int N) {
 #if defined(__AVX__)
   #pragma omp parallel for schedule(dynamic, 16)
