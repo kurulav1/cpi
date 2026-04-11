@@ -51,6 +51,20 @@ void launch_rmsnorm(const half* x,
                     float eps,
                     cudaStream_t stream);
 
+// launch_rmsnorm_offset
+//
+// Qwen3.5-style RMSNorm where the stored weight is an additive offset from 1:
+//   y[row, d] = x[row, d] * rsqrt(mean(x[row]^2) + eps) * (1 + weight[d])
+//
+// Parameters match launch_rmsnorm.
+void launch_rmsnorm_offset(const half* x,
+                           const half* weight,
+                           half* y,
+                           int rows,
+                           int cols,
+                           float eps,
+                           cudaStream_t stream);
+
 // launch_layernorm
 //
 // Applies true LayerNorm over each row:
@@ -134,6 +148,21 @@ void launch_rope_inplace_table(half* q,
                                const float* cos_table,
                                const float* sin_table,
                                cudaStream_t stream);
+
+// launch_rope_inplace_partial_table
+//
+// Partial-RoPE variant that rotates only the first rotary_dim channels of each
+// head and leaves the remaining channels unchanged.
+void launch_rope_inplace_partial_table(half* q,
+                                       half* k,
+                                       int num_heads_q,
+                                       int num_heads_k,
+                                       int head_dim,
+                                       int rotary_dim,
+                                       int position,
+                                       const float* cos_table,
+                                       const float* sin_table,
+                                       cudaStream_t stream);
 
 // launch_rope_inplace_device_pos
 //
@@ -381,6 +410,27 @@ void launch_silu_mul(const half* gate,
                      half* out,
                      int n,
                      cudaStream_t stream);
+
+// launch_apply_sigmoid_gate_inplace
+//
+// Element-wise gated multiply used by Qwen3.5 full attention:
+//   values[i] *= sigmoid(gate[i])
+void launch_apply_sigmoid_gate_inplace(half* values,
+                                       const half* gate,
+                                       int n,
+                                       cudaStream_t stream);
+
+// launch_split_interleaved_head_halves
+//
+// Splits a tensor laid out as repeated per-head pairs:
+//   src[head] = [first_half, second_half]
+// into two separate outputs.
+void launch_split_interleaved_head_halves(const half* src,
+                                          half* first,
+                                          half* second,
+                                          int heads,
+                                          int head_dim,
+                                          cudaStream_t stream);
 
 // launch_scale_copy
 //

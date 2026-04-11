@@ -32,6 +32,7 @@ HDR_V1 = struct.Struct("<8siiiiiiiiiQ")
 HDR_V2 = struct.Struct("<8siiiiiiiiiiQ")
 HDR_V3 = struct.Struct("<8siiiiiiiiiiQffiii")
 HDR_V4 = struct.Struct("<8siiiiiiiiiiQffiiiiii")
+HDR_V5 = struct.Struct("<8siiiiiiiiiiQffiiiiiifiiiQ")
 ENTRY = struct.Struct("<64sqq")
 
 
@@ -60,6 +61,27 @@ def parse_header(buf: bytes) -> dict:
     if len(buf) < HDR_V1.size:
         raise ValueError("file too small for LL2C header")
     version = struct.unpack_from("<i", buf, 8)[0]
+    if version >= 5:
+        fields = HDR_V5.unpack_from(buf, 0)
+        attention_count = int(fields[23])
+        attention_offset = int(fields[24])
+        attention_blob = b""
+        if attention_count > 0:
+            byte_count = attention_count * 4
+            attention_blob = bytes(buf[attention_offset:attention_offset + byte_count])
+        return {
+            "version": version,
+            "struct": HDR_V5,
+            "fields": list(fields),
+            "header_size": HDR_V5.size,
+            "hidden": int(fields[3]),
+            "inter": int(fields[4]),
+            "layers": int(fields[5]),
+            "tensor_count": int(fields[10]),
+            "table_offset": int(fields[11]),
+            "expert_inter": int(fields[19]),
+            "attention_blob": attention_blob,
+        }
     if version >= 4:
         fields = HDR_V4.unpack_from(buf, 0)
         return {
@@ -119,6 +141,10 @@ def parse_header(buf: bytes) -> dict:
 
 def repack_header(header: dict, tensor_count: int, table_offset: int) -> bytes:
     fields = list(header["fields"])
+    if header["version"] >= 5:
+        attention_blob = header.get("attention_blob", b"")
+        fields[23] = len(attention_blob) // 4
+        fields[24] = header["header_size"] if attention_blob else 0
     if header["version"] >= 2:
         fields[10] = int(tensor_count)
         fields[11] = int(table_offset)
@@ -355,8 +381,9 @@ def main() -> None:
                 out_entries.append({"name": spec["qname"], "kind": "gen_q", "spec": spec, "nbytes": spec["qbytes"]})
                 out_entries.append({"name": spec["sname"], "kind": "gen_s", "spec": spec, "nbytes": spec["sbytes"]})
 
+            attention_blob = header.get("attention_blob", b"")
             header_size = header["header_size"]
-            new_table_offset = header_size
+            new_table_offset = header_size + len(attention_blob)
             new_tensor_count = len(out_entries)
             data_cursor = new_table_offset + new_tensor_count * ENTRY.size
 
@@ -374,6 +401,8 @@ def main() -> None:
 
             with out_path.open("wb") as out_f:
                 out_f.write(out_header)
+                if attention_blob:
+                    out_f.write(attention_blob)
                 for name_raw, off, nbytes, _item in packed_entries:
                     out_f.write(ENTRY.pack(name_raw, off, nbytes))
 

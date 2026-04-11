@@ -22,12 +22,22 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
   const int inter = cfg.intermediate_size;
   const int head_dim = attn_head_dim_ > 0 ? attn_head_dim_ : (cfg.hidden_size / cfg.num_heads);
   const int kv_hidden = attn_kv_hidden_ > 0 ? attn_kv_hidden_ : (cfg.num_kv_heads * head_dim);
-  const int sliding_window = cfg.sliding_window > 0 ? cfg.sliding_window : 0;
-  const auto attention_bounds = [&](int pos) {
+  const auto attention_bounds = [&](int layer, int pos) {
     const int full = pos + 1;
-    const int seq_len = (sliding_window > 0) ? std::min(sliding_window, full) : full;
-    const int start = full - seq_len;
-    return std::pair<int, int>{start, seq_len};
+    switch (cfg.attention_kind_for_layer(layer)) {
+      case model::AttentionKind::Full:
+        return std::pair<int, int>{0, full};
+      case model::AttentionKind::SlidingWindow: {
+        const int window = cfg.attention_window_for_layer(layer);
+        const int seq_len = (window > 0) ? std::min(window, full) : full;
+        const int start = full - seq_len;
+        return std::pair<int, int>{start, seq_len};
+      }
+      case model::AttentionKind::Linear:
+        LLAMA_ENGINE_THROW("native CUDA runtime does not support linear-attention layers yet");
+      default:
+        LLAMA_ENGINE_THROW("unknown attention kind in model metadata");
+    }
   };
   const bool can_use_dp4a_decode = ((hidden & 3) == 0) && ((inter & 3) == 0);
   const bool resident_fast_path = cached_layer_count_ == cfg.num_layers && !options_.paged_kv_cache;
@@ -62,7 +72,7 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
   // Helper: compute INT4 layer-local pointers and dispatch KV store + attention.
   // Captures layer, position, kv_hidden, head_dim, cfg from the surrounding scope.
   const auto do_kv_int4 = [&](int layer) {
-    const auto [attn_start, attn_seq_len] = attention_bounds(position);
+    const auto [attn_start, attn_seq_len] = attention_bounds(layer, position);
     const int packed_per_head = head_dim / 2;
     const std::size_t i4_stride = static_cast<std::size_t>(options_.max_context) *
                                    static_cast<std::size_t>(cfg.num_kv_heads) *
@@ -305,7 +315,7 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
       if (kv_int4_enabled_) {
         do_kv_int4(layer);
       } else {
-        const auto [attn_start, attn_seq_len] = attention_bounds(position);
+        const auto [attn_start, attn_seq_len] = attention_bounds(layer, position);
         const std::size_t kv_bytes = bytes_for_matrix(1, kv_hidden);
         const std::size_t layer_stride = static_cast<std::size_t>(options_.max_context) * static_cast<std::size_t>(kv_hidden);
         __half* k_layer = nullptr;
@@ -555,7 +565,7 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
     if (kv_int4_enabled_) {
       do_kv_int4(layer);
     } else {
-      const auto [attn_start, attn_seq_len] = attention_bounds(position);
+      const auto [attn_start, attn_seq_len] = attention_bounds(layer, position);
       const std::size_t kv_bytes = bytes_for_matrix(1, kv_hidden);
       const std::size_t layer_stride = static_cast<std::size_t>(options_.max_context) * static_cast<std::size_t>(kv_hidden);
       __half* k_layer = nullptr;
@@ -766,7 +776,7 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
 
     if (!kv_int4_enabled_) {
       run_profiled(last_benchmark_stats_.decode_attention_ms, [&] {
-        const auto [attn_start, attn_seq_len] = attention_bounds(position);
+        const auto [attn_start, attn_seq_len] = attention_bounds(layer, position);
         const std::size_t layer_stride = static_cast<std::size_t>(options_.max_context) * static_cast<std::size_t>(kv_hidden);
         auto* k_layer = static_cast<__half*>(d_k_cache_) + static_cast<std::size_t>(layer) * layer_stride +
                         static_cast<std::size_t>(attn_start) * static_cast<std::size_t>(kv_hidden);
@@ -938,7 +948,7 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
 
     if (!kv_int4_enabled_) {
       run_profiled(last_benchmark_stats_.decode_attention_ms, [&] {
-        const auto [attn_start, attn_seq_len] = attention_bounds(position);
+        const auto [attn_start, attn_seq_len] = attention_bounds(layer, position);
         const std::size_t layer_stride = static_cast<std::size_t>(options_.max_context) * static_cast<std::size_t>(kv_hidden);
         auto* k_layer = static_cast<__half*>(d_k_cache_) + static_cast<std::size_t>(layer) * layer_stride +
                         static_cast<std::size_t>(attn_start) * static_cast<std::size_t>(kv_hidden);
@@ -1210,7 +1220,7 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
     });
 
     run_profiled(last_benchmark_stats_.decode_attention_ms, [&] {
-      const auto [attn_start, attn_seq_len] = attention_bounds(position);
+      const auto [attn_start, attn_seq_len] = attention_bounds(layer, position);
       const std::size_t layer_stride = static_cast<std::size_t>(options_.max_context) * kv_hidden;
       auto* k_layer = static_cast<__half*>(d_k_cache_) + static_cast<std::size_t>(layer) * layer_stride +
                       static_cast<std::size_t>(attn_start) * static_cast<std::size_t>(kv_hidden);

@@ -142,6 +142,48 @@ __global__ void rmsnorm_kernel_simple(const half* x,
   }
 }
 
+__global__ void rmsnorm_offset_kernel_simple(const half* x,
+                                             const half* w,
+                                             half* y,
+                                             int cols,
+                                             float eps) {
+  const int row = blockIdx.x;
+  const int tid = threadIdx.x;
+  const half* x_row =
+      x + static_cast<std::size_t>(row) * static_cast<std::size_t>(cols);
+  half* y_row =
+      y + static_cast<std::size_t>(row) * static_cast<std::size_t>(cols);
+  __shared__ float sum_sq[256];
+  __shared__ float inv_shared;
+
+  float local = 0.0f;
+  for (int col = tid; col < cols; col += blockDim.x) {
+    const float v = __half2float(x_row[col]);
+    local += v * v;
+  }
+  sum_sq[tid] = local;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      sum_sq[tid] += sum_sq[tid + stride];
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    inv_shared = rsqrtf(sum_sq[0] / static_cast<float>(cols) + eps);
+  }
+  __syncthreads();
+
+  const float inv = inv_shared;
+  for (int col = tid; col < cols; col += blockDim.x) {
+    const float xv = __half2float(x_row[col]);
+    const float ww = __half2float(w[col]);
+    y_row[col] = __float2half(xv * inv * (1.0f + ww));
+  }
+}
+
 __global__ void layernorm_kernel(const half* x,
                                  const half* w,
                                  const half* b,
@@ -262,6 +304,44 @@ __global__ void rope_inplace_table_kernel(half* q,
   const int head = blockIdx.x;
   const int pair = threadIdx.x;
   const int half_dim = head_dim / 2;
+  if (pair >= half_dim) {
+    return;
+  }
+
+  const int table_idx = position * half_dim + pair;
+  const float c = cos_table[table_idx];
+  const float s = sin_table[table_idx];
+
+  if (head < num_heads_q) {
+    const int i0 = head * head_dim + pair;
+    const int i1 = head * head_dim + pair + half_dim;
+    const float q0 = __half2float(q[i0]);
+    const float q1 = __half2float(q[i1]);
+    q[i0] = __float2half(q0 * c - q1 * s);
+    q[i1] = __float2half(q1 * c + q0 * s);
+  }
+  if (head < num_heads_k) {
+    const int i0 = head * head_dim + pair;
+    const int i1 = head * head_dim + pair + half_dim;
+    const float k0 = __half2float(k[i0]);
+    const float k1 = __half2float(k[i1]);
+    k[i0] = __float2half(k0 * c - k1 * s);
+    k[i1] = __float2half(k1 * c + k0 * s);
+  }
+}
+
+__global__ void rope_inplace_partial_table_kernel(half* q,
+                                                  half* k,
+                                                  int num_heads_q,
+                                                  int num_heads_k,
+                                                  int head_dim,
+                                                  int rotary_dim,
+                                                  int position,
+                                                  const float* cos_table,
+                                                  const float* sin_table) {
+  const int head = blockIdx.x;
+  const int pair = threadIdx.x;
+  const int half_dim = rotary_dim / 2;
   if (pair >= half_dim) {
     return;
   }
@@ -574,6 +654,17 @@ void launch_rmsnorm(const half* x,
   rmsnorm_kernel_simple<<<rows, threads, 0, stream>>>(x, weight, y, cols, eps);
 }
 
+void launch_rmsnorm_offset(const half* x,
+                           const half* weight,
+                           half* y,
+                           int rows,
+                           int cols,
+                           float eps,
+                           cudaStream_t stream) {
+  const int threads = choose_rmsnorm_threads(cols);
+  rmsnorm_offset_kernel_simple<<<rows, threads, 0, stream>>>(x, weight, y, cols, eps);
+}
+
 void launch_layernorm(const half* x,
                       const half* weight,
                       const half* bias,
@@ -626,6 +717,25 @@ void launch_rope_inplace_table(half* q,
   const int blocks = (num_heads_q > num_heads_k) ? num_heads_q : num_heads_k;
   rope_inplace_table_kernel<<<blocks, threads, 0, stream>>>(
       q, k, num_heads_q, num_heads_k, head_dim, position, cos_table, sin_table);
+}
+
+void launch_rope_inplace_partial_table(half* q,
+                                       half* k,
+                                       int num_heads_q,
+                                       int num_heads_k,
+                                       int head_dim,
+                                       int rotary_dim,
+                                       int position,
+                                       const float* cos_table,
+                                       const float* sin_table,
+                                       cudaStream_t stream) {
+  if (rotary_dim <= 0 || (rotary_dim & 1) != 0) {
+    return;
+  }
+  const int threads = rotary_dim / 2;
+  const int blocks = (num_heads_q > num_heads_k) ? num_heads_q : num_heads_k;
+  rope_inplace_partial_table_kernel<<<blocks, threads, 0, stream>>>(
+      q, k, num_heads_q, num_heads_k, head_dim, rotary_dim, position, cos_table, sin_table);
 }
 
 void launch_rope_inplace_device_pos(half* q,

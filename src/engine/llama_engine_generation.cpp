@@ -43,7 +43,7 @@ void LlamaEngine::prefill_prompt(const std::vector<int>& prompt_tokens) {
   const auto& cfg = weights_.config();
   // Batched prefill requires fp16 projection weights; fall back to sequential when int8 proj or TQ3 is active.
   if (options_.paged_kv_cache || prefill_chunk_size_ <= 1 || cached_int8_proj_enabled_ ||
-      kv_int4_enabled_ || tq3_enabled_ || cfg.is_moe() || cfg.sliding_window > 0) {
+      kv_int4_enabled_ || tq3_enabled_ || cfg.is_moe() || cfg.uses_non_full_attention()) {
     prefill_prompt_sequential(prompt_tokens);
     return;
   }

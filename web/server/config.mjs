@@ -533,14 +533,18 @@ function inspectLl2cQuantInfo(modelPath) {
   }
 }
 
-function buildQuantState(modelPath, extraArgs, { isSafetensorsDir = false } = {}) {
+function buildQuantState(modelPath, extraArgs, { isSafetensorsDir = false, family = "" } = {}) {
   const configuredMode = parseConfiguredQuantMode(extraArgs);
+  const normalizedFamily = String(family || "").toLowerCase();
+  const qwen35Safetensors = isSafetensorsDir && normalizedFamily === "qwen3_5";
   const fallback = {
     format: isSafetensorsDir ? "safetensors" : "unknown",
     configuredMode,
     recommendedMode: configuredMode,
-    effectiveMode: configuredMode,
-    selectableModes: ["none"],
+    effectiveMode: qwen35Safetensors
+      ? (configuredMode === "int8" || configuredMode === "int4" ? configuredMode : "none")
+      : configuredMode,
+    selectableModes: qwen35Safetensors ? ["none", "int8", "int4"] : ["none"],
     packed: { int8: false, int4: false, tq3: false },
     mlpCoverage: {
       totalTensors: 0,
@@ -552,8 +556,12 @@ function buildQuantState(modelPath, extraArgs, { isSafetensorsDir = false } = {}
       expertIntermediateSize: 0
     },
     conversion: {
-      int8: { state: "unavailable", reason: "LL2C model required for streaming quant conversion." },
-      int4: { state: "unavailable", reason: "LL2C model required for streaming quant conversion." }
+      int8: qwen35Safetensors
+        ? { state: "native-runtime", reason: "Native Qwen3.5 safetensors runtime supports explicit int8 execution without LL2C conversion." }
+        : { state: "unavailable", reason: "LL2C model required for streaming quant conversion." },
+      int4: qwen35Safetensors
+        ? { state: "native-runtime", reason: "Native Qwen3.5 safetensors runtime supports explicit int4 execution without LL2C conversion." }
+        : { state: "unavailable", reason: "LL2C model required for streaming quant conversion." }
     }
   };
 
@@ -646,54 +654,78 @@ function readHfModelConfig(modelPath) {
     ? modelPath
     : path.dirname(modelPath);
 
-  const configPath = path.join(modelDir, "config.json");
-  if (!fs.existsSync(configPath)) {
-    return null;
-  }
-
   let raw;
-  try {
-    raw = JSON.parse(fs.readFileSync(configPath, "utf8"));
-  } catch {
+  const candidates = [
+    path.join(modelDir, "config.json"),
+    path.join(modelDir, "hf", "config.json")
+  ];
+  for (const configPath of candidates) {
+    if (!fs.existsSync(configPath)) continue;
+    try {
+      raw = JSON.parse(fs.readFileSync(configPath, "utf8"));
+      if (raw && typeof raw === "object") {
+        break;
+      }
+    } catch {
+      raw = null;
+    }
+  }
+  if (!raw || typeof raw !== "object") {
     return null;
   }
 
   const result = {};
+  const textConfig =
+    raw.text_config && typeof raw.text_config === "object" ? raw.text_config : raw;
 
   // Model type / architecture
-  const modelType = (raw.model_type || "").toLowerCase();
-  const arch = ((raw.architectures || [])[0] || "").toLowerCase();
+  const rootModelType = (raw.model_type || "").toLowerCase();
+  const modelType = (textConfig.model_type || rootModelType || "").toLowerCase();
+  const arch = ((textConfig.architectures || raw.architectures || [])[0] || "").toLowerCase();
+  result.rootModelType = rootModelType || null;
   result.modelType = modelType || arch || null;
 
   // RoPE theta
-  if (typeof raw.rope_theta === "number") {
-    result.ropeTheta = raw.rope_theta;
+  if (typeof textConfig.rope_theta === "number") {
+    result.ropeTheta = textConfig.rope_theta;
   } else if (
-    raw.rope_scaling &&
-    typeof raw.rope_scaling.rope_type === "string" &&
-    raw.rope_scaling.rope_type !== "default"
+    textConfig.rope_scaling &&
+    typeof textConfig.rope_scaling.rope_type === "string" &&
+    textConfig.rope_scaling.rope_type !== "default"
   ) {
     // Llama3 uses rope_scaling with no explicit rope_theta field in some checkpoints
     result.ropeTheta = 500000.0;
   }
 
   // Context length
-  if (typeof raw.max_position_embeddings === "number") {
-    result.maxPositionEmbeddings = raw.max_position_embeddings;
+  if (typeof textConfig.max_position_embeddings === "number") {
+    result.maxPositionEmbeddings = textConfig.max_position_embeddings;
   }
 
   // Vocab size (useful for sanity checks)
-  if (typeof raw.vocab_size === "number") {
-    result.vocabSize = raw.vocab_size;
+  if (typeof textConfig.vocab_size === "number") {
+    result.vocabSize = textConfig.vocab_size;
   }
-  if (typeof raw.num_local_experts === "number") {
-    result.numLocalExperts = raw.num_local_experts;
+  if (typeof textConfig.num_local_experts === "number") {
+    result.numLocalExperts = textConfig.num_local_experts;
   }
-  if (typeof raw.num_experts_per_tok === "number") {
-    result.numExpertsPerTok = raw.num_experts_per_tok;
+  if (typeof textConfig.num_experts_per_tok === "number") {
+    result.numExpertsPerTok = textConfig.num_experts_per_tok;
   }
-  if (typeof raw.expert_intermediate_size === "number") {
-    result.expertIntermediateSize = raw.expert_intermediate_size;
+  if (typeof textConfig.expert_intermediate_size === "number") {
+    result.expertIntermediateSize = textConfig.expert_intermediate_size;
+  }
+  if (Array.isArray(textConfig.layer_types)) {
+    result.layerTypes = textConfig.layer_types.map((value) => String(value));
+  }
+  if (typeof textConfig.linear_num_key_heads === "number") {
+    result.linearNumKeyHeads = textConfig.linear_num_key_heads;
+  }
+  if (typeof textConfig.linear_num_value_heads === "number") {
+    result.linearNumValueHeads = textConfig.linear_num_value_heads;
+  }
+  if (typeof textConfig.partial_rotary_factor === "number") {
+    result.partialRotaryFactor = textConfig.partial_rotary_factor;
   }
   if (result.modelType === "mixtral" && !result.numLocalExperts) {
     result.numLocalExperts = 8;
@@ -701,6 +733,101 @@ function readHfModelConfig(modelPath) {
   }
 
   return result;
+}
+
+function ll2cFamilyFromId(modelFamilyId) {
+  switch (Number(modelFamilyId) || 0) {
+    case 1: return "llama2";
+    case 2: return "llama3";
+    case 3: return "mistral";
+    case 4: return "phi3";
+    case 5: return "qwen2";
+    case 6: return "mixtral";
+    case 7: return "qwen3_5";
+    default: return "";
+  }
+}
+
+function ll2cLayerTypeName(kindId) {
+  switch (Number(kindId) || 0) {
+    case 1: return "sliding_window_attention";
+    case 2: return "linear_attention";
+    default: return "full_attention";
+  }
+}
+
+function readLl2cModelConfig(modelPath) {
+  if (!modelPath || path.extname(modelPath).toLowerCase() !== ".ll2c") {
+    return null;
+  }
+  try {
+    const fd = fs.openSync(modelPath, "r");
+    try {
+      const header = Buffer.alloc(112);
+      const bytesRead = fs.readSync(fd, header, 0, header.length, 0);
+      if (bytesRead < 12) return null;
+      if (header.subarray(0, 7).toString("ascii") !== "LL2CUDA") {
+        return null;
+      }
+
+      const version = header.readInt32LE(8);
+      if (version < 3) {
+        return null;
+      }
+
+      const result = {
+        maxPositionEmbeddings: header.readInt32LE(36)
+      };
+      const family = ll2cFamilyFromId(version >= 3 ? header.readInt32LE(72) : 0);
+      if (family) {
+        result.modelType = family;
+        result.rootModelType = family;
+      }
+      const ropeTheta = header.readFloatLE(56);
+      if (Number.isFinite(ropeTheta) && ropeTheta > 0) {
+        result.ropeTheta = ropeTheta;
+      }
+      if (version >= 4) {
+        result.numLocalExperts = header.readInt32LE(76);
+        result.numExpertsPerTok = header.readInt32LE(80);
+        result.expertIntermediateSize = header.readInt32LE(84);
+      }
+      if (version >= 5 && bytesRead >= 112) {
+        result.partialRotaryFactor = header.readFloatLE(88);
+        result.linearNumKeyHeads = header.readInt32LE(92);
+        result.linearNumValueHeads = header.readInt32LE(96);
+        const attentionTypeCount = header.readInt32LE(100);
+        const attentionTypeOffset = Number(header.readBigInt64LE(104));
+        if (attentionTypeCount > 0 && attentionTypeOffset > 0) {
+          const meta = Buffer.alloc(attentionTypeCount * 4);
+          const metaRead = fs.readSync(fd, meta, 0, meta.length, attentionTypeOffset);
+          if (metaRead === meta.length) {
+            result.layerTypes = [];
+            for (let i = 0; i < attentionTypeCount; i += 1) {
+              result.layerTypes.push(ll2cLayerTypeName(meta.readInt32LE(i * 4)));
+            }
+          }
+        }
+      }
+      return result;
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return null;
+  }
+}
+
+function mergeModelConfigs(...configs) {
+  const merged = {};
+  for (const config of configs) {
+    if (!config || typeof config !== "object") continue;
+    for (const [key, value] of Object.entries(config)) {
+      if (value === undefined || value === null || value === "") continue;
+      merged[key] = value;
+    }
+  }
+  return Object.keys(merged).length > 0 ? merged : null;
 }
 
 function tokenizerConfigCandidates(modelPath, tokenizerPath) {
@@ -761,6 +888,9 @@ function inferTemplateFromChatTemplate(chatTemplate) {
   const raw = String(chatTemplate || "").trim();
   if (!raw) return "";
 
+  if (raw.includes("<|im_start|>") && raw.includes("<|im_end|>") && raw.includes("<think>")) {
+    return "qwen3_5";
+  }
   if (raw.includes("<|start_header_id|>") && raw.includes("<|eot_id|>")) {
     return raw.includes("<|begin_of_text|>") ? "llama4" : "llama3";
   }
@@ -815,6 +945,47 @@ function modelFamilyName(value) {
   return "generic";
 }
 
+function inferProfileFamily(modelPath, hfConfig) {
+  const modelType = String(hfConfig?.modelType || "").toLowerCase();
+  const rootModelType = String(hfConfig?.rootModelType || "").toLowerCase();
+
+  if (modelType.includes("qwen3_5") || rootModelType.includes("qwen3_5")) {
+    return "qwen3_5";
+  }
+  if (modelType.includes("mixtral")) {
+    return "mixtral";
+  }
+  if (modelType.includes("qwen2")) {
+    return "qwen";
+  }
+  return modelFamilyName(path.basename(modelPath || ""));
+}
+
+function inferUnsupportedArchitecture(hfConfig = {}) {
+  if (!hfConfig || typeof hfConfig !== "object") {
+    return "";
+  }
+  const modelType = String(hfConfig.modelType || "").toLowerCase();
+  const rootModelType = String(hfConfig.rootModelType || "").toLowerCase();
+  const layerTypes = Array.isArray(hfConfig.layerTypes)
+    ? hfConfig.layerTypes.map((value) => String(value).toLowerCase())
+    : [];
+  const hasLinearAttention =
+    layerTypes.some((value) => value.includes("linear_attention")) ||
+    Number(hfConfig.linearNumKeyHeads) > 0 ||
+    Number(hfConfig.linearNumValueHeads) > 0;
+
+  if (modelType.includes("qwen3_5") || rootModelType.includes("qwen3_5")) {
+    return "";
+  }
+
+  if (hasLinearAttention) {
+    return "This model uses linear attention layers, which the native engine does not support yet.";
+  }
+
+  return "";
+}
+
 function inferTemplate(modelPath, tokenizerPath, fallbackTemplate, hfConfig, hfTokenizerConfig) {
   const family = modelFamilyName(path.basename(modelPath));
   const tokenizerExt = path.extname(tokenizerPath || "").toLowerCase();
@@ -830,6 +1001,9 @@ function inferTemplate(modelPath, tokenizerPath, fallbackTemplate, hfConfig, hfT
   const modelType = hfConfig?.modelType || "";
   if (modelType.includes("llama3") || modelType.includes("llama-3")) {
     return "llama3";
+  }
+  if (modelType.includes("qwen3_5")) {
+    return "qwen3_5";
   }
   if (modelType.includes("phimoe") || modelType.includes("phi")) {
     return "phi3";
@@ -847,6 +1021,7 @@ function inferTemplate(modelPath, tokenizerPath, fallbackTemplate, hfConfig, hfT
   if (family === "mixtral") return "mistral";
   if (family === "phi") return "phi3";
   if (family === "qwen") return "qwen2";
+  if (family === "qwen3_5") return "qwen3_5";
 
   if (tokenizerExt === ".json" && isSafetensorsModelDir(modelPath)) {
     return "llama4";
@@ -983,46 +1158,53 @@ function discoverSafetensorsModelDirs(scanRoots) {
 }
 
 function buildProfile(modelPath, tokenizerPath, baseConfig, source = "discovered") {
+  const ll2cConfig = readLl2cModelConfig(modelPath);
   const hfConfig = readHfModelConfig(modelPath);
+  const modelConfig = mergeModelConfigs(ll2cConfig, hfConfig);
   const hfTokenizerConfig = readHfTokenizerConfig(modelPath, tokenizerPath);
   const template = inferTemplate(
     modelPath,
     tokenizerPath,
     baseConfig.template,
-    hfConfig,
+    modelConfig,
     hfTokenizerConfig
   );
-  const modelType = String(hfConfig?.modelType || "").toLowerCase();
-  const family = modelType.includes("mixtral")
-    ? "mixtral"
-    : modelFamilyName(path.basename(modelPath || ""));
+  const family = inferProfileFamily(modelPath, modelConfig);
   const extraArgs = modelPath
-    ? buildAutoExtraArgs(modelPath, hfConfig, baseConfig.extraArgs)
+    ? buildAutoExtraArgs(modelPath, modelConfig, baseConfig.extraArgs)
     : [...baseConfig.extraArgs];
   const tokenizerFormat = path.extname(tokenizerPath || "").toLowerCase();
-  const ropeTheta = inferRopeTheta(modelPath, hfConfig);
+  const ropeTheta = inferRopeTheta(modelPath, modelConfig);
+  const unsupportedReason = inferUnsupportedArchitecture(modelConfig);
 
   // Safetensors model directories are only supported by the Llama4 engine.
   // All other families must be converted to .ll2c before use.
   const isSafetensorsDir = isSafetensorsModelDir(modelPath);
+  const supportsNativeSafetensors =
+    isSafetensorsDir && (family === "llama4" || family === "qwen3_5");
   const filesExist =
     Boolean(modelPath) &&
     fs.existsSync(modelPath) &&
     Boolean(tokenizerPath) &&
     fs.existsSync(tokenizerPath);
-  const ready = filesExist && (!isSafetensorsDir || family === "llama4");
+  const ready =
+    filesExist &&
+    !unsupportedReason &&
+    (!isSafetensorsDir || supportsNativeSafetensors);
 
   let status;
-  if (ready) {
+  if (unsupportedReason) {
+    status = "unsupported-architecture";
+  } else if (ready) {
     status = "ready";
-  } else if (isSafetensorsDir && family !== "llama4") {
+  } else if (isSafetensorsDir && !supportsNativeSafetensors) {
     status = "needs-conversion";
   } else if (!tokenizerPath || !fs.existsSync(tokenizerPath)) {
     status = "tokenizer-missing";
   } else {
     status = "model-missing";
   }
-  const quant = buildQuantState(modelPath, extraArgs, { isSafetensorsDir });
+  const quant = buildQuantState(modelPath, extraArgs, { isSafetensorsDir, family });
   const moeFromQuant = quant?.mlpCoverage?.numLocalExperts > 0
     ? {
         numLocalExperts: quant.mlpCoverage.numLocalExperts,
@@ -1030,19 +1212,24 @@ function buildProfile(modelPath, tokenizerPath, baseConfig, source = "discovered
         expertIntermediateSize: quant.mlpCoverage.expertIntermediateSize
       }
     : null;
-  const moeFromHf = (hfConfig?.numLocalExperts > 0)
+  const moeFromHf = (modelConfig?.numLocalExperts > 0)
     ? {
-        numLocalExperts: hfConfig.numLocalExperts,
-        numExpertsPerTok: hfConfig.numExpertsPerTok || 2,
-        expertIntermediateSize: hfConfig.expertIntermediateSize || 0
+        numLocalExperts: modelConfig.numLocalExperts,
+        numExpertsPerTok: modelConfig.numExpertsPerTok || 2,
+        expertIntermediateSize: modelConfig.expertIntermediateSize || 0
       }
     : null;
   const moe = moeFromQuant || moeFromHf;
+  const baseLabel = path.basename(modelPath || "Unconfigured model", ".ll2c");
+  const label =
+    baseLabel.toLowerCase() === "hf" && modelPath
+      ? path.basename(path.dirname(modelPath))
+      : baseLabel;
 
   return {
     id: modelPath,
     source,
-    label: path.basename(modelPath || "Unconfigured model", ".ll2c"),
+    label,
     family,
     modelPath,
     tokenizerPath,
@@ -1053,7 +1240,8 @@ function buildProfile(modelPath, tokenizerPath, baseConfig, source = "discovered
       hfTokenizerConfig?.useDefaultSystemPrompt,
     extraArgs,
     ropeTheta,
-    maxPositionEmbeddings: hfConfig?.maxPositionEmbeddings ?? null,
+    maxPositionEmbeddings: modelConfig?.maxPositionEmbeddings ?? null,
+    unsupportedReason,
     quant,
     moe,
     ready,
@@ -1076,6 +1264,7 @@ function publicModelProfile(profile) {
     extraArgs: profile.extraArgs,
     ropeTheta: profile.ropeTheta,
     maxPositionEmbeddings: profile.maxPositionEmbeddings,
+    unsupportedReason: profile.unsupportedReason || "",
     quant: profile.quant,
     moe: profile.moe,
     ready: profile.ready,

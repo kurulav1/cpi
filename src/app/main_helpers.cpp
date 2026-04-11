@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
@@ -399,6 +400,11 @@ std::string build_chat_prompt(const std::string& chat_template,
            "<|im_end|>\n<|im_start|>user\n" + prompt_text +
            "<|im_end|>\n<|im_start|>assistant\n";
   }
+  if (chat_template == "qwen3_5") {
+    return "<|im_start|>system\n" + std::string(kDefaultSystemPrompt) +
+           "<|im_end|>\n<|im_start|>user\n" + prompt_text +
+           "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+  }
   if (chat_template == "llama4") {
     return build_llama3_style_prompt(prompt_text);
   }
@@ -422,6 +428,9 @@ std::vector<std::string> default_stop_texts_for_template(
   }
   if (chat_template == "qwen2") {
     return {"<|im_end|>", "<|im_start|>"};
+  }
+  if (chat_template == "qwen3_5") {
+    return {"<|im_end|>", "<|im_start|>", "<|endoftext|>"};
   }
   if (chat_template == "llama4") {
     return {"<|eot_id|>", "<|start_header_id|>", "<|end_header_id|>",
@@ -664,8 +673,47 @@ bool is_safetensors_model_dir(const std::string& path) {
   return false;
 }
 
+std::string infer_safetensors_model_family(const std::string& path) {
+  if (!is_safetensors_model_dir(path)) {
+    return "";
+  }
+  std::error_code ec;
+  const std::filesystem::path model_path(path);
+  const std::filesystem::path config_path = model_path / "config.json";
+  if (!std::filesystem::exists(config_path, ec) || ec) {
+    return "";
+  }
+  std::ifstream in(config_path, std::ios::binary);
+  if (!in) {
+    return "";
+  }
+  const std::string json((std::istreambuf_iterator<char>(in)),
+                         std::istreambuf_iterator<char>());
+  const std::string root_model_type = json_get_string(json, "model_type");
+  if (root_model_type.find("qwen3_5") != std::string::npos) {
+    return "qwen3_5";
+  }
+  const std::size_t text_config_pos = json.find("\"text_config\"");
+  if (text_config_pos != std::string::npos) {
+    const std::string tail = json.substr(text_config_pos);
+    const std::string text_model_type = json_get_string(tail, "model_type");
+    if (text_model_type.find("qwen3_5") != std::string::npos) {
+      return "qwen3_5";
+    }
+  }
+  if (root_model_type.find("llama4") != std::string::npos ||
+      json.find("\"architectures\":[\"Llama4") != std::string::npos) {
+    return "llama4";
+  }
+  return "";
+}
+
 std::string guess_chat_template_from_model_path(const std::string& model_path) {
   const std::string name = to_lower_copy(model_path);
+  if (name.find("qwen3.5") != std::string::npos ||
+      name.find("qwen3_5") != std::string::npos) {
+    return "qwen3_5";
+  }
   if (name.find("llama-4") != std::string::npos ||
       name.find("llama4") != std::string::npos) {
     return "llama4";

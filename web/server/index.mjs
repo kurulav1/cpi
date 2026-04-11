@@ -592,7 +592,10 @@ function buildCliArgs(config, body) {
     );
   }
   if (!selectedProfile.ready) {
-    throw new Error(`Model is not runnable: ${selectedProfile.label}.`);
+    const detail = selectedProfile.unsupportedReason
+      ? ` ${selectedProfile.unsupportedReason}`
+      : "";
+    throw new Error(`Model is not runnable: ${selectedProfile.label}.${detail}`);
   }
 
   const performanceMode = isTruthyFlag(body.performanceMode);
@@ -1092,11 +1095,15 @@ function spawnInteractiveWorker(config, cliConfig) {
 
     if (worker.pending) {
       const pending = worker.pending;
-      worker.pending = null;
-      pending.reject(
+      const exitMessage =
         worker.stderrText.trim() ||
-          `interactive worker exited with code ${code}${signal ? ` (${signal})` : ""}.`
-      );
+        `interactive worker exited with code ${code}${signal ? ` (${signal})` : ""}.`;
+      if (pending.handleWorkerExit?.(exitMessage)) {
+        worker.pending = null;
+      } else {
+        worker.pending = null;
+        pending.reject(exitMessage);
+      }
     }
 
     if (interactiveWorker === worker) {
@@ -1149,7 +1156,8 @@ function resolveWarmupProfile(config, profileId) {
     throw new Error("No model available for warmup.");
   }
   if (!profile.ready) {
-    throw new Error(`Model is not runnable: ${profile.label}.`);
+    const detail = profile.unsupportedReason ? ` ${profile.unsupportedReason}` : "";
+    throw new Error(`Model is not runnable: ${profile.label}.${detail}`);
   }
   return profile;
 }
@@ -1255,6 +1263,52 @@ function runGeneration(
     }
   };
 
+  const payload = {
+    id: requestId,
+    prompt: cliConfig.prompt,
+    max_new: cliConfig.meta.maxNewTokens,
+    temp: cliConfig.meta.temperature,
+    stop_texts: cliConfig.stopTexts,
+    add_bos: cliConfig.addBos,
+    // TinyLlama often starts with a short lead-in sentence before the real
+    // answer. Cutting on the first sentence boundary turns sane answers into
+    // fragments like "Sure, who is Elon Musk?".
+    sentence_stop: false
+  };
+
+  let requestAttempt = 0;
+  const maxAutoRetries = 1;
+
+  const canRetryWorkerExit = (pending) =>
+    requestKind === "generation" &&
+    requestAttempt < maxAutoRetries &&
+    !settled &&
+    pending &&
+    !pending.rawText &&
+    !pending.emittedText;
+
+  const sendPayload = (targetWorker) => {
+    if (
+      !targetWorker.child.stdin ||
+      targetWorker.child.stdin.destroyed ||
+      targetWorker.child.stdin.writableEnded
+    ) {
+      if (targetWorker.pending?.id === requestId) {
+        targetWorker.pending = null;
+      }
+      settle(() => onError("Failed to send request to worker: stdin is closed."));
+      return;
+    }
+
+    targetWorker.child.stdin.write(`${JSON.stringify(payload)}\n`, (err) => {
+      if (!err) return;
+      if (targetWorker.pending?.id === requestId) {
+        targetWorker.pending = null;
+      }
+      settle(() => onError(`Failed to send request to worker: ${err.message}`));
+    });
+  };
+
   worker.pending = {
     id: requestId,
     startedAt: Date.now(),
@@ -1264,6 +1318,33 @@ function runGeneration(
     emittedText: "",
     onDelta,
     onMetrics,
+    handleWorkerExit: (message) => {
+      const pending = worker?.pending;
+      if (!canRetryWorkerExit(pending)) {
+        return false;
+      }
+
+      requestAttempt += 1;
+      console.warn(
+        `[cpi] worker exited before producing output for ${cliConfig.meta.modelLabel}; retrying once (${message})`
+      );
+
+      try {
+        const replacementWorker = ensureInteractiveWorker(config, cliConfig);
+        worker = replacementWorker;
+      } catch (err) {
+        settle(() => onError(err.message || String(err)));
+        return true;
+      }
+
+      worker.pending = {
+        ...pending,
+        startedAt: Date.now(),
+        handleWorkerExit: pending.handleWorkerExit
+      };
+      sendPayload(worker);
+      return true;
+    },
     resolve: (result) =>
       settle(() =>
         onDone({
@@ -1276,19 +1357,6 @@ function runGeneration(
         })
       ),
     reject: (msg) => settle(() => onError(msg))
-  };
-
-  const payload = {
-    id: requestId,
-    prompt: cliConfig.prompt,
-    max_new: cliConfig.meta.maxNewTokens,
-    temp: cliConfig.meta.temperature,
-    stop_texts: cliConfig.stopTexts,
-    add_bos: cliConfig.addBos,
-    // TinyLlama often starts with a short lead-in sentence before the real
-    // answer. Cutting on the first sentence boundary turns sane answers into
-    // fragments like "Sure, who is Elon Musk?".
-    sentence_stop: false
   };
 
   const sampleMs = Math.max(0, config.resourceSampleMs || 250);
@@ -1324,24 +1392,7 @@ function runGeneration(
   }
 
   try {
-    if (
-      !worker.child.stdin ||
-      worker.child.stdin.destroyed ||
-      worker.child.stdin.writableEnded
-    ) {
-      if (worker.pending?.id === requestId) {
-        worker.pending = null;
-      }
-      settle(() => onError("Failed to send request to worker: stdin is closed."));
-    } else {
-      worker.child.stdin.write(`${JSON.stringify(payload)}\n`, (err) => {
-        if (!err) return;
-        if (worker.pending?.id === requestId) {
-          worker.pending = null;
-        }
-        settle(() => onError(`Failed to send request to worker: ${err.message}`));
-      });
-    }
+    sendPayload(worker);
   } catch (err) {
     if (worker.pending?.id === requestId) {
       worker.pending = null;
@@ -1446,9 +1497,12 @@ async function generateWithTinyLlamaRetry(config, cliConfig) {
 
 function guardReady(config, res) {
   if (!config.ready) {
+    const detail = config.selectedProfile?.unsupportedReason
+      ? ` ${config.selectedProfile.unsupportedReason}`
+      : "";
     res.status(503).json({
       error:
-        "Runtime not ready. Check config.json (or .env): inferBin, modelPath, tokenizerPath."
+        `Runtime not ready. Check config.json (or .env): inferBin, modelPath, tokenizerPath.${detail}`
     });
     return false;
   }

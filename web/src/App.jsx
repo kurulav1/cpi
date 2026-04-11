@@ -10,6 +10,7 @@ const TEMPLATES = [
   { value: "mistral",         label: "Mistral" },
   { value: "phi3",            label: "Phi-3" },
   { value: "qwen2",           label: "Qwen 2" },
+  { value: "qwen3_5",         label: "Qwen 3.5" },
   { value: "plain",           label: "Plain" },
 ];
 
@@ -650,7 +651,7 @@ function HubPanel() {
                   <div style={{ minWidth:0, flex:1 }}>
                     <p style={{ fontFamily:"var(--mono)", fontSize:"0.78rem", color:"var(--text)", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{m.id}</p>
                     <p style={{ fontSize:"0.68rem", color:"var(--text-3)", marginTop:"0.1rem" }}>
-                      Downloads {fmtDl(m.downloads)}{m.likes ? ` - Likes ${m.likes}` : ""}{m.gated ? " - gated" : ""}
+                      Downloads {fmtDl(m.downloads)}{m.likes ? ` - Likes ${m.likes}` : ""}{m.pipelineTag ? ` - ${m.pipelineTag}` : ""}{m.gated ? " - gated" : ""}
                     </p>
                     {dlStatus[m.id]?.state === "error" && dlStatus[m.id]?.error && (
                       <p style={{ fontSize:"0.66rem", color:"var(--red)", marginTop:"0.15rem", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
@@ -717,8 +718,18 @@ function HubPanel() {
                       {quantSet.has(`${m.id}|int4`) ? "INT4..." : "Pack INT4"}
                     </button>
                   )}
-                  <span className={`badge ${m.ready ? "badge-green" : "badge-amber"}`}>{m.ready ? "ready" : m.status}</span>
+                  <span
+                    className={`badge ${m.ready ? "badge-green" : "badge-amber"}`}
+                    title={m.unsupportedReason || ""}
+                  >
+                    {m.ready ? "ready" : m.status}
+                  </span>
                 </div>
+                {!m.ready && m.unsupportedReason && (
+                  <div style={{ fontSize:"0.72rem", color:"var(--muted)", marginTop:"0.25rem" }}>
+                    {m.unsupportedReason}
+                  </div>
+                )}
               </div>
             ))
           )}

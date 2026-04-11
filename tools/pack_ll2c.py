@@ -19,18 +19,26 @@ except Exception:  # pragma: no cover
     np = None
 
 MAGIC = b"LL2CUDA\x00"
-VERSION = 4
+VERSION = 5
 
-# HeaderV4 layout (matches HeaderV4 struct in weight_loader.cpp):
+# HeaderV5 layout (matches HeaderV5 struct in weight_loader.cpp):
 #   magic[8], version, vocab, hidden, inter, layers, heads, kv_heads,
 #   max_seq, tp, tensor_count, table_offset (Q=uint64),
 #   rope_theta (f), norm_eps (f), sliding_window (i), flags (i), model_family_id (i)
-#   num_local_experts (i), num_experts_per_tok (i), expert_intermediate_size (i)
+#   num_local_experts (i), num_experts_per_tok (i), expert_intermediate_size (i),
+#   partial_rotary_factor (f), linear_num_key_heads (i), linear_num_value_heads (i),
+#   attention_type_count (i), attention_type_offset (Q)
 #
 # flags bit layout: bit 0 = tie_word_embeddings, bit 1 = has_qkv_bias,
 # bit 2 = use_layernorm
-HEADER_FMT = "<8siiiiiiiiiiQffiiiiii"
+HEADER_FMT = "<8siiiiiiiiiiQffiiiiiifiiiQ"
 ENTRY_FMT = "<64sqq"
+
+ATTENTION_KIND_ID = {
+    "full": 0,
+    "sliding_window": 1,
+    "linear": 2,
+}
 
 
 def pad_name(name: str) -> bytes:
@@ -69,6 +77,12 @@ def load_config(src: Path, args) -> dict:
     result["num_local_experts"] = int(cfg.get("num_local_experts", 0) or 0)
     result["num_experts_per_tok"] = int(cfg.get("num_experts_per_tok", 0) or 0)
     result["expert_intermediate_size"] = int(cfg.get("expert_intermediate_size", 0) or 0)
+    result["partial_rotary_factor"] = float(cfg.get("partial_rotary_factor", 1.0) or 1.0)
+    result["linear_num_key_heads"] = int(cfg.get("linear_num_key_heads", 0) or 0)
+    result["linear_num_value_heads"] = int(cfg.get("linear_num_value_heads", 0) or 0)
+    result["layer_attention_types"] = [
+        str(value).lower() for value in cfg.get("layer_attention_types", []) or []
+    ]
 
     return result
 
@@ -211,8 +225,19 @@ def main() -> None:
     tensor_names = list(blobs_by_name.keys())
     tensor_count = len(tensor_names)
 
+    attention_types = cfg.get("layer_attention_types", [])
+    attention_type_ids = []
+    for value in attention_types:
+        if value not in ATTENTION_KIND_ID:
+            raise ValueError(f"Unsupported layer attention type in model_config.json: {value}")
+        attention_type_ids.append(ATTENTION_KIND_ID[value])
+    if attention_type_ids and len(attention_type_ids) != int(cfg["num_layers"]):
+        raise ValueError("layer_attention_types length must match num_layers")
+
     header_size = struct.calcsize(HEADER_FMT)
-    table_offset = header_size
+    attention_type_offset = header_size if attention_type_ids else 0
+    attention_type_blob = struct.pack("<" + "i" * len(attention_type_ids), *attention_type_ids) if attention_type_ids else b""
+    table_offset = header_size + len(attention_type_blob)
     table_size = tensor_count * struct.calcsize(ENTRY_FMT)
     cursor = table_offset + table_size
 
@@ -258,7 +283,14 @@ def main() -> None:
             cfg["num_local_experts"],       # int32
             cfg["num_experts_per_tok"],     # int32
             cfg["expert_intermediate_size"],# int32
+            cfg["partial_rotary_factor"],   # float
+            cfg["linear_num_key_heads"],    # int32
+            cfg["linear_num_value_heads"],  # int32
+            len(attention_type_ids),        # int32
+            attention_type_offset,          # uint64
         ))
+        if attention_type_blob:
+            f.write(attention_type_blob)
         for e in entries:
             f.write(struct.pack(ENTRY_FMT, *e))
         for blob in blobs:

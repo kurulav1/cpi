@@ -87,6 +87,36 @@ struct HeaderV4 {
   std::int32_t expert_intermediate_size;
 };
 
+// HeaderV5 extends HeaderV4 with richer architecture metadata used by
+// mixed-attention families such as Qwen3.5.
+struct HeaderV5 {
+  char magic[8];
+  std::int32_t version;
+  std::int32_t vocab_size;
+  std::int32_t hidden_size;
+  std::int32_t intermediate_size;
+  std::int32_t num_layers;
+  std::int32_t num_heads;
+  std::int32_t num_kv_heads;
+  std::int32_t max_seq_len;
+  std::int32_t tensor_parallel;
+  std::int32_t tensor_count;
+  std::int64_t table_offset;
+  float        rope_theta;
+  float        norm_eps;
+  std::int32_t sliding_window;
+  std::int32_t flags;
+  std::int32_t model_family_id;
+  std::int32_t num_local_experts;
+  std::int32_t num_experts_per_tok;
+  std::int32_t expert_intermediate_size;
+  float        partial_rotary_factor;
+  std::int32_t linear_num_key_heads;
+  std::int32_t linear_num_value_heads;
+  std::int32_t attention_type_count;
+  std::int64_t attention_type_offset;
+};
+
 struct TensorEntry {
   char name[64];
   std::int64_t offset;
@@ -139,8 +169,54 @@ void WeightLoader::parse_manifest() {
   const auto version = *reinterpret_cast<const std::int32_t*>(mmap_.data() + 8);
   std::int32_t tensor_count = 0;
   std::int64_t table_offset = 0;
+  config_.layer_attention_kinds.clear();
+  config_.partial_rotary_factor = 1.0f;
+  config_.linear_num_key_heads = 0;
+  config_.linear_num_value_heads = 0;
 
-  if (version >= 4) {
+  if (version >= 5) {
+    if (mmap_.size() < sizeof(HeaderV5)) {
+      LLAMA_ENGINE_THROW("invalid v5 model header");
+    }
+    const auto* hdr = reinterpret_cast<const HeaderV5*>(mmap_.data());
+    config_.vocab_size = hdr->vocab_size;
+    config_.hidden_size = hdr->hidden_size;
+    config_.intermediate_size = hdr->intermediate_size;
+    config_.num_layers = hdr->num_layers;
+    config_.num_heads = hdr->num_heads;
+    config_.num_kv_heads = hdr->num_kv_heads;
+    config_.max_seq_len = hdr->max_seq_len;
+    config_.tensor_parallel = hdr->tensor_parallel;
+    tensor_count = hdr->tensor_count;
+    table_offset = hdr->table_offset;
+    config_.rope_theta = hdr->rope_theta;
+    config_.norm_eps = hdr->norm_eps > 0.0f ? hdr->norm_eps : 1e-5f;
+    config_.sliding_window = hdr->sliding_window;
+    config_.tie_word_embeddings = (hdr->flags & 1) != 0;
+    config_.has_qkv_bias = (hdr->flags & 2) != 0;
+    config_.use_layernorm = (hdr->flags & 4) != 0;
+    config_.model_family = static_cast<ModelFamily>(hdr->model_family_id);
+    config_.num_local_experts = hdr->num_local_experts;
+    config_.num_experts_per_tok = hdr->num_experts_per_tok;
+    config_.expert_intermediate_size = hdr->expert_intermediate_size;
+    config_.partial_rotary_factor = hdr->partial_rotary_factor > 0.0f ? hdr->partial_rotary_factor : 1.0f;
+    config_.linear_num_key_heads = hdr->linear_num_key_heads;
+    config_.linear_num_value_heads = hdr->linear_num_value_heads;
+
+    if (hdr->attention_type_count > 0) {
+      const std::size_t bytes =
+          static_cast<std::size_t>(hdr->attention_type_count) * sizeof(std::int32_t);
+      if (hdr->attention_type_offset < 0 ||
+          static_cast<std::size_t>(hdr->attention_type_offset) + bytes > mmap_.size()) {
+        LLAMA_ENGINE_THROW("invalid v5 attention metadata table");
+      }
+      const auto* kinds = reinterpret_cast<const std::int32_t*>(mmap_.data() + hdr->attention_type_offset);
+      config_.layer_attention_kinds.reserve(static_cast<std::size_t>(hdr->attention_type_count));
+      for (int i = 0; i < hdr->attention_type_count; ++i) {
+        config_.layer_attention_kinds.push_back(static_cast<AttentionKind>(kinds[i]));
+      }
+    }
+  } else if (version >= 4) {
     if (mmap_.size() < sizeof(HeaderV4)) {
       LLAMA_ENGINE_THROW("invalid v4 model header");
     }
@@ -225,6 +301,11 @@ void WeightLoader::parse_manifest() {
     config_.num_experts_per_tok = 0;
     config_.expert_intermediate_size = 0;
     config_.use_layernorm = false;
+  }
+
+  if (!config_.layer_attention_kinds.empty() &&
+      static_cast<int>(config_.layer_attention_kinds.size()) != config_.num_layers) {
+    LLAMA_ENGINE_THROW("attention metadata count does not match num_layers");
   }
 
   if (config_.num_kv_heads <= 0 || config_.num_heads <= 0 || config_.num_heads % config_.num_kv_heads != 0) {

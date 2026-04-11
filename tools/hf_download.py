@@ -70,15 +70,47 @@ def run_logged_subprocess(cmd: list[str], failure_prefix: str):
         raise RuntimeError(f"{failure_prefix}: {err_detail}")
 
 
+def normalize_search_text(value: str) -> str:
+    return "".join(ch.lower() for ch in str(value or "") if ch.isalnum())
+
+
+def rank_search_model(model: dict, query: str) -> tuple:
+    model_id = str(model.get("id", ""))
+    normalized_id = normalize_search_text(model_id)
+    normalized_query = normalize_search_text(query)
+    tags = [str(tag).lower() for tag in model.get("tags", [])]
+    pipeline_tag = str(model.get("pipeline_tag", "") or "").lower()
+
+    exact_id = normalized_id == normalized_query and normalized_query != ""
+    exact_tail = normalize_search_text(model_id.split("/")[-1]) == normalized_query and normalized_query != ""
+    starts_with = normalized_id.startswith(normalized_query) and normalized_query != ""
+    contains = normalized_query in normalized_id and normalized_query != ""
+    officialish = model_id.split("/", 1)[0].lower() in {"qwen", "meta-llama", "mistralai", "microsoft", "tiiuae"}
+    text_like = pipeline_tag in {"text-generation", "image-text-to-text"} or any(
+        tag in {"text-generation", "image-text-to-text", "conversational"} for tag in tags
+    )
+
+    return (
+        1 if exact_id else 0,
+        1 if exact_tail else 0,
+        1 if starts_with else 0,
+        1 if contains else 0,
+        1 if officialish else 0,
+        1 if text_like else 0,
+        int(model.get("downloads", 0) or 0),
+        int(model.get("likes", 0) or 0),
+    )
+
+
 # ── commands ──────────────────────────────────────────────────────────────────
 
 def cmd_search(args):
-    q = urllib.parse.quote(args.query)
+    raw_query = str(args.query or "").strip()
+    q = urllib.parse.quote(raw_query)
     limit = max(1, min(50, args.limit))
     url = (
         f"{HF_API}/models"
         f"?search={q}&limit={limit}"
-        f"&filter=text-generation"
         f"&sort=downloads&direction=-1"
     )
     try:
@@ -97,11 +129,13 @@ def cmd_search(args):
             "likes":        m.get("likes", 0),
             "private":      m.get("private", False),
             "tags":         m.get("tags", []),
+            "pipelineTag":  m.get("pipeline_tag", ""),
             "lastModified": m.get("lastModified", ""),
             "gated":        m.get("gated", False),
         }
         for m in (models if isinstance(models, list) else [])
     ]
+    results.sort(key=lambda model: rank_search_model(model, raw_query), reverse=True)
     emit({"type": "results", "models": results})
 
 
@@ -252,6 +286,23 @@ def cmd_download(args):
             sys.exit(1)
 
     log("Download complete.")
+
+    config_path = hf_dir / "config.json"
+    model_type = ""
+    text_model_type = ""
+    if config_path.exists():
+        try:
+            cfg = json.loads(config_path.read_text(encoding="utf-8"))
+            model_type = str(cfg.get("model_type", "")).lower()
+            text_model_type = str(cfg.get("text_config", {}).get("model_type", "")).lower()
+        except Exception:
+            model_type = ""
+            text_model_type = ""
+
+    if "qwen3_5" in model_type or "qwen3_5" in text_model_type:
+        log("Detected Qwen3.5. Skipping .ll2c conversion and keeping the native safetensors install.")
+        done(root_dir)
+        return
 
     # ── step 2: convert ───────────────────────────────────────────────────────
     log("Converting weights to .bin files …")

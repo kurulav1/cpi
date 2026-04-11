@@ -18,9 +18,11 @@
 #include "app/main_modes.hpp"
 #include "engine/cpu_engine.hpp"
 #include "engine/llama4_cpu_engine.hpp"
+#include "engine/qwen35_cpu_engine.hpp"
 #if LLAMA_ENGINE_HAS_CUDA
 #include "engine/llama4_cuda_engine.hpp"
 #include "engine/llama_engine.hpp"
+#include "engine/qwen35_cuda_engine.hpp"
 #endif
 #include "model/tokenizer.hpp"
 
@@ -34,6 +36,7 @@ using app::main_helpers::SingleInstanceGuard;
 using app::main_helpers::auto_detect_tokenizer_path;
 using app::main_helpers::build_chat_prompt;
 using app::main_helpers::default_stop_texts_for_template;
+using app::main_helpers::infer_safetensors_model_family;
 using app::main_helpers::is_safetensors_model_dir;
 using app::main_helpers::join_ints;
 using app::main_helpers::parse_tokens;
@@ -80,6 +83,7 @@ int main(int argc, char** argv) {
     const bool use_tokenizer = !cli.prompt_text.empty() || cli.interactive_mode;
     std::ostream& info_out = quiet_output ? std::cerr : std::cout;
     const bool is_llama4_safetensors = is_safetensors_model_dir(cli.opts.model_path);
+    const std::string safetensors_family = infer_safetensors_model_family(cli.opts.model_path);
 
     // --- Tokenizer setup ---
     if (use_tokenizer) {
@@ -95,8 +99,13 @@ int main(int argc, char** argv) {
       }
       if (!cli.interactive_mode && cli.chat_template.empty() && is_llama4_safetensors &&
           std::filesystem::path(cli.tokenizer_path).extension() == ".json") {
-        cli.chat_template = "llama4";
-        info_out << "[info] defaulting to --chat-template llama4 for the configured safetensors model directory.\n";
+        if (safetensors_family == "qwen3_5") {
+          cli.chat_template = "qwen3_5";
+          info_out << "[info] defaulting to --chat-template qwen3_5 for the configured Qwen3.5 safetensors model directory.\n";
+        } else {
+          cli.chat_template = "llama4";
+          info_out << "[info] defaulting to --chat-template llama4 for the configured safetensors model directory.\n";
+        }
       }
       if (!cli.interactive_mode && cli.stop_texts.empty()) {
         cli.stop_texts = default_stop_texts_for_template(cli.chat_template);
@@ -119,7 +128,8 @@ int main(int argc, char** argv) {
           info_out << "[tokenizer] using native tokenizer.json BPE path\n";
         } else if (cli.chat_template == "llama4" && std::filesystem::path(cli.tokenizer_path).extension() != ".json") {
           info_out << "[warn] Llama4 is expected to use a HuggingFace tokenizer.json tokenizer.\n";
-        } else if ((cli.chat_template == "llama3" || cli.chat_template == "phi3" || cli.chat_template == "qwen2") &&
+        } else if ((cli.chat_template == "llama3" || cli.chat_template == "phi3" ||
+                    cli.chat_template == "qwen2" || cli.chat_template == "qwen3_5") &&
                    std::filesystem::path(cli.tokenizer_path).extension() != ".json") {
           info_out << "[warn] " << cli.chat_template << " is expected to use a tokenizer.json (HF BPE). "
                       "Pass --tokenizer path/to/tokenizer.json for best results.\n";
@@ -175,15 +185,28 @@ int main(int argc, char** argv) {
     const int cuda_device_count = 0;
 #endif
     const bool is_llama4_model = is_safetensors_model_dir(cli.opts.model_path);
-    const bool use_llama4_cpu_engine = is_llama4_model && (cli.force_cpu || cuda_device_count == 0);
+    const bool is_qwen35_model = safetensors_family == "qwen3_5";
+    const bool use_qwen35_cpu_engine = is_qwen35_model && (cli.force_cpu || cuda_device_count == 0);
+    const bool use_llama4_cpu_engine =
+        is_llama4_model && !is_qwen35_model && (cli.force_cpu || cuda_device_count == 0);
 #if LLAMA_ENGINE_HAS_CUDA
-    const bool use_llama4_cuda_engine = is_llama4_model && !cli.force_cpu && cuda_device_count > 0;
+    const bool use_qwen35_cuda_engine =
+        is_qwen35_model && !cli.force_cpu && cuda_device_count > 0;
+    const bool use_llama4_cuda_engine =
+        is_llama4_model && !is_qwen35_model && !cli.force_cpu && cuda_device_count > 0;
 #else
+    const bool use_qwen35_cuda_engine = false;
     const bool use_llama4_cuda_engine = false;
 #endif
-    const bool use_cpu_engine = use_llama4_cpu_engine || (!is_llama4_model && (cli.force_cpu || cuda_device_count == 0));
+    const bool use_cpu_engine =
+        use_qwen35_cpu_engine || use_llama4_cpu_engine ||
+        (!is_llama4_model && (cli.force_cpu || cuda_device_count == 0));
     if (!quiet_output) {
-      if (use_llama4_cuda_engine) {
+      if (use_qwen35_cpu_engine) {
+        std::cout << "[info] Detected a Qwen3.5 safetensors model. Using the Qwen3.5 CPU engine.\n";
+      } else if (use_qwen35_cuda_engine) {
+        std::cout << "[info] Detected a Qwen3.5 safetensors model. Using the Qwen3.5 CUDA engine.\n";
+      } else if (use_llama4_cuda_engine) {
         std::cout << "[info] Detected a safetensors model. Using the Llama4 CUDA engine.\n";
       } else if (use_llama4_cpu_engine) {
         std::cout << "[info] Detected a safetensors model. Using the Llama4 CPU engine.\n";
@@ -249,12 +272,21 @@ int main(int argc, char** argv) {
     };
 
 #if LLAMA_ENGINE_HAS_CUDA
-    if (use_llama4_cuda_engine) {
+    if (use_qwen35_cuda_engine) {
+      engine::Qwen35CudaEngine qwen35_cuda_eng;
+      run_with_engine(qwen35_cuda_eng);
+    } else if (use_llama4_cuda_engine) {
       engine::Llama4CudaEngine llama4_cuda_eng;
       run_with_engine(llama4_cuda_eng);
+    } else if (use_qwen35_cpu_engine) {
+      engine::Qwen35CpuEngine qwen35_cpu_eng;
+      run_with_engine(qwen35_cpu_eng);
     } else if (use_llama4_cpu_engine) {
 #else
-    if (use_llama4_cpu_engine) {
+    if (use_qwen35_cpu_engine) {
+      engine::Qwen35CpuEngine qwen35_cpu_eng;
+      run_with_engine(qwen35_cpu_eng);
+    } else if (use_llama4_cpu_engine) {
 #endif
       engine::Llama4CpuEngine llama4_cpu_eng;
       run_with_engine(llama4_cpu_eng);

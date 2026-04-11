@@ -40,11 +40,12 @@ import numpy as np
 MAGIC = b"LL2CUDA\x00"
 HEADER_V3_FMT = "<8siiiiiiiiiiQffiii"  # HeaderV3
 HEADER_V4_FMT = "<8siiiiiiiiiiQffiiiiii"  # HeaderV4
+HEADER_V5_FMT = "<8siiiiiiiiiiQffiiiiiifiiiQ"  # HeaderV5
 HEADER_V2_FMT = "<8siiiiiiiiiiQ"  # HeaderV2
 HEADER_V1_FMT = "<8siiiiiiiiiQ"  # HeaderV1
 ENTRY_FMT = "<64sqq"  # TensorEntry: name[64], offset int64, bytes int64
 
-HEADER_SIZE = struct.calcsize(HEADER_V4_FMT)
+HEADER_SIZE = struct.calcsize(HEADER_V5_FMT)
 ENTRY_SIZE = struct.calcsize(ENTRY_FMT)
 
 
@@ -265,7 +266,40 @@ def read_ll2c_mmap(path: Path):
 
     version = struct.unpack_from("<i", mm, 8)[0]
 
-    if version >= 4:
+    if version >= 5:
+        hdr = struct.unpack_from(HEADER_V5_FMT, mm, 0)
+        fields = {
+            "magic": hdr[0],
+            "version": 5,
+            "vocab_size": hdr[2],
+            "hidden_size": hdr[3],
+            "intermediate_size": hdr[4],
+            "num_layers": hdr[5],
+            "num_heads": hdr[6],
+            "num_kv_heads": hdr[7],
+            "max_seq_len": hdr[8],
+            "tensor_parallel": hdr[9],
+            "tensor_count": hdr[10],
+            "table_offset": hdr[11],
+            "rope_theta": hdr[12],
+            "norm_eps": hdr[13],
+            "sliding_window": hdr[14],
+            "flags": hdr[15],
+            "model_family_id": hdr[16],
+            "num_local_experts": hdr[17],
+            "num_experts_per_tok": hdr[18],
+            "expert_intermediate_size": hdr[19],
+            "partial_rotary_factor": hdr[20],
+            "linear_num_key_heads": hdr[21],
+            "linear_num_value_heads": hdr[22],
+            "attention_type_count": hdr[23],
+            "attention_type_offset": hdr[24],
+        }
+        if fields["attention_type_count"] > 0:
+            meta_bytes = int(fields["attention_type_count"]) * 4
+            off = int(fields["attention_type_offset"])
+            fields["attention_types_blob"] = bytes(mm[off:off + meta_bytes])
+    elif version >= 4:
         hdr = struct.unpack_from(HEADER_V4_FMT, mm, 0)
         fields = {
             "magic": hdr[0],
@@ -288,6 +322,11 @@ def read_ll2c_mmap(path: Path):
             "num_local_experts": hdr[17],
             "num_experts_per_tok": hdr[18],
             "expert_intermediate_size": hdr[19],
+            "partial_rotary_factor": 1.0,
+            "linear_num_key_heads": 0,
+            "linear_num_value_heads": 0,
+            "attention_type_count": 0,
+            "attention_type_offset": 0,
         }
     elif version >= 3:
         hdr = struct.unpack_from(HEADER_V3_FMT, mm, 0)
@@ -312,6 +351,11 @@ def read_ll2c_mmap(path: Path):
             "num_local_experts": 0,
             "num_experts_per_tok": 0,
             "expert_intermediate_size": 0,
+            "partial_rotary_factor": 1.0,
+            "linear_num_key_heads": 0,
+            "linear_num_value_heads": 0,
+            "attention_type_count": 0,
+            "attention_type_offset": 0,
         }
     elif version == 2:
         hdr = struct.unpack_from(HEADER_V2_FMT, mm, 0)
@@ -336,6 +380,11 @@ def read_ll2c_mmap(path: Path):
             "num_local_experts": 0,
             "num_experts_per_tok": 0,
             "expert_intermediate_size": 0,
+            "partial_rotary_factor": 1.0,
+            "linear_num_key_heads": 0,
+            "linear_num_value_heads": 0,
+            "attention_type_count": 0,
+            "attention_type_offset": 0,
         }
     else:
         hdr = struct.unpack_from(HEADER_V1_FMT, mm, 0)
@@ -362,7 +411,7 @@ def read_ll2c_mmap(path: Path):
             "expert_intermediate_size": 0,
         }
 
-    print(f"[tq3] input version={version}, writing output as header v4")
+    print(f"[tq3] input version={version}, preserving header metadata in output")
 
     table_offset = fields["table_offset"]
     tensor_count = fields["tensor_count"]
@@ -566,7 +615,12 @@ def write_ll2c_streaming(
     """
     tensor_count = len(out_names)
 
-    table_base = _align8(HEADER_SIZE)
+    attention_blob = fields.get("attention_types_blob", b"")
+    attention_count = int(fields.get("attention_type_count", 0) or 0)
+    if attention_blob and len(attention_blob) != attention_count * 4:
+        raise ValueError("attention_types_blob does not match attention_type_count")
+
+    table_base = _align8(HEADER_SIZE + len(attention_blob))
     data_start = _align8(table_base + tensor_count * ENTRY_SIZE)
 
     offsets = {}
@@ -576,9 +630,9 @@ def write_ll2c_streaming(
         cursor = _align8(cursor + tensor_sizes[name])
 
     hdr = struct.pack(
-        HEADER_V4_FMT,
+        HEADER_V5_FMT,
         fields["magic"],
-        fields["version"],
+        5,
         fields["vocab_size"],
         fields["hidden_size"],
         fields["intermediate_size"],
@@ -597,6 +651,11 @@ def write_ll2c_streaming(
         int(fields.get("num_local_experts", 0)),
         int(fields.get("num_experts_per_tok", 0)),
         int(fields.get("expert_intermediate_size", 0)),
+        float(fields.get("partial_rotary_factor", 1.0)),
+        int(fields.get("linear_num_key_heads", 0)),
+        int(fields.get("linear_num_value_heads", 0)),
+        attention_count,
+        HEADER_SIZE if attention_count > 0 else 0,
     )
 
     table = bytearray()
@@ -609,7 +668,9 @@ def write_ll2c_streaming(
 
     with open(tmp_path, "wb") as out:
         out.write(hdr)
-        pad = table_base - len(hdr)
+        if attention_blob:
+            out.write(attention_blob)
+        pad = table_base - (len(hdr) + len(attention_blob))
         if pad > 0:
             out.write(b"\x00" * pad)
 

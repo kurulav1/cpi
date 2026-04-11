@@ -13,6 +13,7 @@ HDR_V1 = struct.Struct("<8siiiiiiiiiQ")
 HDR_V2 = struct.Struct("<8siiiiiiiiiiQ")
 HDR_V3 = struct.Struct("<8siiiiiiiiiiQffiii")
 HDR_V4 = struct.Struct("<8siiiiiiiiiiQffiiiiii")
+HDR_V5 = struct.Struct("<8siiiiiiiiiiQffiiiiiifiiiQ")
 ENTRY = struct.Struct("<64sqq")
 
 
@@ -34,7 +35,39 @@ def main() -> None:
     num_local_experts = 0
     num_experts_per_tok = 0
     expert_inter = 0
-    if version >= 4:
+    attention_type_count = 0
+    attention_type_offset = 0
+    if version >= 5:
+        if len(data) < HDR_V5.size:
+            raise ValueError("file too small for v5 header")
+        (
+            magic,
+            version,
+            vocab,
+            hidden,
+            inter,
+            layers,
+            heads,
+            kv_heads,
+            max_seq,
+            tp,
+            tensor_count,
+            table_off,
+            _rope_theta,
+            _norm_eps,
+            _sliding_window,
+            _flags,
+            _model_family_id,
+            num_local_experts,
+            num_experts_per_tok,
+            expert_inter,
+            _partial_rotary_factor,
+            _linear_num_key_heads,
+            _linear_num_value_heads,
+            attention_type_count,
+            attention_type_offset,
+        ) = HDR_V5.unpack_from(data, 0)
+    elif version >= 4:
         if len(data) < HDR_V4.size:
             raise ValueError("file too small for v4 header")
         (
@@ -99,6 +132,18 @@ def main() -> None:
         raise ValueError("invalid model config in header")
     if heads % kv_heads != 0:
         raise ValueError("invalid head topology")
+    if attention_type_count < 0:
+        raise ValueError("invalid attention_type_count")
+    if attention_type_count not in (0, layers):
+        raise ValueError("attention_type_count must be 0 or match num_layers")
+    if attention_type_count > 0:
+        meta_end = attention_type_offset + attention_type_count * 4
+        if attention_type_offset < HDR_V5.size or meta_end > len(data):
+            raise ValueError("attention type metadata out of bounds")
+        for i in range(attention_type_count):
+            kind = struct.unpack_from("<i", data, attention_type_offset + i * 4)[0]
+            if kind not in (0, 1, 2):
+                raise ValueError(f"invalid attention kind id at layer {i}: {kind}")
 
     entries = {}
     offsets = {}

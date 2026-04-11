@@ -95,6 +95,35 @@ __global__ void silu_mul_half2_kernel(const half2* gate, const half2* up, half2*
   out[i] = __halves2half2(__float2half(s0 * u0), __float2half(s1 * u1));
 }
 
+__global__ void apply_sigmoid_gate_inplace_kernel(half* values, const half* gate, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) {
+    return;
+  }
+  const float v = __half2float(values[i]);
+  const float g = __half2float(gate[i]);
+  values[i] = __float2half(v * (1.0f / (1.0f + expf(-g))));
+}
+
+__global__ void split_interleaved_head_halves_kernel(const half* src,
+                                                     half* first,
+                                                     half* second,
+                                                     int head_dim) {
+  const int head = blockIdx.x;
+  const int d = blockIdx.y * blockDim.x + threadIdx.x;
+  if (d >= head_dim) {
+    return;
+  }
+  const std::size_t src_base =
+      static_cast<std::size_t>(head) * static_cast<std::size_t>(head_dim * 2);
+  const std::size_t dst_base =
+      static_cast<std::size_t>(head) * static_cast<std::size_t>(head_dim);
+  first[dst_base + static_cast<std::size_t>(d)] =
+      src[src_base + static_cast<std::size_t>(d)];
+  second[dst_base + static_cast<std::size_t>(d)] =
+      src[src_base + static_cast<std::size_t>(head_dim + d)];
+}
+
 __global__ void scale_copy_kernel(half* dst, const half* src, int n, float scale) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) {
@@ -673,6 +702,29 @@ static void launch_rowmajor_half_gemv(const half* w,
   } else {
     launch_rows(std::integral_constant<int, 4>{}, std::integral_constant<int, 128>{});
   }
+}
+
+void launch_apply_sigmoid_gate_inplace(half* values,
+                                       const half* gate,
+                                       int n,
+                                       cudaStream_t stream) {
+  constexpr int threads = 256;
+  const int blocks = (n + threads - 1) / threads;
+  apply_sigmoid_gate_inplace_kernel<<<blocks, threads, 0, stream>>>(
+      values, gate, n);
+}
+
+void launch_split_interleaved_head_halves(const half* src,
+                                          half* first,
+                                          half* second,
+                                          int heads,
+                                          int head_dim,
+                                          cudaStream_t stream) {
+  constexpr int threads = 256;
+  const dim3 grid(static_cast<unsigned int>(heads),
+                  static_cast<unsigned int>((head_dim + threads - 1) / threads));
+  split_interleaved_head_halves_kernel<<<grid, threads, 0, stream>>>(
+      src, first, second, head_dim);
 }
 
 void launch_rowmajor_half_gemv_f16(const half* w, const half* x, half* y,

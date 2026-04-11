@@ -102,6 +102,7 @@ set(LLAMA_ENGINE_SOURCES
   src/model/tokenizer.cpp
   src/engine/cpu_engine.cpp
   src/engine/llama4_cpu_engine.cpp
+  src/engine/qwen35_cpu_engine.cpp
 )
 
 if(LLAMA_ENGINE_ENABLE_CUDA)
@@ -131,6 +132,7 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
     src/engine/llama_engine_parity.cpp
     src/engine/llama4_cuda_engine.cu
     src/engine/llama4_cuda_engine_setup.cu
+    src/engine/qwen35_cuda_engine.cu
   )
 endif()
 
@@ -166,10 +168,14 @@ if(MSVC)
     COMPILE_OPTIONS "/arch:AVX2")
   set_source_files_properties(src/engine/llama4_cpu_engine.cpp PROPERTIES
     COMPILE_OPTIONS "/arch:AVX2")
+  set_source_files_properties(src/engine/qwen35_cpu_engine.cpp PROPERTIES
+    COMPILE_OPTIONS "/arch:AVX2")
 else()
   set_source_files_properties(src/engine/cpu_engine.cpp PROPERTIES
     COMPILE_OPTIONS "-mavx2;-mf16c;-mfma")
   set_source_files_properties(src/engine/llama4_cpu_engine.cpp PROPERTIES
+    COMPILE_OPTIONS "-mavx2;-mfma")
+  set_source_files_properties(src/engine/qwen35_cpu_engine.cpp PROPERTIES
     COMPILE_OPTIONS "-mavx2;-mfma")
 endif()
 

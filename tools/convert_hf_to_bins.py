@@ -11,6 +11,7 @@ is extracted and saved to model_config.json for use by pack_ll2c.py.
 import argparse
 import json
 import struct
+import sys
 from collections import defaultdict
 from pathlib import Path
 
@@ -30,6 +31,7 @@ FAMILY_MISTRAL  = "mistral"
 FAMILY_MIXTRAL  = "mixtral"
 FAMILY_PHI3     = "phi3"
 FAMILY_QWEN2    = "qwen2"
+FAMILY_QWEN3_5  = "qwen3_5"
 FAMILY_UNKNOWN  = "unknown"
 
 # Canonical internal family ID (must match ModelFamily enum in llama_config.hpp)
@@ -41,6 +43,7 @@ FAMILY_ID = {
     FAMILY_MIXTRAL: 6,
     FAMILY_PHI3:    4,
     FAMILY_QWEN2:   5,
+    FAMILY_QWEN3_5: 7,
 }
 
 # Default RoPE theta per family (matches default_rope_theta() in llama_config.hpp)
@@ -51,12 +54,14 @@ DEFAULT_ROPE_THETA = {
     FAMILY_MIXTRAL: 10000.0,
     FAMILY_PHI3:    10000.0,
     FAMILY_QWEN2:   1000000.0,
+    FAMILY_QWEN3_5: 1000000.0,
 }
 
 
 def detect_family(cfg: dict) -> str:
     """Detect model family from HuggingFace config.json."""
-    model_type = cfg.get("model_type", "").lower()
+    text_cfg = cfg.get("text_config", cfg)
+    model_type = text_cfg.get("model_type", cfg.get("model_type", "")).lower()
 
     if model_type in ("llama", "llama2"):
         # LLaMA-3 uses rope_scaling or has large vocab; LLaMA-2 has vocab=32000
@@ -80,6 +85,8 @@ def detect_family(cfg: dict) -> str:
 
     if model_type == "qwen2":
         return FAMILY_QWEN2
+    if model_type == "qwen3_5":
+        return FAMILY_QWEN3_5
 
     # Fallback heuristics
     if "qwen" in model_type:
@@ -93,6 +100,29 @@ def detect_family(cfg: dict) -> str:
 
     print(f"[warn] Unknown model_type '{model_type}', defaulting to llama2")
     return FAMILY_LLAMA2
+
+
+def unsupported_reason(cfg: dict) -> str:
+    text_cfg = cfg.get("text_config", cfg)
+    model_type = str(text_cfg.get("model_type", cfg.get("model_type", ""))).lower()
+    layer_types = [str(value).lower() for value in text_cfg.get("layer_types", [])]
+    has_linear_attention = (
+        any("linear_attention" in value for value in layer_types) or
+        int(text_cfg.get("linear_num_key_heads", 0) or 0) > 0 or
+        int(text_cfg.get("linear_num_value_heads", 0) or 0) > 0
+    )
+
+    if "qwen3_5" in model_type:
+        if has_linear_attention:
+            return ("Qwen3.5 is not supported by the native CPI engine yet: "
+                    "the model mixes linear-attention and full-attention layers.")
+        return "Qwen3.5 is not supported by the native CPI engine yet."
+
+    if has_linear_attention:
+        return ("This model uses linear-attention layers, which the native CPI "
+                "engine does not support yet.")
+
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -167,18 +197,19 @@ def read_safetensor_blob(safetensor_path: Path, tensor_name: str):
 
 def extract_model_config(hf_cfg: dict, family: str) -> dict:
     """Build the model_config.json that pack_ll2c.py consumes."""
-    num_heads = int(hf_cfg["num_attention_heads"])
-    num_kv_heads = int(hf_cfg.get("num_key_value_heads", num_heads))
+    text_cfg = hf_cfg.get("text_config", hf_cfg)
+    num_heads = int(text_cfg.get("num_attention_heads", hf_cfg["num_attention_heads"]))
+    num_kv_heads = int(text_cfg.get("num_key_value_heads", hf_cfg.get("num_key_value_heads", num_heads)))
 
-    rope_theta = float(hf_cfg.get("rope_theta", DEFAULT_ROPE_THETA.get(family, 10000.0)))
+    rope_theta = float(text_cfg.get("rope_theta", hf_cfg.get("rope_theta", DEFAULT_ROPE_THETA.get(family, 10000.0))))
 
     # Sliding-window attention (set when provided by checkpoint config).
-    sliding_window = int(hf_cfg.get("sliding_window", 0) or 0)
+    sliding_window = int(text_cfg.get("sliding_window", hf_cfg.get("sliding_window", 0)) or 0)
 
     # Sparse-MoE metadata.
-    num_local_experts = int(hf_cfg.get("num_local_experts", 0) or 0)
-    num_experts_per_tok = int(hf_cfg.get("num_experts_per_tok", 0) or 0)
-    expert_intermediate_size = int(hf_cfg.get("expert_intermediate_size", 0) or 0)
+    num_local_experts = int(text_cfg.get("num_local_experts", hf_cfg.get("num_local_experts", 0)) or 0)
+    num_experts_per_tok = int(text_cfg.get("num_experts_per_tok", hf_cfg.get("num_experts_per_tok", 0)) or 0)
+    expert_intermediate_size = int(text_cfg.get("expert_intermediate_size", hf_cfg.get("expert_intermediate_size", 0)) or 0)
     if family == FAMILY_MIXTRAL and num_local_experts <= 0:
         num_local_experts = 8
     if num_local_experts > 0:
@@ -186,19 +217,19 @@ def extract_model_config(hf_cfg: dict, family: str) -> dict:
             num_experts_per_tok = 2
         if expert_intermediate_size <= 0:
             # Most HF MoE checkpoints reuse intermediate_size as per-expert hidden dim.
-            expert_intermediate_size = int(hf_cfg.get("intermediate_size", 0) or 0)
+            expert_intermediate_size = int(text_cfg.get("intermediate_size", hf_cfg.get("intermediate_size", 0)) or 0)
 
     # Tied word embeddings (some Phi-2 style models)
-    tie_word_embeddings = bool(hf_cfg.get("tie_word_embeddings", False))
+    tie_word_embeddings = bool(text_cfg.get("tie_word_embeddings", hf_cfg.get("tie_word_embeddings", False)))
 
     # QKV biases (Qwen2 uses them)
-    has_qkv_bias = (family == FAMILY_QWEN2) or bool(hf_cfg.get("attention_bias", False))
+    has_qkv_bias = (family == FAMILY_QWEN2) or bool(text_cfg.get("attention_bias", hf_cfg.get("attention_bias", False)))
 
     # LayerNorm vs RMSNorm selection.
     # Prefer explicit normalization kind when present; otherwise infer from eps keys.
-    norm_kind = str(hf_cfg.get("norm_type", hf_cfg.get("normalization", ""))).lower()
-    has_rms_eps = "rms_norm_eps" in hf_cfg
-    has_layer_eps = "layer_norm_eps" in hf_cfg
+    norm_kind = str(text_cfg.get("norm_type", text_cfg.get("normalization", hf_cfg.get("norm_type", hf_cfg.get("normalization", ""))))).lower()
+    has_rms_eps = "rms_norm_eps" in text_cfg or "rms_norm_eps" in hf_cfg
+    has_layer_eps = "layer_norm_eps" in text_cfg or "layer_norm_eps" in hf_cfg
     use_layernorm = False
     if "layernorm" in norm_kind:
         use_layernorm = True
@@ -206,24 +237,38 @@ def extract_model_config(hf_cfg: dict, family: str) -> dict:
         use_layernorm = False
     elif has_layer_eps and not has_rms_eps:
         use_layernorm = True
-    norm_eps = float(hf_cfg.get("rms_norm_eps", hf_cfg.get("layer_norm_eps", 1e-5)))
+    norm_eps = float(text_cfg.get("rms_norm_eps", text_cfg.get("layer_norm_eps", hf_cfg.get("rms_norm_eps", hf_cfg.get("layer_norm_eps", 1e-5)))))
 
     # Partial rotary factor (Phi-3; stored in config but not yet kernel-enforced)
-    partial_rotary_factor = float(hf_cfg.get("partial_rotary_factor", 1.0))
+    partial_rotary_factor = float(text_cfg.get("partial_rotary_factor", hf_cfg.get("partial_rotary_factor", 1.0)))
     if partial_rotary_factor != 1.0:
         print(f"[info] partial_rotary_factor={partial_rotary_factor} detected (Phi-3). "
               "Full rotary will be used in the engine until partial RoPE is kernel-supported.")
 
+    layer_types_raw = text_cfg.get("layer_types", [])
+    layer_attention_types = []
+    for value in layer_types_raw:
+        lower = str(value).lower()
+        if "linear_attention" in lower:
+            layer_attention_types.append("linear")
+        elif "sliding" in lower:
+            layer_attention_types.append("sliding_window")
+        else:
+            layer_attention_types.append("full")
+
+    linear_num_key_heads = int(text_cfg.get("linear_num_key_heads", 0) or 0)
+    linear_num_value_heads = int(text_cfg.get("linear_num_value_heads", 0) or 0)
+
     return {
         "model_family":        family,
         "model_family_id":     FAMILY_ID.get(family, 0),
-        "vocab_size":          int(hf_cfg["vocab_size"]),
-        "hidden_size":         int(hf_cfg["hidden_size"]),
-        "intermediate_size":   int(hf_cfg["intermediate_size"]),
-        "num_layers":          int(hf_cfg["num_hidden_layers"]),
+        "vocab_size":          int(text_cfg.get("vocab_size", hf_cfg["vocab_size"])),
+        "hidden_size":         int(text_cfg.get("hidden_size", hf_cfg["hidden_size"])),
+        "intermediate_size":   int(text_cfg.get("intermediate_size", hf_cfg["intermediate_size"])),
+        "num_layers":          int(text_cfg.get("num_hidden_layers", hf_cfg["num_hidden_layers"])),
         "num_heads":           num_heads,
         "num_kv_heads":        num_kv_heads,
-        "max_seq_len":         int(hf_cfg.get("max_position_embeddings", 4096)),
+        "max_seq_len":         int(text_cfg.get("max_position_embeddings", hf_cfg.get("max_position_embeddings", 4096))),
         "rope_theta":          rope_theta,
         "norm_eps":            norm_eps,
         "sliding_window":      sliding_window,
@@ -231,6 +276,9 @@ def extract_model_config(hf_cfg: dict, family: str) -> dict:
         "has_qkv_bias":        has_qkv_bias,
         "use_layernorm":       use_layernorm,
         "partial_rotary_factor": partial_rotary_factor,
+        "linear_num_key_heads": linear_num_key_heads,
+        "linear_num_value_heads": linear_num_value_heads,
+        "layer_attention_types": layer_attention_types,
         "num_local_experts":   num_local_experts,
         "num_experts_per_tok": num_experts_per_tok,
         "expert_intermediate_size": expert_intermediate_size,
@@ -335,6 +383,9 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     hf_cfg  = load_hf_config(hf_dir)
+    reason = unsupported_reason(hf_cfg)
+    if reason:
+        raise RuntimeError(reason)
     family  = args.family if args.family else detect_family(hf_cfg)
     if family == "phimoe":
         # Keep runtime behavior aligned with Phi templates/defaults while using
@@ -420,4 +471,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except RuntimeError as exc:
+        print(f"[error] {exc}", file=sys.stderr)
+        sys.exit(1)

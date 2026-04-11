@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace model {
 
@@ -22,6 +23,7 @@ enum class ModelFamily : std::int32_t {
   Phi3     = 4,  // Microsoft Phi-3 (partial rotary, rope_theta=10000)
   Qwen2    = 5,  // Alibaba Qwen2 (rope_theta=1000000, QKV biases)
   Mixtral  = 6,  // Mixtral sparse-MoE (top-k routed experts, rope_theta=10000).
+  Qwen3_5  = 7,  // Qwen3.5 mixed-attention family (metadata only until linear kernels land).
 };
 
 // Returns the default RoPE base frequency for a given model family.
@@ -29,7 +31,26 @@ inline float default_rope_theta(ModelFamily family) {
   switch (family) {
     case ModelFamily::LLaMA3: return 500000.0f;
     case ModelFamily::Qwen2:  return 1000000.0f;
+    case ModelFamily::Qwen3_5:return 1000000.0f;
     default:                  return 10000.0f;
+  }
+}
+
+// Per-layer attention implementation used by the checkpoint.
+// Older model files omit this metadata; those default to a single global
+// attention policy inferred from sliding_window.
+enum class AttentionKind : std::int32_t {
+  Full          = 0,
+  SlidingWindow = 1,
+  Linear        = 2,
+};
+
+inline const char* attention_kind_name(AttentionKind kind) {
+  switch (kind) {
+    case AttentionKind::Full:          return "full";
+    case AttentionKind::SlidingWindow: return "sliding_window";
+    case AttentionKind::Linear:        return "linear";
+    default:                           return "unknown";
   }
 }
 
@@ -59,6 +80,10 @@ struct LlamaConfig {
   std::int32_t num_local_experts = 0;     // Number of MoE experts per layer (0 = dense FFN).
   std::int32_t num_experts_per_tok = 0;   // Router top-k experts selected per token (Mixtral uses 2).
   std::int32_t expert_intermediate_size = 0; // Expert FFN hidden size (0 = use intermediate_size).
+  float        partial_rotary_factor = 1.0f; // Phi/Qwen-style partial RoPE factor (1.0 = full rotary).
+  std::int32_t linear_num_key_heads = 0; // Linear-attention KV-head metadata for future runtimes.
+  std::int32_t linear_num_value_heads = 0;
+  std::vector<AttentionKind> layer_attention_kinds; // Optional per-layer attention dispatch metadata.
 
   // Returns the effective RoPE theta: uses the stored value if set, otherwise
   // falls back to the family default.
@@ -72,6 +97,45 @@ struct LlamaConfig {
 
   [[nodiscard]] std::int32_t effective_expert_intermediate_size() const {
     return expert_intermediate_size > 0 ? expert_intermediate_size : intermediate_size;
+  }
+
+  [[nodiscard]] AttentionKind default_attention_kind() const {
+    return sliding_window > 0 ? AttentionKind::SlidingWindow : AttentionKind::Full;
+  }
+
+  [[nodiscard]] AttentionKind attention_kind_for_layer(int layer) const {
+    if (layer >= 0 && static_cast<std::size_t>(layer) < layer_attention_kinds.size()) {
+      return layer_attention_kinds[static_cast<std::size_t>(layer)];
+    }
+    return default_attention_kind();
+  }
+
+  [[nodiscard]] int attention_window_for_layer(int layer) const {
+    return attention_kind_for_layer(layer) == AttentionKind::SlidingWindow ? sliding_window : 0;
+  }
+
+  [[nodiscard]] bool has_linear_attention() const {
+    if (linear_num_key_heads > 0 || linear_num_value_heads > 0) {
+      return true;
+    }
+    for (const AttentionKind kind : layer_attention_kinds) {
+      if (kind == AttentionKind::Linear) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  [[nodiscard]] bool uses_non_full_attention() const {
+    if (default_attention_kind() != AttentionKind::Full) {
+      return true;
+    }
+    for (const AttentionKind kind : layer_attention_kinds) {
+      if (kind != AttentionKind::Full) {
+        return true;
+      }
+    }
+    return false;
   }
 };
 

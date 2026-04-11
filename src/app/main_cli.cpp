@@ -87,7 +87,7 @@ void print_usage(std::ostream& os) {
         "[--tokens csv] [--max-new n] [--temp t] [--max-context n] "
         "[--gpu-cache-all] [--gpu-cache-layers n] [--gpu-cache-limit-mb n] [--vram-safety-margin-mb n] "
         "[--top-k n] [--top-p p] [--repeat-penalty r] [--no-repeat-ngram n] [--rope-theta f] "
-         "[--stop-text text] [--chat-template tinyllama|tinyllama-chatml|llama2|llama3|mistral|phi3|qwen2|llama4] "
+        "[--stop-text text] [--chat-template tinyllama|tinyllama-chatml|llama2|llama3|mistral|phi3|qwen2|qwen3_5|llama4] "
           "[--dump-tokenizer-meta] [--dump-prompt-tokens] [--inspect-next-topk n] "
         "[--trace-steps n] [--sentence-stop] [--benchmark] [--benchmark-reps n] [--benchmark-warmup n] "
         "[--benchmark-phases] [--runtime-metrics] [--no-split-attention] "

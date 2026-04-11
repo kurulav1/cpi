@@ -47,6 +47,7 @@ std::size_t find_first_stop_pos(const std::string& text, const std::vector<std::
 bool has_complete_sentence(const std::string& text);
 
 bool is_safetensors_model_dir(const std::string& path);
+std::string infer_safetensors_model_family(const std::string& path);
 std::string guess_chat_template_from_model_path(const std::string& model_path);
 std::string auto_detect_tokenizer_path(const std::string& model_path);
 

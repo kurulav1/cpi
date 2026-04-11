@@ -455,6 +455,9 @@ void CpuLlamaEngine::rope(float* q, float* k, int pos, int n_heads,
 // Reads current Q/K/V from q_/k_/v_; writes result to att_.
 // Stores the new K and V into k_cache_ / v_cache_ at position pos.
 void CpuLlamaEngine::attention(int pos, int layer) {
+  if (cfg_.attention_kind_for_layer(layer) == model::AttentionKind::Linear) {
+    LLAMA_ENGINE_THROW("native CPU runtime does not support linear-attention layers yet");
+  }
   const int H       = cfg_.num_heads;
   const int H_kv    = cfg_.num_kv_heads;
   const int kv_mul  = H / H_kv;   // Q heads per KV head (GQA ratio)
@@ -472,7 +475,7 @@ void CpuLlamaEngine::attention(int pos, int layer) {
   std::copy(v_.begin(), v_.end(), vc);
 
   const int full_seq_len = pos + 1;
-  const int window = cfg_.sliding_window > 0 ? cfg_.sliding_window : 0;
+  const int window = cfg_.attention_window_for_layer(layer);
   const int attn_seq_len = (window > 0) ? std::min(window, full_seq_len) : full_seq_len;
   const int attn_start = full_seq_len - attn_seq_len;
 
@@ -777,6 +780,9 @@ void CpuLlamaEngine::initialize(const EngineOptions& options) {
   options_ = options;
   weights_.open(options.model_path);
   cfg_ = weights_.config();
+  if (cfg_.has_linear_attention()) {
+    LLAMA_ENGINE_THROW("native CPU runtime does not support linear-attention layers yet");
+  }
 
   const int H    = cfg_.hidden_size;
   const int I    = cfg_.intermediate_size;

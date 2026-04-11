@@ -7,6 +7,7 @@ const STOP_SEQUENCES = {
   mistral:  ["</s>", "[INST]"],
   phi3:     ["<|end|>", "<|user|>", "<|system|>", "<|assistant|>"],
   qwen2:    ["<|im_end|>", "<|im_start|>"],
+  qwen3_5:  ["<|im_end|>", "<|im_start|>", "<|endoftext|>"],
   plain:    []
 };
 
@@ -424,6 +425,19 @@ function formatQwen2(turns, systemPrompt) {
   return blocks.join("\n");
 }
 
+function formatQwen35(turns, systemPrompt) {
+  const blocks = [`<|im_start|>system\n${systemPrompt}<|im_end|>`];
+  for (const turn of turns) {
+    blocks.push(`<|im_start|>user\n${turn.user}<|im_end|>`);
+    if (turn.assistant) {
+      blocks.push(`<|im_start|>assistant\n${turn.assistant}<|im_end|>`);
+    } else {
+      blocks.push("<|im_start|>assistant\n<think>\n\n</think>\n\n");
+    }
+  }
+  return blocks.join("\n");
+}
+
 function formatPlain(turns, systemPrompt) {
   const lines = [`System: ${systemPrompt}`];
 
@@ -526,6 +540,16 @@ export function buildPromptPackage(messages, options = {}) {
       prompt: formatQwen2(turns, effectiveSystemPrompt),
       template,
       stopTexts: STOP_SEQUENCES.qwen2,
+      addBos: false
+    };
+  }
+
+  if (template === "qwen3_5") {
+    return {
+      messages: normalized,
+      prompt: formatQwen35(turns, effectiveSystemPrompt),
+      template,
+      stopTexts: STOP_SEQUENCES.qwen3_5,
       addBos: false
     };
   }

@@ -1018,6 +1018,14 @@ void LlamaEngine::initialize(const EngineOptions& options) {
     }
   }
   const auto& cfg = weights_.config();
+  if (cfg.has_linear_attention()) {
+    std::ostringstream oss;
+    oss << "native CUDA runtime does not support linear-attention layers yet";
+    if (cfg.model_family == model::ModelFamily::Qwen3_5) {
+      oss << " (Qwen3.5 metadata was detected successfully, but kernels are not implemented yet)";
+    }
+    LLAMA_ENGINE_THROW(oss.str());
+  }
   const AttentionDims attn_dims = infer_attention_dims(weights_, cfg);
   attn_q_hidden_ = attn_dims.q_hidden;
   attn_head_dim_ = attn_dims.head_dim;
@@ -1045,6 +1053,7 @@ void LlamaEngine::initialize(const EngineOptions& options) {
       case model::ModelFamily::Mixtral: family_str = "mixtral"; break;
       case model::ModelFamily::Phi3:    family_str = "phi3";    break;
       case model::ModelFamily::Qwen2:   family_str = "qwen2";   break;
+      case model::ModelFamily::Qwen3_5: family_str = "qwen3_5"; break;
       default: break;
     }
     std::cout << "[engine] model_family=" << family_str
@@ -1064,6 +1073,12 @@ void LlamaEngine::initialize(const EngineOptions& options) {
     if (has_any_layer_output_bias_) std::cout << " o_proj_bias=yes";
     if (weights_.has_tensor("output.bias")) std::cout << " lm_head_bias=yes";
     if (cfg.sliding_window > 0) std::cout << " sliding_window=" << cfg.sliding_window;
+    if (cfg.partial_rotary_factor != 1.0f) std::cout << " partial_rope=" << cfg.partial_rotary_factor;
+    if (cfg.has_linear_attention()) {
+      std::cout << " attention=linear-mixed";
+    } else if (cfg.uses_non_full_attention()) {
+      std::cout << " attention=nonfull";
+    }
     if (cfg.is_moe()) {
       std::cout << " moe_experts=" << cfg.num_local_experts
                 << " moe_topk=" << (cfg.num_experts_per_tok > 0 ? cfg.num_experts_per_tok : 2);
