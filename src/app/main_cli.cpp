@@ -283,22 +283,27 @@ ParsedArgs parse_args(int argc, char** argv) {
     } else if (arg == "--int8-streaming") {
       args.opts.int8_streaming = true;
       args.opts.streaming_quant_bits = 8;
+      args.opts.prefer_lowbit_cache = true;
       args.weight_quant_set = true;
     } else if (arg == "--int4-streaming") {
       args.opts.int8_streaming = true;
       args.opts.streaming_quant_bits = 4;
+      args.opts.prefer_lowbit_cache = true;
       args.weight_quant_set = true;
     } else if (arg == "--weight-quant") {
       const std::string mode = need_val("--weight-quant");
       args.weight_quant_set = true;
       if (mode == "none") {
         args.opts.int8_streaming = false;
+        args.opts.prefer_lowbit_cache = false;
       } else if (mode == "int8") {
         args.opts.int8_streaming = true;
         args.opts.streaming_quant_bits = 8;
+        args.opts.prefer_lowbit_cache = true;
       } else if (mode == "int4") {
         args.opts.int8_streaming = true;
         args.opts.streaming_quant_bits = 4;
+        args.opts.prefer_lowbit_cache = true;
       } else {
         throw std::runtime_error("--weight-quant must be one of: none, int8, int4");
       }

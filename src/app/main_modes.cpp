@@ -251,11 +251,19 @@ void execute_engine_modes(const RunExecutionOptions& options,
                       static_cast<double>(elapsed_ms);
         }
         const auto& stats = last_benchmark_stats();
+        double decode_tok_per_s = 0.0;
+        if (generated_tokens > 0 && stats.decode_ms > 0.0) {
+          decode_tok_per_s =
+              (1000.0 * static_cast<double>(generated_tokens)) / stats.decode_ms;
+        }
         std::ostringstream done_extra;
         done_extra << "\"text\":\"" << json_escape(final_text) << "\""
                    << ",\"elapsed_ms\":" << elapsed_ms
                    << ",\"generated_tokens\":" << generated_tokens
                    << ",\"tok_per_s\":" << std::fixed << std::setprecision(2) << tok_per_s
+                   << ",\"decode_ms\":" << std::fixed << std::setprecision(2) << stats.decode_ms
+                   << ",\"decode_tok_per_s\":" << std::fixed << std::setprecision(2)
+                   << decode_tok_per_s
                    << ",\"metrics\":{"
                    << "\"moe_quant_mode\":\"" << json_escape(stats.moe_quant_mode) << "\""
                    << ",\"moe_router_ms\":" << std::fixed << std::setprecision(4) << stats.decode_moe_router_ms

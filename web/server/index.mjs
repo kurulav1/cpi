@@ -39,9 +39,10 @@ function generationPolicy(profile, template = "") {
 
   if (family === "llama2" || normalizedTemplate === "llama2") {
     return {
-      streamTextDeltas: false,
+      streamTextDeltas: true,
       historyStrategy: "llama2-summary",
-      finalResponseExtractor: "llama2-answer-only"
+      finalResponseExtractor: "llama2-answer-only",
+      streamingExtractor: "llama2-answer-live"
     };
   }
 
@@ -49,14 +50,16 @@ function generationPolicy(profile, template = "") {
     return {
       streamTextDeltas: true,
       historyStrategy: "tinyllama-focused",
-      finalResponseExtractor: "default"
+      finalResponseExtractor: "default",
+      streamingExtractor: "default"
     };
   }
 
   return {
     streamTextDeltas: true,
     historyStrategy: "default",
-    finalResponseExtractor: "default"
+    finalResponseExtractor: "default",
+    streamingExtractor: "default"
   };
 }
 
@@ -286,6 +289,57 @@ function extractLlama2AnswerOnly(text = "") {
   cleaned = cleanupRepeatedSentences(cleaned);
   cleaned = trimIncompleteTrailingTail(cleaned);
   return normalizeWhitespace(cleaned);
+}
+
+function extractLlama2StreamingAnswer(text = "") {
+  let cleaned = String(text || "").replace(/\r/g, "");
+  if (!cleaned) return "";
+
+  const instMarker = cleaned.lastIndexOf("[/INST]");
+  if (instMarker >= 0) {
+    cleaned = cleaned.slice(instMarker + "[/INST]".length);
+  }
+
+  const answerMatches = [...cleaned.matchAll(/(?:^|\n)\s*Answer\s*:*/gi)];
+  if (answerMatches.length > 0) {
+    const lastAnswer = answerMatches[answerMatches.length - 1];
+    const answerStart = (lastAnswer.index ?? 0) + lastAnswer[0].length;
+    cleaned = cleaned.slice(answerStart);
+  } else {
+    const promptEcho = cleaned.match(
+      /(?:^|\n)\s*(?:Relevant context:|Current user message:|Current question:|Question:|Instructions:|\[INST\]|<<SYS>>)/i
+    );
+    if (promptEcho && typeof promptEcho.index === "number" && promptEcho.index === 0) {
+      return "";
+    }
+  }
+
+  cleaned = cleaned.replace(/^\s*(?:Answer|Assistant)\s*:?\s*/i, "");
+  cleaned = cleaned.replace(/^\s*(?:<\/?s>|<<SYS>>|<<\/SYS>>|\[INST\]|\[\/INST\])\s*/gi, "");
+  cleaned = cleaned.replace(/^[\s:;,-]+/, "");
+
+  const followupMarker = cleaned.match(
+    /(?:^|\n)\s*(?:Relevant context:|Current user message:|Current question:|Question:|User:|System:|Instructions:|\[INST\]|<<SYS>>)/i
+  );
+  if (followupMarker && typeof followupMarker.index === "number" && followupMarker.index > 0) {
+    cleaned = cleaned.slice(0, followupMarker.index);
+  }
+
+  cleaned = cleaned.replace(
+    /\n\s*(?:Relevant|Current|Question|User|System|Instructions|Answer|Assistant)\s*:?\s*$/i,
+    ""
+  );
+  cleaned = cleanupRepeatedWords(cleaned);
+  cleaned = collapseAdjacentNearDuplicateWords(cleaned);
+  return cleaned.replace(/[ \t]{2,}/g, " ").replace(/^\s+/, "");
+}
+
+function normalizeStreamingResponseText(text, template, policy = null) {
+  const effectivePolicy = policy ?? generationPolicy(null, template);
+  if (effectivePolicy.streamingExtractor === "llama2-answer-live") {
+    return extractLlama2StreamingAnswer(text);
+  }
+  return normalizeGeneratedChatText(text, template);
 }
 
 function normalizeFinalResponseText(text, template, policy = null) {
@@ -916,9 +970,10 @@ function parseWorkerStdout(worker) {
               nl = worker.stdoutBuffer.indexOf("\n");
               continue;
             }
-            const cleaned = normalizeGeneratedChatText(
+            const cleaned = normalizeStreamingResponseText(
               pending.rawText,
-              pending.meta?.template
+              pending.meta?.template,
+              pending.policy
             );
             const emitted = pending.emittedText || "";
             if (cleaned.startsWith(emitted)) {
@@ -927,9 +982,10 @@ function parseWorkerStdout(worker) {
               if (nextDelta) {
                 pending.onDelta?.(nextDelta);
               }
-            } else if (cleaned && cleaned !== emitted) {
-              pending.emittedText = cleaned;
-              pending.onDelta?.(cleaned);
+            } else if (emitted.startsWith(cleaned)) {
+              // Wait for the normalized prefix to stabilize again.
+            } else if (!cleaned) {
+              // Ignore transient scaffolding until we have stable answer text.
             }
           }
         } else if (event.type === "metrics") {
@@ -947,11 +1003,20 @@ function parseWorkerStdout(worker) {
           const generatedTokens = Number.isFinite(Number(event.generated_tokens))
             ? Number(event.generated_tokens)
             : null;
+          const decodeMs = Number.isFinite(Number(event.decode_ms))
+            ? Number(event.decode_ms)
+            : null;
           const tokPerSFromEvent = Number(event.tok_per_s);
           const tokPerS = Number.isFinite(tokPerSFromEvent)
             ? tokPerSFromEvent
             : (generatedTokens != null && elapsedMs > 0
                 ? (1000.0 * generatedTokens) / elapsedMs
+                : null);
+          const decodeTokPerSFromEvent = Number(event.decode_tok_per_s);
+          const decodeTokPerS = Number.isFinite(decodeTokPerSFromEvent)
+            ? decodeTokPerSFromEvent
+            : (generatedTokens != null && decodeMs != null && decodeMs > 0
+                ? (1000.0 * generatedTokens) / decodeMs
                 : null);
           const metrics =
             event.metrics && typeof event.metrics === "object"
@@ -962,7 +1027,16 @@ function parseWorkerStdout(worker) {
           }
           worker.ready = true;
           worker.pending = null;
-          pending.resolve({ text, elapsedMs, generatedTokens, tokPerS, metrics, ...pending.meta });
+          pending.resolve({
+            text,
+            elapsedMs,
+            generatedTokens,
+            tokPerS,
+            decodeMs,
+            decodeTokPerS,
+            metrics,
+            ...pending.meta
+          });
         } else if (event.type === "error") {
           worker.pending = null;
           pending.reject(event.error || "interactive worker error");
@@ -1747,6 +1821,8 @@ app.post("/api/chat/stream", async (req, res) => {
         elapsedMs: result.elapsedMs,
         generatedTokens: result.generatedTokens,
         tokPerS: result.tokPerS,
+        decodeMs: result.decodeMs ?? null,
+        decodeTokPerS: result.decodeTokPerS ?? null,
         metrics: result.metrics || null,
         message: result.text
       });
@@ -1761,12 +1837,14 @@ app.post("/api/chat/stream", async (req, res) => {
     onStart: (meta) => writeNdjson(res, { type: "start", ...meta }),
     onDelta: (delta) => writeNdjson(res, { type: "delta", delta }),
     onMetrics: (metrics) => writeNdjson(res, { type: "metrics", metrics }),
-    onDone: ({ text, elapsedMs, generatedTokens, tokPerS, metrics }) => {
+    onDone: ({ text, elapsedMs, generatedTokens, tokPerS, decodeMs, decodeTokPerS, metrics }) => {
       writeNdjson(res, {
         type: "done",
         elapsedMs,
         generatedTokens,
         tokPerS,
+        decodeMs,
+        decodeTokPerS,
         metrics: metrics || null,
         message: text
       });

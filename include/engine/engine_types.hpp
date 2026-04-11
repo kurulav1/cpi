@@ -21,6 +21,7 @@ struct EngineOptions {
   int no_repeat_ngram_size = 0;
   bool int8_streaming = false;
   int streaming_quant_bits = 8;
+  bool prefer_lowbit_cache = false;
   bool profile_decode_phases = false;
   bool disable_split_attention = false;
   bool loop_guard = true;

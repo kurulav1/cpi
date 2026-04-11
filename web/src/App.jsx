@@ -1095,6 +1095,8 @@ export default function App() {
         elapsedMs: done?.elapsedMs ?? 0,
         generatedTokens: done?.generatedTokens ?? null,
         tokPerS: done?.tokPerS ?? null,
+        decodeMs: done?.decodeMs ?? null,
+        decodeTokPerS: done?.decodeTokPerS ?? null,
         metrics: done?.metrics ?? null
       });
     } catch (e) {
@@ -1491,6 +1493,12 @@ export default function App() {
                     )}
                     {runMeta.tokPerS > 0 && (
                       <div className="stat-line"><span>Tok/s</span><span className="stat-line-val">{Number(runMeta.tokPerS).toFixed(2)}</span></div>
+                    )}
+                    {runMeta.decodeTokPerS > 0 && (
+                      <div className="stat-line"><span>Decode tok/s</span><span className="stat-line-val">{Number(runMeta.decodeTokPerS).toFixed(2)}</span></div>
+                    )}
+                    {runMeta.decodeMs > 0 && (
+                      <div className="stat-line"><span>Decode time</span><span className="stat-line-val">{fmtMs(runMeta.decodeMs)}</span></div>
                     )}
                     {runMeta.modelLabel && (
                       <div className="stat-line"><span>Model</span><span className="stat-line-val" style={{ overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap", maxWidth:"140px" }}>{runMeta.modelLabel}</span></div>

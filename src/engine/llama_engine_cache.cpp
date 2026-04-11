@@ -232,6 +232,8 @@ void LlamaEngine::init_layer_cache() {
   }
   const std::size_t full_int8_bytes =
       (has_any_cached_int8_layer && prefix_can_cache(cfg.num_layers, true)) ? prefix_cache_bytes(cfg.num_layers, true) : 0;
+  const bool prefer_packed_cache =
+      options_.prefer_lowbit_cache && lowbit_streaming_enabled(options_) && has_any_cached_int8_layer;
 
   int requested_layers = 0;
   std::string cache_mode = "auto";
@@ -239,71 +241,167 @@ void LlamaEngine::init_layer_cache() {
   std::size_t effective_budget_b = cacheable_b;
   if (options_.gpu_cache_all) {
     cache_mode = "all";
-    if (full_fp16_bytes > 0 && full_fp16_bytes <= effective_budget_b) {
-      requested_layers = cfg.num_layers;
-      cached_int8_mlp_enabled_ = false;
-      cache_policy = "full_fp16_fit";
-    } else if (full_int8_bytes > 0 && full_int8_bytes <= effective_budget_b) {
-      requested_layers = cfg.num_layers;
-      cached_int8_mlp_enabled_ = true;
-      cache_policy = "full_packed_fit";
+    if (prefer_packed_cache) {
+      if (full_int8_bytes > 0 && full_int8_bytes <= effective_budget_b) {
+        requested_layers = cfg.num_layers;
+        cached_int8_mlp_enabled_ = true;
+        cache_policy = "requested_full_packed_fit";
+      } else if (full_fp16_bytes > 0 && full_fp16_bytes <= effective_budget_b) {
+        requested_layers = cfg.num_layers;
+        cached_int8_mlp_enabled_ = false;
+        cache_policy = "requested_full_fp16_fallback";
+      } else {
+        const int int8_layers = max_layers_for_budget(effective_budget_b, true);
+        const int fp16_layers = max_layers_for_budget(effective_budget_b, false);
+        if (int8_layers > 0) {
+          cached_int8_mlp_enabled_ = true;
+          requested_layers = int8_layers;
+          cache_policy = "requested_partial_packed";
+        } else {
+          cached_int8_mlp_enabled_ = false;
+          requested_layers = fp16_layers;
+          cache_policy = "requested_partial_fp16_fallback";
+        }
+      }
     } else {
-      const int fp16_layers = max_layers_for_budget(effective_budget_b, false);
-      const int int8_layers = max_layers_for_budget(effective_budget_b, true);
-      cached_int8_mlp_enabled_ = int8_layers > fp16_layers;
-      requested_layers = cached_int8_mlp_enabled_ ? int8_layers : fp16_layers;
-      cache_policy = cached_int8_mlp_enabled_ ? "packed_fallback_to_maximize_fit" : "fp16_fallback_to_maximize_fit";
+      if (full_fp16_bytes > 0 && full_fp16_bytes <= effective_budget_b) {
+        requested_layers = cfg.num_layers;
+        cached_int8_mlp_enabled_ = false;
+        cache_policy = "full_fp16_fit";
+      } else if (full_int8_bytes > 0 && full_int8_bytes <= effective_budget_b) {
+        requested_layers = cfg.num_layers;
+        cached_int8_mlp_enabled_ = true;
+        cache_policy = "full_packed_fit";
+      } else {
+        const int fp16_layers = max_layers_for_budget(effective_budget_b, false);
+        const int int8_layers = max_layers_for_budget(effective_budget_b, true);
+        cached_int8_mlp_enabled_ = int8_layers > fp16_layers;
+        requested_layers = cached_int8_mlp_enabled_ ? int8_layers : fp16_layers;
+        cache_policy = cached_int8_mlp_enabled_ ? "packed_fallback_to_maximize_fit" : "fp16_fallback_to_maximize_fit";
+      }
     }
   } else if (options_.gpu_cache_layers >= 0) {
     cache_mode = "layers";
     requested_layers = std::min(options_.gpu_cache_layers, cfg.num_layers);
-    if (requested_layers > 0 && prefix_can_cache(requested_layers, false) &&
-        prefix_cache_bytes(requested_layers, false) <= effective_budget_b) {
-      cached_int8_mlp_enabled_ = false;
-      cache_policy = "requested_fp16_fit";
-    } else if (requested_layers > 0 && prefix_can_cache(requested_layers, true) &&
-               prefix_cache_bytes(requested_layers, true) <= effective_budget_b) {
-      cached_int8_mlp_enabled_ = true;
-      cache_policy = "requested_packed_fit";
+    if (prefer_packed_cache) {
+      if (requested_layers > 0 && prefix_can_cache(requested_layers, true) &&
+          prefix_cache_bytes(requested_layers, true) <= effective_budget_b) {
+        cached_int8_mlp_enabled_ = true;
+        cache_policy = "requested_packed_fit";
+      } else if (requested_layers > 0 && prefix_can_cache(requested_layers, false) &&
+                 prefix_cache_bytes(requested_layers, false) <= effective_budget_b) {
+        cached_int8_mlp_enabled_ = false;
+        cache_policy = "requested_fp16_fallback";
+      } else {
+        const int int8_layers = max_layers_for_budget(effective_budget_b, true);
+        const int fp16_layers = max_layers_for_budget(effective_budget_b, false);
+        if (int8_layers > 0) {
+          cached_int8_mlp_enabled_ = true;
+          requested_layers = int8_layers;
+          cache_policy = "requested_packed_partial";
+        } else {
+          cached_int8_mlp_enabled_ = false;
+          requested_layers = fp16_layers;
+          cache_policy = "requested_fp16_fallback";
+        }
+      }
     } else {
-      const int fp16_layers = max_layers_for_budget(effective_budget_b, false);
-      const int int8_layers = max_layers_for_budget(effective_budget_b, true);
-      cached_int8_mlp_enabled_ = int8_layers > fp16_layers;
-      cache_policy = cached_int8_mlp_enabled_ ? "requested_packed_fallback" : "requested_fp16_fallback";
+      if (requested_layers > 0 && prefix_can_cache(requested_layers, false) &&
+          prefix_cache_bytes(requested_layers, false) <= effective_budget_b) {
+        cached_int8_mlp_enabled_ = false;
+        cache_policy = "requested_fp16_fit";
+      } else if (requested_layers > 0 && prefix_can_cache(requested_layers, true) &&
+                 prefix_cache_bytes(requested_layers, true) <= effective_budget_b) {
+        cached_int8_mlp_enabled_ = true;
+        cache_policy = "requested_packed_fit";
+      } else {
+        const int fp16_layers = max_layers_for_budget(effective_budget_b, false);
+        const int int8_layers = max_layers_for_budget(effective_budget_b, true);
+        cached_int8_mlp_enabled_ = int8_layers > fp16_layers;
+        cache_policy = cached_int8_mlp_enabled_ ? "requested_packed_fallback" : "requested_fp16_fallback";
+      }
     }
   } else if (options_.gpu_cache_limit_mb > 0) {
     cache_mode = "budget";
     effective_budget_b = std::min(cacheable_b, options_.gpu_cache_limit_mb * 1024ULL * 1024ULL);
-    if (full_fp16_bytes > 0 && full_fp16_bytes <= effective_budget_b) {
-      requested_layers = cfg.num_layers;
-      cached_int8_mlp_enabled_ = false;
-      cache_policy = "budget_full_fp16_fit";
-    } else if (full_int8_bytes > 0 && full_int8_bytes <= effective_budget_b) {
-      requested_layers = cfg.num_layers;
-      cached_int8_mlp_enabled_ = true;
-      cache_policy = "budget_full_packed_fit";
+    if (prefer_packed_cache) {
+      if (full_int8_bytes > 0 && full_int8_bytes <= effective_budget_b) {
+        requested_layers = cfg.num_layers;
+        cached_int8_mlp_enabled_ = true;
+        cache_policy = "budget_full_packed_fit";
+      } else if (full_fp16_bytes > 0 && full_fp16_bytes <= effective_budget_b) {
+        requested_layers = cfg.num_layers;
+        cached_int8_mlp_enabled_ = false;
+        cache_policy = "budget_full_fp16_fallback";
+      } else {
+        const int int8_layers = max_layers_for_budget(effective_budget_b, true);
+        const int fp16_layers = max_layers_for_budget(effective_budget_b, false);
+        if (int8_layers > 0) {
+          cached_int8_mlp_enabled_ = true;
+          requested_layers = int8_layers;
+          cache_policy = "budget_partial_packed";
+        } else {
+          cached_int8_mlp_enabled_ = false;
+          requested_layers = fp16_layers;
+          cache_policy = "budget_partial_fp16_fallback";
+        }
+      }
     } else {
-      const int fp16_layers = max_layers_for_budget(effective_budget_b, false);
-      const int int8_layers = max_layers_for_budget(effective_budget_b, true);
-      cached_int8_mlp_enabled_ = int8_layers > fp16_layers;
-      requested_layers = cached_int8_mlp_enabled_ ? int8_layers : fp16_layers;
-      cache_policy = cached_int8_mlp_enabled_ ? "budget_partial_packed" : "budget_partial_fp16";
+      if (full_fp16_bytes > 0 && full_fp16_bytes <= effective_budget_b) {
+        requested_layers = cfg.num_layers;
+        cached_int8_mlp_enabled_ = false;
+        cache_policy = "budget_full_fp16_fit";
+      } else if (full_int8_bytes > 0 && full_int8_bytes <= effective_budget_b) {
+        requested_layers = cfg.num_layers;
+        cached_int8_mlp_enabled_ = true;
+        cache_policy = "budget_full_packed_fit";
+      } else {
+        const int fp16_layers = max_layers_for_budget(effective_budget_b, false);
+        const int int8_layers = max_layers_for_budget(effective_budget_b, true);
+        cached_int8_mlp_enabled_ = int8_layers > fp16_layers;
+        requested_layers = cached_int8_mlp_enabled_ ? int8_layers : fp16_layers;
+        cache_policy = cached_int8_mlp_enabled_ ? "budget_partial_packed" : "budget_partial_fp16";
+      }
     }
   } else {
-    if (full_fp16_bytes > 0 && full_fp16_bytes <= effective_budget_b) {
-      requested_layers = cfg.num_layers;
-      cached_int8_mlp_enabled_ = false;
-      cache_policy = "full_fp16_fit";
-    } else if (full_int8_bytes > 0 && full_int8_bytes <= effective_budget_b) {
-      requested_layers = cfg.num_layers;
-      cached_int8_mlp_enabled_ = true;
-      cache_policy = "full_packed_fit";
+    if (prefer_packed_cache) {
+      if (full_int8_bytes > 0 && full_int8_bytes <= effective_budget_b) {
+        requested_layers = cfg.num_layers;
+        cached_int8_mlp_enabled_ = true;
+        cache_policy = "requested_full_packed_fit";
+      } else if (full_fp16_bytes > 0 && full_fp16_bytes <= effective_budget_b) {
+        requested_layers = cfg.num_layers;
+        cached_int8_mlp_enabled_ = false;
+        cache_policy = "requested_full_fp16_fallback";
+      } else {
+        const int int8_layers = max_layers_for_budget(effective_budget_b, true);
+        const int fp16_layers = max_layers_for_budget(effective_budget_b, false);
+        if (int8_layers > 0) {
+          cached_int8_mlp_enabled_ = true;
+          requested_layers = int8_layers;
+          cache_policy = "requested_partial_packed";
+        } else {
+          cached_int8_mlp_enabled_ = false;
+          requested_layers = fp16_layers;
+          cache_policy = "requested_partial_fp16_fallback";
+        }
+      }
     } else {
-      const int fp16_layers = max_layers_for_budget(effective_budget_b, false);
-      const int int8_layers = max_layers_for_budget(effective_budget_b, true);
-      cached_int8_mlp_enabled_ = int8_layers > fp16_layers;
-      requested_layers = cached_int8_mlp_enabled_ ? int8_layers : fp16_layers;
-      cache_policy = cached_int8_mlp_enabled_ ? "partial_packed_to_reduce_streaming" : "partial_fp16";
+      if (full_fp16_bytes > 0 && full_fp16_bytes <= effective_budget_b) {
+        requested_layers = cfg.num_layers;
+        cached_int8_mlp_enabled_ = false;
+        cache_policy = "full_fp16_fit";
+      } else if (full_int8_bytes > 0 && full_int8_bytes <= effective_budget_b) {
+        requested_layers = cfg.num_layers;
+        cached_int8_mlp_enabled_ = true;
+        cache_policy = "full_packed_fit";
+      } else {
+        const int fp16_layers = max_layers_for_budget(effective_budget_b, false);
+        const int int8_layers = max_layers_for_budget(effective_budget_b, true);
+        cached_int8_mlp_enabled_ = int8_layers > fp16_layers;
+        requested_layers = cached_int8_mlp_enabled_ ? int8_layers : fp16_layers;
+        cache_policy = cached_int8_mlp_enabled_ ? "partial_packed_to_reduce_streaming" : "partial_fp16";
+      }
     }
   }
 
