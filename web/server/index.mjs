@@ -8,6 +8,20 @@ import { StringDecoder } from "node:string_decoder";
 import { randomUUID } from "node:crypto";
 
 import { getRuntimeConfig, publicRuntimeSummary, setPreferredModelDir } from "./config.mjs";
+import {
+  buildInternalBodyFromChatRequest,
+  buildInternalBodyFromCompletionRequest,
+  buildInternalBodyFromResponsesRequest,
+  buildOpenAiChatCompletion,
+  buildOpenAiCompletion,
+  buildOpenAiResponseObject,
+  buildOpenAiUsage,
+  normalizeOpenAiStop,
+  openAiErrorPayload,
+  publicOpenAiModel,
+  publicOpenAiModelId,
+  sendOpenAiError
+} from "./openai_compat.mjs";
 import { buildPromptPackage } from "./prompting.mjs";
 
 dotenv.config();
@@ -61,6 +75,142 @@ function generationPolicy(profile, template = "") {
     finalResponseExtractor: "default",
     streamingExtractor: "default"
   };
+}
+
+function wordCount(text = "") {
+  return String(text || "").trim().split(/\s+/).filter(Boolean).length;
+}
+
+function lastUserMessage(messages = []) {
+  if (!Array.isArray(messages)) return "";
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    if (messages[i]?.role === "user" && messages[i]?.content) {
+      return String(messages[i].content);
+    }
+  }
+  return "";
+}
+
+function instructionText(messages = []) {
+  if (!Array.isArray(messages)) return "";
+  return messages
+    .filter((message) => message?.role === "system" || message?.role === "developer")
+    .map((message) => String(message.content || ""))
+    .join("\n");
+}
+
+function familyOutputBudget(profile) {
+  const family = String(profile?.family || "").toLowerCase();
+  if (family === "llama3" || family === "llama4") {
+    return {
+      brief: 96,
+      factual: 192,
+      structured: 320,
+      code: 640,
+      normal: 384,
+      continuation: 512,
+      long: 1536,
+      longCode: 2048,
+      longContinuation: 4096,
+      cautiousLongContext: 384,
+      hardCap: 4096
+    };
+  }
+  if (family === "llama2") {
+    return {
+      brief: 96,
+      factual: 160,
+      structured: 256,
+      code: 512,
+      normal: 320,
+      continuation: 384,
+      long: 1024,
+      longCode: 1024,
+      longContinuation: 1536,
+      cautiousLongContext: 320,
+      hardCap: 2048
+    };
+  }
+  if (family === "qwen3_5" || family === "qwen2") {
+    return {
+      brief: 96,
+      factual: 160,
+      structured: 256,
+      code: 448,
+      normal: 256,
+      continuation: 320,
+      long: 768,
+      longCode: 768,
+      longContinuation: 1024,
+      cautiousLongContext: 256,
+      hardCap: 1536
+    };
+  }
+  return {
+    brief: 96,
+    factual: 192,
+    structured: 320,
+    code: 512,
+    normal: 320,
+    continuation: 384,
+    long: 1024,
+    longCode: 1024,
+    longContinuation: 1536,
+    cautiousLongContext: 320,
+    hardCap: 2048
+  };
+}
+
+function computeDynamicMaxNewTokens(body, profile, maxContext) {
+  const latestUser = lastUserMessage(body.messages);
+  const instructions = instructionText(body.messages);
+  const combined = `${instructions}\n${latestUser}`.toLowerCase();
+  const latestLower = latestUser.toLowerCase();
+  const latestWords = wordCount(latestUser);
+  const longFormMode = isTruthyFlag(body.longFormMode);
+  const brief =
+    /(one short sentence|short sentence|briefly|brief answer|concise|few words|one line|single word|only the answer|just the answer|exactly two bullet|two bullet)/i.test(combined);
+  const structured =
+    /(bullet|bullets|list|steps|outline|table|compare|pros and cons|json|markdown)/i.test(combined);
+  const codeLike =
+    /(code|function|class|script|bug|debug|stack|trace|error|regex|sql|python|javascript|typescript|c\+\+|implement|refactor)/i.test(combined);
+  const continuation =
+    /^(go on|continue|keep going|tell me more|elaborate|expand|more details|deeper|walk me through|carry on)\b/i.test(latestLower.trim());
+  const explicitLong =
+    longFormMode ||
+    /(detailed|in depth|deep dive|thorough|comprehensive|full explanation|essay|long-form|long form|step by step)/i.test(combined);
+  const shortFactual =
+    latestWords > 0 &&
+    latestWords <= 14 &&
+    /^(who|what|when|where|why|how|is|are|can|could|does|do|did|explain)\b/i.test(latestLower.trim());
+  const budget = familyOutputBudget(profile);
+  let recommended = budget.normal;
+
+  if (brief) {
+    recommended = budget.brief;
+  } else if (explicitLong) {
+    if (continuation) {
+      recommended = budget.longContinuation;
+    } else if (codeLike) {
+      recommended = budget.longCode;
+    } else {
+      recommended = budget.long;
+    }
+  } else if (codeLike) {
+    recommended = budget.code;
+  } else if (structured) {
+    recommended = budget.structured;
+  } else if (shortFactual) {
+    recommended = budget.factual;
+  } else if (continuation) {
+    recommended = budget.continuation;
+  }
+
+  if (Number(maxContext) >= 8192 && !explicitLong) {
+    recommended = Math.min(recommended, budget.cautiousLongContext);
+  }
+
+  return Math.round(clampNumber(recommended, 32, budget.hardCap, budget.normal));
 }
 
 function expandStopTexts(template, stopTexts = []) {
@@ -386,10 +536,6 @@ function looksLikeGreetingReply(text = "") {
   return /\b(?:hey|hi|hello|greetings)\b/i.test(String(text || "").trim());
 }
 
-function wordCount(text = "") {
-  return String(text || "").trim().split(/\s+/).filter(Boolean).length;
-}
-
 function hasRoleLeakage(text = "") {
   return /<\|(?:user|assistant|system)\|>|(?:^|\n)\s*(?:user|assistant|system|bot)\s*:/i.test(
     String(text || "")
@@ -431,6 +577,30 @@ function isTruthyFlag(value) {
 function requestBody(req) {
   return req.body && typeof req.body === "object" ? req.body : {};
 }
+
+function computePromptBudget(maxContext, performanceMode = false) {
+  const resolvedContext = Math.max(128, Number(maxContext) || 0);
+  const contextRatio = Math.max(1, resolvedContext / 2048);
+  const maxTurns = performanceMode
+    ? Math.max(4, Math.min(12, Math.round(4 * Math.sqrt(contextRatio))))
+    : Math.max(8, Math.min(24, Math.round(8 * Math.sqrt(contextRatio))));
+  const maxChars = performanceMode
+    ? Math.max(3500, Math.round(resolvedContext * 4.5))
+    : Math.max(9000, Math.round(resolvedContext * 5.5));
+  return { maxTurns, maxChars };
+}
+
+function shouldAutoLiftResourceLimits(profile, maxContext) {
+  const family = String(profile?.family || "").toLowerCase();
+  const requestedContext = Math.max(0, Number(maxContext) || 0);
+  const maxPositionEmbeddings = Math.max(0, Number(profile?.maxPositionEmbeddings) || 0);
+  return (
+    requestedContext >= 8192 &&
+    maxPositionEmbeddings >= 8192 &&
+    (family === "llama3" || family === "llama4" || family === "qwen3_5")
+  );
+}
+
 
 function findProfileByIdOrLabel(config, profileId) {
   if (!profileId) return config.selectedProfile;
@@ -607,26 +777,42 @@ function buildCliArgs(config, body) {
     ? body.systemPrompt
     : (requestTemplate === "tinyllama" ? "" : config.systemPrompt);
   const policy = generationPolicy(selectedProfile, requestTemplate);
+  const maxSupportedContext = Math.max(
+    128,
+    Number(selectedProfile.maxPositionEmbeddings) || 0,
+    Number(config.maxContext) || 0
+  );
+  const maxContext = Math.round(
+    clampNumber(body.maxContext, 128, maxSupportedContext, config.maxContext)
+  );
+  const autoMaxTokens = body.autoMaxTokens === undefined
+    ? true
+    : isTruthyFlag(body.autoMaxTokens);
+  const longFormMode = isTruthyFlag(body.longFormMode);
+  const promptBudget = computePromptBudget(maxContext, performanceMode);
 
   const promptPackage = buildPromptPackage(body.messages, {
     template: requestTemplate,
     systemPrompt: requestSystemPrompt,
     historyStrategy: policy.historyStrategy,
-    // Reduce prefill in perf mode so token-1 starts sooner in longer chats.
-    maxTurns: performanceMode ? 4 : 8,
-    maxChars: performanceMode ? 3500 : 9000
+    maxTurns: promptBudget.maxTurns,
+    maxChars: promptBudget.maxChars
   });
 
   if (!promptPackage.prompt) {
     throw new Error("Provide at least one user message.");
   }
 
-  const maxNewTokens = Math.round(
-    clampNumber(body.maxNewTokens ?? body.max_tokens, 32, 4096, config.maxNewTokens)
-  );
+  const maxNewTokens = autoMaxTokens
+    ? computeDynamicMaxNewTokens(body, selectedProfile, maxContext)
+    : Math.round(
+        clampNumber(body.maxNewTokens ?? body.max_tokens, 32, 4096, config.maxNewTokens)
+      );
   const temperature = clampNumber(body.temperature, 0, 2, config.temperature);
   const noResourceLimits =
-    performanceMode || profileExtraArgs.includes("--no-resource-limits");
+    performanceMode ||
+    shouldAutoLiftResourceLimits(selectedProfile, maxContext) ||
+    profileExtraArgs.includes("--no-resource-limits");
 
   return {
     profile: selectedProfile,
@@ -635,18 +821,25 @@ function buildCliArgs(config, body) {
     messages: promptPackage.messages,
     prompt: promptPackage.prompt,
     addBos: promptPackage.addBos,
-    stopTexts: expandStopTexts(promptPackage.template, promptPackage.stopTexts),
+    stopTexts: expandStopTexts(
+      promptPackage.template,
+      [...promptPackage.stopTexts, ...normalizeOpenAiStop(body.stop ?? body.stopTexts)]
+    ),
     policy,
+    maxContext,
     noResourceLimits,
     performanceMode,
     forceCpu,
-    workerKey: `${selectedProfile.id}|perf:${performanceMode ? 1 : 0}|q:${quantMode}|cpu:${forceCpu ? 1 : 0}`,
+    workerKey: `${selectedProfile.id}|ctx:${maxContext}|perf:${performanceMode ? 1 : 0}|q:${quantMode}|cpu:${forceCpu ? 1 : 0}`,
     meta: {
       profileId: selectedProfile.id,
       modelLabel: selectedProfile.label,
       template: promptPackage.template,
       messageCount: promptPackage.messages.length,
       maxNewTokens,
+      maxContext,
+      autoMaxTokens,
+      longFormMode,
       temperature,
       performanceMode,
       quantMode,
@@ -660,24 +853,36 @@ function buildWorkerCliConfig(profile, options = {}) {
   const quantMode = resolveQuantModeForProfile(profile, options.quantMode);
   const profileExtraArgs = buildProfileExtraArgs(profile, quantMode);
   const policy = generationPolicy(profile, profile?.template || "");
+  const maxSupportedContext = Math.max(
+    128,
+    Number(profile?.maxPositionEmbeddings) || 0,
+    Number(options.maxContext) || 0
+  );
+  const maxContext = Math.round(
+    clampNumber(options.maxContext, 128, maxSupportedContext, maxSupportedContext)
+  );
   const noResourceLimits =
-    performanceMode || profileExtraArgs.includes("--no-resource-limits");
+    performanceMode ||
+    shouldAutoLiftResourceLimits(profile, maxContext) ||
+    profileExtraArgs.includes("--no-resource-limits");
   const forceCpu = isTruthyFlag(options.forceCpu);
   return {
     profile,
     profileExtraArgs,
     quantMode,
     policy,
+    maxContext,
     noResourceLimits,
     performanceMode,
     forceCpu,
-    workerKey: `${profile.id}|perf:${performanceMode ? 1 : 0}|q:${quantMode}|cpu:${forceCpu ? 1 : 0}`,
+    workerKey: `${profile.id}|ctx:${maxContext}|perf:${performanceMode ? 1 : 0}|q:${quantMode}|cpu:${forceCpu ? 1 : 0}`,
     meta: {
       profileId: profile.id,
       modelLabel: profile.label,
       template: profile.template,
       messageCount: 0,
       maxNewTokens: 0,
+      maxContext,
       temperature: 0,
       performanceMode,
       quantMode,
@@ -702,7 +907,7 @@ function buildInteractiveLaunchArgs(config, cliConfig) {
   return [
     selectedProfile.modelPath,
     "--tokenizer", selectedProfile.tokenizerPath,
-    "--max-context", String(config.maxContext),
+    "--max-context", String(cliConfig.maxContext ?? config.maxContext),
     "--top-k", String(config.topK),
     "--top-p", String(config.topP),
     "--repeat-penalty", String(config.repeatPenalty),
@@ -1153,7 +1358,7 @@ function ensureInteractiveWorker(config, cliConfig) {
 function resolveWarmupProfile(config, profileId) {
   const profile = findProfileByIdOrLabel(config, profileId);
   if (!profile) {
-    throw new Error("No model available for warmup.");
+    throw new Error("No model available for preparation.");
   }
   if (!profile.ready) {
     const detail = profile.unsupportedReason ? ` ${profile.unsupportedReason}` : "";
@@ -1181,7 +1386,7 @@ async function warmupProfileWorker(config, profileId, options = {}) {
     return profile;
   }
 
-  // Warmup should mean "first token ready soon", not just "process spawned".
+  // Preparation should mean "first token ready soon", not just "process spawned".
   await new Promise((resolve, reject) => {
     const warmCliConfig = {
       ...workerCliConfig,
@@ -1509,6 +1714,22 @@ function guardReady(config, res) {
   return true;
 }
 
+function guardOpenAiReady(config, res) {
+  if (!config.ready) {
+    const detail = config.selectedProfile?.unsupportedReason
+      ? ` ${config.selectedProfile.unsupportedReason}`
+      : "";
+    sendOpenAiError(
+      res,
+      503,
+      `Runtime not ready. Check config.json (or .env): inferBin, modelPath, tokenizerPath.${detail}`,
+      { type: "server_error", code: "runtime_not_ready" }
+    );
+    return false;
+  }
+  return true;
+}
+
 async function guardIdle(
   res,
   { waitForWarmup = false, warmupWaitMs = 180000, pollMs = 25 } = {}
@@ -1524,9 +1745,35 @@ async function guardIdle(
   if (activeRequest) {
     const reason =
       activeRequest.kind === "warmup"
-        ? "Engine is still warming up. Please retry in a moment."
+        ? "Engine is still preparing. Please retry in a moment."
         : "Engine is busy with another generation.";
     res.status(409).json({ error: reason });
+    return false;
+  }
+  return true;
+}
+
+async function guardOpenAiIdle(
+  res,
+  { waitForWarmup = false, warmupWaitMs = 180000, pollMs = 25 } = {}
+) {
+  if (waitForWarmup && activeRequest?.kind === "warmup") {
+    const deadline = Date.now() + Math.max(0, Number(warmupWaitMs) || 0);
+    const intervalMs = Math.max(10, Number(pollMs) || 25);
+    while (activeRequest?.kind === "warmup" && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    }
+  }
+
+  if (activeRequest) {
+    const reason =
+      activeRequest.kind === "warmup"
+        ? "Engine is still preparing. Please retry in a moment."
+        : "Engine is busy with another generation.";
+    sendOpenAiError(res, 409, reason, {
+      type: "server_error",
+      code: activeRequest.kind === "warmup" ? "engine_preparing" : "engine_busy"
+    });
     return false;
   }
   return true;
@@ -1542,15 +1789,20 @@ function onDisconnect(req, res, cancel) {
 
 function parseWorkerKey(workerKey) {
   if (!workerKey || typeof workerKey !== "string") {
-    return { profileId: "", performanceMode: false, quantMode: "none", forceCpu: false };
+    return { profileId: "", maxContext: 0, performanceMode: false, quantMode: "none", forceCpu: false };
   }
   const parts = workerKey.split("|");
   const profileId = parts[0] || "";
+  let maxContext = 0;
   let performanceMode = false;
   let quantMode = "none";
   let forceCpu = false;
   for (let i = 1; i < parts.length; i += 1) {
     const part = parts[i];
+    if (part.startsWith("ctx:")) {
+      maxContext = Number(part.slice(4)) || 0;
+      continue;
+    }
     if (part.startsWith("perf:")) {
       performanceMode = part.slice(5) === "1";
       continue;
@@ -1563,7 +1815,7 @@ function parseWorkerKey(workerKey) {
       forceCpu = part.slice(4) === "1";
     }
   }
-  return { profileId, performanceMode, quantMode, forceCpu };
+  return { profileId, maxContext, performanceMode, quantMode, forceCpu };
 }
 
 function findLatestQuantJobForProfile(profileId, quantMode = "") {
@@ -1736,8 +1988,9 @@ app.post("/api/warmup", async (req, res) => {
     const body = requestBody(req);
     const performanceMode = isTruthyFlag(body.performanceMode);
     const quantMode = body.quantMode;
+    const maxContext = Number(body.maxContext) || config.maxContext;
     const profile = resolveWarmupProfile(config, body.profileId);
-    const targetWorkerKey = buildWorkerCliConfig(profile, { performanceMode, quantMode }).workerKey;
+    const targetWorkerKey = buildWorkerCliConfig(profile, { performanceMode, quantMode, maxContext }).workerKey;
 
     const ready =
       Boolean(interactiveWorker) &&
@@ -1756,8 +2009,8 @@ app.post("/api/warmup", async (req, res) => {
       return;
     }
 
-    // If a generation is already running, report warmup as pending instead of
-    // failing with 409; the UI can keep showing a non-error warming state.
+    // If a generation is already running, report preparation as pending instead of
+    // failing with 409; the UI can keep showing a non-error preparing state.
     if (activeRequest) {
       res.json({
         ok: true,
@@ -1770,11 +2023,11 @@ app.post("/api/warmup", async (req, res) => {
       return;
     }
 
-    // Kick warmup in background so this endpoint stays responsive even when
-    // first-token warmup takes tens of seconds on larger models.
-    void warmupProfileWorker(config, profile.id, { performanceMode, quantMode }).catch((err) => {
+    // Kick preparation in background so this endpoint stays responsive even when
+    // first-token preparation takes tens of seconds on larger models.
+    void warmupProfileWorker(config, profile.id, { performanceMode, quantMode, maxContext }).catch((err) => {
       console.warn(
-        `[cpi] warmup failed for ${profile.label}: ${err?.message || String(err)}`
+        `[cpi] preparation failed for ${profile.label}: ${err?.message || String(err)}`
       );
     });
 
@@ -1913,52 +2166,219 @@ app.post("/api/chat/stream", async (req, res) => {
   onDisconnect(req, res, cancel);
 });
 
-// POST /v1/chat/completions
-// OpenAI-compatible chat completions endpoint.
-//
-// Supports both streaming (stream: true â†’ SSE) and non-streaming (stream: false â†’ JSON).
-// Request body follows the OpenAI API spec:
-//   model?       maps to profileId / model label
-//   messages     array of { role, content }
-//   temperature? max_tokens? stream?
-//
-// Non-streaming response:
-//   { id, object, created, model, choices: [{ message: { role, content }, finish_reason }], usage: null }
-//
-// Streaming response (SSE):
-//   data: { id, object, created, model, choices: [{ delta: { role|content }, finish_reason }] }
-//   data: [DONE]
-app.post("/v1/chat/completions", async (req, res) => {
+// GET /v1/models
+// OpenAI-compatible model listing.
+app.get("/v1/models", (_req, res) => {
   const config = getRuntimeConfig();
-  if (!guardReady(config, res)) return;
-  if (!(await guardIdle(res, { waitForWarmup: true }))) return;
+  res.json({
+    object: "list",
+    data: publicRuntimeSummary(config).availableProfiles
+      .filter((profile) => profile.ready)
+      .map(publicOpenAiModel)
+  });
+});
 
-  const body = requestBody(req);
-  const stream = Boolean(body.stream);
-  const completionId = `chatcmpl-${randomUUID().replace(/-/g, "").slice(0, 24)}`;
-  const created = Math.floor(Date.now() / 1000);
-
-  let cliConfig;
-  try {
-    cliConfig = buildCliArgs(config, body);
-  } catch (err) {
-    res.status(400).json({
-      error: { message: err.message, type: "invalid_request_error" }
+app.get("/v1/models/:model", (req, res) => {
+  const config = getRuntimeConfig();
+  const profile = findProfileByIdOrLabel(config, req.params.model);
+  if (!profile || !profile.ready) {
+    sendOpenAiError(res, 404, `Model '${req.params.model}' was not found.`, {
+      type: "invalid_request_error",
+      code: "model_not_found"
     });
     return;
   }
+  res.json(publicOpenAiModel(profile));
+});
 
-  const modelName = cliConfig.meta.modelLabel;
+// POST /v1/completions
+// OpenAI-compatible legacy completions endpoint.
+app.post("/v1/completions", async (req, res) => {
+  const config = getRuntimeConfig();
+  if (!guardOpenAiReady(config, res)) return;
+  if (!(await guardOpenAiIdle(res, { waitForWarmup: true }))) return;
+
+  const body = requestBody(req);
+  const stream = Boolean(body.stream);
+  const includeUsage = Boolean(body.stream_options?.include_usage);
+  const completionId = `cmpl-${randomUUID().replace(/-/g, "").slice(0, 24)}`;
+  const created = Math.floor(Date.now() / 1000);
+
+  let cliConfig;
+  let internalBody;
+  try {
+    internalBody = buildInternalBodyFromCompletionRequest(body);
+    cliConfig = buildCliArgs(config, internalBody);
+  } catch (err) {
+    sendOpenAiError(res, 400, err.message, { type: "invalid_request_error" });
+    return;
+  }
+
+  const modelName = publicOpenAiModelId(cliConfig.profile);
 
   if (stream) {
     setStreamingHeaders(res, "text/event-stream; charset=utf-8");
 
-    // First chunk: role declaration
+    if (internalBody.echo && internalBody.promptText) {
+      writeSse(res, {
+        id: completionId,
+        object: "text_completion",
+        created,
+        model: modelName,
+        system_fingerprint: openAiSystemFingerprint(cliConfig),
+        choices: [{ index: 0, text: internalBody.promptText, logprobs: null, finish_reason: null }]
+      });
+    }
+
+    if (prefersHfChatBackend(cliConfig)) {
+      try {
+        const result = await generatePreferredFamilyResponse(config, cliConfig);
+        const text = result.text;
+        if (shouldStreamTextDeltas(cliConfig.policy) && text) {
+          writeSse(res, {
+            id: completionId,
+            object: "text_completion",
+            created,
+            model: modelName,
+            system_fingerprint: openAiSystemFingerprint(cliConfig),
+            choices: [{ index: 0, text, logprobs: null, finish_reason: null }]
+          });
+        }
+        if (includeUsage) {
+          writeSse(res, {
+            id: completionId,
+            object: "text_completion",
+            created,
+            model: modelName,
+            system_fingerprint: openAiSystemFingerprint(cliConfig),
+            choices: [],
+            usage: buildOpenAiUsage(result, cliConfig)
+          });
+        }
+        writeSse(res, {
+          id: completionId,
+          object: "text_completion",
+          created,
+          model: modelName,
+          system_fingerprint: openAiSystemFingerprint(cliConfig),
+          choices: [{ index: 0, text: "", logprobs: null, finish_reason: "stop" }]
+        });
+        res.write("data: [DONE]\n\n");
+        res.end();
+      } catch (err) {
+        writeSse(res, openAiErrorPayload(err.message || String(err), "server_error"));
+        res.end();
+      }
+      return;
+    }
+
+    const { cancel } = runGeneration(config, cliConfig, {
+      onDelta: (delta) =>
+        writeSse(res, {
+          id: completionId,
+          object: "text_completion",
+          created,
+          model: modelName,
+          system_fingerprint: openAiSystemFingerprint(cliConfig),
+          choices: [{ index: 0, text: delta, logprobs: null, finish_reason: null }]
+        }),
+      onDone: (result) => {
+        if (includeUsage) {
+          writeSse(res, {
+            id: completionId,
+            object: "text_completion",
+            created,
+            model: modelName,
+            system_fingerprint: openAiSystemFingerprint(cliConfig),
+            choices: [],
+            usage: buildOpenAiUsage(result, cliConfig)
+          });
+        }
+        writeSse(res, {
+          id: completionId,
+          object: "text_completion",
+          created,
+          model: modelName,
+          system_fingerprint: openAiSystemFingerprint(cliConfig),
+          choices: [{ index: 0, text: "", logprobs: null, finish_reason: "stop" }]
+        });
+        res.write("data: [DONE]\n\n");
+        res.end();
+      },
+      onError: (msg) => {
+        writeSse(res, openAiErrorPayload(msg, "server_error"));
+        res.end();
+      }
+    });
+
+    onDisconnect(req, res, cancel);
+    return;
+  }
+
+  if (prefersHfChatBackend(cliConfig)) {
+    try {
+      const result = await generatePreferredFamilyResponse(config, cliConfig);
+      res.json(
+        buildOpenAiCompletion(completionId, created, modelName, cliConfig, result, internalBody)
+      );
+    } catch (err) {
+      if (!res.headersSent) {
+        sendOpenAiError(res, 500, err.message || String(err), { type: "server_error" });
+      }
+    }
+    return;
+  }
+
+  const { cancel } = runGeneration(config, cliConfig, {
+    onDelta: () => {},
+    onDone: (result) =>
+      res.json(
+        buildOpenAiCompletion(completionId, created, modelName, cliConfig, result, internalBody)
+      ),
+    onError: (msg) => {
+      if (!res.headersSent) {
+        sendOpenAiError(res, 500, msg, { type: "server_error" });
+      }
+    }
+  });
+
+  onDisconnect(req, res, cancel);
+});
+
+// POST /v1/chat/completions
+// OpenAI-compatible chat completions endpoint.
+app.post("/v1/chat/completions", async (req, res) => {
+  const config = getRuntimeConfig();
+  if (!guardOpenAiReady(config, res)) return;
+  if (!(await guardOpenAiIdle(res, { waitForWarmup: true }))) return;
+
+  const body = requestBody(req);
+  const stream = Boolean(body.stream);
+  const includeUsage = Boolean(body.stream_options?.include_usage);
+  const completionId = `chatcmpl-${randomUUID().replace(/-/g, "").slice(0, 24)}`;
+  const created = Math.floor(Date.now() / 1000);
+
+  let cliConfig;
+  let internalBody;
+  try {
+    internalBody = buildInternalBodyFromChatRequest(body);
+    cliConfig = buildCliArgs(config, internalBody);
+  } catch (err) {
+    sendOpenAiError(res, 400, err.message, { type: "invalid_request_error" });
+    return;
+  }
+
+  const modelName = publicOpenAiModelId(cliConfig.profile);
+
+  if (stream) {
+    setStreamingHeaders(res, "text/event-stream; charset=utf-8");
+
     writeSse(res, {
       id: completionId,
       object: "chat.completion.chunk",
       created,
       model: modelName,
+      system_fingerprint: openAiSystemFingerprint(cliConfig),
       choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }]
     });
 
@@ -1971,7 +2391,19 @@ app.post("/v1/chat/completions", async (req, res) => {
             object: "chat.completion.chunk",
             created,
             model: modelName,
+            system_fingerprint: openAiSystemFingerprint(cliConfig),
             choices: [{ index: 0, delta: { content: result.text }, finish_reason: null }]
+          });
+        }
+        if (includeUsage) {
+          writeSse(res, {
+            id: completionId,
+            object: "chat.completion.chunk",
+            created,
+            model: modelName,
+            system_fingerprint: openAiSystemFingerprint(cliConfig),
+            choices: [],
+            usage: buildOpenAiUsage(result, cliConfig)
           });
         }
         writeSse(res, {
@@ -1979,98 +2411,218 @@ app.post("/v1/chat/completions", async (req, res) => {
           object: "chat.completion.chunk",
           created,
           model: modelName,
+          system_fingerprint: openAiSystemFingerprint(cliConfig),
           choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
         });
         res.write("data: [DONE]\n\n");
         res.end();
       } catch (err) {
-        writeSse(res, {
-          error: { message: err.message || String(err), type: "server_error" }
-        });
+        writeSse(res, openAiErrorPayload(err.message || String(err), "server_error"));
         res.end();
       }
-    } else {
-      const { cancel } = runGeneration(config, cliConfig, {
-        onDelta: (delta) =>
-          writeSse(res, {
-            id: completionId,
-            object: "chat.completion.chunk",
-            created,
-            model: modelName,
-            choices: [{ index: 0, delta: { content: delta }, finish_reason: null }]
-          }),
-        onDone: () => {
-          writeSse(res, {
-            id: completionId,
-            object: "chat.completion.chunk",
-            created,
-            model: modelName,
-            choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
-          });
-          res.write("data: [DONE]\n\n");
-          res.end();
-        },
-        onError: (msg) => {
-          writeSse(res, { error: { message: msg, type: "server_error" } });
-          res.end();
-        }
-      });
-
-      onDisconnect(req, res, cancel);
+      return;
     }
-  } else {
-    if (prefersHfChatBackend(cliConfig)) {
-      try {
-        const { text } = await generatePreferredFamilyResponse(config, cliConfig);
-        res.json({
+
+    const { cancel } = runGeneration(config, cliConfig, {
+      onDelta: (delta) =>
+        writeSse(res, {
           id: completionId,
-          object: "chat.completion",
+          object: "chat.completion.chunk",
           created,
           model: modelName,
-          choices: [
-            {
-              index: 0,
-              message: { role: "assistant", content: text },
-              finish_reason: "stop"
-            }
-          ],
-          usage: null
-        });
-      } catch (err) {
-        if (!res.headersSent)
-          res.status(500).json({
-            error: { message: err.message || String(err), type: "server_error" }
-          });
-      }
-    } else {
-      const { cancel } = runGeneration(config, cliConfig, {
-        onDelta: () => {},
-        onDone: ({ text }) =>
-          res.json({
+          system_fingerprint: openAiSystemFingerprint(cliConfig),
+          choices: [{ index: 0, delta: { content: delta }, finish_reason: null }]
+        }),
+      onDone: (result) => {
+        if (includeUsage) {
+          writeSse(res, {
             id: completionId,
-            object: "chat.completion",
+            object: "chat.completion.chunk",
             created,
             model: modelName,
-            choices: [
-              {
-                index: 0,
-                message: { role: "assistant", content: text },
-                finish_reason: "stop"
-              }
-            ],
-            usage: null
-          }),
-        onError: (msg) => {
-          if (!res.headersSent)
-            res.status(500).json({
-              error: { message: msg, type: "server_error" }
-            });
+            system_fingerprint: openAiSystemFingerprint(cliConfig),
+            choices: [],
+            usage: buildOpenAiUsage(result, cliConfig)
+          });
         }
-      });
+        writeSse(res, {
+          id: completionId,
+          object: "chat.completion.chunk",
+          created,
+          model: modelName,
+          system_fingerprint: openAiSystemFingerprint(cliConfig),
+          choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
+        });
+        res.write("data: [DONE]\n\n");
+        res.end();
+      },
+      onError: (msg) => {
+        writeSse(res, openAiErrorPayload(msg, "server_error"));
+        res.end();
+      }
+    });
 
-      onDisconnect(req, res, cancel);
-    }
+    onDisconnect(req, res, cancel);
+    return;
   }
+
+  if (prefersHfChatBackend(cliConfig)) {
+    try {
+      const result = await generatePreferredFamilyResponse(config, cliConfig);
+      res.json(buildOpenAiChatCompletion(completionId, created, modelName, cliConfig, result));
+    } catch (err) {
+      if (!res.headersSent) {
+        sendOpenAiError(res, 500, err.message || String(err), { type: "server_error" });
+      }
+    }
+    return;
+  }
+
+  const { cancel } = runGeneration(config, cliConfig, {
+    onDelta: () => {},
+    onDone: (result) =>
+      res.json(buildOpenAiChatCompletion(completionId, created, modelName, cliConfig, result)),
+    onError: (msg) => {
+      if (!res.headersSent) {
+        sendOpenAiError(res, 500, msg, { type: "server_error" });
+      }
+    }
+  });
+
+  onDisconnect(req, res, cancel);
+});
+
+// POST /v1/responses
+// Minimal OpenAI-compatible responses endpoint for text generation clients.
+app.post("/v1/responses", async (req, res) => {
+  const config = getRuntimeConfig();
+  if (!guardOpenAiReady(config, res)) return;
+  if (!(await guardOpenAiIdle(res, { waitForWarmup: true }))) return;
+
+  const body = requestBody(req);
+  const stream = Boolean(body.stream);
+  const responseId = `resp_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
+  const created = Math.floor(Date.now() / 1000);
+
+  let cliConfig;
+  let internalBody;
+  try {
+    internalBody = buildInternalBodyFromResponsesRequest(body);
+    cliConfig = buildCliArgs(config, internalBody);
+  } catch (err) {
+    sendOpenAiError(res, 400, err.message, { type: "invalid_request_error" });
+    return;
+  }
+
+  const modelName = publicOpenAiModelId(cliConfig.profile);
+
+  if (stream) {
+    setStreamingHeaders(res, "text/event-stream; charset=utf-8");
+    const baseResponse = {
+      id: responseId,
+      object: "response",
+      created_at: created,
+      status: "in_progress",
+      model: modelName
+    };
+    writeSse(res, { type: "response.created", response: baseResponse });
+
+    if (prefersHfChatBackend(cliConfig)) {
+      try {
+        const result = await generatePreferredFamilyResponse(config, cliConfig);
+        const itemId = `msg_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
+        if (shouldStreamTextDeltas(cliConfig.policy) && result.text) {
+          writeSse(res, {
+            type: "response.output_text.delta",
+            item_id: itemId,
+            output_index: 0,
+            content_index: 0,
+            delta: result.text
+          });
+        }
+        writeSse(res, {
+          type: "response.output_text.done",
+          item_id: itemId,
+          output_index: 0,
+          content_index: 0,
+          text: result.text
+        });
+        writeSse(res, {
+          type: "response.completed",
+          response: buildOpenAiResponseObject(responseId, created, modelName, cliConfig, result, internalBody)
+        });
+        res.write("data: [DONE]\n\n");
+        res.end();
+      } catch (err) {
+        writeSse(res, openAiErrorPayload(err.message || String(err), "server_error"));
+        res.end();
+      }
+      return;
+    }
+
+    const itemId = `msg_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
+    const { cancel } = runGeneration(config, cliConfig, {
+      onDelta: (delta) =>
+        writeSse(res, {
+          type: "response.output_text.delta",
+          item_id: itemId,
+          output_index: 0,
+          content_index: 0,
+          delta
+        }),
+      onDone: (result) => {
+        writeSse(res, {
+          type: "response.output_text.done",
+          item_id: itemId,
+          output_index: 0,
+          content_index: 0,
+          text: result.text
+        });
+        writeSse(res, {
+          type: "response.completed",
+          response: buildOpenAiResponseObject(responseId, created, modelName, cliConfig, result, internalBody)
+        });
+        res.write("data: [DONE]\n\n");
+        res.end();
+      },
+      onError: (msg) => {
+        writeSse(res, openAiErrorPayload(msg, "server_error"));
+        res.end();
+      }
+    });
+
+    onDisconnect(req, res, cancel);
+    return;
+  }
+
+  if (prefersHfChatBackend(cliConfig)) {
+    try {
+      const result = await generatePreferredFamilyResponse(config, cliConfig);
+      res.json(
+        buildOpenAiResponseObject(responseId, created, modelName, cliConfig, result, internalBody)
+      );
+    } catch (err) {
+      if (!res.headersSent) {
+        sendOpenAiError(res, 500, err.message || String(err), { type: "server_error" });
+      }
+    }
+    return;
+  }
+
+  const { cancel } = runGeneration(config, cliConfig, {
+    onDelta: () => {},
+    onDone: (result) =>
+      res.json(
+        buildOpenAiResponseObject(responseId, created, modelName, cliConfig, result, internalBody)
+      ),
+    onError: (msg) => {
+      if (!res.headersSent) {
+        sendOpenAiError(res, 500, msg, { type: "server_error" });
+      }
+    }
+  });
+
+  onDisconnect(req, res, cancel);
 });
 
 // quantization conversion jobs

@@ -9,6 +9,7 @@ web/.env
 web/.env.*
 !web/.env.example
 web/config.json
+web/.runtime-state.json
 
 # ------------------------------
 # Build and generated outputs

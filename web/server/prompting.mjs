@@ -242,15 +242,19 @@ function normalizeMessages(messages, options = {}) {
     ? Math.max(512, Number(options.maxChars))
     : 9000;
 
-  const allowedRoles = new Set(["system", "user", "assistant"]);
+  const allowedRoles = new Set(["system", "developer", "user", "assistant"]);
   const cleaned = messages
-    .map((message) => ({
-      role: allowedRoles.has(message?.role) ? message.role : "user",
-      content:
-        (allowedRoles.has(message?.role) ? message.role : "user") === "user"
-          ? normalizeUserContent(message?.content, options)
-          : sanitizeContent(message?.content)
-    }))
+    .map((message) => {
+      const requestedRole = allowedRoles.has(message?.role) ? message.role : "user";
+      const role = requestedRole === "developer" ? "system" : requestedRole;
+      return {
+        role,
+        content:
+          role === "user"
+            ? normalizeUserContent(message?.content, options)
+            : sanitizeContent(message?.content)
+      };
+    })
     .filter((message) => message.content.length > 0);
 
   return trimConversation(selectHistory(cleaned, options), maxChars);
@@ -455,18 +459,26 @@ function formatPlain(turns, systemPrompt) {
 
 export function buildPromptPackage(messages, options = {}) {
   const normalized = normalizeMessages(messages, options);
+  const messageSystemPrompt = normalized
+    .filter((message) => message.role === "system")
+    .map((message) => message.content)
+    .filter(Boolean)
+    .join("\n\n");
+  const chatMessages = normalized.filter((message) => message.role !== "system");
   const turns = toTurns(normalized, options);
   const template = options.template || "tinyllama";
   const hasExplicitSystemPrompt =
     Object.prototype.hasOwnProperty.call(options, "systemPrompt");
   const systemPrompt = sanitizeContent(options.systemPrompt);
-  const effectiveSystemPrompt = hasExplicitSystemPrompt
-    ? systemPrompt
-    : (template === "tinyllama" ? "" : "You are a helpful assistant.");
+  const defaultSystemPrompt = template === "tinyllama" ? "" : "You are a helpful assistant.";
+  const explicitSystemPrompt = hasExplicitSystemPrompt ? systemPrompt : defaultSystemPrompt;
+  const effectiveSystemPrompt = [explicitSystemPrompt, messageSystemPrompt]
+    .filter(Boolean)
+    .join("\n\n");
 
   if (turns.length === 0) {
     return {
-      messages: normalized,
+      messages: chatMessages,
       prompt: "",
       template,
       stopTexts: STOP_SEQUENCES[template] ?? STOP_SEQUENCES.plain,
@@ -476,7 +488,7 @@ export function buildPromptPackage(messages, options = {}) {
 
   if (template === "tinyllama-chatml") {
     return {
-      messages: normalized,
+      messages: chatMessages,
       prompt: formatChatMl(turns, effectiveSystemPrompt),
       template,
       stopTexts: STOP_SEQUENCES[template],
@@ -486,7 +498,7 @@ export function buildPromptPackage(messages, options = {}) {
 
   if (template === "llama2") {
     return {
-      messages: normalized,
+      messages: chatMessages,
       prompt: formatLlama2(turns, effectiveSystemPrompt),
       template,
       stopTexts: STOP_SEQUENCES[template],
@@ -496,7 +508,7 @@ export function buildPromptPackage(messages, options = {}) {
 
   if (template === "llama3") {
     return {
-      messages: normalized,
+      messages: chatMessages,
       prompt: formatLlama3(turns, effectiveSystemPrompt),
       template,
       stopTexts: STOP_SEQUENCES.llama3,
@@ -506,7 +518,7 @@ export function buildPromptPackage(messages, options = {}) {
 
   if (template === "llama4") {
     return {
-      messages: normalized,
+      messages: chatMessages,
       prompt: formatLlama4(turns, effectiveSystemPrompt),
       template,
       stopTexts: STOP_SEQUENCES.llama4,
@@ -516,7 +528,7 @@ export function buildPromptPackage(messages, options = {}) {
 
   if (template === "mistral") {
     return {
-      messages: normalized,
+      messages: chatMessages,
       prompt: formatMistral(turns, effectiveSystemPrompt),
       template,
       stopTexts: STOP_SEQUENCES.mistral,
@@ -526,7 +538,7 @@ export function buildPromptPackage(messages, options = {}) {
 
   if (template === "phi3") {
     return {
-      messages: normalized,
+      messages: chatMessages,
       prompt: formatPhi3(turns, effectiveSystemPrompt),
       template,
       stopTexts: STOP_SEQUENCES.phi3,
@@ -536,7 +548,7 @@ export function buildPromptPackage(messages, options = {}) {
 
   if (template === "qwen2") {
     return {
-      messages: normalized,
+      messages: chatMessages,
       prompt: formatQwen2(turns, effectiveSystemPrompt),
       template,
       stopTexts: STOP_SEQUENCES.qwen2,
@@ -546,7 +558,7 @@ export function buildPromptPackage(messages, options = {}) {
 
   if (template === "qwen3_5") {
     return {
-      messages: normalized,
+      messages: chatMessages,
       prompt: formatQwen35(turns, effectiveSystemPrompt),
       template,
       stopTexts: STOP_SEQUENCES.qwen3_5,
@@ -556,7 +568,7 @@ export function buildPromptPackage(messages, options = {}) {
 
   if (template === "plain") {
     return {
-      messages: normalized,
+      messages: chatMessages,
       prompt: formatPlain(turns, effectiveSystemPrompt),
       template,
       stopTexts: STOP_SEQUENCES[template],
@@ -565,7 +577,7 @@ export function buildPromptPackage(messages, options = {}) {
   }
 
   return {
-    messages: normalized,
+    messages: chatMessages,
     prompt: formatTinyLlama(turns, effectiveSystemPrompt),
     template: "tinyllama",
     stopTexts: STOP_SEQUENCES.tinyllama,

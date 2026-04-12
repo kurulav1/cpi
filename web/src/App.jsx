@@ -1,4 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkBreaks from "remark-breaks";
+import remarkGfm from "remark-gfm";
 import { fetchHealth, streamChat } from "./lib/chatStream";
 
 const TEMPLATES = [
@@ -39,7 +42,10 @@ const API_ROUTES = Object.freeze({
 const STORAGE_KEYS = Object.freeze({
   hubToken: "hub_token",
   hubOutputDir: "hub_output_dir",
-  perfMode: "cpi_perf_mode"
+  perfMode: "cpi_perf_mode",
+  theme: "cpi_theme",
+  autoMaxTokens: "cpi_auto_max_tokens",
+  longFormMode: "cpi_long_form_mode"
 });
 
 function safeStorageGet(key, fallback = "") {
@@ -131,32 +137,74 @@ function defaultQuantForProfile(profile) {
   );
 }
 
-// Render assistant text with smart newline handling:
-//   \n\n   paragraph break (two <br>s, via empty part)
-//   \n before a list/code/empty line  hard break
-//   \n mid-prose  space (prevents tokens landing on their own lines)
 function MsgContent({ text }) {
-  const clean = text.replace(/^\n+/, '').replace(/\n{3,}/g, '\n\n');
-  const parts = clean.split('\n');
-  const elems = [];
-  for (let i = 0; i < parts.length; i++) {
-    const line = parts[i];
-    elems.push(<span key={i}>{line}</span>);
-    if (i < parts.length - 1) {
-      const next = parts[i + 1];
-      // Empty line (from \n\n split)  paragraph break
-      if (line === '' || next === '') {
-        elems.push(<br key={`br-${i}`} />);
-      // List markers, blockquote, code fence  hard break
-      } else if (/^[-*>]|\d+\.|^```/.test(next.trimStart())) {
-        elems.push(<br key={`br-${i}`} />);
-      // Mid-prose \n  soft space
-      } else {
-        elems.push(' ');
-      }
-    }
-  }
-  return <>{elems}</>;
+  const clean = formatModelMarkdown(text);
+
+  return (
+    <div className="msg-rich">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm, remarkBreaks]}
+        components={{
+          p: ({ children }) => <p className="msg-paragraph">{children}</p>,
+          h1: ({ children }) => <h1 className="msg-heading">{children}</h1>,
+          h2: ({ children }) => <h2 className="msg-heading">{children}</h2>,
+          h3: ({ children }) => <h3 className="msg-heading msg-heading-sm">{children}</h3>,
+          ul: ({ children }) => <ul className="msg-list">{children}</ul>,
+          ol: ({ children }) => <ol className="msg-list msg-list-ordered">{children}</ol>,
+          blockquote: ({ children }) => <blockquote className="msg-blockquote">{children}</blockquote>,
+          code: ({ inline, children }) =>
+            inline
+              ? <code className="msg-inline-code">{children}</code>
+              : (
+                  <pre className="msg-code">
+                    <code>{String(children).replace(/\n$/, "")}</code>
+                  </pre>
+                ),
+          table: ({ children }) => (
+            <div className="msg-table-wrap">
+              <table className="msg-table">{children}</table>
+            </div>
+          ),
+          thead: ({ children }) => <thead className="msg-table-head">{children}</thead>,
+          th: ({ children }) => <th className="msg-table-th">{children}</th>,
+          td: ({ children }) => <td className="msg-table-td">{children}</td>,
+          a: ({ href, children }) => (
+            <a
+              className="msg-link"
+              href={href}
+              target="_blank"
+              rel="noreferrer"
+            >
+              {children}
+            </a>
+          ),
+          hr: () => <hr className="msg-rule" />
+        }}
+      >
+        {clean}
+      </ReactMarkdown>
+    </div>
+  );
+}
+
+function formatModelMarkdown(text) {
+  let clean = String(text || "")
+    .replace(/\r/g, "")
+    .replace(/^\n+/, "")
+    .replace(/\n{3,}/g, "\n\n");
+
+  // Many models emit list markers inline in one paragraph. Split those into
+  // real markdown blocks so the final render preserves the intended layout.
+  clean = clean.replace(/([:!?\.])\s+(\d+\.\s+)/g, "$1\n\n$2");
+  clean = clean.replace(/([:!?\.])\s+([*-]\s+)/g, "$1\n\n$2");
+
+  // If numbered items are packed together on one line, give each item its own line.
+  clean = clean.replace(/(\d+\.\s+[^\n]+?)\s+(?=\d+\.\s+)/g, "$1\n");
+
+  // Same for packed bullet lists.
+  clean = clean.replace(/([*-]\s+[^\n]+?)\s+(?=[*-]\s+)/g, "$1\n");
+
+  return clean.trim();
 }
 
 function normalise(msgs) {
@@ -745,6 +793,7 @@ function HubPanel() {
 export default function App() {
   const [view,     setView]     = useState("chat");
   const [showCfg,  setShowCfg]  = useState(false);
+  const [theme,    setTheme]    = useState(() => safeStorageGet(STORAGE_KEYS.theme, "dark") || "dark");
   const [messages, setMessages] = useState([{ id:"seed", role:"assistant", content:"Ready.", seed:true }]);
   const [draft,    setDraft]    = useState("");
   const [health,   setHealth]   = useState({ ready:false, busy:false, activeKind:null, config:null });
@@ -754,7 +803,10 @@ export default function App() {
     systemPrompt: "",
     temperature: 0.7,
     maxNewTokens: 320,
+    maxContext: 2048,
     quantMode: "none",
+    autoMaxTokens: safeStorageGet(STORAGE_KEYS.autoMaxTokens, "1") !== "0",
+    longFormMode: safeStorageGet(STORAGE_KEYS.longFormMode, "0") === "1",
     performanceMode: (() => {
       return safeStorageGet(STORAGE_KEYS.perfMode) === "1";
     })()
@@ -783,8 +835,14 @@ export default function App() {
     readyProfiles.find((p) => p.id === settings.profileId) ||
     profiles.find((p) => p.id === settings.profileId) ||
     health.config?.selectedProfile || null;
+  const maxContextLimit = Math.max(
+    128,
+    Number(selProfile?.maxPositionEmbeddings) || 0,
+    Number(health.config?.maxContext) || 0,
+    2048
+  );
   const selectedWorkerKey =
-    `${settings.profileId || ""}|perf:${settings.performanceMode ? 1 : 0}|q:${settings.quantMode || "none"}`;
+    `${settings.profileId || ""}|ctx:${settings.maxContext || 0}|perf:${settings.performanceMode ? 1 : 0}|q:${settings.quantMode || "none"}`;
   const warmupForSelected = warmup.workerKey === selectedWorkerKey ? warmup.state : "idle";
   const warmupDoneForSelected = warmupForSelected === "ready";
   const backendBusyForWarmup = health.busy && health.activeKind === "warmup";
@@ -807,12 +865,12 @@ export default function App() {
     if (!health.ready) return { label:"Not configured", dot:"dot-amber", badge:"badge-amber" };
     if (!settings.profileId) return { label:"No model", dot:"dot-amber", badge:"badge-amber" };
     if (streaming) return { label:"Streaming", dot:"dot-blue", badge:"badge-blue" };
-    if (backendBusyForWarmup) return { label:"Warming", dot:"dot-blue", badge:"badge-blue" };
+    if (backendBusyForWarmup) return { label:"Preparing", dot:"dot-blue", badge:"badge-blue" };
     if (health.busy) return { label:"Streaming", dot:"dot-blue", badge:"badge-blue" };
-    if (warmupForSelected === "warming") return { label:"Warming", dot:"dot-blue", badge:"badge-blue" };
-    if (warmupForSelected === "error") return { label:"Warmup failed", dot:"dot-red", badge:"badge-red" };
-    if (warmupDoneForSelected) return { label:"Warm", dot:"dot-green", badge:"badge-green" };
-    return { label:"Cold", dot:"dot-amber", badge:"badge-amber" };
+    if (warmupForSelected === "preparing") return { label:"Preparing", dot:"dot-blue", badge:"badge-blue" };
+    if (warmupForSelected === "error") return { label:"Preparation failed", dot:"dot-red", badge:"badge-red" };
+    if (warmupDoneForSelected) return { label:"Ready", dot:"dot-green", badge:"badge-green" };
+    return { label:"Idle", dot:"dot-amber", badge:"badge-amber" };
   })();
 
   // Health polling
@@ -877,6 +935,7 @@ export default function App() {
         if (health.config.systemPrompt && next.systemPrompt !== health.config.systemPrompt)  { next.systemPrompt  = health.config.systemPrompt;  changed = true; }
         if (health.config.temperature  != null && next.temperature  !== health.config.temperature)  { next.temperature  = health.config.temperature;  changed = true; }
         if (health.config.maxNewTokens != null && next.maxNewTokens !== health.config.maxNewTokens) { next.maxNewTokens = health.config.maxNewTokens; changed = true; }
+        if (health.config.maxContext   != null && next.maxContext   !== health.config.maxContext)   { next.maxContext   = health.config.maxContext;   changed = true; }
       }
       const alive = next.profileId && profs.some((p) => p.id === next.profileId && p.ready);
       if ((!next.profileId || !alive) && fallback) {
@@ -892,11 +951,37 @@ export default function App() {
           next.quantMode = allowed[0] || "none";
           changed = true;
         }
+        const contextCap = Math.max(
+          128,
+          Number(activeProfile.maxPositionEmbeddings) || 0,
+          Number(health.config?.maxContext) || 0
+        );
+        if (!Number.isFinite(next.maxContext) || next.maxContext < 128) {
+          next.maxContext = Math.min(Number(health.config?.maxContext) || 2048, contextCap);
+          changed = true;
+        } else if (next.maxContext > contextCap) {
+          next.maxContext = contextCap;
+          changed = true;
+        }
       }
       return changed ? next : cur;
     });
     if (!hydrated) setHydrated(true);
   }, [hydrated, health.config]);
+
+  useEffect(() => {
+    const nextTheme = theme === "light" ? "light" : "dark";
+    document.documentElement.dataset.theme = nextTheme;
+    safeStorageSet(STORAGE_KEYS.theme, nextTheme);
+  }, [theme]);
+
+  useEffect(() => {
+    safeStorageSet(STORAGE_KEYS.autoMaxTokens, settings.autoMaxTokens ? "1" : "0");
+  }, [settings.autoMaxTokens]);
+
+  useEffect(() => {
+    safeStorageSet(STORAGE_KEYS.longFormMode, settings.longFormMode ? "1" : "0");
+  }, [settings.longFormMode]);
 
   // Warm selected model immediately so first response avoids a full cold start.
   useEffect(() => {
@@ -908,7 +993,7 @@ export default function App() {
     const ctrl = new AbortController();
     warmupAbortRef.current = ctrl;
     const seq = ++warmupSeqRef.current;
-    setWarmup({ state:"warming", workerKey, error:"" });
+    setWarmup({ state:"preparing", workerKey, error:"" });
 
     const pollWarmup = async () => {
       const maxPolls = 240; // ~5 minutes at 1.25s
@@ -919,32 +1004,33 @@ export default function App() {
           body: JSON.stringify({
             profileId,
             performanceMode: settings.performanceMode,
-            quantMode: settings.quantMode
+            quantMode: settings.quantMode,
+            maxContext: settings.maxContext
           }),
           signal: ctrl.signal
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) {
-          throw new Error(data.error || `Warmup failed (${res.status})`);
+          throw new Error(data.error || `Preparation failed (${res.status})`);
         }
         if (seq !== warmupSeqRef.current || ctrl.signal.aborted) return;
         if (data?.ready === true || data?.pending === false) {
           setWarmup({ state:"ready", workerKey, error:"" });
           return;
         }
-        setWarmup({ state:"warming", workerKey, error:"" });
+        setWarmup({ state:"preparing", workerKey, error:"" });
         await new Promise((resolve) => setTimeout(resolve, 1250));
       }
-      throw new Error("Warmup timed out. Try sending a prompt to start the model.");
+      throw new Error("Preparation timed out. Try sending a prompt to start the model.");
     };
 
     pollWarmup().catch((e) => {
       if (seq !== warmupSeqRef.current || ctrl.signal.aborted) return;
-      setWarmup({ state:"error", workerKey, error: e.message || "warmup failed" });
+      setWarmup({ state:"error", workerKey, error: e.message || "preparation failed" });
     });
 
     return () => ctrl.abort();
-  }, [selectedWorkerKey, selProfile?.ready, settings.profileId, settings.performanceMode, settings.quantMode, streaming]);
+  }, [selectedWorkerKey, selProfile?.ready, settings.profileId, settings.performanceMode, settings.quantMode, settings.maxContext, streaming]);
 
   useEffect(() => () => warmupAbortRef.current?.abort(), []);
   useEffect(() => () => stopDeltaPump(), []);
@@ -1083,7 +1169,13 @@ export default function App() {
         signal: ctrl.signal,
         onEvent: (ev) => {
           if (ev.type === "start") {
-            setRunMeta({ state:"streaming", modelLabel: ev.modelLabel }); return;
+            setRunMeta({
+              state:"streaming",
+              modelLabel: ev.modelLabel,
+              maxNewTokens: ev.maxNewTokens ?? null,
+              autoMaxTokens: ev.autoMaxTokens ?? settings.autoMaxTokens,
+              longFormMode: ev.longFormMode ?? settings.longFormMode
+            }); return;
           }
           if (ev.type === "metrics" && ev.metrics) {
             setRunMeta((prev) => ({ ...(prev || {}), state:"streaming", metrics: ev.metrics }));
@@ -1101,15 +1193,19 @@ export default function App() {
           ? { ...m, content: finalMessage || m.content, streaming:false }
           : m
       ));
-      setRunMeta({
+      setRunMeta((prev) => ({
+        ...(prev || {}),
         state: done?.type === "aborted" ? "stopped" : "done",
         elapsedMs: done?.elapsedMs ?? 0,
         generatedTokens: done?.generatedTokens ?? null,
         tokPerS: done?.tokPerS ?? null,
         decodeMs: done?.decodeMs ?? null,
         decodeTokPerS: done?.decodeTokPerS ?? null,
-        metrics: done?.metrics ?? null
-      });
+        metrics: done?.metrics ?? null,
+        maxNewTokens: done?.maxNewTokens ?? prev?.maxNewTokens ?? null,
+        autoMaxTokens: done?.autoMaxTokens ?? prev?.autoMaxTokens ?? settings.autoMaxTokens,
+        longFormMode: done?.longFormMode ?? prev?.longFormMode ?? settings.longFormMode
+      }));
     } catch (e) {
       flushDeltaQueue();
       const aborted = e.name === "AbortError";
@@ -1131,7 +1227,7 @@ export default function App() {
   const empty = messages.filter((m) => !m.seed).length === 0;
 
   return (
-    <div className="shell">
+    <div className={`shell shell-${view}`}>
 
       {/*  Topbar  */}
       <header className="topbar">
@@ -1232,6 +1328,15 @@ export default function App() {
           Model Hub
         </button>
 
+        <button
+          type="button"
+          className="topbar-btn"
+          onClick={() => setTheme((cur) => cur === "light" ? "dark" : "light")}
+          title="Toggle color theme"
+        >
+          {theme === "light" ? "Dark" : "Light"}
+        </button>
+
         {/* Settings */}
         <button type="button" className="topbar-icon" title="Settings" onClick={() => setShowCfg(true)}>
           Cfg
@@ -1248,7 +1353,7 @@ export default function App() {
             {/* Notices */}
             {error && <div className="notice notice-warn">{error}</div>}
             {warmup.state === "error" && warmup.workerKey === selectedWorkerKey && (
-              <div className="notice notice-warn">Model warmup failed: {warmup.error}</div>
+              <div className="notice notice-warn">Model preparation failed: {warmup.error}</div>
             )}
             {selectedQuantJobRunning && (
               <div className="notice notice-info">
@@ -1257,7 +1362,7 @@ export default function App() {
             )}
             {selectedQuantNeedsPacking && (
               <div className="notice notice-info">
-                Selected {quantLabel(settings.quantMode)} mode will quantize from fp16 at runtime. Open Model Hub to pack this mode for faster warm starts.
+                Selected {quantLabel(settings.quantMode)} mode will quantize from fp16 at runtime. Open Model Hub to pack this mode for faster startup.
               </div>
             )}
             {!selectedQuantJobRunning && selectedQuantJob?.status === "done" && (
@@ -1382,9 +1487,62 @@ export default function App() {
                   </div>
 
                   <div className="field">
-                    <label className="field-label">Max new tokens</label>
-                    <input className="field-ctrl" type="number" min="32" max="4096" value={settings.maxNewTokens}
-                      onChange={(e) => setSettings((c) => ({ ...c, maxNewTokens: Number(e.target.value) }))} />
+                    <label className="field-label">Output budget</label>
+                    <label className="field-check" style={{ marginBottom:"0.55rem" }}>
+                      <input
+                        type="checkbox"
+                        checked={Boolean(settings.autoMaxTokens)}
+                        onChange={(e) => setSettings((c) => ({ ...c, autoMaxTokens: e.target.checked }))}
+                      />
+                      <span>Auto-select max new tokens per model and prompt.</span>
+                    </label>
+                    <input
+                      className="field-ctrl"
+                      type="number"
+                      min="32"
+                      max="4096"
+                      value={settings.maxNewTokens}
+                      disabled={Boolean(settings.autoMaxTokens)}
+                      onChange={(e) => setSettings((c) => ({ ...c, maxNewTokens: Number(e.target.value) }))}
+                    />
+                    <p className="field-help">
+                      {settings.autoMaxTokens
+                        ? "Manual cap is stored as a fallback. The server chooses the actual budget."
+                        : "Manual upper bound for generated tokens."}
+                    </p>
+                  </div>
+
+                  <div className="field">
+                    <label className="field-label">Long-form mode</label>
+                    <label className="field-check">
+                      <input
+                        type="checkbox"
+                        checked={Boolean(settings.longFormMode)}
+                        onChange={(e) => setSettings((c) => ({ ...c, longFormMode: e.target.checked }))}
+                      />
+                      <span>Allow much larger detailed answers when the prompt calls for them.</span>
+                    </label>
+                  </div>
+
+                  <div className="field">
+                    <label className="field-label">
+                      Context size
+                      <span className="field-mono">{settings.maxContext}</span>
+                    </label>
+                    <input
+                      className="field-ctrl"
+                      type="number"
+                      min="128"
+                      max={maxContextLimit}
+                      step="128"
+                      value={settings.maxContext}
+                      onChange={(e) =>
+                        setSettings((c) => ({
+                          ...c,
+                          maxContext: Math.max(128, Math.min(maxContextLimit, Number(e.target.value) || 128))
+                        }))
+                      }
+                    />
                   </div>
 
                   <div className="field">
@@ -1481,6 +1639,7 @@ export default function App() {
                   <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:"0.5rem", marginTop:"0.2rem" }}>
                     {[
                       ["Context",  health.config?.maxContext ?? "-"],
+                      ["Chosen ctx", settings.maxContext ?? "-"],
                       ["Models",   readyProfiles.length],
                     ].map(([k, v]) => (
                       <div key={k} style={{ background:"var(--surface-2)", border:"1px solid var(--border)", borderRadius:"0.4rem", padding:"0.5rem 0.65rem" }}>
@@ -1499,6 +1658,17 @@ export default function App() {
                     {runMeta.elapsedMs > 0 && (
                       <div className="stat-line"><span>Duration</span><span className="stat-line-val">{fmtMs(runMeta.elapsedMs)}</span></div>
                     )}
+                    {runMeta.maxNewTokens > 0 && (
+                      <div className="stat-line"><span>Output budget</span><span className="stat-line-val">{runMeta.maxNewTokens}</span></div>
+                    )}
+                    <div className="stat-line">
+                      <span>Budget mode</span>
+                      <span className="stat-line-val">{runMeta.autoMaxTokens === false ? "manual" : "auto"}</span>
+                    </div>
+                    <div className="stat-line">
+                      <span>Long-form</span>
+                      <span className="stat-line-val">{runMeta.longFormMode ? "on" : "off"}</span>
+                    </div>
                     {runMeta.generatedTokens > 0 && (
                       <div className="stat-line"><span>Tokens</span><span className="stat-line-val">{runMeta.generatedTokens}</span></div>
                     )}

@@ -124,6 +124,239 @@ __global__ void split_interleaved_head_halves_kernel(const half* src,
       src[src_base + static_cast<std::size_t>(head_dim + d)];
 }
 
+__device__ __forceinline__ float sigmoid_f32(float x) {
+  return 1.0f / (1.0f + expf(-x));
+}
+
+__device__ __forceinline__ float silu_f32(float x) {
+  return x * sigmoid_f32(x);
+}
+
+__device__ __forceinline__ float softplus_f32(float x) {
+  if (x > 20.0f) return x;
+  if (x < -20.0f) return expf(x);
+  return log1pf(expf(x));
+}
+
+__global__ void qwen35_linear_conv1d_silu_kernel(const half* conv_weight,
+                                                 float* conv_state,
+                                                 half* qkv_mix,
+                                                 int channels,
+                                                 int kernel_size) {
+  const int channel = blockIdx.x * blockDim.x + threadIdx.x;
+  if (channel >= channels) {
+    return;
+  }
+
+  const int state_len = kernel_size - 1;
+  const std::size_t weight_base =
+      static_cast<std::size_t>(channel) * static_cast<std::size_t>(kernel_size);
+  const float input = __half2float(qkv_mix[channel]);
+  float out = __half2float(
+      conv_weight[weight_base + static_cast<std::size_t>(kernel_size - 1)]) *
+              input;
+  if (state_len > 0) {
+    float* state_row = conv_state + static_cast<std::size_t>(channel) *
+                                        static_cast<std::size_t>(state_len);
+    for (int j = 0; j < state_len; ++j) {
+      out += __half2float(conv_weight[weight_base + static_cast<std::size_t>(j)]) *
+             state_row[j];
+    }
+    for (int j = 0; j + 1 < state_len; ++j) {
+      state_row[j] = state_row[j + 1];
+    }
+    state_row[state_len - 1] = input;
+  }
+  qkv_mix[channel] = __float2half(silu_f32(out));
+}
+
+__global__ void qwen35_repeat_linear_heads_kernel(const half* qkv_mix,
+                                                  half* q_out,
+                                                  half* k_out,
+                                                  half* v_out,
+                                                  int num_key_heads,
+                                                  int head_repeat,
+                                                  int key_head_dim,
+                                                  int value_head_dim) {
+  const int key_head = blockIdx.x;
+  const int d = blockIdx.y * blockDim.x + threadIdx.x;
+
+  const std::size_t q_base =
+      static_cast<std::size_t>(key_head) * static_cast<std::size_t>(key_head_dim);
+  const std::size_t k_base =
+      static_cast<std::size_t>(num_key_heads) * static_cast<std::size_t>(key_head_dim) +
+      q_base;
+  const std::size_t v_src_base =
+      static_cast<std::size_t>(num_key_heads * 2 * key_head_dim) +
+      static_cast<std::size_t>(key_head * head_repeat) *
+          static_cast<std::size_t>(value_head_dim);
+
+  for (int rep = 0; rep < head_repeat; ++rep) {
+    const int value_head = key_head * head_repeat + rep;
+    const std::size_t dst_q_base =
+        static_cast<std::size_t>(value_head) * static_cast<std::size_t>(key_head_dim);
+    const std::size_t dst_k_base =
+        static_cast<std::size_t>(value_head) * static_cast<std::size_t>(key_head_dim);
+    const std::size_t dst_v_base =
+        static_cast<std::size_t>(value_head) * static_cast<std::size_t>(value_head_dim);
+    if (d < key_head_dim) {
+      q_out[dst_q_base + static_cast<std::size_t>(d)] =
+          qkv_mix[q_base + static_cast<std::size_t>(d)];
+      k_out[dst_k_base + static_cast<std::size_t>(d)] =
+          qkv_mix[k_base + static_cast<std::size_t>(d)];
+    }
+    if (d < value_head_dim) {
+      v_out[dst_v_base + static_cast<std::size_t>(d)] =
+          qkv_mix[v_src_base + static_cast<std::size_t>(rep) *
+                                   static_cast<std::size_t>(value_head_dim) +
+                  static_cast<std::size_t>(d)];
+    }
+  }
+}
+
+__global__ void qwen35_linear_attention_step_kernel(const half* q,
+                                                    const half* k,
+                                                    const half* v,
+                                                    const half* z,
+                                                    const half* a,
+                                                    const half* b,
+                                                    const float* norm_weight,
+                                                    const float* a_log,
+                                                    const half* dt_bias,
+                                                    float* recurrent_state,
+                                                    half* out,
+                                                    int key_head_dim,
+                                                    int value_head_dim,
+                                                    float rms_eps) {
+  const int head = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int state_stride = key_head_dim * value_head_dim;
+  const std::size_t q_base =
+      static_cast<std::size_t>(head) * static_cast<std::size_t>(key_head_dim);
+  const std::size_t v_base =
+      static_cast<std::size_t>(head) * static_cast<std::size_t>(value_head_dim);
+  float* state = recurrent_state +
+                 static_cast<std::size_t>(head) *
+                     static_cast<std::size_t>(state_stride);
+
+  extern __shared__ float shared[];
+  float* q_shared = shared;
+  float* k_shared = q_shared + key_head_dim;
+  float* scratch = k_shared + key_head_dim;
+  __shared__ float reduce_buf[256];
+  __shared__ float q_norm_factor;
+  __shared__ float k_norm_factor;
+  __shared__ float beta_shared;
+  __shared__ float decay_shared;
+  __shared__ float out_inv_shared;
+
+  float q_ss = 0.0f;
+  float k_ss = 0.0f;
+  for (int idx = tid; idx < key_head_dim; idx += blockDim.x) {
+    const float qv = __half2float(q[q_base + static_cast<std::size_t>(idx)]);
+    const float kv = __half2float(k[q_base + static_cast<std::size_t>(idx)]);
+    q_ss += qv * qv;
+    k_ss += kv * kv;
+  }
+  reduce_buf[tid] = q_ss;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      reduce_buf[tid] += reduce_buf[tid + stride];
+    }
+    __syncthreads();
+  }
+  if (tid == 0) {
+    q_norm_factor = rsqrtf(reduce_buf[0] + 1.0e-6f) /
+                    sqrtf(static_cast<float>(key_head_dim));
+  }
+  __syncthreads();
+
+  reduce_buf[tid] = k_ss;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      reduce_buf[tid] += reduce_buf[tid + stride];
+    }
+    __syncthreads();
+  }
+  if (tid == 0) {
+    k_norm_factor = rsqrtf(reduce_buf[0] + 1.0e-6f);
+    beta_shared = sigmoid_f32(__half2float(b[head]));
+    decay_shared = expf(-expf(a_log[head]) *
+                        softplus_f32(__half2float(a[head]) +
+                                     __half2float(dt_bias[head])));
+  }
+  __syncthreads();
+
+  for (int idx = tid; idx < key_head_dim; idx += blockDim.x) {
+    q_shared[idx] = __half2float(q[q_base + static_cast<std::size_t>(idx)]) *
+                    q_norm_factor;
+    k_shared[idx] = __half2float(k[q_base + static_cast<std::size_t>(idx)]) *
+                    k_norm_factor;
+  }
+  __syncthreads();
+
+  for (int idx = tid; idx < state_stride; idx += blockDim.x) {
+    state[idx] *= decay_shared;
+  }
+  __syncthreads();
+
+  for (int dv = tid; dv < value_head_dim; dv += blockDim.x) {
+    float kv_mem = 0.0f;
+    for (int kd = 0; kd < key_head_dim; ++kd) {
+      kv_mem += state[static_cast<std::size_t>(kd) *
+                          static_cast<std::size_t>(value_head_dim) +
+                      static_cast<std::size_t>(dv)] *
+                k_shared[kd];
+    }
+    scratch[dv] =
+        (__half2float(v[v_base + static_cast<std::size_t>(dv)]) - kv_mem) *
+        beta_shared;
+  }
+  __syncthreads();
+
+  for (int idx = tid; idx < state_stride; idx += blockDim.x) {
+    const int kd = idx / value_head_dim;
+    const int dv = idx % value_head_dim;
+    state[idx] += k_shared[kd] * scratch[dv];
+  }
+  __syncthreads();
+
+  float out_ss = 0.0f;
+  for (int dv = tid; dv < value_head_dim; dv += blockDim.x) {
+    float sum = 0.0f;
+    for (int kd = 0; kd < key_head_dim; ++kd) {
+      sum += state[static_cast<std::size_t>(kd) *
+                       static_cast<std::size_t>(value_head_dim) +
+                   static_cast<std::size_t>(dv)] *
+             q_shared[kd];
+    }
+    scratch[dv] = sum;
+    out_ss += sum * sum;
+  }
+  reduce_buf[tid] = out_ss;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      reduce_buf[tid] += reduce_buf[tid + stride];
+    }
+    __syncthreads();
+  }
+  if (tid == 0) {
+    out_inv_shared = rsqrtf(
+        reduce_buf[0] / static_cast<float>(value_head_dim) + rms_eps);
+  }
+  __syncthreads();
+
+  for (int dv = tid; dv < value_head_dim; dv += blockDim.x) {
+    const float gated =
+        scratch[dv] * out_inv_shared * norm_weight[dv] *
+        silu_f32(__half2float(z[v_base + static_cast<std::size_t>(dv)]));
+    out[v_base + static_cast<std::size_t>(dv)] = __float2half(gated);
+  }
+}
+
 __global__ void scale_copy_kernel(half* dst, const half* src, int n, float scale) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) {
@@ -725,6 +958,77 @@ void launch_split_interleaved_head_halves(const half* src,
                   static_cast<unsigned int>((head_dim + threads - 1) / threads));
   split_interleaved_head_halves_kernel<<<grid, threads, 0, stream>>>(
       src, first, second, head_dim);
+}
+
+void launch_qwen35_linear_conv1d_silu(const half* conv_weight,
+                                      float* conv_state,
+                                      half* qkv_mix,
+                                      int channels,
+                                      int kernel_size,
+                                      cudaStream_t stream) {
+  constexpr int threads = 256;
+  const int blocks = (channels + threads - 1) / threads;
+  qwen35_linear_conv1d_silu_kernel<<<blocks, threads, 0, stream>>>(
+      conv_weight, conv_state, qkv_mix, channels, kernel_size);
+}
+
+void launch_qwen35_repeat_linear_heads(const half* qkv_mix,
+                                       half* q_out,
+                                       half* k_out,
+                                       half* v_out,
+                                       int num_key_heads,
+                                       int num_value_heads,
+                                       int key_head_dim,
+                                       int value_head_dim,
+                                       cudaStream_t stream) {
+  constexpr int threads = 256;
+  const int head_repeat = num_value_heads / num_key_heads;
+  const int width = key_head_dim > value_head_dim ? key_head_dim : value_head_dim;
+  const dim3 grid(static_cast<unsigned int>(num_key_heads),
+                  static_cast<unsigned int>((width + threads - 1) / threads));
+  qwen35_repeat_linear_heads_kernel<<<grid, threads, 0, stream>>>(
+      qkv_mix, q_out, k_out, v_out, num_key_heads, head_repeat, key_head_dim, value_head_dim);
+}
+
+void launch_qwen35_linear_attention_step(const half* q,
+                                         const half* k,
+                                         const half* v,
+                                         const half* z,
+                                         const half* a,
+                                         const half* b,
+                                         const float* norm_weight,
+                                         const float* a_log,
+                                         const half* dt_bias,
+                                         float* recurrent_state,
+                                         half* out,
+                                         int num_heads,
+                                         int key_head_dim,
+                                         int value_head_dim,
+                                         float rms_eps,
+                                         cudaStream_t stream) {
+  int threads = key_head_dim > value_head_dim ? key_head_dim : value_head_dim;
+  if (threads < 32) {
+    threads = 32;
+  } else if (threads > 256) {
+    threads = 256;
+  }
+  const std::size_t shared_bytes =
+      static_cast<std::size_t>(key_head_dim * 2 + value_head_dim) * sizeof(float);
+  qwen35_linear_attention_step_kernel<<<num_heads, threads, shared_bytes, stream>>>(
+      q,
+      k,
+      v,
+      z,
+      a,
+      b,
+      norm_weight,
+      a_log,
+      dt_bias,
+      recurrent_state,
+      out,
+      key_head_dim,
+      value_head_dim,
+      rms_eps);
 }
 
 void launch_rowmajor_half_gemv_f16(const half* w, const half* x, half* y,

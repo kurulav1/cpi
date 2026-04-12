@@ -77,10 +77,10 @@ class Qwen35CudaEngine {
     DeviceMatrix linear_a{};
     DeviceMatrix linear_b{};
     DeviceMatrix linear_out{};
-    const std::uint16_t* linear_conv = nullptr;
-    const float* linear_norm = nullptr;
-    const float* linear_A_log = nullptr;
-    const std::uint16_t* linear_dt_bias = nullptr;
+    void* linear_conv = nullptr;
+    float* linear_norm = nullptr;
+    float* linear_A_log = nullptr;
+    void* linear_dt_bias = nullptr;
   };
 
   struct ModelConfig {
@@ -158,29 +158,17 @@ class Qwen35CudaEngine {
   void* d_linear_a_ = nullptr;
   void* d_linear_b_ = nullptr;
   void* d_linear_att_ = nullptr;
+  void* d_linear_q_ = nullptr;
+  void* d_linear_k_ = nullptr;
+  void* d_linear_v_ = nullptr;
+  float* d_linear_conv_state_ = nullptr;
+  float* d_linear_recurrent_state_ = nullptr;
 
   void* d_k_cache_ = nullptr;
   void* d_v_cache_ = nullptr;
 
   std::vector<std::uint16_t> h_token_embedding_fp16_;
   std::vector<float> h_logits_;
-  std::vector<std::uint16_t> h_linear_qkv_mix_bits_;
-  std::vector<std::uint16_t> h_linear_z_bits_;
-  std::vector<std::uint16_t> h_linear_a_bits_;
-  std::vector<std::uint16_t> h_linear_b_bits_;
-  std::vector<std::uint16_t> h_linear_att_bits_;
-
-  std::vector<float> h_linear_qkv_mix_;
-  std::vector<float> h_linear_z_;
-  std::vector<float> h_linear_a_;
-  std::vector<float> h_linear_b_;
-  std::vector<float> h_linear_att_;
-  std::vector<float> h_linear_q_;
-  std::vector<float> h_linear_k_;
-  std::vector<float> h_linear_v_;
-
-  std::vector<std::vector<float>> linear_conv_state_;
-  std::vector<std::vector<float>> linear_recurrent_state_;
 
   int max_ctx_ = 2048;
   int bos_id_ = 0;
@@ -191,6 +179,8 @@ class Qwen35CudaEngine {
   int linear_v_dim_ = 0;
   int linear_conv_dim_ = 0;
   int linear_head_repeat_ = 1;
+  int linear_conv_state_stride_ = 0;
+  int linear_recurrent_state_stride_ = 0;
 };
 
 }  // namespace engine

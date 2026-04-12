@@ -13,6 +13,9 @@ function logDevRequest(payload) {
     template: payload.template,
     temperature: payload.temperature,
     maxNewTokens: payload.maxNewTokens,
+    autoMaxTokens: payload.autoMaxTokens,
+    longFormMode: payload.longFormMode,
+    maxContext: payload.maxContext,
     performanceMode: payload.performanceMode,
     quantMode: payload.quantMode,
     messages: payload.messages
@@ -40,6 +43,9 @@ export async function streamChat({ messages, settings, signal, onEvent }) {
     systemPrompt: settings.systemPrompt,
     temperature: settings.temperature,
     maxNewTokens: settings.maxNewTokens,
+    autoMaxTokens: Boolean(settings.autoMaxTokens),
+    longFormMode: Boolean(settings.longFormMode),
+    maxContext: settings.maxContext,
     performanceMode: Boolean(settings.performanceMode),
     quantMode: settings.quantMode || "none"
   };

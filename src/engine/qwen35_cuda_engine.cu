@@ -40,33 +40,6 @@ std::uint16_t float_to_half_bits(float value) {
   return bits;
 }
 
-float half_bits_to_float(std::uint16_t bits) {
-  __half h{};
-  std::memcpy(&h, &bits, sizeof(bits));
-  return __half2float(h);
-}
-
-float silu(float x) {
-  return x / (1.0f + std::exp(-x));
-}
-
-float sigmoid(float x) {
-  return 1.0f / (1.0f + std::exp(-x));
-}
-
-float softplus(float x) {
-  if (x > 20.0f) return x;
-  if (x < -20.0f) return std::exp(x);
-  return std::log1p(std::exp(x));
-}
-
-void l2norm_inplace(float* x, int n, float eps = 1.0e-6f) {
-  float ss = 0.0f;
-  for (int i = 0; i < n; ++i) ss += x[i] * x[i];
-  const float inv = 1.0f / std::sqrt(ss + eps);
-  for (int i = 0; i < n; ++i) x[i] *= inv;
-}
-
 std::string read_text_file(const std::filesystem::path& path) {
   std::ifstream in(path, std::ios::binary);
   if (!in) {
@@ -301,10 +274,10 @@ void Qwen35CudaEngine::destroy() {
     free_matrix(layer.linear_out);
     free_device_void(layer.full_q_norm);
     free_device_void(layer.full_k_norm);
-    layer.linear_conv = nullptr;
-    layer.linear_norm = nullptr;
-    layer.linear_A_log = nullptr;
-    layer.linear_dt_bias = nullptr;
+    free_device_void(layer.linear_conv);
+    free_device_ptr(layer.linear_norm);
+    free_device_ptr(layer.linear_A_log);
+    free_device_void(layer.linear_dt_bias);
   }
   layers_.clear();
   free_device_void(d_norm_out_);
@@ -330,6 +303,11 @@ void Qwen35CudaEngine::destroy() {
   free_device_void(d_linear_a_);
   free_device_void(d_linear_b_);
   free_device_void(d_linear_att_);
+  free_device_void(d_linear_q_);
+  free_device_void(d_linear_k_);
+  free_device_void(d_linear_v_);
+  free_device_ptr(d_linear_conv_state_);
+  free_device_ptr(d_linear_recurrent_state_);
   free_device_void(d_k_cache_);
   free_device_void(d_v_cache_);
   if (cublas_) {
@@ -343,21 +321,6 @@ void Qwen35CudaEngine::destroy() {
   tok_embeddings_ = nullptr;
   h_token_embedding_fp16_.clear();
   h_logits_.clear();
-  h_linear_qkv_mix_bits_.clear();
-  h_linear_z_bits_.clear();
-  h_linear_a_bits_.clear();
-  h_linear_b_bits_.clear();
-  h_linear_att_bits_.clear();
-  h_linear_qkv_mix_.clear();
-  h_linear_z_.clear();
-  h_linear_a_.clear();
-  h_linear_b_.clear();
-  h_linear_att_.clear();
-  h_linear_q_.clear();
-  h_linear_k_.clear();
-  h_linear_v_.clear();
-  linear_conv_state_.clear();
-  linear_recurrent_state_.clear();
 }
 
 void Qwen35CudaEngine::load_config(const std::string& model_dir) {
@@ -430,6 +393,11 @@ void Qwen35CudaEngine::allocate_runtime_buffers() {
   linear_v_dim_ = cfg_.linear_num_value_heads * cfg_.linear_value_head_dim;
   linear_conv_dim_ = linear_k_dim_ * 2 + linear_v_dim_;
   linear_head_repeat_ = cfg_.linear_num_value_heads / cfg_.linear_num_key_heads;
+  linear_conv_state_stride_ =
+      linear_conv_dim_ * std::max(0, cfg_.linear_conv_kernel_dim - 1);
+  linear_recurrent_state_stride_ =
+      cfg_.linear_num_value_heads * cfg_.linear_key_head_dim *
+      cfg_.linear_value_head_dim;
 
   auto malloc_device = [](void** ptr, std::size_t bytes) {
     CUDA_CHECK(cudaMalloc(ptr, bytes));
@@ -455,40 +423,26 @@ void Qwen35CudaEngine::allocate_runtime_buffers() {
   malloc_device(&d_linear_a_, static_cast<std::size_t>(cfg_.linear_num_value_heads) * sizeof(__half));
   malloc_device(&d_linear_b_, static_cast<std::size_t>(cfg_.linear_num_value_heads) * sizeof(__half));
   malloc_device(&d_linear_att_, static_cast<std::size_t>(linear_v_dim_) * sizeof(__half));
+  malloc_device(&d_linear_q_, static_cast<std::size_t>(cfg_.linear_num_value_heads) *
+                                static_cast<std::size_t>(cfg_.linear_key_head_dim) *
+                                sizeof(__half));
+  malloc_device(&d_linear_k_, static_cast<std::size_t>(cfg_.linear_num_value_heads) *
+                                static_cast<std::size_t>(cfg_.linear_key_head_dim) *
+                                sizeof(__half));
+  malloc_device(&d_linear_v_, static_cast<std::size_t>(linear_v_dim_) * sizeof(__half));
+  CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_linear_conv_state_),
+                        static_cast<std::size_t>(cfg_.num_layers) *
+                            static_cast<std::size_t>(linear_conv_state_stride_) *
+                            sizeof(float)));
+  CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_linear_recurrent_state_),
+                        static_cast<std::size_t>(cfg_.num_layers) *
+                            static_cast<std::size_t>(linear_recurrent_state_stride_) *
+                            sizeof(float)));
   malloc_device(&d_k_cache_, static_cast<std::size_t>(cfg_.num_layers) * static_cast<std::size_t>(max_ctx_) * static_cast<std::size_t>(full_kv_dim_) * sizeof(__half));
   malloc_device(&d_v_cache_, static_cast<std::size_t>(cfg_.num_layers) * static_cast<std::size_t>(max_ctx_) * static_cast<std::size_t>(full_kv_dim_) * sizeof(__half));
 
   h_token_embedding_fp16_.resize(static_cast<std::size_t>(cfg_.hidden_size));
   h_logits_.resize(static_cast<std::size_t>(cfg_.vocab_size));
-  h_linear_qkv_mix_bits_.resize(static_cast<std::size_t>(linear_conv_dim_));
-  h_linear_z_bits_.resize(static_cast<std::size_t>(linear_v_dim_));
-  h_linear_a_bits_.resize(static_cast<std::size_t>(cfg_.linear_num_value_heads));
-  h_linear_b_bits_.resize(static_cast<std::size_t>(cfg_.linear_num_value_heads));
-  h_linear_att_bits_.resize(static_cast<std::size_t>(linear_v_dim_));
-  h_linear_qkv_mix_.resize(static_cast<std::size_t>(linear_conv_dim_));
-  h_linear_z_.resize(static_cast<std::size_t>(linear_v_dim_));
-  h_linear_a_.resize(static_cast<std::size_t>(cfg_.linear_num_value_heads));
-  h_linear_b_.resize(static_cast<std::size_t>(cfg_.linear_num_value_heads));
-  h_linear_att_.resize(static_cast<std::size_t>(linear_v_dim_));
-  h_linear_q_.resize(static_cast<std::size_t>(cfg_.linear_num_value_heads) * static_cast<std::size_t>(cfg_.linear_key_head_dim));
-  h_linear_k_.resize(static_cast<std::size_t>(cfg_.linear_num_value_heads) * static_cast<std::size_t>(cfg_.linear_key_head_dim));
-  h_linear_v_.resize(static_cast<std::size_t>(linear_v_dim_));
-
-  linear_conv_state_.assign(static_cast<std::size_t>(cfg_.num_layers), {});
-  linear_recurrent_state_.assign(static_cast<std::size_t>(cfg_.num_layers), {});
-  for (int layer = 0; layer < cfg_.num_layers; ++layer) {
-    if (cfg_.layer_kinds[static_cast<std::size_t>(layer)] == LayerKind::LinearAttention) {
-      linear_conv_state_[static_cast<std::size_t>(layer)].assign(
-          static_cast<std::size_t>(linear_conv_dim_) *
-              static_cast<std::size_t>(cfg_.linear_conv_kernel_dim - 1),
-          0.0f);
-      linear_recurrent_state_[static_cast<std::size_t>(layer)].assign(
-          static_cast<std::size_t>(cfg_.linear_num_value_heads) *
-              static_cast<std::size_t>(cfg_.linear_key_head_dim) *
-              static_cast<std::size_t>(cfg_.linear_value_head_dim),
-          0.0f);
-    }
-  }
 }
 
 void Qwen35CudaEngine::build_rope_tables() {
@@ -532,13 +486,19 @@ void Qwen35CudaEngine::reset_state() {
       sizeof(__half);
   CUDA_CHECK(cudaMemsetAsync(d_k_cache_, 0, cache_bytes, compute_stream_));
   CUDA_CHECK(cudaMemsetAsync(d_v_cache_, 0, cache_bytes, compute_stream_));
+  CUDA_CHECK(cudaMemsetAsync(
+      d_linear_conv_state_,
+      0,
+      static_cast<std::size_t>(cfg_.num_layers) *
+          static_cast<std::size_t>(linear_conv_state_stride_) * sizeof(float),
+      compute_stream_));
+  CUDA_CHECK(cudaMemsetAsync(
+      d_linear_recurrent_state_,
+      0,
+      static_cast<std::size_t>(cfg_.num_layers) *
+          static_cast<std::size_t>(linear_recurrent_state_stride_) * sizeof(float),
+      compute_stream_));
   CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
-  for (auto& state : linear_conv_state_) {
-    std::fill(state.begin(), state.end(), 0.0f);
-  }
-  for (auto& state : linear_recurrent_state_) {
-    std::fill(state.begin(), state.end(), 0.0f);
-  }
 }
 
 void Qwen35CudaEngine::load_token_embedding_to_device(int token) {
@@ -606,6 +566,30 @@ void Qwen35CudaEngine::rowmajor_projection_float(const DeviceMatrix& matrix,
 void Qwen35CudaEngine::load_weights() {
   auto load_vector_fp16 = [&](const std::string& name, int elems) -> void* {
     const auto* src = require_bf16_tensor(weights_, name);
+    const auto host = convert_bf16_to_fp16_host(src, static_cast<std::size_t>(elems));
+    void* dst = nullptr;
+    CUDA_CHECK(cudaMalloc(&dst, static_cast<std::size_t>(elems) * sizeof(__half)));
+    CUDA_CHECK(cudaMemcpyAsync(dst,
+                               host.data(),
+                               host.size() * sizeof(std::uint16_t),
+                               cudaMemcpyHostToDevice,
+                               compute_stream_));
+    return dst;
+  };
+
+  auto load_float_tensor = [&](const float* src, int elems) -> float* {
+    float* dst = nullptr;
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&dst),
+                          static_cast<std::size_t>(elems) * sizeof(float)));
+    CUDA_CHECK(cudaMemcpyAsync(dst,
+                               src,
+                               static_cast<std::size_t>(elems) * sizeof(float),
+                               cudaMemcpyHostToDevice,
+                               compute_stream_));
+    return dst;
+  };
+
+  auto load_bf16_tensor_fp16 = [&](const std::uint16_t* src, int elems) -> void* {
     const auto host = convert_bf16_to_fp16_host(src, static_cast<std::size_t>(elems));
     void* dst = nullptr;
     CUDA_CHECK(cudaMalloc(&dst, static_cast<std::size_t>(elems) * sizeof(__half)));
@@ -751,10 +735,18 @@ void Qwen35CudaEngine::load_weights() {
       lw.linear_a = load_matrix(prefix + ".linear_attn.in_proj_a.weight", cfg_.linear_num_value_heads, cfg_.hidden_size);
       lw.linear_b = load_matrix(prefix + ".linear_attn.in_proj_b.weight", cfg_.linear_num_value_heads, cfg_.hidden_size);
       lw.linear_out = load_matrix(prefix + ".linear_attn.out_proj.weight", cfg_.hidden_size, linear_v_dim_);
-      lw.linear_conv = require_bf16_tensor(weights_, prefix + ".linear_attn.conv1d.weight");
-      lw.linear_norm = require_f32_tensor(weights_, prefix + ".linear_attn.norm.weight");
-      lw.linear_A_log = require_f32_tensor(weights_, prefix + ".linear_attn.A_log");
-      lw.linear_dt_bias = require_bf16_tensor(weights_, prefix + ".linear_attn.dt_bias");
+      lw.linear_conv = load_bf16_tensor_fp16(
+          require_bf16_tensor(weights_, prefix + ".linear_attn.conv1d.weight"),
+          linear_conv_dim_ * cfg_.linear_conv_kernel_dim);
+      lw.linear_norm = load_float_tensor(
+          require_f32_tensor(weights_, prefix + ".linear_attn.norm.weight"),
+          cfg_.linear_value_head_dim);
+      lw.linear_A_log = load_float_tensor(
+          require_f32_tensor(weights_, prefix + ".linear_attn.A_log"),
+          cfg_.linear_num_value_heads);
+      lw.linear_dt_bias = load_bf16_tensor_fp16(
+          require_bf16_tensor(weights_, prefix + ".linear_attn.dt_bias"),
+          cfg_.linear_num_value_heads);
     }
   }
   CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
@@ -870,138 +862,47 @@ void Qwen35CudaEngine::forward_token(int token,
       project(lw.linear_z, d_x_norm_, d_linear_z_);
       project(lw.linear_a, d_x_norm_, d_linear_a_);
       project(lw.linear_b, d_x_norm_, d_linear_b_);
+      auto* conv_state = d_linear_conv_state_ +
+          static_cast<std::size_t>(layer) *
+              static_cast<std::size_t>(linear_conv_state_stride_);
+      auto* recurrent_state = d_linear_recurrent_state_ +
+          static_cast<std::size_t>(layer) *
+              static_cast<std::size_t>(linear_recurrent_state_stride_);
 
-      CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
-      CUDA_CHECK(cudaMemcpy(h_linear_qkv_mix_bits_.data(),
-                            d_linear_qkv_mix_,
-                            h_linear_qkv_mix_bits_.size() * sizeof(std::uint16_t),
-                            cudaMemcpyDeviceToHost));
-      CUDA_CHECK(cudaMemcpy(h_linear_z_bits_.data(),
-                            d_linear_z_,
-                            h_linear_z_bits_.size() * sizeof(std::uint16_t),
-                            cudaMemcpyDeviceToHost));
-      CUDA_CHECK(cudaMemcpy(h_linear_a_bits_.data(),
-                            d_linear_a_,
-                            h_linear_a_bits_.size() * sizeof(std::uint16_t),
-                            cudaMemcpyDeviceToHost));
-      CUDA_CHECK(cudaMemcpy(h_linear_b_bits_.data(),
-                            d_linear_b_,
-                            h_linear_b_bits_.size() * sizeof(std::uint16_t),
-                            cudaMemcpyDeviceToHost));
-
-      for (std::size_t i = 0; i < h_linear_qkv_mix_bits_.size(); ++i) {
-        h_linear_qkv_mix_[i] = half_bits_to_float(h_linear_qkv_mix_bits_[i]);
-      }
-      for (std::size_t i = 0; i < h_linear_z_bits_.size(); ++i) {
-        h_linear_z_[i] = half_bits_to_float(h_linear_z_bits_[i]);
-      }
-      for (std::size_t i = 0; i < h_linear_a_bits_.size(); ++i) {
-        h_linear_a_[i] = half_bits_to_float(h_linear_a_bits_[i]);
-        h_linear_b_[i] = half_bits_to_float(h_linear_b_bits_[i]);
-      }
-
-      const int kernel = cfg_.linear_conv_kernel_dim;
-      auto& conv_state = linear_conv_state_[static_cast<std::size_t>(layer)];
-      if (kernel > 1) {
-        const int state_len = kernel - 1;
-        for (int channel = 0; channel < linear_conv_dim_; ++channel) {
-          const std::uint16_t* w =
-              lw.linear_conv + static_cast<std::size_t>(channel) * static_cast<std::size_t>(kernel);
-          float out = 0.0f;
-          float* state_row = conv_state.data() +
-              static_cast<std::size_t>(channel) * static_cast<std::size_t>(state_len);
-          for (int j = 0; j < state_len; ++j) out += bf16_to_float(w[j]) * state_row[j];
-          out += bf16_to_float(w[kernel - 1]) * h_linear_qkv_mix_[static_cast<std::size_t>(channel)];
-          for (int j = 0; j + 1 < state_len; ++j) state_row[j] = state_row[j + 1];
-          state_row[state_len - 1] = h_linear_qkv_mix_[static_cast<std::size_t>(channel)];
-          h_linear_qkv_mix_[static_cast<std::size_t>(channel)] = silu(out);
-        }
-      } else {
-        for (float& value : h_linear_qkv_mix_) value = silu(value);
-      }
-
-      const float* q_raw = h_linear_qkv_mix_.data();
-      const float* k_raw = q_raw + linear_k_dim_;
-      const float* v_raw = k_raw + linear_k_dim_;
-      std::memcpy(h_linear_v_.data(), v_raw, static_cast<std::size_t>(linear_v_dim_) * sizeof(float));
-
-      for (int k_head = 0; k_head < cfg_.linear_num_key_heads; ++k_head) {
-        const float* src_q = q_raw + static_cast<std::size_t>(k_head) * static_cast<std::size_t>(cfg_.linear_key_head_dim);
-        const float* src_k = k_raw + static_cast<std::size_t>(k_head) * static_cast<std::size_t>(cfg_.linear_key_head_dim);
-        for (int rep = 0; rep < linear_head_repeat_; ++rep) {
-          const int v_head = k_head * linear_head_repeat_ + rep;
-          float* dst_q = h_linear_q_.data() + static_cast<std::size_t>(v_head) * static_cast<std::size_t>(cfg_.linear_key_head_dim);
-          float* dst_k = h_linear_k_.data() + static_cast<std::size_t>(v_head) * static_cast<std::size_t>(cfg_.linear_key_head_dim);
-          std::memcpy(dst_q, src_q, static_cast<std::size_t>(cfg_.linear_key_head_dim) * sizeof(float));
-          std::memcpy(dst_k, src_k, static_cast<std::size_t>(cfg_.linear_key_head_dim) * sizeof(float));
-        }
-      }
-
-      auto& recurrent = linear_recurrent_state_[static_cast<std::size_t>(layer)];
-      const float q_scale = 1.0f / std::sqrt(static_cast<float>(cfg_.linear_key_head_dim));
-      std::vector<float> scratch(static_cast<std::size_t>(cfg_.linear_value_head_dim), 0.0f);
-      for (int head = 0; head < cfg_.linear_num_value_heads; ++head) {
-        float* q_head = h_linear_q_.data() + static_cast<std::size_t>(head) * static_cast<std::size_t>(cfg_.linear_key_head_dim);
-        float* k_head = h_linear_k_.data() + static_cast<std::size_t>(head) * static_cast<std::size_t>(cfg_.linear_key_head_dim);
-        float* v_head = h_linear_v_.data() + static_cast<std::size_t>(head) * static_cast<std::size_t>(cfg_.linear_value_head_dim);
-        float* z_head = h_linear_z_.data() + static_cast<std::size_t>(head) * static_cast<std::size_t>(cfg_.linear_value_head_dim);
-        float* out_head = h_linear_att_.data() + static_cast<std::size_t>(head) * static_cast<std::size_t>(cfg_.linear_value_head_dim);
-        float* state = recurrent.data() + static_cast<std::size_t>(head) *
-                           static_cast<std::size_t>(cfg_.linear_key_head_dim) *
-                           static_cast<std::size_t>(cfg_.linear_value_head_dim);
-
-        l2norm_inplace(q_head, cfg_.linear_key_head_dim);
-        l2norm_inplace(k_head, cfg_.linear_key_head_dim);
-        for (int d = 0; d < cfg_.linear_key_head_dim; ++d) q_head[d] *= q_scale;
-
-        const float beta = sigmoid(h_linear_b_[static_cast<std::size_t>(head)]);
-        const float a = h_linear_a_[static_cast<std::size_t>(head)];
-        const float dt_bias = bf16_to_float(lw.linear_dt_bias[head]);
-        const float decay = std::exp(-std::exp(lw.linear_A_log[head]) * softplus(a + dt_bias));
-
-        for (int k = 0; k < cfg_.linear_key_head_dim; ++k) {
-          float* row = state + static_cast<std::size_t>(k) * static_cast<std::size_t>(cfg_.linear_value_head_dim);
-          for (int dv = 0; dv < cfg_.linear_value_head_dim; ++dv) row[dv] *= decay;
-        }
-
-        for (int dv = 0; dv < cfg_.linear_value_head_dim; ++dv) {
-          float kv_mem = 0.0f;
-          for (int k = 0; k < cfg_.linear_key_head_dim; ++k) {
-            kv_mem += state[static_cast<std::size_t>(k) * static_cast<std::size_t>(cfg_.linear_value_head_dim) +
-                            static_cast<std::size_t>(dv)] * k_head[k];
-          }
-          scratch[static_cast<std::size_t>(dv)] = (v_head[dv] - kv_mem) * beta;
-        }
-        for (int k = 0; k < cfg_.linear_key_head_dim; ++k) {
-          float* row = state + static_cast<std::size_t>(k) * static_cast<std::size_t>(cfg_.linear_value_head_dim);
-          const float kk = k_head[k];
-          for (int dv = 0; dv < cfg_.linear_value_head_dim; ++dv) row[dv] += kk * scratch[static_cast<std::size_t>(dv)];
-        }
-        for (int dv = 0; dv < cfg_.linear_value_head_dim; ++dv) {
-          float sum = 0.0f;
-          for (int k = 0; k < cfg_.linear_key_head_dim; ++k) {
-            sum += state[static_cast<std::size_t>(k) * static_cast<std::size_t>(cfg_.linear_value_head_dim) +
-                         static_cast<std::size_t>(dv)] * q_head[k];
-          }
-          out_head[dv] = sum;
-        }
-
-        float ss = 0.0f;
-        for (int dv = 0; dv < cfg_.linear_value_head_dim; ++dv) ss += out_head[dv] * out_head[dv];
-        const float inv = 1.0f / std::sqrt(ss / static_cast<float>(cfg_.linear_value_head_dim) + cfg_.rms_norm_eps);
-        for (int dv = 0; dv < cfg_.linear_value_head_dim; ++dv) {
-          out_head[dv] = out_head[dv] * inv * lw.linear_norm[dv] * silu(z_head[dv]);
-        }
-      }
-
-      for (std::size_t i = 0; i < h_linear_att_.size(); ++i) {
-        h_linear_att_bits_[i] = float_to_half_bits(h_linear_att_[i]);
-      }
-      CUDA_CHECK(cudaMemcpyAsync(d_linear_att_,
-                                 h_linear_att_bits_.data(),
-                                 h_linear_att_bits_.size() * sizeof(std::uint16_t),
-                                 cudaMemcpyHostToDevice,
-                                 compute_stream_));
+      kernels::launch_qwen35_linear_conv1d_silu(
+          static_cast<const __half*>(lw.linear_conv),
+          conv_state,
+          static_cast<__half*>(d_linear_qkv_mix_),
+          linear_conv_dim_,
+          cfg_.linear_conv_kernel_dim,
+          compute_stream_);
+      kernels::launch_qwen35_repeat_linear_heads(
+          static_cast<const __half*>(d_linear_qkv_mix_),
+          static_cast<__half*>(d_linear_q_),
+          static_cast<__half*>(d_linear_k_),
+          static_cast<__half*>(d_linear_v_),
+          cfg_.linear_num_key_heads,
+          cfg_.linear_num_value_heads,
+          cfg_.linear_key_head_dim,
+          cfg_.linear_value_head_dim,
+          compute_stream_);
+      kernels::launch_qwen35_linear_attention_step(
+          static_cast<const __half*>(d_linear_q_),
+          static_cast<const __half*>(d_linear_k_),
+          static_cast<const __half*>(d_linear_v_),
+          static_cast<const __half*>(d_linear_z_),
+          static_cast<const __half*>(d_linear_a_),
+          static_cast<const __half*>(d_linear_b_),
+          lw.linear_norm,
+          lw.linear_A_log,
+          static_cast<const __half*>(lw.linear_dt_bias),
+          recurrent_state,
+          static_cast<__half*>(d_linear_att_),
+          cfg_.linear_num_value_heads,
+          cfg_.linear_key_head_dim,
+          cfg_.linear_value_head_dim,
+          cfg_.rms_norm_eps,
+          compute_stream_);
       project(lw.linear_out, d_linear_att_, d_tmp_hidden_);
       kernels::launch_add_inplace(static_cast<__half*>(d_x_),
                                   static_cast<const __half*>(d_tmp_hidden_),
