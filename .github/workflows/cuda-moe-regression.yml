@@ -55,6 +55,56 @@ jobs:
             --thresholds tools/ci/moe_gate_thresholds.json `
             --result-json artifacts/ci_moe_gate_result.json
 
+      - name: Write job summary
+        if: always()
+        shell: pwsh
+        run: |
+          $result = Get-Content artifacts/ci_moe_gate_result.json -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json
+          $md = [System.Text.StringBuilder]::new()
+          [void]$md.AppendLine("## MoE Regression Gate")
+          if ($null -eq $result) {
+            [void]$md.AppendLine("> Gate result JSON not found — the gate step may have failed before writing output.")
+          } else {
+            $overall = if ($result.failed) { ":x: **FAILED**" } else { ":white_check_mark: **PASSED**" }
+            [void]$md.AppendLine($overall)
+            [void]$md.AppendLine("")
+            [void]$md.AppendLine("### Throughput (decode tok/s)")
+            [void]$md.AppendLine("")
+            [void]$md.AppendLine("| Mode | Decode tok/s | Prefill ms |")
+            [void]$md.AppendLine("|------|-------------:|-----------:|")
+            foreach ($mode in @("fp16", "int8", "int4")) {
+              $m = $result.models.$mode
+              if ($null -ne $m) {
+                $dtps = if ($null -ne $m.bench.decode_tok_per_s) { "{0:F2}" -f $m.bench.decode_tok_per_s } else { "—" }
+                $pfms = if ($null -ne $m.bench.prefill_ms) { "{0:F1}" -f $m.bench.prefill_ms } else { "—" }
+                [void]$md.AppendLine("| $mode | $dtps | $pfms |")
+              }
+            }
+            [void]$md.AppendLine("")
+            [void]$md.AppendLine("### Logit Parity (vs fp16 baseline)")
+            [void]$md.AppendLine("")
+            [void]$md.AppendLine("| Mode | top1 match | overlap@k | mean abs | max abs | Status |")
+            [void]$md.AppendLine("|------|:----------:|----------:|---------:|--------:|--------|")
+            $thresholds = $result.thresholds
+            foreach ($mode in @("int8", "int4")) {
+              $p = $result.parity.$mode
+              if ($null -ne $p) {
+                $t1    = if ($p.top1_match -eq 1) { ":white_check_mark:" } else { ":x:" }
+                $ovlp  = "{0:F3}" -f $p.overlap_at_k
+                $mabs  = if ([double]::IsInfinity($p.mean_abs)) { "∞" } else { "{0:F4}" -f $p.mean_abs }
+                $xabs  = if ([double]::IsInfinity($p.max_abs))  { "∞" } else { "{0:F4}" -f $p.max_abs }
+                $maxMeanKey = "$(${mode})_max_mean_abs"
+                $minOvlpKey = "$(${mode})_min_overlap"
+                $maxMean = if ($null -ne $thresholds.$maxMeanKey) { $thresholds.$maxMeanKey } else { [double]::PositiveInfinity }
+                $minOvlp = if ($null -ne $thresholds.$minOvlpKey) { $thresholds.$minOvlpKey } else { 0.0 }
+                $ok = (-not [double]::IsInfinity($p.mean_abs)) -and ($p.mean_abs -le $maxMean) -and ($p.overlap_at_k -ge $minOvlp)
+                $status = if ($ok) { ":white_check_mark: pass" } else { ":x: fail" }
+                [void]$md.AppendLine("| $mode | $t1 | $ovlp | $mabs | $xabs | $status |")
+              }
+            }
+          }
+          $md.ToString() | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
       - name: Upload MoE gate artifact
         if: always()
         uses: actions/upload-artifact@v4

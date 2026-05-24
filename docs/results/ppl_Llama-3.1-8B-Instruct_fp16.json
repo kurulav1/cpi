@@ -1,0 +1,24 @@
+{
+  "schema": "cpi-ppl-v1",
+  "timestamp": "2026-05-24T20:23:36.107158Z",
+  "host": "DESKTOP-31S0GEM",
+  "platform": "Windows-11-10.0.26200-SP0",
+  "cpu": "AMD64 Family 26 Model 68 Stepping 0, AuthenticAMD",
+  "gpu": "NVIDIA GeForce RTX 5090, 32607 MiB",
+  "model_name": "Llama-3.1-8B-Instruct",
+  "model_dir": "C:\\Users\\V\u00e4in\u00f6\\Downloads\\cpi\\artifacts\\hub\\meta-llama__Llama-3.1-8B-Instruct\\hf",
+  "corpus": "wikitext-2-v1/test",
+  "stride": 256,
+  "max_length": 512,
+  "results": {
+    "fp16": {
+      "mode": "fp16",
+      "ppl": 6.76345,
+      "bpb": 0.68944,
+      "loss": 1.911533,
+      "n_tokens": 512,
+      "load_s": 20.11,
+      "eval_s": 43.67
+    }
+  }
+}

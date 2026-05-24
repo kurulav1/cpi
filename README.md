@@ -10,6 +10,28 @@ CPI is a local LLM inference engine with a CLI, REST API, and web UI. It support
 - Model auto-discovery and per-model web defaults
 - Tools for converting Hugging Face weights into `.ll2c`
 
+## Research & Benchmarking
+
+| Document | Contents |
+| -------- | -------- |
+| [docs/research.md](docs/research.md) | System architecture, design rationale, related work |
+| [docs/benchmarks.md](docs/benchmarks.md) | Benchmark methodology, metric definitions, reproduction guide |
+| [docs/results/](docs/results/) | Machine-generated JSON and Markdown result files |
+
+### Benchmark tools
+
+```powershell
+# Throughput / latency / memory sweep (context × quant × CPU/CUDA)
+python tools/bench_sweep.py --model artifacts/model.ll2c --tokenizer path/to/tokenizer.json `
+    --context-lengths 128 512 2048 4096 --quant-modes fp16 int8 int4
+
+# WikiText-2 perplexity (fp16 / int8 / int4)
+python tools/perplexity.py --model-dir artifacts/model/hf --all-modes
+
+# Aggregate results into Markdown report (updates docs/benchmarks.md)
+python tools/bench_report.py --patch-benchmarks
+```
+
 ## Quick Start
 
 ### First-run setup
@@ -230,6 +252,29 @@ TinyLlama note:
 
 - prefer `tokenizer.json` over `tokenizer.model`
 - use `tinyllama-chatml` only when you specifically want the role-marker format
+
+### CPT `cpt_gpt` exports
+
+CPI can run CPT's Hugging Face-style `cpt_gpt` export folders through a small Python backend. This is intended for tiny/debug CPT models while the native `llama_infer` engine grows direct CPT architecture support.
+
+Export from CPT:
+
+```powershell
+python ..\cpt\tools\export_cpt_to_hf.py `
+  --checkpoint C:\path\to\model.ckpt `
+  --out-dir .\artifacts\cpt_tiny_hf `
+  --model-name cpt-tiny `
+  --overwrite
+```
+
+Run it in CPI:
+
+```powershell
+$env:LLAMA_MODEL_PATH=".\artifacts\cpt_tiny_hf"
+.\start_local.bat
+```
+
+The export folder must contain `config.json` with `model_type: cpt_gpt` and `model.safetensors`. Byte-level exports use CPT's `byte_tokenizer.json`; tokenizer-backed exports use `tokenizer.json` and require the Python `tokenizers` package in CPI's environment.
 
 ## Useful Commands
 

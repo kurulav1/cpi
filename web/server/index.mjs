@@ -507,8 +507,13 @@ function isTinyLlamaFamily(cliConfig) {
 }
 
 function prefersHfChatBackend(target) {
-  void target;
-  return false;
+  const family = String(
+    target?.family ||
+    target?.profile?.family ||
+    target?.selectedProfile?.family ||
+    ""
+  ).toLowerCase();
+  return family === "cpt_gpt";
 }
 
 function shouldStreamTextDeltas(cliConfigOrTemplate) {
@@ -946,6 +951,12 @@ function resolvePreferredHfModelDir(profile) {
   const modelPath = profile?.modelPath;
   if (!modelPath) return "";
 
+  if (profile?.family === "cpt_gpt") {
+    const hasConfig = fs.existsSync(path.join(modelPath, "config.json"));
+    const hasWeights = fs.existsSync(path.join(modelPath, "model.safetensors"));
+    return hasConfig && hasWeights ? modelPath : "";
+  }
+
   const candidate = path.resolve(path.dirname(modelPath), "hf");
   const hasConfig = fs.existsSync(path.join(candidate, "config.json"));
   const hasTokenizer = ["tokenizer.json", "tokenizer.model"]
@@ -1012,7 +1023,12 @@ function parsePreferredHfStdout(worker) {
 
 function spawnPreferredHfWorker(config, cliConfig) {
   const modelDir = resolvePreferredHfModelDir(cliConfig.profile);
-  const scriptPath = path.resolve(config.repoRoot, "tools", "hf_chat_worker.py");
+  const isCptGpt = cliConfig?.profile?.family === "cpt_gpt";
+  const scriptPath = path.resolve(
+    config.repoRoot,
+    "tools",
+    isCptGpt ? "cpt_gpt_worker.py" : "hf_chat_worker.py"
+  );
   const child = spawn(pythonBin(), [scriptPath, "--model-dir", modelDir], {
     cwd: config.repoRoot,
     env: {
@@ -1030,6 +1046,7 @@ function spawnPreferredHfWorker(config, cliConfig) {
 
   const worker = {
     modelDir,
+    scriptPath,
     child,
     ready: false,
     readyPromise,
@@ -1634,6 +1651,9 @@ async function runPreferredFamilyGenerationOnce(config, cliConfig, requestKind =
       return await runPreferredHfGeneration(config, cliConfig);
     } catch (err) {
       const family = String(cliConfig?.profile?.family || cliConfig?.meta?.template || "model");
+      if (prefersHfChatBackend(cliConfig)) {
+        throw err;
+      }
       console.warn(`[${family}] HF backend failed, using llama_infer: ${err.message}`);
     }
   }

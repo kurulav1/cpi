@@ -949,6 +949,9 @@ function inferProfileFamily(modelPath, hfConfig) {
   const modelType = String(hfConfig?.modelType || "").toLowerCase();
   const rootModelType = String(hfConfig?.rootModelType || "").toLowerCase();
 
+  if (modelType.includes("cpt_gpt") || rootModelType.includes("cpt_gpt")) {
+    return "cpt_gpt";
+  }
   if (modelType.includes("qwen3_5") || rootModelType.includes("qwen3_5")) {
     return "qwen3_5";
   }
@@ -999,6 +1002,9 @@ function inferTemplate(modelPath, tokenizerPath, fallbackTemplate, hfConfig, hfT
 
   // HF config model_type override
   const modelType = hfConfig?.modelType || "";
+  if (modelType.includes("cpt_gpt")) {
+    return "plain";
+  }
   if (modelType.includes("llama3") || modelType.includes("llama-3")) {
     return "llama3";
   }
@@ -1177,29 +1183,30 @@ function buildProfile(modelPath, tokenizerPath, baseConfig, source = "discovered
   const ropeTheta = inferRopeTheta(modelPath, modelConfig);
   const unsupportedReason = inferUnsupportedArchitecture(modelConfig);
 
-  // Safetensors model directories are only supported by the Llama4 engine.
-  // All other families must be converted to .ll2c before use.
+  // Native safetensors directories use llama_infer; CPT GPT exports use a
+  // lightweight Python worker until the native engine grows this architecture.
   const isSafetensorsDir = isSafetensorsModelDir(modelPath);
+  const supportsCptGpt = isSafetensorsDir && family === "cpt_gpt";
   const supportsNativeSafetensors =
     isSafetensorsDir && (family === "llama4" || family === "qwen3_5");
+  const modelExists = Boolean(modelPath) && fs.existsSync(modelPath);
+  const tokenizerExists = Boolean(tokenizerPath) && fs.existsSync(tokenizerPath);
   const filesExist =
-    Boolean(modelPath) &&
-    fs.existsSync(modelPath) &&
-    Boolean(tokenizerPath) &&
-    fs.existsSync(tokenizerPath);
+    modelExists &&
+    (supportsCptGpt || tokenizerExists);
   const ready =
     filesExist &&
     !unsupportedReason &&
-    (!isSafetensorsDir || supportsNativeSafetensors);
+    (!isSafetensorsDir || supportsNativeSafetensors || supportsCptGpt);
 
   let status;
   if (unsupportedReason) {
     status = "unsupported-architecture";
   } else if (ready) {
     status = "ready";
-  } else if (isSafetensorsDir && !supportsNativeSafetensors) {
+  } else if (isSafetensorsDir && !supportsNativeSafetensors && !supportsCptGpt) {
     status = "needs-conversion";
-  } else if (!tokenizerPath || !fs.existsSync(tokenizerPath)) {
+  } else if (!supportsCptGpt && !tokenizerExists) {
     status = "tokenizer-missing";
   } else {
     status = "model-missing";
@@ -1295,7 +1302,11 @@ function discoverModelProfiles(baseConfig) {
     ...scanRoots.flatMap((root) =>
       walkFiles(root, (p) => {
         const lower = p.toLowerCase();
-        return lower.endsWith("tokenizer.json") || lower.endsWith("tokenizer.model");
+        return (
+          lower.endsWith("tokenizer.json") ||
+          lower.endsWith("tokenizer.model") ||
+          lower.endsWith("byte_tokenizer.json")
+        );
       })
     )
   ]);
@@ -1468,6 +1479,7 @@ export function getRuntimeConfig() {
       )
         ? ""
         : baseConfig.systemPrompt;
+  const selectedUsesExternalWorker = selectedProfile?.family === "cpt_gpt";
 
   return {
     ...baseConfig,
@@ -1479,7 +1491,9 @@ export function getRuntimeConfig() {
     tokenizerPath: selectedProfile?.tokenizerPath ?? configuredTokenizerPath,
     template: hasExplicitTemplate ? template : (selectedProfile?.template ?? template),
     systemPrompt,
-    ready: fs.existsSync(inferBin) && Boolean(selectedProfile?.ready)
+    ready:
+      (selectedUsesExternalWorker || fs.existsSync(inferBin)) &&
+      Boolean(selectedProfile?.ready)
   };
 }
 
