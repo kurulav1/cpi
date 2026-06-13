@@ -94,7 +94,7 @@ void print_usage(std::ostream& os) {
         "[--enable-tq-cached] [--tq-mode auto|mse|prod] "
         "[--max-cpu-percent n] [--max-memory-percent n] "
         "[--resource-sample-ms n] [--resource-sustain-ms n] [--resource-throttle-ms n] "
-        "[--no-resource-limits] "
+        "[--no-resource-limits] [--resource-limits] "
         "[--tq-cached-init-timeout-ms n] [--tq-first-token-timeout-ms n] "
           "[--allow-legacy-chat-tokenizer] "
         "[--no-bos] [--eos-token n] [--no-loop-guard] [--int8-streaming|--int4-streaming|--weight-quant none|int8|int4] "
@@ -330,6 +330,8 @@ ParsedArgs parse_args(int argc, char** argv) {
       args.opts.resource_throttle_sleep_ms = std::stoi(need_val("--resource-throttle-ms"));
     } else if (arg == "--no-resource-limits") {
       args.opts.enable_host_resource_limits = false;
+    } else if (arg == "--resource-limits") {
+      args.opts.enable_host_resource_limits = true;
     } else if (arg == "--tq-cached-init-timeout-ms") {
       args.opts.tq_cached_init_timeout_ms = std::stoi(need_val("--tq-cached-init-timeout-ms"));
     } else if (arg == "--tq-first-token-timeout-ms") {

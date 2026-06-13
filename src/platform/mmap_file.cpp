@@ -50,8 +50,12 @@ void MMapFile::open(const std::string& path) {
   }
 
 #ifdef _WIN32
+  // FILE_FLAG_SEQUENTIAL_SCAN tells the cache manager to do aggressive
+  // read-ahead, which matters because we stream the entire weight file to the
+  // GPU in one pass right after opening it.
   file_handle_ = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
-                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+                             OPEN_EXISTING,
+                             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
   if (file_handle_ == INVALID_HANDLE_VALUE) {
     file_handle_ = nullptr;
     LLAMA_ENGINE_THROW("CreateFileA failed for: " + path);

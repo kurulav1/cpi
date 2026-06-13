@@ -306,6 +306,30 @@ function normalizeGeneratedChatText(text, template) {
   return cleaned.trim();
 }
 
+// Detects degenerate repetition loops (the failure mode the aggressive
+// cleanup pipeline exists for). Healthy output must NOT match: the cleanup
+// collapses newlines/indentation and re-joins sentences with single spaces,
+// which corrupts code blocks ("self.data" -> "self. data") and formatted text.
+// Mirrors looks_degenerate_repetition() in src/app/main_helpers.cpp.
+function looksDegenerateRepetition(text) {
+  const s = String(text || "");
+  // A word repeated 3+ times in a row ("the the the").
+  if (/\b([A-Za-z][A-Za-z'-]*)\b(?:\s+\1\b){2,}/i.test(s)) return true;
+  // The same letter 6+ times in a row ("aaaaaa").
+  if (/([A-Za-z])\1{5,}/.test(s)) return true;
+  // The same punctuation mark 3+ times in a row ("!!!!").
+  if (/([!?,])\1{2,}/.test(s)) return true;
+  // The same sentence emitted twice (or more) consecutively.
+  const sentences = s.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [];
+  let prev = "";
+  for (const sentence of sentences) {
+    const key = sentence.replace(/\s+/g, " ").trim().toLowerCase();
+    if (key.length >= 16 && key === prev) return true;
+    prev = key;
+  }
+  return false;
+}
+
 function cleanupRepeatedWords(text) {
   let cleaned = String(text || "");
   for (let i = 0; i < 4; i += 1) {
@@ -434,6 +458,12 @@ function extractLlama2AnswerOnly(text = "") {
     /\n\s*(?:Relevant|Current|Question|User|System|Instructions|Explanation|Answer|Assistant)\s*:?.*$/i,
     ""
   );
+  // Healthy output keeps the model's own formatting (newlines, indentation,
+  // code blocks); the aggressive repetition pipeline is a salvage path for
+  // degenerate loops only.
+  if (!looksDegenerateRepetition(cleaned)) {
+    return cleaned.trim();
+  }
   cleaned = cleanupRepeatedWords(cleaned);
   cleaned = collapseAdjacentNearDuplicateWords(cleaned);
   cleaned = cleanupRepeatedSentences(cleaned);
@@ -497,9 +527,11 @@ function normalizeFinalResponseText(text, template, policy = null) {
   if (effectivePolicy.finalResponseExtractor === "llama2-answer-only") {
     return extractLlama2AnswerOnly(text);
   }
-  return cleanupRepeatedSentences(
-    cleanupRepeatedWords(normalizeGeneratedChatText(text, template))
-  );
+  const cleaned = normalizeGeneratedChatText(text, template);
+  if (!looksDegenerateRepetition(cleaned)) {
+    return cleaned;
+  }
+  return cleanupRepeatedSentences(cleanupRepeatedWords(cleaned));
 }
 
 function isTinyLlamaFamily(cliConfig) {

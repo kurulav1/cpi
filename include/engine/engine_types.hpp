@@ -31,7 +31,11 @@ struct EngineOptions {
   std::string tq_mode = "auto";
   bool verbose = true;
   float rope_theta = 0.0f;
-  bool enable_host_resource_limits = true;
+  // Off by default: on a single-user box the host-memory check counts the
+  // mmap'd model file pages (which are file-backed and reclaimable), so loading
+  // a model that is a large fraction of RAM would otherwise abort the load.
+  // Opt in with --resource-limits for shared/constrained environments.
+  bool enable_host_resource_limits = false;
   double max_cpu_percent = 85.0;
   double max_memory_percent = 85.0;
   int resource_sample_interval_ms = 250;

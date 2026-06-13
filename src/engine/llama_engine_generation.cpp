@@ -41,8 +41,14 @@ void LlamaEngine::prefill_prompt(const std::vector<int>& prompt_tokens) {
     return;
   }
   const auto& cfg = weights_.config();
-  // Batched prefill requires fp16 projection weights; fall back to sequential when int8 proj or TQ3 is active.
-  if (options_.paged_kv_cache || prefill_chunk_size_ <= 1 || cached_int8_proj_enabled_ ||
+  const bool all_layers_cached = cached_layer_count_ == cfg.num_layers;
+  // Batched prefill runs the attention projections through the batched low-bit
+  // kernels in --weight-quant int8/int4 mode (the resident cache frees the
+  // fp16 wqkv/wo copies after quantisation) and through fp16 cuBLAS GEMMs
+  // otherwise. Streamed layers may not have their projections resident in
+  // either form, so quant + streaming falls back to sequential prefill.
+  if (options_.paged_kv_cache || prefill_chunk_size_ <= 1 ||
+      (cached_int8_proj_enabled_ && !all_layers_cached) ||
       kv_int4_enabled_ || tq3_enabled_ || cfg.is_moe() || cfg.uses_non_full_attention()) {
     prefill_prompt_sequential(prompt_tokens);
     return;
@@ -54,7 +60,10 @@ void LlamaEngine::prefill_prompt(const std::vector<int>& prompt_tokens) {
   const int kv_hidden = attn_kv_hidden_ > 0 ? attn_kv_hidden_ : (cfg.num_kv_heads * head_dim);
   const int prompt_count = static_cast<int>(prompt_tokens.size()) - 1;
   const bool can_use_dp4a_prefill = ((hidden & 3) == 0) && ((inter & 3) == 0);
-  const bool all_layers_cached = cached_layer_count_ == cfg.num_layers;
+  // d_prefill_i8_ holds rows x max(hidden, inter) int8 activations; the wo
+  // input is rows x q_hidden, so q_hidden must fit within that buffer.
+  const bool can_use_dp4a_proj = ((hidden & 3) == 0) && ((q_hidden & 3) == 0) &&
+                                 (q_hidden <= std::max(hidden, inter));
   const std::size_t q_row_bytes = static_cast<std::size_t>(q_hidden) * sizeof(__half);
   const std::size_t kv_row_bytes = static_cast<std::size_t>(kv_hidden) * sizeof(__half);
   const std::size_t ff_row_bytes = static_cast<std::size_t>(inter) * sizeof(__half);
@@ -84,21 +93,76 @@ void LlamaEngine::prefill_prompt(const std::vector<int>& prompt_tokens) {
                                      compute_stream_);
 
     const auto run_layer = [&](int layer, const LayerDeviceWeights* lw, const LayerDeviceInt8Weights* lw_i8) {
+      // In --weight-quant mode the resident cache only keeps low-bit
+      // projection weights (fp16 wqkv/wo are freed after quantisation), so the
+      // projections go through the batched low-bit kernels, mirroring the MLP.
+      const bool lowbit_proj = cached_int8_proj_enabled_ && lw_i8 && lw_i8->wqkv && lw_i8->wo;
+
       launch_norm(d_x_, lw->norm_att, lw->norm_att_bias, d_x_norm_, rows, hidden);
 
-      detail::dispatch_linear_rowmajor_weight(cublas_,
-                             cublas_lt_,
-                             &lt_plan_cache_,
-                             lt_workspace_,
-                             lt_workspace_bytes_,
-                             compute_stream_,
-                             lw->wqkv,
-                             d_x_norm_,
-                             d_qkv_,
-                             q_hidden + 2 * kv_hidden,
-                             hidden,
-                             rows,
-                             CUDA_R_16F);
+      if (lowbit_proj && can_use_dp4a_proj) {
+        kernels::launch_quantize_rowwise_fp16_to_int8(static_cast<const __half*>(d_x_norm_),
+                                                      d_prefill_i8_,
+                                                      d_prefill_i8_scales_,
+                                                      rows,
+                                                      hidden,
+                                                      compute_stream_);
+        if (lw_i8->proj_int4) {
+          kernels::launch_weight_only_int4_matvec_batched_dp4a(lw_i8->wqkv,
+                                                               lw_i8->s_wqkv,
+                                                               d_prefill_i8_,
+                                                               d_prefill_i8_scales_,
+                                                               static_cast<__half*>(d_qkv_),
+                                                               rows,
+                                                               q_hidden + 2 * kv_hidden,
+                                                               hidden,
+                                                               compute_stream_);
+        } else {
+          kernels::launch_weight_only_int8_matvec_batched_dp4a(lw_i8->wqkv,
+                                                               lw_i8->s_wqkv,
+                                                               d_prefill_i8_,
+                                                               d_prefill_i8_scales_,
+                                                               static_cast<__half*>(d_qkv_),
+                                                               rows,
+                                                               q_hidden + 2 * kv_hidden,
+                                                               hidden,
+                                                               compute_stream_);
+        }
+      } else if (lowbit_proj) {
+        if (lw_i8->proj_int4) {
+          kernels::launch_weight_only_int4_matvec_batched(lw_i8->wqkv,
+                                                          lw_i8->s_wqkv,
+                                                          static_cast<const __half*>(d_x_norm_),
+                                                          static_cast<__half*>(d_qkv_),
+                                                          rows,
+                                                          q_hidden + 2 * kv_hidden,
+                                                          hidden,
+                                                          compute_stream_);
+        } else {
+          kernels::launch_weight_only_int8_matvec_batched(lw_i8->wqkv,
+                                                          lw_i8->s_wqkv,
+                                                          static_cast<const __half*>(d_x_norm_),
+                                                          static_cast<__half*>(d_qkv_),
+                                                          rows,
+                                                          q_hidden + 2 * kv_hidden,
+                                                          hidden,
+                                                          compute_stream_);
+        }
+      } else {
+        detail::dispatch_linear_rowmajor_weight(cublas_,
+                               cublas_lt_,
+                               &lt_plan_cache_,
+                               lt_workspace_,
+                               lt_workspace_bytes_,
+                               compute_stream_,
+                               lw->wqkv,
+                               d_x_norm_,
+                               d_qkv_,
+                               q_hidden + 2 * kv_hidden,
+                               hidden,
+                               rows,
+                               CUDA_R_16F);
+      }
       maybe_add_half_bias(d_ff3_, lw->bo, rows, hidden);
 
       CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_q_,
@@ -174,19 +238,69 @@ void LlamaEngine::prefill_prompt(const std::vector<int>& prompt_tokens) {
                                         head_dim,
                                         compute_stream_);
 
-      detail::dispatch_linear_rowmajor_weight(cublas_,
-                             cublas_lt_,
-                             &lt_plan_cache_,
-                             lt_workspace_,
-                             lt_workspace_bytes_,
-                             compute_stream_,
-                             lw->wo,
-                             d_att_,
-                             d_ff3_,
-                             hidden,
-                             q_hidden,
-                             rows,
-                             CUDA_R_16F);
+      if (lowbit_proj && can_use_dp4a_proj) {
+        kernels::launch_quantize_rowwise_fp16_to_int8(static_cast<const __half*>(d_att_),
+                                                      d_prefill_i8_,
+                                                      d_prefill_i8_scales_,
+                                                      rows,
+                                                      q_hidden,
+                                                      compute_stream_);
+        if (lw_i8->proj_int4) {
+          kernels::launch_weight_only_int4_matvec_batched_dp4a(lw_i8->wo,
+                                                               lw_i8->s_wo,
+                                                               d_prefill_i8_,
+                                                               d_prefill_i8_scales_,
+                                                               static_cast<__half*>(d_ff3_),
+                                                               rows,
+                                                               hidden,
+                                                               q_hidden,
+                                                               compute_stream_);
+        } else {
+          kernels::launch_weight_only_int8_matvec_batched_dp4a(lw_i8->wo,
+                                                               lw_i8->s_wo,
+                                                               d_prefill_i8_,
+                                                               d_prefill_i8_scales_,
+                                                               static_cast<__half*>(d_ff3_),
+                                                               rows,
+                                                               hidden,
+                                                               q_hidden,
+                                                               compute_stream_);
+        }
+      } else if (lowbit_proj) {
+        if (lw_i8->proj_int4) {
+          kernels::launch_weight_only_int4_matvec_batched(lw_i8->wo,
+                                                          lw_i8->s_wo,
+                                                          static_cast<const __half*>(d_att_),
+                                                          static_cast<__half*>(d_ff3_),
+                                                          rows,
+                                                          hidden,
+                                                          q_hidden,
+                                                          compute_stream_);
+        } else {
+          kernels::launch_weight_only_int8_matvec_batched(lw_i8->wo,
+                                                          lw_i8->s_wo,
+                                                          static_cast<const __half*>(d_att_),
+                                                          static_cast<__half*>(d_ff3_),
+                                                          rows,
+                                                          hidden,
+                                                          q_hidden,
+                                                          compute_stream_);
+        }
+      } else {
+        detail::dispatch_linear_rowmajor_weight(cublas_,
+                               cublas_lt_,
+                               &lt_plan_cache_,
+                               lt_workspace_,
+                               lt_workspace_bytes_,
+                               compute_stream_,
+                               lw->wo,
+                               d_att_,
+                               d_ff3_,
+                               hidden,
+                               q_hidden,
+                               rows,
+                               CUDA_R_16F);
+      }
 
       kernels::launch_add_inplace(static_cast<__half*>(d_x_),
                                   static_cast<const __half*>(d_ff3_),

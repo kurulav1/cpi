@@ -593,6 +593,51 @@ std::string cleanup_repeated_sentences(const std::string& text) {
   return normalize_whitespace(joined.str());
 }
 
+// Detects degenerate repetition loops (the failure mode the aggressive
+// cleanup pipeline below exists for). Healthy output must NOT match: the
+// cleanup collapses newlines/indentation and re-joins sentences with single
+// spaces, which corrupts code blocks ("self.data" -> "self. data") and any
+// formatted text.
+bool looks_degenerate_repetition(const std::string& text) {
+  // A word repeated 3+ times in a row ("the the the").
+  static const std::regex repeated_word_run(
+      R"(\b([A-Za-z][A-Za-z'-]*)\b(?:\s+\1\b){2,})", std::regex_constants::icase);
+  // The same letter 6+ times in a row ("aaaaaa").
+  static const std::regex repeated_letter_run(R"(([A-Za-z])\1{5,})");
+  // The same punctuation mark 3+ times in a row ("!!!!", "....").
+  static const std::regex repeated_punct_run(R"(([!?,])\1{2,})");
+  if (std::regex_search(text, repeated_word_run) ||
+      std::regex_search(text, repeated_letter_run) ||
+      std::regex_search(text, repeated_punct_run)) {
+    return true;
+  }
+
+  // The same sentence emitted twice (or more) consecutively.
+  static const std::regex sentence_re(R"([^.!?]+[.!?]+|[^.!?]+$)");
+  std::sregex_iterator it(text.begin(), text.end(), sentence_re);
+  std::sregex_iterator end;
+  std::string previous_key;
+  for (; it != end; ++it) {
+    const std::string key = to_lower_copy(normalize_whitespace(it->str()));
+    if (key.size() >= 16 && key == previous_key) {
+      return true;
+    }
+    previous_key = key;
+  }
+  return false;
+}
+
+// Trims leading/trailing whitespace without touching interior formatting.
+std::string trim_outer_whitespace(std::string text) {
+  while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front()))) {
+    text.erase(text.begin());
+  }
+  while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back()))) {
+    text.pop_back();
+  }
+  return text;
+}
+
 std::string normalize_final_response_text(const std::string& text) {
   std::string cleaned = sanitize_stream_text(text);
   const std::vector<std::regex> cut_markers = {
@@ -615,6 +660,14 @@ std::string normalize_final_response_text(const std::string& text) {
   cleaned = std::regex_replace(cleaned, std::regex(R"(^\s*Assistant\s*:?\s*)", std::regex_constants::icase), "");
   cleaned = std::regex_replace(cleaned, std::regex(R"(^\s*Answer\s*:?\s*)", std::regex_constants::icase), "");
   cleaned = std::regex_replace(cleaned, std::regex(R"(^\s*(?:\[/?INST\]|<<\/?SYS>>|</?s>)\s*)", std::regex_constants::icase), "");
+
+  // Healthy output: keep the model's own formatting intact (newlines,
+  // indentation, code blocks). The aggressive repetition pipeline below is a
+  // salvage path for degenerate loops only — it collapses all whitespace and
+  // would corrupt well-formed responses.
+  if (!looks_degenerate_repetition(cleaned)) {
+    return trim_outer_whitespace(std::move(cleaned));
+  }
 
   return cleanup_repeated_sentences(
       trim_incomplete_trailing_tail(
