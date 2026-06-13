@@ -800,3 +800,116 @@ input[type="range"] { width: 100%; accent-color: var(--accent); cursor: pointer;
   .msg-user-bubble { max-width: 94%; }
   .topbar-select { max-width: 140px; }
 }
+
+/* ── Chat sidebar ── */
+.chat-layout {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+  min-height: 0;
+}
+
+.chat-sidebar {
+  width: 232px;
+  flex-shrink: 0;
+  border-right: 1px solid var(--border);
+  background: var(--surface);
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+  padding: 0.65rem 0.55rem;
+  overflow: hidden;
+}
+
+.chat-new-btn {
+  width: 100%;
+  font-size: 0.78rem;
+}
+
+.chat-list {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-height: 0;
+}
+
+.chat-list-empty {
+  font-size: 0.74rem;
+  color: var(--text-3);
+  padding: 0.4rem 0.5rem;
+}
+
+.chat-item {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.42rem 0.55rem;
+  border-radius: 0.4rem;
+  border: 1px solid transparent;
+  cursor: pointer;
+  color: var(--text-2);
+  font-size: 0.78rem;
+}
+
+.chat-item:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.chat-item-on {
+  background: var(--surface-2);
+  color: var(--text);
+  border-color: var(--border-2);
+}
+
+.chat-item-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+}
+
+.chat-item-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  line-height: 1.35;
+}
+
+.chat-item-stamp {
+  font-size: 0.64rem;
+  color: var(--text-3);
+}
+
+.chat-item-del {
+  flex-shrink: 0;
+  background: none;
+  border: none;
+  color: var(--text-3);
+  font: inherit;
+  font-size: 0.95rem;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0.12rem 0.3rem;
+  border-radius: 0.3rem;
+  opacity: 0;
+  transition: opacity 0.12s, color 0.12s;
+}
+
+.chat-item:hover .chat-item-del { opacity: 1; }
+.chat-item-del:hover { color: var(--red); background: rgba(248,113,113,0.12); }
+
+.chat-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+@media (max-width: 760px) {
+  .chat-sidebar { display: none; }
+}

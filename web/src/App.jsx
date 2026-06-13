@@ -45,8 +45,12 @@ const STORAGE_KEYS = Object.freeze({
   perfMode: "cpi_perf_mode",
   theme: "cpi_theme",
   autoMaxTokens: "cpi_auto_max_tokens",
-  longFormMode: "cpi_long_form_mode"
+  longFormMode: "cpi_long_form_mode",
+  chats: "cpi_chats",
+  activeChat: "cpi_active_chat"
 });
+
+const MAX_STORED_CHATS = 100;
 
 function safeStorageGet(key, fallback = "") {
   try {
@@ -83,6 +87,49 @@ async function fetchJson(url, options) {
 
 function createMsg(role, content, extra = {}) {
   return { id: crypto.randomUUID(), role, content, ...extra };
+}
+
+function seedMessages() {
+  return [{ id: "seed", role: "assistant", content: "Ready.", seed: true }];
+}
+
+//  Chat storage (localStorage)
+
+function loadStoredChats() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(STORAGE_KEYS.chats) || "[]");
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (c) => c && typeof c.id === "string" && Array.isArray(c.messages) && c.messages.length > 0
+    );
+  } catch {
+    return [];
+  }
+}
+
+function persistStoredChats(chats) {
+  try {
+    localStorage.setItem(STORAGE_KEYS.chats, JSON.stringify(chats));
+  } catch {
+    // quota exceeded / private mode: chat history just won't persist
+  }
+}
+
+function chatTitleFrom(messages) {
+  const firstUser = messages.find((m) => m.role === "user" && String(m.content || "").trim());
+  if (!firstUser) return "New chat";
+  const t = String(firstUser.content).trim().replace(/\s+/g, " ");
+  return t.length > 48 ? `${t.slice(0, 48)}...` : t;
+}
+
+function fmtChatStamp(ts) {
+  if (!Number.isFinite(ts)) return "";
+  const d = new Date(ts);
+  const today = new Date();
+  const sameDay = d.toDateString() === today.toDateString();
+  return sameDay
+    ? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+    : d.toLocaleDateString([], { month: "short", day: "numeric" });
 }
 
 function tailPath(v) {
@@ -794,7 +841,22 @@ export default function App() {
   const [view,     setView]     = useState("chat");
   const [showCfg,  setShowCfg]  = useState(false);
   const [theme,    setTheme]    = useState(() => safeStorageGet(STORAGE_KEYS.theme, "dark") || "dark");
-  const [messages, setMessages] = useState([{ id:"seed", role:"assistant", content:"Ready.", seed:true }]);
+  // Restore stored chats and the previously active conversation once.
+  const [initialChatState] = useState(() => {
+    const storedChats = loadStoredChats();
+    const storedActiveId = safeStorageGet(STORAGE_KEYS.activeChat, "");
+    const active = storedChats.find((c) => c.id === storedActiveId) || null;
+    return {
+      chats: storedChats,
+      activeChatId: active ? active.id : crypto.randomUUID(),
+      messages: active
+        ? [...seedMessages(), ...active.messages.map((m) => createMsg(m.role, m.content))]
+        : seedMessages()
+    };
+  });
+  const [chats,        setChats]        = useState(initialChatState.chats);
+  const [activeChatId, setActiveChatId] = useState(initialChatState.activeChatId);
+  const [messages,     setMessages]     = useState(initialChatState.messages);
   const [draft,    setDraft]    = useState("");
   const [health,   setHealth]   = useState({ ready:false, busy:false, activeKind:null, config:null });
   const [settings, setSettings] = useState(() => ({
@@ -1037,6 +1099,65 @@ export default function App() {
   useEffect(() => {
     messagesRef.current = messages;
   }, [messages]);
+
+  // Sync the current conversation into the chat list. Skipped while streaming
+  // so delta frames don't churn state; the final message lands when streaming
+  // flips back to false.
+  useEffect(() => {
+    if (streaming) return;
+    const real = messages
+      .filter((m) => !m.seed && String(m.content || "").trim())
+      .map(({ role, content }) => ({ role, content }));
+    if (real.length === 0) return;
+    setChats((cur) => {
+      const existing = cur.find((c) => c.id === activeChatId);
+      if (existing && JSON.stringify(existing.messages) === JSON.stringify(real)) {
+        return cur;
+      }
+      const entry = {
+        id: activeChatId,
+        title: chatTitleFrom(real),
+        createdAt: existing?.createdAt ?? Date.now(),
+        updatedAt: Date.now(),
+        messages: real
+      };
+      return [entry, ...cur.filter((c) => c.id !== activeChatId)].slice(0, MAX_STORED_CHATS);
+    });
+  }, [messages, streaming, activeChatId]);
+
+  useEffect(() => {
+    persistStoredChats(chats);
+  }, [chats]);
+
+  useEffect(() => {
+    safeStorageSet(STORAGE_KEYS.activeChat, activeChatId);
+  }, [activeChatId]);
+
+  function startNewChat() {
+    abortRef.current?.abort();
+    setActiveChatId(crypto.randomUUID());
+    updateMessages(seedMessages());
+    setRunMeta(null);
+    setError("");
+  }
+
+  function openChat(id) {
+    if (id === activeChatId) return;
+    const chat = chats.find((c) => c.id === id);
+    if (!chat) return;
+    abortRef.current?.abort();
+    setActiveChatId(id);
+    updateMessages([...seedMessages(), ...chat.messages.map((m) => createMsg(m.role, m.content))]);
+    setRunMeta(null);
+    setError("");
+  }
+
+  function deleteChat(id) {
+    setChats((cur) => cur.filter((c) => c.id !== id));
+    if (id === activeChatId) {
+      startNewChat();
+    }
+  }
 
   // Auto-scroll
   useEffect(() => {
@@ -1349,7 +1470,47 @@ export default function App() {
         {view === "hub" ? (
           <HubPanel />
         ) : (
-          <>
+          <div className="chat-layout">
+
+            {/* Chat sidebar */}
+            <aside className="chat-sidebar">
+              <button
+                type="button"
+                className="btn btn-primary chat-new-btn"
+                onClick={startNewChat}
+              >
+                + New chat
+              </button>
+              <div className="chat-list">
+                {chats.length === 0 ? (
+                  <p className="chat-list-empty">No previous chats yet.</p>
+                ) : (
+                  chats.map((c) => (
+                    <div
+                      key={c.id}
+                      className={`chat-item ${c.id === activeChatId ? "chat-item-on" : ""}`}
+                      onClick={() => openChat(c.id)}
+                      title={c.title}
+                    >
+                      <div className="chat-item-main">
+                        <span className="chat-item-title">{c.title}</span>
+                        <span className="chat-item-stamp">{fmtChatStamp(c.updatedAt)}</span>
+                      </div>
+                      <button
+                        type="button"
+                        className="chat-item-del"
+                        title="Delete chat"
+                        onClick={(e) => { e.stopPropagation(); deleteChat(c.id); }}
+                      >
+                        ×
+                      </button>
+                    </div>
+                  ))
+                )}
+              </div>
+            </aside>
+
+            <div className="chat-main">
             {/* Notices */}
             {error && <div className="notice notice-warn">{error}</div>}
             {warmup.state === "error" && warmup.workerKey === selectedWorkerKey && (
@@ -1459,7 +1620,8 @@ export default function App() {
                 </div>
               </div>
             </div>
-          </>
+            </div>
+          </div>
         )}
 
         {/*  Settings drawer  */}
