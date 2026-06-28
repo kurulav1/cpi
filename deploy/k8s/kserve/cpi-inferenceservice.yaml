@@ -1,0 +1,23 @@
+# InferenceService — the user-facing KServe object. It asks for a model of format
+# "ll2c"; KServe matches it to the cpi-llama ServingRuntime and builds the
+# Deployment + Service + (optional) route + HPA in RawDeployment mode.
+#
+# No storageUri: the cpi-llama runtime mounts the model itself from the node
+# (hostPath), so there's no storage-initializer step. On a real cluster you'd set
+# storageUri (s3://… / pvc://…) and let KServe's initializer stage it to /mnt/models.
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: cpi
+  namespace: default
+  annotations:
+    serving.kserve.io/deploymentMode: RawDeployment
+    serving.kserve.io/autoscalerClass: hpa
+spec:
+  predictor:
+    minReplicas: 1
+    maxReplicas: 3
+    model:
+      modelFormat:
+        name: ll2c
+      runtime: cpi-llama

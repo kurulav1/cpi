@@ -1,0 +1,61 @@
+# Custom KServe ServingRuntime wrapping the CPI engine. This is how you plug a
+# non-standard engine into KServe's control plane: declare a model format the
+# runtime serves (here "ll2c") and the container that serves it. KServe then
+# builds the Deployment/Service/HPA/route for any InferenceService that asks for
+# this format/runtime — you keep your engine, KServe owns the serving lifecycle.
+#
+# GPU here uses the same WSL2/Docker-Desktop bind-mount trick as the plain pod
+# (privileged + /dev/dxg + /usr/lib/wsl, ldconfig before start). On a real cluster
+# you'd drop all that and add `resources: { limits: { nvidia.com/gpu: 1 } }`.
+apiVersion: serving.kserve.io/v1alpha1
+kind: ServingRuntime
+metadata:
+  name: cpi-llama
+  namespace: default
+spec:
+  supportedModelFormats:
+    - name: ll2c
+      version: "1"
+      autoSelect: true
+  protocolVersions:
+    - v1
+  containers:
+    - name: kserve-container          # KServe requires this exact name
+      image: cpi-llama:test
+      imagePullPolicy: Never
+      securityContext:
+        privileged: true              # access /dev/dxg (WSL GPU)
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          echo /usr/lib/wsl/lib > /etc/ld.so.conf.d/wsl.conf
+          for d in /usr/lib/wsl/drivers/*/; do echo "$d" >> /etc/ld.so.conf.d/wsl.conf; done
+          ldconfig
+          cd /app/web && exec npm run start
+      ports:
+        - containerPort: 3001
+          protocol: TCP
+      env:
+        - { name: PORT, value: "3001" }
+        - { name: LLAMA_INFER_BIN, value: /app/bin/llama_infer }
+        - { name: LLAMA_MODEL_DIRS, value: /models }
+        - { name: LLAMA_MODEL_PATH, value: /models/model.ll2c }
+        - { name: LLAMA_TOKENIZER_PATH, value: /models/tokenizer.json }
+        - { name: LLAMA_CHAT_TEMPLATE, value: tinyllama }
+        - { name: LLAMA_MAX_CPU_PERCENT, value: "100" }
+        - { name: LLAMA_MAX_MEMORY_PERCENT, value: "100" }
+      readinessProbe:
+        httpGet: { path: /api/health, port: 3001 }
+        initialDelaySeconds: 15
+        periodSeconds: 10
+      volumeMounts:
+        - { name: models, mountPath: /models, readOnly: true }
+        - { name: wsl-libs, mountPath: /usr/lib/wsl, readOnly: true }
+        - { name: dxg, mountPath: /dev/dxg }
+  volumes:
+    - name: models
+      hostPath: { path: /tmp/cpt-models, type: DirectoryOrCreate }
+    - name: wsl-libs
+      hostPath: { path: /usr/lib/wsl, type: Directory }
+    - name: dxg
+      hostPath: { path: /dev/dxg, type: CharDevice }
