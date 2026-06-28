@@ -460,6 +460,21 @@ std::string Tokenizer::decode(const std::vector<int>& ids) const {
   return result;
 }
 
+// Returns the per-token byte table for grammar-constrained decoding. Only the
+// HfBpe backend supplies it; the SentencePiece backends return an empty vector
+// (the grammar targets — Qwen2.5 / Llama-3.1 — use HfBpe tokenizer.json files).
+const std::vector<std::string>& Tokenizer::token_pieces() const {
+  if (!tokenizer_json_path_.empty()) {
+    auto* tok = reinterpret_cast<const HfBpeTokenizer*>(hf_bpe_);
+    if (!tok) {
+      throw std::runtime_error("hf bpe tokenizer is not loaded");
+    }
+    return tok->token_pieces();
+  }
+  static const std::vector<std::string> empty;
+  return empty;
+}
+
 // Returns the set of token ids that should halt autoregressive generation.
 // EOS is always included when valid.  Other special tokens (e.g. <eot>,
 // end-of-turn markers) are included because models that use them during

@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "engine/engine_types.hpp"
+#include "engine/generation_constraints.hpp"
 #include "model/weight_loader.hpp"
 
 namespace engine {
@@ -66,6 +67,10 @@ struct LtMatmulPlan {
 // weight loading, KV-cache allocation, prefill, and autoregressive decode.
 // It is not copyable or movable; construct exactly one instance per GPU.
 class LlamaEngine {
+  // Speculative decoding drives a draft + target engine pair through their
+  // internal decode/prefill/verify methods.
+  friend class SpeculativeDecoder;
+
  public:
   ~LlamaEngine();
 
@@ -86,7 +91,8 @@ class LlamaEngine {
   std::vector<int> generate_stream(const std::vector<int>& prompt_tokens,
                                    int max_new_tokens,
                                    float temperature,
-                                   const std::function<bool(int)>& on_token);
+                                   const std::function<bool(int)>& on_token,
+                                   const GenerationConstraints* constraints = nullptr);
 
   // Runs a forward pass over prompt_tokens and returns the top_k (token_id,
   // logit_value) pairs from the next-token distribution.  Useful for
@@ -211,12 +217,27 @@ class LlamaEngine {
 
   // Processes the prompt token-by-token (sequential prefill) without using
   // chunked attention.  Used as a fallback when the prompt fits in a single
-  // chunk or when split-attention is disabled.
-  void prefill_prompt_sequential(const std::vector<int>& prompt_tokens);
+  // chunk or when split-attention is disabled. start_pos skips a leading prefix
+  // whose KV is already resident (prefix reuse).
+  void prefill_prompt_sequential(const std::vector<int>& prompt_tokens, int start_pos = 0);
 
   // Processes the prompt using chunked attention to support long sequences
-  // efficiently, then falls back to sequential for the tail.
-  void prefill_prompt(const std::vector<int>& prompt_tokens);
+  // efficiently, then falls back to sequential for the tail. start_pos skips a
+  // shared prefix whose KV is already resident (prefix reuse).
+  void prefill_prompt(const std::vector<int>& prompt_tokens, int start_pos = 0);
+
+  // Runs `rows` tokens (already uploaded to d_token_id_) through the full
+  // transformer in one batched pass at absolute positions
+  // [base_pos, base_pos+rows), writing their K/V into the cache. Shared body of
+  // prefill_prompt (per chunk) and verify_tokens (speculative decoding).
+  void run_batched_chunk(int rows, int base_pos);
+
+  // Speculative-decoding verify: runs the K `tokens` through the full model in
+  // one batched pass at absolute positions [start_pos, start_pos+K), writes
+  // their K/V into the cache, and fills out_argmax[i] with the greedy (argmax)
+  // next token at position start_pos+i. Requires the batched full-attention
+  // path; K must be <= prefill_chunk_size_.
+  void verify_tokens(const std::vector<int>& tokens, int start_pos, std::vector<int>& out_argmax);
 
   // Returns true if the greedy-decode CUDA graph can be used for the current
   // engine state (e.g. all layers cached, temperature == 0 implied by caller).
@@ -308,6 +329,16 @@ class LlamaEngine {
                                     int layer_index);
 
   EngineOptions options_{};         // Runtime configuration supplied by the caller.
+  // Active grammar for the in-flight generate_stream call, or null. Set at entry
+  // and cleared on exit; read by decode_next_token to mask logits.
+  grammar::GrammarSampler* active_grammar_ = nullptr;
+  // When true, decode_next_token masks the EOS logit so it cannot be sampled
+  // (min_new_tokens). Set per-step by the generate_stream decode loop.
+  bool suppress_eos_ = false;
+  // Tokens whose KV is currently resident in the cache (KV[0, size) valid for
+  // exactly these tokens). Lets generate_stream reuse a shared prompt prefix and
+  // prefill only the divergent tail. Cleared by reset_kv_cache (KV wiped).
+  std::vector<int> resident_prefix_;
   model::WeightLoader weights_;     // Memory-mapped weight file handle.
   int attn_q_hidden_ = 0;           // Query projection width (rows in attention.wq).
   int attn_head_dim_ = 0;           // Per-head attention width (attn_q_hidden_ / num_heads).

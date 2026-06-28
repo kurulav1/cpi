@@ -49,7 +49,16 @@ class HfBpeTokenizer {
   // section of tokenizer.json.
   const std::vector<int>& special_ids() const { return special_ids_; }
 
+  // Returns a per-token byte table: token_pieces()[id] is the raw bytes token
+  // `id` emits (byte-level / byte-fallback resolved, word-boundary marker -> a
+  // space, NO sequence-level leading-space strip). Special/added tokens map to
+  // an empty string. Built once at load(); used by grammar-constrained decoding.
+  const std::vector<std::string>& token_pieces() const { return token_pieces_; }
+
  private:
+  // Resolves a single token's vocabulary piece to the raw bytes it emits,
+  // mirroring decode() for one token but without the leading-space strip.
+  std::string piece_to_bytes(const std::string& piece) const;
   // Encodes a single pre-tokenised segment using BPE merge rules.
   // prepend_boundary controls whether the word-boundary marker is prepended.
   std::vector<int> encode_segment(const std::string& text, bool prepend_boundary) const;
@@ -67,6 +76,7 @@ class HfBpeTokenizer {
 
   std::unordered_map<std::string, int> vocab_;          // Piece-to-ID mapping from the vocab section.
   std::vector<std::string> id_to_piece_;                // Reverse ID-to-piece mapping for decode.
+  std::vector<std::string> token_pieces_;               // Per-token emitted bytes for grammar masking (see token_pieces()).
   std::unordered_map<std::string, int> merge_ranks_;    // BPE merge pair -> priority rank (lower = earlier).
   std::vector<std::pair<std::string, int>> added_tokens_; // Special/added tokens with their IDs.
   std::vector<int> special_ids_;                        // IDs of all added/special tokens.

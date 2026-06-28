@@ -1,5 +1,7 @@
 #include "engine/qwen35_cpu_engine.hpp"
 
+#include "grammar/grammar_sampler.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -950,6 +952,11 @@ int Qwen35CpuEngine::sample_token(float temperature,
     }
   }
 
+  // Grammar constraint: mask tokens that cannot continue the schema-valid JSON.
+  if (active_grammar_ != nullptr) {
+    active_grammar_->apply_mask(logits_);
+  }
+
   if (temperature <= 0.0f || top_k == 1) {
     return static_cast<int>(
         std::max_element(logits_.begin(), logits_.end()) - logits_.begin());
@@ -1044,7 +1051,14 @@ std::vector<int> Qwen35CpuEngine::generate_stream(
     const std::vector<int>& prompt_tokens,
     int max_new_tokens,
     float temperature,
-    const std::function<bool(int)>& on_token) {
+    const std::function<bool(int)>& on_token,
+    const GenerationConstraints* constraints) {
+  active_grammar_ = constraints ? constraints->grammar : nullptr;
+  struct GrammarScope {
+    grammar::GrammarSampler** slot;
+    ~GrammarScope() { *slot = nullptr; }
+  } grammar_scope{&active_grammar_};
+
   stats_ = BenchmarkStats{};
   stats_.prompt_tokens = static_cast<int>(prompt_tokens.size());
   for (auto& cache : full_k_cache_) {
@@ -1084,6 +1098,9 @@ std::vector<int> Qwen35CpuEngine::generate_stream(
   for (int step = 0; step < max_new_tokens; ++step) {
     const int next =
         sample_token(temperature, options_.top_k, history, options_.repetition_penalty);
+    if (active_grammar_ != nullptr) {
+      active_grammar_->accept(next);
+    }
     history.push_back(next);
     output.push_back(next);
     ++stats_.generated_tokens;

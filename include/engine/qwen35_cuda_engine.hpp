@@ -11,6 +11,7 @@
 #include <cuda_runtime.h>
 
 #include "engine/engine_types.hpp"
+#include "engine/generation_constraints.hpp"
 #include "model/safetensors_loader.hpp"
 
 namespace engine {
@@ -28,7 +29,8 @@ class Qwen35CudaEngine {
   std::vector<int> generate_stream(const std::vector<int>& prompt_tokens,
                                    int max_new_tokens,
                                    float temperature,
-                                   const std::function<bool(int)>& on_token);
+                                   const std::function<bool(int)>& on_token,
+                                   const GenerationConstraints* constraints = nullptr);
 
   std::vector<std::pair<int, float>> inspect_next_logits(
       const std::vector<int>& prompt_tokens, int top_k);
@@ -124,6 +126,8 @@ class Qwen35CudaEngine {
   EngineOptions options_{};
   BenchmarkStats stats_{};
   ModelConfig cfg_{};
+  // Active grammar for the in-flight generate_stream call (see generation_constraints.hpp).
+  grammar::GrammarSampler* active_grammar_ = nullptr;
 
   cublasHandle_t cublas_ = nullptr;
   cudaStream_t compute_stream_ = nullptr;

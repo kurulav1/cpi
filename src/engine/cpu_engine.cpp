@@ -25,6 +25,7 @@
 
 #include "engine/cpu_engine.hpp"
 #include "common.hpp"
+#include "grammar/grammar_sampler.hpp"
 
 #include <algorithm>
 #include <cassert>
@@ -731,6 +732,11 @@ int CpuLlamaEngine::sample_token(float temperature, int top_k,
     }
   }
 
+  // Grammar constraint: mask tokens that cannot continue the schema-valid JSON.
+  if (active_grammar_ != nullptr) {
+    active_grammar_->apply_mask(logits_);
+  }
+
   // Greedy argmax when temperature is effectively zero.
   if (temperature < 1e-6f) {
     return static_cast<int>(
@@ -1075,7 +1081,14 @@ std::vector<int> CpuLlamaEngine::generate(
 // ============================================================
 std::vector<int> CpuLlamaEngine::generate_stream(
     const std::vector<int>& prompt_tokens, int max_new_tokens,
-    float temperature, const std::function<bool(int)>& on_token) {
+    float temperature, const std::function<bool(int)>& on_token,
+    const GenerationConstraints* constraints) {
+  active_grammar_ = constraints ? constraints->grammar : nullptr;
+  struct GrammarScope {
+    grammar::GrammarSampler** slot;
+    ~GrammarScope() { *slot = nullptr; }
+  } grammar_scope{&active_grammar_};
+
   const int eos_id = 2;  // Llama2 EOS token
   const int max_ctx = options_.max_context;
   const int top_k   = options_.top_k;
@@ -1117,6 +1130,9 @@ std::vector<int> CpuLlamaEngine::generate_stream(
   const auto decode_start = std::chrono::steady_clock::now();
   for (int step = 0; step < max_new_tokens; ++step) {
     const int next = sample_token(temperature, top_k, history, rep_p);
+    if (active_grammar_ != nullptr) {
+      active_grammar_->accept(next);
+    }
 
     history.push_back(next);
     output.push_back(next);

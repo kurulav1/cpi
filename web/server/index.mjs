@@ -16,13 +16,17 @@ import {
   buildOpenAiCompletion,
   buildOpenAiResponseObject,
   buildOpenAiUsage,
+  extractJsonObject,
   normalizeOpenAiStop,
   openAiErrorPayload,
+  openAiSystemFingerprint,
   publicOpenAiModel,
   publicOpenAiModelId,
   sendOpenAiError
 } from "./openai_compat.mjs";
 import { buildPromptPackage } from "./prompting.mjs";
+import { normalizeGeneratedChatText, looksDegenerateRepetition } from "./text_normalize.mjs";
+import { embed as embedTexts, embedStatus } from "./embed_worker.mjs";
 import * as obsMetrics from "./metrics.mjs";
 
 dotenv.config();
@@ -267,89 +271,9 @@ function expandStopTexts(template, stopTexts = []) {
   return [...expanded];
 }
 
-function normalizeGeneratedChatText(text, template) {
-  let cleaned = String(text || "").replace(/\r/g, "");
-
-  if (
-    template === "tinyllama" ||
-    template === "tinyllama-chatml" ||
-    template === "plain"
-  ) {
-    cleaned = cleaned.replace(
-      /^\s*(?:>\s*)?(?:<\|assistant\|>\s*|assistant\|+\>\s*|assistant\|>\s*|assistant\s*:)?\s*/i,
-      ""
-    );
-
-    const roleMarker =
-      /(?:^|\n)\s*(?:>\s*)?(?:<\|user\|>|<\|system\|>|<\|assistant\|>|assistant\|+\>|assistant\|>|user\s*:|assistant\s*:|system\s*:|bot\s*:)/i;
-    const match = cleaned.match(roleMarker);
-    if (match && typeof match.index === "number") {
-      cleaned = cleaned.slice(0, match.index);
-    }
-  }
-
-  if (template === "llama2") {
-    const answerMatches = [...cleaned.matchAll(/(?:^|\n)\s*Answer:\s*/gi)];
-    if (answerMatches.length > 0) {
-      const lastAnswer = answerMatches[answerMatches.length - 1];
-      const answerStart = (lastAnswer.index ?? 0) + lastAnswer[0].length;
-      cleaned = cleaned.slice(answerStart);
-    } else if (/(?:^|\n)\s*Question:\s*/i.test(cleaned)) {
-      cleaned = "";
-    }
-
-    const followupMarker = /(?:^|\n)\s*(?:Question:|User:|System:)/i;
-    const match = cleaned.match(followupMarker);
-    if (match && typeof match.index === "number" && match.index >= 0) {
-      cleaned = cleaned.slice(0, match.index);
-    }
-
-    cleaned = cleaned.replace(
-      /\n\s*(?:Q(?:u(?:e(?:s(?:t(?:i(?:o(?:n?)?)?)?)?)?)?)?|U(?:s(?:e(?:r?)?)?)?|S(?:y(?:s(?:t(?:e(?:m?)?)?)?)?)?)\s*$/i,
-      ""
-    );
-  }
-
-  // Tiny models often drift into a second sentence and then get cut mid-phrase.
-  // If we have at least one complete sentence, drop any trailing incomplete tail.
-  const lastTerminal = Math.max(
-    cleaned.lastIndexOf("."),
-    cleaned.lastIndexOf("!"),
-    cleaned.lastIndexOf("?")
-  );
-  if (lastTerminal >= 0 && lastTerminal + 1 < cleaned.length) {
-    const trailing = cleaned.slice(lastTerminal + 1).trim();
-    if (trailing && !/[.!?]$/.test(trailing)) {
-      cleaned = cleaned.slice(0, lastTerminal + 1);
-    }
-  }
-
-  return cleaned.trim();
-}
-
-// Detects degenerate repetition loops (the failure mode the aggressive
-// cleanup pipeline exists for). Healthy output must NOT match: the cleanup
-// collapses newlines/indentation and re-joins sentences with single spaces,
-// which corrupts code blocks ("self.data" -> "self. data") and formatted text.
-// Mirrors looks_degenerate_repetition() in src/app/main_helpers.cpp.
-function looksDegenerateRepetition(text) {
-  const s = String(text || "");
-  // A word repeated 3+ times in a row ("the the the").
-  if (/\b([A-Za-z][A-Za-z'-]*)\b(?:\s+\1\b){2,}/i.test(s)) return true;
-  // The same letter 6+ times in a row ("aaaaaa").
-  if (/([A-Za-z])\1{5,}/.test(s)) return true;
-  // The same punctuation mark 3+ times in a row ("!!!!").
-  if (/([!?,])\1{2,}/.test(s)) return true;
-  // The same sentence emitted twice (or more) consecutively.
-  const sentences = s.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [];
-  let prev = "";
-  for (const sentence of sentences) {
-    const key = sentence.replace(/\s+/g, " ").trim().toLowerCase();
-    if (key.length >= 16 && key === prev) return true;
-    prev = key;
-  }
-  return false;
-}
+// normalizeGeneratedChatText + looksDegenerateRepetition live in
+// ./text_normalize.mjs so they can be unit-tested without starting the server
+// (see text_normalize.test.mjs). Imported at the top of this file.
 
 function cleanupRepeatedWords(text) {
   let cleaned = String(text || "");
@@ -861,11 +785,23 @@ function buildCliArgs(config, body) {
     throw new Error("Provide at least one user message.");
   }
 
-  const maxNewTokens = autoMaxTokens
+  // An explicit client max_tokens (the OpenAI contract) is authoritative and
+  // caps generation. The autoMaxTokens keyword heuristic only applies when the
+  // client supplied NO budget. Previously auto (default on) ignored max_tokens
+  // and could pick a tiny budget (~96 tokens), silently truncating output
+  // mid-generation with finish_reason:"stop" for any client that relies on
+  // max_tokens. See docs/MORPH_PERF_TODO.md P0.
+  const explicitMaxTokens = body.maxNewTokens ?? body.max_tokens;
+  const hasExplicitMaxTokens =
+    explicitMaxTokens !== undefined && explicitMaxTokens !== null;
+  const maxNewTokens = (autoMaxTokens && !hasExplicitMaxTokens)
     ? computeDynamicMaxNewTokens(body, selectedProfile, maxContext)
-    : Math.round(
-        clampNumber(body.maxNewTokens ?? body.max_tokens, 32, 4096, config.maxNewTokens)
-      );
+    : Math.round(clampNumber(explicitMaxTokens, 32, 4096, config.maxNewTokens));
+  // min_new_tokens: suppress EOS until this many tokens are generated (prevents
+  // early greedy truncation on collapsed/repeated runs). Clamped to [0, max].
+  const minNewTokens = Math.round(
+    clampNumber(body.min_tokens ?? body.minNewTokens ?? body.min_new_tokens ?? 0, 0, maxNewTokens, 0)
+  );
   const temperature = clampNumber(body.temperature, 0, 2, config.temperature);
   const noResourceLimits =
     performanceMode ||
@@ -879,6 +815,9 @@ function buildCliArgs(config, body) {
     messages: promptPackage.messages,
     prompt: promptPackage.prompt,
     addBos: promptPackage.addBos,
+    // Structural schema for grammar-constrained decoding, forwarded to the
+    // engine as `json_schema` on the request line (null when not supplied).
+    jsonSchema: body.jsonSchema ?? null,
     stopTexts: expandStopTexts(
       promptPackage.template,
       [...promptPackage.stopTexts, ...normalizeOpenAiStop(body.stop ?? body.stopTexts)]
@@ -895,6 +834,7 @@ function buildCliArgs(config, body) {
       template: promptPackage.template,
       messageCount: promptPackage.messages.length,
       maxNewTokens,
+      minNewTokens,
       maxContext,
       autoMaxTokens,
       longFormMode,
@@ -1543,13 +1483,17 @@ function runGeneration(
     id: requestId,
     prompt: cliConfig.prompt,
     max_new: cliConfig.meta.maxNewTokens,
+    min_new: cliConfig.meta.minNewTokens ?? 0,
     temp: cliConfig.meta.temperature,
     stop_texts: cliConfig.stopTexts,
     add_bos: cliConfig.addBos,
     // TinyLlama often starts with a short lead-in sentence before the real
     // answer. Cutting on the first sentence boundary turns sane answers into
     // fragments like "Sure, who is Elon Musk?".
-    sentence_stop: false
+    sentence_stop: false,
+    // Grammar-constrained decoding: forward the tool/response schema so the
+    // engine masks sampling to schema-valid JSON. Omitted when absent.
+    ...(cliConfig.jsonSchema ? { json_schema: cliConfig.jsonSchema } : {})
   };
 
   let requestAttempt = 0;
@@ -1829,12 +1773,25 @@ async function guardIdle(
 
 async function guardOpenAiIdle(
   res,
-  { waitForWarmup = false, warmupWaitMs = 180000, pollMs = 25 } = {}
+  { waitForWarmup = false, warmupWaitMs = 180000, waitForIdleMs = 120000, pollMs = 25 } = {}
 ) {
+  const intervalMs = Math.max(10, Number(pollMs) || 25);
+
   if (waitForWarmup && activeRequest?.kind === "warmup") {
     const deadline = Date.now() + Math.max(0, Number(warmupWaitMs) || 0);
-    const intervalMs = Math.max(10, Number(pollMs) || 25);
     while (activeRequest?.kind === "warmup" && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    }
+  }
+
+  // Single-engine queuing: rather than rejecting concurrent generations with
+  // engine_busy, wait (up to waitForIdleMs) for the in-flight one to finish. This
+  // lets clients that fan out parallel requests (e.g. Morph's section agents)
+  // serialize through the engine instead of failing. The engine's own single-
+  // instance lock still guards the rare wake-up race.
+  if (waitForIdleMs > 0 && activeRequest && activeRequest.kind !== "warmup") {
+    const deadline = Date.now() + Math.max(0, Number(waitForIdleMs) || 0);
+    while (activeRequest && activeRequest.kind !== "warmup" && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, intervalMs));
     }
   }
@@ -2244,11 +2201,18 @@ app.post("/api/chat/stream", async (req, res) => {
 // OpenAI-compatible model listing.
 app.get("/v1/models", (_req, res) => {
   const config = getRuntimeConfig();
+  const embeddings = embedStatus(config);
   res.json({
     object: "list",
     data: publicRuntimeSummary(config).availableProfiles
       .filter((profile) => profile.ready)
-      .map(publicOpenAiModel)
+      .map(publicOpenAiModel),
+    // Non-standard readiness hint so clients (Morph RAG/folder-search) can
+    // preflight embeddings instead of discovering a 500 mid-index.
+    embeddings: {
+      available: embeddings.available,
+      model: embeddings.available ? "bge-small-en-v1.5" : null,
+    },
   });
 });
 
@@ -2443,6 +2407,7 @@ app.post("/v1/chat/completions", async (req, res) => {
   }
 
   const modelName = publicOpenAiModelId(cliConfig.profile);
+  const toolMode = internalBody.toolMode ?? null;
 
   if (stream) {
     setStreamingHeaders(res, "text/event-stream; charset=utf-8");
@@ -2459,7 +2424,17 @@ app.post("/v1/chat/completions", async (req, res) => {
     if (prefersHfChatBackend(cliConfig)) {
       try {
         const result = await generatePreferredFamilyResponse(config, cliConfig);
-        if (shouldStreamTextDeltas(cliConfig.policy) && result.text) {
+        if (toolMode) {
+          // Emit the model's JSON as one tool-call delta (no native incremental tool stream).
+          writeSse(res, {
+            id: completionId,
+            object: "chat.completion.chunk",
+            created,
+            model: modelName,
+            system_fingerprint: openAiSystemFingerprint(cliConfig),
+            choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: `call_${completionId.slice(-16)}`, type: "function", function: { name: toolMode.name, arguments: extractJsonObject(result.text) } }] }, finish_reason: null }]
+          });
+        } else if (shouldStreamTextDeltas(cliConfig.policy) && result.text) {
           writeSse(res, {
             id: completionId,
             object: "chat.completion.chunk",
@@ -2486,7 +2461,7 @@ app.post("/v1/chat/completions", async (req, res) => {
           created,
           model: modelName,
           system_fingerprint: openAiSystemFingerprint(cliConfig),
-          choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
+          choices: [{ index: 0, delta: {}, finish_reason: toolMode ? "tool_calls" : "stop" }]
         });
         res.write("data: [DONE]\n\n");
         res.end();
@@ -2497,8 +2472,15 @@ app.post("/v1/chat/completions", async (req, res) => {
       return;
     }
 
+    let toolBuffer = "";
     const { cancel } = runGeneration(config, cliConfig, {
-      onDelta: (delta) =>
+      onDelta: (delta) => {
+        // In tool mode, buffer raw text and emit a single clean tool-call at the end
+        // rather than streaming partial (and likely invalid) JSON fragments.
+        if (toolMode) {
+          toolBuffer += delta;
+          return;
+        }
         writeSse(res, {
           id: completionId,
           object: "chat.completion.chunk",
@@ -2506,8 +2488,19 @@ app.post("/v1/chat/completions", async (req, res) => {
           model: modelName,
           system_fingerprint: openAiSystemFingerprint(cliConfig),
           choices: [{ index: 0, delta: { content: delta }, finish_reason: null }]
-        }),
+        });
+      },
       onDone: (result) => {
+        if (toolMode) {
+          writeSse(res, {
+            id: completionId,
+            object: "chat.completion.chunk",
+            created,
+            model: modelName,
+            system_fingerprint: openAiSystemFingerprint(cliConfig),
+            choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: `call_${completionId.slice(-16)}`, type: "function", function: { name: toolMode.name, arguments: extractJsonObject(result?.text || toolBuffer) } }] }, finish_reason: null }]
+          });
+        }
         if (includeUsage) {
           writeSse(res, {
             id: completionId,
@@ -2525,7 +2518,7 @@ app.post("/v1/chat/completions", async (req, res) => {
           created,
           model: modelName,
           system_fingerprint: openAiSystemFingerprint(cliConfig),
-          choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
+          choices: [{ index: 0, delta: {}, finish_reason: toolMode ? "tool_calls" : "stop" }]
         });
         res.write("data: [DONE]\n\n");
         res.end();
@@ -2543,7 +2536,7 @@ app.post("/v1/chat/completions", async (req, res) => {
   if (prefersHfChatBackend(cliConfig)) {
     try {
       const result = await generatePreferredFamilyResponse(config, cliConfig);
-      res.json(buildOpenAiChatCompletion(completionId, created, modelName, cliConfig, result));
+      res.json(buildOpenAiChatCompletion(completionId, created, modelName, cliConfig, result, { toolMode }));
     } catch (err) {
       if (!res.headersSent) {
         sendOpenAiError(res, 500, err.message || String(err), { type: "server_error" });
@@ -2555,7 +2548,7 @@ app.post("/v1/chat/completions", async (req, res) => {
   const { cancel } = runGeneration(config, cliConfig, {
     onDelta: () => {},
     onDone: (result) =>
-      res.json(buildOpenAiChatCompletion(completionId, created, modelName, cliConfig, result)),
+      res.json(buildOpenAiChatCompletion(completionId, created, modelName, cliConfig, result, { toolMode })),
     onError: (msg) => {
       if (!res.headersSent) {
         sendOpenAiError(res, 500, msg, { type: "server_error" });
@@ -2564,6 +2557,58 @@ app.post("/v1/chat/completions", async (req, res) => {
   });
 
   onDisconnect(req, res, cancel);
+});
+
+// POST /v1/embeddings
+// OpenAI-compatible embeddings via the CUDA BERT-family embedding core
+// (cpi_embed worker). Supports a non-standard `input_type:"query"|"document"`
+// (default "document") so the model's retrieval prefix is applied server-side.
+// Returns L2-normalized float vectors, order-preserving for batch input.
+app.post("/v1/embeddings", async (req, res) => {
+  const config = getRuntimeConfig();
+  const body = requestBody(req);
+  if (body.input === undefined || body.input === null) {
+    sendOpenAiError(res, 400, "'input' is required", { type: "invalid_request_error" });
+    return;
+  }
+  if (body.encoding_format && body.encoding_format !== "float") {
+    sendOpenAiError(res, 400, "only encoding_format 'float' is supported", {
+      type: "invalid_request_error",
+    });
+    return;
+  }
+  const inputs = Array.isArray(body.input) ? body.input : [body.input];
+  if (inputs.length === 0 || !inputs.every((x) => typeof x === "string")) {
+    sendOpenAiError(res, 400, "'input' must be a string or array of strings", {
+      type: "invalid_request_error",
+    });
+    return;
+  }
+  const inputType = body.input_type === "query" ? "query" : "document";
+  const status = embedStatus(config);
+  if (!status.available) {
+    sendOpenAiError(
+      res,
+      503,
+      `embeddings unavailable — cpi_embed not found at ${status.binary}. ` +
+        "Build CPI's CUDA target or set EMBED_BIN; the embed worker must be started.",
+      { type: "server_error", code: "embeddings_unavailable" }
+    );
+    return;
+  }
+  try {
+    const { embeddings, tokens } = await embedTexts(config, inputs, inputType);
+    const data = embeddings.map((embedding, index) => ({ object: "embedding", index, embedding }));
+    const total = (tokens || []).reduce((a, b) => a + (Number(b) || 0), 0);
+    res.json({
+      object: "list",
+      model: body.model || "bge-small-en-v1.5",
+      data,
+      usage: { prompt_tokens: total, total_tokens: total },
+    });
+  } catch (err) {
+    sendOpenAiError(res, 500, err.message || String(err), { type: "server_error" });
+  }
 });
 
 // POST /v1/responses
@@ -3236,6 +3281,15 @@ app.listen(runtimeConfig.port, () => {
   if (!s.ready) {
     console.log(
       "[cpi] Set modelPath and tokenizerPath in web/config.json (or LLAMA_MODEL_PATH / LLAMA_TOKENIZER_PATH)."
+    );
+  }
+  const emb = embedStatus(runtimeConfig);
+  if (emb.available) {
+    console.log(`[cpi] embeddings: enabled (bge-small) bin=${emb.binary}`);
+  } else {
+    console.log(
+      `[cpi] embeddings: DISABLED (cpi_embed not found at ${emb.binary}) — RAG/folder-search will 503. ` +
+        "Build the CUDA target or set EMBED_BIN."
     );
   }
 });

@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "engine/engine_types.hpp"
+#include "engine/generation_constraints.hpp"
 
 namespace model {
 class Tokenizer;
@@ -36,7 +37,8 @@ using GenerateStreamFn = std::function<std::vector<int>(
     const std::vector<int>& prompt_tokens,
     int max_new_tokens,
     float temperature,
-    const std::function<bool(int)>& on_token)>;
+    const std::function<bool(int)>& on_token,
+    const engine::GenerationConstraints* constraints)>;
 using InspectNextLogitsFn = std::function<std::vector<std::pair<int, float>>(
     const std::vector<int>& prompt_tokens,
     int top_k)>;

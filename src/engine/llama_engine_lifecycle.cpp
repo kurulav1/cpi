@@ -423,6 +423,9 @@ void LlamaEngine::allocate_runtime_buffers() {
 }
 
 void LlamaEngine::reset_kv_cache() {
+  // The KV cache is being wiped, so any resident prompt prefix is no longer
+  // valid for reuse (callers like inspect_next_logits / verify also reset here).
+  resident_prefix_.clear();
   const auto& cfg = weights_.config();
   const int head_dim = attn_head_dim_ > 0 ? attn_head_dim_ : (cfg.hidden_size / cfg.num_heads);
   const int kv_hidden = attn_kv_hidden_ > 0 ? attn_kv_hidden_ : (cfg.num_kv_heads * head_dim);

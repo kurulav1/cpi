@@ -20,6 +20,7 @@
 #include <cuda_fp16.h>
 
 #include "common.hpp"
+#include "grammar/grammar_sampler.hpp"
 #include "runtime/cuda_utils.cuh"
 #include "runtime/kernels.cuh"
 
@@ -966,7 +967,8 @@ int Qwen35CudaEngine::sample_next_token(float temperature,
   const bool greedy_fast_path =
       temperature <= 0.0f &&
       options_.repetition_penalty <= 1.0f &&
-      options_.no_repeat_ngram_size <= 1;
+      options_.no_repeat_ngram_size <= 1 &&
+      active_grammar_ == nullptr;  // grammar masking needs host logits; skip the device argmax
   if (greedy_fast_path) {
     kernels::launch_argmax_float(static_cast<const float*>(d_logits_),
                                  cfg_.vocab_size,
@@ -990,6 +992,12 @@ int Qwen35CudaEngine::sample_next_token(float temperature,
       logit = (logit > 0.0f) ? (logit / options_.repetition_penalty)
                              : (logit * options_.repetition_penalty);
     }
+  }
+  // Grammar constraint: mask tokens that cannot continue the schema-valid JSON.
+  // Masked entries become -inf, so both the argmax and the sampling path below
+  // exclude them without any further change.
+  if (active_grammar_ != nullptr) {
+    active_grammar_->apply_mask(logits);
   }
   if (temperature <= 0.0f) {
     return static_cast<int>(std::max_element(logits.begin(), logits.end()) - logits.begin());
@@ -1067,13 +1075,21 @@ std::vector<int> Qwen35CudaEngine::generate_stream(
     const std::vector<int>& prompt_tokens,
     int max_new_tokens,
     float temperature,
-    const std::function<bool(int)>& on_token) {
+    const std::function<bool(int)>& on_token,
+    const GenerationConstraints* constraints) {
   if (max_new_tokens < 0) {
     LLAMA_ENGINE_THROW("max_new_tokens must be >= 0");
   }
   if (static_cast<int>(prompt_tokens.size()) > max_ctx_) {
     LLAMA_ENGINE_THROW("prompt length exceeds max context");
   }
+
+  // Bind the per-request grammar for the duration of this call; cleared on exit.
+  active_grammar_ = constraints ? constraints->grammar : nullptr;
+  struct GrammarScope {
+    grammar::GrammarSampler** slot;
+    ~GrammarScope() { *slot = nullptr; }
+  } grammar_scope{&active_grammar_};
 
   reset_state();
   stats_ = {};
@@ -1107,6 +1123,9 @@ std::vector<int> Qwen35CudaEngine::generate_stream(
   const auto decode_start = std::chrono::steady_clock::now();
   for (int step = 0; step < max_new_tokens; ++step) {
     const int next = sample_next_token(temperature, history);
+    if (active_grammar_ != nullptr) {
+      active_grammar_->accept(next);  // advance grammar state by the chosen token
+    }
     history.push_back(next);
     out.push_back(next);
     if (on_token && !on_token(next)) {

@@ -13,6 +13,11 @@ struct ParsedArgs {
   std::string prompt_text;
   std::string chat_template;
   std::string tokenizer_path;
+  // Speculative decoding: a small draft model (same tokenizer/vocab as the
+  // target) proposes spec_tokens tokens per round that the target verifies in
+  // one batched forward pass. Empty draft_model_path disables it.
+  std::string draft_model_path;
+  int spec_tokens = 5;
   std::string token_csv = "1,2,3";
   int max_new = 16;
   float temp = 0.8f;

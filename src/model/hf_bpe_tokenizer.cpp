@@ -667,6 +667,95 @@ void HfBpeTokenizer::load(const std::string& path) {
       unicode_to_byte_[cp] = static_cast<unsigned char>(b);
     }
   }
+
+  // Build the per-token byte table used by grammar-constrained decoding. Each
+  // entry is the raw bytes a single token emits; special/added tokens are left
+  // empty so the grammar sampler masks them (empty-piece contract).
+  token_pieces_.assign(id_to_piece_.size(), std::string());
+  for (std::size_t id = 0; id < id_to_piece_.size(); ++id) {
+    const std::string& piece = id_to_piece_[id];
+    if (!piece.empty()) {
+      token_pieces_[id] = piece_to_bytes(piece);
+    }
+  }
+  for (const int sid : special_ids_) {
+    if (sid >= 0 && static_cast<std::size_t>(sid) < token_pieces_.size()) {
+      token_pieces_[static_cast<std::size_t>(sid)].clear();
+    }
+  }
+}
+
+// Resolves a single token's vocabulary piece to the raw bytes it emits. This
+// mirrors decode() for one token but deliberately omits the sequence-level
+// leading-space strip: a token like "▁the" / "Ġthe" contributes a leading space
+// when it appears mid-sequence, which is what the grammar matcher must see.
+std::string HfBpeTokenizer::piece_to_bytes(const std::string& piece) const {
+  std::string raw;
+  unsigned char byte = 0;
+  if (is_byte_token(piece, &byte)) {
+    raw.push_back(static_cast<char>(byte));
+  } else {
+    raw = piece;
+  }
+
+  if (byte_level_) {
+    // ByteLevel BPE: each UTF-8 code point in `raw` is a GPT-2-encoded byte;
+    // reverse-map each back to its original byte (matches decode()).
+    std::string out;
+    out.reserve(raw.size());
+    for (std::size_t i = 0; i < raw.size();) {
+      const unsigned char ch = static_cast<unsigned char>(raw[i]);
+      std::size_t clen = 1;
+      if ((ch & 0x80U) == 0U) {
+        clen = 1;
+      } else if ((ch & 0xE0U) == 0xC0U) {
+        clen = 2;
+      } else if ((ch & 0xF0U) == 0xE0U) {
+        clen = 3;
+      } else if ((ch & 0xF8U) == 0xF0U) {
+        clen = 4;
+      }
+      if (i + clen > raw.size()) {
+        clen = 1;
+      }
+      std::uint32_t cp = 0;
+      if (clen == 1) {
+        cp = ch;
+      } else if (clen == 2) {
+        cp = (static_cast<std::uint32_t>(ch & 0x1FU) << 6) |
+             static_cast<std::uint32_t>(static_cast<unsigned char>(raw[i + 1]) & 0x3FU);
+      } else if (clen == 3) {
+        cp = (static_cast<std::uint32_t>(ch & 0x0FU) << 12) |
+             (static_cast<std::uint32_t>(static_cast<unsigned char>(raw[i + 1]) & 0x3FU) << 6) |
+             static_cast<std::uint32_t>(static_cast<unsigned char>(raw[i + 2]) & 0x3FU);
+      } else {
+        cp = (static_cast<std::uint32_t>(ch & 0x07U) << 18) |
+             (static_cast<std::uint32_t>(static_cast<unsigned char>(raw[i + 1]) & 0x3FU) << 12) |
+             (static_cast<std::uint32_t>(static_cast<unsigned char>(raw[i + 2]) & 0x3FU) << 6) |
+             static_cast<std::uint32_t>(static_cast<unsigned char>(raw[i + 3]) & 0x3FU);
+      }
+      i += clen;
+      const auto it = unicode_to_byte_.find(cp);
+      if (it != unicode_to_byte_.end()) {
+        out.push_back(static_cast<char>(it->second));
+      }
+      // Unknown code points (special-token text) are dropped, matching decode().
+    }
+    return out;
+  }
+
+  // SentencePiece-style: replace word-boundary markers with spaces (no strip).
+  std::string text;
+  text.reserve(raw.size());
+  for (std::size_t i = 0; i < raw.size();) {
+    if (!word_boundary_.empty() && raw.compare(i, word_boundary_.size(), word_boundary_) == 0) {
+      text.push_back(' ');
+      i += word_boundary_.size();
+    } else {
+      text.push_back(raw[i++]);
+    }
+  }
+  return text;
 }
 
 // Constructs the composite key used to look up a merge rule in merge_ranks_.

@@ -50,6 +50,12 @@ class Tokenizer {
   // Returns the full set of special token IDs (e.g. BOS, EOS, PAD).
   const std::vector<int>& special_ids() const { return special_ids_; }
 
+  // Returns a per-token byte table for grammar-constrained decoding:
+  // token_pieces()[id] is the raw bytes token `id` emits, with special/added
+  // tokens mapped to an empty string. The HfBpe backend builds this at load();
+  // the SentencePiece backend returns an empty vector (grammar targets use HfBpe).
+  const std::vector<std::string>& token_pieces() const;
+
   // Returns the token IDs that should terminate generation (typically EOS
   // and any other end-of-turn tokens defined by the model).
   std::vector<int> generation_stop_ids() const;

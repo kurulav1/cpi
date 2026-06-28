@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "engine/engine_types.hpp"
+#include "engine/generation_constraints.hpp"
 #include "model/weight_loader.hpp"
 
 namespace engine {
@@ -25,7 +26,8 @@ class CpuLlamaEngine {
   std::vector<int> generate_stream(const std::vector<int>& prompt_tokens,
                                    int max_new_tokens,
                                    float temperature,
-                                   const std::function<bool(int)>& on_token);
+                                   const std::function<bool(int)>& on_token,
+                                   const GenerationConstraints* constraints = nullptr);
 
   std::vector<std::pair<int, float>> inspect_next_logits(
       const std::vector<int>& prompt_tokens, int top_k);
@@ -87,6 +89,8 @@ class CpuLlamaEngine {
   model::LlamaConfig cfg_;
   EngineOptions options_;
   BenchmarkStats last_benchmark_stats_{};
+  // Active grammar for the in-flight generate_stream call (see generation_constraints.hpp).
+  grammar::GrammarSampler* active_grammar_ = nullptr;
 
   std::vector<LayerWeights> layers_;
 

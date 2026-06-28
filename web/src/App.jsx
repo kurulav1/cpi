@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
+import rehypeHighlight from "rehype-highlight";
 import { fetchHealth, streamChat } from "./lib/chatStream";
 
 const TEMPLATES = [
@@ -184,6 +185,45 @@ function defaultQuantForProfile(profile) {
   );
 }
 
+// Recursively flatten React children (incl. rehype-highlight's nested token
+// spans) back to plain text — used for the copy-to-clipboard button.
+function nodeText(node) {
+  if (node == null || node === false) return "";
+  if (typeof node === "string" || typeof node === "number") return String(node);
+  if (Array.isArray(node)) return node.map(nodeText).join("");
+  if (node.props && node.props.children != null) return nodeText(node.props.children);
+  return "";
+}
+
+// Fenced code block: syntax-highlighted body (rehype-highlight has already
+// wrapped `children` in hljs token spans) plus a header with the language label
+// and a copy button.
+function CodeBlock({ language, children }) {
+  const [copied, setCopied] = useState(false);
+  const copy = () => {
+    try {
+      navigator.clipboard.writeText(nodeText(children).replace(/\n$/, ""));
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    } catch {
+      // clipboard blocked (insecure context / permissions) — ignore
+    }
+  };
+  return (
+    <div className="msg-code-wrap">
+      <div className="msg-code-head">
+        <span className="msg-code-lang">{language || "code"}</span>
+        <button type="button" className="msg-code-copy" onClick={copy}>
+          {copied ? "Copied" : "Copy"}
+        </button>
+      </div>
+      <pre className="msg-code">
+        <code className={language ? `hljs language-${language}` : "hljs"}>{children}</code>
+      </pre>
+    </div>
+  );
+}
+
 function MsgContent({ text }) {
   const clean = formatModelMarkdown(text);
 
@@ -191,6 +231,7 @@ function MsgContent({ text }) {
     <div className="msg-rich">
       <ReactMarkdown
         remarkPlugins={[remarkGfm, remarkBreaks]}
+        rehypePlugins={[[rehypeHighlight, { detect: true, ignoreMissing: true }]]}
         components={{
           p: ({ children }) => <p className="msg-paragraph">{children}</p>,
           h1: ({ children }) => <h1 className="msg-heading">{children}</h1>,
@@ -199,14 +240,19 @@ function MsgContent({ text }) {
           ul: ({ children }) => <ul className="msg-list">{children}</ul>,
           ol: ({ children }) => <ol className="msg-list msg-list-ordered">{children}</ol>,
           blockquote: ({ children }) => <blockquote className="msg-blockquote">{children}</blockquote>,
-          code: ({ inline, children }) =>
-            inline
-              ? <code className="msg-inline-code">{children}</code>
-              : (
-                  <pre className="msg-code">
-                    <code>{String(children).replace(/\n$/, "")}</code>
-                  </pre>
-                ),
+          // react-markdown v10 dropped the `inline` prop: distinguish fenced
+          // blocks (rehype-highlight adds an hljs/language- class) from inline code.
+          code: ({ className, children }) => {
+            const isBlock = /\blanguage-|\bhljs\b/.test(className || "");
+            if (!isBlock) {
+              return <code className="msg-inline-code">{children}</code>;
+            }
+            const match = /language-(\w+)/.exec(className || "");
+            return <CodeBlock language={match ? match[1] : ""}>{children}</CodeBlock>;
+          },
+          // Block code's <code> already renders its own <pre> via CodeBlock; unwrap
+          // the default <pre> to avoid double nesting.
+          pre: ({ children }) => <>{children}</>,
           table: ({ children }) => (
             <div className="msg-table-wrap">
               <table className="msg-table">{children}</table>

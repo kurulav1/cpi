@@ -102,6 +102,11 @@ set(LLAMA_ENGINE_SOURCES
   src/model/safetensors_loader.cpp
   src/model/hf_bpe_tokenizer.cpp
   src/model/tokenizer.cpp
+  src/model/wordpiece_tokenizer.cpp
+  src/engine/embedding_config.cpp
+  src/grammar/grammar.cpp
+  src/grammar/json_schema_to_grammar.cpp
+  src/grammar/grammar_sampler.cpp
   src/engine/cpu_engine.cpp
   src/engine/llama4_cpu_engine.cpp
   src/engine/qwen35_cpu_engine.cpp
@@ -131,10 +136,12 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
     src/engine/llama_engine_sampling_utils.cpp
     src/engine/llama_engine_generation.cpp
     src/engine/llama_engine_sampling.cpp
+    src/engine/speculative_decoder.cpp
     src/engine/llama_engine_parity.cpp
     src/engine/llama4_cuda_engine.cu
     src/engine/llama4_cuda_engine_setup.cu
     src/engine/qwen35_cuda_engine.cu
+    src/engine/bert_embedder.cu
   )
 endif()
 
@@ -208,6 +215,44 @@ add_executable(llama_infer
 )
 target_link_libraries(llama_infer PRIVATE llama_engine)
 
+# cpi_embed: embedding worker (CUDA BERT-family encoder). Needs CUDA.
+if(LLAMA_ENGINE_ENABLE_CUDA)
+  add_executable(cpi_embed
+    src/cpi_embed.cpp
+    src/app/main_helpers.cpp
+  )
+  target_link_libraries(cpi_embed PRIVATE llama_engine)
+endif()
+
+# Grammar unit tests. CUDA-free: built from the grammar sources directly so the
+# test runs in CI without a GPU and without linking the full engine.
+add_executable(grammar_test
+  src/tests/grammar_test.cpp
+  src/grammar/grammar.cpp
+  src/grammar/json_schema_to_grammar.cpp
+  src/grammar/grammar_sampler.cpp
+)
+target_include_directories(grammar_test PRIVATE include)
+add_test(NAME grammar_test COMMAND grammar_test)
+
+# Tokenizer byte-table test. CUDA-free: built from the self-contained HfBpe
+# tokenizer backend so it runs in CI without a GPU.
+add_executable(tokenizer_pieces_test
+  src/tests/tokenizer_pieces_test.cpp
+  src/model/hf_bpe_tokenizer.cpp
+)
+target_include_directories(tokenizer_pieces_test PRIVATE include)
+add_test(NAME tokenizer_pieces_test COMMAND tokenizer_pieces_test)
+
+# WordPiece tokenizer test (CUDA-free). Needs the bge model dir at run time.
+add_executable(wordpiece_test
+  src/tests/wordpiece_test.cpp
+  src/model/wordpiece_tokenizer.cpp
+)
+target_include_directories(wordpiece_test PRIVATE include)
+add_test(NAME wordpiece_test
+  COMMAND wordpiece_test "${CMAKE_SOURCE_DIR}/artifacts/hub/BAAI__bge-small-en-v1.5")
+
 if(LLAMA_ENGINE_ENABLE_CUDA)
   add_executable(cuda_bandwidth_bench
     src/tools/cuda_bandwidth_bench.cu
@@ -230,6 +275,16 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
   )
   add_test(NAME moe_kernel_parity_test COMMAND moe_kernel_parity_test)
+
+  add_executable(int4_gemv_bench
+    src/tests/int4_gemv_bench.cu
+  )
+  target_include_directories(int4_gemv_bench PRIVATE include)
+  target_link_libraries(int4_gemv_bench PRIVATE llama_engine)
+  set_target_properties(int4_gemv_bench PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+  )
 endif()
 
 if(LLAMA_ENGINE_ENABLE_CLANG_TIDY AND CLANG_TIDY_EXE)

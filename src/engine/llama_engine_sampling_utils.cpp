@@ -7,6 +7,117 @@
 #include <vector>
 namespace engine {
 namespace {
+
+// Shared per-thread sampling RNG. Seeded to 42 by default for reproducible
+// behaviour; reseeded via detail::dispatch_seed_sampler_rng when a request
+// supplies a seed. Only the temperature>0 paths draw from it.
+std::mt19937& sampler_rng() {
+  thread_local std::mt19937 rng(42);
+  return rng;
+}
+
+// Fast sampling path for the common chat configuration (temperature > 0,
+// 0 < top_k < vocab, no repetition penalty, no n-gram blocking).
+//
+// The full sampler below scales, softmaxes and — for top_p — std::sorts the
+// entire vocabulary (~128k entries) on every decoded token, even though only
+// the top_k (default 40) candidates can ever be chosen. This collapses that to
+// the top_k set first, so the per-token work drops from an O(vocab log vocab)
+// sort to an O(top_k log top_k) one. The resulting distribution is identical to
+// the full path: top_k keeps exactly the entries >= the k-th largest logit
+// (ties included), and the nucleus for top_p is always a subset of that set.
+int sample_from_logits_topk(const std::vector<float>& logits,
+                            float temperature,
+                            int top_k,
+                            float top_p) {
+  struct Candidate {
+    int id;
+    float value;  // logit, then reused as probability
+  };
+
+  // Threshold = the k-th largest logit. nth_element is O(vocab) (no full sort).
+  std::vector<float> partitioned(logits);
+  std::nth_element(partitioned.begin(),
+                  partitioned.begin() + (top_k - 1),
+                  partitioned.end(),
+                  std::greater<float>());
+  const float kth = partitioned[static_cast<std::size_t>(top_k - 1)];
+
+  // Gather the finite candidates at or above the threshold, applying the same
+  // [-80, 80] clamp the full path uses to keep exp() well-behaved.
+  std::vector<Candidate> cand;
+  cand.reserve(static_cast<std::size_t>(top_k) + 8);
+  for (std::size_t i = 0; i < logits.size(); ++i) {
+    float v = logits[i];
+    if (!std::isfinite(v) || v < kth) {
+      continue;
+    }
+    if (v > 80.0f) v = 80.0f;
+    else if (v < -80.0f) v = -80.0f;
+    cand.push_back({static_cast<int>(i), v});
+  }
+  if (cand.empty()) {
+    return 0;
+  }
+
+  const float inv_temp = 1.0f / temperature;
+  float max_logit = -std::numeric_limits<float>::infinity();
+  for (const Candidate& c : cand) {
+    max_logit = std::max(max_logit, c.value * inv_temp);
+  }
+
+  float sum = 0.0f;
+  for (Candidate& c : cand) {
+    c.value = std::exp(c.value * inv_temp - max_logit);
+    sum += c.value;
+  }
+  if (sum <= 0.0f) {
+    return cand.front().id;
+  }
+  for (Candidate& c : cand) {
+    c.value /= sum;
+  }
+
+  // Sort by probability descending; used for both nucleus truncation and a
+  // stable, high-mass-first sampling traversal.
+  std::sort(cand.begin(), cand.end(),
+            [](const Candidate& a, const Candidate& b) { return a.value > b.value; });
+
+  std::size_t keep = cand.size();
+  if (top_p > 0.0f && top_p < 1.0f) {
+    float csum = 0.0f;
+    keep = 0;
+    for (std::size_t i = 0; i < cand.size(); ++i) {
+      csum += cand[i].value;
+      ++keep;
+      if (csum >= top_p) {
+        break;
+      }
+    }
+    float renorm = 0.0f;
+    for (std::size_t i = 0; i < keep; ++i) {
+      renorm += cand[i].value;
+    }
+    if (renorm > 0.0f) {
+      for (std::size_t i = 0; i < keep; ++i) {
+        cand[i].value /= renorm;
+      }
+    }
+  }
+
+  std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+  const float r = dist(sampler_rng());
+
+  float acc = 0.0f;
+  for (std::size_t i = 0; i < keep; ++i) {
+    acc += cand[i].value;
+    if (r <= acc) {
+      return cand[i].id;
+    }
+  }
+  return cand[keep - 1].id;
+}
+
 int sample_from_logits(std::vector<float>& logits,
                        float temperature,
                        int top_k,
@@ -16,6 +127,15 @@ int sample_from_logits(std::vector<float>& logits,
                        const std::vector<int>& history) {
   if (logits.empty()) {
     return 0;
+  }
+
+  // Common chat path: reduce to the top_k candidate set before scaling/sorting.
+  // Equivalent in distribution to the full path below, but avoids the
+  // full-vocabulary softmax + sort on every token. Only valid when the
+  // full-vocabulary features (repetition penalty, n-gram blocking) are off.
+  if (temperature > 0.0f && top_k > 0 && top_k < static_cast<int>(logits.size()) &&
+      repetition_penalty <= 1.0f && no_repeat_ngram_size <= 1) {
+    return sample_from_logits_topk(logits, temperature, top_k, top_p);
   }
 
   /*
@@ -173,9 +293,8 @@ int sample_from_logits(std::vector<float>& logits,
     }
   }
 
-  thread_local std::mt19937 rng(42);
   std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-  const float r = dist(rng);
+  const float r = dist(sampler_rng());
 
   float acc = 0.0f;
   for (std::size_t i = 0; i < probs.size(); ++i) {
@@ -260,6 +379,10 @@ int dispatch_sample_from_logits(std::vector<float>& logits,
 
 bool dispatch_has_degenerate_tail(const std::vector<int>& ids, std::size_t prompt_size) {
   return has_degenerate_tail(ids, prompt_size);
+}
+
+void dispatch_seed_sampler_rng(unsigned seed) {
+  sampler_rng().seed(seed);
 }
 }  // namespace detail
 }  // namespace engine

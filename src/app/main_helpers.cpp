@@ -242,6 +242,71 @@ std::string json_get_string(const std::string& json, const std::string& key) {
   return json_read_string(json, p);
 }
 
+std::string json_get_raw_value(const std::string& json, const std::string& key) {
+  const std::size_t v = json_find_key(json, key);
+  if (v == std::string::npos) {
+    return "";
+  }
+  std::size_t p = v;
+  while (p < json.size() && (json[p] == ' ' || json[p] == '\t')) {
+    ++p;
+  }
+  if (p >= json.size()) {
+    return "";
+  }
+  const std::size_t start = p;
+  const char c = json[p];
+
+  // Object or array: capture the balanced span, skipping over string contents.
+  if (c == '{' || c == '[') {
+    const char close = (c == '{') ? '}' : ']';
+    int depth = 0;
+    bool in_str = false;
+    for (; p < json.size(); ++p) {
+      const char ch = json[p];
+      if (in_str) {
+        if (ch == '\\') {
+          ++p;  // skip the escaped character
+        } else if (ch == '"') {
+          in_str = false;
+        }
+      } else if (ch == '"') {
+        in_str = true;
+      } else if (ch == c) {
+        ++depth;
+      } else if (ch == close) {
+        if (--depth == 0) {
+          ++p;
+          break;
+        }
+      }
+    }
+    return json.substr(start, p - start);
+  }
+
+  // Quoted string: capture including the surrounding quotes.
+  if (c == '"') {
+    std::size_t q = p + 1;
+    while (q < json.size() && json[q] != '"') {
+      if (json[q] == '\\') {
+        ++q;
+      }
+      ++q;
+    }
+    if (q < json.size()) {
+      ++q;  // include closing quote
+    }
+    return json.substr(start, q - start);
+  }
+
+  // Scalar (number/bool/null): capture until a delimiter.
+  std::size_t e = p;
+  while (e < json.size() && json[e] != ',' && json[e] != '}' && json[e] != ']') {
+    ++e;
+  }
+  return json.substr(start, e - start);
+}
+
 int json_get_int(const std::string& json, const std::string& key, int def) {
   const std::size_t v = json_find_key(json, key);
   if (v == std::string::npos) {

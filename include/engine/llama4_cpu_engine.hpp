@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "engine/engine_types.hpp"
+#include "engine/generation_constraints.hpp"
 #include "model/safetensors_loader.hpp"
 
 namespace engine {
@@ -31,7 +32,8 @@ class Llama4CpuEngine {
 
   std::vector<int> generate_stream(const std::vector<int>& prompt_tokens,
                                    int max_new_tokens, float temperature,
-                                   const std::function<bool(int)>& on_token);
+                                   const std::function<bool(int)>& on_token,
+                                   const GenerationConstraints* constraints = nullptr);
 
   std::vector<std::pair<int, float>> inspect_next_logits(
       const std::vector<int>& prompt_tokens, int top_k);
@@ -109,6 +111,8 @@ class Llama4CpuEngine {
 
   BenchmarkStats stats_{};
   EngineOptions options_;
+  // Active grammar for the in-flight generate_stream call (see generation_constraints.hpp).
+  grammar::GrammarSampler* active_grammar_ = nullptr;
 
   // ---- Core operations ----
   void rmsnorm(const float* x, const uint16_t* w, float* out, int n);

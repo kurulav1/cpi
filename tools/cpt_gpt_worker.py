@@ -287,7 +287,14 @@ class CptGptModel:
                 next_states.append(add(x, h))
             states = next_states
 
-        return matvec(self.tensors["lm_head.weight"], states[-1])
+        # Pre-norm models apply a final LayerNorm (ln_f) to the last block's output before the
+        # head. Older exports predate ln_f, so apply it only when the tensors are present.
+        final_state = states[-1]
+        if "transformer.ln_f.weight" in self.tensors and "transformer.ln_f.bias" in self.tensors:
+            ln_f_w = vector_tensor(self.tensors, "transformer.ln_f.weight", self.hidden_size)
+            ln_f_b = vector_tensor(self.tensors, "transformer.ln_f.bias", self.hidden_size)
+            final_state = layer_norm(final_state, ln_f_w, ln_f_b, self.layer_norm_eps)
+        return matvec(self.tensors["lm_head.weight"], final_state)
 
     def generate(self, prompt, max_new=64, temperature=0.0, top_k=0):
         prompt_tokens = self.prompt_tokens(prompt)

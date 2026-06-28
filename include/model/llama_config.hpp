@@ -100,7 +100,14 @@ struct LlamaConfig {
   }
 
   [[nodiscard]] AttentionKind default_attention_kind() const {
-    return sliding_window > 0 ? AttentionKind::SlidingWindow : AttentionKind::Full;
+    // A window that spans (or exceeds) the model's max context never clips, so
+    // it is mathematically identical to full attention. Several models (e.g.
+    // Qwen2.5) advertise a large sliding_window while keeping it disabled
+    // (use_sliding_window=false); treating those as full attention keeps them
+    // on the fast batched-prefill path instead of the sequential fallback.
+    const bool window_clips = sliding_window > 0 &&
+                              (max_seq_len <= 0 || sliding_window < max_seq_len);
+    return window_clips ? AttentionKind::SlidingWindow : AttentionKind::Full;
   }
 
   [[nodiscard]] AttentionKind attention_kind_for_layer(int layer) const {

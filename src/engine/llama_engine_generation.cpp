@@ -11,6 +11,7 @@
 #include <cuda_fp16.h>
 
 #include "common.hpp"
+#include "grammar/grammar_sampler.hpp"
 #include "runtime/cuda_utils.cuh"
 #include "runtime/kernels.cuh"
 
@@ -22,12 +23,12 @@ std::vector<int> LlamaEngine::generate(const std::vector<int>& prompt_tokens,
   return generate_stream(prompt_tokens, max_new_tokens, temperature, {});
 }
 
-void LlamaEngine::prefill_prompt_sequential(const std::vector<int>& prompt_tokens) {
+void LlamaEngine::prefill_prompt_sequential(const std::vector<int>& prompt_tokens, int start_pos) {
   if (prompt_tokens.size() <= 1) {
     return;
   }
   const bool needs_streaming_barrier = cached_layer_count_ < weights_.config().num_layers;
-  for (int i = 0; i < static_cast<int>(prompt_tokens.size()) - 1; ++i) {
+  for (int i = std::max(0, start_pos); i < static_cast<int>(prompt_tokens.size()) - 1; ++i) {
     enforce_host_resource_limits("prefill.sequential");
     forward_token(prompt_tokens[static_cast<std::size_t>(i)], i, false, nullptr, nullptr);
     if (needs_streaming_barrier) {
@@ -36,7 +37,7 @@ void LlamaEngine::prefill_prompt_sequential(const std::vector<int>& prompt_token
   }
 }
 
-void LlamaEngine::prefill_prompt(const std::vector<int>& prompt_tokens) {
+void LlamaEngine::prefill_prompt(const std::vector<int>& prompt_tokens, int start_pos) {
   if (prompt_tokens.size() <= 1) {
     return;
   }
@@ -50,15 +51,45 @@ void LlamaEngine::prefill_prompt(const std::vector<int>& prompt_tokens) {
   if (options_.paged_kv_cache || prefill_chunk_size_ <= 1 ||
       (cached_int8_proj_enabled_ && !all_layers_cached) ||
       kv_int4_enabled_ || tq3_enabled_ || cfg.is_moe() || cfg.uses_non_full_attention()) {
-    prefill_prompt_sequential(prompt_tokens);
+    prefill_prompt_sequential(prompt_tokens, start_pos);
     return;
   }
+  const int prompt_count = static_cast<int>(prompt_tokens.size()) - 1;
+
+  /*
+   * Process prompt tokens in small fp16 chunks so we can reuse larger GEMMs
+   * and batched attention without changing the exact decode path.
+   */
+  for (int chunk_start = std::max(0, start_pos); chunk_start < prompt_count;
+       chunk_start += prefill_chunk_size_) {
+    enforce_host_resource_limits("prefill.chunk_begin");
+    const int rows = std::min(prefill_chunk_size_, prompt_count - chunk_start);
+    CUDA_CHECK(cudaMemcpyAsync(d_token_id_,
+                               prompt_tokens.data() + chunk_start,
+                               static_cast<std::size_t>(rows) * sizeof(int),
+                               cudaMemcpyHostToDevice,
+                               compute_stream_));
+    run_batched_chunk(rows, chunk_start);
+  }
+  if (!all_layers_cached) {
+    CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
+  }
+  enforce_host_resource_limits("prefill.done");
+}
+
+// Runs `rows` tokens (already uploaded to d_token_id_) through the full
+// transformer in a single batched pass at absolute positions
+// [base_pos, base_pos+rows), writing their K/V into the cache. Shared by
+// prefill_prompt (per chunk, base_pos=chunk_start) and verify_tokens
+// (speculative decoding, base_pos=accepted frontier).
+void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
+  const auto& cfg = weights_.config();
+  const bool all_layers_cached = cached_layer_count_ == cfg.num_layers;
   const int hidden = cfg.hidden_size;
   const int inter = cfg.intermediate_size;
   const int q_hidden = attn_q_hidden_ > 0 ? attn_q_hidden_ : hidden;
   const int head_dim = attn_head_dim_ > 0 ? attn_head_dim_ : (hidden / cfg.num_heads);
   const int kv_hidden = attn_kv_hidden_ > 0 ? attn_kv_hidden_ : (cfg.num_kv_heads * head_dim);
-  const int prompt_count = static_cast<int>(prompt_tokens.size()) - 1;
   const bool can_use_dp4a_prefill = ((hidden & 3) == 0) && ((inter & 3) == 0);
   // d_prefill_i8_ holds rows x max(hidden, inter) int8 activations; the wo
   // input is rows x q_hidden, so q_hidden must fit within that buffer.
@@ -73,26 +104,14 @@ void LlamaEngine::prefill_prompt(const std::vector<int>& prompt_tokens) {
   auto* qkv_base = static_cast<const __half*>(d_qkv_);
   auto* ff13_base = static_cast<const __half*>(d_ff13_);
 
-  /*
-   * Process prompt tokens in small fp16 chunks so we can reuse larger GEMMs
-   * and batched attention without changing the exact decode path.
-   */
-  for (int chunk_start = 0; chunk_start < prompt_count; chunk_start += prefill_chunk_size_) {
-    enforce_host_resource_limits("prefill.chunk_begin");
-    const int rows = std::min(prefill_chunk_size_, prompt_count - chunk_start);
-    CUDA_CHECK(cudaMemcpyAsync(d_token_id_,
-                               prompt_tokens.data() + chunk_start,
-                               static_cast<std::size_t>(rows) * sizeof(int),
-                               cudaMemcpyHostToDevice,
-                               compute_stream_));
-    kernels::launch_embedding_lookup(static_cast<const __half*>(d_tok_embeddings_),
-                                     d_token_id_,
-                                     static_cast<__half*>(d_x_),
-                                     rows,
-                                     hidden,
-                                     compute_stream_);
+  kernels::launch_embedding_lookup(static_cast<const __half*>(d_tok_embeddings_),
+                                   d_token_id_,
+                                   static_cast<__half*>(d_x_),
+                                   rows,
+                                   hidden,
+                                   compute_stream_);
 
-    const auto run_layer = [&](int layer, const LayerDeviceWeights* lw, const LayerDeviceInt8Weights* lw_i8) {
+  const auto run_layer = [&](int layer, const LayerDeviceWeights* lw, const LayerDeviceInt8Weights* lw_i8) {
       // In --weight-quant mode the resident cache only keeps low-bit
       // projection weights (fp16 wqkv/wo are freed after quantisation), so the
       // projections go through the batched low-bit kernels, mirroring the MLP.
@@ -203,14 +222,14 @@ void LlamaEngine::prefill_prompt(const std::vector<int>& prompt_tokens) {
                                            cfg.num_heads,
                                            cfg.num_kv_heads,
                                            head_dim,
-                                           chunk_start,
+                                           base_pos,
                                            d_rope_cos_,
                                            d_rope_sin_,
                                            compute_stream_);
 
       auto* k_layer = static_cast<__half*>(d_k_cache_) + static_cast<std::size_t>(layer) * layer_stride;
       auto* v_layer = static_cast<__half*>(d_v_cache_) + static_cast<std::size_t>(layer) * layer_stride;
-      CUDA_CHECK(cudaMemcpy2DAsync(k_layer + static_cast<std::size_t>(chunk_start) * kv_hidden,
+      CUDA_CHECK(cudaMemcpy2DAsync(k_layer + static_cast<std::size_t>(base_pos) * kv_hidden,
                                    kv_row_bytes,
                                    d_prefill_k_,
                                    kv_row_bytes,
@@ -218,7 +237,7 @@ void LlamaEngine::prefill_prompt(const std::vector<int>& prompt_tokens) {
                                    rows,
                                    cudaMemcpyDeviceToDevice,
                                    compute_stream_));
-      CUDA_CHECK(cudaMemcpy2DAsync(v_layer + static_cast<std::size_t>(chunk_start) * kv_hidden,
+      CUDA_CHECK(cudaMemcpy2DAsync(v_layer + static_cast<std::size_t>(base_pos) * kv_hidden,
                                    kv_row_bytes,
                                    d_prefill_v_,
                                    kv_row_bytes,
@@ -232,7 +251,7 @@ void LlamaEngine::prefill_prompt(const std::vector<int>& prompt_tokens) {
                                         v_layer,
                                         static_cast<__half*>(d_att_),
                                         rows,
-                                        chunk_start,
+                                        base_pos,
                                         cfg.num_heads,
                                         cfg.num_kv_heads,
                                         head_dim,
@@ -561,27 +580,70 @@ void LlamaEngine::prefill_prompt(const std::vector<int>& prompt_tokens) {
     }
   }
 
-  if (!all_layers_cached) {
-    CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
-  }
-  enforce_host_resource_limits("prefill.done");
-}
-
 std::vector<int> LlamaEngine::generate_stream(const std::vector<int>& prompt_tokens,
                                               int max_new_tokens,
                                               float temperature,
-                                              const std::function<bool(int)>& on_token) {
+                                              const std::function<bool(int)>& on_token,
+                                              const GenerationConstraints* constraints) {
   if (prompt_tokens.empty()) {
     LLAMA_ENGINE_THROW("prompt token list is empty");
   }
 
-  reset_kv_cache();
+  // Bind the per-request grammar for the duration of this call; cleared on exit.
+  active_grammar_ = constraints ? constraints->grammar : nullptr;
+  const int min_new_tokens = constraints ? std::max(0, constraints->min_new_tokens) : 0;
+  if (min_new_tokens > 0) {
+    std::cerr << "[engine] min_new_tokens=" << min_new_tokens << " (EOS suppressed until then)\n";
+  }
+  suppress_eos_ = false;
+  struct DecodeScope {
+    grammar::GrammarSampler** grammar_slot;
+    bool* suppress_slot;
+    ~DecodeScope() {
+      *grammar_slot = nullptr;
+      *suppress_slot = false;
+    }
+  } decode_scope{&active_grammar_, &suppress_eos_};
+
+  // Reproducible sampling when a seed is supplied (affects temperature>0 only).
+  if (constraints != nullptr && constraints->seed >= 0) {
+    detail::dispatch_seed_sampler_rng(static_cast<unsigned>(constraints->seed));
+  }
+
+  const auto& cfg = weights_.config();
+
+  // Prefix KV reuse: if the head of this prompt matches the tokens whose KV is
+  // already resident, skip re-prefilling that shared prefix. Morph resends the
+  // same ~2.3k-token system prompt every request, varying only the trailing user
+  // message. KV for an identical prefix at identical positions is bit-exact
+  // (causal attention + position-based RoPE), so the output is unchanged. Only
+  // the simple contiguous fp16 KV layout is eligible; paged / int4-KV / TQ3 /
+  // MoE / sliding-window configs take a full reset + prefill.
+  const bool prefix_cacheable =
+      !options_.paged_kv_cache && !kv_int4_enabled_ && !tq3_enabled_ &&
+      !cfg.is_moe() && !cfg.uses_non_full_attention();
+  int reuse = 0;
+  if (prefix_cacheable && !resident_prefix_.empty()) {
+    // Cap at prompt size - 1 so at least one token remains to seed decode.
+    const int cap = std::min(static_cast<int>(resident_prefix_.size()),
+                             static_cast<int>(prompt_tokens.size()) - 1);
+    while (reuse < cap && prompt_tokens[static_cast<std::size_t>(reuse)] ==
+                              resident_prefix_[static_cast<std::size_t>(reuse)]) {
+      ++reuse;
+    }
+  }
+  if (reuse == 0) {
+    reset_kv_cache();  // wipes KV and clears resident_prefix_
+  }
+  // Invalidate the tracked prefix until this generation re-establishes it after
+  // the decode loop; the reuse count above already captured the prior value.
+  resident_prefix_.clear();
+
   enforce_host_resource_limits("generate.begin");
   std::vector<int> out = prompt_tokens;
   out.reserve(prompt_tokens.size() + max_new_tokens);
   last_benchmark_stats_ = {};
   last_benchmark_stats_.prompt_tokens = static_cast<int>(prompt_tokens.size());
-  const auto& cfg = weights_.config();
   if (!cfg.is_moe()) {
     last_benchmark_stats_.moe_quant_mode = "none";
   }
@@ -595,8 +657,11 @@ std::vector<int> LlamaEngine::generate_stream(const std::vector<int>& prompt_tok
   benchmark_transfer_active_ = false;
   greedy_decode_graph_state_valid_ = false;
 
+  if (options_.verbose && reuse > 0) {
+    std::cout << "[engine] prefix_reuse tokens=" << reuse << "/" << prompt_tokens.size() << "\n";
+  }
   const auto prefill_start = std::chrono::steady_clock::now();
-  prefill_prompt(prompt_tokens);
+  prefill_prompt(prompt_tokens, reuse);
   CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
   const auto prefill_end = std::chrono::steady_clock::now();
   last_benchmark_stats_.prefill_ms =
@@ -610,6 +675,9 @@ std::vector<int> LlamaEngine::generate_stream(const std::vector<int>& prompt_tok
   const auto decode_start = std::chrono::steady_clock::now();
   for (int i = 0; i < max_new_tokens; ++i) {
     enforce_host_resource_limits("decode.step");
+    // Suppress EOS until at least min_new_tokens have been generated, so greedy
+    // decoding can't terminate early on a collapsed/repeated-token distribution.
+    suppress_eos_ = (i < min_new_tokens);
     if (options_.verbose && i < 3) {
       std::cout << "[engine] decode_step i=" << i << " pos=" << pos << "\n";
     }
@@ -624,6 +692,9 @@ std::vector<int> LlamaEngine::generate_stream(const std::vector<int>& prompt_tok
             << " limit_ms=" << options_.tq_first_token_timeout_ms;
         LLAMA_ENGINE_THROW(oss.str());
       }
+    }
+    if (active_grammar_ != nullptr) {
+      active_grammar_->accept(next);  // advance grammar state by the chosen token
     }
     out.push_back(next);
     if (on_token && !on_token(next)) {
@@ -654,6 +725,17 @@ std::vector<int> LlamaEngine::generate_stream(const std::vector<int>& prompt_tok
       std::chrono::duration<double, std::milli>(decode_end - decode_start).count();
   last_benchmark_stats_.generated_tokens =
       static_cast<int>((out.size() > prompt_tokens.size()) ? (out.size() - prompt_tokens.size()) : 0);
+
+  // Record the resident prefix for the next request's reuse. KV[0, prompt_len)
+  // is valid only once at least one decode step has run (it writes the last
+  // prompt position's KV); if none ran, only prefill's [0, prompt_len-1) is valid.
+  if (prefix_cacheable) {
+    const std::size_t valid = (out.size() > prompt_tokens.size())
+                                  ? prompt_tokens.size()
+                                  : (prompt_tokens.empty() ? 0 : prompt_tokens.size() - 1);
+    resident_prefix_.assign(prompt_tokens.begin(),
+                            prompt_tokens.begin() + static_cast<std::ptrdiff_t>(valid));
+  }
 
   return out;
 }
@@ -690,6 +772,74 @@ std::vector<std::pair<int, float>> LlamaEngine::inspect_next_logits(const std::v
     out.push_back({id, logits[static_cast<std::size_t>(id)]});
   }
   return out;
+}
+
+void LlamaEngine::verify_tokens(const std::vector<int>& tokens, int start_pos, std::vector<int>& out_argmax) {
+  const auto& cfg = weights_.config();
+  const int K = static_cast<int>(tokens.size());
+  out_argmax.assign(static_cast<std::size_t>(K), 0);
+  if (K == 0) {
+    return;
+  }
+
+  // Verify needs the same batched full-attention path as prefill; the scratch
+  // buffers are sized for prefill_chunk_size_ rows.
+  const bool all_layers_cached = cached_layer_count_ == cfg.num_layers;
+  if (options_.paged_kv_cache || prefill_chunk_size_ <= 1 ||
+      (cached_int8_proj_enabled_ && !all_layers_cached) ||
+      kv_int4_enabled_ || tq3_enabled_ || cfg.is_moe() || cfg.uses_non_full_attention()) {
+    LLAMA_ENGINE_THROW("verify_tokens requires the batched full-attention path");
+  }
+  if (K > prefill_chunk_size_) {
+    LLAMA_ENGINE_THROW("verify_tokens: K exceeds prefill_chunk_size_");
+  }
+
+  const int hidden = cfg.hidden_size;
+
+  // Run the K tokens through all layers in one batched pass at absolute
+  // positions [start_pos, start_pos+K); this writes their K/V into the cache.
+  CUDA_CHECK(cudaMemcpyAsync(d_token_id_,
+                             tokens.data(),
+                             static_cast<std::size_t>(K) * sizeof(int),
+                             cudaMemcpyHostToDevice,
+                             compute_stream_));
+  run_batched_chunk(K, start_pos);
+  if (!all_layers_cached) {
+    CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
+  }
+
+  // Final RMSNorm over all K rows, then per-position LM head + argmax. d_logits_
+  // and d_argmax_ are reused each iteration; stream ordering guarantees the
+  // i-th argmax is copied to the host before the (i+1)-th overwrites it.
+  launch_norm(d_x_, d_norm_out_, d_norm_out_bias_, d_x_norm_, K, hidden);
+
+  const auto* x_norm = static_cast<const __half*>(d_x_norm_);
+  for (int i = 0; i < K; ++i) {
+    resident_projection_float(d_lm_head_,
+                              x_norm + static_cast<std::size_t>(i) * static_cast<std::size_t>(hidden),
+                              d_logits_,
+                              cfg.vocab_size,
+                              hidden,
+                              resident_lm_head_warps_,
+                              resident_lm_head_tile_pairs_,
+                              resident_lm_head_rows_per_warp_);
+    if (d_lm_head_bias_) {
+      kernels::launch_add_bias_inplace_float_from_half(static_cast<float*>(d_logits_),
+                                                       static_cast<const __half*>(d_lm_head_bias_),
+                                                       cfg.vocab_size,
+                                                       compute_stream_);
+    }
+    kernels::launch_argmax_float(static_cast<const float*>(d_logits_),
+                                 cfg.vocab_size,
+                                 d_argmax_,
+                                 compute_stream_);
+    CUDA_CHECK(cudaMemcpyAsync(out_argmax.data() + i,
+                               d_argmax_,
+                               sizeof(int),
+                               cudaMemcpyDeviceToHost,
+                               compute_stream_));
+  }
+  CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
 }
 
 

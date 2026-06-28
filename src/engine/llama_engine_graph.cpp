@@ -12,7 +12,21 @@
 namespace engine {
 
 bool LlamaEngine::can_use_greedy_decode_graph() const {
-  return false;
+  // Greedy decode CUDA graph. Verified byte-identical to the non-graph path for
+  // fp16, int8 AND int4 once the RMSNorm eps was sourced from the model config
+  // (it had been hardcoded to 1e-5, which corrupted models like Qwen2.5 that use
+  // 1e-6 — the corruption compounded badly through int8/int4 quantization).
+  // Requires: all layers resident, full attention, standard attention dims, and
+  // no biases / LayerNorm / paged-KV / int4-KV / MoE / TQ3 (TQ3 untested in the
+  // graph and unused here).
+  const auto& cfg = weights_.config();
+  return cached_layer_count_ == cfg.num_layers && !options_.paged_kv_cache &&
+         !options_.profile_decode_phases && !kv_int4_enabled_ && !tq3_enabled_ &&
+         !cfg.is_moe() && !cfg.use_layernorm &&
+         (attn_q_hidden_ <= 0 || attn_q_hidden_ == cfg.hidden_size) &&
+         !has_any_layer_norm_bias_ && !has_any_layer_output_bias_ &&
+         !weights_.has_tensor("norm.bias") && !weights_.has_tensor("output.bias") &&
+         !cfg.uses_non_full_attention();
 }
 
 void LlamaEngine::destroy_greedy_decode_graph() {
@@ -52,6 +66,7 @@ void LlamaEngine::init_greedy_decode_graph() {
   }
 
   const auto& cfg = weights_.config();
+  const float norm_eps = cfg.norm_eps > 0.0f ? cfg.norm_eps : 1e-5f;
   const int hidden = cfg.hidden_size;
   const int inter = cfg.intermediate_size;
   const int head_dim = cfg.hidden_size / cfg.num_heads;
@@ -194,7 +209,7 @@ void LlamaEngine::init_greedy_decode_graph() {
                             static_cast<__half*>(d_x_norm_),
                             1,
                             hidden,
-                            1e-5f,
+                            norm_eps,
                             compute_stream_);
 
     if (tq && tq->wqkv) {
@@ -370,7 +385,7 @@ void LlamaEngine::init_greedy_decode_graph() {
                             static_cast<__half*>(d_x_norm_),
                             1,
                             hidden,
-                            1e-5f,
+                            norm_eps,
                             compute_stream_);
 
     if (tq && tq->w13) {
@@ -456,7 +471,7 @@ void LlamaEngine::init_greedy_decode_graph() {
                           static_cast<__half*>(d_x_norm_),
                           1,
                           hidden,
-                          1e-5f,
+                          norm_eps,
                           compute_stream_);
   // Always use custom kernel in graph capture: cuBLASLt may fall through to
   // cublasGemmEx which is not graph-capturable, causing INVALID_VALUE errors.
@@ -490,6 +505,7 @@ void LlamaEngine::init_logits_decode_graph() {
   }
 
   const auto& cfg = weights_.config();
+  const float norm_eps = cfg.norm_eps > 0.0f ? cfg.norm_eps : 1e-5f;
   const int hidden = cfg.hidden_size;
   const int inter = cfg.intermediate_size;
   const int head_dim = cfg.hidden_size / cfg.num_heads;
@@ -622,7 +638,7 @@ void LlamaEngine::init_logits_decode_graph() {
                         static_cast<std::size_t>(kv_hidden);
 
     kernels::launch_rmsnorm(static_cast<const __half*>(d_x_), static_cast<const __half*>(lw->norm_att),
-                            static_cast<__half*>(d_x_norm_), 1, hidden, 1e-5f, compute_stream_);
+                            static_cast<__half*>(d_x_norm_), 1, hidden, norm_eps, compute_stream_);
 
     if (tq && tq->wqkv) {
       CUDA_CHECK(cudaMemcpyAsync(d_x_tq3_, d_x_norm_, static_cast<std::size_t>(hidden) * sizeof(__half),
@@ -723,7 +739,7 @@ void LlamaEngine::init_logits_decode_graph() {
                                 hidden, compute_stream_);
 
     kernels::launch_rmsnorm(static_cast<const __half*>(d_x_), static_cast<const __half*>(lw->norm_ffn),
-                            static_cast<__half*>(d_x_norm_), 1, hidden, 1e-5f, compute_stream_);
+                            static_cast<__half*>(d_x_norm_), 1, hidden, norm_eps, compute_stream_);
 
     if (tq && tq->w13) {
       CUDA_CHECK(cudaMemcpyAsync(d_x_tq3_, d_x_norm_, static_cast<std::size_t>(hidden) * sizeof(__half),
@@ -796,7 +812,7 @@ void LlamaEngine::init_logits_decode_graph() {
   }
 
   kernels::launch_rmsnorm(static_cast<const __half*>(d_x_), static_cast<const __half*>(d_norm_out_),
-                          static_cast<__half*>(d_x_norm_), 1, hidden, 1e-5f, compute_stream_);
+                          static_cast<__half*>(d_x_norm_), 1, hidden, norm_eps, compute_stream_);
   // Always use custom kernel in graph capture — same reason as greedy graph.
   resident_projection_float(d_lm_head_, d_x_norm_, d_logits_, cfg.vocab_size, hidden,
                              resident_lm_head_warps_, resident_lm_head_tile_pairs_,

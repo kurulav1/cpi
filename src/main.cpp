@@ -23,6 +23,7 @@
 #include "engine/llama4_cuda_engine.hpp"
 #include "engine/llama_engine.hpp"
 #include "engine/qwen35_cuda_engine.hpp"
+#include "engine/speculative_decoder.hpp"
 #endif
 #include "model/tokenizer.hpp"
 
@@ -260,8 +261,9 @@ int main(int argc, char** argv) {
           [&](const std::vector<int>& p,
               int max_new,
               float temperature,
-              const std::function<bool(int)>& on_token) {
-            return eng.generate_stream(p, max_new, temperature, on_token);
+              const std::function<bool(int)>& on_token,
+              const engine::GenerationConstraints* constraints) {
+            return eng.generate_stream(p, max_new, temperature, on_token, constraints);
           },
           [&](const std::vector<int>& p, int top_k) {
             return eng.inspect_next_logits(p, top_k);
@@ -295,8 +297,71 @@ int main(int argc, char** argv) {
       run_with_engine(cpu_eng);
     } else {
 #if LLAMA_ENGINE_HAS_CUDA
-      engine::LlamaEngine gpu_eng;
-      run_with_engine(gpu_eng);
+      if (!cli.draft_model_path.empty()) {
+        // Speculative decoding: target (this model) + a small draft model that
+        // shares the tokenizer. Initialize the target first so the draft's VRAM
+        // budgeting sees the remaining free memory.
+        engine::LlamaEngine target_eng;
+        target_eng.initialize(cli.opts);
+
+        engine::EngineOptions draft_opts = cli.opts;
+        draft_opts.model_path = cli.draft_model_path;
+        // Quantize the (fp16) draft to int8 at load so it fits fully in the VRAM
+        // left after the int4 target — a partially-cached, layer-streamed draft
+        // is far too slow to be a useful speculator. int8 is near-lossless for a
+        // small model, so acceptance is essentially unchanged.
+        draft_opts.int8_streaming = true;
+        draft_opts.streaming_quant_bits = 8;
+        draft_opts.prefer_lowbit_cache = true;
+        draft_opts.gpu_cache_all = true;
+        engine::LlamaEngine draft_eng;
+        draft_eng.initialize(draft_opts);
+
+        engine::SpeculativeDecoder spec(draft_eng, target_eng, cli.spec_tokens);
+        const int eos = cli.opts.eos_token_id;
+        app::main_modes::execute_engine_modes(
+            run_opts,
+            prompt_tokens,
+            stop_token_ids,
+            cli.stop_texts,
+            use_tokenizer ? &tokenizer : nullptr,
+            [&](const std::vector<int>& p, int max_new, float /*temperature*/) {
+              return spec.generate(p, max_new, eos, nullptr);
+            },
+            [&](const std::vector<int>& p,
+                int max_new,
+                float temperature,
+                const std::function<bool(int)>& on_token,
+                const engine::GenerationConstraints* constraints) {
+              // Grammar-constrained decoding can't run on the speculative verify
+              // path (it argmaxes K drafts on-device, which a logit mask can't
+              // reach). Fall back to non-speculative single-token decode on the
+              // target engine, which honours the grammar. Unconstrained requests
+              // still use the fast speculative path.
+              if (constraints != nullptr && constraints->grammar != nullptr) {
+                return target_eng.generate_stream(p, max_new, temperature, on_token, constraints);
+              }
+              return spec.generate(p, max_new, eos, on_token);
+            },
+            [&](const std::vector<int>& p, int top_k) {
+              return target_eng.inspect_next_logits(p, top_k);
+            },
+            [&]() -> const engine::BenchmarkStats& {
+              return target_eng.last_benchmark_stats();
+            });
+
+        if (!quiet_output) {
+          const auto& s = spec.stats();
+          std::cerr << "[spec] rounds=" << s.rounds << " drafted=" << s.drafted
+                    << " accepted=" << s.accepted << " emitted=" << s.emitted
+                    << " accept_rate=" << s.accept_rate()
+                    << " tokens_per_round=" << s.tokens_per_round()
+                    << " spec_tokens=" << cli.spec_tokens << "\n";
+        }
+      } else {
+        engine::LlamaEngine gpu_eng;
+        run_with_engine(gpu_eng);
+      }
 #else
       throw std::runtime_error("CUDA inference was requested, but this binary was built without CUDA support");
 #endif

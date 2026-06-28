@@ -7,12 +7,17 @@
 #include <exception>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
 
 #include "app/main_helpers.hpp"
+#include "engine/generation_constraints.hpp"
+#include "grammar/grammar.hpp"
+#include "grammar/grammar_sampler.hpp"
+#include "grammar/json_schema_to_grammar.hpp"
 #include "model/tokenizer.hpp"
 
 namespace app::main_modes {
@@ -24,6 +29,7 @@ using app::main_helpers::json_escape;
 using app::main_helpers::json_get_bool;
 using app::main_helpers::json_get_float;
 using app::main_helpers::json_get_int;
+using app::main_helpers::json_get_raw_value;
 using app::main_helpers::json_get_string;
 using app::main_helpers::json_get_string_array;
 using app::main_helpers::normalize_final_response_text;
@@ -148,6 +154,41 @@ void execute_engine_modes(const RunExecutionOptions& options,
         }
 
         const std::vector<int> req_prompt_tokens = tokenizer->encode(req_prompt, req_add_bos);
+
+        // Grammar-constrained decoding: if the request carries a structural
+        // `json_schema` (the tool's `parameters`), compile it to a grammar and
+        // constrain sampling to schema-valid JSON. Absent or unparseable schema
+        // falls back to unconstrained generation (the Node layer's prose
+        // instruction still applies). See docs/MORPH_GRAMMAR_DESIGN.md.
+        const std::string req_schema = json_get_raw_value(request_json, "json_schema");
+        const int req_seed = json_get_int(request_json, "seed", -1);
+        // min_new_tokens: suppress EOS until this many tokens are generated so
+        // greedy (temp 0) decoding can't terminate early on a collapsed/repeated
+        // token run. See docs/MORPH_PERF_TODO.md.
+        const int req_min_new = std::max(0, json_get_int(request_json, "min_new", 0));
+        std::unique_ptr<grammar::GrammarSampler> req_sampler;
+        engine::GenerationConstraints req_constraints;
+        req_constraints.seed = req_seed;
+        req_constraints.min_new_tokens = req_min_new;
+        if (!req_schema.empty()) {
+          try {
+            grammar::Grammar g =
+                grammar::Grammar::parse(grammar::json_schema_to_grammar(req_schema));
+            req_sampler = std::make_unique<grammar::GrammarSampler>(
+                std::move(g), tokenizer->token_pieces(), tokenizer->eos_id());
+            req_constraints.grammar = req_sampler.get();
+            std::cerr << "[grammar] active for request id=" << req_id << "\n";
+          } catch (const std::exception& e) {
+            std::cerr << "[grammar] schema compile failed (" << e.what()
+                      << "); falling back to unconstrained generation\n";
+            req_sampler.reset();
+            req_constraints.grammar = nullptr;
+          }
+        }
+        // Constraints carry grammar/seed/min_new_tokens; always passed (a
+        // default-constructed struct is a no-op for the engine).
+        const engine::GenerationConstraints* req_constraints_ptr = &req_constraints;
+
         std::vector<int> generated_ids;
         std::mutex stream_mu;
         std::condition_variable stream_cv;
@@ -193,11 +234,16 @@ void execute_engine_modes(const RunExecutionOptions& options,
           }
         });
 
+        int emitted_count = 0;
         (void)generate_stream(req_prompt_tokens, req_max_new, req_temp, [&](int tok) {
-          if (std::find(req_stop_ids.begin(), req_stop_ids.end(), tok) != req_stop_ids.end()) {
+          // Until min_new tokens are produced, don't honour stop conditions
+          // either (the engine also masks EOS); keeps greedy from truncating early.
+          const bool may_stop = emitted_count >= req_min_new;
+          if (may_stop &&
+              std::find(req_stop_ids.begin(), req_stop_ids.end(), tok) != req_stop_ids.end()) {
             return false;
           }
-          if (sentence_stop_hit.load()) {
+          if (may_stop && sentence_stop_hit.load()) {
             return false;
           }
           int token_index = 0;
@@ -206,6 +252,7 @@ void execute_engine_modes(const RunExecutionOptions& options,
             generated_ids.push_back(tok);
             token_index = static_cast<int>(generated_ids.size());
           }
+          ++emitted_count;
           stream_cv.notify_one();
           const auto& stats = last_benchmark_stats();
           const double token_router_ms = std::max(0.0, stats.decode_moe_router_ms - prev_moe_router_ms);
@@ -224,11 +271,11 @@ void execute_engine_modes(const RunExecutionOptions& options,
           append_moe_selected_json(metrics_extra, stats);
           metrics_extra << "}";
           write_event("metrics", req_id, metrics_extra.str());
-          if (sentence_stop_hit.load()) {
+          if (may_stop && sentence_stop_hit.load()) {
             return false;
           }
           return true;
-        });
+        }, req_constraints_ptr);
         stream_done.store(true);
         stream_cv.notify_one();
         if (stream_thread.joinable()) {
@@ -355,7 +402,7 @@ void execute_engine_modes(const RunExecutionOptions& options,
     return generate_stream(prompt_tokens, options.max_new, options.temp, [&](int tok) {
       return std::find(stop_token_ids.begin(), stop_token_ids.end(), tok) ==
              stop_token_ids.end();
-    });
+    }, nullptr);
   };
 
   if (repeated_benchmark) {
@@ -493,7 +540,7 @@ void execute_engine_modes(const RunExecutionOptions& options,
           { std::lock_guard<std::mutex> lk(queue_mutex); token_queue.push_back(tok); }
           queue_cv.notify_one();
           return true;
-        });
+        }, nullptr);
       } catch (...) {
         generation_error = std::current_exception();
       }

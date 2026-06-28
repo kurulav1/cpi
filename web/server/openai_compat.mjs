@@ -133,23 +133,75 @@ function responseFormatInstruction(responseFormat) {
   throw new Error(`Unsupported response_format type '${responseFormat.type}'.`);
 }
 
+// ── Tool / function calling (prompt-driven) ───────────────────────────────────
+// This engine has no native tool-calling, so we emulate the OpenAI protocol:
+// when a tool is forced we inject its JSON schema as an instruction, let the model
+// generate, then present the model's JSON output as a `tool_calls` response. The
+// quality of that JSON is entirely the model's job — pair with constrained decoding
+// and a capable model for reliable results.
+
+export function resolveForcedTool(body) {
+  const tools = Array.isArray(body?.tools)
+    ? body.tools.filter((t) => t?.type === "function" && t?.function?.name)
+    : [];
+  if (tools.length === 0) return null;
+
+  const choice = body.tool_choice;
+  if (choice === "none") return null;
+
+  let chosen = null;
+  if (choice && typeof choice === "object" && choice.type === "function" && choice.function?.name) {
+    chosen = tools.find((t) => t.function.name === choice.function.name) ?? null;
+  }
+  // tools present with "auto"/absent choice → force the first tool (single-tool clients).
+  if (!chosen) chosen = tools[0];
+  if (!chosen) return null;
+
+  return { name: chosen.function.name, parameters: chosen.function.parameters ?? {} };
+}
+
+function toolInstruction(tool) {
+  const schemaText = tool.parameters ? JSON.stringify(tool.parameters) : "";
+  const schemaPart = schemaText
+    ? ` that matches this JSON schema: ${schemaText}`
+    : "";
+  return `You must call the function "${tool.name}". Respond with ONLY a single JSON object (no prose, no markdown code fences)${schemaPart}.`;
+}
+
+// Best-effort extraction of one JSON object from model text: strips ``` fences and
+// returns the first balanced {...}. Returns the raw text as a last resort so the
+// client still receives something to parse.
+export function extractJsonObject(text) {
+  if (text == null) return "";
+  let t = String(text).trim();
+  const fence = t.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fence) t = fence[1].trim();
+  const start = t.indexOf("{");
+  if (start === -1) return t;
+  let depth = 0;
+  for (let i = start; i < t.length; i++) {
+    const ch = t[i];
+    if (ch === "{") depth++;
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0) return t.slice(start, i + 1);
+    }
+  }
+  return t.slice(start);
+}
+
 function validateOpenAiRequestShape(body, mode = "chat") {
   const n = Number(body?.n);
   if (Number.isFinite(n) && n > 1) {
     throw new Error("Only n=1 is supported.");
   }
 
-  if (body?.tools && Array.isArray(body.tools) && body.tools.length > 0) {
-    throw new Error("Tool calling is not supported yet.");
-  }
+  // Legacy `functions` / `function_call` are not supported; use `tools` instead.
   if (body?.functions && Array.isArray(body.functions) && body.functions.length > 0) {
-    throw new Error("Function calling is not supported yet.");
-  }
-  if (body?.tool_choice && body.tool_choice !== "none" && body.tool_choice !== "auto") {
-    throw new Error("tool_choice is not supported yet.");
+    throw new Error("Legacy `functions` is not supported; use `tools` instead.");
   }
   if (body?.function_call && body.function_call !== "none" && body.function_call !== "auto") {
-    throw new Error("function_call is not supported yet.");
+    throw new Error("Legacy `function_call` is not supported; use `tool_choice` instead.");
   }
   if (body?.audio || (Array.isArray(body?.modalities) && body.modalities.some((value) => String(value).toLowerCase() === "audio"))) {
     throw new Error("Audio output is not supported.");
@@ -162,10 +214,24 @@ function validateOpenAiRequestShape(body, mode = "chat") {
 export function buildInternalBodyFromChatRequest(body) {
   validateOpenAiRequestShape(body, "chat");
   const messages = normalizeOpenAiMessages(body.messages);
-  const extraInstruction = responseFormatInstruction(body.response_format);
+  // A forced tool takes precedence over response_format for the JSON instruction.
+  const forcedTool = resolveForcedTool(body);
+  const extraInstruction = forcedTool
+    ? toolInstruction(forcedTool)
+    : responseFormatInstruction(body.response_format);
   const internalMessages = extraInstruction
     ? [{ role: "developer", content: extraInstruction }, ...messages]
     : messages;
+
+  // Structural JSON schema for grammar-constrained decoding (the engine masks
+  // sampling to schema-valid JSON). The prose `extraInstruction` above is kept
+  // as a fallback for backends without grammar support. Prefer a forced tool's
+  // parameters; otherwise a response_format json_schema if present.
+  const jsonSchema = forcedTool
+    ? (forcedTool.parameters ?? null)
+    : (body.response_format?.type === "json_schema"
+        ? (body.response_format.json_schema?.schema ?? null)
+        : null);
 
   return {
     profileId: body.model,
@@ -173,13 +239,21 @@ export function buildInternalBodyFromChatRequest(body) {
     systemPrompt: "",
     temperature: body.temperature,
     max_tokens: body.max_tokens,
+    // Minimum tokens before EOS is allowed (suppresses early greedy truncation);
+    // forwarded to the engine as `min_new`. Accepts either spelling.
+    min_tokens: body.min_tokens ?? body.min_new_tokens,
     stop: body.stop,
     maxContext: body.max_context ?? body.maxContext,
     autoMaxTokens: body.autoMaxTokens,
     longFormMode: body.longFormMode,
     performanceMode: body.performanceMode,
     quantMode: body.quantMode,
-    forceCpu: body.forceCpu
+    forceCpu: body.forceCpu,
+    // Non-OpenAI field consumed by the handler to wrap the response as a tool call.
+    toolMode: forcedTool ? { name: forcedTool.name } : null,
+    // Non-OpenAI field forwarded to the engine as `json_schema` for grammar-
+    // constrained decoding; null when no structural schema was supplied.
+    jsonSchema
   };
 }
 
@@ -201,6 +275,9 @@ export function buildInternalBodyFromCompletionRequest(body) {
     systemPrompt: "",
     temperature: body.temperature,
     max_tokens: body.max_tokens,
+    // Minimum tokens before EOS is allowed (suppresses early greedy truncation);
+    // forwarded to the engine as `min_new`. Accepts either spelling.
+    min_tokens: body.min_tokens ?? body.min_new_tokens,
     stop: body.stop,
     maxContext: body.max_context ?? body.maxContext,
     autoMaxTokens: body.autoMaxTokens,
@@ -335,12 +412,27 @@ function buildOpenAiResponsesUsage(result, cliConfig) {
   };
 }
 
-function openAiSystemFingerprint(cliConfig) {
+export function openAiSystemFingerprint(cliConfig) {
   const raw = String(cliConfig?.workerKey || cliConfig?.profile?.modelPath || "cpi");
   return `fp_${Buffer.from(raw).toString("base64url").slice(0, 12)}`;
 }
 
-export function buildOpenAiChatCompletion(completionId, created, modelName, cliConfig, result) {
+export function buildOpenAiChatCompletion(completionId, created, modelName, cliConfig, result, options = {}) {
+  const toolMode = options.toolMode;
+  const message = toolMode
+    ? {
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            id: `call_${completionId.slice(-16)}`,
+            type: "function",
+            function: { name: toolMode.name, arguments: extractJsonObject(result.text) }
+          }
+        ]
+      }
+    : { role: "assistant", content: result.text };
+
   return {
     id: completionId,
     object: "chat.completion",
@@ -350,8 +442,8 @@ export function buildOpenAiChatCompletion(completionId, created, modelName, cliC
     choices: [
       {
         index: 0,
-        message: { role: "assistant", content: result.text },
-        finish_reason: "stop"
+        message,
+        finish_reason: toolMode ? "tool_calls" : "stop"
       }
     ],
     usage: buildOpenAiUsage(result, cliConfig)

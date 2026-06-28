@@ -343,6 +343,10 @@ ParsedArgs parse_args(int argc, char** argv) {
       args.web_mode = true;
     } else if (arg == "--simple") {
       args.simple_mode = true;
+    } else if (arg == "--draft-model") {
+      args.draft_model_path = need_val("--draft-model");
+    } else if (arg == "--spec-tokens") {
+      args.spec_tokens = std::stoi(need_val("--spec-tokens"));
     } else if (arg == "--cpu") {
       args.force_cpu = true;
     } else {

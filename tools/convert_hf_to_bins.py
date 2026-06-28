@@ -204,7 +204,13 @@ def extract_model_config(hf_cfg: dict, family: str) -> dict:
     rope_theta = float(text_cfg.get("rope_theta", hf_cfg.get("rope_theta", DEFAULT_ROPE_THETA.get(family, 10000.0))))
 
     # Sliding-window attention (set when provided by checkpoint config).
+    # Honor use_sliding_window: models like Qwen2.5 advertise a large window but
+    # keep it disabled, in which case attention is full and storing a window
+    # would push the engine onto the slow non-full (sequential prefill) path.
     sliding_window = int(text_cfg.get("sliding_window", hf_cfg.get("sliding_window", 0)) or 0)
+    use_sliding_window = text_cfg.get("use_sliding_window", hf_cfg.get("use_sliding_window", None))
+    if use_sliding_window is False:
+        sliding_window = 0
 
     # Sparse-MoE metadata.
     num_local_experts = int(text_cfg.get("num_local_experts", hf_cfg.get("num_local_experts", 0)) or 0)

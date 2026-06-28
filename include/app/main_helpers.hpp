@@ -30,6 +30,10 @@ std::vector<int> parse_tokens(const std::string& csv);
 std::string join_ints(const std::vector<int>& values, std::size_t limit = 0);
 
 std::string json_get_string(const std::string& json, const std::string& key);
+// Returns the raw JSON text of a key's value (object, array, string, or scalar),
+// brace/bracket-balanced and string-aware. Use for nested values like
+// `json_schema` that json_get_string (scalars only) cannot extract. Empty if absent.
+std::string json_get_raw_value(const std::string& json, const std::string& key);
 int json_get_int(const std::string& json, const std::string& key, int def);
 float json_get_float(const std::string& json, const std::string& key, float def);
 bool json_get_bool(const std::string& json, const std::string& key, bool def);

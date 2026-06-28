@@ -63,6 +63,10 @@ int dispatch_sample_from_logits(std::vector<float>& logits,
 
 bool dispatch_has_degenerate_tail(const std::vector<int>& ids, std::size_t prompt_size);
 
+// Reseeds the shared sampling RNG (used by the temperature>0 paths) for
+// reproducible sampling. No effect on greedy (temperature<=0) decoding.
+void dispatch_seed_sampler_rng(unsigned seed);
+
 }  // namespace detail
 
 }  // namespace engine

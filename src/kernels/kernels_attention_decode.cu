@@ -1036,6 +1036,11 @@ __global__ void gqa_decode_kernel_device_pos(const half* __restrict__ q,
 
 }  // namespace
 
+// Sequence length at/below which the GQA-fused decode kernel (num_kv_heads
+// blocks, serial over the sequence) is used. Above it, decode attention routes
+// to the split-K path (parallel over KV chunks) — see launch_attention_step.
+constexpr int kGqaFusedMaxSeq = 256;
+
 void launch_attention_step(const half* q,
                            const half* k_cache,
                            const half* v_cache,
@@ -1068,10 +1073,15 @@ void launch_attention_step(const half* q,
     return;
   }
   // GQA fused: one block per KV head, group_size warps share K/V loads.
-  // Gives group_size× KV-bandwidth reduction vs. per-Q-head kernels.
-  // Dispatched before split-K so GQA models always take this path.
+  // Gives group_size× KV-bandwidth reduction vs. per-Q-head kernels — but it
+  // launches only num_kv_heads blocks and scans the sequence serially per block,
+  // so it is bandwidth-optimal at SHORT context yet badly under-parallelized at
+  // long context (e.g. 4 blocks on a 170-SM GPU at 2k+ tokens dominated decode).
+  // Above this length, fall through to the split-K path (parallel over KV
+  // chunks, ~num_heads×ceil(seq/32) blocks).
   if (num_kv_heads > 0 && num_heads > num_kv_heads &&
-      (num_heads % num_kv_heads) == 0 && head_dim == 128) {
+      (num_heads % num_kv_heads) == 0 && head_dim == 128 &&
+      seq_len <= kGqaFusedMaxSeq) {
     const int group_size_val = num_heads / num_kv_heads;
     if (group_size_val <= 32) {
       const int threads_gqa = group_size_val * 32;
@@ -1181,8 +1191,17 @@ void launch_attention_step_device_pos(const half* q,
         head_dim);
     return;
   }
-  // GQA fused dispatch (device-position variant for CUDA graph capture).
-  if (num_kv_heads > 0 && num_heads > num_kv_heads &&
+  // GQA fused dispatch (device-position variant for CUDA graph capture). The
+  // graphed decode path can't gate on runtime seq_len (position is device-side),
+  // so when the split-K path is available it takes priority for GQA models:
+  // split-K parallelizes over KV chunks (fixed num_heads×scratch_chunks grid
+  // with a per-chunk seq guard, so it stays graph-safe as the sequence grows)
+  // and avoids the GQA-fused kernel's num_kv_heads-block serial scan that
+  // dominated long-context decode. GQA-fused stays as the fallback when split is
+  // disabled (--no-split-attention).
+  const bool split_available =
+      allow_split && scratch_m && scratch_l && scratch_o && scratch_chunks > 0 && head_dim == 128;
+  if (!split_available && num_kv_heads > 0 && num_heads > num_kv_heads &&
       (num_heads % num_kv_heads) == 0 && head_dim == 128) {
     const int group_size_val = num_heads / num_kv_heads;
     if (group_size_val <= 32) {

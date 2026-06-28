@@ -371,18 +371,56 @@ body {
   background: rgba(255,255,255,0.06);
   border: 1px solid var(--border);
 }
-.msg-code {
-  margin: 0;
-  padding: 0.85rem 1rem;
-  overflow-x: auto;
+/* Fenced code block: wrapper holds the border/radius; header carries the
+   language label + copy button; the <pre> is the scrollable body. */
+.msg-code-wrap {
   border-radius: 0.9rem;
   border: 1px solid var(--border);
   background: #111216;
   box-shadow: var(--shadow-soft);
+  overflow: hidden;
+  margin: 0.2rem 0;
 }
-:root[data-theme="light"] .msg-code {
-  background: #f7fbff;
+.msg-code-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.3rem 0.7rem 0.3rem 0.85rem;
+  background: rgba(255,255,255,0.04);
+  border-bottom: 1px solid var(--border);
 }
+.msg-code-lang {
+  font-family: var(--mono);
+  font-size: 0.66rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+.msg-code-copy {
+  font: inherit;
+  font-size: 0.68rem;
+  color: var(--text-2);
+  background: transparent;
+  border: 1px solid var(--border-2);
+  border-radius: 0.4rem;
+  padding: 0.12rem 0.5rem;
+  cursor: pointer;
+  transition: color 0.12s, border-color 0.12s, background 0.12s;
+}
+.msg-code-copy:hover {
+  color: var(--text);
+  border-color: rgba(75,163,255,0.4);
+  background: rgba(255,255,255,0.05);
+}
+.msg-code {
+  margin: 0;
+  padding: 0.85rem 1rem;
+  overflow-x: auto;
+  background: #111216;
+}
+:root[data-theme="light"] .msg-code-wrap { background: #f7fbff; }
+:root[data-theme="light"] .msg-code { background: #f7fbff; }
+:root[data-theme="light"] .msg-code-head { background: rgba(64,93,230,0.05); }
 :root[data-theme="light"] .topbar-select option { background: #ffffff; }
 :root[data-theme="light"] .topbar-btn-on { background: rgba(64, 93, 230, 0.08); border-color: rgba(64, 93, 230, 0.18); }
 :root[data-theme="light"] .starter:hover { background: rgba(64, 93, 230, 0.06); }
@@ -395,6 +433,27 @@ body {
   font-size: 0.78rem;
   color: var(--text);
 }
+
+/* highlight.js token theme (compact; covers the common rehype-highlight classes).
+   Dark by default, with a light-theme override below. */
+.hljs-comment, .hljs-quote { color: #6b7280; font-style: italic; }
+.hljs-keyword, .hljs-selector-tag, .hljs-literal, .hljs-section, .hljs-doctag, .hljs-name { color: #c792ea; }
+.hljs-string, .hljs-attr, .hljs-meta-string, .hljs-regexp, .hljs-addition { color: #c3e88d; }
+.hljs-number, .hljs-symbol, .hljs-bullet, .hljs-link { color: #f78c6c; }
+.hljs-title, .hljs-title.function_, .hljs-built_in, .hljs-type, .hljs-class .hljs-title { color: #82aaff; }
+.hljs-attribute, .hljs-variable, .hljs-template-variable, .hljs-tag { color: #ffcb6b; }
+.hljs-operator, .hljs-punctuation { color: #89ddff; }
+.hljs-meta { color: #7986cb; }
+.hljs-deletion { color: #ff5370; }
+.hljs-emphasis { font-style: italic; }
+.hljs-strong { font-weight: 600; }
+:root[data-theme="light"] .hljs-comment, :root[data-theme="light"] .hljs-quote { color: #8a919e; }
+:root[data-theme="light"] .hljs-keyword, :root[data-theme="light"] .hljs-selector-tag, :root[data-theme="light"] .hljs-literal, :root[data-theme="light"] .hljs-section, :root[data-theme="light"] .hljs-doctag, :root[data-theme="light"] .hljs-name { color: #9a35c7; }
+:root[data-theme="light"] .hljs-string, :root[data-theme="light"] .hljs-attr, :root[data-theme="light"] .hljs-regexp, :root[data-theme="light"] .hljs-addition { color: #2e8b3d; }
+:root[data-theme="light"] .hljs-number, :root[data-theme="light"] .hljs-symbol, :root[data-theme="light"] .hljs-bullet, :root[data-theme="light"] .hljs-link { color: #c2541b; }
+:root[data-theme="light"] .hljs-title, :root[data-theme="light"] .hljs-title.function_, :root[data-theme="light"] .hljs-built_in, :root[data-theme="light"] .hljs-type { color: #2150c5; }
+:root[data-theme="light"] .hljs-attribute, :root[data-theme="light"] .hljs-variable, :root[data-theme="light"] .hljs-template-variable, :root[data-theme="light"] .hljs-tag { color: #b3892a; }
+:root[data-theme="light"] .hljs-operator, :root[data-theme="light"] .hljs-punctuation { color: #0e7490; }
 .msg-blockquote {
   margin: 0;
   padding: 0.75rem 0.95rem;
