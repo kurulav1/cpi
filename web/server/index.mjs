@@ -23,12 +23,33 @@ import {
   sendOpenAiError
 } from "./openai_compat.mjs";
 import { buildPromptPackage } from "./prompting.mjs";
+import * as obsMetrics from "./metrics.mjs";
 
 dotenv.config();
 
 const app = express();
 app.disable("x-powered-by");
 app.use(express.json({ limit: "4mb" }));
+
+// Prometheus metrics for observability (VictoriaMetrics scrape) and autoscaling
+// (KEDA). Instrument only the API surface (/api, /v1) to keep label cardinality
+// bounded; static assets and the scrape endpoint itself are skipped.
+obsMetrics.setReadyProbe(() => (getRuntimeConfig().ready ? 1 : 0));
+app.use((req, res, next) => {
+  if (req.path === "/metrics") return next();
+  if (!(req.path.startsWith("/api") || req.path.startsWith("/v1"))) return next();
+  const start = process.hrtime.bigint();
+  obsMetrics.reqStart();
+  res.on("finish", () => {
+    const seconds = Number(process.hrtime.bigint() - start) / 1e9;
+    obsMetrics.reqEnd(req.path, res.statusCode, seconds);
+  });
+  next();
+});
+app.get("/metrics", (_req, res) => {
+  res.set("Content-Type", "text/plain; version=0.0.4");
+  res.send(obsMetrics.render());
+});
 
 // Only one generation runs at a time (single GPU). The worker process is kept
 // warm across requests and restarted only when the selected profile changes.
@@ -1282,6 +1303,7 @@ function parseWorkerStdout(worker) {
           if (metrics) {
             worker.lastMetrics = metrics;
           }
+          obsMetrics.recordGeneration(generatedTokens, decodeMs);
           worker.ready = true;
           worker.pending = null;
           pending.resolve({

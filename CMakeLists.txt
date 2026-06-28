@@ -62,7 +62,9 @@ if(MSVC)
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/WX>)
   endif()
 else()
-  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wpedantic>)
+  # Quote the genexp so its internal ';' list stays inside it; unquoted, CMake would
+  # split at parse time and leave a stray "-Wpedantic>" token on gcc/clang.
+  add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Wpedantic>")
   if(LLAMA_ENGINE_WARNINGS_AS_ERRORS)
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Werror>)
   endif()

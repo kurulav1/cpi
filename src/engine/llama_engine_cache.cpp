@@ -323,7 +323,8 @@ void LlamaEngine::init_layer_cache() {
     }
   } else if (options_.gpu_cache_limit_mb > 0) {
     cache_mode = "budget";
-    effective_budget_b = std::min(cacheable_b, options_.gpu_cache_limit_mb * 1024ULL * 1024ULL);
+    effective_budget_b = std::min<std::size_t>(
+        cacheable_b, static_cast<std::size_t>(options_.gpu_cache_limit_mb) * 1024ULL * 1024ULL);
     if (prefer_packed_cache) {
       if (full_int8_bytes > 0 && full_int8_bytes <= effective_budget_b) {
         requested_layers = cfg.num_layers;

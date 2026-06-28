@@ -1,0 +1,152 @@
+# Grafana with the VictoriaMetrics datasource and a CPI dashboard, both provisioned
+# from ConfigMaps (no manual clicking). Anonymous admin is enabled for the local
+# demo — do NOT do that on a real cluster.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-datasource
+  namespace: observability
+data:
+  datasource.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: VictoriaMetrics
+        type: prometheus
+        uid: victoriametrics
+        access: proxy
+        url: http://vmsingle.observability.svc:8428
+        isDefault: true
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-provider
+  namespace: observability
+data:
+  provider.yaml: |
+    apiVersion: 1
+    providers:
+      - name: cpi
+        orgId: 1
+        folder: ''
+        type: file
+        disableDeletion: false
+        editable: true
+        options:
+          path: /var/lib/grafana/dashboards
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-cpi
+  namespace: observability
+data:
+  cpi.json: |
+    {
+      "uid": "cpi-serving",
+      "title": "CPI Serving",
+      "schemaVersion": 39,
+      "version": 1,
+      "refresh": "5s",
+      "time": { "from": "now-15m", "to": "now" },
+      "panels": [
+        {
+          "id": 1, "type": "stat", "title": "Model ready (pods)",
+          "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "targets": [ { "refId": "A", "expr": "sum(cpi_model_ready)", "datasource": { "type": "prometheus", "uid": "victoriametrics" } } ]
+        },
+        {
+          "id": 2, "type": "stat", "title": "Replicas (scraped)",
+          "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "targets": [ { "refId": "A", "expr": "count(up{job=\"cpi\"} == 1)", "datasource": { "type": "prometheus", "uid": "victoriametrics" } } ]
+        },
+        {
+          "id": 3, "type": "stat", "title": "In-flight requests",
+          "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "targets": [ { "refId": "A", "expr": "sum(cpi_inflight_requests)", "datasource": { "type": "prometheus", "uid": "victoriametrics" } } ]
+        },
+        {
+          "id": 4, "type": "stat", "title": "Tokens/s (fleet)",
+          "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "targets": [ { "refId": "A", "expr": "sum(rate(cpi_generated_tokens_total[1m]))", "datasource": { "type": "prometheus", "uid": "victoriametrics" } } ]
+        },
+        {
+          "id": 5, "type": "timeseries", "title": "Request rate by status (req/s)",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "targets": [ { "refId": "A", "expr": "sum by (status) (rate(cpi_http_requests_total[1m]))", "legendFormat": "{{status}}", "datasource": { "type": "prometheus", "uid": "victoriametrics" } } ]
+        },
+        {
+          "id": 6, "type": "timeseries", "title": "409 backpressure rate (autoscale signal)",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "targets": [ { "refId": "A", "expr": "sum(rate(cpi_http_requests_total{status=\"409\"}[30s]))", "legendFormat": "409/s", "datasource": { "type": "prometheus", "uid": "victoriametrics" } } ]
+        },
+        {
+          "id": 7, "type": "timeseries", "title": "Avg request latency (s)",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "targets": [ { "refId": "A", "expr": "sum(rate(cpi_http_request_duration_seconds_sum[1m])) / sum(rate(cpi_http_request_duration_seconds_count[1m]))", "legendFormat": "avg", "datasource": { "type": "prometheus", "uid": "victoriametrics" } } ]
+        },
+        {
+          "id": 8, "type": "timeseries", "title": "Replicas (scraped CPI pods)",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "targets": [ { "refId": "A", "expr": "count(up{job=\"cpi\"} == 1)", "legendFormat": "replicas", "datasource": { "type": "prometheus", "uid": "victoriametrics" } } ]
+        }
+      ]
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: observability
+  labels: { app: grafana }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: grafana }
+  template:
+    metadata:
+      labels: { app: grafana }
+    spec:
+      containers:
+        - name: grafana
+          image: grafana/grafana:11.4.0
+          env:
+            - { name: GF_AUTH_ANONYMOUS_ENABLED, value: "true" }
+            - { name: GF_AUTH_ANONYMOUS_ORG_ROLE, value: "Admin" }
+            - { name: GF_AUTH_BASIC_ENABLED, value: "false" }
+            - { name: GF_SECURITY_ALLOW_EMBEDDING, value: "true" }
+          ports:
+            - { name: http, containerPort: 3000 }
+          volumeMounts:
+            - { name: ds, mountPath: /etc/grafana/provisioning/datasources }
+            - { name: dashprovider, mountPath: /etc/grafana/provisioning/dashboards }
+            - { name: dashboards, mountPath: /var/lib/grafana/dashboards }
+          readinessProbe:
+            httpGet: { path: /api/health, port: 3000 }
+            initialDelaySeconds: 10
+      volumes:
+        - { name: ds, configMap: { name: grafana-datasource } }
+        - { name: dashprovider, configMap: { name: grafana-dashboard-provider } }
+        - name: dashboards
+          configMap:
+            name: grafana-dashboard-cpi
+            items: [ { key: cpi.json, path: cpi.json } ]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: observability
+spec:
+  selector: { app: grafana }
+  ports:
+    - { name: http, port: 3000, targetPort: 3000 }
+  type: NodePort

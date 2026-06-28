@@ -1,0 +1,104 @@
+# GPU variant of the CPI inference pod for kind on WSL2/Docker Desktop.
+# No NVIDIA device plugin (unreliable on Docker Desktop). Instead the pod bind-mounts
+# the WSL GPU device + driver libs that the GPU-enabled node already has, runs ldconfig
+# so the dynamic loader finds libcuda.so.1, then starts the CPI server. Requires the
+# cluster's node to be the gpu node image (NVIDIA_VISIBLE_DEVICES=all).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cpi-kind
+  labels:
+    app: cpi-kind
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cpi-kind
+  template:
+    metadata:
+      labels:
+        app: cpi-kind
+    spec:
+      volumes:
+        - name: models
+          hostPath:
+            path: /tmp/cpt-models
+            type: DirectoryOrCreate
+        - name: wsl-libs
+          hostPath:
+            path: /usr/lib/wsl
+            type: Directory
+        - name: dxg
+          hostPath:
+            path: /dev/dxg
+            type: CharDevice
+      containers:
+        - name: web
+          image: cpi-llama:test
+          imagePullPolicy: Never
+          securityContext:
+            privileged: true           # access /dev/dxg
+          # Register the WSL driver libs with ldconfig, then start the server.
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              echo /usr/lib/wsl/lib > /etc/ld.so.conf.d/wsl.conf
+              for d in /usr/lib/wsl/drivers/*/; do echo "$d" >> /etc/ld.so.conf.d/wsl.conf; done
+              ldconfig
+              ldconfig -p | grep -i libcuda || echo "WARN: libcuda not in ldconfig"
+              cd /app/web && exec npm run start
+          ports:
+            - containerPort: 3001
+          env:
+            - name: PORT
+              value: "3001"
+            - name: LLAMA_INFER_BIN
+              value: /app/bin/llama_infer
+            - name: LLAMA_MODEL_DIRS
+              value: /models
+            - name: LLAMA_MODEL_PATH
+              value: /models/model.ll2c
+            - name: LLAMA_TOKENIZER_PATH
+              value: /models/tokenizer.json
+            - name: LLAMA_CHAT_TEMPLATE
+              value: tinyllama
+            - name: LLAMA_MAX_CPU_PERCENT
+              value: "100"
+            - name: LLAMA_MAX_MEMORY_PERCENT
+              value: "100"
+          volumeMounts:
+            - name: models
+              mountPath: /models
+              readOnly: true
+            - name: wsl-libs
+              mountPath: /usr/lib/wsl
+              readOnly: true
+            - name: dxg
+              mountPath: /dev/dxg
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: 3001
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 3001
+            initialDelaySeconds: 15
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cpi-kind
+  labels:
+    app: cpi-kind
+spec:
+  selector:
+    app: cpi-kind
+  ports:
+    - name: http
+      port: 80
+      targetPort: 3001
+  type: NodePort

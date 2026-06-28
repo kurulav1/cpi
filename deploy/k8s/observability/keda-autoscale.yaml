@@ -1,0 +1,66 @@
+# KEDA ScaledObject: autoscale the CPI Deployment on a VictoriaMetrics query.
+#
+# Signal = aggregate request RATE (cpi_http_requests_total). CPI is single-stream:
+# it serves one generation at a time and returns 409 engine_busy on concurrent
+# requests (no continuous batching). So the load signal that matters is *demand
+# rate* — when requests arrive faster than one replica can drain them, add
+# replicas and let the Service spread them. (The most precise signal would be the
+# 409 backpressure rate, rate(cpi_http_requests_total{status="409"}); request
+# rate is the simpler proxy used here.)
+#
+# These CPI pods don't request a finite nvidia.com/gpu resource (they share
+# /dev/dxg), so KEDA can actually scale 1->N on this single-GPU box and the new
+# pods schedule and share the GPU. minReplicaCount: 0 would give scale-to-zero
+# for idle models. KEDA manages the underlying HPA.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: cpi-kind
+  namespace: default
+spec:
+  scaleTargetRef:
+    name: cpi-kind
+  minReplicaCount: 1            # set to 0 for scale-to-zero (cold-start tradeoff)
+  maxReplicaCount: 3
+  pollingInterval: 5
+  cooldownPeriod: 30
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 0
+        scaleDown:
+          stabilizationWindowSeconds: 30
+  # KEDA scales on the MAX desired-replicas across all triggers.
+  #
+  # CPI's /v1/completions WAITS-for-idle on a busy worker (it does not fast-reject);
+  # concurrent generations therefore pile up as in-flight (1 generating + N waiting).
+  # So in-flight count == queue depth == the true saturation signal. (Verified: 8
+  # concurrent generations -> ok=29, busy409=0 over 45s — they queued, not rejected.)
+  triggers:
+    # PRIMARY — queue depth / concurrency. Target ~1 in-flight per replica: when more
+    # than one request is outstanding, a single-stream replica is already saturated.
+    - type: prometheus
+      name: queue_depth
+      metadata:
+        serverAddress: http://vmsingle.observability.svc:8428
+        query: sum(cpi_inflight_requests)
+        threshold: "1"
+        activationThreshold: "0.5"
+    # SECONDARY — 409 backpressure: only appears once waits time out (extreme
+    # overload); a strong "definitely add capacity now" signal when it does.
+    - type: prometheus
+      name: backpressure_409
+      metadata:
+        serverAddress: http://vmsingle.observability.svc:8428
+        query: sum(rate(cpi_http_requests_total{status="409"}[30s]))
+        threshold: "0.5"
+        activationThreshold: "0.1"
+    # SECONDARY — raw demand rate, catches bursty fast traffic (e.g. /v1/models).
+    - type: prometheus
+      name: request_rate
+      metadata:
+        serverAddress: http://vmsingle.observability.svc:8428
+        query: sum(rate(cpi_http_requests_total[30s]))
+        threshold: "8"
+        activationThreshold: "0.5"

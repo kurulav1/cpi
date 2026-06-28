@@ -13,18 +13,28 @@ FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS engine-build
 ARG DEBIAN_FRONTEND=noninteractive
 WORKDIR /app
 
+# Ubuntu 22.04's apt cmake is 3.22, but CMakeLists.txt requires >= 3.24.
+# Install an official static cmake into /usr/local instead.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
-    cmake \
     pkg-config \
     libsentencepiece-dev \
+    ca-certificates \
+    wget \
+    && wget -qO- https://github.com/Kitware/CMake/releases/download/v3.28.3/cmake-3.28.3-linux-x86_64.tar.gz \
+       | tar --strip-components=1 -xz -C /usr/local \
     && rm -rf /var/lib/apt/lists/*
 
 COPY CMakeLists.txt ./
 COPY include ./include
 COPY src ./src
 
+# The build host has no GPU, so the CMakeLists default of CMAKE_CUDA_ARCHITECTURES=native
+# can't probe a device and falls back to a low arch lacking __dp4a (needs sm_61+). Pin a
+# real arch list (Turing..Hopper) plus 90-virtual PTX for forward-compat on newer GPUs.
+ARG CUDA_ARCHS="75-real;80-real;86-real;89-real;90-real;90-virtual"
 RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
     && cmake --build build -j"$(nproc)" --target llama_infer
 
 FROM node:22-bullseye-slim AS node-runtime
@@ -36,6 +46,7 @@ WORKDIR /app/web
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    libgomp1 \
     libsentencepiece0 \
     && rm -rf /var/lib/apt/lists/*
 

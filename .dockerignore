@@ -20,3 +20,7 @@ __pycache__
 .env.*
 web/.env
 web/.env.*
+
+# but keep the committed example files the Dockerfile copies
+!.env.example
+!web/.env.example

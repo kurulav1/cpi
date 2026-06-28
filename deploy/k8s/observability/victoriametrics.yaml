@@ -1,0 +1,138 @@
+# VictoriaMetrics single-node + vmagent for high-scale metrics collection.
+# vmsingle stores the TSDB and serves PromQL/MetricsQL + the vmui at :8428.
+# vmagent scrapes the CPI pods (via the /metrics endpoint) and remote-writes to
+# vmsingle. On a real cluster you'd use the VictoriaMetrics Operator (VMSingle/
+# VMAgent CRDs) and VMServiceScrape; this is the dependency-free static-config
+# version so it runs on bare kind.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: observability
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vmsingle
+  namespace: observability
+  labels: { app: vmsingle }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: vmsingle }
+  template:
+    metadata:
+      labels: { app: vmsingle }
+    spec:
+      containers:
+        - name: vmsingle
+          image: victoriametrics/victoria-metrics:v1.111.0
+          args:
+            - "-storageDataPath=/storage"
+            - "-retentionPeriod=7d"
+            - "-httpListenAddr=:8428"
+          ports:
+            - { name: http, containerPort: 8428 }
+          volumeMounts:
+            - { name: storage, mountPath: /storage }
+          readinessProbe:
+            httpGet: { path: /health, port: 8428 }
+            initialDelaySeconds: 5
+      volumes:
+        - name: storage
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vmsingle
+  namespace: observability
+spec:
+  selector: { app: vmsingle }
+  ports:
+    - { name: http, port: 8428, targetPort: 8428 }
+  type: NodePort
+---
+# Scrape config for vmagent: discover CPI pods by label and scrape /metrics.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vmagent-scrape
+  namespace: observability
+data:
+  scrape.yml: |
+    global:
+      scrape_interval: 5s
+    scrape_configs:
+      - job_name: cpi
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          # keep only pods labelled app=cpi-kind
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            regex: cpi-kind
+            action: keep
+          # scrape the container port 3001
+          - source_labels: [__meta_kubernetes_pod_ip]
+            target_label: __address__
+            replacement: ${1}:3001
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+        metrics_path: /metrics
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vmagent
+  namespace: observability
+  labels: { app: vmagent }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: vmagent }
+  template:
+    metadata:
+      labels: { app: vmagent }
+    spec:
+      serviceAccountName: vmagent
+      containers:
+        - name: vmagent
+          image: victoriametrics/vmagent:v1.111.0
+          args:
+            - "-promscrape.config=/config/scrape.yml"
+            - "-remoteWrite.url=http://vmsingle.observability.svc:8428/api/v1/write"
+          volumeMounts:
+            - { name: config, mountPath: /config }
+      volumes:
+        - name: config
+          configMap: { name: vmagent-scrape }
+---
+# vmagent needs to read pods/endpoints for kubernetes_sd discovery.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vmagent
+  namespace: observability
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: vmagent
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "endpoints", "services", "nodes"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: vmagent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: vmagent
+subjects:
+  - kind: ServiceAccount
+    name: vmagent
+    namespace: observability
