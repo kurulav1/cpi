@@ -17,7 +17,19 @@ the API is ready without a re-seed or cold start).
 > `0.0.0.0`, so use `http://<this-host-ip>:3001` (open the firewall for 3001).
 > Note: **no auth** — keep it on trusted networks / behind a proxy if exposed.
 
-## Using the API (it's the OpenAI API; model id is `Qwen2.5-Coder-3B-Instruct`)
+## Available models
+
+`GET /v1/models` is the source of truth. Currently two:
+
+| model id (use in the `model` field) | notes |
+|---|---|
+| `Qwen2.5-Coder-3B-Instruct` | **default**, warm at all times — code-tuned, fast |
+| `Qwen2.5-7B-Instruct` | larger general chat — first request after switching reloads the GPU (~30 s), then fast |
+
+Single GPU → one model is resident at a time; **switching models reloads** (the default
+3B stays warm, others load on first use). Pick a model per request via the `model` field.
+
+## Using the API (it's the OpenAI API)
 
 ```bash
 curl http://localhost:3001/v1/models

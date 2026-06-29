@@ -65,17 +65,21 @@ curl localhost:3001/v1/models            # OpenAI-compatible model list
 
 `kind-inference-gpu.yaml` is hardened for real serving; the gaps it closes:
 
-- **Persistent model** — `model-pvc.yaml` (a `standard`/local-path PVC on the node's
-  `/var` ext4) replaces the old `hostPath /tmp/cpt-models`. In kind, `/tmp` is **tmpfs
-  (RAM)**, so every node/Docker restart wiped the 6.8 GB model and forced a re-seed.
-  On the PVC it persists. Seed it **once** (stream into the PV dir on the node):
+- **Persistent multi-model store** — a `hostPath` on the node's **`/var` (ext4)**,
+  `/var/cpi-models`, with **one subdir per model** (`<name>/<name>.ll2c` + its
+  `tokenizer.json`). This replaces the old `hostPath /tmp/cpt-models`: kind's `/tmp` is
+  **tmpfs (RAM)**, so every restart wiped the model; `/var` persists. CPI scans the dir
+  recursively, so every model present shows up in `/v1/models` and the selector (one
+  GPU → only one is resident at a time; switching reloads). Seed each model **once** by
+  streaming into the store on the node (robust for multi-GB files):
   ```bash
-  kubectl apply -f deploy/k8s/model-pvc.yaml
-  # provision + find the PV dir, then stream the model in via the node (robust for GBs):
-  PV=$(kubectl get pv "$(kubectl get pvc cpi-models -o jsonpath='{.spec.volumeName}')" -o jsonpath='{.spec.local.path}')
-  docker exec -i cpt-control-plane sh -c "cat > '$PV/model.ll2c'"    < model.ll2c
-  docker exec -i cpt-control-plane sh -c "cat > '$PV/tokenizer.json'" < tokenizer.json
+  N=cpt-control-plane; D=/var/cpi-models/<Model-Name>
+  docker exec $N mkdir -p $D
+  docker exec -i $N sh -c "cat > $D/<Model-Name>.ll2c"  < model.ll2c
+  docker exec -i $N sh -c "cat > $D/tokenizer.json"     < tokenizer.json
   ```
+  (`model-pvc.yaml` remains as the single-model PVC example; real clusters use a sized
+  RWX PVC or object store instead of hostPath.)
 - **No cold start** — `LLAMA_WARM_ON_START=1` loads the model into the GPU **at boot**,
   and readiness is gated on the model actually being warm. The first real request is
   generation-time only (~2 s), never a ~60 s lazy load.
