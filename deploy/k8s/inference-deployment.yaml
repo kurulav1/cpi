@@ -74,7 +74,7 @@ spec:
             - name: LLAMA_MODEL_DIRS
               value: /models
             - name: LLAMA_MODEL_PATH
-              value: /models/model.ll2c
+              value: /models/Qwen2.5-Coder-3B-Instruct.ll2c
             - name: LLAMA_TOKENIZER_PATH
               value: /models/tokenizer.json
             - name: LLAMA_CHAT_TEMPLATE

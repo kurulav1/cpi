@@ -39,7 +39,7 @@ spec:
         - { name: PORT, value: "3001" }
         - { name: LLAMA_INFER_BIN, value: /app/bin/llama_infer }
         - { name: LLAMA_MODEL_DIRS, value: /models }
-        - { name: LLAMA_MODEL_PATH, value: /models/model.ll2c }
+        - { name: LLAMA_MODEL_PATH, value: /models/Qwen2.5-Coder-3B-Instruct.ll2c }
         - { name: LLAMA_TOKENIZER_PATH, value: /models/tokenizer.json }
         - { name: LLAMA_CHAT_TEMPLATE, value: qwen2 }   # ChatML — matches Qwen2.5
         - { name: LLAMA_WARM_ON_START, value: "1" }   # load the model at boot

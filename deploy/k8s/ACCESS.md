@@ -17,25 +17,25 @@ the API is ready without a re-seed or cold start).
 > `0.0.0.0`, so use `http://<this-host-ip>:3001` (open the firewall for 3001).
 > Note: **no auth** — keep it on trusted networks / behind a proxy if exposed.
 
-## Using the API (it's the OpenAI API; model id is `model`)
+## Using the API (it's the OpenAI API; model id is `Qwen2.5-Coder-3B-Instruct`)
 
 ```bash
 curl http://localhost:3001/v1/models
 
 curl -X POST http://localhost:3001/v1/completions \
   -H "content-type: application/json" \
-  -d '{"model":"model","prompt":"def add(a, b):","max_tokens":64,"temperature":0}'
+  -d '{"model":"Qwen2.5-Coder-3B-Instruct","prompt":"def add(a, b):","max_tokens":64,"temperature":0}'
 
 curl -X POST http://localhost:3001/v1/chat/completions \
   -H "content-type: application/json" \
-  -d '{"model":"model","messages":[{"role":"user","content":"Hello"}]}'
+  -d '{"model":"Qwen2.5-Coder-3B-Instruct","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
 ```python
 from openai import OpenAI
 client = OpenAI(base_url="http://localhost:3001/v1", api_key="not-checked")
 print(client.chat.completions.create(
-    model="model",
+    model="Qwen2.5-Coder-3B-Instruct",   # the id from GET /v1/models
     messages=[{"role": "user", "content": "Hello"}],
 ).choices[0].message.content)
 ```
