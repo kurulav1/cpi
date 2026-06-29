@@ -1,0 +1,21 @@
+# Persistent model storage. The model used to live on the node's /tmp/cpt-models,
+# which in kind is a tmpfs (RAM) — so every node/Docker restart WIPED it and the
+# 6.8 GB model had to be re-seeded. This PVC uses the default `standard` (local-path)
+# StorageClass, which stores data under /var (ext4, persistent across restarts), so
+# the model survives Docker Desktop / node restarts with no re-seed.
+#
+# RWO is fine here: all replicas run on the single kind node and mount it read-only.
+# On a real cluster use an RWX class (so replicas on different nodes share it) or an
+# object-store + initContainer/storage-initializer.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cpi-models
+  namespace: default
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 12Gi

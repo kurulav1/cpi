@@ -42,19 +42,33 @@ spec:
         - { name: LLAMA_MODEL_PATH, value: /models/model.ll2c }
         - { name: LLAMA_TOKENIZER_PATH, value: /models/tokenizer.json }
         - { name: LLAMA_CHAT_TEMPLATE, value: tinyllama }
+        - { name: LLAMA_WARM_ON_START, value: "1" }   # load the model at boot
         - { name: LLAMA_MAX_CPU_PERCENT, value: "100" }
         - { name: LLAMA_MAX_MEMORY_PERCENT, value: "100" }
+      resources:                        # model is in GPU VRAM; host footprint is small
+        requests: { cpu: "1", memory: 2Gi }
+        limits: { memory: 8Gi }
+      # Gate traffic on the model being warm (not just the process being up), and give
+      # the ~60s GPU load room before liveness/readiness apply.
+      startupProbe:
+        httpGet: { path: /healthz/ready, port: 3001 }
+        periodSeconds: 5
+        failureThreshold: 60
       readinessProbe:
-        httpGet: { path: /api/health, port: 3001 }
-        initialDelaySeconds: 15
+        httpGet: { path: /healthz/ready, port: 3001 }
         periodSeconds: 10
+        failureThreshold: 3
+      livenessProbe:
+        httpGet: { path: /healthz/live, port: 3001 }
+        periodSeconds: 20
+        failureThreshold: 3
       volumeMounts:
         - { name: models, mountPath: /models, readOnly: true }
         - { name: wsl-libs, mountPath: /usr/lib/wsl, readOnly: true }
         - { name: dxg, mountPath: /dev/dxg }
   volumes:
-    - name: models
-      hostPath: { path: /tmp/cpt-models, type: DirectoryOrCreate }
+    - name: models                       # persistent PVC, not tmpfs
+      persistentVolumeClaim: { claimName: cpi-models }
     - name: wsl-libs
       hostPath: { path: /usr/lib/wsl, type: Directory }
     - name: dxg

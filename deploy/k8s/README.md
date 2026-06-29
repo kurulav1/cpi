@@ -61,18 +61,42 @@ curl localhost:3001/api/health           # {"ok":true,"ready":...}
 curl localhost:3001/v1/models            # OpenAI-compatible model list
 ```
 
-## Probes
+## Production-grade serving (no cold start, survives restarts)
 
-`/api/health` returns **200 whenever the server is listening**; the model-loaded state is the
-`ready` field in the **body**, not the status code. So the bundled probes gate on "process up".
-For **model-aware readiness** (don't route traffic until weights are loaded), swap the readiness
-`httpGet` for an `exec` probe that greps the body:
+`kind-inference-gpu.yaml` is hardened for real serving; the gaps it closes:
 
-```yaml
-readinessProbe:
-  exec:
-    command: ["sh","-c","curl -sf localhost:3001/api/health | grep -q '\"ready\":true'"]
-```
+- **Persistent model** — `model-pvc.yaml` (a `standard`/local-path PVC on the node's
+  `/var` ext4) replaces the old `hostPath /tmp/cpt-models`. In kind, `/tmp` is **tmpfs
+  (RAM)**, so every node/Docker restart wiped the 6.8 GB model and forced a re-seed.
+  On the PVC it persists. Seed it **once** (stream into the PV dir on the node):
+  ```bash
+  kubectl apply -f deploy/k8s/model-pvc.yaml
+  # provision + find the PV dir, then stream the model in via the node (robust for GBs):
+  PV=$(kubectl get pv "$(kubectl get pvc cpi-models -o jsonpath='{.spec.volumeName}')" -o jsonpath='{.spec.local.path}')
+  docker exec -i cpt-control-plane sh -c "cat > '$PV/model.ll2c'"    < model.ll2c
+  docker exec -i cpt-control-plane sh -c "cat > '$PV/tokenizer.json'" < tokenizer.json
+  ```
+- **No cold start** — `LLAMA_WARM_ON_START=1` loads the model into the GPU **at boot**,
+  and readiness is gated on the model actually being warm. The first real request is
+  generation-time only (~2 s), never a ~60 s lazy load.
+- **Model-aware probes** — the server exposes dedicated endpoints (don't gate liveness
+  on the model, so a slow load can't trigger a restart loop):
+  - `GET /healthz/live` → 200 once the process is up (**liveness**)
+  - `GET /healthz/ready` → 200 only when the model is warm, else 503 (**readiness** +
+    **startupProbe**, with a generous `failureThreshold` for the load window)
+- **Zero-downtime + graceful** — `maxUnavailable: 0` rollout, a `preStop` drain, and
+  `terminationGracePeriodSeconds` so rollouts/scale-down don't drop in-flight requests.
+- **Right-sized resources** — requests are small (the model is in GPU VRAM, not host
+  RAM), so replicas and the alternative KServe path co-schedule on the node.
+
+Verified: after a full Docker Desktop restart the model stays in the PVC (no re-seed),
+the pod auto-warms, and the first request is ~2.5 s — not a cold load.
+
+## Probes (legacy note)
+
+`/api/health` still returns **200 whenever the server is listening** with model state in
+the body — fine as a simple liveness check. The `/healthz/*` endpoints above are the
+production probes (status-code based, so plain `httpGet` works — no body-grep needed).
 
 ## GPU on kind (WSL2 / Docker Desktop)
 

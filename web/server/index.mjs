@@ -55,6 +55,18 @@ app.get("/metrics", (_req, res) => {
   res.send(obsMetrics.render());
 });
 
+// Kubernetes probes. Registered before the SPA catch-all so they aren't shadowed.
+// Liveness: the process is up and serving HTTP (do NOT gate on the model, so a slow
+// model load never triggers a liveness kill — the startupProbe covers that window).
+app.get("/healthz/live", (_req, res) => res.status(200).send("ok"));
+// Readiness: the model is actually loaded/warmed into the worker. Gating traffic on
+// this is what makes serving production-grade — the Service never routes to a cold
+// pod, so clients never see cold-start latency or 503s during scale-up / rollouts.
+app.get("/healthz/ready", (_req, res) => {
+  const warm = Boolean(interactiveWorker && interactiveWorker.ready) && getRuntimeConfig().ready;
+  res.status(warm ? 200 : 503).json({ ready: warm });
+});
+
 // Only one generation runs at a time (single GPU). The worker process is kept
 // warm across requests and restarted only when the selected profile changes.
 let activeRequest = null;
@@ -3282,6 +3294,14 @@ app.listen(runtimeConfig.port, () => {
     console.log(
       "[cpi] Set modelPath and tokenizerPath in web/config.json (or LLAMA_MODEL_PATH / LLAMA_TOKENIZER_PATH)."
     );
+  } else if (isTruthyFlag(process.env.LLAMA_WARM_ON_START ?? "1")) {
+    // Pre-load the model into the worker at boot so the first real request isn't a
+    // ~60s cold start. /healthz/ready stays 503 until this completes, so k8s holds
+    // traffic until the pod is genuinely warm. Disable with LLAMA_WARM_ON_START=0.
+    console.log("[cpi] warming model on startup…");
+    warmupProfileWorker(runtimeConfig)
+      .then(() => console.log("[cpi] model warm — readiness will pass"))
+      .catch((err) => console.warn(`[cpi] startup warm failed: ${err?.message || String(err)}`));
   }
   const emb = embedStatus(runtimeConfig);
   if (emb.available) {
