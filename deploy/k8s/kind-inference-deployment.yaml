@@ -53,7 +53,7 @@ spec:
             - name: LLAMA_TOKENIZER_PATH
               value: /models/tokenizer.json
             - name: LLAMA_CHAT_TEMPLATE
-              value: tinyllama
+              value: qwen2
             # CPU-only inference pegs the CPU at 100%, which trips CPI's resource
             # governor (default 85%). Relax it for this CPU smoke-test pod.
             - name: LLAMA_MAX_CPU_PERCENT

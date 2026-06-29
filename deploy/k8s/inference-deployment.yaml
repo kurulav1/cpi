@@ -78,7 +78,7 @@ spec:
             - name: LLAMA_TOKENIZER_PATH
               value: /models/tokenizer.json
             - name: LLAMA_CHAT_TEMPLATE
-              value: tinyllama
+              value: qwen2
           volumeMounts:
             - name: models
               mountPath: /models
