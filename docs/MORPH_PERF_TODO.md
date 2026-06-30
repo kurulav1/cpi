@@ -18,6 +18,22 @@ the short user message varies per request.
 
 ---
 
+## A — GPU / k8s serving-path correctness (bugs, not optimizations) — ✅ DONE
+
+**A1 — Blackwell (sm_120) missing from the distributable fatbin.** `CMakePresets.json`'s
+`cuda-distributable-release` pinned `CMAKE_CUDA_ARCHITECTURES="75;80;86;89;90"` — no 120. On an
+RTX 5090 (sm_120) the Release build emitted garbage (e.g. `"1,2,…"→"!"`) because no native cubin
+matched and Release lacked the Debug PTX-JIT fallback. **Fix:** added `120` →
+`"75;80;86;89;90;120"`. (Rebuild the CUDA Release target to ship a correct 5090 binary.)
+
+**A2 — `LLAMA_MAX_CONTEXT` defaulted to 2048 in k8s.** `config.mjs` defaults `maxContext=2048`;
+the k8s manifests didn't override it, so Morph's ~5–8k-token prompt was truncated, dropping the DSL
+format rules → prose / empty_surface. **Fix:** set `LLAMA_MAX_CONTEXT="8192"` in both
+`deploy/k8s/inference-deployment.yaml` and `deploy/k8s/kind-inference-deployment.yaml` (matches
+`web/config.json`'s `maxContext`).
+
+---
+
 ## P0 — autoMaxTokens ignored client max_tokens — ✅ DONE
 
 **Bug:** `autoMaxTokens` defaulted ON and `computeDynamicMaxNewTokens` (a keyword heuristic)
@@ -129,6 +145,70 @@ to the simple contiguous fp16 KV layout (paged / int4-KV / TQ3 / MoE / sliding-w
 **byte-identical** between cold (full prefill) and warm (reuse) for the same prompt. Morph keeps
 the system prefix byte-stable, so repeat gens are now decode-bound (~3–4s for 400–600 tokens).
 
+**RE-MEASURED on the real Morph bodies (`morph-bench/`, ~6,392-token system prompt, RTX 5090
+`build-run` GPU build) — confirmed:**
+
+- **Cold prefill (first request): ~20.4s** → **warm prefill (system prefix resident): ~210ms** =
+  **~97×**. Warm end-to-end: counter 0.88s, gmail 1.5s, dashboard 12s. All `dsl=OK`, deterministic.
+- **Decode ~50 tok/s (server) / ~63 tok/s (clean CLI).** So in steady state **prefill is ~free and
+  latency is decode-bound** — dashboard's 12s is ~11s of *decode* (564 tok ÷ ~50). This is the reframe:
+  for big apps the bottleneck is now **decode**, not prefill.
+- **NOTE (cold-start follow-up):** the ~20s cold prefill is paid once per worker (re)start, but the
+  current boot **warmup uses a generic prompt, so it does NOT pre-seed Morph's system prefix** — the
+  first real request still eats the full 20s. Cheap win: warm with Morph's actual system prompt at
+  boot so even the first request is warm. (Measured: 5-6 redundant ~20s warmup prefills on boot —
+  the warmup is both ineffective for the prefix AND wasteful.)
+- **Tooling added:** `morph-bench/bench.mjs` (server replay) + a server `[perf]` log line gated on
+  `CPI_PERF_LOG=1` (`web/server/index.mjs`, prefill≈elapsed−decode) for per-request prefill/decode.
+
+## Prefill throughput — ✅ FIXED ~5.3× via `prefill_chunk_size` 16 → 256
+
+**Finding:** cold prefill of the ~6.4k system was ~247 tok/s on a 5090 — not a slow Blackwell GEMM,
+but `prefill_chunk_size_` **defaulting to 16**, so the prompt prefilled in ~400 tiny 16-row batched
+passes that starve the GEMMs/attention. **Measured (real Morph counter, `build-run`):**
+
+| chunk | cold prefill (6k sys) | vs 16 |
+|---|---|---|
+| 16 (old) | ~20,100 ms | 1× |
+| 256 | **3,818 ms** | **5.3×** |
+| 512 | 3,587 ms | 5.6× (knee at ~256) |
+
+Output **byte-identical** across chunk sizes (chunking is mathematically exact — verified on the
+counter surface). Cold-start gen now ~4.5s (was ~26s). **Shipped:** default 16 → **256**
+(`src/engine/llama_engine.cpp`, `include/engine/llama_engine.hpp`) **and** set
+`LLAMA_INFER_PREFILL_CHUNK_SIZE=256` in `web/.env` + both k8s manifests so the *existing* binary
+benefits immediately (dotenv → worker env; no rebuild needed). Env-tunable down for small-VRAM GPUs.
+
+## Warm-hit ~6.6s floor — ✅ FIXED: O(n²) BPE tokenization re-run every request
+
+**The reported ~6.6s warm floor / "36% effective" was real** — I initially mis-read it as 0.1s because
+the *worker's* `elapsed_ms` starts **after** tokenization (`src/app/main_modes.cpp:156` encodes, `:200`
+sets `req_start`), so the worker self-reported 0.1s prefill while the **client-observed** warm latency
+was ~6.6s. Instrumenting the Node handler (`[chatT]` log) localized a constant ~6.6s **outside** the
+worker's measured window, **binary- and output-length-independent** — i.e. not the GEMM.
+
+**Root cause:** `HfBpeTokenizer::encode_segment` ran the BPE merge loop **O(n²)** over the whole
+segment, and `encode()` only splits on *added/special* tokens — so the entire ~23k-char system-prompt
+body between `<|im_start|>system` and `<|im_end|>` is **one segment**, re-tokenized from scratch every
+request (~264M pair-scans ≈ 6.6s, ~1.1ms/token). Same tokenizer in every binary → the binary-
+independent floor.
+
+**Fix (`src/model/hf_bpe_tokenizer.cpp`):** replaced the rescan-all-pairs loop with a **min-heap over a
+doubly-linked list** — *exact same* greedy lowest-rank merges, leftmost tie-break, so **output is
+byte-identical** — in O(n log n). **Measured:** warm Node overhead **6,647ms → 14ms** (~700× on the
+encode); **counter e2e 6.69s → 0.83s, gmail 8.08s → 1.31s** (both sub-2s); output **byte-identical**
+(verified on the counter surface + all bodies `dsl=OK`). Needs a rebuild (tokenizer is in the worker;
+no env knob) — already built into `build-run/Release`. **This is the steady-state win:** simple Morph
+apps are now decode-bound and sub-second; only big apps (dashboard ~10s, 564-token decode) remain, and
+those are the int8/spec levers. Instrumentation: `[chatT]` handler-timing log gated on `CPI_PERF_LOG`.
+
+## Wrong default binary (`.env`) — CPU build, no prefix cache
+
+Separately: the `.env` default `LLAMA_INFER_BIN=../build/Release/llama_infer.exe` points at the **CPU
+build** (`CpuLlamaEngine`, no `resident_prefix_` — measured 4.6 tok/s decode, ~21s prefill, no warm
+speedup). The Blackwell GPU binary is **`build-run/Release`**. If the autostart/daily-driver uses the
+`.env` default it runs on CPU. Action: repoint `.env`/launcher/autostart at the GPU build.
+
 ## P1 — int4-streaming is *slower* than fp16 (it shouldn't be)
 **Observation:** the int4-streaming models (3B, 32B) decode **slower per token** than the fp16 7B —
 backwards; quantized should be ≥ fp16 throughput. This is why the 32B costs 73s.
@@ -142,6 +222,34 @@ projection/MLP matvecs (per-token dequant without a fused int4 matmul), as suspe
 **Task (larger, deferred):** a fused dequant+matmul int4 kernel. Not a quick one-line fix; lower
 Morph value than P1 prefix-cache since the fp16 7B is the default and the 32B isn't currently
 needed (both score 100%).
+
+## B3 — int8 7B — ❌ no prefill help, but ✅ ~1.45× DECODE (the real bottleneck) — RECOMMEND
+
+**MEASURED (Qwen2.5-7B `--int8-streaming` vs fp16, real Morph bodies, RTX 5090):** decode
+**~63 → ~92 tok/s (~1.45×)**, and output stays **valid DSL on all three** (near-lossless; differs
+from fp16 only by the expected quant-shifted greedy path). Warm prefill unchanged (~210ms — int8 is
+B1-compatible: int8 weights, fp16 KV). So int8 does NOT touch prefill (below) but **directly speeds
+the decode phase that now dominates big apps** — dashboard decode ~11s → ~7.5s. **Recommend shipping
+an int8 7B profile** (or enabling `--int8-streaming`): it's the cheapest real win for large apps and
+stacks with B1. Why it helps decode but not prefill: decode is batch-1 matrix-*vector*, memory-
+bandwidth-bound on weight reads, so halving weight bytes (int8) wins despite the fp16-dequant; prefill
+is compute-bound on the fp16 GEMM, where int8 only adds dequant.
+
+### Why it can't help prefill (engine has no int8/fp8 GEMM)
+
+**Investigated before quantizing an artifact.** The hope was that Blackwell int8 tensor cores would
+cut the ~7s prefill. They can't, as CPI is built: the matmul is `cublasLtMatmul` with
+**`CUBLAS_COMPUTE_32F`** (`src/engine/llama_engine.cpp:104`) and int8-streaming **dequantizes
+int8→fp16 before the GEMM** (`launch_dequant_rowwise_int8_to_fp16`,
+`src/engine/llama_engine_cache.cpp:625`). There is **no `CUDA_R_8I` / `CUBLAS_COMPUTE_32I` / fp8
+path anywhere** in the tree. So int8-streaming runs the *identical* fp16 prefill matmul plus a
+dequant step → prefill equal-or-slightly-worse, never faster. int8's real wins are **weight VRAM +
+decode bandwidth** (helps decode — the cheap phase — and frees VRAM), not prefill.
+**To actually cut prefill with low precision on Blackwell:** implement a true **int8 or fp8 (e4m3)
+tensor-core GEMM** for the prefill matmuls (cublasLt `CUDA_R_8I`/`COMPUTE_32I`, or fp8). Real kernel
+work, but it stacks with B1 (weights-only; fp16 KV preserved). **The cheap, effective prefill lever
+that needs no kernel work is trimming the ~5k-token system prompt** (prefill is linear in prompt
+tokens) — being done Morph-side in parallel.
 
 ## P2 — SSE token streaming (any path) — ✅ DONE
 
@@ -171,10 +279,32 @@ is no longer required). **Verify:** `curl -N -X POST .../v1/chat/completions -d 
 emits incremental `data:` chunks and closes cleanly. Then Morph progressive reveal is a one-line flip
 (`stream:false`→`true` + forward deltas) on its side.
 
-## P2 — Speculative decoding for the 7B
-CPI already has speculative decoding; it isn't used for the 7B default. Wire a small draft model
-(e.g. Qwen2.5-0.5B) to speculate for the 7B — structured/low-entropy output like the DSL speculates
-well, often 2–3× decode. **Verify:** tok/s up, greedy output byte-identical.
+## P2 — Speculative decoding for the 7B — ✅ EXPOSED (server-side); needs a draft artifact to measure
+The engine already had speculative decoding (`speculative_decoder.cpp`, `--draft-model`/`--spec-tokens`
+in `main_cli.cpp`); the gap was that the **server never passed the flags**. Now wired: a first-class
+`draftModel` / `specTokens` config (`LLAMA_DRAFT_MODEL` / `LLAMA_SPEC_TOKENS`, or `web/config.json`
+`draftModel`/`specTokens`) that `buildInteractiveLaunchArgs` appends as `--draft-model`/`--spec-tokens`
+to the persistent worker. Crucially, `main.cpp`'s `--draft-model` branch wraps **`execute_engine_modes`**
+— the same dispatcher that drives `--interactive --web` — so the serving loop speculates transparently;
+no per-request API change. Enabled only on GPU with a draft file that exists (else a silent no-op);
+greedy output stays byte-identical (the target verifies every drafted token), and grammar-constrained
+requests fall back to single-token target decode.
+
+**MEASURED (Qwen2.5-7B fp16 target + Qwen2.5-0.5B fp16 draft, k=6, real Morph bodies) — ❌ REGRESSES
+as currently wired.** Output is **byte-identical** to greedy (correctness ✓), but decode dropped to
+**~5 tok/s vs ~63 tok/s baseline (~12× slower)**: counter 50.0s / dashboard 107.4s wall for
+48 / 335 tokens. **Root cause:** `main.cpp`'s draft setup (lines ~309-316) hard-forces the draft to
+`int8_streaming=true` + `streaming_quant_bits=8`, a config written for an **int4 32B target** that
+leaves almost no spare VRAM ("a partially-cached, layer-streamed draft is far too slow" — exactly the
+trap it then falls into here). With our **fp16 7B target (~14 GB) there is ~18 GB free**, so the 0.5B
+draft should run **fp16 fully GPU-cached** (sub-ms/pass); instead it streams int8 weights from host
+every pass, so the 6 draft passes/round dominate and speculation is a net loss.
+**Fix before B2 is usable:** make the draft's precision/caching adaptive (or a separate
+`--draft-quant` flag) — when free VRAM comfortably fits the draft, load it fp16 `gpu_cache_all` and do
+NOT force streaming. Then re-measure; with a fast cached 0.5B draft and the DSL's low entropy, the
+expected win returns. **Until fixed, leave `LLAMA_DRAFT_MODEL` unset** (the wiring + 0.5B `.ll2c` are
+ready: `artifacts/hub/Qwen__Qwen2.5-0.5B-Instruct/Qwen2.5-0.5B-Instruct.ll2c`). Harness:
+`morph-bench/` (`make_ndjson.mjs` + direct `llama_infer --interactive --draft-model` run).
 
 ## P3 — DSL grammar (robustness insurance, not urgent)
 Quality is already 100%, so this is insurance, not a fix. Optionally accept a Morph-DSL grammar (or

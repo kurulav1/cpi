@@ -914,6 +914,12 @@ function buildInteractiveLaunchArgs(config, cliConfig) {
     cliConfig.noResourceLimits ||
     profileExtraArgs.includes("--no-resource-limits");
   const forceCpu = cliConfig.forceCpu || config.forceCpu;
+  // Speculative decoding: enable only with a configured draft model that exists
+  // on disk and a GPU target (the engine's spec path is CUDA-only). main.cpp
+  // routes --draft-model through execute_engine_modes, which also drives the
+  // --interactive --web serving loop, so the worker speculates transparently.
+  const draftModel = config.draftModel;
+  const specEnabled = !forceCpu && draftModel && fs.existsSync(draftModel);
   return [
     selectedProfile.modelPath,
     "--tokenizer", selectedProfile.tokenizerPath,
@@ -924,6 +930,9 @@ function buildInteractiveLaunchArgs(config, cliConfig) {
     "--interactive",
     "--web",
     "--runtime-metrics",
+    ...(specEnabled
+      ? ["--draft-model", draftModel, "--spec-tokens", String(config.specTokens)]
+      : []),
     ...(forceCpu ? ["--cpu"] : []),
     ...(noResourceLimits
       ? ["--no-resource-limits"]
@@ -1256,6 +1265,20 @@ function parseWorkerStdout(worker) {
             worker.lastMetrics = metrics;
           }
           obsMetrics.recordGeneration(generatedTokens, decodeMs);
+          // Per-request perf line (prefill is the dominant cost on Morph's fixed
+          // ~6k-token system prompt; prefill ~= elapsed - decode). Gated on
+          // CPI_PERF_LOG so it's quiet by default.
+          if (process.env.CPI_PERF_LOG) {
+            const prefillMs =
+              elapsedMs != null && decodeMs != null ? elapsedMs - decodeMs : null;
+            console.log(
+              `[perf] ${pending.meta?.benchTag || ""} gen_tokens=${generatedTokens} ` +
+                `prefill_ms=${prefillMs != null ? prefillMs.toFixed(0) : "?"} ` +
+                `decode_ms=${decodeMs != null ? decodeMs.toFixed(0) : "?"} ` +
+                `decode_tok_s=${decodeTokPerS != null ? decodeTokPerS.toFixed(1) : "?"} ` +
+                `total_ms=${elapsedMs != null ? elapsedMs.toFixed(0) : "?"}`
+            );
+          }
           worker.ready = true;
           worker.pending = null;
           pending.resolve({
@@ -2398,9 +2421,11 @@ app.post("/v1/completions", async (req, res) => {
 // POST /v1/chat/completions
 // OpenAI-compatible chat completions endpoint.
 app.post("/v1/chat/completions", async (req, res) => {
+  const _t0 = Date.now();
   const config = getRuntimeConfig();
   if (!guardOpenAiReady(config, res)) return;
   if (!(await guardOpenAiIdle(res, { waitForWarmup: true }))) return;
+  const _tGuard = Date.now();
 
   const body = requestBody(req);
   const stream = Boolean(body.stream);
@@ -2413,6 +2438,11 @@ app.post("/v1/chat/completions", async (req, res) => {
   try {
     internalBody = buildInternalBodyFromChatRequest(body);
     cliConfig = buildCliArgs(config, internalBody);
+    if (process.env.CPI_PERF_LOG) {
+      cliConfig._t0 = _t0;
+      cliConfig._tGuard = _tGuard;
+      cliConfig._tBuild = Date.now();
+    }
   } catch (err) {
     sendOpenAiError(res, 400, err.message, { type: "invalid_request_error" });
     return;
@@ -2557,10 +2587,22 @@ app.post("/v1/chat/completions", async (req, res) => {
     return;
   }
 
+  const _tPreRun = Date.now();
   const { cancel } = runGeneration(config, cliConfig, {
     onDelta: () => {},
-    onDone: (result) =>
-      res.json(buildOpenAiChatCompletion(completionId, created, modelName, cliConfig, result, { toolMode })),
+    onDone: (result) => {
+      if (process.env.CPI_PERF_LOG && cliConfig._t0) {
+        const now = Date.now();
+        const wTotal = Number(result?.elapsedMs) || 0;
+        console.log(
+          `[chatT] guard=${_tGuard - cliConfig._t0}ms build=${cliConfig._tBuild - _tGuard}ms ` +
+            `preRun=${_tPreRun - cliConfig._tBuild}ms run+queue=${now - _tPreRun}ms ` +
+            `(worker_total=${wTotal}ms queue/overhead=${now - _tPreRun - wTotal}ms) ` +
+            `e2e=${now - cliConfig._t0}ms`
+        );
+      }
+      res.json(buildOpenAiChatCompletion(completionId, created, modelName, cliConfig, result, { toolMode }));
+    },
     onError: (msg) => {
       if (!res.headersSent) {
         sendOpenAiError(res, 500, msg, { type: "server_error" });

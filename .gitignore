@@ -75,6 +75,7 @@ pnpm-debug.log*
 # Runtime artifacts and logs
 # ------------------------------
 *.log
+*-log.txt
 *.tmp
 *.bak
 *.swp

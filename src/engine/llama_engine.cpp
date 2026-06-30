@@ -1090,7 +1090,12 @@ void LlamaEngine::initialize(const EngineOptions& options) {
   }
 
   CUDA_CHECK(cudaSetDevice(0));
-  const int prefill_chunk_target = env_int_or_default("LLAMA_INFER_PREFILL_CHUNK_SIZE", 16);
+  // 256 keeps the batched prefill GEMMs large enough to saturate the GPU; the
+  // old default of 16 left them tiny (e.g. a 6.4k-token prompt prefilled in 400
+  // passes), capping prefill at ~250 tok/s on a 5090. 256 measured ~5.3x faster
+  // cold prefill, byte-identical output (chunking is exact). Tune down via env
+  // for small-VRAM GPUs; up (512) for a marginal further gain.
+  const int prefill_chunk_target = env_int_or_default("LLAMA_INFER_PREFILL_CHUNK_SIZE", 256);
   prefill_chunk_size_ = std::max(1, std::min(options_.max_context, prefill_chunk_target));
   lt_workspace_bytes_ = env_workspace_bytes_or_default("LLAMA_INFER_LT_WORKSPACE_MB", lt_workspace_bytes_);
   CUDA_CHECK(cudaStreamCreateWithFlags(&compute_stream_, cudaStreamNonBlocking));

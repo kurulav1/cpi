@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <fstream>
 #include <limits>
+#include <queue>
 #include <sstream>
 #include <stdexcept>
 
@@ -880,25 +881,71 @@ std::vector<int> HfBpeTokenizer::encode_segment(const std::string& text, bool pr
   }
 
   std::vector<std::string> pieces = split_utf8_pieces(normalized);
-  while (pieces.size() > 1) {
-    // Find the adjacent pair with the globally lowest merge rank.
-    int best_rank = std::numeric_limits<int>::max();
-    std::size_t best_pos = pieces.size();
-    for (std::size_t i = 0; i + 1 < pieces.size(); ++i) {
-      const auto it = merge_ranks_.find(merge_key(pieces[i], pieces[i + 1]));
-      if (it != merge_ranks_.end() && it->second < best_rank) {
-        best_rank = it->second;
-        best_pos = i;
+  // Apply greedy lowest-rank BPE merges. This is the exact same algorithm as a
+  // naive "rescan every pair, merge the global minimum, repeat" loop — same
+  // merges, same order (lowest rank wins; leftmost breaks ties) — but driven by
+  // a min-heap over a doubly-linked list so it runs in O(n log n) instead of
+  // O(n^2). The old O(n^2) form made a single ~23k-char segment (e.g. a large
+  // system prompt with no special tokens inside) cost seconds to tokenise.
+  const std::size_t n = pieces.size();
+  if (n > 1) {
+    std::vector<int> prev(n), next(n);
+    std::vector<char> alive(n, 1);
+    for (std::size_t i = 0; i < n; ++i) {
+      prev[i] = static_cast<int>(i) - 1;
+      next[i] = (i + 1 < n) ? static_cast<int>(i + 1) : -1;
+    }
+    // Heap entry: (rank, left node index). Ordered by rank asc, then left index
+    // asc so ties merge leftmost-first (matching the naive scan).
+    struct Cand {
+      int rank;
+      int left;
+    };
+    struct Cmp {
+      bool operator()(const Cand& a, const Cand& b) const {
+        return a.rank != b.rank ? a.rank > b.rank : a.left > b.left;
       }
+    };
+    std::priority_queue<Cand, std::vector<Cand>, Cmp> heap;
+    auto push_pair = [&](int i) {
+      if (i < 0) return;
+      const int j = next[i];
+      if (j < 0) return;
+      const auto it = merge_ranks_.find(merge_key(pieces[i], pieces[j]));
+      if (it != merge_ranks_.end()) heap.push({it->second, i});
+    };
+    for (std::size_t i = 0; i + 1 < n; ++i) push_pair(static_cast<int>(i));
+
+    while (!heap.empty()) {
+      const Cand c = heap.top();
+      heap.pop();
+      const int i = c.left;
+      if (!alive[i]) continue;
+      const int j = next[i];
+      if (j < 0 || !alive[j]) continue;
+      // Stale check: only merge if (i, next[i]) still has exactly the popped
+      // rank. If either piece's string changed since this entry was pushed, the
+      // recomputed rank differs and we skip it (a fresh entry was pushed for the
+      // current pair). This catches both topology and string changes.
+      const auto it = merge_ranks_.find(merge_key(pieces[i], pieces[j]));
+      if (it == merge_ranks_.end() || it->second != c.rank) continue;
+      // Merge j into i, splice j out of the list.
+      pieces[i] += pieces[j];
+      alive[j] = 0;
+      const int rn = next[j];
+      next[i] = rn;
+      if (rn >= 0) prev[rn] = i;
+      // The pairs (prev[i], i) and (i, next[i]) changed; re-push them.
+      push_pair(prev[i]);
+      push_pair(i);
     }
-    if (best_pos == pieces.size()) {
-      // No applicable merge found; the sequence is fully tokenised.
-      break;
+
+    std::vector<int> ids;
+    for (int i = 0; i >= 0; i = next[i]) {
+      const auto piece_ids = encode_piece_with_fallback(pieces[i]);
+      ids.insert(ids.end(), piece_ids.begin(), piece_ids.end());
     }
-    // Perform the merge in-place: concatenate pieces[best_pos+1] into
-    // pieces[best_pos] then erase the now-redundant element.
-    pieces[best_pos] += pieces[best_pos + 1];
-    pieces.erase(pieces.begin() + static_cast<std::vector<std::string>::difference_type>(best_pos + 1));
+    return ids;
   }
 
   std::vector<int> ids;

@@ -29,7 +29,7 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "LLAMA_ENGINE_ENABLE_CUDA": "ON",
-        "CMAKE_CUDA_ARCHITECTURES": "75;80;86;89;90"
+        "CMAKE_CUDA_ARCHITECTURES": "75;80;86;89;90;120"
       }
     }
   ],

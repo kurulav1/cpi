@@ -54,6 +54,13 @@ spec:
               value: /models/tokenizer.json
             - name: LLAMA_CHAT_TEMPLATE
               value: qwen2
+            # Morph's ~5k-token system prompt exceeds the 2048 server default and
+            # gets truncated (drops the DSL format rules). Match web/config.json.
+            - name: LLAMA_MAX_CONTEXT
+              value: "8192"
+            # Larger batched prefill pass (built-in default 16 is ~5.3x slower on GPU).
+            - name: LLAMA_INFER_PREFILL_CHUNK_SIZE
+              value: "256"
             # CPU-only inference pegs the CPU at 100%, which trips CPI's resource
             # governor (default 85%). Relax it for this CPU smoke-test pod.
             - name: LLAMA_MAX_CPU_PERCENT

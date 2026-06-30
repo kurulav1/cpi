@@ -125,7 +125,11 @@ const DEFAULT_RUNTIME = Object.freeze({
   resourceSampleMs: 250,
   resourceSustainMs: 5000,
   resourceThrottleMs: 50,
-  extraArgs: ""
+  extraArgs: "",
+  // Speculative decoding: a small draft model (same tokenizer family) speculates
+  // for the served target. Empty = off. specTokens = drafts per round.
+  draftModel: "",
+  specTokens: 5
 });
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -1462,6 +1466,19 @@ export function getRuntimeConfig() {
     ),
     extraArgs: splitArgs(
       pick("LLAMA_EXTRA_ARGS", "extraArgs", DEFAULT_RUNTIME.extraArgs)
+    ),
+    // Speculative decoding (off unless a draft model is configured). The path is
+    // resolved like the other model paths; the worker only enables it when the
+    // file exists (see buildInteractiveLaunchArgs).
+    draftModel: resolveExistingPath(
+      pick("LLAMA_DRAFT_MODEL", "draftModel", DEFAULT_RUNTIME.draftModel)
+    ),
+    specTokens: readIntSetting(
+      "LLAMA_SPEC_TOKENS",
+      "specTokens",
+      DEFAULT_RUNTIME.specTokens,
+      1,
+      16
     )
   };
 
