@@ -54,8 +54,8 @@ spec:
               value: /models/tokenizer.json
             - name: LLAMA_CHAT_TEMPLATE
               value: qwen2
-            # Morph's ~5k-token system prompt exceeds the 2048 server default and
-            # gets truncated (drops the DSL format rules). Match web/config.json.
+            # A large fixed system prompt can exceed the 2048 server default and
+            # get truncated (dropping later instructions). Match web/config.json.
             - name: LLAMA_MAX_CONTEXT
               value: "8192"
             # Larger batched prefill pass (built-in default 16 is ~5.3x slower on GPU).

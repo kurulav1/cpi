@@ -802,7 +802,7 @@ function buildCliArgs(config, body) {
   // client supplied NO budget. Previously auto (default on) ignored max_tokens
   // and could pick a tiny budget (~96 tokens), silently truncating output
   // mid-generation with finish_reason:"stop" for any client that relies on
-  // max_tokens. See docs/MORPH_PERF_TODO.md P0.
+  // max_tokens.
   const explicitMaxTokens = body.maxNewTokens ?? body.max_tokens;
   const hasExplicitMaxTokens =
     explicitMaxTokens !== undefined && explicitMaxTokens !== null;
@@ -1265,8 +1265,8 @@ function parseWorkerStdout(worker) {
             worker.lastMetrics = metrics;
           }
           obsMetrics.recordGeneration(generatedTokens, decodeMs);
-          // Per-request perf line (prefill is the dominant cost on Morph's fixed
-          // ~6k-token system prompt; prefill ~= elapsed - decode). Gated on
+          // Per-request perf line (prefill dominates when a large fixed system
+          // prompt is reused; prefill ~= elapsed - decode). Gated on
           // CPI_PERF_LOG so it's quiet by default.
           if (process.env.CPI_PERF_LOG) {
             const prefillMs =
@@ -1821,8 +1821,8 @@ async function guardOpenAiIdle(
 
   // Single-engine queuing: rather than rejecting concurrent generations with
   // engine_busy, wait (up to waitForIdleMs) for the in-flight one to finish. This
-  // lets clients that fan out parallel requests (e.g. Morph's section agents)
-  // serialize through the engine instead of failing. The engine's own single-
+  // lets clients that fan out parallel requests serialize through the engine
+  // instead of failing. The engine's own single-
   // instance lock still guards the rare wake-up race.
   if (waitForIdleMs > 0 && activeRequest && activeRequest.kind !== "warmup") {
     const deadline = Date.now() + Math.max(0, Number(waitForIdleMs) || 0);
@@ -2242,7 +2242,7 @@ app.get("/v1/models", (_req, res) => {
     data: publicRuntimeSummary(config).availableProfiles
       .filter((profile) => profile.ready)
       .map(publicOpenAiModel),
-    // Non-standard readiness hint so clients (Morph RAG/folder-search) can
+    // Non-standard readiness hint so clients (e.g. RAG / retrieval) can
     // preflight embeddings instead of discovering a 500 mid-index.
     embeddings: {
       available: embeddings.available,

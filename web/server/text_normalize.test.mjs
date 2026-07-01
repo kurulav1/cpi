@@ -1,7 +1,7 @@
 // Regression tests for generated-text normalization — guards the decoder-halt
-// bug in docs/MORPH_DECODER_BUG.md, where an ungated "drop trailing incomplete
-// tail" heuristic truncated healthy output at the last '.'/'?'/'!' (breaking
-// ternaries, quoted ".", em-dashes — all of Morph's DSL).
+// bug where an ungated "drop trailing incomplete tail" heuristic truncated
+// healthy output at the last '.'/'?'/'!' (breaking ternaries, quoted ".",
+// em-dashes — common in code/DSL output).
 //
 // Run: node web/server/text_normalize.test.mjs
 
@@ -26,7 +26,7 @@ check(normalizeGeneratedChatText('X then "." then DONE', "qwen2") === 'X then ".
       "R1: quoted period not truncated");
 check(normalizeGeneratedChatText('display=display=="0"?$item:display~$item', "qwen2")
         === 'display=display=="0"?$item:display~$item',
-      "Morph DSL ternary handler preserved");
+      "DSL ternary handler preserved");
 check(normalizeGeneratedChatText("foo — bar then DONE", "qwen2") === "foo — bar then DONE",
       "em-dash content not truncated");
 check(normalizeGeneratedChatText("result = x > 0.5 ? hi : lo", "llama3")

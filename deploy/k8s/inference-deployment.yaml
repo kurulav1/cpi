@@ -79,10 +79,10 @@ spec:
               value: /models/tokenizer.json
             - name: LLAMA_CHAT_TEMPLATE
               value: qwen2
-            # Morph sends a fixed ~5k-token system prompt + short user message.
-            # The server default is 2048 (config.mjs), which truncates the prompt
-            # and drops the DSL format rules -> prose / empty_surface. Match
-            # web/config.json's maxContext.
+            # For workloads with a large fixed system prompt (multi-thousand
+            # tokens), the 2048 server default (config.mjs) truncates the prompt
+            # and drops instructions past the cutoff. Match web/config.json's
+            # maxContext.
             - name: LLAMA_MAX_CONTEXT
               value: "8192"
             # Batched prefill pass size. Built-in default (16) caps cold prefill

@@ -286,8 +286,8 @@ class GrammarBuilder {
     const std::string root_ref = visit(schema, "root");
     // Leading whitespace is tolerated, but there is deliberately NO trailing
     // whitespace rule: once the top-level value closes, the only grammar-legal
-    // continuation is EOS, which forces a clean stop (see MORPH_GRAMMAR_DESIGN.md,
-    // P1.2) rather than letting the model ramble past the closing brace.
+    // continuation is EOS, which forces a clean stop rather than letting the
+    // model ramble past the closing brace.
     ensure_ws();
     std::ostringstream out;
     out << "root ::= ws " << root_ref << "\n";
@@ -458,7 +458,7 @@ class GrammarBuilder {
       }
     }
 
-    // v1 property model (documented in MORPH_GRAMMAR_DESIGN.md):
+    // v1 property model:
     //   - If any properties are required: required ones are mandatory in
     //     declaration order, then optional ones follow as trailing optional
     //     groups (fixed required-before-optional ordering).

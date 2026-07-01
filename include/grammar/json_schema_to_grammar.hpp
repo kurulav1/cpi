@@ -1,7 +1,7 @@
 #pragma once
 
 // Compiles a JSON Schema into a GBNF grammar string suitable for grammar::Grammar.
-// A subset of JSON Schema is supported, covering what Morph's tool schemas use:
+// A subset of JSON Schema is supported, covering what typical tool schemas use:
 //   - "type": object, array, string, integer, number, boolean, null
 //   - object: "properties", "required"
 //   - array:  "items"

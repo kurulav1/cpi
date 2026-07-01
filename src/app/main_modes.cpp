@@ -159,12 +159,12 @@ void execute_engine_modes(const RunExecutionOptions& options,
         // `json_schema` (the tool's `parameters`), compile it to a grammar and
         // constrain sampling to schema-valid JSON. Absent or unparseable schema
         // falls back to unconstrained generation (the Node layer's prose
-        // instruction still applies). See docs/MORPH_GRAMMAR_DESIGN.md.
+        // instruction still applies).
         const std::string req_schema = json_get_raw_value(request_json, "json_schema");
         const int req_seed = json_get_int(request_json, "seed", -1);
         // min_new_tokens: suppress EOS until this many tokens are generated so
         // greedy (temp 0) decoding can't terminate early on a collapsed/repeated
-        // token run. See docs/MORPH_PERF_TODO.md.
+        // token run.
         const int req_min_new = std::max(0, json_get_int(request_json, "min_new", 0));
         std::unique_ptr<grammar::GrammarSampler> req_sampler;
         engine::GenerationConstraints req_constraints;

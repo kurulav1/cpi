@@ -613,9 +613,9 @@ std::vector<int> LlamaEngine::generate_stream(const std::vector<int>& prompt_tok
   const auto& cfg = weights_.config();
 
   // Prefix KV reuse: if the head of this prompt matches the tokens whose KV is
-  // already resident, skip re-prefilling that shared prefix. Morph resends the
-  // same ~2.3k-token system prompt every request, varying only the trailing user
-  // message. KV for an identical prefix at identical positions is bit-exact
+  // already resident, skip re-prefilling that shared prefix. This wins big for
+  // workloads that resend a large fixed system prompt every request, varying
+  // only the trailing user message. KV for an identical prefix at identical positions is bit-exact
   // (causal attention + position-based RoPE), so the output is unchanged. Only
   // the simple contiguous fp16 KV layout is eligible; paged / int4-KV / TQ3 /
   // MoE / sliding-window configs take a full reset + prefill.
