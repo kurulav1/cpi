@@ -3,11 +3,15 @@
 Skips the redundant .pth originals and any GGUF; we only need safetensors and
 the tokenizer/config files for the convert->pack pipeline.
 """
+import os
 import sys
+from pathlib import Path
+
 from huggingface_hub import snapshot_download
 
 REPO = "Qwen/Qwen2.5-Coder-32B-Instruct"
-OUT = r"c:\Users\Väinö\Downloads\cpi\artifacts\hub\Qwen__Qwen2.5-Coder-32B-Instruct\hf"
+_ARTIFACTS = Path(os.environ.get("CPI_ARTIFACTS_DIR", Path(__file__).resolve().parent.parent / "artifacts"))
+OUT = str(_ARTIFACTS / "hub" / "Qwen__Qwen2.5-Coder-32B-Instruct" / "hf")
 
 path = snapshot_download(
     repo_id=REPO,

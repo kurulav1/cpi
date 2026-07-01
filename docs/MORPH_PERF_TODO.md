@@ -337,7 +337,8 @@ plain CPU `build/`, and the resolver guessed a single wrong dir. Fixed (`web/ser
 - **Path resolution scans candidates in order** — `EMBED_BIN`, the dir holding the resolved
   `llama_infer`, then `build-run` / `build-cuda` / `build` — and returns the first that exists. No
   `EMBED_BIN` needed; the autostarted service finds the binary on its own. (Also fixed the earlier
-  non-ASCII-home-dir bug: `fileURLToPath` instead of `new URL().pathname`, which URL-encoded `Väinö`.)
+  non-ASCII-home-dir bug: `fileURLToPath` instead of `new URL().pathname`, which URL-encoded any
+  non-ASCII characters in the home-directory path.)
 - **Fail loud, not mid-use:** startup logs `embeddings: enabled (bge-small) bin=…` or
   `DISABLED (cpi_embed not found at … — RAG/folder-search will 503)`; `GET /v1/models` carries a
   non-standard `embeddings:{available,model}` readiness hint so Morph can preflight; and the route

@@ -2,6 +2,30 @@
 
 CPI is a local LLM inference engine with a CLI, REST API, and web UI. It supports CPU inference everywhere and CUDA acceleration when a CUDA toolchain is available.
 
+## Benchmarks
+
+Greedy single-request decode throughput on the reference machine below (`--benchmark`, temperature 0,
+2048-token context). GPU weights are held resident with `--gpu-cache-all`. Once a prompt's prefix is
+cached, warm-request latency is decode-bound, so decode tokens/s is the number that sets end-to-end
+latency.
+
+### Reference hardware
+
+- **GPU:** NVIDIA GeForce RTX 5090 — 32 GB, `sm_120` (Blackwell), driver 591.86
+- **CPU:** AMD Ryzen 9 9950X3D (16-core)
+- **RAM:** 32 GB · **OS:** Windows 11 Pro · **CUDA:** 13.2
+
+| Model | Params | Weights | Peak VRAM | GPU decode (tok/s) | CPU decode (tok/s) |
+| ----- | ------ | ------- | --------- | ------------------ | ------------------ |
+| Qwen2.5-Coder-3B-Instruct | 3B | fp16 | 10.7 GB | ~53 | ~7.3 |
+| Qwen2.5-7B-Instruct | 7B | fp16 | 19.3 GB | ~50 | ~3.3 |
+| Llama-3.1-8B-Instruct | 8B | fp16 | 20.2 GB | ~84 | ~3.2 |
+| Qwen2.5-Coder-32B-Instruct | 32B | int4 (streaming) | 26.8 GB | ~24 | — |
+
+Peak VRAM is total GPU memory during the run (includes ~1 GB desktop compositor). The 32B on CPU is
+omitted: its int4 weights dequantize past the 32 GB of system RAM (out-of-memory). See
+[docs/benchmarks.md](docs/benchmarks.md) for methodology and the full context × quant sweep.
+
 ## Highlights
 
 - CPU and CUDA inference paths

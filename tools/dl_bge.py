@@ -1,8 +1,14 @@
 """One-off: download BAAI/bge-small-en-v1.5 (384-dim retrieval embedding model)."""
+import os
+from pathlib import Path
+
 from huggingface_hub import snapshot_download
 
 REPO = "BAAI/bge-small-en-v1.5"
-OUT = r"c:\Users\Väinö\Downloads\cpi\artifacts\hub\BAAI__bge-small-en-v1.5"
+# Download into <repo>/artifacts/hub/... — derived from this file's location
+# (tools/), not a hardcoded path. Override the artifacts root with CPI_ARTIFACTS_DIR.
+_ARTIFACTS = Path(os.environ.get("CPI_ARTIFACTS_DIR", Path(__file__).resolve().parent.parent / "artifacts"))
+OUT = str(_ARTIFACTS / "hub" / "BAAI__bge-small-en-v1.5")
 
 path = snapshot_download(
     repo_id=REPO,

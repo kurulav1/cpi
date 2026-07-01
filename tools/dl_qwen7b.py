@@ -1,8 +1,12 @@
-"""One-off: download Qwen2.5-7B-Instruct (Morph primary target model)."""
+"""One-off: download Qwen2.5-7B-Instruct weights + tokenizer into artifacts/hub/."""
+import os
+from pathlib import Path
+
 from huggingface_hub import snapshot_download
 
 REPO = "Qwen/Qwen2.5-7B-Instruct"
-OUT = r"c:\Users\Väinö\Downloads\cpi\artifacts\hub\Qwen__Qwen2.5-7B-Instruct\hf"
+_ARTIFACTS = Path(os.environ.get("CPI_ARTIFACTS_DIR", Path(__file__).resolve().parent.parent / "artifacts"))
+OUT = str(_ARTIFACTS / "hub" / "Qwen__Qwen2.5-7B-Instruct" / "hf")
 
 path = snapshot_download(
     repo_id=REPO,
