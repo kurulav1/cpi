@@ -1,0 +1,46 @@
+# cpi-specific serving configuration, patched onto the compute-mesh inference base.
+#
+# cpi is a Node web server on :3001 that shells out to the llama_infer CUDA binary and reads model
+# artifacts from the read-only /models store the base provides. Named ports keep the base's probe and
+# Service references stable, so only the containerPort number and the health path are patched here.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inference
+spec:
+  replicas: 2
+  template:
+    spec:
+      containers:
+        - name: server
+          # The serving port number is set via a JSON6902 patch in kustomization.yaml (strategic
+          # merge keys container ports by number, so it would add a second port instead of replacing).
+          env:
+            - name: PORT
+              value: "3001"
+            - name: LLAMA_INFER_BIN
+              value: /app/bin/llama_infer
+            - name: LLAMA_MODEL_DIRS
+              value: /models
+            - name: LLAMA_MODEL_PATH
+              value: /models/Qwen2.5-Coder-3B-Instruct.ll2c
+            - name: LLAMA_TOKENIZER_PATH
+              value: /models/tokenizer.json
+            - name: LLAMA_CHAT_TEMPLATE
+              value: qwen2
+            - name: LLAMA_MAX_CONTEXT
+              value: "8192"
+            - name: LLAMA_INFER_PREFILL_CHUNK_SIZE
+              value: "256"
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+          # cpi's health endpoint (200 whenever the server is listening; model-loaded state is in
+          # the body). Named "http" port comes from the base.
+          livenessProbe:
+            httpGet:
+              path: /api/health
+          readinessProbe:
+            httpGet:
+              path: /api/health

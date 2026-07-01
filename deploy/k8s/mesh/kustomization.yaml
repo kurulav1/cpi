@@ -1,0 +1,35 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# cpi's thin serving descriptor for the compute-mesh distribution plane. The mechanism (stateless
+# GPU replica Deployment, RWX /models model store, health-gated Service, rolling updates) lives in
+# the compute-mesh inference base; cpi supplies only its image, LLAMA_* env, serving port, health
+# path, and resources.
+#
+# This is the compute-mesh-managed path. cpi's richer standalone stack (../inference-deployment.yaml
+# plus kserve/ and observability/) is independent and untouched -- use whichever fits the target.
+#
+# References the sibling compute-mesh checkout by relative path (matches cpt's convention).
+namespace: cpi-serving
+
+resources:
+  - namespace.yaml
+  - ../../../../compute-mesh/deploy/kubernetes/inference/base
+
+# The serving image cpi builds and pushes (see the repo Dockerfile / deploy README).
+images:
+  - name: inference-image
+    newName: cpi-llama
+    newTag: latest
+
+patches:
+  - path: inference-patch.yaml
+  # Set the serving port on the base's named "http" port (probes and Service reference it by name,
+  # so they follow automatically). JSON6902 because strategic merge would add a duplicate port.
+  - target:
+      kind: Deployment
+      name: inference
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/ports/0/containerPort
+        value: 3001
