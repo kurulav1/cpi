@@ -277,6 +277,28 @@ void launch_attention_step_paged(const half* q,
                                  float* scratch_o,
                                  int scratch_chunks);
 
+// Batched paged decode attention (P2 primitive): one decode step for `batch`
+// sequences in one launch. block_tables/seq_lens are per-sequence; q/out/scratch
+// are batched ([batch][num_heads][...]); all share the one KV block pool.
+void launch_attention_step_batched_paged(const half* q,
+                                         const half* k_pool,
+                                         const half* v_pool,
+                                         const int* block_tables,
+                                         const int* seq_lens,
+                                         int max_blocks,
+                                         int max_seq_len,
+                                         half* out,
+                                         int batch,
+                                         int num_heads,
+                                         int num_kv_heads,
+                                         int head_dim,
+                                         int block_size,
+                                         cudaStream_t stream,
+                                         float* scratch_m,
+                                         float* scratch_l,
+                                         float* scratch_o,
+                                         int scratch_chunks);
+
 // launch_attention_step_device_pos
 //
 // Device-position variant of launch_attention_step.  seq_len is derived on
