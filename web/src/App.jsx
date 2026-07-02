@@ -164,6 +164,44 @@ function quantLabel(mode) {
   return "FP16";
 }
 
+// Split a raw model label (from its filename) into a clean base name and a
+// human-readable format tag, so "Qwen2.5-Coder-32B-Instruct-streaming-int4"
+// shows as "Qwen2.5-Coder-32B-Instruct" + tag "int4 · streaming" instead of
+// cramming the storage format into the name (which collides with the runtime
+// quant selector and confuses people).
+function modelDisplay(profile) {
+  const raw = String(profile?.label || "");
+  const lower = raw.toLowerCase();
+  const isStreaming = lower.includes("streaming");
+  const fmt = lower.includes("int4") ? "int4" : lower.includes("int8") ? "int8" : "";
+  const base = raw
+    .replace(/[-_]?streaming/gi, "")
+    .replace(/[-_]?int[48]/gi, "")
+    .replace(/[-_]{2,}/g, "-")
+    .replace(/[-_]+$/g, "")
+    .trim() || raw;
+  const tag = [fmt, isStreaming ? "streaming" : ""].filter(Boolean).join(" · ");
+  return { base, tag, isStreaming, fmt, pinned: Boolean(fmt || isStreaming) };
+}
+
+// "Streaming" = the model is larger than VRAM, so its (usually int4/int8) weights
+// are streamed from disk/RAM layer-by-layer during inference. Lets you run huge
+// models (e.g. 32B) at the cost of speed.
+const STREAMING_HELP =
+  "Streaming model: too large to fit in VRAM, so its weights are streamed from disk during inference — runs big models, but slower.";
+
+// Turn low-level engine errors into something a user can act on.
+function friendlyEngineError(msg) {
+  const m = String(msg || "");
+  if (/gpu-cache-all|fully resident|not supported by the batched|INT8\/INT4-quantized/i.test(m)) {
+    return "This model can't run with fast batching — it's a streaming/quantized model that doesn't fit fully in VRAM. Pick a full-precision (FP16) model, or turn batching off.";
+  }
+  if (/pool exhausted|max_context budget/i.test(m)) {
+    return "Ran out of KV-cache space for this many concurrent requests. Lower the context size or reduce concurrency.";
+  }
+  return m;
+}
+
 function defaultQuantForProfile(profile) {
   const selectable = profile?.quant?.selectableModes ?? ["none"];
   const pickIfAllowed = (mode) => (selectable.includes(mode) ? mode : "");
@@ -943,6 +981,7 @@ export default function App() {
     readyProfiles.find((p) => p.id === settings.profileId) ||
     profiles.find((p) => p.id === settings.profileId) ||
     health.config?.selectedProfile || null;
+  const selDisplay   = selProfile ? modelDisplay(selProfile) : { base:"", tag:"", isStreaming:false, fmt:"", pinned:false };
   const maxContextLimit = Math.max(
     128,
     Number(selProfile?.maxPositionEmbeddings) || 0,
@@ -1376,11 +1415,12 @@ export default function App() {
     } catch (e) {
       flushDeltaQueue();
       const aborted = e.name === "AbortError";
-      const errMsg = (e?.message || "No response from engine.").trim();
+      const rawMsg = (e?.message || "No response from engine.").trim();
+      const errMsg = friendlyEngineError(rawMsg);
       const briefErr = errMsg.length > 220 ? `${errMsg.slice(0, 220)}...` : errMsg;
       updateMessages((cur) => cur.map((m) =>
         m.id === asstMsg.id
-          ? { ...m, content: m.content || (aborted ? "Stopped." : `Engine error: ${briefErr}`), streaming:false }
+          ? { ...m, content: m.content || (aborted ? "Stopped." : briefErr), streaming:false }
           : m
       ));
       if (!aborted) setError(errMsg);
@@ -1427,17 +1467,20 @@ export default function App() {
           {readyProfiles.length === 0 && (
             <option value="">{health.config ? "No models found" : "Loading"}</option>
           )}
-          {readyProfiles.map((p) => (
-            <option key={p.id} value={p.id}>
-              {p.label}
-            </option>
-          ))}
+          {readyProfiles.map((p) => {
+            const d = modelDisplay(p);
+            return (
+              <option key={p.id} value={p.id}>
+                {d.base}{d.tag ? ` (${d.tag})` : ""}
+              </option>
+            );
+          })}
         </select>
 
         <select
           className="topbar-select"
           value={settings.quantMode}
-          disabled={streaming || !selProfile}
+          disabled={streaming || !selProfile || selDisplay.pinned}
           onChange={(e) => {
             const quantMode = e.target.value;
             setSettings((cur) => ({ ...cur, quantMode }));
@@ -1448,7 +1491,9 @@ export default function App() {
               body: JSON.stringify({ profileId: selProfile.id, quantMode })
             }).catch((err) => setError(err.message));
           }}
-          title="Quantization mode"
+          title={selDisplay.pinned
+            ? `Weight precision is fixed by this model file (${selDisplay.tag || "packed"}). ${selDisplay.isStreaming ? STREAMING_HELP : ""}`
+            : "Runtime weight precision — FP16: full quality. INT8 / INT4: smaller & faster, slight quality trade-off. Applies to full-precision models."}
         >
           {(selProfile?.quant?.selectableModes ?? ["none"]).map((mode) => (
             <option key={mode} value={mode}>
@@ -1480,7 +1525,8 @@ export default function App() {
             <span className="badge badge-red">Worker Q {quantLabel(activeWorkerQuantMode)}</span>
           )}
           {settings.performanceMode && <span className="badge badge-blue">Perf</span>}
-          <span className="topbar-model">{selProfile?.label || "-"}</span>
+          {selDisplay.isStreaming && <span className="badge badge-neutral" title={STREAMING_HELP}>streaming</span>}
+          <span className="topbar-model" title={selProfile?.label || ""}>{selDisplay.base || "-"}</span>
         </span>
 
         <span style={{ fontSize:"0.7rem", color:"var(--text-3)", marginLeft:"0.4rem", flexShrink:0 }}>{stamp}</span>
@@ -1817,6 +1863,18 @@ export default function App() {
                             : "Runtime quantization from fp16")}
                     </span>
                   </div>
+                  {selDisplay.isStreaming && (
+                    <div className="kv">
+                      <span className="kv-key">Loading</span>
+                      <span className="kv-val" title={STREAMING_HELP}>Streaming (weights from disk)</span>
+                    </div>
+                  )}
+                  <p className="field-help" style={{ marginTop:"0.5rem" }}>
+                    <strong>Quant</strong> = weight precision: FP16 (full quality) vs INT8/INT4 (smaller &amp; faster,
+                    slight quality loss). It only applies to full-precision models — models whose name already lists a
+                    format (e.g. <em>int4</em>) are pre-packed and fixed. <strong>Streaming</strong> models are too big for
+                    VRAM, so their weights stream from disk (runs huge models, but slower).
+                  </p>
                   {selectedQuantJob && (
                     <div className="kv">
                       <span className="kv-key">Conversion Job</span>
