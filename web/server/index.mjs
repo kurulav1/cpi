@@ -1425,6 +1425,10 @@ function isBatchCompatible(cliConfig) {
   if (label.includes("streaming")) return false;                           // streamed weights
   if (/(^|[-_])int4([-_]|$)|(^|[-_])int8([-_]|$)/.test(label)) return false; // pre-packed quant
   if (p.moe) return false;                                                  // MoE
+  // SentencePiece (.model) tokenizers hang the node-spawned batch worker mid
+  // decode (works fine in the single-flight worker) — route them there until the
+  // worker-side interaction is root-caused.
+  if (String(p.tokenizerFormat || "").toLowerCase() === ".model") return false;
   return true;
 }
 

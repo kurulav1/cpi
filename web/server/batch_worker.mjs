@@ -35,6 +35,9 @@ export function createBatchWorker({ bin, args, env, cwd, onReadyError }) {
   const child = spawn(bin, args, { stdio: ["pipe", "pipe", "pipe"], env: env ?? process.env, cwd });
   const pending = new Map(); // id -> { onStart, onDelta, onDone, onError, text }
   const decoder = new StringDecoder("utf8");
+  // Surface worker stderr — otherwise a worker-side error/crash is invisible and
+  // the request just hangs.
+  child.stderr?.on("data", (d) => { try { process.stderr.write(`[batch-worker] ${d}`); } catch { /* ignore */ } });
   let stdoutBuffer = "";
 
   const routeLine = (line) => {
