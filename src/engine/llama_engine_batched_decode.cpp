@@ -33,6 +33,25 @@
 
 namespace engine {
 
+// The batched decode path implements ONLY the plain fp16 full-attention resident
+// case (lw->wqkv/wo/w13/w2 fp16, non-paged single-token path otherwise). Reject
+// anything else with a clear message instead of dereferencing null fp16 weights
+// (int8/int4 keep their weights in layer_cache_i8_, MoE/TQ3 use other caches).
+void LlamaEngine::require_batched_supported() const {
+  const auto& cfg = weights_.config();
+  const char* why = nullptr;
+  if (!options_.paged_blocks) why = "requires --paged-blocks";
+  else if (cached_layer_count_ != cfg.num_layers) why = "requires --gpu-cache-all (fully resident weights)";
+  else if (cfg.is_moe()) why = "MoE models are not supported by the batched path";
+  else if (cfg.uses_non_full_attention()) why = "sliding-window / non-full-attention models are not supported";
+  else if (kv_int4_enabled_) why = "INT4 KV cache is not supported by the batched path";
+  else if (tq3_enabled_) why = "TurboQuant (TQ3) models are not supported by the batched path";
+  else if (cached_int8_proj_enabled_ || cached_int8_mlp_enabled_) {
+    why = "INT8/INT4-quantized models are not supported by the batched path (use the fp16 model)";
+  }
+  if (why) throw std::runtime_error(std::string("batched decode ") + why);
+}
+
 // Shared batched-decode forward: embed -> layers (paged batched attention) ->
 // final norm. Leaves the per-row final hidden states in d_x_norm_ [batch][hidden]
 // so the LM-head tail can produce either argmax (greedy) or per-row logits (for
@@ -48,12 +67,7 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
       static_cast<int>(block_tables_flat.size()) != batch * max_blocks) {
     throw std::runtime_error("decode_step_batched: ragged tokens/positions/block_tables");
   }
-  if (cached_layer_count_ != cfg.num_layers) {
-    throw std::runtime_error("decode_step_batched requires fully resident weights (--gpu-cache-all)");
-  }
-  if (!options_.paged_blocks) {
-    throw std::runtime_error("decode_step_batched requires --paged-blocks");
-  }
+  require_batched_supported();
 
   const int hidden = cfg.hidden_size;
   const int inter = cfg.intermediate_size;
@@ -389,12 +403,8 @@ int LlamaEngine::stream_active() const { return static_cast<int>(stream_seqs_.si
 
 void LlamaEngine::stream_admit(const std::string& id, const std::vector<int>& prompt_tokens,
                                const StreamParams& params) {
-  if (!options_.paged_blocks || !block_alloc_) {
-    throw std::runtime_error("stream_admit requires --paged-blocks");
-  }
-  if (cached_layer_count_ != weights_.config().num_layers) {
-    throw std::runtime_error("stream_admit requires --gpu-cache-all (fully resident)");
-  }
+  if (!block_alloc_) throw std::runtime_error("stream_admit requires --paged-blocks");
+  require_batched_supported();
   if (prompt_tokens.empty()) throw std::runtime_error("stream_admit: empty prompt");
   const int bs = options_.paged_block_size > 0 ? options_.paged_block_size : 32;
 

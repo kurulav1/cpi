@@ -447,6 +447,9 @@ class LlamaEngine {
                                   const std::vector<int>& positions,
                                   const std::vector<int>& block_tables_flat,
                                   int max_blocks);
+  // Throws with a clear message if the current model/mode isn't supported by the
+  // batched decode path (only plain fp16 full-attention resident is).
+  void require_batched_supported() const;
   // Project all `batch` rows of d_x_norm_ through the LM head into d_batch_logits_
   // ([batch][vocab], float) in one GEMM. Lazily (re)allocates d_batch_logits_.
   void batched_lm_head(int batch, int hidden, int vocab);
