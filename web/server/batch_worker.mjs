@@ -31,8 +31,8 @@ export function toBatchArgs(interactiveArgs) {
 
 // Create a batch worker around a spawned llama_infer --interactive-batch process.
 // Returns { submit, activeCount, close }.
-export function createBatchWorker({ bin, args, env, onReadyError }) {
-  const child = spawn(bin, args, { stdio: ["pipe", "pipe", "pipe"], env: env ?? process.env });
+export function createBatchWorker({ bin, args, env, cwd, onReadyError }) {
+  const child = spawn(bin, args, { stdio: ["pipe", "pipe", "pipe"], env: env ?? process.env, cwd });
   const pending = new Map(); // id -> { onStart, onDelta, onDone, onError, text }
   const decoder = new StringDecoder("utf8");
   let stdoutBuffer = "";

@@ -8,6 +8,7 @@ import { StringDecoder } from "node:string_decoder";
 import { randomUUID } from "node:crypto";
 
 import { getRuntimeConfig, publicRuntimeSummary, setPreferredModelDir } from "./config.mjs";
+import { createBatchWorker, toBatchArgs } from "./batch_worker.mjs";
 import {
   buildInternalBodyFromChatRequest,
   buildInternalBodyFromCompletionRequest,
@@ -1402,6 +1403,45 @@ function ensureInteractiveWorker(config, cliConfig) {
   return interactiveWorker;
 }
 
+// Continuous-batching worker (opt-in via CPI_BATCH_WORKER=1). A single shared
+// --interactive-batch process serves concurrent chat requests, demuxed by id.
+// Uses a distinct single-instance mutex so it doesn't collide with the regular
+// single-flight interactive worker. Respawned on profile change.
+let batchWorker = null;
+let batchWorkerKey = null;
+
+function batchWorkerEnabled() {
+  return process.env.CPI_BATCH_WORKER === "1";
+}
+
+function getBatchWorker(config, cliConfig) {
+  const key =
+    cliConfig.workerKey ??
+    `${cliConfig.meta.profileId}|q:${cliConfig.meta.quantMode || "none"}|cpu:${cliConfig.meta.forceCpu ? 1 : 0}`;
+  if (
+    batchWorker &&
+    batchWorkerKey === key &&
+    !batchWorker.child.killed &&
+    batchWorker.child.exitCode == null
+  ) {
+    return batchWorker;
+  }
+  if (batchWorker) {
+    try { batchWorker.close(); } catch { /* ignore */ }
+    batchWorker = null;
+  }
+  const args = toBatchArgs(buildInteractiveLaunchArgs(config, cliConfig));
+  batchWorker = createBatchWorker({
+    bin: config.inferBin,
+    args,
+    cwd: config.repoRoot,
+    env: { ...process.env, LLAMA_INFER_INSTANCE_MUTEX: "Local\\llama_infer_batch_worker" },
+    onReadyError: (err) => console.error("[batch] worker error:", err?.message || err)
+  });
+  batchWorkerKey = key;
+  return batchWorker;
+}
+
 function resolveWarmupProfile(config, profileId) {
   const profile = findProfileByIdOrLabel(config, profileId);
   if (!profile) {
@@ -2273,8 +2313,9 @@ app.post("/api/generate", async (req, res) => {
 app.post("/api/chat/stream", async (req, res) => {
   const config = getRuntimeConfig();
   if (!guardReady(config, res)) return;
-  if (!(await guardIdle(res, { waitForWarmup: true }))) return;
 
+  // Build the request config up front so the opt-in batch path and the default
+  // single-flight path share validation.
   let cliConfig;
   try {
     cliConfig = buildCliArgs(config, requestBody(req));
@@ -2282,6 +2323,41 @@ app.post("/api/chat/stream", async (req, res) => {
     res.status(400).json({ error: err.message });
     return;
   }
+
+  // Opt-in continuous-batching path (CPI_BATCH_WORKER=1): many concurrent chat
+  // requests share one batching worker, demuxed by id. Skips the single-flight
+  // idle gate. HF-backed profiles fall through to their own path below.
+  if (batchWorkerEnabled() && !prefersHfChatBackend(cliConfig)) {
+    setStreamingHeaders(res, "application/x-ndjson; charset=utf-8");
+    writeNdjson(res, { type: "start", ...cliConfig.meta });
+    let ended = false;
+    const finish = (fn) => { if (!ended) { ended = true; fn(); res.end(); } };
+    try {
+      const worker = getBatchWorker(config, cliConfig);
+      worker.submit({
+        id: randomUUID(),
+        prompt: cliConfig.prompt,
+        maxNew: cliConfig.meta.maxNewTokens,
+        minNew: cliConfig.meta.minNewTokens ?? 0,
+        temp: cliConfig.meta.temperature,
+        stopTexts: cliConfig.stopTexts,
+        addBos: cliConfig.addBos,
+        onDelta: (delta) => { if (!ended) writeNdjson(res, { type: "delta", delta }); },
+        onDone: ({ text }) => finish(() => writeNdjson(res, {
+          type: "done", message: text, generatedTokens: null, tokPerS: null, metrics: null
+        })),
+        onError: (err) => finish(() => writeNdjson(res, { type: "error", error: err.message || String(err) }))
+      });
+    } catch (err) {
+      finish(() => writeNdjson(res, { type: "error", error: err.message || String(err) }));
+    }
+    // v1: no per-request cancel on disconnect (the batch worker keeps decoding);
+    // the response is simply abandoned.
+    onDisconnect(req, res, () => { ended = true; });
+    return;
+  }
+
+  if (!(await guardIdle(res, { waitForWarmup: true }))) return;
 
   setStreamingHeaders(res, "application/x-ndjson; charset=utf-8");
 
