@@ -1414,6 +1414,31 @@ function batchWorkerEnabled() {
   return process.env.CPI_BATCH_WORKER === "1";
 }
 
+// The batched decode path only supports plain fp16 fully-resident, full-attention
+// models. Anything else (runtime int8/int4, pre-packed streaming weights, MoE)
+// must fall back to the single-flight worker, which can run them. Deciding this
+// on the Node side lets a request route to the right worker instead of failing.
+function isBatchCompatible(cliConfig) {
+  const p = cliConfig.profile || {};
+  if (cliConfig.quantMode && cliConfig.quantMode !== "none") return false; // runtime quantization
+  const label = String(p.label || "").toLowerCase();
+  if (label.includes("streaming")) return false;                           // streamed weights
+  if (/(^|[-_])int4([-_]|$)|(^|[-_])int8([-_]|$)/.test(label)) return false; // pre-packed quant
+  if (p.moe) return false;                                                  // MoE
+  return true;
+}
+
+// Tear down the batch worker (e.g. when a request falls back to single-flight so
+// the single-flight model has VRAM to load into).
+function killBatchWorker() {
+  if (batchWorker) {
+    const old = batchWorker;
+    batchWorker = null;
+    batchWorkerKey = null;
+    try { old.kill(); } catch { /* ignore */ }
+  }
+}
+
 async function getBatchWorker(config, cliConfig) {
   const key =
     cliConfig.workerKey ??
@@ -2339,8 +2364,14 @@ app.post("/api/chat/stream", async (req, res) => {
 
   // Opt-in continuous-batching path (CPI_BATCH_WORKER=1): many concurrent chat
   // requests share one batching worker, demuxed by id. Skips the single-flight
-  // idle gate. HF-backed profiles fall through to their own path below.
-  if (batchWorkerEnabled() && !prefersHfChatBackend(cliConfig)) {
+  // idle gate. HF-backed profiles, and models the batched path can't run
+  // (quantized / streaming / MoE), fall through to the single-flight path below.
+  const wantBatch = batchWorkerEnabled() && !prefersHfChatBackend(cliConfig);
+  if (wantBatch && !isBatchCompatible(cliConfig)) {
+    // This model needs single-flight; free the batch worker's VRAM so it can load.
+    killBatchWorker();
+  }
+  if (wantBatch && isBatchCompatible(cliConfig)) {
     setStreamingHeaders(res, "application/x-ndjson; charset=utf-8");
     writeNdjson(res, { type: "start", ...cliConfig.meta });
     let ended = false;
