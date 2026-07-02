@@ -778,6 +778,20 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
       run_profiled(last_benchmark_stats_.decode_attention_ms, [&] {
         const auto [attn_start, attn_seq_len] = attention_bounds(layer, position);
         const std::size_t layer_stride = static_cast<std::size_t>(options_.max_context) * static_cast<std::size_t>(kv_hidden);
+        if (options_.paged_blocks && d_block_table_ != nullptr && attn_start == 0) {
+          // P3 phase 2c: gather KV through the device block table. Pool base is
+          // the layer's KV region; the block table maps logical chunk -> physical
+          // block (identity for a single contiguous sequence -> byte-identical).
+          auto* k_pool = static_cast<__half*>(d_k_cache_) + static_cast<std::size_t>(layer) * layer_stride;
+          auto* v_pool = static_cast<__half*>(d_v_cache_) + static_cast<std::size_t>(layer) * layer_stride;
+          const int bs = options_.paged_block_size > 0 ? options_.paged_block_size : 32;
+          kernels::launch_attention_step_paged(static_cast<const __half*>(d_q_),
+                                               k_pool, v_pool, d_block_table_, static_cast<__half*>(d_att_),
+                                               attn_seq_len, cfg.num_heads, cfg.num_kv_heads, head_dim, bs,
+                                               compute_stream_, d_attn_chunk_m_, d_attn_chunk_l_, d_attn_chunk_o_,
+                                               attn_chunk_capacity_);
+          return;
+        }
         auto* k_layer = static_cast<__half*>(d_k_cache_) + static_cast<std::size_t>(layer) * layer_stride +
                         static_cast<std::size_t>(attn_start) * static_cast<std::size_t>(kv_hidden);
         auto* v_layer = static_cast<__half*>(d_v_cache_) + static_cast<std::size_t>(layer) * layer_stride +
@@ -950,6 +964,20 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
       run_profiled(last_benchmark_stats_.decode_attention_ms, [&] {
         const auto [attn_start, attn_seq_len] = attention_bounds(layer, position);
         const std::size_t layer_stride = static_cast<std::size_t>(options_.max_context) * static_cast<std::size_t>(kv_hidden);
+        if (options_.paged_blocks && d_block_table_ != nullptr && attn_start == 0) {
+          // P3 phase 2c: gather KV through the device block table. Pool base is
+          // the layer's KV region; the block table maps logical chunk -> physical
+          // block (identity for a single contiguous sequence -> byte-identical).
+          auto* k_pool = static_cast<__half*>(d_k_cache_) + static_cast<std::size_t>(layer) * layer_stride;
+          auto* v_pool = static_cast<__half*>(d_v_cache_) + static_cast<std::size_t>(layer) * layer_stride;
+          const int bs = options_.paged_block_size > 0 ? options_.paged_block_size : 32;
+          kernels::launch_attention_step_paged(static_cast<const __half*>(d_q_),
+                                               k_pool, v_pool, d_block_table_, static_cast<__half*>(d_att_),
+                                               attn_seq_len, cfg.num_heads, cfg.num_kv_heads, head_dim, bs,
+                                               compute_stream_, d_attn_chunk_m_, d_attn_chunk_l_, d_attn_chunk_o_,
+                                               attn_chunk_capacity_);
+          return;
+        }
         auto* k_layer = static_cast<__half*>(d_k_cache_) + static_cast<std::size_t>(layer) * layer_stride +
                         static_cast<std::size_t>(attn_start) * static_cast<std::size_t>(kv_hidden);
         auto* v_layer = static_cast<__half*>(d_v_cache_) + static_cast<std::size_t>(layer) * layer_stride +

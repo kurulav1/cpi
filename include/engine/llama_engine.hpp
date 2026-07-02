@@ -348,6 +348,7 @@ class LlamaEngine {
   // and is the hook for the non-contiguous gather kernel (Phase 2b).
   std::unique_ptr<BlockAllocator> block_alloc_;
   std::unique_ptr<SequenceBlockTable> seq_blocks_;
+  int* d_block_table_ = nullptr;    // device: logical chunk -> physical block, for paged decode attention
   model::WeightLoader weights_;     // Memory-mapped weight file handle.
   int attn_q_hidden_ = 0;           // Query projection width (rows in attention.wq).
   int attn_head_dim_ = 0;           // Per-head attention width (attn_q_hidden_ / num_heads).

@@ -287,9 +287,24 @@ void LlamaEngine::allocate_runtime_buffers() {
     const int num_blocks = (options_.max_context + bs - 1) / bs;
     block_alloc_ = std::make_unique<BlockAllocator>(num_blocks);
     seq_blocks_ = std::make_unique<SequenceBlockTable>(block_alloc_.get(), bs);
+    // Device block table for the paged decode-attention kernel. Phase 2c uses a
+    // single contiguous sequence => identity mapping (logical chunk c -> block c),
+    // so KV writes stay in place and paged reads are byte-identical to contiguous.
+    // (Non-contiguous/multi-sequence tables come with continuous batching.)
+    CUDA_CHECK(cudaMalloc(&d_block_table_, static_cast<std::size_t>(num_blocks) * sizeof(int)));
+    std::vector<int> table(static_cast<std::size_t>(num_blocks));
+    // Identity mapping (byte-identical). CPI_PAGED_SCRAMBLE reverses it: a
+    // diagnostic that MUST corrupt output iff the paged gather is truly live
+    // (writes are still contiguous), proving the paged read path is engaged.
+    const bool scramble = std::getenv("CPI_PAGED_SCRAMBLE") != nullptr;
+    for (int i = 0; i < num_blocks; ++i) {
+      table[static_cast<std::size_t>(i)] = scramble ? (num_blocks - 1 - i) : i;
+    }
+    CUDA_CHECK(cudaMemcpy(d_block_table_, table.data(),
+                          static_cast<std::size_t>(num_blocks) * sizeof(int), cudaMemcpyHostToDevice));
     if (options_.verbose) {
       std::cout << "[engine] paged_blocks=on block_size=" << bs << " num_blocks=" << num_blocks
-                << " (P3 phase 2a: contiguous blocks, byte-identical)\n";
+                << " (P3 phase 2c: paged decode attention, identity table, byte-identical)\n";
     }
   }
 
