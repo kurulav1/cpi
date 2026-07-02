@@ -90,7 +90,11 @@ export function createBatchWorker({ bin, args, env, cwd, onReadyError }) {
     for (const [, req] of pending) req.onError?.(err);
     pending.clear();
   };
-  child.on("exit", (code) => failAll(new Error(`batch worker exited (code ${code})`)));
+  // Resolves once the child process has fully exited (its single-instance mutex
+  // and GPU memory are released) — used to serialize teardown before respawning.
+  let markExited;
+  const exited = new Promise((resolve) => { markExited = resolve; });
+  child.on("exit", (code) => { failAll(new Error(`batch worker exited (code ${code})`)); markExited(); });
   child.on("error", (err) => {
     onReadyError?.(err);
     failAll(err);
@@ -126,10 +130,18 @@ export function createBatchWorker({ bin, args, env, cwd, onReadyError }) {
     }
   };
 
+  // Force-terminate immediately (used when respawning for a different model, so
+  // the old process releases its mutex + VRAM before the new one loads).
+  const kill = () => {
+    try { child.kill("SIGKILL"); } catch { /* ignore */ }
+  };
+
   return {
     submit,
     activeCount: () => pending.size,
     close,
+    kill,
+    exited,
     child
   };
 }

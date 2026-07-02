@@ -1622,7 +1622,7 @@ export default function App() {
                           : <MsgContent text={m.content} />}
                         {m.streaming && <span className="cursor" />}
                       </div>
-                      {!m.streaming && isLast && runMeta?.elapsedMs && (
+                      {!m.streaming && isLast && runMeta?.elapsedMs > 0 && (
                         <div className="run-meta">{fmtMs(runMeta.elapsedMs)}</div>
                       )}
                     </div>

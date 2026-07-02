@@ -1414,7 +1414,7 @@ function batchWorkerEnabled() {
   return process.env.CPI_BATCH_WORKER === "1";
 }
 
-function getBatchWorker(config, cliConfig) {
+async function getBatchWorker(config, cliConfig) {
   const key =
     cliConfig.workerKey ??
     `${cliConfig.meta.profileId}|q:${cliConfig.meta.quantMode || "none"}|cpu:${cliConfig.meta.forceCpu ? 1 : 0}`;
@@ -1426,16 +1426,24 @@ function getBatchWorker(config, cliConfig) {
   ) {
     return batchWorker;
   }
+  // Respawning (profile change, or a dead worker): force-kill the old process and
+  // wait for it to fully exit BEFORE launching the new one, so its single-instance
+  // mutex + GPU memory are released (otherwise the new worker dies with exit
+  // code 3 — "another instance is already running").
   if (batchWorker) {
-    try { batchWorker.close(); } catch { /* ignore */ }
+    const old = batchWorker;
     batchWorker = null;
+    batchWorkerKey = null;
+    old.kill();
+    try { await Promise.race([old.exited, new Promise((r) => setTimeout(r, 8000))]); } catch { /* ignore */ }
   }
   const args = toBatchArgs(buildInteractiveLaunchArgs(config, cliConfig));
   batchWorker = createBatchWorker({
     bin: config.inferBin,
     args,
     cwd: config.repoRoot,
-    env: { ...process.env, LLAMA_INFER_INSTANCE_MUTEX: "Local\\llama_infer_batch_worker" },
+    // Unique per spawn so a still-dying predecessor can never collide on the lock.
+    env: { ...process.env, LLAMA_INFER_INSTANCE_MUTEX: `Local\\llama_infer_batch_${process.pid}_${Date.now()}` },
     onReadyError: (err) => console.error("[batch] worker error:", err?.message || err)
   });
   batchWorkerKey = key;
@@ -2331,9 +2339,10 @@ app.post("/api/chat/stream", async (req, res) => {
     setStreamingHeaders(res, "application/x-ndjson; charset=utf-8");
     writeNdjson(res, { type: "start", ...cliConfig.meta });
     let ended = false;
+    const startedAt = Date.now();
     const finish = (fn) => { if (!ended) { ended = true; fn(); res.end(); } };
     try {
-      const worker = getBatchWorker(config, cliConfig);
+      const worker = await getBatchWorker(config, cliConfig);
       worker.submit({
         id: randomUUID(),
         prompt: cliConfig.prompt,
@@ -2344,7 +2353,8 @@ app.post("/api/chat/stream", async (req, res) => {
         addBos: cliConfig.addBos,
         onDelta: (delta) => { if (!ended) writeNdjson(res, { type: "delta", delta }); },
         onDone: ({ text }) => finish(() => writeNdjson(res, {
-          type: "done", message: text, generatedTokens: null, tokPerS: null, metrics: null
+          type: "done", message: text, elapsedMs: Date.now() - startedAt,
+          generatedTokens: null, tokPerS: null, metrics: null
         })),
         onError: (err) => finish(() => writeNdjson(res, { type: "error", error: err.message || String(err) }))
       });
