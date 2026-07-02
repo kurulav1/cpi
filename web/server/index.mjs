@@ -1437,7 +1437,12 @@ async function getBatchWorker(config, cliConfig) {
     old.kill();
     try { await Promise.race([old.exited, new Promise((r) => setTimeout(r, 8000))]); } catch { /* ignore */ }
   }
-  const args = toBatchArgs(buildInteractiveLaunchArgs(config, cliConfig));
+  // The batched path is always fully GPU-resident (--gpu-cache-all), so the host
+  // RAM it "uses" is mostly the reclaimable mmap of the weights. The host
+  // memory/CPU throttle would otherwise fire (weights push system RAM past the
+  // 85% default) and sleep between decode steps — a ~10x decode slowdown for no
+  // real benefit. Lift host resource limits for the batch worker.
+  const args = toBatchArgs(buildInteractiveLaunchArgs(config, { ...cliConfig, noResourceLimits: true }));
   batchWorker = createBatchWorker({
     bin: config.inferBin,
     args,
