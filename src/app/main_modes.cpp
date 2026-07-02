@@ -235,6 +235,7 @@ void execute_engine_modes(const RunExecutionOptions& options,
         });
 
         int emitted_count = 0;
+        try {
         (void)generate_stream(req_prompt_tokens, req_max_new, req_temp, [&](int tok) {
           // Until min_new tokens are produced, don't honour stop conditions
           // either (the engine also masks EOS); keeps greedy from truncating early.
@@ -276,6 +277,20 @@ void execute_engine_modes(const RunExecutionOptions& options,
           }
           return true;
         }, req_constraints_ptr);
+        } catch (...) {
+          // Join the streaming thread before the exception propagates: a joinable
+          // std::thread destroyed during stack unwinding calls std::terminate and
+          // kills the whole worker. Signal + join here, then rethrow to the
+          // per-request handler below, which emits a clean "error" event and keeps
+          // the worker serving the next request. (E.g. a prompt exceeding the
+          // context window now returns an error instead of crashing the process.)
+          stream_done.store(true);
+          stream_cv.notify_one();
+          if (stream_thread.joinable()) {
+            stream_thread.join();
+          }
+          throw;
+        }
         stream_done.store(true);
         stream_cv.notify_one();
         if (stream_thread.joinable()) {

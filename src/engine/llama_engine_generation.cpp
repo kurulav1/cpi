@@ -588,6 +588,18 @@ std::vector<int> LlamaEngine::generate_stream(const std::vector<int>& prompt_tok
   if (prompt_tokens.empty()) {
     LLAMA_ENGINE_THROW("prompt token list is empty");
   }
+  // Bounds guard: the KV cache and position tables are allocated for exactly
+  // options_.max_context positions (see llama_engine_lifecycle.cpp). A prompt
+  // that meets or exceeds the window would prefill KV out of bounds, corrupting
+  // memory — observed as garbage output on some builds and a 0xC0000409
+  // stack-buffer-overrun on others. Reject with a clear error before touching
+  // any buffer, leaving at least one slot for a generated token.
+  if (static_cast<int>(prompt_tokens.size()) >= options_.max_context) {
+    LLAMA_ENGINE_THROW("prompt length " + std::to_string(prompt_tokens.size()) +
+                       " exceeds the model context window " +
+                       std::to_string(options_.max_context) +
+                       " (reduce the prompt or raise --max-context / LLAMA_MAX_CONTEXT)");
+  }
 
   // Bind the per-request grammar for the duration of this call; cleared on exit.
   active_grammar_ = constraints ? constraints->grammar : nullptr;

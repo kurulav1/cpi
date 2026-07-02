@@ -1279,6 +1279,7 @@ function parseWorkerStdout(worker) {
                 `total_ms=${elapsedMs != null ? elapsedMs.toFixed(0) : "?"}`
             );
           }
+          recordGenLatency(elapsedMs, decodeTokPerS);
           worker.ready = true;
           worker.pending = null;
           pending.resolve({
@@ -1479,11 +1480,19 @@ function runGeneration(
   let previousCpu = null;
   let overLimitSince = 0;
   let worker = null;
+  let releaseSlot = null;   // single-flight engine slot; released on settle
+  let cancelled = false;    // cancel requested before the slot was acquired
+  let started = false;      // true once this request holds the slot and is running
+  let genTimer = null;      // per-request watchdog; frees a wedged slot on timeout
 
   const stopResourceMonitor = () => {
     if (resourceTimer) {
       clearInterval(resourceTimer);
       resourceTimer = null;
+    }
+    if (genTimer) {
+      clearTimeout(genTimer);
+      genTimer = null;
     }
   };
 
@@ -1491,28 +1500,43 @@ function runGeneration(
     if (settled) return;
     settled = true;
     stopResourceMonitor();
-    activeRequest = null;
+    // Only the running request owns the module-global activeRequest; a queued
+    // request settling (e.g. cancelled before its turn) must not clear it.
+    if (started) activeRequest = null;
+    if (releaseSlot) { releaseSlot(); releaseSlot = null; }
     fn();
   };
 
-  try {
-    worker = ensureInteractiveWorker(config, cliConfig);
-  } catch (err) {
-    return {
-      cancel() {
-        settle(() => onError(err.message || String(err)));
+  // Runs only once this request holds the single-flight engine slot.
+  const start = () => {
+    try {
+      worker = ensureInteractiveWorker(config, cliConfig);
+    } catch (err) {
+      settle(() => onError(err.message || String(err)));
+      return;
+    }
+
+    onStart?.(cliConfig.meta);
+    activeRequest = {
+      kind: requestKind,
+      cancel: () => {
+        killWorker(worker);
+        settle(() => onError("generation cancelled"));
       }
     };
-  }
+    started = true;
 
-  onStart?.(cliConfig.meta);
-  activeRequest = {
-    kind: requestKind,
-    cancel: () => {
-      killWorker(worker);
-      settle(() => onError("generation cancelled"));
+    // Per-request watchdog: if a generation never settles (wedged worker), free
+    // the single-flight slot so the queue behind it isn't blocked forever.
+    // Generous default (5 min); tune/disable via CPI_GEN_TIMEOUT_MS (0 = off).
+    const genTimeoutMs = Math.max(0, Number(process.env.CPI_GEN_TIMEOUT_MS ?? 300000));
+    if (genTimeoutMs > 0 && requestKind === "generation") {
+      genTimer = setTimeout(() => {
+        killWorker(worker);
+        settle(() => onError(`generation timed out after ${genTimeoutMs}ms`));
+      }, genTimeoutMs);
+      genTimer.unref?.();
     }
-  };
 
   const payload = {
     id: requestId,
@@ -1654,11 +1678,31 @@ function runGeneration(
     }
     settle(() => onError(`Failed to send request to worker: ${err.message}`));
   }
+  };  // end start()
+
+  // Acquire the single-flight engine slot, then run. Concurrent requests queue
+  // FIFO and run serially; over-capacity acquisition rejects -> surfaced as 503.
+  acquireEngineSlot().then(
+    (release) => {
+      if (settled) { release(); return; }        // cancelled/aborted while queued
+      releaseSlot = release;
+      if (cancelled) { settle(() => onError("generation cancelled")); return; }
+      start();
+    },
+    (err) => {
+      settle(() => onError(err.message || String(err)));  // over capacity; never held the slot
+    }
+  );
 
   return {
     cancel() {
-      if (!activeRequest?.cancel) return;
-      activeRequest.cancel();
+      if (settled) return;
+      if (started && activeRequest?.cancel) {
+        activeRequest.cancel();                   // running: kill worker + settle (releases slot)
+      } else {
+        cancelled = true;                          // still queued: settle now, release on our turn
+        settle(() => onError("generation cancelled"));
+      }
     }
   };
 }
@@ -1767,6 +1811,79 @@ function guardReady(config, res) {
   return true;
 }
 
+// Map a worker error message to an OpenAI-style status/type/code. A prompt that
+// exceeds the model context window is a client error (400 context_length_exceeded),
+// not a server fault — the engine now rejects it with a clear message instead of
+// crashing (see llama_engine generate_stream bounds guard). Over-capacity is 503.
+function classifyWorkerError(msg) {
+  const m = String(msg || "");
+  if (/context window|context length|prompt length \d+ exceeds/i.test(m)) {
+    return { status: 400, type: "invalid_request_error", code: "context_length_exceeded" };
+  }
+  if (/at capacity|engine_overloaded|too many/i.test(m)) {
+    return { status: 503, type: "server_error", code: "engine_overloaded" };
+  }
+  return { status: 500, type: "server_error", code: undefined };
+}
+
+// ── Single-flight engine gate ────────────────────────────────────────────────
+// The interactive worker, `activeRequest`, and `worker.pending` are all single-
+// slot, so at most ONE generation may run at a time. Every generation funnels
+// through runGeneration, which acquires a slot here; concurrent requests queue
+// FIFO and run serially (correct — latency stacks) instead of racing into the
+// worker and clobbering each other's response slot (the old check-then-act
+// guardOpenAiIdle let two idle-arriving requests both pass). Bounded depth gives
+// backpressure: past the cap, acquisition rejects and the route returns 503.
+const ENGINE_MAX_QUEUE = Math.max(1, Number(process.env.CPI_MAX_QUEUE) || 32);
+let engineTail = Promise.resolve();
+let engineQueueDepth = 0;   // requests waiting for or holding the slot
+let engineInFlight = false;
+// Rolling window of recent generation latencies for p50/p95 + tok/s (P0.3).
+const recentGens = [];
+const RECENT_CAP = 200;
+function recordGenLatency(totalMs, tokPerS) {
+  if (!Number.isFinite(totalMs) || totalMs <= 0) return;
+  recentGens.push({ ms: totalMs, tokPerS: Number.isFinite(tokPerS) ? tokPerS : null });
+  if (recentGens.length > RECENT_CAP) recentGens.shift();
+}
+function _pct(sorted, p) {
+  if (!sorted.length) return null;
+  return Math.round(sorted[Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length))]);
+}
+function engineStats() {
+  const ms = recentGens.map((g) => g.ms).sort((a, b) => a - b);
+  const toks = recentGens.map((g) => g.tokPerS).filter((x) => x != null);
+  return {
+    queueDepth: engineQueueDepth,
+    inFlight: engineInFlight,
+    maxQueue: ENGINE_MAX_QUEUE,
+    samples: recentGens.length,
+    p50Ms: _pct(ms, 50),
+    p95Ms: _pct(ms, 95),
+    avgTokPerS: toks.length ? Math.round((toks.reduce((a, b) => a + b, 0) / toks.length) * 10) / 10 : null,
+  };
+}
+function acquireEngineSlot() {
+  if (engineQueueDepth >= ENGINE_MAX_QUEUE) {
+    return Promise.reject(new Error("server is at capacity; retry shortly (engine_overloaded)"));
+  }
+  engineQueueDepth++;
+  const prior = engineTail;
+  let releaseTurn;
+  engineTail = new Promise((r) => { releaseTurn = r; });
+  return prior.then(() => {
+    engineInFlight = true;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      engineInFlight = false;
+      engineQueueDepth = Math.max(0, engineQueueDepth - 1);
+      releaseTurn();
+    };
+  });
+}
+
 function guardOpenAiReady(config, res) {
   if (!config.ready) {
     const detail = config.selectedProfile?.unsupportedReason
@@ -1819,29 +1936,12 @@ async function guardOpenAiIdle(
     }
   }
 
-  // Single-engine queuing: rather than rejecting concurrent generations with
-  // engine_busy, wait (up to waitForIdleMs) for the in-flight one to finish. This
-  // lets clients that fan out parallel requests serialize through the engine
-  // instead of failing. The engine's own single-
-  // instance lock still guards the rare wake-up race.
-  if (waitForIdleMs > 0 && activeRequest && activeRequest.kind !== "warmup") {
-    const deadline = Date.now() + Math.max(0, Number(waitForIdleMs) || 0);
-    while (activeRequest && activeRequest.kind !== "warmup" && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, intervalMs));
-    }
-  }
-
-  if (activeRequest) {
-    const reason =
-      activeRequest.kind === "warmup"
-        ? "Engine is still preparing. Please retry in a moment."
-        : "Engine is busy with another generation.";
-    sendOpenAiError(res, 409, reason, {
-      type: "server_error",
-      code: activeRequest.kind === "warmup" ? "engine_preparing" : "engine_busy"
-    });
-    return false;
-  }
+  // Serialization + backpressure now live in the single-flight engine queue
+  // (acquireEngineSlot in runGeneration): concurrent requests queue FIFO and run
+  // one at a time; past the depth cap, acquisition rejects and the route returns
+  // 503. So there is no idle-wait / engine_busy 409 here — admit and let the
+  // queue order it. (waitForIdleMs is retained in the signature but unused.)
+  void waitForIdleMs;
   return true;
 }
 
@@ -1947,7 +2047,10 @@ app.get("/api/health", (_req, res) => {
     config: summary,
     quantOverrides: Object.fromEntries(quantOverrides),
     activeWorker,
-    activeQuantJob
+    activeQuantJob,
+    // Concurrency + throughput (P0.3): queue depth, in-flight, backpressure cap,
+    // recent p50/p95 end-to-end latency and average decode tok/s.
+    engine: engineStats()
   });
 });
 
@@ -2379,7 +2482,8 @@ app.post("/v1/completions", async (req, res) => {
         res.end();
       },
       onError: (msg) => {
-        writeSse(res, openAiErrorPayload(msg, "server_error"));
+        const c = classifyWorkerError(msg);
+        writeSse(res, openAiErrorPayload(msg, c.type, null, c.code));
         res.end();
       }
     });
@@ -2410,7 +2514,8 @@ app.post("/v1/completions", async (req, res) => {
       ),
     onError: (msg) => {
       if (!res.headersSent) {
-        sendOpenAiError(res, 500, msg, { type: "server_error" });
+        const c = classifyWorkerError(msg);
+        sendOpenAiError(res, c.status, msg, { type: c.type, code: c.code });
       }
     }
   });
@@ -2566,7 +2671,8 @@ app.post("/v1/chat/completions", async (req, res) => {
         res.end();
       },
       onError: (msg) => {
-        writeSse(res, openAiErrorPayload(msg, "server_error"));
+        const c = classifyWorkerError(msg);
+        writeSse(res, openAiErrorPayload(msg, c.type, null, c.code));
         res.end();
       }
     });
@@ -2605,7 +2711,8 @@ app.post("/v1/chat/completions", async (req, res) => {
     },
     onError: (msg) => {
       if (!res.headersSent) {
-        sendOpenAiError(res, 500, msg, { type: "server_error" });
+        const c = classifyWorkerError(msg);
+        sendOpenAiError(res, c.status, msg, { type: c.type, code: c.code });
       }
     }
   });
@@ -2759,7 +2866,8 @@ app.post("/v1/responses", async (req, res) => {
         res.end();
       },
       onError: (msg) => {
-        writeSse(res, openAiErrorPayload(msg, "server_error"));
+        const c = classifyWorkerError(msg);
+        writeSse(res, openAiErrorPayload(msg, c.type, null, c.code));
         res.end();
       }
     });
@@ -2790,7 +2898,8 @@ app.post("/v1/responses", async (req, res) => {
       ),
     onError: (msg) => {
       if (!res.headersSent) {
-        sendOpenAiError(res, 500, msg, { type: "server_error" });
+        const c = classifyWorkerError(msg);
+        sendOpenAiError(res, c.status, msg, { type: c.type, code: c.code });
       }
     }
   });
