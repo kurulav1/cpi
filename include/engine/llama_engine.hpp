@@ -447,8 +447,20 @@ class LlamaEngine {
                                   const std::vector<int>& positions,
                                   const std::vector<int>& block_tables_flat,
                                   int max_blocks);
-  // Project row b's hidden state through the LM head into d_logits_ (float).
-  void batched_lm_head_row(int b, int hidden);
+  // Project all `batch` rows of d_x_norm_ through the LM head into d_batch_logits_
+  // ([batch][vocab], float) in one GEMM. Lazily (re)allocates d_batch_logits_.
+  void batched_lm_head(int batch, int hidden, int vocab);
+  float* d_batch_logits_ = nullptr;  // [max_batch * vocab] float LM-head output
+  int d_batch_logits_cap_ = 0;       // capacity in rows
+  // Persistent split-K attention scratch for batched decode (grown on demand).
+  float* d_bs_scratch_m_ = nullptr;
+  float* d_bs_scratch_l_ = nullptr;
+  float* d_bs_scratch_o_ = nullptr;
+  std::size_t d_bs_stat_cap_ = 0;    // capacity in stat elements (m/l); o is *head_dim
+  // Optional attribution (CPI_BATCH_PROFILE): cumulative seconds in the batched
+  // forward vs the LM-head/logits-copy tail.
+  double prof_fwd_s_ = 0.0;
+  double prof_head_s_ = 0.0;
 
   // A running request in the streaming batch scheduler.
   struct StreamSeq {

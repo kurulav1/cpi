@@ -851,6 +851,10 @@ LlamaEngine::~LlamaEngine() {
   if (d_batch_positions_) { cudaFree(d_batch_positions_); d_batch_positions_ = nullptr; }
   if (d_batch_seq_lens_) { cudaFree(d_batch_seq_lens_); d_batch_seq_lens_ = nullptr; }
   if (d_batch_block_tables_) { cudaFree(d_batch_block_tables_); d_batch_block_tables_ = nullptr; }
+  if (d_batch_logits_) { cudaFree(d_batch_logits_); d_batch_logits_ = nullptr; }
+  if (d_bs_scratch_m_) { cudaFree(d_bs_scratch_m_); d_bs_scratch_m_ = nullptr; }
+  if (d_bs_scratch_l_) { cudaFree(d_bs_scratch_l_); d_bs_scratch_l_ = nullptr; }
+  if (d_bs_scratch_o_) { cudaFree(d_bs_scratch_o_); d_bs_scratch_o_ = nullptr; }
   if (h_k_cache_) {
     cudaFreeHost(h_k_cache_);
     h_k_cache_ = nullptr;

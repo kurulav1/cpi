@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -94,13 +95,23 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
 
   // Split-K scratch for the batched attention: [batch*heads*chunks] stats and
   // [batch*heads*chunks*head_dim] partial outputs. Chunks bounded by max_seq.
+  // Persistent (grown on demand) — allocating/freeing per step would stall the
+  // pipeline with synchronizing cudaMalloc/cudaFree on every decode step.
   const int chunks = (max_seq + bs - 1) / bs;
   const std::size_t stat_elems =
       static_cast<std::size_t>(batch) * cfg.num_heads * chunks;
-  float *scratch_m = nullptr, *scratch_l = nullptr, *scratch_o = nullptr;
-  CUDA_CHECK(cudaMalloc(&scratch_m, stat_elems * sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&scratch_l, stat_elems * sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&scratch_o, stat_elems * head_dim * sizeof(float)));
+  if (stat_elems > d_bs_stat_cap_) {
+    if (d_bs_scratch_m_) cudaFree(d_bs_scratch_m_);
+    if (d_bs_scratch_l_) cudaFree(d_bs_scratch_l_);
+    if (d_bs_scratch_o_) cudaFree(d_bs_scratch_o_);
+    CUDA_CHECK(cudaMalloc(&d_bs_scratch_m_, stat_elems * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_bs_scratch_l_, stat_elems * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_bs_scratch_o_, stat_elems * head_dim * sizeof(float)));
+    d_bs_stat_cap_ = stat_elems;
+  }
+  float* scratch_m = d_bs_scratch_m_;
+  float* scratch_l = d_bs_scratch_l_;
+  float* scratch_o = d_bs_scratch_o_;
 
   kernels::launch_embedding_lookup(static_cast<const __half*>(d_tok_embeddings_),
                                    d_token_id_, static_cast<__half*>(d_x_), batch, hidden,
@@ -189,25 +200,29 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
   }
 
   launch_norm(d_x_, d_norm_out_, d_norm_out_bias_, d_x_norm_, batch, hidden);
-
-  cudaFree(scratch_m);
-  cudaFree(scratch_l);
-  cudaFree(scratch_o);
   return batch;
 }
 
-// Project one row's final hidden state (d_x_norm_ + b*hidden) through the LM head
-// into d_logits_ (float, +optional bias). Caller has run the forward.
-void LlamaEngine::batched_lm_head_row(int b, int hidden) {
-  const auto& cfg = weights_.config();
-  const auto* x_row = static_cast<const __half*>(d_x_norm_) + static_cast<std::size_t>(b) * hidden;
-  resident_projection_float(d_lm_head_, x_row, d_logits_, cfg.vocab_size, hidden,
-                            resident_lm_head_warps_, resident_lm_head_tile_pairs_,
-                            resident_lm_head_rows_per_warp_);
+// Project all `batch` rows of d_x_norm_ through the LM head into d_batch_logits_
+// ([batch][vocab] float) with a single GEMM (half in, float out via cublasGemmEx),
+// replacing a per-row loop of GEMV + sync + big D2H copy.
+void LlamaEngine::batched_lm_head(int batch, int hidden, int vocab) {
+  if (batch > d_batch_logits_cap_) {
+    if (d_batch_logits_) cudaFree(d_batch_logits_);
+    CUDA_CHECK(cudaMalloc(&d_batch_logits_,
+                          static_cast<std::size_t>(batch) * vocab * sizeof(float)));
+    d_batch_logits_cap_ = batch;
+  }
+  detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
+                                          lt_workspace_bytes_, compute_stream_, d_lm_head_,
+                                          d_x_norm_, d_batch_logits_, vocab, hidden, batch,
+                                          CUDA_R_32F);
   if (d_lm_head_bias_) {
-    kernels::launch_add_bias_inplace_float_from_half(static_cast<float*>(d_logits_),
-                                                     static_cast<const __half*>(d_lm_head_bias_),
-                                                     cfg.vocab_size, compute_stream_);
+    for (int b = 0; b < batch; ++b) {
+      kernels::launch_add_bias_inplace_float_from_half(
+          d_batch_logits_ + static_cast<std::size_t>(b) * vocab,
+          static_cast<const __half*>(d_lm_head_bias_), vocab, compute_stream_);
+    }
   }
 }
 
@@ -219,10 +234,12 @@ std::vector<int> LlamaEngine::decode_step_batched(const std::vector<int>& tokens
   if (batch == 0) return {};
   const int hidden = weights_.config().hidden_size;
   const int vocab = weights_.config().vocab_size;
+  batched_lm_head(batch, hidden, vocab);
+  // Per-row device argmax (only B ints cross the bus, not B*vocab floats).
   std::vector<int> next(batch);
   for (int b = 0; b < batch; ++b) {
-    batched_lm_head_row(b, hidden);
-    kernels::launch_argmax_float(static_cast<const float*>(d_logits_), vocab, d_argmax_, compute_stream_);
+    kernels::launch_argmax_float(d_batch_logits_ + static_cast<std::size_t>(b) * vocab, vocab,
+                                 d_argmax_, compute_stream_);
     CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
     CUDA_CHECK(cudaMemcpy(&next[b], d_argmax_, sizeof(int), cudaMemcpyDeviceToHost));
   }
@@ -234,18 +251,29 @@ void LlamaEngine::decode_step_batched_logits(const std::vector<int>& tokens,
                                              const std::vector<int>& block_tables_flat,
                                              int max_blocks,
                                              std::vector<std::vector<float>>& out_logits) {
+  static const bool prof = std::getenv("CPI_BATCH_PROFILE") != nullptr;
+  const auto t0 = std::chrono::steady_clock::now();
   const int batch = decode_step_batched_forward(tokens, positions, block_tables_flat, max_blocks);
   out_logits.assign(static_cast<std::size_t>(batch), {});
   if (batch == 0) return;
   const int hidden = weights_.config().hidden_size;
   const int vocab = weights_.config().vocab_size;
-  for (int b = 0; b < batch; ++b) {
-    batched_lm_head_row(b, hidden);
-    out_logits[b].resize(static_cast<std::size_t>(vocab));
+  if (prof) {
     CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
-    CUDA_CHECK(cudaMemcpy(out_logits[b].data(), d_logits_,
-                          static_cast<std::size_t>(vocab) * sizeof(float), cudaMemcpyDeviceToHost));
+    prof_fwd_s_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   }
+  const auto t1 = std::chrono::steady_clock::now();
+  // One batched GEMM, then one coalesced D2H copy of the whole [batch][vocab] block.
+  batched_lm_head(batch, hidden, vocab);
+  std::vector<float> host(static_cast<std::size_t>(batch) * vocab);
+  CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
+  CUDA_CHECK(cudaMemcpy(host.data(), d_batch_logits_,
+                        host.size() * sizeof(float), cudaMemcpyDeviceToHost));
+  for (int b = 0; b < batch; ++b) {
+    out_logits[b].assign(host.begin() + static_cast<std::ptrdiff_t>(b) * vocab,
+                         host.begin() + static_cast<std::ptrdiff_t>(b + 1) * vocab);
+  }
+  if (prof) prof_head_s_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
 }
 
 void LlamaEngine::run_batched_decode_check(const std::vector<int>& prompt_tokens, int num_steps) {
@@ -526,8 +554,16 @@ void LlamaEngine::run_batch_bench(const std::vector<int>& prompt, int max_new) {
 
     const double serial_tps = serial_s > 0 ? serial_tokens / serial_s : 0.0;
     const double batched_tps = batched_s > 0 ? batched_tokens / batched_s : 0.0;
-    std::printf("  %4d  %14.1f  %14.1f  %7.2fx\n", B, serial_tps, batched_tps,
+    std::printf("  %4d  %14.1f  %14.1f  %7.2fx", B, serial_tps, batched_tps,
                 serial_tps > 0 ? batched_tps / serial_tps : 0.0);
+    if (std::getenv("CPI_BATCH_PROFILE")) {
+      const double tot = prof_fwd_s_ + prof_head_s_;
+      std::printf("   [fwd %.0f%% head %.0f%%]", tot > 0 ? 100.0 * prof_fwd_s_ / tot : 0.0,
+                  tot > 0 ? 100.0 * prof_head_s_ / tot : 0.0);
+      prof_fwd_s_ = 0.0;
+      prof_head_s_ = 0.0;
+    }
+    std::printf("\n");
   }
 }
 
