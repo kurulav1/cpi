@@ -1082,6 +1082,7 @@ export default function App() {
     if (backendBusyForWarmup) return { label:"Preparing", dot:"dot-blue", badge:"badge-blue" };
     if (health.busy) return { label:"Streaming", dot:"dot-blue", badge:"badge-blue" };
     if (warmupForSelected === "preparing") return { label:"Preparing", dot:"dot-blue", badge:"badge-blue" };
+    if (warmupForSelected === "lazy") return { label:"Loads on first message", dot:"dot-amber", badge:"badge-amber" };
     if (warmupForSelected === "error") return { label:"Preparation failed", dot:"dot-red", badge:"badge-red" };
     if (warmupDoneForSelected) return { label:"Ready", dot:"dot-green", badge:"badge-green" };
     return { label:"Idle", dot:"dot-amber", badge:"badge-amber" };
@@ -1201,6 +1202,10 @@ export default function App() {
   useEffect(() => {
     const profileId = settings.profileId;
     if (!profileId || !selProfile?.ready || streaming) return;
+    // Streaming models load slowly and lazily (weights stream from disk, often
+    // gigabytes). A blocking pre-warm just times out and looks like a failure, so
+    // skip it — they load on the first message instead.
+    if (selDisplay.isStreaming) { setWarmup({ state:"lazy", workerKey: selectedWorkerKey, error:"" }); return; }
     const workerKey = selectedWorkerKey;
 
     warmupAbortRef.current?.abort();
