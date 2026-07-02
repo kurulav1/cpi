@@ -247,6 +247,8 @@ ParsedArgs parse_args(int argc, char** argv) {
       args.batched_check = std::stoi(need_val("--batched-check"));
     } else if (arg == "--scheduler-check") {
       args.scheduler_check = std::stoi(need_val("--scheduler-check"));
+    } else if (arg == "--batch-bench") {
+      args.batch_bench = std::stoi(need_val("--batch-bench"));
     } else if (arg == "--dump-tokenizer-meta") {
       args.dump_tokenizer_meta = true;
     } else if (arg == "--dump-prompt-tokens") {

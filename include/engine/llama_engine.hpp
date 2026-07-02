@@ -403,6 +403,10 @@ class LlamaEngine {
   // the single-sequence path, and compares token-for-token. Prints PASS/FAIL.
   void run_scheduler_check(const std::vector<int>& base_prompt, int max_new, int eos_id);
 
+  // Throughput benchmark: sweeps batch sizes, comparing serial single-sequence
+  // generation against concurrent run_batch (decode tokens/sec + speedup).
+  void run_batch_bench(const std::vector<int>& prompt, int max_new);
+
   // ---- Streaming batch scheduler (continuous batching for the server) --------
   // Per-request generation parameters. top_k/top_p/repetition_penalty/no_repeat
   // come from EngineOptions (shared); temperature/min_new/stop/grammar are

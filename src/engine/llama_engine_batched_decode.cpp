@@ -21,6 +21,7 @@
 #include "grammar/grammar_sampler.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <limits>
 #include <memory>
@@ -481,6 +482,53 @@ std::vector<std::vector<int>> LlamaEngine::run_batch(const std::vector<BatchRequ
     for (const auto& e : events) outs[id_to_index[e.id]].push_back(e.token);
   }
   return outs;
+}
+
+void LlamaEngine::run_batch_bench(const std::vector<int>& prompt, int max_new) {
+  if (!options_.paged_blocks) throw std::runtime_error("batch bench requires --paged-blocks");
+  if (cached_layer_count_ != weights_.config().num_layers) {
+    throw std::runtime_error("batch bench requires --gpu-cache-all (fully resident)");
+  }
+  using clock = std::chrono::steady_clock;
+  const auto secs = [](clock::duration d) {
+    return std::chrono::duration<double>(d).count();
+  };
+
+  // Batch sizes to sweep; skip any whose worst-case KV would exceed the budget.
+  std::vector<int> sizes = {1, 2, 4, 8, 16};
+  const int per_seq = static_cast<int>(prompt.size()) + max_new;
+
+  // Warmup (kernel autotune / first-launch costs shouldn't skew the first row).
+  { std::vector<BatchRequest> w(1, BatchRequest{prompt, std::min(8, max_new), -1}); run_batch(w); }
+
+  std::printf("batch throughput bench: prompt=%zu max_new=%d (decode tokens/sec, eos disabled)\n",
+              prompt.size(), max_new);
+  std::printf("  %4s  %14s  %14s  %8s\n", "B", "serial_tok/s", "batched_tok/s", "speedup");
+  for (int B : sizes) {
+    if (static_cast<long long>(B) * per_seq > options_.max_context) continue;
+
+    // Serial baseline: B independent single-sequence generations, back to back.
+    const auto s0 = clock::now();
+    long long serial_tokens = 0;
+    for (int i = 0; i < B; ++i) {
+      const auto out = greedy_generate_single(prompt, max_new, -1);
+      serial_tokens += static_cast<long long>(out.size());
+    }
+    const double serial_s = secs(clock::now() - s0);
+
+    // Batched: all B sequences concurrently through the scheduler.
+    std::vector<BatchRequest> reqs(B, BatchRequest{prompt, max_new, -1});
+    const auto b0 = clock::now();
+    const auto outs = run_batch(reqs);
+    const double batched_s = secs(clock::now() - b0);
+    long long batched_tokens = 0;
+    for (const auto& o : outs) batched_tokens += static_cast<long long>(o.size());
+
+    const double serial_tps = serial_s > 0 ? serial_tokens / serial_s : 0.0;
+    const double batched_tps = batched_s > 0 ? batched_tokens / batched_s : 0.0;
+    std::printf("  %4d  %14.1f  %14.1f  %7.2fx\n", B, serial_tps, batched_tps,
+                serial_tps > 0 ? batched_tps / serial_tps : 0.0);
+  }
 }
 
 void LlamaEngine::run_scheduler_check(const std::vector<int>& base_prompt, int max_new, int eos_id) {

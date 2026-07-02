@@ -254,6 +254,10 @@ int main(int argc, char** argv) {
           eng.run_scheduler_check(prompt_tokens, cli.scheduler_check, -1);
           return;
         }
+        if (cli.batch_bench > 0) {
+          eng.run_batch_bench(prompt_tokens, cli.batch_bench);
+          return;
+        }
         if (cli.interactive_batch) {
           if (!use_tokenizer) {
             throw std::runtime_error("--interactive-batch requires --tokenizer");
