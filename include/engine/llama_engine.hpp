@@ -368,6 +368,14 @@ class LlamaEngine {
                                        const std::vector<int>& block_tables_flat,
                                        int max_blocks);
 
+  // Same forward as decode_step_batched but returns per-row logits [batch][vocab]
+  // so each sequence can be sampled with its own params/grammar (streaming batcher).
+  void decode_step_batched_logits(const std::vector<int>& tokens,
+                                  const std::vector<int>& positions,
+                                  const std::vector<int>& block_tables_flat,
+                                  int max_blocks,
+                                  std::vector<std::vector<float>>& out_logits);
+
   // Parity gate for decode_step_batched: prefill `prompt_tokens`, then for
   // `num_steps` decode steps compare the batched path (N=1 and N=2 duplicate
   // rows) against the single-token path token-for-token. Prints PASS/FAIL.
@@ -398,6 +406,14 @@ class LlamaEngine {
  private:
   // Single-sequence greedy decode (reference for the scheduler gate).
   std::vector<int> greedy_generate_single(const std::vector<int>& prompt, int max_new, int eos_id);
+  // Shared batched-decode forward (embed -> layers -> final norm); leaves per-row
+  // final hidden states in d_x_norm_. Returns batch size.
+  int decode_step_batched_forward(const std::vector<int>& tokens,
+                                  const std::vector<int>& positions,
+                                  const std::vector<int>& block_tables_flat,
+                                  int max_blocks);
+  // Project row b's hidden state through the LM head into d_logits_ (float).
+  void batched_lm_head_row(int b, int hidden);
 
  public:
 

@@ -26,13 +26,17 @@
 
 namespace engine {
 
-std::vector<int> LlamaEngine::decode_step_batched(const std::vector<int>& tokens,
-                                                  const std::vector<int>& positions,
-                                                  const std::vector<int>& block_tables_flat,
-                                                  int max_blocks) {
+// Shared batched-decode forward: embed -> layers (paged batched attention) ->
+// final norm. Leaves the per-row final hidden states in d_x_norm_ [batch][hidden]
+// so the LM-head tail can produce either argmax (greedy) or per-row logits (for
+// per-request sampling). Returns the batch size.
+int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
+                                             const std::vector<int>& positions,
+                                             const std::vector<int>& block_tables_flat,
+                                             int max_blocks) {
   const auto& cfg = weights_.config();
   const int batch = static_cast<int>(tokens.size());
-  if (batch == 0) return {};
+  if (batch == 0) return 0;
   if (static_cast<int>(positions.size()) != batch ||
       static_cast<int>(block_tables_flat.size()) != batch * max_blocks) {
     throw std::runtime_error("decode_step_batched: ragged tokens/positions/block_tables");
@@ -180,29 +184,62 @@ std::vector<int> LlamaEngine::decode_step_batched(const std::vector<int>& tokens
 
   launch_norm(d_x_, d_norm_out_, d_norm_out_bias_, d_x_norm_, batch, hidden);
 
-  // LM head + greedy argmax, one sequence at a time (the batching win is in the
-  // decoder stack; a batched float-output GEMM is a later optimization).
-  std::vector<int> next(batch);
-  for (int b = 0; b < batch; ++b) {
-    const auto* x_row = static_cast<const __half*>(d_x_norm_) + static_cast<std::size_t>(b) * hidden;
-    resident_projection_float(d_lm_head_, x_row, d_logits_, cfg.vocab_size, hidden,
-                              resident_lm_head_warps_, resident_lm_head_tile_pairs_,
-                              resident_lm_head_rows_per_warp_);
-    if (d_lm_head_bias_) {
-      kernels::launch_add_bias_inplace_float_from_half(static_cast<float*>(d_logits_),
-                                                       static_cast<const __half*>(d_lm_head_bias_),
-                                                       cfg.vocab_size, compute_stream_);
-    }
-    kernels::launch_argmax_float(static_cast<const float*>(d_logits_), cfg.vocab_size, d_argmax_,
-                                 compute_stream_);
-    CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
-    CUDA_CHECK(cudaMemcpy(&next[b], d_argmax_, sizeof(int), cudaMemcpyDeviceToHost));
-  }
-
   cudaFree(scratch_m);
   cudaFree(scratch_l);
   cudaFree(scratch_o);
+  return batch;
+}
+
+// Project one row's final hidden state (d_x_norm_ + b*hidden) through the LM head
+// into d_logits_ (float, +optional bias). Caller has run the forward.
+void LlamaEngine::batched_lm_head_row(int b, int hidden) {
+  const auto& cfg = weights_.config();
+  const auto* x_row = static_cast<const __half*>(d_x_norm_) + static_cast<std::size_t>(b) * hidden;
+  resident_projection_float(d_lm_head_, x_row, d_logits_, cfg.vocab_size, hidden,
+                            resident_lm_head_warps_, resident_lm_head_tile_pairs_,
+                            resident_lm_head_rows_per_warp_);
+  if (d_lm_head_bias_) {
+    kernels::launch_add_bias_inplace_float_from_half(static_cast<float*>(d_logits_),
+                                                     static_cast<const __half*>(d_lm_head_bias_),
+                                                     cfg.vocab_size, compute_stream_);
+  }
+}
+
+std::vector<int> LlamaEngine::decode_step_batched(const std::vector<int>& tokens,
+                                                  const std::vector<int>& positions,
+                                                  const std::vector<int>& block_tables_flat,
+                                                  int max_blocks) {
+  const int batch = decode_step_batched_forward(tokens, positions, block_tables_flat, max_blocks);
+  if (batch == 0) return {};
+  const int hidden = weights_.config().hidden_size;
+  const int vocab = weights_.config().vocab_size;
+  std::vector<int> next(batch);
+  for (int b = 0; b < batch; ++b) {
+    batched_lm_head_row(b, hidden);
+    kernels::launch_argmax_float(static_cast<const float*>(d_logits_), vocab, d_argmax_, compute_stream_);
+    CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
+    CUDA_CHECK(cudaMemcpy(&next[b], d_argmax_, sizeof(int), cudaMemcpyDeviceToHost));
+  }
   return next;
+}
+
+void LlamaEngine::decode_step_batched_logits(const std::vector<int>& tokens,
+                                             const std::vector<int>& positions,
+                                             const std::vector<int>& block_tables_flat,
+                                             int max_blocks,
+                                             std::vector<std::vector<float>>& out_logits) {
+  const int batch = decode_step_batched_forward(tokens, positions, block_tables_flat, max_blocks);
+  out_logits.assign(static_cast<std::size_t>(batch), {});
+  if (batch == 0) return;
+  const int hidden = weights_.config().hidden_size;
+  const int vocab = weights_.config().vocab_size;
+  for (int b = 0; b < batch; ++b) {
+    batched_lm_head_row(b, hidden);
+    out_logits[b].resize(static_cast<std::size_t>(vocab));
+    CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
+    CUDA_CHECK(cudaMemcpy(out_logits[b].data(), d_logits_,
+                          static_cast<std::size_t>(vocab) * sizeof(float), cudaMemcpyDeviceToHost));
+  }
 }
 
 void LlamaEngine::run_batched_decode_check(const std::vector<int>& prompt_tokens, int num_steps) {
@@ -351,13 +388,16 @@ std::vector<std::vector<int>> LlamaEngine::run_batch(const std::vector<BatchRequ
     s.eos = r.eos_id;
     grow_table(s, s.pos);  // blocks covering the prompt
     // Point the engine's prefill KV addressing at this sequence's blocks.
+    // d_block_table_ is shared engine state, and fully-cached prefill runs async
+    // on compute_stream_ without syncing, so we must let this prefill finish
+    // before the next sequence overwrites d_block_table_.
     block_table_host_ = s.table;
     CUDA_CHECK(cudaMemcpy(d_block_table_, s.table.data(),
                           s.table.size() * sizeof(int), cudaMemcpyHostToDevice));
     prefill_prompt(r.prompt);
+    CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
     seqs.push_back(std::move(s));
   }
-  CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
 
   // Decode all running sequences together, one step at a time.
   int remaining = N;
