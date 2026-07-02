@@ -533,7 +533,7 @@ void LlamaEngine::run_batch_bench(const std::vector<int>& prompt, int max_new) {
   };
 
   // Batch sizes to sweep; skip any whose worst-case KV would exceed the budget.
-  std::vector<int> sizes = {1, 2, 4, 8, 16};
+  std::vector<int> sizes = {1, 2, 4, 8, 16, 32};
   const int per_seq = static_cast<int>(prompt.size()) + max_new;
 
   // Warmup (kernel autotune / first-launch costs shouldn't skew the first row).
