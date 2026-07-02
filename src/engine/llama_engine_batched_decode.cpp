@@ -18,10 +18,15 @@
 #include "runtime/cuda_utils.cuh"
 #include "runtime/kernels.cuh"
 
+#include "grammar/grammar_sampler.hpp"
+
 #include <algorithm>
 #include <cstdio>
+#include <limits>
 #include <memory>
 #include <stdexcept>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace engine {
@@ -339,111 +344,142 @@ std::vector<int> LlamaEngine::greedy_generate_single(const std::vector<int>& pro
   return out;
 }
 
-std::vector<std::vector<int>> LlamaEngine::run_batch(const std::vector<BatchRequest>& requests) {
-  if (!options_.paged_blocks || !seq_blocks_ || !block_alloc_) {
-    throw std::runtime_error("run_batch requires --paged-blocks");
+void LlamaEngine::stream_grow_table(StreamSeq& s, int upto_pos) {
+  const int bs = options_.paged_block_size > 0 ? options_.paged_block_size : 32;
+  if (!s.blocks->ensure_position(upto_pos)) {
+    throw std::runtime_error("stream scheduler: paged KV pool exhausted (concurrent length > max_context budget)");
+  }
+  const int nblk = upto_pos / bs + 1;
+  if (static_cast<int>(s.table.size()) != nblk) {
+    s.table.resize(static_cast<std::size_t>(nblk));
+    for (int c = 0; c < nblk; ++c) s.table[static_cast<std::size_t>(c)] = s.blocks->block_for(c * bs);
+  }
+}
+
+int LlamaEngine::stream_active() const { return static_cast<int>(stream_seqs_.size()); }
+
+void LlamaEngine::stream_admit(const std::string& id, const std::vector<int>& prompt_tokens,
+                               const StreamParams& params) {
+  if (!options_.paged_blocks || !block_alloc_) {
+    throw std::runtime_error("stream_admit requires --paged-blocks");
   }
   if (cached_layer_count_ != weights_.config().num_layers) {
-    throw std::runtime_error("run_batch requires --gpu-cache-all (fully resident)");
+    throw std::runtime_error("stream_admit requires --gpu-cache-all (fully resident)");
   }
+  if (prompt_tokens.empty()) throw std::runtime_error("stream_admit: empty prompt");
   const int bs = options_.paged_block_size > 0 ? options_.paged_block_size : 32;
+
+  StreamSeq s;
+  s.id = id;
+  s.blocks = std::make_unique<SequenceBlockTable>(block_alloc_.get(), bs);
+  s.history = prompt_tokens;
+  s.last_token = prompt_tokens.back();
+  s.pos = static_cast<int>(prompt_tokens.size()) - 1;
+  s.params = params;
+  stream_grow_table(s, s.pos);
+
+  // Prefill this request's prompt into its own blocks. d_block_table_ is shared
+  // engine state and fully-cached prefill runs async on compute_stream_, so sync
+  // before returning (a later admit / the decode loop must not clobber it).
+  block_table_host_ = s.table;
+  CUDA_CHECK(cudaMemcpy(d_block_table_, s.table.data(), s.table.size() * sizeof(int),
+                        cudaMemcpyHostToDevice));
+  prefill_prompt(prompt_tokens);
+  CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
+  stream_seqs_.push_back(std::move(s));
+}
+
+bool LlamaEngine::stream_step(std::vector<StreamEvent>& events) {
+  events.clear();
+  const int B = static_cast<int>(stream_seqs_.size());
+  if (B == 0) return false;
+
+  // Assemble the running batch (grow each table to cover the position we write).
+  int max_blocks = 0;
+  for (auto& s : stream_seqs_) {
+    stream_grow_table(s, s.pos);
+    max_blocks = std::max(max_blocks, static_cast<int>(s.table.size()));
+  }
+  std::vector<int> toks(B), poss(B), flat(static_cast<std::size_t>(B) * max_blocks, 0);
+  for (int b = 0; b < B; ++b) {
+    toks[b] = stream_seqs_[b].last_token;
+    poss[b] = stream_seqs_[b].pos;
+    const auto& t = stream_seqs_[b].table;
+    for (std::size_t c = 0; c < t.size(); ++c) flat[static_cast<std::size_t>(b) * max_blocks + c] = t[c];
+  }
+
+  std::vector<std::vector<float>> logits;
+  decode_step_batched_logits(toks, poss, flat, max_blocks, logits);
+
+  // Sample each row with its own params/grammar, then retire finished requests.
+  std::vector<int> finished;  // indices into stream_seqs_
+  for (int b = 0; b < B; ++b) {
+    StreamSeq& s = stream_seqs_[b];
+    std::vector<float>& lg = logits[b];
+
+    if (s.params.grammar) s.params.grammar->apply_mask(lg);
+    // Suppress EOS until min_new_tokens (skip when a grammar drives termination).
+    if (s.generated < s.params.min_new_tokens && !s.params.grammar &&
+        options_.eos_token_id >= 0 &&
+        static_cast<std::size_t>(options_.eos_token_id) < lg.size()) {
+      lg[static_cast<std::size_t>(options_.eos_token_id)] = -std::numeric_limits<float>::infinity();
+    }
+
+    const int tok = detail::dispatch_sample_from_logits(lg, s.params.temperature, options_.top_k,
+                                                        options_.top_p, options_.repetition_penalty,
+                                                        options_.no_repeat_ngram_size, s.history);
+    if (s.params.grammar) s.params.grammar->accept(tok);
+    s.history.push_back(tok);
+    s.last_token = tok;
+    ++s.pos;
+    ++s.generated;
+
+    const bool is_stop =
+        std::find(s.params.stop_ids.begin(), s.params.stop_ids.end(), tok) != s.params.stop_ids.end();
+    const char* reason = "";
+    bool fin = false;
+    if (is_stop) {
+      fin = true;
+      reason = (tok == options_.eos_token_id) ? "eos" : "stop";
+    } else if (s.generated >= s.params.max_new_tokens || s.pos >= options_.max_context) {
+      fin = true;
+      reason = "length";
+    }
+    events.push_back(StreamEvent{s.id, tok, fin, reason});
+    if (fin) finished.push_back(b);
+  }
+
+  // Free finished requests' blocks and remove them (iterate high->low to keep
+  // indices valid). RAII on the unique_ptr releases blocks to the pool.
+  for (auto it = finished.rbegin(); it != finished.rend(); ++it) {
+    stream_seqs_.erase(stream_seqs_.begin() + *it);
+  }
+  return true;
+}
+
+std::vector<std::vector<int>> LlamaEngine::run_batch(const std::vector<BatchRequest>& requests) {
+  if (!options_.paged_blocks || !block_alloc_) {
+    throw std::runtime_error("run_batch requires --paged-blocks");
+  }
   const int N = static_cast<int>(requests.size());
+  reset_kv_cache();  // release any prior blocks before we admit
 
-  struct Seq {
-    std::unique_ptr<SequenceBlockTable> blocks;
-    std::vector<int> table;  // logical chunk -> physical block, grown on demand
-    std::vector<int> out;
-    int pos = 0;
-    int last = 0;
-    int budget = 0;
-    int eos = -1;
-    bool done = false;
-  };
-
-  // Grow a sequence's block table so it covers `upto_pos`, refreshing the host
-  // mirror. Blocks are allocated on demand from the shared pool.
-  const auto grow_table = [&](Seq& s, int upto_pos) {
-    if (!s.blocks->ensure_position(upto_pos)) {
-      throw std::runtime_error("run_batch: paged KV pool exhausted (concurrent length > max_context budget)");
-    }
-    const int nblk = upto_pos / bs + 1;
-    if (static_cast<int>(s.table.size()) != nblk) {
-      s.table.resize(static_cast<std::size_t>(nblk));
-      for (int c = 0; c < nblk; ++c) s.table[static_cast<std::size_t>(c)] = s.blocks->block_for(c * bs);
-    }
-  };
-
-  reset_kv_cache();  // release the engine's single-seq table blocks before we allocate our own
-
-  // Admit + prefill each request into its own (non-contiguous) blocks.
-  std::vector<Seq> seqs;
-  seqs.reserve(N);
-  for (const auto& r : requests) {
-    if (r.prompt.empty()) throw std::runtime_error("run_batch: empty prompt");
-    Seq s;
-    s.blocks = std::make_unique<SequenceBlockTable>(block_alloc_.get(), bs);
-    s.last = r.prompt.back();
-    s.pos = static_cast<int>(r.prompt.size()) - 1;
-    s.budget = r.max_new_tokens;
-    s.eos = r.eos_id;
-    grow_table(s, s.pos);  // blocks covering the prompt
-    // Point the engine's prefill KV addressing at this sequence's blocks.
-    // d_block_table_ is shared engine state, and fully-cached prefill runs async
-    // on compute_stream_ without syncing, so we must let this prefill finish
-    // before the next sequence overwrites d_block_table_.
-    block_table_host_ = s.table;
-    CUDA_CHECK(cudaMemcpy(d_block_table_, s.table.data(),
-                          s.table.size() * sizeof(int), cudaMemcpyHostToDevice));
-    prefill_prompt(r.prompt);
-    CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
-    seqs.push_back(std::move(s));
-  }
-
-  // Decode all running sequences together, one step at a time.
-  int remaining = N;
-  while (remaining > 0) {
-    std::vector<int> idx;
-    idx.reserve(remaining);
-    for (int i = 0; i < N; ++i) if (!seqs[i].done) idx.push_back(i);
-    const int B = static_cast<int>(idx.size());
-
-    int max_blocks = 0;
-    for (int i : idx) {
-      grow_table(seqs[i], seqs[i].pos);  // ensure block for the position we're about to write
-      max_blocks = std::max(max_blocks, static_cast<int>(seqs[i].table.size()));
-    }
-
-    std::vector<int> toks(B), poss(B), flat(static_cast<std::size_t>(B) * max_blocks, 0);
-    for (int b = 0; b < B; ++b) {
-      Seq& s = seqs[idx[b]];
-      toks[b] = s.last;
-      poss[b] = s.pos;
-      for (std::size_t c = 0; c < s.table.size(); ++c) {
-        flat[static_cast<std::size_t>(b) * max_blocks + c] = s.table[c];
-      }
-    }
-
-    const auto next = decode_step_batched(toks, poss, flat, max_blocks);
-
-    for (int b = 0; b < B; ++b) {
-      Seq& s = seqs[idx[b]];
-      const int t = next[b];
-      s.out.push_back(t);
-      s.last = t;
-      ++s.pos;
-      const bool fin = (t == s.eos) ||
-                       (static_cast<int>(s.out.size()) >= s.budget) ||
-                       (s.pos >= options_.max_context);
-      if (fin) {
-        s.done = true;
-        s.blocks->clear();  // free-on-finish: return blocks to the pool for other sequences
-        --remaining;
-      }
-    }
-  }
-
+  std::unordered_map<std::string, int> id_to_index;
   std::vector<std::vector<int>> outs(N);
-  for (int i = 0; i < N; ++i) outs[i] = std::move(seqs[i].out);
+  for (int i = 0; i < N; ++i) {
+    StreamParams p;
+    p.max_new_tokens = requests[i].max_new_tokens;
+    p.temperature = 0.0f;  // greedy
+    if (requests[i].eos_id >= 0) p.stop_ids.push_back(requests[i].eos_id);
+    const std::string id = std::to_string(i);
+    id_to_index[id] = i;
+    stream_admit(id, requests[i].prompt, p);
+  }
+
+  std::vector<StreamEvent> events;
+  while (stream_step(events)) {
+    for (const auto& e : events) outs[id_to_index[e.id]].push_back(e.token);
+  }
   return outs;
 }
 

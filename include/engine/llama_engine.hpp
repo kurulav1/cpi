@@ -403,6 +403,37 @@ class LlamaEngine {
   // the single-sequence path, and compares token-for-token. Prints PASS/FAIL.
   void run_scheduler_check(const std::vector<int>& base_prompt, int max_new, int eos_id);
 
+  // ---- Streaming batch scheduler (continuous batching for the server) --------
+  // Per-request generation parameters. top_k/top_p/repetition_penalty/no_repeat
+  // come from EngineOptions (shared); temperature/min_new/stop/grammar are
+  // per-request. `grammar` is optional and owned by the caller — it must outlive
+  // the request (until its finished StreamEvent is emitted).
+  struct StreamParams {
+    int max_new_tokens = 16;
+    int min_new_tokens = 0;
+    float temperature = 0.0f;
+    std::vector<int> stop_ids;
+    grammar::GrammarSampler* grammar = nullptr;
+  };
+  // One token emitted for a request during a decode step.
+  struct StreamEvent {
+    std::string id;
+    int token = 0;
+    bool finished = false;
+    const char* finish_reason = "";  // "eos" | "stop" | "length"
+  };
+
+  // Admit a request into the running batch (prefills its prompt into its own
+  // paged blocks). Requires --paged-blocks + --gpu-cache-all.
+  void stream_admit(const std::string& id, const std::vector<int>& prompt_tokens,
+                    const StreamParams& params);
+  // Advance one decode step over all running requests, sampling each with its own
+  // params/grammar; appends one StreamEvent per running request. Retires and
+  // frees blocks for finished requests. Returns false if nothing is running.
+  bool stream_step(std::vector<StreamEvent>& events);
+  // Number of requests currently running.
+  int stream_active() const;
+
  private:
   // Single-sequence greedy decode (reference for the scheduler gate).
   std::vector<int> greedy_generate_single(const std::vector<int>& prompt, int max_new, int eos_id);
@@ -414,6 +445,21 @@ class LlamaEngine {
                                   int max_blocks);
   // Project row b's hidden state through the LM head into d_logits_ (float).
   void batched_lm_head_row(int b, int hidden);
+
+  // A running request in the streaming batch scheduler.
+  struct StreamSeq {
+    std::string id;
+    std::unique_ptr<SequenceBlockTable> blocks;
+    std::vector<int> table;    // logical chunk -> physical block, grown on demand
+    std::vector<int> history;  // full token history (prompt + generated)
+    int pos = 0;
+    int last_token = 0;
+    int generated = 0;
+    StreamParams params;
+  };
+  std::vector<StreamSeq> stream_seqs_;
+  // Grow a streaming request's block table so it covers `upto_pos`.
+  void stream_grow_table(StreamSeq& s, int upto_pos);
 
  public:
 
