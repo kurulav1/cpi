@@ -22,6 +22,7 @@ struct ParsedArgs {
   int max_new = 16;
   float temp = 0.8f;
   bool parity_check = false;
+  int batched_check = 0;  // >0: run decode_step_batched parity gate for this many steps
   bool dump_tokenizer_meta = false;
   bool dump_prompt_tokens = false;
   bool allow_legacy_chat_tokenizer = false;

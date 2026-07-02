@@ -135,6 +135,7 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
     src/engine/llama_engine_forward_decode.cpp
     src/engine/llama_engine_sampling_utils.cpp
     src/engine/llama_engine_generation.cpp
+    src/engine/llama_engine_batched_decode.cpp
     src/engine/llama_engine_sampling.cpp
     src/engine/paged_kv.cpp
     src/engine/speculative_decoder.cpp

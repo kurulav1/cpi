@@ -848,6 +848,9 @@ LlamaEngine::~LlamaEngine() {
   free_ptr(d_k_cache_);
   free_ptr(d_v_cache_);
   if (d_block_table_) { cudaFree(d_block_table_); d_block_table_ = nullptr; }  // paged KV device block table
+  if (d_batch_positions_) { cudaFree(d_batch_positions_); d_batch_positions_ = nullptr; }
+  if (d_batch_seq_lens_) { cudaFree(d_batch_seq_lens_); d_batch_seq_lens_ = nullptr; }
+  if (d_batch_block_tables_) { cudaFree(d_batch_block_tables_); d_batch_block_tables_ = nullptr; }
   if (h_k_cache_) {
     cudaFreeHost(h_k_cache_);
     h_k_cache_ = nullptr;

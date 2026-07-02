@@ -243,6 +243,8 @@ ParsedArgs parse_args(int argc, char** argv) {
       args.opts.no_repeat_ngram_size = std::stoi(need_val("--no-repeat-ngram"));
     } else if (arg == "--parity-check") {
       args.parity_check = true;
+    } else if (arg == "--batched-check") {
+      args.batched_check = std::stoi(need_val("--batched-check"));
     } else if (arg == "--dump-tokenizer-meta") {
       args.dump_tokenizer_meta = true;
     } else if (arg == "--dump-prompt-tokens") {

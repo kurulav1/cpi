@@ -246,6 +246,10 @@ int main(int argc, char** argv) {
         if (cli.parity_check) {
           eng.run_parity_check(prompt_tokens);
         }
+        if (cli.batched_check > 0) {
+          eng.run_batched_decode_check(prompt_tokens, cli.batched_check);
+          return;
+        }
       }
 #endif
 

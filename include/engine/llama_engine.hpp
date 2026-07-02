@@ -350,6 +350,30 @@ class LlamaEngine {
   std::unique_ptr<SequenceBlockTable> seq_blocks_;
   int* d_block_table_ = nullptr;    // device: logical chunk -> physical block, for paged attention
   std::vector<int> block_table_host_;  // host mirror, for host-side paged KV-write addressing
+  // P2 batched decode: per-sequence device state (positions, seq_lens, block tables).
+  int* d_batch_positions_ = nullptr;
+  int* d_batch_seq_lens_ = nullptr;
+  int* d_batch_block_tables_ = nullptr;
+  int batch_buffers_max_seqs_ = 0;
+  int batch_buffers_max_blocks_ = 0;
+  void ensure_batch_state_buffers(int batch, int max_blocks);
+
+ public:
+  // One decode step for a batch of sequences (P2). tokens[b] is sequence b's
+  // current token at positions[b]; block_tables_flat is [batch][max_blocks]
+  // (logical chunk -> physical block). Returns each sequence's next (greedy) token.
+  // fp16 resident (--gpu-cache-all), full-attention path only.
+  std::vector<int> decode_step_batched(const std::vector<int>& tokens,
+                                       const std::vector<int>& positions,
+                                       const std::vector<int>& block_tables_flat,
+                                       int max_blocks);
+
+  // Parity gate for decode_step_batched: prefill `prompt_tokens`, then for
+  // `num_steps` decode steps compare the batched path (N=1 and N=2 duplicate
+  // rows) against the single-token path token-for-token. Prints PASS/FAIL.
+  void run_batched_decode_check(const std::vector<int>& prompt_tokens, int num_steps);
+
+ private:
   model::WeightLoader weights_;     // Memory-mapped weight file handle.
   int attn_q_hidden_ = 0;           // Query projection width (rows in attention.wq).
   int attn_head_dim_ = 0;           // Per-head attention width (attn_q_hidden_ / num_heads).
