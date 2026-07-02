@@ -210,6 +210,18 @@ void launch_rope_inplace_batched(half* q,
                                  const float* sin_table,
                                  cudaStream_t stream);
 
+// Per-position RoPE (P2 batched decode): row `i` rotated at positions[i].
+void launch_rope_inplace_perpos(half* q,
+                                half* k,
+                                int num_tokens,
+                                int num_heads_q,
+                                int num_heads_k,
+                                int head_dim,
+                                const int* positions,
+                                const float* cos_table,
+                                const float* sin_table,
+                                cudaStream_t stream);
+
 // launch_attention_step
 //
 // Computes single-token causal self-attention using the full K/V cache up to
@@ -419,6 +431,19 @@ void launch_store_kv_paged(half* k_pool,
                            int kv_hidden,
                            int block_size,
                            cudaStream_t stream);
+// Batched decode KV scatter (P2): one token per sequence to its own block table
+// at positions[b].
+void launch_store_kv_batched_paged(half* k_pool,
+                                   half* v_pool,
+                                   const half* k_src,
+                                   const half* v_src,
+                                   const int* block_tables,
+                                   const int* positions,
+                                   int max_blocks,
+                                   int batch,
+                                   int kv_hidden,
+                                   int block_size,
+                                   cudaStream_t stream);
 
 // launch_add_inplace
 //

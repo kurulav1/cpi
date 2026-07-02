@@ -309,6 +309,18 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
   )
   add_test(NAME paged_batched_attention_parity_test COMMAND paged_batched_attention_parity_test)
 
+  # Batched-decode primitives (P2): per-position RoPE + batched KV scatter.
+  add_executable(paged_batched_primitives_test
+    src/tests/paged_batched_primitives_test.cu
+  )
+  target_include_directories(paged_batched_primitives_test PRIVATE include)
+  target_link_libraries(paged_batched_primitives_test PRIVATE llama_engine)
+  set_target_properties(paged_batched_primitives_test PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+  )
+  add_test(NAME paged_batched_primitives_test COMMAND paged_batched_primitives_test)
+
   add_executable(int4_gemv_bench
     src/tests/int4_gemv_bench.cu
   )

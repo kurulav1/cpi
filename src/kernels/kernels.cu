@@ -406,6 +406,42 @@ __global__ void rope_inplace_device_pos_kernel(half* q,
   }
 }
 
+// Per-position RoPE (P2): like rope_inplace_batched_kernel but each of the
+// num_tokens rows is rotated at its OWN position positions[token] (one token per
+// sequence in a batched decode step), rather than a contiguous start_position+token.
+__global__ void rope_inplace_perpos_kernel(half* q,
+                                           half* k,
+                                           int num_tokens,
+                                           int num_heads_q,
+                                           int num_heads_k,
+                                           int head_dim,
+                                           const int* __restrict__ positions,
+                                           const float* cos_table,
+                                           const float* sin_table) {
+  const int head = blockIdx.x;
+  const int token = blockIdx.y;
+  const int pair = threadIdx.x;
+  const int half_dim = head_dim / 2;
+  if (token >= num_tokens || pair >= half_dim) return;
+  const int table_idx = positions[token] * half_dim + pair;
+  const float c = cos_table[table_idx];
+  const float s = sin_table[table_idx];
+  if (head < num_heads_q) {
+    const int base = token * num_heads_q * head_dim + head * head_dim;
+    const float q0 = __half2float(q[base + pair]);
+    const float q1 = __half2float(q[base + pair + half_dim]);
+    q[base + pair] = __float2half(q0 * c - q1 * s);
+    q[base + pair + half_dim] = __float2half(q1 * c + q0 * s);
+  }
+  if (head < num_heads_k) {
+    const int base = token * num_heads_k * head_dim + head * head_dim;
+    const float k0 = __half2float(k[base + pair]);
+    const float k1 = __half2float(k[base + pair + half_dim]);
+    k[base + pair] = __float2half(k0 * c - k1 * s);
+    k[base + pair + half_dim] = __float2half(k1 * c + k0 * s);
+  }
+}
+
 __global__ void rope_inplace_batched_kernel(half* q,
                                             half* k,
                                             int num_tokens,
@@ -775,6 +811,33 @@ __global__ void store_kv_paged_kernel(half* k_pool,
   }
 }
 
+// Batched decode KV scatter (P2): one token per sequence, each to its own block
+// table at its own position. row = sequence; positions[row] + block_tables[row].
+__global__ void store_kv_batched_paged_kernel(half* k_pool,
+                                              half* v_pool,
+                                              const half* k_src,
+                                              const half* v_src,
+                                              const int* __restrict__ block_tables,
+                                              const int* __restrict__ positions,
+                                              int max_blocks,
+                                              int batch,
+                                              int kv_hidden,
+                                              int block_size) {
+  const int b = blockIdx.x;
+  if (b >= batch) return;
+  const int pos = positions[b];
+  const int* bt = block_tables + static_cast<std::size_t>(b) * max_blocks;
+  const int phys = bt[pos / block_size] * block_size + (pos % block_size);
+  half* kd = k_pool + static_cast<std::size_t>(phys) * kv_hidden;
+  half* vd = v_pool + static_cast<std::size_t>(phys) * kv_hidden;
+  const half* ks = k_src + static_cast<std::size_t>(b) * kv_hidden;
+  const half* vs = v_src + static_cast<std::size_t>(b) * kv_hidden;
+  for (int d = threadIdx.x; d < kv_hidden; d += blockDim.x) {
+    kd[d] = ks[d];
+    vd[d] = vs[d];
+  }
+}
+
 }  // namespace
 
 // Host launch wrappers keep kernel-selection policy out of the runtime call
@@ -905,6 +968,25 @@ void launch_rope_inplace_batched(half* q,
   rope_inplace_batched_kernel<<<grid, threads, 0, stream>>>(
       q, k, num_tokens, num_heads_q, num_heads_k, head_dim, start_position, cos_table, sin_table);
 }
+
+// Per-position RoPE (P2 batched decode): each of num_tokens rows uses its own
+// positions[row] instead of a contiguous start_position.
+void launch_rope_inplace_perpos(half* q,
+                                half* k,
+                                int num_tokens,
+                                int num_heads_q,
+                                int num_heads_k,
+                                int head_dim,
+                                const int* positions,
+                                const float* cos_table,
+                                const float* sin_table,
+                                cudaStream_t stream) {
+  const int threads = head_dim / 2;
+  const int blocks = (num_heads_q > num_heads_k) ? num_heads_q : num_heads_k;
+  const dim3 grid(blocks, num_tokens);
+  rope_inplace_perpos_kernel<<<grid, threads, 0, stream>>>(
+      q, k, num_tokens, num_heads_q, num_heads_k, head_dim, positions, cos_table, sin_table);
+}
 void launch_attention_prefill(const half* q,
                               const half* k_cache,
                               const half* v_cache,
@@ -986,6 +1068,24 @@ void launch_store_kv_paged(half* k_pool,
   if (rows <= 0) return;
   store_kv_paged_kernel<<<rows, 128, 0, stream>>>(
       k_pool, v_pool, k_src, v_src, block_table, base_pos, rows, kv_hidden, block_size);
+}
+
+// Batched decode KV scatter (P2): one token per sequence to its own block table
+// at its own position.
+void launch_store_kv_batched_paged(half* k_pool,
+                                   half* v_pool,
+                                   const half* k_src,
+                                   const half* v_src,
+                                   const int* block_tables,
+                                   const int* positions,
+                                   int max_blocks,
+                                   int batch,
+                                   int kv_hidden,
+                                   int block_size,
+                                   cudaStream_t stream) {
+  if (batch <= 0) return;
+  store_kv_batched_paged_kernel<<<batch, 128, 0, stream>>>(
+      k_pool, v_pool, k_src, v_src, block_tables, positions, max_blocks, batch, kv_hidden, block_size);
 }
 
 
