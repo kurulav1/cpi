@@ -386,6 +386,7 @@ class LlamaEngine {
     std::vector<int> prompt;
     int max_new_tokens = 0;
     int eos_id = -1;  // stop when this token is produced (-1 = run to max_new_tokens)
+    float temperature = 0.0f;  // 0 = greedy
   };
 
   // Iteration-level scheduler: prefill every request into its own paged block

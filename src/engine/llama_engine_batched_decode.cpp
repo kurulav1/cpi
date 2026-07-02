@@ -508,7 +508,7 @@ std::vector<std::vector<int>> LlamaEngine::run_batch(const std::vector<BatchRequ
   for (int i = 0; i < N; ++i) {
     StreamParams p;
     p.max_new_tokens = requests[i].max_new_tokens;
-    p.temperature = 0.0f;  // greedy
+    p.temperature = requests[i].temperature;
     if (requests[i].eos_id >= 0) p.stop_ids.push_back(requests[i].eos_id);
     const std::string id = std::to_string(i);
     id_to_index[id] = i;
@@ -533,14 +533,16 @@ void LlamaEngine::run_batch_bench(const std::vector<int>& prompt, int max_new) {
   };
 
   // Batch sizes to sweep; skip any whose worst-case KV would exceed the budget.
-  std::vector<int> sizes = {1, 2, 4, 8, 16, 32};
+  std::vector<int> sizes = {1, 2, 4, 8, 16, 32, 48, 64};
   const int per_seq = static_cast<int>(prompt.size()) + max_new;
+  const float bench_temp =
+      std::getenv("CPI_BENCH_TEMP") ? std::atof(std::getenv("CPI_BENCH_TEMP")) : 0.0f;
 
   // Warmup (kernel autotune / first-launch costs shouldn't skew the first row).
   { std::vector<BatchRequest> w(1, BatchRequest{prompt, std::min(8, max_new), -1}); run_batch(w); }
 
-  std::printf("batch throughput bench: prompt=%zu max_new=%d (decode tokens/sec, eos disabled)\n",
-              prompt.size(), max_new);
+  std::printf("batch throughput bench: prompt=%zu max_new=%d temp=%.2f (decode tokens/sec, eos disabled)\n",
+              prompt.size(), max_new, bench_temp);
   std::printf("  %4s  %14s  %14s  %8s\n", "B", "serial_tok/s", "batched_tok/s", "speedup");
   for (int B : sizes) {
     if (static_cast<long long>(B) * per_seq > options_.max_context) continue;
@@ -555,7 +557,7 @@ void LlamaEngine::run_batch_bench(const std::vector<int>& prompt, int max_new) {
     const double serial_s = secs(clock::now() - s0);
 
     // Batched: all B sequences concurrently through the scheduler.
-    std::vector<BatchRequest> reqs(B, BatchRequest{prompt, max_new, -1});
+    std::vector<BatchRequest> reqs(B, BatchRequest{prompt, max_new, -1, bench_temp});
     const auto b0 = clock::now();
     const auto outs = run_batch(reqs);
     const double batched_s = secs(clock::now() - b0);
