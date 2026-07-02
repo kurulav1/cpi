@@ -257,6 +257,26 @@ void launch_attention_step(const half* q,
                            int scratch_chunks = 0,
                            bool allow_split = true);
 
+// Paged split-K decode attention (P3). K/V live in a block pool laid out like a
+// flat cache of (num_blocks*block_size) tokens; block_table[c] gives the physical
+// block for logical chunk c (block_size == the split chunk). Same math/output as
+// launch_attention_step's split-K path; enables non-contiguous KV.
+void launch_attention_step_paged(const half* q,
+                                 const half* k_pool,
+                                 const half* v_pool,
+                                 const int* block_table,
+                                 half* out,
+                                 int seq_len,
+                                 int num_heads,
+                                 int num_kv_heads,
+                                 int head_dim,
+                                 int block_size,
+                                 cudaStream_t stream,
+                                 float* scratch_m,
+                                 float* scratch_l,
+                                 float* scratch_o,
+                                 int scratch_chunks);
+
 // launch_attention_step_device_pos
 //
 // Device-position variant of launch_attention_step.  seq_len is derived on

@@ -285,6 +285,18 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
   )
   add_test(NAME moe_kernel_parity_test COMMAND moe_kernel_parity_test)
 
+  # Paged split-K decode attention parity (P3 phase 2b): paged == contiguous.
+  add_executable(paged_attention_parity_test
+    src/tests/paged_attention_parity_test.cu
+  )
+  target_include_directories(paged_attention_parity_test PRIVATE include)
+  target_link_libraries(paged_attention_parity_test PRIVATE llama_engine)
+  set_target_properties(paged_attention_parity_test PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+  )
+  add_test(NAME paged_attention_parity_test COMMAND paged_attention_parity_test)
+
   add_executable(int4_gemv_bench
     src/tests/int4_gemv_bench.cu
   )

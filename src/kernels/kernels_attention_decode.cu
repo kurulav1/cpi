@@ -758,6 +758,148 @@ __global__ void attention_step_chunk_reduce_kernel(const float* chunk_m,
   }
 }
 
+// Split-K decode pass-1, PAGED (P3 phase 2b): identical math to
+// attention_step_chunk_stats_kernel, but K/V for logical chunk `chunk` live in
+// physical block `block_table[chunk]` of a block pool (block_size == chunk_size).
+// Only the token->address mapping changes: token t reads pool token
+// (block_table[chunk]*chunk_size + (t - chunk_start)). The pool is laid out like
+// a flat cache of (num_blocks*chunk_size) tokens, so cache_index() is reused on
+// the remapped token index. Non-contiguous physical blocks work; the pass-2
+// reduce kernel is unchanged (it only touches the scratch stats).
+template <int WarpsPerBlock>
+__global__ void attention_step_chunk_stats_paged_kernel(const half* q,
+                                                        const half* k_pool,
+                                                        const half* v_pool,
+                                                        const int* __restrict__ block_table,
+                                                        float* chunk_m,
+                                                        float* chunk_l,
+                                                        float* chunk_o,
+                                                        int seq_len,
+                                                        int num_heads,
+                                                        int num_kv_heads,
+                                                        int head_dim,
+                                                        int chunk_size,
+                                                        int scratch_chunks) {
+  extern __shared__ unsigned char smem_bytes[];
+  half*  q_shared     = reinterpret_cast<half*>(smem_bytes);
+  float* score_shared = reinterpret_cast<float*>(q_shared + head_dim);
+  float* beta_shared  = score_shared + WarpsPerBlock;
+  float* stats_shared = beta_shared + WarpsPerBlock;
+  half*  v_tile       = reinterpret_cast<half*>(stats_shared + 4);
+
+  const int head = blockIdx.x;
+  const int chunk = blockIdx.y;
+  const int chunk_start = chunk * chunk_size;
+  if (chunk_start >= seq_len) {
+    return;
+  }
+  const int chunk_end = min(chunk_start + chunk_size, seq_len);
+  const int tid = threadIdx.x;
+  const int warp_id = tid / warpSize;
+  const int lane = tid % warpSize;
+  const float scale = rsqrtf(static_cast<float>(head_dim));
+  const int kv_heads_safe = (num_kv_heads > 0) ? num_kv_heads : 1;
+  const int group_size = ((num_heads / kv_heads_safe) > 0) ? (num_heads / kv_heads_safe) : 1;
+  const int kv_head = ((head / group_size) < kv_heads_safe) ? (head / group_size) : (kv_heads_safe - 1);
+  const int head_pairs = head_dim / 2;
+  const int chunk_index = head * scratch_chunks + chunk;
+  // Map a logical token in this chunk to its physical pool token. Every token in
+  // the chunk lives in physical block block_table[chunk]; phys_token =
+  // block_table[chunk]*chunk_size + (t - chunk_start) = (t + phys_base).
+  const int phys_base = block_table[chunk] * chunk_size - chunk_start;
+
+  for (int d = tid; d < head_dim; d += blockDim.x) {
+    q_shared[d] = q[head * head_dim + d];
+  }
+  if (tid == 0) {
+    stats_shared[0] = neg_inf<float>();
+    stats_shared[1] = 0.0f;
+  }
+  __syncthreads();
+
+  float acc = 0.0f;
+  for (int tile_base = chunk_start; tile_base < chunk_end; tile_base += WarpsPerBlock) {
+    const int tile_tokens = min(WarpsPerBlock, chunk_end - tile_base);
+
+    {
+      const int t = tile_base + warp_id;
+      float score = neg_inf<float>();
+      if (warp_id < tile_tokens) {
+        const int base = cache_index(phys_base + t, kv_head, 0, num_kv_heads, head_dim);
+        const half2* q2 = reinterpret_cast<const half2*>(q_shared);
+        const half2* k2 = reinterpret_cast<const half2*>(k_pool + base);
+        float partial = 0.0f;
+        for (int pair = lane; pair < head_pairs; pair += warpSize) {
+          const float2 qv = __half22float2(q2[pair]);
+          const float2 kv = __half22float2(k2[pair]);
+          partial += qv.x * kv.x + qv.y * kv.y;
+        }
+        score = warp_sum(partial) * scale;
+      }
+      if (lane == 0 && warp_id < tile_tokens) {
+        score_shared[warp_id] = score;
+      }
+    }
+
+    {
+      for (int i = 0; i < tile_tokens; ++i) {
+        const int base = cache_index(phys_base + tile_base + i, kv_head, 0, num_kv_heads, head_dim);
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+          v_tile[i * head_dim + d] = v_pool[base + d];
+        }
+      }
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+      float tile_m = neg_inf<float>();
+      for (int i = 0; i < tile_tokens; ++i) {
+        tile_m = fmaxf(tile_m, score_shared[i]);
+      }
+      float tile_l = 0.0f;
+      for (int i = 0; i < tile_tokens; ++i) {
+        const float b = expf(score_shared[i] - tile_m);
+        beta_shared[i] = b;
+        tile_l += b;
+      }
+      stats_shared[2] = tile_m;
+      stats_shared[3] = tile_l;
+    }
+    __syncthreads();
+
+    {
+      const float tile_m    = stats_shared[2];
+      const float tile_l    = stats_shared[3];
+      const float running_m = stats_shared[0];
+      const float running_l = stats_shared[1];
+      const float new_m  = fmaxf(running_m, tile_m);
+      const float c_prev = (running_l == 0.0f) ? 0.0f : expf(running_m - new_m);
+      const float c_tile = expf(tile_m - new_m);
+
+      for (int d = tid; d < head_dim; d += blockDim.x) {
+        float tile_o = 0.0f;
+        for (int i = 0; i < tile_tokens; ++i) {
+          tile_o += beta_shared[i] * __half2float(v_tile[i * head_dim + d]);
+        }
+        acc = acc * c_prev + tile_o * c_tile;
+      }
+      if (tid == 0) {
+        stats_shared[0] = new_m;
+        stats_shared[1] = running_l * c_prev + tile_l * c_tile;
+      }
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    chunk_m[chunk_index] = stats_shared[0];
+    chunk_l[chunk_index] = stats_shared[1];
+  }
+  for (int d = tid; d < head_dim; d += blockDim.x) {
+    chunk_o[static_cast<std::size_t>(chunk_index) * static_cast<std::size_t>(head_dim) + static_cast<std::size_t>(d)] = acc;
+  }
+}
+
 __global__ void attention_step_chunk_reduce_device_pos_kernel(const float* chunk_m,
                                                               const float* chunk_l,
                                                               const float* chunk_o,
@@ -1158,6 +1300,41 @@ void launch_attention_step(const half* q,
       num_heads,
       num_kv_heads,
       head_dim);
+}
+
+// Paged split-K decode attention (P3 phase 2b). K/V live in a block pool; the
+// per-sequence block_table (device, one physical block id per logical chunk,
+// chunk_size == block_size) selects each chunk's physical block. Same online-
+// softmax math as launch_attention_step's split-K path, reusing its pass-2
+// reduce (scratch-only). Requires head_dim==128 + valid split-K scratch, which
+// is the paged decode target on the Qwen/Llama family.
+void launch_attention_step_paged(const half* q,
+                                 const half* k_pool,
+                                 const half* v_pool,
+                                 const int* block_table,
+                                 half* out,
+                                 int seq_len,
+                                 int num_heads,
+                                 int num_kv_heads,
+                                 int head_dim,
+                                 int block_size,
+                                 cudaStream_t stream,
+                                 float* scratch_m,
+                                 float* scratch_l,
+                                 float* scratch_o,
+                                 int scratch_chunks) {
+  constexpr int warps = 4;
+  constexpr int threads = warps * 32;
+  const std::size_t smem = static_cast<std::size_t>(head_dim) * sizeof(half) +
+                           static_cast<std::size_t>(2 * warps + 4) * sizeof(float) +
+                           static_cast<std::size_t>(warps * head_dim) * sizeof(half);
+  const int chunk_count = min(scratch_chunks, (seq_len + block_size - 1) / block_size);
+  const dim3 grid(num_heads, chunk_count);
+  attention_step_chunk_stats_paged_kernel<warps><<<grid, threads, smem, stream>>>(
+      q, k_pool, v_pool, block_table, scratch_m, scratch_l, scratch_o,
+      seq_len, num_heads, num_kv_heads, head_dim, block_size, scratch_chunks);
+  attention_step_chunk_reduce_kernel<<<num_heads, threads, 0, stream>>>(
+      scratch_m, scratch_l, scratch_o, out, seq_len, num_heads, head_dim, block_size, scratch_chunks);
 }
 
 void launch_attention_step_device_pos(const half* q,
