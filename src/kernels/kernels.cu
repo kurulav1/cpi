@@ -639,6 +639,142 @@ __global__ void attention_prefill_kernel_tiled(const half* q,
   }
 }
 
+// Paged prefill attention (P3 phase 2d): identical to attention_prefill_kernel_tiled
+// but each key position t is read through the block table (block_size tokens per
+// block) — phys(t) = block_table[t/block_size]*block_size + t%block_size — into a
+// block pool, so KV need not be contiguous. Same causal online-softmax math.
+template <int WarpsPerBlock>
+__global__ void attention_prefill_kernel_tiled_paged(const half* q,
+                                                     const half* k_pool,
+                                                     const half* v_pool,
+                                                     const int* __restrict__ block_table,
+                                                     half* out,
+                                                     int num_tokens,
+                                                     int start_position,
+                                                     int num_heads,
+                                                     int num_kv_heads,
+                                                     int head_dim,
+                                                     int block_size) {
+  extern __shared__ unsigned char smem_bytes[];
+  half* q_shared = reinterpret_cast<half*>(smem_bytes);
+  float* score_shared = reinterpret_cast<float*>(q_shared + head_dim);
+  float* alpha_shared = score_shared + WarpsPerBlock;
+  float* beta_shared = alpha_shared + WarpsPerBlock;
+  float* stats_shared = beta_shared + WarpsPerBlock;
+
+  const int head = blockIdx.x;
+  const int token = blockIdx.y;
+  const int tid = threadIdx.x;
+  const int warp_id = tid / warpSize;
+  const int lane = tid % warpSize;
+  if (token >= num_tokens) {
+    return;
+  }
+
+  const int hidden = num_heads * head_dim;
+  const int q_base = token * hidden + head * head_dim;
+  const int out_base = q_base;
+  const float scale = rsqrtf(static_cast<float>(head_dim));
+  const int kv_heads_safe = (num_kv_heads > 0) ? num_kv_heads : 1;
+  const int group_size = ((num_heads / kv_heads_safe) > 0) ? (num_heads / kv_heads_safe) : 1;
+  const int kv_head = ((head / group_size) < kv_heads_safe) ? (head / group_size) : (kv_heads_safe - 1);
+  const int head_pairs = head_dim / 2;
+  const int limit = start_position + token + 1;
+
+  for (int d = tid; d < head_dim; d += blockDim.x) {
+    q_shared[d] = q[q_base + d];
+  }
+  if (tid == 0) {
+    stats_shared[0] = -1.0e30f;
+    stats_shared[1] = 0.0f;
+  }
+  __syncthreads();
+
+  float acc = 0.0f;
+  for (int tile_base = 0; tile_base < limit; tile_base += WarpsPerBlock) {
+    const int t = tile_base + warp_id;
+    float score = -1.0e30f;
+    if (warp_id < WarpsPerBlock && t < limit) {
+      const int phys = block_table[t / block_size] * block_size + (t % block_size);
+      const int base = cache_index(phys, kv_head, 0, num_kv_heads, head_dim);
+      const half2* q2 = reinterpret_cast<const half2*>(q_shared);
+      const half2* k2 = reinterpret_cast<const half2*>(k_pool + base);
+      float partial = 0.0f;
+      for (int pair = lane; pair < head_pairs; pair += warpSize) {
+        const float2 qv = __half22float2(q2[pair]);
+        const float2 kv = __half22float2(k2[pair]);
+        partial += qv.x * kv.x + qv.y * kv.y;
+      }
+      score = warp_sum(partial) * scale;
+    }
+    if (lane == 0 && warp_id < WarpsPerBlock) {
+      score_shared[warp_id] = score;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+      float running_m = stats_shared[0];
+      float running_l = stats_shared[1];
+      const int tile_tokens = min(WarpsPerBlock, limit - tile_base);
+      for (int i = 0; i < tile_tokens; ++i) {
+        const float token_score = score_shared[i];
+        const float new_m = fmaxf(running_m, token_score);
+        const float alpha = (running_l == 0.0f) ? 0.0f : expf(running_m - new_m);
+        const float beta = expf(token_score - new_m);
+        running_l = running_l * alpha + beta;
+        running_m = new_m;
+        alpha_shared[i] = alpha;
+        beta_shared[i] = beta;
+      }
+      stats_shared[0] = running_m;
+      stats_shared[1] = running_l;
+    }
+    __syncthreads();
+
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+      float acc_local = acc;
+      const int tile_tokens = min(WarpsPerBlock, limit - tile_base);
+      for (int i = 0; i < tile_tokens; ++i) {
+        const int phys = block_table[(tile_base + i) / block_size] * block_size + ((tile_base + i) % block_size);
+        const int base = cache_index(phys, kv_head, 0, num_kv_heads, head_dim);
+        acc_local = acc_local * alpha_shared[i] + beta_shared[i] * __half2float(v_pool[base + d]);
+      }
+      acc = acc_local;
+    }
+    __syncthreads();
+  }
+
+  const float inv_l = 1.0f / fmaxf(stats_shared[1], 1e-8f);
+  for (int d = tid; d < head_dim; d += blockDim.x) {
+    out[out_base + d] = __float2half(acc * inv_l);
+  }
+}
+
+// Scatter `rows` freshly-projected KV rows (contiguous src) into the block pool
+// at paged positions base_pos..base_pos+rows-1 (P3 phase 2d prefill KV write).
+__global__ void store_kv_paged_kernel(half* k_pool,
+                                      half* v_pool,
+                                      const half* k_src,
+                                      const half* v_src,
+                                      const int* __restrict__ block_table,
+                                      int base_pos,
+                                      int rows,
+                                      int kv_hidden,
+                                      int block_size) {
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const int pos = base_pos + row;
+  const int phys = block_table[pos / block_size] * block_size + (pos % block_size);
+  half* kd = k_pool + static_cast<std::size_t>(phys) * kv_hidden;
+  half* vd = v_pool + static_cast<std::size_t>(phys) * kv_hidden;
+  const half* ks = k_src + static_cast<std::size_t>(row) * kv_hidden;
+  const half* vs = v_src + static_cast<std::size_t>(row) * kv_hidden;
+  for (int d = threadIdx.x; d < kv_hidden; d += blockDim.x) {
+    kd[d] = ks[d];
+    vd[d] = vs[d];
+  }
+}
+
 }  // namespace
 
 // Host launch wrappers keep kernel-selection policy out of the runtime call
@@ -805,6 +941,51 @@ void launch_attention_prefill(const half* q,
                            static_cast<std::size_t>(threads + 3) * sizeof(float);
   attention_prefill_kernel_fallback<<<grid, threads, smem, stream>>>(
       q, k_cache, v_cache, out, num_tokens, start_position, num_heads, num_kv_heads, head_dim);
+}
+
+// Paged prefill attention (P3 phase 2d). K/V gathered via block_table from a
+// block pool. Targets head_dim<=256 even (128 on Qwen/Llama); the split-K decode
+// path handles the same family, so no fallback is needed here.
+void launch_attention_prefill_paged(const half* q,
+                                     const half* k_pool,
+                                     const half* v_pool,
+                                     const int* block_table,
+                                     half* out,
+                                     int num_tokens,
+                                     int start_position,
+                                     int num_heads,
+                                     int num_kv_heads,
+                                     int head_dim,
+                                     int block_size,
+                                     cudaStream_t stream) {
+  const dim3 grid(num_heads, num_tokens);
+  const int warps = (head_dim <= 64) ? 2 : 4;
+  const int threads = warps * 32;
+  const std::size_t smem = static_cast<std::size_t>(head_dim) * sizeof(half) +
+                           static_cast<std::size_t>(3 * warps + 2) * sizeof(float);
+  if (warps == 2) {
+    attention_prefill_kernel_tiled_paged<2><<<grid, threads, smem, stream>>>(
+        q, k_pool, v_pool, block_table, out, num_tokens, start_position, num_heads, num_kv_heads, head_dim, block_size);
+  } else {
+    attention_prefill_kernel_tiled_paged<4><<<grid, threads, smem, stream>>>(
+        q, k_pool, v_pool, block_table, out, num_tokens, start_position, num_heads, num_kv_heads, head_dim, block_size);
+  }
+}
+
+// Scatter freshly-projected prefill KV rows into the block pool at paged positions.
+void launch_store_kv_paged(half* k_pool,
+                           half* v_pool,
+                           const half* k_src,
+                           const half* v_src,
+                           const int* block_table,
+                           int base_pos,
+                           int rows,
+                           int kv_hidden,
+                           int block_size,
+                           cudaStream_t stream) {
+  if (rows <= 0) return;
+  store_kv_paged_kernel<<<rows, 128, 0, stream>>>(
+      k_pool, v_pool, k_src, v_src, block_table, base_pos, rows, kv_hidden, block_size);
 }
 
 

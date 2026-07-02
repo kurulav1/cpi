@@ -767,9 +767,17 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
         const std::size_t layer_stride = static_cast<std::size_t>(options_.max_context) * static_cast<std::size_t>(kv_hidden);
         auto* k_layer = static_cast<__half*>(d_k_cache_) + static_cast<std::size_t>(layer) * layer_stride;
         auto* v_layer = static_cast<__half*>(d_v_cache_) + static_cast<std::size_t>(layer) * layer_stride;
-        CUDA_CHECK(cudaMemcpyAsync(k_layer + static_cast<std::size_t>(position) * kv_hidden,
+        // Paged (phase 2d): write to the token's physical block slot via the host
+        // block table, matching what the paged attention read will gather.
+        std::size_t store_pos = static_cast<std::size_t>(position);
+        if (options_.paged_blocks && !block_table_host_.empty()) {
+          const int bs = options_.paged_block_size > 0 ? options_.paged_block_size : 32;
+          store_pos = static_cast<std::size_t>(block_table_host_[static_cast<std::size_t>(position / bs)]) *
+                          static_cast<std::size_t>(bs) + static_cast<std::size_t>(position % bs);
+        }
+        CUDA_CHECK(cudaMemcpyAsync(k_layer + store_pos * kv_hidden,
                                    d_k_, kv_bytes, cudaMemcpyDeviceToDevice, compute_stream_));
-        CUDA_CHECK(cudaMemcpyAsync(v_layer + static_cast<std::size_t>(position) * kv_hidden,
+        CUDA_CHECK(cudaMemcpyAsync(v_layer + store_pos * kv_hidden,
                                    d_v_, kv_bytes, cudaMemcpyDeviceToDevice, compute_stream_));
       }
     });
@@ -953,9 +961,17 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
         const std::size_t layer_stride = static_cast<std::size_t>(options_.max_context) * static_cast<std::size_t>(kv_hidden);
         auto* k_layer = static_cast<__half*>(d_k_cache_) + static_cast<std::size_t>(layer) * layer_stride;
         auto* v_layer = static_cast<__half*>(d_v_cache_) + static_cast<std::size_t>(layer) * layer_stride;
-        CUDA_CHECK(cudaMemcpyAsync(k_layer + static_cast<std::size_t>(position) * kv_hidden,
+        // Paged (phase 2d): write to the token's physical block slot via the host
+        // block table, matching what the paged attention read will gather.
+        std::size_t store_pos = static_cast<std::size_t>(position);
+        if (options_.paged_blocks && !block_table_host_.empty()) {
+          const int bs = options_.paged_block_size > 0 ? options_.paged_block_size : 32;
+          store_pos = static_cast<std::size_t>(block_table_host_[static_cast<std::size_t>(position / bs)]) *
+                          static_cast<std::size_t>(bs) + static_cast<std::size_t>(position % bs);
+        }
+        CUDA_CHECK(cudaMemcpyAsync(k_layer + store_pos * kv_hidden,
                                    d_k_, kv_bytes, cudaMemcpyDeviceToDevice, compute_stream_));
-        CUDA_CHECK(cudaMemcpyAsync(v_layer + static_cast<std::size_t>(position) * kv_hidden,
+        CUDA_CHECK(cudaMemcpyAsync(v_layer + store_pos * kv_hidden,
                                    d_v_, kv_bytes, cudaMemcpyDeviceToDevice, compute_stream_));
       }
     });

@@ -229,33 +229,47 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
 
       auto* k_layer = static_cast<__half*>(d_k_cache_) + static_cast<std::size_t>(layer) * layer_stride;
       auto* v_layer = static_cast<__half*>(d_v_cache_) + static_cast<std::size_t>(layer) * layer_stride;
-      CUDA_CHECK(cudaMemcpy2DAsync(k_layer + static_cast<std::size_t>(base_pos) * kv_hidden,
-                                   kv_row_bytes,
-                                   d_prefill_k_,
-                                   kv_row_bytes,
-                                   kv_row_bytes,
-                                   rows,
-                                   cudaMemcpyDeviceToDevice,
-                                   compute_stream_));
-      CUDA_CHECK(cudaMemcpy2DAsync(v_layer + static_cast<std::size_t>(base_pos) * kv_hidden,
-                                   kv_row_bytes,
-                                   d_prefill_v_,
-                                   kv_row_bytes,
-                                   kv_row_bytes,
-                                   rows,
-                                   cudaMemcpyDeviceToDevice,
-                                   compute_stream_));
+      if (options_.paged_blocks && d_block_table_ != nullptr) {
+        // P3 phase 2d: scatter this chunk's KV into the block pool via the block
+        // table, and run paged prefill attention (gather via the same table).
+        const int bs = options_.paged_block_size > 0 ? options_.paged_block_size : 32;
+        kernels::launch_store_kv_paged(k_layer, v_layer,
+                                       static_cast<const __half*>(d_prefill_k_),
+                                       static_cast<const __half*>(d_prefill_v_),
+                                       d_block_table_, base_pos, rows, kv_hidden, bs, compute_stream_);
+        kernels::launch_attention_prefill_paged(static_cast<const __half*>(d_prefill_q_),
+                                                k_layer, v_layer, d_block_table_,
+                                                static_cast<__half*>(d_att_), rows, base_pos,
+                                                cfg.num_heads, cfg.num_kv_heads, head_dim, bs, compute_stream_);
+      } else {
+        CUDA_CHECK(cudaMemcpy2DAsync(k_layer + static_cast<std::size_t>(base_pos) * kv_hidden,
+                                     kv_row_bytes,
+                                     d_prefill_k_,
+                                     kv_row_bytes,
+                                     kv_row_bytes,
+                                     rows,
+                                     cudaMemcpyDeviceToDevice,
+                                     compute_stream_));
+        CUDA_CHECK(cudaMemcpy2DAsync(v_layer + static_cast<std::size_t>(base_pos) * kv_hidden,
+                                     kv_row_bytes,
+                                     d_prefill_v_,
+                                     kv_row_bytes,
+                                     kv_row_bytes,
+                                     rows,
+                                     cudaMemcpyDeviceToDevice,
+                                     compute_stream_));
 
-      kernels::launch_attention_prefill(static_cast<const __half*>(d_prefill_q_),
-                                        k_layer,
-                                        v_layer,
-                                        static_cast<__half*>(d_att_),
-                                        rows,
-                                        base_pos,
-                                        cfg.num_heads,
-                                        cfg.num_kv_heads,
-                                        head_dim,
-                                        compute_stream_);
+        kernels::launch_attention_prefill(static_cast<const __half*>(d_prefill_q_),
+                                          k_layer,
+                                          v_layer,
+                                          static_cast<__half*>(d_att_),
+                                          rows,
+                                          base_pos,
+                                          cfg.num_heads,
+                                          cfg.num_kv_heads,
+                                          head_dim,
+                                          compute_stream_);
+      }
 
       if (lowbit_proj && can_use_dp4a_proj) {
         kernels::launch_quantize_rowwise_fp16_to_int8(static_cast<const __half*>(d_att_),
@@ -632,8 +646,9 @@ std::vector<int> LlamaEngine::generate_stream(const std::vector<int>& prompt_tok
   // the simple contiguous fp16 KV layout is eligible; paged / int4-KV / TQ3 /
   // MoE / sliding-window configs take a full reset + prefill.
   const bool prefix_cacheable =
-      !options_.paged_kv_cache && !kv_int4_enabled_ && !tq3_enabled_ &&
-      !cfg.is_moe() && !cfg.uses_non_full_attention();
+      !options_.paged_kv_cache && !options_.paged_blocks &&  // paged: each request gets its own
+      !kv_int4_enabled_ && !tq3_enabled_ &&                  // block table, so prior KV isn't at the
+      !cfg.is_moe() && !cfg.uses_non_full_attention();       // same physical blocks (paged shared-prefix is a later phase)
   int reuse = 0;
   if (prefix_cacheable && !resident_prefix_.empty()) {
     // Cap at prompt size - 1 so at least one token remains to seed decode.
@@ -660,17 +675,29 @@ std::vector<int> LlamaEngine::generate_stream(const std::vector<int>& prompt_tok
   // paging enables, and is consumed by the phase-2b gather kernel that will read
   // KV through this table instead of a flat offset.
   if (seq_blocks_) {
+    // Phase 2d: allocate this sequence's blocks and publish its block table
+    // (host + device). The allocator's free-list is LIFO, so requests after the
+    // first get NON-CONTIGUOUS physical blocks — exercising real paging. Prefill
+    // + decode KV writes and both attention reads all go through this table, so
+    // byte-identical output proves non-contiguous paging works.
     seq_blocks_->clear();
     const int total = std::min(options_.max_context,
                                static_cast<int>(prompt_tokens.size()) + std::max(0, max_new_tokens));
     if (!seq_blocks_->ensure_position(total - 1)) {
       LLAMA_ENGINE_THROW("paged KV pool exhausted for sequence length " + std::to_string(total));
     }
-    for (int p : {0, total / 2, total - 1}) {
-      if (p >= 0 && seq_blocks_->block_for(p) == BlockAllocator::kInvalidBlock) {
-        LLAMA_ENGINE_THROW("paged block table has no block for pos " + std::to_string(p));
+    const int bs = options_.paged_block_size > 0 ? options_.paged_block_size : 32;
+    const int nblk = (total + bs - 1) / bs;
+    block_table_host_.assign(static_cast<std::size_t>(nblk), 0);
+    for (int c = 0; c < nblk; ++c) {
+      const int blk = seq_blocks_->block_for(c * bs);
+      if (blk == BlockAllocator::kInvalidBlock) {
+        LLAMA_ENGINE_THROW("paged block table has no block for chunk " + std::to_string(c));
       }
+      block_table_host_[static_cast<std::size_t>(c)] = blk;
     }
+    CUDA_CHECK(cudaMemcpy(d_block_table_, block_table_host_.data(),
+                          static_cast<std::size_t>(nblk) * sizeof(int), cudaMemcpyHostToDevice));
   }
 
   enforce_host_resource_limits("generate.begin");

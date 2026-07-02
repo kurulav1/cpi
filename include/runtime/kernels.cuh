@@ -373,6 +373,31 @@ void launch_attention_prefill(const half* q,
                               int head_dim,
                               cudaStream_t stream);
 
+// Paged prefill attention + paged KV scatter (P3 phase 2d). K/V live in a block
+// pool; block_table maps logical chunk -> physical block (block_size tokens each).
+void launch_attention_prefill_paged(const half* q,
+                                     const half* k_pool,
+                                     const half* v_pool,
+                                     const int* block_table,
+                                     half* out,
+                                     int num_tokens,
+                                     int start_position,
+                                     int num_heads,
+                                     int num_kv_heads,
+                                     int head_dim,
+                                     int block_size,
+                                     cudaStream_t stream);
+void launch_store_kv_paged(half* k_pool,
+                           half* v_pool,
+                           const half* k_src,
+                           const half* v_src,
+                           const int* block_table,
+                           int base_pos,
+                           int rows,
+                           int kv_hidden,
+                           int block_size,
+                           cudaStream_t stream);
+
 // launch_add_inplace
 //
 // Element-wise in-place addition: x[i] += y[i] for all i in [0, n).
