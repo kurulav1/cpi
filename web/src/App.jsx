@@ -227,6 +227,13 @@ function buildModelGroups(profiles) {
     // de-dup identical keys, then order fp16 < int8 < int4 < streaming
     const seen = new Set();
     g.variants = g.variants.filter((v) => (seen.has(v.key) ? false : seen.add(v.key)));
+    // "Streaming" is a fit-necessity, not a user choice: if a full-precision build
+    // exists (order < 10), hide the pre-packed streaming builds — the engine keeps
+    // what fits VRAM resident and streams any overflow automatically. Streaming
+    // only stays visible when it's the ONLY way to run the model (e.g. a 32B with
+    // no fp16 build). Runtime INT8/INT4 remain as a genuine quality/speed choice.
+    const hasFullPrecision = g.variants.some((v) => v.order < 10);
+    if (hasFullPrecision) g.variants = g.variants.filter((v) => v.order < 10);
     g.variants.sort((a, b) => a.order - b.order);
   }
   groups.sort((a, b) => a.base.localeCompare(b.base));
