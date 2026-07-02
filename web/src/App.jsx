@@ -190,6 +190,49 @@ function modelDisplay(profile) {
 const STREAMING_HELP =
   "Streaming model: too large to fit in VRAM, so its weights are streamed from disk during inference — runs big models, but slower.";
 
+// Group ready profiles by base model name and collapse each model's precision
+// options — runtime FP16/INT8/INT4 on the full-precision file, plus any pre-packed
+// streaming builds — into a single ordered variant list. So the UI can offer one
+// model picker + one variant picker instead of scattering formats across names,
+// tags and a separate quant menu. Each variant maps to a (profileId, quantMode).
+function buildModelGroups(profiles) {
+  const byBase = new Map();
+  for (const p of profiles || []) {
+    const d = modelDisplay(p);
+    if (!byBase.has(d.base)) byBase.set(d.base, { base: d.base, variants: [] });
+    const g = byBase.get(d.base);
+    if (d.pinned) {
+      // Pre-packed / streaming file → one fixed variant (its baked format).
+      const fmtRank = d.fmt === "int4" ? 2 : d.fmt === "int8" ? 1 : 0;
+      g.variants.push({
+        key: `${p.id}|none`,
+        label: `${(d.fmt || "packed").toUpperCase()}${d.isStreaming ? " · streaming" : ""}`,
+        profileId: p.id, quantMode: "none", template: p.template,
+        order: 10 + fmtRank
+      });
+    } else {
+      // Full-precision file → its selectable runtime precisions.
+      for (const m of (p.quant?.selectableModes ?? ["none"])) {
+        g.variants.push({
+          key: `${p.id}|${m}`,
+          label: m === "none" ? "FP16" : `${quantLabel(m)} · runtime`,
+          profileId: p.id, quantMode: m, template: p.template,
+          order: m === "none" ? 0 : m === "int8" ? 1 : 2
+        });
+      }
+    }
+  }
+  const groups = [...byBase.values()];
+  for (const g of groups) {
+    // de-dup identical keys, then order fp16 < int8 < int4 < streaming
+    const seen = new Set();
+    g.variants = g.variants.filter((v) => (seen.has(v.key) ? false : seen.add(v.key)));
+    g.variants.sort((a, b) => a.order - b.order);
+  }
+  groups.sort((a, b) => a.base.localeCompare(b.base));
+  return groups;
+}
+
 // Turn low-level engine errors into something a user can act on.
 function friendlyEngineError(msg) {
   const m = String(msg || "");
@@ -982,6 +1025,23 @@ export default function App() {
     profiles.find((p) => p.id === settings.profileId) ||
     health.config?.selectedProfile || null;
   const selDisplay   = selProfile ? modelDisplay(selProfile) : { base:"", tag:"", isStreaming:false, fmt:"", pinned:false };
+  // Consolidated model + precision/variant selection.
+  const modelGroups  = buildModelGroups(readyProfiles);
+  const currentVarKey = `${settings.profileId}|${settings.quantMode || "none"}`;
+  const selectedGroup = modelGroups.find((g) => g.variants.some((v) => v.profileId === settings.profileId))
+    || modelGroups[0] || null;
+  const selectedVariant = selectedGroup?.variants.find((v) => v.key === currentVarKey)
+    || selectedGroup?.variants.find((v) => v.profileId === settings.profileId)
+    || selectedGroup?.variants[0] || null;
+  const applyVariant = (v) => {
+    if (!v) return;
+    setSettings((cur) => ({ ...cur, profileId: v.profileId, quantMode: v.quantMode, template: v.template || cur.template }));
+    fetchJson(API_ROUTES.quantSelect, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ profileId: v.profileId, quantMode: v.quantMode })
+    }).catch(() => {});
+  };
   const maxContextLimit = Math.max(
     128,
     Number(selProfile?.maxPositionEmbeddings) || 0,
@@ -1441,64 +1501,38 @@ export default function App() {
         <span className="topbar-brand">CPI</span>
         <span className="topbar-sep" />
 
-        {/* Model selector */}
+        {/* Model selector (base name) */}
         <select
           className="topbar-select"
-          value={settings.profileId}
+          value={selectedGroup?.base || ""}
           disabled={streaming}
           onChange={(e) => {
-            const p = profiles.find((x) => x.id === e.target.value);
-            if (!p || !p.ready) return;
-            const quantMode = defaultQuantForProfile(p);
-            setSettings((cur) => ({
-              ...cur,
-              profileId: e.target.value,
-              template: p.template || cur.template,
-              quantMode
-            }));
-            fetchJson(API_ROUTES.quantSelect, {
-              method: "POST",
-              headers: { "Content-Type":"application/json" },
-              body: JSON.stringify({ profileId: p.id, quantMode })
-            }).catch(() => {});
+            const g = modelGroups.find((x) => x.base === e.target.value);
+            // Default to FP16 (non-streaming) if available, else the first variant.
+            const def = g?.variants.find((v) => v.quantMode === "none" && !v.label.includes("streaming"))
+              || g?.variants[0];
+            applyVariant(def);
           }}
           title="Model"
         >
-          {readyProfiles.length === 0 && (
+          {modelGroups.length === 0 && (
             <option value="">{health.config ? "No models found" : "Loading"}</option>
           )}
-          {readyProfiles.map((p) => {
-            const d = modelDisplay(p);
-            return (
-              <option key={p.id} value={p.id}>
-                {d.base}{d.tag ? ` (${d.tag})` : ""}
-              </option>
-            );
-          })}
+          {modelGroups.map((g) => (
+            <option key={g.base} value={g.base}>{g.base}</option>
+          ))}
         </select>
 
+        {/* Variant / precision selector (FP16 · INT8 · INT4 · streaming) */}
         <select
           className="topbar-select"
-          value={settings.quantMode}
-          disabled={streaming || !selProfile || selDisplay.pinned}
-          onChange={(e) => {
-            const quantMode = e.target.value;
-            setSettings((cur) => ({ ...cur, quantMode }));
-            if (!selProfile) return;
-            fetchJson(API_ROUTES.quantSelect, {
-              method: "POST",
-              headers: { "Content-Type":"application/json" },
-              body: JSON.stringify({ profileId: selProfile.id, quantMode })
-            }).catch((err) => setError(err.message));
-          }}
-          title={selDisplay.pinned
-            ? `Weight precision is fixed by this model file (${selDisplay.tag || "packed"}). ${selDisplay.isStreaming ? STREAMING_HELP : ""}`
-            : "Runtime weight precision — FP16: full quality. INT8 / INT4: smaller & faster, slight quality trade-off. Applies to full-precision models."}
+          value={selectedVariant?.key || ""}
+          disabled={streaming || !selectedGroup || (selectedGroup.variants.length <= 1)}
+          onChange={(e) => applyVariant(selectedGroup?.variants.find((v) => v.key === e.target.value))}
+          title="Precision / variant — FP16: full quality. INT8 / INT4: smaller & faster (slight quality trade-off). 'streaming' builds run models too large for VRAM by streaming weights from disk."
         >
-          {(selProfile?.quant?.selectableModes ?? ["none"]).map((mode) => (
-            <option key={mode} value={mode}>
-              {quantLabel(mode)}
-            </option>
+          {(selectedGroup?.variants ?? []).map((v) => (
+            <option key={v.key} value={v.key}>{v.label}</option>
           ))}
         </select>
 
@@ -1509,24 +1543,18 @@ export default function App() {
           <span className={`dot ${engineState.dot}`} />
           <span>Engine</span>
           <span className={`badge ${engineState.badge}`}>{engineState.label}</span>
-          <span className="badge badge-neutral">Q {quantLabel(settings.quantMode)}</span>
-          {selectedQuantJobRunning ? (
+          {selectedQuantJobRunning && (
             <span className="badge badge-blue">
               Converting{selectedQuantJobPct != null ? ` ${selectedQuantJobPct}%` : ""}
             </span>
-          ) : (
-            settings.quantMode !== "none" && (
-              <span className={`badge ${selectedQuantConversionState === "ready" ? "badge-green" : "badge-amber"}`}>
-                {selectedQuantConversionState === "ready" ? "Packed" : "Runtime"}
-              </span>
-            )
           )}
           {activeWorkerQuantMode && activeWorkerQuantMode !== settings.quantMode && (
             <span className="badge badge-red">Worker Q {quantLabel(activeWorkerQuantMode)}</span>
           )}
           {settings.performanceMode && <span className="badge badge-blue">Perf</span>}
-          {selDisplay.isStreaming && <span className="badge badge-neutral" title={STREAMING_HELP}>streaming</span>}
-          <span className="topbar-model" title={selProfile?.label || ""}>{selDisplay.base || "-"}</span>
+          <span className="topbar-model" title={selProfile?.label || ""}>
+            {selDisplay.base || "-"}{selectedVariant && selectedVariant.label !== "FP16" ? ` · ${selectedVariant.label}` : ""}
+          </span>
         </span>
 
         <span style={{ fontSize:"0.7rem", color:"var(--text-3)", marginLeft:"0.4rem", flexShrink:0 }}>{stamp}</span>
