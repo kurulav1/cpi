@@ -250,6 +250,10 @@ int main(int argc, char** argv) {
           eng.run_batched_decode_check(prompt_tokens, cli.batched_check);
           return;
         }
+        if (cli.scheduler_check > 0) {
+          eng.run_scheduler_check(prompt_tokens, cli.scheduler_check, -1);
+          return;
+        }
       }
 #endif
 

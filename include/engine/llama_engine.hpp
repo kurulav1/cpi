@@ -373,6 +373,34 @@ class LlamaEngine {
   // rows) against the single-token path token-for-token. Prints PASS/FAIL.
   void run_batched_decode_check(const std::vector<int>& prompt_tokens, int num_steps);
 
+  // One request in a concurrently-scheduled batch.
+  struct BatchRequest {
+    std::vector<int> prompt;
+    int max_new_tokens = 0;
+    int eos_id = -1;  // stop when this token is produced (-1 = run to max_new_tokens)
+  };
+
+  // Iteration-level scheduler: prefill every request into its own paged block
+  // table (non-contiguous physical blocks from the shared pool), then decode all
+  // running sequences together one step at a time via decode_step_batched,
+  // freeing a sequence's blocks when it hits eos / max_new_tokens. Ragged
+  // lengths handled per-sequence. Greedy. Returns each request's generated
+  // tokens. Blocking; the streaming server wrapper comes on top of this.
+  // Requires --paged-blocks + --gpu-cache-all; the concurrent sequences' total
+  // length must fit the max_context KV budget.
+  std::vector<std::vector<int>> run_batch(const std::vector<BatchRequest>& requests);
+
+  // Parity gate for the scheduler: builds several distinct-length sequences from
+  // `base_prompt`, generates them concurrently via run_batch and each alone via
+  // the single-sequence path, and compares token-for-token. Prints PASS/FAIL.
+  void run_scheduler_check(const std::vector<int>& base_prompt, int max_new, int eos_id);
+
+ private:
+  // Single-sequence greedy decode (reference for the scheduler gate).
+  std::vector<int> greedy_generate_single(const std::vector<int>& prompt, int max_new, int eos_id);
+
+ public:
+
  private:
   model::WeightLoader weights_;     // Memory-mapped weight file handle.
   int attn_q_hidden_ = 0;           // Query projection width (rows in attention.wq).
