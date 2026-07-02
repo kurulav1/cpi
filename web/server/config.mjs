@@ -1118,7 +1118,27 @@ function scoreTokenizerCandidate(modelPath, tokenizerPath) {
 
 function chooseTokenizer(modelPath, tokenizerCandidates, preferredTokenizerPath) {
   if (preferredTokenizerPath && fs.existsSync(preferredTokenizerPath)) {
-    return preferredTokenizerPath;
+    // Honor an explicitly-configured tokenizer only when it plausibly belongs to
+    // this model. Otherwise (e.g. LLAMA_TOKENIZER_PATH left pointing at the default
+    // model's tokenizer while LLAMA_MODEL_PATH names a different-family model) it
+    // would force the wrong chat template + stop tokens onto the model — which
+    // silently breaks stopping (the model runs to max_new and spills special-token
+    // text). In that case fall through to scoring the co-located candidates.
+    const modelDir = isSafetensorsModelDir(modelPath) ? modelPath : path.dirname(modelPath);
+    const prefDir = path.dirname(preferredTokenizerPath);
+    const coLocated =
+      normalizeKey(prefDir).startsWith(normalizeKey(modelDir)) ||
+      normalizeKey(modelDir).startsWith(normalizeKey(prefDir));
+    const modelFamily = modelFamilyName(path.basename(modelPath));
+    // Tokenizer family from its containing model dir (…/<ModelDir>/hf/tokenizer.json).
+    const tokModelDir = path.basename(path.dirname(prefDir)) || path.basename(prefDir);
+    const tokFamily = modelFamilyName(tokModelDir);
+    const familyOk =
+      modelFamily === "generic" || tokFamily === "generic" || modelFamily === tokFamily;
+    if (coLocated || familyOk) {
+      return preferredTokenizerPath;
+    }
+    // mismatched family and not co-located → ignore it and score instead.
   }
   if (tokenizerCandidates.length === 0) return "";
   if (tokenizerCandidates.length === 1) return tokenizerCandidates[0];
