@@ -651,6 +651,28 @@ std::vector<int> LlamaEngine::generate_stream(const std::vector<int>& prompt_tok
   // the decode loop; the reuse count above already captured the prior value.
   resident_prefix_.clear();
 
+  // P3 phase 2a: mirror this sequence's positions in the paged block table so the
+  // allocator is exercised against real sequence lengths (allocation + pool
+  // sizing + no-exhaustion + release across requests). Bookkeeping only in 2a —
+  // the KV hot path still uses the flat cache, so output stays byte-identical.
+  // Physical block ids are intentionally NOT contiguous/identity (the free-list
+  // hands blocks back LIFO across requests) — that permutation is exactly what
+  // paging enables, and is consumed by the phase-2b gather kernel that will read
+  // KV through this table instead of a flat offset.
+  if (seq_blocks_) {
+    seq_blocks_->clear();
+    const int total = std::min(options_.max_context,
+                               static_cast<int>(prompt_tokens.size()) + std::max(0, max_new_tokens));
+    if (!seq_blocks_->ensure_position(total - 1)) {
+      LLAMA_ENGINE_THROW("paged KV pool exhausted for sequence length " + std::to_string(total));
+    }
+    for (int p : {0, total / 2, total - 1}) {
+      if (p >= 0 && seq_blocks_->block_for(p) == BlockAllocator::kInvalidBlock) {
+        LLAMA_ENGINE_THROW("paged block table has no block for pos " + std::to_string(p));
+      }
+    }
+  }
+
   enforce_host_resource_limits("generate.begin");
   std::vector<int> out = prompt_tokens;
   out.reserve(prompt_tokens.size() + max_new_tokens);

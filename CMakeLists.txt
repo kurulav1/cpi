@@ -136,6 +136,7 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
     src/engine/llama_engine_sampling_utils.cpp
     src/engine/llama_engine_generation.cpp
     src/engine/llama_engine_sampling.cpp
+    src/engine/paged_kv.cpp
     src/engine/speculative_decoder.cpp
     src/engine/llama_engine_parity.cpp
     src/engine/llama4_cuda_engine.cu

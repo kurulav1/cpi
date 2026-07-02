@@ -282,6 +282,17 @@ void LlamaEngine::allocate_runtime_buffers() {
                                  (cfg.rope_theta > 0.0f ? "model_file" : "family_default")) << ")\n";
   }
 
+  if (options_.paged_blocks) {
+    const int bs = options_.paged_block_size > 0 ? options_.paged_block_size : 32;
+    const int num_blocks = (options_.max_context + bs - 1) / bs;
+    block_alloc_ = std::make_unique<BlockAllocator>(num_blocks);
+    seq_blocks_ = std::make_unique<SequenceBlockTable>(block_alloc_.get(), bs);
+    if (options_.verbose) {
+      std::cout << "[engine] paged_blocks=on block_size=" << bs << " num_blocks=" << num_blocks
+                << " (P3 phase 2a: contiguous blocks, byte-identical)\n";
+    }
+  }
+
   for (int pos = 0; pos < options_.max_context; ++pos) {
     for (int pair = 0; pair < half_dim; ++pair) {
       const float theta = std::pow(eff_rope_theta, -2.0f * static_cast<float>(pair) / static_cast<float>(head_dim));
@@ -426,6 +437,7 @@ void LlamaEngine::reset_kv_cache() {
   // The KV cache is being wiped, so any resident prompt prefix is no longer
   // valid for reuse (callers like inspect_next_logits / verify also reset here).
   resident_prefix_.clear();
+  if (seq_blocks_) seq_blocks_->clear();  // release paged blocks alongside the KV wipe
   const auto& cfg = weights_.config();
   const int head_dim = attn_head_dim_ > 0 ? attn_head_dim_ : (cfg.hidden_size / cfg.num_heads);
   const int kv_hidden = attn_kv_hidden_ > 0 ? attn_kv_hidden_ : (cfg.num_kv_heads * head_dim);

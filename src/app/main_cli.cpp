@@ -309,6 +309,10 @@ ParsedArgs parse_args(int argc, char** argv) {
       }
     } else if (arg == "--paged-kv-cache") {
       args.opts.paged_kv_cache = true;
+    } else if (arg == "--paged-blocks") {
+      args.opts.paged_blocks = true;
+    } else if (arg == "--paged-block-size") {
+      args.opts.paged_block_size = std::stoi(need_val("--paged-block-size"));
     } else if (arg == "--kv-int4") {
       args.opts.kv_cache_int4 = true;
     } else if (arg == "--enable-tq-cached") {

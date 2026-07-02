@@ -26,6 +26,12 @@ struct EngineOptions {
   bool disable_split_attention = false;
   bool loop_guard = true;
   bool paged_kv_cache = false;
+  // Block-paged KV (P3). When on, the KV cache is carved into fixed blocks and a
+  // per-sequence block table maps token positions to blocks (foundation for
+  // continuous batching + concurrent shared-prefix). Phase 2a: contiguous blocks,
+  // byte-identical to the flat cache. Off by default.
+  bool paged_blocks = false;
+  int paged_block_size = 32;   // tokens/block; 32 aligns with the split-K attention chunk
   bool kv_cache_int4 = false;
   bool enable_tq_cached = false;
   std::string tq_mode = "auto";

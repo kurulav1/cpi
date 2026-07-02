@@ -23,12 +23,14 @@
 #include <cstdint>
 #include <cstddef>
 #include <functional>
+#include <memory>
 #include <utility>
 #include <string>
 #include <vector>
 
 #include "engine/engine_types.hpp"
 #include "engine/generation_constraints.hpp"
+#include "engine/paged_kv.hpp"
 #include "model/weight_loader.hpp"
 
 namespace engine {
@@ -339,6 +341,13 @@ class LlamaEngine {
   // exactly these tokens). Lets generate_stream reuse a shared prompt prefix and
   // prefill only the divergent tail. Cleared by reset_kv_cache (KV wiped).
   std::vector<int> resident_prefix_;
+  // P3 paged KV (Phase 2a): block allocator + current sequence's block table.
+  // Null unless options_.paged_blocks. Phase 2a uses contiguous blocks (the KV
+  // cache is rounded to a whole number of blocks), so addressing is unchanged and
+  // output is byte-identical; the block table validates position->block mapping
+  // and is the hook for the non-contiguous gather kernel (Phase 2b).
+  std::unique_ptr<BlockAllocator> block_alloc_;
+  std::unique_ptr<SequenceBlockTable> seq_blocks_;
   model::WeightLoader weights_;     // Memory-mapped weight file handle.
   int attn_q_hidden_ = 0;           // Query projection width (rows in attention.wq).
   int attn_head_dim_ = 0;           // Per-head attention width (attn_q_hidden_ / num_heads).
