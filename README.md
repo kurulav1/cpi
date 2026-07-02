@@ -26,6 +26,38 @@ Peak VRAM is total GPU memory during the run (includes ~1 GB desktop compositor)
 omitted: its int4 weights dequantize past the 32 GB of system RAM (out-of-memory). See
 [docs/benchmarks.md](docs/benchmarks.md) for methodology and the full context × quant sweep.
 
+### Concurrent throughput (continuous batching)
+
+For multi-user serving, CPI has an opt-in continuous-batching path (paged KV cache + batched decode):
+many requests are prefilled into their own paged blocks and decoded together one step at a time.
+Aggregate decode throughput below — total tokens/s summed over all concurrent sequences —
+measured with `--batch-bench` (greedy, fp16 resident, prompt 8 / 64 new tokens, short context) on the
+same RTX 5090. The "1 req" column is the identical engine at batch 1.
+
+| Model | Params | Vocab | 1 req | batch 16 | batch 32 | batch 64 | peak |
+| ----- | ------ | ----- | ----- | -------- | -------- | -------- | ---- |
+| Qwen2.5-0.5B-Instruct | 0.5B | 152k | ~250 tok/s | 1697 (6.0×) | 1504 (5.7×) | — | 6.0× @16 |
+| TinyLlama-1.1B-Chat | 1.1B | 32k | ~263 tok/s | 2896 (10.3×) | 3879 (13.9×) | 4652 (17.2×) | 17.2× |
+| Qwen2.5-Coder-3B | 3B | 152k | ~130 tok/s | 1027 (8.0×) | 1319 (10.1×) | 1677 (13.2×) | 13.2× |
+| Llama-2-7b-chat | 7B | 32k | ~85 tok/s | 1000 (11.7×) | 1532 (17.9×) | 2118 (24.1×) | 24.1× |
+| Qwen2.5-7B-Instruct | 7B | 152k | ~85 tok/s | 800 (9.5×) | 1128 (13.4×) | 1462 (17.1×) | 17.1× |
+| Llama-3.1-8B-Instruct | 8B | 128k | ~80 tok/s | 825 (10.1×) | 1206 (14.7×) | 1392 (17.9×) | 17.9× |
+
+Notes:
+
+- **Larger, compute-bound models batch better** — the 8B reaches ~18× aggregate and is still climbing
+  at batch 64, while the tiny 0.5B saturates and regresses past batch 16.
+- **Smaller vocabularies batch better** — each step transfers a `[batch × vocab]` logit block, so the
+  32k-vocab models (Llama-2, TinyLlama) outscale the 128–152k-vocab ones at the same batch size.
+- **No single-request penalty on real models** — the batch-1 slowdown (batched GEMM vs the tuned
+  single-token kernel) is a small-model artifact and vanishes by 7–8B (~1.0×).
+- **Sampling (temperature > 0) currently runs ~half the greedy throughput at high batch** (e.g.
+  Llama-3.1-8B batch 64: 666 vs 1392 tok/s) because top-k/top-p sampling runs per row on the host;
+  on-device sampling is planned.
+- Enabled with `CPI_BATCH_WORKER=1` on the web server; requires fp16-resident weights
+  (`--gpu-cache-all`) + paged KV (`--paged-blocks`) and full-attention models. Quantized / MoE /
+  streaming models (e.g. the 32B int4) fall back to single-request serving.
+
 ## Highlights
 
 - CPU and CUDA inference paths
