@@ -244,6 +244,14 @@ add_executable(tokenizer_pieces_test
 target_include_directories(tokenizer_pieces_test PRIVATE include)
 add_test(NAME tokenizer_pieces_test COMMAND tokenizer_pieces_test)
 
+# Paged-KV allocator/block-table test (CUDA-free host logic; P3 Phase 1).
+add_executable(paged_kv_test
+  src/tests/paged_kv_test.cpp
+  src/engine/paged_kv.cpp
+)
+target_include_directories(paged_kv_test PRIVATE include)
+add_test(NAME paged_kv_test COMMAND paged_kv_test)
+
 # WordPiece tokenizer test (CUDA-free). Needs the bge model dir at run time.
 add_executable(wordpiece_test
   src/tests/wordpiece_test.cpp
