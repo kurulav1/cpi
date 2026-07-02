@@ -24,6 +24,7 @@ struct ParsedArgs {
   bool parity_check = false;
   int batched_check = 0;  // >0: run decode_step_batched parity gate for this many steps
   int scheduler_check = 0;  // >0: run the batch-scheduler parity gate with this max_new
+  bool interactive_batch = false;  // multiplexed continuous-batching interactive worker
   bool dump_tokenizer_meta = false;
   bool dump_prompt_tokens = false;
   bool allow_legacy_chat_tokenizer = false;

@@ -214,6 +214,7 @@ add_executable(llama_infer
   src/app/main_helpers.cpp
   src/app/main_cli.cpp
   src/app/main_modes.cpp
+  src/app/main_interactive_batch.cpp
 )
 target_link_libraries(llama_infer PRIVATE llama_engine)
 

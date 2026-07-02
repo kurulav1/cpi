@@ -254,6 +254,14 @@ int main(int argc, char** argv) {
           eng.run_scheduler_check(prompt_tokens, cli.scheduler_check, -1);
           return;
         }
+        if (cli.interactive_batch) {
+          if (!use_tokenizer) {
+            throw std::runtime_error("--interactive-batch requires --tokenizer");
+          }
+          app::main_modes::run_interactive_batch(eng, tokenizer, cli.stop_texts,
+                                                 !cli.force_no_bos, cli.max_new, cli.temp);
+          return;
+        }
       }
 #endif
 

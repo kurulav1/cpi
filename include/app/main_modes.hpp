@@ -11,6 +11,9 @@
 namespace model {
 class Tokenizer;
 }
+namespace engine {
+class LlamaEngine;
+}
 
 namespace app::main_modes {
 
@@ -53,5 +56,16 @@ void execute_engine_modes(const RunExecutionOptions& options,
                           const GenerateStreamFn& generate_stream,
                           const InspectNextLogitsFn& inspect_next_logits,
                           const LastBenchmarkStatsFn& last_benchmark_stats);
+
+#if LLAMA_ENGINE_HAS_CUDA
+// Multiplexed continuous-batching interactive worker (opt-in, --interactive-batch).
+// Drives the engine's streaming batch scheduler; see main_interactive_batch.cpp.
+void run_interactive_batch(engine::LlamaEngine& eng,
+                           model::Tokenizer& tokenizer,
+                           const std::vector<std::string>& default_stop_texts,
+                           bool default_add_bos,
+                           int default_max_new,
+                           float default_temp);
+#endif
 
 }  // namespace app::main_modes

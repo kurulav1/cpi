@@ -349,6 +349,10 @@ ParsedArgs parse_args(int argc, char** argv) {
     } else if (arg == "--interactive") {
       args.interactive_mode = true;
       args.web_mode = true;
+    } else if (arg == "--interactive-batch") {
+      args.interactive_batch = true;
+      args.interactive_mode = true;  // reuse interactive setup (tokenizer required)
+      args.web_mode = true;
     } else if (arg == "--simple") {
       args.simple_mode = true;
     } else if (arg == "--draft-model") {
