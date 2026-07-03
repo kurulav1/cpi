@@ -21,9 +21,9 @@ const TEMPLATES = [
 const HF_FAMILIES = ["llama2", "llama3", "mistral", "mixtral", "phi3", "phimoe", "qwen2"];
 
 const STARTERS = [
-  "How does the engine decide how many layers to keep resident on the GPU?",
-  "What's the difference between int8 streaming and fp16 decode?",
-  "Suggest benchmark flags for TinyLlama on a 12 GB GPU.",
+  "Explain something fascinating in simple terms.",
+  "Help me draft a message to a friend.",
+  "Give me ideas for a weekend project.",
 ];
 
 const API_ROUTES = Object.freeze({
@@ -1681,7 +1681,6 @@ export default function App() {
                 {empty && (
                   <div className="empty">
                     <p className="empty-title">{selProfile?.label || "CPI"}</p>
-                    <p className="empty-sub">Local inference, no internet required.</p>
                     <div className="starters">
                       {STARTERS.map((s) => (
                         <button key={s} type="button" className="starter" onClick={() => applyStarter(s)}>{s}</button>
