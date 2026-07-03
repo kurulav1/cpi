@@ -79,10 +79,11 @@ command-line limit.)
 ## Highlights
 
 - CPU and CUDA inference paths
+- Continuous batching with a paged KV cache for concurrent multi-user serving (opt-in)
+- Streaming weights for models larger than VRAM; runtime int8/int4 quantization
 - Native `tokenizer.json` and SentencePiece tokenizer support
 - React web UI plus Node API bridge in `web/`
-- Model auto-discovery and per-model web defaults
-- Tools for converting Hugging Face weights into `.ll2c`
+- Model auto-discovery, one-command Hugging Face download + `.ll2c` conversion
 
 ## Research & Benchmarking
 
@@ -302,7 +303,13 @@ curl -X POST http://localhost:3001/v1/chat/completions \
 
 ## Preparing Models
 
-Convert Hugging Face weights into `.ll2c`:
+Easiest — download from Hugging Face and convert to `.ll2c` in one step (auto-discovered afterwards):
+
+```bash
+python tools/hf_download.py download Qwen/Qwen2.5-Coder-7B-Instruct
+```
+
+Or convert an existing local Hugging Face checkpoint manually:
 
 ```bash
 python tools/convert_hf_to_bins.py \
@@ -326,29 +333,6 @@ TinyLlama note:
 
 - prefer `tokenizer.json` over `tokenizer.model`
 - use `tinyllama-chatml` only when you specifically want the role-marker format
-
-### CPT `cpt_gpt` exports
-
-CPI can run CPT's Hugging Face-style `cpt_gpt` export folders through a small Python backend. This is intended for tiny/debug CPT models while the native `llama_infer` engine grows direct CPT architecture support.
-
-Export from CPT:
-
-```powershell
-python ..\cpt\tools\export_cpt_to_hf.py `
-  --checkpoint C:\path\to\model.ckpt `
-  --out-dir .\artifacts\cpt_tiny_hf `
-  --model-name cpt-tiny `
-  --overwrite
-```
-
-Run it in CPI:
-
-```powershell
-$env:LLAMA_MODEL_PATH=".\artifacts\cpt_tiny_hf"
-.\start_local.bat
-```
-
-The export folder must contain `config.json` with `model_type: cpt_gpt` and `model.safetensors`. Byte-level exports use CPT's `byte_tokenizer.json`; tokenizer-backed exports use `tokenizer.json` and require the Python `tokenizers` package in CPI's environment.
 
 ## Useful Commands
 

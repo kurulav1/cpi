@@ -107,3 +107,8 @@ third_party/vcpkg/installed/
 .claude/
 .DS_Store
 Thumbs.db
+
+# ------------------------------
+# Local / internal (not for the public repo)
+# ------------------------------
+RELEASE_CHECKLIST.md
