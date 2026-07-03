@@ -1,13 +1,32 @@
 #include "app/main_cli.hpp"
 
 #include <cstdlib>
+#include <fstream>
 #include <ostream>
+#include <sstream>
 #include <stdexcept>
 
 #include "app/main_helpers.hpp"
 
 namespace app::main_cli {
 namespace {
+
+// Read a whole file into a string (trailing whitespace trimmed). Lets --prompt/
+// --tokens come from a file, bypassing the OS command-line length limit for long
+// prompts / large token lists (e.g. long-context benchmarking on Windows).
+std::string read_file_to_string(const std::string& path) {
+  std::ifstream f(path, std::ios::binary);
+  if (!f) {
+    throw std::runtime_error("cannot open file: " + path);
+  }
+  std::ostringstream ss;
+  ss << f.rdbuf();
+  std::string s = ss.str();
+  while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ' || s.back() == '\t')) {
+    s.pop_back();
+  }
+  return s;
+}
 
 constexpr int kDefaultMaxNewTokens = 16;
 constexpr float kDefaultTemperature = 0.8f;
@@ -212,6 +231,10 @@ ParsedArgs parse_args(int argc, char** argv) {
       args.chat_template_set = true;
     } else if (arg == "--tokens") {
       args.token_csv = need_val("--tokens");
+    } else if (arg == "--prompt-file") {
+      args.prompt_text = read_file_to_string(need_val("--prompt-file"));
+    } else if (arg == "--tokens-file") {
+      args.token_csv = read_file_to_string(need_val("--tokens-file"));
     } else if (arg == "--max-new") {
       args.max_new = std::stoi(need_val("--max-new"));
       args.max_new_set = true;
