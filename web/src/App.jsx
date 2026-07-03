@@ -1702,9 +1702,12 @@ export default function App() {
                     <div key={m.id} className="msg msg-asst">
                       {!m.seed && <span className="msg-who">{selProfile?.label || "Assistant"}</span>}
                       <div className="msg-asst-text">
-                        {m.streaming
-                          ? <span className="msg-streaming-text">{m.content}</span>
-                          : <MsgContent text={m.content} />}
+                        {/* Render markdown live while streaming too, so code
+                            blocks / lists / tables format as they arrive rather
+                            than only on completion. Delta updates are throttled
+                            via requestAnimationFrame, and ReactMarkdown tolerates
+                            partially-streamed (e.g. unclosed ```) content. */}
+                        <MsgContent text={m.content} />
                         {m.streaming && <span className="cursor" />}
                       </div>
                       {!m.streaming && isLast && runMeta?.elapsedMs > 0 && (
