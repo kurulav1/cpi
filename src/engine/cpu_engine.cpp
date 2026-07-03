@@ -33,6 +33,7 @@
 #include <cmath>
 #include <cstring>
 #include <iostream>
+#include <unordered_set>
 #include <numeric>
 #include <random>
 #include <stdexcept>
@@ -722,9 +723,14 @@ int CpuLlamaEngine::sample_token(float temperature, int top_k,
   const int V = cfg_.vocab_size;
   float* logits = logits_.data();
 
-  // Repetition penalty: downscale logits of recently generated tokens.
-  if (rep_penalty != 1.f && !history.empty()) {
-    for (int id : history) {
+  // Repetition penalty: downscale logits of tokens already in the context.
+  // Penalize each unique token ONCE (HF semantics). Iterating raw history would
+  // divide a token's logit by rep_penalty^(occurrences), exponentially
+  // suppressing frequent tokens (space, common words) in long contexts and
+  // collapsing generation into word-merged gibberish.
+  if (rep_penalty > 1.f && !history.empty()) {
+    std::unordered_set<int> seen(history.begin(), history.end());
+    for (int id : seen) {
       if (id >= 0 && id < V) {
         logits[id] = (logits[id] > 0.f) ? logits[id] / rep_penalty
                                          : logits[id] * rep_penalty;
