@@ -1,0 +1,92 @@
+name: Release
+
+# Cut a GitHub Release on a version tag (vX.Y.Z). Attaches portable CPU-only
+# binaries per OS. CUDA builds are intentionally NOT shipped as binaries: they
+# are GPU-architecture and driver specific, so the release notes point users to
+# a from-source CUDA build instead.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-binaries:
+    name: Build CPU binary (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset: llama_infer-linux-x64-cpu
+            bin: build/llama_infer
+          - os: windows-latest
+            asset: llama_infer-windows-x64-cpu
+            bin: build/Release/llama_infer.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (CPU-only)
+        run: >
+          cmake -S . -B build
+          -DLLAMA_ENGINE_ENABLE_CUDA=OFF
+          -DLLAMA_ENGINE_ENABLE_SENTENCEPIECE=OFF
+          -DCMAKE_BUILD_TYPE=Release
+      - name: Build llama_infer
+        run: cmake --build build --config Release --target llama_infer -j
+      - name: Stage package
+        shell: bash
+        run: |
+          mkdir -p pkg/${{ matrix.asset }}
+          cp "${{ matrix.bin }}" pkg/${{ matrix.asset }}/
+          cp README.md LICENSE* pkg/${{ matrix.asset }}/ 2>/dev/null || true
+      - name: Archive
+        shell: bash
+        run: |
+          cd pkg
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a "${{ matrix.asset }}.zip" "${{ matrix.asset }}" >/dev/null
+          else
+            tar -czf "${{ matrix.asset }}.tar.gz" "${{ matrix.asset }}"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: pkg/${{ matrix.asset }}.*
+
+  release:
+    name: Publish release
+    needs: build-binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          files: dist/*
+          body: |
+            ## CPI ${{ github.event.inputs.tag || github.ref_name }}
+
+            Attached are **portable CPU-only** builds of `llama_infer` for Linux and Windows (x64).
+
+            ### GPU (CUDA) builds
+            CUDA binaries are GPU-architecture and driver specific, so they are not
+            shipped here. Build from source with a CUDA toolkit present:
+
+            ```
+            cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+            cmake --build build --config Release
+            ```
+
+            See the README for prerequisites and the web UI / REST API setup.

@@ -109,6 +109,20 @@ python tools/bench_report.py --patch-benchmarks
 
 ## Quick Start
 
+### Prerequisites
+
+| Tool | Version | Needed for |
+| ---- | ------- | ---------- |
+| C++ compiler | C++20 (MSVC 2022, GCC 11+, or Clang 14+) | building the engine |
+| CMake | ≥ 3.24 | build system |
+| Python | ≥ 3.10 + pip | model download/conversion (`tools/`) |
+| Node.js | ≥ 18 + npm | web UI + REST API (`web/`) |
+| CUDA Toolkit | ≥ 12 (optional) | GPU acceleration — auto-detected; CPU-only build otherwise |
+
+No CUDA GPU is required: without a CUDA toolkit CMake falls back to a CPU-only
+build automatically (see [Build Modes](#build-modes)). GitHub-hosted CI builds
+and tests this CPU-only path on Linux and Windows on every push.
+
 ### First-run setup
 
 Linux/macOS:

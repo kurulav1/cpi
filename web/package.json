@@ -5,7 +5,8 @@
   "scripts": {
     "dev": "concurrently -k -n api,ui -c green,cyan \"node --watch server/index.mjs\" \"vite --host 0.0.0.0\"",
     "build": "vite build",
-    "start": "node server/index.mjs"
+    "start": "node server/index.mjs",
+    "lint": "eslint ."
   },
   "dependencies": {
     "dotenv": "^17.3.1",
@@ -18,9 +19,14 @@
     "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
+    "@eslint/js": "^9.15.0",
     "@tailwindcss/vite": "^4.2.1",
     "@vitejs/plugin-react": "^4.7.0",
     "concurrently": "^9.2.1",
+    "eslint": "^9.15.0",
+    "eslint-plugin-react-hooks": "^5.0.0",
+    "eslint-plugin-react-refresh": "^0.4.14",
+    "globals": "^15.12.0",
     "tailwindcss": "^4.2.1",
     "vite": "^5.4.21",
     "vite-plugin-pwa": "^1.2.0"

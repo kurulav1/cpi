@@ -24,7 +24,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 
 BENCH_RE = re.compile(r"^\[bench(?:-avg)?\]\s+(.*)$")

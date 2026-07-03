@@ -370,7 +370,6 @@ def _render_table(runs: list[dict], model_name: str) -> str:
 
 def _render_speedup_table(runs: list[dict], model_name: str) -> str:
     """Compute int8 and int4 speedup over fp16 baseline for each (path, context) pair."""
-    from collections import defaultdict
     grouped: dict[tuple, dict] = {}
     for r in runs:
         if r.get("status") != "ok":

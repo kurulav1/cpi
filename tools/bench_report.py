@@ -230,7 +230,7 @@ def _build_report(sweep_docs: list[dict], ppl_docs: list[dict]) -> str:
 
 def _patch_benchmarks_md(report_body: str) -> None:
     if not BENCHMARKS_MD.exists():
-        print(f"[report] docs/benchmarks.md not found; skipping patch.", file=sys.stderr)
+        print("[report] docs/benchmarks.md not found; skipping patch.", file=sys.stderr)
         return
 
     original = BENCHMARKS_MD.read_text(encoding="utf-8")
