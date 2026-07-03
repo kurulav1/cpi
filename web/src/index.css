@@ -614,7 +614,10 @@ body {
   box-shadow: 0 10px 26px rgba(34, 102, 165, 0.35);
 }
 :root[data-theme="light"] .btn-primary {
-  box-shadow: 0 10px 24px rgba(52, 120, 170, 0.20);
+  /* Softer gradient for light mode — the saturated blue→magenta→red reads harsh
+     on white, so use a gentler blue→orchid→coral with a lighter shadow. */
+  background: linear-gradient(135deg, #5f78ea 0%, #a06cce 50%, #ef7e63 100%);
+  box-shadow: 0 8px 20px rgba(52, 120, 170, 0.16);
 }
 .btn-primary:hover:not(:disabled) { opacity: 0.82; }
 
