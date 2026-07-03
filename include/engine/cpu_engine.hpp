@@ -47,6 +47,7 @@ class CpuLlamaEngine {
     const uint16_t* wv = nullptr;
     const uint16_t* wo = nullptr;
     const uint16_t* bo = nullptr;
+    const uint16_t* bqkv = nullptr;  // fused q||k||v projection bias (Qwen2 et al.)
 
     const uint16_t* w1_fp16 = nullptr;
     const uint16_t* w2_fp16 = nullptr;

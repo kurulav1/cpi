@@ -683,6 +683,18 @@ void CpuLlamaEngine::forward_token(int token, int pos) {
     gemv_fp16(lw.wk, x_norm_.data(), k_.data(), kv_dim_, H);
     gemv_fp16(lw.wv, x_norm_.data(), v_.data(), kv_dim_, H);
 
+    // Fused q||k||v projection bias (Qwen2 and friends). Without this the CPU
+    // engine drops the q/k/v biases entirely and Qwen output is garbage.
+    if (lw.bqkv) {
+      for (int i = 0; i < q_dim_; ++i) {
+        q_[i] += fp16_to_fp32(lw.bqkv[i]);
+      }
+      for (int i = 0; i < kv_dim_; ++i) {
+        k_[i] += fp16_to_fp32(lw.bqkv[q_dim_ + i]);
+        v_[i] += fp16_to_fp32(lw.bqkv[q_dim_ + kv_dim_ + i]);
+      }
+    }
+
     rope(q_.data(), k_.data(), pos, NH, NKV, head_dim_);
     attention(pos, l);
 
@@ -960,6 +972,9 @@ void CpuLlamaEngine::initialize(const EngineOptions& options) {
     lw.wo       = ptr16(p + ".attention.wo");
     lw.bo       = weights_.has_tensor(p + ".attention.bo")
         ? ptr16(p + ".attention.bo")
+        : nullptr;
+    lw.bqkv     = weights_.has_tensor(p + ".attention.bqkv")
+        ? ptr16(p + ".attention.bqkv")
         : nullptr;
 
     auto& buf_w1 = dequant_mlp_[static_cast<std::size_t>(l) * 3 + 0];
