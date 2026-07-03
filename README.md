@@ -17,10 +17,10 @@ latency.
 
 | Model | Params | Weights | Peak VRAM | GPU decode (tok/s) | CPU decode (tok/s) |
 | ----- | ------ | ------- | --------- | ------------------ | ------------------ |
-| Qwen2.5-Coder-3B-Instruct | 3B | fp16 | 10.7 GB | ~53 | ~7.3 |
-| Qwen2.5-7B-Instruct | 7B | fp16 | 19.3 GB | ~50 | ~3.3 |
-| Llama-3.1-8B-Instruct | 8B | fp16 | 20.2 GB | ~84 | ~3.2 |
-| Qwen2.5-Coder-32B-Instruct | 32B | int4 (streaming) | 26.8 GB | ~24 | — |
+| Qwen2.5-Coder-3B-Instruct | 3B | fp16 | 10.7 GB | ~115 | ~7.3 |
+| Qwen2.5-7B-Instruct | 7B | fp16 | 19.3 GB | ~81 | ~3.4 |
+| Llama-3.1-8B-Instruct | 8B | fp16 | 20.2 GB | ~76 | ~3.2 |
+| Qwen2.5-Coder-32B-Instruct | 32B | int4 (streaming) | 26.8 GB | ~42 | — |
 
 Peak VRAM is total GPU memory during the run (includes ~1 GB desktop compositor). The 32B on CPU is
 omitted: its int4 weights dequantize past the 32 GB of system RAM (out-of-memory). See
@@ -36,23 +36,23 @@ same RTX 5090. The "1 req" column is the identical engine at batch 1.
 
 | Model | Params | Vocab | 1 req | batch 16 | batch 32 | batch 64 | peak |
 | ----- | ------ | ----- | ----- | -------- | -------- | -------- | ---- |
-| Qwen2.5-0.5B-Instruct | 0.5B | 152k | ~250 tok/s | 1697 (6.0×) | 1504 (5.7×) | — | 6.0× @16 |
+| Qwen2.5-0.5B-Instruct | 0.5B | 152k | ~243 tok/s | 1662 (6.0×) | 1709 (6.3×) | 1974 (7.1×) | 7.1× @64 |
 | TinyLlama-1.1B-Chat | 1.1B | 32k | ~263 tok/s | 2896 (10.3×) | 3879 (13.9×) | 4652 (17.2×) | 17.2× |
-| Qwen2.5-Coder-3B | 3B | 152k | ~130 tok/s | 1027 (8.0×) | 1319 (10.1×) | 1677 (13.2×) | 13.2× |
+| Qwen2.5-Coder-3B | 3B | 152k | ~126 tok/s | 999 (7.8×) | 1198 (9.5×) | 1763 (13.8×) | 13.8× |
 | Llama-2-7b-chat | 7B | 32k | ~85 tok/s | 1000 (11.7×) | 1532 (17.9×) | 2118 (24.1×) | 24.1× |
-| Qwen2.5-7B-Instruct | 7B | 152k | ~85 tok/s | 800 (9.5×) | 1128 (13.4×) | 1462 (17.1×) | 17.1× |
-| Llama-3.1-8B-Instruct | 8B | 128k | ~80 tok/s | 825 (10.1×) | 1206 (14.7×) | 1392 (17.9×) | 17.9× |
+| Qwen2.5-7B-Instruct | 7B | 152k | ~85 tok/s | 807 (9.5×) | 1132 (13.3×) | 1475 (17.6×) | 17.6× |
+| Llama-3.1-8B-Instruct | 8B | 128k | ~80 tok/s | 775 (9.7×) | 1105 (14.2×) | 1457 (18.2×) | 18.2× |
 
 Notes:
 
 - **Larger, compute-bound models batch better** — the 8B reaches ~18× aggregate and is still climbing
-  at batch 64, while the tiny 0.5B saturates and regresses past batch 16.
+  at batch 64, while the tiny 0.5B plateaus near ~7× (its slim compute can't hide per-step overhead).
 - **Smaller vocabularies batch better** — each step transfers a `[batch × vocab]` logit block, so the
   32k-vocab models (Llama-2, TinyLlama) outscale the 128–152k-vocab ones at the same batch size.
 - **No single-request penalty on real models** — the batch-1 slowdown (batched GEMM vs the tuned
   single-token kernel) is a small-model artifact and vanishes by 7–8B (~1.0×).
 - **Sampling (temperature > 0) currently runs ~half the greedy throughput at high batch** (e.g.
-  Llama-3.1-8B batch 64: 666 vs 1392 tok/s) because top-k/top-p sampling runs per row on the host;
+  Llama-3.1-8B batch 64: 747 vs 1457 tok/s) because top-k/top-p sampling runs per row on the host;
   on-device sampling is planned.
 - Enabled with `CPI_BATCH_WORKER=1` on the web server; requires fp16-resident weights
   (`--gpu-cache-all`) + paged KV (`--paged-blocks`) and full-attention models. Quantized / MoE /
@@ -66,9 +66,9 @@ with `--tokens-file`, fp16 resident, RTX 5090).
 
 | Model | 512 | 2048 | 4096 | 8192 | 16384 | 32768 |
 | ----- | --- | ---- | ---- | ---- | ----- | ----- |
-| Qwen2.5-7B-Instruct | ~87 | ~85 | ~76 | ~61 | ~47 | ~34 |
-| Qwen2.5-Coder-7B-Instruct | ~83 | ~81 | ~73 | ~64 | ~42 | ~30 |
-| Llama-3.1-8B-Instruct | ~82 | ~76 | ~69 | ~54 | ~38 | ~25 |
+| Qwen2.5-7B-Instruct | ~84 | ~80 | ~72 | ~61 | ~50 | ~31 |
+| Qwen2.5-Coder-7B-Instruct | ~83 | ~78 | ~72 | ~65 | ~50 | ~33 |
+| Llama-3.1-8B-Instruct | ~84 | ~76 | ~69 | ~55 | ~41 | ~26 |
 
 Decode is near-flat to a few thousand tokens, then falls roughly in half for each ~4× of context
 as attention over the KV cache dominates each step — at 32K it's ~2.5–3.2× slower than at 512.
