@@ -20,7 +20,17 @@ bool LlamaEngine::can_use_greedy_decode_graph() const {
   // no biases / LayerNorm / paged-KV / int4-KV / MoE / TQ3 (TQ3 untested in the
   // graph and unused here).
   const auto& cfg = weights_.config();
+  // The graph's device-position split-K attention launches a FIXED grid sized to
+  // the full max_context (scratch_chunks = ceil(max_context/32)) every step,
+  // since the grid can't depend on the runtime seq_len once captured. For large
+  // max_context that fixed grid dwarfs the per-step launch savings and makes
+  // decode scale with the *allocated* context rather than the *filled* one (e.g.
+  // Qwen2.5-7B: ~82 tok/s at 128K but ~26 at 256K on an 8-token prompt). Above
+  // this threshold, skip the graph so decode uses the host-launched path whose
+  // grid is min(scratch_chunks, ceil(seq_len/32)) — i.e. scales with filled tokens.
+  constexpr int kGreedyGraphMaxContext = 32768;
   return cached_layer_count_ == cfg.num_layers && !options_.paged_kv_cache &&
+         options_.max_context <= kGreedyGraphMaxContext &&
          !options_.paged_blocks &&  // paged decode uses the non-graph split-K block-gather path
          !options_.profile_decode_phases && !kv_int4_enabled_ && !tq3_enabled_ &&
          !cfg.is_moe() && !cfg.use_layernorm &&
