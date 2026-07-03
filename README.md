@@ -61,18 +61,20 @@ Notes:
 ### Decode throughput vs context length
 
 Single-request greedy decode (tok/s) as the prefilled context grows. Each decode step's
-attention scans the whole KV cache, so throughput falls as the context lengthens (`--benchmark`,
-fp16 resident, RTX 5090).
+attention scans the whole KV cache, so throughput falls as the context lengthens (`--benchmark`
+with `--tokens-file`, fp16 resident, RTX 5090).
 
-| Model | Params | 512 ctx | 2048 ctx | 4096 ctx |
-| ----- | ------ | ------- | -------- | -------- |
-| Qwen2.5-7B-Instruct | 7B | ~87 | ~85 | ~76 |
-| Qwen2.5-Coder-7B-Instruct | 7B | ~83 | ~81 | ~73 |
-| Llama-3.1-8B-Instruct | 8B | ~82 | ~76 | ~69 |
+| Model | 512 | 2048 | 4096 | 8192 | 16384 | 32768 |
+| ----- | --- | ---- | ---- | ---- | ----- | ----- |
+| Qwen2.5-7B-Instruct | ~87 | ~85 | ~76 | ~61 | ~47 | ~34 |
+| Qwen2.5-Coder-7B-Instruct | ~83 | ~81 | ~73 | ~64 | ~42 | ~30 |
+| Llama-3.1-8B-Instruct | ~82 | ~76 | ~69 | ~54 | ~38 | ~25 |
 
-Throughput drops ~10–16% from 512 → 4096 tokens as attention over the larger KV cache dominates
-each step. Llama-3.1-8B decays fastest here — it has 8 KV heads to Qwen2.5-7B's 4, so ~2× the KV
-to scan per token.
+Decode is near-flat to a few thousand tokens, then falls roughly in half for each ~4× of context
+as attention over the KV cache dominates each step — at 32K it's ~2.5–3.2× slower than at 512.
+Llama-3.1-8B falls off fastest: it has 8 KV heads to Qwen2.5-7B's 4, so ~2× the KV to scan per
+token. (Contexts past ~4K need `--tokens-file`, since a token list that long exceeds the OS
+command-line limit.)
 
 ## Highlights
 
