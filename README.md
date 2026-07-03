@@ -58,6 +58,22 @@ Notes:
   (`--gpu-cache-all`) + paged KV (`--paged-blocks`) and full-attention models. Quantized / MoE /
   streaming models (e.g. the 32B int4) fall back to single-request serving.
 
+### Decode throughput vs context length
+
+Single-request greedy decode (tok/s) as the prefilled context grows. Each decode step's
+attention scans the whole KV cache, so throughput falls as the context lengthens (`--benchmark`,
+fp16 resident, RTX 5090).
+
+| Model | Params | 512 ctx | 2048 ctx | 4096 ctx |
+| ----- | ------ | ------- | -------- | -------- |
+| Qwen2.5-7B-Instruct | 7B | ~87 | ~85 | ~76 |
+| Qwen2.5-Coder-7B-Instruct | 7B | ~83 | ~81 | ~73 |
+| Llama-3.1-8B-Instruct | 8B | ~82 | ~76 | ~69 |
+
+Throughput drops ~10–16% from 512 → 4096 tokens as attention over the larger KV cache dominates
+each step. Llama-3.1-8B decays fastest here — it has 8 KV heads to Qwen2.5-7B's 4, so ~2× the KV
+to scan per token.
+
 ## Highlights
 
 - CPU and CUDA inference paths
