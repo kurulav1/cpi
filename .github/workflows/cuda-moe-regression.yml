@@ -1,10 +1,14 @@
 name: CUDA MoE Regression
 
+# GPU parity + throughput gate. Runs kernels and measures decode tok/s, so it
+# needs a real GPU and lives on the self-hosted runner. Triggered manually (and
+# weekly) rather than on every push: otherwise runs queue indefinitely whenever
+# the self-hosted box is offline. The free GitHub-hosted `build-cuda` job in
+# ci.yml covers "does the CUDA path still compile" on every push.
 on:
-  push:
-    branches: ["**"]
-  pull_request:
   workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 1"  # Mondays 06:00 UTC
 
 jobs:
   cuda-build-moe-gates:

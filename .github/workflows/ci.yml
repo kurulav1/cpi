@@ -91,6 +91,32 @@ jobs:
       - name: Test
         run: ctest --test-dir build -C Release --output-on-failure
 
+  build-cuda:
+    name: Build (CUDA compile-only)
+    runs-on: ubuntu-latest
+    # Free GitHub-hosted runner (no GPU): nvcc COMPILES + links the CUDA path to
+    # catch build breakage cross-machine. The parity/throughput gate that must
+    # RUN kernels stays on the self-hosted GPU box (cuda-moe-regression.yml).
+    # The official CUDA devel image ships nvcc + cuBLAS; ubuntu24.04 gives an
+    # apt cmake >= 3.24.
+    container: nvidia/cuda:12.6.2-devel-ubuntu24.04
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends cmake g++ git ca-certificates
+      - uses: actions/checkout@v4
+      - name: Configure (CUDA on, fixed arch, sentencepiece off)
+        run: >
+          cmake -S . -B build
+          -DLLAMA_ENGINE_ENABLE_CUDA=ON
+          -DLLAMA_ENGINE_ENABLE_SENTENCEPIECE=OFF
+          -DLLAMA_ENGINE_ENABLE_LTO=OFF
+          -DCMAKE_CUDA_ARCHITECTURES=89
+          -DCMAKE_BUILD_TYPE=Release
+      - name: Compile + link (no GPU execution)
+        run: cmake --build build --config Release --target llama_infer -j
+
   repo-hygiene:
     name: No committed build/model artifacts
     runs-on: ubuntu-latest
