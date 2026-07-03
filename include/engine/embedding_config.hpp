@@ -23,19 +23,19 @@ struct EmbeddingConfig {
   int vocab_size = 0;
   int type_vocab_size = 2;
   float layer_norm_eps = 1e-12f;
-  std::string hidden_act = "gelu";                  // gelu (only supported act)
-  std::string position_embedding_type = "absolute"; // absolute (only supported)
+  std::string hidden_act = "gelu";                   // gelu (only supported act)
+  std::string position_embedding_type = "absolute";  // absolute (only supported)
   std::string model_type = "bert";
 
   // Embedding behaviour (from cpi_embed.json / 1_Pooling/config.json).
   PoolingMode pooling = PoolingMode::Cls;
-  bool normalize = true;          // L2-normalize the output
-  int dimension = 0;              // output dim (defaults to hidden_size)
-  int max_tokens = 512;           // truncate inputs to this many tokens
-  std::string query_prefix;       // prepended to input_type=="query"
-  std::string doc_prefix;         // prepended to input_type=="document"
+  bool normalize = true;     // L2-normalize the output
+  int dimension = 0;         // output dim (defaults to hidden_size)
+  int max_tokens = 512;      // truncate inputs to this many tokens
+  std::string query_prefix;  // prepended to input_type=="query"
+  std::string doc_prefix;    // prepended to input_type=="document"
 
-  bool lowercase = true;          // tokenizer normalizer (from config/defaults)
+  bool lowercase = true;  // tokenizer normalizer (from config/defaults)
   bool strip_accents = true;
 
   // Loads and merges config.json + cpi_embed.json + 1_Pooling/config.json from

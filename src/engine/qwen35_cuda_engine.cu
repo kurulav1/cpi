@@ -1,4 +1,4 @@
-#include "engine/qwen35_cuda_engine.hpp"
+#include <cuda_fp16.h>
 
 #include <algorithm>
 #include <chrono>
@@ -10,17 +10,16 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
-#include <unordered_set>
 #include <limits>
 #include <numeric>
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
-#include <cuda_fp16.h>
-
 #include "common.hpp"
+#include "engine/qwen35_cuda_engine.hpp"
 #include "grammar/grammar_sampler.hpp"
 #include "runtime/cuda_utils.cuh"
 #include "runtime/kernels.cuh"
@@ -47,13 +46,11 @@ std::string read_text_file(const std::filesystem::path& path) {
   if (!in) {
     throw std::runtime_error("failed to open config file: " + path.string());
   }
-  return std::string((std::istreambuf_iterator<char>(in)),
-                     std::istreambuf_iterator<char>());
+  return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 }
 
 void skip_ws(const std::string& json, std::size_t& pos) {
-  while (pos < json.size() &&
-         std::isspace(static_cast<unsigned char>(json[pos]))) {
+  while (pos < json.size() && std::isspace(static_cast<unsigned char>(json[pos]))) {
     ++pos;
   }
 }
@@ -84,15 +81,33 @@ std::string json_read_string(const std::string& json, std::size_t& pos) {
     if (c == '\\' && pos < json.size()) {
       const char escaped = json[pos++];
       switch (escaped) {
-        case '"': result.push_back('"'); break;
-        case '\\': result.push_back('\\'); break;
-        case '/': result.push_back('/'); break;
-        case 'b': result.push_back('\b'); break;
-        case 'f': result.push_back('\f'); break;
-        case 'n': result.push_back('\n'); break;
-        case 'r': result.push_back('\r'); break;
-        case 't': result.push_back('\t'); break;
-        default: result.push_back(escaped); break;
+        case '"':
+          result.push_back('"');
+          break;
+        case '\\':
+          result.push_back('\\');
+          break;
+        case '/':
+          result.push_back('/');
+          break;
+        case 'b':
+          result.push_back('\b');
+          break;
+        case 'f':
+          result.push_back('\f');
+          break;
+        case 'n':
+          result.push_back('\n');
+          break;
+        case 'r':
+          result.push_back('\r');
+          break;
+        case 't':
+          result.push_back('\t');
+          break;
+        default:
+          result.push_back(escaped);
+          break;
       }
       continue;
     }
@@ -137,8 +152,7 @@ std::string json_extract_object(const std::string& json, const std::string& key)
   return "";
 }
 
-std::string json_get_string(const std::string& json,
-                            const std::string& key,
+std::string json_get_string(const std::string& json, const std::string& key,
                             const std::string& def = "") {
   std::size_t pos = json_find_key(json, key);
   if (pos == std::string::npos) return def;
@@ -152,9 +166,8 @@ int json_get_int(const std::string& json, const std::string& key, int def = 0) {
   if (pos == std::string::npos) return def;
   skip_ws(json, pos);
   std::size_t end = pos;
-  while (end < json.size() &&
-         (std::isdigit(static_cast<unsigned char>(json[end])) ||
-          json[end] == '-' || json[end] == '+')) {
+  while (end < json.size() && (std::isdigit(static_cast<unsigned char>(json[end])) ||
+                               json[end] == '-' || json[end] == '+')) {
     ++end;
   }
   if (end == pos) return def;
@@ -165,17 +178,14 @@ int json_get_int(const std::string& json, const std::string& key, int def = 0) {
   }
 }
 
-float json_get_float(const std::string& json,
-                     const std::string& key,
-                     float def = 0.0f) {
+float json_get_float(const std::string& json, const std::string& key, float def = 0.0f) {
   std::size_t pos = json_find_key(json, key);
   if (pos == std::string::npos) return def;
   skip_ws(json, pos);
   std::size_t end = pos;
   while (end < json.size() &&
-         (std::isdigit(static_cast<unsigned char>(json[end])) ||
-          json[end] == '-' || json[end] == '+' || json[end] == '.' ||
-          json[end] == 'e' || json[end] == 'E')) {
+         (std::isdigit(static_cast<unsigned char>(json[end])) || json[end] == '-' ||
+          json[end] == '+' || json[end] == '.' || json[end] == 'e' || json[end] == 'E')) {
     ++end;
   }
   if (end == pos) return def;
@@ -186,8 +196,7 @@ float json_get_float(const std::string& json,
   }
 }
 
-std::vector<std::string> json_get_string_array(const std::string& json,
-                                               const std::string& key) {
+std::vector<std::string> json_get_string_array(const std::string& json, const std::string& key) {
   std::size_t pos = json_find_key(json, key);
   if (pos == std::string::npos) return {};
   skip_ws(json, pos);
@@ -215,8 +224,7 @@ const std::uint16_t* require_bf16_tensor(const model::SafetensorsLoader& loader,
   return reinterpret_cast<const std::uint16_t*>(loader.tensor_ptr(name));
 }
 
-const float* require_f32_tensor(const model::SafetensorsLoader& loader,
-                                const std::string& name) {
+const float* require_f32_tensor(const model::SafetensorsLoader& loader, const std::string& name) {
   if (!loader.has_tensor(name)) {
     throw std::runtime_error("missing tensor: " + name);
   }
@@ -238,8 +246,7 @@ void free_device_ptr(T*& ptr) {
   }
 }
 
-std::vector<std::uint16_t> convert_bf16_to_fp16_host(const std::uint16_t* src,
-                                                     std::size_t elems) {
+std::vector<std::uint16_t> convert_bf16_to_fp16_host(const std::uint16_t* src, std::size_t elems) {
   std::vector<std::uint16_t> out(elems);
   for (std::size_t i = 0; i < elems; ++i) {
     out[i] = float_to_half_bits(bf16_to_float(src[i]));
@@ -353,8 +360,8 @@ void Qwen35CudaEngine::load_config(const std::string& model_dir) {
   cfg_.linear_value_head_dim = json_get_int(text_config, "linear_value_head_dim", 0);
   cfg_.linear_conv_kernel_dim = json_get_int(text_config, "linear_conv_kernel_dim", 0);
   cfg_.max_position_embeddings = json_get_int(text_config, "max_position_embeddings", 0);
-  cfg_.eos_token_id = json_get_int(text_config, "eos_token_id",
-                                   json_get_int(raw, "eos_token_id", -1));
+  cfg_.eos_token_id =
+      json_get_int(text_config, "eos_token_id", json_get_int(raw, "eos_token_id", -1));
   cfg_.rms_norm_eps = json_get_float(text_config, "rms_norm_eps", 1e-6f);
   const std::string rope_parameters = json_extract_object(text_config, "rope_parameters");
   cfg_.rope_theta = json_get_float(rope_parameters, "rope_theta", 10000000.0f);
@@ -363,16 +370,15 @@ void Qwen35CudaEngine::load_config(const std::string& model_dir) {
   const auto layer_types = json_get_string_array(text_config, "layer_types");
   cfg_.layer_kinds.reserve(layer_types.size());
   for (const std::string& value : layer_types) {
-    cfg_.layer_kinds.push_back(
-        value == "full_attention" ? LayerKind::FullAttention
-                                  : LayerKind::LinearAttention);
+    cfg_.layer_kinds.push_back(value == "full_attention" ? LayerKind::FullAttention
+                                                         : LayerKind::LinearAttention);
   }
 
   if (cfg_.vocab_size <= 0 || cfg_.hidden_size <= 0 || cfg_.intermediate_size <= 0 ||
       cfg_.num_layers <= 0 || cfg_.num_attention_heads <= 0 || cfg_.num_key_value_heads <= 0 ||
-      cfg_.head_dim <= 0 || cfg_.linear_num_key_heads <= 0 ||
-      cfg_.linear_num_value_heads <= 0 || cfg_.linear_key_head_dim <= 0 ||
-      cfg_.linear_value_head_dim <= 0 || cfg_.linear_conv_kernel_dim <= 0) {
+      cfg_.head_dim <= 0 || cfg_.linear_num_key_heads <= 0 || cfg_.linear_num_value_heads <= 0 ||
+      cfg_.linear_key_head_dim <= 0 || cfg_.linear_value_head_dim <= 0 ||
+      cfg_.linear_conv_kernel_dim <= 0) {
     throw std::runtime_error("Qwen3.5 config.json is missing required text_config fields");
   }
   if (cfg_.layer_kinds.size() != static_cast<std::size_t>(cfg_.num_layers)) {
@@ -381,11 +387,11 @@ void Qwen35CudaEngine::load_config(const std::string& model_dir) {
 }
 
 void Qwen35CudaEngine::allocate_runtime_buffers() {
-  max_ctx_ = options_.max_context > 0
-      ? std::min(options_.max_context, cfg_.max_position_embeddings)
-      : std::min(2048, cfg_.max_position_embeddings);
+  max_ctx_ = options_.max_context > 0 ? std::min(options_.max_context, cfg_.max_position_embeddings)
+                                      : std::min(2048, cfg_.max_position_embeddings);
   bos_id_ = cfg_.eos_token_id >= 0 ? cfg_.eos_token_id : 0;
-  rotary_dim_ = static_cast<int>(std::round(static_cast<float>(cfg_.head_dim) * cfg_.partial_rotary_factor));
+  rotary_dim_ =
+      static_cast<int>(std::round(static_cast<float>(cfg_.head_dim) * cfg_.partial_rotary_factor));
   if (rotary_dim_ <= 0 || (rotary_dim_ % 2) != 0) {
     rotary_dim_ = cfg_.head_dim - (cfg_.head_dim % 2);
   }
@@ -395,17 +401,15 @@ void Qwen35CudaEngine::allocate_runtime_buffers() {
   linear_v_dim_ = cfg_.linear_num_value_heads * cfg_.linear_value_head_dim;
   linear_conv_dim_ = linear_k_dim_ * 2 + linear_v_dim_;
   linear_head_repeat_ = cfg_.linear_num_value_heads / cfg_.linear_num_key_heads;
-  linear_conv_state_stride_ =
-      linear_conv_dim_ * std::max(0, cfg_.linear_conv_kernel_dim - 1);
+  linear_conv_state_stride_ = linear_conv_dim_ * std::max(0, cfg_.linear_conv_kernel_dim - 1);
   linear_recurrent_state_stride_ =
-      cfg_.linear_num_value_heads * cfg_.linear_key_head_dim *
-      cfg_.linear_value_head_dim;
+      cfg_.linear_num_value_heads * cfg_.linear_key_head_dim * cfg_.linear_value_head_dim;
 
-  auto malloc_device = [](void** ptr, std::size_t bytes) {
-    CUDA_CHECK(cudaMalloc(ptr, bytes));
-  };
-  malloc_device(&d_rope_cos_, static_cast<std::size_t>(max_ctx_) * static_cast<std::size_t>(rotary_dim_ / 2) * sizeof(float));
-  malloc_device(&d_rope_sin_, static_cast<std::size_t>(max_ctx_) * static_cast<std::size_t>(rotary_dim_ / 2) * sizeof(float));
+  auto malloc_device = [](void** ptr, std::size_t bytes) { CUDA_CHECK(cudaMalloc(ptr, bytes)); };
+  malloc_device(&d_rope_cos_, static_cast<std::size_t>(max_ctx_) *
+                                  static_cast<std::size_t>(rotary_dim_ / 2) * sizeof(float));
+  malloc_device(&d_rope_sin_, static_cast<std::size_t>(max_ctx_) *
+                                  static_cast<std::size_t>(rotary_dim_ / 2) * sizeof(float));
   malloc_device(&d_x_, static_cast<std::size_t>(cfg_.hidden_size) * sizeof(__half));
   malloc_device(&d_x_norm_, static_cast<std::size_t>(cfg_.hidden_size) * sizeof(__half));
   malloc_device(&d_q_pair_, static_cast<std::size_t>(full_q_dim_ * 2) * sizeof(__half));
@@ -422,26 +426,31 @@ void Qwen35CudaEngine::allocate_runtime_buffers() {
   malloc_device(&d_mlp_inter_, static_cast<std::size_t>(cfg_.intermediate_size) * sizeof(__half));
   malloc_device(&d_linear_qkv_mix_, static_cast<std::size_t>(linear_conv_dim_) * sizeof(__half));
   malloc_device(&d_linear_z_, static_cast<std::size_t>(linear_v_dim_) * sizeof(__half));
-  malloc_device(&d_linear_a_, static_cast<std::size_t>(cfg_.linear_num_value_heads) * sizeof(__half));
-  malloc_device(&d_linear_b_, static_cast<std::size_t>(cfg_.linear_num_value_heads) * sizeof(__half));
+  malloc_device(&d_linear_a_,
+                static_cast<std::size_t>(cfg_.linear_num_value_heads) * sizeof(__half));
+  malloc_device(&d_linear_b_,
+                static_cast<std::size_t>(cfg_.linear_num_value_heads) * sizeof(__half));
   malloc_device(&d_linear_att_, static_cast<std::size_t>(linear_v_dim_) * sizeof(__half));
   malloc_device(&d_linear_q_, static_cast<std::size_t>(cfg_.linear_num_value_heads) *
-                                static_cast<std::size_t>(cfg_.linear_key_head_dim) *
-                                sizeof(__half));
+                                  static_cast<std::size_t>(cfg_.linear_key_head_dim) *
+                                  sizeof(__half));
   malloc_device(&d_linear_k_, static_cast<std::size_t>(cfg_.linear_num_value_heads) *
-                                static_cast<std::size_t>(cfg_.linear_key_head_dim) *
-                                sizeof(__half));
+                                  static_cast<std::size_t>(cfg_.linear_key_head_dim) *
+                                  sizeof(__half));
   malloc_device(&d_linear_v_, static_cast<std::size_t>(linear_v_dim_) * sizeof(__half));
   CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_linear_conv_state_),
                         static_cast<std::size_t>(cfg_.num_layers) *
-                            static_cast<std::size_t>(linear_conv_state_stride_) *
-                            sizeof(float)));
+                            static_cast<std::size_t>(linear_conv_state_stride_) * sizeof(float)));
   CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_linear_recurrent_state_),
                         static_cast<std::size_t>(cfg_.num_layers) *
                             static_cast<std::size_t>(linear_recurrent_state_stride_) *
                             sizeof(float)));
-  malloc_device(&d_k_cache_, static_cast<std::size_t>(cfg_.num_layers) * static_cast<std::size_t>(max_ctx_) * static_cast<std::size_t>(full_kv_dim_) * sizeof(__half));
-  malloc_device(&d_v_cache_, static_cast<std::size_t>(cfg_.num_layers) * static_cast<std::size_t>(max_ctx_) * static_cast<std::size_t>(full_kv_dim_) * sizeof(__half));
+  malloc_device(&d_k_cache_, static_cast<std::size_t>(cfg_.num_layers) *
+                                 static_cast<std::size_t>(max_ctx_) *
+                                 static_cast<std::size_t>(full_kv_dim_) * sizeof(__half));
+  malloc_device(&d_v_cache_, static_cast<std::size_t>(cfg_.num_layers) *
+                                 static_cast<std::size_t>(max_ctx_) *
+                                 static_cast<std::size_t>(full_kv_dim_) * sizeof(__half));
 
   h_token_embedding_fp16_.resize(static_cast<std::size_t>(cfg_.hidden_size));
   h_logits_.resize(static_cast<std::size_t>(cfg_.vocab_size));
@@ -449,15 +458,14 @@ void Qwen35CudaEngine::allocate_runtime_buffers() {
 
 void Qwen35CudaEngine::build_rope_tables() {
   const int half_dim = rotary_dim_ / 2;
-  std::vector<float> rope_cos(
-      static_cast<std::size_t>(max_ctx_) * static_cast<std::size_t>(half_dim));
-  std::vector<float> rope_sin(
-      static_cast<std::size_t>(max_ctx_) * static_cast<std::size_t>(half_dim));
+  std::vector<float> rope_cos(static_cast<std::size_t>(max_ctx_) *
+                              static_cast<std::size_t>(half_dim));
+  std::vector<float> rope_sin(static_cast<std::size_t>(max_ctx_) *
+                              static_cast<std::size_t>(half_dim));
 
   for (int i = 0; i < half_dim; ++i) {
-    const float inv_freq = std::pow(
-        cfg_.rope_theta,
-        -2.0f * static_cast<float>(i) / static_cast<float>(rotary_dim_));
+    const float inv_freq =
+        std::pow(cfg_.rope_theta, -2.0f * static_cast<float>(i) / static_cast<float>(rotary_dim_));
     for (int pos = 0; pos < max_ctx_; ++pos) {
       const float angle = static_cast<float>(pos) * inv_freq;
       rope_cos[static_cast<std::size_t>(pos) * static_cast<std::size_t>(half_dim) +
@@ -467,102 +475,75 @@ void Qwen35CudaEngine::build_rope_tables() {
     }
   }
 
-  CUDA_CHECK(cudaMemcpyAsync(d_rope_cos_,
-                             rope_cos.data(),
-                             rope_cos.size() * sizeof(float),
-                             cudaMemcpyHostToDevice,
-                             compute_stream_));
-  CUDA_CHECK(cudaMemcpyAsync(d_rope_sin_,
-                             rope_sin.data(),
-                             rope_sin.size() * sizeof(float),
-                             cudaMemcpyHostToDevice,
-                             compute_stream_));
+  CUDA_CHECK(cudaMemcpyAsync(d_rope_cos_, rope_cos.data(), rope_cos.size() * sizeof(float),
+                             cudaMemcpyHostToDevice, compute_stream_));
+  CUDA_CHECK(cudaMemcpyAsync(d_rope_sin_, rope_sin.data(), rope_sin.size() * sizeof(float),
+                             cudaMemcpyHostToDevice, compute_stream_));
   CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
 }
 
 void Qwen35CudaEngine::reset_state() {
-  const std::size_t cache_bytes =
-      static_cast<std::size_t>(cfg_.num_layers) *
-      static_cast<std::size_t>(max_ctx_) *
-      static_cast<std::size_t>(full_kv_dim_) *
-      sizeof(__half);
+  const std::size_t cache_bytes = static_cast<std::size_t>(cfg_.num_layers) *
+                                  static_cast<std::size_t>(max_ctx_) *
+                                  static_cast<std::size_t>(full_kv_dim_) * sizeof(__half);
   CUDA_CHECK(cudaMemsetAsync(d_k_cache_, 0, cache_bytes, compute_stream_));
   CUDA_CHECK(cudaMemsetAsync(d_v_cache_, 0, cache_bytes, compute_stream_));
-  CUDA_CHECK(cudaMemsetAsync(
-      d_linear_conv_state_,
-      0,
-      static_cast<std::size_t>(cfg_.num_layers) *
-          static_cast<std::size_t>(linear_conv_state_stride_) * sizeof(float),
-      compute_stream_));
-  CUDA_CHECK(cudaMemsetAsync(
-      d_linear_recurrent_state_,
-      0,
-      static_cast<std::size_t>(cfg_.num_layers) *
-          static_cast<std::size_t>(linear_recurrent_state_stride_) * sizeof(float),
-      compute_stream_));
+  CUDA_CHECK(cudaMemsetAsync(d_linear_conv_state_, 0,
+                             static_cast<std::size_t>(cfg_.num_layers) *
+                                 static_cast<std::size_t>(linear_conv_state_stride_) *
+                                 sizeof(float),
+                             compute_stream_));
+  CUDA_CHECK(cudaMemsetAsync(d_linear_recurrent_state_, 0,
+                             static_cast<std::size_t>(cfg_.num_layers) *
+                                 static_cast<std::size_t>(linear_recurrent_state_stride_) *
+                                 sizeof(float),
+                             compute_stream_));
   CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
 }
 
 void Qwen35CudaEngine::load_token_embedding_to_device(int token) {
   token = std::clamp(token, 0, cfg_.vocab_size - 1);
-  const std::uint16_t* row =
-      tok_embeddings_ +
-      static_cast<std::size_t>(token) * static_cast<std::size_t>(cfg_.hidden_size);
+  const std::uint16_t* row = tok_embeddings_ + static_cast<std::size_t>(token) *
+                                                   static_cast<std::size_t>(cfg_.hidden_size);
   for (int i = 0; i < cfg_.hidden_size; ++i) {
     h_token_embedding_fp16_[static_cast<std::size_t>(i)] =
         float_to_half_bits(bf16_to_float(row[i]));
   }
-  CUDA_CHECK(cudaMemcpyAsync(d_x_,
-                             h_token_embedding_fp16_.data(),
-                             static_cast<std::size_t>(cfg_.hidden_size) *
-                                 sizeof(std::uint16_t),
-                             cudaMemcpyHostToDevice,
-                             compute_stream_));
+  CUDA_CHECK(cudaMemcpyAsync(d_x_, h_token_embedding_fp16_.data(),
+                             static_cast<std::size_t>(cfg_.hidden_size) * sizeof(std::uint16_t),
+                             cudaMemcpyHostToDevice, compute_stream_));
 }
 
 void Qwen35CudaEngine::project(const DeviceMatrix& matrix, const void* x, void* y) {
   switch (matrix.kind) {
     case MatrixKind::Fp16:
       kernels::launch_rowmajor_half_gemv_f16(static_cast<const __half*>(matrix.data),
-                                             static_cast<const __half*>(x),
-                                             static_cast<__half*>(y),
-                                             matrix.rows,
-                                             matrix.cols,
-                                             compute_stream_);
+                                             static_cast<const __half*>(x), static_cast<__half*>(y),
+                                             matrix.rows, matrix.cols, compute_stream_);
       return;
     case MatrixKind::Int8:
       kernels::launch_weight_only_int8_matvec(static_cast<const std::int8_t*>(matrix.data),
-                                              matrix.scales,
-                                              static_cast<const __half*>(x),
-                                              static_cast<__half*>(y),
-                                              matrix.rows,
-                                              matrix.cols,
+                                              matrix.scales, static_cast<const __half*>(x),
+                                              static_cast<__half*>(y), matrix.rows, matrix.cols,
                                               compute_stream_);
       return;
     case MatrixKind::Int4:
       kernels::launch_weight_only_int4_matvec(static_cast<const std::int8_t*>(matrix.data),
-                                              matrix.scales,
-                                              static_cast<const __half*>(x),
-                                              static_cast<__half*>(y),
-                                              matrix.rows,
-                                              matrix.cols,
+                                              matrix.scales, static_cast<const __half*>(x),
+                                              static_cast<__half*>(y), matrix.rows, matrix.cols,
                                               compute_stream_);
       return;
   }
 }
 
-void Qwen35CudaEngine::rowmajor_projection_float(const DeviceMatrix& matrix,
-                                                 const void* x,
+void Qwen35CudaEngine::rowmajor_projection_float(const DeviceMatrix& matrix, const void* x,
                                                  void* y) {
   if (matrix.kind != MatrixKind::Fp16) {
     LLAMA_ENGINE_THROW("float projection requires fp16 weights");
   }
   kernels::launch_rowmajor_half_gemv_f32(static_cast<const __half*>(matrix.data),
-                                         static_cast<const __half*>(x),
-                                         static_cast<float*>(y),
-                                         matrix.rows,
-                                         matrix.cols,
-                                         compute_stream_);
+                                         static_cast<const __half*>(x), static_cast<float*>(y),
+                                         matrix.rows, matrix.cols, compute_stream_);
 }
 
 void Qwen35CudaEngine::load_weights() {
@@ -571,11 +552,8 @@ void Qwen35CudaEngine::load_weights() {
     const auto host = convert_bf16_to_fp16_host(src, static_cast<std::size_t>(elems));
     void* dst = nullptr;
     CUDA_CHECK(cudaMalloc(&dst, static_cast<std::size_t>(elems) * sizeof(__half)));
-    CUDA_CHECK(cudaMemcpyAsync(dst,
-                               host.data(),
-                               host.size() * sizeof(std::uint16_t),
-                               cudaMemcpyHostToDevice,
-                               compute_stream_));
+    CUDA_CHECK(cudaMemcpyAsync(dst, host.data(), host.size() * sizeof(std::uint16_t),
+                               cudaMemcpyHostToDevice, compute_stream_));
     return dst;
   };
 
@@ -583,11 +561,8 @@ void Qwen35CudaEngine::load_weights() {
     float* dst = nullptr;
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&dst),
                           static_cast<std::size_t>(elems) * sizeof(float)));
-    CUDA_CHECK(cudaMemcpyAsync(dst,
-                               src,
-                               static_cast<std::size_t>(elems) * sizeof(float),
-                               cudaMemcpyHostToDevice,
-                               compute_stream_));
+    CUDA_CHECK(cudaMemcpyAsync(dst, src, static_cast<std::size_t>(elems) * sizeof(float),
+                               cudaMemcpyHostToDevice, compute_stream_));
     return dst;
   };
 
@@ -595,18 +570,12 @@ void Qwen35CudaEngine::load_weights() {
     const auto host = convert_bf16_to_fp16_host(src, static_cast<std::size_t>(elems));
     void* dst = nullptr;
     CUDA_CHECK(cudaMalloc(&dst, static_cast<std::size_t>(elems) * sizeof(__half)));
-    CUDA_CHECK(cudaMemcpyAsync(dst,
-                               host.data(),
-                               host.size() * sizeof(std::uint16_t),
-                               cudaMemcpyHostToDevice,
-                               compute_stream_));
+    CUDA_CHECK(cudaMemcpyAsync(dst, host.data(), host.size() * sizeof(std::uint16_t),
+                               cudaMemcpyHostToDevice, compute_stream_));
     return dst;
   };
 
-  auto quantize_rowwise = [&](const std::uint16_t* src,
-                              int rows,
-                              int cols,
-                              DeviceMatrix* out) {
+  auto quantize_rowwise = [&](const std::uint16_t* src, int rows, int cols, DeviceMatrix* out) {
     const int max_q = options_.streaming_quant_bits == 4 ? 7 : 127;
     const bool int4 = options_.streaming_quant_bits == 4;
     std::vector<float> scales(static_cast<std::size_t>(rows), 1.0f);
@@ -620,7 +589,8 @@ void Qwen35CudaEngine::load_weights() {
       const std::size_t row_off = static_cast<std::size_t>(row) * static_cast<std::size_t>(cols);
       float max_abs = 0.0f;
       for (int col = 0; col < cols; ++col) {
-        max_abs = std::max(max_abs, std::fabs(bf16_to_float(src[row_off + static_cast<std::size_t>(col)])));
+        max_abs = std::max(max_abs,
+                           std::fabs(bf16_to_float(src[row_off + static_cast<std::size_t>(col)])));
       }
       const float scale = max_abs > 0.0f ? (max_abs / static_cast<float>(max_q)) : 1.0f;
       scales[static_cast<std::size_t>(row)] = scale;
@@ -630,20 +600,19 @@ void Qwen35CudaEngine::load_weights() {
         for (int col = 0; col < cols; col += 2) {
           const auto pack_val = [&](int c) -> std::uint8_t {
             if (c >= cols) return 0;
-            int v = static_cast<int>(std::lrint(
-                bf16_to_float(src[row_off + static_cast<std::size_t>(c)]) / scale));
+            int v = static_cast<int>(
+                std::lrint(bf16_to_float(src[row_off + static_cast<std::size_t>(c)]) / scale));
             v = std::clamp(v, -8, 7);
             return static_cast<std::uint8_t>(v < 0 ? v + 16 : v);
           };
           const std::uint8_t lo = pack_val(col);
           const std::uint8_t hi = pack_val(col + 1);
-          q[dst_off + static_cast<std::size_t>(col / 2)] =
-              static_cast<std::int8_t>(lo | (hi << 4));
+          q[dst_off + static_cast<std::size_t>(col / 2)] = static_cast<std::int8_t>(lo | (hi << 4));
         }
       } else {
         for (int col = 0; col < cols; ++col) {
-          int v = static_cast<int>(std::lrint(
-              bf16_to_float(src[row_off + static_cast<std::size_t>(col)]) / scale));
+          int v = static_cast<int>(
+              std::lrint(bf16_to_float(src[row_off + static_cast<std::size_t>(col)]) / scale));
           v = std::clamp(v, -127, 127);
           q[row_off + static_cast<std::size_t>(col)] = static_cast<std::int8_t>(v);
         }
@@ -654,18 +623,11 @@ void Qwen35CudaEngine::load_weights() {
     out->rows = rows;
     out->cols = cols;
     CUDA_CHECK(cudaMalloc(&out->data, q.size() * sizeof(std::int8_t)));
-    CUDA_CHECK(cudaMemcpyAsync(out->data,
-                               q.data(),
-                               q.size() * sizeof(std::int8_t),
-                               cudaMemcpyHostToDevice,
-                               compute_stream_));
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&out->scales),
-                          scales.size() * sizeof(float)));
-    CUDA_CHECK(cudaMemcpyAsync(out->scales,
-                               scales.data(),
-                               scales.size() * sizeof(float),
-                               cudaMemcpyHostToDevice,
-                               compute_stream_));
+    CUDA_CHECK(cudaMemcpyAsync(out->data, q.data(), q.size() * sizeof(std::int8_t),
+                               cudaMemcpyHostToDevice, compute_stream_));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&out->scales), scales.size() * sizeof(float)));
+    CUDA_CHECK(cudaMemcpyAsync(out->scales, scales.data(), scales.size() * sizeof(float),
+                               cudaMemcpyHostToDevice, compute_stream_));
   };
 
   auto load_matrix = [&](const std::string& name, int rows, int cols) -> DeviceMatrix {
@@ -678,11 +640,8 @@ void Qwen35CudaEngine::load_weights() {
       const auto host = convert_bf16_to_fp16_host(
           src, static_cast<std::size_t>(rows) * static_cast<std::size_t>(cols));
       CUDA_CHECK(cudaMalloc(&out.data, host.size() * sizeof(std::uint16_t)));
-      CUDA_CHECK(cudaMemcpyAsync(out.data,
-                                 host.data(),
-                                 host.size() * sizeof(std::uint16_t),
-                                 cudaMemcpyHostToDevice,
-                                 compute_stream_));
+      CUDA_CHECK(cudaMemcpyAsync(out.data, host.data(), host.size() * sizeof(std::uint16_t),
+                                 cudaMemcpyHostToDevice, compute_stream_));
       return out;
     }
     quantize_rowwise(src, rows, cols, &out);
@@ -698,16 +657,12 @@ void Qwen35CudaEngine::load_weights() {
     const auto host = convert_bf16_to_fp16_host(
         src, static_cast<std::size_t>(rows) * static_cast<std::size_t>(cols));
     CUDA_CHECK(cudaMalloc(&out.data, host.size() * sizeof(std::uint16_t)));
-    CUDA_CHECK(cudaMemcpyAsync(out.data,
-                               host.data(),
-                               host.size() * sizeof(std::uint16_t),
-                               cudaMemcpyHostToDevice,
-                               compute_stream_));
+    CUDA_CHECK(cudaMemcpyAsync(out.data, host.data(), host.size() * sizeof(std::uint16_t),
+                               cudaMemcpyHostToDevice, compute_stream_));
     return out;
   };
 
-  tok_embeddings_ =
-      require_bf16_tensor(weights_, "model.language_model.embed_tokens.weight");
+  tok_embeddings_ = require_bf16_tensor(weights_, "model.language_model.embed_tokens.weight");
   d_norm_out_ = load_vector_fp16("model.language_model.norm.weight", cfg_.hidden_size);
   lm_head_.kind = MatrixKind::Fp16;
   lm_head_.rows = cfg_.vocab_size;
@@ -720,45 +675,51 @@ void Qwen35CudaEngine::load_weights() {
     LayerWeights& lw = layers_[static_cast<std::size_t>(layer)];
     lw.kind = cfg_.layer_kinds[static_cast<std::size_t>(layer)];
     lw.norm_att = load_matrix_fp16_only(prefix + ".input_layernorm.weight", 1, cfg_.hidden_size);
-    lw.norm_ffn = load_matrix_fp16_only(prefix + ".post_attention_layernorm.weight", 1, cfg_.hidden_size);
-    lw.mlp_gate = load_matrix(prefix + ".mlp.gate_proj.weight", cfg_.intermediate_size, cfg_.hidden_size);
-    lw.mlp_up = load_matrix(prefix + ".mlp.up_proj.weight", cfg_.intermediate_size, cfg_.hidden_size);
-    lw.mlp_down = load_matrix(prefix + ".mlp.down_proj.weight", cfg_.hidden_size, cfg_.intermediate_size);
+    lw.norm_ffn =
+        load_matrix_fp16_only(prefix + ".post_attention_layernorm.weight", 1, cfg_.hidden_size);
+    lw.mlp_gate =
+        load_matrix(prefix + ".mlp.gate_proj.weight", cfg_.intermediate_size, cfg_.hidden_size);
+    lw.mlp_up =
+        load_matrix(prefix + ".mlp.up_proj.weight", cfg_.intermediate_size, cfg_.hidden_size);
+    lw.mlp_down =
+        load_matrix(prefix + ".mlp.down_proj.weight", cfg_.hidden_size, cfg_.intermediate_size);
     if (lw.kind == LayerKind::FullAttention) {
-      lw.full_q = load_matrix(prefix + ".self_attn.q_proj.weight", full_q_dim_ * 2, cfg_.hidden_size);
+      lw.full_q =
+          load_matrix(prefix + ".self_attn.q_proj.weight", full_q_dim_ * 2, cfg_.hidden_size);
       lw.full_k = load_matrix(prefix + ".self_attn.k_proj.weight", full_kv_dim_, cfg_.hidden_size);
       lw.full_v = load_matrix(prefix + ".self_attn.v_proj.weight", full_kv_dim_, cfg_.hidden_size);
       lw.full_o = load_matrix(prefix + ".self_attn.o_proj.weight", cfg_.hidden_size, full_q_dim_);
       lw.full_q_norm = load_vector_fp16(prefix + ".self_attn.q_norm.weight", cfg_.head_dim);
       lw.full_k_norm = load_vector_fp16(prefix + ".self_attn.k_norm.weight", cfg_.head_dim);
     } else {
-      lw.linear_qkv = load_matrix(prefix + ".linear_attn.in_proj_qkv.weight", linear_conv_dim_, cfg_.hidden_size);
-      lw.linear_z = load_matrix(prefix + ".linear_attn.in_proj_z.weight", linear_v_dim_, cfg_.hidden_size);
-      lw.linear_a = load_matrix(prefix + ".linear_attn.in_proj_a.weight", cfg_.linear_num_value_heads, cfg_.hidden_size);
-      lw.linear_b = load_matrix(prefix + ".linear_attn.in_proj_b.weight", cfg_.linear_num_value_heads, cfg_.hidden_size);
-      lw.linear_out = load_matrix(prefix + ".linear_attn.out_proj.weight", cfg_.hidden_size, linear_v_dim_);
+      lw.linear_qkv = load_matrix(prefix + ".linear_attn.in_proj_qkv.weight", linear_conv_dim_,
+                                  cfg_.hidden_size);
+      lw.linear_z =
+          load_matrix(prefix + ".linear_attn.in_proj_z.weight", linear_v_dim_, cfg_.hidden_size);
+      lw.linear_a = load_matrix(prefix + ".linear_attn.in_proj_a.weight",
+                                cfg_.linear_num_value_heads, cfg_.hidden_size);
+      lw.linear_b = load_matrix(prefix + ".linear_attn.in_proj_b.weight",
+                                cfg_.linear_num_value_heads, cfg_.hidden_size);
+      lw.linear_out =
+          load_matrix(prefix + ".linear_attn.out_proj.weight", cfg_.hidden_size, linear_v_dim_);
       lw.linear_conv = load_bf16_tensor_fp16(
           require_bf16_tensor(weights_, prefix + ".linear_attn.conv1d.weight"),
           linear_conv_dim_ * cfg_.linear_conv_kernel_dim);
-      lw.linear_norm = load_float_tensor(
-          require_f32_tensor(weights_, prefix + ".linear_attn.norm.weight"),
-          cfg_.linear_value_head_dim);
+      lw.linear_norm =
+          load_float_tensor(require_f32_tensor(weights_, prefix + ".linear_attn.norm.weight"),
+                            cfg_.linear_value_head_dim);
       lw.linear_A_log = load_float_tensor(
-          require_f32_tensor(weights_, prefix + ".linear_attn.A_log"),
-          cfg_.linear_num_value_heads);
-      lw.linear_dt_bias = load_bf16_tensor_fp16(
-          require_bf16_tensor(weights_, prefix + ".linear_attn.dt_bias"),
-          cfg_.linear_num_value_heads);
+          require_f32_tensor(weights_, prefix + ".linear_attn.A_log"), cfg_.linear_num_value_heads);
+      lw.linear_dt_bias =
+          load_bf16_tensor_fp16(require_bf16_tensor(weights_, prefix + ".linear_attn.dt_bias"),
+                                cfg_.linear_num_value_heads);
     }
   }
   CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
 }
 
-void Qwen35CudaEngine::forward_token(int token,
-                                     int position,
-                                     bool compute_logits,
-                                     std::vector<float>* out_logits,
-                                     int* out_argmax) {
+void Qwen35CudaEngine::forward_token(int token, int position, bool compute_logits,
+                                     std::vector<float>* out_logits, int* out_argmax) {
   if (position < 0 || position >= max_ctx_) {
     LLAMA_ENGINE_THROW("decode position exceeds max context");
   }
@@ -769,185 +730,118 @@ void Qwen35CudaEngine::forward_token(int token,
     LayerWeights& lw = layers_[static_cast<std::size_t>(layer)];
 
     if (lw.kind == LayerKind::FullAttention) {
-      kernels::launch_rmsnorm_offset(static_cast<const __half*>(d_x_),
-                                     static_cast<const __half*>(lw.norm_att.data),
-                                     static_cast<__half*>(d_x_norm_),
-                                     1,
-                                     cfg_.hidden_size,
-                                     cfg_.rms_norm_eps,
-                                     compute_stream_);
+      kernels::launch_rmsnorm_offset(
+          static_cast<const __half*>(d_x_), static_cast<const __half*>(lw.norm_att.data),
+          static_cast<__half*>(d_x_norm_), 1, cfg_.hidden_size, cfg_.rms_norm_eps, compute_stream_);
       project(lw.full_q, d_x_norm_, d_q_pair_);
       project(lw.full_k, d_x_norm_, d_k_);
       project(lw.full_v, d_x_norm_, d_v_);
       kernels::launch_split_interleaved_head_halves(
-          static_cast<const __half*>(d_q_pair_),
-          static_cast<__half*>(d_q_),
-          static_cast<__half*>(d_q_gate_),
-          cfg_.num_attention_heads,
-          cfg_.head_dim,
+          static_cast<const __half*>(d_q_pair_), static_cast<__half*>(d_q_),
+          static_cast<__half*>(d_q_gate_), cfg_.num_attention_heads, cfg_.head_dim,
           compute_stream_);
 
       kernels::launch_rmsnorm_offset(static_cast<const __half*>(d_q_),
                                      static_cast<const __half*>(lw.full_q_norm),
-                                     static_cast<__half*>(d_q_),
-                                     cfg_.num_attention_heads,
-                                     cfg_.head_dim,
-                                     cfg_.rms_norm_eps,
-                                     compute_stream_);
+                                     static_cast<__half*>(d_q_), cfg_.num_attention_heads,
+                                     cfg_.head_dim, cfg_.rms_norm_eps, compute_stream_);
       kernels::launch_rmsnorm_offset(static_cast<const __half*>(d_k_),
                                      static_cast<const __half*>(lw.full_k_norm),
-                                     static_cast<__half*>(d_k_),
-                                     cfg_.num_key_value_heads,
-                                     cfg_.head_dim,
-                                     cfg_.rms_norm_eps,
-                                     compute_stream_);
+                                     static_cast<__half*>(d_k_), cfg_.num_key_value_heads,
+                                     cfg_.head_dim, cfg_.rms_norm_eps, compute_stream_);
 
-      kernels::launch_rope_inplace_partial_table(static_cast<__half*>(d_q_),
-                                                 static_cast<__half*>(d_k_),
-                                                 cfg_.num_attention_heads,
-                                                 cfg_.num_key_value_heads,
-                                                 cfg_.head_dim,
-                                                 rotary_dim_,
-                                                 position,
-                                                 static_cast<const float*>(d_rope_cos_),
-                                                 static_cast<const float*>(d_rope_sin_),
-                                                 compute_stream_);
+      kernels::launch_rope_inplace_partial_table(
+          static_cast<__half*>(d_q_), static_cast<__half*>(d_k_), cfg_.num_attention_heads,
+          cfg_.num_key_value_heads, cfg_.head_dim, rotary_dim_, position,
+          static_cast<const float*>(d_rope_cos_), static_cast<const float*>(d_rope_sin_),
+          compute_stream_);
 
-      auto* k_cache_layer =
-          static_cast<__half*>(d_k_cache_) +
-          static_cast<std::size_t>(layer) * static_cast<std::size_t>(max_ctx_) *
-              static_cast<std::size_t>(full_kv_dim_);
-      auto* v_cache_layer =
-          static_cast<__half*>(d_v_cache_) +
-          static_cast<std::size_t>(layer) * static_cast<std::size_t>(max_ctx_) *
-              static_cast<std::size_t>(full_kv_dim_);
-      CUDA_CHECK(cudaMemcpyAsync(
-          k_cache_layer + static_cast<std::size_t>(position) * static_cast<std::size_t>(full_kv_dim_),
-          d_k_,
-          static_cast<std::size_t>(full_kv_dim_) * sizeof(__half),
-          cudaMemcpyDeviceToDevice,
-          compute_stream_));
-      CUDA_CHECK(cudaMemcpyAsync(
-          v_cache_layer + static_cast<std::size_t>(position) * static_cast<std::size_t>(full_kv_dim_),
-          d_v_,
-          static_cast<std::size_t>(full_kv_dim_) * sizeof(__half),
-          cudaMemcpyDeviceToDevice,
-          compute_stream_));
+      auto* k_cache_layer = static_cast<__half*>(d_k_cache_) +
+                            static_cast<std::size_t>(layer) * static_cast<std::size_t>(max_ctx_) *
+                                static_cast<std::size_t>(full_kv_dim_);
+      auto* v_cache_layer = static_cast<__half*>(d_v_cache_) +
+                            static_cast<std::size_t>(layer) * static_cast<std::size_t>(max_ctx_) *
+                                static_cast<std::size_t>(full_kv_dim_);
+      CUDA_CHECK(cudaMemcpyAsync(k_cache_layer + static_cast<std::size_t>(position) *
+                                                     static_cast<std::size_t>(full_kv_dim_),
+                                 d_k_, static_cast<std::size_t>(full_kv_dim_) * sizeof(__half),
+                                 cudaMemcpyDeviceToDevice, compute_stream_));
+      CUDA_CHECK(cudaMemcpyAsync(v_cache_layer + static_cast<std::size_t>(position) *
+                                                     static_cast<std::size_t>(full_kv_dim_),
+                                 d_v_, static_cast<std::size_t>(full_kv_dim_) * sizeof(__half),
+                                 cudaMemcpyDeviceToDevice, compute_stream_));
 
-      kernels::launch_attention_step(static_cast<const __half*>(d_q_),
-                                     k_cache_layer,
-                                     v_cache_layer,
-                                     static_cast<__half*>(d_att_),
-                                     position + 1,
-                                     cfg_.num_attention_heads,
-                                     cfg_.num_key_value_heads,
-                                     cfg_.head_dim,
-                                     compute_stream_);
+      kernels::launch_attention_step(static_cast<const __half*>(d_q_), k_cache_layer, v_cache_layer,
+                                     static_cast<__half*>(d_att_), position + 1,
+                                     cfg_.num_attention_heads, cfg_.num_key_value_heads,
+                                     cfg_.head_dim, compute_stream_);
       kernels::launch_apply_sigmoid_gate_inplace(static_cast<__half*>(d_att_),
-                                                 static_cast<const __half*>(d_q_gate_),
-                                                 full_q_dim_,
+                                                 static_cast<const __half*>(d_q_gate_), full_q_dim_,
                                                  compute_stream_);
       project(lw.full_o, d_att_, d_tmp_hidden_);
       kernels::launch_add_inplace(static_cast<__half*>(d_x_),
-                                  static_cast<const __half*>(d_tmp_hidden_),
-                                  cfg_.hidden_size,
+                                  static_cast<const __half*>(d_tmp_hidden_), cfg_.hidden_size,
                                   compute_stream_);
     } else {
-      kernels::launch_rmsnorm_offset(static_cast<const __half*>(d_x_),
-                                     static_cast<const __half*>(lw.norm_att.data),
-                                     static_cast<__half*>(d_x_norm_),
-                                     1,
-                                     cfg_.hidden_size,
-                                     cfg_.rms_norm_eps,
-                                     compute_stream_);
+      kernels::launch_rmsnorm_offset(
+          static_cast<const __half*>(d_x_), static_cast<const __half*>(lw.norm_att.data),
+          static_cast<__half*>(d_x_norm_), 1, cfg_.hidden_size, cfg_.rms_norm_eps, compute_stream_);
       project(lw.linear_qkv, d_x_norm_, d_linear_qkv_mix_);
       project(lw.linear_z, d_x_norm_, d_linear_z_);
       project(lw.linear_a, d_x_norm_, d_linear_a_);
       project(lw.linear_b, d_x_norm_, d_linear_b_);
-      auto* conv_state = d_linear_conv_state_ +
-          static_cast<std::size_t>(layer) *
-              static_cast<std::size_t>(linear_conv_state_stride_);
-      auto* recurrent_state = d_linear_recurrent_state_ +
-          static_cast<std::size_t>(layer) *
-              static_cast<std::size_t>(linear_recurrent_state_stride_);
+      auto* conv_state =
+          d_linear_conv_state_ +
+          static_cast<std::size_t>(layer) * static_cast<std::size_t>(linear_conv_state_stride_);
+      auto* recurrent_state =
+          d_linear_recurrent_state_ + static_cast<std::size_t>(layer) *
+                                          static_cast<std::size_t>(linear_recurrent_state_stride_);
 
-      kernels::launch_qwen35_linear_conv1d_silu(
-          static_cast<const __half*>(lw.linear_conv),
-          conv_state,
-          static_cast<__half*>(d_linear_qkv_mix_),
-          linear_conv_dim_,
-          cfg_.linear_conv_kernel_dim,
-          compute_stream_);
+      kernels::launch_qwen35_linear_conv1d_silu(static_cast<const __half*>(lw.linear_conv),
+                                                conv_state, static_cast<__half*>(d_linear_qkv_mix_),
+                                                linear_conv_dim_, cfg_.linear_conv_kernel_dim,
+                                                compute_stream_);
       kernels::launch_qwen35_repeat_linear_heads(
-          static_cast<const __half*>(d_linear_qkv_mix_),
-          static_cast<__half*>(d_linear_q_),
-          static_cast<__half*>(d_linear_k_),
-          static_cast<__half*>(d_linear_v_),
-          cfg_.linear_num_key_heads,
-          cfg_.linear_num_value_heads,
-          cfg_.linear_key_head_dim,
-          cfg_.linear_value_head_dim,
-          compute_stream_);
+          static_cast<const __half*>(d_linear_qkv_mix_), static_cast<__half*>(d_linear_q_),
+          static_cast<__half*>(d_linear_k_), static_cast<__half*>(d_linear_v_),
+          cfg_.linear_num_key_heads, cfg_.linear_num_value_heads, cfg_.linear_key_head_dim,
+          cfg_.linear_value_head_dim, compute_stream_);
       kernels::launch_qwen35_linear_attention_step(
-          static_cast<const __half*>(d_linear_q_),
-          static_cast<const __half*>(d_linear_k_),
-          static_cast<const __half*>(d_linear_v_),
-          static_cast<const __half*>(d_linear_z_),
-          static_cast<const __half*>(d_linear_a_),
-          static_cast<const __half*>(d_linear_b_),
-          lw.linear_norm,
-          lw.linear_A_log,
-          static_cast<const __half*>(lw.linear_dt_bias),
-          recurrent_state,
-          static_cast<__half*>(d_linear_att_),
-          cfg_.linear_num_value_heads,
-          cfg_.linear_key_head_dim,
-          cfg_.linear_value_head_dim,
-          cfg_.rms_norm_eps,
-          compute_stream_);
+          static_cast<const __half*>(d_linear_q_), static_cast<const __half*>(d_linear_k_),
+          static_cast<const __half*>(d_linear_v_), static_cast<const __half*>(d_linear_z_),
+          static_cast<const __half*>(d_linear_a_), static_cast<const __half*>(d_linear_b_),
+          lw.linear_norm, lw.linear_A_log, static_cast<const __half*>(lw.linear_dt_bias),
+          recurrent_state, static_cast<__half*>(d_linear_att_), cfg_.linear_num_value_heads,
+          cfg_.linear_key_head_dim, cfg_.linear_value_head_dim, cfg_.rms_norm_eps, compute_stream_);
       project(lw.linear_out, d_linear_att_, d_tmp_hidden_);
       kernels::launch_add_inplace(static_cast<__half*>(d_x_),
-                                  static_cast<const __half*>(d_tmp_hidden_),
-                                  cfg_.hidden_size,
+                                  static_cast<const __half*>(d_tmp_hidden_), cfg_.hidden_size,
                                   compute_stream_);
     }
 
-    kernels::launch_rmsnorm_offset(static_cast<const __half*>(d_x_),
-                                   static_cast<const __half*>(lw.norm_ffn.data),
-                                   static_cast<__half*>(d_x_norm_),
-                                   1,
-                                   cfg_.hidden_size,
-                                   cfg_.rms_norm_eps,
-                                   compute_stream_);
+    kernels::launch_rmsnorm_offset(
+        static_cast<const __half*>(d_x_), static_cast<const __half*>(lw.norm_ffn.data),
+        static_cast<__half*>(d_x_norm_), 1, cfg_.hidden_size, cfg_.rms_norm_eps, compute_stream_);
     project(lw.mlp_gate, d_x_norm_, d_mlp_gate_);
     project(lw.mlp_up, d_x_norm_, d_mlp_up_);
-    kernels::launch_silu_mul(static_cast<const __half*>(d_mlp_gate_),
-                             static_cast<const __half*>(d_mlp_up_),
-                             static_cast<__half*>(d_mlp_inter_),
-                             cfg_.intermediate_size,
-                             compute_stream_);
+    kernels::launch_silu_mul(
+        static_cast<const __half*>(d_mlp_gate_), static_cast<const __half*>(d_mlp_up_),
+        static_cast<__half*>(d_mlp_inter_), cfg_.intermediate_size, compute_stream_);
     project(lw.mlp_down, d_mlp_inter_, d_tmp_hidden_);
     kernels::launch_add_inplace(static_cast<__half*>(d_x_),
-                                static_cast<const __half*>(d_tmp_hidden_),
-                                cfg_.hidden_size,
+                                static_cast<const __half*>(d_tmp_hidden_), cfg_.hidden_size,
                                 compute_stream_);
   }
 
   if (!compute_logits && out_logits == nullptr && out_argmax == nullptr) {
     return;
   }
-  kernels::launch_rmsnorm_offset(static_cast<const __half*>(d_x_),
-                                 static_cast<const __half*>(d_norm_out_),
-                                 static_cast<__half*>(d_x_norm_),
-                                 1,
-                                 cfg_.hidden_size,
-                                 cfg_.rms_norm_eps,
-                                 compute_stream_);
+  kernels::launch_rmsnorm_offset(
+      static_cast<const __half*>(d_x_), static_cast<const __half*>(d_norm_out_),
+      static_cast<__half*>(d_x_norm_), 1, cfg_.hidden_size, cfg_.rms_norm_eps, compute_stream_);
   rowmajor_projection_float(lm_head_, d_x_norm_, d_logits_);
   if (out_argmax) {
-    kernels::launch_argmax_float(static_cast<const float*>(d_logits_),
-                                 cfg_.vocab_size,
-                                 d_argmax_,
+    kernels::launch_argmax_float(static_cast<const float*>(d_logits_), cfg_.vocab_size, d_argmax_,
                                  compute_stream_);
   }
   if (out_argmax) {
@@ -956,24 +850,19 @@ void Qwen35CudaEngine::forward_token(int token,
   }
   if (out_logits) {
     CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
-    CUDA_CHECK(cudaMemcpy(out_logits->data(),
-                          d_logits_,
+    CUDA_CHECK(cudaMemcpy(out_logits->data(), d_logits_,
                           static_cast<std::size_t>(cfg_.vocab_size) * sizeof(float),
                           cudaMemcpyDeviceToHost));
   }
 }
 
-int Qwen35CudaEngine::sample_next_token(float temperature,
-                                        const std::vector<int>& history) {
+int Qwen35CudaEngine::sample_next_token(float temperature, const std::vector<int>& history) {
   const bool greedy_fast_path =
-      temperature <= 0.0f &&
-      options_.repetition_penalty <= 1.0f &&
+      temperature <= 0.0f && options_.repetition_penalty <= 1.0f &&
       options_.no_repeat_ngram_size <= 1 &&
       active_grammar_ == nullptr;  // grammar masking needs host logits; skip the device argmax
   if (greedy_fast_path) {
-    kernels::launch_argmax_float(static_cast<const float*>(d_logits_),
-                                 cfg_.vocab_size,
-                                 d_argmax_,
+    kernels::launch_argmax_float(static_cast<const float*>(d_logits_), cfg_.vocab_size, d_argmax_,
                                  compute_stream_);
     CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
     int next = 0;
@@ -982,8 +871,7 @@ int Qwen35CudaEngine::sample_next_token(float temperature,
   }
 
   CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
-  CUDA_CHECK(cudaMemcpy(h_logits_.data(),
-                        d_logits_,
+  CUDA_CHECK(cudaMemcpy(h_logits_.data(), d_logits_,
                         static_cast<std::size_t>(cfg_.vocab_size) * sizeof(float),
                         cudaMemcpyDeviceToHost));
   std::vector<float> logits = h_logits_;
@@ -1015,11 +903,9 @@ int Qwen35CudaEngine::sample_next_token(float temperature,
   const int k = std::clamp(options_.top_k, 1, cfg_.vocab_size);
   std::vector<int> ids(static_cast<std::size_t>(cfg_.vocab_size));
   std::iota(ids.begin(), ids.end(), 0);
-  std::partial_sort(ids.begin(), ids.begin() + k, ids.end(),
-                    [&](int left, int right) {
-                      return logits[static_cast<std::size_t>(left)] >
-                             logits[static_cast<std::size_t>(right)];
-                    });
+  std::partial_sort(ids.begin(), ids.begin() + k, ids.end(), [&](int left, int right) {
+    return logits[static_cast<std::size_t>(left)] > logits[static_cast<std::size_t>(right)];
+  });
   const float max_logit = logits[static_cast<std::size_t>(ids[0])];
   std::vector<float> probs(static_cast<std::size_t>(k));
   float sum = 0.0f;
@@ -1059,15 +945,13 @@ void Qwen35CudaEngine::initialize(const EngineOptions& options) {
     reset_state();
 
     if (options_.verbose) {
-      std::cout << "[qwen3_5_cuda] layers=" << cfg_.num_layers
-                << " hidden=" << cfg_.hidden_size
+      std::cout << "[qwen3_5_cuda] layers=" << cfg_.num_layers << " hidden=" << cfg_.hidden_size
                 << " heads=" << cfg_.num_attention_heads << "/" << cfg_.num_key_value_heads
-                << " linear_heads=" << cfg_.linear_num_key_heads << "/" << cfg_.linear_num_value_heads
-                << " quant=" << (options_.int8_streaming
-                                      ? (options_.streaming_quant_bits == 4 ? "int4" : "int8")
-                                      : "fp16")
-                << " max_ctx=" << max_ctx_
-                << "\n";
+                << " linear_heads=" << cfg_.linear_num_key_heads << "/"
+                << cfg_.linear_num_value_heads << " quant="
+                << (options_.int8_streaming ? (options_.streaming_quant_bits == 4 ? "int4" : "int8")
+                                            : "fp16")
+                << " max_ctx=" << max_ctx_ << "\n";
     }
   } catch (...) {
     destroy();
@@ -1076,17 +960,14 @@ void Qwen35CudaEngine::initialize(const EngineOptions& options) {
 }
 
 std::vector<int> Qwen35CudaEngine::generate(const std::vector<int>& prompt_tokens,
-                                            int max_new_tokens,
-                                            float temperature) {
+                                            int max_new_tokens, float temperature) {
   return generate_stream(prompt_tokens, max_new_tokens, temperature, [](int) { return true; });
 }
 
-std::vector<int> Qwen35CudaEngine::generate_stream(
-    const std::vector<int>& prompt_tokens,
-    int max_new_tokens,
-    float temperature,
-    const std::function<bool(int)>& on_token,
-    const GenerationConstraints* constraints) {
+std::vector<int> Qwen35CudaEngine::generate_stream(const std::vector<int>& prompt_tokens,
+                                                   int max_new_tokens, float temperature,
+                                                   const std::function<bool(int)>& on_token,
+                                                   const GenerationConstraints* constraints) {
   if (max_new_tokens < 0) {
     LLAMA_ENGINE_THROW("max_new_tokens must be >= 0");
   }
@@ -1098,7 +979,9 @@ std::vector<int> Qwen35CudaEngine::generate_stream(
   active_grammar_ = constraints ? constraints->grammar : nullptr;
   struct GrammarScope {
     grammar::GrammarSampler** slot;
-    ~GrammarScope() { *slot = nullptr; }
+    ~GrammarScope() {
+      *slot = nullptr;
+    }
   } grammar_scope{&active_grammar_};
 
   reset_state();
@@ -1153,18 +1036,14 @@ std::vector<int> Qwen35CudaEngine::generate_stream(
   }
   CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
   const auto decode_end = std::chrono::steady_clock::now();
-  stats_.decode_ms =
-      std::chrono::duration<double, std::milli>(decode_end - decode_start).count();
-  stats_.generated_tokens =
-      static_cast<int>((out.size() > prompt_tokens.size())
-                           ? (out.size() - prompt_tokens.size())
-                           : 0);
+  stats_.decode_ms = std::chrono::duration<double, std::milli>(decode_end - decode_start).count();
+  stats_.generated_tokens = static_cast<int>(
+      (out.size() > prompt_tokens.size()) ? (out.size() - prompt_tokens.size()) : 0);
   return out;
 }
 
 std::vector<std::pair<int, float>> Qwen35CudaEngine::inspect_next_logits(
-    const std::vector<int>& prompt_tokens,
-    int top_k) {
+    const std::vector<int>& prompt_tokens, int top_k) {
   if (top_k <= 0) {
     return {};
   }
@@ -1179,27 +1058,21 @@ std::vector<std::pair<int, float>> Qwen35CudaEngine::inspect_next_logits(
     for (int i = 0; i + 1 < static_cast<int>(prompt_tokens.size()); ++i) {
       forward_token(prompt_tokens[static_cast<std::size_t>(i)], i, false, nullptr, nullptr);
     }
-    forward_token(prompt_tokens.back(),
-                  static_cast<int>(prompt_tokens.size()) - 1,
-                  true,
-                  nullptr,
+    forward_token(prompt_tokens.back(), static_cast<int>(prompt_tokens.size()) - 1, true, nullptr,
                   nullptr);
   }
 
   CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
-  CUDA_CHECK(cudaMemcpy(h_logits_.data(),
-                        d_logits_,
+  CUDA_CHECK(cudaMemcpy(h_logits_.data(), d_logits_,
                         static_cast<std::size_t>(cfg_.vocab_size) * sizeof(float),
                         cudaMemcpyDeviceToHost));
 
   std::vector<int> order(static_cast<std::size_t>(cfg_.vocab_size));
   std::iota(order.begin(), order.end(), 0);
   const int k = std::min(top_k, cfg_.vocab_size);
-  std::partial_sort(order.begin(), order.begin() + k, order.end(),
-                    [&](int a, int b) {
-                      return h_logits_[static_cast<std::size_t>(a)] >
-                             h_logits_[static_cast<std::size_t>(b)];
-                    });
+  std::partial_sort(order.begin(), order.begin() + k, order.end(), [&](int a, int b) {
+    return h_logits_[static_cast<std::size_t>(a)] > h_logits_[static_cast<std::size_t>(b)];
+  });
 
   std::vector<std::pair<int, float>> out;
   out.reserve(static_cast<std::size_t>(k));

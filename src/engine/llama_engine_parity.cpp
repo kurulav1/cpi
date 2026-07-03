@@ -1,4 +1,4 @@
-#include "engine/llama_engine.hpp"
+#include <cuda_fp16.h>
 
 #include <algorithm>
 #include <cmath>
@@ -6,43 +6,32 @@
 #include <string>
 #include <vector>
 
-#include <cuda_fp16.h>
-
 #include "common.hpp"
+#include "engine/llama_engine.hpp"
 
 namespace engine {
 namespace {
 
-const __half* tensor_half(const model::WeightLoader& weights,
-                          const std::string& name) {
+const __half* tensor_half(const model::WeightLoader& weights, const std::string& name) {
   return reinterpret_cast<const __half*>(weights.tensor_data(name));
 }
 
-void matvec_rowmajor(const __half* w,
-                     const std::vector<float>& x,
-                     int out_features,
-                     int in_features,
-                     std::vector<float>* y) {
+void matvec_rowmajor(const __half* w, const std::vector<float>& x, int out_features,
+                     int in_features, std::vector<float>* y) {
   y->assign(static_cast<std::size_t>(out_features), 0.0f);
   for (int o = 0; o < out_features; ++o) {
     float acc = 0.0f;
     for (int i = 0; i < in_features; ++i) {
-      acc += __half2float(
-                 w[static_cast<std::size_t>(o) *
-                       static_cast<std::size_t>(in_features) +
-                   i]) *
-             x[i];
+      acc +=
+          __half2float(w[static_cast<std::size_t>(o) * static_cast<std::size_t>(in_features) + i]) *
+          x[i];
     }
     (*y)[o] = acc;
   }
 }
 
-void normalize_cpu(const std::vector<float>& x,
-                   const __half* w,
-                   const __half* b,
-                   bool use_layernorm,
-                   float eps,
-                   std::vector<float>* y) {
+void normalize_cpu(const std::vector<float>& x, const __half* w, const __half* b,
+                   bool use_layernorm, float eps, std::vector<float>* y) {
   y->resize(x.size());
   if (use_layernorm) {
     float sum = 0.0f;
@@ -72,18 +61,13 @@ void normalize_cpu(const std::vector<float>& x,
   }
 }
 
-void rope_cpu(std::vector<float>* q,
-              std::vector<float>* k,
-              int num_heads_q,
-              int num_heads_k,
-              int head_dim,
-              int position,
-              float rope_theta = 10000.0f) {
+void rope_cpu(std::vector<float>* q, std::vector<float>* k, int num_heads_q, int num_heads_k,
+              int head_dim, int position, float rope_theta = 10000.0f) {
   const int half_dim = head_dim / 2;
   for (int h = 0; h < num_heads_q; ++h) {
     for (int i = 0; i < half_dim; ++i) {
-      const float theta = std::pow(
-          rope_theta, -2.0f * static_cast<float>(i) / static_cast<float>(head_dim));
+      const float theta =
+          std::pow(rope_theta, -2.0f * static_cast<float>(i) / static_cast<float>(head_dim));
       const float angle = static_cast<float>(position) * theta;
       const float c = std::cos(angle);
       const float s = std::sin(angle);
@@ -98,8 +82,8 @@ void rope_cpu(std::vector<float>* q,
 
   for (int h = 0; h < num_heads_k; ++h) {
     for (int i = 0; i < half_dim; ++i) {
-      const float theta = std::pow(
-          rope_theta, -2.0f * static_cast<float>(i) / static_cast<float>(head_dim));
+      const float theta =
+          std::pow(rope_theta, -2.0f * static_cast<float>(i) / static_cast<float>(head_dim));
       const float angle = static_cast<float>(position) * theta;
       const float c = std::cos(angle);
       const float s = std::sin(angle);
@@ -157,43 +141,39 @@ void LlamaEngine::run_parity_check(const std::vector<int>& prompt_tokens) {
 
   const auto* emb = tensor_half(weights_, "tok_embeddings.weight");
   const auto* norm_out = tensor_half(weights_, "norm.weight");
-  const auto* norm_out_bias = weights_.has_tensor("norm.bias")
-                                  ? tensor_half(weights_, "norm.bias")
-                                  : nullptr;
+  const auto* norm_out_bias =
+      weights_.has_tensor("norm.bias") ? tensor_half(weights_, "norm.bias") : nullptr;
   const auto* lm_head = tensor_half(
-      weights_, weights_.has_tensor("output.weight") ? "output.weight"
-                                                      : "tok_embeddings.weight");
-  const auto* lm_head_bias = weights_.has_tensor("output.bias")
-                                 ? tensor_half(weights_, "output.bias")
-                                 : nullptr;
+      weights_, weights_.has_tensor("output.weight") ? "output.weight" : "tok_embeddings.weight");
+  const auto* lm_head_bias =
+      weights_.has_tensor("output.bias") ? tensor_half(weights_, "output.bias") : nullptr;
 
   std::vector<float> cpu_logits(static_cast<std::size_t>(cfg.vocab_size), 0.0f);
 
   for (int pos = 0; pos < seq_len; ++pos) {
     const int tok = prompt_tokens[pos];
     for (int i = 0; i < hidden; ++i) {
-      x[i] = __half2float(
-          emb[static_cast<std::size_t>(tok) * static_cast<std::size_t>(hidden) +
-              i]);
+      x[i] =
+          __half2float(emb[static_cast<std::size_t>(tok) * static_cast<std::size_t>(hidden) + i]);
     }
 
     for (int layer = 0; layer < cfg.num_layers; ++layer) {
       const std::string p = "layers." + std::to_string(layer);
       const auto* norm_att = tensor_half(weights_, p + ".attention_norm.weight");
       const auto* norm_att_bias = weights_.has_tensor(p + ".attention_norm.bias")
-          ? tensor_half(weights_, p + ".attention_norm.bias")
-          : nullptr;
+                                      ? tensor_half(weights_, p + ".attention_norm.bias")
+                                      : nullptr;
       const auto* wq = tensor_half(weights_, p + ".attention.wq");
       const auto* wk = tensor_half(weights_, p + ".attention.wk");
       const auto* wv = tensor_half(weights_, p + ".attention.wv");
       const auto* wo = tensor_half(weights_, p + ".attention.wo");
       const auto* bo = weights_.has_tensor(p + ".attention.bo")
-          ? tensor_half(weights_, p + ".attention.bo")
-          : nullptr;
+                           ? tensor_half(weights_, p + ".attention.bo")
+                           : nullptr;
       const auto* norm_ffn = tensor_half(weights_, p + ".ffn_norm.weight");
       const auto* norm_ffn_bias = weights_.has_tensor(p + ".ffn_norm.bias")
-          ? tensor_half(weights_, p + ".ffn_norm.bias")
-          : nullptr;
+                                      ? tensor_half(weights_, p + ".ffn_norm.bias")
+                                      : nullptr;
       const auto* w1 = tensor_half(weights_, p + ".feed_forward.w1");
       const auto* w2 = tensor_half(weights_, p + ".feed_forward.w2");
       const auto* w3 = tensor_half(weights_, p + ".feed_forward.w3");
@@ -203,22 +183,16 @@ void LlamaEngine::run_parity_check(const std::vector<int>& prompt_tokens) {
       matvec_rowmajor(wk, x_norm, kv_hidden, hidden, &k);
       matvec_rowmajor(wv, x_norm, kv_hidden, hidden, &v);
       const float parity_rope_theta =
-          (options_.rope_theta > 0.0f) ? options_.rope_theta
-                                       : cfg.effective_rope_theta();
-      rope_cpu(&q, &k, cfg.num_heads, cfg.num_kv_heads, head_dim, pos,
-               parity_rope_theta);
+          (options_.rope_theta > 0.0f) ? options_.rope_theta : cfg.effective_rope_theta();
+      rope_cpu(&q, &k, cfg.num_heads, cfg.num_kv_heads, head_dim, pos, parity_rope_theta);
 
-      const std::size_t layer_off =
-          static_cast<std::size_t>(layer) * static_cast<std::size_t>(seq_len) *
-          static_cast<std::size_t>(kv_hidden);
+      const std::size_t layer_off = static_cast<std::size_t>(layer) *
+                                    static_cast<std::size_t>(seq_len) *
+                                    static_cast<std::size_t>(kv_hidden);
       for (int i = 0; i < kv_hidden; ++i) {
-        k_cache[layer_off +
-                static_cast<std::size_t>(pos) *
-                    static_cast<std::size_t>(kv_hidden) +
+        k_cache[layer_off + static_cast<std::size_t>(pos) * static_cast<std::size_t>(kv_hidden) +
                 i] = k[i];
-        v_cache[layer_off +
-                static_cast<std::size_t>(pos) *
-                    static_cast<std::size_t>(kv_hidden) +
+        v_cache[layer_off + static_cast<std::size_t>(pos) * static_cast<std::size_t>(kv_hidden) +
                 i] = v[i];
       }
 
@@ -235,9 +209,7 @@ void LlamaEngine::run_parity_check(const std::vector<int>& prompt_tokens) {
             const int kv_idx = kv_head * head_dim + d;
             const float kv =
                 k_cache[layer_off +
-                        static_cast<std::size_t>(t) *
-                            static_cast<std::size_t>(kv_hidden) +
-                        kv_idx];
+                        static_cast<std::size_t>(t) * static_cast<std::size_t>(kv_hidden) + kv_idx];
             dot += q[q_idx] * kv;
           }
           dot /= std::sqrt(static_cast<float>(head_dim));
@@ -258,9 +230,7 @@ void LlamaEngine::run_parity_check(const std::vector<int>& prompt_tokens) {
             const float p_att = scores[static_cast<std::size_t>(t)] / denom;
             const float vv =
                 v_cache[layer_off +
-                        static_cast<std::size_t>(t) *
-                            static_cast<std::size_t>(kv_hidden) +
-                        kv_idx];
+                        static_cast<std::size_t>(t) * static_cast<std::size_t>(kv_hidden) + kv_idx];
             acc += p_att * vv;
           }
           att[static_cast<std::size_t>(q_idx)] = acc;
@@ -289,7 +259,8 @@ void LlamaEngine::run_parity_check(const std::vector<int>& prompt_tokens) {
     matvec_rowmajor(lm_head, x_norm, cfg.vocab_size, hidden, &cpu_logits);
     if (lm_head_bias) {
       for (int i = 0; i < cfg.vocab_size; ++i) {
-        cpu_logits[static_cast<std::size_t>(i)] += __half2float(lm_head_bias[static_cast<std::size_t>(i)]);
+        cpu_logits[static_cast<std::size_t>(i)] +=
+            __half2float(lm_head_bias[static_cast<std::size_t>(i)]);
       }
     }
   }
@@ -297,21 +268,19 @@ void LlamaEngine::run_parity_check(const std::vector<int>& prompt_tokens) {
   double max_abs = 0.0;
   double mean_abs = 0.0;
   for (std::size_t i = 0; i < cpu_logits.size(); ++i) {
-    const double d = std::abs(static_cast<double>(cpu_logits[i]) -
-                              static_cast<double>(gpu_logits[i]));
+    const double d =
+        std::abs(static_cast<double>(cpu_logits[i]) - static_cast<double>(gpu_logits[i]));
     max_abs = std::max(max_abs, d);
     mean_abs += d;
   }
   mean_abs /= static_cast<double>(cpu_logits.size());
 
-  const int cpu_top = static_cast<int>(
-      std::max_element(cpu_logits.begin(), cpu_logits.end()) - cpu_logits.begin());
-  const int gpu_top = static_cast<int>(
-      std::max_element(gpu_logits.begin(), gpu_logits.end()) - gpu_logits.begin());
-  std::cout << "[parity] top_token_cpu=" << cpu_top
-            << " top_token_gpu=" << gpu_top << "\n";
-  std::cout << "[parity] max_abs_diff=" << max_abs
-            << " mean_abs_diff=" << mean_abs << "\n";
+  const int cpu_top =
+      static_cast<int>(std::max_element(cpu_logits.begin(), cpu_logits.end()) - cpu_logits.begin());
+  const int gpu_top =
+      static_cast<int>(std::max_element(gpu_logits.begin(), gpu_logits.end()) - gpu_logits.begin());
+  std::cout << "[parity] top_token_cpu=" << cpu_top << " top_token_gpu=" << gpu_top << "\n";
+  std::cout << "[parity] max_abs_diff=" << max_abs << " mean_abs_diff=" << mean_abs << "\n";
 }
 
 }  // namespace engine

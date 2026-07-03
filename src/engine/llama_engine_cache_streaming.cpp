@@ -1,4 +1,4 @@
-#include "llama_engine_internal.hpp"
+#include <cuda_fp16.h>
 
 #include <cstdint>
 #include <cstring>
@@ -6,9 +6,8 @@
 #include <string>
 #include <vector>
 
-#include <cuda_fp16.h>
-
 #include "common.hpp"
+#include "llama_engine_internal.hpp"
 #include "runtime/cuda_utils.cuh"
 
 namespace engine {
@@ -20,8 +19,7 @@ std::size_t bytes_for_matrix(int rows, int cols) {
 
 }  // namespace
 
-void LlamaEngine::copy_layer_weights_to_device(int layer,
-                                               LayerDeviceWeights* dst,
+void LlamaEngine::copy_layer_weights_to_device(int layer, LayerDeviceWeights* dst,
                                                LayerDeviceInt8Weights* dst_i8,
                                                cudaStream_t stream) {
   enforce_host_resource_limits("copy_layer_weights_to_device.begin");
@@ -41,14 +39,16 @@ void LlamaEngine::copy_layer_weights_to_device(int layer,
   }
 
   const LayerHostInt8Weights* quant = nullptr;
-  if (lowbit_streaming_enabled(options_) && layer >= 0 && layer < static_cast<int>(layer_host_int8_.size())) {
+  if (lowbit_streaming_enabled(options_) && layer >= 0 &&
+      layer < static_cast<int>(layer_host_int8_.size())) {
     const auto& q = layer_host_int8_[static_cast<std::size_t>(layer)];
     if (q.w1 || q.w2 || q.w3) {
       quant = &q;
     }
   }
 
-  const auto load_fp16 = [&](const std::string& name, void* dst_fp16, std::size_t bytes, const void* src_override) {
+  const auto load_fp16 = [&](const std::string& name, void* dst_fp16, std::size_t bytes,
+                             const void* src_override) {
     if (!weights_.has_tensor(name) && !src_override) {
       if (has_any_packed_lowbit_tensor(weights_, name)) {
         LLAMA_ENGINE_THROW("packed low-bit tensor requires --weight-quant int8|int4: " + name);
@@ -58,9 +58,7 @@ void LlamaEngine::copy_layer_weights_to_device(int layer,
     const void* src = src_override ? src_override : weights_.tensor_data(name);
     CUDA_CHECK(cudaMemcpyAsync(dst_fp16, src, bytes, cudaMemcpyHostToDevice, stream));
   };
-  const auto load_optional_fp16 = [&](const std::string& name,
-                                      void* dst_fp16,
-                                      std::size_t bytes,
+  const auto load_optional_fp16 = [&](const std::string& name, void* dst_fp16, std::size_t bytes,
                                       const void* src_override) {
     const void* src = src_override;
     if (!src && weights_.has_tensor(name)) {
@@ -80,29 +78,35 @@ void LlamaEngine::copy_layer_weights_to_device(int layer,
   ++last_benchmark_stats_.streamed_layer_copies;
 
   const std::string p = "layers." + std::to_string(layer);
-  load_fp16(p + ".attention_norm.weight", dst->norm_att, bytes_for_matrix(1, hidden), pinned ? pinned->norm_att : nullptr);
-  load_fp16(p + ".ffn_norm.weight", dst->norm_ffn, bytes_for_matrix(1, hidden), pinned ? pinned->norm_ffn : nullptr);
+  load_fp16(p + ".attention_norm.weight", dst->norm_att, bytes_for_matrix(1, hidden),
+            pinned ? pinned->norm_att : nullptr);
+  load_fp16(p + ".ffn_norm.weight", dst->norm_ffn, bytes_for_matrix(1, hidden),
+            pinned ? pinned->norm_ffn : nullptr);
   load_optional_fp16(p + ".attention_norm.bias", dst->norm_att_bias, bytes_for_matrix(1, hidden),
                      pinned ? pinned->norm_att_bias : nullptr);
   load_optional_fp16(p + ".ffn_norm.bias", dst->norm_ffn_bias, bytes_for_matrix(1, hidden),
                      pinned ? pinned->norm_ffn_bias : nullptr);
-  load_fp16(p + ".attention.wo", dst->wo, bytes_for_matrix(hidden, q_hidden), pinned ? pinned->wo : nullptr);
-  load_optional_fp16(p + ".attention.bo", dst->bo, bytes_for_matrix(1, hidden), pinned ? pinned->bo : nullptr);
+  load_fp16(p + ".attention.wo", dst->wo, bytes_for_matrix(hidden, q_hidden),
+            pinned ? pinned->wo : nullptr);
+  load_optional_fp16(p + ".attention.bo", dst->bo, bytes_for_matrix(1, hidden),
+                     pinned ? pinned->bo : nullptr);
 
   auto* wqkv_base = static_cast<__half*>(dst->wqkv);
-  load_fp16(p + ".attention.wq", wqkv_base, bytes_for_matrix(q_hidden, hidden), pinned ? pinned->wq : nullptr);
+  load_fp16(p + ".attention.wq", wqkv_base, bytes_for_matrix(q_hidden, hidden),
+            pinned ? pinned->wq : nullptr);
   load_fp16(p + ".attention.wk",
             wqkv_base + static_cast<std::size_t>(q_hidden) * static_cast<std::size_t>(hidden),
-            bytes_for_matrix(kv_hidden, hidden),
-            pinned ? pinned->wk : nullptr);
-  load_fp16(p + ".attention.wv",
-            wqkv_base + static_cast<std::size_t>(q_hidden + kv_hidden) * static_cast<std::size_t>(hidden),
-            bytes_for_matrix(kv_hidden, hidden),
-            pinned ? pinned->wv : nullptr);
+            bytes_for_matrix(kv_hidden, hidden), pinned ? pinned->wk : nullptr);
+  load_fp16(
+      p + ".attention.wv",
+      wqkv_base + static_cast<std::size_t>(q_hidden + kv_hidden) * static_cast<std::size_t>(hidden),
+      bytes_for_matrix(kv_hidden, hidden), pinned ? pinned->wv : nullptr);
 
   if (cfg.has_qkv_bias && dst->bqkv) {
     const std::string bname = p + ".attention.bqkv";
-    const void* bsrc = (pinned && pinned->bqkv) ? pinned->bqkv : (weights_.has_tensor(bname) ? weights_.tensor_data(bname) : nullptr);
+    const void* bsrc = (pinned && pinned->bqkv)
+                           ? pinned->bqkv
+                           : (weights_.has_tensor(bname) ? weights_.tensor_data(bname) : nullptr);
     if (bsrc) {
       CUDA_CHECK(cudaMemcpyAsync(dst->bqkv, bsrc, bytes_for_matrix(1, q_hidden + 2 * kv_hidden),
                                  cudaMemcpyHostToDevice, stream));
@@ -110,53 +114,43 @@ void LlamaEngine::copy_layer_weights_to_device(int layer,
   }
 
   if (quant) {
-    if (!dst_i8 || !dst_i8->w1 || !dst_i8->w2 || !dst_i8->w3 || !dst_i8->s_w1 || !dst_i8->s_w2 || !dst_i8->s_w3) {
+    if (!dst_i8 || !dst_i8->w1 || !dst_i8->w2 || !dst_i8->w3 || !dst_i8->s_w1 || !dst_i8->s_w2 ||
+        !dst_i8->s_w3) {
       LLAMA_ENGINE_THROW("missing weight-only int8 staging buffers");
     }
     dst_i8->mlp_int4 = false;
     dst_i8->proj_int4 = false;
-    CUDA_CHECK(cudaMemcpyAsync(dst_i8->w1,
-                               quant->w1,
+    CUDA_CHECK(cudaMemcpyAsync(dst_i8->w1, quant->w1,
                                static_cast<std::size_t>(inter) * static_cast<std::size_t>(hidden),
-                               cudaMemcpyHostToDevice,
-                               stream));
-    CUDA_CHECK(cudaMemcpyAsync(dst_i8->w2,
-                               quant->w2,
+                               cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(dst_i8->w2, quant->w2,
                                static_cast<std::size_t>(hidden) * static_cast<std::size_t>(inter),
-                               cudaMemcpyHostToDevice,
-                               stream));
-    CUDA_CHECK(cudaMemcpyAsync(dst_i8->w3,
-                               quant->w3,
+                               cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(dst_i8->w3, quant->w3,
                                static_cast<std::size_t>(inter) * static_cast<std::size_t>(hidden),
-                               cudaMemcpyHostToDevice,
-                               stream));
-    CUDA_CHECK(cudaMemcpyAsync(dst_i8->s_w1,
-                               quant->s_w1,
+                               cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(dst_i8->s_w1, quant->s_w1,
                                static_cast<std::size_t>(inter) * sizeof(float),
-                               cudaMemcpyHostToDevice,
-                               stream));
-    CUDA_CHECK(cudaMemcpyAsync(dst_i8->s_w2,
-                               quant->s_w2,
+                               cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(dst_i8->s_w2, quant->s_w2,
                                static_cast<std::size_t>(hidden) * sizeof(float),
-                               cudaMemcpyHostToDevice,
-                               stream));
-    CUDA_CHECK(cudaMemcpyAsync(dst_i8->s_w3,
-                               quant->s_w3,
+                               cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(dst_i8->s_w3, quant->s_w3,
                                static_cast<std::size_t>(inter) * sizeof(float),
-                               cudaMemcpyHostToDevice,
-                               stream));
+                               cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaEventRecord(benchmark_transfer_end_, stream));
     enforce_host_resource_limits("copy_layer_weights_to_device.end");
     return;
   }
 
   auto* w13_base = static_cast<__half*>(dst->w13);
-  load_fp16(p + ".feed_forward.w1", w13_base, bytes_for_matrix(inter, hidden), pinned ? pinned->w1 : nullptr);
+  load_fp16(p + ".feed_forward.w1", w13_base, bytes_for_matrix(inter, hidden),
+            pinned ? pinned->w1 : nullptr);
   load_fp16(p + ".feed_forward.w3",
             w13_base + static_cast<std::size_t>(inter) * static_cast<std::size_t>(hidden),
-            bytes_for_matrix(inter, hidden),
-            pinned ? pinned->w3 : nullptr);
-  load_fp16(p + ".feed_forward.w2", dst->w2, bytes_for_matrix(hidden, inter), pinned ? pinned->w2 : nullptr);
+            bytes_for_matrix(inter, hidden), pinned ? pinned->w3 : nullptr);
+  load_fp16(p + ".feed_forward.w2", dst->w2, bytes_for_matrix(hidden, inter),
+            pinned ? pinned->w2 : nullptr);
   CUDA_CHECK(cudaEventRecord(benchmark_transfer_end_, stream));
   enforce_host_resource_limits("copy_layer_weights_to_device.end");
 }
@@ -297,11 +291,8 @@ void LlamaEngine::init_uncached_int8_host_weights() {
     auto& hq = layer_host_int8_[static_cast<std::size_t>(layer)];
     const std::string p = "layers." + std::to_string(layer);
 
-    const auto maybe_alloc_and_load = [&](const std::string& name,
-                                          int rows,
-                                          int cols,
-                                          std::int8_t** dst_w,
-                                          float** dst_scales) -> bool {
+    const auto maybe_alloc_and_load = [&](const std::string& name, int rows, int cols,
+                                          std::int8_t** dst_w, float** dst_scales) -> bool {
       if (!is_streaming_quantizable_tensor(name) && !has_any_packed_lowbit_tensor(weights_, name)) {
         return true;
       }
@@ -313,9 +304,7 @@ void LlamaEngine::init_uncached_int8_host_weights() {
       if (prefer_i4 && has_packed_int4_tensor(weights_, name)) {
         unpack_rowwise_int4_to_int8(
             reinterpret_cast<const std::int8_t*>(weights_.tensor_data(int4_tensor_name(name))),
-            rows,
-            cols,
-            *dst_w);
+            rows, cols, *dst_w);
         load_rowwise_scales(weights_, name, rows, *dst_scales);
         return true;
       }
@@ -325,7 +314,8 @@ void LlamaEngine::init_uncached_int8_host_weights() {
         return true;
       }
       if (weights_.has_tensor(name)) {
-        quantize_rowwise_to_int8(tensor_half(weights_, name), rows, cols, quant_bits, *dst_w, *dst_scales);
+        quantize_rowwise_to_int8(tensor_half(weights_, name), rows, cols, quant_bits, *dst_w,
+                                 *dst_scales);
         return true;
       }
       if (has_packed_int8_tensor(weights_, name)) {
@@ -336,9 +326,7 @@ void LlamaEngine::init_uncached_int8_host_weights() {
       if (has_packed_int4_tensor(weights_, name)) {
         unpack_rowwise_int4_to_int8(
             reinterpret_cast<const std::int8_t*>(weights_.tensor_data(int4_tensor_name(name))),
-            rows,
-            cols,
-            *dst_w);
+            rows, cols, *dst_w);
         load_rowwise_scales(weights_, name, rows, *dst_scales);
         return true;
       }

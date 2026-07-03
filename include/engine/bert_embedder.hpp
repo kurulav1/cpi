@@ -19,7 +19,7 @@
 namespace engine {
 
 class BertEmbedder {
- public:
+public:
   ~BertEmbedder();
 
   // Loads config + weights from `model_dir` onto the GPU. Throws on error.
@@ -29,20 +29,34 @@ class BertEmbedder {
   // (optionally) L2-normalized embedding of size dim().
   std::vector<float> embed(const std::vector<int>& token_ids);
 
-  int dim() const { return cfg_.dimension; }
-  int max_tokens() const { return cfg_.max_tokens; }
-  const EmbeddingConfig& config() const { return cfg_; }
+  int dim() const {
+    return cfg_.dimension;
+  }
+  int max_tokens() const {
+    return cfg_.max_tokens;
+  }
+  const EmbeddingConfig& config() const {
+    return cfg_;
+  }
 
- private:
+private:
   struct LayerWeights {
-    void* q_w = nullptr; void* q_b = nullptr;     // [H,H], [H]
-    void* k_w = nullptr; void* k_b = nullptr;
-    void* v_w = nullptr; void* v_b = nullptr;
-    void* o_w = nullptr; void* o_b = nullptr;     // attention output dense
-    void* attn_ln_w = nullptr; void* attn_ln_b = nullptr;
-    void* inter_w = nullptr; void* inter_b = nullptr;  // [I,H], [I]
-    void* out_w = nullptr; void* out_b = nullptr;      // [H,I], [H]
-    void* out_ln_w = nullptr; void* out_ln_b = nullptr;
+    void* q_w = nullptr;
+    void* q_b = nullptr;  // [H,H], [H]
+    void* k_w = nullptr;
+    void* k_b = nullptr;
+    void* v_w = nullptr;
+    void* v_b = nullptr;
+    void* o_w = nullptr;
+    void* o_b = nullptr;  // attention output dense
+    void* attn_ln_w = nullptr;
+    void* attn_ln_b = nullptr;
+    void* inter_w = nullptr;
+    void* inter_b = nullptr;  // [I,H], [I]
+    void* out_w = nullptr;
+    void* out_b = nullptr;  // [H,I], [H]
+    void* out_ln_w = nullptr;
+    void* out_ln_b = nullptr;
   };
 
   void* upload_fp16(const std::string& name, std::size_t expected_elems);
@@ -56,18 +70,20 @@ class BertEmbedder {
   cudaStream_t stream_ = nullptr;
 
   // Embedding tables (fp16, device).
-  void* word_emb_ = nullptr;   // [vocab, H]
-  void* pos_emb_ = nullptr;    // [max_pos, H]
-  void* type_emb_ = nullptr;   // [type_vocab, H]
+  void* word_emb_ = nullptr;  // [vocab, H]
+  void* pos_emb_ = nullptr;   // [max_pos, H]
+  void* type_emb_ = nullptr;  // [type_vocab, H]
   void* emb_ln_w_ = nullptr;
   void* emb_ln_b_ = nullptr;
   std::vector<LayerWeights> layers_;
 
   // Per-call scratch (sized for max_tokens).
   int* d_tokens_ = nullptr;
-  void* d_x_ = nullptr;        // [L,H] hidden state
-  void* d_tmp_ = nullptr;      // [L,H] sublayer output
-  void* d_q_ = nullptr; void* d_k_ = nullptr; void* d_v_ = nullptr;  // [L,H]
+  void* d_x_ = nullptr;    // [L,H] hidden state
+  void* d_tmp_ = nullptr;  // [L,H] sublayer output
+  void* d_q_ = nullptr;
+  void* d_k_ = nullptr;
+  void* d_v_ = nullptr;        // [L,H]
   void* d_att_ = nullptr;      // [L,H] attention output
   void* d_inter_ = nullptr;    // [L,I]
   float* d_pooled_ = nullptr;  // [H] pooled embedding (fp32)

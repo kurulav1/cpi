@@ -9,16 +9,8 @@
 // Correctness is proven by the independent-decode parity gate: decoding N
 // sequences a step at a time through this method must produce the same tokens
 // as decoding each sequence alone through the single-token path.
-#include "engine/llama_engine.hpp"
-#include "llama_engine_internal.hpp"
-
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-
-#include "runtime/cuda_utils.cuh"
-#include "runtime/kernels.cuh"
-
-#include "grammar/grammar_sampler.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -31,6 +23,12 @@
 #include <unordered_map>
 #include <vector>
 
+#include "engine/llama_engine.hpp"
+#include "grammar/grammar_sampler.hpp"
+#include "llama_engine_internal.hpp"
+#include "runtime/cuda_utils.cuh"
+#include "runtime/kernels.cuh"
+
 namespace engine {
 
 // The batched decode path implements ONLY the plain fp16 full-attention resident
@@ -40,12 +38,18 @@ namespace engine {
 void LlamaEngine::require_batched_supported() const {
   const auto& cfg = weights_.config();
   const char* why = nullptr;
-  if (!options_.paged_blocks) why = "requires --paged-blocks";
-  else if (cached_layer_count_ != cfg.num_layers) why = "requires --gpu-cache-all (fully resident weights)";
-  else if (cfg.is_moe()) why = "MoE models are not supported by the batched path";
-  else if (cfg.uses_non_full_attention()) why = "sliding-window / non-full-attention models are not supported";
-  else if (kv_int4_enabled_) why = "INT4 KV cache is not supported by the batched path";
-  else if (tq3_enabled_) why = "TurboQuant (TQ3) models are not supported by the batched path";
+  if (!options_.paged_blocks)
+    why = "requires --paged-blocks";
+  else if (cached_layer_count_ != cfg.num_layers)
+    why = "requires --gpu-cache-all (fully resident weights)";
+  else if (cfg.is_moe())
+    why = "MoE models are not supported by the batched path";
+  else if (cfg.uses_non_full_attention())
+    why = "sliding-window / non-full-attention models are not supported";
+  else if (kv_int4_enabled_)
+    why = "INT4 KV cache is not supported by the batched path";
+  else if (tq3_enabled_)
+    why = "TurboQuant (TQ3) models are not supported by the batched path";
   else if (cached_int8_proj_enabled_ || cached_int8_mlp_enabled_) {
     why = "INT8/INT4-quantized models are not supported by the batched path (use the fp16 model)";
   }
@@ -75,15 +79,16 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
   const int head_dim = attn_head_dim_ > 0 ? attn_head_dim_ : (hidden / cfg.num_heads);
   const int kv_hidden = attn_kv_hidden_ > 0 ? attn_kv_hidden_ : (cfg.num_kv_heads * head_dim);
   const int bs = options_.paged_block_size > 0 ? options_.paged_block_size : 32;
-  const std::size_t layer_stride = static_cast<std::size_t>(options_.max_context) *
-                                   static_cast<std::size_t>(kv_hidden);
+  const std::size_t layer_stride =
+      static_cast<std::size_t>(options_.max_context) * static_cast<std::size_t>(kv_hidden);
 
   // Row-strided views into the fused QKV / gate-up buffers (per-row layout,
   // identical to run_batched_chunk).
   const std::size_t q_row_bytes = static_cast<std::size_t>(q_hidden) * sizeof(__half);
   const std::size_t kv_row_bytes = static_cast<std::size_t>(kv_hidden) * sizeof(__half);
   const std::size_t ff_row_bytes = static_cast<std::size_t>(inter) * sizeof(__half);
-  const std::size_t qkv_stride_bytes = static_cast<std::size_t>(q_hidden + 2 * kv_hidden) * sizeof(__half);
+  const std::size_t qkv_stride_bytes =
+      static_cast<std::size_t>(q_hidden + 2 * kv_hidden) * sizeof(__half);
   const std::size_t ff13_stride_bytes = static_cast<std::size_t>(2 * inter) * sizeof(__half);
   auto* qkv_base = static_cast<const __half*>(d_qkv_);
   auto* ff13_base = static_cast<const __half*>(d_ff13_);
@@ -112,8 +117,7 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
   // Persistent (grown on demand) — allocating/freeing per step would stall the
   // pipeline with synchronizing cudaMalloc/cudaFree on every decode step.
   const int chunks = (max_seq + bs - 1) / bs;
-  const std::size_t stat_elems =
-      static_cast<std::size_t>(batch) * cfg.num_heads * chunks;
+  const std::size_t stat_elems = static_cast<std::size_t>(batch) * cfg.num_heads * chunks;
   if (stat_elems > d_bs_stat_cap_) {
     if (d_bs_scratch_m_) cudaFree(d_bs_scratch_m_);
     if (d_bs_scratch_l_) cudaFree(d_bs_scratch_l_);
@@ -127,9 +131,8 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
   float* scratch_l = d_bs_scratch_l_;
   float* scratch_o = d_bs_scratch_o_;
 
-  kernels::launch_embedding_lookup(static_cast<const __half*>(d_tok_embeddings_),
-                                   d_token_id_, static_cast<__half*>(d_x_), batch, hidden,
-                                   compute_stream_);
+  kernels::launch_embedding_lookup(static_cast<const __half*>(d_tok_embeddings_), d_token_id_,
+                                   static_cast<__half*>(d_x_), batch, hidden, compute_stream_);
 
   for (int layer = 0; layer < cfg.num_layers; ++layer) {
     const LayerDeviceWeights* lw = &layer_cache_[static_cast<std::size_t>(layer)];
@@ -137,23 +140,22 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
     // --- Attention block ---
     launch_norm(d_x_, lw->norm_att, lw->norm_att_bias, d_x_norm_, batch, hidden);
 
-    detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_,
-                                            lt_workspace_, lt_workspace_bytes_, compute_stream_,
-                                            lw->wqkv, d_x_norm_, d_qkv_,
-                                            q_hidden + 2 * kv_hidden, hidden, batch, CUDA_R_16F);
+    detail::dispatch_linear_rowmajor_weight(
+        cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,
+        lw->wqkv, d_x_norm_, d_qkv_, q_hidden + 2 * kv_hidden, hidden, batch, CUDA_R_16F);
 
-    CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_q_, q_row_bytes, qkv_base, qkv_stride_bytes,
-                                 q_row_bytes, batch, cudaMemcpyDeviceToDevice, compute_stream_));
+    CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_q_, q_row_bytes, qkv_base, qkv_stride_bytes, q_row_bytes,
+                                 batch, cudaMemcpyDeviceToDevice, compute_stream_));
     CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_k_, kv_row_bytes, qkv_base + q_hidden, qkv_stride_bytes,
                                  kv_row_bytes, batch, cudaMemcpyDeviceToDevice, compute_stream_));
     CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_v_, kv_row_bytes, qkv_base + q_hidden + kv_hidden,
-                                 qkv_stride_bytes, kv_row_bytes, batch,
-                                 cudaMemcpyDeviceToDevice, compute_stream_));
+                                 qkv_stride_bytes, kv_row_bytes, batch, cudaMemcpyDeviceToDevice,
+                                 compute_stream_));
 
     if (lw->bqkv) {
       const auto* bqkv_half = static_cast<const __half*>(lw->bqkv);
-      kernels::launch_add_bias_broadcast(static_cast<__half*>(d_prefill_q_), bqkv_half,
-                                         batch, q_hidden, compute_stream_);
+      kernels::launch_add_bias_broadcast(static_cast<__half*>(d_prefill_q_), bqkv_half, batch,
+                                         q_hidden, compute_stream_);
       kernels::launch_add_bias_broadcast(static_cast<__half*>(d_prefill_k_), bqkv_half + q_hidden,
                                          batch, kv_hidden, compute_stream_);
       kernels::launch_add_bias_broadcast(static_cast<__half*>(d_prefill_v_),
@@ -162,31 +164,27 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
     }
 
     kernels::launch_rope_inplace_perpos(static_cast<__half*>(d_prefill_q_),
-                                        static_cast<__half*>(d_prefill_k_), batch,
-                                        cfg.num_heads, cfg.num_kv_heads, head_dim,
-                                        d_batch_positions_, d_rope_cos_, d_rope_sin_,
-                                        compute_stream_);
+                                        static_cast<__half*>(d_prefill_k_), batch, cfg.num_heads,
+                                        cfg.num_kv_heads, head_dim, d_batch_positions_, d_rope_cos_,
+                                        d_rope_sin_, compute_stream_);
 
-    auto* k_pool = static_cast<__half*>(d_k_cache_) + static_cast<std::size_t>(layer) * layer_stride;
-    auto* v_pool = static_cast<__half*>(d_v_cache_) + static_cast<std::size_t>(layer) * layer_stride;
-    kernels::launch_store_kv_batched_paged(k_pool, v_pool,
-                                           static_cast<const __half*>(d_prefill_k_),
+    auto* k_pool =
+        static_cast<__half*>(d_k_cache_) + static_cast<std::size_t>(layer) * layer_stride;
+    auto* v_pool =
+        static_cast<__half*>(d_v_cache_) + static_cast<std::size_t>(layer) * layer_stride;
+    kernels::launch_store_kv_batched_paged(k_pool, v_pool, static_cast<const __half*>(d_prefill_k_),
                                            static_cast<const __half*>(d_prefill_v_),
-                                           d_batch_block_tables_, d_batch_positions_,
-                                           max_blocks, batch, kv_hidden, bs, compute_stream_);
+                                           d_batch_block_tables_, d_batch_positions_, max_blocks,
+                                           batch, kv_hidden, bs, compute_stream_);
 
-    kernels::launch_attention_step_batched_paged(static_cast<const __half*>(d_prefill_q_),
-                                                 k_pool, v_pool, d_batch_block_tables_,
-                                                 d_batch_seq_lens_, max_blocks, max_seq,
-                                                 static_cast<__half*>(d_att_), batch,
-                                                 cfg.num_heads, cfg.num_kv_heads, head_dim, bs,
-                                                 compute_stream_, scratch_m, scratch_l, scratch_o,
-                                                 chunks);
+    kernels::launch_attention_step_batched_paged(
+        static_cast<const __half*>(d_prefill_q_), k_pool, v_pool, d_batch_block_tables_,
+        d_batch_seq_lens_, max_blocks, max_seq, static_cast<__half*>(d_att_), batch, cfg.num_heads,
+        cfg.num_kv_heads, head_dim, bs, compute_stream_, scratch_m, scratch_l, scratch_o, chunks);
 
-    detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_,
-                                            lt_workspace_, lt_workspace_bytes_, compute_stream_,
-                                            lw->wo, d_att_, d_ff3_, hidden, q_hidden, batch,
-                                            CUDA_R_16F);
+    detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
+                                            lt_workspace_bytes_, compute_stream_, lw->wo, d_att_,
+                                            d_ff3_, hidden, q_hidden, batch, CUDA_R_16F);
     maybe_add_half_bias(d_ff3_, lw->bo, batch, hidden);
     kernels::launch_add_inplace(static_cast<__half*>(d_x_), static_cast<const __half*>(d_ff3_),
                                 batch * hidden, compute_stream_);
@@ -194,10 +192,9 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
     // --- FFN block ---
     launch_norm(d_x_, lw->norm_ffn, lw->norm_ffn_bias, d_x_norm_, batch, hidden);
 
-    detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_,
-                                            lt_workspace_, lt_workspace_bytes_, compute_stream_,
-                                            lw->w13, d_x_norm_, d_ff13_, 2 * inter, hidden, batch,
-                                            CUDA_R_16F);
+    detail::dispatch_linear_rowmajor_weight(
+        cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,
+        lw->w13, d_x_norm_, d_ff13_, 2 * inter, hidden, batch, CUDA_R_16F);
     CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_ff1_, ff_row_bytes, ff13_base, ff13_stride_bytes,
                                  ff_row_bytes, batch, cudaMemcpyDeviceToDevice, compute_stream_));
     CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_ff2_, ff_row_bytes, ff13_base + inter, ff13_stride_bytes,
@@ -205,10 +202,9 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
     kernels::launch_silu_mul(static_cast<const __half*>(d_prefill_ff1_),
                              static_cast<const __half*>(d_prefill_ff2_),
                              static_cast<__half*>(d_prefill_ff2_), batch * inter, compute_stream_);
-    detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_,
-                                            lt_workspace_, lt_workspace_bytes_, compute_stream_,
-                                            lw->w2, d_prefill_ff2_, d_ff3_, hidden, inter, batch,
-                                            CUDA_R_16F);
+    detail::dispatch_linear_rowmajor_weight(
+        cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,
+        lw->w2, d_prefill_ff2_, d_ff3_, hidden, inter, batch, CUDA_R_16F);
     kernels::launch_add_inplace(static_cast<__half*>(d_x_), static_cast<const __half*>(d_ff3_),
                                 batch * hidden, compute_stream_);
   }
@@ -223,14 +219,13 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
 void LlamaEngine::batched_lm_head(int batch, int hidden, int vocab) {
   if (batch > d_batch_logits_cap_) {
     if (d_batch_logits_) cudaFree(d_batch_logits_);
-    CUDA_CHECK(cudaMalloc(&d_batch_logits_,
-                          static_cast<std::size_t>(batch) * vocab * sizeof(float)));
+    CUDA_CHECK(
+        cudaMalloc(&d_batch_logits_, static_cast<std::size_t>(batch) * vocab * sizeof(float)));
     d_batch_logits_cap_ = batch;
   }
-  detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
-                                          lt_workspace_bytes_, compute_stream_, d_lm_head_,
-                                          d_x_norm_, d_batch_logits_, vocab, hidden, batch,
-                                          CUDA_R_32F);
+  detail::dispatch_linear_rowmajor_weight(
+      cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,
+      d_lm_head_, d_x_norm_, d_batch_logits_, vocab, hidden, batch, CUDA_R_32F);
   if (d_lm_head_bias_) {
     for (int b = 0; b < batch; ++b) {
       kernels::launch_add_bias_inplace_float_from_half(
@@ -281,13 +276,14 @@ void LlamaEngine::decode_step_batched_logits(const std::vector<int>& tokens,
   batched_lm_head(batch, hidden, vocab);
   std::vector<float> host(static_cast<std::size_t>(batch) * vocab);
   CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
-  CUDA_CHECK(cudaMemcpy(host.data(), d_batch_logits_,
-                        host.size() * sizeof(float), cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(host.data(), d_batch_logits_, host.size() * sizeof(float),
+                        cudaMemcpyDeviceToHost));
   for (int b = 0; b < batch; ++b) {
     out_logits[b].assign(host.begin() + static_cast<std::ptrdiff_t>(b) * vocab,
                          host.begin() + static_cast<std::ptrdiff_t>(b + 1) * vocab);
   }
-  if (prof) prof_head_s_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
+  if (prof)
+    prof_head_s_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
 }
 
 void LlamaEngine::run_batched_decode_check(const std::vector<int>& prompt_tokens, int num_steps) {
@@ -323,10 +319,11 @@ void LlamaEngine::run_batched_decode_check(const std::vector<int>& prompt_tokens
   // N=2 (duplicate rows). KV writes at the current position are idempotent (same
   // K/V to the same slot), so running both at the same state is safe; identical
   // logits => identical argmax. Advance by the reference token.
-  std::printf("batched-decode check: prompt=%d steps=%d block_size=%d blocks=%d\n",
-              seq_len, steps, bs, nblk);
+  std::printf("batched-decode check: prompt=%d steps=%d block_size=%d blocks=%d\n", seq_len, steps,
+              bs, nblk);
   std::vector<int> dup_table = block_table_host_;
-  dup_table.insert(dup_table.end(), block_table_host_.begin(), block_table_host_.end());  // [2][nblk]
+  dup_table.insert(dup_table.end(), block_table_host_.begin(),
+                   block_table_host_.end());  // [2][nblk]
 
   int cur = prompt_tokens.back();
   int pos = seq_len - 1;
@@ -343,8 +340,8 @@ void LlamaEngine::run_batched_decode_check(const std::vector<int>& prompt_tokens
     if (!ok1) ++mism1;
     if (!ok2) ++mism2;
     if (s < 12 || !ok1 || !ok2) {
-      std::printf("  step %2d pos %4d  single=%d  batched[N=1]=%d %s  batched[N=2]=%d,%d %s\n",
-                  s, pos, single_arg, n1[0], ok1 ? "ok" : "MISMATCH", n2[0], n2[1],
+      std::printf("  step %2d pos %4d  single=%d  batched[N=1]=%d %s  batched[N=2]=%d,%d %s\n", s,
+                  pos, single_arg, n1[0], ok1 ? "ok" : "MISMATCH", n2[0], n2[1],
                   ok2 ? "ok" : "MISMATCH");
     }
     cur = single_arg;
@@ -367,7 +364,8 @@ std::vector<int> LlamaEngine::greedy_generate_single(const std::vector<int>& pro
   }
   const int nblk = (total + bs - 1) / bs;
   block_table_host_.assign(static_cast<std::size_t>(nblk), 0);
-  for (int c = 0; c < nblk; ++c) block_table_host_[static_cast<std::size_t>(c)] = seq_blocks_->block_for(c * bs);
+  for (int c = 0; c < nblk; ++c)
+    block_table_host_[static_cast<std::size_t>(c)] = seq_blocks_->block_for(c * bs);
   CUDA_CHECK(cudaMemcpy(d_block_table_, block_table_host_.data(),
                         static_cast<std::size_t>(nblk) * sizeof(int), cudaMemcpyHostToDevice));
   prefill_prompt(prompt);
@@ -390,16 +388,20 @@ std::vector<int> LlamaEngine::greedy_generate_single(const std::vector<int>& pro
 void LlamaEngine::stream_grow_table(StreamSeq& s, int upto_pos) {
   const int bs = options_.paged_block_size > 0 ? options_.paged_block_size : 32;
   if (!s.blocks->ensure_position(upto_pos)) {
-    throw std::runtime_error("stream scheduler: paged KV pool exhausted (concurrent length > max_context budget)");
+    throw std::runtime_error(
+        "stream scheduler: paged KV pool exhausted (concurrent length > max_context budget)");
   }
   const int nblk = upto_pos / bs + 1;
   if (static_cast<int>(s.table.size()) != nblk) {
     s.table.resize(static_cast<std::size_t>(nblk));
-    for (int c = 0; c < nblk; ++c) s.table[static_cast<std::size_t>(c)] = s.blocks->block_for(c * bs);
+    for (int c = 0; c < nblk; ++c)
+      s.table[static_cast<std::size_t>(c)] = s.blocks->block_for(c * bs);
   }
 }
 
-int LlamaEngine::stream_active() const { return static_cast<int>(stream_seqs_.size()); }
+int LlamaEngine::stream_active() const {
+  return static_cast<int>(stream_seqs_.size());
+}
 
 void LlamaEngine::stream_admit(const std::string& id, const std::vector<int>& prompt_tokens,
                                const StreamParams& params) {
@@ -444,7 +446,8 @@ bool LlamaEngine::stream_step(std::vector<StreamEvent>& events) {
     toks[b] = stream_seqs_[b].last_token;
     poss[b] = stream_seqs_[b].pos;
     const auto& t = stream_seqs_[b].table;
-    for (std::size_t c = 0; c < t.size(); ++c) flat[static_cast<std::size_t>(b) * max_blocks + c] = t[c];
+    for (std::size_t c = 0; c < t.size(); ++c)
+      flat[static_cast<std::size_t>(b) * max_blocks + c] = t[c];
   }
 
   std::vector<std::vector<float>> logits;
@@ -458,8 +461,7 @@ bool LlamaEngine::stream_step(std::vector<StreamEvent>& events) {
 
     if (s.params.grammar) s.params.grammar->apply_mask(lg);
     // Suppress EOS until min_new_tokens (skip when a grammar drives termination).
-    if (s.generated < s.params.min_new_tokens && !s.params.grammar &&
-        options_.eos_token_id >= 0 &&
+    if (s.generated < s.params.min_new_tokens && !s.params.grammar && options_.eos_token_id >= 0 &&
         static_cast<std::size_t>(options_.eos_token_id) < lg.size()) {
       lg[static_cast<std::size_t>(options_.eos_token_id)] = -std::numeric_limits<float>::infinity();
     }
@@ -473,8 +475,8 @@ bool LlamaEngine::stream_step(std::vector<StreamEvent>& events) {
     ++s.pos;
     ++s.generated;
 
-    const bool is_stop =
-        std::find(s.params.stop_ids.begin(), s.params.stop_ids.end(), tok) != s.params.stop_ids.end();
+    const bool is_stop = std::find(s.params.stop_ids.begin(), s.params.stop_ids.end(), tok) !=
+                         s.params.stop_ids.end();
     const char* reason = "";
     bool fin = false;
     if (is_stop) {
@@ -528,9 +530,7 @@ void LlamaEngine::run_batch_bench(const std::vector<int>& prompt, int max_new) {
     throw std::runtime_error("batch bench requires --gpu-cache-all (fully resident)");
   }
   using clock = std::chrono::steady_clock;
-  const auto secs = [](clock::duration d) {
-    return std::chrono::duration<double>(d).count();
-  };
+  const auto secs = [](clock::duration d) { return std::chrono::duration<double>(d).count(); };
 
   // Batch sizes to sweep; skip any whose worst-case KV would exceed the budget.
   std::vector<int> sizes = {1, 2, 4, 8, 16, 32, 48, 64};
@@ -539,10 +539,14 @@ void LlamaEngine::run_batch_bench(const std::vector<int>& prompt, int max_new) {
       std::getenv("CPI_BENCH_TEMP") ? std::atof(std::getenv("CPI_BENCH_TEMP")) : 0.0f;
 
   // Warmup (kernel autotune / first-launch costs shouldn't skew the first row).
-  { std::vector<BatchRequest> w(1, BatchRequest{prompt, std::min(8, max_new), -1}); run_batch(w); }
+  {
+    std::vector<BatchRequest> w(1, BatchRequest{prompt, std::min(8, max_new), -1});
+    run_batch(w);
+  }
 
-  std::printf("batch throughput bench: prompt=%zu max_new=%d temp=%.2f (decode tokens/sec, eos disabled)\n",
-              prompt.size(), max_new, bench_temp);
+  std::printf(
+      "batch throughput bench: prompt=%zu max_new=%d temp=%.2f (decode tokens/sec, eos disabled)\n",
+      prompt.size(), max_new, bench_temp);
   std::printf("  %4s  %14s  %14s  %8s\n", "B", "serial_tok/s", "batched_tok/s", "speedup");
   for (int B : sizes) {
     if (static_cast<long long>(B) * per_seq > options_.max_context) continue;
@@ -579,20 +583,22 @@ void LlamaEngine::run_batch_bench(const std::vector<int>& prompt, int max_new) {
   }
 }
 
-void LlamaEngine::run_scheduler_check(const std::vector<int>& base_prompt, int max_new, int eos_id) {
-  if (base_prompt.size() < 4) throw std::runtime_error("scheduler check needs a prompt of >= 4 tokens");
+void LlamaEngine::run_scheduler_check(const std::vector<int>& base_prompt, int max_new,
+                                      int eos_id) {
+  if (base_prompt.size() < 4)
+    throw std::runtime_error("scheduler check needs a prompt of >= 4 tokens");
   const int L = static_cast<int>(base_prompt.size());
 
   // Build distinct sequences of different lengths/content so prefill lands in
   // non-contiguous blocks and sequences finish on different steps (ragged batch
   // + free-on-finish). Each gets a different max_new so completions stagger.
   std::vector<std::vector<int>> prompts = {
-      base_prompt,                                                  // full
+      base_prompt,                                                             // full
       std::vector<int>(base_prompt.begin(), base_prompt.begin() + L / 2 + 1),  // shorter
-      std::vector<int>(base_prompt.begin() + 1, base_prompt.end()),           // shifted content
+      std::vector<int>(base_prompt.begin() + 1, base_prompt.end()),            // shifted content
   };
   {
-    std::vector<int> longer = base_prompt;                          // longer than max prefill? no
+    std::vector<int> longer = base_prompt;  // longer than max prefill? no
     longer.insert(longer.end(), base_prompt.begin(), base_prompt.begin() + 3);
     prompts.push_back(std::move(longer));
   }
@@ -615,7 +621,8 @@ void LlamaEngine::run_scheduler_check(const std::vector<int>& base_prompt, int m
   const auto got = run_batch(reqs);
 
   std::printf("scheduler check: %d concurrent sequences (block_size=%d, max_context=%d)\n",
-              static_cast<int>(prompts.size()), (options_.paged_block_size > 0 ? options_.paged_block_size : 32),
+              static_cast<int>(prompts.size()),
+              (options_.paged_block_size > 0 ? options_.paged_block_size : 32),
               options_.max_context);
   int fails = 0;
   for (std::size_t i = 0; i < prompts.size(); ++i) {
@@ -624,17 +631,20 @@ void LlamaEngine::run_scheduler_check(const std::vector<int>& base_prompt, int m
     int diverge = -1;
     const std::size_t n = std::min(got[i].size(), ref[i].size());
     for (std::size_t k = 0; k < n; ++k) {
-      if (got[i][k] != ref[i][k]) { diverge = static_cast<int>(k); break; }
+      if (got[i][k] != ref[i][k]) {
+        diverge = static_cast<int>(k);
+        break;
+      }
     }
     if (got[i].size() != ref[i].size() && diverge < 0) diverge = static_cast<int>(n);
     if (!ok) ++fails;
-    std::printf("  seq %zu: prompt_len=%zu budget=%d ref_tokens=%zu batch_tokens=%zu  %s%s\n",
-                i, prompts[i].size(), budgets[i], ref[i].size(), got[i].size(),
+    std::printf("  seq %zu: prompt_len=%zu budget=%d ref_tokens=%zu batch_tokens=%zu  %s%s\n", i,
+                prompts[i].size(), budgets[i], ref[i].size(), got[i].size(),
                 ok ? "MATCH" : "MISMATCH",
                 diverge >= 0 ? (" @" + std::to_string(diverge)).c_str() : "");
   }
-  std::printf("scheduler check: %s  (%d/%zu sequences mismatched)\n",
-              fails == 0 ? "PASS" : "FAIL", fails, prompts.size());
+  std::printf("scheduler check: %s  (%d/%zu sequences mismatched)\n", fails == 0 ? "PASS" : "FAIL",
+              fails, prompts.size());
 }
 
 void LlamaEngine::ensure_batch_state_buffers(int batch, int max_blocks) {

@@ -2,12 +2,12 @@
 //
 // CUDA kernels and host launch wrappers for TurboQuant/TQ3 helpers.
 
-#include "runtime/kernels.cuh"
+#include <cuda_fp16.h>
 
 #include <cstddef>
 #include <cstdint>
 
-#include <cuda_fp16.h>
+#include "runtime/kernels.cuh"
 
 namespace kernels {
 namespace {
@@ -19,15 +19,14 @@ __device__ __forceinline__ float warp_sum(float v) {
   return v;
 }
 
-__global__ void hadamard_rotate_fp16_kernel(half* __restrict__ x,
-                                            const int8_t* __restrict__ signs,
+__global__ void hadamard_rotate_fp16_kernel(half* __restrict__ x, const int8_t* __restrict__ signs,
                                             int block_size) {
   extern __shared__ float smem[];
 
   // Each CUDA block handles one WHT sub-block.
-  const int base       = blockIdx.x * block_size;
-  half*         xb     = x     + base;
-  const int8_t* sb     = signs + base;
+  const int base = blockIdx.x * block_size;
+  half* xb = x + base;
+  const int8_t* sb = signs + base;
 
   // Load and apply random sign diagonal D for this sub-block.
   for (int i = threadIdx.x; i < block_size; i += blockDim.x) {
@@ -64,12 +63,9 @@ __global__ void hadamard_rotate_fp16_kernel(half* __restrict__ x,
 //   8 floats for the codebook.
 template <int WarpsPerBlock>
 __global__ void tq3_gemv_f16_kernel(const uint32_t* __restrict__ w_packed,
-                                    const half*     __restrict__ codebook,
-                                    const half*     __restrict__ scales,
-                                    const half*     __restrict__ x,
-                                    half*           __restrict__ y,
-                                    int out_features,
-                                    int in_features,
+                                    const half* __restrict__ codebook,
+                                    const half* __restrict__ scales, const half* __restrict__ x,
+                                    half* __restrict__ y, int out_features, int in_features,
                                     int words_per_row) {
   // Shared memory: x only.  Codebook is held in per-lane registers and looked
   // up with __shfl_sync (2-cycle warp op) rather than shared memory, which
@@ -82,7 +78,7 @@ __global__ void tq3_gemv_f16_kernel(const uint32_t* __restrict__ w_packed,
   }
 
   const int warp_id = threadIdx.x / warpSize;
-  const int lane    = threadIdx.x & (warpSize - 1);
+  const int lane = threadIdx.x & (warpSize - 1);
 
   // Lane i (0..7) holds codebook[i]; lanes 8..31 hold 0 (unused as source).
   // All threads issue the same 8 global loads → L2 broadcast, no bank issue.
@@ -112,13 +108,13 @@ __global__ void tq3_gemv_f16_kernel(const uint32_t* __restrict__ w_packed,
     // For dummy (padding) iterations beyond words_per_row, use 0 so all 3-bit
     // indices are 0 — the __shfl_sync still executes but j >= in_features
     // guards prevent any accumulation.
-    const uint32_t packed  = (wi < words_per_row) ? row_w[wi] : 0u;
-    const int      base_j  = wi * 10;
-    // Unroll the inner 10-element loop; the compiler can hoist this fully.
-    #pragma unroll
+    const uint32_t packed = (wi < words_per_row) ? row_w[wi] : 0u;
+    const int base_j = wi * 10;
+// Unroll the inner 10-element loop; the compiler can hoist this fully.
+#pragma unroll
     for (int k = 0; k < 10; ++k) {
       const int j = base_j + k;
-      const int   idx  = (packed >> (k * 3)) & 0x7;
+      const int idx = (packed >> (k * 3)) & 0x7;
       // __shfl_sync MUST be called unconditionally by all warp lanes so the
       // 0xFFFFFFFF convergence requirement is satisfied.  The j < in_features
       // guard below prevents accumulating out-of-range elements.
@@ -139,8 +135,7 @@ __global__ void tq3_gemv_f16_kernel(const uint32_t* __restrict__ w_packed,
 __global__ void tq_qjl_pack_sign_bits_kernel(const half* __restrict__ x,
                                              const int32_t* __restrict__ indices,
                                              const int8_t* __restrict__ signs,
-                                             uint32_t* __restrict__ out_bits,
-                                             int qjl_dim) {
+                                             uint32_t* __restrict__ out_bits, int qjl_dim) {
   const int j = blockIdx.x * blockDim.x + threadIdx.x;
   if (j >= qjl_dim) {
     return;
@@ -159,9 +154,7 @@ template <int WarpsPerBlock>
 __global__ void tq_qjl_residual_add_f16_kernel(const uint32_t* __restrict__ row_bits,
                                                const half* __restrict__ scales,
                                                const uint32_t* __restrict__ x_bits,
-                                               half* __restrict__ y,
-                                               int out_features,
-                                               int qjl_dim,
+                                               half* __restrict__ y, int out_features, int qjl_dim,
                                                int words_per_row) {
   const int warp_id = threadIdx.x / warpSize;
   const int lane = threadIdx.x & (warpSize - 1);
@@ -197,22 +190,18 @@ __global__ void tq_qjl_residual_add_f16_kernel(const uint32_t* __restrict__ row_
 
 // block_size: largest power-of-2 factor of n (== n when n is a power of 2).
 // n / block_size CUDA blocks are launched, each handling one WHT sub-block.
-void launch_hadamard_rotate_fp16(half* x, const int8_t* signs, int n, int block_size, cudaStream_t stream) {
+void launch_hadamard_rotate_fp16(half* x, const int8_t* signs, int n, int block_size,
+                                 cudaStream_t stream) {
   const int cuda_blocks = n / block_size;
   const int threads = 512;
   const std::size_t shmem = static_cast<std::size_t>(block_size) * sizeof(float);
   hadamard_rotate_fp16_kernel<<<cuda_blocks, threads, shmem, stream>>>(x, signs, block_size);
 }
 
-void launch_tq3_gemv_f16(const uint32_t* w_packed,
-                          const half*     codebook,
-                          const half*     scales,
-                          const half*     x,
-                          half*           y,
-                          int             out_features,
-                          int             in_features,
-                          cudaStream_t    stream) {
-  constexpr int kWarps   = 8;
+void launch_tq3_gemv_f16(const uint32_t* w_packed, const half* codebook, const half* scales,
+                         const half* x, half* y, int out_features, int in_features,
+                         cudaStream_t stream) {
+  constexpr int kWarps = 8;
   constexpr int kThreads = kWarps * 32;
   const int words_per_row = (in_features + 9) / 10;
   const int blocks = (out_features + kWarps - 1) / kWarps;
@@ -222,12 +211,8 @@ void launch_tq3_gemv_f16(const uint32_t* w_packed,
       w_packed, codebook, scales, x, y, out_features, in_features, words_per_row);
 }
 
-void launch_tq_qjl_pack_sign_bits(const half*     x,
-                                  const int32_t*  indices,
-                                  const int8_t*   signs,
-                                  uint32_t*       out_bits,
-                                  int             qjl_dim,
-                                  cudaStream_t    stream) {
+void launch_tq_qjl_pack_sign_bits(const half* x, const int32_t* indices, const int8_t* signs,
+                                  uint32_t* out_bits, int qjl_dim, cudaStream_t stream) {
   if (qjl_dim <= 0) {
     return;
   }
@@ -235,16 +220,13 @@ void launch_tq_qjl_pack_sign_bits(const half*     x,
   cudaMemsetAsync(out_bits, 0, static_cast<std::size_t>(words) * sizeof(uint32_t), stream);
   constexpr int kThreads = 256;
   const int blocks = (qjl_dim + kThreads - 1) / kThreads;
-  tq_qjl_pack_sign_bits_kernel<<<blocks, kThreads, 0, stream>>>(x, indices, signs, out_bits, qjl_dim);
+  tq_qjl_pack_sign_bits_kernel<<<blocks, kThreads, 0, stream>>>(x, indices, signs, out_bits,
+                                                                qjl_dim);
 }
 
-void launch_tq_qjl_residual_add_f16(const uint32_t* row_bits,
-                                    const half*     scales,
-                                    const uint32_t* x_bits,
-                                    half*           y,
-                                    int             out_features,
-                                    int             qjl_dim,
-                                    cudaStream_t    stream) {
+void launch_tq_qjl_residual_add_f16(const uint32_t* row_bits, const half* scales,
+                                    const uint32_t* x_bits, half* y, int out_features, int qjl_dim,
+                                    cudaStream_t stream) {
   if (out_features <= 0 || qjl_dim <= 0) {
     return;
   }
@@ -252,8 +234,8 @@ void launch_tq_qjl_residual_add_f16(const uint32_t* row_bits,
   constexpr int kThreads = kWarps * 32;
   const int blocks = (out_features + kWarps - 1) / kWarps;
   const int words = (qjl_dim + 31) / 32;
-  tq_qjl_residual_add_f16_kernel<kWarps><<<blocks, kThreads, 0, stream>>>(
-      row_bits, scales, x_bits, y, out_features, qjl_dim, words);
+  tq_qjl_residual_add_f16_kernel<kWarps>
+      <<<blocks, kThreads, 0, stream>>>(row_bits, scales, x_bits, y, out_features, qjl_dim, words);
 }
 
 }  // namespace kernels

@@ -22,7 +22,8 @@ std::string read_file_to_string(const std::string& path) {
   std::ostringstream ss;
   ss << f.rdbuf();
   std::string s = ss.str();
-  while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ' || s.back() == '\t')) {
+  while (!s.empty() &&
+         (s.back() == '\n' || s.back() == '\r' || s.back() == ' ' || s.back() == '\t')) {
     s.pop_back();
   }
   return s;
@@ -63,40 +64,49 @@ T parse_env_or_default(const char* name, const T& default_value, ParseFn&& parse
 }
 
 void init_options_from_env(engine::EngineOptions* opts) {
-  opts->max_context = parse_env_or_default(
-      "LLAMA_INFER_MAX_CONTEXT", opts->max_context, [](const char* v) { return std::stoi(v); });
-  opts->top_k = parse_env_or_default(
-      "LLAMA_INFER_TOP_K", opts->top_k, [](const char* v) { return std::stoi(v); });
-  opts->top_p = parse_env_or_default(
-      "LLAMA_INFER_TOP_P", opts->top_p, [](const char* v) { return std::stof(v); });
-  opts->repetition_penalty = parse_env_or_default(
-      "LLAMA_INFER_REPEAT_PENALTY", opts->repetition_penalty, [](const char* v) { return std::stof(v); });
-  opts->no_repeat_ngram_size = parse_env_or_default(
-      "LLAMA_INFER_NO_REPEAT_NGRAM", opts->no_repeat_ngram_size, [](const char* v) { return std::stoi(v); });
-  opts->eos_token_id = parse_env_or_default(
-      "LLAMA_INFER_EOS_TOKEN_ID", opts->eos_token_id, [](const char* v) { return std::stoi(v); });
-  opts->gpu_cache_layers = parse_env_or_default(
-      "LLAMA_INFER_GPU_CACHE_LAYERS", opts->gpu_cache_layers, [](const char* v) { return std::stoi(v); });
+  opts->max_context = parse_env_or_default("LLAMA_INFER_MAX_CONTEXT", opts->max_context,
+                                           [](const char* v) { return std::stoi(v); });
+  opts->top_k = parse_env_or_default("LLAMA_INFER_TOP_K", opts->top_k,
+                                     [](const char* v) { return std::stoi(v); });
+  opts->top_p = parse_env_or_default("LLAMA_INFER_TOP_P", opts->top_p,
+                                     [](const char* v) { return std::stof(v); });
+  opts->repetition_penalty =
+      parse_env_or_default("LLAMA_INFER_REPEAT_PENALTY", opts->repetition_penalty,
+                           [](const char* v) { return std::stof(v); });
+  opts->no_repeat_ngram_size =
+      parse_env_or_default("LLAMA_INFER_NO_REPEAT_NGRAM", opts->no_repeat_ngram_size,
+                           [](const char* v) { return std::stoi(v); });
+  opts->eos_token_id = parse_env_or_default("LLAMA_INFER_EOS_TOKEN_ID", opts->eos_token_id,
+                                            [](const char* v) { return std::stoi(v); });
+  opts->gpu_cache_layers =
+      parse_env_or_default("LLAMA_INFER_GPU_CACHE_LAYERS", opts->gpu_cache_layers,
+                           [](const char* v) { return std::stoi(v); });
   opts->gpu_cache_limit_mb = static_cast<std::size_t>(parse_env_or_default(
       "LLAMA_INFER_GPU_CACHE_LIMIT_MB", static_cast<unsigned long long>(opts->gpu_cache_limit_mb),
       [](const char* v) { return std::stoull(v); }));
   opts->vram_safety_margin_mb = static_cast<std::size_t>(parse_env_or_default(
       "LLAMA_INFER_VRAM_MARGIN_MB", static_cast<unsigned long long>(opts->vram_safety_margin_mb),
       [](const char* v) { return std::stoull(v); }));
-  opts->max_cpu_percent = parse_env_or_default(
-      "LLAMA_INFER_MAX_CPU_PERCENT", opts->max_cpu_percent, [](const char* v) { return std::stod(v); });
-  opts->max_memory_percent = parse_env_or_default(
-      "LLAMA_INFER_MAX_MEMORY_PERCENT", opts->max_memory_percent, [](const char* v) { return std::stod(v); });
-  opts->resource_sample_interval_ms = parse_env_or_default(
-      "LLAMA_INFER_RESOURCE_SAMPLE_MS", opts->resource_sample_interval_ms, [](const char* v) { return std::stoi(v); });
-  opts->resource_sustain_ms = parse_env_or_default(
-      "LLAMA_INFER_RESOURCE_SUSTAIN_MS", opts->resource_sustain_ms, [](const char* v) { return std::stoi(v); });
-  opts->resource_throttle_sleep_ms = parse_env_or_default(
-      "LLAMA_INFER_RESOURCE_THROTTLE_MS", opts->resource_throttle_sleep_ms, [](const char* v) { return std::stoi(v); });
-  opts->tq_cached_init_timeout_ms = parse_env_or_default(
-      "LLAMA_INFER_TQ_CACHED_INIT_TIMEOUT_MS", opts->tq_cached_init_timeout_ms, [](const char* v) { return std::stoi(v); });
-  opts->tq_first_token_timeout_ms = parse_env_or_default(
-      "LLAMA_INFER_TQ_FIRST_TOKEN_TIMEOUT_MS", opts->tq_first_token_timeout_ms, [](const char* v) { return std::stoi(v); });
+  opts->max_cpu_percent = parse_env_or_default("LLAMA_INFER_MAX_CPU_PERCENT", opts->max_cpu_percent,
+                                               [](const char* v) { return std::stod(v); });
+  opts->max_memory_percent =
+      parse_env_or_default("LLAMA_INFER_MAX_MEMORY_PERCENT", opts->max_memory_percent,
+                           [](const char* v) { return std::stod(v); });
+  opts->resource_sample_interval_ms =
+      parse_env_or_default("LLAMA_INFER_RESOURCE_SAMPLE_MS", opts->resource_sample_interval_ms,
+                           [](const char* v) { return std::stoi(v); });
+  opts->resource_sustain_ms =
+      parse_env_or_default("LLAMA_INFER_RESOURCE_SUSTAIN_MS", opts->resource_sustain_ms,
+                           [](const char* v) { return std::stoi(v); });
+  opts->resource_throttle_sleep_ms =
+      parse_env_or_default("LLAMA_INFER_RESOURCE_THROTTLE_MS", opts->resource_throttle_sleep_ms,
+                           [](const char* v) { return std::stoi(v); });
+  opts->tq_cached_init_timeout_ms =
+      parse_env_or_default("LLAMA_INFER_TQ_CACHED_INIT_TIMEOUT_MS", opts->tq_cached_init_timeout_ms,
+                           [](const char* v) { return std::stoi(v); });
+  opts->tq_first_token_timeout_ms =
+      parse_env_or_default("LLAMA_INFER_TQ_FIRST_TOKEN_TIMEOUT_MS", opts->tq_first_token_timeout_ms,
+                           [](const char* v) { return std::stoi(v); });
 }
 
 }  // namespace
@@ -104,19 +114,23 @@ void init_options_from_env(engine::EngineOptions* opts) {
 void print_usage(std::ostream& os) {
   os << "Usage: llama_infer <model.ll2c|model_dir> [--prompt text --tokenizer tokenizer.model] "
         "[--tokens csv] [--max-new n] [--temp t] [--max-context n] "
-        "[--gpu-cache-all] [--gpu-cache-layers n] [--gpu-cache-limit-mb n] [--vram-safety-margin-mb n] "
+        "[--gpu-cache-all] [--gpu-cache-layers n] [--gpu-cache-limit-mb n] "
+        "[--vram-safety-margin-mb n] "
         "[--top-k n] [--top-p p] [--repeat-penalty r] [--no-repeat-ngram n] [--rope-theta f] "
-        "[--stop-text text] [--chat-template tinyllama|tinyllama-chatml|llama2|llama3|mistral|phi3|qwen2|qwen3_5|llama4] "
-          "[--dump-tokenizer-meta] [--dump-prompt-tokens] [--inspect-next-topk n] "
-        "[--trace-steps n] [--sentence-stop] [--benchmark] [--benchmark-reps n] [--benchmark-warmup n] "
+        "[--stop-text text] [--chat-template "
+        "tinyllama|tinyllama-chatml|llama2|llama3|mistral|phi3|qwen2|qwen3_5|llama4] "
+        "[--dump-tokenizer-meta] [--dump-prompt-tokens] [--inspect-next-topk n] "
+        "[--trace-steps n] [--sentence-stop] [--benchmark] [--benchmark-reps n] "
+        "[--benchmark-warmup n] "
         "[--benchmark-phases] [--runtime-metrics] [--no-split-attention] "
         "[--enable-tq-cached] [--tq-mode auto|mse|prod] "
         "[--max-cpu-percent n] [--max-memory-percent n] "
         "[--resource-sample-ms n] [--resource-sustain-ms n] [--resource-throttle-ms n] "
         "[--no-resource-limits] [--resource-limits] "
         "[--tq-cached-init-timeout-ms n] [--tq-first-token-timeout-ms n] "
-          "[--allow-legacy-chat-tokenizer] "
-        "[--no-bos] [--eos-token n] [--no-loop-guard] [--int8-streaming|--int4-streaming|--weight-quant none|int8|int4] "
+        "[--allow-legacy-chat-tokenizer] "
+        "[--no-bos] [--eos-token n] [--no-loop-guard] "
+        "[--int8-streaming|--int4-streaming|--weight-quant none|int8|int4] "
         "[--paged-kv-cache] [--web] [--interactive] [--simple]\n";
 }
 
@@ -124,10 +138,12 @@ void apply_simple_mode_defaults(ParsedArgs* args) {
   if (!args->simple_mode) {
     return;
   }
-  const int simple_default_max_new = parse_env_or_default(
-      "LLAMA_INFER_SIMPLE_MAX_NEW", kSimpleModeDefaultMaxNewTokens, [](const char* v) { return std::stoi(v); });
-  const float simple_default_temp = parse_env_or_default(
-      "LLAMA_INFER_SIMPLE_TEMP", kSimpleModeDefaultTemperature, [](const char* v) { return std::stof(v); });
+  const int simple_default_max_new =
+      parse_env_or_default("LLAMA_INFER_SIMPLE_MAX_NEW", kSimpleModeDefaultMaxNewTokens,
+                           [](const char* v) { return std::stoi(v); });
+  const float simple_default_temp =
+      parse_env_or_default("LLAMA_INFER_SIMPLE_TEMP", kSimpleModeDefaultTemperature,
+                           [](const char* v) { return std::stof(v); });
 
   if (!args->max_new_set) {
     args->max_new = simple_default_max_new;
@@ -195,7 +211,8 @@ void validate_args(const ParsedArgs& args) {
   gpu_cache_mode_count += (args.opts.gpu_cache_layers >= 0) ? 1 : 0;
   gpu_cache_mode_count += (args.opts.gpu_cache_limit_mb > 0) ? 1 : 0;
   if (gpu_cache_mode_count > 1) {
-    throw std::runtime_error("use only one of --gpu-cache-all, --gpu-cache-layers, or --gpu-cache-limit-mb");
+    throw std::runtime_error(
+        "use only one of --gpu-cache-all, --gpu-cache-layers, or --gpu-cache-limit-mb");
   }
 }
 
@@ -207,10 +224,10 @@ ParsedArgs parse_args(int argc, char** argv) {
   ParsedArgs args;
   args.opts.model_path = argv[1];
   init_options_from_env(&args.opts);
-  args.max_new = parse_env_or_default(
-      "LLAMA_INFER_DEFAULT_MAX_NEW", kDefaultMaxNewTokens, [](const char* v) { return std::stoi(v); });
-  args.temp = parse_env_or_default(
-      "LLAMA_INFER_DEFAULT_TEMP", kDefaultTemperature, [](const char* v) { return std::stof(v); });
+  args.max_new = parse_env_or_default("LLAMA_INFER_DEFAULT_MAX_NEW", kDefaultMaxNewTokens,
+                                      [](const char* v) { return std::stoi(v); });
+  args.temp = parse_env_or_default("LLAMA_INFER_DEFAULT_TEMP", kDefaultTemperature,
+                                   [](const char* v) { return std::stof(v); });
 
   for (int i = 2; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -250,12 +267,12 @@ ParsedArgs parse_args(int argc, char** argv) {
       args.opts.gpu_cache_layers = std::stoi(need_val("--gpu-cache-layers"));
       args.cache_mode_set = true;
     } else if (arg == "--gpu-cache-limit-mb") {
-      args.opts.gpu_cache_limit_mb = static_cast<std::size_t>(
-          std::stoull(need_val("--gpu-cache-limit-mb")));
+      args.opts.gpu_cache_limit_mb =
+          static_cast<std::size_t>(std::stoull(need_val("--gpu-cache-limit-mb")));
       args.cache_mode_set = true;
     } else if (arg == "--vram-safety-margin-mb") {
-      args.opts.vram_safety_margin_mb = static_cast<std::size_t>(
-          std::stoull(need_val("--vram-safety-margin-mb")));
+      args.opts.vram_safety_margin_mb =
+          static_cast<std::size_t>(std::stoull(need_val("--vram-safety-margin-mb")));
     } else if (arg == "--top-k") {
       args.opts.top_k = std::stoi(need_val("--top-k"));
     } else if (arg == "--top-p") {
@@ -348,7 +365,8 @@ ParsedArgs parse_args(int argc, char** argv) {
       args.opts.enable_tq_cached = true;
     } else if (arg == "--tq-mode") {
       args.opts.tq_mode = need_val("--tq-mode");
-      if (args.opts.tq_mode != "auto" && args.opts.tq_mode != "mse" && args.opts.tq_mode != "prod") {
+      if (args.opts.tq_mode != "auto" && args.opts.tq_mode != "mse" &&
+          args.opts.tq_mode != "prod") {
         throw std::runtime_error("--tq-mode must be one of: auto, mse, prod");
       }
     } else if (arg == "--max-cpu-percent") {

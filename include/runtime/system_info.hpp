@@ -23,10 +23,10 @@ struct GpuMemoryStats {
 // A point-in-time snapshot of the host and all visible CUDA devices.
 // Fields are populated by collect_system_snapshot().
 struct SystemSnapshot {
-  std::string os_name;                       // e.g. "Windows 11" or "Linux 5.15"
-  int device_count = 0;                      // number of CUDA-visible GPUs
-  std::vector<std::string> gpu_names;        // human-readable device names, indexed by device id
-  std::vector<GpuMemoryStats> gpu_memory;   // per-device VRAM statistics at time of query
+  std::string os_name;                     // e.g. "Windows 11" or "Linux 5.15"
+  int device_count = 0;                    // number of CUDA-visible GPUs
+  std::vector<std::string> gpu_names;      // human-readable device names, indexed by device id
+  std::vector<GpuMemoryStats> gpu_memory;  // per-device VRAM statistics at time of query
 };
 
 // Point-in-time host-resource usage.

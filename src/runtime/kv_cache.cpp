@@ -7,10 +7,11 @@
 
 namespace runtime {
 
-KVCachePager::~KVCachePager() { reset(); }
+KVCachePager::~KVCachePager() {
+  reset();
+}
 
-void KVCachePager::initialize(std::size_t num_pages,
-                              std::size_t page_bytes,
+void KVCachePager::initialize(std::size_t num_pages, std::size_t page_bytes,
                               std::size_t max_device_pages) {
   reset();
   page_bytes_ = page_bytes;
@@ -98,8 +99,7 @@ void KVCachePager::page_out(std::size_t slot) {
     return;
   }
 
-  CUDA_CHECK(cudaMemcpy(host_pages_[dev.page_id], dev.ptr, page_bytes_,
-                        cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(host_pages_[dev.page_id], dev.ptr, page_bytes_, cudaMemcpyDeviceToHost));
   resident_.erase(dev.page_id);
   dev.page_id = -1;
   dev.last_access = 0;

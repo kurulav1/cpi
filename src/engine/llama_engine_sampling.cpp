@@ -1,14 +1,12 @@
+#include <limits>
+
 #include "engine/llama_engine.hpp"
 #include "grammar/grammar_sampler.hpp"
 #include "llama_engine_internal.hpp"
 
-#include <limits>
-
 namespace engine {
 
-int LlamaEngine::decode_next_token(int token,
-                                   int position,
-                                   float temperature,
+int LlamaEngine::decode_next_token(int token, int position, float temperature,
                                    const std::vector<int>& history) {
   // Host-logits path is required whenever we must edit the logits before
   // sampling: a grammar mask, or EOS suppression for min_new_tokens. The greedy
@@ -34,17 +32,13 @@ int LlamaEngine::decode_next_token(int token,
       h_logits[static_cast<std::size_t>(options_.eos_token_id)] =
           -std::numeric_limits<float>::infinity();
     }
-    return detail::dispatch_sample_from_logits(h_logits,
-                                               temperature,
-                                               options_.top_k,
-                                               options_.top_p,
-                                               options_.repetition_penalty,
-                                               options_.no_repeat_ngram_size,
-                                               history);
+    return detail::dispatch_sample_from_logits(h_logits, temperature, options_.top_k,
+                                               options_.top_p, options_.repetition_penalty,
+                                               options_.no_repeat_ngram_size, history);
   }
 
-  const bool greedy_fast_path =
-      temperature <= 0.0f && options_.repetition_penalty <= 1.0f && options_.no_repeat_ngram_size <= 1;
+  const bool greedy_fast_path = temperature <= 0.0f && options_.repetition_penalty <= 1.0f &&
+                                options_.no_repeat_ngram_size <= 1;
   if (greedy_fast_path) {
     if (can_use_greedy_decode_graph()) {
       return decode_next_token_graph(token, position);
@@ -60,15 +54,9 @@ int LlamaEngine::decode_next_token(int token,
   } else {
     forward_token_logits(token, position, &h_logits, nullptr);
   }
-  return detail::dispatch_sample_from_logits(
-      h_logits,
-      temperature,
-      options_.top_k,
-      options_.top_p,
-      options_.repetition_penalty,
-      options_.no_repeat_ngram_size,
-      history);
+  return detail::dispatch_sample_from_logits(h_logits, temperature, options_.top_k, options_.top_p,
+                                             options_.repetition_penalty,
+                                             options_.no_repeat_ngram_size, history);
 }
-
 
 }  // namespace engine

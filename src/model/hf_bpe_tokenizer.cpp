@@ -82,7 +82,7 @@ void append_utf8(std::string* out, std::uint32_t cp) {
 // string.  All methods throw std::runtime_error on a parse error so callers
 // do not need to check return values for validity.
 class JsonCursor {
- public:
+public:
   explicit JsonCursor(const std::string& text) : text_(text) {}
 
   // Advances past any leading whitespace characters.
@@ -269,7 +269,7 @@ class JsonCursor {
     throw std::runtime_error("json parse error: unsupported value");
   }
 
- private:
+private:
   const std::string& text_;
   std::size_t pos_ = 0;
 };
@@ -292,7 +292,8 @@ std::string to_hex_byte(unsigned char value) {
 // check avoids false-positive matches on longer tokens that happen to start
 // with "<0x".
 bool is_byte_token(const std::string& piece, unsigned char* value) {
-  if (piece.size() != 6 || piece[0] != '<' || piece[1] != '0' || piece[2] != 'x' || piece[5] != '>') {
+  if (piece.size() != 6 || piece[0] != '<' || piece[1] != '0' || piece[2] != 'x' ||
+      piece[5] != '>') {
     return false;
   }
   auto hex = [](char ch) -> int {
@@ -466,61 +467,61 @@ void HfBpeTokenizer::load(const std::string& path) {
       if (!cur.consume('{')) {
         cur.skip_value();
       } else {
-      while (!cur.consume('}')) {
-        const std::string subkey = cur.parse_string();
-        cur.expect(':');
-        if (subkey == "type") {
-          const std::string dtype = cur.parse_string();
-          if (dtype == "ByteLevel") {
-            byte_level_ = true;
-          }
-        } else if (subkey == "decoders") {
-          cur.expect('[');
-          if (!cur.consume(']')) {
-            while (true) {
-              cur.expect('{');
-              std::string type;
-              std::string content;
-              int start = 0;
-              while (!cur.consume('}')) {
-                const std::string dk = cur.parse_string();
-                cur.expect(':');
-                if (dk == "type") {
-                  type = cur.parse_string();
-                } else if (dk == "content") {
-                  content = cur.parse_string();
-                } else if (dk == "start") {
-                  start = cur.parse_int();
-                } else {
-                  cur.skip_value();
+        while (!cur.consume('}')) {
+          const std::string subkey = cur.parse_string();
+          cur.expect(':');
+          if (subkey == "type") {
+            const std::string dtype = cur.parse_string();
+            if (dtype == "ByteLevel") {
+              byte_level_ = true;
+            }
+          } else if (subkey == "decoders") {
+            cur.expect('[');
+            if (!cur.consume(']')) {
+              while (true) {
+                cur.expect('{');
+                std::string type;
+                std::string content;
+                int start = 0;
+                while (!cur.consume('}')) {
+                  const std::string dk = cur.parse_string();
+                  cur.expect(':');
+                  if (dk == "type") {
+                    type = cur.parse_string();
+                  } else if (dk == "content") {
+                    content = cur.parse_string();
+                  } else if (dk == "start") {
+                    start = cur.parse_int();
+                  } else {
+                    cur.skip_value();
+                  }
+                  if (cur.consume('}')) {
+                    break;
+                  }
+                  cur.expect(',');
                 }
-                if (cur.consume('}')) {
+                // A Strip decoder with content=" " and start=1 means "remove the
+                // first space from the decoded output", which is how models that
+                // prepend a space to the first word signal that the space is an
+                // encoding artefact rather than genuine whitespace.
+                if (type == "Strip" && content == " " && start == 1) {
+                  strip_leading_space_ = true;
+                }
+                if (cur.consume(']')) {
                   break;
                 }
                 cur.expect(',');
               }
-              // A Strip decoder with content=" " and start=1 means "remove the
-              // first space from the decoded output", which is how models that
-              // prepend a space to the first word signal that the space is an
-              // encoding artefact rather than genuine whitespace.
-              if (type == "Strip" && content == " " && start == 1) {
-                strip_leading_space_ = true;
-              }
-              if (cur.consume(']')) {
-                break;
-              }
-              cur.expect(',');
             }
+          } else {
+            cur.skip_value();
           }
-        } else {
-          cur.skip_value();
+          if (cur.consume('}')) {
+            break;
+          }
+          cur.expect(',');
         }
-        if (cur.consume('}')) {
-          break;
-        }
-        cur.expect(',');
-      }
-      } // end else (decoder was an object)
+      }  // end else (decoder was an object)
     } else if (key == "model") {
       cur.expect('{');
       std::string model_type;
@@ -623,8 +624,7 @@ void HfBpeTokenizer::load(const std::string& path) {
 
   // Sort added tokens by descending length so that the encode() loop performs
   // greedy longest-match when scanning for added/special token occurrences.
-  std::sort(added_tokens_.begin(),
-            added_tokens_.end(),
+  std::sort(added_tokens_.begin(), added_tokens_.end(),
             [](const auto& a, const auto& b) { return a.first.size() > b.first.size(); });
 
   // Fall back to vocabulary lookup for BOS/EOS/UNK if they were not found in
@@ -852,7 +852,8 @@ std::vector<int> HfBpeTokenizer::encode_piece_with_fallback(const std::string& p
 // segments are short (bounded by the longest word in the input), so this is
 // acceptable.  A priority-queue optimisation could reduce this to O(n log n)
 // if profiling identifies this as a bottleneck.
-std::vector<int> HfBpeTokenizer::encode_segment(const std::string& text, bool prepend_boundary) const {
+std::vector<int> HfBpeTokenizer::encode_segment(const std::string& text,
+                                                bool prepend_boundary) const {
   if (text.empty()) {
     return {};
   }
@@ -1067,16 +1068,16 @@ std::string HfBpeTokenizer::decode(const std::vector<int>& ids) const {
         cp = ch;
       } else if (clen == 2) {
         cp = (static_cast<std::uint32_t>(ch & 0x1FU) << 6) |
-             static_cast<std::uint32_t>(static_cast<unsigned char>(raw[i+1]) & 0x3FU);
+             static_cast<std::uint32_t>(static_cast<unsigned char>(raw[i + 1]) & 0x3FU);
       } else if (clen == 3) {
         cp = (static_cast<std::uint32_t>(ch & 0x0FU) << 12) |
-             (static_cast<std::uint32_t>(static_cast<unsigned char>(raw[i+1]) & 0x3FU) << 6) |
-             static_cast<std::uint32_t>(static_cast<unsigned char>(raw[i+2]) & 0x3FU);
+             (static_cast<std::uint32_t>(static_cast<unsigned char>(raw[i + 1]) & 0x3FU) << 6) |
+             static_cast<std::uint32_t>(static_cast<unsigned char>(raw[i + 2]) & 0x3FU);
       } else {
         cp = (static_cast<std::uint32_t>(ch & 0x07U) << 18) |
-             (static_cast<std::uint32_t>(static_cast<unsigned char>(raw[i+1]) & 0x3FU) << 12) |
-             (static_cast<std::uint32_t>(static_cast<unsigned char>(raw[i+2]) & 0x3FU) << 6) |
-             static_cast<std::uint32_t>(static_cast<unsigned char>(raw[i+3]) & 0x3FU);
+             (static_cast<std::uint32_t>(static_cast<unsigned char>(raw[i + 1]) & 0x3FU) << 12) |
+             (static_cast<std::uint32_t>(static_cast<unsigned char>(raw[i + 2]) & 0x3FU) << 6) |
+             static_cast<std::uint32_t>(static_cast<unsigned char>(raw[i + 3]) & 0x3FU);
       }
       i += clen;
       const auto it = unicode_to_byte_.find(cp);

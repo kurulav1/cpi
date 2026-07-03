@@ -43,8 +43,8 @@ int main(int argc, char** argv) {
     return 1;
   }
   const engine::EmbeddingConfig& cfg = embedder.config();
-  std::cerr << "[embed] ready dim=" << embedder.dim() << " pool="
-            << (cfg.pooling == engine::PoolingMode::Mean ? "mean" : "cls")
+  std::cerr << "[embed] ready dim=" << embedder.dim()
+            << " pool=" << (cfg.pooling == engine::PoolingMode::Mean ? "mean" : "cls")
             << " max_tokens=" << embedder.max_tokens() << " model=" << model_dir << "\n"
             << std::flush;
 
@@ -58,8 +58,7 @@ int main(int argc, char** argv) {
     }
     const std::string id = json_get_string(line, "id");
     const std::string input_type = json_get_string(line, "input_type");
-    const std::string prefix =
-        (input_type == "query") ? cfg.query_prefix : cfg.doc_prefix;
+    const std::string prefix = (input_type == "query") ? cfg.query_prefix : cfg.doc_prefix;
 
     // input may be a single string or an array of strings (order preserved).
     std::vector<std::string> inputs;
@@ -76,7 +75,10 @@ int main(int argc, char** argv) {
       for (std::size_t i = 0; i < inputs.size(); ++i) {
         const std::vector<int> ids = tokenizer.encode(prefix + inputs[i], embedder.max_tokens());
         const std::vector<float> v = embedder.embed(ids);
-        if (i) { embs << ","; toks << ","; }
+        if (i) {
+          embs << ",";
+          toks << ",";
+        }
         embs << "[";
         for (std::size_t d = 0; d < v.size(); ++d) {
           if (d) embs << ",";

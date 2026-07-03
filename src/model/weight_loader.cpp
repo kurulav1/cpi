@@ -55,11 +55,11 @@ struct HeaderV3 {
   std::int32_t tensor_parallel;
   std::int32_t tensor_count;
   std::int64_t table_offset;
-  float        rope_theta;      // RoPE base frequency (0 = use family default).
-  float        norm_eps;        // RMSNorm epsilon.
+  float rope_theta;             // RoPE base frequency (0 = use family default).
+  float norm_eps;               // RMSNorm epsilon.
   std::int32_t sliding_window;  // Sliding window attention size (0 = disabled).
-  std::int32_t flags;           // Bit 0: tie_word_embeddings. Bit 1: has_qkv_bias. Bit 2: use_layernorm.
-  std::int32_t model_family_id; // ModelFamily enum value.
+  std::int32_t flags;  // Bit 0: tie_word_embeddings. Bit 1: has_qkv_bias. Bit 2: use_layernorm.
+  std::int32_t model_family_id;  // ModelFamily enum value.
 };
 
 // HeaderV4 extends HeaderV3 with sparse-MoE metadata.
@@ -77,8 +77,8 @@ struct HeaderV4 {
   std::int32_t tensor_parallel;
   std::int32_t tensor_count;
   std::int64_t table_offset;
-  float        rope_theta;
-  float        norm_eps;
+  float rope_theta;
+  float norm_eps;
   std::int32_t sliding_window;
   std::int32_t flags;
   std::int32_t model_family_id;
@@ -102,15 +102,15 @@ struct HeaderV5 {
   std::int32_t tensor_parallel;
   std::int32_t tensor_count;
   std::int64_t table_offset;
-  float        rope_theta;
-  float        norm_eps;
+  float rope_theta;
+  float norm_eps;
   std::int32_t sliding_window;
   std::int32_t flags;
   std::int32_t model_family_id;
   std::int32_t num_local_experts;
   std::int32_t num_experts_per_tok;
   std::int32_t expert_intermediate_size;
-  float        partial_rotary_factor;
+  float partial_rotary_factor;
   std::int32_t linear_num_key_heads;
   std::int32_t linear_num_value_heads;
   std::int32_t attention_type_count;
@@ -199,7 +199,8 @@ void WeightLoader::parse_manifest() {
     config_.num_local_experts = hdr->num_local_experts;
     config_.num_experts_per_tok = hdr->num_experts_per_tok;
     config_.expert_intermediate_size = hdr->expert_intermediate_size;
-    config_.partial_rotary_factor = hdr->partial_rotary_factor > 0.0f ? hdr->partial_rotary_factor : 1.0f;
+    config_.partial_rotary_factor =
+        hdr->partial_rotary_factor > 0.0f ? hdr->partial_rotary_factor : 1.0f;
     config_.linear_num_key_heads = hdr->linear_num_key_heads;
     config_.linear_num_value_heads = hdr->linear_num_value_heads;
 
@@ -210,7 +211,8 @@ void WeightLoader::parse_manifest() {
           static_cast<std::size_t>(hdr->attention_type_offset) + bytes > mmap_.size()) {
         LLAMA_ENGINE_THROW("invalid v5 attention metadata table");
       }
-      const auto* kinds = reinterpret_cast<const std::int32_t*>(mmap_.data() + hdr->attention_type_offset);
+      const auto* kinds =
+          reinterpret_cast<const std::int32_t*>(mmap_.data() + hdr->attention_type_offset);
       config_.layer_attention_kinds.reserve(static_cast<std::size_t>(hdr->attention_type_count));
       for (int i = 0; i < hdr->attention_type_count; ++i) {
         config_.layer_attention_kinds.push_back(static_cast<AttentionKind>(kinds[i]));
@@ -308,7 +310,8 @@ void WeightLoader::parse_manifest() {
     LLAMA_ENGINE_THROW("attention metadata count does not match num_layers");
   }
 
-  if (config_.num_kv_heads <= 0 || config_.num_heads <= 0 || config_.num_heads % config_.num_kv_heads != 0) {
+  if (config_.num_kv_heads <= 0 || config_.num_heads <= 0 ||
+      config_.num_heads % config_.num_kv_heads != 0) {
     LLAMA_ENGINE_THROW("invalid attention head config in model header");
   }
 
@@ -317,8 +320,8 @@ void WeightLoader::parse_manifest() {
   for (int i = 0; i < tensor_count; ++i) {
     const auto& e = table[i];
     std::string name(e.name, strnlen(e.name, sizeof(e.name)));
-    tensors_[name] = TensorSlice{static_cast<std::size_t>(e.offset),
-                                 static_cast<std::size_t>(e.bytes)};
+    tensors_[name] =
+        TensorSlice{static_cast<std::size_t>(e.offset), static_cast<std::size_t>(e.bytes)};
   }
 }
 

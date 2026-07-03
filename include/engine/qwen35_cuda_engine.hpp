@@ -1,14 +1,14 @@
 #pragma once
 
+#include <cublas_v2.h>
+#include <cuda_runtime.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <string>
 #include <utility>
 #include <vector>
-
-#include <cublas_v2.h>
-#include <cuda_runtime.h>
 
 #include "engine/engine_types.hpp"
 #include "engine/generation_constraints.hpp"
@@ -17,29 +17,26 @@
 namespace engine {
 
 class Qwen35CudaEngine {
- public:
+public:
   ~Qwen35CudaEngine();
 
   void initialize(const EngineOptions& options);
 
-  std::vector<int> generate(const std::vector<int>& prompt_tokens,
-                            int max_new_tokens,
+  std::vector<int> generate(const std::vector<int>& prompt_tokens, int max_new_tokens,
                             float temperature);
 
-  std::vector<int> generate_stream(const std::vector<int>& prompt_tokens,
-                                   int max_new_tokens,
-                                   float temperature,
-                                   const std::function<bool(int)>& on_token,
+  std::vector<int> generate_stream(const std::vector<int>& prompt_tokens, int max_new_tokens,
+                                   float temperature, const std::function<bool(int)>& on_token,
                                    const GenerationConstraints* constraints = nullptr);
 
-  std::vector<std::pair<int, float>> inspect_next_logits(
-      const std::vector<int>& prompt_tokens, int top_k);
+  std::vector<std::pair<int, float>> inspect_next_logits(const std::vector<int>& prompt_tokens,
+                                                         int top_k);
 
   const BenchmarkStats& last_benchmark_stats() const {
     return stats_;
   }
 
- private:
+private:
   enum class LayerKind {
     LinearAttention,
     FullAttention,
@@ -115,10 +112,7 @@ class Qwen35CudaEngine {
   void load_token_embedding_to_device(int token);
   void project(const DeviceMatrix& matrix, const void* x, void* y);
   void rowmajor_projection_float(const DeviceMatrix& matrix, const void* x, void* y);
-  void forward_token(int token,
-                     int position,
-                     bool compute_logits,
-                     std::vector<float>* out_logits,
+  void forward_token(int token, int position, bool compute_logits, std::vector<float>* out_logits,
                      int* out_argmax);
   int sample_next_token(float temperature, const std::vector<int>& history);
 

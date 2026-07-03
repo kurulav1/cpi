@@ -15,7 +15,7 @@ namespace {
 // transitions runs the expensive grammar walk a few thousand times per step
 // instead of once per (token x codepoint) across the whole vocabulary.
 class TransitionMemo {
- public:
+public:
   explicit TransitionMemo(const Grammar& grammar) : grammar_(grammar) {}
 
   int intern(std::vector<Stack> stacks) {
@@ -39,13 +39,14 @@ class TransitionMemo {
     if (it != transitions_[static_cast<std::size_t>(id)].end()) {
       return it->second;
     }
-    std::vector<Stack> next = grammar_accept_codepoint(grammar_, states_[static_cast<std::size_t>(id)], cp);
+    std::vector<Stack> next =
+        grammar_accept_codepoint(grammar_, states_[static_cast<std::size_t>(id)], cp);
     const int nid = next.empty() ? -1 : intern(std::move(next));
     transitions_[static_cast<std::size_t>(id)][cp] = nid;  // re-index: `id` is stable
     return nid;
   }
 
- private:
+private:
   static void canonicalize(std::vector<Stack>& stacks) {
     std::sort(stacks.begin(), stacks.end());
     stacks.erase(std::unique(stacks.begin(), stacks.end()), stacks.end());
@@ -75,8 +76,7 @@ class TransitionMemo {
 
 }  // namespace
 
-GrammarSampler::GrammarSampler(Grammar grammar,
-                               const std::vector<std::string>& token_pieces,
+GrammarSampler::GrammarSampler(Grammar grammar, const std::vector<std::string>& token_pieces,
                                int eos_token_id)
     : grammar_(std::move(grammar)),
       token_pieces_(token_pieces),

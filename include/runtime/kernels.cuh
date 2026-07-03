@@ -21,8 +21,9 @@
 
 #pragma once
 
-#include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_runtime.h>
+
 #include <cstdint>
 
 namespace kernels {
@@ -43,12 +44,7 @@ namespace kernels {
 //
 // Algorithm: two-pass block reduction (warp sums -> warp-0 cross-warp sum)
 // with fp32 accumulation, then a single pass applying the computed scale.
-void launch_rmsnorm(const half* x,
-                    const half* weight,
-                    half* y,
-                    int rows,
-                    int cols,
-                    float eps,
+void launch_rmsnorm(const half* x, const half* weight, half* y, int rows, int cols, float eps,
                     cudaStream_t stream);
 
 // launch_rmsnorm_offset
@@ -57,13 +53,8 @@ void launch_rmsnorm(const half* x,
 //   y[row, d] = x[row, d] * rsqrt(mean(x[row]^2) + eps) * (1 + weight[d])
 //
 // Parameters match launch_rmsnorm.
-void launch_rmsnorm_offset(const half* x,
-                           const half* weight,
-                           half* y,
-                           int rows,
-                           int cols,
-                           float eps,
-                           cudaStream_t stream);
+void launch_rmsnorm_offset(const half* x, const half* weight, half* y, int rows, int cols,
+                           float eps, cudaStream_t stream);
 
 // launch_layernorm
 //
@@ -71,14 +62,8 @@ void launch_rmsnorm_offset(const half* x,
 //   y[row, d] = (x[row, d] - mean(row)) * rsqrt(var(row) + eps) * weight[d] + bias[d]
 //
 // bias may be null (treated as zeros).
-void launch_layernorm(const half* x,
-                      const half* weight,
-                      const half* bias,
-                      half* y,
-                      int rows,
-                      int cols,
-                      float eps,
-                      cudaStream_t stream);
+void launch_layernorm(const half* x, const half* weight, const half* bias, half* y, int rows,
+                      int cols, float eps, cudaStream_t stream);
 
 // launch_embedding_lookup
 //
@@ -93,12 +78,8 @@ void launch_layernorm(const half* x,
 //   hidden     - embedding dimension; if divisible by 8 uses int4 vectorised
 //                copies (128-bit loads), else by 2 uses half2, else scalar
 //   stream     - CUDA stream for async launch
-void launch_embedding_lookup(const half* embedding,
-                             const int* token_ids,
-                             half* out,
-                             int num_tokens,
-                             int hidden,
-                             cudaStream_t stream);
+void launch_embedding_lookup(const half* embedding, const int* token_ids, half* out, int num_tokens,
+                             int hidden, cudaStream_t stream);
 
 // launch_rope_inplace
 //
@@ -118,14 +99,8 @@ void launch_embedding_lookup(const half* embedding,
 //   stream       - CUDA stream for async launch
 //
 // Grid: max(num_heads_q, num_heads_k) blocks, head_dim/2 threads per block.
-void launch_rope_inplace(half* q,
-                         half* k,
-                         int num_heads_q,
-                         int num_heads_k,
-                         int head_dim,
-                         int position,
-                         float rope_theta,
-                         cudaStream_t stream);
+void launch_rope_inplace(half* q, half* k, int num_heads_q, int num_heads_k, int head_dim,
+                         int position, float rope_theta, cudaStream_t stream);
 
 // launch_rope_inplace_table
 //
@@ -139,29 +114,17 @@ void launch_rope_inplace(half* q,
 //   position     - row index into cos_table and sin_table
 //   cos_table    - fp32 table, row-major [max_position, head_dim/2]
 //   sin_table    - fp32 table, row-major [max_position, head_dim/2]
-void launch_rope_inplace_table(half* q,
-                               half* k,
-                               int num_heads_q,
-                               int num_heads_k,
-                               int head_dim,
-                               int position,
-                               const float* cos_table,
-                               const float* sin_table,
+void launch_rope_inplace_table(half* q, half* k, int num_heads_q, int num_heads_k, int head_dim,
+                               int position, const float* cos_table, const float* sin_table,
                                cudaStream_t stream);
 
 // launch_rope_inplace_partial_table
 //
 // Partial-RoPE variant that rotates only the first rotary_dim channels of each
 // head and leaves the remaining channels unchanged.
-void launch_rope_inplace_partial_table(half* q,
-                                       half* k,
-                                       int num_heads_q,
-                                       int num_heads_k,
-                                       int head_dim,
-                                       int rotary_dim,
-                                       int position,
-                                       const float* cos_table,
-                                       const float* sin_table,
+void launch_rope_inplace_partial_table(half* q, half* k, int num_heads_q, int num_heads_k,
+                                       int head_dim, int rotary_dim, int position,
+                                       const float* cos_table, const float* sin_table,
                                        cudaStream_t stream);
 
 // launch_rope_inplace_device_pos
@@ -174,15 +137,9 @@ void launch_rope_inplace_partial_table(half* q,
 // Parameters:
 //   position  - device pointer to a single int holding the current position
 //   All other parameters: see launch_rope_inplace_table
-void launch_rope_inplace_device_pos(half* q,
-                                    half* k,
-                                    int num_heads_q,
-                                    int num_heads_k,
-                                    int head_dim,
-                                    const int* position,
-                                    const float* cos_table,
-                                    const float* sin_table,
-                                    cudaStream_t stream);
+void launch_rope_inplace_device_pos(half* q, half* k, int num_heads_q, int num_heads_k,
+                                    int head_dim, const int* position, const float* cos_table,
+                                    const float* sin_table, cudaStream_t stream);
 
 // launch_rope_inplace_batched
 //
@@ -199,28 +156,14 @@ void launch_rope_inplace_device_pos(half* q,
 //   stream       - CUDA stream for async launch
 //
 // Grid: (max(num_heads_q, num_heads_k), num_tokens), head_dim/2 threads.
-void launch_rope_inplace_batched(half* q,
-                                 half* k,
-                                 int num_tokens,
-                                 int num_heads_q,
-                                 int num_heads_k,
-                                 int head_dim,
-                                 int start_position,
-                                 const float* cos_table,
-                                 const float* sin_table,
-                                 cudaStream_t stream);
+void launch_rope_inplace_batched(half* q, half* k, int num_tokens, int num_heads_q, int num_heads_k,
+                                 int head_dim, int start_position, const float* cos_table,
+                                 const float* sin_table, cudaStream_t stream);
 
 // Per-position RoPE (P2 batched decode): row `i` rotated at positions[i].
-void launch_rope_inplace_perpos(half* q,
-                                half* k,
-                                int num_tokens,
-                                int num_heads_q,
-                                int num_heads_k,
-                                int head_dim,
-                                const int* positions,
-                                const float* cos_table,
-                                const float* sin_table,
-                                cudaStream_t stream);
+void launch_rope_inplace_perpos(half* q, half* k, int num_tokens, int num_heads_q, int num_heads_k,
+                                int head_dim, const int* positions, const float* cos_table,
+                                const float* sin_table, cudaStream_t stream);
 
 // launch_attention_step
 //
@@ -254,62 +197,31 @@ void launch_rope_inplace_perpos(half* q,
 //     chunk_stats + chunk_reduce two-pass kernels
 //   - tiled path: head_dim even and <=256 -> flash-attention tile merge
 //   - fallback: scalar per-token online softmax
-void launch_attention_step(const half* q,
-                           const half* k_cache,
-                           const half* v_cache,
-                           half* out,
-                           int seq_len,
-                           int num_heads,
-                           int num_kv_heads,
-                           int head_dim,
-                           cudaStream_t stream,
-                           float* scratch_m = nullptr,
-                           float* scratch_l = nullptr,
-                           float* scratch_o = nullptr,
-                           int scratch_chunks = 0,
-                           bool allow_split = true);
+void launch_attention_step(const half* q, const half* k_cache, const half* v_cache, half* out,
+                           int seq_len, int num_heads, int num_kv_heads, int head_dim,
+                           cudaStream_t stream, float* scratch_m = nullptr,
+                           float* scratch_l = nullptr, float* scratch_o = nullptr,
+                           int scratch_chunks = 0, bool allow_split = true);
 
 // Paged split-K decode attention (P3). K/V live in a block pool laid out like a
 // flat cache of (num_blocks*block_size) tokens; block_table[c] gives the physical
 // block for logical chunk c (block_size == the split chunk). Same math/output as
 // launch_attention_step's split-K path; enables non-contiguous KV.
-void launch_attention_step_paged(const half* q,
-                                 const half* k_pool,
-                                 const half* v_pool,
-                                 const int* block_table,
-                                 half* out,
-                                 int seq_len,
-                                 int num_heads,
-                                 int num_kv_heads,
-                                 int head_dim,
-                                 int block_size,
-                                 cudaStream_t stream,
-                                 float* scratch_m,
-                                 float* scratch_l,
-                                 float* scratch_o,
-                                 int scratch_chunks);
+void launch_attention_step_paged(const half* q, const half* k_pool, const half* v_pool,
+                                 const int* block_table, half* out, int seq_len, int num_heads,
+                                 int num_kv_heads, int head_dim, int block_size,
+                                 cudaStream_t stream, float* scratch_m, float* scratch_l,
+                                 float* scratch_o, int scratch_chunks);
 
 // Batched paged decode attention (P2 primitive): one decode step for `batch`
 // sequences in one launch. block_tables/seq_lens are per-sequence; q/out/scratch
 // are batched ([batch][num_heads][...]); all share the one KV block pool.
-void launch_attention_step_batched_paged(const half* q,
-                                         const half* k_pool,
-                                         const half* v_pool,
-                                         const int* block_tables,
-                                         const int* seq_lens,
-                                         int max_blocks,
-                                         int max_seq_len,
-                                         half* out,
-                                         int batch,
-                                         int num_heads,
-                                         int num_kv_heads,
-                                         int head_dim,
-                                         int block_size,
-                                         cudaStream_t stream,
-                                         float* scratch_m,
-                                         float* scratch_l,
-                                         float* scratch_o,
-                                         int scratch_chunks);
+void launch_attention_step_batched_paged(const half* q, const half* k_pool, const half* v_pool,
+                                         const int* block_tables, const int* seq_lens,
+                                         int max_blocks, int max_seq_len, half* out, int batch,
+                                         int num_heads, int num_kv_heads, int head_dim,
+                                         int block_size, cudaStream_t stream, float* scratch_m,
+                                         float* scratch_l, float* scratch_o, int scratch_chunks);
 
 // launch_attention_step_device_pos
 //
@@ -325,19 +237,11 @@ void launch_attention_step_batched_paged(const half* q,
 // Note: when split-K scratch buffers are provided the grid is launched with
 // scratch_chunks columns so all chunks run unconditionally; individual blocks
 // whose chunk_start >= seq_len exit early.
-void launch_attention_step_device_pos(const half* q,
-                                      const half* k_cache,
-                                      const half* v_cache,
-                                      half* out,
-                                      const int* position,
-                                      int num_heads,
-                                      int num_kv_heads,
-                                      int head_dim,
-                                      cudaStream_t stream,
-                                      float* scratch_m = nullptr,
-                                      float* scratch_l = nullptr,
-                                      float* scratch_o = nullptr,
-                                      int scratch_chunks = 0,
+void launch_attention_step_device_pos(const half* q, const half* k_cache, const half* v_cache,
+                                      half* out, const int* position, int num_heads,
+                                      int num_kv_heads, int head_dim, cudaStream_t stream,
+                                      float* scratch_m = nullptr, float* scratch_l = nullptr,
+                                      float* scratch_o = nullptr, int scratch_chunks = 0,
                                       bool allow_split = true);
 
 // launch_store_kv_device_pos
@@ -357,13 +261,8 @@ void launch_attention_step_device_pos(const half* q,
 //
 // Uses 128-bit vectorised (int4) stores when all four pointers are 16-byte
 // aligned and kv_hidden is divisible by 8.
-void launch_store_kv_device_pos(const half* k,
-                                const half* v,
-                                half* k_cache,
-                                half* v_cache,
-                                const int* position,
-                                int kv_hidden,
-                                int max_context,
+void launch_store_kv_device_pos(const half* k, const half* v, half* k_cache, half* v_cache,
+                                const int* position, int kv_hidden, int max_context,
                                 cudaStream_t stream);
 
 // launch_copy_int / launch_increment_int
@@ -396,54 +295,24 @@ void launch_increment_int(int* value, cudaStream_t stream);
 // Grid: (num_heads, num_tokens); one block per (head, token) pair.
 // Kernel selection: tiled (flash-attention style) when head_dim even and
 // <=256, otherwise scalar per-token online softmax fallback.
-void launch_attention_prefill(const half* q,
-                              const half* k_cache,
-                              const half* v_cache,
-                              half* out,
-                              int num_tokens,
-                              int start_position,
-                              int num_heads,
-                              int num_kv_heads,
-                              int head_dim,
-                              cudaStream_t stream);
+void launch_attention_prefill(const half* q, const half* k_cache, const half* v_cache, half* out,
+                              int num_tokens, int start_position, int num_heads, int num_kv_heads,
+                              int head_dim, cudaStream_t stream);
 
 // Paged prefill attention + paged KV scatter (P3 phase 2d). K/V live in a block
 // pool; block_table maps logical chunk -> physical block (block_size tokens each).
-void launch_attention_prefill_paged(const half* q,
-                                     const half* k_pool,
-                                     const half* v_pool,
-                                     const int* block_table,
-                                     half* out,
-                                     int num_tokens,
-                                     int start_position,
-                                     int num_heads,
-                                     int num_kv_heads,
-                                     int head_dim,
-                                     int block_size,
-                                     cudaStream_t stream);
-void launch_store_kv_paged(half* k_pool,
-                           half* v_pool,
-                           const half* k_src,
-                           const half* v_src,
-                           const int* block_table,
-                           int base_pos,
-                           int rows,
-                           int kv_hidden,
-                           int block_size,
-                           cudaStream_t stream);
+void launch_attention_prefill_paged(const half* q, const half* k_pool, const half* v_pool,
+                                    const int* block_table, half* out, int num_tokens,
+                                    int start_position, int num_heads, int num_kv_heads,
+                                    int head_dim, int block_size, cudaStream_t stream);
+void launch_store_kv_paged(half* k_pool, half* v_pool, const half* k_src, const half* v_src,
+                           const int* block_table, int base_pos, int rows, int kv_hidden,
+                           int block_size, cudaStream_t stream);
 // Batched decode KV scatter (P2): one token per sequence to its own block table
 // at positions[b].
-void launch_store_kv_batched_paged(half* k_pool,
-                                   half* v_pool,
-                                   const half* k_src,
-                                   const half* v_src,
-                                   const int* block_tables,
-                                   const int* positions,
-                                   int max_blocks,
-                                   int batch,
-                                   int kv_hidden,
-                                   int block_size,
-                                   cudaStream_t stream);
+void launch_store_kv_batched_paged(half* k_pool, half* v_pool, const half* k_src, const half* v_src,
+                                   const int* block_tables, const int* positions, int max_blocks,
+                                   int batch, int kv_hidden, int block_size, cudaStream_t stream);
 
 // launch_add_inplace
 //
@@ -473,15 +342,14 @@ void launch_add_inplace(half* x, const half* y, int n, cudaStream_t stream);
 //   rows   - number of rows (token count for prefill)
 //   cols   - number of columns (projection output dimension)
 //   stream - CUDA stream
-void launch_add_bias_broadcast(half* out, const half* bias, int rows, int cols, cudaStream_t stream);
+void launch_add_bias_broadcast(half* out, const half* bias, int rows, int cols,
+                               cudaStream_t stream);
 
 // launch_add_bias_inplace_float_from_half
 //
 // Adds an fp16 bias vector to an fp32 vector in place:
 //   out[i] += float(bias[i])
-void launch_add_bias_inplace_float_from_half(float* out,
-                                             const half* bias,
-                                             int n,
+void launch_add_bias_inplace_float_from_half(float* out, const half* bias, int n,
                                              cudaStream_t stream);
 
 // launch_silu_mul
@@ -497,66 +365,35 @@ void launch_add_bias_inplace_float_from_half(float* out,
 //   stream - CUDA stream
 //
 // Uses half2 vectorised paths when n is even and all pointers are aligned.
-void launch_silu_mul(const half* gate,
-                     const half* up,
-                     half* out,
-                     int n,
-                     cudaStream_t stream);
+void launch_silu_mul(const half* gate, const half* up, half* out, int n, cudaStream_t stream);
 
 // launch_apply_sigmoid_gate_inplace
 //
 // Element-wise gated multiply used by Qwen3.5 full attention:
 //   values[i] *= sigmoid(gate[i])
-void launch_apply_sigmoid_gate_inplace(half* values,
-                                       const half* gate,
-                                       int n,
-                                       cudaStream_t stream);
+void launch_apply_sigmoid_gate_inplace(half* values, const half* gate, int n, cudaStream_t stream);
 
 // launch_split_interleaved_head_halves
 //
 // Splits a tensor laid out as repeated per-head pairs:
 //   src[head] = [first_half, second_half]
 // into two separate outputs.
-void launch_split_interleaved_head_halves(const half* src,
-                                          half* first,
-                                          half* second,
-                                          int heads,
-                                          int head_dim,
-                                          cudaStream_t stream);
+void launch_split_interleaved_head_halves(const half* src, half* first, half* second, int heads,
+                                          int head_dim, cudaStream_t stream);
 
 // Qwen3.5 linear-attention helpers.
-void launch_qwen35_linear_conv1d_silu(const half* conv_weight,
-                                      float* conv_state,
-                                      half* qkv_mix,
-                                      int channels,
-                                      int kernel_size,
-                                      cudaStream_t stream);
+void launch_qwen35_linear_conv1d_silu(const half* conv_weight, float* conv_state, half* qkv_mix,
+                                      int channels, int kernel_size, cudaStream_t stream);
 
-void launch_qwen35_repeat_linear_heads(const half* qkv_mix,
-                                       half* q_out,
-                                       half* k_out,
-                                       half* v_out,
-                                       int num_key_heads,
-                                       int num_value_heads,
-                                       int key_head_dim,
-                                       int value_head_dim,
-                                       cudaStream_t stream);
+void launch_qwen35_repeat_linear_heads(const half* qkv_mix, half* q_out, half* k_out, half* v_out,
+                                       int num_key_heads, int num_value_heads, int key_head_dim,
+                                       int value_head_dim, cudaStream_t stream);
 
-void launch_qwen35_linear_attention_step(const half* q,
-                                         const half* k,
-                                         const half* v,
-                                         const half* z,
-                                         const half* a,
-                                         const half* b,
-                                         const float* norm_weight,
-                                         const float* a_log,
-                                         const half* dt_bias,
-                                         float* recurrent_state,
-                                         half* out,
-                                         int num_heads,
-                                         int key_head_dim,
-                                         int value_head_dim,
-                                         float rms_eps,
+void launch_qwen35_linear_attention_step(const half* q, const half* k, const half* v, const half* z,
+                                         const half* a, const half* b, const float* norm_weight,
+                                         const float* a_log, const half* dt_bias,
+                                         float* recurrent_state, half* out, int num_heads,
+                                         int key_head_dim, int value_head_dim, float rms_eps,
                                          cudaStream_t stream);
 
 // launch_scale_copy
@@ -570,11 +407,7 @@ void launch_qwen35_linear_attention_step(const half* q,
 //   n      - number of elements
 //   scale  - fp32 scalar multiplier
 //   stream - CUDA stream
-void launch_scale_copy(half* dst,
-                       const half* src,
-                       int n,
-                       float scale,
-                       cudaStream_t stream);
+void launch_scale_copy(half* dst, const half* src, int n, float scale, cudaStream_t stream);
 
 // launch_scale_add_inplace
 //
@@ -587,11 +420,7 @@ void launch_scale_copy(half* dst,
 //   n      - number of elements
 //   scale  - fp32 scalar multiplier
 //   stream - CUDA stream
-void launch_scale_add_inplace(half* dst,
-                              const half* src,
-                              int n,
-                              float scale,
-                              cudaStream_t stream);
+void launch_scale_add_inplace(half* dst, const half* src, int n, float scale, cudaStream_t stream);
 
 // launch_moe_router_topk_softmax
 //
@@ -605,12 +434,8 @@ void launch_scale_add_inplace(half* dst,
 //   topk_idx    - selected expert indices [top_k]
 //   topk_prob   - selected normalized gate probabilities [top_k]
 //   stream      - CUDA stream
-void launch_moe_router_topk_softmax(const half* logits,
-                                    int experts,
-                                    int top_k,
-                                    int* topk_idx,
-                                    float* topk_prob,
-                                    cudaStream_t stream);
+void launch_moe_router_topk_softmax(const half* logits, int experts, int top_k, int* topk_idx,
+                                    float* topk_prob, cudaStream_t stream);
 
 // launch_dequant_int8_to_fp16
 //
@@ -623,10 +448,7 @@ void launch_moe_router_topk_softmax(const half* logits,
 //   n      - number of elements
 //   scale  - scalar dequantisation factor (host float)
 //   stream - CUDA stream
-void launch_dequant_int8_to_fp16(const std::int8_t* src,
-                                 half* dst,
-                                 int n,
-                                 float scale,
+void launch_dequant_int8_to_fp16(const std::int8_t* src, half* dst, int n, float scale,
                                  cudaStream_t stream);
 
 // launch_dequant_rowwise_int8_to_fp16
@@ -641,12 +463,8 @@ void launch_dequant_int8_to_fp16(const std::int8_t* src,
 //   rows   - number of rows
 //   cols   - number of columns per row
 //   stream - CUDA stream
-void launch_dequant_rowwise_int8_to_fp16(const std::int8_t* src,
-                                         const float* scales,
-                                         half* dst,
-                                         int rows,
-                                         int cols,
-                                         cudaStream_t stream);
+void launch_dequant_rowwise_int8_to_fp16(const std::int8_t* src, const float* scales, half* dst,
+                                         int rows, int cols, cudaStream_t stream);
 
 // launch_quantize_rowwise_fp16_to_int8
 //
@@ -664,22 +482,14 @@ void launch_dequant_rowwise_int8_to_fp16(const std::int8_t* src,
 //   cols   - columns per row; if even uses half2 vectorised max reduction
 //   stream - CUDA stream
 //   max_q  - positive symmetric quant bound (default 127)
-void launch_quantize_rowwise_fp16_to_int8(const half* src,
-                                          std::int8_t* dst,
-                                          float* scales,
-                                          int rows,
-                                          int cols,
-                                          cudaStream_t stream,
-                                          int max_q = 127);
+void launch_quantize_rowwise_fp16_to_int8(const half* src, std::int8_t* dst, float* scales,
+                                          int rows, int cols, cudaStream_t stream, int max_q = 127);
 
 // launch_pack_rowwise_int8_to_int4
 //
 // Packs row-major signed int8 values into signed int4 (two values per byte).
 // Input is expected to be within the int4 range [-8, 7]; values are clamped.
-void launch_pack_rowwise_int8_to_int4(const std::int8_t* src,
-                                      std::int8_t* dst,
-                                      int rows,
-                                      int cols,
+void launch_pack_rowwise_int8_to_int4(const std::int8_t* src, std::int8_t* dst, int rows, int cols,
                                       cudaStream_t stream);
 
 // launch_weight_only_int8_matvec
@@ -695,12 +505,8 @@ void launch_pack_rowwise_int8_to_int4(const std::int8_t* src,
 //   out_features - number of output rows (one block per row)
 //   in_features  - inner dimension; reduction done with shared-memory tree
 //   stream       - CUDA stream
-void launch_weight_only_int8_matvec(const std::int8_t* w,
-                                    const float* scales,
-                                    const half* x,
-                                    half* y,
-                                    int out_features,
-                                    int in_features,
+void launch_weight_only_int8_matvec(const std::int8_t* w, const float* scales, const half* x,
+                                    half* y, int out_features, int in_features,
                                     cudaStream_t stream);
 
 // launch_weight_only_int8_matvec_batched
@@ -719,14 +525,9 @@ void launch_weight_only_int8_matvec(const std::int8_t* w,
 //   stream       - CUDA stream
 //
 // Grid: (out_features, batch_size).
-void launch_weight_only_int8_matvec_batched(const std::int8_t* w,
-                                            const float* scales,
-                                            const half* x,
-                                            half* y,
-                                            int batch_size,
-                                            int out_features,
-                                            int in_features,
-                                            cudaStream_t stream);
+void launch_weight_only_int8_matvec_batched(const std::int8_t* w, const float* scales,
+                                            const half* x, half* y, int batch_size,
+                                            int out_features, int in_features, cudaStream_t stream);
 
 // launch_weight_only_int8_matvec_batched_dp4a
 //
@@ -747,15 +548,10 @@ void launch_weight_only_int8_matvec_batched(const std::int8_t* w,
 //
 // Uses int4 (128-bit) loads when in_features is divisible by 16, then int
 // (32-bit / 4 elements) loads for the remainder, then scalar for any tail.
-void launch_weight_only_int8_matvec_batched_dp4a(const std::int8_t* w,
-                                                 const float* w_scales,
-                                                 const std::int8_t* x,
-                                                 const float* x_scales,
-                                                 half* y,
-                                                 int batch_size,
-                                                 int out_features,
-                                                 int in_features,
-                                                 cudaStream_t stream);
+void launch_weight_only_int8_matvec_batched_dp4a(const std::int8_t* w, const float* w_scales,
+                                                 const std::int8_t* x, const float* x_scales,
+                                                 half* y, int batch_size, int out_features,
+                                                 int in_features, cudaStream_t stream);
 
 // launch_weight_only_int8_matvec_dp4a
 //
@@ -774,16 +570,10 @@ void launch_weight_only_int8_matvec_batched_dp4a(const std::int8_t* w,
 //   x/x_scale    - int8 input [in_features] and single device scale pointer
 //   y            - fp16 output [out_features]
 //   stream       - CUDA stream
-void launch_weight_only_int8_matvec_dp4a(const std::int8_t* w,
-                                         const float* w_scales,
-                                         const std::int8_t* x,
-                                         const float* x_scale,
-                                         half* y,
-                                         int out_features,
-                                         int in_features,
-                                         cudaStream_t stream,
-                                         int warps_per_block = 0,
-                                         int tile_packed4 = 0,
+void launch_weight_only_int8_matvec_dp4a(const std::int8_t* w, const float* w_scales,
+                                         const std::int8_t* x, const float* x_scale, half* y,
+                                         int out_features, int in_features, cudaStream_t stream,
+                                         int warps_per_block = 0, int tile_packed4 = 0,
                                          int warps_per_row = 1);
 
 // launch_weight_only_int8_matvec_dual_dp4a
@@ -803,93 +593,56 @@ void launch_weight_only_int8_matvec_dp4a(const std::int8_t* w,
 //   out_features/in_features - weight matrix dimensions
 //   stream         - CUDA stream
 //   warps_per_block/tile_packed4/warps_per_row - see launch_weight_only_int8_matvec_dp4a
-void launch_weight_only_int8_matvec_dual_dp4a(const std::int8_t* w_a,
-                                              const float* w_scales_a,
-                                              const std::int8_t* w_b,
-                                              const float* w_scales_b,
-                                              const std::int8_t* x,
-                                              const float* x_scale,
-                                              half* y_a,
-                                              half* y_b,
-                                              int out_features,
-                                              int in_features,
-                                              cudaStream_t stream,
-                                              int warps_per_block = 0,
-                                              int tile_packed4 = 0,
-                                              int warps_per_row = 1);
+void launch_weight_only_int8_matvec_dual_dp4a(const std::int8_t* w_a, const float* w_scales_a,
+                                              const std::int8_t* w_b, const float* w_scales_b,
+                                              const std::int8_t* x, const float* x_scale, half* y_a,
+                                              half* y_b, int out_features, int in_features,
+                                              cudaStream_t stream, int warps_per_block = 0,
+                                              int tile_packed4 = 0, int warps_per_row = 1);
 
 // launch_weight_only_int4_matvec
 //
 // Weight-only int4 matrix-vector multiply with per-row scales and fp16 input.
 // Weights are packed row-major with two signed int4 values per byte
 // (low nibble first), matching .int4 tensor layout.
-void launch_weight_only_int4_matvec(const std::int8_t* w_packed,
-                                    const float* scales,
-                                    const half* x,
-                                    half* y,
-                                    int out_features,
-                                    int in_features,
+void launch_weight_only_int4_matvec(const std::int8_t* w_packed, const float* scales, const half* x,
+                                    half* y, int out_features, int in_features,
                                     cudaStream_t stream);
 
 // launch_weight_only_int4_matvec_batched
 //
 // Batched variant of launch_weight_only_int4_matvec using fp16 activations.
-void launch_weight_only_int4_matvec_batched(const std::int8_t* w_packed,
-                                            const float* scales,
-                                            const half* x,
-                                            half* y,
-                                            int batch_size,
-                                            int out_features,
-                                            int in_features,
-                                            cudaStream_t stream);
+void launch_weight_only_int4_matvec_batched(const std::int8_t* w_packed, const float* scales,
+                                            const half* x, half* y, int batch_size,
+                                            int out_features, int in_features, cudaStream_t stream);
 
 // launch_weight_only_int4_matvec_batched_dp4a
 //
 // Batched int4(weight) x int8(activation) GEMV using dp4a. The input
 // activations are int8 with one scale per batch row.
-void launch_weight_only_int4_matvec_batched_dp4a(const std::int8_t* w_packed,
-                                                 const float* w_scales,
-                                                 const std::int8_t* x,
-                                                 const float* x_scales,
-                                                 half* y,
-                                                 int batch_size,
-                                                 int out_features,
-                                                 int in_features,
-                                                 cudaStream_t stream);
+void launch_weight_only_int4_matvec_batched_dp4a(const std::int8_t* w_packed, const float* w_scales,
+                                                 const std::int8_t* x, const float* x_scales,
+                                                 half* y, int batch_size, int out_features,
+                                                 int in_features, cudaStream_t stream);
 
 // launch_weight_only_int4_matvec_dp4a
 //
 // Single-row (batch=1) int4(weight) x int8(activation) GEMV using dp4a.
-void launch_weight_only_int4_matvec_dp4a(const std::int8_t* w_packed,
-                                         const float* w_scales,
-                                         const std::int8_t* x,
-                                         const float* x_scale,
-                                         half* y,
-                                         int out_features,
-                                         int in_features,
-                                         cudaStream_t stream,
-                                         int warps_per_block = 0,
-                                         int tile_packed4 = 0,
+void launch_weight_only_int4_matvec_dp4a(const std::int8_t* w_packed, const float* w_scales,
+                                         const std::int8_t* x, const float* x_scale, half* y,
+                                         int out_features, int in_features, cudaStream_t stream,
+                                         int warps_per_block = 0, int tile_packed4 = 0,
                                          int warps_per_row = 1);
 
 // launch_weight_only_int4_matvec_dual_dp4a
 //
 // Dual-output dp4a GEMV for two packed-int4 weight matrices sharing the same
 // int8 input activation vector and scale.
-void launch_weight_only_int4_matvec_dual_dp4a(const std::int8_t* w_a_packed,
-                                              const float* w_scales_a,
-                                              const std::int8_t* w_b_packed,
-                                              const float* w_scales_b,
-                                              const std::int8_t* x,
-                                              const float* x_scale,
-                                              half* y_a,
-                                              half* y_b,
-                                              int out_features,
-                                              int in_features,
-                                              cudaStream_t stream,
-                                              int warps_per_block = 0,
-                                              int tile_packed4 = 0,
-                                              int warps_per_row = 1);
+void launch_weight_only_int4_matvec_dual_dp4a(
+    const std::int8_t* w_a_packed, const float* w_scales_a, const std::int8_t* w_b_packed,
+    const float* w_scales_b, const std::int8_t* x, const float* x_scale, half* y_a, half* y_b,
+    int out_features, int in_features, cudaStream_t stream, int warps_per_block = 0,
+    int tile_packed4 = 0, int warps_per_row = 1);
 
 // launch_rowmajor_half_gemv_f16
 //
@@ -915,15 +668,9 @@ void launch_weight_only_int4_matvec_dual_dp4a(const std::int8_t* w_a_packed,
 //                     out_features >= 8192 heuristic when 0)
 //   tile_pairs      - half2 elements staged per shared-memory tile (128 or 256)
 //   rows_per_warp   - output rows assigned to each warp (1 or 2)
-void launch_rowmajor_half_gemv_f16(const half* w,
-                                   const half* x,
-                                   half* y,
-                                   int out_features,
-                                   int in_features,
-                                   cudaStream_t stream,
-                                   int warps_per_block = 0,
-                                   int tile_pairs = 0,
-                                   int rows_per_warp = 1);
+void launch_rowmajor_half_gemv_f16(const half* w, const half* x, half* y, int out_features,
+                                   int in_features, cudaStream_t stream, int warps_per_block = 0,
+                                   int tile_pairs = 0, int rows_per_warp = 1);
 
 // launch_rowmajor_half_gemv_f32
 //
@@ -936,15 +683,9 @@ void launch_rowmajor_half_gemv_f16(const half* w,
 //
 // The same templated kernel (rowmajor_half_gemv_kernel) is instantiated with
 // OutT=float; the only difference is the final store path.
-void launch_rowmajor_half_gemv_f32(const half* w,
-                                   const half* x,
-                                   float* y,
-                                   int out_features,
-                                   int in_features,
-                                   cudaStream_t stream,
-                                   int warps_per_block = 0,
-                                   int tile_pairs = 0,
-                                   int rows_per_warp = 1);
+void launch_rowmajor_half_gemv_f32(const half* w, const half* x, float* y, int out_features,
+                                   int in_features, cudaStream_t stream, int warps_per_block = 0,
+                                   int tile_pairs = 0, int rows_per_warp = 1);
 
 // launch_argmax_float
 //
@@ -959,10 +700,7 @@ void launch_rowmajor_half_gemv_f32(const half* w,
 //
 // Uses a two-level warp-argmax reduction (per-warp then across warps in
 // warp 0) within a single block of 256 threads.
-void launch_argmax_float(const float* logits,
-                         int n,
-                         int* out_index,
-                         cudaStream_t stream);
+void launch_argmax_float(const float* logits, int n, int* out_index, cudaStream_t stream);
 
 // launch_convert_bf16_to_fp16
 //
@@ -974,10 +712,7 @@ void launch_argmax_float(const float* logits,
 //   dst    - output fp16 tensor [n]
 //   n      - number of elements
 //   stream - CUDA stream
-void launch_convert_bf16_to_fp16(const std::uint16_t* src,
-                                 half* dst,
-                                 int n,
-                                 cudaStream_t stream);
+void launch_convert_bf16_to_fp16(const std::uint16_t* src, half* dst, int n, cudaStream_t stream);
 
 // launch_store_kv_int4
 //
@@ -998,17 +733,9 @@ void launch_convert_bf16_to_fp16(const std::uint16_t* src,
 //   head_dim       - dimension per head; must be a multiple of 32
 //   max_context    - cache capacity
 //   stream         - CUDA stream
-void launch_store_kv_int4(const half*  k,
-                           const half*  v,
-                           int8_t*      k_cache_i4,
-                           int8_t*      v_cache_i4,
-                           half*        k_scales,
-                           half*        v_scales,
-                           int          position,
-                           int          num_kv_heads,
-                           int          head_dim,
-                           int          max_context,
-                           cudaStream_t stream);
+void launch_store_kv_int4(const half* k, const half* v, int8_t* k_cache_i4, int8_t* v_cache_i4,
+                          half* k_scales, half* v_scales, int position, int num_kv_heads,
+                          int head_dim, int max_context, cudaStream_t stream);
 
 // launch_attention_step_int4
 //
@@ -1034,22 +761,12 @@ void launch_store_kv_int4(const half*  k,
 //   scratch_m/l/o  - split-K scratch buffers (same layout as launch_attention_step)
 //   scratch_chunks - capacity of scratch buffers in chunks
 //   allow_split    - enable split-K path (requires head_dim==128, seq_len>=64, scratch)
-void launch_attention_step_int4(const half*   q,
-                                 const int8_t* k_cache_i4,
-                                 const int8_t* v_cache_i4,
-                                 const half*   k_scales,
-                                 const half*   v_scales,
-                                 half*         out,
-                                 int           seq_len,
-                                 int           num_heads,
-                                 int           num_kv_heads,
-                                 int           head_dim,
-                                 cudaStream_t  stream,
-                                 float*        scratch_m    = nullptr,
-                                 float*        scratch_l    = nullptr,
-                                 float*        scratch_o    = nullptr,
-                                 int           scratch_chunks = 0,
-                                 bool          allow_split  = false);
+void launch_attention_step_int4(const half* q, const int8_t* k_cache_i4, const int8_t* v_cache_i4,
+                                const half* k_scales, const half* v_scales, half* out, int seq_len,
+                                int num_heads, int num_kv_heads, int head_dim, cudaStream_t stream,
+                                float* scratch_m = nullptr, float* scratch_l = nullptr,
+                                float* scratch_o = nullptr, int scratch_chunks = 0,
+                                bool allow_split = false);
 
 // ── TurboQuant 3-bit (TQ3) kernels ───────────────────────────────────────────
 
@@ -1071,7 +788,8 @@ void launch_attention_step_int4(const half*   q,
 //   stream     - CUDA stream
 //
 // Launches (n / block_size) CUDA blocks with 512 threads each.
-void launch_hadamard_rotate_fp16(half* x, const int8_t* signs, int n, int block_size, cudaStream_t stream);
+void launch_hadamard_rotate_fp16(half* x, const int8_t* signs, int n, int block_size,
+                                 cudaStream_t stream);
 
 // launch_tq3_gemv_f16
 //
@@ -1096,34 +814,21 @@ void launch_hadamard_rotate_fp16(half* x, const int8_t* signs, int n, int block_
 //
 // Grid: ceil(out_features/8) blocks, 256 threads (8 warps, one per row).
 // Shared memory: in_features*2 + 32 bytes.
-void launch_tq3_gemv_f16(const uint32_t* w_packed,
-                          const half*     codebook,
-                          const half*     scales,
-                          const half*     x,
-                          half*           y,
-                          int             out_features,
-                          int             in_features,
-                          cudaStream_t    stream);
+void launch_tq3_gemv_f16(const uint32_t* w_packed, const half* codebook, const half* scales,
+                         const half* x, half* y, int out_features, int in_features,
+                         cudaStream_t stream);
 
 // Builds packed sign bits for projected coordinates of x:
 //   bit[j] = sign(signs[j] * x[indices[j]]) >= 0
 // Output is packed little-endian in uint32 words.
-void launch_tq_qjl_pack_sign_bits(const half*     x,
-                                  const int32_t*  indices,
-                                  const int8_t*   signs,
-                                  uint32_t*       out_bits,
-                                  int             qjl_dim,
-                                  cudaStream_t    stream);
+void launch_tq_qjl_pack_sign_bits(const half* x, const int32_t* indices, const int8_t* signs,
+                                  uint32_t* out_bits, int qjl_dim, cudaStream_t stream);
 
 // Adds residual 1-bit correction (Qprod stage-B style) to y:
 //   y[row] += scales[row] * corr(sign(row_bits), sign(x_bits))
 // where corr is normalized sign-agreement in [-1, 1].
-void launch_tq_qjl_residual_add_f16(const uint32_t* row_bits,
-                                    const half*     scales,
-                                    const uint32_t* x_bits,
-                                    half*           y,
-                                    int             out_features,
-                                    int             qjl_dim,
-                                    cudaStream_t    stream);
+void launch_tq_qjl_residual_add_f16(const uint32_t* row_bits, const half* scales,
+                                    const uint32_t* x_bits, half* y, int out_features, int qjl_dim,
+                                    cudaStream_t stream);
 
 }  // namespace kernels

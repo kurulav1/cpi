@@ -2,13 +2,13 @@
 //
 // CUDA kernels and host launch wrappers for INT4 decode-time attention paths.
 
-#include "runtime/kernels.cuh"
+#include <cuda_fp16.h>
+#include <sm_61_intrinsics.h>
 
 #include <cstddef>
 #include <cstdint>
 
-#include <cuda_fp16.h>
-#include <sm_61_intrinsics.h>
+#include "runtime/kernels.cuh"
 
 namespace kernels {
 namespace {
@@ -28,14 +28,9 @@ __device__ __forceinline__ float neg_inf<float>() {
   return -3.402823466e+38F;
 }
 
-__global__ void attention_step_chunk_reduce_kernel(const float* chunk_m,
-                                                   const float* chunk_l,
-                                                   const float* chunk_o,
-                                                   half* out,
-                                                   int seq_len,
-                                                   int num_heads,
-                                                   int head_dim,
-                                                   int chunk_size,
+__global__ void attention_step_chunk_reduce_kernel(const float* chunk_m, const float* chunk_l,
+                                                   const float* chunk_o, half* out, int seq_len,
+                                                   int num_heads, int head_dim, int chunk_size,
                                                    int scratch_chunks) {
   __shared__ float scale_shared[3];
   const int head = blockIdx.x;
@@ -63,9 +58,10 @@ __global__ void attention_step_chunk_reduce_kernel(const float* chunk_m,
 
     const float alpha = scale_shared[0];
     const float beta = scale_shared[1];
-    const std::size_t base = (static_cast<std::size_t>(head) * static_cast<std::size_t>(scratch_chunks) +
-                              static_cast<std::size_t>(chunk)) *
-                             static_cast<std::size_t>(head_dim);
+    const std::size_t base =
+        (static_cast<std::size_t>(head) * static_cast<std::size_t>(scratch_chunks) +
+         static_cast<std::size_t>(chunk)) *
+        static_cast<std::size_t>(head_dim);
     for (int d = tid; d < head_dim; d += blockDim.x) {
       acc = acc * alpha + chunk_o[base + static_cast<std::size_t>(d)] * beta;
     }
@@ -78,44 +74,34 @@ __global__ void attention_step_chunk_reduce_kernel(const float* chunk_m,
   }
 }
 
-
 template <int WarpsPerBlock>
-__global__ void attention_step_chunk_stats_int4_kernel(const half*   q,
-                                                        const int8_t* k_cache_i4,
-                                                        const int8_t* v_cache_i4,
-                                                        const half*   k_scales,
-                                                        const half*   v_scales,
-                                                        float*        chunk_m,
-                                                        float*        chunk_l,
-                                                        float*        chunk_o,
-                                                        int           seq_len,
-                                                        int           num_heads,
-                                                        int           num_kv_heads,
-                                                        int           head_dim,
-                                                        int           chunk_size,
-                                                        int           scratch_chunks) {
+__global__ void attention_step_chunk_stats_int4_kernel(
+    const half* q, const int8_t* k_cache_i4, const int8_t* v_cache_i4, const half* k_scales,
+    const half* v_scales, float* chunk_m, float* chunk_l, float* chunk_o, int seq_len,
+    int num_heads, int num_kv_heads, int head_dim, int chunk_size, int scratch_chunks) {
   extern __shared__ unsigned char smem_bytes[];
-  half*  q_shared     = reinterpret_cast<half*>(smem_bytes);
+  half* q_shared = reinterpret_cast<half*>(smem_bytes);
   float* score_shared = reinterpret_cast<float*>(q_shared + head_dim);
-  float* beta_shared  = score_shared + WarpsPerBlock;
+  float* beta_shared = score_shared + WarpsPerBlock;
   float* stats_shared = beta_shared + WarpsPerBlock;  // [running_m, running_l, tile_m, tile_l]
-  half*  v_tile       = reinterpret_cast<half*>(stats_shared + 4);
+  half* v_tile = reinterpret_cast<half*>(stats_shared + 4);
 
-  const int head        = blockIdx.x;
-  const int chunk       = blockIdx.y;
+  const int head = blockIdx.x;
+  const int chunk = blockIdx.y;
   const int chunk_start = chunk * chunk_size;
   if (chunk_start >= seq_len) return;
   const int chunk_end = min(chunk_start + chunk_size, seq_len);
 
-  const int tid      = threadIdx.x;
-  const int warp_id  = tid / warpSize;
-  const int lane     = tid % warpSize;
-  const float scale  = rsqrtf(static_cast<float>(head_dim));
+  const int tid = threadIdx.x;
+  const int warp_id = tid / warpSize;
+  const int lane = tid % warpSize;
+  const float scale = rsqrtf(static_cast<float>(head_dim));
   const int kv_heads_safe = (num_kv_heads > 0) ? num_kv_heads : 1;
-  const int group_size    = ((num_heads / kv_heads_safe) > 0) ? (num_heads / kv_heads_safe) : 1;
-  const int kv_head = ((head / group_size) < kv_heads_safe) ? (head / group_size) : (kv_heads_safe - 1);
+  const int group_size = ((num_heads / kv_heads_safe) > 0) ? (num_heads / kv_heads_safe) : 1;
+  const int kv_head =
+      ((head / group_size) < kv_heads_safe) ? (head / group_size) : (kv_heads_safe - 1);
   const int packed_per_head = head_dim / 2;
-  const int chunk_index     = head * scratch_chunks + chunk;
+  const int chunk_index = head * scratch_chunks + chunk;
 
   for (int d = tid; d < head_dim; d += blockDim.x) {
     q_shared[d] = q[head * head_dim + d];
@@ -135,14 +121,14 @@ __global__ void attention_step_chunk_stats_int4_kernel(const half*   q,
       const int t = tile_base + warp_id;
       float score = neg_inf<float>();
       if (warp_id < tile_tokens) {
-        const float kscale  = __half2float(k_scales[t * num_kv_heads + kv_head]);
+        const float kscale = __half2float(k_scales[t * num_kv_heads + kv_head]);
         const int8_t* k_i4 = k_cache_i4 + (t * num_kv_heads + kv_head) * packed_per_head;
         float partial = 0.0f;
         for (int i = lane; i < packed_per_head; i += warpSize) {
           const int8_t b = k_i4[i];
           const float k0 = static_cast<float>(((int)b << 28) >> 28) * kscale;
-          const float k1 = static_cast<float>((int)b >> 4)          * kscale;
-          partial += __half2float(q_shared[2 * i])     * k0;
+          const float k1 = static_cast<float>((int)b >> 4) * kscale;
+          partial += __half2float(q_shared[2 * i]) * k0;
           partial += __half2float(q_shared[2 * i + 1]) * k1;
         }
         score = warp_sum(partial) * scale;
@@ -154,14 +140,14 @@ __global__ void attention_step_chunk_stats_int4_kernel(const half*   q,
 
     // Phase 1b: decode INT4 V into shared v_tile.
     for (int i = 0; i < tile_tokens; ++i) {
-      const int t         = tile_base + i;
-      const float vscale  = __half2float(v_scales[t * num_kv_heads + kv_head]);
-      const int8_t* v_i4  = v_cache_i4 + (t * num_kv_heads + kv_head) * packed_per_head;
+      const int t = tile_base + i;
+      const float vscale = __half2float(v_scales[t * num_kv_heads + kv_head]);
+      const int8_t* v_i4 = v_cache_i4 + (t * num_kv_heads + kv_head) * packed_per_head;
       half* vt = v_tile + i * head_dim;
       for (int d = tid; d < head_dim; d += blockDim.x) {
         const int8_t b = v_i4[d >> 1];
-        const float vval = static_cast<float>((d & 1) ? ((int)b >> 4)
-                                                       : (((int)b << 28) >> 28)) * vscale;
+        const float vval =
+            static_cast<float>((d & 1) ? ((int)b >> 4) : (((int)b << 28) >> 28)) * vscale;
         vt[d] = __float2half(vval);
       }
     }
@@ -184,11 +170,11 @@ __global__ void attention_step_chunk_stats_int4_kernel(const half*   q,
 
     // Phase 3: accumulate V and merge online softmax stats.
     {
-      const float tile_m    = stats_shared[2];
-      const float tile_l    = stats_shared[3];
+      const float tile_m = stats_shared[2];
+      const float tile_l = stats_shared[3];
       const float running_m = stats_shared[0];
       const float running_l = stats_shared[1];
-      const float new_m  = fmaxf(running_m, tile_m);
+      const float new_m = fmaxf(running_m, tile_m);
       const float c_prev = (running_l == 0.0f) ? 0.0f : expf(running_m - new_m);
       const float c_tile = expf(tile_m - new_m);
       for (int d = tid; d < head_dim; d += blockDim.x) {
@@ -221,21 +207,15 @@ __global__ void attention_step_chunk_stats_int4_kernel(const half*   q,
 // Grid: dim3(num_kv_heads).  Block: dim3(head_dim).
 // Shared memory layout: [k_warp_max, v_warp_max, k_scale_bcast, v_scale_bcast]
 //   = (2*num_warps + 2) floats.
-__global__ void store_kv_int4_kernel(const half* k,
-                                     const half* v,
-                                     int8_t*     k_cache_i4,
-                                     int8_t*     v_cache_i4,
-                                     half*       k_scales,
-                                     half*       v_scales,
-                                     int         position,
-                                     int         num_kv_heads,
-                                     int         head_dim,
-                                     int         max_context) {
+__global__ void store_kv_int4_kernel(const half* k, const half* v, int8_t* k_cache_i4,
+                                     int8_t* v_cache_i4, half* k_scales, half* v_scales,
+                                     int position, int num_kv_heads, int head_dim,
+                                     int max_context) {
   extern __shared__ float smem[];
-  const int kv_head  = blockIdx.x;
-  const int tid      = threadIdx.x;
-  const int warp_id  = tid / 32;
-  const int lane     = tid % 32;
+  const int kv_head = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int warp_id = tid / 32;
+  const int lane = tid % 32;
   const int num_warps = blockDim.x / 32;
 
   if (position < 0 || position >= max_context) {
@@ -309,32 +289,27 @@ __global__ void store_kv_int4_kernel(const half* k,
 //   - Phase 1b decodes packed INT4 V bytes to fp16 into shared memory.
 //   - All subsequent phases (softmax, accumulate, normalise) are unchanged.
 template <int WarpsPerBlock>
-__global__ void attention_step_kernel_int4(const half*   q,
-                                           const int8_t* k_cache_i4,
-                                           const int8_t* v_cache_i4,
-                                           const half*   k_scales,
-                                           const half*   v_scales,
-                                           half*         out,
-                                           int           seq_len,
-                                           int           num_heads,
-                                           int           num_kv_heads,
-                                           int           head_dim) {
+__global__ void attention_step_kernel_int4(const half* q, const int8_t* k_cache_i4,
+                                           const int8_t* v_cache_i4, const half* k_scales,
+                                           const half* v_scales, half* out, int seq_len,
+                                           int num_heads, int num_kv_heads, int head_dim) {
   const int packed_per_head = head_dim / 2;
   extern __shared__ unsigned char smem_bytes[];
-  half*  q_shared     = reinterpret_cast<half*>(smem_bytes);
+  half* q_shared = reinterpret_cast<half*>(smem_bytes);
   float* score_shared = reinterpret_cast<float*>(q_shared + head_dim);
-  float* beta_shared  = score_shared + WarpsPerBlock;
+  float* beta_shared = score_shared + WarpsPerBlock;
   float* stats_shared = beta_shared + WarpsPerBlock;  // [running_m, running_l, tile_m, tile_l]
-  half*  v_tile       = reinterpret_cast<half*>(stats_shared + 4);
+  half* v_tile = reinterpret_cast<half*>(stats_shared + 4);
 
-  const int head     = blockIdx.x;
-  const int tid      = threadIdx.x;
-  const int warp_id  = tid / warpSize;
-  const int lane     = tid % warpSize;
-  const float scale  = rsqrtf(static_cast<float>(head_dim));
+  const int head = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int warp_id = tid / warpSize;
+  const int lane = tid % warpSize;
+  const float scale = rsqrtf(static_cast<float>(head_dim));
   const int kv_heads_safe = (num_kv_heads > 0) ? num_kv_heads : 1;
   const int group_size = ((num_heads / kv_heads_safe) > 0) ? (num_heads / kv_heads_safe) : 1;
-  const int kv_head = ((head / group_size) < kv_heads_safe) ? (head / group_size) : (kv_heads_safe - 1);
+  const int kv_head =
+      ((head / group_size) < kv_heads_safe) ? (head / group_size) : (kv_heads_safe - 1);
 
   // Load Q into shared memory.
   for (int d = tid; d < head_dim; d += blockDim.x) {
@@ -362,8 +337,8 @@ __global__ void attention_step_kernel_int4(const half*   q,
           const int8_t b = k_i4[i];
           // Sign-extend low nibble (bits 3:0) and high nibble (bits 7:4).
           const float k0 = static_cast<float>(((int)b << 28) >> 28) * kscale;
-          const float k1 = static_cast<float>((int)b >> 4)          * kscale;
-          partial += __half2float(q_shared[2 * i])     * k0;
+          const float k1 = static_cast<float>((int)b >> 4) * kscale;
+          partial += __half2float(q_shared[2 * i]) * k0;
           partial += __half2float(q_shared[2 * i + 1]) * k1;
         }
         score = warp_sum(partial) * scale;
@@ -383,8 +358,8 @@ __global__ void attention_step_kernel_int4(const half*   q,
         for (int d = tid; d < head_dim; d += blockDim.x) {
           const int8_t b = v_i4[d >> 1];
           // Select low or high nibble depending on element parity.
-          const float vval = static_cast<float>((d & 1) ? ((int)b >> 4)
-                                                        : (((int)b << 28) >> 28)) * vscale;
+          const float vval =
+              static_cast<float>((d & 1) ? ((int)b >> 4) : (((int)b << 28) >> 28)) * vscale;
           vt[d] = __float2half(vval);
         }
       }
@@ -410,13 +385,13 @@ __global__ void attention_step_kernel_int4(const half*   q,
 
     // Phase 3: accumulate V weighted by betas, merge tile stats (identical).
     {
-      const float tile_m    = stats_shared[2];
-      const float tile_l    = stats_shared[3];
+      const float tile_m = stats_shared[2];
+      const float tile_l = stats_shared[3];
       const float running_m = stats_shared[0];
       const float running_l = stats_shared[1];
-      const float new_m     = fmaxf(running_m, tile_m);
-      const float c_prev    = (running_l == 0.0f) ? 0.0f : expf(running_m - new_m);
-      const float c_tile    = expf(tile_m - new_m);
+      const float new_m = fmaxf(running_m, tile_m);
+      const float c_prev = (running_l == 0.0f) ? 0.0f : expf(running_m - new_m);
+      const float c_tile = expf(tile_m - new_m);
       for (int d = tid; d < head_dim; d += blockDim.x) {
         float tile_o = 0.0f;
         for (int i = 0; i < tile_tokens; ++i) {
@@ -438,75 +413,53 @@ __global__ void attention_step_kernel_int4(const half*   q,
   }
 }
 
-
 }  // namespace
 
 // Host launch wrappers for INT4 decode attention paths.
-void launch_store_kv_int4(const half*  k,
-                           const half*  v,
-                           int8_t*      k_cache_i4,
-                           int8_t*      v_cache_i4,
-                           half*        k_scales,
-                           half*        v_scales,
-                           int          position,
-                           int          num_kv_heads,
-                           int          head_dim,
-                           int          max_context,
-                           cudaStream_t stream) {
+void launch_store_kv_int4(const half* k, const half* v, int8_t* k_cache_i4, int8_t* v_cache_i4,
+                          half* k_scales, half* v_scales, int position, int num_kv_heads,
+                          int head_dim, int max_context, cudaStream_t stream) {
   const int num_warps = head_dim / 32;
   const std::size_t smem = static_cast<std::size_t>(2 * num_warps + 2) * sizeof(float);
   store_kv_int4_kernel<<<num_kv_heads, head_dim, smem, stream>>>(
-      k, v, k_cache_i4, v_cache_i4, k_scales, v_scales,
-      position, num_kv_heads, head_dim, max_context);
+      k, v, k_cache_i4, v_cache_i4, k_scales, v_scales, position, num_kv_heads, head_dim,
+      max_context);
 }
 
-void launch_attention_step_int4(const half*   q,
-                                 const int8_t* k_cache_i4,
-                                 const int8_t* v_cache_i4,
-                                 const half*   k_scales,
-                                 const half*   v_scales,
-                                 half*         out,
-                                 int           seq_len,
-                                 int           num_heads,
-                                 int           num_kv_heads,
-                                 int           head_dim,
-                                 cudaStream_t  stream,
-                                 float*        scratch_m,
-                                 float*        scratch_l,
-                                 float*        scratch_o,
-                                 int           scratch_chunks,
-                                 bool          allow_split) {
-  constexpr int warps   = 4;
+void launch_attention_step_int4(const half* q, const int8_t* k_cache_i4, const int8_t* v_cache_i4,
+                                const half* k_scales, const half* v_scales, half* out, int seq_len,
+                                int num_heads, int num_kv_heads, int head_dim, cudaStream_t stream,
+                                float* scratch_m, float* scratch_l, float* scratch_o,
+                                int scratch_chunks, bool allow_split) {
+  constexpr int warps = 4;
   constexpr int threads = warps * 32;
   const std::size_t smem = static_cast<std::size_t>(head_dim) * sizeof(half) +
-                            static_cast<std::size_t>(2 * warps + 4) * sizeof(float) +
-                            static_cast<std::size_t>(warps * head_dim) * sizeof(half);
+                           static_cast<std::size_t>(2 * warps + 4) * sizeof(float) +
+                           static_cast<std::size_t>(warps * head_dim) * sizeof(half);
 
   // Split-K path: same chunk decomposition as the FP16 attention kernel.
   // Requires head_dim==128 (matches scratch_o element stride), seq_len>=64, and
   // allocated scratch buffers.
   constexpr int split_chunk_size = 32;
-  if (allow_split && scratch_m && scratch_l && scratch_o && scratch_chunks > 0
-      && head_dim == 128 && seq_len >= 64) {
-    const int chunk_count = min(scratch_chunks, (seq_len + split_chunk_size - 1) / split_chunk_size);
+  if (allow_split && scratch_m && scratch_l && scratch_o && scratch_chunks > 0 && head_dim == 128 &&
+      seq_len >= 64) {
+    const int chunk_count =
+        min(scratch_chunks, (seq_len + split_chunk_size - 1) / split_chunk_size);
     const dim3 grid(num_heads, chunk_count);
     attention_step_chunk_stats_int4_kernel<warps><<<grid, threads, smem, stream>>>(
-        q, k_cache_i4, v_cache_i4, k_scales, v_scales,
-        scratch_m, scratch_l, scratch_o,
-        seq_len, num_heads, num_kv_heads, head_dim,
-        split_chunk_size, scratch_chunks);
+        q, k_cache_i4, v_cache_i4, k_scales, v_scales, scratch_m, scratch_l, scratch_o, seq_len,
+        num_heads, num_kv_heads, head_dim, split_chunk_size, scratch_chunks);
     // Reuse the FP16 reduce kernel — it only operates on float scratch, not the cache format.
     attention_step_chunk_reduce_kernel<<<num_heads, threads, 0, stream>>>(
-        scratch_m, scratch_l, scratch_o, out,
-        seq_len, num_heads, head_dim, split_chunk_size, scratch_chunks);
+        scratch_m, scratch_l, scratch_o, out, seq_len, num_heads, head_dim, split_chunk_size,
+        scratch_chunks);
     return;
   }
 
   // Fallback: single-block serial path (correct for any head_dim, slow at long context).
-  attention_step_kernel_int4<warps><<<num_heads, threads, smem, stream>>>(
-      q, k_cache_i4, v_cache_i4, k_scales, v_scales, out,
-      seq_len, num_heads, num_kv_heads, head_dim);
+  attention_step_kernel_int4<warps>
+      <<<num_heads, threads, smem, stream>>>(q, k_cache_i4, v_cache_i4, k_scales, v_scales, out,
+                                             seq_len, num_heads, num_kv_heads, head_dim);
 }
-
 
 }  // namespace kernels

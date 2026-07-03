@@ -1,10 +1,11 @@
-#include "llama_engine_internal.hpp"
 #include <algorithm>
 #include <cmath>
 #include <limits>
 #include <random>
 #include <unordered_set>
 #include <vector>
+
+#include "llama_engine_internal.hpp"
 namespace engine {
 namespace {
 
@@ -26,9 +27,7 @@ std::mt19937& sampler_rng() {
 // sort to an O(top_k log top_k) one. The resulting distribution is identical to
 // the full path: top_k keeps exactly the entries >= the k-th largest logit
 // (ties included), and the nucleus for top_p is always a subset of that set.
-int sample_from_logits_topk(const std::vector<float>& logits,
-                            float temperature,
-                            int top_k,
+int sample_from_logits_topk(const std::vector<float>& logits, float temperature, int top_k,
                             float top_p) {
   struct Candidate {
     int id;
@@ -37,10 +36,8 @@ int sample_from_logits_topk(const std::vector<float>& logits,
 
   // Threshold = the k-th largest logit. nth_element is O(vocab) (no full sort).
   std::vector<float> partitioned(logits);
-  std::nth_element(partitioned.begin(),
-                  partitioned.begin() + (top_k - 1),
-                  partitioned.end(),
-                  std::greater<float>());
+  std::nth_element(partitioned.begin(), partitioned.begin() + (top_k - 1), partitioned.end(),
+                   std::greater<float>());
   const float kth = partitioned[static_cast<std::size_t>(top_k - 1)];
 
   // Gather the finite candidates at or above the threshold, applying the same
@@ -52,8 +49,10 @@ int sample_from_logits_topk(const std::vector<float>& logits,
     if (!std::isfinite(v) || v < kth) {
       continue;
     }
-    if (v > 80.0f) v = 80.0f;
-    else if (v < -80.0f) v = -80.0f;
+    if (v > 80.0f)
+      v = 80.0f;
+    else if (v < -80.0f)
+      v = -80.0f;
     cand.push_back({static_cast<int>(i), v});
   }
   if (cand.empty()) {
@@ -118,12 +117,8 @@ int sample_from_logits_topk(const std::vector<float>& logits,
   return cand[keep - 1].id;
 }
 
-int sample_from_logits(std::vector<float>& logits,
-                       float temperature,
-                       int top_k,
-                       float top_p,
-                       float repetition_penalty,
-                       int no_repeat_ngram_size,
+int sample_from_logits(std::vector<float>& logits, float temperature, int top_k, float top_p,
+                       float repetition_penalty, int no_repeat_ngram_size,
                        const std::vector<int>& history) {
   if (logits.empty()) {
     return 0;
@@ -173,13 +168,15 @@ int sample_from_logits(std::vector<float>& logits,
    * If the current (n-1)-token suffix has appeared before, ban tokens that
    * previously followed that suffix.
    */
-  if (no_repeat_ngram_size > 1 && history.size() + 1 >= static_cast<std::size_t>(no_repeat_ngram_size)) {
+  if (no_repeat_ngram_size > 1 &&
+      history.size() + 1 >= static_cast<std::size_t>(no_repeat_ngram_size)) {
     const int n = no_repeat_ngram_size;
     const int prefix_len = n - 1;
     const int hist_size = static_cast<int>(history.size());
     std::vector<int> prefix(prefix_len);
     for (int i = 0; i < prefix_len; ++i) {
-      prefix[static_cast<std::size_t>(i)] = history[static_cast<std::size_t>(hist_size - prefix_len + i)];
+      prefix[static_cast<std::size_t>(i)] =
+          history[static_cast<std::size_t>(hist_size - prefix_len + i)];
     }
 
     std::vector<char> banned(logits.size(), 0);
@@ -307,8 +304,7 @@ int sample_from_logits(std::vector<float>& logits,
   return static_cast<int>(std::max_element(probs.begin(), probs.end()) - probs.begin());
 }
 
-bool has_degenerate_tail(const std::vector<int>& ids,
-                         std::size_t prompt_size) {
+bool has_degenerate_tail(const std::vector<int>& ids, std::size_t prompt_size) {
   if (ids.size() <= prompt_size + 8) {
     return false;
   }
@@ -361,20 +357,11 @@ bool has_degenerate_tail(const std::vector<int>& ids,
 }
 }  // namespace
 namespace detail {
-int dispatch_sample_from_logits(std::vector<float>& logits,
-                                float temperature,
-                                int top_k,
-                                float top_p,
-                                float repetition_penalty,
-                                int no_repeat_ngram_size,
+int dispatch_sample_from_logits(std::vector<float>& logits, float temperature, int top_k,
+                                float top_p, float repetition_penalty, int no_repeat_ngram_size,
                                 const std::vector<int>& history) {
-  return sample_from_logits(logits,
-                            temperature,
-                            top_k,
-                            top_p,
-                            repetition_penalty,
-                            no_repeat_ngram_size,
-                            history);
+  return sample_from_logits(logits, temperature, top_k, top_p, repetition_penalty,
+                            no_repeat_ngram_size, history);
 }
 
 bool dispatch_has_degenerate_tail(const std::vector<int>& ids, std::size_t prompt_size) {

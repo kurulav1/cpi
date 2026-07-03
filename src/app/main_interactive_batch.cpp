@@ -13,10 +13,6 @@
 
 #if LLAMA_ENGINE_HAS_CUDA
 
-#include "app/main_helpers.hpp"
-#include "engine/llama_engine.hpp"
-#include "model/tokenizer.hpp"
-
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
@@ -29,6 +25,10 @@
 #include <unordered_map>
 #include <vector>
 
+#include "app/main_helpers.hpp"
+#include "engine/llama_engine.hpp"
+#include "model/tokenizer.hpp"
+
 namespace app::main_modes {
 
 using app::main_helpers::json_escape;
@@ -39,12 +39,9 @@ using app::main_helpers::json_get_string;
 using app::main_helpers::json_get_string_array;
 using app::main_helpers::sanitize_stream_text;
 
-void run_interactive_batch(engine::LlamaEngine& eng,
-                           model::Tokenizer& tokenizer,
-                           const std::vector<std::string>& default_stop_texts,
-                           bool default_add_bos,
-                           int default_max_new,
-                           float default_temp) {
+void run_interactive_batch(engine::LlamaEngine& eng, model::Tokenizer& tokenizer,
+                           const std::vector<std::string>& default_stop_texts, bool default_add_bos,
+                           int default_max_new, float default_temp) {
   std::mutex out_mu;
   const auto write_event = [&](const std::string& type, const std::string& id,
                                const std::string& extra) {

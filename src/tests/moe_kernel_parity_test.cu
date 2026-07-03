@@ -89,29 +89,26 @@ void test_router_topk_softmax(cudaStream_t stream) {
   __half* d_logits = nullptr;
   int* d_idx = nullptr;
   float* d_prob = nullptr;
-  require_cuda(cudaMalloc(&d_logits, static_cast<std::size_t>(experts) * sizeof(__half)), "cudaMalloc d_logits");
-  require_cuda(cudaMalloc(&d_idx, static_cast<std::size_t>(top_k) * sizeof(int)), "cudaMalloc d_idx");
-  require_cuda(cudaMalloc(&d_prob, static_cast<std::size_t>(top_k) * sizeof(float)), "cudaMalloc d_prob");
-  require_cuda(cudaMemcpyAsync(d_logits,
-                               h_logits.data(),
-                               static_cast<std::size_t>(experts) * sizeof(__half),
-                               cudaMemcpyHostToDevice,
-                               stream),
-               "cudaMemcpyAsync logits");
+  require_cuda(cudaMalloc(&d_logits, static_cast<std::size_t>(experts) * sizeof(__half)),
+               "cudaMalloc d_logits");
+  require_cuda(cudaMalloc(&d_idx, static_cast<std::size_t>(top_k) * sizeof(int)),
+               "cudaMalloc d_idx");
+  require_cuda(cudaMalloc(&d_prob, static_cast<std::size_t>(top_k) * sizeof(float)),
+               "cudaMalloc d_prob");
+  require_cuda(
+      cudaMemcpyAsync(d_logits, h_logits.data(), static_cast<std::size_t>(experts) * sizeof(__half),
+                      cudaMemcpyHostToDevice, stream),
+      "cudaMemcpyAsync logits");
 
   kernels::launch_moe_router_topk_softmax(d_logits, experts, top_k, d_idx, d_prob, stream);
   require_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize router");
 
   std::vector<int> out_idx(static_cast<std::size_t>(top_k), -1);
   std::vector<float> out_prob(static_cast<std::size_t>(top_k), 0.0f);
-  require_cuda(cudaMemcpy(out_idx.data(),
-                          d_idx,
-                          static_cast<std::size_t>(top_k) * sizeof(int),
+  require_cuda(cudaMemcpy(out_idx.data(), d_idx, static_cast<std::size_t>(top_k) * sizeof(int),
                           cudaMemcpyDeviceToHost),
                "cudaMemcpy idx");
-  require_cuda(cudaMemcpy(out_prob.data(),
-                          d_prob,
-                          static_cast<std::size_t>(top_k) * sizeof(float),
+  require_cuda(cudaMemcpy(out_prob.data(), d_prob, static_cast<std::size_t>(top_k) * sizeof(float),
                           cudaMemcpyDeviceToHost),
                "cudaMemcpy prob");
 
@@ -120,7 +117,8 @@ void test_router_topk_softmax(cudaStream_t stream) {
     if (out_idx[static_cast<std::size_t>(k)] != ref.idx[static_cast<std::size_t>(k)]) {
       throw std::runtime_error("router top-k index mismatch at k=" + std::to_string(k));
     }
-    const float diff = std::abs(out_prob[static_cast<std::size_t>(k)] - ref.prob[static_cast<std::size_t>(k)]);
+    const float diff =
+        std::abs(out_prob[static_cast<std::size_t>(k)] - ref.prob[static_cast<std::size_t>(k)]);
     if (diff > 5e-3f) {
       throw std::runtime_error("router top-k probability mismatch at k=" + std::to_string(k));
     }
@@ -154,17 +152,11 @@ void test_weighted_merge(cudaStream_t stream) {
   require_cuda(cudaMalloc(&d1, static_cast<std::size_t>(n) * sizeof(__half)), "cudaMalloc d1");
   require_cuda(cudaMalloc(&d2, static_cast<std::size_t>(n) * sizeof(__half)), "cudaMalloc d2");
   require_cuda(cudaMalloc(&dout, static_cast<std::size_t>(n) * sizeof(__half)), "cudaMalloc dout");
-  require_cuda(cudaMemcpyAsync(d1,
-                               h1.data(),
-                               static_cast<std::size_t>(n) * sizeof(__half),
-                               cudaMemcpyHostToDevice,
-                               stream),
+  require_cuda(cudaMemcpyAsync(d1, h1.data(), static_cast<std::size_t>(n) * sizeof(__half),
+                               cudaMemcpyHostToDevice, stream),
                "cudaMemcpyAsync d1");
-  require_cuda(cudaMemcpyAsync(d2,
-                               h2.data(),
-                               static_cast<std::size_t>(n) * sizeof(__half),
-                               cudaMemcpyHostToDevice,
-                               stream),
+  require_cuda(cudaMemcpyAsync(d2, h2.data(), static_cast<std::size_t>(n) * sizeof(__half),
+                               cudaMemcpyHostToDevice, stream),
                "cudaMemcpyAsync d2");
 
   kernels::launch_scale_copy(dout, d1, n, a, stream);
@@ -172,9 +164,7 @@ void test_weighted_merge(cudaStream_t stream) {
   require_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize merge");
 
   std::vector<__half> out(static_cast<std::size_t>(n));
-  require_cuda(cudaMemcpy(out.data(),
-                          dout,
-                          static_cast<std::size_t>(n) * sizeof(__half),
+  require_cuda(cudaMemcpy(out.data(), dout, static_cast<std::size_t>(n) * sizeof(__half),
                           cudaMemcpyDeviceToHost),
                "cudaMemcpy dout");
   for (int i = 0; i < n; ++i) {
@@ -214,4 +204,3 @@ int main() {
     return 1;
   }
 }
-

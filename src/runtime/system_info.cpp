@@ -65,8 +65,7 @@ SystemSnapshot collect_system_snapshot() {
     std::size_t free_b = 0;
     std::size_t total_b = 0;
     const cudaError_t mem_status = cudaMemGetInfo(&free_b, &total_b);
-    out.gpu_names.emplace_back(
-        (prop_status == cudaSuccess) ? prop.name : "unavailable");
+    out.gpu_names.emplace_back((prop_status == cudaSuccess) ? prop.name : "unavailable");
     if (mem_status != cudaSuccess) {
       free_b = 0;
       total_b = 0;

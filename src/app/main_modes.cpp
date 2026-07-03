@@ -37,13 +37,10 @@ using app::main_helpers::sanitize_stream_text;
 
 }  // namespace
 
-void execute_engine_modes(const RunExecutionOptions& options,
-                          const std::vector<int>& prompt_tokens,
+void execute_engine_modes(const RunExecutionOptions& options, const std::vector<int>& prompt_tokens,
                           const std::vector<int>& stop_token_ids,
-                          const std::vector<std::string>& stop_texts,
-                          model::Tokenizer* tokenizer,
-                          const GenerateFn& generate,
-                          const GenerateStreamFn& generate_stream,
+                          const std::vector<std::string>& stop_texts, model::Tokenizer* tokenizer,
+                          const GenerateFn& generate, const GenerateStreamFn& generate_stream,
                           const InspectNextLogitsFn& inspect_next_logits,
                           const LastBenchmarkStatsFn& last_benchmark_stats) {
   if (options.use_tokenizer && tokenizer == nullptr) {
@@ -56,8 +53,7 @@ void execute_engine_modes(const RunExecutionOptions& options,
       throw std::runtime_error("--interactive requires --tokenizer");
     }
 
-    const auto write_event = [&](const std::string& type,
-                                 const std::string& id,
+    const auto write_event = [&](const std::string& type, const std::string& id,
                                  const std::string& extra_json) {
       static std::mutex write_mu;
       std::lock_guard<std::mutex> lk(write_mu);
@@ -72,8 +68,8 @@ void execute_engine_modes(const RunExecutionOptions& options,
     };
     const auto append_moe_selected_json = [&](std::ostringstream& os,
                                               const engine::BenchmarkStats& stats) {
-      if (stats.moe_topk_layers <= 0 || stats.moe_topk_k <= 0 ||
-          stats.moe_topk_indices.empty() || stats.moe_topk_probs.empty()) {
+      if (stats.moe_topk_layers <= 0 || stats.moe_topk_k <= 0 || stats.moe_topk_indices.empty() ||
+          stats.moe_topk_probs.empty()) {
         return;
       }
       os << ",\"moe_selected\":[";
@@ -132,7 +128,8 @@ void execute_engine_modes(const RunExecutionOptions& options,
         const float req_temp_raw = json_get_float(request_json, "temp", options.temp);
         const float req_temp = (req_temp_raw < 0.0f) ? 0.0f : req_temp_raw;
         const bool req_add_bos = json_get_bool(request_json, "add_bos", !options.force_no_bos);
-        const bool req_sentence_stop = json_get_bool(request_json, "sentence_stop", options.sentence_stop);
+        const bool req_sentence_stop =
+            json_get_bool(request_json, "sentence_stop", options.sentence_stop);
 
         std::vector<std::string> req_stop_texts = json_get_string_array(request_json, "stop_texts");
         if (req_stop_texts.empty()) {
@@ -208,9 +205,8 @@ void execute_engine_modes(const RunExecutionOptions& options,
             bool done_now = false;
             {
               std::unique_lock<std::mutex> lk(stream_mu);
-              stream_cv.wait(lk, [&] {
-                return stream_done.load() || generated_ids.size() != seen_tokens;
-              });
+              stream_cv.wait(
+                  lk, [&] { return stream_done.load() || generated_ids.size() != seen_tokens; });
               snapshot = generated_ids;
               seen_tokens = snapshot.size();
               done_now = stream_done.load();
@@ -236,47 +232,55 @@ void execute_engine_modes(const RunExecutionOptions& options,
 
         int emitted_count = 0;
         try {
-        (void)generate_stream(req_prompt_tokens, req_max_new, req_temp, [&](int tok) {
-          // Until min_new tokens are produced, don't honour stop conditions
-          // either (the engine also masks EOS); keeps greedy from truncating early.
-          const bool may_stop = emitted_count >= req_min_new;
-          if (may_stop &&
-              std::find(req_stop_ids.begin(), req_stop_ids.end(), tok) != req_stop_ids.end()) {
-            return false;
-          }
-          if (may_stop && sentence_stop_hit.load()) {
-            return false;
-          }
-          int token_index = 0;
-          {
-            std::lock_guard<std::mutex> lk(stream_mu);
-            generated_ids.push_back(tok);
-            token_index = static_cast<int>(generated_ids.size());
-          }
-          ++emitted_count;
-          stream_cv.notify_one();
-          const auto& stats = last_benchmark_stats();
-          const double token_router_ms = std::max(0.0, stats.decode_moe_router_ms - prev_moe_router_ms);
-          const double token_expert_ms = std::max(0.0, stats.decode_moe_expert_ms - prev_moe_expert_ms);
-          const double token_merge_ms = std::max(0.0, stats.decode_moe_merge_ms - prev_moe_merge_ms);
-          prev_moe_router_ms = stats.decode_moe_router_ms;
-          prev_moe_expert_ms = stats.decode_moe_expert_ms;
-          prev_moe_merge_ms = stats.decode_moe_merge_ms;
-          std::ostringstream metrics_extra;
-          metrics_extra << "\"metrics\":{"
-                        << "\"token_index\":" << token_index
-                        << ",\"moe_quant_mode\":\"" << json_escape(stats.moe_quant_mode) << "\""
-                        << ",\"moe_router_ms\":" << std::fixed << std::setprecision(4) << token_router_ms
-                        << ",\"moe_expert_ms\":" << std::fixed << std::setprecision(4) << token_expert_ms
-                        << ",\"moe_merge_ms\":" << std::fixed << std::setprecision(4) << token_merge_ms;
-          append_moe_selected_json(metrics_extra, stats);
-          metrics_extra << "}";
-          write_event("metrics", req_id, metrics_extra.str());
-          if (may_stop && sentence_stop_hit.load()) {
-            return false;
-          }
-          return true;
-        }, req_constraints_ptr);
+          (void)generate_stream(
+              req_prompt_tokens, req_max_new, req_temp,
+              [&](int tok) {
+                // Until min_new tokens are produced, don't honour stop conditions
+                // either (the engine also masks EOS); keeps greedy from truncating early.
+                const bool may_stop = emitted_count >= req_min_new;
+                if (may_stop && std::find(req_stop_ids.begin(), req_stop_ids.end(), tok) !=
+                                    req_stop_ids.end()) {
+                  return false;
+                }
+                if (may_stop && sentence_stop_hit.load()) {
+                  return false;
+                }
+                int token_index = 0;
+                {
+                  std::lock_guard<std::mutex> lk(stream_mu);
+                  generated_ids.push_back(tok);
+                  token_index = static_cast<int>(generated_ids.size());
+                }
+                ++emitted_count;
+                stream_cv.notify_one();
+                const auto& stats = last_benchmark_stats();
+                const double token_router_ms =
+                    std::max(0.0, stats.decode_moe_router_ms - prev_moe_router_ms);
+                const double token_expert_ms =
+                    std::max(0.0, stats.decode_moe_expert_ms - prev_moe_expert_ms);
+                const double token_merge_ms =
+                    std::max(0.0, stats.decode_moe_merge_ms - prev_moe_merge_ms);
+                prev_moe_router_ms = stats.decode_moe_router_ms;
+                prev_moe_expert_ms = stats.decode_moe_expert_ms;
+                prev_moe_merge_ms = stats.decode_moe_merge_ms;
+                std::ostringstream metrics_extra;
+                metrics_extra << "\"metrics\":{"
+                              << "\"token_index\":" << token_index << ",\"moe_quant_mode\":\""
+                              << json_escape(stats.moe_quant_mode) << "\""
+                              << ",\"moe_router_ms\":" << std::fixed << std::setprecision(4)
+                              << token_router_ms << ",\"moe_expert_ms\":" << std::fixed
+                              << std::setprecision(4) << token_expert_ms
+                              << ",\"moe_merge_ms\":" << std::fixed << std::setprecision(4)
+                              << token_merge_ms;
+                append_moe_selected_json(metrics_extra, stats);
+                metrics_extra << "}";
+                write_event("metrics", req_id, metrics_extra.str());
+                if (may_stop && sentence_stop_hit.load()) {
+                  return false;
+                }
+                return true;
+              },
+              req_constraints_ptr);
         } catch (...) {
           // Join the streaming thread before the exception propagates: a joinable
           // std::thread destroyed during stack unwinding calls std::terminate and
@@ -309,14 +313,13 @@ void execute_engine_modes(const RunExecutionOptions& options,
         const int generated_tokens = static_cast<int>(generated_ids.size());
         double tok_per_s = 0.0;
         if (generated_tokens > 0 && elapsed_ms > 0) {
-          tok_per_s = (1000.0 * static_cast<double>(generated_tokens)) /
-                      static_cast<double>(elapsed_ms);
+          tok_per_s =
+              (1000.0 * static_cast<double>(generated_tokens)) / static_cast<double>(elapsed_ms);
         }
         const auto& stats = last_benchmark_stats();
         double decode_tok_per_s = 0.0;
         if (generated_tokens > 0 && stats.decode_ms > 0.0) {
-          decode_tok_per_s =
-              (1000.0 * static_cast<double>(generated_tokens)) / stats.decode_ms;
+          decode_tok_per_s = (1000.0 * static_cast<double>(generated_tokens)) / stats.decode_ms;
         }
         std::ostringstream done_extra;
         done_extra << "\"text\":\"" << json_escape(final_text) << "\""
@@ -325,17 +328,16 @@ void execute_engine_modes(const RunExecutionOptions& options,
                    << ",\"tok_per_s\":" << std::fixed << std::setprecision(2) << tok_per_s
                    << ",\"decode_ms\":" << std::fixed << std::setprecision(2) << stats.decode_ms
                    << ",\"decode_tok_per_s\":" << std::fixed << std::setprecision(2)
-                   << decode_tok_per_s
-                   << ",\"metrics\":{"
+                   << decode_tok_per_s << ",\"metrics\":{"
                    << "\"moe_quant_mode\":\"" << json_escape(stats.moe_quant_mode) << "\""
-                   << ",\"moe_router_ms\":" << std::fixed << std::setprecision(4) << stats.decode_moe_router_ms
-                   << ",\"moe_expert_ms\":" << std::fixed << std::setprecision(4) << stats.decode_moe_expert_ms
-                   << ",\"moe_merge_ms\":" << std::fixed << std::setprecision(4) << stats.decode_moe_merge_ms;
+                   << ",\"moe_router_ms\":" << std::fixed << std::setprecision(4)
+                   << stats.decode_moe_router_ms << ",\"moe_expert_ms\":" << std::fixed
+                   << std::setprecision(4) << stats.decode_moe_expert_ms
+                   << ",\"moe_merge_ms\":" << std::fixed << std::setprecision(4)
+                   << stats.decode_moe_merge_ms;
         append_moe_selected_json(done_extra, stats);
         done_extra << "}";
-        write_event("done",
-                    req_id,
-                    done_extra.str());
+        write_event("done", req_id, done_extra.str());
       } catch (const std::exception& e) {
         write_event("error", req_id, "\"error\":\"" + json_escape(e.what()) + "\"");
       }
@@ -408,16 +410,20 @@ void execute_engine_modes(const RunExecutionOptions& options,
   int avg_streamed_layer_copies = 0;
   int avg_tq3_cached_active = 0;
 
-  const bool repeated_benchmark = options.benchmark_mode && (options.benchmark_reps > 1 || options.benchmark_warmup > 0);
+  const bool repeated_benchmark =
+      options.benchmark_mode && (options.benchmark_reps > 1 || options.benchmark_warmup > 0);
 
   auto run_quiet_generation = [&]() {
     if (!options.use_tokenizer) {
       return generate(prompt_tokens, options.max_new, options.temp);
     }
-    return generate_stream(prompt_tokens, options.max_new, options.temp, [&](int tok) {
-      return std::find(stop_token_ids.begin(), stop_token_ids.end(), tok) ==
-             stop_token_ids.end();
-    }, nullptr);
+    return generate_stream(
+        prompt_tokens, options.max_new, options.temp,
+        [&](int tok) {
+          return std::find(stop_token_ids.begin(), stop_token_ids.end(), tok) ==
+                 stop_token_ids.end();
+        },
+        nullptr);
   };
 
   if (repeated_benchmark) {
@@ -450,7 +456,8 @@ void execute_engine_modes(const RunExecutionOptions& options,
       const auto rep_start = std::chrono::steady_clock::now();
       out = run_quiet_generation();
       const auto rep_end = std::chrono::steady_clock::now();
-      const auto rep_ms = std::chrono::duration_cast<std::chrono::milliseconds>(rep_end - rep_start).count();
+      const auto rep_ms =
+          std::chrono::duration_cast<std::chrono::milliseconds>(rep_end - rep_start).count();
       const auto& stats = last_benchmark_stats();
       total_ms_sum += rep_ms;
       prefill_ms_sum += stats.prefill_ms;
@@ -481,14 +488,17 @@ void execute_engine_modes(const RunExecutionOptions& options,
     avg_decode_attention_ms = decode_attention_ms_sum / static_cast<double>(options.benchmark_reps);
     avg_decode_wo_ms = decode_wo_ms_sum / static_cast<double>(options.benchmark_reps);
     avg_decode_mlp_ms = decode_mlp_ms_sum / static_cast<double>(options.benchmark_reps);
-    avg_decode_moe_router_ms = decode_moe_router_ms_sum / static_cast<double>(options.benchmark_reps);
-    avg_decode_moe_expert_ms = decode_moe_expert_ms_sum / static_cast<double>(options.benchmark_reps);
+    avg_decode_moe_router_ms =
+        decode_moe_router_ms_sum / static_cast<double>(options.benchmark_reps);
+    avg_decode_moe_expert_ms =
+        decode_moe_expert_ms_sum / static_cast<double>(options.benchmark_reps);
     avg_decode_moe_merge_ms = decode_moe_merge_ms_sum / static_cast<double>(options.benchmark_reps);
     avg_decode_lm_head_ms = decode_lm_head_ms_sum / static_cast<double>(options.benchmark_reps);
     avg_generated_tokens = generated_sum / options.benchmark_reps;
     avg_streamed_layer_copies = streamed_layer_copy_sum / options.benchmark_reps;
     avg_tq3_cached_active = tq3_cached_active_sum / options.benchmark_reps;
-    const int prefill_tokens = static_cast<int>(prompt_tokens.size() > 0 ? prompt_tokens.size() - 1 : 0);
+    const int prefill_tokens =
+        static_cast<int>(prompt_tokens.size() > 0 ? prompt_tokens.size() - 1 : 0);
     if (prefill_tokens > 0 && avg_prefill_ms > 0.0) {
       avg_prefill_tok_per_s = 1000.0 * static_cast<double>(prefill_tokens) / avg_prefill_ms;
     }
@@ -530,7 +540,10 @@ void execute_engine_modes(const RunExecutionOptions& options,
           }
           if (gen_done.load()) {
             std::vector<int> tail;
-            { std::lock_guard<std::mutex> lk(queue_mutex); tail.swap(token_queue); }
+            {
+              std::lock_guard<std::mutex> lk(queue_mutex);
+              tail.swap(token_queue);
+            }
             if (!tail.empty()) {
               display_ids.insert(display_ids.end(), tail.begin(), tail.end());
               const std::string decoded = sanitize_stream_text(tokenizer->decode(display_ids));
@@ -548,14 +561,21 @@ void execute_engine_modes(const RunExecutionOptions& options,
 
       std::exception_ptr generation_error;
       try {
-        out = generate_stream(prompt_tokens, options.max_new, options.temp, [&](int tok) {
-          if (std::find(stop_token_ids.begin(), stop_token_ids.end(), tok) != stop_token_ids.end()) {
-            return false;
-          }
-          { std::lock_guard<std::mutex> lk(queue_mutex); token_queue.push_back(tok); }
-          queue_cv.notify_one();
-          return true;
-        }, nullptr);
+        out = generate_stream(
+            prompt_tokens, options.max_new, options.temp,
+            [&](int tok) {
+              if (std::find(stop_token_ids.begin(), stop_token_ids.end(), tok) !=
+                  stop_token_ids.end()) {
+                return false;
+              }
+              {
+                std::lock_guard<std::mutex> lk(queue_mutex);
+                token_queue.push_back(tok);
+              }
+              queue_cv.notify_one();
+              return true;
+            },
+            nullptr);
       } catch (...) {
         generation_error = std::current_exception();
       }
@@ -590,13 +610,13 @@ void execute_engine_modes(const RunExecutionOptions& options,
       const auto prompt_n = static_cast<std::vector<int>::difference_type>(prompt_tokens.size());
       generated_only.assign(out.begin() + prompt_n, out.end());
     }
-      std::string final_text = sanitize_stream_text(tokenizer->decode(generated_only));
-      const std::size_t stop_pos = find_first_stop_pos(final_text, stop_texts);
-      if (stop_pos != std::string::npos) {
-        final_text = final_text.substr(0, stop_pos);
-      }
-      final_text = normalize_final_response_text(final_text);
-      if (!generated_only.empty()) {
+    std::string final_text = sanitize_stream_text(tokenizer->decode(generated_only));
+    const std::size_t stop_pos = find_first_stop_pos(final_text, stop_texts);
+    if (stop_pos != std::string::npos) {
+      final_text = final_text.substr(0, stop_pos);
+    }
+    final_text = normalize_final_response_text(final_text);
+    if (!generated_only.empty()) {
       std::size_t special_count = 0;
       const auto& specials = tokenizer->special_ids();
       for (int id : generated_only) {
@@ -604,11 +624,13 @@ void execute_engine_modes(const RunExecutionOptions& options,
           ++special_count;
         }
       }
-      const double special_ratio = static_cast<double>(special_count) / static_cast<double>(generated_only.size());
+      const double special_ratio =
+          static_cast<double>(special_count) / static_cast<double>(generated_only.size());
       if (!options.quiet_output && special_ratio > 0.25) {
-        std::cout << "[warn] generated special-token ratio is high (" << std::fixed << std::setprecision(2)
-                  << (special_ratio * 100.0)
-                  << "%). This often indicates a model/tokenizer mismatch or an incorrect chat template.\n";
+        std::cout << "[warn] generated special-token ratio is high (" << std::fixed
+                  << std::setprecision(2) << (special_ratio * 100.0)
+                  << "%). This often indicates a model/tokenizer mismatch or an incorrect chat "
+                     "template.\n";
       }
     }
     if (options.simple_mode) {
@@ -619,41 +641,39 @@ void execute_engine_modes(const RunExecutionOptions& options,
   }
 
   // --- Performance reporting ---
-  const std::size_t generated_count = (out.size() > prompt_tokens.size()) ? (out.size() - prompt_tokens.size()) : 0;
+  const std::size_t generated_count =
+      (out.size() > prompt_tokens.size()) ? (out.size() - prompt_tokens.size()) : 0;
   if (!options.quiet_output && generated_count > 0 && gen_ms > 0) {
-    const std::size_t perf_tokens = repeated_benchmark ? static_cast<std::size_t>(avg_generated_tokens) : generated_count;
+    const std::size_t perf_tokens =
+        repeated_benchmark ? static_cast<std::size_t>(avg_generated_tokens) : generated_count;
     const double perf_ms = repeated_benchmark ? avg_total_ms : static_cast<double>(gen_ms);
-    const double toks_per_sec = (perf_tokens > 0 && perf_ms > 0.0) ? (1000.0 * static_cast<double>(perf_tokens)) / perf_ms : 0.0;
+    const double toks_per_sec = (perf_tokens > 0 && perf_ms > 0.0)
+                                    ? (1000.0 * static_cast<double>(perf_tokens)) / perf_ms
+                                    : 0.0;
     std::cout << std::fixed << std::setprecision(2)
               << (repeated_benchmark ? "[perf-avg] " : "[perf] ")
-              << "generated_tokens=" << perf_tokens
-              << " elapsed_ms=" << perf_ms
+              << "generated_tokens=" << perf_tokens << " elapsed_ms=" << perf_ms
               << " tok_per_s=" << toks_per_sec << "\n";
   }
   if (!options.quiet_output && options.benchmark_mode) {
     if (repeated_benchmark) {
-      const int prefill_tokens = prompt_tokens.empty() ? 0 : static_cast<int>(prompt_tokens.size()) - 1;
+      const int prefill_tokens =
+          prompt_tokens.empty() ? 0 : static_cast<int>(prompt_tokens.size()) - 1;
       std::cout << std::fixed << std::setprecision(2)
                 << "[bench-avg] reps=" << options.benchmark_reps
-                << " prefill_tokens=" << prefill_tokens
-                << " prefill_ms=" << avg_prefill_ms
+                << " prefill_tokens=" << prefill_tokens << " prefill_ms=" << avg_prefill_ms
                 << " prefill_tok_per_s=" << avg_prefill_tok_per_s
-                << " decode_tokens=" << avg_generated_tokens
-                << " decode_ms=" << avg_decode_ms
+                << " decode_tokens=" << avg_generated_tokens << " decode_ms=" << avg_decode_ms
                 << " decode_tok_per_s=" << avg_decode_tok_per_s
                 << " transfer_ms=" << avg_transfer_ms
                 << " streamed_layer_copies=" << avg_streamed_layer_copies
-                << " tq3_cached_active=" << avg_tq3_cached_active
-                << " total_ms=" << avg_total_ms
+                << " tq3_cached_active=" << avg_tq3_cached_active << " total_ms=" << avg_total_ms
                 << " total_tok_per_s=" << avg_total_tok_per_s << "\n";
       if (options.benchmark_phases) {
-        std::cout << std::fixed << std::setprecision(2)
-                  << "[bench-phase-avg]"
-                  << " rmsnorm_ms=" << avg_decode_rmsnorm_ms
-                  << " qkv_ms=" << avg_decode_qkv_ms
+        std::cout << std::fixed << std::setprecision(2) << "[bench-phase-avg]"
+                  << " rmsnorm_ms=" << avg_decode_rmsnorm_ms << " qkv_ms=" << avg_decode_qkv_ms
                   << " kv_store_ms=" << avg_decode_kv_store_ms
-                  << " attention_ms=" << avg_decode_attention_ms
-                  << " wo_ms=" << avg_decode_wo_ms
+                  << " attention_ms=" << avg_decode_attention_ms << " wo_ms=" << avg_decode_wo_ms
                   << " mlp_ms=" << avg_decode_mlp_ms
                   << " moe_router_ms=" << avg_decode_moe_router_ms
                   << " moe_expert_ms=" << avg_decode_moe_expert_ms
@@ -664,28 +684,25 @@ void execute_engine_modes(const RunExecutionOptions& options,
       const auto& stats = last_benchmark_stats();
       const int prefill_tokens = (stats.prompt_tokens > 0) ? (stats.prompt_tokens - 1) : 0;
       const double prefill_tok_per_s =
-          (prefill_tokens > 0 && stats.prefill_ms > 0.0) ? (1000.0 * static_cast<double>(prefill_tokens) / stats.prefill_ms) : 0.0;
+          (prefill_tokens > 0 && stats.prefill_ms > 0.0)
+              ? (1000.0 * static_cast<double>(prefill_tokens) / stats.prefill_ms)
+              : 0.0;
       const double decode_tok_per_s =
-          (stats.generated_tokens > 0 && stats.decode_ms > 0.0) ? (1000.0 * static_cast<double>(stats.generated_tokens) / stats.decode_ms) : 0.0;
-      std::cout << std::fixed << std::setprecision(2)
-                << "[bench] prefill_tokens=" << prefill_tokens
-                << " prefill_ms=" << stats.prefill_ms
-                << " prefill_tok_per_s=" << prefill_tok_per_s
-                << " decode_tokens=" << stats.generated_tokens
-                << " decode_ms=" << stats.decode_ms
-                << " decode_tok_per_s=" << decode_tok_per_s
-                << " transfer_ms=" << stats.transfer_ms
+          (stats.generated_tokens > 0 && stats.decode_ms > 0.0)
+              ? (1000.0 * static_cast<double>(stats.generated_tokens) / stats.decode_ms)
+              : 0.0;
+      std::cout << std::fixed << std::setprecision(2) << "[bench] prefill_tokens=" << prefill_tokens
+                << " prefill_ms=" << stats.prefill_ms << " prefill_tok_per_s=" << prefill_tok_per_s
+                << " decode_tokens=" << stats.generated_tokens << " decode_ms=" << stats.decode_ms
+                << " decode_tok_per_s=" << decode_tok_per_s << " transfer_ms=" << stats.transfer_ms
                 << " streamed_layer_copies=" << stats.streamed_layer_copies
                 << " tq3_cached_active=" << stats.tq3_cached_active << "\n";
       if (options.benchmark_phases) {
-        std::cout << std::fixed << std::setprecision(2)
-                  << "[bench-phase]"
-                  << " rmsnorm_ms=" << stats.decode_rmsnorm_ms
-                  << " qkv_ms=" << stats.decode_qkv_ms
+        std::cout << std::fixed << std::setprecision(2) << "[bench-phase]"
+                  << " rmsnorm_ms=" << stats.decode_rmsnorm_ms << " qkv_ms=" << stats.decode_qkv_ms
                   << " kv_store_ms=" << stats.decode_kv_store_ms
                   << " attention_ms=" << stats.decode_attention_ms
-                  << " wo_ms=" << stats.decode_wo_ms
-                  << " mlp_ms=" << stats.decode_mlp_ms
+                  << " wo_ms=" << stats.decode_wo_ms << " mlp_ms=" << stats.decode_mlp_ms
                   << " moe_router_ms=" << stats.decode_moe_router_ms
                   << " moe_expert_ms=" << stats.decode_moe_expert_ms
                   << " moe_merge_ms=" << stats.decode_moe_merge_ms

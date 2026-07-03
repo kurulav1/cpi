@@ -37,14 +37,14 @@ int main() {
   // Refcounted sharing: a block freed only when the last ref drops.
   {
     BlockAllocator a(2);
-    int b = a.allocate();      // rc 1
-    a.add_ref(b);              // rc 2
-    a.release(b);              // rc 1 -> still held
+    int b = a.allocate();  // rc 1
+    a.add_ref(b);          // rc 2
+    a.release(b);          // rc 1 -> still held
     check(a.free_count() == 1, "shared block not freed while referenced");
     check(a.ref_count(b) == 1, "refcount tracks shares");
-    a.release(b);              // rc 0 -> free
+    a.release(b);  // rc 0 -> free
     check(a.free_count() == 2, "freed when last ref drops");
-    a.release(b);              // double-free ignored
+    a.release(b);  // double-free ignored
     check(a.free_count() == 2, "double-free is a no-op");
   }
 

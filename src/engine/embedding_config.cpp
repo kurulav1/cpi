@@ -31,7 +31,8 @@ std::size_t find_value(const std::string& json, const std::string& key) {
     return std::string::npos;
   }
   ++p;
-  while (p < json.size() && (json[p] == ' ' || json[p] == '\t' || json[p] == '\n' || json[p] == '\r')) {
+  while (p < json.size() &&
+         (json[p] == ' ' || json[p] == '\t' || json[p] == '\n' || json[p] == '\r')) {
     ++p;
   }
   return p;
@@ -43,8 +44,9 @@ std::optional<double> json_num(const std::string& json, const std::string& key) 
     return std::nullopt;
   }
   std::size_t e = p;
-  while (e < json.size() && (std::isdigit(static_cast<unsigned char>(json[e])) || json[e] == '-' ||
-                             json[e] == '+' || json[e] == '.' || json[e] == 'e' || json[e] == 'E')) {
+  while (e < json.size() &&
+         (std::isdigit(static_cast<unsigned char>(json[e])) || json[e] == '-' || json[e] == '+' ||
+          json[e] == '.' || json[e] == 'e' || json[e] == 'E')) {
     ++e;
   }
   if (e == p) {
@@ -78,10 +80,18 @@ std::optional<std::string> json_str(const std::string& json, const std::string& 
     if (json[i] == '\\' && i + 1 < json.size()) {
       const char e = json[i + 1];
       switch (e) {
-        case 'n': out.push_back('\n'); break;
-        case 't': out.push_back('\t'); break;
-        case 'r': out.push_back('\r'); break;
-        default: out.push_back(e); break;
+        case 'n':
+          out.push_back('\n');
+          break;
+        case 't':
+          out.push_back('\t');
+          break;
+        case 'r':
+          out.push_back('\r');
+          break;
+        default:
+          out.push_back(e);
+          break;
       }
       i += 2;
     } else {
@@ -134,7 +144,8 @@ EmbeddingConfig EmbeddingConfig::load(const std::string& model_dir) {
   // Embedding-specific knobs (CPI-authored, model-agnostic schema).
   if (const auto e_text = read_file(model_dir + "/cpi_embed.json")) {
     const std::string& e = *e_text;
-    if (const auto v = json_str(e, "pooling")) cfg.pooling = (*v == "mean") ? PoolingMode::Mean : PoolingMode::Cls;
+    if (const auto v = json_str(e, "pooling"))
+      cfg.pooling = (*v == "mean") ? PoolingMode::Mean : PoolingMode::Cls;
     if (const auto v = json_bool(e, "normalize")) cfg.normalize = *v;
     if (const auto v = json_num(e, "dimension")) cfg.dimension = static_cast<int>(*v);
     if (const auto v = json_num(e, "max_tokens")) cfg.max_tokens = static_cast<int>(*v);

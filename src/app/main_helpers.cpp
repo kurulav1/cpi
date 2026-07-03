@@ -135,26 +135,28 @@ std::string build_plain_chat_prompt(const std::string& prompt_text) {
 std::string build_llama3_style_prompt(const std::string& prompt_text) {
   return "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n" +
          std::string(kDefaultSystemPrompt) +
-         "<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n" +
-         prompt_text + "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n";
+         "<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n" + prompt_text +
+         "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n";
 }
 
 std::string build_llama2_style_prompt(const std::string& prompt_text) {
   return "[INST] <<SYS>>\n" + std::string(kDefaultSystemPrompt) +
-         "\nReply naturally to the user's latest request only. Do not add explanation unless asked.\n<</SYS>>\n\n" +
+         "\nReply naturally to the user's latest request only. Do not add explanation unless "
+         "asked.\n<</SYS>>\n\n" +
          prompt_text + " [/INST]";
 }
 
 std::string to_lower_copy(std::string s) {
-  std::transform(s.begin(), s.end(), s.begin(), [](unsigned char ch) {
-    return static_cast<char>(std::tolower(ch));
-  });
+  std::transform(s.begin(), s.end(), s.begin(),
+                 [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
   return s;
 }
 
 }  // namespace
 
-SingleInstanceGuard::~SingleInstanceGuard() { release(); }
+SingleInstanceGuard::~SingleInstanceGuard() {
+  release();
+}
 
 bool SingleInstanceGuard::acquire() {
 #ifdef _WIN32
@@ -366,8 +368,7 @@ bool json_get_bool(const std::string& json, const std::string& key, bool def) {
   return def;
 }
 
-std::vector<std::string> json_get_string_array(const std::string& json,
-                                               const std::string& key) {
+std::vector<std::string> json_get_string_array(const std::string& json, const std::string& key) {
   const std::size_t v = json_find_key(json, key);
   if (v == std::string::npos) {
     return {};
@@ -431,8 +432,7 @@ std::string json_escape(const std::string& s) {
   return out;
 }
 
-std::string build_chat_prompt(const std::string& chat_template,
-                              const std::string& prompt_text,
+std::string build_chat_prompt(const std::string& chat_template, const std::string& prompt_text,
                               bool tinyllama_plain_fallback) {
   if (chat_template.empty()) {
     return prompt_text;
@@ -444,8 +444,8 @@ std::string build_chat_prompt(const std::string& chat_template,
     if (tinyllama_plain_fallback) {
       return build_plain_chat_prompt(prompt_text);
     }
-    return "<|system|>\n" + std::string(kDefaultSystemPrompt) + "</s>\n<|user|>\n" +
-           prompt_text + "</s>\n<|assistant|>\n";
+    return "<|system|>\n" + std::string(kDefaultSystemPrompt) + "</s>\n<|user|>\n" + prompt_text +
+           "</s>\n<|assistant|>\n";
   }
   if (chat_template == "llama2") {
     return build_llama2_style_prompt(prompt_text);
@@ -462,8 +462,7 @@ std::string build_chat_prompt(const std::string& chat_template,
   }
   if (chat_template == "qwen2") {
     return "<|im_start|>system\n" + std::string(kDefaultSystemPrompt) +
-           "<|im_end|>\n<|im_start|>user\n" + prompt_text +
-           "<|im_end|>\n<|im_start|>assistant\n";
+           "<|im_end|>\n<|im_start|>user\n" + prompt_text + "<|im_end|>\n<|im_start|>assistant\n";
   }
   if (chat_template == "qwen3_5") {
     return "<|im_start|>system\n" + std::string(kDefaultSystemPrompt) +
@@ -476,11 +475,10 @@ std::string build_chat_prompt(const std::string& chat_template,
   throw std::runtime_error("unsupported --chat-template value: " + chat_template);
 }
 
-std::vector<std::string> default_stop_texts_for_template(
-    const std::string& chat_template) {
+std::vector<std::string> default_stop_texts_for_template(const std::string& chat_template) {
   if (chat_template == "llama2") {
-    return {"</s>", "[INST]", "[/INST]", "<<SYS>>", "<</SYS>>", "\nQuestion:",
-            "\nUser:", "\nSystem:", "\nAssistant:", "\nExplanation:", "</", "<|"};
+    return {"</s>",    "[INST]",    "[/INST]",      "<<SYS>>",        "<</SYS>>", "\nQuestion:",
+            "\nUser:", "\nSystem:", "\nAssistant:", "\nExplanation:", "</",       "<|"};
   }
   if (chat_template == "llama3") {
     return {"<|eot_id|>", "<|start_header_id|>", "<|end_header_id|>"};
@@ -498,8 +496,7 @@ std::vector<std::string> default_stop_texts_for_template(
     return {"<|im_end|>", "<|im_start|>", "<|endoftext|>"};
   }
   if (chat_template == "llama4") {
-    return {"<|eot_id|>", "<|start_header_id|>", "<|end_header_id|>",
-            "<|begin_of_text|>"};
+    return {"<|eot_id|>", "<|start_header_id|>", "<|end_header_id|>", "<|begin_of_text|>"};
   }
   if (chat_template == "tinyllama") {
     return {"</s>", "\nUser:"};
@@ -529,8 +526,7 @@ std::string normalize_whitespace(std::string text) {
 std::string cleanup_repeated_words(std::string text) {
   static const std::regex repeated_word(R"(\b([A-Za-z][A-Za-z'-]*)\b(?:\s+\1\b)+)",
                                         std::regex_constants::icase);
-  static const std::regex repeated_segment(R"(\b([A-Za-z]{3,})\1\b)",
-                                           std::regex_constants::icase);
+  static const std::regex repeated_segment(R"(\b([A-Za-z]{3,})\1\b)", std::regex_constants::icase);
   static const std::regex repeated_letter(R"(([A-Za-z])\1{4,})");
   static const std::regex repeated_punct(R"(([!?.,])\1+)");
 
@@ -665,14 +661,13 @@ std::string cleanup_repeated_sentences(const std::string& text) {
 // formatted text.
 bool looks_degenerate_repetition(const std::string& text) {
   // A word repeated 3+ times in a row ("the the the").
-  static const std::regex repeated_word_run(
-      R"(\b([A-Za-z][A-Za-z'-]*)\b(?:\s+\1\b){2,})", std::regex_constants::icase);
+  static const std::regex repeated_word_run(R"(\b([A-Za-z][A-Za-z'-]*)\b(?:\s+\1\b){2,})",
+                                            std::regex_constants::icase);
   // The same letter 6+ times in a row ("aaaaaa").
   static const std::regex repeated_letter_run(R"(([A-Za-z])\1{5,})");
   // The same punctuation mark 3+ times in a row ("!!!!", "....").
   static const std::regex repeated_punct_run(R"(([!?,])\1{2,})");
-  if (std::regex_search(text, repeated_word_run) ||
-      std::regex_search(text, repeated_letter_run) ||
+  if (std::regex_search(text, repeated_word_run) || std::regex_search(text, repeated_letter_run) ||
       std::regex_search(text, repeated_punct_run)) {
     return true;
   }
@@ -722,9 +717,13 @@ std::string normalize_final_response_text(const std::string& text) {
     }
   }
 
-  cleaned = std::regex_replace(cleaned, std::regex(R"(^\s*Assistant\s*:?\s*)", std::regex_constants::icase), "");
-  cleaned = std::regex_replace(cleaned, std::regex(R"(^\s*Answer\s*:?\s*)", std::regex_constants::icase), "");
-  cleaned = std::regex_replace(cleaned, std::regex(R"(^\s*(?:\[/?INST\]|<<\/?SYS>>|</?s>)\s*)", std::regex_constants::icase), "");
+  cleaned = std::regex_replace(
+      cleaned, std::regex(R"(^\s*Assistant\s*:?\s*)", std::regex_constants::icase), "");
+  cleaned = std::regex_replace(
+      cleaned, std::regex(R"(^\s*Answer\s*:?\s*)", std::regex_constants::icase), "");
+  cleaned = std::regex_replace(
+      cleaned, std::regex(R"(^\s*(?:\[/?INST\]|<<\/?SYS>>|</?s>)\s*)", std::regex_constants::icase),
+      "");
 
   // Healthy output: keep the model's own formatting intact (newlines,
   // indentation, code blocks). The aggressive repetition pipeline below is a
@@ -735,13 +734,11 @@ std::string normalize_final_response_text(const std::string& text) {
   }
 
   return cleanup_repeated_sentences(
-      trim_incomplete_trailing_tail(
-          collapse_adjacent_near_duplicate_words(
-              cleanup_repeated_words(normalize_whitespace(cleaned)))));
+      trim_incomplete_trailing_tail(collapse_adjacent_near_duplicate_words(
+          cleanup_repeated_words(normalize_whitespace(cleaned)))));
 }
 
-std::size_t find_first_stop_pos(const std::string& text,
-                                const std::vector<std::string>& stops) {
+std::size_t find_first_stop_pos(const std::string& text, const std::vector<std::string>& stops) {
   std::size_t best = std::string::npos;
   for (const auto& stop : stops) {
     if (stop.empty()) {
@@ -783,8 +780,7 @@ bool is_safetensors_model_dir(const std::string& path) {
     if (ec) {
       return false;
     }
-    if (entry.is_regular_file(ec) && !ec &&
-        entry.path().extension() == ".safetensors") {
+    if (entry.is_regular_file(ec) && !ec && entry.path().extension() == ".safetensors") {
       return true;
     }
   }
@@ -805,8 +801,7 @@ std::string infer_safetensors_model_family(const std::string& path) {
   if (!in) {
     return "";
   }
-  const std::string json((std::istreambuf_iterator<char>(in)),
-                         std::istreambuf_iterator<char>());
+  const std::string json((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
   const std::string root_model_type = json_get_string(json, "model_type");
   if (root_model_type.find("qwen3_5") != std::string::npos) {
     return "qwen3_5";
@@ -828,27 +823,22 @@ std::string infer_safetensors_model_family(const std::string& path) {
 
 std::string guess_chat_template_from_model_path(const std::string& model_path) {
   const std::string name = to_lower_copy(model_path);
-  if (name.find("qwen3.5") != std::string::npos ||
-      name.find("qwen3_5") != std::string::npos) {
+  if (name.find("qwen3.5") != std::string::npos || name.find("qwen3_5") != std::string::npos) {
     return "qwen3_5";
   }
-  if (name.find("llama-4") != std::string::npos ||
-      name.find("llama4") != std::string::npos) {
+  if (name.find("llama-4") != std::string::npos || name.find("llama4") != std::string::npos) {
     return "llama4";
   }
-  if (name.find("llama-3") != std::string::npos ||
-      name.find("llama3") != std::string::npos) {
+  if (name.find("llama-3") != std::string::npos || name.find("llama3") != std::string::npos) {
     return "llama3";
   }
-  if (name.find("llama-2") != std::string::npos ||
-      name.find("llama2") != std::string::npos) {
+  if (name.find("llama-2") != std::string::npos || name.find("llama2") != std::string::npos) {
     return "llama2";
   }
   if (name.find("qwen") != std::string::npos) {
     return "qwen2";
   }
-  if (name.find("phi-3") != std::string::npos ||
-      name.find("phi3") != std::string::npos) {
+  if (name.find("phi-3") != std::string::npos || name.find("phi3") != std::string::npos) {
     return "phi3";
   }
   if (name.find("mistral") != std::string::npos) {

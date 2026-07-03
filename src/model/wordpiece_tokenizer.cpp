@@ -21,19 +21,42 @@ std::vector<std::uint32_t> to_codepoints(const std::string& s) {
     const unsigned char c = static_cast<unsigned char>(s[i]);
     std::uint32_t cp = c;
     int extra = 0;
-    if ((c & 0x80) == 0x00) { cp = c; extra = 0; }
-    else if ((c & 0xE0) == 0xC0) { cp = c & 0x1F; extra = 1; }
-    else if ((c & 0xF0) == 0xE0) { cp = c & 0x0F; extra = 2; }
-    else if ((c & 0xF8) == 0xF0) { cp = c & 0x07; extra = 3; }
-    else { ++i; out.push_back(c); continue; }
-    if (i + extra >= s.size()) { ++i; out.push_back(c); continue; }
+    if ((c & 0x80) == 0x00) {
+      cp = c;
+      extra = 0;
+    } else if ((c & 0xE0) == 0xC0) {
+      cp = c & 0x1F;
+      extra = 1;
+    } else if ((c & 0xF0) == 0xE0) {
+      cp = c & 0x0F;
+      extra = 2;
+    } else if ((c & 0xF8) == 0xF0) {
+      cp = c & 0x07;
+      extra = 3;
+    } else {
+      ++i;
+      out.push_back(c);
+      continue;
+    }
+    if (i + extra >= s.size()) {
+      ++i;
+      out.push_back(c);
+      continue;
+    }
     bool ok = true;
     for (int k = 1; k <= extra; ++k) {
       const unsigned char cc = static_cast<unsigned char>(s[i + k]);
-      if ((cc & 0xC0) != 0x80) { ok = false; break; }
+      if ((cc & 0xC0) != 0x80) {
+        ok = false;
+        break;
+      }
       cp = (cp << 6) | (cc & 0x3F);
     }
-    if (!ok) { ++i; out.push_back(c); continue; }
+    if (!ok) {
+      ++i;
+      out.push_back(c);
+      continue;
+    }
     out.push_back(cp);
     i += extra + 1;
   }
@@ -93,21 +116,70 @@ bool is_cjk(std::uint32_t cp) {
 // the common Latin Extended-A letters; everything else is returned unchanged.
 std::uint32_t strip_accent(std::uint32_t cp) {
   switch (cp) {
-    case 0xE0: case 0xE1: case 0xE2: case 0xE3: case 0xE4: case 0xE5: case 0x101:
-    case 0x103: case 0x105: return 'a';
-    case 0xE7: case 0x107: case 0x109: case 0x10D: return 'c';
-    case 0xE8: case 0xE9: case 0xEA: case 0xEB: case 0x113: case 0x115: case 0x117:
-    case 0x119: case 0x11B: return 'e';
-    case 0xEC: case 0xED: case 0xEE: case 0xEF: case 0x129: case 0x12B: case 0x12F:
+    case 0xE0:
+    case 0xE1:
+    case 0xE2:
+    case 0xE3:
+    case 0xE4:
+    case 0xE5:
+    case 0x101:
+    case 0x103:
+    case 0x105:
+      return 'a';
+    case 0xE7:
+    case 0x107:
+    case 0x109:
+    case 0x10D:
+      return 'c';
+    case 0xE8:
+    case 0xE9:
+    case 0xEA:
+    case 0xEB:
+    case 0x113:
+    case 0x115:
+    case 0x117:
+    case 0x119:
+    case 0x11B:
+      return 'e';
+    case 0xEC:
+    case 0xED:
+    case 0xEE:
+    case 0xEF:
+    case 0x129:
+    case 0x12B:
+    case 0x12F:
       return 'i';
-    case 0xF1: case 0x144: case 0x148: return 'n';
-    case 0xF2: case 0xF3: case 0xF4: case 0xF5: case 0xF6: case 0xF8: case 0x14D:
-    case 0x14F: case 0x151: return 'o';
-    case 0xF9: case 0xFA: case 0xFB: case 0xFC: case 0x169: case 0x16B: case 0x16D:
-    case 0x16F: case 0x171: return 'u';
-    case 0xFD: case 0xFF: return 'y';
-    case 0xDF: return 's';  // sharp s -> s (approximation)
-    default: return cp;
+    case 0xF1:
+    case 0x144:
+    case 0x148:
+      return 'n';
+    case 0xF2:
+    case 0xF3:
+    case 0xF4:
+    case 0xF5:
+    case 0xF6:
+    case 0xF8:
+    case 0x14D:
+    case 0x14F:
+    case 0x151:
+      return 'o';
+    case 0xF9:
+    case 0xFA:
+    case 0xFB:
+    case 0xFC:
+    case 0x169:
+    case 0x16B:
+    case 0x16D:
+    case 0x16F:
+    case 0x171:
+      return 'u';
+    case 0xFD:
+    case 0xFF:
+      return 'y';
+    case 0xDF:
+      return 's';  // sharp s -> s (approximation)
+    default:
+      return cp;
   }
 }
 

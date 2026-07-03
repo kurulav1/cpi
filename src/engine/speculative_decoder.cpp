@@ -10,8 +10,7 @@ SpeculativeDecoder::SpeculativeDecoder(LlamaEngine& draft, LlamaEngine& target, 
     : draft_(draft), target_(target), k_(std::max(1, spec_tokens)) {}
 
 std::vector<int> SpeculativeDecoder::generate(const std::vector<int>& prompt_tokens,
-                                              int max_new_tokens,
-                                              int eos_token_id,
+                                              int max_new_tokens, int eos_token_id,
                                               const std::function<bool(int)>& on_token) {
   // Return the full sequence (prompt + generated), matching generate_stream's
   // contract: callers strip the first prompt_tokens.size() entries.
@@ -80,7 +79,8 @@ std::vector<int> SpeculativeDecoder::generate(const std::vector<int>& prompt_tok
 
     // 3. Accept the longest prefix where the draft matched the target argmax.
     int n_accept = 0;
-    while (n_accept < K && targ[static_cast<std::size_t>(n_accept)] == draft_tokens[static_cast<std::size_t>(n_accept)]) {
+    while (n_accept < K && targ[static_cast<std::size_t>(n_accept)] ==
+                               draft_tokens[static_cast<std::size_t>(n_accept)]) {
       ++n_accept;
     }
 

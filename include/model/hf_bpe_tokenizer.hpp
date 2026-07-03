@@ -23,7 +23,7 @@ namespace model {
 // Instances are not thread-safe during load() but are safe for concurrent
 // encode()/decode() calls after initialisation.
 class HfBpeTokenizer {
- public:
+public:
   // Loads vocabulary, merge rules, and special tokens from the tokenizer.json
   // file at path.  Throws on missing file or JSON parse errors.
   void load(const std::string& path);
@@ -37,25 +37,35 @@ class HfBpeTokenizer {
   std::string decode(const std::vector<int>& ids) const;
 
   // Returns the beginning-of-sequence token ID, or -1 if not present in vocab.
-  int bos_id() const { return bos_id_; }
+  int bos_id() const {
+    return bos_id_;
+  }
 
   // Returns the end-of-sequence token ID, or -1 if not present in vocab.
-  int eos_id() const { return eos_id_; }
+  int eos_id() const {
+    return eos_id_;
+  }
 
   // Returns the unknown token ID, or -1 if not present in vocab.
-  int unk_id() const { return unk_id_; }
+  int unk_id() const {
+    return unk_id_;
+  }
 
   // Returns the full set of special token IDs loaded from the added_tokens
   // section of tokenizer.json.
-  const std::vector<int>& special_ids() const { return special_ids_; }
+  const std::vector<int>& special_ids() const {
+    return special_ids_;
+  }
 
   // Returns a per-token byte table: token_pieces()[id] is the raw bytes token
   // `id` emits (byte-level / byte-fallback resolved, word-boundary marker -> a
   // space, NO sequence-level leading-space strip). Special/added tokens map to
   // an empty string. Built once at load(); used by grammar-constrained decoding.
-  const std::vector<std::string>& token_pieces() const { return token_pieces_; }
+  const std::vector<std::string>& token_pieces() const {
+    return token_pieces_;
+  }
 
- private:
+private:
   // Resolves a single token's vocabulary piece to the raw bytes it emits,
   // mirroring decode() for one token but without the leading-space strip.
   std::string piece_to_bytes(const std::string& piece) const;
@@ -74,20 +84,24 @@ class HfBpeTokenizer {
   // Returns the canonical merge-table key for a BPE pair (left, right).
   std::string merge_key(const std::string& left, const std::string& right) const;
 
-  std::unordered_map<std::string, int> vocab_;          // Piece-to-ID mapping from the vocab section.
-  std::vector<std::string> id_to_piece_;                // Reverse ID-to-piece mapping for decode.
-  std::vector<std::string> token_pieces_;               // Per-token emitted bytes for grammar masking (see token_pieces()).
-  std::unordered_map<std::string, int> merge_ranks_;    // BPE merge pair -> priority rank (lower = earlier).
-  std::vector<std::pair<std::string, int>> added_tokens_; // Special/added tokens with their IDs.
-  std::vector<int> special_ids_;                        // IDs of all added/special tokens.
+  std::unordered_map<std::string, int> vocab_;  // Piece-to-ID mapping from the vocab section.
+  std::vector<std::string> id_to_piece_;        // Reverse ID-to-piece mapping for decode.
+  std::vector<std::string>
+      token_pieces_;  // Per-token emitted bytes for grammar masking (see token_pieces()).
+  std::unordered_map<std::string, int>
+      merge_ranks_;  // BPE merge pair -> priority rank (lower = earlier).
+  std::vector<std::pair<std::string, int>> added_tokens_;  // Special/added tokens with their IDs.
+  std::vector<int> special_ids_;                           // IDs of all added/special tokens.
 
-  std::string word_boundary_ = "\xE2\x96\x81"; // UTF-8 encoding of the U+2581 word-boundary marker (▁).
-  bool byte_fallback_ = false;       // When true, unknown pieces are encoded as individual byte tokens.
-  bool strip_leading_space_ = true;  // When true, a leading word-boundary marker is stripped during decode.
-  bool byte_level_ = false;          // When true, use GPT-2 byte-to-unicode encoding (ByteLevel BPE).
-  int bos_id_ = -1;                  // Cached BOS token ID.
-  int eos_id_ = -1;                  // Cached EOS token ID.
-  int unk_id_ = -1;                  // Cached UNK token ID.
+  std::string word_boundary_ =
+      "\xE2\x96\x81";           // UTF-8 encoding of the U+2581 word-boundary marker (▁).
+  bool byte_fallback_ = false;  // When true, unknown pieces are encoded as individual byte tokens.
+  bool strip_leading_space_ =
+      true;                  // When true, a leading word-boundary marker is stripped during decode.
+  bool byte_level_ = false;  // When true, use GPT-2 byte-to-unicode encoding (ByteLevel BPE).
+  int bos_id_ = -1;          // Cached BOS token ID.
+  int eos_id_ = -1;          // Cached EOS token ID.
+  int unk_id_ = -1;          // Cached UNK token ID.
 
   // GPT-2 byte-to-unicode table: byte_to_unicode_[b] is the UTF-8 string for the
   // Unicode code point that byte b maps to.  Only populated when byte_level_ == true.

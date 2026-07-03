@@ -1,3 +1,5 @@
+#include <cuda_runtime.h>
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -8,8 +10,6 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
-
-#include <cuda_runtime.h>
 
 #include "runtime/cuda_utils.cuh"
 
@@ -32,9 +32,13 @@ struct BenchResult {
   double avg_gbps = 0.0;
 };
 
-double bytes_to_gb(std::size_t bytes) { return static_cast<double>(bytes) / 1.0e9; }
+double bytes_to_gb(std::size_t bytes) {
+  return static_cast<double>(bytes) / 1.0e9;
+}
 
-double bytes_to_gib(std::size_t bytes) { return static_cast<double>(bytes) / static_cast<double>(1ull << 30); }
+double bytes_to_gib(std::size_t bytes) {
+  return static_cast<double>(bytes) / static_cast<double>(1ull << 30);
+}
 
 std::string need_value(int& i, int argc, char** argv, const std::string& flag) {
   if (i + 1 >= argc) {
@@ -50,7 +54,8 @@ Options parse_args(int argc, char** argv) {
     if (arg == "--device") {
       opts.device = std::stoi(need_value(i, argc, argv, arg));
     } else if (arg == "--mb") {
-      opts.bytes = static_cast<std::size_t>(std::stoull(need_value(i, argc, argv, arg))) * 1024ull * 1024ull;
+      opts.bytes =
+          static_cast<std::size_t>(std::stoull(need_value(i, argc, argv, arg))) * 1024ull * 1024ull;
     } else if (arg == "--iters") {
       opts.iters = std::stoi(need_value(i, argc, argv, arg));
     } else if (arg == "--warmup") {
@@ -61,9 +66,9 @@ Options parse_args(int argc, char** argv) {
       opts.bytes_per_token_gb = std::stod(need_value(i, argc, argv, arg));
       opts.have_bytes_per_token = true;
     } else if (arg == "--help" || arg == "-h") {
-      std::cout
-          << "Usage: cuda_bandwidth_bench [--device N] [--mb N] [--iters N] [--warmup N] [--repeats N] "
-             "[--bytes-per-token-gb X]\n";
+      std::cout << "Usage: cuda_bandwidth_bench [--device N] [--mb N] [--iters N] [--warmup N] "
+                   "[--repeats N] "
+                   "[--bytes-per-token-gb X]\n";
       std::exit(0);
     } else {
       throw std::runtime_error("unknown argument: " + arg);
@@ -96,8 +101,10 @@ __global__ void read_int4_kernel(const int4* src, unsigned int* sink, std::size_
   const int lane = tid & (warpSize - 1);
   const int warp = tid / warpSize;
   const int warp_count = (blockDim.x + warpSize - 1) / warpSize;
-  const std::size_t stride = static_cast<std::size_t>(gridDim.x) * static_cast<std::size_t>(blockDim.x);
-  std::size_t idx = static_cast<std::size_t>(blockIdx.x) * static_cast<std::size_t>(blockDim.x) + static_cast<std::size_t>(tid);
+  const std::size_t stride =
+      static_cast<std::size_t>(gridDim.x) * static_cast<std::size_t>(blockDim.x);
+  std::size_t idx = static_cast<std::size_t>(blockIdx.x) * static_cast<std::size_t>(blockDim.x) +
+                    static_cast<std::size_t>(tid);
 
   unsigned int local = 0;
   while (idx < n) {
@@ -123,8 +130,10 @@ __global__ void read_int4_kernel(const int4* src, unsigned int* sink, std::size_
 }
 
 __global__ void write_int4_kernel(int4* dst, int4 value, std::size_t n) {
-  const std::size_t stride = static_cast<std::size_t>(gridDim.x) * static_cast<std::size_t>(blockDim.x);
-  std::size_t idx = static_cast<std::size_t>(blockIdx.x) * static_cast<std::size_t>(blockDim.x) + static_cast<std::size_t>(threadIdx.x);
+  const std::size_t stride =
+      static_cast<std::size_t>(gridDim.x) * static_cast<std::size_t>(blockDim.x);
+  std::size_t idx = static_cast<std::size_t>(blockIdx.x) * static_cast<std::size_t>(blockDim.x) +
+                    static_cast<std::size_t>(threadIdx.x);
   while (idx < n) {
     dst[idx] = value;
     idx += stride;
@@ -132,8 +141,10 @@ __global__ void write_int4_kernel(int4* dst, int4 value, std::size_t n) {
 }
 
 __global__ void copy_int4_kernel(const int4* src, int4* dst, std::size_t n) {
-  const std::size_t stride = static_cast<std::size_t>(gridDim.x) * static_cast<std::size_t>(blockDim.x);
-  std::size_t idx = static_cast<std::size_t>(blockIdx.x) * static_cast<std::size_t>(blockDim.x) + static_cast<std::size_t>(threadIdx.x);
+  const std::size_t stride =
+      static_cast<std::size_t>(gridDim.x) * static_cast<std::size_t>(blockDim.x);
+  std::size_t idx = static_cast<std::size_t>(blockIdx.x) * static_cast<std::size_t>(blockDim.x) +
+                    static_cast<std::size_t>(threadIdx.x);
   while (idx < n) {
     dst[idx] = src[idx];
     idx += stride;
@@ -141,11 +152,7 @@ __global__ void copy_int4_kernel(const int4* src, int4* dst, std::size_t n) {
 }
 
 template <typename Launch>
-BenchResult run_bench(Launch&& launch,
-                      double bytes_per_iter,
-                      int warmup,
-                      int iters,
-                      int repeats,
+BenchResult run_bench(Launch&& launch, double bytes_per_iter, int warmup, int iters, int repeats,
                       cudaStream_t stream) {
   cudaEvent_t start = nullptr;
   cudaEvent_t stop = nullptr;
@@ -190,8 +197,7 @@ BenchResult run_bench(Launch&& launch,
   return result;
 }
 
-void print_result(const std::string& label,
-                  const BenchResult& payload,
+void print_result(const std::string& label, const BenchResult& payload,
                   double traffic_multiplier = 1.0) {
   std::cout << std::fixed << std::setprecision(2);
   std::cout << "[bandwidth] " << label << " payload_best_gbps=" << payload.best_gbps
@@ -225,7 +231,8 @@ int main(int argc, char** argv) {
 
     std::size_t bytes = opts.bytes;
     const std::size_t reserve_bytes = 256ull * 1024ull * 1024ull;
-    const std::size_t max_safe_bytes = (free_b > reserve_bytes) ? ((free_b - reserve_bytes) / 2ull) : 0ull;
+    const std::size_t max_safe_bytes =
+        (free_b > reserve_bytes) ? ((free_b - reserve_bytes) / 2ull) : 0ull;
     if (bytes > max_safe_bytes && max_safe_bytes >= 64ull * 1024ull * 1024ull) {
       bytes = max_safe_bytes;
     }
@@ -236,8 +243,9 @@ int main(int argc, char** argv) {
 
     const std::size_t n_vec = bytes / sizeof(int4);
     constexpr int threads = 256;
-    const int blocks = std::min<std::size_t>((n_vec + threads - 1) / threads,
-                                             static_cast<std::size_t>(std::max(1, prop.multiProcessorCount * 32)));
+    const int blocks =
+        std::min<std::size_t>((n_vec + threads - 1) / threads,
+                              static_cast<std::size_t>(std::max(1, prop.multiProcessorCount * 32)));
     cudaStream_t stream = nullptr;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
 
@@ -249,19 +257,20 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMalloc(&d_sink, static_cast<std::size_t>(blocks) * sizeof(unsigned int)));
     CUDA_CHECK(cudaMemsetAsync(d_src, 0x5a, bytes, stream));
     CUDA_CHECK(cudaMemsetAsync(d_dst, 0, bytes, stream));
-    CUDA_CHECK(cudaMemsetAsync(d_sink, 0, static_cast<std::size_t>(blocks) * sizeof(unsigned int), stream));
+    CUDA_CHECK(cudaMemsetAsync(d_sink, 0, static_cast<std::size_t>(blocks) * sizeof(unsigned int),
+                               stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     int mem_clock_khz = 0;
     int bus_width_bits = 0;
     CUDA_CHECK(cudaDeviceGetAttribute(&mem_clock_khz, cudaDevAttrMemoryClockRate, opts.device));
-    CUDA_CHECK(cudaDeviceGetAttribute(&bus_width_bits, cudaDevAttrGlobalMemoryBusWidth, opts.device));
-    const double theoretical_gbps =
-        2.0 * static_cast<double>(mem_clock_khz) * (static_cast<double>(bus_width_bits) / 8.0) / 1.0e6;
+    CUDA_CHECK(
+        cudaDeviceGetAttribute(&bus_width_bits, cudaDevAttrGlobalMemoryBusWidth, opts.device));
+    const double theoretical_gbps = 2.0 * static_cast<double>(mem_clock_khz) *
+                                    (static_cast<double>(bus_width_bits) / 8.0) / 1.0e6;
 
     std::cout << "[device] index=" << opts.device << " name=" << prop.name
-              << " sm=" << prop.multiProcessorCount
-              << " cc=" << prop.major << "." << prop.minor
+              << " sm=" << prop.multiProcessorCount << " cc=" << prop.major << "." << prop.minor
               << " free_gb=" << std::fixed << std::setprecision(2) << bytes_to_gb(free_b)
               << " total_gb=" << bytes_to_gb(total_b)
               << " benchmark_buffer_gib=" << bytes_to_gib(bytes)
@@ -270,38 +279,26 @@ int main(int argc, char** argv) {
     const int4 pattern{0x01020304, 0x05060708, 0x09101112, 0x13141516};
     const auto read_result = run_bench(
         [&](cudaStream_t s) { read_int4_kernel<<<blocks, threads, 0, s>>>(d_src, d_sink, n_vec); },
-        static_cast<double>(bytes),
-        opts.warmup,
-        opts.iters,
-        opts.repeats,
-        stream);
+        static_cast<double>(bytes), opts.warmup, opts.iters, opts.repeats, stream);
     CUDA_CHECK(cudaGetLastError());
 
     const auto write_result = run_bench(
-        [&](cudaStream_t s) { write_int4_kernel<<<blocks, threads, 0, s>>>(d_dst, pattern, n_vec); },
-        static_cast<double>(bytes),
-        opts.warmup,
-        opts.iters,
-        opts.repeats,
-        stream);
+        [&](cudaStream_t s) {
+          write_int4_kernel<<<blocks, threads, 0, s>>>(d_dst, pattern, n_vec);
+        },
+        static_cast<double>(bytes), opts.warmup, opts.iters, opts.repeats, stream);
     CUDA_CHECK(cudaGetLastError());
 
     const auto copy_kernel_result = run_bench(
         [&](cudaStream_t s) { copy_int4_kernel<<<blocks, threads, 0, s>>>(d_src, d_dst, n_vec); },
-        static_cast<double>(bytes),
-        opts.warmup,
-        opts.iters,
-        opts.repeats,
-        stream);
+        static_cast<double>(bytes), opts.warmup, opts.iters, opts.repeats, stream);
     CUDA_CHECK(cudaGetLastError());
 
     const auto memcpy_result = run_bench(
-        [&](cudaStream_t s) { CUDA_CHECK(cudaMemcpyAsync(d_dst, d_src, bytes, cudaMemcpyDeviceToDevice, s)); },
-        static_cast<double>(bytes),
-        opts.warmup,
-        opts.iters,
-        opts.repeats,
-        stream);
+        [&](cudaStream_t s) {
+          CUDA_CHECK(cudaMemcpyAsync(d_dst, d_src, bytes, cudaMemcpyDeviceToDevice, s));
+        },
+        static_cast<double>(bytes), opts.warmup, opts.iters, opts.repeats, stream);
 
     print_result("read_int4", read_result);
     print_result("write_int4", write_result);

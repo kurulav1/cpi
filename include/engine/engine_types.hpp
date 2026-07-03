@@ -31,7 +31,7 @@ struct EngineOptions {
   // continuous batching + concurrent shared-prefix). Phase 2a: contiguous blocks,
   // byte-identical to the flat cache. Off by default.
   bool paged_blocks = false;
-  int paged_block_size = 32;   // tokens/block; 32 aligns with the split-K attention chunk
+  int paged_block_size = 32;  // tokens/block; 32 aligns with the split-K attention chunk
   bool kv_cache_int4 = false;
   bool enable_tq_cached = false;
   std::string tq_mode = "auto";

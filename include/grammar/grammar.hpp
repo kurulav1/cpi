@@ -50,7 +50,7 @@ struct PartialUtf8 {
 
 // Immutable compiled grammar.
 class Grammar {
- public:
+public:
   Grammar() = default;
   Grammar(std::vector<Rule> rules, std::size_t root_rule_id)
       : rules_(std::move(rules)), root_rule_(root_rule_id) {}
@@ -59,11 +59,17 @@ class Grammar {
   // Throws std::runtime_error on a parse error or a missing root rule.
   static Grammar parse(const std::string& gbnf, const std::string& root_rule_name = "root");
 
-  const std::vector<Rule>& rules() const { return rules_; }
-  std::size_t root_rule_id() const { return root_rule_; }
-  bool empty() const { return rules_.empty(); }
+  const std::vector<Rule>& rules() const {
+    return rules_;
+  }
+  std::size_t root_rule_id() const {
+    return root_rule_;
+  }
+  bool empty() const {
+    return rules_.empty();
+  }
 
- private:
+private:
   std::vector<Rule> rules_;
   std::size_t root_rule_ = 0;
 };
@@ -88,14 +94,13 @@ bool decode_simple_codepoints(const std::string& bytes, std::vector<std::uint32_
 // memoize transitions per grammar state instead of re-walking the grammar for
 // every token in the vocabulary.
 std::vector<Stack> grammar_accept_codepoint(const Grammar& grammar,
-                                            const std::vector<Stack>& stacks,
-                                            std::uint32_t cp);
+                                            const std::vector<Stack>& stacks, std::uint32_t cp);
 
 // Mutable matcher state. Holds pointers into the Grammar it was constructed
 // from, so that Grammar must outlive the state and must not be moved/reallocated
 // while the state is in use.
 class GrammarState {
- public:
+public:
   explicit GrammarState(const Grammar& grammar);
 
   // Advances the state by every byte in `piece`. Returns false if the bytes
@@ -121,15 +126,21 @@ class GrammarState {
 
   // True when a partial UTF-8 sequence is pending from a prior accepted token
   // (the fast codepoint path is invalid in that case).
-  bool has_partial() const { return partial_utf8_.n_remain > 0; }
+  bool has_partial() const {
+    return partial_utf8_.n_remain > 0;
+  }
 
   // The current live stack-set (starting point for memoized token masking).
-  const std::vector<Stack>& current_stacks() const { return stacks_; }
+  const std::vector<Stack>& current_stacks() const {
+    return stacks_;
+  }
 
   // True when no stacks remain (grammar is dead and cannot continue).
-  bool empty() const { return stacks_.empty(); }
+  bool empty() const {
+    return stacks_.empty();
+  }
 
- private:
+private:
   const Grammar* grammar_ = nullptr;
   std::vector<Stack> stacks_;
   PartialUtf8 partial_utf8_{};

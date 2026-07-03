@@ -209,8 +209,8 @@ struct JsonParser {
       if (*s == '-') {
         ++s;
       }
-      while (s < end && ((*s >= '0' && *s <= '9') || *s == '.' || *s == 'e' || *s == 'E' || *s == '+' ||
-                          *s == '-')) {
+      while (s < end && ((*s >= '0' && *s <= '9') || *s == '.' || *s == 'e' || *s == 'E' ||
+                         *s == '+' || *s == '-')) {
         ++s;
       }
       return;
@@ -329,9 +329,10 @@ void SafetensorsLoader::open(const std::string& model_dir) {
     throw std::runtime_error("safetensors: no .safetensors files found in: " + root.string());
   }
 
-  std::sort(shard_paths.begin(), shard_paths.end(), [](const fs::path& left, const fs::path& right) {
-    return left.filename().string() < right.filename().string();
-  });
+  std::sort(shard_paths.begin(), shard_paths.end(),
+            [](const fs::path& left, const fs::path& right) {
+              return left.filename().string() < right.filename().string();
+            });
 
   shards_.reserve(shard_paths.size());
   shard_data_offsets_.reserve(shard_paths.size());
@@ -363,7 +364,8 @@ void SafetensorsLoader::open(const std::string& model_dir) {
     const int shard_index = static_cast<int>(shard_idx);
     parser.parse_header([&](const std::string& name, std::size_t start, std::size_t end_offset) {
       if (end_offset < start || end_offset > payload_size) {
-        throw std::runtime_error("safetensors: invalid data_offsets for tensor " + name + " in " + path.string());
+        throw std::runtime_error("safetensors: invalid data_offsets for tensor " + name + " in " +
+                                 path.string());
       }
       if (tensors_.find(name) != tensors_.end()) {
         return;
@@ -381,7 +383,8 @@ const std::byte* SafetensorsLoader::tensor_ptr(const std::string& name) const {
     throw std::runtime_error("safetensors: tensor not found: " + name);
   }
   const TensorMeta& meta = it->second;
-  const std::size_t file_offset = shard_data_offsets_[static_cast<std::size_t>(meta.shard_idx)] + meta.data_start;
+  const std::size_t file_offset =
+      shard_data_offsets_[static_cast<std::size_t>(meta.shard_idx)] + meta.data_start;
   return shards_[static_cast<std::size_t>(meta.shard_idx)].data() + file_offset;
 }
 

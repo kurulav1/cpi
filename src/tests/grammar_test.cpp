@@ -3,6 +3,8 @@
 //
 // Exit code 0 = all passed, 1 = a failure.
 
+#include "grammar/grammar.hpp"
+
 #include <cmath>
 #include <cstdint>
 #include <iostream>
@@ -10,7 +12,6 @@
 #include <string>
 #include <vector>
 
-#include "grammar/grammar.hpp"
 #include "grammar/grammar_sampler.hpp"
 #include "grammar/json_schema_to_grammar.hpp"
 
@@ -97,8 +98,7 @@ void test_schema_object() {
         "schema: rejects required props out of order (documented v1 strictness)");
   check(!feed_bytes(g, R"({"title":"hi","count":"x"})"),
         "schema: rejects wrong-typed value (string where integer required)");
-  check(!feed_bytes(g, R"({"title":"hi"})"),
-        "schema: rejects missing required prop (no count)");
+  check(!feed_bytes(g, R"({"title":"hi"})"), "schema: rejects missing required prop (no count)");
 }
 
 void test_schema_enum() {
@@ -111,7 +111,8 @@ void test_schema_enum() {
 void test_partial_utf8() {
   // A bare string schema; feed a 2-byte UTF-8 codepoint (U+00E9 'é' = C3 A9)
   // split across two accept_bytes calls to exercise partial-UTF-8 carry.
-  grammar::Grammar g = grammar::Grammar::parse(grammar::json_schema_to_grammar(R"({"type":"string"})"));
+  grammar::Grammar g =
+      grammar::Grammar::parse(grammar::json_schema_to_grammar(R"({"type":"string"})"));
   grammar::GrammarState st(g);
   check(st.accept_bytes("\""), "utf8: opening quote");
   check(st.accept_bytes(std::string(1, static_cast<char>(0xC3))), "utf8: lead byte alive");
@@ -122,7 +123,8 @@ void test_partial_utf8() {
 }
 
 void test_grammar_sampler_mask() {
-  grammar::Grammar g = grammar::Grammar::parse(grammar::json_schema_to_grammar(R"({"type":"integer"})"));
+  grammar::Grammar g =
+      grammar::Grammar::parse(grammar::json_schema_to_grammar(R"({"type":"integer"})"));
 
   // Tiny synthetic vocab. id 0 is EOS (empty piece).
   const std::vector<std::string> pieces = {"", "-", "0", "1", "9", "a", "{", " "};
@@ -203,8 +205,7 @@ void test_mask_fastpath_parity() {
   };
 
   grammar::GrammarSampler sampler(std::move(g), pieces, eos_id);
-  grammar::Grammar g_ref =
-      grammar::Grammar::parse(grammar::json_schema_to_grammar(R"({
+  grammar::Grammar g_ref = grammar::Grammar::parse(grammar::json_schema_to_grammar(R"({
         "type": "object",
         "properties": { "title": {"type":"string"}, "count": {"type":"integer"} },
         "required": ["title", "count"]

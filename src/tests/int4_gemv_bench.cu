@@ -19,14 +19,14 @@
 
 namespace {
 
-#define CK(call)                                                                      \
-  do {                                                                                \
-    cudaError_t _e = (call);                                                          \
-    if (_e != cudaSuccess) {                                                          \
-      std::fprintf(stderr, "CUDA error %s at %s:%d\n", cudaGetErrorString(_e),        \
-                   __FILE__, __LINE__);                                               \
-      std::exit(1);                                                                   \
-    }                                                                                 \
+#define CK(call)                                                                         \
+  do {                                                                                   \
+    cudaError_t _e = (call);                                                             \
+    if (_e != cudaSuccess) {                                                             \
+      std::fprintf(stderr, "CUDA error %s at %s:%d\n", cudaGetErrorString(_e), __FILE__, \
+                   __LINE__);                                                            \
+      std::exit(1);                                                                      \
+    }                                                                                    \
   } while (0)
 
 constexpr double kPeakGBs = 1792.0;  // RTX 5090 GDDR7 ~1.79 TB/s
@@ -96,7 +96,8 @@ void run_shape(const Shape& s, std::mt19937& rng) {
   // Use the engine's tuned default config (warps=8, tile=256, wpr=2).
   auto launch = [&] {
     kernels::launch_weight_only_int4_matvec_dp4a(d_w, d_wscale, d_x, d_xscale, d_y, out, in,
-                                                 /*stream=*/0, /*warps=*/8, /*tile=*/256, /*wpr=*/2);
+                                                 /*stream=*/0, /*warps=*/8, /*tile=*/256,
+                                                 /*wpr=*/2);
   };
 
   // Parity.
@@ -131,9 +132,10 @@ void run_shape(const Shape& s, std::mt19937& rng) {
   const double weight_bytes = static_cast<double>(out) * packed_cols;  // dominant traffic
   const double gbs = weight_bytes / (per_call_ms * 1e-3) / 1e9;
 
-  std::printf("%-22s out=%-6d in=%-6d  %.4f ms  %.1f GB/s (%.0f%% peak)  max_abs=%.4g max_rel=%.4g %s\n",
-              s.name, out, in, per_call_ms, gbs, 100.0 * gbs / kPeakGBs, max_abs, max_rel,
-              (max_rel < 1e-3 ? "PARITY_OK" : "PARITY_FAIL"));
+  std::printf(
+      "%-22s out=%-6d in=%-6d  %.4f ms  %.1f GB/s (%.0f%% peak)  max_abs=%.4g max_rel=%.4g %s\n",
+      s.name, out, in, per_call_ms, gbs, 100.0 * gbs / kPeakGBs, max_abs, max_rel,
+      (max_rel < 1e-3 ? "PARITY_OK" : "PARITY_FAIL"));
 
   cudaEventDestroy(t0);
   cudaEventDestroy(t1);
@@ -149,11 +151,8 @@ void run_shape(const Shape& s, std::mt19937& rng) {
 int main() {
   std::mt19937 rng(1234);
   const Shape shapes[] = {
-      {"32B w1/w3", 27648, 5120},
-      {"32B w2", 5120, 27648},
-      {"32B wqkv", 5120 + 2 * 1024, 5120},
-      {"8B w1/w3", 14336, 4096},
-      {"8B w2", 4096, 14336},
+      {"32B w1/w3", 27648, 5120}, {"32B w2", 5120, 27648}, {"32B wqkv", 5120 + 2 * 1024, 5120},
+      {"8B w1/w3", 14336, 4096},  {"8B w2", 4096, 14336},
   };
   std::printf("int4 GEMV bench (peak %.0f GB/s)\n", kPeakGBs);
   for (const auto& s : shapes) {

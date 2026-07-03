@@ -42,17 +42,16 @@ jobs:
       - run: npm run build
 
   format-cpp:
-    name: clang-format (advisory)
+    name: clang-format
     runs-on: ubuntu-latest
-    # Advisory: the tree predates clang-format enforcement, so this surfaces
-    # formatting suggestions on changed files without blocking merges. Flip
-    # continue-on-error to false after a one-time `clang-format -i` sweep.
-    continue-on-error: true
+    # Enforced: the whole tree was swept with clang-format 19.1.7, so changed
+    # files must stay formatted. Pin the exact version -- clang-format output can
+    # differ across major versions.
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - run: pipx install "clang-format~=19.1"
+      - run: pipx install "clang-format==19.1.7"
       - name: Check changed C/C++/CUDA files
         shell: bash
         run: |
@@ -62,7 +61,11 @@ jobs:
             base="$(git rev-parse HEAD~1 2>/dev/null || true)"
           fi
           [ -z "$base" ] && { echo "No base ref; nothing to check."; exit 0; }
-          mapfile -t files < <(git diff --name-only --diff-filter=ACMR "$base" HEAD -- \
+          # Regular files only (skip submodule gitlinks like third_party/llama.cpp).
+          files=()
+          while IFS= read -r f; do
+            [ -f "$f" ] && files+=("$f")
+          done < <(git diff --name-only --diff-filter=ACMR "$base" HEAD -- \
             '*.c' '*.cc' '*.cpp' '*.cxx' '*.h' '*.hpp' '*.cu' '*.cuh')
           if [ "${#files[@]}" -eq 0 ]; then echo "No C/C++ changes."; exit 0; fi
           printf 'checking:\n%s\n' "${files[*]}"

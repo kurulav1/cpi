@@ -15,11 +15,17 @@
 
 namespace platform {
 
-MMapFile::MMapFile(const std::string& path) { open(path); }
+MMapFile::MMapFile(const std::string& path) {
+  open(path);
+}
 
-MMapFile::~MMapFile() { close(); }
+MMapFile::~MMapFile() {
+  close();
+}
 
-MMapFile::MMapFile(MMapFile&& other) noexcept { *this = std::move(other); }
+MMapFile::MMapFile(MMapFile&& other) noexcept {
+  *this = std::move(other);
+}
 
 MMapFile& MMapFile::operator=(MMapFile&& other) noexcept {
   if (this == &other) {
@@ -53,8 +59,7 @@ void MMapFile::open(const std::string& path) {
   // FILE_FLAG_SEQUENTIAL_SCAN tells the cache manager to do aggressive
   // read-ahead, which matters because we stream the entire weight file to the
   // GPU in one pass right after opening it.
-  file_handle_ = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
-                             OPEN_EXISTING,
+  file_handle_ = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                              FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
   if (file_handle_ == INVALID_HANDLE_VALUE) {
     file_handle_ = nullptr;
@@ -68,15 +73,15 @@ void MMapFile::open(const std::string& path) {
   }
   size_ = static_cast<std::size_t>(li.QuadPart);
 
-  mapping_handle_ = CreateFileMappingA(static_cast<HANDLE>(file_handle_), nullptr,
-                                       PAGE_READONLY, 0, 0, nullptr);
+  mapping_handle_ =
+      CreateFileMappingA(static_cast<HANDLE>(file_handle_), nullptr, PAGE_READONLY, 0, 0, nullptr);
   if (!mapping_handle_) {
     close();
     LLAMA_ENGINE_THROW("CreateFileMappingA failed");
   }
 
-  data_ = static_cast<const std::byte*>(MapViewOfFile(
-      static_cast<HANDLE>(mapping_handle_), FILE_MAP_READ, 0, 0, 0));
+  data_ = static_cast<const std::byte*>(
+      MapViewOfFile(static_cast<HANDLE>(mapping_handle_), FILE_MAP_READ, 0, 0, 0));
   if (!data_) {
     close();
     LLAMA_ENGINE_THROW("MapViewOfFile failed");
@@ -94,8 +99,7 @@ void MMapFile::open(const std::string& path) {
   }
 
   size_ = static_cast<std::size_t>(st.st_size);
-  data_ = static_cast<const std::byte*>(
-      mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd_, 0));
+  data_ = static_cast<const std::byte*>(mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd_, 0));
   if (data_ == MAP_FAILED) {
     data_ = nullptr;
     close();

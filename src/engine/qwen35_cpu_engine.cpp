@@ -1,6 +1,6 @@
 #include "engine/qwen35_cpu_engine.hpp"
 
-#include "grammar/grammar_sampler.hpp"
+#include <immintrin.h>
 
 #include <algorithm>
 #include <array>
@@ -11,14 +11,15 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <immintrin.h>
-#include <unordered_set>
 #include <iterator>
 #include <numeric>
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <vector>
+
+#include "grammar/grammar_sampler.hpp"
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -73,13 +74,11 @@ std::string read_text_file(const std::filesystem::path& path) {
   if (!in) {
     throw std::runtime_error("failed to open config file: " + path.string());
   }
-  return std::string((std::istreambuf_iterator<char>(in)),
-                     std::istreambuf_iterator<char>());
+  return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 }
 
 void skip_ws(const std::string& json, std::size_t& pos) {
-  while (pos < json.size() &&
-         std::isspace(static_cast<unsigned char>(json[pos]))) {
+  while (pos < json.size() && std::isspace(static_cast<unsigned char>(json[pos]))) {
     ++pos;
   }
 }
@@ -112,15 +111,33 @@ std::string json_read_string(const std::string& json, std::size_t& pos) {
     if (c == '\\' && pos < json.size()) {
       const char escaped = json[pos++];
       switch (escaped) {
-        case '"': result.push_back('"'); break;
-        case '\\': result.push_back('\\'); break;
-        case '/': result.push_back('/'); break;
-        case 'b': result.push_back('\b'); break;
-        case 'f': result.push_back('\f'); break;
-        case 'n': result.push_back('\n'); break;
-        case 'r': result.push_back('\r'); break;
-        case 't': result.push_back('\t'); break;
-        default: result.push_back(escaped); break;
+        case '"':
+          result.push_back('"');
+          break;
+        case '\\':
+          result.push_back('\\');
+          break;
+        case '/':
+          result.push_back('/');
+          break;
+        case 'b':
+          result.push_back('\b');
+          break;
+        case 'f':
+          result.push_back('\f');
+          break;
+        case 'n':
+          result.push_back('\n');
+          break;
+        case 'r':
+          result.push_back('\r');
+          break;
+        case 't':
+          result.push_back('\t');
+          break;
+        default:
+          result.push_back(escaped);
+          break;
       }
       continue;
     }
@@ -169,8 +186,7 @@ std::string json_extract_object(const std::string& json, const std::string& key)
   return "";
 }
 
-std::string json_get_string(const std::string& json,
-                            const std::string& key,
+std::string json_get_string(const std::string& json, const std::string& key,
                             const std::string& def = "") {
   std::size_t pos = json_find_key(json, key);
   if (pos == std::string::npos) {
@@ -190,9 +206,8 @@ int json_get_int(const std::string& json, const std::string& key, int def = 0) {
   }
   skip_ws(json, pos);
   std::size_t end = pos;
-  while (end < json.size() &&
-         (std::isdigit(static_cast<unsigned char>(json[end])) ||
-          json[end] == '-' || json[end] == '+')) {
+  while (end < json.size() && (std::isdigit(static_cast<unsigned char>(json[end])) ||
+                               json[end] == '-' || json[end] == '+')) {
     ++end;
   }
   if (end == pos) {
@@ -205,9 +220,7 @@ int json_get_int(const std::string& json, const std::string& key, int def = 0) {
   }
 }
 
-float json_get_float(const std::string& json,
-                     const std::string& key,
-                     float def = 0.0f) {
+float json_get_float(const std::string& json, const std::string& key, float def = 0.0f) {
   std::size_t pos = json_find_key(json, key);
   if (pos == std::string::npos) {
     return def;
@@ -215,9 +228,8 @@ float json_get_float(const std::string& json,
   skip_ws(json, pos);
   std::size_t end = pos;
   while (end < json.size() &&
-         (std::isdigit(static_cast<unsigned char>(json[end])) ||
-          json[end] == '-' || json[end] == '+' || json[end] == '.' ||
-          json[end] == 'e' || json[end] == 'E')) {
+         (std::isdigit(static_cast<unsigned char>(json[end])) || json[end] == '-' ||
+          json[end] == '+' || json[end] == '.' || json[end] == 'e' || json[end] == 'E')) {
     ++end;
   }
   if (end == pos) {
@@ -230,8 +242,7 @@ float json_get_float(const std::string& json,
   }
 }
 
-std::vector<std::string> json_get_string_array(const std::string& json,
-                                               const std::string& key) {
+std::vector<std::string> json_get_string_array(const std::string& json, const std::string& key) {
   std::size_t pos = json_find_key(json, key);
   if (pos == std::string::npos) {
     return {};
@@ -267,8 +278,7 @@ const std::uint16_t* require_bf16_tensor(const model::SafetensorsLoader& loader,
   return reinterpret_cast<const std::uint16_t*>(loader.tensor_ptr(name));
 }
 
-const float* require_f32_tensor(const model::SafetensorsLoader& loader,
-                                const std::string& name) {
+const float* require_f32_tensor(const model::SafetensorsLoader& loader, const std::string& name) {
   if (!loader.has_tensor(name)) {
     throw std::runtime_error("missing tensor: " + name);
   }
@@ -288,11 +298,7 @@ void l2norm_inplace(float* x, int n, float eps = 1e-6f) {
 
 }  // namespace
 
-void Qwen35CpuEngine::gemv_bf16(const std::uint16_t* W,
-                                const float* x,
-                                float* y,
-                                int M,
-                                int N) {
+void Qwen35CpuEngine::gemv_bf16(const std::uint16_t* W, const float* x, float* y, int M, int N) {
   const int M4 = (M / 4) * 4;
 
 #pragma omp parallel for schedule(static)
@@ -353,10 +359,7 @@ void Qwen35CpuEngine::gemv_bf16(const std::uint16_t* W,
   }
 }
 
-void Qwen35CpuEngine::rmsnorm_offset(const float* x,
-                                     const std::uint16_t* weight,
-                                     float* out,
-                                     int n,
+void Qwen35CpuEngine::rmsnorm_offset(const float* x, const std::uint16_t* weight, float* out, int n,
                                      float eps) {
   float ss = 0.0f;
   for (int i = 0; i < n; ++i) {
@@ -368,9 +371,7 @@ void Qwen35CpuEngine::rmsnorm_offset(const float* x,
   }
 }
 
-void Qwen35CpuEngine::rmsnorm_offset_inplace(float* x,
-                                             const std::uint16_t* weight,
-                                             int n,
+void Qwen35CpuEngine::rmsnorm_offset_inplace(float* x, const std::uint16_t* weight, int n,
                                              float eps) {
   float ss = 0.0f;
   for (int i = 0; i < n; ++i) {
@@ -382,11 +383,8 @@ void Qwen35CpuEngine::rmsnorm_offset_inplace(float* x,
   }
 }
 
-void Qwen35CpuEngine::rmsnorm_direct_gated_inplace(float* x,
-                                                   const float* weight,
-                                                   const float* gate,
-                                                   int n,
-                                                   float eps) {
+void Qwen35CpuEngine::rmsnorm_direct_gated_inplace(float* x, const float* weight, const float* gate,
+                                                   int n, float eps) {
   float ss = 0.0f;
   for (int i = 0; i < n; ++i) {
     ss += x[i] * x[i];
@@ -425,8 +423,8 @@ void Qwen35CpuEngine::load_config(const std::string& model_dir) {
   cfg_.linear_value_head_dim = json_get_int(text_config, "linear_value_head_dim", 0);
   cfg_.linear_conv_kernel_dim = json_get_int(text_config, "linear_conv_kernel_dim", 0);
   cfg_.max_position_embeddings = json_get_int(text_config, "max_position_embeddings", 0);
-  cfg_.eos_token_id = json_get_int(text_config, "eos_token_id",
-                                   json_get_int(raw, "eos_token_id", -1));
+  cfg_.eos_token_id =
+      json_get_int(text_config, "eos_token_id", json_get_int(raw, "eos_token_id", -1));
   cfg_.rms_norm_eps = json_get_float(text_config, "rms_norm_eps", 1e-6f);
   const std::string rope_parameters = json_extract_object(text_config, "rope_parameters");
   cfg_.rope_theta = json_get_float(rope_parameters, "rope_theta", 10000000.0f);
@@ -435,16 +433,15 @@ void Qwen35CpuEngine::load_config(const std::string& model_dir) {
   const auto layer_types = json_get_string_array(text_config, "layer_types");
   cfg_.layer_kinds.reserve(layer_types.size());
   for (const std::string& value : layer_types) {
-    cfg_.layer_kinds.push_back(
-        value == "full_attention" ? LayerKind::FullAttention
-                                   : LayerKind::LinearAttention);
+    cfg_.layer_kinds.push_back(value == "full_attention" ? LayerKind::FullAttention
+                                                         : LayerKind::LinearAttention);
   }
 
   if (cfg_.vocab_size <= 0 || cfg_.hidden_size <= 0 || cfg_.intermediate_size <= 0 ||
       cfg_.num_layers <= 0 || cfg_.num_attention_heads <= 0 || cfg_.num_key_value_heads <= 0 ||
-      cfg_.head_dim <= 0 || cfg_.linear_num_key_heads <= 0 ||
-      cfg_.linear_num_value_heads <= 0 || cfg_.linear_key_head_dim <= 0 ||
-      cfg_.linear_value_head_dim <= 0 || cfg_.linear_conv_kernel_dim <= 0) {
+      cfg_.head_dim <= 0 || cfg_.linear_num_key_heads <= 0 || cfg_.linear_num_value_heads <= 0 ||
+      cfg_.linear_key_head_dim <= 0 || cfg_.linear_value_head_dim <= 0 ||
+      cfg_.linear_conv_kernel_dim <= 0) {
     throw std::runtime_error("Qwen3.5 config.json is missing required text_config fields");
   }
   if (cfg_.layer_kinds.size() != static_cast<std::size_t>(cfg_.num_layers)) {
@@ -453,11 +450,11 @@ void Qwen35CpuEngine::load_config(const std::string& model_dir) {
 }
 
 void Qwen35CpuEngine::allocate_runtime_buffers() {
-  max_ctx_ = options_.max_context > 0
-      ? std::min(options_.max_context, cfg_.max_position_embeddings)
-      : std::min(2048, cfg_.max_position_embeddings);
+  max_ctx_ = options_.max_context > 0 ? std::min(options_.max_context, cfg_.max_position_embeddings)
+                                      : std::min(2048, cfg_.max_position_embeddings);
   bos_id_ = cfg_.eos_token_id >= 0 ? cfg_.eos_token_id : 0;
-  rotary_dim_ = static_cast<int>(std::round(static_cast<float>(cfg_.head_dim) * cfg_.partial_rotary_factor));
+  rotary_dim_ =
+      static_cast<int>(std::round(static_cast<float>(cfg_.head_dim) * cfg_.partial_rotary_factor));
   if (rotary_dim_ <= 0 || (rotary_dim_ % 2) != 0) {
     rotary_dim_ = std::max(2, cfg_.head_dim);
     if ((rotary_dim_ % 2) != 0) {
@@ -471,8 +468,7 @@ void Qwen35CpuEngine::allocate_runtime_buffers() {
   linear_conv_dim_ = linear_k_dim_ * 2 + linear_v_dim_;
   linear_head_repeat_ = cfg_.linear_num_value_heads / cfg_.linear_num_key_heads;
 
-  if (linear_head_repeat_ <= 0 ||
-      cfg_.linear_num_value_heads % cfg_.linear_num_key_heads != 0) {
+  if (linear_head_repeat_ <= 0 || cfg_.linear_num_value_heads % cfg_.linear_num_key_heads != 0) {
     throw std::runtime_error("Qwen3.5 linear head counts are not divisible");
   }
 
@@ -502,18 +498,15 @@ void Qwen35CpuEngine::allocate_runtime_buffers() {
 
   mlp_gate_buf_.resize(static_cast<std::size_t>(cfg_.intermediate_size));
   mlp_up_buf_.resize(static_cast<std::size_t>(cfg_.intermediate_size));
-  mlp_down_buf_.resize(static_cast<std::size_t>(
-      std::max(cfg_.intermediate_size, cfg_.linear_value_head_dim)));
+  mlp_down_buf_.resize(
+      static_cast<std::size_t>(std::max(cfg_.intermediate_size, cfg_.linear_value_head_dim)));
 
   const int rotary_half = rotary_dim_ / 2;
-  rope_cos_.resize(static_cast<std::size_t>(max_ctx_) *
-                   static_cast<std::size_t>(rotary_half));
-  rope_sin_.resize(static_cast<std::size_t>(max_ctx_) *
-                   static_cast<std::size_t>(rotary_half));
+  rope_cos_.resize(static_cast<std::size_t>(max_ctx_) * static_cast<std::size_t>(rotary_half));
+  rope_sin_.resize(static_cast<std::size_t>(max_ctx_) * static_cast<std::size_t>(rotary_half));
   for (int i = 0; i < rotary_half; ++i) {
-    const float inv_freq = std::pow(
-        cfg_.rope_theta,
-        -2.0f * static_cast<float>(i) / static_cast<float>(rotary_dim_));
+    const float inv_freq =
+        std::pow(cfg_.rope_theta, -2.0f * static_cast<float>(i) / static_cast<float>(rotary_dim_));
     for (int pos = 0; pos < max_ctx_; ++pos) {
       const float angle = static_cast<float>(pos) * inv_freq;
       rope_cos_[static_cast<std::size_t>(pos) * static_cast<std::size_t>(rotary_half) +
@@ -529,16 +522,11 @@ void Qwen35CpuEngine::allocate_runtime_buffers() {
   linear_recurrent_state_.assign(static_cast<std::size_t>(cfg_.num_layers), {});
 
   for (int layer = 0; layer < cfg_.num_layers; ++layer) {
-    if (cfg_.layer_kinds[static_cast<std::size_t>(layer)] ==
-        LayerKind::FullAttention) {
+    if (cfg_.layer_kinds[static_cast<std::size_t>(layer)] == LayerKind::FullAttention) {
       full_k_cache_[static_cast<std::size_t>(layer)].assign(
-          static_cast<std::size_t>(max_ctx_) *
-              static_cast<std::size_t>(full_kv_dim_),
-          0.0f);
+          static_cast<std::size_t>(max_ctx_) * static_cast<std::size_t>(full_kv_dim_), 0.0f);
       full_v_cache_[static_cast<std::size_t>(layer)].assign(
-          static_cast<std::size_t>(max_ctx_) *
-              static_cast<std::size_t>(full_kv_dim_),
-          0.0f);
+          static_cast<std::size_t>(max_ctx_) * static_cast<std::size_t>(full_kv_dim_), 0.0f);
     } else {
       linear_conv_state_[static_cast<std::size_t>(layer)].assign(
           static_cast<std::size_t>(linear_conv_dim_) *
@@ -554,21 +542,17 @@ void Qwen35CpuEngine::allocate_runtime_buffers() {
 }
 
 void Qwen35CpuEngine::load_weight_pointers() {
-  tok_embeddings_ =
-      require_bf16_tensor(weights_, "model.language_model.embed_tokens.weight");
+  tok_embeddings_ = require_bf16_tensor(weights_, "model.language_model.embed_tokens.weight");
   norm_out_ = require_bf16_tensor(weights_, "model.language_model.norm.weight");
   lm_head_ = require_bf16_tensor(weights_, "lm_head.weight");
 
   layers_.resize(static_cast<std::size_t>(cfg_.num_layers));
   for (int layer = 0; layer < cfg_.num_layers; ++layer) {
-    const std::string prefix = "model.language_model.layers." +
-                               std::to_string(layer);
+    const std::string prefix = "model.language_model.layers." + std::to_string(layer);
     LayerWeights& lw = layers_[static_cast<std::size_t>(layer)];
     lw.kind = cfg_.layer_kinds[static_cast<std::size_t>(layer)];
-    lw.norm_att =
-        require_bf16_tensor(weights_, prefix + ".input_layernorm.weight");
-    lw.norm_ffn =
-        require_bf16_tensor(weights_, prefix + ".post_attention_layernorm.weight");
+    lw.norm_att = require_bf16_tensor(weights_, prefix + ".input_layernorm.weight");
+    lw.norm_ffn = require_bf16_tensor(weights_, prefix + ".post_attention_layernorm.weight");
     lw.mlp_gate = require_bf16_tensor(weights_, prefix + ".mlp.gate_proj.weight");
     lw.mlp_up = require_bf16_tensor(weights_, prefix + ".mlp.up_proj.weight");
     lw.mlp_down = require_bf16_tensor(weights_, prefix + ".mlp.down_proj.weight");
@@ -578,43 +562,31 @@ void Qwen35CpuEngine::load_weight_pointers() {
       lw.full_k = require_bf16_tensor(weights_, prefix + ".self_attn.k_proj.weight");
       lw.full_v = require_bf16_tensor(weights_, prefix + ".self_attn.v_proj.weight");
       lw.full_o = require_bf16_tensor(weights_, prefix + ".self_attn.o_proj.weight");
-      lw.full_q_norm =
-          require_bf16_tensor(weights_, prefix + ".self_attn.q_norm.weight");
-      lw.full_k_norm =
-          require_bf16_tensor(weights_, prefix + ".self_attn.k_norm.weight");
+      lw.full_q_norm = require_bf16_tensor(weights_, prefix + ".self_attn.q_norm.weight");
+      lw.full_k_norm = require_bf16_tensor(weights_, prefix + ".self_attn.k_norm.weight");
     } else {
-      lw.linear_qkv =
-          require_bf16_tensor(weights_, prefix + ".linear_attn.in_proj_qkv.weight");
-      lw.linear_z =
-          require_bf16_tensor(weights_, prefix + ".linear_attn.in_proj_z.weight");
-      lw.linear_a =
-          require_bf16_tensor(weights_, prefix + ".linear_attn.in_proj_a.weight");
-      lw.linear_b =
-          require_bf16_tensor(weights_, prefix + ".linear_attn.in_proj_b.weight");
-      lw.linear_out =
-          require_bf16_tensor(weights_, prefix + ".linear_attn.out_proj.weight");
-      lw.linear_conv =
-          require_bf16_tensor(weights_, prefix + ".linear_attn.conv1d.weight");
-      lw.linear_norm =
-          require_f32_tensor(weights_, prefix + ".linear_attn.norm.weight");
-      lw.linear_A_log =
-          require_f32_tensor(weights_, prefix + ".linear_attn.A_log");
-      lw.linear_dt_bias =
-          require_bf16_tensor(weights_, prefix + ".linear_attn.dt_bias");
+      lw.linear_qkv = require_bf16_tensor(weights_, prefix + ".linear_attn.in_proj_qkv.weight");
+      lw.linear_z = require_bf16_tensor(weights_, prefix + ".linear_attn.in_proj_z.weight");
+      lw.linear_a = require_bf16_tensor(weights_, prefix + ".linear_attn.in_proj_a.weight");
+      lw.linear_b = require_bf16_tensor(weights_, prefix + ".linear_attn.in_proj_b.weight");
+      lw.linear_out = require_bf16_tensor(weights_, prefix + ".linear_attn.out_proj.weight");
+      lw.linear_conv = require_bf16_tensor(weights_, prefix + ".linear_attn.conv1d.weight");
+      lw.linear_norm = require_f32_tensor(weights_, prefix + ".linear_attn.norm.weight");
+      lw.linear_A_log = require_f32_tensor(weights_, prefix + ".linear_attn.A_log");
+      lw.linear_dt_bias = require_bf16_tensor(weights_, prefix + ".linear_attn.dt_bias");
     }
   }
 }
 
 void Qwen35CpuEngine::apply_rope_partial(float* q, float* k, int position) {
   const int rotary_half = rotary_dim_ / 2;
-  const float* cos_row = rope_cos_.data() +
-      static_cast<std::size_t>(position) * static_cast<std::size_t>(rotary_half);
-  const float* sin_row = rope_sin_.data() +
-      static_cast<std::size_t>(position) * static_cast<std::size_t>(rotary_half);
+  const float* cos_row =
+      rope_cos_.data() + static_cast<std::size_t>(position) * static_cast<std::size_t>(rotary_half);
+  const float* sin_row =
+      rope_sin_.data() + static_cast<std::size_t>(position) * static_cast<std::size_t>(rotary_half);
 
   for (int head = 0; head < cfg_.num_attention_heads; ++head) {
-    float* q_head = q + static_cast<std::size_t>(head) *
-                          static_cast<std::size_t>(cfg_.head_dim);
+    float* q_head = q + static_cast<std::size_t>(head) * static_cast<std::size_t>(cfg_.head_dim);
     for (int d = 0; d < rotary_half; ++d) {
       const float q0 = q_head[d];
       const float q1 = q_head[d + rotary_half];
@@ -626,8 +598,7 @@ void Qwen35CpuEngine::apply_rope_partial(float* q, float* k, int position) {
   }
 
   for (int head = 0; head < cfg_.num_key_value_heads; ++head) {
-    float* k_head = k + static_cast<std::size_t>(head) *
-                          static_cast<std::size_t>(cfg_.head_dim);
+    float* k_head = k + static_cast<std::size_t>(head) * static_cast<std::size_t>(cfg_.head_dim);
     for (int d = 0; d < rotary_half; ++d) {
       const float k0 = k_head[d];
       const float k1 = k_head[d + rotary_half];
@@ -641,37 +612,31 @@ void Qwen35CpuEngine::apply_rope_partial(float* q, float* k, int position) {
 
 void Qwen35CpuEngine::run_full_attention_layer(int layer, int position) {
   const LayerWeights& lw = layers_[static_cast<std::size_t>(layer)];
-  rmsnorm_offset(x_.data(), lw.norm_att, x_norm_.data(), cfg_.hidden_size,
-                 cfg_.rms_norm_eps);
+  rmsnorm_offset(x_.data(), lw.norm_att, x_norm_.data(), cfg_.hidden_size, cfg_.rms_norm_eps);
 
-  gemv_bf16(lw.full_q, x_norm_.data(), full_qkv_.data(), full_q_dim_ * 2,
-            cfg_.hidden_size);
+  gemv_bf16(lw.full_q, x_norm_.data(), full_qkv_.data(), full_q_dim_ * 2, cfg_.hidden_size);
   for (int head = 0; head < cfg_.num_attention_heads; ++head) {
     const float* src = full_qkv_.data() +
-        static_cast<std::size_t>(head) * static_cast<std::size_t>(cfg_.head_dim) * 2;
-    float* dst_q = full_q_.data() +
-        static_cast<std::size_t>(head) * static_cast<std::size_t>(cfg_.head_dim);
+                       static_cast<std::size_t>(head) * static_cast<std::size_t>(cfg_.head_dim) * 2;
+    float* dst_q =
+        full_q_.data() + static_cast<std::size_t>(head) * static_cast<std::size_t>(cfg_.head_dim);
     float* dst_gate = full_q_gate_.data() +
-        static_cast<std::size_t>(head) * static_cast<std::size_t>(cfg_.head_dim);
+                      static_cast<std::size_t>(head) * static_cast<std::size_t>(cfg_.head_dim);
     std::memcpy(dst_q, src, static_cast<std::size_t>(cfg_.head_dim) * sizeof(float));
     std::memcpy(dst_gate, src + static_cast<std::size_t>(cfg_.head_dim),
                 static_cast<std::size_t>(cfg_.head_dim) * sizeof(float));
   }
-  gemv_bf16(lw.full_k, x_norm_.data(), full_k_.data(), full_kv_dim_,
-            cfg_.hidden_size);
-  gemv_bf16(lw.full_v, x_norm_.data(), full_v_.data(), full_kv_dim_,
-            cfg_.hidden_size);
+  gemv_bf16(lw.full_k, x_norm_.data(), full_k_.data(), full_kv_dim_, cfg_.hidden_size);
+  gemv_bf16(lw.full_v, x_norm_.data(), full_v_.data(), full_kv_dim_, cfg_.hidden_size);
 
   for (int head = 0; head < cfg_.num_attention_heads; ++head) {
     rmsnorm_offset_inplace(
-        full_q_.data() +
-            static_cast<std::size_t>(head) * static_cast<std::size_t>(cfg_.head_dim),
+        full_q_.data() + static_cast<std::size_t>(head) * static_cast<std::size_t>(cfg_.head_dim),
         lw.full_q_norm, cfg_.head_dim, cfg_.rms_norm_eps);
   }
   for (int head = 0; head < cfg_.num_key_value_heads; ++head) {
     rmsnorm_offset_inplace(
-        full_k_.data() +
-            static_cast<std::size_t>(head) * static_cast<std::size_t>(cfg_.head_dim),
+        full_k_.data() + static_cast<std::size_t>(head) * static_cast<std::size_t>(cfg_.head_dim),
         lw.full_k_norm, cfg_.head_dim, cfg_.rms_norm_eps);
   }
 
@@ -679,14 +644,10 @@ void Qwen35CpuEngine::run_full_attention_layer(int layer, int position) {
 
   float* k_cache = full_k_cache_[static_cast<std::size_t>(layer)].data();
   float* v_cache = full_v_cache_[static_cast<std::size_t>(layer)].data();
-  std::memcpy(k_cache + static_cast<std::size_t>(position) *
-                           static_cast<std::size_t>(full_kv_dim_),
-              full_k_.data(),
-              static_cast<std::size_t>(full_kv_dim_) * sizeof(float));
-  std::memcpy(v_cache + static_cast<std::size_t>(position) *
-                           static_cast<std::size_t>(full_kv_dim_),
-              full_v_.data(),
-              static_cast<std::size_t>(full_kv_dim_) * sizeof(float));
+  std::memcpy(k_cache + static_cast<std::size_t>(position) * static_cast<std::size_t>(full_kv_dim_),
+              full_k_.data(), static_cast<std::size_t>(full_kv_dim_) * sizeof(float));
+  std::memcpy(v_cache + static_cast<std::size_t>(position) * static_cast<std::size_t>(full_kv_dim_),
+              full_v_.data(), static_cast<std::size_t>(full_kv_dim_) * sizeof(float));
 
   const int seq_len = position + 1;
   const int kv_mul = cfg_.num_attention_heads / cfg_.num_key_value_heads;
@@ -695,10 +656,10 @@ void Qwen35CpuEngine::run_full_attention_layer(int layer, int position) {
 #pragma omp parallel for schedule(static)
   for (int head = 0; head < cfg_.num_attention_heads; ++head) {
     const int kv_head = head / kv_mul;
-    const float* q_head = full_q_.data() +
-        static_cast<std::size_t>(head) * static_cast<std::size_t>(cfg_.head_dim);
-    float* scores = full_scores_.data() +
-        static_cast<std::size_t>(head) * static_cast<std::size_t>(max_ctx_);
+    const float* q_head =
+        full_q_.data() + static_cast<std::size_t>(head) * static_cast<std::size_t>(cfg_.head_dim);
+    float* scores =
+        full_scores_.data() + static_cast<std::size_t>(head) * static_cast<std::size_t>(max_ctx_);
 
     float max_score = -1.0e30f;
     for (int t = 0; t < seq_len; ++t) {
@@ -723,8 +684,8 @@ void Qwen35CpuEngine::run_full_attention_layer(int layer, int position) {
       scores[t] *= inv_sum;
     }
 
-    float* out_head = full_att_.data() +
-        static_cast<std::size_t>(head) * static_cast<std::size_t>(cfg_.head_dim);
+    float* out_head =
+        full_att_.data() + static_cast<std::size_t>(head) * static_cast<std::size_t>(cfg_.head_dim);
     std::fill(out_head, out_head + cfg_.head_dim, 0.0f);
     for (int t = 0; t < seq_len; ++t) {
       const float* v_head =
@@ -738,12 +699,10 @@ void Qwen35CpuEngine::run_full_attention_layer(int layer, int position) {
   }
 
   for (int i = 0; i < full_q_dim_; ++i) {
-    full_att_[static_cast<std::size_t>(i)] *=
-        sigmoid(full_q_gate_[static_cast<std::size_t>(i)]);
+    full_att_[static_cast<std::size_t>(i)] *= sigmoid(full_q_gate_[static_cast<std::size_t>(i)]);
   }
 
-  gemv_bf16(lw.full_o, full_att_.data(), x_norm_.data(), cfg_.hidden_size,
-            full_q_dim_);
+  gemv_bf16(lw.full_o, full_att_.data(), x_norm_.data(), cfg_.hidden_size, full_q_dim_);
   for (int i = 0; i < cfg_.hidden_size; ++i) {
     x_[static_cast<std::size_t>(i)] += x_norm_[static_cast<std::size_t>(i)];
   }
@@ -751,28 +710,26 @@ void Qwen35CpuEngine::run_full_attention_layer(int layer, int position) {
 
 void Qwen35CpuEngine::run_linear_attention_layer(int layer) {
   const LayerWeights& lw = layers_[static_cast<std::size_t>(layer)];
-  rmsnorm_offset(x_.data(), lw.norm_att, x_norm_.data(), cfg_.hidden_size,
-                 cfg_.rms_norm_eps);
+  rmsnorm_offset(x_.data(), lw.norm_att, x_norm_.data(), cfg_.hidden_size, cfg_.rms_norm_eps);
 
-  gemv_bf16(lw.linear_qkv, x_norm_.data(), linear_qkv_mix_.data(),
-            linear_conv_dim_, cfg_.hidden_size);
-  gemv_bf16(lw.linear_z, x_norm_.data(), linear_z_.data(), linear_v_dim_,
+  gemv_bf16(lw.linear_qkv, x_norm_.data(), linear_qkv_mix_.data(), linear_conv_dim_,
             cfg_.hidden_size);
-  gemv_bf16(lw.linear_b, x_norm_.data(), linear_b_.data(),
-            cfg_.linear_num_value_heads, cfg_.hidden_size);
-  gemv_bf16(lw.linear_a, x_norm_.data(), linear_a_.data(),
-            cfg_.linear_num_value_heads, cfg_.hidden_size);
+  gemv_bf16(lw.linear_z, x_norm_.data(), linear_z_.data(), linear_v_dim_, cfg_.hidden_size);
+  gemv_bf16(lw.linear_b, x_norm_.data(), linear_b_.data(), cfg_.linear_num_value_heads,
+            cfg_.hidden_size);
+  gemv_bf16(lw.linear_a, x_norm_.data(), linear_a_.data(), cfg_.linear_num_value_heads,
+            cfg_.hidden_size);
 
   const int kernel = cfg_.linear_conv_kernel_dim;
   std::vector<float>& conv_state = linear_conv_state_[static_cast<std::size_t>(layer)];
   if (kernel > 1) {
     const int state_len = kernel - 1;
     for (int channel = 0; channel < linear_conv_dim_; ++channel) {
-      const std::uint16_t* w = lw.linear_conv +
-          static_cast<std::size_t>(channel) * static_cast<std::size_t>(kernel);
+      const std::uint16_t* w =
+          lw.linear_conv + static_cast<std::size_t>(channel) * static_cast<std::size_t>(kernel);
       float out = 0.0f;
       float* state_row = conv_state.data() +
-          static_cast<std::size_t>(channel) * static_cast<std::size_t>(state_len);
+                         static_cast<std::size_t>(channel) * static_cast<std::size_t>(state_len);
       for (int j = 0; j < state_len; ++j) {
         out += bf16_to_f32(w[j]) * state_row[j];
       }
@@ -792,8 +749,7 @@ void Qwen35CpuEngine::run_linear_attention_layer(int layer) {
   const float* q_raw = linear_qkv_mix_.data();
   const float* k_raw = q_raw + linear_k_dim_;
   const float* v_raw = k_raw + linear_k_dim_;
-  std::memcpy(linear_v_.data(), v_raw,
-              static_cast<std::size_t>(linear_v_dim_) * sizeof(float));
+  std::memcpy(linear_v_.data(), v_raw, static_cast<std::size_t>(linear_v_dim_) * sizeof(float));
 
   for (int k_head = 0; k_head < cfg_.linear_num_key_heads; ++k_head) {
     const float* src_q = q_raw + static_cast<std::size_t>(k_head) *
@@ -803,34 +759,30 @@ void Qwen35CpuEngine::run_linear_attention_layer(int layer) {
     for (int rep = 0; rep < linear_head_repeat_; ++rep) {
       const int v_head = k_head * linear_head_repeat_ + rep;
       float* dst_q = linear_q_.data() + static_cast<std::size_t>(v_head) *
-                                         static_cast<std::size_t>(cfg_.linear_key_head_dim);
+                                            static_cast<std::size_t>(cfg_.linear_key_head_dim);
       float* dst_k = linear_k_.data() + static_cast<std::size_t>(v_head) *
-                                         static_cast<std::size_t>(cfg_.linear_key_head_dim);
-      std::memcpy(dst_q, src_q,
-                  static_cast<std::size_t>(cfg_.linear_key_head_dim) * sizeof(float));
-      std::memcpy(dst_k, src_k,
-                  static_cast<std::size_t>(cfg_.linear_key_head_dim) * sizeof(float));
+                                            static_cast<std::size_t>(cfg_.linear_key_head_dim);
+      std::memcpy(dst_q, src_q, static_cast<std::size_t>(cfg_.linear_key_head_dim) * sizeof(float));
+      std::memcpy(dst_k, src_k, static_cast<std::size_t>(cfg_.linear_key_head_dim) * sizeof(float));
     }
   }
 
-  std::vector<float>& recurrent =
-      linear_recurrent_state_[static_cast<std::size_t>(layer)];
-  const float scale = 1.0f /
-      std::sqrt(static_cast<float>(cfg_.linear_key_head_dim));
+  std::vector<float>& recurrent = linear_recurrent_state_[static_cast<std::size_t>(layer)];
+  const float scale = 1.0f / std::sqrt(static_cast<float>(cfg_.linear_key_head_dim));
   for (int head = 0; head < cfg_.linear_num_value_heads; ++head) {
     float* q_head = linear_q_.data() + static_cast<std::size_t>(head) *
-                                       static_cast<std::size_t>(cfg_.linear_key_head_dim);
+                                           static_cast<std::size_t>(cfg_.linear_key_head_dim);
     float* k_head = linear_k_.data() + static_cast<std::size_t>(head) *
-                                       static_cast<std::size_t>(cfg_.linear_key_head_dim);
+                                           static_cast<std::size_t>(cfg_.linear_key_head_dim);
     float* v_head = linear_v_.data() + static_cast<std::size_t>(head) *
-                                       static_cast<std::size_t>(cfg_.linear_value_head_dim);
+                                           static_cast<std::size_t>(cfg_.linear_value_head_dim);
     float* z_head = linear_z_.data() + static_cast<std::size_t>(head) *
-                                       static_cast<std::size_t>(cfg_.linear_value_head_dim);
+                                           static_cast<std::size_t>(cfg_.linear_value_head_dim);
     float* out_head = linear_att_.data() + static_cast<std::size_t>(head) *
-                                         static_cast<std::size_t>(cfg_.linear_value_head_dim);
+                                               static_cast<std::size_t>(cfg_.linear_value_head_dim);
     float* state = recurrent.data() + static_cast<std::size_t>(head) *
-                       static_cast<std::size_t>(cfg_.linear_key_head_dim) *
-                       static_cast<std::size_t>(cfg_.linear_value_head_dim);
+                                          static_cast<std::size_t>(cfg_.linear_key_head_dim) *
+                                          static_cast<std::size_t>(cfg_.linear_value_head_dim);
 
     l2norm_inplace(q_head, cfg_.linear_key_head_dim);
     l2norm_inplace(k_head, cfg_.linear_key_head_dim);
@@ -841,8 +793,7 @@ void Qwen35CpuEngine::run_linear_attention_layer(int layer) {
     const float beta = sigmoid(linear_b_[static_cast<std::size_t>(head)]);
     const float a = linear_a_[static_cast<std::size_t>(head)];
     const float dt_bias = bf16_to_f32(lw.linear_dt_bias[head]);
-    const float decay =
-        std::exp(-std::exp(lw.linear_A_log[head]) * softplus(a + dt_bias));
+    const float decay = std::exp(-std::exp(lw.linear_A_log[head]) * softplus(a + dt_bias));
 
     for (int k = 0; k < cfg_.linear_key_head_dim; ++k) {
       float* state_row = state + static_cast<std::size_t>(k) *
@@ -884,12 +835,11 @@ void Qwen35CpuEngine::run_linear_attention_layer(int layer) {
       out_head[dv] = sum;
     }
 
-    rmsnorm_direct_gated_inplace(out_head, lw.linear_norm, z_head,
-                                 cfg_.linear_value_head_dim, cfg_.rms_norm_eps);
+    rmsnorm_direct_gated_inplace(out_head, lw.linear_norm, z_head, cfg_.linear_value_head_dim,
+                                 cfg_.rms_norm_eps);
   }
 
-  gemv_bf16(lw.linear_out, linear_att_.data(), x_norm_.data(),
-            cfg_.hidden_size, linear_v_dim_);
+  gemv_bf16(lw.linear_out, linear_att_.data(), x_norm_.data(), cfg_.hidden_size, linear_v_dim_);
   for (int i = 0; i < cfg_.hidden_size; ++i) {
     x_[static_cast<std::size_t>(i)] += x_norm_[static_cast<std::size_t>(i)];
   }
@@ -897,28 +847,25 @@ void Qwen35CpuEngine::run_linear_attention_layer(int layer) {
 
 void Qwen35CpuEngine::run_mlp_layer(int layer) {
   const LayerWeights& lw = layers_[static_cast<std::size_t>(layer)];
-  rmsnorm_offset(x_.data(), lw.norm_ffn, x_norm_.data(), cfg_.hidden_size,
-                 cfg_.rms_norm_eps);
-  gemv_bf16(lw.mlp_gate, x_norm_.data(), mlp_gate_buf_.data(),
-            cfg_.intermediate_size, cfg_.hidden_size);
-  gemv_bf16(lw.mlp_up, x_norm_.data(), mlp_up_buf_.data(),
-            cfg_.intermediate_size, cfg_.hidden_size);
+  rmsnorm_offset(x_.data(), lw.norm_ffn, x_norm_.data(), cfg_.hidden_size, cfg_.rms_norm_eps);
+  gemv_bf16(lw.mlp_gate, x_norm_.data(), mlp_gate_buf_.data(), cfg_.intermediate_size,
+            cfg_.hidden_size);
+  gemv_bf16(lw.mlp_up, x_norm_.data(), mlp_up_buf_.data(), cfg_.intermediate_size,
+            cfg_.hidden_size);
   for (int i = 0; i < cfg_.intermediate_size; ++i) {
     mlp_down_buf_[static_cast<std::size_t>(i)] =
-        silu(mlp_gate_buf_[static_cast<std::size_t>(i)]) *
-        mlp_up_buf_[static_cast<std::size_t>(i)];
+        silu(mlp_gate_buf_[static_cast<std::size_t>(i)]) * mlp_up_buf_[static_cast<std::size_t>(i)];
   }
-  gemv_bf16(lw.mlp_down, mlp_down_buf_.data(), x_norm_.data(),
-            cfg_.hidden_size, cfg_.intermediate_size);
+  gemv_bf16(lw.mlp_down, mlp_down_buf_.data(), x_norm_.data(), cfg_.hidden_size,
+            cfg_.intermediate_size);
   for (int i = 0; i < cfg_.hidden_size; ++i) {
     x_[static_cast<std::size_t>(i)] += x_norm_[static_cast<std::size_t>(i)];
   }
 }
 
 void Qwen35CpuEngine::forward_token(int token, int position) {
-  const std::uint16_t* emb_row =
-      tok_embeddings_ + static_cast<std::size_t>(token) *
-                            static_cast<std::size_t>(cfg_.hidden_size);
+  const std::uint16_t* emb_row = tok_embeddings_ + static_cast<std::size_t>(token) *
+                                                       static_cast<std::size_t>(cfg_.hidden_size);
   for (int i = 0; i < cfg_.hidden_size; ++i) {
     x_[static_cast<std::size_t>(i)] = bf16_to_f32(emb_row[i]);
   }
@@ -932,15 +879,11 @@ void Qwen35CpuEngine::forward_token(int token, int position) {
     run_mlp_layer(layer);
   }
 
-  rmsnorm_offset(x_.data(), norm_out_, x_norm_.data(), cfg_.hidden_size,
-                 cfg_.rms_norm_eps);
-  gemv_bf16(lm_head_, x_norm_.data(), logits_.data(), cfg_.vocab_size,
-            cfg_.hidden_size);
+  rmsnorm_offset(x_.data(), norm_out_, x_norm_.data(), cfg_.hidden_size, cfg_.rms_norm_eps);
+  gemv_bf16(lm_head_, x_norm_.data(), logits_.data(), cfg_.vocab_size, cfg_.hidden_size);
 }
 
-int Qwen35CpuEngine::sample_token(float temperature,
-                                  int top_k,
-                                  const std::vector<int>& history,
+int Qwen35CpuEngine::sample_token(float temperature, int top_k, const std::vector<int>& history,
                                   float repetition_penalty) {
   // Penalize each unique history token once (HF semantics). Iterating raw
   // history would divide a token's logit by rp^(occurrences), exponentially
@@ -952,8 +895,7 @@ int Qwen35CpuEngine::sample_token(float temperature,
         continue;
       }
       float& logit = logits_[static_cast<std::size_t>(token)];
-      logit = (logit > 0.0f) ? (logit / repetition_penalty)
-                             : (logit * repetition_penalty);
+      logit = (logit > 0.0f) ? (logit / repetition_penalty) : (logit * repetition_penalty);
     }
   }
 
@@ -963,27 +905,22 @@ int Qwen35CpuEngine::sample_token(float temperature,
   }
 
   if (temperature <= 0.0f || top_k == 1) {
-    return static_cast<int>(
-        std::max_element(logits_.begin(), logits_.end()) - logits_.begin());
+    return static_cast<int>(std::max_element(logits_.begin(), logits_.end()) - logits_.begin());
   }
 
   const int k = std::clamp(top_k, 1, cfg_.vocab_size);
   std::vector<int> ids(static_cast<std::size_t>(cfg_.vocab_size));
   std::iota(ids.begin(), ids.end(), 0);
-  std::partial_sort(ids.begin(), ids.begin() + k, ids.end(),
-                    [&](int left, int right) {
-                      return logits_[static_cast<std::size_t>(left)] >
-                             logits_[static_cast<std::size_t>(right)];
-                    });
+  std::partial_sort(ids.begin(), ids.begin() + k, ids.end(), [&](int left, int right) {
+    return logits_[static_cast<std::size_t>(left)] > logits_[static_cast<std::size_t>(right)];
+  });
 
   const float max_logit = logits_[static_cast<std::size_t>(ids[0])];
   std::vector<float> probs(static_cast<std::size_t>(k));
   float sum = 0.0f;
   for (int i = 0; i < k; ++i) {
     probs[static_cast<std::size_t>(i)] =
-        std::exp((logits_[static_cast<std::size_t>(
-                      ids[static_cast<std::size_t>(i)])] -
-                  max_logit) /
+        std::exp((logits_[static_cast<std::size_t>(ids[static_cast<std::size_t>(i)])] - max_logit) /
                  temperature);
     sum += probs[static_cast<std::size_t>(i)];
   }
@@ -1037,31 +974,29 @@ void Qwen35CpuEngine::initialize(const EngineOptions& options) {
   load_weight_pointers();
 
   if (options_.verbose) {
-    std::fprintf(stderr,
-                 "[qwen3_5_cpu] layers=%d hidden=%d heads=%d/%d linear_heads=%d/%d vocab=%d max_ctx=%d\n",
-                 cfg_.num_layers, cfg_.hidden_size, cfg_.num_attention_heads,
-                 cfg_.num_key_value_heads, cfg_.linear_num_key_heads,
-                 cfg_.linear_num_value_heads, cfg_.vocab_size, max_ctx_);
+    std::fprintf(
+        stderr,
+        "[qwen3_5_cpu] layers=%d hidden=%d heads=%d/%d linear_heads=%d/%d vocab=%d max_ctx=%d\n",
+        cfg_.num_layers, cfg_.hidden_size, cfg_.num_attention_heads, cfg_.num_key_value_heads,
+        cfg_.linear_num_key_heads, cfg_.linear_num_value_heads, cfg_.vocab_size, max_ctx_);
   }
 }
 
 std::vector<int> Qwen35CpuEngine::generate(const std::vector<int>& prompt_tokens,
-                                           int max_new_tokens,
-                                           float temperature) {
-  return generate_stream(prompt_tokens, max_new_tokens, temperature,
-                         [](int) { return true; });
+                                           int max_new_tokens, float temperature) {
+  return generate_stream(prompt_tokens, max_new_tokens, temperature, [](int) { return true; });
 }
 
-std::vector<int> Qwen35CpuEngine::generate_stream(
-    const std::vector<int>& prompt_tokens,
-    int max_new_tokens,
-    float temperature,
-    const std::function<bool(int)>& on_token,
-    const GenerationConstraints* constraints) {
+std::vector<int> Qwen35CpuEngine::generate_stream(const std::vector<int>& prompt_tokens,
+                                                  int max_new_tokens, float temperature,
+                                                  const std::function<bool(int)>& on_token,
+                                                  const GenerationConstraints* constraints) {
   active_grammar_ = constraints ? constraints->grammar : nullptr;
   struct GrammarScope {
     grammar::GrammarSampler** slot;
-    ~GrammarScope() { *slot = nullptr; }
+    ~GrammarScope() {
+      *slot = nullptr;
+    }
   } grammar_scope{&active_grammar_};
 
   stats_ = BenchmarkStats{};
@@ -1088,16 +1023,14 @@ std::vector<int> Qwen35CpuEngine::generate_stream(
     forward_token(bos_id_, 0);
     pos = 1;
   } else {
-    for (int i = 0; i < static_cast<int>(prompt_tokens.size()) && i < max_ctx_;
-         ++i) {
+    for (int i = 0; i < static_cast<int>(prompt_tokens.size()) && i < max_ctx_; ++i) {
       forward_token(prompt_tokens[static_cast<std::size_t>(i)], i);
       pos = i + 1;
     }
   }
   const auto prefill_end = std::chrono::steady_clock::now();
-  stats_.prefill_ms = std::chrono::duration<double, std::milli>(
-                          prefill_end - prefill_start)
-                          .count();
+  stats_.prefill_ms =
+      std::chrono::duration<double, std::milli>(prefill_end - prefill_start).count();
 
   const auto decode_start = std::chrono::steady_clock::now();
   for (int step = 0; step < max_new_tokens; ++step) {
@@ -1124,15 +1057,12 @@ std::vector<int> Qwen35CpuEngine::generate_stream(
     ++pos;
   }
   const auto decode_end = std::chrono::steady_clock::now();
-  stats_.decode_ms = std::chrono::duration<double, std::milli>(
-                         decode_end - decode_start)
-                         .count();
+  stats_.decode_ms = std::chrono::duration<double, std::milli>(decode_end - decode_start).count();
   return output;
 }
 
 std::vector<std::pair<int, float>> Qwen35CpuEngine::inspect_next_logits(
-    const std::vector<int>& prompt_tokens,
-    int top_k) {
+    const std::vector<int>& prompt_tokens, int top_k) {
   for (auto& cache : full_k_cache_) {
     std::fill(cache.begin(), cache.end(), 0.0f);
   }
@@ -1149,8 +1079,7 @@ std::vector<std::pair<int, float>> Qwen35CpuEngine::inspect_next_logits(
   if (prompt_tokens.empty()) {
     forward_token(bos_id_, 0);
   } else {
-    for (int i = 0; i < static_cast<int>(prompt_tokens.size()) && i < max_ctx_;
-         ++i) {
+    for (int i = 0; i < static_cast<int>(prompt_tokens.size()) && i < max_ctx_; ++i) {
       forward_token(prompt_tokens[static_cast<std::size_t>(i)], i);
     }
   }
@@ -1162,9 +1091,7 @@ std::vector<std::pair<int, float>> Qwen35CpuEngine::inspect_next_logits(
     pairs.emplace_back(i, logits_[static_cast<std::size_t>(i)]);
   }
   std::partial_sort(pairs.begin(), pairs.begin() + k, pairs.end(),
-                    [](const auto& left, const auto& right) {
-                      return left.second > right.second;
-                    });
+                    [](const auto& left, const auto& right) { return left.second > right.second; });
   pairs.resize(static_cast<std::size_t>(k));
   return pairs;
 }

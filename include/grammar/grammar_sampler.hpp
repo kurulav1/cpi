@@ -20,7 +20,7 @@
 namespace grammar {
 
 class GrammarSampler {
- public:
+public:
   // `token_pieces[id]` is the raw bytes token `id` emits; an empty entry marks a
   // special/control token the grammar must not consume. `eos_token_id` may be -1.
   GrammarSampler(Grammar grammar, const std::vector<std::string>& token_pieces, int eos_token_id);
@@ -39,9 +39,11 @@ class GrammarSampler {
   bool accept(int token_id);
 
   // True when the grammar has matched a complete value and may legally stop.
-  bool can_terminate() const { return state_.can_terminate(); }
+  bool can_terminate() const {
+    return state_.can_terminate();
+  }
 
- private:
+private:
   Grammar grammar_;
   const std::vector<std::string>& token_pieces_;
   int eos_token_id_;

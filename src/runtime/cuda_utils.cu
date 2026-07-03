@@ -1,9 +1,9 @@
-#include "runtime/cuda_utils.cuh"
-
 #include <cublas_v2.h>
 
 #include <sstream>
 #include <stdexcept>
+
+#include "runtime/cuda_utils.cuh"
 
 namespace runtime {
 

@@ -34,7 +34,7 @@ struct JsonValue {
 };
 
 class JsonParser {
- public:
+public:
   explicit JsonParser(const std::string& src) : s_(src) {}
 
   JsonValue parse() {
@@ -47,7 +47,7 @@ class JsonParser {
     return v;
   }
 
- private:
+private:
   const std::string& s_;
   std::size_t i_ = 0;
 
@@ -55,7 +55,9 @@ class JsonParser {
     throw std::runtime_error(std::string("json schema parse error: ") + msg);
   }
 
-  char peek() const { return i_ < s_.size() ? s_[i_] : '\0'; }
+  char peek() const {
+    return i_ < s_.size() ? s_[i_] : '\0';
+  }
 
   void skip_ws() {
     while (i_ < s_.size()) {
@@ -71,8 +73,10 @@ class JsonParser {
   JsonValue parse_value() {
     const char c = peek();
     switch (c) {
-      case '{': return parse_object();
-      case '[': return parse_array();
+      case '{':
+        return parse_object();
+      case '[':
+        return parse_array();
       case '"': {
         JsonValue v;
         v.type = JsonValue::Type::String;
@@ -80,8 +84,10 @@ class JsonParser {
         return v;
       }
       case 't':
-      case 'f': return parse_bool();
-      case 'n': return parse_null();
+      case 'f':
+        return parse_bool();
+      case 'n':
+        return parse_null();
       default:
         if (c == '-' || (c >= '0' && c <= '9')) {
           return parse_number();
@@ -168,14 +174,30 @@ class JsonParser {
         }
         const char e = s_[i_++];
         switch (e) {
-          case '"': out.push_back('"'); break;
-          case '\\': out.push_back('\\'); break;
-          case '/': out.push_back('/'); break;
-          case 'b': out.push_back('\b'); break;
-          case 'f': out.push_back('\f'); break;
-          case 'n': out.push_back('\n'); break;
-          case 'r': out.push_back('\r'); break;
-          case 't': out.push_back('\t'); break;
+          case '"':
+            out.push_back('"');
+            break;
+          case '\\':
+            out.push_back('\\');
+            break;
+          case '/':
+            out.push_back('/');
+            break;
+          case 'b':
+            out.push_back('\b');
+            break;
+          case 'f':
+            out.push_back('\f');
+            break;
+          case 'n':
+            out.push_back('\n');
+            break;
+          case 'r':
+            out.push_back('\r');
+            break;
+          case 't':
+            out.push_back('\t');
+            break;
           case 'u': {
             // Keep the escape verbatim; schema strings used here (keys, enum
             // members) are ASCII in practice, and we only need round-trippable
@@ -187,7 +209,8 @@ class JsonParser {
             }
             break;
           }
-          default: fail("invalid escape in string");
+          default:
+            fail("invalid escape in string");
         }
       } else {
         out.push_back(c);
@@ -261,9 +284,12 @@ std::string gbnf_literal(const std::string& raw) {
 // Serializes a JSON value back to canonical JSON text (used for enum literals).
 std::string json_serialize(const JsonValue& v) {
   switch (v.type) {
-    case JsonValue::Type::Null: return "null";
-    case JsonValue::Type::Bool: return v.bool_val ? "true" : "false";
-    case JsonValue::Type::Number: return v.text;
+    case JsonValue::Type::Null:
+      return "null";
+    case JsonValue::Type::Bool:
+      return v.bool_val ? "true" : "false";
+    case JsonValue::Type::Number:
+      return v.text;
     case JsonValue::Type::String: {
       std::string out = "\"";
       for (const char c : v.text) {
@@ -281,7 +307,7 @@ std::string json_serialize(const JsonValue& v) {
 }
 
 class GrammarBuilder {
- public:
+public:
   std::string build(const JsonValue& schema) {
     const std::string root_ref = visit(schema, "root");
     // Leading whitespace is tolerated, but there is deliberately NO trailing
@@ -297,7 +323,7 @@ class GrammarBuilder {
     return out.str();
   }
 
- private:
+private:
   std::vector<std::pair<std::string, std::string>> rules_;
   std::set<std::string> defined_;
   int counter_ = 0;
@@ -307,8 +333,8 @@ class GrammarBuilder {
     std::string clean;
     clean.reserve(base.size());
     for (const char c : base) {
-      const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                      (c >= '0' && c <= '9') || c == '-' || c == '_';
+      const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                      c == '-' || c == '_';
       clean.push_back(ok ? c : '_');
     }
     return clean + "-" + std::to_string(counter_++);
@@ -323,10 +349,18 @@ class GrammarBuilder {
   }
 
   // --- primitive rules (added on demand) ---
-  void ensure_ws() { define("ws", "[ \\t\\n]*"); }
-  std::string ensure_boolean() { return define("boolean", "\"true\" | \"false\""); }
-  std::string ensure_null() { return define("null", "\"null\""); }
-  std::string ensure_integer() { return define("integer", "\"-\"? [0-9]+"); }
+  void ensure_ws() {
+    define("ws", "[ \\t\\n]*");
+  }
+  std::string ensure_boolean() {
+    return define("boolean", "\"true\" | \"false\"");
+  }
+  std::string ensure_null() {
+    return define("null", "\"null\"");
+  }
+  std::string ensure_integer() {
+    return define("integer", "\"-\"? [0-9]+");
+  }
   std::string ensure_number() {
     return define("number", "\"-\"? [0-9]+ (\".\" [0-9]+)? ([eE] [-+]? [0-9]+)?");
   }
@@ -341,9 +375,8 @@ class GrammarBuilder {
     const std::string n = ensure_number();
     const std::string b = ensure_boolean();
     const std::string nl = ensure_null();
-    define("object-any",
-           "\"{\" ws ( " + s + " ws \":\" ws value ( ws \",\" ws " + s +
-               " ws \":\" ws value )* )? ws \"}\"");
+    define("object-any", "\"{\" ws ( " + s + " ws \":\" ws value ( ws \",\" ws " + s +
+                             " ws \":\" ws value )* )? ws \"}\"");
     define("array-any", "\"[\" ws ( value ( ws \",\" ws value )* )? ws \"]\"");
     return define("value", "object-any | array-any | " + s + " | " + n + " | " + b + " | " + nl);
   }
@@ -395,8 +428,7 @@ class GrammarBuilder {
     return ref_for_simple_type(type->text, schema, hint);
   }
 
-  std::string ref_for_simple_type(const std::string& type,
-                                  const JsonValue& schema,
+  std::string ref_for_simple_type(const std::string& type, const JsonValue& schema,
                                   const std::string& hint) {
     if (type == "object") {
       return visit_object(schema, hint);

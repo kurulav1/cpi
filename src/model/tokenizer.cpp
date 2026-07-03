@@ -1,14 +1,14 @@
 #include "model/tokenizer.hpp"
 
-#include "model/hf_bpe_tokenizer.hpp"
-
-#include <cstdlib>
 #include <algorithm>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <set>
 #include <sstream>
 #include <stdexcept>
+
+#include "model/hf_bpe_tokenizer.hpp"
 
 #ifdef LLAMA_ENGINE_HAS_SENTENCEPIECE
 #include <sentencepiece_processor.h>
@@ -35,8 +35,8 @@ namespace {
 // is returned.
 std::string default_tool_path(const char* exe_name) {
 #ifdef _WIN32
-  const std::filesystem::path p = std::filesystem::path("third_party") / "vcpkg" / "installed" / "x64-windows" /
-                                  "tools" / "sentencepiece" / exe_name;
+  const std::filesystem::path p = std::filesystem::path("third_party") / "vcpkg" / "installed" /
+                                  "x64-windows" / "tools" / "sentencepiece" / exe_name;
 #else
   const std::filesystem::path p = std::filesystem::path(exe_name);
 #endif
@@ -91,9 +91,7 @@ std::vector<std::string> python_command_candidates() {
   return out;
 }
 
-bool parse_special_id_line(const std::string& line,
-                           const std::string& key,
-                           int* out_value) {
+bool parse_special_id_line(const std::string& line, const std::string& key, int* out_value) {
   if (!out_value) {
     return false;
   }
@@ -240,8 +238,7 @@ void Tokenizer::load(const std::string& path) {
       const auto tmp_dir = std::filesystem::temp_directory_path();
       const auto out_path = tmp_dir / "llama_spm_special_ids.txt";
       for (const std::string& python_cmd : python_command_candidates()) {
-        const std::string cmd = python_cmd + " " +
-                                quote_shell_arg(helper_script) +
+        const std::string cmd = python_cmd + " " + quote_shell_arg(helper_script) +
                                 " special-ids --model " + quote_shell_arg(model_path_) +
                                 " --output " + quote_shell_arg(out_path);
         const int rc = std::system(cmd.c_str());
@@ -337,11 +334,9 @@ std::vector<int> Tokenizer::encode(const std::string& text, bool add_bos) const 
   write_text_file(in_path, text);
   if (!spm_python_cmd_.empty()) {
     const std::filesystem::path helper_script = python_sentencepiece_script_path();
-    const std::string cmd = spm_python_cmd_ + " " +
-                            quote_shell_arg(helper_script) +
-                            " encode --model " + quote_shell_arg(model_path_) +
-                            " --input " + quote_shell_arg(in_path) +
-                            " --output " + quote_shell_arg(out_path) +
+    const std::string cmd = spm_python_cmd_ + " " + quote_shell_arg(helper_script) +
+                            " encode --model " + quote_shell_arg(model_path_) + " --input " +
+                            quote_shell_arg(in_path) + " --output " + quote_shell_arg(out_path) +
                             (add_bos ? " --add-bos" : "");
     const int rc = std::system(cmd.c_str());
     if (rc != 0) {
@@ -427,11 +422,9 @@ std::string Tokenizer::decode(const std::vector<int>& ids) const {
 
   if (!spm_python_cmd_.empty()) {
     const std::filesystem::path helper_script = python_sentencepiece_script_path();
-    const std::string cmd = spm_python_cmd_ + " " +
-                            quote_shell_arg(helper_script) +
-                            " decode --model " + quote_shell_arg(model_path_) +
-                            " --input " + quote_shell_arg(in_path) +
-                            " --output " + quote_shell_arg(out_path);
+    const std::string cmd = spm_python_cmd_ + " " + quote_shell_arg(helper_script) +
+                            " decode --model " + quote_shell_arg(model_path_) + " --input " +
+                            quote_shell_arg(in_path) + " --output " + quote_shell_arg(out_path);
     const int rc = std::system(cmd.c_str());
     if (rc != 0) {
       throw std::runtime_error("sentencepiece python decode failed: " + cmd);

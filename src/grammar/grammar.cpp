@@ -216,8 +216,7 @@ std::vector<Stack> init_stacks(const Grammar& grammar) {
 
 // Advances every stack by one codepoint, returning the surviving stacks.
 std::vector<Stack> accept_codepoint(const std::vector<Rule>& rules,
-                                    const std::vector<Stack>& stacks,
-                                    std::uint32_t chr) {
+                                    const std::vector<Stack>& stacks, std::uint32_t chr) {
   std::vector<Stack> next;
   for (const Stack& stack : stacks) {
     if (stack.empty()) {
@@ -282,7 +281,8 @@ void add_rule(ParseState& state, std::uint32_t rule_id, Rule rule) {
 }
 
 const char* parse_space(const char* src, bool newline_ok) {
-  while (*src == ' ' || *src == '\t' || *src == '#' || (newline_ok && (*src == '\r' || *src == '\n'))) {
+  while (*src == ' ' || *src == '\t' || *src == '#' ||
+         (newline_ok && (*src == '\r' || *src == '\n'))) {
     if (*src == '#') {
       while (*src != 0 && *src != '\r' && *src != '\n') {
         ++src;
@@ -331,12 +331,24 @@ std::uint32_t parse_char(const char*& pos) {
   if (*pos == '\\') {
     const char esc = pos[1];
     switch (esc) {
-      case 'x': pos += 2; return parse_hex(pos, 2);
-      case 'u': pos += 2; return parse_hex(pos, 4);
-      case 'U': pos += 2; return parse_hex(pos, 8);
-      case 't': pos += 2; return '\t';
-      case 'r': pos += 2; return '\r';
-      case 'n': pos += 2; return '\n';
+      case 'x':
+        pos += 2;
+        return parse_hex(pos, 2);
+      case 'u':
+        pos += 2;
+        return parse_hex(pos, 4);
+      case 'U':
+        pos += 2;
+        return parse_hex(pos, 8);
+      case 't':
+        pos += 2;
+        return '\t';
+      case 'r':
+        pos += 2;
+        return '\r';
+      case 'n':
+        pos += 2;
+        return '\n';
       case '\\':
       case '"':
       case '[':
@@ -385,17 +397,11 @@ std::uint32_t parse_char(const char*& pos) {
   return value;
 }
 
-const char* parse_sequence(ParseState& state,
-                           const char* src,
-                           const std::string& rule_name,
-                           Rule& out,
-                           bool is_nested);
+const char* parse_sequence(ParseState& state, const char* src, const std::string& rule_name,
+                           Rule& out, bool is_nested);
 
-const char* parse_alternates(ParseState& state,
-                             const char* src,
-                             const std::string& rule_name,
-                             std::uint32_t rule_id,
-                             bool is_nested) {
+const char* parse_alternates(ParseState& state, const char* src, const std::string& rule_name,
+                             std::uint32_t rule_id, bool is_nested) {
   Rule rule;
   const char* pos = parse_sequence(state, src, rule_name, rule, is_nested);
   while (*pos == '|') {
@@ -408,11 +414,8 @@ const char* parse_alternates(ParseState& state,
   return pos;
 }
 
-const char* parse_sequence(ParseState& state,
-                           const char* src,
-                           const std::string& rule_name,
-                           Rule& out,
-                           bool is_nested) {
+const char* parse_sequence(ParseState& state, const char* src, const std::string& rule_name,
+                           Rule& out, bool is_nested) {
   const char* pos = src;
   std::size_t last_sym_start = out.size();
 
@@ -548,8 +551,7 @@ bool char_set_accepts(const Element* set, std::uint32_t cp) {
 }
 
 std::vector<Stack> grammar_accept_codepoint(const Grammar& grammar,
-                                            const std::vector<Stack>& stacks,
-                                            std::uint32_t cp) {
+                                            const std::vector<Stack>& stacks, std::uint32_t cp) {
   return accept_codepoint(grammar.rules(), stacks, cp);
 }
 

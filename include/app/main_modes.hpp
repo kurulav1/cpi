@@ -34,38 +34,28 @@ struct RunExecutionOptions {
   int benchmark_warmup = 0;
 };
 
-using GenerateFn =
-    std::function<std::vector<int>(const std::vector<int>& prompt_tokens, int max_new_tokens, float temperature)>;
+using GenerateFn = std::function<std::vector<int>(const std::vector<int>& prompt_tokens,
+                                                  int max_new_tokens, float temperature)>;
 using GenerateStreamFn = std::function<std::vector<int>(
-    const std::vector<int>& prompt_tokens,
-    int max_new_tokens,
-    float temperature,
-    const std::function<bool(int)>& on_token,
-    const engine::GenerationConstraints* constraints)>;
+    const std::vector<int>& prompt_tokens, int max_new_tokens, float temperature,
+    const std::function<bool(int)>& on_token, const engine::GenerationConstraints* constraints)>;
 using InspectNextLogitsFn = std::function<std::vector<std::pair<int, float>>(
-    const std::vector<int>& prompt_tokens,
-    int top_k)>;
+    const std::vector<int>& prompt_tokens, int top_k)>;
 using LastBenchmarkStatsFn = std::function<const engine::BenchmarkStats&()>;
 
-void execute_engine_modes(const RunExecutionOptions& options,
-                          const std::vector<int>& prompt_tokens,
+void execute_engine_modes(const RunExecutionOptions& options, const std::vector<int>& prompt_tokens,
                           const std::vector<int>& stop_token_ids,
-                          const std::vector<std::string>& stop_texts,
-                          model::Tokenizer* tokenizer,
-                          const GenerateFn& generate,
-                          const GenerateStreamFn& generate_stream,
+                          const std::vector<std::string>& stop_texts, model::Tokenizer* tokenizer,
+                          const GenerateFn& generate, const GenerateStreamFn& generate_stream,
                           const InspectNextLogitsFn& inspect_next_logits,
                           const LastBenchmarkStatsFn& last_benchmark_stats);
 
 #if LLAMA_ENGINE_HAS_CUDA
 // Multiplexed continuous-batching interactive worker (opt-in, --interactive-batch).
 // Drives the engine's streaming batch scheduler; see main_interactive_batch.cpp.
-void run_interactive_batch(engine::LlamaEngine& eng,
-                           model::Tokenizer& tokenizer,
-                           const std::vector<std::string>& default_stop_texts,
-                           bool default_add_bos,
-                           int default_max_new,
-                           float default_temp);
+void run_interactive_batch(engine::LlamaEngine& eng, model::Tokenizer& tokenizer,
+                           const std::vector<std::string>& default_stop_texts, bool default_add_bos,
+                           int default_max_new, float default_temp);
 #endif
 
 }  // namespace app::main_modes

@@ -17,7 +17,7 @@
 namespace model {
 
 class SafetensorsLoader {
- public:
+public:
   // Opens and memory-maps all .safetensors files in model_dir (sorted by
   // filename), parses their JSON headers, and builds a tensor name→location
   // index. Throws on I/O or parse errors.
@@ -33,7 +33,7 @@ class SafetensorsLoader {
   // Returns true if `name` is present in the index.
   [[nodiscard]] bool has_tensor(const std::string& name) const;
 
- private:
+private:
   struct TensorMeta {
     int shard_idx;
     std::size_t data_start;  // byte offset within shard binary payload

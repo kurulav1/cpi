@@ -1,12 +1,11 @@
-#include "engine/llama_engine.hpp"
-#include "llama_engine_internal.hpp"
+#include <cuda_fp16.h>
 
 #include <algorithm>
 #include <utility>
 
-#include <cuda_fp16.h>
-
 #include "common.hpp"
+#include "engine/llama_engine.hpp"
+#include "llama_engine_internal.hpp"
 #include "runtime/cuda_utils.cuh"
 #include "runtime/kernels.cuh"
 
@@ -40,15 +39,13 @@ double timed_cuda_launch_ms(cudaStream_t stream, int warmup, int iters, Launch&&
 
 }  // namespace
 
-void LlamaEngine::forward_token_logits(int token, int position, std::vector<float>* out_logits, int* out_argmax) {
+void LlamaEngine::forward_token_logits(int token, int position, std::vector<float>* out_logits,
+                                       int* out_argmax) {
   forward_token(token, position, true, out_logits, out_argmax);
 }
 
-void LlamaEngine::forward_token(int token,
-                                int position,
-                                bool compute_logits,
-                                std::vector<float>* out_logits,
-                                int* out_argmax) {
+void LlamaEngine::forward_token(int token, int position, bool compute_logits,
+                                std::vector<float>* out_logits, int* out_argmax) {
   const auto& cfg = weights_.config();
   const int hidden = cfg.hidden_size;
   const bool resident_fast_path = cached_layer_count_ == cfg.num_layers && !options_.paged_kv_cache;
@@ -69,39 +66,31 @@ void LlamaEngine::forward_token(int token,
     return;
   }
 
-  run_profiled(last_benchmark_stats_.decode_rmsnorm_ms, [&] {
-    launch_norm(d_x_, d_norm_out_, d_norm_out_bias_, d_x_norm_, 1, hidden);
-  });
+  run_profiled(last_benchmark_stats_.decode_rmsnorm_ms,
+               [&] { launch_norm(d_x_, d_norm_out_, d_norm_out_bias_, d_x_norm_, 1, hidden); });
 
   run_profiled(last_benchmark_stats_.decode_lm_head_ms, [&] {
-    resident_projection_float(
-        d_lm_head_,
-        d_x_norm_,
-        d_logits_,
-        cfg.vocab_size,
-        hidden,
-        resident_lm_head_warps_,
-        resident_lm_head_tile_pairs_,
-        resident_lm_head_rows_per_warp_);
+    resident_projection_float(d_lm_head_, d_x_norm_, d_logits_, cfg.vocab_size, hidden,
+                              resident_lm_head_warps_, resident_lm_head_tile_pairs_,
+                              resident_lm_head_rows_per_warp_);
     if (d_lm_head_bias_) {
       kernels::launch_add_bias_inplace_float_from_half(static_cast<float*>(d_logits_),
                                                        static_cast<const __half*>(d_lm_head_bias_),
-                                                       cfg.vocab_size,
-                                                       compute_stream_);
+                                                       cfg.vocab_size, compute_stream_);
     }
   });
 
   if (out_logits) {
     out_logits->resize(static_cast<std::size_t>(cfg.vocab_size));
     CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
-    CUDA_CHECK(cudaMemcpy(out_logits->data(), d_logits_, out_logits->size() * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(out_logits->data(), d_logits_, out_logits->size() * sizeof(float),
+                          cudaMemcpyDeviceToHost));
   } else if (out_argmax) {
-    kernels::launch_argmax_float(static_cast<const float*>(d_logits_), cfg.vocab_size, d_argmax_, compute_stream_);
+    kernels::launch_argmax_float(static_cast<const float*>(d_logits_), cfg.vocab_size, d_argmax_,
+                                 compute_stream_);
     CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
     CUDA_CHECK(cudaMemcpy(out_argmax, d_argmax_, sizeof(int), cudaMemcpyDeviceToHost));
   }
 }
-
-
 
 }  // namespace engine

@@ -1,5 +1,3 @@
-#include "engine/bert_embedder.hpp"
-
 #include <cuda_fp16.h>
 
 #include <cmath>
@@ -8,25 +6,27 @@
 #include <string>
 #include <vector>
 
+#include "engine/bert_embedder.hpp"
+
 namespace engine {
 namespace {
 
-#define CUDA_CHECK(x)                                                                       \
-  do {                                                                                      \
-    const cudaError_t e_ = (x);                                                             \
-    if (e_ != cudaSuccess) {                                                                \
-      throw std::runtime_error(std::string("bert cuda: ") + cudaGetErrorString(e_) + " @ " \
-                               + __FILE__ + ":" + std::to_string(__LINE__));                \
-    }                                                                                       \
+#define CUDA_CHECK(x)                                                                        \
+  do {                                                                                       \
+    const cudaError_t e_ = (x);                                                              \
+    if (e_ != cudaSuccess) {                                                                 \
+      throw std::runtime_error(std::string("bert cuda: ") + cudaGetErrorString(e_) + " @ " + \
+                               __FILE__ + ":" + std::to_string(__LINE__));                   \
+    }                                                                                        \
   } while (0)
 
-#define CUBLAS_CHECK(x)                                                              \
-  do {                                                                              \
-    const cublasStatus_t s_ = (x);                                                  \
-    if (s_ != CUBLAS_STATUS_SUCCESS) {                                              \
-      throw std::runtime_error("bert cublas error " + std::to_string((int)s_) +     \
-                               " @ " + std::to_string(__LINE__));                    \
-    }                                                                               \
+#define CUBLAS_CHECK(x)                                                                 \
+  do {                                                                                  \
+    const cublasStatus_t s_ = (x);                                                      \
+    if (s_ != CUBLAS_STATUS_SUCCESS) {                                                  \
+      throw std::runtime_error("bert cublas error " + std::to_string((int)s_) + " @ " + \
+                               std::to_string(__LINE__));                               \
+    }                                                                                   \
   } while (0)
 
 // Portable host float -> IEEE half (round-to-nearest-even-ish; fine for weights).
@@ -50,8 +50,8 @@ std::uint16_t f32_to_f16(float f) {
     if ((mant >> (shift - 1)) & 1u) ++h;  // round
     return static_cast<std::uint16_t>(sign | h);
   }
-  std::uint16_t h = static_cast<std::uint16_t>(sign | (static_cast<std::uint32_t>(exp) << 10) |
-                                               (mant >> 13));
+  std::uint16_t h =
+      static_cast<std::uint16_t>(sign | (static_cast<std::uint32_t>(exp) << 10) | (mant >> 13));
   if (mant & 0x1000u) ++h;  // round to nearest
   return h;
 }
@@ -139,7 +139,7 @@ __global__ void attention_kernel(const half* q, const half* k, const half* v, ha
   const int H = num_heads * head_dim;
   const int hbase = head * head_dim;
   extern __shared__ float smem[];
-  float* q_sh = smem;             // head_dim
+  float* q_sh = smem;               // head_dim
   float* scores = smem + head_dim;  // L
   for (int d = lane; d < head_dim; d += 32) {
     q_sh[d] = __half2float(q[i * H + hbase + d]);
@@ -211,7 +211,9 @@ __global__ void pool_normalize_kernel(const half* x, float* out, int L, int H, i
 
 }  // namespace
 
-BertEmbedder::~BertEmbedder() { destroy(); }
+BertEmbedder::~BertEmbedder() {
+  destroy();
+}
 
 void* BertEmbedder::upload_fp16(const std::string& name, std::size_t expected_elems) {
   if (!weights_.has_tensor(name)) {
@@ -228,7 +230,8 @@ void* BertEmbedder::upload_fp16(const std::string& name, std::size_t expected_el
   for (std::size_t i = 0; i < expected_elems; ++i) half_host[i] = f32_to_f16(src[i]);
   void* dptr = nullptr;
   CUDA_CHECK(cudaMalloc(&dptr, expected_elems * sizeof(half)));
-  CUDA_CHECK(cudaMemcpy(dptr, half_host.data(), expected_elems * sizeof(half), cudaMemcpyHostToDevice));
+  CUDA_CHECK(
+      cudaMemcpy(dptr, half_host.data(), expected_elems * sizeof(half), cudaMemcpyHostToDevice));
   return dptr;
 }
 
@@ -236,21 +239,23 @@ void BertEmbedder::linear(const void* w, const void* bias, const void* x, void* 
                           int rows) {
   const float alpha = 1.0f, beta = 0.0f;
   // y[rows,out] = x[rows,in] @ W[out,in]^T  (row-major). See derivation in commit.
-  CUBLAS_CHECK(cublasGemmEx(cublas_, CUBLAS_OP_T, CUBLAS_OP_N, out, rows, in, &alpha, w,
-                            CUDA_R_16F, in, x, CUDA_R_16F, in, &beta, y, CUDA_R_16F, out,
-                            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+  CUBLAS_CHECK(cublasGemmEx(cublas_, CUBLAS_OP_T, CUBLAS_OP_N, out, rows, in, &alpha, w, CUDA_R_16F,
+                            in, x, CUDA_R_16F, in, &beta, y, CUDA_R_16F, out, CUBLAS_COMPUTE_32F,
+                            CUBLAS_GEMM_DEFAULT));
   if (bias) {
     const int n = rows * out;
-    add_bias_kernel<<<(n + 255) / 256, 256, 0, stream_>>>(static_cast<half*>(y),
-                                                          static_cast<const half*>(bias), rows, out);
+    add_bias_kernel<<<(n + 255) / 256, 256, 0, stream_>>>(
+        static_cast<half*>(y), static_cast<const half*>(bias), rows, out);
   }
 }
 
 void BertEmbedder::initialize(const std::string& model_dir) {
   cfg_ = EmbeddingConfig::load(model_dir);
   if (cfg_.model_type != "bert" || cfg_.position_embedding_type != "absolute") {
-    throw std::runtime_error("bert embedder: only absolute-position BERT-family models are "
-                             "supported (got model_type=" + cfg_.model_type + ")");
+    throw std::runtime_error(
+        "bert embedder: only absolute-position BERT-family models are "
+        "supported (got model_type=" +
+        cfg_.model_type + ")");
   }
   weights_.open(model_dir);
   CUBLAS_CHECK(cublasCreate(&cublas_));
@@ -354,8 +359,9 @@ std::vector<float> BertEmbedder::embed(const std::vector<int>& token_ids) {
       static_cast<const half*>(d_x_), d_pooled_, L, H, cfg_.pooling == PoolingMode::Mean ? 1 : 0,
       cfg_.normalize ? 1 : 0);
 
-  CUDA_CHECK(cudaMemcpyAsync(h_pooled_.data(), d_pooled_, static_cast<std::size_t>(H) * sizeof(float),
-                             cudaMemcpyDeviceToHost, stream_));
+  CUDA_CHECK(cudaMemcpyAsync(h_pooled_.data(), d_pooled_,
+                             static_cast<std::size_t>(H) * sizeof(float), cudaMemcpyDeviceToHost,
+                             stream_));
   CUDA_CHECK(cudaStreamSynchronize(stream_));
   if (cfg_.dimension == H) {
     return h_pooled_;
@@ -364,21 +370,59 @@ std::vector<float> BertEmbedder::embed(const std::vector<int>& token_ids) {
 }
 
 void BertEmbedder::destroy() {
-  const auto free_d = [](void*& p) { if (p) { cudaFree(p); p = nullptr; } };
-  free_d(word_emb_); free_d(pos_emb_); free_d(type_emb_); free_d(emb_ln_w_); free_d(emb_ln_b_);
+  const auto free_d = [](void*& p) {
+    if (p) {
+      cudaFree(p);
+      p = nullptr;
+    }
+  };
+  free_d(word_emb_);
+  free_d(pos_emb_);
+  free_d(type_emb_);
+  free_d(emb_ln_w_);
+  free_d(emb_ln_b_);
   for (LayerWeights& w : layers_) {
-    free_d(w.q_w); free_d(w.q_b); free_d(w.k_w); free_d(w.k_b); free_d(w.v_w); free_d(w.v_b);
-    free_d(w.o_w); free_d(w.o_b); free_d(w.attn_ln_w); free_d(w.attn_ln_b);
-    free_d(w.inter_w); free_d(w.inter_b); free_d(w.out_w); free_d(w.out_b);
-    free_d(w.out_ln_w); free_d(w.out_ln_b);
+    free_d(w.q_w);
+    free_d(w.q_b);
+    free_d(w.k_w);
+    free_d(w.k_b);
+    free_d(w.v_w);
+    free_d(w.v_b);
+    free_d(w.o_w);
+    free_d(w.o_b);
+    free_d(w.attn_ln_w);
+    free_d(w.attn_ln_b);
+    free_d(w.inter_w);
+    free_d(w.inter_b);
+    free_d(w.out_w);
+    free_d(w.out_b);
+    free_d(w.out_ln_w);
+    free_d(w.out_ln_b);
   }
   layers_.clear();
-  free_d(d_x_); free_d(d_tmp_); free_d(d_q_); free_d(d_k_); free_d(d_v_); free_d(d_att_);
+  free_d(d_x_);
+  free_d(d_tmp_);
+  free_d(d_q_);
+  free_d(d_k_);
+  free_d(d_v_);
+  free_d(d_att_);
   free_d(d_inter_);
-  if (d_tokens_) { cudaFree(d_tokens_); d_tokens_ = nullptr; }
-  if (d_pooled_) { cudaFree(d_pooled_); d_pooled_ = nullptr; }
-  if (cublas_) { cublasDestroy(cublas_); cublas_ = nullptr; }
-  if (stream_) { cudaStreamDestroy(stream_); stream_ = nullptr; }
+  if (d_tokens_) {
+    cudaFree(d_tokens_);
+    d_tokens_ = nullptr;
+  }
+  if (d_pooled_) {
+    cudaFree(d_pooled_);
+    d_pooled_ = nullptr;
+  }
+  if (cublas_) {
+    cublasDestroy(cublas_);
+    cublas_ = nullptr;
+  }
+  if (stream_) {
+    cudaStreamDestroy(stream_);
+    stream_ = nullptr;
+  }
 }
 
 }  // namespace engine

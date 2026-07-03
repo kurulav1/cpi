@@ -1,18 +1,19 @@
 #include "engine/llama4_cpu_engine.hpp"
 
-#include "grammar/grammar_sampler.hpp"
+#include <immintrin.h>
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
-#include <immintrin.h>
 #include <numeric>
 #include <random>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#include "grammar/grammar_sampler.hpp"
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -131,7 +132,8 @@ void Llama4CpuEngine::gemv_bf16(const std::uint16_t* W, const float* x, float* y
   }
 }
 
-void Llama4CpuEngine::gemv_bf16_T(const std::uint16_t* W, const float* x, float* y, int in_dim, int out_dim) {
+void Llama4CpuEngine::gemv_bf16_T(const std::uint16_t* W, const float* x, float* y, int in_dim,
+                                  int out_dim) {
   std::fill(y, y + out_dim, 0.0f);
   constexpr int tile = 256;
 
@@ -145,7 +147,8 @@ void Llama4CpuEngine::gemv_bf16_T(const std::uint16_t* W, const float* x, float*
         continue;
       }
       const __m256 xv = _mm256_set1_ps(xi);
-      const std::uint16_t* row = W + static_cast<std::size_t>(i) * static_cast<std::size_t>(out_dim) +
+      const std::uint16_t* row = W +
+                                 static_cast<std::size_t>(i) * static_cast<std::size_t>(out_dim) +
                                  static_cast<std::size_t>(j0);
       float* yp = y + j0;
       int j = 0;
@@ -197,15 +200,17 @@ void Llama4CpuEngine::rope(float* q, float* k, int pos) {
 void Llama4CpuEngine::attention(int pos, int layer) {
   const int kv_mul = n_heads_ / n_kv_heads_;
   const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim_));
-  float* k_layer = k_cache_.data() + static_cast<std::size_t>(layer) * static_cast<std::size_t>(max_ctx_) *
-                                       static_cast<std::size_t>(kv_dim_);
-  float* v_layer = v_cache_.data() + static_cast<std::size_t>(layer) * static_cast<std::size_t>(max_ctx_) *
-                                       static_cast<std::size_t>(kv_dim_);
+  float* k_layer = k_cache_.data() + static_cast<std::size_t>(layer) *
+                                         static_cast<std::size_t>(max_ctx_) *
+                                         static_cast<std::size_t>(kv_dim_);
+  float* v_layer = v_cache_.data() + static_cast<std::size_t>(layer) *
+                                         static_cast<std::size_t>(max_ctx_) *
+                                         static_cast<std::size_t>(kv_dim_);
 
-  std::memcpy(k_layer + static_cast<std::size_t>(pos) * static_cast<std::size_t>(kv_dim_), k_.data(),
-              static_cast<std::size_t>(kv_dim_) * sizeof(float));
-  std::memcpy(v_layer + static_cast<std::size_t>(pos) * static_cast<std::size_t>(kv_dim_), v_.data(),
-              static_cast<std::size_t>(kv_dim_) * sizeof(float));
+  std::memcpy(k_layer + static_cast<std::size_t>(pos) * static_cast<std::size_t>(kv_dim_),
+              k_.data(), static_cast<std::size_t>(kv_dim_) * sizeof(float));
+  std::memcpy(v_layer + static_cast<std::size_t>(pos) * static_cast<std::size_t>(kv_dim_),
+              v_.data(), static_cast<std::size_t>(kv_dim_) * sizeof(float));
 
   const int seq_len = pos + 1;
 
@@ -238,7 +243,8 @@ void Llama4CpuEngine::attention(int pos, int layer) {
       head_scores[t] *= inv_sum;
     }
 
-    float* out_head = att_.data() + static_cast<std::size_t>(h) * static_cast<std::size_t>(head_dim_);
+    float* out_head =
+        att_.data() + static_cast<std::size_t>(h) * static_cast<std::size_t>(head_dim_);
     std::fill(out_head, out_head + head_dim_, 0.0f);
     for (int t = 0; t < seq_len; ++t) {
       const float* vt = v_layer + static_cast<std::size_t>(t) * static_cast<std::size_t>(kv_dim_) +
@@ -259,23 +265,24 @@ void Llama4CpuEngine::moe_ffn(int layer) {
 
   int expert_idx = 0;
   for (int e = 1; e < n_experts_; ++e) {
-    if (router_logits_[static_cast<std::size_t>(e)] > router_logits_[static_cast<std::size_t>(expert_idx)]) {
+    if (router_logits_[static_cast<std::size_t>(e)] >
+        router_logits_[static_cast<std::size_t>(expert_idx)]) {
       expert_idx = e;
     }
   }
 
-  const std::uint16_t* gate_up_ptr =
-      lw.gate_up + static_cast<std::size_t>(expert_idx) * static_cast<std::size_t>(hidden_) *
-                       static_cast<std::size_t>(inter_mlp_);
+  const std::uint16_t* gate_up_ptr = lw.gate_up + static_cast<std::size_t>(expert_idx) *
+                                                      static_cast<std::size_t>(hidden_) *
+                                                      static_cast<std::size_t>(inter_mlp_);
   gemv_bf16_T(gate_up_ptr, x_norm_.data(), gate_buf_.data(), hidden_, inter_mlp_);
   for (int i = 0; i < half_int; ++i) {
-    down_buf_[static_cast<std::size_t>(i)] =
-        silu(gate_buf_[static_cast<std::size_t>(i)]) * gate_buf_[static_cast<std::size_t>(i + half_int)];
+    down_buf_[static_cast<std::size_t>(i)] = silu(gate_buf_[static_cast<std::size_t>(i)]) *
+                                             gate_buf_[static_cast<std::size_t>(i + half_int)];
   }
 
-  const std::uint16_t* down_ptr =
-      lw.down_exp + static_cast<std::size_t>(expert_idx) * static_cast<std::size_t>(half_int) *
-                        static_cast<std::size_t>(hidden_);
+  const std::uint16_t* down_ptr = lw.down_exp + static_cast<std::size_t>(expert_idx) *
+                                                    static_cast<std::size_t>(half_int) *
+                                                    static_cast<std::size_t>(hidden_);
   gemv_bf16_T(down_ptr, down_buf_.data(), shared_buf_.data(), half_int, hidden_);
 
   gemv_bf16(lw.sh_gate, x_norm_.data(), shared_gate_.data(), inter_shared_, hidden_);
@@ -309,11 +316,13 @@ void Llama4CpuEngine::forward_token(int token, int pos) {
 
     if (use_qk_norm_) {
       for (int h = 0; h < n_heads_; ++h) {
-        float* q_head = q_.data() + static_cast<std::size_t>(h) * static_cast<std::size_t>(head_dim_);
+        float* q_head =
+            q_.data() + static_cast<std::size_t>(h) * static_cast<std::size_t>(head_dim_);
         rmsnorm_optional_weight(q_head, lw.q_norm, q_head, head_dim_);
       }
       for (int h = 0; h < n_kv_heads_; ++h) {
-        float* k_head = k_.data() + static_cast<std::size_t>(h) * static_cast<std::size_t>(head_dim_);
+        float* k_head =
+            k_.data() + static_cast<std::size_t>(h) * static_cast<std::size_t>(head_dim_);
         rmsnorm_optional_weight(k_head, lw.k_norm, k_head, head_dim_);
       }
     }
@@ -334,7 +343,8 @@ void Llama4CpuEngine::forward_token(int token, int pos) {
   gemv_bf16(lm_head_, x_norm_.data(), logits_.data(), vocab_size_, hidden_);
 }
 
-int Llama4CpuEngine::sample_token(float temperature, int top_k, const std::vector<int>& history, float rep_penalty) {
+int Llama4CpuEngine::sample_token(float temperature, int top_k, const std::vector<int>& history,
+                                  float rep_penalty) {
   if (rep_penalty != 1.0f) {
     for (int tok : history) {
       if (tok < 0 || tok >= vocab_size_) {
@@ -357,16 +367,17 @@ int Llama4CpuEngine::sample_token(float temperature, int top_k, const std::vecto
   const int k = std::clamp(top_k, 1, vocab_size_);
   std::vector<int> ids(static_cast<std::size_t>(vocab_size_));
   std::iota(ids.begin(), ids.end(), 0);
-  std::partial_sort(ids.begin(), ids.begin() + k, ids.end(),
-                    [&](int left, int right) { return logits_[static_cast<std::size_t>(left)] >
-                                                      logits_[static_cast<std::size_t>(right)]; });
+  std::partial_sort(ids.begin(), ids.begin() + k, ids.end(), [&](int left, int right) {
+    return logits_[static_cast<std::size_t>(left)] > logits_[static_cast<std::size_t>(right)];
+  });
 
   const float max_logit = logits_[static_cast<std::size_t>(ids[0])];
   std::vector<float> probs(static_cast<std::size_t>(k));
   float sum = 0.0f;
   for (int i = 0; i < k; ++i) {
     probs[static_cast<std::size_t>(i)] =
-        std::exp((logits_[static_cast<std::size_t>(ids[static_cast<std::size_t>(i)])] - max_logit) / temperature);
+        std::exp((logits_[static_cast<std::size_t>(ids[static_cast<std::size_t>(i)])] - max_logit) /
+                 temperature);
     sum += probs[static_cast<std::size_t>(i)];
   }
   if (sum <= 0.0f) {
@@ -501,34 +512,28 @@ void Llama4CpuEngine::initialize(const EngineOptions& options) {
   scores_.resize(static_cast<std::size_t>(n_heads_) * static_cast<std::size_t>(max_ctx_));
 
   if (options_.verbose) {
-    std::fprintf(stderr,
-                 "[llama4_cpu] layers=%d hidden=%d heads=%d/%d experts=%d vocab=%d max_ctx=%d kv_dim=%d\n",
-                 n_layers_,
-                 hidden_,
-                 n_heads_,
-                 n_kv_heads_,
-                 n_experts_,
-                 vocab_size_,
-                 max_ctx_,
-                 kv_dim_);
+    std::fprintf(
+        stderr,
+        "[llama4_cpu] layers=%d hidden=%d heads=%d/%d experts=%d vocab=%d max_ctx=%d kv_dim=%d\n",
+        n_layers_, hidden_, n_heads_, n_kv_heads_, n_experts_, vocab_size_, max_ctx_, kv_dim_);
   }
 }
 
 std::vector<int> Llama4CpuEngine::generate(const std::vector<int>& prompt_tokens,
-                                           int max_new_tokens,
-                                           float temperature) {
+                                           int max_new_tokens, float temperature) {
   return generate_stream(prompt_tokens, max_new_tokens, temperature, [](int) { return true; });
 }
 
 std::vector<int> Llama4CpuEngine::generate_stream(const std::vector<int>& prompt_tokens,
-                                                  int max_new_tokens,
-                                                  float temperature,
+                                                  int max_new_tokens, float temperature,
                                                   const std::function<bool(int)>& on_token,
                                                   const GenerationConstraints* constraints) {
   active_grammar_ = constraints ? constraints->grammar : nullptr;
   struct GrammarScope {
     grammar::GrammarSampler** slot;
-    ~GrammarScope() { *slot = nullptr; }
+    ~GrammarScope() {
+      *slot = nullptr;
+    }
   } grammar_scope{&active_grammar_};
 
   stats_ = BenchmarkStats{};
@@ -556,7 +561,8 @@ std::vector<int> Llama4CpuEngine::generate_stream(const std::vector<int>& prompt
 
   const auto decode_start = std::chrono::steady_clock::now();
   for (int step = 0; step < max_new_tokens; ++step) {
-    const int next = sample_token(temperature, options_.top_k, history, options_.repetition_penalty);
+    const int next =
+        sample_token(temperature, options_.top_k, history, options_.repetition_penalty);
     if (active_grammar_ != nullptr) {
       active_grammar_->accept(next);
     }
@@ -582,8 +588,8 @@ std::vector<int> Llama4CpuEngine::generate_stream(const std::vector<int>& prompt
   return output;
 }
 
-std::vector<std::pair<int, float>> Llama4CpuEngine::inspect_next_logits(const std::vector<int>& prompt_tokens,
-                                                                        int top_k) {
+std::vector<std::pair<int, float>> Llama4CpuEngine::inspect_next_logits(
+    const std::vector<int>& prompt_tokens, int top_k) {
   std::fill(k_cache_.begin(), k_cache_.end(), 0.0f);
   std::fill(v_cache_.begin(), v_cache_.end(), 0.0f);
 

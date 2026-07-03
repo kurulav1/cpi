@@ -20,7 +20,7 @@
 namespace model {
 
 class WordPieceTokenizer {
- public:
+public:
   // Loads vocab.txt from `model_dir`. `lowercase` and `strip_accents` follow the
   // model's normalizer (bge-small-en is uncased: both true). Throws on error.
   void load(const std::string& model_dir, bool lowercase = true, bool strip_accents = true);
@@ -29,13 +29,23 @@ class WordPieceTokenizer {
   // truncated so the total length is at most max_tokens (graceful truncation).
   std::vector<int> encode(const std::string& text, int max_tokens) const;
 
-  int cls_id() const { return cls_id_; }
-  int sep_id() const { return sep_id_; }
-  int pad_id() const { return pad_id_; }
-  int unk_id() const { return unk_id_; }
-  std::size_t vocab_size() const { return id_to_token_.size(); }
+  int cls_id() const {
+    return cls_id_;
+  }
+  int sep_id() const {
+    return sep_id_;
+  }
+  int pad_id() const {
+    return pad_id_;
+  }
+  int unk_id() const {
+    return unk_id_;
+  }
+  std::size_t vocab_size() const {
+    return id_to_token_.size();
+  }
 
- private:
+private:
   // Greedy WordPiece over one normalized, whitespace-free word.
   void wordpiece(const std::string& word, std::vector<int>& out) const;
 

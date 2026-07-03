@@ -22,10 +22,10 @@ struct ParsedArgs {
   int max_new = 16;
   float temp = 0.8f;
   bool parity_check = false;
-  int batched_check = 0;  // >0: run decode_step_batched parity gate for this many steps
-  int scheduler_check = 0;  // >0: run the batch-scheduler parity gate with this max_new
+  int batched_check = 0;           // >0: run decode_step_batched parity gate for this many steps
+  int scheduler_check = 0;         // >0: run the batch-scheduler parity gate with this max_new
   bool interactive_batch = false;  // multiplexed continuous-batching interactive worker
-  int batch_bench = 0;  // >0: run the batch throughput benchmark with this max_new
+  int batch_bench = 0;             // >0: run the batch throughput benchmark with this max_new
   bool dump_tokenizer_meta = false;
   bool dump_prompt_tokens = false;
   bool allow_legacy_chat_tokenizer = false;

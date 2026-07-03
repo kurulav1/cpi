@@ -9,15 +9,15 @@
 // - Expert routing runs on CPU from a copied RMSNorm activation.
 // - The selected expert plus shared expert weights are streamed to GPU per layer.
 
+#include <cublas_v2.h>
+#include <cuda_runtime.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <string>
 #include <utility>
 #include <vector>
-
-#include <cublas_v2.h>
-#include <cuda_runtime.h>
 
 #include "engine/engine_types.hpp"
 #include "engine/generation_constraints.hpp"
@@ -26,29 +26,26 @@
 namespace engine {
 
 class Llama4CudaEngine {
- public:
+public:
   ~Llama4CudaEngine();
 
   void initialize(const EngineOptions& options);
 
-  std::vector<int> generate(const std::vector<int>& prompt_tokens,
-                            int max_new_tokens,
+  std::vector<int> generate(const std::vector<int>& prompt_tokens, int max_new_tokens,
                             float temperature);
 
-  std::vector<int> generate_stream(const std::vector<int>& prompt_tokens,
-                                   int max_new_tokens,
-                                   float temperature,
-                                   const std::function<bool(int)>& on_token,
+  std::vector<int> generate_stream(const std::vector<int>& prompt_tokens, int max_new_tokens,
+                                   float temperature, const std::function<bool(int)>& on_token,
                                    const GenerationConstraints* constraints = nullptr);
 
-  std::vector<std::pair<int, float>> inspect_next_logits(
-      const std::vector<int>& prompt_tokens, int top_k);
+  std::vector<std::pair<int, float>> inspect_next_logits(const std::vector<int>& prompt_tokens,
+                                                         int top_k);
 
   const BenchmarkStats& last_benchmark_stats() const {
     return last_benchmark_stats_;
   }
 
- private:
+private:
   struct LayerDeviceWeights {
     void* norm_att = nullptr;
     void* norm_ffn = nullptr;
@@ -61,12 +58,12 @@ class Llama4CudaEngine {
   };
 
   struct LayerHostMoEWeights {
-    const std::uint16_t* router = nullptr;   // [n_experts, hidden] BF16
-    const std::uint16_t* gate_up = nullptr;  // [hidden, 2*inter] BF16 row-major
-    const std::uint16_t* down_exp = nullptr; // [inter, hidden] BF16 row-major
-    const std::uint16_t* sh_gate = nullptr;  // [inter_shared, hidden] BF16 row-major
-    const std::uint16_t* sh_up = nullptr;    // [inter_shared, hidden] BF16 row-major
-    const std::uint16_t* sh_down = nullptr;  // [hidden, inter_shared] BF16 row-major
+    const std::uint16_t* router = nullptr;    // [n_experts, hidden] BF16
+    const std::uint16_t* gate_up = nullptr;   // [hidden, 2*inter] BF16 row-major
+    const std::uint16_t* down_exp = nullptr;  // [inter, hidden] BF16 row-major
+    const std::uint16_t* sh_gate = nullptr;   // [inter_shared, hidden] BF16 row-major
+    const std::uint16_t* sh_up = nullptr;     // [inter_shared, hidden] BF16 row-major
+    const std::uint16_t* sh_down = nullptr;   // [hidden, inter_shared] BF16 row-major
   };
 
   // Shared expert FP16 weights resident on GPU.  The shared expert is active
@@ -84,40 +81,23 @@ class Llama4CudaEngine {
   void build_rope_tables();
   void reset_kv_cache();
 
-  void copy_bf16_tensor_to_fp16_device(const std::uint16_t* src,
-                                       void* dst,
-                                       std::size_t elems);
+  void copy_bf16_tensor_to_fp16_device(const std::uint16_t* src, void* dst, std::size_t elems);
   void load_token_embedding_to_device(int token);
   int select_expert_cpu(int layer);
   void load_layer_moe_weights_to_device(int layer, int expert_idx);
 
-  void rowmajor_projection_half(const void* w,
-                                const void* x,
-                                void* y,
-                                int out_features,
+  void rowmajor_projection_half(const void* w, const void* x, void* y, int out_features,
                                 int in_features);
-  void rowmajor_projection_float(const void* w,
-                                 const void* x,
-                                 void* y,
-                                 int out_features,
+  void rowmajor_projection_float(const void* w, const void* x, void* y, int out_features,
                                  int in_features);
-  void transposed_projection_half(const void* w_in_out,
-                                  const void* x,
-                                  void* y,
-                                  int in_features,
+  void transposed_projection_half(const void* w_in_out, const void* x, void* y, int in_features,
                                   int out_features);
 
-  void forward_token(int token,
-                     int position,
-                     bool compute_logits,
-                     std::vector<float>* out_logits,
+  void forward_token(int token, int position, bool compute_logits, std::vector<float>* out_logits,
                      int* out_argmax);
-  void forward_token_logits(int token,
-                            int position,
-                            std::vector<float>* out_logits,
+  void forward_token_logits(int token, int position, std::vector<float>* out_logits,
                             int* out_argmax);
-  int sample_next_token(float temperature,
-                        const std::vector<int>& history);
+  int sample_next_token(float temperature, const std::vector<int>& history);
 
   // Llama4 Scout architecture.
   int vocab_size_ = 202048;
@@ -182,10 +162,10 @@ class Llama4CudaEngine {
   void* d_v_cache_ = nullptr;
 
   // Streamed MoE weight buffers.
-  void* d_expert_gate_up_w_ = nullptr;  // [hidden, 2*inter] converted to fp16
-  void* d_expert_down_w_ = nullptr;     // [inter, hidden] converted to fp16
-  void* d_streamed_rowmajor_w_ = nullptr; // reused for shared gate/up/down
-  std::uint16_t* d_bf16_stage_ = nullptr; // conversion staging buffer
+  void* d_expert_gate_up_w_ = nullptr;     // [hidden, 2*inter] converted to fp16
+  void* d_expert_down_w_ = nullptr;        // [inter, hidden] converted to fp16
+  void* d_streamed_rowmajor_w_ = nullptr;  // reused for shared gate/up/down
+  std::uint16_t* d_bf16_stage_ = nullptr;  // conversion staging buffer
   std::size_t bf16_stage_elems_ = 0;
 
   // Host-side scratch/state.

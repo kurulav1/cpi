@@ -2,14 +2,14 @@
 //
 // CUDA kernels and host launch wrappers for weight-only int8/int4 matvec paths.
 
-#include "runtime/kernels.cuh"
+#include <cuda_fp16.h>
+#include <sm_61_intrinsics.h>
 
 #include <cstddef>
 #include <cstdint>
 #include <type_traits>
 
-#include <cuda_fp16.h>
-#include <sm_61_intrinsics.h>
+#include "runtime/kernels.cuh"
 
 namespace kernels {
 namespace {
@@ -47,22 +47,20 @@ __device__ __forceinline__ int load_packed_int4x4(const int8_t* row_packed, int 
   const int byte_index = packed4_index * 2;
   const std::uint8_t b0 = static_cast<std::uint8_t>(row_packed[byte_index + 0]);
   const std::uint8_t b1 = static_cast<std::uint8_t>(row_packed[byte_index + 1]);
-  const std::uint8_t q0 = static_cast<std::uint8_t>(static_cast<int8_t>(decode_signed_int4(b0 & 0x0Fu)));
-  const std::uint8_t q1 = static_cast<std::uint8_t>(static_cast<int8_t>(decode_signed_int4((b0 >> 4) & 0x0Fu)));
-  const std::uint8_t q2 = static_cast<std::uint8_t>(static_cast<int8_t>(decode_signed_int4(b1 & 0x0Fu)));
-  const std::uint8_t q3 = static_cast<std::uint8_t>(static_cast<int8_t>(decode_signed_int4((b1 >> 4) & 0x0Fu)));
-  return static_cast<int>(q0) |
-         (static_cast<int>(q1) << 8) |
-         (static_cast<int>(q2) << 16) |
+  const std::uint8_t q0 =
+      static_cast<std::uint8_t>(static_cast<int8_t>(decode_signed_int4(b0 & 0x0Fu)));
+  const std::uint8_t q1 =
+      static_cast<std::uint8_t>(static_cast<int8_t>(decode_signed_int4((b0 >> 4) & 0x0Fu)));
+  const std::uint8_t q2 =
+      static_cast<std::uint8_t>(static_cast<int8_t>(decode_signed_int4(b1 & 0x0Fu)));
+  const std::uint8_t q3 =
+      static_cast<std::uint8_t>(static_cast<int8_t>(decode_signed_int4((b1 >> 4) & 0x0Fu)));
+  return static_cast<int>(q0) | (static_cast<int>(q1) << 8) | (static_cast<int>(q2) << 16) |
          (static_cast<int>(q3) << 24);
 }
 
-__global__ void weight_only_int8_matvec_kernel(const int8_t* w,
-                                               const float* scales,
-                                               const half* x,
-                                               half* y,
-                                               int out_features,
-                                               int in_features) {
+__global__ void weight_only_int8_matvec_kernel(const int8_t* w, const float* scales, const half* x,
+                                               half* y, int out_features, int in_features) {
   extern __shared__ float ssum[];
   const int row = blockIdx.x;
   const int tid = threadIdx.x;
@@ -95,13 +93,9 @@ __global__ void weight_only_int8_matvec_kernel(const int8_t* w,
   }
 }
 
-__global__ void weight_only_int8_matvec_batched_kernel(const int8_t* w,
-                                                       const float* scales,
-                                                       const half* x,
-                                                       half* y,
-                                                       int batch_size,
-                                                       int out_features,
-                                                       int in_features) {
+__global__ void weight_only_int8_matvec_batched_kernel(const int8_t* w, const float* scales,
+                                                       const half* x, half* y, int batch_size,
+                                                       int out_features, int in_features) {
   extern __shared__ float ssum[];
   const int row = blockIdx.x;
   const int batch = blockIdx.y;
@@ -134,14 +128,10 @@ __global__ void weight_only_int8_matvec_batched_kernel(const int8_t* w,
 
 // The dp4a path consumes 16-byte chunks first, then packed int32 groups, and
 // finally a scalar tail so one kernel covers arbitrary input widths.
-__global__ void weight_only_int8_matvec_batched_dp4a_kernel(const int8_t* w,
-                                                            const float* w_scales,
-                                                            const int8_t* x,
-                                                            const float* x_scales,
-                                                            half* y,
-                                                            int batch_size,
-                                                            int out_features,
-                                                            int in_features) {
+__global__ void weight_only_int8_matvec_batched_dp4a_kernel(const int8_t* w, const float* w_scales,
+                                                            const int8_t* x, const float* x_scales,
+                                                            half* y, int batch_size,
+                                                            int out_features, int in_features) {
   __shared__ int warp_sums[32];
   const int row = blockIdx.x;
   const int batch = blockIdx.y;
@@ -204,12 +194,9 @@ __global__ void weight_only_int8_matvec_batched_dp4a_kernel(const int8_t* w,
 // Tiled dp4a GEMV stages the activation tile once per block and can split the
 // K dimension across multiple warps that cooperate on the same output row.
 template <int TotalWarps, int TilePacked4, int WarpsPerRow>
-__global__ void weight_only_int8_matvec_dp4a_tiled_kernel(const int8_t* w,
-                                                          const float* w_scales,
-                                                          const int8_t* x,
-                                                          const float* x_scale,
-                                                          half* y,
-                                                          int out_features,
+__global__ void weight_only_int8_matvec_dp4a_tiled_kernel(const int8_t* w, const float* w_scales,
+                                                          const int8_t* x, const float* x_scale,
+                                                          half* y, int out_features,
                                                           int in_features) {
   static_assert(TotalWarps % WarpsPerRow == 0, "TotalWarps must be divisible by WarpsPerRow");
   constexpr int RowsPerBlock = TotalWarps / WarpsPerRow;
@@ -226,7 +213,8 @@ __global__ void weight_only_int8_matvec_dp4a_tiled_kernel(const int8_t* w,
   }
 
   const int packed4_total = in_features / 4;
-  const int* w4 = reinterpret_cast<const int*>(w + static_cast<std::size_t>(row) * static_cast<std::size_t>(in_features));
+  const int* w4 = reinterpret_cast<const int*>(w + static_cast<std::size_t>(row) *
+                                                       static_cast<std::size_t>(in_features));
   int local = 0;
 
   for (int tile_base = 0; tile_base < packed4_total; tile_base += TilePacked4) {
@@ -238,7 +226,8 @@ __global__ void weight_only_int8_matvec_dp4a_tiled_kernel(const int8_t* w,
 
     // Split the K work across several warps that collaborate on the same row
     // while still processing two packed fragments per loop step when possible.
-    for (int idx = split_warp * warpSize + lane; idx < tile_count; idx += WarpsPerRow * warpSize * 2) {
+    for (int idx = split_warp * warpSize + lane; idx < tile_count;
+         idx += WarpsPerRow * warpSize * 2) {
       local = __dp4a(w4[tile_base + idx], x_tile[idx], local);
       const int idx_next = idx + WarpsPerRow * warpSize;
       if (idx_next < tile_count) {
@@ -250,8 +239,10 @@ __global__ void weight_only_int8_matvec_dp4a_tiled_kernel(const int8_t* w,
 
   const int consumed = packed4_total * 4;
   for (int col = consumed + lane; col < in_features; col += warpSize) {
-    local += static_cast<int>(w[static_cast<std::size_t>(row) * static_cast<std::size_t>(in_features) + static_cast<std::size_t>(col)]) *
-             static_cast<int>(x[col]);
+    local +=
+        static_cast<int>(w[static_cast<std::size_t>(row) * static_cast<std::size_t>(in_features) +
+                           static_cast<std::size_t>(col)]) *
+        static_cast<int>(x[col]);
   }
 
   local = warp_sum_int(local);
@@ -273,16 +264,10 @@ __global__ void weight_only_int8_matvec_dp4a_tiled_kernel(const int8_t* w,
 // Dual-output variant that reuses the staged activation tile for two
 // independent weight matrices.
 template <int TotalWarps, int TilePacked4, int WarpsPerRow>
-__global__ void weight_only_int8_matvec_dual_dp4a_tiled_kernel(const int8_t* w_a,
-                                                               const float* w_scales_a,
-                                                               const int8_t* w_b,
-                                                               const float* w_scales_b,
-                                                               const int8_t* x,
-                                                               const float* x_scale,
-                                                               half* y_a,
-                                                               half* y_b,
-                                                               int out_features,
-                                                               int in_features) {
+__global__ void weight_only_int8_matvec_dual_dp4a_tiled_kernel(
+    const int8_t* w_a, const float* w_scales_a, const int8_t* w_b, const float* w_scales_b,
+    const int8_t* x, const float* x_scale, half* y_a, half* y_b, int out_features,
+    int in_features) {
   static_assert(TotalWarps % WarpsPerRow == 0, "TotalWarps must be divisible by WarpsPerRow");
   constexpr int RowsPerBlock = TotalWarps / WarpsPerRow;
   __shared__ int x_tile[TilePacked4];
@@ -299,8 +284,10 @@ __global__ void weight_only_int8_matvec_dual_dp4a_tiled_kernel(const int8_t* w_a
   }
 
   const int packed4_total = in_features / 4;
-  const int* wa4 = reinterpret_cast<const int*>(w_a + static_cast<std::size_t>(row) * static_cast<std::size_t>(in_features));
-  const int* wb4 = reinterpret_cast<const int*>(w_b + static_cast<std::size_t>(row) * static_cast<std::size_t>(in_features));
+  const int* wa4 = reinterpret_cast<const int*>(w_a + static_cast<std::size_t>(row) *
+                                                          static_cast<std::size_t>(in_features));
+  const int* wb4 = reinterpret_cast<const int*>(w_b + static_cast<std::size_t>(row) *
+                                                          static_cast<std::size_t>(in_features));
   int local_a = 0;
   int local_b = 0;
 
@@ -313,7 +300,8 @@ __global__ void weight_only_int8_matvec_dual_dp4a_tiled_kernel(const int8_t* w_a
 
     // Reuse each staged x tile across both outputs and split the K work across
     // several warps when configured to do so.
-    for (int idx = split_warp * warpSize + lane; idx < tile_count; idx += WarpsPerRow * warpSize * 2) {
+    for (int idx = split_warp * warpSize + lane; idx < tile_count;
+         idx += WarpsPerRow * warpSize * 2) {
       const int xv0 = x_tile[idx];
       local_a = __dp4a(wa4[tile_base + idx], xv0, local_a);
       local_b = __dp4a(wb4[tile_base + idx], xv0, local_b);
@@ -330,7 +318,9 @@ __global__ void weight_only_int8_matvec_dual_dp4a_tiled_kernel(const int8_t* w_a
   const int consumed = packed4_total * 4;
   for (int col = consumed + lane; col < in_features; col += warpSize) {
     const int xv = static_cast<int>(x[col]);
-    const std::size_t offset = static_cast<std::size_t>(row) * static_cast<std::size_t>(in_features) + static_cast<std::size_t>(col);
+    const std::size_t offset =
+        static_cast<std::size_t>(row) * static_cast<std::size_t>(in_features) +
+        static_cast<std::size_t>(col);
     local_a += static_cast<int>(w_a[offset]) * xv;
     local_b += static_cast<int>(w_b[offset]) * xv;
   }
@@ -356,11 +346,8 @@ __global__ void weight_only_int8_matvec_dual_dp4a_tiled_kernel(const int8_t* w_a
   }
 }
 
-__global__ void weight_only_int4_matvec_kernel(const int8_t* w_packed,
-                                               const float* scales,
-                                               const half* x,
-                                               half* y,
-                                               int out_features,
+__global__ void weight_only_int4_matvec_kernel(const int8_t* w_packed, const float* scales,
+                                               const half* x, half* y, int out_features,
                                                int in_features) {
   extern __shared__ float ssum[];
   const int row = blockIdx.x;
@@ -370,7 +357,8 @@ __global__ void weight_only_int4_matvec_kernel(const int8_t* w_packed,
   }
 
   const int packed_cols = (in_features + 1) / 2;
-  const int8_t* row_w = w_packed + static_cast<std::size_t>(row) * static_cast<std::size_t>(packed_cols);
+  const int8_t* row_w =
+      w_packed + static_cast<std::size_t>(row) * static_cast<std::size_t>(packed_cols);
 
   float local = 0.0f;
   for (int col = tid; col < in_features; col += blockDim.x) {
@@ -396,13 +384,9 @@ __global__ void weight_only_int4_matvec_kernel(const int8_t* w_packed,
   }
 }
 
-__global__ void weight_only_int4_matvec_batched_kernel(const int8_t* w_packed,
-                                                       const float* scales,
-                                                       const half* x,
-                                                       half* y,
-                                                       int batch_size,
-                                                       int out_features,
-                                                       int in_features) {
+__global__ void weight_only_int4_matvec_batched_kernel(const int8_t* w_packed, const float* scales,
+                                                       const half* x, half* y, int batch_size,
+                                                       int out_features, int in_features) {
   extern __shared__ float ssum[];
   const int row = blockIdx.x;
   const int batch = blockIdx.y;
@@ -412,7 +396,8 @@ __global__ void weight_only_int4_matvec_batched_kernel(const int8_t* w_packed,
   }
 
   const int packed_cols = (in_features + 1) / 2;
-  const int8_t* row_w = w_packed + static_cast<std::size_t>(row) * static_cast<std::size_t>(packed_cols);
+  const int8_t* row_w =
+      w_packed + static_cast<std::size_t>(row) * static_cast<std::size_t>(packed_cols);
   const int x_base = batch * in_features;
 
   float local = 0.0f;
@@ -436,12 +421,9 @@ __global__ void weight_only_int4_matvec_batched_kernel(const int8_t* w_packed,
 }
 
 __global__ void weight_only_int4_matvec_batched_dp4a_kernel(const int8_t* w_packed,
-                                                            const float* w_scales,
-                                                            const int8_t* x,
-                                                            const float* x_scales,
-                                                            half* y,
-                                                            int batch_size,
-                                                            int out_features,
+                                                            const float* w_scales, const int8_t* x,
+                                                            const float* x_scales, half* y,
+                                                            int batch_size, int out_features,
                                                             int in_features) {
   __shared__ int warp_sums[32];
   const int row = blockIdx.x;
@@ -452,7 +434,8 @@ __global__ void weight_only_int4_matvec_batched_dp4a_kernel(const int8_t* w_pack
   }
 
   const int packed_cols = (in_features + 1) / 2;
-  const int8_t* row_w = w_packed + static_cast<std::size_t>(row) * static_cast<std::size_t>(packed_cols);
+  const int8_t* row_w =
+      w_packed + static_cast<std::size_t>(row) * static_cast<std::size_t>(packed_cols);
   const int x_base = batch * in_features;
   const int* x4 = reinterpret_cast<const int*>(x + x_base);
   const int packed4_total = in_features / 4;
@@ -489,12 +472,9 @@ __global__ void weight_only_int4_matvec_batched_dp4a_kernel(const int8_t* w_pack
 
 template <int TotalWarps, int TilePacked4, int WarpsPerRow>
 __global__ void weight_only_int4_matvec_dp4a_tiled_kernel(const int8_t* w_packed,
-                                                          const float* w_scales,
-                                                          const int8_t* x,
-                                                          const float* x_scale,
-                                                          half* y,
-                                                          int out_features,
-                                                          int in_features) {
+                                                          const float* w_scales, const int8_t* x,
+                                                          const float* x_scale, half* y,
+                                                          int out_features, int in_features) {
   static_assert(TotalWarps % WarpsPerRow == 0, "TotalWarps must be divisible by WarpsPerRow");
   constexpr int RowsPerBlock = TotalWarps / WarpsPerRow;
   __shared__ int x_tile[TilePacked4];
@@ -510,7 +490,8 @@ __global__ void weight_only_int4_matvec_dp4a_tiled_kernel(const int8_t* w_packed
   }
 
   const int packed_cols = (in_features + 1) / 2;
-  const int8_t* row_w = w_packed + static_cast<std::size_t>(row) * static_cast<std::size_t>(packed_cols);
+  const int8_t* row_w =
+      w_packed + static_cast<std::size_t>(row) * static_cast<std::size_t>(packed_cols);
   const int packed4_total = in_features / 4;
   int local = 0;
 
@@ -521,7 +502,8 @@ __global__ void weight_only_int4_matvec_dp4a_tiled_kernel(const int8_t* w_packed
     }
     __syncthreads();
 
-    for (int idx = split_warp * warpSize + lane; idx < tile_count; idx += WarpsPerRow * warpSize * 2) {
+    for (int idx = split_warp * warpSize + lane; idx < tile_count;
+         idx += WarpsPerRow * warpSize * 2) {
       local = __dp4a(load_packed_int4x4(row_w, tile_base + idx), x_tile[idx], local);
       const int idx_next = idx + WarpsPerRow * warpSize;
       if (idx_next < tile_count) {
@@ -553,16 +535,10 @@ __global__ void weight_only_int4_matvec_dp4a_tiled_kernel(const int8_t* w_packed
 }
 
 template <int TotalWarps, int TilePacked4, int WarpsPerRow>
-__global__ void weight_only_int4_matvec_dual_dp4a_tiled_kernel(const int8_t* w_a_packed,
-                                                               const float* w_scales_a,
-                                                               const int8_t* w_b_packed,
-                                                               const float* w_scales_b,
-                                                               const int8_t* x,
-                                                               const float* x_scale,
-                                                               half* y_a,
-                                                               half* y_b,
-                                                               int out_features,
-                                                               int in_features) {
+__global__ void weight_only_int4_matvec_dual_dp4a_tiled_kernel(
+    const int8_t* w_a_packed, const float* w_scales_a, const int8_t* w_b_packed,
+    const float* w_scales_b, const int8_t* x, const float* x_scale, half* y_a, half* y_b,
+    int out_features, int in_features) {
   static_assert(TotalWarps % WarpsPerRow == 0, "TotalWarps must be divisible by WarpsPerRow");
   constexpr int RowsPerBlock = TotalWarps / WarpsPerRow;
   __shared__ int x_tile[TilePacked4];
@@ -579,8 +555,10 @@ __global__ void weight_only_int4_matvec_dual_dp4a_tiled_kernel(const int8_t* w_a
   }
 
   const int packed_cols = (in_features + 1) / 2;
-  const int8_t* row_wa = w_a_packed + static_cast<std::size_t>(row) * static_cast<std::size_t>(packed_cols);
-  const int8_t* row_wb = w_b_packed + static_cast<std::size_t>(row) * static_cast<std::size_t>(packed_cols);
+  const int8_t* row_wa =
+      w_a_packed + static_cast<std::size_t>(row) * static_cast<std::size_t>(packed_cols);
+  const int8_t* row_wb =
+      w_b_packed + static_cast<std::size_t>(row) * static_cast<std::size_t>(packed_cols);
   const int packed4_total = in_features / 4;
   int local_a = 0;
   int local_b = 0;
@@ -592,7 +570,8 @@ __global__ void weight_only_int4_matvec_dual_dp4a_tiled_kernel(const int8_t* w_a
     }
     __syncthreads();
 
-    for (int idx = split_warp * warpSize + lane; idx < tile_count; idx += WarpsPerRow * warpSize * 2) {
+    for (int idx = split_warp * warpSize + lane; idx < tile_count;
+         idx += WarpsPerRow * warpSize * 2) {
       const int xv0 = x_tile[idx];
       local_a = __dp4a(load_packed_int4x4(row_wa, tile_base + idx), xv0, local_a);
       local_b = __dp4a(load_packed_int4x4(row_wb, tile_base + idx), xv0, local_b);
@@ -634,44 +613,30 @@ __global__ void weight_only_int4_matvec_dual_dp4a_tiled_kernel(const int8_t* w_a
   }
 }
 
-
 }  // namespace
 
 // Host launch wrappers for weight-only int8/int4 matvec kernels.
-void launch_weight_only_int8_matvec(const int8_t* w,
-                                    const float* scales,
-                                    const half* x,
-                                    half* y,
-                                    int out_features,
-                                    int in_features,
-                                    cudaStream_t stream) {
+void launch_weight_only_int8_matvec(const int8_t* w, const float* scales, const half* x, half* y,
+                                    int out_features, int in_features, cudaStream_t stream) {
   const int threads = choose_reduction_threads(in_features);
-  weight_only_int8_matvec_kernel<<<out_features, threads, static_cast<std::size_t>(threads) * sizeof(float), stream>>>(
+  weight_only_int8_matvec_kernel<<<out_features, threads,
+                                   static_cast<std::size_t>(threads) * sizeof(float), stream>>>(
       w, scales, x, y, out_features, in_features);
 }
 
-void launch_weight_only_int8_matvec_batched(const int8_t* w,
-                                            const float* scales,
-                                            const half* x,
-                                            half* y,
-                                            int batch_size,
-                                            int out_features,
-                                            int in_features,
-                                            cudaStream_t stream) {
+void launch_weight_only_int8_matvec_batched(const int8_t* w, const float* scales, const half* x,
+                                            half* y, int batch_size, int out_features,
+                                            int in_features, cudaStream_t stream) {
   const int threads = choose_reduction_threads(in_features);
   const dim3 grid(out_features, batch_size);
-  weight_only_int8_matvec_batched_kernel<<<grid, threads, static_cast<std::size_t>(threads) * sizeof(float), stream>>>(
+  weight_only_int8_matvec_batched_kernel<<<
+      grid, threads, static_cast<std::size_t>(threads) * sizeof(float), stream>>>(
       w, scales, x, y, batch_size, out_features, in_features);
 }
 
-void launch_weight_only_int8_matvec_batched_dp4a(const int8_t* w,
-                                                 const float* w_scales,
-                                                 const int8_t* x,
-                                                 const float* x_scales,
-                                                 half* y,
-                                                 int batch_size,
-                                                 int out_features,
-                                                 int in_features,
+void launch_weight_only_int8_matvec_batched_dp4a(const int8_t* w, const float* w_scales,
+                                                 const int8_t* x, const float* x_scales, half* y,
+                                                 int batch_size, int out_features, int in_features,
                                                  cudaStream_t stream) {
   const int threads = choose_reduction_threads(in_features);
   const dim3 grid(out_features, batch_size);
@@ -679,17 +644,10 @@ void launch_weight_only_int8_matvec_batched_dp4a(const int8_t* w,
       w, w_scales, x, x_scales, y, batch_size, out_features, in_features);
 }
 
-void launch_weight_only_int8_matvec_dp4a(const int8_t* w,
-                                         const float* w_scales,
-                                         const int8_t* x,
-                                         const float* x_scale,
-                                         half* y,
-                                         int out_features,
-                                         int in_features,
-                                         cudaStream_t stream,
-                                         int warps_per_block,
-                                         int tile_packed4,
-                                         int warps_per_row) {
+void launch_weight_only_int8_matvec_dp4a(const int8_t* w, const float* w_scales, const int8_t* x,
+                                         const float* x_scale, half* y, int out_features,
+                                         int in_features, cudaStream_t stream, int warps_per_block,
+                                         int tile_packed4, int warps_per_row) {
   const int warps = (warps_per_block > 0) ? warps_per_block : 4;
   const int tile = (tile_packed4 > 0) ? tile_packed4 : 128;
   int split = (warps_per_row > 0) ? warps_per_row : 1;
@@ -703,8 +661,8 @@ void launch_weight_only_int8_matvec_dp4a(const int8_t* w,
     constexpr int kThreads = kWarps * 32;
     constexpr int kRowsPerBlock = kWarps / kSplit;
     const int blocks = (out_features + kRowsPerBlock - 1) / kRowsPerBlock;
-    weight_only_int8_matvec_dp4a_tiled_kernel<kWarps, kTile, kSplit><<<blocks, kThreads, 0, stream>>>(
-        w, w_scales, x, x_scale, y, out_features, in_features);
+    weight_only_int8_matvec_dp4a_tiled_kernel<kWarps, kTile, kSplit>
+        <<<blocks, kThreads, 0, stream>>>(w, w_scales, x, x_scale, y, out_features, in_features);
   };
 
   auto launch_split = [&](auto warps_tag, auto tile_tag) {
@@ -748,20 +706,12 @@ void launch_weight_only_int8_matvec_dp4a(const int8_t* w,
   }
 }
 
-void launch_weight_only_int8_matvec_dual_dp4a(const int8_t* w_a,
-                                              const float* w_scales_a,
-                                              const int8_t* w_b,
-                                              const float* w_scales_b,
-                                              const int8_t* x,
-                                              const float* x_scale,
-                                              half* y_a,
-                                              half* y_b,
-                                              int out_features,
-                                              int in_features,
-                                              cudaStream_t stream,
-                                              int warps_per_block,
-                                              int tile_packed4,
-                                              int warps_per_row) {
+void launch_weight_only_int8_matvec_dual_dp4a(const int8_t* w_a, const float* w_scales_a,
+                                              const int8_t* w_b, const float* w_scales_b,
+                                              const int8_t* x, const float* x_scale, half* y_a,
+                                              half* y_b, int out_features, int in_features,
+                                              cudaStream_t stream, int warps_per_block,
+                                              int tile_packed4, int warps_per_row) {
   const int warps = (warps_per_block > 0) ? warps_per_block : 4;
   const int tile = (tile_packed4 > 0) ? tile_packed4 : 128;
   int split = (warps_per_row > 0) ? warps_per_row : 1;
@@ -775,8 +725,9 @@ void launch_weight_only_int8_matvec_dual_dp4a(const int8_t* w_a,
     constexpr int kThreads = kWarps * 32;
     constexpr int kRowsPerBlock = kWarps / kSplit;
     const int blocks = (out_features + kRowsPerBlock - 1) / kRowsPerBlock;
-    weight_only_int8_matvec_dual_dp4a_tiled_kernel<kWarps, kTile, kSplit><<<blocks, kThreads, 0, stream>>>(
-        w_a, w_scales_a, w_b, w_scales_b, x, x_scale, y_a, y_b, out_features, in_features);
+    weight_only_int8_matvec_dual_dp4a_tiled_kernel<kWarps, kTile, kSplit>
+        <<<blocks, kThreads, 0, stream>>>(w_a, w_scales_a, w_b, w_scales_b, x, x_scale, y_a, y_b,
+                                          out_features, in_features);
   };
 
   auto launch_split = [&](auto warps_tag, auto tile_tag) {
@@ -820,40 +771,29 @@ void launch_weight_only_int8_matvec_dual_dp4a(const int8_t* w_a,
   }
 }
 
-void launch_weight_only_int4_matvec(const int8_t* w_packed,
-                                    const float* scales,
-                                    const half* x,
-                                    half* y,
-                                    int out_features,
-                                    int in_features,
+void launch_weight_only_int4_matvec(const int8_t* w_packed, const float* scales, const half* x,
+                                    half* y, int out_features, int in_features,
                                     cudaStream_t stream) {
   const int threads = choose_reduction_threads(in_features);
-  weight_only_int4_matvec_kernel<<<out_features, threads, static_cast<std::size_t>(threads) * sizeof(float), stream>>>(
+  weight_only_int4_matvec_kernel<<<out_features, threads,
+                                   static_cast<std::size_t>(threads) * sizeof(float), stream>>>(
       w_packed, scales, x, y, out_features, in_features);
 }
 
-void launch_weight_only_int4_matvec_batched(const int8_t* w_packed,
-                                            const float* scales,
-                                            const half* x,
-                                            half* y,
-                                            int batch_size,
-                                            int out_features,
-                                            int in_features,
+void launch_weight_only_int4_matvec_batched(const int8_t* w_packed, const float* scales,
+                                            const half* x, half* y, int batch_size,
+                                            int out_features, int in_features,
                                             cudaStream_t stream) {
   const int threads = choose_reduction_threads(in_features);
   const dim3 grid(out_features, batch_size);
-  weight_only_int4_matvec_batched_kernel<<<grid, threads, static_cast<std::size_t>(threads) * sizeof(float), stream>>>(
+  weight_only_int4_matvec_batched_kernel<<<
+      grid, threads, static_cast<std::size_t>(threads) * sizeof(float), stream>>>(
       w_packed, scales, x, y, batch_size, out_features, in_features);
 }
 
-void launch_weight_only_int4_matvec_batched_dp4a(const int8_t* w_packed,
-                                                 const float* w_scales,
-                                                 const int8_t* x,
-                                                 const float* x_scales,
-                                                 half* y,
-                                                 int batch_size,
-                                                 int out_features,
-                                                 int in_features,
+void launch_weight_only_int4_matvec_batched_dp4a(const int8_t* w_packed, const float* w_scales,
+                                                 const int8_t* x, const float* x_scales, half* y,
+                                                 int batch_size, int out_features, int in_features,
                                                  cudaStream_t stream) {
   const int threads = choose_reduction_threads(in_features);
   const dim3 grid(out_features, batch_size);
@@ -861,17 +801,10 @@ void launch_weight_only_int4_matvec_batched_dp4a(const int8_t* w_packed,
       w_packed, w_scales, x, x_scales, y, batch_size, out_features, in_features);
 }
 
-void launch_weight_only_int4_matvec_dp4a(const int8_t* w_packed,
-                                         const float* w_scales,
-                                         const int8_t* x,
-                                         const float* x_scale,
-                                         half* y,
-                                         int out_features,
-                                         int in_features,
-                                         cudaStream_t stream,
-                                         int warps_per_block,
-                                         int tile_packed4,
-                                         int warps_per_row) {
+void launch_weight_only_int4_matvec_dp4a(const int8_t* w_packed, const float* w_scales,
+                                         const int8_t* x, const float* x_scale, half* y,
+                                         int out_features, int in_features, cudaStream_t stream,
+                                         int warps_per_block, int tile_packed4, int warps_per_row) {
   const int warps = (warps_per_block > 0) ? warps_per_block : 4;
   const int tile = (tile_packed4 > 0) ? tile_packed4 : 128;
   int split = (warps_per_row > 0) ? warps_per_row : 1;
@@ -885,8 +818,9 @@ void launch_weight_only_int4_matvec_dp4a(const int8_t* w_packed,
     constexpr int kThreads = kWarps * 32;
     constexpr int kRowsPerBlock = kWarps / kSplit;
     const int blocks = (out_features + kRowsPerBlock - 1) / kRowsPerBlock;
-    weight_only_int4_matvec_dp4a_tiled_kernel<kWarps, kTile, kSplit><<<blocks, kThreads, 0, stream>>>(
-        w_packed, w_scales, x, x_scale, y, out_features, in_features);
+    weight_only_int4_matvec_dp4a_tiled_kernel<kWarps, kTile, kSplit>
+        <<<blocks, kThreads, 0, stream>>>(w_packed, w_scales, x, x_scale, y, out_features,
+                                          in_features);
   };
 
   auto launch_split = [&](auto warps_tag, auto tile_tag) {
@@ -930,20 +864,12 @@ void launch_weight_only_int4_matvec_dp4a(const int8_t* w_packed,
   }
 }
 
-void launch_weight_only_int4_matvec_dual_dp4a(const int8_t* w_a_packed,
-                                              const float* w_scales_a,
-                                              const int8_t* w_b_packed,
-                                              const float* w_scales_b,
-                                              const int8_t* x,
-                                              const float* x_scale,
-                                              half* y_a,
-                                              half* y_b,
-                                              int out_features,
-                                              int in_features,
-                                              cudaStream_t stream,
-                                              int warps_per_block,
-                                              int tile_packed4,
-                                              int warps_per_row) {
+void launch_weight_only_int4_matvec_dual_dp4a(const int8_t* w_a_packed, const float* w_scales_a,
+                                              const int8_t* w_b_packed, const float* w_scales_b,
+                                              const int8_t* x, const float* x_scale, half* y_a,
+                                              half* y_b, int out_features, int in_features,
+                                              cudaStream_t stream, int warps_per_block,
+                                              int tile_packed4, int warps_per_row) {
   const int warps = (warps_per_block > 0) ? warps_per_block : 4;
   const int tile = (tile_packed4 > 0) ? tile_packed4 : 128;
   int split = (warps_per_row > 0) ? warps_per_row : 1;
@@ -957,8 +883,9 @@ void launch_weight_only_int4_matvec_dual_dp4a(const int8_t* w_a_packed,
     constexpr int kThreads = kWarps * 32;
     constexpr int kRowsPerBlock = kWarps / kSplit;
     const int blocks = (out_features + kRowsPerBlock - 1) / kRowsPerBlock;
-    weight_only_int4_matvec_dual_dp4a_tiled_kernel<kWarps, kTile, kSplit><<<blocks, kThreads, 0, stream>>>(
-        w_a_packed, w_scales_a, w_b_packed, w_scales_b, x, x_scale, y_a, y_b, out_features, in_features);
+    weight_only_int4_matvec_dual_dp4a_tiled_kernel<kWarps, kTile, kSplit>
+        <<<blocks, kThreads, 0, stream>>>(w_a_packed, w_scales_a, w_b_packed, w_scales_b, x,
+                                          x_scale, y_a, y_b, out_features, in_features);
   };
 
   auto launch_split = [&](auto warps_tag, auto tile_tag) {
@@ -1001,6 +928,5 @@ void launch_weight_only_int4_matvec_dual_dp4a(const int8_t* w_a_packed,
     launch_split(std::integral_constant<int, 4>{}, std::integral_constant<int, 128>{});
   }
 }
-
 
 }  // namespace kernels

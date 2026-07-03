@@ -5,12 +5,13 @@
 // the performance-critical implementation details used by RMSNorm, embedding,
 // RoPE, and prefill-attention kernels.
 
-#include "runtime/kernels.cuh"
-#include "runtime/cuda_utils.cuh"
+#include <cuda_fp16.h>
 
 #include <cstdint>
 #include <vector>
-#include <cuda_fp16.h>
+
+#include "runtime/cuda_utils.cuh"
+#include "runtime/kernels.cuh"
 
 namespace kernels {
 namespace {
@@ -35,11 +36,7 @@ __device__ __forceinline__ float warp_sum(float v) {
 }
 
 // Basic normalization, embedding, and RoPE kernels.
-__global__ void rmsnorm_kernel(const half* x,
-                               const half* w,
-                               half* y,
-                               int cols,
-                               float eps) {
+__global__ void rmsnorm_kernel(const half* x, const half* w, half* y, int cols, float eps) {
   const int row = blockIdx.x;
   const int tid = threadIdx.x;
   const int lane = tid & (warpSize - 1);
@@ -89,7 +86,8 @@ __global__ void rmsnorm_kernel(const half* x,
     for (int col2 = tid; col2 < cols2; col2 += blockDim.x) {
       const float2 xv = __half22float2(x_row2[col2]);
       const float2 wv = __half22float2(w2[col2]);
-      y_row2[col2] = __halves2half2(__float2half(xv.x * inv * wv.x), __float2half(xv.y * inv * wv.y));
+      y_row2[col2] =
+          __halves2half2(__float2half(xv.x * inv * wv.x), __float2half(xv.y * inv * wv.y));
     }
   } else {
     for (int col = tid; col < cols; col += blockDim.x) {
@@ -100,17 +98,11 @@ __global__ void rmsnorm_kernel(const half* x,
   }
 }
 
-__global__ void rmsnorm_kernel_simple(const half* x,
-                                      const half* w,
-                                      half* y,
-                                      int cols,
-                                      float eps) {
+__global__ void rmsnorm_kernel_simple(const half* x, const half* w, half* y, int cols, float eps) {
   const int row = blockIdx.x;
   const int tid = threadIdx.x;
-  const half* x_row =
-      x + static_cast<std::size_t>(row) * static_cast<std::size_t>(cols);
-  half* y_row =
-      y + static_cast<std::size_t>(row) * static_cast<std::size_t>(cols);
+  const half* x_row = x + static_cast<std::size_t>(row) * static_cast<std::size_t>(cols);
+  half* y_row = y + static_cast<std::size_t>(row) * static_cast<std::size_t>(cols);
   __shared__ float sum_sq[256];
   __shared__ float inv_shared;
 
@@ -142,17 +134,12 @@ __global__ void rmsnorm_kernel_simple(const half* x,
   }
 }
 
-__global__ void rmsnorm_offset_kernel_simple(const half* x,
-                                             const half* w,
-                                             half* y,
-                                             int cols,
+__global__ void rmsnorm_offset_kernel_simple(const half* x, const half* w, half* y, int cols,
                                              float eps) {
   const int row = blockIdx.x;
   const int tid = threadIdx.x;
-  const half* x_row =
-      x + static_cast<std::size_t>(row) * static_cast<std::size_t>(cols);
-  half* y_row =
-      y + static_cast<std::size_t>(row) * static_cast<std::size_t>(cols);
+  const half* x_row = x + static_cast<std::size_t>(row) * static_cast<std::size_t>(cols);
+  half* y_row = y + static_cast<std::size_t>(row) * static_cast<std::size_t>(cols);
   __shared__ float sum_sq[256];
   __shared__ float inv_shared;
 
@@ -184,11 +171,7 @@ __global__ void rmsnorm_offset_kernel_simple(const half* x,
   }
 }
 
-__global__ void layernorm_kernel(const half* x,
-                                 const half* w,
-                                 const half* b,
-                                 half* y,
-                                 int cols,
+__global__ void layernorm_kernel(const half* x, const half* w, const half* b, half* y, int cols,
                                  float eps) {
   const int row = blockIdx.x;
   const int tid = threadIdx.x;
@@ -242,9 +225,7 @@ __global__ void layernorm_kernel(const half* x,
   }
 }
 
-__global__ void embedding_lookup_kernel(const half* embedding,
-                                        const int* token_ids,
-                                        half* out,
+__global__ void embedding_lookup_kernel(const half* embedding, const int* token_ids, half* out,
                                         int hidden) {
   const int token_idx = blockIdx.x;
   const int token = token_ids[token_idx];
@@ -256,13 +237,8 @@ __global__ void embedding_lookup_kernel(const half* embedding,
   }
 }
 
-__global__ void rope_inplace_kernel(half* q,
-                                    half* k,
-                                    int num_heads_q,
-                                    int num_heads_k,
-                                    int head_dim,
-                                    int position,
-                                    float rope_theta) {
+__global__ void rope_inplace_kernel(half* q, half* k, int num_heads_q, int num_heads_k,
+                                    int head_dim, int position, float rope_theta) {
   const int head = blockIdx.x;
   const int pair = threadIdx.x;
   const int half_dim = head_dim / 2;
@@ -270,7 +246,8 @@ __global__ void rope_inplace_kernel(half* q,
     return;
   }
 
-  const float theta = powf(rope_theta, -2.0f * static_cast<float>(pair) / static_cast<float>(head_dim));
+  const float theta =
+      powf(rope_theta, -2.0f * static_cast<float>(pair) / static_cast<float>(head_dim));
   const float angle = static_cast<float>(position) * theta;
   const float c = cosf(angle);
   const float s = sinf(angle);
@@ -293,13 +270,8 @@ __global__ void rope_inplace_kernel(half* q,
   }
 }
 
-__global__ void rope_inplace_table_kernel(half* q,
-                                          half* k,
-                                          int num_heads_q,
-                                          int num_heads_k,
-                                          int head_dim,
-                                          int position,
-                                          const float* cos_table,
+__global__ void rope_inplace_table_kernel(half* q, half* k, int num_heads_q, int num_heads_k,
+                                          int head_dim, int position, const float* cos_table,
                                           const float* sin_table) {
   const int head = blockIdx.x;
   const int pair = threadIdx.x;
@@ -330,14 +302,9 @@ __global__ void rope_inplace_table_kernel(half* q,
   }
 }
 
-__global__ void rope_inplace_partial_table_kernel(half* q,
-                                                  half* k,
-                                                  int num_heads_q,
-                                                  int num_heads_k,
-                                                  int head_dim,
-                                                  int rotary_dim,
-                                                  int position,
-                                                  const float* cos_table,
+__global__ void rope_inplace_partial_table_kernel(half* q, half* k, int num_heads_q,
+                                                  int num_heads_k, int head_dim, int rotary_dim,
+                                                  int position, const float* cos_table,
                                                   const float* sin_table) {
   const int head = blockIdx.x;
   const int pair = threadIdx.x;
@@ -368,14 +335,9 @@ __global__ void rope_inplace_partial_table_kernel(half* q,
   }
 }
 
-__global__ void rope_inplace_device_pos_kernel(half* q,
-                                               half* k,
-                                               int num_heads_q,
-                                               int num_heads_k,
-                                               int head_dim,
-                                               const int* position_ptr,
-                                               const float* cos_table,
-                                               const float* sin_table) {
+__global__ void rope_inplace_device_pos_kernel(half* q, half* k, int num_heads_q, int num_heads_k,
+                                               int head_dim, const int* position_ptr,
+                                               const float* cos_table, const float* sin_table) {
   const int position = position_ptr[0];
   const int head = blockIdx.x;
   const int pair = threadIdx.x;
@@ -409,15 +371,10 @@ __global__ void rope_inplace_device_pos_kernel(half* q,
 // Per-position RoPE (P2): like rope_inplace_batched_kernel but each of the
 // num_tokens rows is rotated at its OWN position positions[token] (one token per
 // sequence in a batched decode step), rather than a contiguous start_position+token.
-__global__ void rope_inplace_perpos_kernel(half* q,
-                                           half* k,
-                                           int num_tokens,
-                                           int num_heads_q,
-                                           int num_heads_k,
-                                           int head_dim,
+__global__ void rope_inplace_perpos_kernel(half* q, half* k, int num_tokens, int num_heads_q,
+                                           int num_heads_k, int head_dim,
                                            const int* __restrict__ positions,
-                                           const float* cos_table,
-                                           const float* sin_table) {
+                                           const float* cos_table, const float* sin_table) {
   const int head = blockIdx.x;
   const int token = blockIdx.y;
   const int pair = threadIdx.x;
@@ -442,15 +399,9 @@ __global__ void rope_inplace_perpos_kernel(half* q,
   }
 }
 
-__global__ void rope_inplace_batched_kernel(half* q,
-                                            half* k,
-                                            int num_tokens,
-                                            int num_heads_q,
-                                            int num_heads_k,
-                                            int head_dim,
-                                            int start_position,
-                                            const float* cos_table,
-                                            const float* sin_table) {
+__global__ void rope_inplace_batched_kernel(half* q, half* k, int num_tokens, int num_heads_q,
+                                            int num_heads_k, int head_dim, int start_position,
+                                            const float* cos_table, const float* sin_table) {
   const int head = blockIdx.x;
   const int token = blockIdx.y;
   const int pair = threadIdx.x;
@@ -487,15 +438,10 @@ __device__ __forceinline__ int cache_index(int t, int head, int d, int num_heads
 
 // Prefill path: each block handles one [head, token] pair and attends over
 // the cached prefix plus its own in-chunk prefix.
-__global__ void attention_prefill_kernel_fallback(const half* q,
-                                                  const half* k_cache,
-                                                  const half* v_cache,
-                                                  half* out,
-                                                  int num_tokens,
-                                                  int start_position,
-                                                  int num_heads,
-                                                  int num_kv_heads,
-                                                  int head_dim) {
+__global__ void attention_prefill_kernel_fallback(const half* q, const half* k_cache,
+                                                  const half* v_cache, half* out, int num_tokens,
+                                                  int start_position, int num_heads,
+                                                  int num_kv_heads, int head_dim) {
   extern __shared__ unsigned char smem_bytes[];
   half* q_shared = reinterpret_cast<half*>(smem_bytes);
   float* red = reinterpret_cast<float*>(q_shared + head_dim);
@@ -514,7 +460,8 @@ __global__ void attention_prefill_kernel_fallback(const half* q,
   const float scale = rsqrtf(static_cast<float>(head_dim));
   const int kv_heads_safe = (num_kv_heads > 0) ? num_kv_heads : 1;
   const int group_size = ((num_heads / kv_heads_safe) > 0) ? (num_heads / kv_heads_safe) : 1;
-  const int kv_head = ((head / group_size) < kv_heads_safe) ? (head / group_size) : (kv_heads_safe - 1);
+  const int kv_head =
+      ((head / group_size) < kv_heads_safe) ? (head / group_size) : (kv_heads_safe - 1);
   const bool active_dim = tid < head_dim;
 
   for (int d = tid; d < head_dim; d += blockDim.x) {
@@ -573,14 +520,9 @@ __global__ void attention_prefill_kernel_fallback(const half* q,
 // Tiled prefill keeps the causal limit per token while still vectorizing the
 // K dot Q work inside each tile.
 template <int WarpsPerBlock>
-__global__ void attention_prefill_kernel_tiled(const half* q,
-                                               const half* k_cache,
-                                               const half* v_cache,
-                                               half* out,
-                                               int num_tokens,
-                                               int start_position,
-                                               int num_heads,
-                                               int num_kv_heads,
+__global__ void attention_prefill_kernel_tiled(const half* q, const half* k_cache,
+                                               const half* v_cache, half* out, int num_tokens,
+                                               int start_position, int num_heads, int num_kv_heads,
                                                int head_dim) {
   extern __shared__ unsigned char smem_bytes[];
   half* q_shared = reinterpret_cast<half*>(smem_bytes);
@@ -604,7 +546,8 @@ __global__ void attention_prefill_kernel_tiled(const half* q,
   const float scale = rsqrtf(static_cast<float>(head_dim));
   const int kv_heads_safe = (num_kv_heads > 0) ? num_kv_heads : 1;
   const int group_size = ((num_heads / kv_heads_safe) > 0) ? (num_heads / kv_heads_safe) : 1;
-  const int kv_head = ((head / group_size) < kv_heads_safe) ? (head / group_size) : (kv_heads_safe - 1);
+  const int kv_head =
+      ((head / group_size) < kv_heads_safe) ? (head / group_size) : (kv_heads_safe - 1);
   const int head_pairs = head_dim / 2;
   const int limit = start_position + token + 1;
 
@@ -680,16 +623,11 @@ __global__ void attention_prefill_kernel_tiled(const half* q,
 // block) — phys(t) = block_table[t/block_size]*block_size + t%block_size — into a
 // block pool, so KV need not be contiguous. Same causal online-softmax math.
 template <int WarpsPerBlock>
-__global__ void attention_prefill_kernel_tiled_paged(const half* q,
-                                                     const half* k_pool,
+__global__ void attention_prefill_kernel_tiled_paged(const half* q, const half* k_pool,
                                                      const half* v_pool,
-                                                     const int* __restrict__ block_table,
-                                                     half* out,
-                                                     int num_tokens,
-                                                     int start_position,
-                                                     int num_heads,
-                                                     int num_kv_heads,
-                                                     int head_dim,
+                                                     const int* __restrict__ block_table, half* out,
+                                                     int num_tokens, int start_position,
+                                                     int num_heads, int num_kv_heads, int head_dim,
                                                      int block_size) {
   extern __shared__ unsigned char smem_bytes[];
   half* q_shared = reinterpret_cast<half*>(smem_bytes);
@@ -713,7 +651,8 @@ __global__ void attention_prefill_kernel_tiled_paged(const half* q,
   const float scale = rsqrtf(static_cast<float>(head_dim));
   const int kv_heads_safe = (num_kv_heads > 0) ? num_kv_heads : 1;
   const int group_size = ((num_heads / kv_heads_safe) > 0) ? (num_heads / kv_heads_safe) : 1;
-  const int kv_head = ((head / group_size) < kv_heads_safe) ? (head / group_size) : (kv_heads_safe - 1);
+  const int kv_head =
+      ((head / group_size) < kv_heads_safe) ? (head / group_size) : (kv_heads_safe - 1);
   const int head_pairs = head_dim / 2;
   const int limit = start_position + token + 1;
 
@@ -771,7 +710,8 @@ __global__ void attention_prefill_kernel_tiled_paged(const half* q,
       float acc_local = acc;
       const int tile_tokens = min(WarpsPerBlock, limit - tile_base);
       for (int i = 0; i < tile_tokens; ++i) {
-        const int phys = block_table[(tile_base + i) / block_size] * block_size + ((tile_base + i) % block_size);
+        const int phys =
+            block_table[(tile_base + i) / block_size] * block_size + ((tile_base + i) % block_size);
         const int base = cache_index(phys, kv_head, 0, num_kv_heads, head_dim);
         acc_local = acc_local * alpha_shared[i] + beta_shared[i] * __half2float(v_pool[base + d]);
       }
@@ -788,15 +728,9 @@ __global__ void attention_prefill_kernel_tiled_paged(const half* q,
 
 // Scatter `rows` freshly-projected KV rows (contiguous src) into the block pool
 // at paged positions base_pos..base_pos+rows-1 (P3 phase 2d prefill KV write).
-__global__ void store_kv_paged_kernel(half* k_pool,
-                                      half* v_pool,
-                                      const half* k_src,
-                                      const half* v_src,
-                                      const int* __restrict__ block_table,
-                                      int base_pos,
-                                      int rows,
-                                      int kv_hidden,
-                                      int block_size) {
+__global__ void store_kv_paged_kernel(half* k_pool, half* v_pool, const half* k_src,
+                                      const half* v_src, const int* __restrict__ block_table,
+                                      int base_pos, int rows, int kv_hidden, int block_size) {
   const int row = blockIdx.x;
   if (row >= rows) return;
   const int pos = base_pos + row;
@@ -813,16 +747,11 @@ __global__ void store_kv_paged_kernel(half* k_pool,
 
 // Batched decode KV scatter (P2): one token per sequence, each to its own block
 // table at its own position. row = sequence; positions[row] + block_tables[row].
-__global__ void store_kv_batched_paged_kernel(half* k_pool,
-                                              half* v_pool,
-                                              const half* k_src,
+__global__ void store_kv_batched_paged_kernel(half* k_pool, half* v_pool, const half* k_src,
                                               const half* v_src,
                                               const int* __restrict__ block_tables,
-                                              const int* __restrict__ positions,
-                                              int max_blocks,
-                                              int batch,
-                                              int kv_hidden,
-                                              int block_size) {
+                                              const int* __restrict__ positions, int max_blocks,
+                                              int batch, int kv_hidden, int block_size) {
   const int b = blockIdx.x;
   if (b >= batch) return;
   const int pos = positions[b];
@@ -842,75 +771,43 @@ __global__ void store_kv_batched_paged_kernel(half* k_pool,
 
 // Host launch wrappers keep kernel-selection policy out of the runtime call
 // sites.
-void launch_rmsnorm(const half* x,
-                    const half* weight,
-                    half* y,
-                    int rows,
-                    int cols,
-                    float eps,
+void launch_rmsnorm(const half* x, const half* weight, half* y, int rows, int cols, float eps,
                     cudaStream_t stream) {
   const int threads = choose_rmsnorm_threads(cols);
   rmsnorm_kernel_simple<<<rows, threads, 0, stream>>>(x, weight, y, cols, eps);
 }
 
-void launch_rmsnorm_offset(const half* x,
-                           const half* weight,
-                           half* y,
-                           int rows,
-                           int cols,
-                           float eps,
-                           cudaStream_t stream) {
+void launch_rmsnorm_offset(const half* x, const half* weight, half* y, int rows, int cols,
+                           float eps, cudaStream_t stream) {
   const int threads = choose_rmsnorm_threads(cols);
   rmsnorm_offset_kernel_simple<<<rows, threads, 0, stream>>>(x, weight, y, cols, eps);
 }
 
-void launch_layernorm(const half* x,
-                      const half* weight,
-                      const half* bias,
-                      half* y,
-                      int rows,
-                      int cols,
-                      float eps,
-                      cudaStream_t stream) {
+void launch_layernorm(const half* x, const half* weight, const half* bias, half* y, int rows,
+                      int cols, float eps, cudaStream_t stream) {
   const int threads = choose_rmsnorm_threads(cols);
   layernorm_kernel<<<rows, threads, 0, stream>>>(x, weight, bias, y, cols, eps);
 }
 
-void launch_embedding_lookup(const half* embedding,
-                             const int* token_ids,
-                             half* out,
-                             int num_tokens,
-                             int hidden,
-                             cudaStream_t stream) {
+void launch_embedding_lookup(const half* embedding, const int* token_ids, half* out, int num_tokens,
+                             int hidden, cudaStream_t stream) {
   if (num_tokens <= 0 || hidden <= 0) {
     return;
   }
   constexpr int threads = 256;
-  embedding_lookup_kernel<<<num_tokens, threads, 0, stream>>>(
-      embedding, token_ids, out, hidden);
+  embedding_lookup_kernel<<<num_tokens, threads, 0, stream>>>(embedding, token_ids, out, hidden);
 }
 
-void launch_rope_inplace(half* q,
-                         half* k,
-                         int num_heads_q,
-                         int num_heads_k,
-                         int head_dim,
-                         int position,
-                         float rope_theta,
-                         cudaStream_t stream) {
+void launch_rope_inplace(half* q, half* k, int num_heads_q, int num_heads_k, int head_dim,
+                         int position, float rope_theta, cudaStream_t stream) {
   const int threads = head_dim / 2;
   const int blocks = (num_heads_q > num_heads_k) ? num_heads_q : num_heads_k;
-  rope_inplace_kernel<<<blocks, threads, 0, stream>>>(q, k, num_heads_q, num_heads_k, head_dim, position, rope_theta);
+  rope_inplace_kernel<<<blocks, threads, 0, stream>>>(q, k, num_heads_q, num_heads_k, head_dim,
+                                                      position, rope_theta);
 }
 
-void launch_rope_inplace_table(half* q,
-                               half* k,
-                               int num_heads_q,
-                               int num_heads_k,
-                               int head_dim,
-                               int position,
-                               const float* cos_table,
-                               const float* sin_table,
+void launch_rope_inplace_table(half* q, half* k, int num_heads_q, int num_heads_k, int head_dim,
+                               int position, const float* cos_table, const float* sin_table,
                                cudaStream_t stream) {
   const int threads = head_dim / 2;
   const int blocks = (num_heads_q > num_heads_k) ? num_heads_q : num_heads_k;
@@ -918,15 +815,9 @@ void launch_rope_inplace_table(half* q,
       q, k, num_heads_q, num_heads_k, head_dim, position, cos_table, sin_table);
 }
 
-void launch_rope_inplace_partial_table(half* q,
-                                       half* k,
-                                       int num_heads_q,
-                                       int num_heads_k,
-                                       int head_dim,
-                                       int rotary_dim,
-                                       int position,
-                                       const float* cos_table,
-                                       const float* sin_table,
+void launch_rope_inplace_partial_table(half* q, half* k, int num_heads_q, int num_heads_k,
+                                       int head_dim, int rotary_dim, int position,
+                                       const float* cos_table, const float* sin_table,
                                        cudaStream_t stream) {
   if (rotary_dim <= 0 || (rotary_dim & 1) != 0) {
     return;
@@ -937,31 +828,18 @@ void launch_rope_inplace_partial_table(half* q,
       q, k, num_heads_q, num_heads_k, head_dim, rotary_dim, position, cos_table, sin_table);
 }
 
-void launch_rope_inplace_device_pos(half* q,
-                                    half* k,
-                                    int num_heads_q,
-                                    int num_heads_k,
-                                    int head_dim,
-                                    const int* position,
-                                    const float* cos_table,
-                                    const float* sin_table,
-                                    cudaStream_t stream) {
+void launch_rope_inplace_device_pos(half* q, half* k, int num_heads_q, int num_heads_k,
+                                    int head_dim, const int* position, const float* cos_table,
+                                    const float* sin_table, cudaStream_t stream) {
   const int threads = head_dim / 2;
   const int blocks = (num_heads_q > num_heads_k) ? num_heads_q : num_heads_k;
   rope_inplace_device_pos_kernel<<<blocks, threads, 0, stream>>>(
       q, k, num_heads_q, num_heads_k, head_dim, position, cos_table, sin_table);
 }
 
-void launch_rope_inplace_batched(half* q,
-                                 half* k,
-                                 int num_tokens,
-                                 int num_heads_q,
-                                 int num_heads_k,
-                                 int head_dim,
-                                 int start_position,
-                                 const float* cos_table,
-                                 const float* sin_table,
-                                 cudaStream_t stream) {
+void launch_rope_inplace_batched(half* q, half* k, int num_tokens, int num_heads_q, int num_heads_k,
+                                 int head_dim, int start_position, const float* cos_table,
+                                 const float* sin_table, cudaStream_t stream) {
   const int threads = head_dim / 2;
   const int blocks = (num_heads_q > num_heads_k) ? num_heads_q : num_heads_k;
   const dim3 grid(blocks, num_tokens);
@@ -971,32 +849,18 @@ void launch_rope_inplace_batched(half* q,
 
 // Per-position RoPE (P2 batched decode): each of num_tokens rows uses its own
 // positions[row] instead of a contiguous start_position.
-void launch_rope_inplace_perpos(half* q,
-                                half* k,
-                                int num_tokens,
-                                int num_heads_q,
-                                int num_heads_k,
-                                int head_dim,
-                                const int* positions,
-                                const float* cos_table,
-                                const float* sin_table,
-                                cudaStream_t stream) {
+void launch_rope_inplace_perpos(half* q, half* k, int num_tokens, int num_heads_q, int num_heads_k,
+                                int head_dim, const int* positions, const float* cos_table,
+                                const float* sin_table, cudaStream_t stream) {
   const int threads = head_dim / 2;
   const int blocks = (num_heads_q > num_heads_k) ? num_heads_q : num_heads_k;
   const dim3 grid(blocks, num_tokens);
   rope_inplace_perpos_kernel<<<grid, threads, 0, stream>>>(
       q, k, num_tokens, num_heads_q, num_heads_k, head_dim, positions, cos_table, sin_table);
 }
-void launch_attention_prefill(const half* q,
-                              const half* k_cache,
-                              const half* v_cache,
-                              half* out,
-                              int num_tokens,
-                              int start_position,
-                              int num_heads,
-                              int num_kv_heads,
-                              int head_dim,
-                              cudaStream_t stream) {
+void launch_attention_prefill(const half* q, const half* k_cache, const half* v_cache, half* out,
+                              int num_tokens, int start_position, int num_heads, int num_kv_heads,
+                              int head_dim, cudaStream_t stream) {
   const dim3 grid(num_heads, num_tokens);
   if (head_dim > 0 && (head_dim % 2) == 0 && head_dim <= 256) {
     if (head_dim <= 64) {
@@ -1028,18 +892,10 @@ void launch_attention_prefill(const half* q,
 // Paged prefill attention (P3 phase 2d). K/V gathered via block_table from a
 // block pool. Targets head_dim<=256 even (128 on Qwen/Llama); the split-K decode
 // path handles the same family, so no fallback is needed here.
-void launch_attention_prefill_paged(const half* q,
-                                     const half* k_pool,
-                                     const half* v_pool,
-                                     const int* block_table,
-                                     half* out,
-                                     int num_tokens,
-                                     int start_position,
-                                     int num_heads,
-                                     int num_kv_heads,
-                                     int head_dim,
-                                     int block_size,
-                                     cudaStream_t stream) {
+void launch_attention_prefill_paged(const half* q, const half* k_pool, const half* v_pool,
+                                    const int* block_table, half* out, int num_tokens,
+                                    int start_position, int num_heads, int num_kv_heads,
+                                    int head_dim, int block_size, cudaStream_t stream) {
   const dim3 grid(num_heads, num_tokens);
   const int warps = (head_dim <= 64) ? 2 : 4;
   const int threads = warps * 32;
@@ -1047,46 +903,33 @@ void launch_attention_prefill_paged(const half* q,
                            static_cast<std::size_t>(3 * warps + 2) * sizeof(float);
   if (warps == 2) {
     attention_prefill_kernel_tiled_paged<2><<<grid, threads, smem, stream>>>(
-        q, k_pool, v_pool, block_table, out, num_tokens, start_position, num_heads, num_kv_heads, head_dim, block_size);
+        q, k_pool, v_pool, block_table, out, num_tokens, start_position, num_heads, num_kv_heads,
+        head_dim, block_size);
   } else {
     attention_prefill_kernel_tiled_paged<4><<<grid, threads, smem, stream>>>(
-        q, k_pool, v_pool, block_table, out, num_tokens, start_position, num_heads, num_kv_heads, head_dim, block_size);
+        q, k_pool, v_pool, block_table, out, num_tokens, start_position, num_heads, num_kv_heads,
+        head_dim, block_size);
   }
 }
 
 // Scatter freshly-projected prefill KV rows into the block pool at paged positions.
-void launch_store_kv_paged(half* k_pool,
-                           half* v_pool,
-                           const half* k_src,
-                           const half* v_src,
-                           const int* block_table,
-                           int base_pos,
-                           int rows,
-                           int kv_hidden,
-                           int block_size,
-                           cudaStream_t stream) {
+void launch_store_kv_paged(half* k_pool, half* v_pool, const half* k_src, const half* v_src,
+                           const int* block_table, int base_pos, int rows, int kv_hidden,
+                           int block_size, cudaStream_t stream) {
   if (rows <= 0) return;
-  store_kv_paged_kernel<<<rows, 128, 0, stream>>>(
-      k_pool, v_pool, k_src, v_src, block_table, base_pos, rows, kv_hidden, block_size);
+  store_kv_paged_kernel<<<rows, 128, 0, stream>>>(k_pool, v_pool, k_src, v_src, block_table,
+                                                  base_pos, rows, kv_hidden, block_size);
 }
 
 // Batched decode KV scatter (P2): one token per sequence to its own block table
 // at its own position.
-void launch_store_kv_batched_paged(half* k_pool,
-                                   half* v_pool,
-                                   const half* k_src,
-                                   const half* v_src,
-                                   const int* block_tables,
-                                   const int* positions,
-                                   int max_blocks,
-                                   int batch,
-                                   int kv_hidden,
-                                   int block_size,
-                                   cudaStream_t stream) {
+void launch_store_kv_batched_paged(half* k_pool, half* v_pool, const half* k_src, const half* v_src,
+                                   const int* block_tables, const int* positions, int max_blocks,
+                                   int batch, int kv_hidden, int block_size, cudaStream_t stream) {
   if (batch <= 0) return;
-  store_kv_batched_paged_kernel<<<batch, 128, 0, stream>>>(
-      k_pool, v_pool, k_src, v_src, block_tables, positions, max_blocks, batch, kv_hidden, block_size);
+  store_kv_batched_paged_kernel<<<batch, 128, 0, stream>>>(k_pool, v_pool, k_src, v_src,
+                                                           block_tables, positions, max_blocks,
+                                                           batch, kv_hidden, block_size);
 }
-
 
 }  // namespace kernels

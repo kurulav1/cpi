@@ -1,31 +1,29 @@
-#include "llama_engine_internal.hpp"
+#include <cuda_fp16.h>
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
-#include <iostream>
+#include <cstring>
 #include <iomanip>
+#include <iostream>
 #include <limits>
 #include <numeric>
 #include <random>
 #include <sstream>
 #include <stdexcept>
-#include <cstring>
 #include <thread>
 #include <unordered_set>
 #include <vector>
 
-#include <cuda_fp16.h>
-
 #include "common.hpp"
+#include "llama_engine_internal.hpp"
 #include "runtime/cuda_utils.cuh"
 #include "runtime/kernels.cuh"
 #include "runtime/system_info.hpp"
 
 namespace engine {
-
 
 int env_int_or_default(const char* name, int default_value) {
   std::string raw;
@@ -46,7 +44,8 @@ int env_int_or_default(const char* name, int default_value) {
   }
   char* end = nullptr;
   const long parsed = std::strtol(raw.c_str(), &end, 10);
-  if (end == raw.c_str() || *end != '\0' || parsed < static_cast<long>(std::numeric_limits<int>::min()) ||
+  if (end == raw.c_str() || *end != '\0' ||
+      parsed < static_cast<long>(std::numeric_limits<int>::min()) ||
       parsed > static_cast<long>(std::numeric_limits<int>::max())) {
     return default_value;
   }
@@ -62,21 +61,11 @@ std::size_t env_workspace_bytes_or_default(const char* name, std::size_t default
   return static_cast<std::size_t>(mb) * static_cast<std::size_t>(1024 * 1024);
 }
 
-
-
-
 namespace {
-bool linear_rowmajor_weight_lt(cublasLtHandle_t handle,
-                               std::vector<LtMatmulPlan>* cache,
-                               void* workspace,
-                               std::size_t workspace_bytes,
-                               cudaStream_t stream,
-                               const void* d_w_rowmajor,
-                               const void* d_x,
-                               void* d_y,
-                               int out_features,
-                               int in_features,
-                               int batch_size,
+bool linear_rowmajor_weight_lt(cublasLtHandle_t handle, std::vector<LtMatmulPlan>* cache,
+                               void* workspace, std::size_t workspace_bytes, cudaStream_t stream,
+                               const void* d_w_rowmajor, const void* d_x, void* d_y,
+                               int out_features, int in_features, int batch_size,
                                cudaDataType_t output_type) {
   constexpr float alpha = 1.0f;
   constexpr float beta = 0.0f;
@@ -101,45 +90,39 @@ bool linear_rowmajor_weight_lt(cublasLtHandle_t handle,
     const cudaDataType_t scale_type = CUDA_R_32F;
 
     do {
-      if (cublasLtMatmulDescCreate(&created.op_desc, CUBLAS_COMPUTE_32F, scale_type) != CUBLAS_STATUS_SUCCESS) {
-        break;
-      }
-      if (cublasLtMatmulDescSetAttribute(created.op_desc, CUBLASLT_MATMUL_DESC_TRANSA, &transa, sizeof(transa)) !=
+      if (cublasLtMatmulDescCreate(&created.op_desc, CUBLAS_COMPUTE_32F, scale_type) !=
           CUBLAS_STATUS_SUCCESS) {
         break;
       }
-      if (cublasLtMatmulDescSetAttribute(created.op_desc, CUBLASLT_MATMUL_DESC_TRANSB, &transb, sizeof(transb)) !=
-          CUBLAS_STATUS_SUCCESS) {
+      if (cublasLtMatmulDescSetAttribute(created.op_desc, CUBLASLT_MATMUL_DESC_TRANSA, &transa,
+                                         sizeof(transa)) != CUBLAS_STATUS_SUCCESS) {
         break;
       }
-      if (cublasLtMatrixLayoutCreate(&created.a_desc, CUDA_R_16F, in_features, out_features, in_features) !=
-              CUBLAS_STATUS_SUCCESS ||
-          cublasLtMatrixLayoutCreate(&created.b_desc, CUDA_R_16F, in_features, batch_size, in_features) !=
-              CUBLAS_STATUS_SUCCESS ||
-          cublasLtMatrixLayoutCreate(&created.c_desc, output_type, out_features, batch_size, out_features) !=
-              CUBLAS_STATUS_SUCCESS) {
+      if (cublasLtMatmulDescSetAttribute(created.op_desc, CUBLASLT_MATMUL_DESC_TRANSB, &transb,
+                                         sizeof(transb)) != CUBLAS_STATUS_SUCCESS) {
+        break;
+      }
+      if (cublasLtMatrixLayoutCreate(&created.a_desc, CUDA_R_16F, in_features, out_features,
+                                     in_features) != CUBLAS_STATUS_SUCCESS ||
+          cublasLtMatrixLayoutCreate(&created.b_desc, CUDA_R_16F, in_features, batch_size,
+                                     in_features) != CUBLAS_STATUS_SUCCESS ||
+          cublasLtMatrixLayoutCreate(&created.c_desc, output_type, out_features, batch_size,
+                                     out_features) != CUBLAS_STATUS_SUCCESS) {
         break;
       }
       if (cublasLtMatmulPreferenceCreate(&pref) != CUBLAS_STATUS_SUCCESS) {
         break;
       }
-      if (cublasLtMatmulPreferenceSetAttribute(
-              pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_bytes, sizeof(workspace_bytes)) !=
-          CUBLAS_STATUS_SUCCESS) {
+      if (cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                                               &workspace_bytes,
+                                               sizeof(workspace_bytes)) != CUBLAS_STATUS_SUCCESS) {
         break;
       }
 
       int returned = 0;
-      if (cublasLtMatmulAlgoGetHeuristic(handle,
-                                         created.op_desc,
-                                         created.a_desc,
-                                         created.b_desc,
-                                         created.c_desc,
-                                         created.c_desc,
-                                         pref,
-                                         1,
-                                         &created.heuristic,
-                                         &returned) != CUBLAS_STATUS_SUCCESS ||
+      if (cublasLtMatmulAlgoGetHeuristic(handle, created.op_desc, created.a_desc, created.b_desc,
+                                         created.c_desc, created.c_desc, pref, 1,
+                                         &created.heuristic, &returned) != CUBLAS_STATUS_SUCCESS ||
           returned == 0) {
         break;
       }
@@ -173,50 +156,22 @@ bool linear_rowmajor_weight_lt(cublasLtHandle_t handle,
     }
   }
 
-  return cublasLtMatmul(handle,
-                        plan->op_desc,
-                        &alpha,
-                        d_w_rowmajor,
-                        plan->a_desc,
-                        d_x,
-                        plan->b_desc,
-                        &beta,
-                        d_y,
-                        plan->c_desc,
-                        d_y,
-                        plan->c_desc,
-                        &plan->heuristic.algo,
-                        workspace,
-                        workspace_bytes,
+  return cublasLtMatmul(handle, plan->op_desc, &alpha, d_w_rowmajor, plan->a_desc, d_x,
+                        plan->b_desc, &beta, d_y, plan->c_desc, d_y, plan->c_desc,
+                        &plan->heuristic.algo, workspace, workspace_bytes,
                         stream) == CUBLAS_STATUS_SUCCESS;
 }
 
-void linear_rowmajor_weight(cublasHandle_t handle,
-                            cublasLtHandle_t lt_handle,
-                            std::vector<LtMatmulPlan>* lt_cache,
-                            void* lt_workspace,
-                            std::size_t lt_workspace_bytes,
-                            cudaStream_t stream,
-                            const void* d_w_rowmajor,
-                            const void* d_x,
-                            void* d_y,
-                            int out_features,
-                            int in_features,
-                            int batch_size,
-                            cudaDataType_t output_type) {
+void linear_rowmajor_weight(cublasHandle_t handle, cublasLtHandle_t lt_handle,
+                            std::vector<LtMatmulPlan>* lt_cache, void* lt_workspace,
+                            std::size_t lt_workspace_bytes, cudaStream_t stream,
+                            const void* d_w_rowmajor, const void* d_x, void* d_y, int out_features,
+                            int in_features, int batch_size, cudaDataType_t output_type) {
   const bool allow_lt = output_type != CUDA_R_32F;
-  if (allow_lt && lt_handle && linear_rowmajor_weight_lt(lt_handle,
-                                                         lt_cache,
-                                                         lt_workspace,
-                                                         lt_workspace_bytes,
-                                                         stream,
-                                                         d_w_rowmajor,
-                                                         d_x,
-                                                         d_y,
-                                                         out_features,
-                                                         in_features,
-                                                         batch_size,
-                                                         output_type)) {
+  if (allow_lt && lt_handle &&
+      linear_rowmajor_weight_lt(lt_handle, lt_cache, lt_workspace, lt_workspace_bytes, stream,
+                                d_w_rowmajor, d_x, d_y, out_features, in_features, batch_size,
+                                output_type)) {
     return;
   }
 
@@ -228,45 +183,27 @@ void linear_rowmajor_weight(cublasHandle_t handle,
    * Treat raw memory as column-major [in_features, out_features], then apply transpose:
    * y[out,1] = W^T[out,in] * x[in,1].
    */
-  CUBLAS_CHECK(cublasGemmEx(handle,
-                            CUBLAS_OP_T,
-                            CUBLAS_OP_N,
-                            out_features,
-                            batch_size,
-                            in_features,
-                            &alpha,
-                            d_w_rowmajor,
-                            CUDA_R_16F,
-                            in_features,
-                            d_x,
-                            CUDA_R_16F,
-                            in_features,
-                            &beta,
-                            d_y,
-                            output_type,
-                            out_features,
-                            CUBLAS_COMPUTE_32F,
+  CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, out_features, batch_size, in_features,
+                            &alpha, d_w_rowmajor, CUDA_R_16F, in_features, d_x, CUDA_R_16F,
+                            in_features, &beta, d_y, output_type, out_features, CUBLAS_COMPUTE_32F,
                             CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 }
 
-
-
-void require_tensor_bytes(const model::WeightLoader& weights,
-                          const std::string& name,
+void require_tensor_bytes(const model::WeightLoader& weights, const std::string& name,
                           std::size_t expected_bytes) {
   if (!weights.has_tensor(name)) {
     LLAMA_ENGINE_THROW("missing tensor: " + name);
   }
   const std::size_t got = weights.tensor_bytes(name);
   if (got != expected_bytes) {
-    LLAMA_ENGINE_THROW("tensor size mismatch for " + name + ": expected " + std::to_string(expected_bytes) +
-                       " bytes, got " + std::to_string(got) + " bytes");
+    LLAMA_ENGINE_THROW("tensor size mismatch for " + name + ": expected " +
+                       std::to_string(expected_bytes) + " bytes, got " + std::to_string(got) +
+                       " bytes");
   }
 }
 
 void require_fp16_or_packed_lowbit_bytes(const model::WeightLoader& weights,
-                                         const std::string& name,
-                                         std::size_t expected_fp16_bytes,
+                                         const std::string& name, std::size_t expected_fp16_bytes,
                                          std::size_t expected_int8_bytes,
                                          std::size_t expected_int4_bytes,
                                          std::size_t expected_scale_bytes = sizeof(float)) {
@@ -289,8 +226,10 @@ void require_fp16_or_packed_lowbit_bytes(const model::WeightLoader& weights,
   }
   const std::size_t got_scale = weights.tensor_bytes(sname);
   if (got_scale != sizeof(float) && got_scale != expected_scale_bytes) {
-    LLAMA_ENGINE_THROW("tensor size mismatch for " + sname + ": expected " + std::to_string(expected_scale_bytes) +
-                       " or " + std::to_string(sizeof(float)) + " bytes, got " + std::to_string(got_scale) + " bytes");
+    LLAMA_ENGINE_THROW("tensor size mismatch for " + sname + ": expected " +
+                       std::to_string(expected_scale_bytes) + " or " +
+                       std::to_string(sizeof(float)) + " bytes, got " + std::to_string(got_scale) +
+                       " bytes");
   }
 }
 
@@ -317,7 +256,8 @@ int infer_mat_rows(const model::WeightLoader& weights, const std::string& name, 
     const std::size_t bytes = weights.tensor_bytes(q8name);
     const std::size_t row_bytes = static_cast<std::size_t>(cols);
     if (row_bytes == 0 || (bytes % row_bytes) != 0) {
-      LLAMA_ENGINE_THROW("tensor size mismatch for " + q8name + ": not divisible by int8 row bytes");
+      LLAMA_ENGINE_THROW("tensor size mismatch for " + q8name +
+                         ": not divisible by int8 row bytes");
     }
     return static_cast<int>(bytes / row_bytes);
   }
@@ -327,14 +267,16 @@ int infer_mat_rows(const model::WeightLoader& weights, const std::string& name, 
     const std::size_t bytes = weights.tensor_bytes(q4name);
     const std::size_t row_bytes = static_cast<std::size_t>(packed_cols);
     if (row_bytes == 0 || (bytes % row_bytes) != 0) {
-      LLAMA_ENGINE_THROW("tensor size mismatch for " + q4name + ": not divisible by int4 packed row bytes");
+      LLAMA_ENGINE_THROW("tensor size mismatch for " + q4name +
+                         ": not divisible by int4 packed row bytes");
     }
     return static_cast<int>(bytes / row_bytes);
   }
   LLAMA_ENGINE_THROW("missing tensor: " + name + " (or packed int8/int4 alternative)");
 }
 
-AttentionDims infer_attention_dims(const model::WeightLoader& weights, const model::LlamaConfig& cfg) {
+AttentionDims infer_attention_dims(const model::WeightLoader& weights,
+                                   const model::LlamaConfig& cfg) {
   if (cfg.num_heads <= 0 || cfg.num_kv_heads <= 0 || (cfg.num_heads % cfg.num_kv_heads) != 0) {
     LLAMA_ENGINE_THROW("invalid attention head config in header");
   }
@@ -347,7 +289,8 @@ AttentionDims infer_attention_dims(const model::WeightLoader& weights, const mod
   const int kv_hidden = infer_mat_rows(weights, p + ".attention.wk", hidden);
   const int vv_hidden = infer_mat_rows(weights, p + ".attention.wv", hidden);
   if (q_hidden <= 0 || (q_hidden % cfg.num_heads) != 0) {
-    LLAMA_ENGINE_THROW("invalid attention.wq shape: q_hidden must be positive and divisible by num_heads");
+    LLAMA_ENGINE_THROW(
+        "invalid attention.wq shape: q_hidden must be positive and divisible by num_heads");
   }
   if (kv_hidden <= 0 || kv_hidden != vv_hidden) {
     LLAMA_ENGINE_THROW("invalid attention.wk/wv shape: rows must be positive and equal");
@@ -357,15 +300,17 @@ AttentionDims infer_attention_dims(const model::WeightLoader& weights, const mod
     LLAMA_ENGINE_THROW("invalid inferred attention head_dim");
   }
   if (kv_hidden != cfg.num_kv_heads * head_dim) {
-    LLAMA_ENGINE_THROW("invalid attention dims: wk rows must equal num_kv_heads * (wq_rows / num_heads)");
+    LLAMA_ENGINE_THROW(
+        "invalid attention dims: wk rows must equal num_kv_heads * (wq_rows / num_heads)");
   }
   return AttentionDims{q_hidden, head_dim, kv_hidden};
 }
 
 void validate_tensor_layout(const model::WeightLoader& weights) {
   const auto& cfg = weights.config();
-  if (cfg.hidden_size <= 0 || cfg.intermediate_size <= 0 || cfg.vocab_size <= 0 || cfg.num_layers <= 0 ||
-      cfg.num_heads <= 0 || cfg.num_kv_heads <= 0 || cfg.num_heads % cfg.num_kv_heads != 0) {
+  if (cfg.hidden_size <= 0 || cfg.intermediate_size <= 0 || cfg.vocab_size <= 0 ||
+      cfg.num_layers <= 0 || cfg.num_heads <= 0 || cfg.num_kv_heads <= 0 ||
+      cfg.num_heads % cfg.num_kv_heads != 0) {
     LLAMA_ENGINE_THROW("invalid model config in header");
   }
 
@@ -374,20 +319,22 @@ void validate_tensor_layout(const model::WeightLoader& weights) {
   const bool is_moe = cfg.is_moe();
   const int moe_experts = std::max(0, cfg.num_local_experts);
   const int expert_inter = cfg.effective_expert_intermediate_size() > 0
-      ? cfg.effective_expert_intermediate_size()
-      : inter;
+                               ? cfg.effective_expert_intermediate_size()
+                               : inter;
   const AttentionDims attn_dims = infer_attention_dims(weights, cfg);
   const int q_hidden = attn_dims.q_hidden;
   const int kv_hidden = attn_dims.kv_hidden;
   constexpr std::size_t hsz = sizeof(__half);
 
   require_tensor_bytes(
-      weights, "tok_embeddings.weight", static_cast<std::size_t>(cfg.vocab_size) * static_cast<std::size_t>(hidden) * hsz);
+      weights, "tok_embeddings.weight",
+      static_cast<std::size_t>(cfg.vocab_size) * static_cast<std::size_t>(hidden) * hsz);
   require_tensor_bytes(weights, "norm.weight", static_cast<std::size_t>(hidden) * hsz);
 
   if (weights.has_tensor("output.weight")) {
     require_tensor_bytes(
-        weights, "output.weight", static_cast<std::size_t>(cfg.vocab_size) * static_cast<std::size_t>(hidden) * hsz);
+        weights, "output.weight",
+        static_cast<std::size_t>(cfg.vocab_size) * static_cast<std::size_t>(hidden) * hsz);
   }
   if (weights.has_tensor("output.bias")) {
     require_tensor_bytes(weights, "output.bias", static_cast<std::size_t>(cfg.vocab_size) * hsz);
@@ -396,69 +343,60 @@ void validate_tensor_layout(const model::WeightLoader& weights) {
   for (int layer = 0; layer < cfg.num_layers; ++layer) {
     const std::string p = "layers." + std::to_string(layer);
     require_fp16_or_packed_lowbit_bytes(
-        weights,
-        p + ".attention_norm.weight",
-        static_cast<std::size_t>(hidden) * hsz,
-        static_cast<std::size_t>(hidden),
-        static_cast<std::size_t>((hidden + 1) / 2));
+        weights, p + ".attention_norm.weight", static_cast<std::size_t>(hidden) * hsz,
+        static_cast<std::size_t>(hidden), static_cast<std::size_t>((hidden + 1) / 2));
     if (weights.has_tensor(p + ".attention_norm.bias")) {
-      require_tensor_bytes(weights, p + ".attention_norm.bias", static_cast<std::size_t>(hidden) * hsz);
+      require_tensor_bytes(weights, p + ".attention_norm.bias",
+                           static_cast<std::size_t>(hidden) * hsz);
     }
-    require_fp16_or_packed_lowbit_bytes(weights,
-                                        p + ".attention.wq",
-                                        static_cast<std::size_t>(q_hidden) * static_cast<std::size_t>(hidden) * hsz,
-                                        static_cast<std::size_t>(q_hidden) * static_cast<std::size_t>(hidden),
-                                        static_cast<std::size_t>(q_hidden) * static_cast<std::size_t>((hidden + 1) / 2));
-    require_fp16_or_packed_lowbit_bytes(weights,
-                                        p + ".attention.wk",
-                                        static_cast<std::size_t>(kv_hidden) * static_cast<std::size_t>(hidden) * hsz,
-                                        static_cast<std::size_t>(kv_hidden) * static_cast<std::size_t>(hidden),
-                                        static_cast<std::size_t>(kv_hidden) * static_cast<std::size_t>((hidden + 1) / 2));
-    require_fp16_or_packed_lowbit_bytes(weights,
-                                        p + ".attention.wv",
-                                        static_cast<std::size_t>(kv_hidden) * static_cast<std::size_t>(hidden) * hsz,
-                                        static_cast<std::size_t>(kv_hidden) * static_cast<std::size_t>(hidden),
-                                        static_cast<std::size_t>(kv_hidden) * static_cast<std::size_t>((hidden + 1) / 2));
-    require_fp16_or_packed_lowbit_bytes(weights,
-                                        p + ".attention.wo",
-                                        static_cast<std::size_t>(hidden) * static_cast<std::size_t>(q_hidden) * hsz,
-                                        static_cast<std::size_t>(hidden) * static_cast<std::size_t>(q_hidden),
-                                        static_cast<std::size_t>(hidden) * static_cast<std::size_t>((q_hidden + 1) / 2));
+    require_fp16_or_packed_lowbit_bytes(
+        weights, p + ".attention.wq",
+        static_cast<std::size_t>(q_hidden) * static_cast<std::size_t>(hidden) * hsz,
+        static_cast<std::size_t>(q_hidden) * static_cast<std::size_t>(hidden),
+        static_cast<std::size_t>(q_hidden) * static_cast<std::size_t>((hidden + 1) / 2));
+    require_fp16_or_packed_lowbit_bytes(
+        weights, p + ".attention.wk",
+        static_cast<std::size_t>(kv_hidden) * static_cast<std::size_t>(hidden) * hsz,
+        static_cast<std::size_t>(kv_hidden) * static_cast<std::size_t>(hidden),
+        static_cast<std::size_t>(kv_hidden) * static_cast<std::size_t>((hidden + 1) / 2));
+    require_fp16_or_packed_lowbit_bytes(
+        weights, p + ".attention.wv",
+        static_cast<std::size_t>(kv_hidden) * static_cast<std::size_t>(hidden) * hsz,
+        static_cast<std::size_t>(kv_hidden) * static_cast<std::size_t>(hidden),
+        static_cast<std::size_t>(kv_hidden) * static_cast<std::size_t>((hidden + 1) / 2));
+    require_fp16_or_packed_lowbit_bytes(
+        weights, p + ".attention.wo",
+        static_cast<std::size_t>(hidden) * static_cast<std::size_t>(q_hidden) * hsz,
+        static_cast<std::size_t>(hidden) * static_cast<std::size_t>(q_hidden),
+        static_cast<std::size_t>(hidden) * static_cast<std::size_t>((q_hidden + 1) / 2));
     if (cfg.has_qkv_bias && weights.has_tensor(p + ".attention.bqkv")) {
-      require_tensor_bytes(weights,
-                           p + ".attention.bqkv",
+      require_tensor_bytes(weights, p + ".attention.bqkv",
                            static_cast<std::size_t>(q_hidden + 2 * kv_hidden) * hsz);
     }
     if (weights.has_tensor(p + ".attention.bo")) {
       require_tensor_bytes(weights, p + ".attention.bo", static_cast<std::size_t>(hidden) * hsz);
     }
     require_fp16_or_packed_lowbit_bytes(
-        weights,
-        p + ".ffn_norm.weight",
-        static_cast<std::size_t>(hidden) * hsz,
-        static_cast<std::size_t>(hidden),
-        static_cast<std::size_t>((hidden + 1) / 2));
+        weights, p + ".ffn_norm.weight", static_cast<std::size_t>(hidden) * hsz,
+        static_cast<std::size_t>(hidden), static_cast<std::size_t>((hidden + 1) / 2));
     if (weights.has_tensor(p + ".ffn_norm.bias")) {
       require_tensor_bytes(weights, p + ".ffn_norm.bias", static_cast<std::size_t>(hidden) * hsz);
     }
     if (!is_moe) {
       require_fp16_or_packed_lowbit_bytes(
-          weights,
-          p + ".feed_forward.w1",
+          weights, p + ".feed_forward.w1",
           static_cast<std::size_t>(inter) * static_cast<std::size_t>(hidden) * hsz,
           static_cast<std::size_t>(inter) * static_cast<std::size_t>(hidden),
           static_cast<std::size_t>(inter) * static_cast<std::size_t>((hidden + 1) / 2),
           static_cast<std::size_t>(inter) * sizeof(float));
       require_fp16_or_packed_lowbit_bytes(
-          weights,
-          p + ".feed_forward.w2",
+          weights, p + ".feed_forward.w2",
           static_cast<std::size_t>(hidden) * static_cast<std::size_t>(inter) * hsz,
           static_cast<std::size_t>(hidden) * static_cast<std::size_t>(inter),
           static_cast<std::size_t>(hidden) * static_cast<std::size_t>((inter + 1) / 2),
           static_cast<std::size_t>(hidden) * sizeof(float));
       require_fp16_or_packed_lowbit_bytes(
-          weights,
-          p + ".feed_forward.w3",
+          weights, p + ".feed_forward.w3",
           static_cast<std::size_t>(inter) * static_cast<std::size_t>(hidden) * hsz,
           static_cast<std::size_t>(inter) * static_cast<std::size_t>(hidden),
           static_cast<std::size_t>(inter) * static_cast<std::size_t>((hidden + 1) / 2),
@@ -468,8 +406,7 @@ void validate_tensor_layout(const model::WeightLoader& weights) {
         LLAMA_ENGINE_THROW("invalid MoE config: num_local_experts must be > 0");
       }
       require_fp16_or_packed_lowbit_bytes(
-          weights,
-          p + ".feed_forward.router",
+          weights, p + ".feed_forward.router",
           static_cast<std::size_t>(moe_experts) * static_cast<std::size_t>(hidden) * hsz,
           static_cast<std::size_t>(moe_experts) * static_cast<std::size_t>(hidden),
           static_cast<std::size_t>(moe_experts) * static_cast<std::size_t>((hidden + 1) / 2),
@@ -477,22 +414,19 @@ void validate_tensor_layout(const model::WeightLoader& weights) {
       for (int expert = 0; expert < moe_experts; ++expert) {
         const std::string ebase = p + ".feed_forward.experts." + std::to_string(expert);
         require_fp16_or_packed_lowbit_bytes(
-            weights,
-            ebase + ".w1",
+            weights, ebase + ".w1",
             static_cast<std::size_t>(expert_inter) * static_cast<std::size_t>(hidden) * hsz,
             static_cast<std::size_t>(expert_inter) * static_cast<std::size_t>(hidden),
             static_cast<std::size_t>(expert_inter) * static_cast<std::size_t>((hidden + 1) / 2),
             static_cast<std::size_t>(expert_inter) * sizeof(float));
         require_fp16_or_packed_lowbit_bytes(
-            weights,
-            ebase + ".w2",
+            weights, ebase + ".w2",
             static_cast<std::size_t>(hidden) * static_cast<std::size_t>(expert_inter) * hsz,
             static_cast<std::size_t>(hidden) * static_cast<std::size_t>(expert_inter),
             static_cast<std::size_t>(hidden) * static_cast<std::size_t>((expert_inter + 1) / 2),
             static_cast<std::size_t>(hidden) * sizeof(float));
         require_fp16_or_packed_lowbit_bytes(
-            weights,
-            ebase + ".w3",
+            weights, ebase + ".w3",
             static_cast<std::size_t>(expert_inter) * static_cast<std::size_t>(hidden) * hsz,
             static_cast<std::size_t>(expert_inter) * static_cast<std::size_t>(hidden),
             static_cast<std::size_t>(expert_inter) * static_cast<std::size_t>((hidden + 1) / 2),
@@ -509,7 +443,8 @@ void validate_tensor_layout(const model::WeightLoader& weights) {
   }
   if (has_tq3_codebook) {
     require_tensor_bytes(weights, "tq3_codebook", static_cast<std::size_t>(8) * sizeof(__half));
-    require_tensor_bytes(weights, "tq3_signs_hidden", static_cast<std::size_t>(hidden) * sizeof(std::int8_t));
+    require_tensor_bytes(weights, "tq3_signs_hidden",
+                         static_cast<std::size_t>(hidden) * sizeof(std::int8_t));
   }
 
   int tq_objective = 0;
@@ -525,11 +460,12 @@ void validate_tensor_layout(const model::WeightLoader& weights) {
 
   int qjl_dim = 0;
   if (tq_objective == 1) {
-    if (!weights.has_tensor("tq_qjl_dim") ||
-        !weights.has_tensor("tq_qjl_seed") ||
+    if (!weights.has_tensor("tq_qjl_dim") || !weights.has_tensor("tq_qjl_seed") ||
         !weights.has_tensor("tq_qjl_indices_hidden") ||
         !weights.has_tensor("tq_qjl_signs_hidden")) {
-      LLAMA_ENGINE_THROW("incomplete Qprod metadata: expected tq_qjl_dim/tq_qjl_seed/tq_qjl_indices_hidden/tq_qjl_signs_hidden");
+      LLAMA_ENGINE_THROW(
+          "incomplete Qprod metadata: expected "
+          "tq_qjl_dim/tq_qjl_seed/tq_qjl_indices_hidden/tq_qjl_signs_hidden");
     }
     require_tensor_bytes(weights, "tq_qjl_dim", sizeof(std::int32_t));
     require_tensor_bytes(weights, "tq_qjl_seed", sizeof(std::int32_t));
@@ -539,8 +475,10 @@ void validate_tensor_layout(const model::WeightLoader& weights) {
     if (qjl_dim <= 0 || qjl_dim > hidden) {
       LLAMA_ENGINE_THROW("invalid tq_qjl_dim: expected in [1, hidden_size]");
     }
-    require_tensor_bytes(weights, "tq_qjl_indices_hidden", static_cast<std::size_t>(qjl_dim) * sizeof(std::int32_t));
-    require_tensor_bytes(weights, "tq_qjl_signs_hidden", static_cast<std::size_t>(qjl_dim) * sizeof(std::int8_t));
+    require_tensor_bytes(weights, "tq_qjl_indices_hidden",
+                         static_cast<std::size_t>(qjl_dim) * sizeof(std::int32_t));
+    require_tensor_bytes(weights, "tq_qjl_signs_hidden",
+                         static_cast<std::size_t>(qjl_dim) * sizeof(std::int8_t));
   }
 
   const std::size_t tq3_words_per_row = static_cast<std::size_t>((hidden + 9) / 10);
@@ -566,7 +504,8 @@ void validate_tensor_layout(const model::WeightLoader& weights) {
       const std::string residual_bits = base + ".tq3r";
       const std::string residual_scales = base + ".tq3rs";
       if (!weights.has_tensor(residual_bits) || !weights.has_tensor(residual_scales)) {
-        LLAMA_ENGINE_THROW("incomplete Qprod residual pair: expected both " + residual_bits + " and " + residual_scales);
+        LLAMA_ENGINE_THROW("incomplete Qprod residual pair: expected both " + residual_bits +
+                           " and " + residual_scales);
       }
       const std::size_t expected_rbits =
           static_cast<std::size_t>(out_rows) * qjl_words_per_row * sizeof(std::uint32_t);
@@ -593,63 +532,31 @@ void validate_tensor_layout(const model::WeightLoader& weights) {
 
 namespace detail {
 
-void dispatch_linear_rowmajor_weight(cublasHandle_t handle,
-                                     cublasLtHandle_t lt_handle,
-                                     std::vector<LtMatmulPlan>* lt_cache,
-                                     void* lt_workspace,
-                                     std::size_t lt_workspace_bytes,
-                                     cudaStream_t stream,
-                                     const void* d_w_rowmajor,
-                                     const void* d_x,
-                                     void* d_y,
-                                     int out_features,
-                                     int in_features,
-                                     int batch_size,
+void dispatch_linear_rowmajor_weight(cublasHandle_t handle, cublasLtHandle_t lt_handle,
+                                     std::vector<LtMatmulPlan>* lt_cache, void* lt_workspace,
+                                     std::size_t lt_workspace_bytes, cudaStream_t stream,
+                                     const void* d_w_rowmajor, const void* d_x, void* d_y,
+                                     int out_features, int in_features, int batch_size,
                                      cudaDataType_t output_type) {
-  linear_rowmajor_weight(handle,
-                         lt_handle,
-                         lt_cache,
-                         lt_workspace,
-                         lt_workspace_bytes,
-                         stream,
-                         d_w_rowmajor,
-                         d_x,
-                         d_y,
-                         out_features,
-                         in_features,
-                         batch_size,
+  linear_rowmajor_weight(handle, lt_handle, lt_cache, lt_workspace, lt_workspace_bytes, stream,
+                         d_w_rowmajor, d_x, d_y, out_features, in_features, batch_size,
                          output_type);
 }
 
-
 }  // namespace detail
 
-void LlamaEngine::launch_norm(const void* x,
-                              const void* weight,
-                              const void* bias,
-                              void* y,
-                              int rows,
-                              int cols) {
+void LlamaEngine::launch_norm(const void* x, const void* weight, const void* bias, void* y,
+                              int rows, int cols) {
   const auto& cfg = weights_.config();
   const float eps = cfg.norm_eps > 0.0f ? cfg.norm_eps : 1e-5f;
   if (cfg.use_layernorm) {
-    kernels::launch_layernorm(static_cast<const __half*>(x),
-                              static_cast<const __half*>(weight),
-                              static_cast<const __half*>(bias),
-                              static_cast<__half*>(y),
-                              rows,
-                              cols,
-                              eps,
-                              compute_stream_);
+    kernels::launch_layernorm(static_cast<const __half*>(x), static_cast<const __half*>(weight),
+                              static_cast<const __half*>(bias), static_cast<__half*>(y), rows, cols,
+                              eps, compute_stream_);
     return;
   }
-  kernels::launch_rmsnorm(static_cast<const __half*>(x),
-                          static_cast<const __half*>(weight),
-                          static_cast<__half*>(y),
-                          rows,
-                          cols,
-                          eps,
-                          compute_stream_);
+  kernels::launch_rmsnorm(static_cast<const __half*>(x), static_cast<const __half*>(weight),
+                          static_cast<__half*>(y), rows, cols, eps, compute_stream_);
   maybe_add_half_bias(y, bias, rows, cols);
 }
 
@@ -658,17 +565,12 @@ void LlamaEngine::maybe_add_half_bias(void* out, const void* bias, int rows, int
     return;
   }
   if (rows == 1) {
-    kernels::launch_add_inplace(static_cast<__half*>(out),
-                                static_cast<const __half*>(bias),
-                                cols,
+    kernels::launch_add_inplace(static_cast<__half*>(out), static_cast<const __half*>(bias), cols,
                                 compute_stream_);
     return;
   }
-  kernels::launch_add_bias_broadcast(static_cast<__half*>(out),
-                                     static_cast<const __half*>(bias),
-                                     rows,
-                                     cols,
-                                     compute_stream_);
+  kernels::launch_add_bias_broadcast(static_cast<__half*>(out), static_cast<const __half*>(bias),
+                                     rows, cols, compute_stream_);
 }
 
 LlamaEngine::~LlamaEngine() {
@@ -847,14 +749,38 @@ LlamaEngine::~LlamaEngine() {
   }
   free_ptr(d_k_cache_);
   free_ptr(d_v_cache_);
-  if (d_block_table_) { cudaFree(d_block_table_); d_block_table_ = nullptr; }  // paged KV device block table
-  if (d_batch_positions_) { cudaFree(d_batch_positions_); d_batch_positions_ = nullptr; }
-  if (d_batch_seq_lens_) { cudaFree(d_batch_seq_lens_); d_batch_seq_lens_ = nullptr; }
-  if (d_batch_block_tables_) { cudaFree(d_batch_block_tables_); d_batch_block_tables_ = nullptr; }
-  if (d_batch_logits_) { cudaFree(d_batch_logits_); d_batch_logits_ = nullptr; }
-  if (d_bs_scratch_m_) { cudaFree(d_bs_scratch_m_); d_bs_scratch_m_ = nullptr; }
-  if (d_bs_scratch_l_) { cudaFree(d_bs_scratch_l_); d_bs_scratch_l_ = nullptr; }
-  if (d_bs_scratch_o_) { cudaFree(d_bs_scratch_o_); d_bs_scratch_o_ = nullptr; }
+  if (d_block_table_) {
+    cudaFree(d_block_table_);
+    d_block_table_ = nullptr;
+  }  // paged KV device block table
+  if (d_batch_positions_) {
+    cudaFree(d_batch_positions_);
+    d_batch_positions_ = nullptr;
+  }
+  if (d_batch_seq_lens_) {
+    cudaFree(d_batch_seq_lens_);
+    d_batch_seq_lens_ = nullptr;
+  }
+  if (d_batch_block_tables_) {
+    cudaFree(d_batch_block_tables_);
+    d_batch_block_tables_ = nullptr;
+  }
+  if (d_batch_logits_) {
+    cudaFree(d_batch_logits_);
+    d_batch_logits_ = nullptr;
+  }
+  if (d_bs_scratch_m_) {
+    cudaFree(d_bs_scratch_m_);
+    d_bs_scratch_m_ = nullptr;
+  }
+  if (d_bs_scratch_l_) {
+    cudaFree(d_bs_scratch_l_);
+    d_bs_scratch_l_ = nullptr;
+  }
+  if (d_bs_scratch_o_) {
+    cudaFree(d_bs_scratch_o_);
+    d_bs_scratch_o_ = nullptr;
+  }
   if (h_k_cache_) {
     cudaFreeHost(h_k_cache_);
     h_k_cache_ = nullptr;
@@ -863,31 +789,85 @@ LlamaEngine::~LlamaEngine() {
     cudaFreeHost(h_v_cache_);
     h_v_cache_ = nullptr;
   }
-  if (d_k_cache_i4_) { cudaFree(d_k_cache_i4_); d_k_cache_i4_ = nullptr; }
-  if (d_v_cache_i4_) { cudaFree(d_v_cache_i4_); d_v_cache_i4_ = nullptr; }
-  if (d_k_scales_)   { cudaFree(d_k_scales_);   d_k_scales_   = nullptr; }
-  if (d_tq3_codebook_) { cudaFree(d_tq3_codebook_); d_tq3_codebook_ = nullptr; }
-  if (d_tq3_signs_)    { cudaFree(d_tq3_signs_);    d_tq3_signs_    = nullptr; }
-  if (d_tq_qjl_indices_) { cudaFree(d_tq_qjl_indices_); d_tq_qjl_indices_ = nullptr; }
-  if (d_tq_qjl_signs_)   { cudaFree(d_tq_qjl_signs_);   d_tq_qjl_signs_   = nullptr; }
-  if (d_tq_qjl_x_bits_)  { cudaFree(d_tq_qjl_x_bits_);  d_tq_qjl_x_bits_  = nullptr; }
-  if (d_x_tq3_)        { cudaFree(d_x_tq3_);        d_x_tq3_        = nullptr; }
+  if (d_k_cache_i4_) {
+    cudaFree(d_k_cache_i4_);
+    d_k_cache_i4_ = nullptr;
+  }
+  if (d_v_cache_i4_) {
+    cudaFree(d_v_cache_i4_);
+    d_v_cache_i4_ = nullptr;
+  }
+  if (d_k_scales_) {
+    cudaFree(d_k_scales_);
+    d_k_scales_ = nullptr;
+  }
+  if (d_tq3_codebook_) {
+    cudaFree(d_tq3_codebook_);
+    d_tq3_codebook_ = nullptr;
+  }
+  if (d_tq3_signs_) {
+    cudaFree(d_tq3_signs_);
+    d_tq3_signs_ = nullptr;
+  }
+  if (d_tq_qjl_indices_) {
+    cudaFree(d_tq_qjl_indices_);
+    d_tq_qjl_indices_ = nullptr;
+  }
+  if (d_tq_qjl_signs_) {
+    cudaFree(d_tq_qjl_signs_);
+    d_tq_qjl_signs_ = nullptr;
+  }
+  if (d_tq_qjl_x_bits_) {
+    cudaFree(d_tq_qjl_x_bits_);
+    d_tq_qjl_x_bits_ = nullptr;
+  }
+  if (d_x_tq3_) {
+    cudaFree(d_x_tq3_);
+    d_x_tq3_ = nullptr;
+  }
   for (auto& tq : layer_cache_tq3_) {
-    if (tq.wqkv)   { cudaFree(tq.wqkv);   }
-    if (tq.wo)     { cudaFree(tq.wo);     }
-    if (tq.w13)    { cudaFree(tq.w13);    }
-    if (tq.s_wqkv) { cudaFree(tq.s_wqkv); }
-    if (tq.s_wo)   { cudaFree(tq.s_wo);   }
-    if (tq.s_w13)  { cudaFree(tq.s_w13);  }
-    if (tq.r_wqkv) { cudaFree(tq.r_wqkv); }
-    if (tq.r_wo)   { cudaFree(tq.r_wo);   }
-    if (tq.r_w13)  { cudaFree(tq.r_w13);  }
-    if (tq.rs_wqkv) { cudaFree(tq.rs_wqkv); }
-    if (tq.rs_wo)   { cudaFree(tq.rs_wo);   }
-    if (tq.rs_w13)  { cudaFree(tq.rs_w13);  }
+    if (tq.wqkv) {
+      cudaFree(tq.wqkv);
+    }
+    if (tq.wo) {
+      cudaFree(tq.wo);
+    }
+    if (tq.w13) {
+      cudaFree(tq.w13);
+    }
+    if (tq.s_wqkv) {
+      cudaFree(tq.s_wqkv);
+    }
+    if (tq.s_wo) {
+      cudaFree(tq.s_wo);
+    }
+    if (tq.s_w13) {
+      cudaFree(tq.s_w13);
+    }
+    if (tq.r_wqkv) {
+      cudaFree(tq.r_wqkv);
+    }
+    if (tq.r_wo) {
+      cudaFree(tq.r_wo);
+    }
+    if (tq.r_w13) {
+      cudaFree(tq.r_w13);
+    }
+    if (tq.rs_wqkv) {
+      cudaFree(tq.rs_wqkv);
+    }
+    if (tq.rs_wo) {
+      cudaFree(tq.rs_wo);
+    }
+    if (tq.rs_w13) {
+      cudaFree(tq.rs_w13);
+    }
   }
   layer_cache_tq3_.clear();
-  if (d_v_scales_)   { cudaFree(d_v_scales_);   d_v_scales_   = nullptr; }
+  if (d_v_scales_) {
+    cudaFree(d_v_scales_);
+    d_v_scales_ = nullptr;
+  }
 
   free_ptr(layer_weights_.wqkv);
   free_ptr(layer_weights_.wo);
@@ -977,7 +957,6 @@ LlamaEngine::~LlamaEngine() {
     if (hq.s_w3) cudaFreeHost(hq.s_w3);
     hq = {};
   }
-
 }
 
 void LlamaEngine::initialize(const EngineOptions& options) {
@@ -1045,7 +1024,8 @@ void LlamaEngine::initialize(const EngineOptions& options) {
     if (weights_.has_tensor(p + ".attention.bo")) {
       has_any_layer_output_bias_ = true;
     }
-    if (weights_.has_tensor(p + ".attention_norm.bias") || weights_.has_tensor(p + ".ffn_norm.bias")) {
+    if (weights_.has_tensor(p + ".attention_norm.bias") ||
+        weights_.has_tensor(p + ".ffn_norm.bias")) {
       has_any_layer_norm_bias_ = true;
     }
     if (has_any_layer_output_bias_ && has_any_layer_norm_bias_) {
@@ -1055,23 +1035,34 @@ void LlamaEngine::initialize(const EngineOptions& options) {
   if (options_.verbose) {
     const char* family_str = "unknown";
     switch (cfg.model_family) {
-      case model::ModelFamily::LLaMA2:  family_str = "llama2";  break;
-      case model::ModelFamily::LLaMA3:  family_str = "llama3";  break;
-      case model::ModelFamily::Mistral: family_str = "mistral"; break;
-      case model::ModelFamily::Mixtral: family_str = "mixtral"; break;
-      case model::ModelFamily::Phi3:    family_str = "phi3";    break;
-      case model::ModelFamily::Qwen2:   family_str = "qwen2";   break;
-      case model::ModelFamily::Qwen3_5: family_str = "qwen3_5"; break;
-      default: break;
+      case model::ModelFamily::LLaMA2:
+        family_str = "llama2";
+        break;
+      case model::ModelFamily::LLaMA3:
+        family_str = "llama3";
+        break;
+      case model::ModelFamily::Mistral:
+        family_str = "mistral";
+        break;
+      case model::ModelFamily::Mixtral:
+        family_str = "mixtral";
+        break;
+      case model::ModelFamily::Phi3:
+        family_str = "phi3";
+        break;
+      case model::ModelFamily::Qwen2:
+        family_str = "qwen2";
+        break;
+      case model::ModelFamily::Qwen3_5:
+        family_str = "qwen3_5";
+        break;
+      default:
+        break;
     }
-    std::cout << "[engine] model_family=" << family_str
-              << " hidden=" << cfg.hidden_size
-              << " attn_hidden=" << attn_q_hidden_
-              << " layers=" << cfg.num_layers
-              << " heads=" << cfg.num_heads
-              << " head_dim=" << attn_head_dim_
-              << " kv_heads=" << cfg.num_kv_heads
-              << " vocab=" << cfg.vocab_size;
+    std::cout << "[engine] model_family=" << family_str << " hidden=" << cfg.hidden_size
+              << " attn_hidden=" << attn_q_hidden_ << " layers=" << cfg.num_layers
+              << " heads=" << cfg.num_heads << " head_dim=" << attn_head_dim_
+              << " kv_heads=" << cfg.num_kv_heads << " vocab=" << cfg.vocab_size;
     if (lowbit_streaming_enabled(options_)) {
       std::cout << " weight_quant=int" << options_.streaming_quant_bits;
     }
@@ -1081,7 +1072,8 @@ void LlamaEngine::initialize(const EngineOptions& options) {
     if (has_any_layer_output_bias_) std::cout << " o_proj_bias=yes";
     if (weights_.has_tensor("output.bias")) std::cout << " lm_head_bias=yes";
     if (cfg.sliding_window > 0) std::cout << " sliding_window=" << cfg.sliding_window;
-    if (cfg.partial_rotary_factor != 1.0f) std::cout << " partial_rope=" << cfg.partial_rotary_factor;
+    if (cfg.partial_rotary_factor != 1.0f)
+      std::cout << " partial_rope=" << cfg.partial_rotary_factor;
     if (cfg.has_linear_attention()) {
       std::cout << " attention=linear-mixed";
     } else if (cfg.uses_non_full_attention()) {
@@ -1105,7 +1097,8 @@ void LlamaEngine::initialize(const EngineOptions& options) {
   // for small-VRAM GPUs; up (512) for a marginal further gain.
   const int prefill_chunk_target = env_int_or_default("LLAMA_INFER_PREFILL_CHUNK_SIZE", 256);
   prefill_chunk_size_ = std::max(1, std::min(options_.max_context, prefill_chunk_target));
-  lt_workspace_bytes_ = env_workspace_bytes_or_default("LLAMA_INFER_LT_WORKSPACE_MB", lt_workspace_bytes_);
+  lt_workspace_bytes_ =
+      env_workspace_bytes_or_default("LLAMA_INFER_LT_WORKSPACE_MB", lt_workspace_bytes_);
   CUDA_CHECK(cudaStreamCreateWithFlags(&compute_stream_, cudaStreamNonBlocking));
   CUDA_CHECK(cudaStreamCreateWithFlags(&transfer_stream_, cudaStreamNonBlocking));
   for (auto& ev : streaming_ready_) {
@@ -1143,12 +1136,10 @@ void LlamaEngine::initialize(const EngineOptions& options) {
 
   if (options_.verbose) {
     const auto startup_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - startup_begin).count();
+                                std::chrono::steady_clock::now() - startup_begin)
+                                .count();
     std::cout << "[startup] total_ms=" << startup_ms << "\n";
   }
 }
-
-
-
 
 }  // namespace engine

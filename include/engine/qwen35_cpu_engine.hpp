@@ -13,27 +13,26 @@
 namespace engine {
 
 class Qwen35CpuEngine {
- public:
+public:
   ~Qwen35CpuEngine() = default;
 
   void initialize(const EngineOptions& options);
 
-  std::vector<int> generate(const std::vector<int>& prompt_tokens,
-                            int max_new_tokens,
+  std::vector<int> generate(const std::vector<int>& prompt_tokens, int max_new_tokens,
                             float temperature);
 
-  std::vector<int> generate_stream(const std::vector<int>& prompt_tokens,
-                                   int max_new_tokens,
-                                   float temperature,
-                                   const std::function<bool(int)>& on_token,
+  std::vector<int> generate_stream(const std::vector<int>& prompt_tokens, int max_new_tokens,
+                                   float temperature, const std::function<bool(int)>& on_token,
                                    const GenerationConstraints* constraints = nullptr);
 
-  std::vector<std::pair<int, float>> inspect_next_logits(
-      const std::vector<int>& prompt_tokens, int top_k);
+  std::vector<std::pair<int, float>> inspect_next_logits(const std::vector<int>& prompt_tokens,
+                                                         int top_k);
 
-  const BenchmarkStats& last_benchmark_stats() const { return stats_; }
+  const BenchmarkStats& last_benchmark_stats() const {
+    return stats_;
+  }
 
- private:
+private:
   enum class LayerKind {
     LinearAttention,
     FullAttention,
@@ -90,27 +89,13 @@ class Qwen35CpuEngine {
   void allocate_runtime_buffers();
   void load_weight_pointers();
 
-  void gemv_bf16(const std::uint16_t* weights,
-                 const float* x,
-                 float* y,
-                 int out_dim,
-                 int in_dim);
+  void gemv_bf16(const std::uint16_t* weights, const float* x, float* y, int out_dim, int in_dim);
 
-  void rmsnorm_offset(const float* x,
-                      const std::uint16_t* weight,
-                      float* out,
-                      int n,
-                      float eps);
+  void rmsnorm_offset(const float* x, const std::uint16_t* weight, float* out, int n, float eps);
 
-  void rmsnorm_offset_inplace(float* x,
-                              const std::uint16_t* weight,
-                              int n,
-                              float eps);
+  void rmsnorm_offset_inplace(float* x, const std::uint16_t* weight, int n, float eps);
 
-  void rmsnorm_direct_gated_inplace(float* x,
-                                    const float* weight,
-                                    const float* gate,
-                                    int n,
+  void rmsnorm_direct_gated_inplace(float* x, const float* weight, const float* gate, int n,
                                     float eps);
 
   void apply_rope_partial(float* q, float* k, int position);
@@ -119,9 +104,7 @@ class Qwen35CpuEngine {
   void run_mlp_layer(int layer);
   void forward_token(int token, int position);
 
-  int sample_token(float temperature,
-                   int top_k,
-                   const std::vector<int>& history,
+  int sample_token(float temperature, int top_k, const std::vector<int>& history,
                    float repetition_penalty);
 
   model::SafetensorsLoader weights_;

@@ -14,29 +14,26 @@
 namespace engine {
 
 class CpuLlamaEngine {
- public:
+public:
   ~CpuLlamaEngine() = default;
 
   void initialize(const EngineOptions& options);
 
-  std::vector<int> generate(const std::vector<int>& prompt_tokens,
-                            int max_new_tokens,
+  std::vector<int> generate(const std::vector<int>& prompt_tokens, int max_new_tokens,
                             float temperature);
 
-  std::vector<int> generate_stream(const std::vector<int>& prompt_tokens,
-                                   int max_new_tokens,
-                                   float temperature,
-                                   const std::function<bool(int)>& on_token,
+  std::vector<int> generate_stream(const std::vector<int>& prompt_tokens, int max_new_tokens,
+                                   float temperature, const std::function<bool(int)>& on_token,
                                    const GenerationConstraints* constraints = nullptr);
 
-  std::vector<std::pair<int, float>> inspect_next_logits(
-      const std::vector<int>& prompt_tokens, int top_k);
+  std::vector<std::pair<int, float>> inspect_next_logits(const std::vector<int>& prompt_tokens,
+                                                         int top_k);
 
   const BenchmarkStats& last_benchmark_stats() const {
     return last_benchmark_stats_;
   }
 
- private:
+private:
   struct LayerWeights {
     const uint16_t* norm_att = nullptr;
     const uint16_t* norm_ffn = nullptr;
@@ -66,25 +63,20 @@ class CpuLlamaEngine {
     std::vector<const float*> expert_w3_fp32;
   };
 
-  void normalize(const float* x,
-                 const uint16_t* w,
-                 const uint16_t* b,
-                 float* out,
-                 int n);
+  void normalize(const float* x, const uint16_t* w, const uint16_t* b, float* out, int n);
 
   void gemv_fp16(const uint16_t* W, const float* x, float* y, int M, int N);
   void gemv_fp32(const float* W, const float* x, float* y, int M, int N);
 
-  void rope(float* q, float* k, int pos, int n_heads, int n_kv_heads,
-            int head_dim);
+  void rope(float* q, float* k, int pos, int n_heads, int n_kv_heads, int head_dim);
   void attention(int pos, int layer);
 
   void mlp(int layer);
   void mlp_moe(int layer);
   void forward_token(int token, int pos);
 
-  int sample_token(float temperature, int top_k,
-                   const std::vector<int>& history, float rep_penalty);
+  int sample_token(float temperature, int top_k, const std::vector<int>& history,
+                   float rep_penalty);
 
   model::WeightLoader weights_;
   model::LlamaConfig cfg_;

@@ -7,10 +7,10 @@
 
 #include "engine/tensor_parallel.hpp"
 
+#include <cuda_fp16.h>
+
 #include <algorithm>
 #include <stdexcept>
-
-#include <cuda_fp16.h>
 
 #include "runtime/cuda_utils.cuh"
 
@@ -45,9 +45,7 @@ TensorParallelLinear::~TensorParallelLinear() {
 // rows, ensuring all output rows are covered even when out_features is not
 // evenly divisible by world_size. Each shard is uploaded synchronously from
 // the corresponding host pointer in shard_weights_fp16.
-void TensorParallelLinear::initialize(int world_size,
-                                      int in_features,
-                                      int out_features,
+void TensorParallelLinear::initialize(int world_size, int in_features, int out_features,
                                       const std::vector<const void*>& shard_weights_fp16) {
   if (world_size <= 0) {
     throw std::invalid_argument("world_size must be > 0");
@@ -73,10 +71,11 @@ void TensorParallelLinear::initialize(int world_size,
     CUDA_CHECK(cudaSetDevice(ctx.device));
     CUBLAS_CHECK(cublasCreate(&ctx.handle));
 
-    const std::size_t shard_bytes =
-        static_cast<std::size_t>(ctx.out_rows) * static_cast<std::size_t>(in_features_) * sizeof(__half);
+    const std::size_t shard_bytes = static_cast<std::size_t>(ctx.out_rows) *
+                                    static_cast<std::size_t>(in_features_) * sizeof(__half);
     CUDA_CHECK(cudaMalloc(&ctx.d_weight, shard_bytes));
-    CUDA_CHECK(cudaMemcpy(ctx.d_weight, shard_weights_fp16[rank], shard_bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(
+        cudaMemcpy(ctx.d_weight, shard_weights_fp16[rank], shard_bytes, cudaMemcpyHostToDevice));
   }
 }
 
@@ -87,9 +86,7 @@ void TensorParallelLinear::initialize(int world_size,
 // interpretation). d_partial is re-allocated per call because the batch size
 // may change between invocations; this is acceptable for typical use where
 // batch is constant during inference.
-void TensorParallelLinear::forward(const void* d_input_fp16,
-                                   int batch,
-                                   void* d_output_fp16,
+void TensorParallelLinear::forward(const void* d_input_fp16, int batch, void* d_output_fp16,
                                    cudaStream_t stream) {
   int row_offset = 0;
 
@@ -115,24 +112,10 @@ void TensorParallelLinear::forward(const void* d_input_fp16,
     // in the column-major layout expected by cuBLAS (row_major HF weights are
     // reinterpreted as column-major in the full linear path; here the shard
     // pointer arrives pre-transposed from the caller).
-    CUBLAS_CHECK(cublasGemmEx(ctx.handle,
-                              CUBLAS_OP_N,
-                              CUBLAS_OP_N,
-                              ctx.out_rows,
-                              batch,
-                              in_features_,
-                              &alpha,
-                              ctx.d_weight,
-                              CUDA_R_16F,
-                              ctx.out_rows,
-                              d_input_fp16,
-                              CUDA_R_16F,
-                              in_features_,
-                              &beta,
-                              ctx.d_partial,
-                              CUDA_R_16F,
-                              ctx.out_rows,
-                              CUBLAS_COMPUTE_32F,
+    CUBLAS_CHECK(cublasGemmEx(ctx.handle, CUBLAS_OP_N, CUBLAS_OP_N, ctx.out_rows, batch,
+                              in_features_, &alpha, ctx.d_weight, CUDA_R_16F, ctx.out_rows,
+                              d_input_fp16, CUDA_R_16F, in_features_, &beta, ctx.d_partial,
+                              CUDA_R_16F, ctx.out_rows, CUBLAS_COMPUTE_32F,
                               CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 
     // Copy this shard's result to the correct row range in the output buffer.
@@ -140,10 +123,7 @@ void TensorParallelLinear::forward(const void* d_input_fp16,
     // is sizeof(__half) and we cast to char* for byte arithmetic.
     CUDA_CHECK(cudaMemcpyAsync(
         static_cast<char*>(d_output_fp16) + static_cast<std::size_t>(row_offset) * sizeof(__half),
-        ctx.d_partial,
-        out_bytes,
-        cudaMemcpyDeviceToDevice,
-        stream));
+        ctx.d_partial, out_bytes, cudaMemcpyDeviceToDevice, stream));
 
     row_offset += ctx.out_rows * batch;
   }

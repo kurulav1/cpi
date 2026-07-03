@@ -22,7 +22,7 @@ namespace platform {
 // Read-only memory-mapped view of a file on disk.
 // Designed for large model weights to avoid loading entire blobs into RAM.
 class MMapFile {
- public:
+public:
   MMapFile() = default;
 
   // Opens and maps the file at the given path immediately.
@@ -48,13 +48,19 @@ class MMapFile {
   void close();
 
   // Returns a pointer to the start of the mapped region, or nullptr if closed.
-  [[nodiscard]] const std::byte* data() const { return data_; }
+  [[nodiscard]] const std::byte* data() const {
+    return data_;
+  }
 
   // Returns the size of the mapped region in bytes.
-  [[nodiscard]] std::size_t size() const { return size_; }
+  [[nodiscard]] std::size_t size() const {
+    return size_;
+  }
 
   // Returns true when the mapping is open and non-empty.
-  [[nodiscard]] bool valid() const { return data_ != nullptr && size_ > 0; }
+  [[nodiscard]] bool valid() const {
+    return data_ != nullptr && size_ > 0;
+  }
 
   // Hint to the OS to prefetch the entire mapped region into the page cache.
   // Non-blocking: the OS services the hint asynchronously. Best called immediately
@@ -62,7 +68,7 @@ class MMapFile {
   // No-op if the mapping is not valid.
   void prefetch() const;
 
- private:
+private:
   const std::byte* data_ = nullptr;  // base address of the mapped view
   std::size_t size_ = 0;             // byte length of the mapped view
 

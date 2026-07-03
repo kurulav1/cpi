@@ -4,18 +4,16 @@
 
 namespace engine {
 
-std::size_t paged_kv_pool_bytes(int num_blocks, int num_layers, int block_size,
-                                int kv_hidden) {
+std::size_t paged_kv_pool_bytes(int num_blocks, int num_layers, int block_size, int kv_hidden) {
   // K and V, fp16, per block per layer.
-  return static_cast<std::size_t>(num_blocks) * static_cast<std::size_t>(num_layers) *
-         2ull * static_cast<std::size_t>(block_size) *
-         static_cast<std::size_t>(kv_hidden) * sizeof(unsigned short);
+  return static_cast<std::size_t>(num_blocks) * static_cast<std::size_t>(num_layers) * 2ull *
+         static_cast<std::size_t>(block_size) * static_cast<std::size_t>(kv_hidden) *
+         sizeof(unsigned short);
 }
 
-int paged_kv_blocks_for_budget(std::size_t budget_bytes, int num_layers,
-                               int block_size, int kv_hidden) {
-  const std::size_t per_block =
-      paged_kv_pool_bytes(1, num_layers, block_size, kv_hidden);
+int paged_kv_blocks_for_budget(std::size_t budget_bytes, int num_layers, int block_size,
+                               int kv_hidden) {
+  const std::size_t per_block = paged_kv_pool_bytes(1, num_layers, block_size, kv_hidden);
   if (per_block == 0) return 0;
   const std::size_t n = budget_bytes / per_block;
   return static_cast<int>(n);
@@ -61,7 +59,9 @@ int BlockAllocator::ref_count(int block) const {
 SequenceBlockTable::SequenceBlockTable(BlockAllocator* alloc, int block_size)
     : alloc_(alloc), block_size_(block_size < 1 ? 1 : block_size) {}
 
-SequenceBlockTable::~SequenceBlockTable() { clear(); }
+SequenceBlockTable::~SequenceBlockTable() {
+  clear();
+}
 
 bool SequenceBlockTable::ensure_position(int pos) {
   if (pos < 0) return true;
@@ -87,8 +87,7 @@ int SequenceBlockTable::block_for(int pos) const {
   return blocks_[static_cast<std::size_t>(idx)];
 }
 
-bool SequenceBlockTable::share_prefix_from(const SequenceBlockTable& other,
-                                           int prefix_len) {
+bool SequenceBlockTable::share_prefix_from(const SequenceBlockTable& other, int prefix_len) {
   // Only whole shared blocks are adopted; a partial trailing block of the prefix
   // stays per-sequence (copy-on-write territory, handled by the caller writing
   // its own tail). Must be called before this table owns any blocks.
