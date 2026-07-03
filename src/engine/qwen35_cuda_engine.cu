@@ -10,6 +10,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <unordered_set>
 #include <limits>
 #include <numeric>
 #include <random>
@@ -986,8 +987,17 @@ int Qwen35CudaEngine::sample_next_token(float temperature,
                         static_cast<std::size_t>(cfg_.vocab_size) * sizeof(float),
                         cudaMemcpyDeviceToHost));
   std::vector<float> logits = h_logits_;
-  for (int token_id : history) {
-    if (token_id >= 0 && token_id < cfg_.vocab_size && options_.repetition_penalty > 1.0f) {
+  // Repetition penalty applied ONCE per unique token (HF semantics), matching
+  // LlamaEngine's sampler. Iterating raw history instead would penalize a token
+  // once per occurrence, i.e. divide its logit by rp^(count) -- in a long/multi-
+  // turn context the most frequent tokens (space, common words, punctuation) get
+  // suppressed exponentially, collapsing generation into word-merged gibberish.
+  if (options_.repetition_penalty > 1.0f && !history.empty()) {
+    std::unordered_set<int> seen(history.begin(), history.end());
+    for (int token_id : seen) {
+      if (token_id < 0 || token_id >= cfg_.vocab_size) {
+        continue;
+      }
       float& logit = logits[static_cast<std::size_t>(token_id)];
       logit = (logit > 0.0f) ? (logit / options_.repetition_penalty)
                              : (logit * options_.repetition_penalty);

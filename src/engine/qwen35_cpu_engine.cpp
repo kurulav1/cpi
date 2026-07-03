@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <fstream>
 #include <immintrin.h>
+#include <unordered_set>
 #include <iterator>
 #include <numeric>
 #include <random>
@@ -941,8 +942,12 @@ int Qwen35CpuEngine::sample_token(float temperature,
                                   int top_k,
                                   const std::vector<int>& history,
                                   float repetition_penalty) {
-  if (repetition_penalty != 1.0f) {
-    for (int token : history) {
+  // Penalize each unique history token once (HF semantics). Iterating raw
+  // history would divide a token's logit by rp^(occurrences), exponentially
+  // suppressing frequent tokens in long contexts and collapsing generation.
+  if (repetition_penalty > 1.0f && !history.empty()) {
+    std::unordered_set<int> seen(history.begin(), history.end());
+    for (int token : seen) {
       if (token < 0 || token >= cfg_.vocab_size) {
         continue;
       }
