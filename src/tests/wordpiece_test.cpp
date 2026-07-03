@@ -2,6 +2,7 @@
 // bert-base-uncased token ids (bge-small-en-v1.5 uses that 30522 vocab).
 // Requires the bge model dir (vocab.txt). Pure C++, no CUDA.
 
+#include <filesystem>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -12,19 +13,31 @@ namespace {
 int g_fail = 0, g_checks = 0;
 void check(bool c, const std::string& m) {
   ++g_checks;
-  if (!c) { ++g_fail; std::cerr << "FAIL: " << m << "\n"; }
+  if (!c) {
+    ++g_fail;
+    std::cerr << "FAIL: " << m << "\n";
+  }
 }
 std::string vec(const std::vector<int>& v) {
   std::string s = "[";
-  for (std::size_t i = 0; i < v.size(); ++i) { if (i) s += ","; s += std::to_string(v[i]); }
+  for (std::size_t i = 0; i < v.size(); ++i) {
+    if (i) s += ",";
+    s += std::to_string(v[i]);
+  }
   return s + "]";
 }
 }  // namespace
 
 int main(int argc, char** argv) {
-  const std::string dir = argc > 1
-      ? argv[1]
-      : "artifacts/hub/BAAI__bge-small-en-v1.5";
+  const std::string dir = argc > 1 ? argv[1] : "artifacts/hub/BAAI__bge-small-en-v1.5";
+  // The bge model dir is gitignored, so it is absent in CI and other clean
+  // checkouts. Report a CTest SKIP (return code 77) rather than a failure when
+  // it is missing; the test still runs fully wherever the model is present.
+  if (!std::filesystem::exists(dir)) {
+    std::cerr << "SKIP: bge model dir not found at " << dir
+              << " (gitignored; provide it to run this test)\n";
+    return 77;
+  }
   model::WordPieceTokenizer tok;
   try {
     tok.load(dir, /*lowercase=*/true, /*strip_accents=*/true);
@@ -61,6 +74,9 @@ int main(int argc, char** argv) {
         "truncated to 64 with CLS/SEP, got size " + std::to_string(trunc.size()));
 
   std::cout << "wordpiece_test: " << (g_checks - g_fail) << "/" << g_checks << " passed\n";
-  if (g_fail) { std::cerr << g_fail << " failure(s)\n"; return 1; }
+  if (g_fail) {
+    std::cerr << g_fail << " failure(s)\n";
+    return 1;
+  }
   return 0;
 }

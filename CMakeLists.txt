@@ -263,6 +263,9 @@ add_executable(wordpiece_test
 target_include_directories(wordpiece_test PRIVATE include)
 add_test(NAME wordpiece_test
   COMMAND wordpiece_test "${CMAKE_SOURCE_DIR}/artifacts/hub/BAAI__bge-small-en-v1.5")
+# The bge model dir is gitignored; the test returns 77 to mark itself SKIPPED
+# (not FAILED) when the model is absent, e.g. on CI / clean checkouts.
+set_tests_properties(wordpiece_test PROPERTIES SKIP_RETURN_CODE 77)
 
 if(LLAMA_ENGINE_ENABLE_CUDA)
   add_executable(cuda_bandwidth_bench
