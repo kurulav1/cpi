@@ -17,10 +17,10 @@ latency.
 
 | Model | Params | Weights | Peak VRAM | GPU decode (tok/s) | CPU decode (tok/s) |
 | ----- | ------ | ------- | --------- | ------------------ | ------------------ |
-| Qwen2.5-Coder-3B-Instruct | 3B | fp16 | 10.7 GB | ~115 | ~7.3 |
-| Qwen2.5-7B-Instruct | 7B | fp16 | 19.3 GB | ~81 | ~3.4 |
-| Llama-3.1-8B-Instruct | 8B | fp16 | 20.2 GB | ~76 | ~3.2 |
-| Qwen2.5-Coder-32B-Instruct | 32B | int4 (streaming) | 26.8 GB | ~42 | — |
+| Qwen2.5-Coder-3B-Instruct | 3B | fp16 | 10.7 GB | ~132 | ~7.3 |
+| Qwen2.5-7B-Instruct | 7B | fp16 | 19.3 GB | ~86 | ~3.4 |
+| Llama-3.1-8B-Instruct | 8B | fp16 | 20.2 GB | ~81 | ~3.2 |
+| Qwen2.5-Coder-32B-Instruct | 32B | int4 (streaming) | 26.8 GB | ~43 | — |
 
 Peak VRAM is total GPU memory during the run (includes ~1 GB desktop compositor). The 32B on CPU is
 omitted: its int4 weights dequantize past the 32 GB of system RAM (out-of-memory). See
@@ -66,15 +66,16 @@ with `--tokens-file`, fp16 resident, RTX 5090).
 
 | Model | 512 | 2048 | 4096 | 8192 | 16384 | 32768 |
 | ----- | --- | ---- | ---- | ---- | ----- | ----- |
-| Qwen2.5-7B-Instruct | ~84 | ~80 | ~72 | ~61 | ~50 | ~31 |
-| Qwen2.5-Coder-7B-Instruct | ~83 | ~78 | ~72 | ~65 | ~50 | ~33 |
-| Llama-3.1-8B-Instruct | ~84 | ~76 | ~69 | ~55 | ~41 | ~26 |
+| Qwen2.5-7B-Instruct | ~91 | ~86 | ~80 | ~71 | ~59 | ~42 |
+| Qwen2.5-Coder-7B-Instruct | ~90 | ~86 | ~81 | ~72 | ~59 | ~42 |
+| Llama-3.1-8B-Instruct | ~86 | ~81 | ~75 | ~65 | ~49 | ~30 |
 
-Decode is near-flat to a few thousand tokens, then falls roughly in half for each ~4× of context
-as attention over the KV cache dominates each step — at 32K it's ~2.5–3.2× slower than at 512.
-Llama-3.1-8B falls off fastest: it has 8 KV heads to Qwen2.5-7B's 4, so ~2× the KV to scan per
-token. (Contexts past ~4K need `--tokens-file`, since a token list that long exceeds the OS
-command-line limit.)
+Decode stays flat to a few thousand tokens, then falls as attention over the KV cache dominates
+each step — at 32K it's ~2.1–2.9× slower than at 512. Decode attention is GQA-aware: each K/V entry
+is read from HBM once per KV head and shared across its query-head group, rather than re-read per
+query head. Llama-3.1-8B falls off fastest: it has 8 KV heads to Qwen2.5-7B's 4, so ~2× the KV to
+scan per token and a smaller (4× vs 7×) query group to amortize it over. (Contexts past ~4K need
+`--tokens-file`, since a token list that long exceeds the OS command-line limit.)
 
 ## Highlights
 
