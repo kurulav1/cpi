@@ -222,7 +222,14 @@ __global__ void attention_step_kernel_tiled(const half* q, const half* k_cache, 
   }
   __syncthreads();
 
-  float acc = 0.0f;
+  // One output accumulator per head_dim element this thread owns. head_dim can
+  // exceed blockDim (e.g. head_dim=256 with 128 threads → 2 elements/thread), so
+  // a scalar acc would conflate the strided output dims. kAccPerThread covers
+  // head_dim up to blockDim*8.
+  constexpr int kAccPerThread = 8;
+  float acc[kAccPerThread];
+#pragma unroll
+  for (int j = 0; j < kAccPerThread; ++j) acc[j] = 0.0f;
   for (int tile_base = 0; tile_base < seq_len; tile_base += WarpsPerBlock) {
     const int tile_tokens = min(WarpsPerBlock, seq_len - tile_base);
 
@@ -290,12 +297,13 @@ __global__ void attention_step_kernel_tiled(const half* q, const half* k_cache, 
       const float c_prev = (running_l == 0.0f) ? 0.0f : expf(running_m - new_m);
       const float c_tile = expf(tile_m - new_m);
 
-      for (int d = tid; d < head_dim; d += blockDim.x) {
+      int j = 0;
+      for (int d = tid; d < head_dim; d += blockDim.x, ++j) {
         float tile_o = 0.0f;
         for (int i = 0; i < tile_tokens; ++i) {
           tile_o += beta_shared[i] * __half2float(v_tile[i * head_dim + d]);
         }
-        acc = acc * c_prev + tile_o * c_tile;
+        acc[j] = acc[j] * c_prev + tile_o * c_tile;
       }
       if (tid == 0) {
         stats_shared[0] = new_m;
@@ -306,8 +314,9 @@ __global__ void attention_step_kernel_tiled(const half* q, const half* k_cache, 
   }
 
   const float inv_l = 1.0f / fmaxf(stats_shared[1], 1e-8f);
-  for (int d = tid; d < head_dim; d += blockDim.x) {
-    out[head * head_dim + d] = __float2half(acc * inv_l);
+  int j = 0;
+  for (int d = tid; d < head_dim; d += blockDim.x, ++j) {
+    out[head * head_dim + d] = __float2half(acc[j] * inv_l);
   }
 }
 
@@ -346,7 +355,14 @@ __global__ void attention_step_kernel_tiled_device_pos(const half* q, const half
   }
   __syncthreads();
 
-  float acc = 0.0f;
+  // One output accumulator per head_dim element this thread owns. head_dim can
+  // exceed blockDim (e.g. head_dim=256 with 128 threads → 2 elements/thread), so
+  // a scalar acc would conflate the strided output dims. kAccPerThread covers
+  // head_dim up to blockDim*8.
+  constexpr int kAccPerThread = 8;
+  float acc[kAccPerThread];
+#pragma unroll
+  for (int j = 0; j < kAccPerThread; ++j) acc[j] = 0.0f;
   for (int tile_base = 0; tile_base < seq_len; tile_base += WarpsPerBlock) {
     const int tile_tokens = min(WarpsPerBlock, seq_len - tile_base);
 
@@ -409,12 +425,13 @@ __global__ void attention_step_kernel_tiled_device_pos(const half* q, const half
       const float c_prev = (running_l == 0.0f) ? 0.0f : expf(running_m - new_m);
       const float c_tile = expf(tile_m - new_m);
 
-      for (int d = tid; d < head_dim; d += blockDim.x) {
+      int j = 0;
+      for (int d = tid; d < head_dim; d += blockDim.x, ++j) {
         float tile_o = 0.0f;
         for (int i = 0; i < tile_tokens; ++i) {
           tile_o += beta_shared[i] * __half2float(v_tile[i * head_dim + d]);
         }
-        acc = acc * c_prev + tile_o * c_tile;
+        acc[j] = acc[j] * c_prev + tile_o * c_tile;
       }
       if (tid == 0) {
         stats_shared[0] = new_m;
@@ -425,8 +442,9 @@ __global__ void attention_step_kernel_tiled_device_pos(const half* q, const half
   }
 
   const float inv_l = 1.0f / fmaxf(stats_shared[1], 1e-8f);
-  for (int d = tid; d < head_dim; d += blockDim.x) {
-    out[head * head_dim + d] = __float2half(acc * inv_l);
+  int j = 0;
+  for (int d = tid; d < head_dim; d += blockDim.x, ++j) {
+    out[head * head_dim + d] = __float2half(acc[j] * inv_l);
   }
 }
 
@@ -472,7 +490,10 @@ __global__ void attention_step_chunk_stats_kernel(const half* q, const half* k_c
   }
   __syncthreads();
 
-  float acc = 0.0f;
+  constexpr int kAccPerThread = 8;
+  float acc[kAccPerThread];
+#pragma unroll
+  for (int jj = 0; jj < kAccPerThread; ++jj) acc[jj] = 0.0f;
   for (int tile_base = chunk_start; tile_base < chunk_end; tile_base += WarpsPerBlock) {
     const int tile_tokens = min(WarpsPerBlock, chunk_end - tile_base);
 
@@ -531,12 +552,13 @@ __global__ void attention_step_chunk_stats_kernel(const half* q, const half* k_c
       const float c_prev = (running_l == 0.0f) ? 0.0f : expf(running_m - new_m);
       const float c_tile = expf(tile_m - new_m);
 
-      for (int d = tid; d < head_dim; d += blockDim.x) {
+      int j = 0;
+      for (int d = tid; d < head_dim; d += blockDim.x, ++j) {
         float tile_o = 0.0f;
         for (int i = 0; i < tile_tokens; ++i) {
           tile_o += beta_shared[i] * __half2float(v_tile[i * head_dim + d]);
         }
-        acc = acc * c_prev + tile_o * c_tile;
+        acc[j] = acc[j] * c_prev + tile_o * c_tile;
       }
       if (tid == 0) {
         stats_shared[0] = new_m;
@@ -550,9 +572,10 @@ __global__ void attention_step_chunk_stats_kernel(const half* q, const half* k_c
     chunk_m[chunk_index] = stats_shared[0];
     chunk_l[chunk_index] = stats_shared[1];
   }
-  for (int d = tid; d < head_dim; d += blockDim.x) {
+  int jo = 0;
+  for (int d = tid; d < head_dim; d += blockDim.x, ++jo) {
     chunk_o[static_cast<std::size_t>(chunk_index) * static_cast<std::size_t>(head_dim) +
-            static_cast<std::size_t>(d)] = acc;
+            static_cast<std::size_t>(d)] = acc[jo];
   }
 }
 
@@ -599,7 +622,10 @@ __global__ void attention_step_chunk_stats_device_pos_kernel(const half* q, cons
   }
   __syncthreads();
 
-  float acc = 0.0f;
+  constexpr int kAccPerThread = 8;
+  float acc[kAccPerThread];
+#pragma unroll
+  for (int jj = 0; jj < kAccPerThread; ++jj) acc[jj] = 0.0f;
   for (int tile_base = chunk_start; tile_base < chunk_end; tile_base += WarpsPerBlock) {
     const int tile_tokens = min(WarpsPerBlock, chunk_end - tile_base);
 
@@ -658,12 +684,13 @@ __global__ void attention_step_chunk_stats_device_pos_kernel(const half* q, cons
       const float c_prev = (running_l == 0.0f) ? 0.0f : expf(running_m - new_m);
       const float c_tile = expf(tile_m - new_m);
 
-      for (int d = tid; d < head_dim; d += blockDim.x) {
+      int j = 0;
+      for (int d = tid; d < head_dim; d += blockDim.x, ++j) {
         float tile_o = 0.0f;
         for (int i = 0; i < tile_tokens; ++i) {
           tile_o += beta_shared[i] * __half2float(v_tile[i * head_dim + d]);
         }
-        acc = acc * c_prev + tile_o * c_tile;
+        acc[j] = acc[j] * c_prev + tile_o * c_tile;
       }
       if (tid == 0) {
         stats_shared[0] = new_m;
@@ -677,9 +704,10 @@ __global__ void attention_step_chunk_stats_device_pos_kernel(const half* q, cons
     chunk_m[chunk_index] = stats_shared[0];
     chunk_l[chunk_index] = stats_shared[1];
   }
-  for (int d = tid; d < head_dim; d += blockDim.x) {
+  int jo = 0;
+  for (int d = tid; d < head_dim; d += blockDim.x, ++jo) {
     chunk_o[static_cast<std::size_t>(chunk_index) * static_cast<std::size_t>(head_dim) +
-            static_cast<std::size_t>(d)] = acc;
+            static_cast<std::size_t>(d)] = acc[jo];
   }
 }
 
@@ -782,7 +810,10 @@ __global__ void attention_step_chunk_stats_paged_kernel(
   }
   __syncthreads();
 
-  float acc = 0.0f;
+  constexpr int kAccPerThread = 8;
+  float acc[kAccPerThread];
+#pragma unroll
+  for (int jj = 0; jj < kAccPerThread; ++jj) acc[jj] = 0.0f;
   for (int tile_base = chunk_start; tile_base < chunk_end; tile_base += WarpsPerBlock) {
     const int tile_tokens = min(WarpsPerBlock, chunk_end - tile_base);
 
@@ -841,12 +872,13 @@ __global__ void attention_step_chunk_stats_paged_kernel(
       const float c_prev = (running_l == 0.0f) ? 0.0f : expf(running_m - new_m);
       const float c_tile = expf(tile_m - new_m);
 
-      for (int d = tid; d < head_dim; d += blockDim.x) {
+      int j = 0;
+      for (int d = tid; d < head_dim; d += blockDim.x, ++j) {
         float tile_o = 0.0f;
         for (int i = 0; i < tile_tokens; ++i) {
           tile_o += beta_shared[i] * __half2float(v_tile[i * head_dim + d]);
         }
-        acc = acc * c_prev + tile_o * c_tile;
+        acc[j] = acc[j] * c_prev + tile_o * c_tile;
       }
       if (tid == 0) {
         stats_shared[0] = new_m;
@@ -860,9 +892,10 @@ __global__ void attention_step_chunk_stats_paged_kernel(
     chunk_m[chunk_index] = stats_shared[0];
     chunk_l[chunk_index] = stats_shared[1];
   }
-  for (int d = tid; d < head_dim; d += blockDim.x) {
+  int jo = 0;
+  for (int d = tid; d < head_dim; d += blockDim.x, ++jo) {
     chunk_o[static_cast<std::size_t>(chunk_index) * static_cast<std::size_t>(head_dim) +
-            static_cast<std::size_t>(d)] = acc;
+            static_cast<std::size_t>(d)] = acc[jo];
   }
 }
 
@@ -1413,7 +1446,10 @@ __global__ void attention_step_chunk_stats_batched_kernel(
   }
   __syncthreads();
 
-  float acc = 0.0f;
+  constexpr int kAccPerThread = 8;
+  float acc[kAccPerThread];
+#pragma unroll
+  for (int jj = 0; jj < kAccPerThread; ++jj) acc[jj] = 0.0f;
   for (int tile_base = chunk_start; tile_base < chunk_end; tile_base += WarpsPerBlock) {
     const int tile_tokens = min(WarpsPerBlock, chunk_end - tile_base);
     {
@@ -1460,11 +1496,12 @@ __global__ void attention_step_chunk_stats_batched_kernel(
       const float new_m = fmaxf(running_m, tile_m);
       const float c_prev = (running_l == 0.0f) ? 0.0f : expf(running_m - new_m);
       const float c_tile = expf(tile_m - new_m);
-      for (int d = tid; d < head_dim; d += blockDim.x) {
+      int j = 0;
+      for (int d = tid; d < head_dim; d += blockDim.x, ++j) {
         float tile_o = 0.0f;
         for (int i = 0; i < tile_tokens; ++i)
           tile_o += beta_shared[i] * __half2float(v_tile[i * head_dim + d]);
-        acc = acc * c_prev + tile_o * c_tile;
+        acc[j] = acc[j] * c_prev + tile_o * c_tile;
       }
       if (tid == 0) {
         stats_shared[0] = new_m;
@@ -1477,8 +1514,9 @@ __global__ void attention_step_chunk_stats_batched_kernel(
     chunk_m[chunk_index] = stats_shared[0];
     chunk_l[chunk_index] = stats_shared[1];
   }
-  for (int d = tid; d < head_dim; d += blockDim.x)
-    chunk_o[static_cast<std::size_t>(chunk_index) * head_dim + d] = acc;
+  int jo = 0;
+  for (int d = tid; d < head_dim; d += blockDim.x, ++jo)
+    chunk_o[static_cast<std::size_t>(chunk_index) * head_dim + d] = acc[jo];
 }
 
 __global__ void attention_step_chunk_reduce_batched_kernel(const float* chunk_m,
