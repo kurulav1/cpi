@@ -787,10 +787,12 @@ function buildCliArgs(config, body) {
     ? true
     : isTruthyFlag(body.autoMaxTokens);
   const longFormMode = isTruthyFlag(body.longFormMode);
-  // Reasoning ("thinking") mode is only meaningful for thinking-capable
-  // templates (qwen3_5). When on, the model emits a <think>…</think> block
-  // before its answer, which the stream splitter separates out.
-  const thinking = requestTemplate === "qwen3_5" && isTruthyFlag(body.thinking);
+  // Reasoning ("thinking") mode: the model emits a <think>…</think> block before
+  // its answer, which the stream splitter separates out. qwen3_5 gates it on a
+  // request flag; deepseek-r1 always reasons.
+  const thinking =
+    requestTemplate === "deepseek-r1" ||
+    (requestTemplate === "qwen3_5" && isTruthyFlag(body.thinking));
   const promptBudget = computePromptBudget(maxContext, performanceMode);
 
   const promptPackage = buildPromptPackage(body.messages, {

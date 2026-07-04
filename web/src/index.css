@@ -975,3 +975,41 @@ input[type="range"] { width: 100%; accent-color: var(--accent); cursor: pointer;
 @media (max-width: 760px) {
   .chat-sidebar { display: none; }
 }
+
+/* ── Reasoning ("thinking") block ─────────────────────────────────────── */
+.reasoning {
+  margin: 0 0 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-2);
+  overflow: hidden;
+}
+.reasoning-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  width: 100%;
+  padding: 0.45rem 0.7rem;
+  background: none;
+  border: none;
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--text-3);
+  text-align: left;
+}
+.reasoning-toggle:hover { color: var(--text-2); }
+.reasoning-caret { font-size: 0.7rem; opacity: 0.8; }
+.reasoning-active .reasoning-toggle { color: var(--accent); }
+.reasoning-body {
+  padding: 0.1rem 0.8rem 0.7rem;
+  border-top: 1px solid var(--border);
+  color: var(--text-3);
+  font-size: 0.82rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 22rem;
+  overflow-y: auto;
+}

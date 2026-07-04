@@ -312,6 +312,31 @@ function CodeBlock({ language, children }) {
   );
 }
 
+// Collapsible reasoning ("thinking") block shown above a reasoning model's
+// answer. Auto-expanded while the model is still thinking (no answer yet),
+// auto-collapses once the answer starts; the user can toggle either way.
+function ReasoningBlock({ text, active }) {
+  const [open, setOpen] = useState(true);
+  const userToggled = useRef(false);
+  useEffect(() => {
+    if (!active && !userToggled.current) setOpen(false);
+  }, [active]);
+  if (!text) return null;
+  return (
+    <div className={`reasoning ${active ? "reasoning-active" : ""}`}>
+      <button
+        type="button"
+        className="reasoning-toggle"
+        onClick={() => { userToggled.current = true; setOpen((o) => !o); }}
+      >
+        <span className="reasoning-caret">{open ? "▾" : "▸"}</span>
+        {active ? "Thinking…" : "Thought process"}
+      </button>
+      {open && <div className="reasoning-body">{text}</div>}
+    </div>
+  );
+}
+
 function MsgContent({ text }) {
   const clean = formatModelMarkdown(text);
 
@@ -1459,6 +1484,16 @@ export default function App() {
             setRunMeta((prev) => ({ ...(prev || {}), state:"streaming", metrics: ev.metrics }));
             return;
           }
+          if (ev.type === "reasoning") {
+            // Reasoning (<think>) streams before the answer; accumulate directly
+            // into the message's reasoning field (rendered in a collapsible block).
+            updateMessages((cur) => cur.map((m) =>
+              m.id === asstMsg.id
+                ? { ...m, reasoning: `${m.reasoning || ""}${ev.delta}`, reasoningStreaming: true }
+                : m
+            ));
+            return;
+          }
           if (ev.type === "delta") {
             enqueueDelta(asstMsg.id, ev.delta);
           }
@@ -1466,9 +1501,12 @@ export default function App() {
       });
       flushDeltaQueue();
       const finalMessage = typeof done?.message === "string" ? done.message : "";
+      const finalReasoning = typeof done?.reasoning === "string" ? done.reasoning : "";
       updateMessages((cur) => cur.map((m) =>
         m.id === asstMsg.id
-          ? { ...m, content: finalMessage || m.content, streaming:false }
+          ? { ...m, content: finalMessage || m.content,
+              reasoning: finalReasoning || m.reasoning || "",
+              streaming:false, reasoningStreaming:false }
           : m
       ));
       setRunMeta((prev) => ({
@@ -1702,6 +1740,10 @@ export default function App() {
                     <div key={m.id} className="msg msg-asst">
                       {!m.seed && <span className="msg-who">{selProfile?.label || "Assistant"}</span>}
                       <div className="msg-asst-text">
+                        {/* Reasoning models: collapsible <think> block above the answer. */}
+                        {m.reasoning && (
+                          <ReasoningBlock text={m.reasoning} active={Boolean(m.reasoningStreaming) && !m.content} />
+                        )}
                         {/* Render markdown live while streaming too, so code
                             blocks / lists / tables format as they arrive rather
                             than only on completion. Delta updates are throttled

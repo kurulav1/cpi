@@ -8,6 +8,8 @@ const STOP_SEQUENCES = {
   phi3:     ["<|end|>", "<|user|>", "<|system|>", "<|assistant|>"],
   qwen2:    ["<|im_end|>", "<|im_start|>"],
   qwen3_5:  ["<|im_end|>", "<|im_start|>", "<|endoftext|>"],
+  // DeepSeek-R1 special tokens use U+FF5C (｜) and U+2581 (▁).
+  "deepseek-r1": ["<｜end▁of▁sentence｜>", "<｜User｜>", "<｜Assistant｜>"],
   plain:    []
 };
 
@@ -449,6 +451,26 @@ function formatQwen35(turns, systemPrompt, thinking = false) {
   return blocks.join("\n");
 }
 
+// DeepSeek-R1-Distill: a reasoning model on standard Llama/Qwen2 architecture.
+// BOS is added by the tokenizer; the system prompt (if any) is prepended raw.
+// Each pending turn primes "<｜Assistant｜><think>\n" so the model always reasons,
+// then emits </think> and the answer. Prior turns keep only the answer (reasoning
+// is stripped from history, matching DeepSeek's own template).
+function formatDeepseekR1(turns, systemPrompt) {
+  const BOS = "<｜begin▁of▁sentence｜>";
+  const U = "<｜User｜>";
+  const A = "<｜Assistant｜>";
+  const EOS = "<｜end▁of▁sentence｜>";
+  // Emit BOS literally: this tokenizer doesn't expose bos_id, so relying on the
+  // worker's add_bos would drop it, and a Llama-3 model without BOS degenerates.
+  let out = BOS + (systemPrompt ? systemPrompt : "");
+  for (const turn of turns) {
+    out += `${U}${turn.user}`;
+    out += turn.assistant ? `${A}${turn.assistant}${EOS}` : `${A}<think>\n`;
+  }
+  return out;
+}
+
 function formatPlain(turns, systemPrompt) {
   const lines = [`System: ${systemPrompt}`];
 
@@ -571,6 +593,18 @@ export function buildPromptPackage(messages, options = {}) {
       thinking: Boolean(options.thinking),
       stopTexts: STOP_SEQUENCES.qwen3_5,
       addBos: false
+    };
+  }
+
+  if (template === "deepseek-r1") {
+    return {
+      messages: chatMessages,
+      // R1 recommends no system prompt; only forward an explicit one.
+      prompt: formatDeepseekR1(turns, hasExplicitSystemPrompt ? systemPrompt : ""),
+      template,
+      thinking: true,  // R1 always emits a <think> block
+      stopTexts: STOP_SEQUENCES["deepseek-r1"],
+      addBos: false    // BOS token is emitted literally in the prompt
     };
   }
 

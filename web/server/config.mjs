@@ -892,6 +892,11 @@ function inferTemplateFromChatTemplate(chatTemplate) {
   const raw = String(chatTemplate || "").trim();
   if (!raw) return "";
 
+  // DeepSeek-R1 (and its distills) use <｜User｜>/<｜Assistant｜> (U+FF5C) reasoning
+  // format on standard Llama/Qwen2 architecture.
+  if (raw.includes("<｜Assistant｜>") && raw.includes("<｜User｜>")) {
+    return "deepseek-r1";
+  }
   if (raw.includes("<|im_start|>") && raw.includes("<|im_end|>") && raw.includes("<think>")) {
     return "qwen3_5";
   }
