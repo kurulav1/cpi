@@ -891,6 +891,30 @@ int Qwen35CudaEngine::sample_next_token(float temperature, const std::vector<int
                              : (logit * options_.repetition_penalty);
     }
   }
+  // No-repeat n-gram blocking: if the current (n-1)-token suffix has occurred
+  // before, ban the tokens that followed it (-inf). Breaks the exact-repetition
+  // loops reasoning models fall into ("Wait, the question is X. Wait, the
+  // question is X. …"), which top-k + repetition-penalty alone don't stop.
+  if (options_.no_repeat_ngram_size > 1 &&
+      history.size() + 1 >= static_cast<std::size_t>(options_.no_repeat_ngram_size)) {
+    const std::size_t suffix = static_cast<std::size_t>(options_.no_repeat_ngram_size - 1);
+    const std::size_t hs = history.size();
+    for (std::size_t start = 0; start + suffix < hs; ++start) {
+      bool eq = true;
+      for (std::size_t j = 0; j < suffix; ++j) {
+        if (history[start + j] != history[hs - suffix + j]) {
+          eq = false;
+          break;
+        }
+      }
+      if (eq) {
+        const int banned = history[start + suffix];
+        if (banned >= 0 && banned < cfg_.vocab_size) {
+          logits[static_cast<std::size_t>(banned)] = -std::numeric_limits<float>::infinity();
+        }
+      }
+    }
+  }
   // Grammar constraint: mask tokens that cannot continue the schema-valid JSON.
   // Masked entries become -inf, so both the argmax and the sampling path below
   // exclude them without any further change.
@@ -917,6 +941,25 @@ int Qwen35CudaEngine::sample_next_token(float temperature, const std::vector<int
   }
   if (sum <= 0.0f) return ids[0];
   for (float& p : probs) p /= sum;
+  // Top-p (nucleus): keep the smallest high-probability set covering top_p, drop
+  // the tail, renormalize. ids/probs are already in descending-logit order.
+  if (options_.top_p > 0.0f && options_.top_p < 1.0f) {
+    float cum = 0.0f;
+    int cutoff = k;
+    for (int i = 0; i < k; ++i) {
+      cum += probs[static_cast<std::size_t>(i)];
+      if (cum >= options_.top_p) {
+        cutoff = i + 1;
+        break;
+      }
+    }
+    float renorm = 0.0f;
+    for (int i = 0; i < cutoff; ++i) renorm += probs[static_cast<std::size_t>(i)];
+    for (int i = cutoff; i < k; ++i) probs[static_cast<std::size_t>(i)] = 0.0f;
+    if (renorm > 0.0f) {
+      for (int i = 0; i < cutoff; ++i) probs[static_cast<std::size_t>(i)] /= renorm;
+    }
+  }
   static thread_local std::mt19937 rng(std::random_device{}());
   std::uniform_real_distribution<float> dist(0.0f, 1.0f);
   const float draw = dist(rng);
