@@ -33,8 +33,13 @@ public:
   std::vector<int> encode(const std::string& text, bool add_bos) const;
 
   // Decodes a sequence of token IDs back into a UTF-8 string.
-  // Byte-fallback tokens are collapsed back into their original bytes.
+  // Byte-fallback tokens are collapsed back into their original bytes. Non-
+  // special added tokens (e.g. "</think>") are emitted as their literal text;
+  // special tokens (BOS/EOS/…) are dropped.
   std::string decode(const std::vector<int>& ids) const;
+  // Byte-level/SentencePiece decode of a run of ordinary vocab ids (no added/
+  // special token handling); used by decode() between added-token boundaries.
+  std::string decode_run(const std::vector<int>& ids) const;
 
   // Returns the beginning-of-sequence token ID, or -1 if not present in vocab.
   int bos_id() const {

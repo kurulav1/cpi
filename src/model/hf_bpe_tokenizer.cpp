@@ -8,6 +8,8 @@
 #include <queue>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
+#include <unordered_set>
 
 // Implements HfBpeTokenizer: a self-contained BPE tokenizer that loads
 // HuggingFace tokenizer.json files without depending on the transformers
@@ -1026,6 +1028,38 @@ std::vector<int> HfBpeTokenizer::encode(const std::string& text, bool add_bos) c
 // Out-of-range ids are silently skipped to gracefully handle truncated or
 // otherwise malformed id sequences.
 std::string HfBpeTokenizer::decode(const std::vector<int>& ids) const {
+  // Emit non-special added tokens (e.g. "</think>") as literal text, drop
+  // special ones (EOS/BOS/…), and byte-level-decode ordinary runs in between.
+  // Reasoning models rely on "</think>" being visible so the answer can be
+  // separated from the chain of thought.
+  std::unordered_set<int> special(special_ids_.begin(), special_ids_.end());
+  std::unordered_map<int, std::string> visible;
+  for (const auto& [content, id] : added_tokens_) {
+    if (!special.count(id)) visible.emplace(id, content);
+  }
+  if (visible.empty()) {
+    return decode_run(ids);  // fast path: no visible added tokens for this model
+  }
+
+  std::string out;
+  std::vector<int> run;
+  run.reserve(ids.size());
+  for (int id : ids) {
+    const auto vit = visible.find(id);
+    if (vit != visible.end()) {
+      if (!run.empty()) { out += decode_run(run); run.clear(); }
+      out += vit->second;
+    } else if (special.count(id)) {
+      if (!run.empty()) { out += decode_run(run); run.clear(); }
+    } else {
+      run.push_back(id);
+    }
+  }
+  if (!run.empty()) out += decode_run(run);
+  return out;
+}
+
+std::string HfBpeTokenizer::decode_run(const std::vector<int>& ids) const {
   std::string raw;
   raw.reserve(ids.size() * 4);
 
