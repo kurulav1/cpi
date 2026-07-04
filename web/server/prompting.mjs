@@ -429,13 +429,20 @@ function formatQwen2(turns, systemPrompt) {
   return blocks.join("\n");
 }
 
-function formatQwen35(turns, systemPrompt) {
+function formatQwen35(turns, systemPrompt, thinking = false) {
   const blocks = [`<|im_start|>system\n${systemPrompt}<|im_end|>`];
   for (const turn of turns) {
     blocks.push(`<|im_start|>user\n${turn.user}<|im_end|>`);
     if (turn.assistant) {
+      // Prior turns carry only the answer; the reasoning block is ephemeral and
+      // deliberately not fed back (matches Qwen3's reasoning_content handling).
       blocks.push(`<|im_start|>assistant\n${turn.assistant}<|im_end|>`);
+    } else if (thinking) {
+      // Thinking on: open the block so the model generates its reasoning and
+      // then emits </think> followed by the answer.
+      blocks.push("<|im_start|>assistant\n<think>\n");
     } else {
+      // Thinking off: prime an empty block so the model answers directly.
       blocks.push("<|im_start|>assistant\n<think>\n\n</think>\n\n");
     }
   }
@@ -559,8 +566,9 @@ export function buildPromptPackage(messages, options = {}) {
   if (template === "qwen3_5") {
     return {
       messages: chatMessages,
-      prompt: formatQwen35(turns, effectiveSystemPrompt),
+      prompt: formatQwen35(turns, effectiveSystemPrompt, Boolean(options.thinking)),
       template,
+      thinking: Boolean(options.thinking),
       stopTexts: STOP_SEQUENCES.qwen3_5,
       addBos: false
     };

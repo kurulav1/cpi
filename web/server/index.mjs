@@ -172,16 +172,19 @@ function familyOutputBudget(profile) {
   if (family === "qwen3_5" || family === "qwen2") {
     return {
       brief: 96,
-      factual: 160,
-      structured: 256,
-      code: 448,
-      normal: 256,
-      continuation: 320,
-      long: 768,
-      longCode: 768,
-      longContinuation: 1024,
-      cautiousLongContext: 256,
-      hardCap: 1536
+      factual: 192,
+      structured: 448,
+      code: 1024,
+      normal: 512,
+      continuation: 640,
+      long: 2048,
+      longCode: 2560,
+      longContinuation: 3072,
+      // Keep this >= the largest non-explicitLong budget (code) so the
+      // maxContext>=8192 clamp doesn't crush ordinary code/answers to a stub;
+      // explicitLong requests bypass the clamp and use long*/hardCap.
+      cautiousLongContext: 1024,
+      hardCap: 3072
     };
   }
   return {
@@ -784,6 +787,10 @@ function buildCliArgs(config, body) {
     ? true
     : isTruthyFlag(body.autoMaxTokens);
   const longFormMode = isTruthyFlag(body.longFormMode);
+  // Reasoning ("thinking") mode is only meaningful for thinking-capable
+  // templates (qwen3_5). When on, the model emits a <think>…</think> block
+  // before its answer, which the stream splitter separates out.
+  const thinking = requestTemplate === "qwen3_5" && isTruthyFlag(body.thinking);
   const promptBudget = computePromptBudget(maxContext, performanceMode);
 
   const promptPackage = buildPromptPackage(body.messages, {
@@ -791,7 +798,8 @@ function buildCliArgs(config, body) {
     systemPrompt: requestSystemPrompt,
     historyStrategy: policy.historyStrategy,
     maxTurns: promptBudget.maxTurns,
-    maxChars: promptBudget.maxChars
+    maxChars: promptBudget.maxChars,
+    thinking
   });
 
   if (!promptPackage.prompt) {
@@ -851,6 +859,7 @@ function buildCliArgs(config, body) {
       maxContext,
       autoMaxTokens,
       longFormMode,
+      thinking,
       temperature,
       performanceMode,
       quantMode,
@@ -2352,6 +2361,40 @@ app.post("/api/generate", async (req, res) => {
 //   { type: "error", error: "..." }         (on failure)
 //
 // Request body: same as /api/generate
+// Incrementally splits a thinking model's stream at the first "</think>".
+// The prompt primes the opening "<think>", so the stream starts in reasoning;
+// everything up to </think> is reasoning, the rest (after a trailing blank line)
+// is the answer. Buffers a short tail so a </think> split across token
+// boundaries is still detected.
+function makeThinkingSplitter({ onReasoning, onContent }) {
+  const CLOSE = "</think>";
+  let inReasoning = true;
+  let buf = "";
+  return {
+    push(delta) {
+      if (!inReasoning) { onContent(delta); return; }
+      buf += delta;
+      const idx = buf.indexOf(CLOSE);
+      if (idx === -1) {
+        const keep = CLOSE.length - 1;
+        if (buf.length > keep) {
+          onReasoning(buf.slice(0, buf.length - keep));
+          buf = buf.slice(buf.length - keep);
+        }
+        return;
+      }
+      if (idx > 0) onReasoning(buf.slice(0, idx));
+      inReasoning = false;
+      const after = buf.slice(idx + CLOSE.length).replace(/^\n+/, "");
+      buf = "";
+      if (after) onContent(after);
+    },
+    flush() {
+      if (inReasoning && buf) { onReasoning(buf); buf = ""; }
+    }
+  };
+}
+
 app.post("/api/chat/stream", async (req, res) => {
   const config = getRuntimeConfig();
   if (!guardReady(config, res)) return;
@@ -2435,11 +2478,28 @@ app.post("/api/chat/stream", async (req, res) => {
     return;
   }
 
+  // Thinking mode: the model streams "<reasoning>…</think>\n\n<answer>" (the
+  // opening <think> was primed into the prompt). Split reasoning from the answer
+  // on the fly and emit them as separate event kinds so the UI can collapse the
+  // reasoning. Answer-only text is what lands in the message history.
+  let answerText = "";
+  let reasoningText = "";
+  const splitter = cliConfig.meta.thinking
+    ? makeThinkingSplitter({
+        onReasoning: (r) => { reasoningText += r; writeNdjson(res, { type: "reasoning", delta: r }); },
+        onContent: (c) => { answerText += c; writeNdjson(res, { type: "delta", delta: c }); }
+      })
+    : null;
+
   const { cancel } = runGeneration(config, cliConfig, {
     onStart: (meta) => writeNdjson(res, { type: "start", ...meta }),
-    onDelta: (delta) => writeNdjson(res, { type: "delta", delta }),
+    onDelta: (delta) => {
+      if (splitter) splitter.push(delta);
+      else writeNdjson(res, { type: "delta", delta });
+    },
     onMetrics: (metrics) => writeNdjson(res, { type: "metrics", metrics }),
     onDone: ({ text, elapsedMs, generatedTokens, tokPerS, decodeMs, decodeTokPerS, metrics }) => {
+      if (splitter) splitter.flush();
       writeNdjson(res, {
         type: "done",
         elapsedMs,
@@ -2448,7 +2508,8 @@ app.post("/api/chat/stream", async (req, res) => {
         decodeMs,
         decodeTokPerS,
         metrics: metrics || null,
-        message: text
+        message: splitter ? answerText : text,
+        reasoning: splitter ? reasoningText : undefined
       });
       res.end();
     },
