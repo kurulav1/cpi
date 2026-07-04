@@ -47,6 +47,7 @@ const STORAGE_KEYS = Object.freeze({
   theme: "cpi_theme",
   autoMaxTokens: "cpi_auto_max_tokens",
   longFormMode: "cpi_long_form_mode",
+  thinking: "cpi_thinking",
   chats: "cpi_chats",
   activeChat: "cpi_active_chat"
 });
@@ -1028,6 +1029,7 @@ export default function App() {
     quantMode: "none",
     autoMaxTokens: safeStorageGet(STORAGE_KEYS.autoMaxTokens, "1") !== "0",
     longFormMode: safeStorageGet(STORAGE_KEYS.longFormMode, "0") === "1",
+    thinking: safeStorageGet(STORAGE_KEYS.thinking, "0") === "1",
     performanceMode: (() => {
       return safeStorageGet(STORAGE_KEYS.perfMode) === "1";
     })()
@@ -1222,6 +1224,10 @@ export default function App() {
   useEffect(() => {
     safeStorageSet(STORAGE_KEYS.longFormMode, settings.longFormMode ? "1" : "0");
   }, [settings.longFormMode]);
+
+  useEffect(() => {
+    safeStorageSet(STORAGE_KEYS.thinking, settings.thinking ? "1" : "0");
+  }, [settings.thinking]);
 
   // Warm selected model immediately so first response avoids a full cold start.
   useEffect(() => {
@@ -1849,6 +1855,24 @@ export default function App() {
                         : "Manual upper bound for generated tokens."}
                     </p>
                   </div>
+
+                  {settings.template === "qwen3_5" && (
+                    <div className="field">
+                      <label className="field-label">Reasoning</label>
+                      <label className="field-check">
+                        <input
+                          type="checkbox"
+                          checked={Boolean(settings.thinking)}
+                          onChange={(e) => setSettings((c) => ({ ...c, thinking: e.target.checked }))}
+                        />
+                        <span>Let the model think before answering.</span>
+                      </label>
+                      <p className="field-help">
+                        Streams a collapsible chain-of-thought above the answer. Slower, but
+                        stronger on math and multi-step questions.
+                      </p>
+                    </div>
+                  )}
 
                   <div className="field">
                     <label className="field-label">Long-form mode</label>

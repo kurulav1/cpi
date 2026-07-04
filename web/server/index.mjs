@@ -202,7 +202,7 @@ function familyOutputBudget(profile) {
   };
 }
 
-function computeDynamicMaxNewTokens(body, profile, maxContext) {
+function computeDynamicMaxNewTokens(body, profile, maxContext, thinking = false) {
   const latestUser = lastUserMessage(body.messages);
   const instructions = instructionText(body.messages);
   const combined = `${instructions}\n${latestUser}`.toLowerCase();
@@ -249,6 +249,16 @@ function computeDynamicMaxNewTokens(body, profile, maxContext) {
 
   if (Number(maxContext) >= 8192 && !explicitLong) {
     recommended = Math.min(recommended, budget.cautiousLongContext);
+  }
+
+  if (thinking) {
+    // The <think> block is emitted before the answer and draws from the same
+    // budget, so an ordinary answer allotment (e.g. 192 for a short factual)
+    // would be entirely consumed by reasoning, starving the answer. Add
+    // headroom for the reasoning pass on top of the answer, with a floor so the
+    // answer always has room. Applied after the cautious-context clamp so it is
+    // not crushed back down; the final hardCap clamp keeps it bounded.
+    recommended = Math.max(recommended + 768, 1024);
   }
 
   return Math.round(clampNumber(recommended, 32, budget.hardCap, budget.normal));
@@ -818,7 +828,7 @@ function buildCliArgs(config, body) {
   const hasExplicitMaxTokens =
     explicitMaxTokens !== undefined && explicitMaxTokens !== null;
   const maxNewTokens = (autoMaxTokens && !hasExplicitMaxTokens)
-    ? computeDynamicMaxNewTokens(body, selectedProfile, maxContext)
+    ? computeDynamicMaxNewTokens(body, selectedProfile, maxContext, thinking)
     : Math.round(clampNumber(explicitMaxTokens, 32, 4096, config.maxNewTokens));
   // min_new_tokens: suppress EOS until this many tokens are generated (prevents
   // early greedy truncation on collapsed/repeated runs). Clamped to [0, max].

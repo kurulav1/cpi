@@ -45,6 +45,7 @@ export async function streamChat({ messages, settings, signal, onEvent }) {
     maxNewTokens: settings.maxNewTokens,
     autoMaxTokens: Boolean(settings.autoMaxTokens),
     longFormMode: Boolean(settings.longFormMode),
+    thinking: Boolean(settings.thinking),
     maxContext: settings.maxContext,
     performanceMode: Boolean(settings.performanceMode),
     quantMode: settings.quantMode || "none"
