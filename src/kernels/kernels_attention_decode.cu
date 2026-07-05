@@ -1355,12 +1355,17 @@ __device__ __forceinline__ void gqa_split_chunk_stats_batched_core(
   const half* q_seq = q + (static_cast<std::size_t>(b) * num_heads + q_head) * HeadDim;
 
   // Phase 1: stage this group's query heads + the chunk's paged K tile (once,
-  // reused across all group_size warps).
+  // reused across all group_size warps). Vectorized int4 (8-half) loads: each
+  // token's HeadDim slice is contiguous and 16-byte aligned (HeadDim % 8 == 0),
+  // so 8 halves move per instruction — full-width HBM transactions vs scalar.
+  constexpr int kHd8 = HeadDim / 8;  // int4 chunks per token
+  int4* kv4 = reinterpret_cast<int4*>(kv_tile);
   for (int d = lane; d < HeadDim; d += 32) q_sh[warp_id * HeadDim + d] = q_seq[d];
-  for (int idx = tid; idx < tile_tokens * HeadDim; idx += blockDim.x) {
-    const int t = idx / HeadDim;
-    const int d = idx - t * HeadDim;
-    kv_tile[idx] = k_pool[cache_index(phys_row0 + t, kv_head, 0, num_kv_heads, HeadDim) + d];
+  for (int i8 = tid; i8 < tile_tokens * kHd8; i8 += blockDim.x) {
+    const int t = i8 / kHd8;
+    const int c = i8 - t * kHd8;
+    const int base = cache_index(phys_row0 + t, kv_head, 0, num_kv_heads, HeadDim);
+    kv4[i8] = reinterpret_cast<const int4*>(k_pool + base)[c];
   }
   __syncthreads();
 
@@ -1388,12 +1393,13 @@ __device__ __forceinline__ void gqa_split_chunk_stats_batched_core(
   w_sh[warp_id * block_size + lane] = weight;
   __syncthreads();  // all warps done reading K; safe to overwrite the tile with V
 
-  // Phase 2: stage the paged V tile into the SAME buffer, then weighted V sum
-  // (each lane owns HeadDim/32 output channels).
-  for (int idx = tid; idx < tile_tokens * HeadDim; idx += blockDim.x) {
-    const int t = idx / HeadDim;
-    const int d = idx - t * HeadDim;
-    kv_tile[idx] = v_pool[cache_index(phys_row0 + t, kv_head, 0, num_kv_heads, HeadDim) + d];
+  // Phase 2: stage the paged V tile into the SAME buffer (vectorized int4), then
+  // weighted V sum (each lane owns HeadDim/32 output channels).
+  for (int i8 = tid; i8 < tile_tokens * kHd8; i8 += blockDim.x) {
+    const int t = i8 / kHd8;
+    const int c = i8 - t * kHd8;
+    const int base = cache_index(phys_row0 + t, kv_head, 0, num_kv_heads, HeadDim);
+    kv4[i8] = reinterpret_cast<const int4*>(v_pool + base)[c];
   }
   __syncthreads();
 
