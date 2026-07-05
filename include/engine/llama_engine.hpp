@@ -99,9 +99,12 @@ public:
   std::vector<std::pair<int, float>> inspect_next_logits(const std::vector<int>& prompt_tokens,
                                                          int top_k);
 
-  // Runs a numerical parity check on the model's outputs for prompt_tokens,
-  // printing diagnostic information to stdout.  Used for regression testing.
-  void run_parity_check(const std::vector<int>& prompt_tokens);
+  // Runs a numerical parity check of the GPU decode forward against an
+  // independent CPU-reference forward for prompt_tokens, printing max_abs_diff and
+  // the top-token match. Returns true when the GPU and CPU argmax agree AND the
+  // max logit diff is within tolerance — i.e. a pass/fail gate for verifying that
+  // a forward-path change (e.g. kernel fusion) preserved correctness.
+  bool run_parity_check(const std::vector<int>& prompt_tokens);
 
   // Returns the BenchmarkStats collected during the most recent generate() or
   // generate_stream() call.

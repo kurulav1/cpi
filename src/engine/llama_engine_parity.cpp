@@ -99,7 +99,7 @@ void rope_cpu(std::vector<float>* q, std::vector<float>* k, int num_heads_q, int
 
 }  // namespace
 
-void LlamaEngine::run_parity_check(const std::vector<int>& prompt_tokens) {
+bool LlamaEngine::run_parity_check(const std::vector<int>& prompt_tokens) {
   if (prompt_tokens.empty()) {
     LLAMA_ENGINE_THROW("parity check requires non-empty prompt");
   }
@@ -166,6 +166,11 @@ void LlamaEngine::run_parity_check(const std::vector<int>& prompt_tokens) {
       const auto* wq = tensor_half(weights_, p + ".attention.wq");
       const auto* wk = tensor_half(weights_, p + ".attention.wk");
       const auto* wv = tensor_half(weights_, p + ".attention.wv");
+      // Fused QKV bias [q_hidden | kv_hidden | kv_hidden] (e.g. Qwen2), applied
+      // after the q/k/v projections. Absent for Llama-family.
+      const auto* bqkv = weights_.has_tensor(p + ".attention.bqkv")
+                             ? tensor_half(weights_, p + ".attention.bqkv")
+                             : nullptr;
       const auto* wo = tensor_half(weights_, p + ".attention.wo");
       const auto* bo = weights_.has_tensor(p + ".attention.bo")
                            ? tensor_half(weights_, p + ".attention.bo")
@@ -182,6 +187,13 @@ void LlamaEngine::run_parity_check(const std::vector<int>& prompt_tokens) {
       matvec_rowmajor(wq, x_norm, q_hidden, hidden, &q);
       matvec_rowmajor(wk, x_norm, kv_hidden, hidden, &k);
       matvec_rowmajor(wv, x_norm, kv_hidden, hidden, &v);
+      if (bqkv) {
+        for (int i = 0; i < q_hidden; ++i) q[static_cast<std::size_t>(i)] += __half2float(bqkv[i]);
+        for (int i = 0; i < kv_hidden; ++i)
+          k[static_cast<std::size_t>(i)] += __half2float(bqkv[q_hidden + i]);
+        for (int i = 0; i < kv_hidden; ++i)
+          v[static_cast<std::size_t>(i)] += __half2float(bqkv[q_hidden + kv_hidden + i]);
+      }
       const float parity_rope_theta =
           (options_.rope_theta > 0.0f) ? options_.rope_theta : cfg.effective_rope_theta();
       rope_cpu(&q, &k, cfg.num_heads, cfg.num_kv_heads, head_dim, pos, parity_rope_theta);
@@ -279,8 +291,19 @@ void LlamaEngine::run_parity_check(const std::vector<int>& prompt_tokens) {
       static_cast<int>(std::max_element(cpu_logits.begin(), cpu_logits.end()) - cpu_logits.begin());
   const int gpu_top =
       static_cast<int>(std::max_element(gpu_logits.begin(), gpu_logits.end()) - gpu_logits.begin());
+  // The GPU (fp16/cuBLAS) and CPU (float) forwards never match bit-for-bit, so the
+  // gate is: argmax agrees (the greedy output is unchanged) AND the max logit diff
+  // is within a loose sanity bound (a real forward bug diverges by >> this). To
+  // verify a forward-path change (fusion) preserved correctness, run before and
+  // after and confirm PASS with an unchanged max_abs_diff.
+  constexpr double kMaxAbsTol = 5.0;
+  const bool pass = (cpu_top == gpu_top) && (max_abs < kMaxAbsTol);
   std::cout << "[parity] top_token_cpu=" << cpu_top << " top_token_gpu=" << gpu_top << "\n";
   std::cout << "[parity] max_abs_diff=" << max_abs << " mean_abs_diff=" << mean_abs << "\n";
+  std::cout << "[parity] " << (pass ? "PASS" : "FAIL") << " (argmax "
+            << (cpu_top == gpu_top ? "match" : "MISMATCH") << ", max_abs " << max_abs << " tol "
+            << kMaxAbsTol << ")\n";
+  return pass;
 }
 
 }  // namespace engine

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <filesystem>
 #include <iostream>
@@ -257,7 +258,11 @@ int main(int argc, char** argv) {
 #if LLAMA_ENGINE_HAS_CUDA
       if constexpr (std::is_same_v<std::decay_t<decltype(eng)>, engine::LlamaEngine>) {
         if (cli.parity_check) {
-          eng.run_parity_check(prompt_tokens);
+          // Pure gate: run the check and exit 0 (PASS) / 1 (FAIL) so a script/CI
+          // can verify a forward-path change preserved correctness.
+          const bool ok = eng.run_parity_check(prompt_tokens);
+          std::cout.flush();
+          std::exit(ok ? 0 : 1);
         }
         if (cli.batched_check > 0) {
           eng.run_batched_decode_check(prompt_tokens, cli.batched_check);
