@@ -1439,8 +1439,18 @@ function batchWorkerEnabled() {
 // models. Anything else (runtime int8/int4, pre-packed streaming weights, MoE)
 // must fall back to the single-flight worker, which can run them. Deciding this
 // on the Node side lets a request route to the right worker instead of failing.
+// Families that run on their own engine (NOT LlamaEngine) can't be batched: the
+// --interactive-batch loop is LlamaEngine-only (see main.cpp), so the worker
+// would load the model but never speak the batch protocol and hang the request.
+const NON_LLAMA_ENGINE_FAMILIES = new Set(["qwen3_5", "llama4", "cpt_gpt"]);
+
 function isBatchCompatible(cliConfig) {
   const p = cliConfig.profile || {};
+  // Grammar-constrained requests aren't plumbed through the batch worker (the
+  // submit drops json_schema), so they must run single-flight to be enforced.
+  if (cliConfig.jsonSchema) return false;
+  const family = String(p.family || cliConfig.meta?.template || "").toLowerCase();
+  if (NON_LLAMA_ENGINE_FAMILIES.has(family)) return false;                  // separate engine
   if (cliConfig.quantMode && cliConfig.quantMode !== "none") return false; // runtime quantization
   const label = String(p.label || "").toLowerCase();
   if (label.includes("streaming")) return false;                           // streamed weights
@@ -2450,9 +2460,10 @@ app.post("/api/chat/stream", async (req, res) => {
         stopTexts: cliConfig.stopTexts,
         addBos: cliConfig.addBos,
         onDelta: (delta) => { if (!ended) writeNdjson(res, { type: "delta", delta }); },
-        onDone: ({ text }) => finish(() => writeNdjson(res, {
-          type: "done", message: text, elapsedMs: Date.now() - startedAt,
-          generatedTokens: null, tokPerS: null, metrics: null
+        onDone: ({ text, generated, tokPerS, elapsedMs }) => finish(() => writeNdjson(res, {
+          type: "done", message: text, elapsedMs: elapsedMs ?? (Date.now() - startedAt),
+          generatedTokens: generated ?? null, tokPerS: tokPerS ?? null,
+          decodeTokPerS: tokPerS ?? null, metrics: null
         })),
         onError: (err) => finish(() => writeNdjson(res, { type: "error", error: err.message || String(err) }))
       });

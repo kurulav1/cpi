@@ -66,7 +66,10 @@ export function createBatchWorker({ bin, args, env, cwd, onReadyError }) {
         pending.delete(id);
         req.onDone?.({
           text: typeof ev.text === "string" ? ev.text : req.text,
-          finishReason: ev.finish_reason || "stop"
+          finishReason: ev.finish_reason || "stop",
+          generated: typeof ev.generated === "number" ? ev.generated : null,
+          elapsedMs: typeof ev.elapsed_ms === "number" ? ev.elapsed_ms : null,
+          tokPerS: typeof ev.tok_per_s === "number" ? ev.tok_per_s : null
         });
         break;
       case "error":

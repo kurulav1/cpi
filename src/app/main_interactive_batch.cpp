@@ -15,7 +15,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <deque>
 #include <iostream>
 #include <mutex>
@@ -128,6 +130,7 @@ void run_interactive_batch(engine::LlamaEngine& eng, model::Tokenizer& tokenizer
   struct DetokState {
     std::vector<int> ids;
     std::string prev_text;
+    std::chrono::steady_clock::time_point t0;  // decode start (for tok/s)
   };
   std::unordered_map<std::string, DetokState> detok;
 
@@ -169,7 +172,9 @@ void run_interactive_batch(engine::LlamaEngine& eng, model::Tokenizer& tokenizer
     for (auto& in : admits) {
       try {
         eng.stream_admit(in.id, in.tokens, in.params);
-        detok[in.id] = DetokState{};
+        DetokState st;
+        st.t0 = std::chrono::steady_clock::now();
+        detok[in.id] = std::move(st);
         write_event("start", in.id, "");
       } catch (const std::exception& e) {
         write_event("error", in.id, "\"error\":\"" + json_escape(e.what()) + "\"");
@@ -197,9 +202,17 @@ void run_interactive_batch(engine::LlamaEngine& eng, model::Tokenizer& tokenizer
         it->second.prev_text = decoded;
       }
       if (e.finished) {
+        const int gen = static_cast<int>(it->second.ids.size());
+        const double ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - it->second.t0)
+                              .count();
+        const double tps = ms > 0.0 ? (gen * 1000.0 / ms) : 0.0;
+        char nums[160];
+        std::snprintf(nums, sizeof(nums),
+                      ",\"generated\":%d,\"elapsed_ms\":%.1f,\"tok_per_s\":%.2f", gen, ms, tps);
         write_event("done", e.id,
                     "\"finish_reason\":\"" + std::string(e.finish_reason) + "\",\"text\":\"" +
-                        json_escape(it->second.prev_text) + "\"");
+                        json_escape(it->second.prev_text) + "\"" + nums);
         detok.erase(it);
       }
     }
