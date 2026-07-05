@@ -8,8 +8,10 @@
 // of bug that corrupted Qwen3.5's head_dim=256 attention) is caught: at 256 the
 // buggy kernel scored cosine ≈ 0.65 against this oracle, far below the gate.
 //
-// Both the tiled path (no scratch) and the split-K path (scratch provided) are
-// exercised, so whichever the dispatch selects must match the reference.
+// Exercises all four host decode-attention launches against the reference: the
+// tiled and split-K paths, plus their device-position variants (the CUDA-graph
+// decode path used by the daily driver, where seq_len is read from device
+// memory). All must match the same reference.
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -102,7 +104,7 @@ int main() {
   };
 
   int failures = 0, cases = 0;
-  std::printf("%-16s %-6s %-8s  %-9s  %-9s  %s\n", "config", "seq", "path", "cosine", "max_abs",
+  std::printf("%-16s %-6s %-11s  %-9s  %-9s  %s\n", "config", "seq", "path", "cosine", "max_abs",
               "result");
   std::printf("--------------------------------------------------------------------------\n");
 
@@ -135,14 +137,33 @@ int main() {
       CK(cudaMalloc(&so, static_cast<std::size_t>(c.num_heads) * scratch_chunks * c.head_dim *
                              sizeof(float)));
 
-      for (int path = 0; path < 2; ++path) {
-        const bool split = (path == 1);
-        if (split) {
-          kernels::launch_attention_step(dq, dk, dv, dout, seq_len, c.num_heads, c.num_kv_heads,
-                                         c.head_dim, 0, sm, sl, so, scratch_chunks, true);
-        } else {
+      // Device position for the CUDA-graph capture variant: seq_len = pos[0]+1.
+      int* dpos;
+      const int pos_val = seq_len - 1;
+      CK(cudaMalloc(&dpos, sizeof(int)));
+      CK(cudaMemcpy(dpos, &pos_val, sizeof(int), cudaMemcpyHostToDevice));
+
+      // Paths: host tiled / host split-K / device-pos tiled / device-pos split-K.
+      // The device-pos launches (the CUDA-graph decode path used by the daily
+      // driver) forward to the same cores; covering them here guards that path
+      // directly rather than only by construction.
+      const char* labels[4] = {"tiled", "split-K", "dpos-tiled", "dpos-splitK"};
+      for (int path = 0; path < 4; ++path) {
+        const bool split = (path == 1 || path == 3);
+        const bool device_pos = (path >= 2);
+        if (!device_pos && !split) {
           kernels::launch_attention_step(dq, dk, dv, dout, seq_len, c.num_heads, c.num_kv_heads,
                                          c.head_dim, 0);
+        } else if (!device_pos && split) {
+          kernels::launch_attention_step(dq, dk, dv, dout, seq_len, c.num_heads, c.num_kv_heads,
+                                         c.head_dim, 0, sm, sl, so, scratch_chunks, true);
+        } else if (device_pos && !split) {
+          kernels::launch_attention_step_device_pos(dq, dk, dv, dout, dpos, c.num_heads,
+                                                    c.num_kv_heads, c.head_dim, 0);
+        } else {
+          kernels::launch_attention_step_device_pos(dq, dk, dv, dout, dpos, c.num_heads,
+                                                    c.num_kv_heads, c.head_dim, 0, sm, sl, so,
+                                                    scratch_chunks, true);
         }
         CK(cudaDeviceSynchronize());
         std::vector<half> got(out_elems);
@@ -161,8 +182,8 @@ int main() {
         const bool pass = cos > kCosGate;
         if (!pass) ++failures;
         ++cases;
-        std::printf("%-16s %-6d %-8s  %-9.5f  %-9.2e  %s\n", c.label, seq_len,
-                    split ? "split-K" : "tiled", cos, max_abs, pass ? "PASS" : "FAIL <<<");
+        std::printf("%-16s %-6d %-11s  %-9.5f  %-9.2e  %s\n", c.label, seq_len, labels[path], cos,
+                    max_abs, pass ? "PASS" : "FAIL <<<");
       }
 
       cudaFree(dq);
@@ -172,6 +193,7 @@ int main() {
       cudaFree(sm);
       cudaFree(sl);
       cudaFree(so);
+      cudaFree(dpos);
     }
   }
 
