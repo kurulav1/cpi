@@ -21,11 +21,18 @@ Measured baseline 2026-07-05 (Qwen2.5 7B target + 0.5B draft, 5090, code prompt)
   target alone      92.3 tok/s
   spec K=4  101 tok/s (1.10x)  accept 0.72  3.28 tok/round
   spec K=5  103 tok/s (1.11x)  accept 0.67  3.77 tok/round
-Round cost attributed: ~19 ms draft (5 x 3.75 ms, graphed) + ~18 ms verify.
-Bottleneck = draft step is ~5.6x off its memory roofline (launch-overhead-bound);
-acceptance is already good. Getting to ~2x needs a much cheaper draft step
-(kernel fusion / fewer launches) or tree speculation (more tokens/round without
-more sequential draft steps).
+Round cost attributed (K=5): ~19 ms draft + ~18 ms verify. Acceptance is already
+good (3.6 tok/round would be ~3.6x if free) — the wall is overhead, split two
+ways with DIFFERENT causes:
+  - Draft (5 x 3.75 ms): the 0.5B draft IS graphed (greedy_decode_graph enabled),
+    so launches are amortized. 3.75 ms is genuine execution of ~900 tiny kernels
+    (each a few us even under graph replay) — ~5.6x off the ~0.67 ms weight
+    roofline. Lever: reduce kernel COUNT (forward-path fusion). Large effort.
+  - Verify (~18 ms): run_batched_chunk (~37 kernel launches) is NOT graphed, so
+    it pays full per-round launch overhead. Lever: capture it in a fixed-K CUDA
+    graph (CPI already graphs single-token decode). Tractable, ~1.2x.
+No single change reaches 2x: it needs verify-graphing (~1.2x, tractable) + draft
+forward-fusion (large) + possibly tree speculation. Each modest, all real work.
 """
 import argparse
 import os
