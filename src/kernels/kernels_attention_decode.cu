@@ -1543,7 +1543,14 @@ __global__ void attention_step_chunk_reduce_batched_kernel(const float* chunk_m,
   const int head = blockIdx.x;
   const int tid = threadIdx.x;
   const int chunk_count = (seq_lens[b] + chunk_size - 1) / chunk_size;
-  float acc = 0.0f, running_m = neg_inf<float>(), running_l = 0.0f;
+  // One accumulator per head_dim element this thread owns: head_dim can exceed
+  // blockDim (256 with 128 threads), so a scalar acc would conflate the strided
+  // output dims. Unlike the non-batched split-K reduce (head_dim==128 gated),
+  // this kernel runs at any head_dim, so the array is required for correctness.
+  float acc[kAccPerThread];
+#pragma unroll
+  for (int i = 0; i < kAccPerThread; ++i) acc[i] = 0.0f;
+  float running_m = neg_inf<float>(), running_l = 0.0f;
   for (int chunk = 0; chunk < chunk_count; ++chunk) {
     if (tid == 0) {
       const int idx = (b * num_heads + head) * scratch_chunks + chunk;
@@ -1561,12 +1568,15 @@ __global__ void attention_step_chunk_reduce_batched_kernel(const float* chunk_m,
     const float alpha = scale_shared[0], beta = scale_shared[1];
     const std::size_t base =
         (static_cast<std::size_t>(b * num_heads + head) * scratch_chunks + chunk) * head_dim;
-    for (int d = tid; d < head_dim; d += blockDim.x) acc = acc * alpha + chunk_o[base + d] * beta;
+    int j = 0;
+    for (int d = tid; d < head_dim; d += blockDim.x, ++j)
+      acc[j] = acc[j] * alpha + chunk_o[base + d] * beta;
     __syncthreads();
   }
   const float inv_l = 1.0f / fmaxf(scale_shared[2], 1e-8f);
   half* out_seq = out + (static_cast<std::size_t>(b) * num_heads + head) * head_dim;
-  for (int d = tid; d < head_dim; d += blockDim.x) out_seq[d] = __float2half(acc * inv_l);
+  int j = 0;
+  for (int d = tid; d < head_dim; d += blockDim.x, ++j) out_seq[d] = __float2half(acc[j] * inv_l);
 }
 
 void launch_attention_step_batched_paged(const half* q, const half* k_pool, const half* v_pool,

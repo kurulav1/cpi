@@ -305,6 +305,22 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
   )
   add_test(NAME attention_reference_parity_test COMMAND attention_reference_parity_test)
 
+  # Reference-oracle batched paged decode attention parity (Phase 0, serving
+  # path): independent naive reference vs launch_attention_step_batched_paged
+  # across head_dim ∈ {128,256}, catching head_dim > blockDim bugs in the batched
+  # split-K reduce that only manifest under batched serving.
+  add_executable(batched_paged_attention_reference_parity_test
+    src/tests/batched_paged_attention_reference_parity_test.cu
+  )
+  target_include_directories(batched_paged_attention_reference_parity_test PRIVATE include)
+  target_link_libraries(batched_paged_attention_reference_parity_test PRIVATE llama_engine)
+  set_target_properties(batched_paged_attention_reference_parity_test PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+  )
+  add_test(NAME batched_paged_attention_reference_parity_test
+           COMMAND batched_paged_attention_reference_parity_test)
+
   # Paged split-K decode attention parity (P3 phase 2b): paged == contiguous.
   add_executable(paged_attention_parity_test
     src/tests/paged_attention_parity_test.cu
