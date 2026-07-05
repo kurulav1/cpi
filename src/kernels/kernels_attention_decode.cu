@@ -38,6 +38,16 @@ __device__ __forceinline__ int cache_index(int t, int head, int d, int num_heads
   return (t * num_heads + head) * head_dim + d;
 }
 
+// Largest head_dim routed to the tiled/split-K decode kernels (see the dispatch
+// in launch_attention_step*). These kernels give each thread a fixed-size
+// per-head_dim accumulator array of kAccPerThread floats; the block runs
+// WarpsPerBlock*32 threads, so it covers head_dim up to WarpsPerBlock*32*kAccPerThread.
+// Each kernel static_asserts that bound against kTiledMaxHeadDim, so raising the
+// cap without growing the accumulator is a build error, not silent corruption
+// (the head_dim=256 bug this guards against scored cosine ~0.65 vs a reference).
+constexpr int kTiledMaxHeadDim = 256;
+constexpr int kAccPerThread = 8;
+
 __global__ void attention_step_kernel_fallback(const half* q, const half* k_cache,
                                                const half* v_cache, half* out, int seq_len,
                                                int num_heads, int num_kv_heads, int head_dim) {
@@ -224,9 +234,11 @@ __global__ void attention_step_kernel_tiled(const half* q, const half* k_cache, 
 
   // One output accumulator per head_dim element this thread owns. head_dim can
   // exceed blockDim (e.g. head_dim=256 with 128 threads → 2 elements/thread), so
-  // a scalar acc would conflate the strided output dims. kAccPerThread covers
-  // head_dim up to blockDim*8.
-  constexpr int kAccPerThread = 8;
+  // a scalar acc would conflate the strided output dims. The static_assert ties
+  // the accumulator size to the dispatch cap so raising kTiledMaxHeadDim without
+  // growing kAccPerThread fails the build instead of silently corrupting output.
+  static_assert(WarpsPerBlock * 32 * kAccPerThread >= kTiledMaxHeadDim,
+                "tiled decode accumulator too small for kTiledMaxHeadDim");
   float acc[kAccPerThread];
 #pragma unroll
   for (int j = 0; j < kAccPerThread; ++j) acc[j] = 0.0f;
@@ -357,9 +369,11 @@ __global__ void attention_step_kernel_tiled_device_pos(const half* q, const half
 
   // One output accumulator per head_dim element this thread owns. head_dim can
   // exceed blockDim (e.g. head_dim=256 with 128 threads → 2 elements/thread), so
-  // a scalar acc would conflate the strided output dims. kAccPerThread covers
-  // head_dim up to blockDim*8.
-  constexpr int kAccPerThread = 8;
+  // a scalar acc would conflate the strided output dims. The static_assert ties
+  // the accumulator size to the dispatch cap so raising kTiledMaxHeadDim without
+  // growing kAccPerThread fails the build instead of silently corrupting output.
+  static_assert(WarpsPerBlock * 32 * kAccPerThread >= kTiledMaxHeadDim,
+                "tiled decode accumulator too small for kTiledMaxHeadDim");
   float acc[kAccPerThread];
 #pragma unroll
   for (int j = 0; j < kAccPerThread; ++j) acc[j] = 0.0f;
@@ -490,7 +504,6 @@ __global__ void attention_step_chunk_stats_kernel(const half* q, const half* k_c
   }
   __syncthreads();
 
-  constexpr int kAccPerThread = 8;
   float acc[kAccPerThread];
 #pragma unroll
   for (int jj = 0; jj < kAccPerThread; ++jj) acc[jj] = 0.0f;
@@ -622,7 +635,6 @@ __global__ void attention_step_chunk_stats_device_pos_kernel(const half* q, cons
   }
   __syncthreads();
 
-  constexpr int kAccPerThread = 8;
   float acc[kAccPerThread];
 #pragma unroll
   for (int jj = 0; jj < kAccPerThread; ++jj) acc[jj] = 0.0f;
@@ -810,7 +822,6 @@ __global__ void attention_step_chunk_stats_paged_kernel(
   }
   __syncthreads();
 
-  constexpr int kAccPerThread = 8;
   float acc[kAccPerThread];
 #pragma unroll
   for (int jj = 0; jj < kAccPerThread; ++jj) acc[jj] = 0.0f;
@@ -1186,10 +1197,10 @@ __device__ __forceinline__ void gqa_split_chunk_stats_core(const half* q, const 
   const int tile_tokens = chunk_end - chunk_start;
 
   extern __shared__ unsigned char smem_bytes[];
-  half* q_sh = reinterpret_cast<half*>(smem_bytes);                          // group_size*HeadDim
-  half* k_tile = q_sh + group_size * HeadDim;                                // chunk_size*HeadDim
-  half* v_tile = k_tile + chunk_size * HeadDim;                              // chunk_size*HeadDim
-  float* w_sh = reinterpret_cast<float*>(v_tile + chunk_size * HeadDim);     // group_size*chunk_size
+  half* q_sh = reinterpret_cast<half*>(smem_bytes);                       // group_size*HeadDim
+  half* k_tile = q_sh + group_size * HeadDim;                             // chunk_size*HeadDim
+  half* v_tile = k_tile + chunk_size * HeadDim;                           // chunk_size*HeadDim
+  float* w_sh = reinterpret_cast<float*>(v_tile + chunk_size * HeadDim);  // group_size*chunk_size
 
   const int tid = threadIdx.x;
   const int warp_id = tid / 32;
@@ -1253,10 +1264,12 @@ __device__ __forceinline__ void gqa_split_chunk_stats_core(const half* q, const 
 }
 
 template <int HeadDim>
-__global__ void attention_step_chunk_stats_gqa_split_kernel(
-    const half* q, const half* k_cache, const half* v_cache, float* chunk_m, float* chunk_l,
-    float* chunk_o, int seq_len, int num_kv_heads, int group_size, int chunk_size,
-    int scratch_chunks) {
+__global__ void attention_step_chunk_stats_gqa_split_kernel(const half* q, const half* k_cache,
+                                                            const half* v_cache, float* chunk_m,
+                                                            float* chunk_l, float* chunk_o,
+                                                            int seq_len, int num_kv_heads,
+                                                            int group_size, int chunk_size,
+                                                            int scratch_chunks) {
   gqa_split_chunk_stats_core<HeadDim>(q, k_cache, v_cache, chunk_m, chunk_l, chunk_o, seq_len,
                                       num_kv_heads, group_size, chunk_size, scratch_chunks);
 }
@@ -1319,7 +1332,8 @@ void launch_attention_step(const half* q, const half* k_cache, const half* v_cac
     if (gqa) {
       const int group_size_val = num_heads / num_kv_heads;
       const std::size_t smem_gqa =
-          static_cast<std::size_t>(group_size_val + 2 * split_chunk_size) * head_dim * sizeof(half) +
+          static_cast<std::size_t>(group_size_val + 2 * split_chunk_size) * head_dim *
+              sizeof(half) +
           static_cast<std::size_t>(group_size_val) * split_chunk_size * sizeof(float);
       const dim3 grid(num_kv_heads, chunk_count);
       attention_step_chunk_stats_gqa_split_kernel<128>
@@ -1341,7 +1355,7 @@ void launch_attention_step(const half* q, const half* k_cache, const half* v_cac
     return;
   }
 
-  if (head_dim > 0 && (head_dim % 2) == 0 && head_dim <= 256) {
+  if (head_dim > 0 && (head_dim % 2) == 0 && head_dim <= kTiledMaxHeadDim) {
     if (head_dim <= 64) {
       constexpr int warps = 2;
       constexpr int threads = warps * 32;
@@ -1446,7 +1460,6 @@ __global__ void attention_step_chunk_stats_batched_kernel(
   }
   __syncthreads();
 
-  constexpr int kAccPerThread = 8;
   float acc[kAccPerThread];
 #pragma unroll
   for (int jj = 0; jj < kAccPerThread; ++jj) acc[jj] = 0.0f;
@@ -1628,7 +1641,8 @@ void launch_attention_step_device_pos(const half* q, const half* k_cache, const 
     if (gqa) {
       const int group_size_val = num_heads / num_kv_heads;
       const std::size_t smem_gqa =
-          static_cast<std::size_t>(group_size_val + 2 * split_chunk_size) * head_dim * sizeof(half) +
+          static_cast<std::size_t>(group_size_val + 2 * split_chunk_size) * head_dim *
+              sizeof(half) +
           static_cast<std::size_t>(group_size_val) * split_chunk_size * sizeof(float);
       const dim3 grid(num_kv_heads, scratch_chunks);
       attention_step_chunk_stats_gqa_split_device_pos_kernel<128>
@@ -1650,7 +1664,7 @@ void launch_attention_step_device_pos(const half* q, const half* k_cache, const 
     return;
   }
 
-  if (head_dim > 0 && (head_dim % 2) == 0 && head_dim <= 256) {
+  if (head_dim > 0 && (head_dim % 2) == 0 && head_dim <= kTiledMaxHeadDim) {
     if (head_dim <= 64) {
       constexpr int warps = 2;
       constexpr int threads = warps * 32;

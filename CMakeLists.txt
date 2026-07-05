@@ -290,6 +290,21 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
   )
   add_test(NAME moe_kernel_parity_test COMMAND moe_kernel_parity_test)
 
+  # Reference-oracle decode attention parity (Phase 0 safety net): the kernel
+  # output is compared against an independent naive float reference across
+  # head_dim ∈ {64,128,256} and GQA ratios, catching head_dim > blockDim bugs
+  # that self-consistency tests miss.
+  add_executable(attention_reference_parity_test
+    src/tests/attention_reference_parity_test.cu
+  )
+  target_include_directories(attention_reference_parity_test PRIVATE include)
+  target_link_libraries(attention_reference_parity_test PRIVATE llama_engine)
+  set_target_properties(attention_reference_parity_test PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+  )
+  add_test(NAME attention_reference_parity_test COMMAND attention_reference_parity_test)
+
   # Paged split-K decode attention parity (P3 phase 2b): paged == contiguous.
   add_executable(paged_attention_parity_test
     src/tests/paged_attention_parity_test.cu
