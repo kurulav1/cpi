@@ -184,13 +184,16 @@ __global__ void attention_step_kernel_fallback_device_pos(const half* q, const h
   }
 }
 
-// Tiled decode attention keeps the query resident in shared memory, stages one
-// value tile at a time, and merges tile-local softmax statistics so the block
-// avoids a fully serial per-token expf chain.
+// Shared online-softmax tiled decode-attention core. Keeps the query resident in
+// shared memory, stages one value tile at a time, and merges tile-local softmax
+// statistics so the block avoids a fully serial per-token expf chain. seq_len is
+// resolved by the caller, so the host kernel and the CUDA-graph device-position
+// kernel share this one body.
 template <int WarpsPerBlock>
-__global__ void attention_step_kernel_tiled(const half* q, const half* k_cache, const half* v_cache,
-                                            half* out, int seq_len, int num_heads, int num_kv_heads,
-                                            int head_dim) {
+__device__ __forceinline__ void attention_step_tiled_core(const half* q, const half* k_cache,
+                                                          const half* v_cache, half* out,
+                                                          int seq_len, int num_heads,
+                                                          int num_kv_heads, int head_dim) {
   // Shared-memory layout:
   //   half  q_shared[head_dim]
   //   float score_shared[WarpsPerBlock]
@@ -324,134 +327,25 @@ __global__ void attention_step_kernel_tiled(const half* q, const half* k_cache, 
   }
 }
 
-// Device-position variant of the tiled decode path above. The sequence length
-// is read from device memory so the kernel can be captured in a CUDA Graph.
+// Host tiled decode kernel: seq_len is a runtime argument.
+template <int WarpsPerBlock>
+__global__ void attention_step_kernel_tiled(const half* q, const half* k_cache, const half* v_cache,
+                                            half* out, int seq_len, int num_heads, int num_kv_heads,
+                                            int head_dim) {
+  attention_step_tiled_core<WarpsPerBlock>(q, k_cache, v_cache, out, seq_len, num_heads,
+                                           num_kv_heads, head_dim);
+}
+
+// Device-position variant for CUDA-graph capture: seq_len is read from device
+// memory (position_ptr[0]+1) so the launch stays graph-safe as the sequence
+// grows. The body is shared via attention_step_tiled_core.
 template <int WarpsPerBlock>
 __global__ void attention_step_kernel_tiled_device_pos(const half* q, const half* k_cache,
                                                        const half* v_cache, half* out,
                                                        const int* position_ptr, int num_heads,
                                                        int num_kv_heads, int head_dim) {
-  const int seq_len = position_ptr[0] + 1;
-  extern __shared__ unsigned char smem_bytes[];
-  half* q_shared = reinterpret_cast<half*>(smem_bytes);
-  float* score_shared = reinterpret_cast<float*>(q_shared + head_dim);
-  float* beta_shared = score_shared + WarpsPerBlock;
-  float* stats_shared = beta_shared + WarpsPerBlock;  // [running_m, running_l, tile_m, tile_l]
-  half* v_tile = reinterpret_cast<half*>(stats_shared + 4);
-
-  const int head = blockIdx.x;
-  const int tid = threadIdx.x;
-  const int warp_id = tid / warpSize;
-  const int lane = tid % warpSize;
-  const float scale = rsqrtf(static_cast<float>(head_dim));
-  const int kv_heads_safe = (num_kv_heads > 0) ? num_kv_heads : 1;
-  const int group_size = ((num_heads / kv_heads_safe) > 0) ? (num_heads / kv_heads_safe) : 1;
-  const int kv_head =
-      ((head / group_size) < kv_heads_safe) ? (head / group_size) : (kv_heads_safe - 1);
-  const int head_pairs = head_dim / 2;
-
-  for (int d = tid; d < head_dim; d += blockDim.x) {
-    q_shared[d] = q[head * head_dim + d];
-  }
-  if (tid == 0) {
-    stats_shared[0] = -1.0e30f;
-    stats_shared[1] = 0.0f;
-  }
-  __syncthreads();
-
-  // One output accumulator per head_dim element this thread owns. head_dim can
-  // exceed blockDim (e.g. head_dim=256 with 128 threads → 2 elements/thread), so
-  // a scalar acc would conflate the strided output dims. The static_assert ties
-  // the accumulator size to the dispatch cap so raising kTiledMaxHeadDim without
-  // growing kAccPerThread fails the build instead of silently corrupting output.
-  static_assert(WarpsPerBlock * 32 * kAccPerThread >= kTiledMaxHeadDim,
-                "tiled decode accumulator too small for kTiledMaxHeadDim");
-  float acc[kAccPerThread];
-#pragma unroll
-  for (int j = 0; j < kAccPerThread; ++j) acc[j] = 0.0f;
-  for (int tile_base = 0; tile_base < seq_len; tile_base += WarpsPerBlock) {
-    const int tile_tokens = min(WarpsPerBlock, seq_len - tile_base);
-
-    // Phase 1a: each warp computes the K dot Q score for one token in the tile.
-    {
-      const int t = tile_base + warp_id;
-      float score = -1.0e30f;
-      if (warp_id < tile_tokens) {
-        const int base = cache_index(t, kv_head, 0, num_kv_heads, head_dim);
-        const half2* q2 = reinterpret_cast<const half2*>(q_shared);
-        const half2* k2 = reinterpret_cast<const half2*>(k_cache + base);
-        float partial = 0.0f;
-        for (int pair = lane; pair < head_pairs; pair += warpSize) {
-          const float2 qv = __half22float2(q2[pair]);
-          const float2 kv = __half22float2(k2[pair]);
-          partial += qv.x * kv.x + qv.y * kv.y;
-        }
-        score = warp_sum(partial) * scale;
-      }
-      if (lane == 0 && warp_id < tile_tokens) {
-        score_shared[warp_id] = score;
-      }
-    }
-
-    // Phase 1b: stage V tile into shared memory (all threads participate)
-    {
-      for (int i = 0; i < tile_tokens; ++i) {
-        const int base = cache_index(tile_base + i, kv_head, 0, num_kv_heads, head_dim);
-        for (int d = tid; d < head_dim; d += blockDim.x) {
-          v_tile[i * head_dim + d] = v_cache[base + d];
-        }
-      }
-    }
-    __syncthreads();
-
-    // Phase 2: tile-local softmax weights with no dependency on running state.
-    if (tid == 0) {
-      float tile_m = -1.0e30f;
-      for (int i = 0; i < tile_tokens; ++i) {
-        tile_m = fmaxf(tile_m, score_shared[i]);
-      }
-      float tile_l = 0.0f;
-      for (int i = 0; i < tile_tokens; ++i) {
-        const float b = expf(score_shared[i] - tile_m);
-        beta_shared[i] = b;
-        tile_l += b;
-      }
-      stats_shared[2] = tile_m;
-      stats_shared[3] = tile_l;
-    }
-    __syncthreads();
-
-    // Phase 3: parallel tile accumulation + tile-level stats merge (2 expf/tile)
-    {
-      const float tile_m = stats_shared[2];
-      const float tile_l = stats_shared[3];
-      const float running_m = stats_shared[0];
-      const float running_l = stats_shared[1];
-      const float new_m = fmaxf(running_m, tile_m);
-      const float c_prev = (running_l == 0.0f) ? 0.0f : expf(running_m - new_m);
-      const float c_tile = expf(tile_m - new_m);
-
-      int j = 0;
-      for (int d = tid; d < head_dim; d += blockDim.x, ++j) {
-        float tile_o = 0.0f;
-        for (int i = 0; i < tile_tokens; ++i) {
-          tile_o += beta_shared[i] * __half2float(v_tile[i * head_dim + d]);
-        }
-        acc[j] = acc[j] * c_prev + tile_o * c_tile;
-      }
-      if (tid == 0) {
-        stats_shared[0] = new_m;
-        stats_shared[1] = running_l * c_prev + tile_l * c_tile;
-      }
-    }
-    __syncthreads();
-  }
-
-  const float inv_l = 1.0f / fmaxf(stats_shared[1], 1e-8f);
-  int j = 0;
-  for (int d = tid; d < head_dim; d += blockDim.x, ++j) {
-    out[head * head_dim + d] = __float2half(acc[j] * inv_l);
-  }
+  attention_step_tiled_core<WarpsPerBlock>(q, k_cache, v_cache, out, position_ptr[0] + 1, num_heads,
+                                           num_kv_heads, head_dim);
 }
 
 // Split-K decode, pass 1: each block computes softmax statistics and an
