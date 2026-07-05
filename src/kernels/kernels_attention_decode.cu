@@ -1310,6 +1310,109 @@ __global__ void attention_step_chunk_reduce_batched_kernel(const float* chunk_m,
   for (int d = tid; d < head_dim; d += blockDim.x, ++j) out_seq[d] = __float2half(acc[j] * inv_l);
 }
 
+// Batched + paged GQA-shared variant of split-K pass 1. grid = (num_kv_heads,
+// chunk, batch); blockDim = group_size*32 (one warp per query head in the KV
+// group). Each block loads one KV chunk ONCE into shared and reuses it across the
+// group's query heads, so KV traffic drops by group_size vs the per-query-head
+// batched kernel (which re-reads each KV token once per head). chunk_size ==
+// block_size (<= 32): chunk c of sequence b maps to physical block
+// block_tables[b][c] and lane t owns token t within it. Writes per-query-head
+// partials in the exact layout attention_step_chunk_reduce_batched_kernel
+// consumes, so pass 2 is unchanged.
+template <int HeadDim>
+__device__ __forceinline__ void gqa_split_chunk_stats_batched_core(
+    const half* q, const half* k_pool, const half* v_pool, const int* __restrict__ block_tables,
+    const int* __restrict__ seq_lens, int max_blocks, float* chunk_m, float* chunk_l,
+    float* chunk_o, int num_heads, int num_kv_heads, int group_size, int block_size,
+    int scratch_chunks) {
+  const int b = blockIdx.z;
+  const int seq_len = seq_lens[b];
+  const int kv_head = blockIdx.x;
+  const int chunk = blockIdx.y;
+  const int chunk_start = chunk * block_size;
+  if (chunk_start >= seq_len) return;
+  const int chunk_end = min(chunk_start + block_size, seq_len);
+  const int tile_tokens = chunk_end - chunk_start;
+
+  extern __shared__ unsigned char smem_bytes[];
+  half* q_sh = reinterpret_cast<half*>(smem_bytes);                       // group_size*HeadDim
+  half* k_tile = q_sh + group_size * HeadDim;                             // block_size*HeadDim
+  half* v_tile = k_tile + block_size * HeadDim;                           // block_size*HeadDim
+  float* w_sh = reinterpret_cast<float*>(v_tile + block_size * HeadDim);  // group_size*block_size
+
+  const int tid = threadIdx.x;
+  const int warp_id = tid / 32;
+  const int lane = tid & 31;
+  const float scale = rsqrtf(static_cast<float>(HeadDim));
+  const int q_head = kv_head * group_size + warp_id;
+
+  const int* block_table = block_tables + static_cast<std::size_t>(b) * max_blocks;
+  const int phys_row0 = block_table[chunk] * block_size;  // physical row of token 0 in this chunk
+  const half* q_seq = q + (static_cast<std::size_t>(b) * num_heads + q_head) * HeadDim;
+
+  // Load this group's query heads and the chunk's paged K/V tile once, reused
+  // across all group_size warps.
+  for (int d = lane; d < HeadDim; d += 32) q_sh[warp_id * HeadDim + d] = q_seq[d];
+  for (int idx = tid; idx < tile_tokens * HeadDim; idx += blockDim.x) {
+    const int t = idx / HeadDim;
+    const int d = idx - t * HeadDim;
+    const int base = cache_index(phys_row0 + t, kv_head, 0, num_kv_heads, HeadDim);
+    k_tile[idx] = k_pool[base + d];
+    v_tile[idx] = v_pool[base + d];
+  }
+  __syncthreads();
+
+  // Each warp handles one query head; lane t scores token t against shared K.
+  float score = neg_inf<float>();
+  if (lane < tile_tokens) {
+    const half2* qh = reinterpret_cast<const half2*>(q_sh + warp_id * HeadDim);
+    const half2* kt = reinterpret_cast<const half2*>(k_tile + lane * HeadDim);
+    float dot = 0.0f;
+#pragma unroll
+    for (int p = 0; p < HeadDim / 2; ++p) {
+      const float2 a = __half22float2(qh[p]);
+      const float2 bb = __half22float2(kt[p]);
+      dot += a.x * bb.x + a.y * bb.y;
+    }
+    score = dot * scale;
+  }
+  float tile_m = score;
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) tile_m = fmaxf(tile_m, __shfl_xor_sync(0xffffffffu, tile_m, o));
+  const float weight = (lane < tile_tokens) ? expf(score - tile_m) : 0.0f;
+  float tile_l = weight;
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) tile_l += __shfl_xor_sync(0xffffffffu, tile_l, o);
+  w_sh[warp_id * block_size + lane] = weight;
+  __syncwarp();
+
+  // Weighted V sum: each lane owns HeadDim/32 output channels.
+  const int chunk_index = (b * num_heads + q_head) * scratch_chunks + chunk;
+#pragma unroll
+  for (int i = 0; i < HeadDim / 32; ++i) {
+    const int d = lane + i * 32;
+    float o = 0.0f;
+    for (int t = 0; t < tile_tokens; ++t)
+      o += w_sh[warp_id * block_size + t] * __half2float(v_tile[t * HeadDim + d]);
+    chunk_o[static_cast<std::size_t>(chunk_index) * HeadDim + d] = o;
+  }
+  if (lane == 0) {
+    chunk_m[chunk_index] = tile_m;
+    chunk_l[chunk_index] = tile_l;
+  }
+}
+
+template <int HeadDim>
+__global__ void attention_step_chunk_stats_gqa_split_batched_kernel(
+    const half* q, const half* k_pool, const half* v_pool, const int* __restrict__ block_tables,
+    const int* __restrict__ seq_lens, int max_blocks, float* chunk_m, float* chunk_l,
+    float* chunk_o, int num_heads, int num_kv_heads, int group_size, int block_size,
+    int scratch_chunks) {
+  gqa_split_chunk_stats_batched_core<HeadDim>(q, k_pool, v_pool, block_tables, seq_lens, max_blocks,
+                                              chunk_m, chunk_l, chunk_o, num_heads, num_kv_heads,
+                                              group_size, block_size, scratch_chunks);
+}
+
 void launch_attention_step_batched_paged(const half* q, const half* k_pool, const half* v_pool,
                                          const int* block_tables, const int* seq_lens,
                                          int max_blocks, int max_seq_len, half* out, int batch,
@@ -1318,14 +1421,41 @@ void launch_attention_step_batched_paged(const half* q, const half* k_pool, cons
                                          float* scratch_l, float* scratch_o, int scratch_chunks) {
   constexpr int warps = 4;
   constexpr int threads = warps * 32;
-  const std::size_t smem = static_cast<std::size_t>(head_dim) * sizeof(half) +
-                           static_cast<std::size_t>(2 * warps + 4) * sizeof(float) +
-                           static_cast<std::size_t>(warps * head_dim) * sizeof(half);
   const int chunk_count = min(scratch_chunks, (max_seq_len + block_size - 1) / block_size);
-  const dim3 grid(num_heads, chunk_count, batch);
-  attention_step_chunk_stats_batched_kernel<warps><<<grid, threads, smem, stream>>>(
-      q, k_pool, v_pool, block_tables, seq_lens, max_blocks, scratch_m, scratch_l, scratch_o,
-      num_heads, num_kv_heads, head_dim, block_size, scratch_chunks);
+
+  // GQA-shared path: one block per (KV head, chunk, sequence) with group_size
+  // warps sharing each KV tile, cutting KV traffic by group_size. Requires a real
+  // GQA group, block_size <= 32 (lane owns one token), and group_size <= 32 (warps
+  // per block). Gated to head_dim==128: at head_dim==256 the shared K+V tile is
+  // ~32 KB, which crushes SM occupancy and makes the staging cost exceed the
+  // traffic saved (measured net regression at batch 32) — so head_dim==256 keeps
+  // the per-query-head kernel until a lower-smem variant exists (e.g. sub-tiling
+  // the block or not staging V). At head_dim==128 the tile is ~16 KB and the
+  // shared path is ~1.7-2.2x at batch 8-32.
+  const int kv_hs = (num_kv_heads > 0) ? num_kv_heads : 1;
+  const int group_size = num_heads / kv_hs;
+  const bool gqa_shared = num_kv_heads > 0 && group_size > 1 && (num_heads % kv_hs) == 0 &&
+                          block_size <= 32 && group_size <= 32 && head_dim == 128;
+  if (gqa_shared) {
+    const int threads_g = group_size * 32;
+    const std::size_t smem_g = (static_cast<std::size_t>(group_size) * head_dim +
+                                2 * static_cast<std::size_t>(block_size) * head_dim) *
+                                   sizeof(half) +
+                               static_cast<std::size_t>(group_size) * block_size * sizeof(float);
+    const dim3 grid_g(num_kv_heads, chunk_count, batch);
+    attention_step_chunk_stats_gqa_split_batched_kernel<128><<<grid_g, threads_g, smem_g, stream>>>(
+        q, k_pool, v_pool, block_tables, seq_lens, max_blocks, scratch_m, scratch_l, scratch_o,
+        num_heads, num_kv_heads, group_size, block_size, scratch_chunks);
+  } else {
+    const std::size_t smem = static_cast<std::size_t>(head_dim) * sizeof(half) +
+                             static_cast<std::size_t>(2 * warps + 4) * sizeof(float) +
+                             static_cast<std::size_t>(warps * head_dim) * sizeof(half);
+    const dim3 grid(num_heads, chunk_count, batch);
+    attention_step_chunk_stats_batched_kernel<warps><<<grid, threads, smem, stream>>>(
+        q, k_pool, v_pool, block_tables, seq_lens, max_blocks, scratch_m, scratch_l, scratch_o,
+        num_heads, num_kv_heads, head_dim, block_size, scratch_chunks);
+  }
+
   const dim3 rgrid(num_heads, batch);
   attention_step_chunk_reduce_batched_kernel<<<rgrid, threads, 0, stream>>>(
       scratch_m, scratch_l, scratch_o, out, seq_lens, num_heads, head_dim, block_size,
