@@ -2436,10 +2436,13 @@ app.post("/api/chat/stream", async (req, res) => {
     let ended = false;
     const startedAt = Date.now();
     const finish = (fn) => { if (!ended) { ended = true; fn(); res.end(); } };
+    let batchReqId = null;
+    let activeWorker = null;
     try {
-      const worker = await getBatchWorker(config, cliConfig);
-      worker.submit({
-        id: randomUUID(),
+      activeWorker = await getBatchWorker(config, cliConfig);
+      batchReqId = randomUUID();
+      activeWorker.submit({
+        id: batchReqId,
         prompt: cliConfig.prompt,
         maxNew: cliConfig.meta.maxNewTokens,
         minNew: cliConfig.meta.minNewTokens ?? 0,
@@ -2456,9 +2459,14 @@ app.post("/api/chat/stream", async (req, res) => {
     } catch (err) {
       finish(() => writeNdjson(res, { type: "error", error: err.message || String(err) }));
     }
-    // v1: no per-request cancel on disconnect (the batch worker keeps decoding);
-    // the response is simply abandoned.
-    onDisconnect(req, res, () => { ended = true; });
+    // On client disconnect, cancel the request so the worker evicts it from the
+    // batch and frees its KV blocks/slot instead of decoding into the void.
+    onDisconnect(req, res, () => {
+      ended = true;
+      if (activeWorker && batchReqId) {
+        try { activeWorker.cancel(batchReqId); } catch { /* ignore */ }
+      }
+    });
     return;
   }
 

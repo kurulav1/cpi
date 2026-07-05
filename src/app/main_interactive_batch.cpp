@@ -60,6 +60,7 @@ void run_interactive_batch(engine::LlamaEngine& eng, model::Tokenizer& tokenizer
   std::mutex q_mu;
   std::condition_variable q_cv;
   std::deque<Incoming> queue;
+  std::deque<std::string> cancels;  // ids to cancel (client disconnected)
   std::atomic<bool> shutdown{false};
 
   // Reader thread: parse stdin request lines into the queue. Blocks on getline;
@@ -70,6 +71,16 @@ void run_interactive_batch(engine::LlamaEngine& eng, model::Tokenizer& tokenizer
       if (line.empty()) continue;
       const std::string id = json_get_string(line, "id");
       if (json_get_bool(line, "shutdown", false)) break;
+      // Cancel command: {"cancel":"<id>"} — reclaim a disconnected request.
+      const std::string cancel_id = json_get_string(line, "cancel");
+      if (!cancel_id.empty()) {
+        {
+          std::lock_guard<std::mutex> lk(q_mu);
+          cancels.push_back(cancel_id);
+        }
+        q_cv.notify_all();
+        continue;
+      }
       try {
         Incoming in;
         in.id = id;
@@ -123,16 +134,37 @@ void run_interactive_batch(engine::LlamaEngine& eng, model::Tokenizer& tokenizer
   while (true) {
     // Admit any queued requests (prefill happens inside stream_admit).
     std::vector<Incoming> admits;
+    std::vector<std::string> cancel_ids;
     {
       std::unique_lock<std::mutex> lk(q_mu);
-      if (queue.empty() && eng.stream_active() == 0) {
+      if (queue.empty() && cancels.empty() && eng.stream_active() == 0) {
         if (shutdown.load()) break;
-        q_cv.wait(lk, [&]() { return !queue.empty() || shutdown.load(); });
+        q_cv.wait(lk, [&]() { return !queue.empty() || !cancels.empty() || shutdown.load(); });
+      }
+      while (!cancels.empty()) {
+        cancel_ids.push_back(std::move(cancels.front()));
+        cancels.pop_front();
+      }
+      // Drop cancelled requests still waiting in the queue (cancel beat admit).
+      if (!cancel_ids.empty() && !queue.empty()) {
+        std::deque<Incoming> kept;
+        while (!queue.empty()) {
+          if (std::find(cancel_ids.begin(), cancel_ids.end(), queue.front().id) == cancel_ids.end())
+            kept.push_back(std::move(queue.front()));
+          queue.pop_front();
+        }
+        queue.swap(kept);
       }
       while (!queue.empty()) {
         admits.push_back(std::move(queue.front()));
         queue.pop_front();
       }
+    }
+    // Apply cancels for already-running requests (frees their KV blocks).
+    for (const auto& cid : cancel_ids) {
+      const bool evicted = eng.stream_cancel(cid);
+      detok.erase(cid);
+      std::cerr << "[batch] cancel " << cid << (evicted ? " (evicted)" : " (not running)") << "\n";
     }
     for (auto& in : admits) {
       try {

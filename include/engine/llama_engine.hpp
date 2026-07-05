@@ -413,6 +413,10 @@ public:
   // params/grammar; appends one StreamEvent per running request. Retires and
   // frees blocks for finished requests. Returns false if nothing is running.
   bool stream_step(std::vector<StreamEvent>& events);
+  // Cancel a running request by id: removes it from the batch and frees its paged
+  // blocks (RAII). Returns true if the id was running. Used to reclaim serving
+  // capacity when a client disconnects mid-generation.
+  bool stream_cancel(const std::string& id);
   // Number of requests currently running.
   int stream_active() const;
 

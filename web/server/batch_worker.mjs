@@ -124,6 +124,19 @@ export function createBatchWorker({ bin, args, env, cwd, onReadyError }) {
     });
   };
 
+  // Cancel an in-flight request (client disconnected): tell the worker to evict
+  // it from the batch (frees its KV blocks + slot) and drop our handlers so its
+  // callbacks stop firing. Safe to call for an unknown/finished id.
+  const cancel = (id) => {
+    if (!pending.has(id)) return;
+    pending.delete(id);
+    try {
+      child.stdin.write(`${JSON.stringify({ cancel: id })}\n`);
+    } catch {
+      // ignore — a dead worker frees everything on exit anyway
+    }
+  };
+
   const close = () => {
     try {
       child.stdin.write(`${JSON.stringify({ shutdown: true })}\n`);
@@ -141,6 +154,7 @@ export function createBatchWorker({ bin, args, env, cwd, onReadyError }) {
 
   return {
     submit,
+    cancel,
     activeCount: () => pending.size,
     close,
     kill,

@@ -498,6 +498,18 @@ bool LlamaEngine::stream_step(std::vector<StreamEvent>& events) {
   return true;
 }
 
+bool LlamaEngine::stream_cancel(const std::string& id) {
+  for (auto it = stream_seqs_.begin(); it != stream_seqs_.end(); ++it) {
+    if (it->id == id) {
+      // RAII on the SequenceBlockTable releases the request's KV blocks to the
+      // pool; erasing removes it from the running batch.
+      stream_seqs_.erase(it);
+      return true;
+    }
+  }
+  return false;
+}
+
 std::vector<std::vector<int>> LlamaEngine::run_batch(const std::vector<BatchRequest>& requests) {
   if (!options_.paged_blocks || !block_alloc_) {
     throw std::runtime_error("run_batch requires --paged-blocks");
