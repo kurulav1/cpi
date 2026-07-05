@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <deque>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -29,6 +30,9 @@
 
 #include "app/main_helpers.hpp"
 #include "engine/llama_engine.hpp"
+#include "grammar/grammar.hpp"
+#include "grammar/grammar_sampler.hpp"
+#include "grammar/json_schema_to_grammar.hpp"
 #include "model/tokenizer.hpp"
 
 namespace app::main_modes {
@@ -37,6 +41,7 @@ using app::main_helpers::json_escape;
 using app::main_helpers::json_get_bool;
 using app::main_helpers::json_get_float;
 using app::main_helpers::json_get_int;
+using app::main_helpers::json_get_raw_value;
 using app::main_helpers::json_get_string;
 using app::main_helpers::json_get_string_array;
 using app::main_helpers::sanitize_stream_text;
@@ -58,6 +63,7 @@ void run_interactive_batch(engine::LlamaEngine& eng, model::Tokenizer& tokenizer
     std::string id;
     std::vector<int> tokens;
     engine::LlamaEngine::StreamParams params;
+    std::string json_schema;  // raw structural schema, compiled to a grammar at admit
   };
   std::mutex q_mu;
   std::condition_variable q_cv;
@@ -99,6 +105,7 @@ void run_interactive_batch(engine::LlamaEngine& eng, model::Tokenizer& tokenizer
         in.params.max_new_tokens = mn;
         in.params.temperature = tp;
         in.params.min_new_tokens = std::max(0, json_get_int(line, "min_new", 0));
+        in.json_schema = json_get_raw_value(line, "json_schema");
 
         std::vector<int> stop_ids;
         if (tokenizer.eos_id() >= 0) stop_ids.push_back(tokenizer.eos_id());
@@ -133,6 +140,9 @@ void run_interactive_batch(engine::LlamaEngine& eng, model::Tokenizer& tokenizer
     std::chrono::steady_clock::time_point t0;  // decode start (for tok/s)
   };
   std::unordered_map<std::string, DetokState> detok;
+  // Per-request grammar samplers: StreamParams.grammar is a non-owning pointer
+  // that must outlive the request, so the worker owns them here until done/cancel.
+  std::unordered_map<std::string, std::unique_ptr<grammar::GrammarSampler>> grammars;
 
   while (true) {
     // Admit any queued requests (prefill happens inside stream_admit).
@@ -167,10 +177,27 @@ void run_interactive_batch(engine::LlamaEngine& eng, model::Tokenizer& tokenizer
     for (const auto& cid : cancel_ids) {
       const bool evicted = eng.stream_cancel(cid);
       detok.erase(cid);
+      grammars.erase(cid);
       std::cerr << "[batch] cancel " << cid << (evicted ? " (evicted)" : " (not running)") << "\n";
     }
     for (auto& in : admits) {
       try {
+        // Grammar-constrained decoding: compile the request's json_schema to a
+        // grammar sampler (owned in `grammars`, applied per-step in stream_step).
+        // An unparseable schema falls back to unconstrained generation.
+        if (!in.json_schema.empty()) {
+          try {
+            grammar::Grammar g =
+                grammar::Grammar::parse(grammar::json_schema_to_grammar(in.json_schema));
+            auto sampler = std::make_unique<grammar::GrammarSampler>(
+                std::move(g), tokenizer.token_pieces(), tokenizer.eos_id());
+            in.params.grammar = sampler.get();
+            grammars[in.id] = std::move(sampler);
+          } catch (const std::exception& ge) {
+            std::cerr << "[batch] grammar compile failed for " << in.id << " (" << ge.what()
+                      << "); unconstrained\n";
+          }
+        }
         eng.stream_admit(in.id, in.tokens, in.params);
         DetokState st;
         st.t0 = std::chrono::steady_clock::now();
@@ -192,14 +219,22 @@ void run_interactive_batch(engine::LlamaEngine& eng, model::Tokenizer& tokenizer
     for (const auto& e : events) {
       auto it = detok.find(e.id);
       if (it == detok.end()) continue;
-      it->second.ids.push_back(e.token);
-      const std::string decoded = sanitize_stream_text(tokenizer.decode(it->second.ids));
-      if (decoded.size() > it->second.prev_text.size()) {
-        const std::string delta = decoded.substr(it->second.prev_text.size());
-        if (!delta.empty()) {
-          write_event("delta", e.id, "\"delta\":\"" + json_escape(delta) + "\"");
+      // A request ending on its stop token (eos/stop) must not emit that token's
+      // text: a chat model's EOS is special (decode drops it), but a grammar
+      // terminates on tokenizer.eos_id() which can decode to a visible "</s>".
+      // Keep the token for a "length" finish (it is real content).
+      const std::string reason = e.finish_reason ? e.finish_reason : "";
+      const bool terminator = e.finished && (reason == "eos" || reason == "stop");
+      if (!terminator) {
+        it->second.ids.push_back(e.token);
+        const std::string decoded = sanitize_stream_text(tokenizer.decode(it->second.ids));
+        if (decoded.size() > it->second.prev_text.size()) {
+          const std::string delta = decoded.substr(it->second.prev_text.size());
+          if (!delta.empty()) {
+            write_event("delta", e.id, "\"delta\":\"" + json_escape(delta) + "\"");
+          }
+          it->second.prev_text = decoded;
         }
-        it->second.prev_text = decoded;
       }
       if (e.finished) {
         const int gen = static_cast<int>(it->second.ids.size());
@@ -214,6 +249,7 @@ void run_interactive_batch(engine::LlamaEngine& eng, model::Tokenizer& tokenizer
                     "\"finish_reason\":\"" + std::string(e.finish_reason) + "\",\"text\":\"" +
                         json_escape(it->second.prev_text) + "\"" + nums);
         detok.erase(it);
+        grammars.erase(e.id);
       }
     }
   }

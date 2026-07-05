@@ -1450,9 +1450,6 @@ const NON_LLAMA_ENGINE_FAMILIES = new Set(["qwen3_5", "llama4", "cpt_gpt"]);
 
 function isBatchCompatible(cliConfig) {
   const p = cliConfig.profile || {};
-  // Grammar-constrained requests aren't plumbed through the batch worker (the
-  // submit drops json_schema), so they must run single-flight to be enforced.
-  if (cliConfig.jsonSchema) return false;
   const family = String(p.family || cliConfig.meta?.template || "").toLowerCase();
   if (NON_LLAMA_ENGINE_FAMILIES.has(family)) return false;                  // separate engine
   if (cliConfig.quantMode && cliConfig.quantMode !== "none") return false; // runtime quantization
@@ -2496,6 +2493,7 @@ app.post("/api/chat/stream", async (req, res) => {
         temp: cliConfig.meta.temperature,
         stopTexts: cliConfig.stopTexts,
         addBos: cliConfig.addBos,
+        jsonSchema: cliConfig.jsonSchema ?? null,
         onDelta: (delta) => { if (!ended) writeNdjson(res, { type: "delta", delta }); },
         onDone: ({ text, generated, tokPerS, elapsedMs }) => finish(() => writeNdjson(res, {
           type: "done", message: text, elapsedMs: elapsedMs ?? (Date.now() - startedAt),

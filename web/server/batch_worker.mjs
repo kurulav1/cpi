@@ -107,7 +107,7 @@ export function createBatchWorker({ bin, args, env, cwd, onReadyError }) {
   });
 
   // Submit one request. `id` must be unique among in-flight requests.
-  const submit = ({ id, prompt, maxNew, temp, minNew, stopTexts, addBos, onStart, onDelta, onDone, onError }) => {
+  const submit = ({ id, prompt, maxNew, temp, minNew, stopTexts, addBos, jsonSchema, onStart, onDelta, onDone, onError }) => {
     if (pending.has(id)) throw new Error(`duplicate in-flight request id: ${id}`);
     pending.set(id, { onStart, onDelta, onDone, onError, text: "" });
     const payload = {
@@ -117,7 +117,8 @@ export function createBatchWorker({ bin, args, env, cwd, onReadyError }) {
       ...(minNew != null ? { min_new: minNew } : {}),
       ...(temp != null ? { temp } : {}),
       ...(stopTexts ? { stop_texts: stopTexts } : {}),
-      ...(addBos != null ? { add_bos: addBos } : {})
+      ...(addBos != null ? { add_bos: addBos } : {}),
+      ...(jsonSchema ? { json_schema: jsonSchema } : {})
     };
     child.stdin.write(`${JSON.stringify(payload)}\n`, (err) => {
       if (err && pending.has(id)) {
