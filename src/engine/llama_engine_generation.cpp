@@ -650,19 +650,16 @@ void LlamaEngine::verify_tokens(const std::vector<int>& tokens, int start_pos,
   // i-th argmax is copied to the host before the (i+1)-th overwrites it.
   launch_norm(d_x_, d_norm_out_, d_norm_out_bias_, d_x_norm_, K, hidden);
 
-  const auto* x_norm = static_cast<const __half*>(d_x_norm_);
+  // Batched LM head: one GEMM projects all K normed rows in d_x_norm_ through the
+  // lm_head, reading its ~1 GB weight ONCE — the per-position loop re-read it K
+  // times (K x the lm_head bandwidth per verify). Consistent with the verify's
+  // layer projections, which already run through the batched cuBLAS path. Then a
+  // per-row device argmax (only K ints cross the bus).
+  batched_lm_head(K, hidden, cfg.vocab_size);
   for (int i = 0; i < K; ++i) {
-    resident_projection_float(
-        d_lm_head_, x_norm + static_cast<std::size_t>(i) * static_cast<std::size_t>(hidden),
-        d_logits_, cfg.vocab_size, hidden, resident_lm_head_warps_, resident_lm_head_tile_pairs_,
-        resident_lm_head_rows_per_warp_);
-    if (d_lm_head_bias_) {
-      kernels::launch_add_bias_inplace_float_from_half(static_cast<float*>(d_logits_),
-                                                       static_cast<const __half*>(d_lm_head_bias_),
-                                                       cfg.vocab_size, compute_stream_);
-    }
-    kernels::launch_argmax_float(static_cast<const float*>(d_logits_), cfg.vocab_size, d_argmax_,
-                                 compute_stream_);
+    kernels::launch_argmax_float(
+        d_batch_logits_ + static_cast<std::size_t>(i) * static_cast<std::size_t>(cfg.vocab_size),
+        cfg.vocab_size, d_argmax_, compute_stream_);
     CUDA_CHECK(cudaMemcpyAsync(out_argmax.data() + i, d_argmax_, sizeof(int),
                                cudaMemcpyDeviceToHost, compute_stream_));
   }
