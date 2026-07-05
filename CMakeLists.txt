@@ -381,6 +381,18 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
   )
+
+  # Decode-attention bandwidth bench: locates the memory roofline of the batched
+  # paged decode path before any kernel rewrite (harness-first).
+  add_executable(attention_decode_bench
+    src/tests/attention_decode_bench.cu
+  )
+  target_include_directories(attention_decode_bench PRIVATE include)
+  target_link_libraries(attention_decode_bench PRIVATE llama_engine)
+  set_target_properties(attention_decode_bench PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+  )
 endif()
 
 if(LLAMA_ENGINE_ENABLE_CLANG_TIDY AND CLANG_TIDY_EXE)
