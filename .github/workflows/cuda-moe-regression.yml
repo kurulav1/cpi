@@ -38,7 +38,7 @@ jobs:
 
       - name: Run decode-attention parity gates (reference-oracle + paged + batched)
         shell: pwsh
-        run: ctest --test-dir build -C Release -R "attention_reference_parity_test|batched_paged_attention_reference_parity_test|paged_attention_parity_test|paged_batched_attention_parity_test" --output-on-failure
+        run: ctest --test-dir build -C Release -R "attention_reference_parity_test|batched_paged_attention_reference_parity_test|int4_attention_reference_parity_test|paged_attention_parity_test|paged_batched_attention_parity_test" --output-on-failure
 
       - name: Download and convert Mixtral checkpoint (CI-sized)
         shell: pwsh

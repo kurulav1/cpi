@@ -36,7 +36,12 @@ __global__ void attention_step_chunk_reduce_kernel(const float* chunk_m, const f
   const int head = blockIdx.x;
   const int tid = threadIdx.x;
   const int chunk_count = (seq_len + chunk_size - 1) / chunk_size;
-  float acc = 0.0f;
+  // Per-thread accumulator array: this reduce runs at any head_dim, and head_dim
+  // can exceed blockDim (256 with 128 threads), so a scalar acc would conflate
+  // the strided output dims.
+  float acc[kAccPerThread];
+#pragma unroll
+  for (int i = 0; i < kAccPerThread; ++i) acc[i] = 0.0f;
   float running_m = neg_inf<float>();
   float running_l = 0.0f;
 
@@ -62,15 +67,17 @@ __global__ void attention_step_chunk_reduce_kernel(const float* chunk_m, const f
         (static_cast<std::size_t>(head) * static_cast<std::size_t>(scratch_chunks) +
          static_cast<std::size_t>(chunk)) *
         static_cast<std::size_t>(head_dim);
-    for (int d = tid; d < head_dim; d += blockDim.x) {
-      acc = acc * alpha + chunk_o[base + static_cast<std::size_t>(d)] * beta;
+    int j = 0;
+    for (int d = tid; d < head_dim; d += blockDim.x, ++j) {
+      acc[j] = acc[j] * alpha + chunk_o[base + static_cast<std::size_t>(d)] * beta;
     }
     __syncthreads();
   }
 
   const float inv_l = 1.0f / fmaxf(scale_shared[2], 1e-8f);
-  for (int d = tid; d < head_dim; d += blockDim.x) {
-    out[head * head_dim + d] = __float2half(acc * inv_l);
+  int j = 0;
+  for (int d = tid; d < head_dim; d += blockDim.x, ++j) {
+    out[head * head_dim + d] = __float2half(acc[j] * inv_l);
   }
 }
 
@@ -112,7 +119,11 @@ __global__ void attention_step_chunk_stats_int4_kernel(
   }
   __syncthreads();
 
-  float acc = 0.0f;
+  static_assert(WarpsPerBlock * 32 * kAccPerThread >= kTiledMaxHeadDim,
+                "int4 decode accumulator too small for kTiledMaxHeadDim");
+  float acc[kAccPerThread];
+#pragma unroll
+  for (int i = 0; i < kAccPerThread; ++i) acc[i] = 0.0f;
   for (int tile_base = chunk_start; tile_base < chunk_end; tile_base += WarpsPerBlock) {
     const int tile_tokens = min(WarpsPerBlock, chunk_end - tile_base);
 
@@ -177,12 +188,13 @@ __global__ void attention_step_chunk_stats_int4_kernel(
       const float new_m = fmaxf(running_m, tile_m);
       const float c_prev = (running_l == 0.0f) ? 0.0f : expf(running_m - new_m);
       const float c_tile = expf(tile_m - new_m);
-      for (int d = tid; d < head_dim; d += blockDim.x) {
+      int j = 0;
+      for (int d = tid; d < head_dim; d += blockDim.x, ++j) {
         float tile_o = 0.0f;
         for (int i = 0; i < tile_tokens; ++i) {
           tile_o += beta_shared[i] * __half2float(v_tile[i * head_dim + d]);
         }
-        acc = acc * c_prev + tile_o * c_tile;
+        acc[j] = acc[j] * c_prev + tile_o * c_tile;
       }
       if (tid == 0) {
         stats_shared[0] = new_m;
@@ -197,9 +209,10 @@ __global__ void attention_step_chunk_stats_int4_kernel(
     chunk_m[chunk_index] = stats_shared[0];
     chunk_l[chunk_index] = stats_shared[1];
   }
-  for (int d = tid; d < head_dim; d += blockDim.x) {
+  int jo = 0;
+  for (int d = tid; d < head_dim; d += blockDim.x, ++jo) {
     chunk_o[static_cast<std::size_t>(chunk_index) * static_cast<std::size_t>(head_dim) +
-            static_cast<std::size_t>(d)] = acc;
+            static_cast<std::size_t>(d)] = acc[jo];
   }
 }
 
@@ -321,7 +334,11 @@ __global__ void attention_step_kernel_int4(const half* q, const int8_t* k_cache_
   }
   __syncthreads();
 
-  float acc = 0.0f;
+  static_assert(WarpsPerBlock * 32 * kAccPerThread >= kTiledMaxHeadDim,
+                "int4 decode accumulator too small for kTiledMaxHeadDim");
+  float acc[kAccPerThread];
+#pragma unroll
+  for (int i = 0; i < kAccPerThread; ++i) acc[i] = 0.0f;
   for (int tile_base = 0; tile_base < seq_len; tile_base += WarpsPerBlock) {
     const int tile_tokens = min(WarpsPerBlock, seq_len - tile_base);
 
@@ -392,12 +409,13 @@ __global__ void attention_step_kernel_int4(const half* q, const int8_t* k_cache_
       const float new_m = fmaxf(running_m, tile_m);
       const float c_prev = (running_l == 0.0f) ? 0.0f : expf(running_m - new_m);
       const float c_tile = expf(tile_m - new_m);
-      for (int d = tid; d < head_dim; d += blockDim.x) {
+      int j = 0;
+      for (int d = tid; d < head_dim; d += blockDim.x, ++j) {
         float tile_o = 0.0f;
         for (int i = 0; i < tile_tokens; ++i) {
           tile_o += beta_shared[i] * __half2float(v_tile[i * head_dim + d]);
         }
-        acc = acc * c_prev + tile_o * c_tile;
+        acc[j] = acc[j] * c_prev + tile_o * c_tile;
       }
       if (tid == 0) {
         stats_shared[0] = new_m;
@@ -408,8 +426,9 @@ __global__ void attention_step_kernel_int4(const half* q, const int8_t* k_cache_
   }
 
   const float inv_l = 1.0f / fmaxf(stats_shared[1], 1e-8f);
-  for (int d = tid; d < head_dim; d += blockDim.x) {
-    out[head * head_dim + d] = __float2half(acc * inv_l);
+  int j = 0;
+  for (int d = tid; d < head_dim; d += blockDim.x, ++j) {
+    out[head * head_dim + d] = __float2half(acc[j] * inv_l);
   }
 }
 

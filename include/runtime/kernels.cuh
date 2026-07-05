@@ -28,6 +28,17 @@
 
 namespace kernels {
 
+// Decode-attention accumulator sizing (shared by the fp16 and int4 kernel TUs).
+// The tiled/split-K decode kernels give each thread a fixed-size per-head_dim
+// accumulator array of kAccPerThread floats; a block runs blockDim (<=
+// WarpsPerBlock*32) threads, so it covers head_dim up to blockDim*kAccPerThread.
+// Each templated kernel static_asserts that bound against kTiledMaxHeadDim, so
+// raising the head_dim cap without growing the accumulator is a build error, not
+// silent corruption (the head_dim=256 bug this guards against scored cosine
+// ~0.65 vs an independent reference).
+constexpr int kTiledMaxHeadDim = 256;
+constexpr int kAccPerThread = 8;
+
 // launch_rmsnorm
 //
 // Applies Root Mean Square Layer Normalisation to every row of `x`:

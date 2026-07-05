@@ -321,6 +321,21 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
   add_test(NAME batched_paged_attention_reference_parity_test
            COMMAND batched_paged_attention_reference_parity_test)
 
+  # Reference-oracle INT4 KV-cache decode attention parity (Phase 0): naive float
+  # reference over the dequantized int4 K/V vs launch_attention_step_int4 across
+  # head_dim ∈ {128,256} (256 exercises the serial fallback kernel).
+  add_executable(int4_attention_reference_parity_test
+    src/tests/int4_attention_reference_parity_test.cu
+  )
+  target_include_directories(int4_attention_reference_parity_test PRIVATE include)
+  target_link_libraries(int4_attention_reference_parity_test PRIVATE llama_engine)
+  set_target_properties(int4_attention_reference_parity_test PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+  )
+  add_test(NAME int4_attention_reference_parity_test
+           COMMAND int4_attention_reference_parity_test)
+
   # Paged split-K decode attention parity (P3 phase 2b): paged == contiguous.
   add_executable(paged_attention_parity_test
     src/tests/paged_attention_parity_test.cu

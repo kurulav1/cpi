@@ -37,16 +37,8 @@ __device__ __forceinline__ float neg_inf<float>() {
 __device__ __forceinline__ int cache_index(int t, int head, int d, int num_heads, int head_dim) {
   return (t * num_heads + head) * head_dim + d;
 }
-
-// Largest head_dim routed to the tiled/split-K decode kernels (see the dispatch
-// in launch_attention_step*). These kernels give each thread a fixed-size
-// per-head_dim accumulator array of kAccPerThread floats; the block runs
-// WarpsPerBlock*32 threads, so it covers head_dim up to WarpsPerBlock*32*kAccPerThread.
-// Each kernel static_asserts that bound against kTiledMaxHeadDim, so raising the
-// cap without growing the accumulator is a build error, not silent corruption
-// (the head_dim=256 bug this guards against scored cosine ~0.65 vs a reference).
-constexpr int kTiledMaxHeadDim = 256;
-constexpr int kAccPerThread = 8;
+// kTiledMaxHeadDim / kAccPerThread are shared across decode-attention TUs; see
+// include/runtime/kernels.cuh.
 
 __global__ void attention_step_kernel_fallback(const half* q, const half* k_cache,
                                                const half* v_cache, half* out, int seq_len,
