@@ -40,9 +40,13 @@ __device__ __forceinline__ int cache_index(int t, int head, int d, int num_heads
 // kTiledMaxHeadDim / kAccPerThread are shared across decode-attention TUs; see
 // include/runtime/kernels.cuh.
 
-__global__ void attention_step_kernel_fallback(const half* q, const half* k_cache,
-                                               const half* v_cache, half* out, int seq_len,
-                                               int num_heads, int num_kv_heads, int head_dim) {
+// Shared serial per-token online-softmax fallback core (one thread per head_dim
+// element). seq_len is resolved by the caller so the host and CUDA-graph
+// device-position kernels share this one body.
+__device__ __forceinline__ void attention_step_fallback_core(const half* q, const half* k_cache,
+                                                             const half* v_cache, half* out,
+                                                             int seq_len, int num_heads,
+                                                             int num_kv_heads, int head_dim) {
   extern __shared__ unsigned char smem_bytes[];
   half* q_shared = reinterpret_cast<half*>(smem_bytes);
   float* red = reinterpret_cast<float*>(q_shared + head_dim);
@@ -111,77 +115,22 @@ __global__ void attention_step_kernel_fallback(const half* q, const half* k_cach
   }
 }
 
+// Host fallback kernel: seq_len is a runtime argument.
+__global__ void attention_step_kernel_fallback(const half* q, const half* k_cache,
+                                               const half* v_cache, half* out, int seq_len,
+                                               int num_heads, int num_kv_heads, int head_dim) {
+  attention_step_fallback_core(q, k_cache, v_cache, out, seq_len, num_heads, num_kv_heads,
+                               head_dim);
+}
+
+// Device-position variant for CUDA-graph capture: seq_len is read from device
+// memory (position_ptr[0]+1). The body is shared via attention_step_fallback_core.
 __global__ void attention_step_kernel_fallback_device_pos(const half* q, const half* k_cache,
                                                           const half* v_cache, half* out,
                                                           const int* position_ptr, int num_heads,
                                                           int num_kv_heads, int head_dim) {
-  const int seq_len = position_ptr[0] + 1;
-  extern __shared__ unsigned char smem_bytes[];
-  half* q_shared = reinterpret_cast<half*>(smem_bytes);
-  float* red = reinterpret_cast<float*>(q_shared + head_dim);
-  float* alpha_shared = red + blockDim.x;
-  float* beta_shared = alpha_shared + 1;
-  float* inv_l_shared = beta_shared + 1;
-  const int head = blockIdx.x;
-  const int tid = threadIdx.x;
-  const float scale = rsqrtf(static_cast<float>(head_dim));
-  const int kv_heads_safe = (num_kv_heads > 0) ? num_kv_heads : 1;
-  const int group_size = ((num_heads / kv_heads_safe) > 0) ? (num_heads / kv_heads_safe) : 1;
-  const int kv_head =
-      ((head / group_size) < kv_heads_safe) ? (head / group_size) : (kv_heads_safe - 1);
-  const bool active_dim = tid < head_dim;
-
-  for (int d = tid; d < head_dim; d += blockDim.x) {
-    q_shared[d] = q[head * head_dim + d];
-  }
-  __syncthreads();
-
-  float running_m = -1.0e30f;
-  float running_l = 0.0f;
-  float acc = 0.0f;
-
-  for (int t = 0; t < seq_len; ++t) {
-    float partial_dot = 0.0f;
-    const int base = cache_index(t, kv_head, 0, num_kv_heads, head_dim);
-    for (int d = tid; d < head_dim; d += blockDim.x) {
-      partial_dot += __half2float(q_shared[d]) * __half2float(k_cache[base + d]);
-    }
-    {
-      const int lane_id = tid & (warpSize - 1);
-      const int warp_id = tid / warpSize;
-      float dot = warp_sum(partial_dot);
-      if (lane_id == 0) {
-        red[warp_id] = dot;
-      }
-    }
-    __syncthreads();
-
-    if (tid == 0) {
-      float total = 0.0f;
-      for (int w = 0; w < blockDim.x / warpSize; ++w) {
-        total += red[w];
-      }
-      const float score = total * scale;
-      const float new_m = fmaxf(running_m, score);
-      const float alpha = (running_l == 0.0f) ? 0.0f : expf(running_m - new_m);
-      const float beta = expf(score - new_m);
-      running_l = running_l * alpha + beta;
-      running_m = new_m;
-      alpha_shared[0] = alpha;
-      beta_shared[0] = beta;
-      inv_l_shared[0] = 1.0f / fmaxf(running_l, 1e-8f);
-    }
-    __syncthreads();
-
-    if (active_dim) {
-      acc = acc * alpha_shared[0] + beta_shared[0] * __half2float(v_cache[base + tid]);
-    }
-    __syncthreads();
-  }
-
-  if (active_dim) {
-    out[head * head_dim + tid] = __float2half(acc * inv_l_shared[0]);
-  }
+  attention_step_fallback_core(q, k_cache, v_cache, out, position_ptr[0] + 1, num_heads,
+                               num_kv_heads, head_dim);
 }
 
 // Shared online-softmax tiled decode-attention core. Keeps the query resident in
