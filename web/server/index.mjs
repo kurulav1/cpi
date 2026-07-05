@@ -1431,8 +1431,12 @@ function ensureInteractiveWorker(config, cliConfig) {
 let batchWorker = null;
 let batchWorkerKey = null;
 
+// Continuous batching is the default serving path: for batch-compatible models
+// it is faster even at batch 1 (the GQA-shared + int4-load decode kernel lives in
+// the batched path) and scales with concurrency. Opt out with CPI_BATCH_WORKER=0
+// (forces single-flight for everything).
 function batchWorkerEnabled() {
-  return process.env.CPI_BATCH_WORKER === "1";
+  return process.env.CPI_BATCH_WORKER !== "0";
 }
 
 // The batched decode path only supports plain fp16 fully-resident, full-attention
@@ -1568,6 +1572,39 @@ async function warmupProfileWorker(config, profileId, options = {}) {
   });
 
   return profile;
+}
+
+// Startup warm for the default (batch) path. Warms the BATCH worker rather than
+// the single-flight engine so only ONE copy of the model resides in VRAM — both
+// would be ~2x and OOM large models. Non-batchable default profiles (qwen3_5,
+// quantized, MoE, grammar-only, …) fall back to warming single-flight. Uses the
+// same buildWorkerCliConfig as the single-flight warm so the worker key matches
+// real requests (no respawn on the first request).
+async function warmupBatchWorker(config, options = {}) {
+  const profile = resolveWarmupProfile(config, undefined);
+  const workerCliConfig = buildWorkerCliConfig(profile, options);
+  if (!batchWorkerEnabled() || !isBatchCompatible(workerCliConfig)) {
+    return warmupProfileWorker(config, undefined, options);
+  }
+  activeRequest = { kind: "warmup", cancel: () => {} };
+  try {
+    const worker = await getBatchWorker(config, { ...workerCliConfig, prompt: "warmup" });
+    await new Promise((resolve, reject) => {
+      worker.submit({
+        id: randomUUID(),
+        prompt: "warmup",
+        maxNew: 1,
+        temp: 0,
+        addBos: true,
+        onDelta: () => {},
+        onDone: () => resolve(),
+        onError: (err) => reject(err instanceof Error ? err : new Error(String(err)))
+      });
+    });
+    return profile;
+  } finally {
+    activeRequest = null;
+  }
 }
 
 async function generatePreferredFamilyResponse(config, cliConfig) {
@@ -3667,8 +3704,12 @@ app.listen(runtimeConfig.port, () => {
     // Pre-load the model into the worker at boot so the first real request isn't a
     // ~60s cold start. /healthz/ready stays 503 until this completes, so k8s holds
     // traffic until the pod is genuinely warm. Disable with LLAMA_WARM_ON_START=0.
-    console.log("[cpi] warming model on startup…");
-    warmupProfileWorker(runtimeConfig)
+    const batchDefault = batchWorkerEnabled();
+    console.log(`[cpi] warming model on startup… (${batchDefault ? "batch worker" : "single-flight"})`);
+    const warmStart = batchDefault
+      ? warmupBatchWorker(runtimeConfig, { maxContext: runtimeConfig.maxContext })
+      : warmupProfileWorker(runtimeConfig);
+    warmStart
       .then(() => console.log("[cpi] model warm — readiness will pass"))
       .catch((err) => console.warn(`[cpi] startup warm failed: ${err?.message || String(err)}`));
   }
