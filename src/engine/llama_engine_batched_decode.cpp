@@ -417,16 +417,54 @@ void LlamaEngine::stream_admit(const std::string& id, const std::vector<int>& pr
   s.last_token = prompt_tokens.back();
   s.pos = static_cast<int>(prompt_tokens.size()) - 1;
   s.params = params;
+
+  // Shared-prefix reuse (P4): adopt the cached prefix's KV blocks for the longest
+  // WHOLE-BLOCK common prefix, so only the suffix is prefilled. KV for identical
+  // tokens at identical positions is bit-exact (causal attention + position RoPE),
+  // so output is unchanged. Cap below prompt length so the final block is always
+  // (re)prefilled to seed decode. Must run before stream_grow_table allocates.
+  int shared_tokens = 0;
+  if (cached_prefix_table_ && !cached_prefix_tokens_.empty()) {
+    const int cap = static_cast<int>(prompt_tokens.size()) - 1;
+    const int mmax = std::min(static_cast<int>(cached_prefix_tokens_.size()), cap);
+    int match = 0;
+    while (match < mmax && prompt_tokens[static_cast<std::size_t>(match)] ==
+                               cached_prefix_tokens_[static_cast<std::size_t>(match)]) {
+      ++match;
+    }
+    const int whole = (match / bs) * bs;  // share_prefix_from adopts whole blocks only
+    if (whole >= bs && s.blocks->share_prefix_from(*cached_prefix_table_, whole)) {
+      shared_tokens = whole;
+    }
+  }
+
   stream_grow_table(s, s.pos);
 
-  // Prefill this request's prompt into its own blocks. d_block_table_ is shared
-  // engine state and fully-cached prefill runs async on compute_stream_, so sync
-  // before returning (a later admit / the decode loop must not clobber it).
+  // Prefill only the suffix [shared_tokens, len). d_block_table_ is shared engine
+  // state and fully-cached prefill runs async on compute_stream_, so sync before
+  // returning (a later admit / the decode loop must not clobber it).
   block_table_host_ = s.table;
   CUDA_CHECK(cudaMemcpy(d_block_table_, s.table.data(), s.table.size() * sizeof(int),
                         cudaMemcpyHostToDevice));
-  prefill_prompt(prompt_tokens);
+  prefill_prompt(prompt_tokens, shared_tokens);
   CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
+
+  // Refresh the shared-prefix cache with this sequence's block-aligned prefix (a
+  // fresh table that refcounts the blocks so they outlive this sequence). The old
+  // cache's blocks are released when it is replaced.
+  const int cache_tokens = (static_cast<int>(prompt_tokens.size()) / bs) * bs;
+  if (cache_tokens >= bs) {
+    auto next_cache = std::make_unique<SequenceBlockTable>(block_alloc_.get(), bs);
+    if (next_cache->share_prefix_from(*s.blocks, cache_tokens)) {
+      cached_prefix_table_ = std::move(next_cache);
+      cached_prefix_tokens_.assign(prompt_tokens.begin(), prompt_tokens.begin() + cache_tokens);
+    }
+  }
+
+  if ((options_.verbose || std::getenv("LLAMA_INFER_PREFIX_LOG")) && shared_tokens > 0) {
+    std::fprintf(stderr, "[stream] prefix_reuse tokens=%d/%zu\n", shared_tokens,
+                 prompt_tokens.size());
+  }
   stream_seqs_.push_back(std::move(s));
 }
 

@@ -465,6 +465,12 @@ private:
     StreamParams params;
   };
   std::vector<StreamSeq> stream_seqs_;
+  // Paged shared-prefix cache (P4): the most recent admitted sequence's
+  // block-aligned prefix tokens + a block table holding (refcounted) its KV
+  // blocks, so a later request with the same leading tokens adopts those blocks
+  // via share_prefix_from instead of re-prefilling them.
+  std::unique_ptr<SequenceBlockTable> cached_prefix_table_;
+  std::vector<int> cached_prefix_tokens_;
   // Grow a streaming request's block table so it covers `upto_pos`.
   void stream_grow_table(StreamSeq& s, int upto_pos);
 
