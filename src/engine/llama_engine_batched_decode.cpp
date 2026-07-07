@@ -388,8 +388,19 @@ std::vector<int> LlamaEngine::greedy_generate_single(const std::vector<int>& pro
 void LlamaEngine::stream_grow_table(StreamSeq& s, int upto_pos) {
   const int bs = options_.paged_block_size > 0 ? options_.paged_block_size : 32;
   if (!s.blocks->ensure_position(upto_pos)) {
-    throw std::runtime_error(
-        "stream scheduler: paged KV pool exhausted (concurrent length > max_context budget)");
+    // The prefix cache pins KV blocks that are pure optimization, not live state.
+    // Under pool pressure, drop it to reclaim those blocks and retry once before
+    // declaring exhaustion (callers then reject the admit / preempt in decode).
+    if (!prefix_cache_.empty()) {
+      prefix_cache_.clear();
+      if (options_.verbose || std::getenv("LLAMA_INFER_PREFIX_LOG")) {
+        std::fprintf(stderr, "[stream] prefix_cache evicted under KV pressure\n");
+      }
+    }
+    if (!s.blocks->ensure_position(upto_pos)) {
+      throw std::runtime_error(
+          "stream scheduler: paged KV pool exhausted (concurrent length > max_context budget)");
+    }
   }
   const int nblk = upto_pos / bs + 1;
   if (static_cast<int>(s.table.size()) != nblk) {
@@ -502,13 +513,31 @@ void LlamaEngine::stream_admit(const std::string& id, const std::vector<int>& pr
 
 bool LlamaEngine::stream_step(std::vector<StreamEvent>& events) {
   events.clear();
-  const int B = static_cast<int>(stream_seqs_.size());
-  if (B == 0) return false;
+  if (stream_seqs_.empty()) return false;
 
-  // Assemble the running batch (grow each table to cover the position we write).
+  // Grow each running sequence's table to cover the position we will write. Under
+  // KV-pool pressure stream_grow_table first reclaims prefix-cache blocks; if a
+  // sequence still cannot grow, preempt it (free its KV, report "preempted")
+  // rather than throwing and taking down the whole batch. Sequences are held in
+  // admission order and grown oldest-first, so the newest hit the wall first —
+  // preemption is newest-first, preserving older (closer-to-finish) requests.
+  for (std::size_t b = 0; b < stream_seqs_.size();) {
+    try {
+      stream_grow_table(stream_seqs_[b], stream_seqs_[b].pos);
+      ++b;
+    } catch (const std::exception&) {
+      std::fprintf(stderr, "[stream] preempted %s: paged KV pool exhausted (%d running)\n",
+                   stream_seqs_[b].id.c_str(), static_cast<int>(stream_seqs_.size()));
+      events.push_back(StreamEvent{stream_seqs_[b].id, -1, true, "preempted"});
+      stream_seqs_.erase(stream_seqs_.begin() + static_cast<std::ptrdiff_t>(b));
+    }
+  }
+  const int B = static_cast<int>(stream_seqs_.size());
+  if (B == 0) return !events.empty();  // deliver any preempt events, then idle
+
+  // Assemble the running batch over the survivors.
   int max_blocks = 0;
   for (auto& s : stream_seqs_) {
-    stream_grow_table(s, s.pos);
     max_blocks = std::max(max_blocks, static_cast<int>(s.table.size()));
   }
   std::vector<int> toks(B), poss(B), flat(static_cast<std::size_t>(B) * max_blocks, 0);
@@ -601,7 +630,8 @@ std::vector<std::vector<int>> LlamaEngine::run_batch(const std::vector<BatchRequ
 
   std::vector<StreamEvent> events;
   while (stream_step(events)) {
-    for (const auto& e : events) outs[id_to_index[e.id]].push_back(e.token);
+    for (const auto& e : events)
+      if (e.token >= 0) outs[id_to_index[e.id]].push_back(e.token);  // skip preempt sentinel
   }
   return outs;
 }

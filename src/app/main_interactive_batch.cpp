@@ -225,7 +225,8 @@ void run_interactive_batch(engine::LlamaEngine& eng, model::Tokenizer& tokenizer
       // Keep the token for a "length" finish (it is real content).
       const std::string reason = e.finish_reason ? e.finish_reason : "";
       const bool terminator = e.finished && (reason == "eos" || reason == "stop");
-      if (!terminator) {
+      // token < 0 is the preempt sentinel (no real token to emit).
+      if (!terminator && e.token >= 0) {
         it->second.ids.push_back(e.token);
         const std::string decoded = sanitize_stream_text(tokenizer.decode(it->second.ids));
         if (decoded.size() > it->second.prev_text.size()) {
