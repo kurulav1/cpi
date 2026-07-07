@@ -75,15 +75,20 @@ with `--tokens-file`, fp16 resident, RTX 5090).
 
 | Model | 512 | 2048 | 4096 | 8192 | 16384 | 32768 |
 | ----- | --- | ---- | ---- | ---- | ----- | ----- |
-| Qwen2.5-7B-Instruct | ~91 | ~86 | ~80 | ~71 | ~59 | ~42 |
-| Qwen2.5-Coder-7B-Instruct | ~90 | ~86 | ~81 | ~72 | ~59 | ~42 |
-| Llama-3.1-8B-Instruct | ~86 | ~81 | ~75 | ~65 | ~49 | ~30 |
+| Qwen2.5-7B-Instruct | ~91 | ~86 | ~80 | ~71 | ~67 | ~65 |
+| Qwen2.5-Coder-7B-Instruct | ~90 | ~86 | ~81 | ~72 | ~71 | ~63 |
+| Llama-3.1-8B-Instruct | ~86 | ~81 | ~75 | ~65 | ~60 | ~49 |
 
-Decode stays flat to a few thousand tokens, then falls as attention over the KV cache dominates
-each step — at 32K it's ~2.1–2.9× slower than at 512. Decode attention is GQA-aware: each K/V entry
-is read from HBM once per KV head and shared across its query-head group, rather than re-read per
-query head. Llama-3.1-8B falls off fastest: it has 8 KV heads to Qwen2.5-7B's 4, so ~2× the KV to
-scan per token and a smaller (4× vs 7×) query group to amortize it over. (Contexts past ~4K need
+Decode stays flat to a few thousand tokens, then falls as attention over the KV cache dominates each
+step — at 32K it's ~1.4–1.75× slower than at 512. Decode attention is GQA-aware (each K/V entry is
+read from HBM once per KV head and shared across its query-head group, not re-read per query head) and
+splits the KV sequence across the SMs FlashDecoding-style: at long context each grid block streams
+several KV blocks under a running online softmax, so the memory system stays saturated instead of
+running thousands of tiny latency-bound blocks. That coarsened split roughly doubles long-context
+decode (Llama-3.1-8B at 32K: ~30 → ~49 tok/s, ~34% → ~52% of the weight+KV bandwidth roofline; same
+before/after binary, `LLAMA_INFER_ATTN_BPC=1` vs default). Llama-3.1-8B still falls off fastest: it
+has 8 KV heads to Qwen2.5-7B's 4, so ~2× the KV to scan per token and a smaller (4× vs 7×) query group
+to amortize it over. (Contexts past ~4K need
 `--tokens-file`, since a token list that long exceeds the OS command-line limit.)
 
 ## Highlights
