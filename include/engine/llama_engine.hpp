@@ -489,6 +489,12 @@ private:
   int attn_q_hidden_ = 0;        // Query projection width (rows in attention.wq).
   int attn_head_dim_ = 0;        // Per-head attention width (attn_q_hidden_ / num_heads).
   int attn_kv_hidden_ = 0;       // Key/value projection width (num_kv_heads * attn_head_dim_).
+  // Physical per-layer KV token capacity — the stride of one layer's K/V region
+  // and thus the paged block pool size (num_blocks = kv_capacity_tokens_/bs).
+  // Equals max_context normally; with --paged-blocks it is sized up to available
+  // VRAM so continuous batching can hold many concurrent sequences (each still
+  // bounded by max_context) rather than one max_context sequence total.
+  int kv_capacity_tokens_ = 0;
   bool has_any_layer_output_bias_ = false;  // Any layer has attention.bo.
   bool has_any_layer_norm_bias_ = false;    // Any layer has norm bias tensors.
 

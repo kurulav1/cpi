@@ -98,7 +98,7 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
       static_cast<std::size_t>(q_hidden + 2 * kv_hidden) * sizeof(__half);
   const std::size_t ff13_stride_bytes = static_cast<std::size_t>(2 * inter) * sizeof(__half);
   const std::size_t layer_stride =
-      static_cast<std::size_t>(options_.max_context) * static_cast<std::size_t>(kv_hidden);
+      static_cast<std::size_t>(kv_capacity_tokens_) * static_cast<std::size_t>(kv_hidden);
   auto* qkv_base = static_cast<const __half*>(d_qkv_);
   auto* ff13_base = static_cast<const __half*>(d_ff13_);
 

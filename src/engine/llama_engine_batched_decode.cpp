@@ -80,7 +80,7 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
   const int kv_hidden = attn_kv_hidden_ > 0 ? attn_kv_hidden_ : (cfg.num_kv_heads * head_dim);
   const int bs = options_.paged_block_size > 0 ? options_.paged_block_size : 32;
   const std::size_t layer_stride =
-      static_cast<std::size_t>(options_.max_context) * static_cast<std::size_t>(kv_hidden);
+      static_cast<std::size_t>(kv_capacity_tokens_) * static_cast<std::size_t>(kv_hidden);
 
   // Row-strided views into the fused QKV / gate-up buffers (per-row layout,
   // identical to run_batched_chunk).

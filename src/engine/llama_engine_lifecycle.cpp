@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
@@ -296,9 +297,20 @@ void LlamaEngine::allocate_runtime_buffers() {
               << ")\n";
   }
 
+  // Physical per-layer KV capacity. Default = max_context (holds one sequence).
+  // With --paged-blocks it can be enlarged (explicit override here; VRAM-derived
+  // default is a follow-up) so the shared block pool holds many concurrent
+  // sequences. Every stride into d_k_cache_/d_v_cache_ uses kv_capacity_tokens_,
+  // so read/write layout stays consistent regardless of the value.
+  kv_capacity_tokens_ = options_.max_context;
   if (options_.paged_blocks) {
     const int bs = options_.paged_block_size > 0 ? options_.paged_block_size : 32;
-    const int num_blocks = (options_.max_context + bs - 1) / bs;
+    if (const char* ov = std::getenv("LLAMA_INFER_KV_POOL_TOKENS")) {
+      const int req = std::atoi(ov);
+      if (req > kv_capacity_tokens_) kv_capacity_tokens_ = req;
+    }
+    kv_capacity_tokens_ = ((kv_capacity_tokens_ + bs - 1) / bs) * bs;  // whole blocks
+    const int num_blocks = kv_capacity_tokens_ / bs;
     block_alloc_ = std::make_unique<BlockAllocator>(num_blocks);
     seq_blocks_ = std::make_unique<SequenceBlockTable>(block_alloc_.get(), bs);
     // Device block table for the paged decode-attention kernel. Phase 2c uses a
@@ -399,7 +411,7 @@ void LlamaEngine::allocate_runtime_buffers() {
   }
 
   const std::size_t kv_bytes = static_cast<std::size_t>(cfg.num_layers) *
-                               static_cast<std::size_t>(options_.max_context) *
+                               static_cast<std::size_t>(kv_capacity_tokens_) *
                                static_cast<std::size_t>(kv_hidden) * sizeof(__half);
   if (kv_int4_enabled_) {
     // INT4 KV: packed nibbles + per-head fp16 scales; FP16 KV buffers not allocated.
@@ -486,7 +498,7 @@ void LlamaEngine::reset_kv_cache() {
   const int head_dim = attn_head_dim_ > 0 ? attn_head_dim_ : (cfg.hidden_size / cfg.num_heads);
   const int kv_hidden = attn_kv_hidden_ > 0 ? attn_kv_hidden_ : (cfg.num_kv_heads * head_dim);
   const std::size_t kv_bytes = static_cast<std::size_t>(cfg.num_layers) *
-                               static_cast<std::size_t>(options_.max_context) *
+                               static_cast<std::size_t>(kv_capacity_tokens_) *
                                static_cast<std::size_t>(kv_hidden) * sizeof(__half);
   if (kv_int4_enabled_) {
     const int packed_per_head = head_dim / 2;

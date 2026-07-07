@@ -281,7 +281,7 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
         const auto [attn_start, attn_seq_len] = attention_bounds(layer, position);
         const std::size_t kv_bytes = bytes_for_matrix(1, kv_hidden);
         const std::size_t layer_stride =
-            static_cast<std::size_t>(options_.max_context) * static_cast<std::size_t>(kv_hidden);
+            static_cast<std::size_t>(kv_capacity_tokens_) * static_cast<std::size_t>(kv_hidden);
         __half* k_layer = nullptr;
         __half* v_layer = nullptr;
         if (options_.paged_kv_cache) {
@@ -434,7 +434,7 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
       const auto [attn_start, attn_seq_len] = attention_bounds(layer, position);
       const std::size_t kv_bytes = bytes_for_matrix(1, kv_hidden);
       const std::size_t layer_stride =
-          static_cast<std::size_t>(options_.max_context) * static_cast<std::size_t>(kv_hidden);
+          static_cast<std::size_t>(kv_capacity_tokens_) * static_cast<std::size_t>(kv_hidden);
       __half* k_layer = nullptr;
       __half* v_layer = nullptr;
       if (options_.paged_kv_cache) {
@@ -579,7 +579,7 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
       } else {
         const std::size_t kv_bytes = bytes_for_matrix(1, kv_hidden);
         const std::size_t layer_stride =
-            static_cast<std::size_t>(options_.max_context) * static_cast<std::size_t>(kv_hidden);
+            static_cast<std::size_t>(kv_capacity_tokens_) * static_cast<std::size_t>(kv_hidden);
         auto* k_layer =
             static_cast<__half*>(d_k_cache_) + static_cast<std::size_t>(layer) * layer_stride;
         auto* v_layer =
@@ -605,7 +605,7 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
       run_profiled(last_benchmark_stats_.decode_attention_ms, [&] {
         const auto [attn_start, attn_seq_len] = attention_bounds(layer, position);
         const std::size_t layer_stride =
-            static_cast<std::size_t>(options_.max_context) * static_cast<std::size_t>(kv_hidden);
+            static_cast<std::size_t>(kv_capacity_tokens_) * static_cast<std::size_t>(kv_hidden);
         if (options_.paged_blocks && d_block_table_ != nullptr && attn_start == 0) {
           // P3 phase 2c: gather KV through the device block table. Pool base is
           // the layer's KV region; the block table maps logical chunk -> physical
@@ -718,7 +718,7 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
       } else {
         const std::size_t kv_bytes = bytes_for_matrix(1, kv_hidden);
         const std::size_t layer_stride =
-            static_cast<std::size_t>(options_.max_context) * static_cast<std::size_t>(kv_hidden);
+            static_cast<std::size_t>(kv_capacity_tokens_) * static_cast<std::size_t>(kv_hidden);
         auto* k_layer =
             static_cast<__half*>(d_k_cache_) + static_cast<std::size_t>(layer) * layer_stride;
         auto* v_layer =
@@ -744,7 +744,7 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
       run_profiled(last_benchmark_stats_.decode_attention_ms, [&] {
         const auto [attn_start, attn_seq_len] = attention_bounds(layer, position);
         const std::size_t layer_stride =
-            static_cast<std::size_t>(options_.max_context) * static_cast<std::size_t>(kv_hidden);
+            static_cast<std::size_t>(kv_capacity_tokens_) * static_cast<std::size_t>(kv_hidden);
         if (options_.paged_blocks && d_block_table_ != nullptr && attn_start == 0) {
           // P3 phase 2c: gather KV through the device block table. Pool base is
           // the layer's KV region; the block table maps logical chunk -> physical
@@ -934,7 +934,7 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
 
     run_profiled(last_benchmark_stats_.decode_kv_store_ms, [&] {
       const std::size_t kv_bytes = bytes_for_matrix(1, kv_hidden);
-      const std::size_t layer_stride = static_cast<std::size_t>(options_.max_context) * kv_hidden;
+      const std::size_t layer_stride = static_cast<std::size_t>(kv_capacity_tokens_) * kv_hidden;
       auto* k_layer =
           static_cast<__half*>(d_k_cache_) + static_cast<std::size_t>(layer) * layer_stride;
       auto* v_layer =
@@ -947,7 +947,7 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
 
     run_profiled(last_benchmark_stats_.decode_attention_ms, [&] {
       const auto [attn_start, attn_seq_len] = attention_bounds(layer, position);
-      const std::size_t layer_stride = static_cast<std::size_t>(options_.max_context) * kv_hidden;
+      const std::size_t layer_stride = static_cast<std::size_t>(kv_capacity_tokens_) * kv_hidden;
       auto* k_layer = static_cast<__half*>(d_k_cache_) +
                       static_cast<std::size_t>(layer) * layer_stride +
                       static_cast<std::size_t>(attn_start) * static_cast<std::size_t>(kv_hidden);
