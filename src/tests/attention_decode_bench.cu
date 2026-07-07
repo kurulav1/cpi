@@ -45,7 +45,7 @@ int main() {
       {16, 4, 256, "Qwen3.5-9B"},
   };
   const int batches[] = {1, 8, 32};
-  const int contexts[] = {512, 2048, 4096};
+  const int contexts[] = {512, 2048, 4096, 8192, 16384, 32768};
   const int block_size = 32;
 
   std::mt19937 rng(1);
