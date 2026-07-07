@@ -465,12 +465,21 @@ private:
     StreamParams params;
   };
   std::vector<StreamSeq> stream_seqs_;
-  // Paged shared-prefix cache (P4): the most recent admitted sequence's
-  // block-aligned prefix tokens + a block table holding (refcounted) its KV
-  // blocks, so a later request with the same leading tokens adopts those blocks
-  // via share_prefix_from instead of re-prefilling them.
-  std::unique_ptr<SequenceBlockTable> cached_prefix_table_;
-  std::vector<int> cached_prefix_tokens_;
+  // Paged shared-prefix cache (P4): a small LRU of independent cached prefixes,
+  // each a block-aligned token prefix + a block table holding (refcounted) its
+  // KV blocks. On admit we adopt the longest whole-block common prefix of the
+  // best-matching entry via share_prefix_from instead of re-prefilling it. A
+  // multi-entry cache (vs a single slot) keeps distinct prefixes — different
+  // system prompts, interleaved chats — from evicting each other; a full radix
+  // trie was measured to add <5pp reuse over this at far higher complexity.
+  struct CachedPrefix {
+    std::unique_ptr<SequenceBlockTable> table;
+    std::vector<int> tokens;  // block-aligned prompt prefix these blocks cover
+    std::uint64_t last_use = 0;
+  };
+  std::vector<CachedPrefix> prefix_cache_;
+  std::uint64_t prefix_cache_tick_ = 0;
+  static constexpr std::size_t kPrefixCacheEntries = 32;
   // Grow a streaming request's block table so it covers `upto_pos`.
   void stream_grow_table(StreamSeq& s, int upto_pos);
 

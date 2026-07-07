@@ -424,17 +424,27 @@ void LlamaEngine::stream_admit(const std::string& id, const std::vector<int>& pr
   // so output is unchanged. Cap below prompt length so the final block is always
   // (re)prefilled to seed decode. Must run before stream_grow_table allocates.
   int shared_tokens = 0;
-  if (cached_prefix_table_ && !cached_prefix_tokens_.empty()) {
+  {
+    // Pick the cached entry sharing the longest whole-block common prefix.
     const int cap = static_cast<int>(prompt_tokens.size()) - 1;
-    const int mmax = std::min(static_cast<int>(cached_prefix_tokens_.size()), cap);
-    int match = 0;
-    while (match < mmax && prompt_tokens[static_cast<std::size_t>(match)] ==
-                               cached_prefix_tokens_[static_cast<std::size_t>(match)]) {
-      ++match;
+    CachedPrefix* best = nullptr;
+    int best_whole = 0;
+    for (auto& e : prefix_cache_) {
+      const int mmax = std::min(static_cast<int>(e.tokens.size()), cap);
+      int match = 0;
+      while (match < mmax && prompt_tokens[static_cast<std::size_t>(match)] ==
+                                 e.tokens[static_cast<std::size_t>(match)]) {
+        ++match;
+      }
+      const int whole = (match / bs) * bs;  // share_prefix_from adopts whole blocks only
+      if (whole > best_whole) {
+        best_whole = whole;
+        best = &e;
+      }
     }
-    const int whole = (match / bs) * bs;  // share_prefix_from adopts whole blocks only
-    if (whole >= bs && s.blocks->share_prefix_from(*cached_prefix_table_, whole)) {
-      shared_tokens = whole;
+    if (best && best_whole >= bs && s.blocks->share_prefix_from(*best->table, best_whole)) {
+      shared_tokens = best_whole;
+      best->last_use = ++prefix_cache_tick_;
     }
   }
 
@@ -449,15 +459,37 @@ void LlamaEngine::stream_admit(const std::string& id, const std::vector<int>& pr
   prefill_prompt(prompt_tokens, shared_tokens);
   CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
 
-  // Refresh the shared-prefix cache with this sequence's block-aligned prefix (a
-  // fresh table that refcounts the blocks so they outlive this sequence). The old
-  // cache's blocks are released when it is replaced.
+  // Refresh the cache with this sequence's block-aligned prefix (a fresh table
+  // that refcounts the blocks so they outlive this sequence). If this request
+  // exactly extends the entry it reused, update that entry in place so a growing
+  // chat stays one slot; otherwise insert a new entry and LRU-evict to the cap.
   const int cache_tokens = (static_cast<int>(prompt_tokens.size()) / bs) * bs;
   if (cache_tokens >= bs) {
-    auto next_cache = std::make_unique<SequenceBlockTable>(block_alloc_.get(), bs);
-    if (next_cache->share_prefix_from(*s.blocks, cache_tokens)) {
-      cached_prefix_table_ = std::move(next_cache);
-      cached_prefix_tokens_.assign(prompt_tokens.begin(), prompt_tokens.begin() + cache_tokens);
+    auto next_table = std::make_unique<SequenceBlockTable>(block_alloc_.get(), bs);
+    if (next_table->share_prefix_from(*s.blocks, cache_tokens)) {
+      CachedPrefix* slot = nullptr;
+      for (auto& e : prefix_cache_) {
+        if (static_cast<int>(e.tokens.size()) == shared_tokens && shared_tokens > 0 &&
+            std::equal(e.tokens.begin(), e.tokens.end(), prompt_tokens.begin())) {
+          slot = &e;  // this request extends exactly this entry
+          break;
+        }
+      }
+      if (!slot) {
+        if (prefix_cache_.size() >= kPrefixCacheEntries) {
+          auto lru = std::min_element(
+              prefix_cache_.begin(), prefix_cache_.end(),
+              [](const CachedPrefix& a, const CachedPrefix& b) { return a.last_use < b.last_use; });
+          *lru = CachedPrefix{};  // release its block refs before reuse
+          slot = &*lru;
+        } else {
+          prefix_cache_.emplace_back();
+          slot = &prefix_cache_.back();
+        }
+      }
+      slot->table = std::move(next_table);
+      slot->tokens.assign(prompt_tokens.begin(), prompt_tokens.begin() + cache_tokens);
+      slot->last_use = ++prefix_cache_tick_;
     }
   }
 

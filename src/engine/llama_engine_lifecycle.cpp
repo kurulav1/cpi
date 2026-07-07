@@ -481,8 +481,7 @@ void LlamaEngine::reset_kv_cache() {
   if (seq_blocks_) seq_blocks_->clear();  // release paged blocks alongside the KV wipe
   // The paged shared-prefix cache references KV blocks that this wipe invalidates;
   // drop it so no later request adopts stale blocks.
-  cached_prefix_table_.reset();
-  cached_prefix_tokens_.clear();
+  prefix_cache_.clear();
   const auto& cfg = weights_.config();
   const int head_dim = attn_head_dim_ > 0 ? attn_head_dim_ : (cfg.hidden_size / cfg.num_heads);
   const int kv_hidden = attn_kv_hidden_ > 0 ? attn_kv_hidden_ : (cfg.num_kv_heads * head_dim);
