@@ -90,7 +90,9 @@ int main() {
       {32, 8, 128, "Llama3.1 hd128"}, {28, 4, 128, "Qwen2.5 hd128"}, {16, 4, 256, "Qwen3.5 hd256"},
       {16, 4, 64, "GQA hd64"},        {16, 4, 256, "GQA4x hd256"},
   };
-  const int seq_lens[] = {1, 7, 33, 200};
+  // Long sequences exercise the coarsened split (blocks_per_chunk > 1) and the
+  // reduce combining multiple coarse chunks, on both host and graph (dpos) paths.
+  const int seq_lens[] = {1, 7, 33, 200, 600, 2050};
   // cosine gate: a correct kernel matches the oracle to > 0.9999; the head_dim=256
   // scalar-accumulator bug scored ~0.65. 0.999 cleanly separates the two.
   const double kCosGate = 0.999;

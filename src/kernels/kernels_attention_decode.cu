@@ -918,14 +918,15 @@ __device__ __forceinline__ void gqa_split_chunk_stats_core(const half* q, const 
                                                            float* chunk_l, float* chunk_o,
                                                            int seq_len, int num_kv_heads,
                                                            int group_size, int chunk_size,
-                                                           int scratch_chunks) {
-  // chunk_size is the split step (<= warpSize=32), so lane `t` owns token `t`.
+                                                           int blocks_per_chunk, int scratch_chunks) {
+  // chunk_size is the split step (<= warpSize=32), so lane `t` owns token `t`. A
+  // grid block sweeps blocks_per_chunk such sub-chunks with a running online
+  // softmax, so long context runs on fewer, larger, latency-hiding blocks instead
+  // of thousands of tiny 32-token ones (which left it at ~14% of peak at batch 1).
   const int kv_head = blockIdx.x;
-  const int chunk = blockIdx.y;
-  const int chunk_start = chunk * chunk_size;
-  if (chunk_start >= seq_len) return;
-  const int chunk_end = min(chunk_start + chunk_size, seq_len);
-  const int tile_tokens = chunk_end - chunk_start;
+  const int coarse = blockIdx.y;
+  const int first_sub = coarse * blocks_per_chunk;  // first sub-chunk in this coarse chunk
+  if (first_sub * chunk_size >= seq_len) return;
 
   extern __shared__ unsigned char smem_bytes[];
   half* q_sh = reinterpret_cast<half*>(smem_bytes);                       // group_size*HeadDim
@@ -938,59 +939,87 @@ __device__ __forceinline__ void gqa_split_chunk_stats_core(const half* q, const 
   const int lane = tid & 31;
   const float scale = rsqrtf(static_cast<float>(HeadDim));
   const int q_head = kv_head * group_size + warp_id;
+  constexpr int kOutPerLane = HeadDim / 32;
 
-  // Load this group's query heads and the chunk's K/V tile once (coalesced),
-  // reused across all group_size warps.
+  // Load this group's query heads once (reused across all sub-chunks/warps).
   for (int d = lane; d < HeadDim; d += 32) {
     q_sh[warp_id * HeadDim + d] = q[q_head * HeadDim + d];
   }
-  for (int idx = tid; idx < tile_tokens * HeadDim; idx += blockDim.x) {
-    const int t = idx / HeadDim;
-    const int d = idx - t * HeadDim;
-    const int base = cache_index(chunk_start + t, kv_head, 0, num_kv_heads, HeadDim);
-    k_tile[idx] = k_cache[base + d];
-    v_tile[idx] = v_cache[base + d];
-  }
-  __syncthreads();
 
-  // Each warp handles one query head; lane t scores token t against shared K.
-  float score = neg_inf<float>();
-  if (lane < tile_tokens) {
-    const half2* qh = reinterpret_cast<const half2*>(q_sh + warp_id * HeadDim);
-    const half2* kt = reinterpret_cast<const half2*>(k_tile + lane * HeadDim);
-    float dot = 0.0f;
+  float running_m = neg_inf<float>();
+  float running_l = 0.0f;
+  float acc[kOutPerLane];
 #pragma unroll
-    for (int p = 0; p < HeadDim / 2; ++p) {
-      const float2 a = __half22float2(qh[p]);
-      const float2 b = __half22float2(kt[p]);
-      dot += a.x * b.x + a.y * b.y;
+  for (int i = 0; i < kOutPerLane; ++i) acc[i] = 0.0f;
+
+  for (int jb = 0; jb < blocks_per_chunk; ++jb) {
+    const int sub_start = (first_sub + jb) * chunk_size;
+    if (sub_start >= seq_len) break;
+    const int tile_tokens = min(chunk_size, seq_len - sub_start);
+
+    __syncthreads();  // protect the K/V tiles from the prior sub-chunk's V sum
+    for (int idx = tid; idx < tile_tokens * HeadDim; idx += blockDim.x) {
+      const int t = idx / HeadDim;
+      const int d = idx - t * HeadDim;
+      const int base = cache_index(sub_start + t, kv_head, 0, num_kv_heads, HeadDim);
+      k_tile[idx] = k_cache[base + d];
+      v_tile[idx] = v_cache[base + d];
     }
-    score = dot * scale;
-  }
-  float tile_m = score;
-#pragma unroll
-  for (int o = 16; o > 0; o >>= 1) tile_m = fmaxf(tile_m, __shfl_xor_sync(0xffffffffu, tile_m, o));
-  const float weight = (lane < tile_tokens) ? expf(score - tile_m) : 0.0f;
-  float tile_l = weight;
-#pragma unroll
-  for (int o = 16; o > 0; o >>= 1) tile_l += __shfl_xor_sync(0xffffffffu, tile_l, o);
-  w_sh[warp_id * chunk_size + lane] = weight;
-  __syncwarp();
+    __syncthreads();
 
-  // Weighted V sum: each lane owns HeadDim/32 output channels.
-  const int chunk_index = q_head * scratch_chunks + chunk;
+    // Each warp handles one query head; lane t scores token t against shared K.
+    float score = neg_inf<float>();
+    if (lane < tile_tokens) {
+      const half2* qh = reinterpret_cast<const half2*>(q_sh + warp_id * HeadDim);
+      const half2* kt = reinterpret_cast<const half2*>(k_tile + lane * HeadDim);
+      float dot = 0.0f;
 #pragma unroll
-  for (int i = 0; i < HeadDim / 32; ++i) {
+      for (int p = 0; p < HeadDim / 2; ++p) {
+        const float2 a = __half22float2(qh[p]);
+        const float2 b = __half22float2(kt[p]);
+        dot += a.x * b.x + a.y * b.y;
+      }
+      score = dot * scale;
+    }
+    // Sub-chunk max, then fold into the running softmax (rescale prior partial).
+    float sub_m = score;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) sub_m = fmaxf(sub_m, __shfl_xor_sync(0xffffffffu, sub_m, o));
+    const float new_m = fmaxf(running_m, sub_m);
+    const float corr = (running_l == 0.0f) ? 0.0f : expf(running_m - new_m);
+    running_l *= corr;
+#pragma unroll
+    for (int i = 0; i < kOutPerLane; ++i) acc[i] *= corr;
+    const float weight = (lane < tile_tokens) ? expf(score - new_m) : 0.0f;
+    float sub_l = weight;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) sub_l += __shfl_xor_sync(0xffffffffu, sub_l, o);
+    running_l += sub_l;
+    running_m = new_m;
+    w_sh[warp_id * chunk_size + lane] = weight;
+    __syncwarp();
+
+    // Weighted V sum into the running output (each lane owns HeadDim/32 channels).
+#pragma unroll
+    for (int i = 0; i < kOutPerLane; ++i) {
+      const int d = lane + i * 32;
+      float o = 0.0f;
+      for (int t = 0; t < tile_tokens; ++t) {
+        o += w_sh[warp_id * chunk_size + t] * __half2float(v_tile[t * HeadDim + d]);
+      }
+      acc[i] += o;
+    }
+  }
+
+  const int chunk_index = q_head * scratch_chunks + coarse;
+#pragma unroll
+  for (int i = 0; i < kOutPerLane; ++i) {
     const int d = lane + i * 32;
-    float o = 0.0f;
-    for (int t = 0; t < tile_tokens; ++t) {
-      o += w_sh[warp_id * chunk_size + t] * __half2float(v_tile[t * HeadDim + d]);
-    }
-    chunk_o[static_cast<std::size_t>(chunk_index) * HeadDim + d] = o;
+    chunk_o[static_cast<std::size_t>(chunk_index) * HeadDim + d] = acc[i];
   }
   if (lane == 0) {
-    chunk_m[chunk_index] = tile_m;
-    chunk_l[chunk_index] = tile_l;
+    chunk_m[chunk_index] = running_m;
+    chunk_l[chunk_index] = running_l;
   }
 }
 
@@ -1000,19 +1029,43 @@ __global__ void attention_step_chunk_stats_gqa_split_kernel(const half* q, const
                                                             float* chunk_l, float* chunk_o,
                                                             int seq_len, int num_kv_heads,
                                                             int group_size, int chunk_size,
-                                                            int scratch_chunks) {
+                                                            int blocks_per_chunk, int scratch_chunks) {
   gqa_split_chunk_stats_core<HeadDim>(q, k_cache, v_cache, chunk_m, chunk_l, chunk_o, seq_len,
-                                      num_kv_heads, group_size, chunk_size, scratch_chunks);
+                                      num_kv_heads, group_size, chunk_size, blocks_per_chunk,
+                                      scratch_chunks);
 }
 
 template <int HeadDim>
 __global__ void attention_step_chunk_stats_gqa_split_device_pos_kernel(
     const half* q, const half* k_cache, const half* v_cache, float* chunk_m, float* chunk_l,
     float* chunk_o, const int* position_ptr, int num_kv_heads, int group_size, int chunk_size,
-    int scratch_chunks) {
+    int blocks_per_chunk, int scratch_chunks) {
   gqa_split_chunk_stats_core<HeadDim>(q, k_cache, v_cache, chunk_m, chunk_l, chunk_o,
                                       position_ptr[0] + 1, num_kv_heads, group_size, chunk_size,
-                                      scratch_chunks);
+                                      blocks_per_chunk, scratch_chunks);
+}
+
+// Coarsening factor for the split-K decode attention: each grid block sweeps this
+// many 32-token sub-chunks with a running online softmax. Pick the largest G (<=
+// kMaxBpc) that keeps the grid (lanes*coarse_chunks, lanes = num_kv_heads*batch)
+// above a floor for occupancy, so long context runs on fewer, larger, latency-
+// hiding blocks. Short context stays at G=1. LLAMA_INFER_ATTN_BPC overrides.
+static inline int pick_blocks_per_chunk(int total_blocks, long long lanes) {
+  static const int env_bpc = [] {
+    const char* s = std::getenv("LLAMA_INFER_ATTN_BPC");
+    return s ? atoi(s) : 0;
+  }();
+  const int cap = max(1, total_blocks);
+  if (env_bpc > 0) return min(env_bpc, cap);
+  constexpr int kMaxBpc = 8;     // <= 256 tokens/block: past this it over-serializes
+  constexpr int kMinGrid = 256;  // floor on total grid blocks for occupancy
+  int bpc = min(kMaxBpc, cap);
+  while (bpc > 1) {
+    const int cc = (total_blocks + bpc - 1) / bpc;
+    if (lanes * static_cast<long long>(cc) >= kMinGrid) break;
+    --bpc;
+  }
+  return bpc;
 }
 
 void launch_attention_step(const half* q, const half* k_cache, const half* v_cache, half* out,
@@ -1054,34 +1107,38 @@ void launch_attention_step(const half* q, const half* k_cache, const half* v_cac
       seq_len >= 64) {
     constexpr int warps = 4;
     constexpr int threads = warps * 32;
-    const int chunk_count =
-        min(scratch_chunks, (seq_len + split_chunk_size - 1) / split_chunk_size);
+    const int sub_chunks = min(scratch_chunks, (seq_len + split_chunk_size - 1) / split_chunk_size);
     // GQA models: share each K/V read across the query-head group (no per-head
     // redundancy) while keeping num_kv_heads×chunks blocks for occupancy.
     const bool gqa = num_kv_heads > 0 && num_heads > num_kv_heads &&
                      (num_heads % num_kv_heads) == 0 && (num_heads / num_kv_heads) * 32 <= 1024;
+    int reduce_chunk_size = split_chunk_size;
     if (gqa) {
       const int group_size_val = num_heads / num_kv_heads;
+      // Coarsen the split at long context: one grid block sweeps G sub-chunks.
+      const int G = pick_blocks_per_chunk(sub_chunks, num_kv_heads);
+      const int coarse_chunks = (sub_chunks + G - 1) / G;
+      reduce_chunk_size = split_chunk_size * G;
       const std::size_t smem_gqa =
           static_cast<std::size_t>(group_size_val + 2 * split_chunk_size) * head_dim *
               sizeof(half) +
           static_cast<std::size_t>(group_size_val) * split_chunk_size * sizeof(float);
-      const dim3 grid(num_kv_heads, chunk_count);
+      const dim3 grid(num_kv_heads, coarse_chunks);
       attention_step_chunk_stats_gqa_split_kernel<128>
           <<<grid, group_size_val * 32, smem_gqa, stream>>>(
               q, k_cache, v_cache, scratch_m, scratch_l, scratch_o, seq_len, num_kv_heads,
-              group_size_val, split_chunk_size, scratch_chunks);
+              group_size_val, split_chunk_size, G, scratch_chunks);
     } else {
       const std::size_t smem = static_cast<std::size_t>(head_dim) * sizeof(half) +
                                static_cast<std::size_t>(2 * warps + 4) * sizeof(float) +
                                static_cast<std::size_t>(warps * head_dim) * sizeof(half);
-      const dim3 grid(num_heads, chunk_count);
+      const dim3 grid(num_heads, sub_chunks);
       attention_step_chunk_stats_kernel<warps><<<grid, threads, smem, stream>>>(
           q, k_cache, v_cache, scratch_m, scratch_l, scratch_o, seq_len, num_heads, num_kv_heads,
           head_dim, split_chunk_size, scratch_chunks);
     }
     attention_step_chunk_reduce_kernel<<<num_heads, threads, 0, stream>>>(
-        scratch_m, scratch_l, scratch_o, out, seq_len, num_heads, head_dim, split_chunk_size,
+        scratch_m, scratch_l, scratch_o, out, seq_len, num_heads, head_dim, reduce_chunk_size,
         scratch_chunks);
     return;
   }
@@ -1489,31 +1546,11 @@ void launch_attention_step_batched_paged(const half* q, const half* k_pool, cons
   // batch-1 long-context attention latency-bound at ~14% of peak). Keep the grid
   // (num_kv_heads*chunks*batch) above a floor so SMs stay filled, and cap the
   // coarsening so no single block streams too serially.
-  int blocks_per_chunk = 1;
-  if (gqa_shared) {
-    static const int env_bpc = [] {
-      const char* s = std::getenv("LLAMA_INFER_ATTN_BPC");
-      return s ? atoi(s) : 0;
-    }();
-    if (env_bpc > 0) {
-      blocks_per_chunk = env_bpc;
-    } else {
-      // Use the largest coarsening (up to kMaxBpc) that still leaves enough grid
-      // blocks (num_kv_heads*coarse_chunks*batch) to fill the SMs. Measured on a
-      // 5090: at long context bigger blocks win at every batch (batch-1 32K
-      // 14%->48% peak; batch-32 ->87%), while short context keeps ~1 block/chunk.
-      constexpr int kMaxBpc = 8;    // <= 256 tokens/block: past this it over-serializes
-      constexpr int kMinGrid = 256;  // floor on total grid blocks for occupancy
-      int bpc = min(kMaxBpc, max(1, total_blocks));
-      while (bpc > 1) {
-        const int cc = (total_blocks + bpc - 1) / bpc;
-        if (static_cast<long long>(num_kv_heads) * cc * batch >= kMinGrid) break;
-        --bpc;
-      }
-      blocks_per_chunk = bpc;
-    }
-    blocks_per_chunk = max(1, min(blocks_per_chunk, max(1, total_blocks)));
-  }
+  // Measured on a 5090: at long context bigger blocks win at every batch (batch-1
+  // 32K 14%->48% peak; batch-32 ->87%), while short context keeps ~1 block/chunk.
+  const int blocks_per_chunk =
+      gqa_shared ? pick_blocks_per_chunk(total_blocks, static_cast<long long>(num_kv_heads) * batch)
+                 : 1;
   const int coarse_chunks = (total_blocks + blocks_per_chunk - 1) / blocks_per_chunk;
   // The reduce derives its per-sequence chunk count from this stride, so it must
   // equal the coarse chunk's token span (ceil(ceil(s/b)/G) == ceil(s/(b*G))).
@@ -1602,17 +1639,25 @@ void launch_attention_step_device_pos(const half* q, const half* k_cache, const 
     // keeps occupancy. Graph-safe: fixed grid, per-chunk seq guard.
     const bool gqa = num_kv_heads > 0 && num_heads > num_kv_heads &&
                      (num_heads % num_kv_heads) == 0 && (num_heads / num_kv_heads) * 32 <= 1024;
+    int reduce_chunk_size = split_chunk_size;
     if (gqa) {
       const int group_size_val = num_heads / num_kv_heads;
+      // Graph capture can't see runtime seq_len (device-side position), so the
+      // coarsening factor is fixed from scratch_chunks (the max). The per-sub-chunk
+      // seq guard keeps it correct as the sequence grows; the reduce derives its
+      // count from the coarse chunk_size and the device position.
+      const int G = pick_blocks_per_chunk(scratch_chunks, num_kv_heads);
+      const int coarse_chunks = (scratch_chunks + G - 1) / G;
+      reduce_chunk_size = split_chunk_size * G;
       const std::size_t smem_gqa =
           static_cast<std::size_t>(group_size_val + 2 * split_chunk_size) * head_dim *
               sizeof(half) +
           static_cast<std::size_t>(group_size_val) * split_chunk_size * sizeof(float);
-      const dim3 grid(num_kv_heads, scratch_chunks);
+      const dim3 grid(num_kv_heads, coarse_chunks);
       attention_step_chunk_stats_gqa_split_device_pos_kernel<128>
           <<<grid, group_size_val * 32, smem_gqa, stream>>>(
               q, k_cache, v_cache, scratch_m, scratch_l, scratch_o, position, num_kv_heads,
-              group_size_val, split_chunk_size, scratch_chunks);
+              group_size_val, split_chunk_size, G, scratch_chunks);
     } else {
       const std::size_t smem = static_cast<std::size_t>(head_dim) * sizeof(half) +
                                static_cast<std::size_t>(2 * warps + 4) * sizeof(float) +
@@ -1623,7 +1668,7 @@ void launch_attention_step_device_pos(const half* q, const half* k_cache, const 
           head_dim, split_chunk_size, scratch_chunks);
     }
     attention_step_chunk_reduce_device_pos_kernel<<<num_heads, threads, 0, stream>>>(
-        scratch_m, scratch_l, scratch_o, out, position, num_heads, head_dim, split_chunk_size,
+        scratch_m, scratch_l, scratch_o, out, position, num_heads, head_dim, reduce_chunk_size,
         scratch_chunks);
     return;
   }
