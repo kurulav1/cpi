@@ -378,6 +378,7 @@ int main(int argc, char** argv) {
                     << " accepted=" << s.accepted << " emitted=" << s.emitted
                     << " accept_rate=" << s.accept_rate()
                     << " tokens_per_round=" << s.tokens_per_round()
+                    << " tree2_recovery_rate=" << s.tree2_recovery_rate()
                     << " spec_tokens=" << cli.spec_tokens << "\n";
         }
       } else {

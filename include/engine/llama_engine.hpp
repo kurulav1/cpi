@@ -285,6 +285,11 @@ private:
   int decode_next_token(int token, int position, float temperature,
                         const std::vector<int>& history);
 
+  // Greedy decode returning the top-1 argmax and, via `second`, the top-2 token.
+  // Uses the host-logits forward (advances KV like decode_next_token). Used by
+  // the speculative decoder's tree-opportunity probe.
+  int decode_next_token2(int token, int position, int* second);
+
   // Launches the custom half-precision (FP16) projection kernel for a
   // weight matrix w of shape [out_features x in_features] applied to
   // activation vector x, writing the result to y.

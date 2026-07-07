@@ -1,6 +1,7 @@
 #include "engine/speculative_decoder.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 
 #include "engine/llama_engine.hpp"
 
@@ -33,8 +34,8 @@ std::vector<int> SpeculativeDecoder::generate(const std::vector<int>& prompt_tok
   int pos = static_cast<int>(prompt_tokens.size()) - 1;  // position of `last`
   int last = prompt_tokens.back();                       // token consumed at `pos`
   bool stop = false;
-
-  const std::vector<int> empty_history;  // pure greedy: no repetition history
+  const bool tree_probe_ = std::getenv("LLAMA_INFER_SPEC_TREE_PROBE") != nullptr;
+  const std::vector<int> empty_history_;  // pure greedy: no repetition history
 
   auto emit = [&](int token) -> bool {
     out.push_back(token);
@@ -52,14 +53,23 @@ std::vector<int> SpeculativeDecoder::generate(const std::vector<int>& prompt_tok
   while (!stop && generated < max_new_tokens) {
     const int K = k_;
 
-    // 1. Draft K tokens greedily. Consumes last@pos, draft[0]@pos+1, ...,
-    //    draft[K-2]@pos+K-1, producing draft[0..K-1].
+    // 1. Draft K tokens greedily. When the tree-opportunity probe is on
+    //    (LLAMA_INFER_SPEC_TREE_PROBE), also record each position's SECOND choice
+    //    via the slower host-logits path; production uses the fast argmax graph.
     std::vector<int> draft_tokens;
+    std::vector<int> draft2;
     draft_tokens.reserve(static_cast<std::size_t>(K));
     int cur = last;
     int dpos = pos;
     for (int j = 0; j < K; ++j) {
-      const int t = draft_.decode_next_token(cur, dpos, 0.0f, empty_history);
+      int t;
+      if (tree_probe_) {
+        int second = 0;
+        t = draft_.decode_next_token2(cur, dpos, &second);
+        draft2.push_back(second);
+      } else {
+        t = draft_.decode_next_token(cur, dpos, 0.0f, empty_history_);
+      }
       draft_tokens.push_back(t);
       cur = t;
       ++dpos;
@@ -87,6 +97,15 @@ std::vector<int> SpeculativeDecoder::generate(const std::vector<int>& prompt_tok
     stats_.rounds += 1;
     stats_.drafted += K;
     stats_.accepted += n_accept;
+
+    // Tree-opportunity probe: at the rejection position, would the draft's second
+    // choice have matched the target's token (a width-2 tree recovers there)?
+    if (tree_probe_ && n_accept < K) {
+      ++stats_.mismatch_rounds;
+      if (draft2[static_cast<std::size_t>(n_accept)] == targ[static_cast<std::size_t>(n_accept)]) {
+        ++stats_.tree2_recoveries;
+      }
+    }
 
     // 4. Emit accepted drafts, then advance the frontier.
     for (int i = 0; i < n_accept; ++i) {

@@ -13,12 +13,20 @@ struct SpeculativeStats {
   int drafted = 0;   // draft tokens proposed
   int accepted = 0;  // draft tokens accepted (excludes correction/bonus tokens)
   int emitted = 0;   // total tokens emitted
+  // Tree-speculation opportunity probe: rounds that rejected before K, and of
+  // those, how many where the draft's SECOND choice at the rejection position
+  // equalled the target's token (a width-2 tree would have recovered there).
+  int mismatch_rounds = 0;
+  int tree2_recoveries = 0;
 
   double accept_rate() const {
     return drafted > 0 ? static_cast<double>(accepted) / drafted : 0.0;
   }
   double tokens_per_round() const {
     return rounds > 0 ? static_cast<double>(emitted) / rounds : 0.0;
+  }
+  double tree2_recovery_rate() const {
+    return mismatch_rounds > 0 ? static_cast<double>(tree2_recoveries) / mismatch_rounds : 0.0;
   }
 };
 

@@ -59,4 +59,31 @@ int LlamaEngine::decode_next_token(int token, int position, float temperature,
                                              options_.no_repeat_ngram_size, history);
 }
 
+int LlamaEngine::decode_next_token2(int token, int position, int* second) {
+  std::vector<float> h_logits;
+  if (can_use_greedy_decode_graph()) {
+    decode_next_token_logits_graph(token, position, h_logits);
+  } else {
+    forward_token_logits(token, position, &h_logits, nullptr);
+  }
+  int t1 = 0;
+  int t2 = 0;
+  float m1 = -std::numeric_limits<float>::infinity();
+  float m2 = -std::numeric_limits<float>::infinity();
+  for (int i = 0; i < static_cast<int>(h_logits.size()); ++i) {
+    const float v = h_logits[static_cast<std::size_t>(i)];
+    if (v > m1) {
+      m2 = m1;
+      t2 = t1;
+      m1 = v;
+      t1 = i;
+    } else if (v > m2) {
+      m2 = v;
+      t2 = i;
+    }
+  }
+  if (second) *second = t2;
+  return t1;
+}
+
 }  // namespace engine
