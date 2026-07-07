@@ -144,13 +144,31 @@ void run_interactive_batch(engine::LlamaEngine& eng, model::Tokenizer& tokenizer
   // that must outlive the request, so the worker owns them here until done/cancel.
   std::unordered_map<std::string, std::unique_ptr<grammar::GrammarSampler>> grammars;
 
+  // Requeue-and-resume for preempted requests. When the engine preempts a
+  // request under KV pressure it emits a "preempted" event; instead of closing
+  // the client stream we pause it here (keeping its detok/grammar state) and
+  // re-admit it — re-prefilling prompt+generated-so-far — once a running request
+  // finishes and frees blocks. Since the pool is always >= max_context, any one
+  // request fits alone, so a preempted request always resumes eventually.
+  struct ResumeInfo {
+    std::vector<int> prompt;  // original prompt tokens (pre-generation)
+    engine::LlamaEngine::StreamParams params;  // original params (grammar ptr preserved)
+    int orig_max_new = 0;
+    int orig_min_new = 0;
+    int retries = 0;
+  };
+  std::unordered_map<std::string, ResumeInfo> resume;
+  std::deque<std::string> waiting;  // preempted ids awaiting a free slot
+  bool slot_freed = false;          // a running request finished this cycle
+  constexpr int kMaxResumeRetries = 16;
+
   while (true) {
     // Admit any queued requests (prefill happens inside stream_admit).
     std::vector<Incoming> admits;
     std::vector<std::string> cancel_ids;
     {
       std::unique_lock<std::mutex> lk(q_mu);
-      if (queue.empty() && cancels.empty() && eng.stream_active() == 0) {
+      if (queue.empty() && cancels.empty() && waiting.empty() && eng.stream_active() == 0) {
         if (shutdown.load()) break;
         q_cv.wait(lk, [&]() { return !queue.empty() || !cancels.empty() || shutdown.load(); });
       }
@@ -178,6 +196,8 @@ void run_interactive_batch(engine::LlamaEngine& eng, model::Tokenizer& tokenizer
       const bool evicted = eng.stream_cancel(cid);
       detok.erase(cid);
       grammars.erase(cid);
+      resume.erase(cid);
+      waiting.erase(std::remove(waiting.begin(), waiting.end(), cid), waiting.end());
       std::cerr << "[batch] cancel " << cid << (evicted ? " (evicted)" : " (not running)") << "\n";
     }
     for (auto& in : admits) {
@@ -202,10 +222,51 @@ void run_interactive_batch(engine::LlamaEngine& eng, model::Tokenizer& tokenizer
         DetokState st;
         st.t0 = std::chrono::steady_clock::now();
         detok[in.id] = std::move(st);
+        resume[in.id] = ResumeInfo{in.tokens, in.params, in.params.max_new_tokens,
+                                   in.params.min_new_tokens, 0};
         write_event("start", in.id, "");
       } catch (const std::exception& e) {
         write_event("error", in.id, "\"error\":\"" + json_escape(e.what()) + "\"");
       }
+    }
+
+    // Resume preempted requests once a slot has freed (a running request
+    // finished) or the pool is now empty. Re-prefill prompt+generated so the
+    // client stream continues; if the pool still can't fit it, keep it waiting.
+    if (!waiting.empty() && (slot_freed || eng.stream_active() == 0)) {
+      slot_freed = false;
+      std::deque<std::string> still_waiting;
+      while (!waiting.empty()) {
+        const std::string rid = waiting.front();
+        waiting.pop_front();
+        auto rit = resume.find(rid);
+        auto dit = detok.find(rid);
+        if (rit == resume.end() || dit == detok.end()) continue;  // cancelled meanwhile
+        const int done_so_far = static_cast<int>(dit->second.ids.size());
+        if (++rit->second.retries > kMaxResumeRetries) {
+          // Give up rather than hang the client; report what we produced.
+          write_event("done", rid,
+                      "\"finish_reason\":\"preempted\",\"text\":\"" +
+                          json_escape(dit->second.prev_text) + "\"");
+          grammars.erase(rid);
+          detok.erase(dit);
+          resume.erase(rit);
+          continue;
+        }
+        std::vector<int> full = rit->second.prompt;
+        full.insert(full.end(), dit->second.ids.begin(), dit->second.ids.end());
+        engine::LlamaEngine::StreamParams p = rit->second.params;
+        p.max_new_tokens = std::max(1, rit->second.orig_max_new - done_so_far);
+        p.min_new_tokens = std::max(0, rit->second.orig_min_new - done_so_far);
+        try {
+          eng.stream_admit(rid, full, p);  // no "start"/detok reset: stream continues
+          std::fprintf(stderr, "[batch] resumed %s (tokens=%zu, budget=%d, try=%d)\n", rid.c_str(),
+                       full.size(), p.max_new_tokens, rit->second.retries);
+        } catch (const std::exception&) {
+          still_waiting.push_back(rid);  // no room yet; retry after the next finish
+        }
+      }
+      waiting = std::move(still_waiting);
     }
 
     if (eng.stream_active() == 0) {
@@ -224,6 +285,12 @@ void run_interactive_batch(engine::LlamaEngine& eng, model::Tokenizer& tokenizer
       // terminates on tokenizer.eos_id() which can decode to a visible "</s>".
       // Keep the token for a "length" finish (it is real content).
       const std::string reason = e.finish_reason ? e.finish_reason : "";
+      // Preemption is not a finish: pause the request and requeue it (its detok
+      // and grammar state are kept) so it resumes when a slot frees.
+      if (e.finished && reason == "preempted") {
+        waiting.push_back(e.id);
+        continue;
+      }
       const bool terminator = e.finished && (reason == "eos" || reason == "stop");
       // token < 0 is the preempt sentinel (no real token to emit).
       if (!terminator && e.token >= 0) {
@@ -251,6 +318,8 @@ void run_interactive_batch(engine::LlamaEngine& eng, model::Tokenizer& tokenizer
                         json_escape(it->second.prev_text) + "\"" + nums);
         detok.erase(it);
         grammars.erase(e.id);
+        resume.erase(e.id);
+        slot_freed = true;  // a slot opened — a waiting request can resume next cycle
       }
     }
   }
