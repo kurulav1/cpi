@@ -96,7 +96,9 @@ int main() {
       {16, 4, 256, "Qwen3.5 hd256"},
       {8, 8, 256, "MHA hd256"},
   };
-  const std::vector<int> seq_lens = {40, 100, 200};
+  // Include long sequences so the coarsened split (blocks_per_chunk > 1, multiple
+  // coarse chunks combined by the reduce) is exercised, not just the G=1 path.
+  const std::vector<int> seq_lens = {40, 100, 200, 600, 2050};
   const int batch = static_cast<int>(seq_lens.size());
   const int block_size = 32;
   const double kCosGate = 0.999;
