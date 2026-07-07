@@ -28,8 +28,8 @@ omitted: its int4 weights dequantize past the 32 GB of system RAM (out-of-memory
 
 ### Concurrent throughput (continuous batching)
 
-For multi-user serving, CPI has an opt-in continuous-batching path (paged KV cache + batched decode):
-many requests are prefilled into their own paged blocks and decoded together one step at a time.
+For multi-user serving, continuous batching is CPI's default serving path (paged KV cache + batched
+decode): many requests are prefilled into their own paged blocks and decoded together one step at a time.
 Aggregate decode throughput below — total tokens/s summed over all concurrent sequences —
 measured with `--batch-bench` (greedy, fp16 resident, prompt 8 / 64 new tokens, short context) on the
 same RTX 5090. The "1 req" column is the identical engine at batch 1.
@@ -54,9 +54,18 @@ Notes:
 - **Sampling (temperature > 0) currently runs ~half the greedy throughput at high batch** (e.g.
   Llama-3.1-8B batch 64: 747 vs 1457 tok/s) because top-k/top-p sampling runs per row on the host;
   on-device sampling is planned.
-- Enabled with `CPI_BATCH_WORKER=1` on the web server; requires fp16-resident weights
-  (`--gpu-cache-all`) + paged KV (`--paged-blocks`) and full-attention models. Quantized / MoE /
-  streaming models (e.g. the 32B int4) fall back to single-request serving.
+- **Shared-prefix reuse** — concurrent requests that share a leading prefix (a common system prompt, a
+  multi-turn chat) adopt each other's cached KV blocks instead of re-prefilling. A small per-worker LRU
+  keeps several distinct prefixes live at once, so interleaved requests don't evict each other; on a long
+  shared prefix this cuts time-to-first-token by up to ~7× (measured 1.18 s → 0.16 s, Qwen2.5-0.5B,
+  988-token prefix).
+- **VRAM-sized KV pool** — the paged block pool auto-sizes to free VRAM rather than a single context
+  window, so how many sequences run concurrently scales with the card. Under genuine over-subscription
+  the newest sequences are preempted (and the client told) as a safety net, rather than the server
+  crashing. Override the pool size with `LLAMA_INFER_KV_POOL_TOKENS`.
+- **Default on the web server** for supported models (opt out with `CPI_BATCH_WORKER=0`); requires
+  fp16-resident weights (`--gpu-cache-all`) + paged KV (`--paged-blocks`) and full-attention models.
+  Quantized / MoE / streaming models (e.g. the 32B int4) fall back to single-request serving.
 
 ### Decode throughput vs context length
 
@@ -80,7 +89,7 @@ scan per token and a smaller (4× vs 7×) query group to amortize it over. (Cont
 ## Highlights
 
 - CPU and CUDA inference paths
-- Continuous batching with a paged KV cache for concurrent multi-user serving (opt-in)
+- Continuous batching with a paged KV cache for concurrent multi-user serving (default; VRAM-sized pool, shared-prefix reuse)
 - Streaming weights for models larger than VRAM; runtime int8/int4 quantization
 - Native `tokenizer.json` and SentencePiece tokenizer support
 - React web UI plus Node API bridge in `web/`

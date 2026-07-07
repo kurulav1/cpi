@@ -1424,8 +1424,8 @@ function ensureInteractiveWorker(config, cliConfig) {
   return interactiveWorker;
 }
 
-// Continuous-batching worker (opt-in via CPI_BATCH_WORKER=1). A single shared
-// --interactive-batch process serves concurrent chat requests, demuxed by id.
+// Continuous-batching worker (default; opt out with CPI_BATCH_WORKER=0). A single
+// shared --interactive-batch process serves concurrent chat requests, demuxed by id.
 // Uses a distinct single-instance mutex so it doesn't collide with the regular
 // single-flight interactive worker. Respawned on profile change.
 let batchWorker = null;
