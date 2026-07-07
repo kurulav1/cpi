@@ -2495,10 +2495,10 @@ app.post("/api/chat/stream", async (req, res) => {
         addBos: cliConfig.addBos,
         jsonSchema: cliConfig.jsonSchema ?? null,
         onDelta: (delta) => { if (!ended) writeNdjson(res, { type: "delta", delta }); },
-        onDone: ({ text, generated, tokPerS, elapsedMs }) => finish(() => writeNdjson(res, {
+        onDone: ({ text, generated, tokPerS, elapsedMs, finishReason }) => finish(() => writeNdjson(res, {
           type: "done", message: text, elapsedMs: elapsedMs ?? (Date.now() - startedAt),
           generatedTokens: generated ?? null, tokPerS: tokPerS ?? null,
-          decodeTokPerS: tokPerS ?? null, metrics: null
+          decodeTokPerS: tokPerS ?? null, finishReason: finishReason ?? null, metrics: null
         })),
         onError: (err) => finish(() => writeNdjson(res, { type: "error", error: err.message || String(err) }))
       });
