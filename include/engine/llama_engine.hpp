@@ -344,6 +344,10 @@ private:
   int* d_batch_block_tables_ = nullptr;
   int batch_buffers_max_seqs_ = 0;
   int batch_buffers_max_blocks_ = 0;
+  // Actual element capacity of d_batch_block_tables_ (batch*max_blocks ints). The
+  // batch size can shrink then regrow (e.g. a preempted request resuming), so this
+  // must track the real allocation, not the product of independent high-watermarks.
+  std::size_t batch_buffers_block_table_cap_ = 0;
   void ensure_batch_state_buffers(int batch, int max_blocks);
 
 public:

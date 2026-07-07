@@ -766,14 +766,17 @@ void LlamaEngine::ensure_batch_state_buffers(int batch, int max_blocks) {
     CUDA_CHECK(cudaMalloc(&d_batch_positions_, static_cast<std::size_t>(batch) * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_batch_seq_lens_, static_cast<std::size_t>(batch) * sizeof(int)));
     batch_buffers_max_seqs_ = batch;
-    batch_buffers_max_blocks_ = 0;  // force block-table realloc below
   }
-  if (batch * max_blocks > batch_buffers_max_seqs_ * batch_buffers_max_blocks_ ||
-      max_blocks > batch_buffers_max_blocks_) {
+  // The block table is batch*max_blocks ints. Both factors vary independently and
+  // the batch can regrow after shrinking, so size against the REAL capacity — the
+  // previous product of high-watermarks over-reported it and let a larger request
+  // overflow the buffer (device-side memcpy past the end).
+  const std::size_t need = static_cast<std::size_t>(batch) * static_cast<std::size_t>(max_blocks);
+  if (need > batch_buffers_block_table_cap_) {
     if (d_batch_block_tables_) cudaFree(d_batch_block_tables_);
-    CUDA_CHECK(cudaMalloc(&d_batch_block_tables_,
-                          static_cast<std::size_t>(batch) * max_blocks * sizeof(int)));
-    batch_buffers_max_blocks_ = max_blocks;
+    CUDA_CHECK(cudaMalloc(&d_batch_block_tables_, need * sizeof(int)));
+    batch_buffers_block_table_cap_ = need;
+    if (max_blocks > batch_buffers_max_blocks_) batch_buffers_max_blocks_ = max_blocks;
   }
 }
 
