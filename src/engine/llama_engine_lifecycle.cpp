@@ -308,9 +308,40 @@ void LlamaEngine::allocate_runtime_buffers() {
     if (const char* ov = std::getenv("LLAMA_INFER_KV_POOL_TOKENS")) {
       const int req = std::atoi(ov);
       if (req > kv_capacity_tokens_) kv_capacity_tokens_ = req;
+    } else {
+      // Auto-size the pool to free VRAM so continuous batching can hold many
+      // concurrent sequences. This runs before the resident weight cache is
+      // built (cache-copy phase), so cudaMemGetInfo still counts that VRAM as
+      // free — subtract a conservative full-fp16 layer-cache reserve plus fixed
+      // headroom (streaming staging, activations, cuBLAS, fragmentation). The
+      // reserve is an upper bound (quantized caches are smaller), so we only
+      // ever under-size the pool, never OOM the later weight load.
+      std::size_t free_b = 0, total_b = 0;
+      cudaMemGetInfo(&free_b, &total_b);
+      const std::size_t per_layer_weight_b =
+          (static_cast<std::size_t>(q_hidden + 2 * kv_hidden) * hidden +  // wqkv
+           static_cast<std::size_t>(hidden) * q_hidden +                  // wo
+           static_cast<std::size_t>(2) * inter * hidden +                 // w1|w3
+           static_cast<std::size_t>(hidden) * inter) *                    // w2
+          sizeof(__half);
+      const std::size_t weight_reserve_b =
+          static_cast<std::size_t>(cfg.num_layers) * per_layer_weight_b;
+      const std::size_t headroom_b = static_cast<std::size_t>(3) << 30;  // 3 GiB
+      const std::size_t per_token_kv_b = static_cast<std::size_t>(cfg.num_layers) *
+                                         static_cast<std::size_t>(kv_hidden) * 2 * sizeof(__half);
+      if (free_b > weight_reserve_b + headroom_b && per_token_kv_b > 0) {
+        const std::size_t budget_b = free_b - weight_reserve_b - headroom_b;
+        const long long auto_tokens = static_cast<long long>(budget_b / per_token_kv_b);
+        const long long capped = std::min<long long>(auto_tokens, 1 << 20);  // cap 1M tok
+        if (capped > kv_capacity_tokens_) kv_capacity_tokens_ = static_cast<int>(capped);
+      }
     }
     kv_capacity_tokens_ = ((kv_capacity_tokens_ + bs - 1) / bs) * bs;  // whole blocks
     const int num_blocks = kv_capacity_tokens_ / bs;
+    if (options_.verbose) {
+      std::cout << "[engine] kv_pool_tokens=" << kv_capacity_tokens_ << " (max_context="
+                << options_.max_context << ", " << num_blocks << " blocks)\n";
+    }
     block_alloc_ = std::make_unique<BlockAllocator>(num_blocks);
     seq_blocks_ = std::make_unique<SequenceBlockTable>(block_alloc_.get(), bs);
     // Device block table for the paged decode-attention kernel. Phase 2c uses a
