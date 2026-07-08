@@ -127,6 +127,8 @@ private:
     void* norm_att_bias = nullptr;  // Optional pre-attention norm bias [hidden].
     void* norm_ffn_bias = nullptr;  // Optional pre-FFN norm bias [hidden].
     void* bqkv = nullptr;  // Fused QKV bias vector [q_dim + kv_dim + kv_dim]; null if unused.
+    void* q_norm = nullptr;  // Per-head RMSNorm scale for Q [head_dim]; null unless has_qk_norm (Qwen3).
+    void* k_norm = nullptr;  // Per-head RMSNorm scale for K [head_dim]; null unless has_qk_norm (Qwen3).
   };
 
   // Weight pointers for a single transformer layer stored in host page-locked

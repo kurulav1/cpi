@@ -1056,6 +1056,9 @@ void LlamaEngine::initialize(const EngineOptions& options) {
       case model::ModelFamily::Qwen3_5:
         family_str = "qwen3_5";
         break;
+      case model::ModelFamily::Qwen3:
+        family_str = "qwen3";
+        break;
       default:
         break;
     }

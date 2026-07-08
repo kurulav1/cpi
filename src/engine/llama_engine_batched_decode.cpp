@@ -163,6 +163,18 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
                                          compute_stream_);
     }
 
+    if (lw->q_norm && lw->k_norm) {
+      // Qwen3 per-head RMSNorm on Q and K (batch rows × heads), pre-RoPE.
+      kernels::launch_rmsnorm(static_cast<const __half*>(d_prefill_q_),
+                              static_cast<const __half*>(lw->q_norm),
+                              static_cast<__half*>(d_prefill_q_), batch * cfg.num_heads, head_dim,
+                              cfg.norm_eps, compute_stream_);
+      kernels::launch_rmsnorm(static_cast<const __half*>(d_prefill_k_),
+                              static_cast<const __half*>(lw->k_norm),
+                              static_cast<__half*>(d_prefill_k_), batch * cfg.num_kv_heads, head_dim,
+                              cfg.norm_eps, compute_stream_);
+    }
+
     kernels::launch_rope_inplace_perpos(static_cast<__half*>(d_prefill_q_),
                                         static_cast<__half*>(d_prefill_k_), batch, cfg.num_heads,
                                         cfg.num_kv_heads, head_dim, d_batch_positions_, d_rope_cos_,

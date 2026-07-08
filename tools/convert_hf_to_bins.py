@@ -31,6 +31,7 @@ FAMILY_MISTRAL  = "mistral"
 FAMILY_MIXTRAL  = "mixtral"
 FAMILY_PHI3     = "phi3"
 FAMILY_QWEN2    = "qwen2"
+FAMILY_QWEN3    = "qwen3"
 FAMILY_QWEN3_5  = "qwen3_5"
 FAMILY_UNKNOWN  = "unknown"
 
@@ -44,6 +45,7 @@ FAMILY_ID = {
     FAMILY_PHI3:    4,
     FAMILY_QWEN2:   5,
     FAMILY_QWEN3_5: 7,
+    FAMILY_QWEN3:   8,
 }
 
 # Default RoPE theta per family (matches default_rope_theta() in llama_config.hpp)
@@ -54,6 +56,7 @@ DEFAULT_ROPE_THETA = {
     FAMILY_MIXTRAL: 10000.0,
     FAMILY_PHI3:    10000.0,
     FAMILY_QWEN2:   1000000.0,
+    FAMILY_QWEN3:   1000000.0,
     FAMILY_QWEN3_5: 1000000.0,
 }
 
@@ -87,6 +90,10 @@ def detect_family(cfg: dict) -> str:
         return FAMILY_QWEN2
     if model_type == "qwen3_5":
         return FAMILY_QWEN3_5
+    # Qwen3 dense (model_type "qwen3"): standard decoder + per-head QK-norm, no
+    # QKV bias. Distinct from the mixed linear/full-attention "qwen3_5".
+    if model_type == "qwen3":
+        return FAMILY_QWEN3
 
     # Fallback heuristics
     if "qwen" in model_type:
@@ -228,8 +235,11 @@ def extract_model_config(hf_cfg: dict, family: str) -> dict:
     # Tied word embeddings (some Phi-2 style models)
     tie_word_embeddings = bool(text_cfg.get("tie_word_embeddings", hf_cfg.get("tie_word_embeddings", False)))
 
-    # QKV biases (Qwen2 uses them)
+    # QKV biases (Qwen2 uses them; Qwen3 dropped them)
     has_qkv_bias = (family == FAMILY_QWEN2) or bool(text_cfg.get("attention_bias", hf_cfg.get("attention_bias", False)))
+
+    # Per-head QK-norm (RMSNorm on Q and K after projection): Qwen3 dense.
+    has_qk_norm = (family == FAMILY_QWEN3)
 
     # LayerNorm vs RMSNorm selection.
     # Prefer explicit normalization kind when present; otherwise infer from eps keys.
@@ -280,6 +290,7 @@ def extract_model_config(hf_cfg: dict, family: str) -> dict:
         "sliding_window":      sliding_window,
         "tie_word_embeddings": tie_word_embeddings,
         "has_qkv_bias":        has_qkv_bias,
+        "has_qk_norm":         has_qk_norm,
         "use_layernorm":       use_layernorm,
         "partial_rotary_factor": partial_rotary_factor,
         "linear_num_key_heads": linear_num_key_heads,
@@ -295,7 +306,8 @@ def extract_model_config(hf_cfg: dict, family: str) -> dict:
 # Tensor name mapping
 # ---------------------------------------------------------------------------
 
-def build_mapping(family: str, num_layers: int, has_qkv_bias: bool, num_local_experts: int):
+def build_mapping(family: str, num_layers: int, has_qkv_bias: bool, num_local_experts: int,
+                  has_qk_norm: bool = False):
     """
     Map HuggingFace tensor names to canonical internal names used by LL2CUDA.
 
@@ -367,6 +379,15 @@ def build_mapping(family: str, num_layers: int, has_qkv_bias: bool, num_local_ex
                 (f"model.layers.{i}.self_attn.v_proj.bias",
                  f"layers.{i}.attention.bv",  False),
             ]
+        if has_qk_norm:
+            # Qwen3 per-head RMSNorm on Q and K (head_dim-sized), applied after the
+            # projection and before RoPE.
+            layer += [
+                (f"model.layers.{i}.self_attn.q_norm.weight",
+                 f"layers.{i}.attention.q_norm",  True),
+                (f"model.layers.{i}.self_attn.k_norm.weight",
+                 f"layers.{i}.attention.k_norm",  True),
+            ]
         items.extend(layer)
 
     return items
@@ -409,7 +430,8 @@ def main() -> None:
 
     index      = load_index(hf_dir)
     weight_map = index.get("weight_map", {})
-    mapping    = build_mapping(family, num_layers, has_qkv_bias, num_local_experts)
+    mapping    = build_mapping(family, num_layers, has_qkv_bias, num_local_experts,
+                               bool(model_cfg.get("has_qk_norm", False)))
     mapped_sources = {src for src, _dst, _required in mapping}
 
     # Surface known-but-currently-ignored tensors to make conversion behavior explicit.

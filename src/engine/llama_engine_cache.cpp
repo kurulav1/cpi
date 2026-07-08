@@ -520,6 +520,12 @@ void LlamaEngine::init_layer_cache() {
     const cudaError_t a16 = cudaMalloc(&lw.bo, bytes_for_matrix(1, hidden));
     const cudaError_t a17 = cudaMalloc(&lw.norm_att_bias, bytes_for_matrix(1, hidden));
     const cudaError_t a18 = cudaMalloc(&lw.norm_ffn_bias, bytes_for_matrix(1, hidden));
+    // Qwen3 per-head QK-norm scales [head_dim]; only allocated when present.
+    const int qk_norm_dim = attn_head_dim_ > 0 ? attn_head_dim_ : hidden / cfg.num_heads;
+    const cudaError_t a19 =
+        cfg.has_qk_norm ? cudaMalloc(&lw.q_norm, bytes_for_matrix(1, qk_norm_dim)) : cudaSuccess;
+    const cudaError_t a20 =
+        cfg.has_qk_norm ? cudaMalloc(&lw.k_norm, bytes_for_matrix(1, qk_norm_dim)) : cudaSuccess;
     const cudaError_t a6 = use_cached_int8 ? cudaMalloc(&lw_i8.w1, w1_bytes) : cudaSuccess;
     const cudaError_t a7 = use_cached_int8 ? cudaMalloc(&lw_i8.w2, w2_bytes) : cudaSuccess;
     const cudaError_t a8 = use_cached_int8 ? cudaMalloc(&lw_i8.w3, w3_bytes) : cudaSuccess;
@@ -559,7 +565,8 @@ void LlamaEngine::init_layer_cache() {
         a4 != cudaSuccess || a5 != cudaSuccess || a6 != cudaSuccess || a7 != cudaSuccess ||
         a8 != cudaSuccess || a9 != cudaSuccess || a10 != cudaSuccess || a11 != cudaSuccess ||
         a12 != cudaSuccess || a13 != cudaSuccess || a14 != cudaSuccess || a15 != cudaSuccess ||
-        a16 != cudaSuccess || a17 != cudaSuccess || a18 != cudaSuccess) {
+        a16 != cudaSuccess || a17 != cudaSuccess || a18 != cudaSuccess || a19 != cudaSuccess ||
+        a20 != cudaSuccess) {
       if (lw.wqkv) cudaFree(lw.wqkv);
       if (lw.wo) cudaFree(lw.wo);
       if (lw.bo) cudaFree(lw.bo);
@@ -569,6 +576,8 @@ void LlamaEngine::init_layer_cache() {
       if (lw.norm_ffn) cudaFree(lw.norm_ffn);
       if (lw.norm_att_bias) cudaFree(lw.norm_att_bias);
       if (lw.norm_ffn_bias) cudaFree(lw.norm_ffn_bias);
+      if (lw.q_norm) cudaFree(lw.q_norm);
+      if (lw.k_norm) cudaFree(lw.k_norm);
       if (lw_i8.w1) cudaFree(lw_i8.w1);
       if (lw_i8.w2) cudaFree(lw_i8.w2);
       if (lw_i8.w3) cudaFree(lw_i8.w3);
@@ -689,6 +698,11 @@ void LlamaEngine::init_layer_cache() {
       copy_fp16_direct(p + ".attention_norm.weight", lw.norm_att, bytes_for_matrix(1, hidden));
       copy_optional_fp16_direct(p + ".attention_norm.bias", lw.norm_att_bias,
                                 bytes_for_matrix(1, hidden));
+      if (cfg.has_qk_norm) {
+        const int qkd = attn_head_dim_ > 0 ? attn_head_dim_ : hidden / cfg.num_heads;
+        copy_fp16_direct(p + ".attention.q_norm", lw.q_norm, bytes_for_matrix(1, qkd));
+        copy_fp16_direct(p + ".attention.k_norm", lw.k_norm, bytes_for_matrix(1, qkd));
+      }
       copy_fp16_direct(p + ".attention.wq", wqkv_base, bytes_for_matrix(q_hidden, hidden));
       copy_fp16_direct(
           p + ".attention.wk",

@@ -30,7 +30,7 @@ VERSION = 5
 #   attention_type_count (i), attention_type_offset (Q)
 #
 # flags bit layout: bit 0 = tie_word_embeddings, bit 1 = has_qkv_bias,
-# bit 2 = use_layernorm
+# bit 2 = use_layernorm, bit 3 = has_qk_norm
 HEADER_FMT = "<8siiiiiiiiiiQffiiiiiifiiiQ"
 ENTRY_FMT = "<64sqq"
 
@@ -73,6 +73,7 @@ def load_config(src: Path, args) -> dict:
     result["tie_word_embeddings"] = bool(cfg.get("tie_word_embeddings", False))
     result["has_qkv_bias"]        = bool(cfg.get("has_qkv_bias", False))
     result["use_layernorm"]       = bool(cfg.get("use_layernorm", False))
+    result["has_qk_norm"]         = bool(cfg.get("has_qk_norm", False))
     result["model_family_id"]     = int(cfg.get("model_family_id", 0))
     result["num_local_experts"] = int(cfg.get("num_local_experts", 0) or 0)
     result["num_experts_per_tok"] = int(cfg.get("num_experts_per_tok", 0) or 0)
@@ -259,6 +260,8 @@ def main() -> None:
         flags |= 2
     if cfg.get("use_layernorm"):
         flags |= 4
+    if cfg.get("has_qk_norm"):
+        flags |= 8
 
     with out_path.open("wb") as f:
         f.write(struct.pack(

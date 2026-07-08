@@ -271,6 +271,16 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
                                     static_cast<const __half*>(lw->bqkv), q_hidden + 2 * kv_hidden,
                                     compute_stream_);
       }
+      if (lw->q_norm && lw->k_norm) {
+        kernels::launch_rmsnorm(static_cast<const __half*>(d_q_),
+                                       static_cast<const __half*>(lw->q_norm),
+                                       static_cast<__half*>(d_q_), cfg.num_heads, head_dim,
+                                       cfg.norm_eps, compute_stream_);
+        kernels::launch_rmsnorm(static_cast<const __half*>(d_k_),
+                                       static_cast<const __half*>(lw->k_norm),
+                                       static_cast<__half*>(d_k_), cfg.num_kv_heads, head_dim,
+                                       cfg.norm_eps, compute_stream_);
+      }
       kernels::launch_rope_inplace_table(static_cast<__half*>(d_q_), static_cast<__half*>(d_k_),
                                          cfg.num_heads, cfg.num_kv_heads, head_dim, position,
                                          d_rope_cos_, d_rope_sin_, compute_stream_);
@@ -425,6 +435,16 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
       kernels::launch_add_inplace(static_cast<__half*>(d_q_), static_cast<const __half*>(lw->bqkv),
                                   q_hidden + 2 * kv_hidden, compute_stream_);
     }
+    if (lw->q_norm && lw->k_norm) {
+      kernels::launch_rmsnorm(static_cast<const __half*>(d_q_),
+                                     static_cast<const __half*>(lw->q_norm),
+                                     static_cast<__half*>(d_q_), cfg.num_heads, head_dim,
+                                     cfg.norm_eps, compute_stream_);
+      kernels::launch_rmsnorm(static_cast<const __half*>(d_k_),
+                                     static_cast<const __half*>(lw->k_norm),
+                                     static_cast<__half*>(d_k_), cfg.num_kv_heads, head_dim,
+                                     cfg.norm_eps, compute_stream_);
+    }
     kernels::launch_rope_inplace_table(static_cast<__half*>(d_q_), static_cast<__half*>(d_k_),
                                        cfg.num_heads, cfg.num_kv_heads, head_dim, position,
                                        d_rope_cos_, d_rope_sin_, compute_stream_);
@@ -569,6 +589,16 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
                                   q_hidden + 2 * kv_hidden, compute_stream_);
     }
 
+    if (lw->q_norm && lw->k_norm) {
+      kernels::launch_rmsnorm(static_cast<const __half*>(d_q_),
+                                     static_cast<const __half*>(lw->q_norm),
+                                     static_cast<__half*>(d_q_), cfg.num_heads, head_dim,
+                                     cfg.norm_eps, compute_stream_);
+      kernels::launch_rmsnorm(static_cast<const __half*>(d_k_),
+                                     static_cast<const __half*>(lw->k_norm),
+                                     static_cast<__half*>(d_k_), cfg.num_kv_heads, head_dim,
+                                     cfg.norm_eps, compute_stream_);
+    }
     kernels::launch_rope_inplace_table(static_cast<__half*>(d_q_), static_cast<__half*>(d_k_),
                                        cfg.num_heads, cfg.num_kv_heads, head_dim, position,
                                        d_rope_cos_, d_rope_sin_, compute_stream_);
@@ -708,6 +738,16 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
                                   q_hidden + 2 * kv_hidden, compute_stream_);
     }
 
+    if (lw->q_norm && lw->k_norm) {
+      kernels::launch_rmsnorm(static_cast<const __half*>(d_q_),
+                                     static_cast<const __half*>(lw->q_norm),
+                                     static_cast<__half*>(d_q_), cfg.num_heads, head_dim,
+                                     cfg.norm_eps, compute_stream_);
+      kernels::launch_rmsnorm(static_cast<const __half*>(d_k_),
+                                     static_cast<const __half*>(lw->k_norm),
+                                     static_cast<__half*>(d_k_), cfg.num_kv_heads, head_dim,
+                                     cfg.norm_eps, compute_stream_);
+    }
     kernels::launch_rope_inplace_table(static_cast<__half*>(d_q_), static_cast<__half*>(d_k_),
                                        cfg.num_heads, cfg.num_kv_heads, head_dim, position,
                                        d_rope_cos_, d_rope_sin_, compute_stream_);
@@ -928,6 +968,16 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
                                   q_hidden + 2 * kv_hidden, compute_stream_);
     }
 
+    if (lw->q_norm && lw->k_norm) {
+      kernels::launch_rmsnorm(static_cast<const __half*>(d_q_),
+                                     static_cast<const __half*>(lw->q_norm),
+                                     static_cast<__half*>(d_q_), cfg.num_heads, head_dim,
+                                     cfg.norm_eps, compute_stream_);
+      kernels::launch_rmsnorm(static_cast<const __half*>(d_k_),
+                                     static_cast<const __half*>(lw->k_norm),
+                                     static_cast<__half*>(d_k_), cfg.num_kv_heads, head_dim,
+                                     cfg.norm_eps, compute_stream_);
+    }
     kernels::launch_rope_inplace_table(static_cast<__half*>(d_q_), static_cast<__half*>(d_k_),
                                        cfg.num_heads, cfg.num_kv_heads, head_dim, position,
                                        d_rope_cos_, d_rope_sin_, compute_stream_);

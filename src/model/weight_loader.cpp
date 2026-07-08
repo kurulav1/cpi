@@ -195,6 +195,7 @@ void WeightLoader::parse_manifest() {
     config_.tie_word_embeddings = (hdr->flags & 1) != 0;
     config_.has_qkv_bias = (hdr->flags & 2) != 0;
     config_.use_layernorm = (hdr->flags & 4) != 0;
+    config_.has_qk_norm = (hdr->flags & 8) != 0;
     config_.model_family = static_cast<ModelFamily>(hdr->model_family_id);
     config_.num_local_experts = hdr->num_local_experts;
     config_.num_experts_per_tok = hdr->num_experts_per_tok;
@@ -239,6 +240,7 @@ void WeightLoader::parse_manifest() {
     config_.tie_word_embeddings = (hdr->flags & 1) != 0;
     config_.has_qkv_bias = (hdr->flags & 2) != 0;
     config_.use_layernorm = (hdr->flags & 4) != 0;
+    config_.has_qk_norm = (hdr->flags & 8) != 0;
     config_.model_family = static_cast<ModelFamily>(hdr->model_family_id);
     config_.num_local_experts = hdr->num_local_experts;
     config_.num_experts_per_tok = hdr->num_experts_per_tok;

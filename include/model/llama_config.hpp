@@ -24,6 +24,7 @@ enum class ModelFamily : std::int32_t {
   Qwen2 = 5,    // Alibaba Qwen2 (rope_theta=1000000, QKV biases)
   Mixtral = 6,  // Mixtral sparse-MoE (top-k routed experts, rope_theta=10000).
   Qwen3_5 = 7,  // Qwen3.5 mixed-attention family (metadata only until linear kernels land).
+  Qwen3 = 8,    // Qwen3 dense (rope_theta=1000000, per-head QK-norm, no QKV bias).
 };
 
 // Returns the default RoPE base frequency for a given model family.
@@ -32,6 +33,8 @@ inline float default_rope_theta(ModelFamily family) {
     case ModelFamily::LLaMA3:
       return 500000.0f;
     case ModelFamily::Qwen2:
+      return 1000000.0f;
+    case ModelFamily::Qwen3:
       return 1000000.0f;
     case ModelFamily::Qwen3_5:
       return 1000000.0f;
@@ -83,6 +86,7 @@ struct LlamaConfig {
   float norm_eps = 1e-5f;           // Epsilon added to RMSNorm denominator.
   std::int32_t sliding_window = 0;  // Attention window size (0 = full context, Mistral uses 4096).
   bool has_qkv_bias = false;        // QKV projections have additive bias vectors (Qwen2).
+  bool has_qk_norm = false;         // Per-head RMSNorm on Q and K after projection (Qwen3).
   bool use_layernorm = false;       // Use true LayerNorm (mean+variance) instead of RMSNorm.
   bool tie_word_embeddings =
       false;  // lm_head shares weights with tok_embeddings (some Phi variants).

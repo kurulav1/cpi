@@ -163,6 +163,18 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
                                          compute_stream_);
     }
 
+    if (lw->q_norm && lw->k_norm) {
+      // Qwen3: per-head RMSNorm on Q and K (each head's head_dim slice), pre-RoPE.
+      kernels::launch_rmsnorm(static_cast<const __half*>(d_prefill_q_),
+                                     static_cast<const __half*>(lw->q_norm),
+                                     static_cast<__half*>(d_prefill_q_), rows * cfg.num_heads,
+                                     head_dim, cfg.norm_eps, compute_stream_);
+      kernels::launch_rmsnorm(static_cast<const __half*>(d_prefill_k_),
+                                     static_cast<const __half*>(lw->k_norm),
+                                     static_cast<__half*>(d_prefill_k_), rows * cfg.num_kv_heads,
+                                     head_dim, cfg.norm_eps, compute_stream_);
+    }
+
     kernels::launch_rope_inplace_batched(
         static_cast<__half*>(d_prefill_q_), static_cast<__half*>(d_prefill_k_), rows, cfg.num_heads,
         cfg.num_kv_heads, head_dim, base_pos, d_rope_cos_, d_rope_sin_, compute_stream_);
