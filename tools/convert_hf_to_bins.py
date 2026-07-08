@@ -33,6 +33,7 @@ FAMILY_PHI3     = "phi3"
 FAMILY_QWEN2    = "qwen2"
 FAMILY_QWEN3    = "qwen3"
 FAMILY_QWEN3_5  = "qwen3_5"
+FAMILY_GEMMA    = "gemma"
 FAMILY_UNKNOWN  = "unknown"
 
 # Canonical internal family ID (must match ModelFamily enum in llama_config.hpp)
@@ -46,6 +47,7 @@ FAMILY_ID = {
     FAMILY_QWEN2:   5,
     FAMILY_QWEN3_5: 7,
     FAMILY_QWEN3:   8,
+    FAMILY_GEMMA:   9,
 }
 
 # Default RoPE theta per family (matches default_rope_theta() in llama_config.hpp)
@@ -58,6 +60,7 @@ DEFAULT_ROPE_THETA = {
     FAMILY_QWEN2:   1000000.0,
     FAMILY_QWEN3:   1000000.0,
     FAMILY_QWEN3_5: 1000000.0,
+    FAMILY_GEMMA:   10000.0,
 }
 
 
@@ -95,6 +98,11 @@ def detect_family(cfg: dict) -> str:
     if model_type == "qwen3":
         return FAMILY_QWEN3
 
+    # Gemma 1 (model_type "gemma"): GeGLU MLP, embedding scale, (1+w) RMSNorm.
+    # gemma2/gemma3 add attention/logit softcap and are rejected below.
+    if model_type == "gemma":
+        return FAMILY_GEMMA
+
     # Fallback heuristics
     if "qwen" in model_type:
         return FAMILY_QWEN2
@@ -128,6 +136,10 @@ def unsupported_reason(cfg: dict) -> str:
     if has_linear_attention:
         return ("This model uses linear-attention layers, which the native CPI "
                 "engine does not support yet.")
+
+    if model_type in ("gemma2", "gemma3") or "gemma2" in model_type or "gemma3" in model_type:
+        return ("Gemma 2/3 is not supported yet: it needs attention- and "
+                "logit-softcapping (and Gemma 2's alternating attention).")
 
     return ""
 
@@ -232,14 +244,22 @@ def extract_model_config(hf_cfg: dict, family: str) -> dict:
             # Most HF MoE checkpoints reuse intermediate_size as per-expert hidden dim.
             expert_intermediate_size = int(text_cfg.get("intermediate_size", hf_cfg.get("intermediate_size", 0)) or 0)
 
-    # Tied word embeddings (some Phi-2 style models)
-    tie_word_embeddings = bool(text_cfg.get("tie_word_embeddings", hf_cfg.get("tie_word_embeddings", False)))
+    # Tied word embeddings (some Phi-2 style models). Gemma always ties (no
+    # lm_head.weight in the checkpoint), and some configs omit the flag, so force it.
+    tie_word_embeddings = bool(text_cfg.get("tie_word_embeddings", hf_cfg.get("tie_word_embeddings", False))) \
+        or (family == FAMILY_GEMMA)
 
     # QKV biases (Qwen2 uses them; Qwen3 dropped them)
     has_qkv_bias = (family == FAMILY_QWEN2) or bool(text_cfg.get("attention_bias", hf_cfg.get("attention_bias", False)))
 
     # Per-head QK-norm (RMSNorm on Q and K after projection): Qwen3 dense.
     has_qk_norm = (family == FAMILY_QWEN3)
+
+    # Gemma: GeGLU MLP (tanh GELU) + token-embedding scale by sqrt(hidden). Its
+    # (1+w) RMSNorm is folded into the norm weights at extraction (below), so no
+    # runtime flag is needed for that.
+    mlp_gelu = (family == FAMILY_GEMMA)
+    scale_embeddings = (family == FAMILY_GEMMA)
 
     # LayerNorm vs RMSNorm selection.
     # Prefer explicit normalization kind when present; otherwise infer from eps keys.
@@ -291,6 +311,8 @@ def extract_model_config(hf_cfg: dict, family: str) -> dict:
         "tie_word_embeddings": tie_word_embeddings,
         "has_qkv_bias":        has_qkv_bias,
         "has_qk_norm":         has_qk_norm,
+        "mlp_gelu":            mlp_gelu,
+        "scale_embeddings":    scale_embeddings,
         "use_layernorm":       use_layernorm,
         "partial_rotary_factor": partial_rotary_factor,
         "linear_num_key_heads": linear_num_key_heads,
@@ -464,6 +486,17 @@ def main() -> None:
             blob, shape = read_safetensor_blob(shard_path, src_name)
             extracted[dst_name] = blob
             print(f"  {src_name} -> {dst_name}  shape={shape}")
+
+    # Gemma stores RMSNorm weights `w` and applies `(1 + w)`. Fold the +1 in here
+    # so the standard (scale = w) RMSNorm kernel reproduces Gemma's scaling.
+    if family == FAMILY_GEMMA:
+        folded = 0
+        for dst_name in list(extracted.keys()):
+            if dst_name.endswith("_norm.weight") or dst_name == "norm.weight":
+                arr = np.frombuffer(extracted[dst_name], dtype=np.float16).astype(np.float32) + 1.0
+                extracted[dst_name] = arr.astype(np.float16).tobytes()
+                folded += 1
+        print(f"[info] gemma: folded +1 into {folded} RMSNorm weight tensors")
 
     # Fuse Q/K/V biases into a single bqkv tensor per layer
     if has_qkv_bias:

@@ -25,6 +25,7 @@ enum class ModelFamily : std::int32_t {
   Mixtral = 6,  // Mixtral sparse-MoE (top-k routed experts, rope_theta=10000).
   Qwen3_5 = 7,  // Qwen3.5 mixed-attention family (metadata only until linear kernels land).
   Qwen3 = 8,    // Qwen3 dense (rope_theta=1000000, per-head QK-norm, no QKV bias).
+  Gemma = 9,    // Gemma 1 (GeGLU MLP, embedding scale, (1+w) RMSNorm, tied embeddings).
 };
 
 // Returns the default RoPE base frequency for a given model family.
@@ -87,6 +88,8 @@ struct LlamaConfig {
   std::int32_t sliding_window = 0;  // Attention window size (0 = full context, Mistral uses 4096).
   bool has_qkv_bias = false;        // QKV projections have additive bias vectors (Qwen2).
   bool has_qk_norm = false;         // Per-head RMSNorm on Q and K after projection (Qwen3).
+  bool mlp_gelu = false;            // MLP gate uses GeGLU (tanh GELU) instead of SwiGLU (Gemma).
+  bool scale_embeddings = false;    // Scale token embeddings by sqrt(hidden_size) (Gemma).
   bool use_layernorm = false;       // Use true LayerNorm (mean+variance) instead of RMSNorm.
   bool tie_word_embeddings =
       false;  // lm_head shares weights with tok_embeddings (some Phi variants).

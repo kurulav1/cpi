@@ -133,6 +133,9 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
 
   kernels::launch_embedding_lookup(static_cast<const __half*>(d_tok_embeddings_), d_token_id_,
                                    static_cast<__half*>(d_x_), batch, hidden, compute_stream_);
+  if (cfg.scale_embeddings)  // Gemma: scale token embeddings by sqrt(hidden)
+    kernels::launch_scale_copy(static_cast<__half*>(d_x_), static_cast<const __half*>(d_x_),
+                               batch * hidden, std::sqrt(static_cast<float>(hidden)), compute_stream_);
 
   for (int layer = 0; layer < cfg.num_layers; ++layer) {
     const LayerDeviceWeights* lw = &layer_cache_[static_cast<std::size_t>(layer)];
@@ -211,7 +214,7 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
                                  ff_row_bytes, batch, cudaMemcpyDeviceToDevice, compute_stream_));
     CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_ff2_, ff_row_bytes, ff13_base + inter, ff13_stride_bytes,
                                  ff_row_bytes, batch, cudaMemcpyDeviceToDevice, compute_stream_));
-    kernels::launch_silu_mul(static_cast<const __half*>(d_prefill_ff1_),
+    detail::launch_gated_glu(weights_.config().mlp_gelu, static_cast<const __half*>(d_prefill_ff1_),
                              static_cast<const __half*>(d_prefill_ff2_),
                              static_cast<__half*>(d_prefill_ff2_), batch * inter, compute_stream_);
     detail::dispatch_linear_rowmajor_weight(

@@ -391,9 +391,20 @@ void HfBpeTokenizer::load(const std::string& path) {
             // Identify BOS/EOS/UNK by conventional token strings rather than
             // by a separate "role" field, which is absent in many tokenizer.json
             // files produced by earlier versions of the tokenizers library.
-            if (content == "<s>" || content == "<|begin_of_text|>") {
+            //
+            // Canonical names (<bos>/<eos>) win outright; the legacy
+            // SentencePiece names (<s>/</s>) only fill a gap. Gemma's vocab
+            // carries BOTH — its real BOS is <bos> (id 2) while <s> (id 204) is
+            // an inert leftover, so matching <s> there would prepend the wrong
+            // BOS and produce fluent-looking garbage.
+            if (content == "<bos>" || content == "<|begin_of_text|>") {
               bos_id_ = id;
-            } else if (content == "</s>" || content == "<|end_of_text|>" || content == "<|eot|>") {
+            } else if (content == "<s>") {
+              if (bos_id_ < 0) bos_id_ = id;
+            } else if (content == "<eos>" || content == "<|end_of_text|>" ||
+                       content == "<|eot|>") {
+              eos_id_ = id;
+            } else if (content == "</s>") {
               if (eos_id_ < 0) eos_id_ = id;
             } else if (content == "<unk>") {
               unk_id_ = id;
@@ -633,13 +644,15 @@ void HfBpeTokenizer::load(const std::string& path) {
   // the added_tokens list.  Some older tokenizer.json files omit them there
   // but do include them in the main vocab object.
   if (bos_id_ < 0) {
-    auto it = vocab_.find("<s>");
+    auto it = vocab_.find("<bos>");
+    if (it == vocab_.end()) it = vocab_.find("<s>");
     if (it != vocab_.end()) {
       bos_id_ = it->second;
     }
   }
   if (eos_id_ < 0) {
-    auto it = vocab_.find("</s>");
+    auto it = vocab_.find("<eos>");
+    if (it == vocab_.end()) it = vocab_.find("</s>");
     if (it != vocab_.end()) {
       eos_id_ = it->second;
     }

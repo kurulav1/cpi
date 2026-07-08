@@ -32,7 +32,7 @@ bool LlamaEngine::can_use_greedy_decode_graph() const {
          options_.max_context <= kGreedyGraphMaxContext &&
          !options_.paged_blocks &&  // paged decode uses the non-graph split-K block-gather path
          !options_.profile_decode_phases && !kv_int4_enabled_ && !tq3_enabled_ && !cfg.is_moe() &&
-         !cfg.use_layernorm && !cfg.has_qk_norm &&
+         !cfg.use_layernorm && !cfg.has_qk_norm && !cfg.scale_embeddings &&
          (attn_q_hidden_ <= 0 || attn_q_hidden_ == cfg.hidden_size) &&
          !has_any_layer_norm_bias_ && !has_any_layer_output_bias_ &&
          !weights_.has_tensor("norm.bias") && !weights_.has_tensor("output.bias") &&
@@ -363,7 +363,7 @@ void LlamaEngine::init_greedy_decode_graph() {
                                resident_qkv_tile_pairs_, resident_qkv_rows_per_warp_);
     }
 
-    kernels::launch_silu_mul(static_cast<const __half*>(d_ff1_), static_cast<const __half*>(d_ff2_),
+    detail::launch_gated_glu(weights_.config().mlp_gelu, static_cast<const __half*>(d_ff1_), static_cast<const __half*>(d_ff2_),
                              static_cast<__half*>(d_ff2_), inter, compute_stream_);
 
     if (tq) {
@@ -708,7 +708,7 @@ void LlamaEngine::init_logits_decode_graph() {
                                resident_qkv_tile_pairs_, resident_qkv_rows_per_warp_);
     }
 
-    kernels::launch_silu_mul(static_cast<const __half*>(d_ff1_), static_cast<const __half*>(d_ff2_),
+    detail::launch_gated_glu(weights_.config().mlp_gelu, static_cast<const __half*>(d_ff1_), static_cast<const __half*>(d_ff2_),
                              static_cast<__half*>(d_ff2_), inter, compute_stream_);
 
     if (tq) {

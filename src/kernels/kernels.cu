@@ -560,7 +560,13 @@ __global__ void attention_prefill_kernel_tiled(const half* q, const half* k_cach
   }
   __syncthreads();
 
-  float acc = 0.0f;
+  // Each thread owns head_dim/blockDim output channels (2 at head_dim=256 with
+  // 128 threads), so the accumulator MUST be an array — a scalar conflates the
+  // strided output dims into one, corrupting head_dim > blockDim (256).
+  constexpr int kOutPerThread = (256 + WarpsPerBlock * 32 - 1) / (WarpsPerBlock * 32);
+  float acc[kOutPerThread];
+#pragma unroll
+  for (int j = 0; j < kOutPerThread; ++j) acc[j] = 0.0f;
   for (int tile_base = 0; tile_base < limit; tile_base += WarpsPerBlock) {
     const int t = tile_base + warp_id;
     float score = -1.0e30f;
@@ -600,21 +606,23 @@ __global__ void attention_prefill_kernel_tiled(const half* q, const half* k_cach
     }
     __syncthreads();
 
-    for (int d = tid; d < head_dim; d += blockDim.x) {
-      float acc_local = acc;
+    int j = 0;
+    for (int d = tid; d < head_dim; d += blockDim.x, ++j) {
+      float acc_local = acc[j];
       const int tile_tokens = min(WarpsPerBlock, limit - tile_base);
       for (int i = 0; i < tile_tokens; ++i) {
         const int base = cache_index(tile_base + i, kv_head, 0, num_kv_heads, head_dim);
         acc_local = acc_local * alpha_shared[i] + beta_shared[i] * __half2float(v_cache[base + d]);
       }
-      acc = acc_local;
+      acc[j] = acc_local;
     }
     __syncthreads();
   }
 
   const float inv_l = 1.0f / fmaxf(stats_shared[1], 1e-8f);
-  for (int d = tid; d < head_dim; d += blockDim.x) {
-    out[out_base + d] = __float2half(acc * inv_l);
+  int j = 0;
+  for (int d = tid; d < head_dim; d += blockDim.x, ++j) {
+    out[out_base + d] = __float2half(acc[j] * inv_l);
   }
 }
 
@@ -665,7 +673,12 @@ __global__ void attention_prefill_kernel_tiled_paged(const half* q, const half* 
   }
   __syncthreads();
 
-  float acc = 0.0f;
+  // Per-thread output array (2 channels at head_dim=256 with 128 threads); a
+  // scalar would conflate the strided output dims — see the non-paged variant.
+  constexpr int kOutPerThread = (256 + WarpsPerBlock * 32 - 1) / (WarpsPerBlock * 32);
+  float acc[kOutPerThread];
+#pragma unroll
+  for (int j = 0; j < kOutPerThread; ++j) acc[j] = 0.0f;
   for (int tile_base = 0; tile_base < limit; tile_base += WarpsPerBlock) {
     const int t = tile_base + warp_id;
     float score = -1.0e30f;
@@ -706,8 +719,9 @@ __global__ void attention_prefill_kernel_tiled_paged(const half* q, const half* 
     }
     __syncthreads();
 
-    for (int d = tid; d < head_dim; d += blockDim.x) {
-      float acc_local = acc;
+    int j = 0;
+    for (int d = tid; d < head_dim; d += blockDim.x, ++j) {
+      float acc_local = acc[j];
       const int tile_tokens = min(WarpsPerBlock, limit - tile_base);
       for (int i = 0; i < tile_tokens; ++i) {
         const int phys =
@@ -715,14 +729,15 @@ __global__ void attention_prefill_kernel_tiled_paged(const half* q, const half* 
         const int base = cache_index(phys, kv_head, 0, num_kv_heads, head_dim);
         acc_local = acc_local * alpha_shared[i] + beta_shared[i] * __half2float(v_pool[base + d]);
       }
-      acc = acc_local;
+      acc[j] = acc_local;
     }
     __syncthreads();
   }
 
   const float inv_l = 1.0f / fmaxf(stats_shared[1], 1e-8f);
-  for (int d = tid; d < head_dim; d += blockDim.x) {
-    out[out_base + d] = __float2half(acc * inv_l);
+  int j = 0;
+  for (int d = tid; d < head_dim; d += blockDim.x, ++j) {
+    out[out_base + d] = __float2half(acc[j] * inv_l);
   }
 }
 

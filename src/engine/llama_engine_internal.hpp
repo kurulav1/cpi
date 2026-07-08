@@ -54,6 +54,12 @@ int dispatch_sample_from_logits(std::vector<float>& logits, float temperature, i
 
 bool dispatch_has_degenerate_tail(const std::vector<int>& ids, std::size_t prompt_size);
 
+// Gated MLP activation seam: gelu(gate)*up (GeGLU, Gemma) when use_gelu, else
+// silu(gate)*up (SwiGLU). Single point of control so the activation is chosen
+// once per config rather than hardcoded at every forward site.
+void launch_gated_glu(bool use_gelu, const __half* gate, const __half* up, __half* out, int n,
+                      cudaStream_t stream);
+
 // Reseeds the shared sampling RNG (used by the temperature>0 paths) for
 // reproducible sampling. No effect on greedy (temperature<=0) decoding.
 void dispatch_seed_sampler_rng(unsigned seed);

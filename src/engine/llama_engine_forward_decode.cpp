@@ -139,6 +139,9 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
         cudaMemcpyAsync(d_token_id_, &token, sizeof(int), cudaMemcpyHostToDevice, compute_stream_));
     kernels::launch_embedding_lookup(static_cast<const __half*>(d_tok_embeddings_), d_token_id_,
                                      static_cast<__half*>(d_x_), 1, hidden, compute_stream_);
+    if (cfg.scale_embeddings)  // Gemma: scale token embeddings by sqrt(hidden)
+      kernels::launch_scale_copy(static_cast<__half*>(d_x_), static_cast<const __half*>(d_x_),
+                                 hidden, std::sqrt(static_cast<float>(hidden)), compute_stream_);
 
     const auto copy_fp16 = [&](const std::string& name, void* dst, std::size_t bytes) {
       if (!weights_.has_tensor(name)) {
@@ -386,7 +389,7 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
           matvec_device_weight(ebase + ".w3", expert_inter, hidden,
                                static_cast<const __half*>(d_x_norm_), moe_ff_up, d_moe_w3_,
                                d_moe_w3_q_, d_moe_s_w3_);
-          kernels::launch_silu_mul(moe_ff_gate, moe_ff_up, moe_ff_up, expert_inter,
+          detail::launch_gated_glu(weights_.config().mlp_gelu, moe_ff_gate, moe_ff_up, moe_ff_up, expert_inter,
                                    compute_stream_);
           matvec_device_weight(ebase + ".w2", hidden, expert_inter, moe_ff_up,
                                static_cast<__half*>(d_ff3_), d_moe_w2_, d_moe_w2_q_, d_moe_s_w2_);
@@ -546,7 +549,7 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
                                resident_qkv_tile_pairs_, resident_qkv_rows_per_warp_);
     }
 
-    kernels::launch_silu_mul(static_cast<const __half*>(d_ff1_), static_cast<const __half*>(d_ff2_),
+    detail::launch_gated_glu(weights_.config().mlp_gelu, static_cast<const __half*>(d_ff1_), static_cast<const __half*>(d_ff2_),
                              static_cast<__half*>(d_ff2_), inter, compute_stream_);
 
     if (lw_i8 && lw_i8->w1 && lw_i8->w2 && lw_i8->w3) {
@@ -686,7 +689,7 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
       resident_projection_half(lw->w13, d_x_norm_, d_ff1_, 2 * inter, hidden, resident_qkv_warps_,
                                resident_qkv_tile_pairs_, resident_qkv_rows_per_warp_);
 
-      kernels::launch_silu_mul(static_cast<const __half*>(d_ff1_),
+      detail::launch_gated_glu(weights_.config().mlp_gelu, static_cast<const __half*>(d_ff1_),
                                static_cast<const __half*>(d_ff2_), static_cast<__half*>(d_ff2_),
                                inter, compute_stream_);
 
@@ -875,7 +878,7 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
           }
         }
 
-        kernels::launch_silu_mul(static_cast<const __half*>(d_ff1_),
+        detail::launch_gated_glu(weights_.config().mlp_gelu, static_cast<const __half*>(d_ff1_),
                                  static_cast<const __half*>(d_ff2_), static_cast<__half*>(d_ff2_),
                                  inter, compute_stream_);
 
@@ -901,7 +904,7 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
         resident_projection_half(lw->w13, d_x_norm_, d_ff1_, 2 * inter, hidden, resident_qkv_warps_,
                                  resident_qkv_tile_pairs_, resident_qkv_rows_per_warp_);
 
-        kernels::launch_silu_mul(static_cast<const __half*>(d_ff1_),
+        detail::launch_gated_glu(weights_.config().mlp_gelu, static_cast<const __half*>(d_ff1_),
                                  static_cast<const __half*>(d_ff2_), static_cast<__half*>(d_ff2_),
                                  inter, compute_stream_);
 
@@ -1055,7 +1058,7 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
                                  resident_qkv_tile_pairs_, resident_qkv_rows_per_warp_);
       }
 
-      kernels::launch_silu_mul(static_cast<const __half*>(d_ff1_),
+      detail::launch_gated_glu(weights_.config().mlp_gelu, static_cast<const __half*>(d_ff1_),
                                static_cast<const __half*>(d_ff2_), static_cast<__half*>(d_ff2_),
                                inter, compute_stream_);
 

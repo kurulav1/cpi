@@ -361,7 +361,7 @@ def main():
     p_dl.add_argument("repo_id", help="HuggingFace repo id, e.g. meta-llama/Llama-3.2-1B")
     p_dl.add_argument("--output-dir", default="")
     p_dl.add_argument("--family",
-                      choices=["llama2", "llama3", "mistral", "mixtral", "phi3", "phimoe", "qwen2",
+                      choices=["llama2", "llama3", "mistral", "mixtral", "phi3", "phimoe", "qwen2", "gemma",
                                "qwen3"],
                       default="")
     p_dl.add_argument("--token", default="")

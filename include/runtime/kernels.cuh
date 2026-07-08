@@ -377,6 +377,8 @@ void launch_add_bias_inplace_float_from_half(float* out, const half* bias, int n
 //
 // Uses half2 vectorised paths when n is even and all pointers are aligned.
 void launch_silu_mul(const half* gate, const half* up, half* out, int n, cudaStream_t stream);
+// GeGLU: gelu(gate) * up (tanh GELU approximation, Gemma). Same shape as silu_mul.
+void launch_gelu_mul(const half* gate, const half* up, half* out, int n, cudaStream_t stream);
 
 // launch_apply_sigmoid_gate_inplace
 //

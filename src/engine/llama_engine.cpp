@@ -543,6 +543,15 @@ void dispatch_linear_rowmajor_weight(cublasHandle_t handle, cublasLtHandle_t lt_
                          output_type);
 }
 
+void launch_gated_glu(bool use_gelu, const __half* gate, const __half* up, __half* out, int n,
+                      cudaStream_t stream) {
+  if (use_gelu) {
+    kernels::launch_gelu_mul(gate, up, out, n, stream);
+  } else {
+    kernels::launch_silu_mul(gate, up, out, n, stream);
+  }
+}
+
 }  // namespace detail
 
 void LlamaEngine::launch_norm(const void* x, const void* weight, const void* bias, void* y,
@@ -1059,6 +1068,9 @@ void LlamaEngine::initialize(const EngineOptions& options) {
       case model::ModelFamily::Qwen3:
         family_str = "qwen3";
         break;
+      case model::ModelFamily::Gemma:
+        family_str = "gemma";
+        break;
       default:
         break;
     }
@@ -1070,6 +1082,10 @@ void LlamaEngine::initialize(const EngineOptions& options) {
       std::cout << " weight_quant=int" << options_.streaming_quant_bits;
     }
     if (cfg.has_qkv_bias) std::cout << " qkv_bias=yes";
+    if (cfg.has_qk_norm) std::cout << " qk_norm=yes";
+    if (cfg.mlp_gelu) std::cout << " mlp=gelu";
+    if (cfg.scale_embeddings) std::cout << " embed_scale=yes";
+    if (cfg.tie_word_embeddings) std::cout << " tied=yes";
     if (cfg.use_layernorm) std::cout << " norm=layernorm";
     if (has_any_layer_norm_bias_) std::cout << " norm_bias=yes";
     if (has_any_layer_output_bias_) std::cout << " o_proj_bias=yes";

@@ -104,6 +104,9 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
 
   kernels::launch_embedding_lookup(static_cast<const __half*>(d_tok_embeddings_), d_token_id_,
                                    static_cast<__half*>(d_x_), rows, hidden, compute_stream_);
+  if (cfg.scale_embeddings)  // Gemma: scale token embeddings by sqrt(hidden)
+    kernels::launch_scale_copy(static_cast<__half*>(d_x_), static_cast<const __half*>(d_x_),
+                               rows * hidden, std::sqrt(static_cast<float>(hidden)), compute_stream_);
 
   const auto run_layer = [&](int layer, const LayerDeviceWeights* lw,
                              const LayerDeviceInt8Weights* lw_i8) {
@@ -288,7 +291,7 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
                                    compute_stream_));
     }
 
-    kernels::launch_silu_mul(static_cast<const __half*>(d_prefill_ff1_),
+    detail::launch_gated_glu(weights_.config().mlp_gelu, static_cast<const __half*>(d_prefill_ff1_),
                              static_cast<const __half*>(d_prefill_ff2_),
                              static_cast<__half*>(d_prefill_ff2_), rows * inter, compute_stream_);
 

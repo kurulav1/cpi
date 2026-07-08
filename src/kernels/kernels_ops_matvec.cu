@@ -95,6 +95,33 @@ __global__ void silu_mul_half2_kernel(const half2* gate, const half2* up, half2*
   out[i] = __halves2half2(__float2half(s0 * u0), __float2half(s1 * u1));
 }
 
+// GeGLU: gelu(gate) * up, using the tanh GELU approximation (Gemma's
+// gelu_pytorch_tanh). Same fused gate*up shape as silu_mul, different nonlinearity.
+__device__ __forceinline__ float gelu_tanh_f32(float x) {
+  const float k = 0.7978845608028654f;  // sqrt(2/pi)
+  return 0.5f * x * (1.0f + tanhf(k * (x + 0.044715f * x * x * x)));
+}
+
+__global__ void gelu_mul_kernel(const half* gate, const half* up, half* out, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) {
+    return;
+  }
+  out[i] = __float2half(gelu_tanh_f32(__half2float(gate[i])) * __half2float(up[i]));
+}
+
+__global__ void gelu_mul_half2_kernel(const half2* gate, const half2* up, half2* out, int n2) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n2) {
+    return;
+  }
+  const half2 g2 = gate[i];
+  const half2 u2 = up[i];
+  const float o0 = gelu_tanh_f32(__half2float(__low2half(g2))) * __half2float(__low2half(u2));
+  const float o1 = gelu_tanh_f32(__half2float(__high2half(g2))) * __half2float(__high2half(u2));
+  out[i] = __halves2half2(__float2half(o0), __float2half(o1));
+}
+
 __global__ void apply_sigmoid_gate_inplace_kernel(half* values, const half* gate, int n) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) {
@@ -739,6 +766,24 @@ void launch_silu_mul(const half* gate, const half* up, half* out, int n, cudaStr
 
   const int blocks = (n + threads - 1) / threads;
   silu_mul_kernel<<<blocks, threads, 0, stream>>>(gate, up, out, n);
+}
+
+void launch_gelu_mul(const half* gate, const half* up, half* out, int n, cudaStream_t stream) {
+  constexpr int threads = 256;
+  const bool aligned =
+      ((reinterpret_cast<std::uintptr_t>(gate) | reinterpret_cast<std::uintptr_t>(up) |
+        reinterpret_cast<std::uintptr_t>(out)) &
+       (alignof(half2) - 1)) == 0;
+  if ((n & 1) == 0 && aligned) {
+    const int n2 = n / 2;
+    const int blocks = (n2 + threads - 1) / threads;
+    gelu_mul_half2_kernel<<<blocks, threads, 0, stream>>>(reinterpret_cast<const half2*>(gate),
+                                                          reinterpret_cast<const half2*>(up),
+                                                          reinterpret_cast<half2*>(out), n2);
+    return;
+  }
+  const int blocks = (n + threads - 1) / threads;
+  gelu_mul_kernel<<<blocks, threads, 0, stream>>>(gate, up, out, n);
 }
 
 void launch_scale_copy(half* dst, const half* src, int n, float scale, cudaStream_t stream) {

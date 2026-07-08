@@ -30,7 +30,7 @@ VERSION = 5
 #   attention_type_count (i), attention_type_offset (Q)
 #
 # flags bit layout: bit 0 = tie_word_embeddings, bit 1 = has_qkv_bias,
-# bit 2 = use_layernorm, bit 3 = has_qk_norm
+# bit 2 = use_layernorm, bit 3 = has_qk_norm, bit 4 = mlp_gelu, bit 5 = scale_embeddings
 HEADER_FMT = "<8siiiiiiiiiiQffiiiiiifiiiQ"
 ENTRY_FMT = "<64sqq"
 
@@ -74,6 +74,8 @@ def load_config(src: Path, args) -> dict:
     result["has_qkv_bias"]        = bool(cfg.get("has_qkv_bias", False))
     result["use_layernorm"]       = bool(cfg.get("use_layernorm", False))
     result["has_qk_norm"]         = bool(cfg.get("has_qk_norm", False))
+    result["mlp_gelu"]            = bool(cfg.get("mlp_gelu", False))
+    result["scale_embeddings"]    = bool(cfg.get("scale_embeddings", False))
     result["model_family_id"]     = int(cfg.get("model_family_id", 0))
     result["num_local_experts"] = int(cfg.get("num_local_experts", 0) or 0)
     result["num_experts_per_tok"] = int(cfg.get("num_experts_per_tok", 0) or 0)
@@ -262,6 +264,10 @@ def main() -> None:
         flags |= 4
     if cfg.get("has_qk_norm"):
         flags |= 8
+    if cfg.get("mlp_gelu"):
+        flags |= 16
+    if cfg.get("scale_embeddings"):
+        flags |= 32
 
     with out_path.open("wb") as f:
         f.write(struct.pack(
