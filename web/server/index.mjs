@@ -802,7 +802,8 @@ function buildCliArgs(config, body) {
   // request flag; deepseek-r1 always reasons.
   const thinking =
     requestTemplate === "deepseek-r1" ||
-    (requestTemplate === "qwen3_5" && isTruthyFlag(body.thinking));
+    ((requestTemplate === "qwen3_5" || requestTemplate === "qwen3") &&
+     isTruthyFlag(body.thinking));
   const promptBudget = computePromptBudget(maxContext, performanceMode);
 
   const promptPackage = buildPromptPackage(body.messages, {

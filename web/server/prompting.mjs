@@ -585,6 +585,21 @@ export function buildPromptPackage(messages, options = {}) {
     };
   }
 
+  // Qwen3 dense: same ChatML + thinking text format as qwen3_5 (shared reasoning
+  // block), but runs on the native LlamaEngine (batch-compatible). Thinking off by
+  // default primes an empty <think></think> so the model answers directly instead
+  // of spending the whole budget reasoning.
+  if (template === "qwen3") {
+    return {
+      messages: chatMessages,
+      prompt: formatQwen35(turns, effectiveSystemPrompt, Boolean(options.thinking)),
+      template,
+      thinking: Boolean(options.thinking),
+      stopTexts: STOP_SEQUENCES.qwen3_5,
+      addBos: false
+    };
+  }
+
   if (template === "qwen3_5") {
     return {
       messages: chatMessages,

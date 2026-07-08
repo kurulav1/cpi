@@ -1008,14 +1008,15 @@ function inferTemplate(modelPath, tokenizerPath, fallbackTemplate, hfConfig, hfT
   const family = modelFamilyName(path.basename(modelPath));
   const tokenizerExt = path.extname(tokenizerPath || "").toLowerCase();
 
-  // Qwen3 dense runs on LlamaEngine and chats with ChatML (qwen2). Force it here,
-  // before the chat_template sniff below — Qwen3's template contains <think>, which
-  // would otherwise be misread as the qwen3_5 (mixed-attention fork) template.
+  // Qwen3 dense runs on LlamaEngine (batch-compatible) and uses the "qwen3"
+  // template — ChatML with a thinking toggle (off by default). Force it here,
+  // before the chat_template sniff below, which would misread Qwen3's <think>
+  // template as the qwen3_5 (mixed-attention fork) template.
   const mt = String(hfConfig?.modelType || "").toLowerCase();
   const rmt = String(hfConfig?.rootModelType || "").toLowerCase();
   if ((mt.includes("qwen3") || rmt.includes("qwen3")) &&
       !mt.includes("qwen3_5") && !rmt.includes("qwen3_5")) {
-    return "qwen2";
+    return "qwen3";
   }
 
   const templateFromTokenizerConfig = inferTemplateFromChatTemplate(
