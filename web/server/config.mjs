@@ -748,6 +748,7 @@ function ll2cFamilyFromId(modelFamilyId) {
     case 5: return "qwen2";
     case 6: return "mixtral";
     case 7: return "qwen3_5";
+    case 8: return "qwen3";
     default: return "";
   }
 }
@@ -967,6 +968,11 @@ function inferProfileFamily(modelPath, hfConfig) {
   if (modelType.includes("mixtral")) {
     return "mixtral";
   }
+  // Qwen3 dense runs on the native LlamaEngine (checked after qwen3_5 so the
+  // mixed-attention variant isn't caught here) and chats with ChatML like Qwen2.
+  if (modelType.includes("qwen3") || rootModelType.includes("qwen3")) {
+    return "qwen";
+  }
   if (modelType.includes("qwen2")) {
     return "qwen";
   }
@@ -1001,6 +1007,17 @@ function inferUnsupportedArchitecture(hfConfig = {}) {
 function inferTemplate(modelPath, tokenizerPath, fallbackTemplate, hfConfig, hfTokenizerConfig) {
   const family = modelFamilyName(path.basename(modelPath));
   const tokenizerExt = path.extname(tokenizerPath || "").toLowerCase();
+
+  // Qwen3 dense runs on LlamaEngine and chats with ChatML (qwen2). Force it here,
+  // before the chat_template sniff below — Qwen3's template contains <think>, which
+  // would otherwise be misread as the qwen3_5 (mixed-attention fork) template.
+  const mt = String(hfConfig?.modelType || "").toLowerCase();
+  const rmt = String(hfConfig?.rootModelType || "").toLowerCase();
+  if ((mt.includes("qwen3") || rmt.includes("qwen3")) &&
+      !mt.includes("qwen3_5") && !rmt.includes("qwen3_5")) {
+    return "qwen2";
+  }
+
   const templateFromTokenizerConfig = inferTemplateFromChatTemplate(
     hfTokenizerConfig?.chatTemplate
   );
