@@ -823,6 +823,26 @@ function readLl2cModelConfig(modelPath) {
   }
 }
 
+// A Gemma 4 .cpi (fork-engine format) carries its config in the sibling .manifest.
+// Read the family from it so a .cpi flows through the SAME family-based template/
+// engine/batch logic as every other model, instead of being special-cased on the
+// extension. Mirrors readLl2cModelConfig, which extracts the family from the
+// .ll2c header.
+function readCpiModelConfig(modelPath) {
+  if (!modelPath || path.extname(modelPath).toLowerCase() !== ".cpi") {
+    return null;
+  }
+  const manifestPath = modelPath.slice(0, -path.extname(modelPath).length) + ".manifest";
+  try {
+    const text = fs.readFileSync(manifestPath, "utf8");
+    const m = text.match(/^CFG\s+family\s+(\S+)/m);
+    const family = m ? m[1] : "gemma4";
+    return { modelType: family, rootModelType: family };
+  } catch {
+    return { modelType: "gemma4", rootModelType: "gemma4" }; // gemma4 is the only .cpi family today
+  }
+}
+
 function mergeModelConfigs(...configs) {
   const merged = {};
   for (const config of configs) {
@@ -962,6 +982,9 @@ function inferProfileFamily(modelPath, hfConfig) {
   if (modelType.includes("cpt_gpt") || rootModelType.includes("cpt_gpt")) {
     return "cpt_gpt";
   }
+  if (modelType.includes("gemma4") || rootModelType.includes("gemma4")) {
+    return "gemma4";  // Gemma 4 fork engine (its own family, like qwen3_5/llama4)
+  }
   if (modelType.includes("qwen3_5") || rootModelType.includes("qwen3_5")) {
     return "qwen3_5";
   }
@@ -1008,9 +1031,12 @@ function inferTemplate(modelPath, tokenizerPath, fallbackTemplate, hfConfig, hfT
   const family = modelFamilyName(path.basename(modelPath));
   const tokenizerExt = path.extname(tokenizerPath || "").toLowerCase();
 
-  // Gemma 4 ships as a .cpi (the fork-engine format) and uses the Gemma 4 turn
-  // template (<|turn> / <turn|>), distinct from Gemma 1/2/3.
-  if (path.extname(modelPath || "").toLowerCase() === ".cpi") {
+  // Gemma 4 (its own fork engine) uses the Gemma 4 turn template (<|turn> /
+  // <turn|>), distinct from Gemma 1/2/3. Keyed on the family from the model
+  // config, not the file extension.
+  const mt0 = String(hfConfig?.modelType || "").toLowerCase();
+  const rmt0 = String(hfConfig?.rootModelType || "").toLowerCase();
+  if (mt0.includes("gemma4") || rmt0.includes("gemma4")) {
     return "gemma";
   }
 
@@ -1218,8 +1244,9 @@ function discoverSafetensorsModelDirs(scanRoots) {
 
 function buildProfile(modelPath, tokenizerPath, baseConfig, source = "discovered") {
   const ll2cConfig = readLl2cModelConfig(modelPath);
+  const cpiConfig = readCpiModelConfig(modelPath);
   const hfConfig = readHfModelConfig(modelPath);
-  const modelConfig = mergeModelConfigs(ll2cConfig, hfConfig);
+  const modelConfig = mergeModelConfigs(ll2cConfig, cpiConfig, hfConfig);
   const hfTokenizerConfig = readHfTokenizerConfig(modelPath, tokenizerPath);
   const template = inferTemplate(
     modelPath,

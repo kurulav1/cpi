@@ -1447,18 +1447,12 @@ function batchWorkerEnabled() {
 // Families that run on their own engine (NOT LlamaEngine) can't be batched: the
 // --interactive-batch loop is LlamaEngine-only (see main.cpp), so the worker
 // would load the model but never speak the batch protocol and hang the request.
-const NON_LLAMA_ENGINE_FAMILIES = new Set(["qwen3_5", "llama4", "cpt_gpt"]);
+const NON_LLAMA_ENGINE_FAMILIES = new Set(["qwen3_5", "llama4", "cpt_gpt", "gemma4"]);
 
 function isBatchCompatible(cliConfig) {
   const p = cliConfig.profile || {};
   const family = String(p.family || cliConfig.meta?.template || "").toLowerCase();
-  if (NON_LLAMA_ENGINE_FAMILIES.has(family)) return false;                  // separate engine
-  // Gemma 4 (.cpi) runs on its own fork engine (Gemma4CudaEngine), which the
-  // --interactive-batch loop doesn't drive — route to single-flight. Keyed on the
-  // .cpi extension, not family "gemma", so Gemma 1/2/3 (.ll2c on LlamaEngine) still
-  // batch. (Single-flight also tears down the batch worker first, freeing the VRAM
-  // a large model like the 12B needs.)
-  if (String(p.modelPath || "").toLowerCase().endsWith(".cpi")) return false;
+  if (NON_LLAMA_ENGINE_FAMILIES.has(family)) return false;                  // separate engine (incl. gemma4)
   if (cliConfig.quantMode && cliConfig.quantMode !== "none") return false; // runtime quantization
   const label = String(p.label || "").toLowerCase();
   if (label.includes("streaming")) return false;                           // streamed weights
