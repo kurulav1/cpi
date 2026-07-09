@@ -19,21 +19,6 @@
 namespace engine {
 namespace runtime {
 
-// The contract a decoder-only engine exposes to the driver. Positions are
-// presented strictly increasing (prefill 0..P-1, then decode P, P+1, ...), so an
-// engine may reuse KV state across calls.
-class SequenceModel {
- public:
-  virtual ~SequenceModel() = default;
-  virtual int vocab() const = 0;
-  virtual int eos_id() const = 0;
-  virtual int max_context() const = 0;
-  // Process one token at `position`; when want_logits, refresh logits() with the
-  // host-side logits for that position (size == vocab()).
-  virtual void step(int token, int position, bool want_logits) = 0;
-  virtual std::vector<float>& logits() = 0;
-};
-
 struct DecodeParams {
   int max_new_tokens = 256;
   float temperature = 0.0f;      // <= 0 => greedy
@@ -42,6 +27,39 @@ struct DecodeParams {
   float repetition_penalty = 1.0f;
   int no_repeat_ngram_size = 0;
   int seed = -1;                 // >= 0 reseeds the sampler RNG
+  bool include_prompt = false;   // return prompt+generated (vs generated only)
+  // Optional grammar hooks (kept as std::function so the driver doesn't depend on
+  // the grammar module). mask: set disallowed logits to -inf; accept: advance the
+  // grammar state by the chosen token.
+  std::function<void(std::vector<float>&)> grammar_mask;
+  std::function<void(int)> grammar_accept;
+};
+
+// The contract a decoder-only engine exposes to the driver. Positions are
+// presented strictly increasing (prefill 0..P-1, then decode P, P+1, ...), so an
+// engine may reuse KV state across calls. Only the pure-virtuals are mandatory;
+// the rest have defaults matching the simplest engine (single EOS, host-side
+// sampling, no persistent state).
+class SequenceModel {
+ public:
+  virtual ~SequenceModel() = default;
+  virtual int vocab() const = 0;
+  virtual int eos_id() const = 0;
+  virtual int max_context() const = 0;
+  // Process one token at `position`; when want_logits, make logits() valid for
+  // that position (size == vocab()). Engines with a device-side sample() may keep
+  // logits on device and only fill logits() lazily.
+  virtual void step(int token, int position, bool want_logits) = 0;
+  virtual std::vector<float>& logits() = 0;
+
+  // --- optional hooks (defaults keep the simple single-flight behavior) ---
+  virtual void reset_state() {}                                  // clear KV/recurrent state
+  virtual void synchronize() {}                                  // block until pending work done
+  virtual bool is_stop(int token) const { return token == eos_id(); }  // dual-EOS engines override
+  // Sample the next token from the current step's logits. Default: shared host
+  // sampler (+ optional grammar mask). Engines with a device-argmax greedy fast
+  // path override this to keep it.
+  virtual int sample(const DecodeParams& params, const std::vector<int>& history);
 };
 
 // Prefill `prompt` (only the last token computes logits), then decode up to

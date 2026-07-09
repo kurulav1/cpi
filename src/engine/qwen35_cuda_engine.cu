@@ -857,11 +857,14 @@ void Qwen35CudaEngine::forward_token(int token, int position, bool compute_logit
   }
 }
 
-int Qwen35CudaEngine::sample_next_token(float temperature, const std::vector<int>& history) {
-  const bool greedy_fast_path =
-      temperature <= 0.0f && options_.repetition_penalty <= 1.0f &&
-      options_.no_repeat_ngram_size <= 1 &&
-      active_grammar_ == nullptr;  // grammar masking needs host logits; skip the device argmax
+void Qwen35CudaEngine::synchronize() { CUDA_CHECK(cudaStreamSynchronize(compute_stream_)); }
+
+int Qwen35CudaEngine::sample(const runtime::DecodeParams& params,
+                             const std::vector<int>& history) {
+  // Device-argmax greedy fast path (grammar masking needs host logits, so skip
+  // the device argmax when a mask is active). Kept so greedy perf is unchanged.
+  const bool greedy_fast_path = params.temperature <= 0.0f && params.repetition_penalty <= 1.0f &&
+                                params.no_repeat_ngram_size <= 1 && !params.grammar_mask;
   if (greedy_fast_path) {
     kernels::launch_argmax_float(static_cast<const float*>(d_logits_), cfg_.vocab_size, d_argmax_,
                                  compute_stream_);
@@ -870,25 +873,13 @@ int Qwen35CudaEngine::sample_next_token(float temperature, const std::vector<int
     CUDA_CHECK(cudaMemcpy(&next, d_argmax_, sizeof(int), cudaMemcpyDeviceToHost));
     return next;
   }
-
+  // Host path: bring logits to host, then reuse the base default (optional grammar
+  // mask + the shared sampler over logits()).
   CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
   CUDA_CHECK(cudaMemcpy(h_logits_.data(), d_logits_,
                         static_cast<std::size_t>(cfg_.vocab_size) * sizeof(float),
                         cudaMemcpyDeviceToHost));
-  std::vector<float> logits = h_logits_;
-  // Grammar constraint: mask tokens that cannot continue the schema-valid JSON
-  // (-inf), so the shared sampler excludes them. Applied before the sampler; for
-  // a masked token the order vs. repetition penalty is irrelevant (both keep it
-  // at -inf).
-  if (active_grammar_ != nullptr) {
-    active_grammar_->apply_mask(logits);
-  }
-  // One shared host sampler (temperature/top-k/top-p/repetition penalty/no-repeat
-  // -ngram), matching LlamaEngine — this was a full inline reimplementation. The
-  // device-argmax greedy fast path above is kept, so greedy perf is unchanged.
-  return detail::dispatch_sample_from_logits(logits, temperature, options_.top_k, options_.top_p,
-                                             options_.repetition_penalty,
-                                             options_.no_repeat_ngram_size, history);
+  return runtime::SequenceModel::sample(params, history);
 }
 
 void Qwen35CudaEngine::initialize(const EngineOptions& options) {
@@ -947,62 +938,26 @@ std::vector<int> Qwen35CudaEngine::generate_stream(const std::vector<int>& promp
     }
   } grammar_scope{&active_grammar_};
 
-  reset_state();
-  stats_ = {};
-  stats_.prompt_tokens = static_cast<int>(prompt_tokens.size());
+  // Empty prompt: prime with BOS so there's something to condition on. The shared
+  // decode driver owns the prefill/decode/sample/stop/timing loop; this engine
+  // supplies its forward (step) and the device-argmax fast-path sample().
+  const bool empty = prompt_tokens.empty();
+  const std::vector<int> prompt = empty ? std::vector<int>{bos_id_} : prompt_tokens;
 
-  std::vector<int> out = prompt_tokens;
-  out.reserve(prompt_tokens.size() + static_cast<std::size_t>(max_new_tokens));
-  std::vector<int> history = prompt_tokens;
-  int current = bos_id_;
-  int pos = 0;
-
-  const auto prefill_start = std::chrono::steady_clock::now();
-  if (prompt_tokens.empty()) {
-    current = bos_id_;
-    pos = 0;
-    history.push_back(bos_id_);
-    forward_token(current, pos, true, nullptr, nullptr);
-  } else {
-    for (int i = 0; i + 1 < static_cast<int>(prompt_tokens.size()); ++i) {
-      forward_token(prompt_tokens[static_cast<std::size_t>(i)], i, false, nullptr, nullptr);
-    }
-    current = prompt_tokens.back();
-    pos = static_cast<int>(prompt_tokens.size()) - 1;
-    forward_token(current, pos, true, nullptr, nullptr);
+  runtime::DecodeParams p;
+  p.max_new_tokens = max_new_tokens;
+  p.temperature = temperature;
+  p.top_k = options_.top_k;
+  p.top_p = options_.top_p;
+  p.repetition_penalty = options_.repetition_penalty;
+  p.no_repeat_ngram_size = options_.no_repeat_ngram_size;
+  p.seed = constraints ? constraints->seed : -1;
+  p.include_prompt = !empty;  // prompt+generated (empty prompt -> generated only)
+  if (active_grammar_ != nullptr) {
+    p.grammar_mask = [this](std::vector<float>& lg) { active_grammar_->apply_mask(lg); };
+    p.grammar_accept = [this](int tok) { active_grammar_->accept(tok); };
   }
-  CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
-  const auto prefill_end = std::chrono::steady_clock::now();
-  stats_.prefill_ms =
-      std::chrono::duration<double, std::milli>(prefill_end - prefill_start).count();
-
-  const auto decode_start = std::chrono::steady_clock::now();
-  for (int step = 0; step < max_new_tokens; ++step) {
-    const int next = sample_next_token(temperature, history);
-    if (active_grammar_ != nullptr) {
-      active_grammar_->accept(next);  // advance grammar state by the chosen token
-    }
-    history.push_back(next);
-    out.push_back(next);
-    if (on_token && !on_token(next)) {
-      break;
-    }
-    if (next == cfg_.eos_token_id || next == options_.eos_token_id) {
-      break;
-    }
-    if (step + 1 >= max_new_tokens || pos + 1 >= max_ctx_) {
-      break;
-    }
-    ++pos;
-    current = next;
-    forward_token(current, pos, true, nullptr, nullptr);
-  }
-  CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
-  const auto decode_end = std::chrono::steady_clock::now();
-  stats_.decode_ms = std::chrono::duration<double, std::milli>(decode_end - decode_start).count();
-  stats_.generated_tokens = static_cast<int>(
-      (out.size() > prompt_tokens.size()) ? (out.size() - prompt_tokens.size()) : 0);
-  return out;
+  return runtime::run_decode(*this, prompt, p, on_token, &stats_);
 }
 
 std::vector<std::pair<int, float>> Qwen35CudaEngine::inspect_next_logits(

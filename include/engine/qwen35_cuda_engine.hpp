@@ -10,13 +10,17 @@
 #include <utility>
 #include <vector>
 
+#include "engine/decode_driver.hpp"
 #include "engine/engine_types.hpp"
 #include "engine/generation_constraints.hpp"
 #include "model/safetensors_loader.hpp"
 
 namespace engine {
 
-class Qwen35CudaEngine {
+// Derives from runtime::SequenceModel so generate/generate_stream reuse the
+// shared decode loop (prefill/decode/sample/stop/timing); the engine supplies its
+// forward + a device-argmax greedy fast-path override so perf is unchanged.
+class Qwen35CudaEngine : public runtime::SequenceModel {
 public:
   ~Qwen35CudaEngine();
 
@@ -35,6 +39,20 @@ public:
   const BenchmarkStats& last_benchmark_stats() const {
     return stats_;
   }
+
+  // --- runtime::SequenceModel (the decode driver calls these) ---
+  int vocab() const override { return cfg_.vocab_size; }
+  int eos_id() const override { return cfg_.eos_token_id; }
+  int max_context() const override { return max_ctx_; }
+  void step(int token, int position, bool want_logits) override {
+    forward_token(token, position, want_logits, nullptr, nullptr);
+  }
+  std::vector<float>& logits() override { return h_logits_; }
+  void synchronize() override;
+  bool is_stop(int token) const override {
+    return token == cfg_.eos_token_id || token == options_.eos_token_id;
+  }
+  int sample(const runtime::DecodeParams& params, const std::vector<int>& history) override;
 
 private:
   enum class LayerKind {
@@ -108,13 +126,12 @@ private:
   void allocate_runtime_buffers();
   void build_rope_tables();
   void load_weights();
-  void reset_state();
+  void reset_state() override;
   void load_token_embedding_to_device(int token);
   void project(const DeviceMatrix& matrix, const void* x, void* y);
   void rowmajor_projection_float(const DeviceMatrix& matrix, const void* x, void* y);
   void forward_token(int token, int position, bool compute_logits, std::vector<float>* out_logits,
                      int* out_argmax);
-  int sample_next_token(float temperature, const std::vector<int>& history);
 
   model::SafetensorsLoader weights_;
   EngineOptions options_{};
