@@ -85,6 +85,11 @@ void Gemma4CudaEngine::parse_manifest(const std::string& manifest_path) {
       else if (k == "num_kv_heads") cfg_.num_kv_heads = std::stoi(v);
       else if (k == "head_dim") cfg_.head_dim = std::stoi(v);
       else if (k == "global_head_dim") cfg_.global_head_dim = std::stoi(v);
+      else if (k == "head_dim_sliding") cfg_.head_dim_sliding = std::stoi(v);
+      else if (k == "head_dim_full") cfg_.head_dim_full = std::stoi(v);
+      else if (k == "num_kv_heads_sliding") cfg_.num_kv_heads_sliding = std::stoi(v);
+      else if (k == "num_kv_heads_full") cfg_.num_kv_heads_full = std::stoi(v);
+      else if (k == "attention_k_eq_v") cfg_.attention_k_eq_v = (v == "True" || v == "true" || v == "1");
       else if (k == "intermediate") cfg_.intermediate = std::stoi(v);
       else if (k == "vocab") cfg_.vocab = std::stoi(v);
       else if (k == "rms_eps") cfg_.rms_eps = std::stof(v);
@@ -158,22 +163,24 @@ float Gemma4CudaEngine::scalar_value(const std::string& name) {
 }
 
 void Gemma4CudaEngine::build_rope_tables() {
-  const int hs = cfg_.head_dim / 2;       // sliding pairs (128)
-  const int hf = cfg_.global_head_dim / 2; // full pairs (256)
+  // Tables sized to the ACTUAL per-layer-type head_dim (E2B full=512, 12B full=256).
+  const int hd_s = cfg_.head_dim_sliding, hd_f = cfg_.head_dim_full;
+  const int hs = hd_s / 2;  // sliding pairs
+  const int hf = hd_f / 2;  // full pairs
   std::vector<float> cs(static_cast<std::size_t>(max_ctx_) * hs), ss(cs.size());
   std::vector<float> cf(static_cast<std::size_t>(max_ctx_) * hf), sf(cf.size());
   // sliding: full rotary, inv_freq[i] = theta^(-2i/head_dim)
   for (int p = 0; p < max_ctx_; ++p)
     for (int i = 0; i < hs; ++i) {
-      float inv = std::pow(cfg_.rope_theta_sliding, -2.0f * i / cfg_.head_dim);
+      float inv = std::pow(cfg_.rope_theta_sliding, -2.0f * i / hd_s);
       cs[static_cast<std::size_t>(p) * hs + i] = std::cos(p * inv);
       ss[static_cast<std::size_t>(p) * hs + i] = std::sin(p * inv);
     }
   // full: partial rotary — first rope_angles pairs rotated, rest identity (inv=0)
-  const int rope_angles = static_cast<int>(cfg_.partial_rotary_full * cfg_.global_head_dim) / 2;
+  const int rope_angles = static_cast<int>(cfg_.partial_rotary_full * hd_f) / 2;
   for (int p = 0; p < max_ctx_; ++p)
     for (int i = 0; i < hf; ++i) {
-      float inv = (i < rope_angles) ? std::pow(cfg_.rope_theta_full, -2.0f * i / cfg_.global_head_dim) : 0.0f;
+      float inv = (i < rope_angles) ? std::pow(cfg_.rope_theta_full, -2.0f * i / hd_f) : 0.0f;
       cf[static_cast<std::size_t>(p) * hf + i] = std::cos(p * inv);
       sf[static_cast<std::size_t>(p) * hf + i] = std::sin(p * inv);
     }
@@ -187,9 +194,10 @@ void Gemma4CudaEngine::build_rope_tables() {
 
 void Gemma4CudaEngine::allocate_buffers() {
   const int H = cfg_.hidden;
-  const int maxhd = cfg_.global_head_dim;
+  const int maxhd = std::max(cfg_.head_dim_full, cfg_.head_dim_sliding);
   const int maxq = cfg_.num_heads * maxhd;
-  const int maxkv = cfg_.num_kv_heads * maxhd;
+  const int maxkv = std::max(cfg_.num_kv_heads_sliding * cfg_.head_dim_sliding,
+                             cfg_.num_kv_heads_full * cfg_.head_dim_full);
   const int maxinter = cfg_.intermediate * (cfg_.use_double_wide_mlp ? 2 : 1);
   const int ple_tot = cfg_.num_layers * cfg_.hidden_size_per_layer_input;
   auto al = [&](__half** p, std::size_t n) { G4_CHECK(cudaMalloc(p, n * sizeof(__half))); };
@@ -211,7 +219,7 @@ void Gemma4CudaEngine::allocate_buffers() {
   caches_v_.assign(cfg_.num_layers, nullptr);
   for (int L = 0; L < cfg_.num_layers; ++L) {
     if (L < cfg_.first_shared_layer || cfg_.first_shared_layer == 0) {
-      const int kvd = head_dim_of(L) * cfg_.num_kv_heads;
+      const int kvd = head_dim_of(L) * kv_heads_of(L);
       G4_CHECK(cudaMalloc(&caches_k_[L], static_cast<std::size_t>(max_ctx_) * kvd * sizeof(__half)));
       G4_CHECK(cudaMalloc(&caches_v_[L], static_cast<std::size_t>(max_ctx_) * kvd * sizeof(__half)));
     }
@@ -239,10 +247,11 @@ void Gemma4CudaEngine::load_all(const std::string& cpi_path) {
     for (const char* t : {"input_layernorm.weight", "post_attention_layernorm.weight",
                           "pre_feedforward_layernorm.weight", "post_feedforward_layernorm.weight",
                           "self_attn.q_proj.weight", "self_attn.k_proj.weight",
-                          "self_attn.v_proj.weight", "self_attn.o_proj.weight",
+                          "self_attn.o_proj.weight",
                           "self_attn.q_norm.weight", "self_attn.k_norm.weight",
                           "mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight"})
       upload(p + t);
+    if (!k_eq_v(L)) upload(p + "self_attn.v_proj.weight");  // k_eq_v full layers have none
     if (has_ple())
       for (const char* t : {"per_layer_input_gate.weight", "per_layer_projection.weight",
                             "post_per_layer_input_norm.weight"})
@@ -296,10 +305,11 @@ void Gemma4CudaEngine::run_layer(int layer, int position) {
   const std::string p = "layers." + std::to_string(layer) + ".";
   const int H = cfg_.hidden;
   const int hd = head_dim_of(layer);
-  const int nq = cfg_.num_heads, nkv = cfg_.num_kv_heads;
+  const int nq = cfg_.num_heads, nkv = kv_heads_of(layer);
   const int qdim = nq * hd, kvdim = nkv * hd;
   const bool full = cfg_.layer_full[layer] != 0;
   const bool shared = layer >= cfg_.first_shared_layer && cfg_.first_shared_layer > 0;
+  const bool keqv = k_eq_v(layer);  // full layers (12B): V = weightless_vnorm(k_proj(x))
   const float* cosT = full ? d_cos_full_ : d_cos_sliding_;
   const float* sinT = full ? d_sin_full_ : d_sin_sliding_;
   auto W = [&](const char* t) { return static_cast<const __half*>(dev_[p + t]); };
@@ -314,7 +324,10 @@ void Gemma4CudaEngine::run_layer(int layer, int position) {
   __half* vc = caches_v_[layer];
   if (!shared) {
     kernels::launch_rowmajor_half_gemv_f16(W("self_attn.k_proj.weight"), d_x_norm_, d_k_, kvdim, H, stream_);
-    kernels::launch_rowmajor_half_gemv_f16(W("self_attn.v_proj.weight"), d_x_norm_, d_v_, kvdim, H, stream_);
+    if (keqv)  // V shares the raw k_proj output (taken before k_norm/rope)
+      G4_CHECK(cudaMemcpyAsync(d_v_, d_k_, kvdim * sizeof(__half), cudaMemcpyDeviceToDevice, stream_));
+    else
+      kernels::launch_rowmajor_half_gemv_f16(W("self_attn.v_proj.weight"), d_x_norm_, d_v_, kvdim, H, stream_);
     kernels::launch_rmsnorm(d_k_, W("self_attn.k_norm.weight"), d_k_, nkv, hd, cfg_.rms_eps, stream_);
     kernels::launch_rope_inplace_table(d_k_, d_k_, nkv, 0, hd, position, cosT, sinT, stream_);
     kernels::launch_rmsnorm(d_v_, d_ones_, d_v_, nkv, hd, cfg_.rms_eps, stream_);  // weightless v-norm

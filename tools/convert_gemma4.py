@@ -63,6 +63,30 @@ def main():
 
     nl = tc["num_hidden_layers"]
     layer_types = tc["layer_types"]
+
+    # Actual per-layer head_dim comes from the WEIGHTS (q_norm.weight length),
+    # not config: E2B's full layers use global_head_dim=512, but 12B's use 256
+    # even though both configs advertise global_head_dim=512.
+    def q_norm_dim(L):
+        m = hdr.get(PREFIX + f"layers.{L}.self_attn.q_norm.weight")
+        return m["shape"][0] if m else None
+    slide_idx = next((i for i, t in enumerate(layer_types) if t == "sliding_attention"), 0)
+    full_idxs = [i for i, t in enumerate(layer_types) if t == "full_attention"]
+    head_dim_sliding = q_norm_dim(slide_idx) or tc["head_dim"]
+    head_dim_full = (q_norm_dim(full_idxs[0]) if full_idxs else head_dim_sliding) \
+        or tc.get("global_head_dim") or tc["head_dim"]
+
+    # num_kv_heads can differ per layer type (12B: sliding GQA-8, full MQA-1) —
+    # derive from k_proj rows / head_dim. attention_k_eq_v (12B full layers) means
+    # V shares the K projection: no v_proj tensor, V = weightless_vnorm(k_proj(x)).
+    def k_proj_rows(L):
+        m = hdr.get(PREFIX + f"layers.{L}.self_attn.k_proj.weight")
+        return m["shape"][0] if m else None
+    nkv_slide = (k_proj_rows(slide_idx) or tc["num_key_value_heads"] * head_dim_sliding) // head_dim_sliding
+    nkv_full = ((k_proj_rows(full_idxs[0]) if full_idxs else k_proj_rows(slide_idx))
+                or tc["num_key_value_heads"] * head_dim_full) // head_dim_full
+    attention_k_eq_v = bool(tc.get("attention_k_eq_v", False))
+
     cfg = {
         "family": "gemma4",
         "num_layers": nl,
@@ -71,6 +95,11 @@ def main():
         "num_kv_heads": tc["num_key_value_heads"],
         "head_dim": tc["head_dim"],
         "global_head_dim": tc.get("global_head_dim") or tc["head_dim"],
+        "head_dim_sliding": head_dim_sliding,  # actual, from weights
+        "head_dim_full": head_dim_full,        # actual, from weights (E2B 512, 12B 512)
+        "num_kv_heads_sliding": nkv_slide,     # 12B: 8 (GQA)
+        "num_kv_heads_full": nkv_full,         # 12B: 1 (MQA)
+        "attention_k_eq_v": attention_k_eq_v,  # 12B full layers: V shares k_proj
         "intermediate": tc["intermediate_size"],
         "vocab": tc["vocab_size"],
         "rms_eps": tc["rms_norm_eps"],
@@ -118,6 +147,10 @@ def main():
                       "post_per_layer_input_norm.weight"]
     for L in range(nl):
         for t in per_layer:
+            hf_name = PREFIX + f"layers.{L}.{t}"
+            # attention_k_eq_v full layers have no v_proj — skip if absent.
+            if t == "self_attn.v_proj.weight" and hf_name not in hdr:
+                continue
             exports[f"layers.{L}.{t}"] = f"layers.{L}.{t}"
 
     # compute KV-share source mapping for the engine (which layer each shared layer reuses)
@@ -134,25 +167,25 @@ def main():
     cfg["kv_source"] = kv_source
     cfg["first_shared_layer"] = first_shared
 
-    # gather, convert to fp16, build blob
+    # Pass 1: compute fp16 byte offsets from shapes WITHOUT loading data (a 12B
+    # text tower is ~23GB — buffering all tensors in RAM blows up the pagefile).
     out_hdr = {}
-    blobs = []
     offset = 0
+    order = []
     missing = []
     for out_name, hf_suffix in exports.items():
         hf_name = PREFIX + hf_suffix
         if hf_name not in hdr:
             missing.append(hf_name)
             continue
-        arr = load_tensor(st, hdr, data_start, hf_name).astype(np.float16)
-        raw = np.ascontiguousarray(arr).tobytes()
-        out_hdr[out_name] = {"dtype": "F16", "shape": list(arr.shape),
-                             "data_offsets": [offset, offset + len(raw)]}
-        blobs.append(raw)
-        offset += len(raw)
-
-    # shared layers' k/v_proj are dead weights in HF; we still export them (harmless),
-    # but the engine uses kv_source to decide. Report any genuinely-missing tensors.
+        shape = hdr[hf_name]["shape"]
+        nbytes = 2  # fp16
+        for d in shape:
+            nbytes *= d
+        out_hdr[out_name] = {"dtype": "F16", "shape": list(shape),
+                             "data_offsets": [offset, offset + nbytes]}
+        order.append((out_name, hf_name))
+        offset += nbytes
     if missing:
         print("WARNING missing tensors (first 10):", missing[:10], f"... {len(missing)} total")
 
@@ -162,12 +195,15 @@ def main():
     pad = (8 - len(hdr_json) % 8) % 8
     hdr_json += b" " * pad
 
+    # Pass 2: stream each tensor straight to disk (load -> fp16 -> write, one at a time).
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "wb") as f:
         f.write(struct.pack("<Q", len(hdr_json)))
         f.write(hdr_json)
-        for b in blobs:
-            f.write(b)
+        for out_name, hf_name in order:
+            arr = load_tensor(st, hdr, data_start, hf_name).astype(np.float16)
+            f.write(np.ascontiguousarray(arr).tobytes())
+            del arr
     total = offset + 8 + len(hdr_json)
 
     # Robust, dependency-free sidecar the C++ engine parses (avoids JSON parsing

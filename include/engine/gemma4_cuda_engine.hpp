@@ -56,6 +56,11 @@ class Gemma4CudaEngine {
   struct Config {
     int num_layers = 0, hidden = 0, num_heads = 0, num_kv_heads = 1;
     int head_dim = 256, global_head_dim = 512, intermediate = 0, vocab = 0;
+    // Actual per-layer-type head_dim from the weights (E2B: 256/512; 12B: 256/512).
+    int head_dim_sliding = 256, head_dim_full = 512;
+    // num_kv_heads can differ per layer type (12B: sliding GQA-8, full MQA-1).
+    int num_kv_heads_sliding = 1, num_kv_heads_full = 1;
+    bool attention_k_eq_v = false;  // 12B full layers: V shares k_proj (no v_proj)
     int hidden_size_per_layer_input = 256, num_kv_shared_layers = 0, first_shared_layer = 0;
     int sliding_window = 0, bos_token_id = 2, eos_token_id = 1;
     float rms_eps = 1e-6f, final_logit_softcapping = 0.0f;
@@ -92,7 +97,13 @@ class Gemma4CudaEngine {
   std::vector<float> last_logits_;
   BenchmarkStats stats_;
 
-  int head_dim_of(int layer) const { return cfg_.layer_full[layer] ? cfg_.global_head_dim : cfg_.head_dim; }
+  int head_dim_of(int layer) const {
+    return cfg_.layer_full[layer] ? cfg_.head_dim_full : cfg_.head_dim_sliding;
+  }
+  int kv_heads_of(int layer) const {
+    return cfg_.layer_full[layer] ? cfg_.num_kv_heads_full : cfg_.num_kv_heads_sliding;
+  }
+  bool k_eq_v(int layer) const { return cfg_.attention_k_eq_v && cfg_.layer_full[layer]; }
   bool has_ple() const { return cfg_.hidden_size_per_layer_input > 0; }  // E2B: yes, 12B: no
   float rope_theta_of(int layer) const {
     return cfg_.layer_full[layer] ? cfg_.rope_theta_full : cfg_.rope_theta_sliding;
