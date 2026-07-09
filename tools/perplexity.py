@@ -52,6 +52,16 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 RESULTS_DIR = REPO_ROOT / "docs" / "results"
 
 
+def _rel(p) -> str:
+    """Repo-root-relative path (forward slashes) for portable, non-leaky result
+    metadata — avoids baking an absolute C:\\Users\\<name>\\... path into committed
+    JSON. Falls back to the absolute string if the path is outside the repo."""
+    try:
+        return str(Path(p).resolve().relative_to(REPO_ROOT)).replace("\\", "/")
+    except ValueError:
+        return str(p)
+
+
 # ---------------------------------------------------------------------------
 # Dependency guards
 # ---------------------------------------------------------------------------
@@ -337,7 +347,7 @@ def main() -> int:
         "cpu": _cpu_info(),
         "gpu": _gpu_info(),
         "model_name": model_name,
-        "model_dir": str(model_dir),
+        "model_dir": _rel(model_dir),
         "corpus": corpus_source,
         "stride": args.stride,
         "max_length": args.max_length,

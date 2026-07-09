@@ -56,6 +56,16 @@ from typing import Any, Optional
 REPO_ROOT = Path(__file__).resolve().parent.parent
 RESULTS_DIR = REPO_ROOT / "docs" / "results"
 
+
+def _rel(p) -> str:
+    """Repo-root-relative path (forward slashes) for portable, non-leaky result
+    metadata — avoids baking an absolute C:\\Users\\<name>\\... path into committed
+    JSON. Falls back to the absolute string if the path is outside the repo."""
+    try:
+        return str(Path(p).resolve().relative_to(REPO_ROOT)).replace("\\", "/")
+    except ValueError:
+        return str(p)
+
 BENCH_RE = re.compile(r"^\[bench(?:-avg)?\]\s+(.*)$")
 BENCH_PHASE_RE = re.compile(r"^\[bench-phase(?:-avg)?\]\s+(.*)$")
 PERF_RE = re.compile(r"^\[perf(?:-avg)?\]\s+(.*)$")
@@ -545,9 +555,9 @@ def main() -> int:
         "gpu": _gpu_name(),
         "ram_total_mb": round(_ram_total_mb(), 0),
         "model_name": model_name,
-        "model_path": str(model),
-        "tokenizer_path": str(tokenizer),
-        "infer_bin": str(infer_bin),
+        "model_path": _rel(model),
+        "tokenizer_path": _rel(tokenizer),
+        "infer_bin": _rel(infer_bin),
         "prompt": args.prompt,
         "max_new": args.max_new,
         "benchmark_reps": args.benchmark_reps,
