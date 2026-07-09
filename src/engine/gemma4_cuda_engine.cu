@@ -47,7 +47,7 @@ Gemma4CudaEngine::~Gemma4CudaEngine() {
   cudaFree(d_cos_sliding_); cudaFree(d_sin_sliding_);
   cudaFree(d_cos_full_); cudaFree(d_sin_full_);
   cudaFree(d_ones_);
-  cudaFree(d_x_); cudaFree(d_x_norm_); cudaFree(d_resid_); cudaFree(d_tmp_);
+  cudaFree(d_x_); cudaFree(d_x_norm_); cudaFree(d_tmp_);
   cudaFree(d_q_); cudaFree(d_k_); cudaFree(d_v_); cudaFree(d_att_);
   cudaFree(d_gate_); cudaFree(d_up_); cudaFree(d_inter_);
   cudaFree(d_ple_raw_); cudaFree(d_ple_); cudaFree(d_ple_gate_);
@@ -193,7 +193,7 @@ void Gemma4CudaEngine::allocate_buffers() {
   const int maxinter = cfg_.intermediate * (cfg_.use_double_wide_mlp ? 2 : 1);
   const int ple_tot = cfg_.num_layers * cfg_.hidden_size_per_layer_input;
   auto al = [&](__half** p, std::size_t n) { G4_CHECK(cudaMalloc(p, n * sizeof(__half))); };
-  al(&d_x_, H); al(&d_x_norm_, H); al(&d_resid_, H); al(&d_tmp_, H);
+  al(&d_x_, H); al(&d_x_norm_, H); al(&d_tmp_, H);
   al(&d_q_, maxq); al(&d_k_, maxkv); al(&d_v_, maxkv); al(&d_att_, maxq);
   al(&d_gate_, maxinter); al(&d_up_, maxinter); al(&d_inter_, maxinter);
   al(&d_ple_raw_, ple_tot); al(&d_ple_, ple_tot); al(&d_ple_gate_, cfg_.hidden_size_per_layer_input);
@@ -366,7 +366,8 @@ void Gemma4CudaEngine::run_layer(int layer, int position) {
 // Process one token at `position`, reusing the KV cache from earlier positions.
 // Positions must be presented in increasing order (prefill then decode) so the
 // cache and the KV-share sources are populated before dependent layers read them.
-void Gemma4CudaEngine::forward_one(int token, int position, bool compute_logits) {
+void Gemma4CudaEngine::forward_one(int token, int position, bool compute_logits,
+                                   std::vector<float>* per_layer_rms) {
   const int H = cfg_.hidden;
   static int* d_tok = nullptr;
   if (!d_tok) G4_CHECK(cudaMalloc(&d_tok, sizeof(int)));
@@ -375,7 +376,24 @@ void Gemma4CudaEngine::forward_one(int token, int position, bool compute_logits)
                                    d_x_, 1, H, stream_);
   kernels::launch_scale_copy(d_x_, d_x_, H, std::sqrt((float)H), stream_);  // embed * sqrt(hidden)
   if (has_ple()) build_per_layer_inputs(token);  // uses d_x_ (= embeds) before layers mutate it
-  for (int L = 0; L < cfg_.num_layers; ++L) run_layer(L, position);
+  for (int L = 0; L < cfg_.num_layers; ++L) {
+    run_layer(L, position);
+    if (per_layer_rms) {  // oracle parity: capture this layer's output hidden
+      std::vector<__half> h(H);
+      G4_CHECK(cudaStreamSynchronize(stream_));
+      G4_CHECK(cudaMemcpy(h.data(), d_x_, H * sizeof(__half), cudaMemcpyDeviceToHost));
+      double ss = 0;
+      for (auto v : h) { float fv = __half2float(v); ss += (double)fv * fv; }
+      per_layer_rms->push_back((float)std::sqrt(ss / H));
+      if (const char* dir = std::getenv("G4_DUMP_DIR")) {
+        std::vector<float> hf(H);
+        for (int i = 0; i < H; ++i) hf[i] = __half2float(h[i]);
+        std::string fn = std::string(dir) + "/cpi_layer_" + std::to_string(L) + ".f32";
+        std::FILE* fp = std::fopen(fn.c_str(), "wb");
+        if (fp) { std::fwrite(hf.data(), sizeof(float), H, fp); std::fclose(fp); }
+      }
+    }
+  }
   if (!compute_logits) return;
   kernels::launch_rmsnorm(d_x_, static_cast<const __half*>(dev_["norm.weight"]), d_x_norm_, 1, H,
                           cfg_.rms_eps, stream_);
@@ -399,50 +417,11 @@ int Gemma4CudaEngine::argmax_last() const {
 
 std::vector<float> Gemma4CudaEngine::forward_logits(const std::vector<int>& tokens,
                                                     std::vector<float>* per_layer_rms) {
-  // Parity/debug entry: fresh sequence from position 0. When per_layer_rms is
-  // requested, capture the last token's per-layer hidden (oracle comparison).
-  const int H = cfg_.hidden;
-  static int* d_tok = nullptr;
-  if (!d_tok) G4_CHECK(cudaMalloc(&d_tok, sizeof(int)));
+  // Parity/debug entry: fresh sequence from position 0. Drives forward_one; the
+  // last token requests the per-layer dump for oracle comparison.
   for (int pos = 0; pos < static_cast<int>(tokens.size()); ++pos) {
-    const int tok = tokens[pos];
     const bool last = pos == static_cast<int>(tokens.size()) - 1;
-    G4_CHECK(cudaMemcpyAsync(d_tok, &tok, sizeof(int), cudaMemcpyHostToDevice, stream_));
-    kernels::launch_embedding_lookup(static_cast<const __half*>(dev_["embed_tokens.weight"]), d_tok,
-                                     d_x_, 1, H, stream_);
-    kernels::launch_scale_copy(d_x_, d_x_, H, std::sqrt((float)H), stream_);
-    if (has_ple()) build_per_layer_inputs(tok);
-    for (int L = 0; L < cfg_.num_layers; ++L) {
-      run_layer(L, pos);
-      if (last && per_layer_rms) {
-        std::vector<__half> h(H);
-        G4_CHECK(cudaStreamSynchronize(stream_));
-        G4_CHECK(cudaMemcpy(h.data(), d_x_, H * sizeof(__half), cudaMemcpyDeviceToHost));
-        double ss = 0;
-        for (auto v : h) { float fv = __half2float(v); ss += (double)fv * fv; }
-        per_layer_rms->push_back((float)std::sqrt(ss / H));
-        if (const char* dir = std::getenv("G4_DUMP_DIR")) {
-          std::vector<float> hf(H);
-          for (int i = 0; i < H; ++i) hf[i] = __half2float(h[i]);
-          std::string fn = std::string(dir) + "/cpi_layer_" + std::to_string(L) + ".f32";
-          std::FILE* fp = std::fopen(fn.c_str(), "wb");
-          if (fp) { std::fwrite(hf.data(), sizeof(float), H, fp); std::fclose(fp); }
-        }
-      }
-    }
-    if (last) {
-      kernels::launch_rmsnorm(d_x_, static_cast<const __half*>(dev_["norm.weight"]), d_x_norm_, 1, H,
-                              cfg_.rms_eps, stream_);
-      kernels::launch_rowmajor_half_gemv_f32(static_cast<const __half*>(dev_["embed_tokens.weight"]),
-                                             d_x_norm_, d_logits_, cfg_.vocab, H, stream_);
-      last_logits_.resize(cfg_.vocab);
-      G4_CHECK(cudaStreamSynchronize(stream_));
-      G4_CHECK(cudaMemcpy(last_logits_.data(), d_logits_, cfg_.vocab * sizeof(float),
-                          cudaMemcpyDeviceToHost));
-      const float cap = cfg_.final_logit_softcapping;
-      if (cap > 0.0f)
-        for (float& v : last_logits_) v = cap * std::tanh(v / cap);
-    }
+    forward_one(tokens[pos], pos, last, last ? per_layer_rms : nullptr);
   }
   return last_logits_;
 }

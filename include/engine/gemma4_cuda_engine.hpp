@@ -82,8 +82,11 @@ class Gemma4CudaEngine {
   void run_layer(int layer, int position);
   void build_per_layer_inputs(int token);
   // Process one token at `position` (reusing the KV cache from prior positions).
-  // When compute_logits, fills last_logits_ with softcapped logits.
-  void forward_one(int token, int position, bool compute_logits);
+  // When compute_logits, fills last_logits_ with softcapped logits. When
+  // per_layer_rms != nullptr, appends each layer's output RMS (and dumps the
+  // hidden to $G4_DUMP_DIR if set) — the oracle parity path.
+  void forward_one(int token, int position, bool compute_logits,
+                   std::vector<float>* per_layer_rms = nullptr);
   int argmax_last() const;
 
   std::vector<float> last_logits_;
@@ -117,9 +120,8 @@ class Gemma4CudaEngine {
   std::vector<__half*> caches_v_;
 
   // scratch
-  __half* d_x_ = nullptr;        // [hidden]
+  __half* d_x_ = nullptr;        // [hidden] — also holds the residual (adds are in-place)
   __half* d_x_norm_ = nullptr;   // [hidden]
-  __half* d_resid_ = nullptr;    // [hidden]
   __half* d_tmp_ = nullptr;      // [hidden]
   __half* d_q_ = nullptr;        // [num_heads * max_head_dim]
   __half* d_k_ = nullptr;        // [max_kv_dim]
