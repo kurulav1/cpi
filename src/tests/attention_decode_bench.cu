@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <random>
 #include <vector>
 
@@ -29,7 +30,25 @@
   } while (0)
 
 namespace {
-constexpr double kPeakGBs = 1792.0;  // RTX 5090 GDDR7 ~1.79 TB/s
+// Peak DRAM bandwidth for the "% of roofline" column. Auto-detected from the
+// active GPU (memory clock x bus width); override with CPI_PEAK_GBS=<GB/s> if the
+// query is off for your card. Falls back to an RTX 5090 reference (~1.79 TB/s).
+double peak_gbs() {
+  static const double v = [] {
+    if (const char* e = std::getenv("CPI_PEAK_GBS")) {
+      const double x = std::atof(e);
+      if (x > 0.0) return x;
+    }
+    int dev = 0;
+    cudaGetDevice(&dev);
+    int mem_clock_khz = 0, bus_bits = 0;
+    cudaDeviceGetAttribute(&mem_clock_khz, cudaDevAttrMemoryClockRate, dev);
+    cudaDeviceGetAttribute(&bus_bits, cudaDevAttrGlobalMemoryBusWidth, dev);
+    const double g = 2.0 * (mem_clock_khz * 1.0e3) * (bus_bits / 8.0) / 1.0e9;
+    return g > 1.0 ? g : 1792.0;
+  }();
+  return v;
+}
 
 struct Shape {
   int num_heads;
@@ -51,7 +70,7 @@ int main() {
   std::mt19937 rng(1);
   std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
 
-  std::printf("decode-attention bench (peak %.0f GB/s) — effective KV-read bandwidth\n", kPeakGBs);
+  std::printf("decode-attention bench (peak %.0f GB/s) — effective KV-read bandwidth\n", peak_gbs());
   std::printf("%-12s %-5s %-6s %-9s  %-10s  %s\n", "model", "B", "ctx", "ms/step", "GB/s", "%peak");
   std::printf("--------------------------------------------------------------------\n");
 
@@ -124,7 +143,7 @@ int main() {
         const double gbs = kv_bytes / (per_call_ms * 1e-3) / 1e9;
 
         std::printf("%-12s %-5d %-6d %-9.4f  %-10.1f  %.0f%%\n", s.name, batch, L, per_call_ms, gbs,
-                    100.0 * gbs / kPeakGBs);
+                    100.0 * gbs / peak_gbs());
 
         cudaFree(dq);
         cudaFree(dk);

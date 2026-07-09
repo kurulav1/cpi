@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <random>
 #include <vector>
 
@@ -29,7 +30,25 @@ namespace {
     }                                                                                    \
   } while (0)
 
-constexpr double kPeakGBs = 1792.0;  // RTX 5090 GDDR7 ~1.79 TB/s
+// Peak DRAM bandwidth for the "% of roofline" column. Auto-detected from the
+// active GPU (memory clock x bus width); override with CPI_PEAK_GBS=<GB/s> if the
+// query is off for your card. Falls back to an RTX 5090 reference (~1.79 TB/s).
+double peak_gbs() {
+  static const double v = [] {
+    if (const char* e = std::getenv("CPI_PEAK_GBS")) {
+      const double x = std::atof(e);
+      if (x > 0.0) return x;
+    }
+    int dev = 0;
+    cudaGetDevice(&dev);
+    int mem_clock_khz = 0, bus_bits = 0;
+    cudaDeviceGetAttribute(&mem_clock_khz, cudaDevAttrMemoryClockRate, dev);
+    cudaDeviceGetAttribute(&bus_bits, cudaDevAttrGlobalMemoryBusWidth, dev);
+    const double g = 2.0 * (mem_clock_khz * 1.0e3) * (bus_bits / 8.0) / 1.0e9;
+    return g > 1.0 ? g : 1792.0;
+  }();
+  return v;
+}
 
 int signed_int4(unsigned nibble) {
   const int v = static_cast<int>(nibble & 0x0Fu);
@@ -134,7 +153,7 @@ void run_shape(const Shape& s, std::mt19937& rng) {
 
   std::printf(
       "%-22s out=%-6d in=%-6d  %.4f ms  %.1f GB/s (%.0f%% peak)  max_abs=%.4g max_rel=%.4g %s\n",
-      s.name, out, in, per_call_ms, gbs, 100.0 * gbs / kPeakGBs, max_abs, max_rel,
+      s.name, out, in, per_call_ms, gbs, 100.0 * gbs / peak_gbs(), max_abs, max_rel,
       (max_rel < 1e-3 ? "PARITY_OK" : "PARITY_FAIL"));
 
   cudaEventDestroy(t0);
@@ -154,7 +173,7 @@ int main() {
       {"32B w1/w3", 27648, 5120}, {"32B w2", 5120, 27648}, {"32B wqkv", 5120 + 2 * 1024, 5120},
       {"8B w1/w3", 14336, 4096},  {"8B w2", 4096, 14336},
   };
-  std::printf("int4 GEMV bench (peak %.0f GB/s)\n", kPeakGBs);
+  std::printf("int4 GEMV bench (peak %.0f GB/s)\n", peak_gbs());
   for (const auto& s : shapes) {
     run_shape(s, rng);
   }
