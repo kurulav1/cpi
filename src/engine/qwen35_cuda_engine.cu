@@ -20,6 +20,7 @@
 
 #include "common.hpp"
 #include "engine/qwen35_cuda_engine.hpp"
+#include "engine/sampling.hpp"  // shared logits->token sampler (was reimplemented inline)
 #include "grammar/grammar_sampler.hpp"
 #include "runtime/cuda_utils.cuh"
 #include "runtime/kernels.cuh"
@@ -875,100 +876,19 @@ int Qwen35CudaEngine::sample_next_token(float temperature, const std::vector<int
                         static_cast<std::size_t>(cfg_.vocab_size) * sizeof(float),
                         cudaMemcpyDeviceToHost));
   std::vector<float> logits = h_logits_;
-  // Repetition penalty applied ONCE per unique token (HF semantics), matching
-  // LlamaEngine's sampler. Iterating raw history instead would penalize a token
-  // once per occurrence, i.e. divide its logit by rp^(count) -- in a long/multi-
-  // turn context the most frequent tokens (space, common words, punctuation) get
-  // suppressed exponentially, collapsing generation into word-merged gibberish.
-  if (options_.repetition_penalty > 1.0f && !history.empty()) {
-    std::unordered_set<int> seen(history.begin(), history.end());
-    for (int token_id : seen) {
-      if (token_id < 0 || token_id >= cfg_.vocab_size) {
-        continue;
-      }
-      float& logit = logits[static_cast<std::size_t>(token_id)];
-      logit = (logit > 0.0f) ? (logit / options_.repetition_penalty)
-                             : (logit * options_.repetition_penalty);
-    }
-  }
-  // No-repeat n-gram blocking: if the current (n-1)-token suffix has occurred
-  // before, ban the tokens that followed it (-inf). Breaks the exact-repetition
-  // loops reasoning models fall into ("Wait, the question is X. Wait, the
-  // question is X. …"), which top-k + repetition-penalty alone don't stop.
-  if (options_.no_repeat_ngram_size > 1 &&
-      history.size() + 1 >= static_cast<std::size_t>(options_.no_repeat_ngram_size)) {
-    const std::size_t suffix = static_cast<std::size_t>(options_.no_repeat_ngram_size - 1);
-    const std::size_t hs = history.size();
-    for (std::size_t start = 0; start + suffix < hs; ++start) {
-      bool eq = true;
-      for (std::size_t j = 0; j < suffix; ++j) {
-        if (history[start + j] != history[hs - suffix + j]) {
-          eq = false;
-          break;
-        }
-      }
-      if (eq) {
-        const int banned = history[start + suffix];
-        if (banned >= 0 && banned < cfg_.vocab_size) {
-          logits[static_cast<std::size_t>(banned)] = -std::numeric_limits<float>::infinity();
-        }
-      }
-    }
-  }
-  // Grammar constraint: mask tokens that cannot continue the schema-valid JSON.
-  // Masked entries become -inf, so both the argmax and the sampling path below
-  // exclude them without any further change.
+  // Grammar constraint: mask tokens that cannot continue the schema-valid JSON
+  // (-inf), so the shared sampler excludes them. Applied before the sampler; for
+  // a masked token the order vs. repetition penalty is irrelevant (both keep it
+  // at -inf).
   if (active_grammar_ != nullptr) {
     active_grammar_->apply_mask(logits);
   }
-  if (temperature <= 0.0f) {
-    return static_cast<int>(std::max_element(logits.begin(), logits.end()) - logits.begin());
-  }
-  const int k = std::clamp(options_.top_k, 1, cfg_.vocab_size);
-  std::vector<int> ids(static_cast<std::size_t>(cfg_.vocab_size));
-  std::iota(ids.begin(), ids.end(), 0);
-  std::partial_sort(ids.begin(), ids.begin() + k, ids.end(), [&](int left, int right) {
-    return logits[static_cast<std::size_t>(left)] > logits[static_cast<std::size_t>(right)];
-  });
-  const float max_logit = logits[static_cast<std::size_t>(ids[0])];
-  std::vector<float> probs(static_cast<std::size_t>(k));
-  float sum = 0.0f;
-  for (int i = 0; i < k; ++i) {
-    probs[static_cast<std::size_t>(i)] =
-        std::exp((logits[static_cast<std::size_t>(ids[static_cast<std::size_t>(i)])] - max_logit) /
-                 temperature);
-    sum += probs[static_cast<std::size_t>(i)];
-  }
-  if (sum <= 0.0f) return ids[0];
-  for (float& p : probs) p /= sum;
-  // Top-p (nucleus): keep the smallest high-probability set covering top_p, drop
-  // the tail, renormalize. ids/probs are already in descending-logit order.
-  if (options_.top_p > 0.0f && options_.top_p < 1.0f) {
-    float cum = 0.0f;
-    int cutoff = k;
-    for (int i = 0; i < k; ++i) {
-      cum += probs[static_cast<std::size_t>(i)];
-      if (cum >= options_.top_p) {
-        cutoff = i + 1;
-        break;
-      }
-    }
-    float renorm = 0.0f;
-    for (int i = 0; i < cutoff; ++i) renorm += probs[static_cast<std::size_t>(i)];
-    for (int i = cutoff; i < k; ++i) probs[static_cast<std::size_t>(i)] = 0.0f;
-    if (renorm > 0.0f) {
-      for (int i = 0; i < cutoff; ++i) probs[static_cast<std::size_t>(i)] /= renorm;
-    }
-  }
-  static thread_local std::mt19937 rng(std::random_device{}());
-  std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-  const float draw = dist(rng);
-  float cumulative = 0.0f;
-  for (int i = 0; i < k; ++i) {
-    cumulative += probs[static_cast<std::size_t>(i)];
-    if (draw <= cumulative) return ids[static_cast<std::size_t>(i)];
-  }
-  return ids[static_cast<std::size_t>(k - 1)];
+  // One shared host sampler (temperature/top-k/top-p/repetition penalty/no-repeat
+  // -ngram), matching LlamaEngine — this was a full inline reimplementation. The
+  // device-argmax greedy fast path above is kept, so greedy perf is unchanged.
+  return detail::dispatch_sample_from_logits(logits, temperature, options_.top_k, options_.top_p,
+                                             options_.repetition_penalty,
+                                             options_.no_repeat_ngram_size, history);
 }
 
 void Qwen35CudaEngine::initialize(const EngineOptions& options) {
