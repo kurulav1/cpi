@@ -8,6 +8,9 @@ const STOP_SEQUENCES = {
   phi3:     ["<|end|>", "<|user|>", "<|system|>", "<|assistant|>"],
   qwen2:    ["<|im_end|>", "<|im_start|>"],
   qwen3_5:  ["<|im_end|>", "<|im_start|>", "<|endoftext|>"],
+  // Gemma 4 renamed the turn markers to <|turn> / <turn|> (Gemma 1/2/3 used
+  // <start_of_turn> / <end_of_turn>).
+  gemma:    ["<turn|>", "<|turn>"],
   // DeepSeek-R1 special tokens use U+FF5C (｜) and U+2581 (▁).
   "deepseek-r1": ["<｜end▁of▁sentence｜>", "<｜User｜>", "<｜Assistant｜>"],
   plain:    []
@@ -451,6 +454,19 @@ function formatQwen35(turns, systemPrompt, thinking = false) {
   return blocks.join("\n");
 }
 
+// Gemma 4 turn format. No system role — the system prompt (if any) is folded
+// into the first user turn. The tokenizer prepends <bos> (addBos). sot=<|turn>,
+// eot=<turn|>; a pending turn ends with "<|turn>model\n" for the model to answer.
+function formatGemma(turns, systemPrompt) {
+  let out = "";
+  turns.forEach((turn, i) => {
+    const user = i === 0 && systemPrompt ? `${systemPrompt}\n\n${turn.user}` : turn.user;
+    out += `<|turn>user\n${user}<turn|>\n`;
+    out += turn.assistant ? `<|turn>model\n${turn.assistant}<turn|>\n` : "<|turn>model\n";
+  });
+  return out;
+}
+
 // DeepSeek-R1-Distill: a reasoning model on standard Llama/Qwen2 architecture.
 // BOS is added by the tokenizer; the system prompt (if any) is prepended raw.
 // Each pending turn primes "<｜Assistant｜><think>\n" so the model always reasons,
@@ -582,6 +598,16 @@ export function buildPromptPackage(messages, options = {}) {
       template,
       stopTexts: STOP_SEQUENCES.qwen2,
       addBos: false
+    };
+  }
+
+  if (template === "gemma") {
+    return {
+      messages: chatMessages,
+      prompt: formatGemma(turns, effectiveSystemPrompt),
+      template,
+      stopTexts: STOP_SEQUENCES.gemma,
+      addBos: true
     };
   }
 

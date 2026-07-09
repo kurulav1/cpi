@@ -1008,6 +1008,12 @@ function inferTemplate(modelPath, tokenizerPath, fallbackTemplate, hfConfig, hfT
   const family = modelFamilyName(path.basename(modelPath));
   const tokenizerExt = path.extname(tokenizerPath || "").toLowerCase();
 
+  // Gemma 4 ships as a .cpi (the fork-engine format) and uses the Gemma 4 turn
+  // template (<|turn> / <turn|>), distinct from Gemma 1/2/3.
+  if (path.extname(modelPath || "").toLowerCase() === ".cpi") {
+    return "gemma";
+  }
+
   // Qwen3 dense runs on LlamaEngine (batch-compatible) and uses the "qwen3"
   // template — ChatML with a thinking toggle (off by default). Force it here,
   // before the chat_template sniff below, which would misread Qwen3's <think>
@@ -1274,7 +1280,11 @@ function buildProfile(modelPath, tokenizerPath, baseConfig, source = "discovered
       }
     : null;
   const moe = moeFromQuant || moeFromHf;
-  const baseLabel = path.basename(modelPath || "Unconfigured model", ".ll2c");
+  const modelExt = path.extname(modelPath || "").toLowerCase();
+  const baseLabel = path.basename(
+    modelPath || "Unconfigured model",
+    modelExt === ".cpi" ? ".cpi" : ".ll2c"
+  );
   const label =
     baseLabel.toLowerCase() === "hf" && modelPath
       ? path.basename(path.dirname(modelPath))
@@ -1339,7 +1349,10 @@ function discoverModelProfiles(baseConfig) {
   const modelCandidates = uniquePaths([
     baseConfig.modelPath,
     ...scanRoots.flatMap((root) =>
-      walkFiles(root, (p) => p.toLowerCase().endsWith(".ll2c"))
+      walkFiles(root, (p) => {
+        const l = p.toLowerCase();
+        return l.endsWith(".ll2c") || l.endsWith(".cpi");  // .cpi = Gemma 4 (fork engine)
+      })
     ),
     ...discoverSafetensorsModelDirs(scanRoots)
   ]);
