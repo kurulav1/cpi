@@ -472,6 +472,12 @@ std::string build_chat_prompt(const std::string& chat_template, const std::strin
   if (chat_template == "llama4") {
     return build_llama3_style_prompt(prompt_text);
   }
+  if (chat_template == "gemma") {
+    // Gemma 4 turn format: sot=<|turn> (105), eot=<turn|> (106). No system role —
+    // the tokenizer prepends <bos>. (Gemma 1/2/3 used <start_of_turn>; Gemma 4
+    // renamed the markers.)
+    return "<|turn>user\n" + prompt_text + "<turn|>\n<|turn>model\n";
+  }
   throw std::runtime_error("unsupported --chat-template value: " + chat_template);
 }
 
@@ -497,6 +503,9 @@ std::vector<std::string> default_stop_texts_for_template(const std::string& chat
   }
   if (chat_template == "llama4") {
     return {"<|eot_id|>", "<|start_header_id|>", "<|end_header_id|>", "<|begin_of_text|>"};
+  }
+  if (chat_template == "gemma") {
+    return {"<turn|>", "<|turn>"};
   }
   if (chat_template == "tinyllama") {
     return {"</s>", "\nUser:"};
@@ -823,6 +832,9 @@ std::string infer_safetensors_model_family(const std::string& path) {
 
 std::string guess_chat_template_from_model_path(const std::string& model_path) {
   const std::string name = to_lower_copy(model_path);
+  if (name.find("gemma") != std::string::npos || name.find(".cpi") != std::string::npos) {
+    return "gemma";
+  }
   if (name.find("qwen3.5") != std::string::npos || name.find("qwen3_5") != std::string::npos) {
     return "qwen3_5";
   }

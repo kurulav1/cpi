@@ -143,6 +143,7 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
     src/engine/llama4_cuda_engine.cu
     src/engine/llama4_cuda_engine_setup.cu
     src/engine/qwen35_cuda_engine.cu
+    src/engine/gemma4_cuda_engine.cu
     src/engine/bert_embedder.cu
   )
 endif()
@@ -289,6 +290,17 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
   )
   add_test(NAME moe_kernel_parity_test COMMAND moe_kernel_parity_test)
+
+  # Gemma 4 forward parity driver (checks the fork engine against the HF oracle).
+  add_executable(gemma4_forward_test
+    src/tests/gemma4_forward_test.cu
+  )
+  target_include_directories(gemma4_forward_test PRIVATE include)
+  target_link_libraries(gemma4_forward_test PRIVATE llama_engine)
+  set_target_properties(gemma4_forward_test PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+  )
 
   # Reference-oracle decode attention parity (Phase 0 safety net): the kernel
   # output is compared against an independent naive float reference across

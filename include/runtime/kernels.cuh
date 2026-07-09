@@ -36,7 +36,10 @@ namespace kernels {
 // raising the head_dim cap without growing the accumulator is a build error, not
 // silent corruption (the head_dim=256 bug this guards against scored cosine
 // ~0.65 vs an independent reference).
-constexpr int kTiledMaxHeadDim = 256;
+// 512 accommodates Gemma 4's full-attention layers (global_head_dim=512); the
+// warps=4 tiled path runs 128 threads × kAccPerThread=8 = 1024 >= 512, so the
+// per-thread accumulator still covers it (static_assert enforces this).
+constexpr int kTiledMaxHeadDim = 512;
 constexpr int kAccPerThread = 8;
 
 // launch_rmsnorm

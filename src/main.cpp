@@ -21,6 +21,7 @@
 #include "engine/llama4_cpu_engine.hpp"
 #include "engine/qwen35_cpu_engine.hpp"
 #if LLAMA_ENGINE_HAS_CUDA
+#include "engine/gemma4_cuda_engine.hpp"
 #include "engine/llama4_cuda_engine.hpp"
 #include "engine/llama_engine.hpp"
 #include "engine/qwen35_cuda_engine.hpp"
@@ -198,7 +199,18 @@ int main(int argc, char** argv) {
 #else
     const int cuda_device_count = 0;
 #endif
-    const bool is_llama4_model = is_safetensors_model_dir(cli.opts.model_path);
+    // Gemma 4 (MatFormer fork): a single .cpi blob from tools/convert_gemma4.py.
+    const bool is_gemma4_model =
+        cli.opts.model_path.size() > 4 &&
+        cli.opts.model_path.compare(cli.opts.model_path.size() - 4, 4, ".cpi") == 0;
+#if LLAMA_ENGINE_HAS_CUDA
+    const bool use_gemma4_cuda_engine = is_gemma4_model && !cli.force_cpu && cuda_device_count > 0;
+#else
+    const bool use_gemma4_cuda_engine = false;
+#endif
+    if (is_gemma4_model && !use_gemma4_cuda_engine)
+      throw std::runtime_error("Gemma 4 (.cpi) currently requires a CUDA device");
+    const bool is_llama4_model = !is_gemma4_model && is_safetensors_model_dir(cli.opts.model_path);
     const bool is_qwen35_model = safetensors_family == "qwen3_5";
     const bool use_qwen35_cpu_engine = is_qwen35_model && (cli.force_cpu || cuda_device_count == 0);
     const bool use_llama4_cpu_engine =
@@ -303,7 +315,12 @@ int main(int argc, char** argv) {
     };
 
 #if LLAMA_ENGINE_HAS_CUDA
-    if (use_qwen35_cuda_engine) {
+    if (use_gemma4_cuda_engine) {
+      if (!quiet_output)
+        std::cout << "[info] Detected a Gemma 4 (.cpi) model. Using the Gemma4 CUDA engine.\n";
+      engine::Gemma4CudaEngine gemma4_cuda_eng;
+      run_with_engine(gemma4_cuda_eng);
+    } else if (use_qwen35_cuda_engine) {
       engine::Qwen35CudaEngine qwen35_cuda_eng;
       run_with_engine(qwen35_cuda_eng);
     } else if (use_llama4_cuda_engine) {
