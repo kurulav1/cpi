@@ -1599,6 +1599,16 @@ export default function App() {
           <span className={`dot ${engineState.dot}`} />
           <span>Engine</span>
           <span className={`badge ${engineState.badge}`}>{engineState.label}</span>
+          {health?.system?.gpu ? (
+            <span
+              className="badge badge-blue"
+              title={`${health.system.gpu.name} — ${health.system.gpu.utilPercent}% util, ${(health.system.gpu.memUsedMB / 1024).toFixed(1)}/${(health.system.gpu.memTotalMB / 1024).toFixed(0)} GB VRAM\nCPU: ${health.system.cpu.model} (${health.system.cpu.cores} cores)\nRAM: ${(health.system.ram.totalMB / 1000).toFixed(0)} GB`}
+            >
+              {health.system.gpu.name.replace(/NVIDIA GeForce /i, "")} · {(health.system.gpu.memUsedMB / 1024).toFixed(1)}/{(health.system.gpu.memTotalMB / 1024).toFixed(0)} GB
+            </span>
+          ) : health?.system ? (
+            <span className="badge" title={`${health.system.cpu.model} (${health.system.cpu.cores} cores)`}>CPU</span>
+          ) : null}
           {selectedQuantJobRunning && (
             <span className="badge badge-blue">
               Converting{selectedQuantJobPct != null ? ` ${selectedQuantJobPct}%` : ""}

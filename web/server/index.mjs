@@ -3,7 +3,7 @@ import express from "express";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { randomUUID } from "node:crypto";
 
@@ -754,6 +754,43 @@ function sampleHostUsage(previousCpu) {
     cpuPercent,
     memoryPercent,
     cpuSnapshot: totals
+  };
+}
+
+// --- Hardware / runtime status surfaced in the UI (what the engine runs on) ---
+let gpuInfoCache = { at: 0, data: null };
+function readGpuInfo() {
+  const now = Date.now();
+  if (now - gpuInfoCache.at < 4000) return gpuInfoCache.data; // 4s TTL; health polls ~10s
+  let data = null;
+  try {
+    const out = execFileSync(
+      "nvidia-smi",
+      ["--query-gpu=name,memory.used,memory.total,utilization.gpu", "--format=csv,noheader,nounits"],
+      { encoding: "utf8", timeout: 2000 }
+    );
+    const [name, memUsed, memTotal, util] = out.trim().split("\n")[0].split(",").map((s) => s.trim());
+    data = {
+      name,
+      memUsedMB: Number(memUsed),
+      memTotalMB: Number(memTotal),
+      utilPercent: Number(util)
+    };
+  } catch {
+    data = null; // no NVIDIA GPU / nvidia-smi unavailable -> CPU
+  }
+  gpuInfoCache = { at: now, data };
+  return data;
+}
+
+function systemStatus() {
+  const cpus = os.cpus();
+  const gpu = readGpuInfo();
+  return {
+    device: gpu ? "cuda" : "cpu",
+    gpu, // null when CPU-only
+    cpu: { model: (cpus[0]?.model || "CPU").trim(), cores: cpus.length },
+    ram: { totalMB: Math.round(os.totalmem() / 1e6), freeMB: Math.round(os.freemem() / 1e6) }
   };
 }
 
@@ -2196,6 +2233,7 @@ app.get("/api/health", (_req, res) => {
     quantOverrides: Object.fromEntries(quantOverrides),
     activeWorker,
     activeQuantJob,
+    system: systemStatus(),
     // Concurrency + throughput (P0.3): queue depth, in-flight, backpressure cap,
     // recent p50/p95 end-to-end latency and average decode tok/s.
     engine: engineStats()
