@@ -80,6 +80,12 @@ def main():
         "vocab_size_per_layer_input": tc["vocab_size_per_layer_input"],
         "num_kv_shared_layers": tc.get("num_kv_shared_layers", 0),
         "use_double_wide_mlp": bool(tc.get("use_double_wide_mlp", False)),
+        # MoE (26B-A4B): dense-MLP + top-k experts, summed. Not yet loaded/run by
+        # the engine (needs int4 + expert streaming — the fp16 experts exceed VRAM).
+        "enable_moe_block": bool(tc.get("enable_moe_block", False)),
+        "num_experts": tc.get("num_experts") or 0,
+        "top_k_experts": tc.get("top_k_experts") or 0,
+        "moe_intermediate_size": tc.get("moe_intermediate_size") or 0,
         "rope_theta_full": tc["rope_parameters"]["full_attention"]["rope_theta"],
         "rope_theta_sliding": tc["rope_parameters"]["sliding_attention"]["rope_theta"],
         "partial_rotary_full": tc["rope_parameters"]["full_attention"].get("partial_rotary_factor", 1.0),
@@ -89,23 +95,27 @@ def main():
         "tie_word_embeddings": bool(tc.get("tie_word_embeddings", True)),
     }
 
+    has_ple = cfg["hidden_size_per_layer_input"] > 0  # E2B: yes, 12B: no
+
     # tensors to export: name in output <- HF name (with PREFIX)
     exports = {
         "embed_tokens.weight": "embed_tokens.weight",
-        "embed_tokens_per_layer.weight": "embed_tokens_per_layer.weight",
-        "per_layer_model_projection.weight": "per_layer_model_projection.weight",
-        "per_layer_projection_norm.weight": "per_layer_projection_norm.weight",
         "norm.weight": "norm.weight",
     }
+    if has_ple:
+        exports["embed_tokens_per_layer.weight"] = "embed_tokens_per_layer.weight"
+        exports["per_layer_model_projection.weight"] = "per_layer_model_projection.weight"
+        exports["per_layer_projection_norm.weight"] = "per_layer_projection_norm.weight"
     per_layer = [
         "input_layernorm.weight", "post_attention_layernorm.weight",
         "pre_feedforward_layernorm.weight", "post_feedforward_layernorm.weight",
         "self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight",
         "self_attn.o_proj.weight", "self_attn.q_norm.weight", "self_attn.k_norm.weight",
-        "mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight",
-        "per_layer_input_gate.weight", "per_layer_projection.weight",
-        "post_per_layer_input_norm.weight", "layer_scalar",
+        "mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight", "layer_scalar",
     ]
+    if has_ple:
+        per_layer += ["per_layer_input_gate.weight", "per_layer_projection.weight",
+                      "post_per_layer_input_norm.weight"]
     for L in range(nl):
         for t in per_layer:
             exports[f"layers.{L}.{t}"] = f"layers.{L}.{t}"

@@ -61,6 +61,8 @@ class Gemma4CudaEngine {
     float rms_eps = 1e-6f, final_logit_softcapping = 0.0f;
     float rope_theta_full = 1e6f, rope_theta_sliding = 1e4f, partial_rotary_full = 0.25f;
     bool use_double_wide_mlp = false, tie_word_embeddings = true;
+    bool enable_moe_block = false;  // 26B-A4B: dense-MLP + top-k experts (not yet run)
+    int num_experts = 0, top_k_experts = 0, moe_intermediate_size = 0;
     std::vector<int> layer_full;    // 1 if full_attention, 0 if sliding
     std::vector<int> kv_source;     // which layer's K/V each layer uses
   };
@@ -88,6 +90,7 @@ class Gemma4CudaEngine {
   BenchmarkStats stats_;
 
   int head_dim_of(int layer) const { return cfg_.layer_full[layer] ? cfg_.global_head_dim : cfg_.head_dim; }
+  bool has_ple() const { return cfg_.hidden_size_per_layer_input > 0; }  // E2B: yes, 12B: no
   float rope_theta_of(int layer) const {
     return cfg_.layer_full[layer] ? cfg_.rope_theta_full : cfg_.rope_theta_sliding;
   }

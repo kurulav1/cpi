@@ -99,6 +99,10 @@ void Gemma4CudaEngine::parse_manifest(const std::string& manifest_path) {
       else if (k == "bos_token_id") cfg_.bos_token_id = std::stoi(v);
       else if (k == "eos_token_id") cfg_.eos_token_id = std::stoi(v);
       else if (k == "use_double_wide_mlp") cfg_.use_double_wide_mlp = (v == "True" || v == "true" || v == "1");
+      else if (k == "enable_moe_block") cfg_.enable_moe_block = (v == "True" || v == "true" || v == "1");
+      else if (k == "num_experts") cfg_.num_experts = std::stoi(v);
+      else if (k == "top_k_experts") cfg_.top_k_experts = std::stoi(v);
+      else if (k == "moe_intermediate_size") cfg_.moe_intermediate_size = std::stoi(v);
       else if (k == "tie_word_embeddings") cfg_.tie_word_embeddings = (v == "True" || v == "true" || v == "1");
     } else if (kind == "CFGJSON") {
       std::string k;
@@ -223,10 +227,12 @@ void Gemma4CudaEngine::load_all(const std::string& cpi_path) {
   cpi_path_ = cpi_path;
   // large tables + per-layer weights to device
   upload("embed_tokens.weight");
-  upload("embed_tokens_per_layer.weight");
-  upload("per_layer_model_projection.weight");
-  upload("per_layer_projection_norm.weight");
   upload("norm.weight");
+  if (has_ple()) {  // E2B has Per-Layer Embeddings; 12B does not
+    upload("embed_tokens_per_layer.weight");
+    upload("per_layer_model_projection.weight");
+    upload("per_layer_projection_norm.weight");
+  }
   layer_scalar_host_.assign(cfg_.num_layers, 1.0f);
   for (int L = 0; L < cfg_.num_layers; ++L) {
     const std::string p = "layers." + std::to_string(L) + ".";
@@ -235,10 +241,12 @@ void Gemma4CudaEngine::load_all(const std::string& cpi_path) {
                           "self_attn.q_proj.weight", "self_attn.k_proj.weight",
                           "self_attn.v_proj.weight", "self_attn.o_proj.weight",
                           "self_attn.q_norm.weight", "self_attn.k_norm.weight",
-                          "mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight",
-                          "per_layer_input_gate.weight", "per_layer_projection.weight",
-                          "post_per_layer_input_norm.weight"})
+                          "mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight"})
       upload(p + t);
+    if (has_ple())
+      for (const char* t : {"per_layer_input_gate.weight", "per_layer_projection.weight",
+                            "post_per_layer_input_norm.weight"})
+        upload(p + t);
     layer_scalar_host_[L] = scalar_value(p + "layer_scalar");
   }
 }
@@ -249,6 +257,12 @@ void Gemma4CudaEngine::open(const std::string& cpi_path, int max_context) {
   parse_manifest(manifest);
   if (static_cast<int>(cfg_.layer_full.size()) != cfg_.num_layers)
     throw std::runtime_error("layer_types count mismatch");
+  if (cfg_.enable_moe_block)
+    throw std::runtime_error(
+        "Gemma 4 MoE (e.g. 26B-A4B, " + std::to_string(cfg_.num_experts) +
+        " experts) is not yet runnable: the fp16 experts exceed 32GB VRAM, so it "
+        "needs int4 weights + expert streaming. The forward math is specced in "
+        "memory:cpi-gemma4-arch (dense-MLP + top-k experts, summed).");
   G4_CHECK(cudaStreamCreate(&stream_));
   load_all(cpi_path);
   build_rope_tables();
@@ -334,14 +348,16 @@ void Gemma4CudaEngine::run_layer(int layer, int position) {
   kernels::launch_rmsnorm(d_tmp_, W("post_feedforward_layernorm.weight"), d_tmp_, 1, H, cfg_.rms_eps, stream_);
   kernels::launch_add_inplace(d_x_, d_tmp_, H, stream_);
 
-  // --- Per-Layer Input injection ---
-  const int ple = cfg_.hidden_size_per_layer_input;
-  const __half* ple_L = d_ple_ + static_cast<std::size_t>(layer) * ple;
-  kernels::launch_rowmajor_half_gemv_f16(W("per_layer_input_gate.weight"), d_x_, d_ple_gate_, ple, H, stream_);
-  kernels::launch_gelu_mul(d_ple_gate_, ple_L, d_ple_gate_, ple, stream_);  // gelu(gate)*ple_L
-  kernels::launch_rowmajor_half_gemv_f16(W("per_layer_projection.weight"), d_ple_gate_, d_tmp_, H, ple, stream_);
-  kernels::launch_rmsnorm(d_tmp_, W("post_per_layer_input_norm.weight"), d_tmp_, 1, H, cfg_.rms_eps, stream_);
-  kernels::launch_add_inplace(d_x_, d_tmp_, H, stream_);
+  // --- Per-Layer Input injection (only when the model has PLE) ---
+  if (has_ple()) {
+    const int ple = cfg_.hidden_size_per_layer_input;
+    const __half* ple_L = d_ple_ + static_cast<std::size_t>(layer) * ple;
+    kernels::launch_rowmajor_half_gemv_f16(W("per_layer_input_gate.weight"), d_x_, d_ple_gate_, ple, H, stream_);
+    kernels::launch_gelu_mul(d_ple_gate_, ple_L, d_ple_gate_, ple, stream_);  // gelu(gate)*ple_L
+    kernels::launch_rowmajor_half_gemv_f16(W("per_layer_projection.weight"), d_ple_gate_, d_tmp_, H, ple, stream_);
+    kernels::launch_rmsnorm(d_tmp_, W("post_per_layer_input_norm.weight"), d_tmp_, 1, H, cfg_.rms_eps, stream_);
+    kernels::launch_add_inplace(d_x_, d_tmp_, H, stream_);
+  }
 
   // --- per-layer scalar ---
   kernels::launch_scale_copy(d_x_, d_x_, H, layer_scalar_host_[layer], stream_);
@@ -358,7 +374,7 @@ void Gemma4CudaEngine::forward_one(int token, int position, bool compute_logits)
   kernels::launch_embedding_lookup(static_cast<const __half*>(dev_["embed_tokens.weight"]), d_tok,
                                    d_x_, 1, H, stream_);
   kernels::launch_scale_copy(d_x_, d_x_, H, std::sqrt((float)H), stream_);  // embed * sqrt(hidden)
-  build_per_layer_inputs(token);  // uses d_x_ (= embeds) before the layers mutate it
+  if (has_ple()) build_per_layer_inputs(token);  // uses d_x_ (= embeds) before layers mutate it
   for (int L = 0; L < cfg_.num_layers; ++L) run_layer(L, position);
   if (!compute_logits) return;
   kernels::launch_rmsnorm(d_x_, static_cast<const __half*>(dev_["norm.weight"]), d_x_norm_, 1, H,
@@ -395,7 +411,7 @@ std::vector<float> Gemma4CudaEngine::forward_logits(const std::vector<int>& toke
     kernels::launch_embedding_lookup(static_cast<const __half*>(dev_["embed_tokens.weight"]), d_tok,
                                      d_x_, 1, H, stream_);
     kernels::launch_scale_copy(d_x_, d_x_, H, std::sqrt((float)H), stream_);
-    build_per_layer_inputs(tok);
+    if (has_ple()) build_per_layer_inputs(tok);
     for (int L = 0; L < cfg_.num_layers; ++L) {
       run_layer(L, pos);
       if (last && per_layer_rms) {
