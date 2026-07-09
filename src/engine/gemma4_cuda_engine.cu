@@ -421,12 +421,6 @@ void Gemma4CudaEngine::forward_one(int token, int position, bool compute_logits,
     for (float& v : last_logits_) v = cap * std::tanh(v / cap);
 }
 
-int Gemma4CudaEngine::argmax_last() const {
-  int best = 0;
-  for (int i = 1; i < static_cast<int>(last_logits_.size()); ++i)
-    if (last_logits_[i] > last_logits_[best]) best = i;
-  return best;
-}
 
 std::vector<float> Gemma4CudaEngine::forward_logits(const std::vector<int>& tokens,
                                                     std::vector<float>* per_layer_rms) {
@@ -443,33 +437,29 @@ void Gemma4CudaEngine::initialize(const EngineOptions& options) {
   // Keep the eos from the manifest (Gemma <eos>=1); the CLI's --eos default (2)
   // would otherwise clobber it. Turn-level stops (<end_of_turn>) come via stop
   // texts. Cap the context to what the caller requested (default 2048).
+  samp_top_k_ = options.top_k;
+  samp_top_p_ = options.top_p;
+  samp_rep_penalty_ = options.repetition_penalty;
+  samp_no_repeat_ngram_ = options.no_repeat_ngram_size;
   open(options.model_path, options.max_context > 0 ? options.max_context : 4096);
 }
 
 std::vector<int> Gemma4CudaEngine::generate_stream(const std::vector<int>& prompt, int max_new,
-                                                   float /*temperature*/,
+                                                   float temperature,
                                                    const std::function<bool(int)>& on_token,
                                                    const GenerationConstraints* /*constraints*/) {
-  // Incremental: prefill the prompt once (O(n)), then decode one token at a time
-  // appending to the KV cache (greedy). Position advances monotonically so the
-  // KV-share sources stay populated.
-  std::vector<int> out;
-  const int P = static_cast<int>(prompt.size());
-  if (P == 0) return out;
-  stats_ = BenchmarkStats{};
-  stats_.prompt_tokens = P;
-  for (int i = 0; i < P; ++i) forward_one(prompt[i], i, i == P - 1);
-  int pos = P;
-  for (int step = 0; step < max_new && pos < max_ctx_; ++step) {
-    const int next = argmax_last();
-    out.push_back(next);
-    stats_.generated_tokens++;
-    if (on_token && !on_token(next)) break;
-    if (next == cfg_.eos_token_id) break;
-    forward_one(next, pos, true);
-    ++pos;
-  }
-  return out;
+  // Delegate the prefill+decode+sample+stop loop to the shared driver (which
+  // reuses the canonical sampler); this engine only supplies step()/logits().
+  // Incremental: positions advance monotonically so the KV-share sources stay
+  // populated. (Grammar constraints aren't supported by this fork engine.)
+  runtime::DecodeParams p;
+  p.max_new_tokens = max_new;
+  p.temperature = temperature;
+  p.top_k = samp_top_k_;
+  p.top_p = samp_top_p_;
+  p.repetition_penalty = samp_rep_penalty_;
+  p.no_repeat_ngram_size = samp_no_repeat_ngram_;
+  return runtime::run_decode(*this, prompt, p, on_token, &stats_);
 }
 
 std::vector<int> Gemma4CudaEngine::generate(const std::vector<int>& prompt, int max_new,

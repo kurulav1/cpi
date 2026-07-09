@@ -15,13 +15,16 @@
 #include <unordered_map>
 #include <vector>
 
+#include "engine/decode_driver.hpp"
 #include "engine/engine_types.hpp"
 
 namespace engine {
 
 struct GenerationConstraints;  // fwd (generation_constraints.hpp)
 
-class Gemma4CudaEngine {
+// Derives from runtime::SequenceModel so generate/generate_stream reuse the
+// shared decode driver (loop + sampler + stops) instead of a bespoke greedy loop.
+class Gemma4CudaEngine : public runtime::SequenceModel {
  public:
   Gemma4CudaEngine() = default;
   ~Gemma4CudaEngine();
@@ -48,9 +51,16 @@ class Gemma4CudaEngine {
   std::vector<float> forward_logits(const std::vector<int>& tokens,
                                     std::vector<float>* per_layer_rms = nullptr);
 
-  int vocab() const { return cfg_.vocab; }
   int bos_id() const { return cfg_.bos_token_id; }
-  int eos_id() const { return cfg_.eos_token_id; }
+
+  // --- runtime::SequenceModel (the decode driver calls these) ---
+  int vocab() const override { return cfg_.vocab; }
+  int eos_id() const override { return cfg_.eos_token_id; }
+  int max_context() const override { return max_ctx_; }
+  void step(int token, int position, bool want_logits) override {
+    forward_one(token, position, want_logits);
+  }
+  std::vector<float>& logits() override { return last_logits_; }
 
  private:
   struct Config {
@@ -92,10 +102,14 @@ class Gemma4CudaEngine {
   // hidden to $G4_DUMP_DIR if set) — the oracle parity path.
   void forward_one(int token, int position, bool compute_logits,
                    std::vector<float>* per_layer_rms = nullptr);
-  int argmax_last() const;
 
   std::vector<float> last_logits_;
   BenchmarkStats stats_;
+  // Sampling knobs from EngineOptions (fed to the shared decode driver).
+  int samp_top_k_ = 40;
+  float samp_top_p_ = 0.9f;
+  float samp_rep_penalty_ = 1.0f;
+  int samp_no_repeat_ngram_ = 0;
 
   int head_dim_of(int layer) const {
     return cfg_.layer_full[layer] ? cfg_.head_dim_full : cfg_.head_dim_sliding;
