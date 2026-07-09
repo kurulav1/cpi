@@ -830,6 +830,25 @@ std::string infer_safetensors_model_family(const std::string& path) {
   return "";
 }
 
+ModelProbe probe_model(const std::string& model_path) {
+  ModelProbe p;
+  p.is_cpi = model_path.size() > 4 &&
+             model_path.compare(model_path.size() - 4, 4, ".cpi") == 0;
+  // A .cpi is a self-contained file, not a safetensors dir; skip the dir probes.
+  p.is_safetensors_dir = !p.is_cpi && is_safetensors_model_dir(model_path);
+  p.safetensors_family = p.is_cpi ? "" : infer_safetensors_model_family(model_path);
+  if (p.is_cpi) {
+    p.kind = ModelFamilyKind::Gemma4;
+  } else if (p.safetensors_family == "qwen3_5") {
+    p.kind = ModelFamilyKind::Qwen35;
+  } else if (p.is_safetensors_dir) {
+    p.kind = ModelFamilyKind::Llama4;
+  } else {
+    p.kind = ModelFamilyKind::Llama;
+  }
+  return p;
+}
+
 std::string guess_chat_template_from_model_path(const std::string& model_path) {
   const std::string name = to_lower_copy(model_path);
   if (name.find("gemma") != std::string::npos || name.find(".cpi") != std::string::npos) {

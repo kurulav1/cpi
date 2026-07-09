@@ -54,4 +54,22 @@ std::string infer_safetensors_model_family(const std::string& path);
 std::string guess_chat_template_from_model_path(const std::string& model_path);
 std::string auto_detect_tokenizer_path(const std::string& model_path);
 
+// Which engine family a model maps to. The CPU-vs-CUDA choice is a separate,
+// runtime concern (force_cpu / device availability), not a model property.
+enum class ModelFamilyKind { Llama, Gemma4, Qwen35, Llama4 };
+
+// Centralized model-identity classification: the single place that inspects a
+// model path and reports its engine family + the raw facts dispatch keys off.
+// This is the capability seam — as the engines converge onto one config-driven
+// executor, this grows into a full capability descriptor and the caller stops
+// switching on identity. For now it just de-scatters the detection.
+struct ModelProbe {
+  ModelFamilyKind kind = ModelFamilyKind::Llama;
+  bool is_cpi = false;              // Gemma 4 fork container (.cpi)
+  bool is_safetensors_dir = false;  // Llama4-style safetensors directory
+  std::string safetensors_family;   // e.g. "qwen3_5" for a Qwen3.5 safetensors dir; else ""
+};
+
+ModelProbe probe_model(const std::string& model_path);
+
 }  // namespace app::main_helpers
