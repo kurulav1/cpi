@@ -1866,7 +1866,7 @@ export default function App() {
                     </p>
                   </div>
 
-                  {settings.template === "qwen3_5" && (
+                  {selProfile?.reasoning?.mode === "optional" && (
                     <div className="field">
                       <label className="field-label">Reasoning</label>
                       <label className="field-check">

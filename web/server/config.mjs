@@ -1242,6 +1242,25 @@ function discoverSafetensorsModelDirs(scanRoots) {
   );
 }
 
+// Single source of truth for a model's reasoning ("thinking") capability, keyed
+// by chat template. Replaces the former hardcoded template allowlists scattered
+// across the request gate, the UI toggle, and the stream splitter — so enabling
+// a new reasoning model is one line here (and it lights up everywhere). Flows to
+// the client via the profile, so the UI can show/hide the toggle by capability.
+//   mode:     "none" (no reasoning) | "optional" (user toggles) | "always" (model always reasons)
+//   closeTag: the marker that ends the reasoning block in the token stream
+export function reasoningCapability(template) {
+  switch (template) {
+    case "deepseek-r1":
+      return { mode: "always", closeTag: "</think>" };
+    case "qwen3_5":
+    case "qwen3":
+      return { mode: "optional", closeTag: "</think>" };
+    default:
+      return { mode: "none", closeTag: "</think>" };
+  }
+}
+
 function buildProfile(modelPath, tokenizerPath, baseConfig, source = "discovered") {
   const ll2cConfig = readLl2cModelConfig(modelPath);
   const cpiConfig = readCpiModelConfig(modelPath);
@@ -1326,6 +1345,7 @@ function buildProfile(modelPath, tokenizerPath, baseConfig, source = "discovered
     tokenizerPath,
     tokenizerFormat,
     template,
+    reasoning: reasoningCapability(template),
     tokenizerChatTemplatePath: hfTokenizerConfig?.path || "",
     tokenizerUsesDefaultSystemPrompt:
       hfTokenizerConfig?.useDefaultSystemPrompt,
@@ -1350,6 +1370,7 @@ function publicModelProfile(profile) {
     tokenizerPath: profile.tokenizerPath,
     tokenizerFormat: profile.tokenizerFormat,
     template: profile.template,
+    reasoning: profile.reasoning,
     tokenizerChatTemplatePath: profile.tokenizerChatTemplatePath,
     tokenizerUsesDefaultSystemPrompt: profile.tokenizerUsesDefaultSystemPrompt,
     extraArgs: profile.extraArgs,

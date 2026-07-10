@@ -7,7 +7,7 @@ import { spawn, execFileSync } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { randomUUID } from "node:crypto";
 
-import { getRuntimeConfig, publicRuntimeSummary, setPreferredModelDir } from "./config.mjs";
+import { getRuntimeConfig, publicRuntimeSummary, setPreferredModelDir, reasoningCapability } from "./config.mjs";
 import { createBatchWorker, toBatchArgs } from "./batch_worker.mjs";
 import {
   buildInternalBodyFromChatRequest,
@@ -834,13 +834,14 @@ function buildCliArgs(config, body) {
     ? true
     : isTruthyFlag(body.autoMaxTokens);
   const longFormMode = isTruthyFlag(body.longFormMode);
-  // Reasoning ("thinking") mode: the model emits a <think>…</think> block before
-  // its answer, which the stream splitter separates out. qwen3_5 gates it on a
-  // request flag; deepseek-r1 always reasons.
+  // Reasoning ("thinking") mode: the model emits a reasoning block before its
+  // answer, which the stream splitter separates out. Driven by the template's
+  // declared capability (config.mjs reasoningCapability) — "always" reasons
+  // unconditionally, "optional" honours the request flag, "none" never reasons.
+  const reasoningCap = reasoningCapability(requestTemplate);
   const thinking =
-    requestTemplate === "deepseek-r1" ||
-    ((requestTemplate === "qwen3_5" || requestTemplate === "qwen3") &&
-     isTruthyFlag(body.thinking));
+    reasoningCap.mode === "always" ||
+    (reasoningCap.mode === "optional" && isTruthyFlag(body.thinking));
   const promptBudget = computePromptBudget(maxContext, performanceMode);
 
   const promptPackage = buildPromptPackage(body.messages, {
@@ -910,6 +911,7 @@ function buildCliArgs(config, body) {
       autoMaxTokens,
       longFormMode,
       thinking,
+      reasoningCloseTag: reasoningCap.closeTag,
       temperature,
       performanceMode,
       quantMode,
@@ -1490,6 +1492,7 @@ function isBatchCompatible(cliConfig) {
   const p = cliConfig.profile || {};
   const family = String(p.family || cliConfig.meta?.template || "").toLowerCase();
   if (NON_LLAMA_ENGINE_FAMILIES.has(family)) return false;                  // separate engine (incl. gemma4)
+  if (cliConfig.meta?.thinking) return false;                              // reasoning split needs the single-flight splitter
   if (cliConfig.quantMode && cliConfig.quantMode !== "none") return false; // runtime quantization
   const label = String(p.label || "").toLowerCase();
   if (label.includes("streaming")) return false;                           // streamed weights
@@ -2461,8 +2464,8 @@ app.post("/api/generate", async (req, res) => {
 // everything up to </think> is reasoning, the rest (after a trailing blank line)
 // is the answer. Buffers a short tail so a </think> split across token
 // boundaries is still detected.
-function makeThinkingSplitter({ onReasoning, onContent }) {
-  const CLOSE = "</think>";
+function makeThinkingSplitter({ onReasoning, onContent, closeTag }) {
+  const CLOSE = closeTag || "</think>";
   let inReasoning = true;
   let buf = "";
   return {
@@ -2591,6 +2594,7 @@ app.post("/api/chat/stream", async (req, res) => {
   let reasoningText = "";
   const splitter = cliConfig.meta.thinking
     ? makeThinkingSplitter({
+        closeTag: cliConfig.meta.reasoningCloseTag,
         onReasoning: (r) => { reasoningText += r; writeNdjson(res, { type: "reasoning", delta: r }); },
         onContent: (c) => { answerText += c; writeNdjson(res, { type: "delta", delta: c }); }
       })
