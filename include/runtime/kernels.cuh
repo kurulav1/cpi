@@ -251,12 +251,15 @@ void launch_attention_step_batched_paged(const half* q, const half* k_pool, cons
 // Note: when split-K scratch buffers are provided the grid is launched with
 // scratch_chunks columns so all chunks run unconditionally; individual blocks
 // whose chunk_start >= seq_len exit early.
+// `window` > 0 restricts attention to the last `window` keys (sliding-window
+// layers); 0 = full causal. Windowed requests use the tiled/fallback path (the
+// split-K / GQA-fused device-pos kernels are full-attention only).
 void launch_attention_step_device_pos(const half* q, const half* k_cache, const half* v_cache,
                                       half* out, const int* position, int num_heads,
                                       int num_kv_heads, int head_dim, cudaStream_t stream,
                                       float* scratch_m = nullptr, float* scratch_l = nullptr,
                                       float* scratch_o = nullptr, int scratch_chunks = 0,
-                                      bool allow_split = true);
+                                      bool allow_split = true, int window = 0);
 
 // launch_store_kv_device_pos
 //

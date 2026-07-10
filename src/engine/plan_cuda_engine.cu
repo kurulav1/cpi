@@ -54,7 +54,9 @@ PlanCudaEngine::~PlanCudaEngine() {
   cudaFree(d_q_); cudaFree(d_k_); cudaFree(d_v_); cudaFree(d_att_);
   cudaFree(d_gate_); cudaFree(d_up_); cudaFree(d_inter_);
   cudaFree(d_ple_raw_); cudaFree(d_ple_); cudaFree(d_ple_gate_);
-  cudaFree(d_logits_);
+  cudaFree(d_logits_); cudaFree(d_tok_); cudaFree(d_position_);
+  if (decode_graph_exec_) cudaGraphExecDestroy(decode_graph_exec_);
+  if (decode_graph_) cudaGraphDestroy(decode_graph_);
   if (stream_) cudaStreamDestroy(stream_);
 }
 
@@ -267,6 +269,7 @@ void PlanCudaEngine::load_all(const std::string& cpi_path) {
 
 void PlanCudaEngine::open(const std::string& cpi_path, int max_context) {
   max_ctx_ = max_context;
+  if (std::getenv("LLAMA_INFER_PLAN_NO_GRAPH")) decode_graph_enabled_ = false;
   std::string manifest = cpi_path.substr(0, cpi_path.find_last_of('.')) + ".manifest";
   parse_manifest(manifest);
   if (static_cast<int>(cfg_.layer_full.size()) != cfg_.num_layers)
@@ -521,10 +524,12 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
         __half* vc = caches_v_[layer];
         const std::size_t kvdim = static_cast<std::size_t>(op.kv_heads) * op.head_dim;
         if (device_pos_mode_) {
-          // Full-attention device-pos kernel (seq = d_position_+1). Correct for
-          // position < sliding_window; a windowed variant is the pre-merge task.
+          // Device-position kernel: seq derived from d_position_ on-device (graph-
+          // safe). Sliding layers pass their window so k_start is computed on device.
+          const int window = op.full_attention ? 0 : op.sliding_window;
           kernels::launch_attention_step_device_pos(S(op.in), kc, vc, S(op.out), d_position_,
-                                                     op.heads, op.kv_heads, op.head_dim, stream_);
+                                                     op.heads, op.kv_heads, op.head_dim, stream_,
+                                                     nullptr, nullptr, nullptr, 0, true, window);
         } else {
           const int seq = position + 1;
           int k_start = 0;
@@ -561,6 +566,27 @@ void PlanCudaEngine::run_layer(int layer, int position) {
 void PlanCudaEngine::forward_one(int token, int position, bool compute_logits,
                                    std::vector<float>* per_layer_rms) {
   const int H = cfg_.hidden;
+
+  // Fast path: every logits step is the same single-token forward, so replay a
+  // captured CUDA graph (device-position ops) instead of re-launching ~600 kernels.
+  // Skipped for the per-layer-rms parity dump (it syncs mid-forward). The graph
+  // writes the KV cache at d_position_, so it interleaves correctly with the eager
+  // prefill (which fills earlier rows via host position).
+  if (compute_logits && per_layer_rms == nullptr && decode_graph_enabled_) {
+    if (!decode_graph_ready_) capture_decode_graph();
+    G4_CHECK(cudaMemcpyAsync(d_tok_, &token, sizeof(int), cudaMemcpyHostToDevice, stream_));
+    G4_CHECK(cudaMemcpyAsync(d_position_, &position, sizeof(int), cudaMemcpyHostToDevice, stream_));
+    G4_CHECK(cudaGraphLaunch(decode_graph_exec_, stream_));
+    last_logits_.resize(cfg_.vocab);
+    G4_CHECK(cudaStreamSynchronize(stream_));
+    G4_CHECK(cudaMemcpy(last_logits_.data(), d_logits_, cfg_.vocab * sizeof(float),
+                        cudaMemcpyDeviceToHost));
+    const float cap = cfg_.final_logit_softcapping;
+    if (cap > 0.0f)
+      for (float& v : last_logits_) v = cap * std::tanh(v / cap);
+    return;
+  }
+
   // Publish the token; the prologue's EmbeddingLookup ops read d_tok_ on-device.
   G4_CHECK(cudaMemcpyAsync(d_tok_, &token, sizeof(int), cudaMemcpyHostToDevice, stream_));
   execute_ops(plan_.prologue.data(), plan_.prologue.size(), -1, position);
@@ -605,16 +631,36 @@ std::vector<float> PlanCudaEngine::forward_logits(const std::vector<int>& tokens
   return last_logits_;
 }
 
-void PlanCudaEngine::benchmark_graph_decode(const std::vector<int>& prompt, int iters) {
+void PlanCudaEngine::capture_decode_graph() {
+  // Capture the single-token forward (device-position ops) once; replayed for
+  // every logits step. Buffers referenced (d_tok_/d_position_/caches/weights/
+  // d_logits_) are stable for the engine's lifetime, so one capture serves all
+  // positions and all generate() calls. Sync first so no prefill work is pending.
+  G4_CHECK(cudaStreamSynchronize(stream_));
+  device_pos_mode_ = true;
+  G4_CHECK(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal));
+  execute_ops(plan_.prologue.data(), plan_.prologue.size(), -1, 0);
+  for (int L = 0; L < cfg_.num_layers; ++L) run_layer(L, 0);
+  execute_ops(plan_.epilogue.data(), plan_.epilogue.size(), -1, 0);
+  G4_CHECK(cudaStreamEndCapture(stream_, &decode_graph_));
+  G4_CHECK(cudaGraphInstantiate(&decode_graph_exec_, decode_graph_, nullptr, nullptr, 0));
+  device_pos_mode_ = false;
+  decode_graph_ready_ = true;
+}
+
+void PlanCudaEngine::benchmark_graph_decode(const std::vector<int>& prompt, int iters,
+                                            int pos_override) {
   using clock = std::chrono::steady_clock;
   if (prompt.empty()) { std::printf("[graph-bench] empty prompt\n"); return; }
-  const int P = static_cast<int>(prompt.size());
-  const int pos = P;                  // fixed decode position for the A/B
-  const int token = prompt.back();    // fixed token to decode
+  const int token = prompt.back();
+  // Effective prefill: the prompt, padded with its last token up to pos_override.
+  std::vector<int> pre = prompt;
+  while (static_cast<int>(pre.size()) < pos_override) pre.push_back(token);
+  const int pos = static_cast<int>(pre.size());  // decode position for the A/B
 
-  // Prefill (non-graph, host position) to fill the KV cache for 0..P-1.
+  // Prefill (non-graph, host position) to fill the KV cache for 0..pos-1.
   device_pos_mode_ = false;
-  for (int i = 0; i < P; ++i) forward_one(prompt[i], i, /*compute_logits=*/false);
+  for (int i = 0; i < pos; ++i) forward_one(pre[i], i, /*compute_logits=*/false);
   G4_CHECK(cudaStreamSynchronize(stream_));
 
   // The GPU forward (prologue -> layers -> epilogue), no host copy. Honours

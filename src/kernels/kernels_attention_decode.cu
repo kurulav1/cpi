@@ -46,7 +46,8 @@ __device__ __forceinline__ int cache_index(int t, int head, int d, int num_heads
 __device__ __forceinline__ void attention_step_fallback_core(const half* q, const half* k_cache,
                                                              const half* v_cache, half* out,
                                                              int seq_len, int num_heads,
-                                                             int num_kv_heads, int head_dim) {
+                                                             int num_kv_heads, int head_dim,
+                                                             int k_start = 0) {
   extern __shared__ unsigned char smem_bytes[];
   half* q_shared = reinterpret_cast<half*>(smem_bytes);
   float* red = reinterpret_cast<float*>(q_shared + head_dim);
@@ -71,7 +72,7 @@ __device__ __forceinline__ void attention_step_fallback_core(const half* q, cons
   float running_l = 0.0f;
   float acc = 0.0f;
 
-  for (int t = 0; t < seq_len; ++t) {
+  for (int t = k_start; t < seq_len; ++t) {
     float partial_dot = 0.0f;
     const int base = cache_index(t, kv_head, 0, num_kv_heads, head_dim);
     for (int d = tid; d < head_dim; d += blockDim.x) {
@@ -128,9 +129,12 @@ __global__ void attention_step_kernel_fallback(const half* q, const half* k_cach
 __global__ void attention_step_kernel_fallback_device_pos(const half* q, const half* k_cache,
                                                           const half* v_cache, half* out,
                                                           const int* position_ptr, int num_heads,
-                                                          int num_kv_heads, int head_dim) {
-  attention_step_fallback_core(q, k_cache, v_cache, out, position_ptr[0] + 1, num_heads,
-                               num_kv_heads, head_dim);
+                                                          int num_kv_heads, int head_dim,
+                                                          int window) {
+  const int seq_len = position_ptr[0] + 1;
+  const int k_start = (window > 0 && seq_len > window) ? seq_len - window : 0;
+  attention_step_fallback_core(q, k_cache, v_cache, out, seq_len, num_heads, num_kv_heads, head_dim,
+                               k_start);
 }
 
 // Shared online-softmax tiled decode-attention core. Keeps the query resident in
@@ -142,7 +146,8 @@ template <int WarpsPerBlock>
 __device__ __forceinline__ void attention_step_tiled_core(const half* q, const half* k_cache,
                                                           const half* v_cache, half* out,
                                                           int seq_len, int num_heads,
-                                                          int num_kv_heads, int head_dim) {
+                                                          int num_kv_heads, int head_dim,
+                                                          int k_start = 0) {
   // Shared-memory layout:
   //   half  q_shared[head_dim]
   //   float score_shared[WarpsPerBlock]
@@ -186,7 +191,7 @@ __device__ __forceinline__ void attention_step_tiled_core(const half* q, const h
   float acc[kAccPerThread];
 #pragma unroll
   for (int j = 0; j < kAccPerThread; ++j) acc[j] = 0.0f;
-  for (int tile_base = 0; tile_base < seq_len; tile_base += WarpsPerBlock) {
+  for (int tile_base = k_start; tile_base < seq_len; tile_base += WarpsPerBlock) {
     const int tile_tokens = min(WarpsPerBlock, seq_len - tile_base);
 
     // Phase 1a: each warp computes the K dot Q score for one token in the tile.
@@ -292,9 +297,11 @@ template <int WarpsPerBlock>
 __global__ void attention_step_kernel_tiled_device_pos(const half* q, const half* k_cache,
                                                        const half* v_cache, half* out,
                                                        const int* position_ptr, int num_heads,
-                                                       int num_kv_heads, int head_dim) {
-  attention_step_tiled_core<WarpsPerBlock>(q, k_cache, v_cache, out, position_ptr[0] + 1, num_heads,
-                                           num_kv_heads, head_dim);
+                                                       int num_kv_heads, int head_dim, int window) {
+  const int seq_len = position_ptr[0] + 1;
+  const int k_start = (window > 0 && seq_len > window) ? seq_len - window : 0;
+  attention_step_tiled_core<WarpsPerBlock>(q, k_cache, v_cache, out, seq_len, num_heads,
+                                           num_kv_heads, head_dim, k_start);
 }
 
 // Shared split-K decode pass-1 core: each block computes softmax statistics and
@@ -1596,15 +1603,23 @@ void launch_attention_step_device_pos(const half* q, const half* k_cache, const 
                                       half* out, const int* position, int num_heads,
                                       int num_kv_heads, int head_dim, cudaStream_t stream,
                                       float* scratch_m, float* scratch_l, float* scratch_o,
-                                      int scratch_chunks, bool allow_split) {
+                                      int scratch_chunks, bool allow_split, int window) {
   const bool force_fallback = std::getenv("LLAMA_INFER_FORCE_FALLBACK_DECODE_ATTENTION") != nullptr;
   if (force_fallback) {
     constexpr int threads = 128;
     const std::size_t smem = static_cast<std::size_t>(head_dim) * sizeof(half) +
                              static_cast<std::size_t>(threads + 3) * sizeof(float);
     attention_step_kernel_fallback_device_pos<<<num_heads, threads, smem, stream>>>(
-        q, k_cache, v_cache, out, position, num_heads, num_kv_heads, head_dim);
+        q, k_cache, v_cache, out, position, num_heads, num_kv_heads, head_dim, window);
     return;
+  }
+  // The split-K and GQA-fused device-pos kernels don't support a sliding window
+  // (they're head_dim==128 paths; Gemma's windowed layers are head_dim 256/512 and
+  // pass no scratch, so they never reach here). Force the tiled/fallback path,
+  // which honours the window, whenever one is requested.
+  if (window > 0) {
+    allow_split = false;
+    scratch_m = scratch_l = scratch_o = nullptr;
   }
   // GQA fused dispatch (device-position variant for CUDA graph capture). The
   // graphed decode path can't gate on runtime seq_len (position is device-side),
@@ -1616,7 +1631,7 @@ void launch_attention_step_device_pos(const half* q, const half* k_cache, const 
   // disabled (--no-split-attention).
   const bool split_available =
       allow_split && scratch_m && scratch_l && scratch_o && scratch_chunks > 0 && head_dim == 128;
-  if (!split_available && num_kv_heads > 0 && num_heads > num_kv_heads &&
+  if (window <= 0 && !split_available && num_kv_heads > 0 && num_heads > num_kv_heads &&
       (num_heads % num_kv_heads) == 0 && head_dim == 128) {
     const int group_size_val = num_heads / num_kv_heads;
     if (group_size_val <= 32) {
@@ -1681,7 +1696,7 @@ void launch_attention_step_device_pos(const half* q, const half* k_cache, const 
                                static_cast<std::size_t>(2 * warps + 4) * sizeof(float) +
                                static_cast<std::size_t>(warps * head_dim) * sizeof(half);
       attention_step_kernel_tiled_device_pos<warps><<<num_heads, threads, smem, stream>>>(
-          q, k_cache, v_cache, out, position, num_heads, num_kv_heads, head_dim);
+          q, k_cache, v_cache, out, position, num_heads, num_kv_heads, head_dim, window);
       return;
     }
 
@@ -1691,7 +1706,7 @@ void launch_attention_step_device_pos(const half* q, const half* k_cache, const 
                              static_cast<std::size_t>(2 * warps + 4) * sizeof(float) +
                              static_cast<std::size_t>(warps * head_dim) * sizeof(half);
     attention_step_kernel_tiled_device_pos<warps><<<num_heads, threads, smem, stream>>>(
-        q, k_cache, v_cache, out, position, num_heads, num_kv_heads, head_dim);
+        q, k_cache, v_cache, out, position, num_heads, num_kv_heads, head_dim, window);
     return;
   }
 
@@ -1699,7 +1714,7 @@ void launch_attention_step_device_pos(const half* q, const half* k_cache, const 
   const std::size_t smem = static_cast<std::size_t>(head_dim) * sizeof(half) +
                            static_cast<std::size_t>(threads + 3) * sizeof(float);
   attention_step_kernel_fallback_device_pos<<<num_heads, threads, smem, stream>>>(
-      q, k_cache, v_cache, out, position, num_heads, num_kv_heads, head_dim);
+      q, k_cache, v_cache, out, position, num_heads, num_kv_heads, head_dim, window);
 }
 
 void launch_store_kv_device_pos(const half* k, const half* v, half* k_cache, half* v_cache,

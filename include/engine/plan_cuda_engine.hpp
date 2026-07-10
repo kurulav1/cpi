@@ -67,7 +67,10 @@ class PlanCudaEngine : public runtime::SequenceModel {
   // tok/s for both. NOTE: uses the full-attention device-pos kernels, so it is
   // only correct/representative for position < sliding_window (fine for a fixed
   // short position); long-context sliding correctness needs a windowed kernel.
-  void benchmark_graph_decode(const std::vector<int>& prompt, int iters);
+  // `pos_override` > prompt length pads the prefill (repeating the last token) so
+  // the A/B runs at that decode position — use it to exercise the sliding window
+  // (pos >= sliding_window), where graph and non-graph must still match.
+  void benchmark_graph_decode(const std::vector<int>& prompt, int iters, int pos_override = 0);
 
   int bos_id() const { return cfg_.bos_token_id; }
 
@@ -121,6 +124,9 @@ class PlanCudaEngine : public runtime::SequenceModel {
   // prologue/epilogue, which contain none.
   void execute_ops(const opplan::Op* ops, std::size_t n, int layer, int position);
   void run_layer(int layer, int position);  // executes plan_.layers[layer].ops
+  // Capture the single-token forward (device-position ops) into a CUDA graph once,
+  // for reuse across every logits step. See forward_one.
+  void capture_decode_graph();
   // Process one token at `position` (reusing the KV cache from prior positions).
   // When compute_logits, fills last_logits_ with softcapped logits. When
   // per_layer_rms != nullptr, appends each layer's output RMS (and dumps the
@@ -189,6 +195,14 @@ class PlanCudaEngine : public runtime::SequenceModel {
   // When true, execute_ops uses the device-position kernel variants (RoPE / KV
   // store / attention read d_position_) so the op sequence is CUDA-graph capturable.
   bool device_pos_mode_ = false;
+
+  // Decode CUDA graph: the single-token forward captured once (device-position
+  // ops), replayed for every logits step. decode_graph_enabled_ off falls back to
+  // the eager path (env LLAMA_INFER_PLAN_NO_GRAPH=1, for A/B / debugging).
+  cudaGraph_t decode_graph_ = nullptr;
+  cudaGraphExec_t decode_graph_exec_ = nullptr;
+  bool decode_graph_ready_ = false;
+  bool decode_graph_enabled_ = true;
 
   // The forward as data (built once in build_plan) + the Slot→device-buffer map
   // the executor dereferences. plan_.layers[L] is layer L's resolved op list.
