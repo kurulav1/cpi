@@ -379,15 +379,16 @@ std::vector<int> Tokenizer::encode(const std::string& text, bool add_bos) const 
 // (BOS, EOS, UNK, and any model-specific extras) are stripped before decoding
 // because they carry no surface-form text and would otherwise appear as
 // artefacts in the output.
-std::string Tokenizer::decode(const std::vector<int>& ids) const {
-  const std::vector<int> filtered = strip_special_ids(ids);
+std::string Tokenizer::decode(const std::vector<int>& ids,
+                              const std::unordered_set<int>* keep_special) const {
+  const std::vector<int> filtered = strip_special_ids(ids, keep_special);
 
   if (!tokenizer_json_path_.empty()) {
     auto* tok = reinterpret_cast<const HfBpeTokenizer*>(hf_bpe_);
     if (!tok) {
       throw std::runtime_error("hf bpe tokenizer is not loaded");
     }
-    return tok->decode(filtered);
+    return tok->decode(filtered, keep_special);
   }
 
 #ifdef LLAMA_ENGINE_HAS_SENTENCEPIECE
@@ -496,7 +497,8 @@ std::vector<int> Tokenizer::generation_stop_ids() const {
 // constructed from special_ids_ to give O(log n) lookup per token, which is
 // preferable to a linear scan given that the special set is typically small
 // but the id sequence can be long.
-std::vector<int> Tokenizer::strip_special_ids(const std::vector<int>& ids) const {
+std::vector<int> Tokenizer::strip_special_ids(const std::vector<int>& ids,
+                                              const std::unordered_set<int>* keep_special) const {
   if (special_ids_.empty()) {
     return ids;
   }
@@ -504,7 +506,8 @@ std::vector<int> Tokenizer::strip_special_ids(const std::vector<int>& ids) const
   std::vector<int> out;
   out.reserve(ids.size());
   for (int id : ids) {
-    if (special.find(id) == special.end()) {
+    // Drop specials, except reasoning delimiters the caller asked to preserve.
+    if (special.find(id) == special.end() || (keep_special && keep_special->count(id))) {
       out.push_back(id);
     }
   }

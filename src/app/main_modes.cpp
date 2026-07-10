@@ -12,6 +12,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+#include <unordered_set>
 
 #include "app/main_helpers.hpp"
 #include "engine/generation_constraints.hpp"
@@ -135,6 +136,15 @@ void execute_engine_modes(const RunExecutionOptions& options, const std::vector<
         if (req_stop_texts.empty()) {
           req_stop_texts = stop_texts;
         }
+        // Reasoning delimiters (e.g. Gemma's <|channel> tokens) the client wants
+        // preserved through detokenization so the stream splitter can find them.
+        // Resolve the marker strings to token ids once; decode keeps these visible.
+        std::unordered_set<int> req_keep_special;
+        if (tokenizer != nullptr) {
+          for (const auto& marker : json_get_string_array(request_json, "reasoning_markers")) {
+            for (int id : tokenizer->encode(marker, /*add_bos=*/false)) req_keep_special.insert(id);
+          }
+        }
 
         std::vector<int> req_stop_ids;
         if (tokenizer->eos_id() >= 0) {
@@ -212,7 +222,8 @@ void execute_engine_modes(const RunExecutionOptions& options, const std::vector<
               done_now = stream_done.load();
             }
 
-            const std::string decoded = sanitize_stream_text(tokenizer->decode(snapshot));
+            const std::string decoded = sanitize_stream_text(
+                tokenizer->decode(snapshot, req_keep_special.empty() ? nullptr : &req_keep_special));
             if (decoded.size() > prev_decoded_local.size()) {
               const std::string delta = decoded.substr(prev_decoded_local.size());
               if (!delta.empty()) {

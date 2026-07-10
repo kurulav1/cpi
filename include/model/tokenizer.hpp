@@ -13,6 +13,7 @@
 // performed transparently inside load().
 
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace model {
@@ -35,8 +36,11 @@ public:
   // If add_bos is true, the BOS token ID is prepended to the result.
   std::vector<int> encode(const std::string& text, bool add_bos) const;
 
-  // Decodes a sequence of token IDs back into a UTF-8 string.
-  std::string decode(const std::vector<int>& ids) const;
+  // Decodes a sequence of token IDs back into a UTF-8 string. Special tokens are
+  // dropped, except any listed in keep_special (reasoning delimiters such as
+  // Gemma's "<|channel>" that must survive detokenization for the stream splitter).
+  std::string decode(const std::vector<int>& ids,
+                     const std::unordered_set<int>* keep_special = nullptr) const;
 
   // Returns the beginning-of-sequence token ID, or -1 if not defined.
   int bos_id() const {
@@ -69,7 +73,8 @@ public:
   std::vector<int> generation_stop_ids() const;
 
   // Returns ids with all special token IDs removed.
-  std::vector<int> strip_special_ids(const std::vector<int>& ids) const;
+  std::vector<int> strip_special_ids(const std::vector<int>& ids,
+                                     const std::unordered_set<int>* keep_special = nullptr) const;
 
 private:
   std::string model_path_;           // Directory that contains the tokenizer files.

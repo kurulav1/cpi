@@ -885,7 +885,10 @@ function buildCliArgs(config, body) {
     profileExtraArgs,
     quantMode,
     messages: promptPackage.messages,
-    prompt: promptPackage.prompt,
+    // Generic reasoning enable-injection: prepend the descriptor's enable fragment
+    // (e.g. Gemma's <|think|> system turn) when thinking is on. "" for models that
+    // prime via their own chat template (Qwen/R1), so this is a no-op for them.
+    prompt: (thinking && reasoningCap.enable ? reasoningCap.enable : "") + promptPackage.prompt,
     addBos: promptPackage.addBos,
     // Structural schema for grammar-constrained decoding, forwarded to the
     // engine as `json_schema` on the request line (null when not supplied).
@@ -911,7 +914,9 @@ function buildCliArgs(config, body) {
       autoMaxTokens,
       longFormMode,
       thinking,
-      reasoningCloseTag: reasoningCap.closeTag,
+      reasoningOpen: reasoningCap.open,
+      reasoningClose: reasoningCap.close,
+      reasoningMarkers: reasoningCap.markers,
       temperature,
       performanceMode,
       quantMode,
@@ -1738,6 +1743,12 @@ function runGeneration(
     // answer. Cutting on the first sentence boundary turns sane answers into
     // fragments like "Sure, who is Elon Musk?".
     sentence_stop: false,
+    // Reasoning delimiters that are `special` tokens (dropped by decode by default,
+    // e.g. Gemma's <|channel>): tell the worker to preserve them as text so the
+    // stream splitter can find them. Empty/omitted for text-delimiter models.
+    ...(cliConfig.meta.thinking && cliConfig.meta.reasoningMarkers?.length
+      ? { reasoning_markers: cliConfig.meta.reasoningMarkers }
+      : {}),
     // Grammar-constrained decoding: forward the tool/response schema so the
     // engine masks sampling to schema-valid JSON. Omitted when absent.
     ...(cliConfig.jsonSchema ? { json_schema: cliConfig.jsonSchema } : {})
@@ -2459,36 +2470,47 @@ app.post("/api/generate", async (req, res) => {
 //   { type: "error", error: "..." }         (on failure)
 //
 // Request body: same as /api/generate
-// Incrementally splits a thinking model's stream at the first "</think>".
-// The prompt primes the opening "<think>", so the stream starts in reasoning;
-// everything up to </think> is reasoning, the rest (after a trailing blank line)
-// is the answer. Buffers a short tail so a </think> split across token
-// boundaries is still detected.
-function makeThinkingSplitter({ onReasoning, onContent, closeTag }) {
+// Generic reasoning stream splitter, driven by the model's reasoning descriptor:
+//   - openTag "" (primed, e.g. Qwen): the prompt opens the block, so the stream
+//     STARTS inside reasoning; split at closeTag.
+//   - openTag set (e.g. Gemma "<|channel>"): stream starts in the answer, enters
+//     reasoning at openTag, exits at closeTag.
+// Buffers a short tail so a marker split across token boundaries is still found.
+function makeThinkingSplitter({ onReasoning, onContent, openTag, closeTag }) {
+  const OPEN = openTag || "";
   const CLOSE = closeTag || "</think>";
-  let inReasoning = true;
+  const maxTail = Math.max(OPEN.length, CLOSE.length) - 1;
+  let state = OPEN ? "pre" : "reasoning";  // pre → reasoning → answer
   let buf = "";
+  const emitKeepingTail = (sink) => {
+    if (buf.length > maxTail) { sink(buf.slice(0, buf.length - maxTail)); buf = buf.slice(buf.length - maxTail); }
+  };
   return {
     push(delta) {
-      if (!inReasoning) { onContent(delta); return; }
       buf += delta;
-      const idx = buf.indexOf(CLOSE);
-      if (idx === -1) {
-        const keep = CLOSE.length - 1;
-        if (buf.length > keep) {
-          onReasoning(buf.slice(0, buf.length - keep));
-          buf = buf.slice(buf.length - keep);
+      for (;;) {
+        if (state === "answer") { if (buf) { onContent(buf); buf = ""; } return; }
+        if (state === "pre") {
+          const i = buf.indexOf(OPEN);
+          if (i === -1) { emitKeepingTail(onContent); return; }  // pre-open text (rare) → content
+          if (i > 0) onContent(buf.slice(0, i));
+          buf = buf.slice(i + OPEN.length);
+          state = "reasoning";
+          continue;
         }
-        return;
+        // state === "reasoning"
+        const j = buf.indexOf(CLOSE);
+        if (j === -1) { emitKeepingTail(onReasoning); return; }
+        if (j > 0) onReasoning(buf.slice(0, j));
+        buf = buf.slice(j + CLOSE.length).replace(/^\n+/, "");
+        state = "answer";
       }
-      if (idx > 0) onReasoning(buf.slice(0, idx));
-      inReasoning = false;
-      const after = buf.slice(idx + CLOSE.length).replace(/^\n+/, "");
-      buf = "";
-      if (after) onContent(after);
     },
     flush() {
-      if (inReasoning && buf) { onReasoning(buf); buf = ""; }
+      if (!buf) return;
+      if (state === "reasoning") onReasoning(buf);
+      else onContent(buf);  // "answer" or unclosed "pre" (no reasoning happened)
+      buf = "";
     }
   };
 }
@@ -2594,7 +2616,8 @@ app.post("/api/chat/stream", async (req, res) => {
   let reasoningText = "";
   const splitter = cliConfig.meta.thinking
     ? makeThinkingSplitter({
-        closeTag: cliConfig.meta.reasoningCloseTag,
+        openTag: cliConfig.meta.reasoningOpen,
+        closeTag: cliConfig.meta.reasoningClose,
         onReasoning: (r) => { reasoningText += r; writeNdjson(res, { type: "reasoning", delta: r }); },
         onContent: (c) => { answerText += c; writeNdjson(res, { type: "delta", delta: c }); }
       })

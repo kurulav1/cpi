@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace model {
@@ -35,8 +36,11 @@ public:
   // Decodes a sequence of token IDs back into a UTF-8 string.
   // Byte-fallback tokens are collapsed back into their original bytes. Non-
   // special added tokens (e.g. "</think>") are emitted as their literal text;
-  // special tokens (BOS/EOS/…) are dropped.
-  std::string decode(const std::vector<int>& ids) const;
+  // special tokens (BOS/EOS/…) are dropped — except any listed in keep_special,
+  // which are emitted as their literal text (reasoning delimiters like Gemma's
+  // "<|channel>", which are `special` but must survive for the stream splitter).
+  std::string decode(const std::vector<int>& ids,
+                     const std::unordered_set<int>* keep_special = nullptr) const;
   // Byte-level/SentencePiece decode of a run of ordinary vocab ids (no added/
   // special token handling); used by decode() between added-token boundaries.
   std::string decode_run(const std::vector<int>& ids) const;

@@ -1040,15 +1040,19 @@ std::vector<int> HfBpeTokenizer::encode(const std::string& text, bool add_bos) c
 //
 // Out-of-range ids are silently skipped to gracefully handle truncated or
 // otherwise malformed id sequences.
-std::string HfBpeTokenizer::decode(const std::vector<int>& ids) const {
+std::string HfBpeTokenizer::decode(const std::vector<int>& ids,
+                                   const std::unordered_set<int>* keep_special) const {
   // Emit non-special added tokens (e.g. "</think>") as literal text, drop
   // special ones (EOS/BOS/…), and byte-level-decode ordinary runs in between.
-  // Reasoning models rely on "</think>" being visible so the answer can be
-  // separated from the chain of thought.
+  // Reasoning models rely on their delimiters being visible so the answer can be
+  // separated from the chain of thought. Text delimiters (Qwen "</think>") are
+  // non-special and always visible; special-token delimiters (Gemma "<|channel>")
+  // are made visible only when the caller lists them in keep_special.
   std::unordered_set<int> special(special_ids_.begin(), special_ids_.end());
   std::unordered_map<int, std::string> visible;
   for (const auto& [content, id] : added_tokens_) {
-    if (!special.count(id)) visible.emplace(id, content);
+    if (!special.count(id) || (keep_special && keep_special->count(id)))
+      visible.emplace(id, content);
   }
   if (visible.empty()) {
     return decode_run(ids);  // fast path: no visible added tokens for this model

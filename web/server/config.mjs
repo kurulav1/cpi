@@ -1243,21 +1243,41 @@ function discoverSafetensorsModelDirs(scanRoots) {
 }
 
 // Single source of truth for a model's reasoning ("thinking") capability, keyed
-// by chat template. Replaces the former hardcoded template allowlists scattered
-// across the request gate, the UI toggle, and the stream splitter — so enabling
-// a new reasoning model is one line here (and it lights up everywhere). Flows to
-// the client via the profile, so the UI can show/hide the toggle by capability.
-//   mode:     "none" (no reasoning) | "optional" (user toggles) | "always" (model always reasons)
-//   closeTag: the marker that ends the reasoning block in the token stream
+// by chat template. One generic descriptor the core interprets — the request
+// gate, prompt enable-injection, stream splitter, and UI toggle all read it, so
+// adding a reasoning model is one data entry here (no per-model code anywhere).
+// Every model difference we've hit is a FIELD, not a branch:
+//   mode:    "none" | "optional" (user toggles) | "always" (model always reasons)
+//   enable:  prompt text injected when thinking is on (e.g. Gemma's system turn);
+//            "" for models primed by their own chat template (Qwen/R1).
+//   open:    reasoning-open marker in the OUTPUT; "" means the block is primed by
+//            the prompt so the stream starts already inside reasoning (Qwen/R1).
+//   close:   reasoning-close marker in the output.
+//   markers: delimiter strings the worker must PRESERVE through detokenization
+//            (Gemma's <|channel> tokens are `special` and get dropped by default;
+//            Qwen's </think> is non-special text and survives, so this is []).
+// (L1: this table lives in-core; L2 target = ship the descriptor in each model's
+// manifest so the core carries zero model knowledge.)
 export function reasoningCapability(template) {
   switch (template) {
     case "deepseek-r1":
-      return { mode: "always", closeTag: "</think>" };
+      return { mode: "always", enable: "", open: "", close: "</think>", markers: [] };
     case "qwen3_5":
     case "qwen3":
-      return { mode: "optional", closeTag: "</think>" };
+      return { mode: "optional", enable: "", open: "", close: "</think>", markers: [] };
+    case "gemma":
+      // Gemma 4: enable via a system turn; the model wraps reasoning in the special
+      // tokens <|channel> … <channel|> (verified empirically on E2B + per Google's
+      // docs for 12B+), which decode drops unless preserved.
+      return {
+        mode: "optional",
+        enable: "<|turn>system\n<|think|><turn|>\n",
+        open: "<|channel>",
+        close: "<channel|>",
+        markers: ["<|channel>", "<channel|>"]
+      };
     default:
-      return { mode: "none", closeTag: "</think>" };
+      return { mode: "none", enable: "", open: "", close: "</think>", markers: [] };
   }
 }
 
