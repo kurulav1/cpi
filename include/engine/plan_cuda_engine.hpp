@@ -61,6 +61,14 @@ class PlanCudaEngine : public runtime::SequenceModel {
   std::vector<float> forward_logits(const std::vector<int>& tokens,
                                     std::vector<float>* per_layer_rms = nullptr);
 
+  // Perf validation: capture the single-token decode step (device-position ops)
+  // into a CUDA graph and A/B its replay against the non-graph path at a fixed
+  // decode position. Verifies logits parity (graph vs non-graph) then reports
+  // tok/s for both. NOTE: uses the full-attention device-pos kernels, so it is
+  // only correct/representative for position < sliding_window (fine for a fixed
+  // short position); long-context sliding correctness needs a windowed kernel.
+  void benchmark_graph_decode(const std::vector<int>& prompt, int iters);
+
   int bos_id() const { return cfg_.bos_token_id; }
 
   // --- runtime::SequenceModel (the decode driver calls these) ---
@@ -177,6 +185,10 @@ class PlanCudaEngine : public runtime::SequenceModel {
   __half* d_ple_gate_ = nullptr; // [ple_dim]
   float* d_logits_ = nullptr;    // [vocab]
   int* d_tok_ = nullptr;         // current token id (device); EmbeddingLookup reads it
+  int* d_position_ = nullptr;    // current decode position (device); device-pos ops read it
+  // When true, execute_ops uses the device-position kernel variants (RoPE / KV
+  // store / attention read d_position_) so the op sequence is CUDA-graph capturable.
+  bool device_pos_mode_ = false;
 
   // The forward as data (built once in build_plan) + the Slot→device-buffer map
   // the executor dereferences. plan_.layers[L] is layer L's resolved op list.

@@ -18,11 +18,13 @@ int main(int argc, char** argv) {
   std::vector<int> tokens = {818, 5279, 529, 7001, 563};
   int expect = 7001;
   int gen = 0;
+  int graph_bench = 0;  // >0: run the CUDA-graph decode A/B benchmark for N iters
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     if (a == "--model" && i + 1 < argc) cpi = argv[++i];
     else if (a == "--expect" && i + 1 < argc) expect = std::stoi(argv[++i]);
     else if (a == "--gen" && i + 1 < argc) gen = std::stoi(argv[++i]);
+    else if (a == "--graph-bench" && i + 1 < argc) graph_bench = std::stoi(argv[++i]);
     else if (a == "--tokens" && i + 1 < argc) {
       tokens.clear();
       std::string s = argv[++i], cur;
@@ -36,6 +38,11 @@ int main(int argc, char** argv) {
     std::printf("loading %s ...\n", cpi.c_str());
     eng.open(cpi);
     std::printf("loaded. vocab=%d\n", eng.vocab());
+
+    if (graph_bench > 0) {
+      eng.benchmark_graph_decode(tokens, graph_bench);
+      return 0;
+    }
 
     if (gen > 0) {
       auto out = eng.generate(tokens, gen, 0.0f);

@@ -6,6 +6,7 @@
 #include "engine/plan_cuda_engine.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -209,6 +210,7 @@ void PlanCudaEngine::allocate_buffers() {
   al(&d_ple_raw_, ple_tot); al(&d_ple_, ple_tot); al(&d_ple_gate_, cfg_.hidden_size_per_layer_input);
   G4_CHECK(cudaMalloc(&d_logits_, static_cast<std::size_t>(cfg_.vocab) * sizeof(float)));
   G4_CHECK(cudaMalloc(&d_tok_, sizeof(int)));
+  G4_CHECK(cudaMalloc(&d_position_, sizeof(int)));
   // ones for weightless v-norm
   std::vector<__half> ones(maxhd, __float2half(1.0f));
   G4_CHECK(cudaMalloc(&d_ones_, ones.size() * sizeof(__half)));
@@ -481,8 +483,15 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
       case OpKind::Rope: {
         const float* cosT = op.rope_table == RopeTable::Full ? d_cos_full_ : d_cos_sliding_;
         const float* sinT = op.rope_table == RopeTable::Full ? d_sin_full_ : d_sin_sliding_;
-        kernels::launch_rope_inplace_table(S(op.in), S(op.out), op.heads, 0, op.head_dim, position,
-                                           cosT, sinT, stream_);
+        if (device_pos_mode_) {
+          // Single-tensor RoPE via the device-position kernel (k-branch guarded off
+          // by num_heads_k=0). Graph-capturable: position read from d_position_.
+          kernels::launch_rope_inplace_device_pos(S(op.in), nullptr, op.heads, 0, op.head_dim,
+                                                   d_position_, cosT, sinT, stream_);
+        } else {
+          kernels::launch_rope_inplace_table(S(op.in), S(op.out), op.heads, 0, op.head_dim, position,
+                                             cosT, sinT, stream_);
+        }
         break;
       }
       case OpKind::ScaleCopy:
@@ -496,24 +505,36 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
         __half* kc = caches_k_[layer];
         __half* vc = caches_v_[layer];
         const std::size_t kvdim = static_cast<std::size_t>(op.cols);
-        G4_CHECK(cudaMemcpyAsync(kc + static_cast<std::size_t>(position) * kvdim, S(Slot::K),
-                                 kvdim * sizeof(__half), cudaMemcpyDeviceToDevice, stream_));
-        G4_CHECK(cudaMemcpyAsync(vc + static_cast<std::size_t>(position) * kvdim, S(Slot::V),
-                                 kvdim * sizeof(__half), cudaMemcpyDeviceToDevice, stream_));
+        if (device_pos_mode_) {
+          kernels::launch_store_kv_device_pos(S(Slot::K), S(Slot::V), kc, vc, d_position_,
+                                              static_cast<int>(kvdim), max_ctx_, stream_);
+        } else {
+          G4_CHECK(cudaMemcpyAsync(kc + static_cast<std::size_t>(position) * kvdim, S(Slot::K),
+                                   kvdim * sizeof(__half), cudaMemcpyDeviceToDevice, stream_));
+          G4_CHECK(cudaMemcpyAsync(vc + static_cast<std::size_t>(position) * kvdim, S(Slot::V),
+                                   kvdim * sizeof(__half), cudaMemcpyDeviceToDevice, stream_));
+        }
         break;
       }
       case OpKind::Attention: {
         __half* kc = caches_k_[layer];
         __half* vc = caches_v_[layer];
         const std::size_t kvdim = static_cast<std::size_t>(op.kv_heads) * op.head_dim;
-        const int seq = position + 1;
-        int k_start = 0;
-        if (!op.full_attention && op.sliding_window > 0 && seq > op.sliding_window)
-          k_start = seq - op.sliding_window;
-        const int att_seq = seq - k_start;
-        kernels::launch_attention_step(S(op.in), kc + static_cast<std::size_t>(k_start) * kvdim,
-                                       vc + static_cast<std::size_t>(k_start) * kvdim, S(op.out),
-                                       att_seq, op.heads, op.kv_heads, op.head_dim, stream_);
+        if (device_pos_mode_) {
+          // Full-attention device-pos kernel (seq = d_position_+1). Correct for
+          // position < sliding_window; a windowed variant is the pre-merge task.
+          kernels::launch_attention_step_device_pos(S(op.in), kc, vc, S(op.out), d_position_,
+                                                     op.heads, op.kv_heads, op.head_dim, stream_);
+        } else {
+          const int seq = position + 1;
+          int k_start = 0;
+          if (!op.full_attention && op.sliding_window > 0 && seq > op.sliding_window)
+            k_start = seq - op.sliding_window;
+          const int att_seq = seq - k_start;
+          kernels::launch_attention_step(S(op.in), kc + static_cast<std::size_t>(k_start) * kvdim,
+                                         vc + static_cast<std::size_t>(k_start) * kvdim, S(op.out),
+                                         att_seq, op.heads, op.kv_heads, op.head_dim, stream_);
+        }
         break;
       }
       case OpKind::GeluMul: {
@@ -582,6 +603,88 @@ std::vector<float> PlanCudaEngine::forward_logits(const std::vector<int>& tokens
     forward_one(tokens[pos], pos, last, last ? per_layer_rms : nullptr);
   }
   return last_logits_;
+}
+
+void PlanCudaEngine::benchmark_graph_decode(const std::vector<int>& prompt, int iters) {
+  using clock = std::chrono::steady_clock;
+  if (prompt.empty()) { std::printf("[graph-bench] empty prompt\n"); return; }
+  const int P = static_cast<int>(prompt.size());
+  const int pos = P;                  // fixed decode position for the A/B
+  const int token = prompt.back();    // fixed token to decode
+
+  // Prefill (non-graph, host position) to fill the KV cache for 0..P-1.
+  device_pos_mode_ = false;
+  for (int i = 0; i < P; ++i) forward_one(prompt[i], i, /*compute_logits=*/false);
+  G4_CHECK(cudaStreamSynchronize(stream_));
+
+  // The GPU forward (prologue -> layers -> epilogue), no host copy. Honours
+  // device_pos_mode_ (host position `pos` is ignored by the device-pos kernels).
+  auto gpu_forward = [&]() {
+    execute_ops(plan_.prologue.data(), plan_.prologue.size(), -1, pos);
+    for (int L = 0; L < cfg_.num_layers; ++L) run_layer(L, pos);
+    execute_ops(plan_.epilogue.data(), plan_.epilogue.size(), -1, pos);
+  };
+  auto read_softcapped_logits = [&]() {
+    std::vector<float> lg(cfg_.vocab);
+    G4_CHECK(cudaMemcpy(lg.data(), d_logits_, cfg_.vocab * sizeof(float), cudaMemcpyDeviceToHost));
+    const float cap = cfg_.final_logit_softcapping;
+    if (cap > 0.0f) for (float& v : lg) v = cap * std::tanh(v / cap);
+    return lg;
+  };
+  auto argmax = [&](const std::vector<float>& v) {
+    int a = 0; for (int i = 1; i < (int)v.size(); ++i) if (v[i] > v[a]) a = i; return a;
+  };
+
+  // Reference: non-graph forward at (token, pos).
+  device_pos_mode_ = false;
+  G4_CHECK(cudaMemcpyAsync(d_tok_, &token, sizeof(int), cudaMemcpyHostToDevice, stream_));
+  gpu_forward();
+  G4_CHECK(cudaStreamSynchronize(stream_));
+  const std::vector<float> ref = read_softcapped_logits();
+
+  // Capture the device-position forward into a CUDA graph.
+  device_pos_mode_ = true;
+  G4_CHECK(cudaMemcpyAsync(d_tok_, &token, sizeof(int), cudaMemcpyHostToDevice, stream_));
+  G4_CHECK(cudaMemcpyAsync(d_position_, &pos, sizeof(int), cudaMemcpyHostToDevice, stream_));
+  G4_CHECK(cudaStreamSynchronize(stream_));
+  cudaGraph_t graph = nullptr;
+  cudaGraphExec_t exec = nullptr;
+  G4_CHECK(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal));
+  gpu_forward();
+  G4_CHECK(cudaStreamEndCapture(stream_, &graph));
+  G4_CHECK(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+
+  // Correctness: graph logits vs non-graph reference (valid since pos < window
+  // makes full-attention == sliding here).
+  G4_CHECK(cudaGraphLaunch(exec, stream_));
+  G4_CHECK(cudaStreamSynchronize(stream_));
+  const std::vector<float> glog = read_softcapped_logits();
+  float maxdiff = 0.0f;
+  for (int i = 0; i < cfg_.vocab; ++i) maxdiff = std::max(maxdiff, std::fabs(glog[i] - ref[i]));
+  const int a_ref = argmax(ref), a_g = argmax(glog);
+  std::printf("[graph-bench] pos=%d argmax non-graph=%d graph=%d %s | max|logit diff|=%.4f\n",
+              pos, a_ref, a_g, a_ref == a_g ? "MATCH" : "MISMATCH", maxdiff);
+
+  auto time_loop = [&](const std::function<void()>& fn) {
+    G4_CHECK(cudaStreamSynchronize(stream_));
+    const auto t0 = clock::now();
+    for (int i = 0; i < iters; ++i) fn();
+    G4_CHECK(cudaStreamSynchronize(stream_));
+    return std::chrono::duration<double, std::milli>(clock::now() - t0).count();
+  };
+
+  device_pos_mode_ = false;
+  const double ng_ms = time_loop([&]() { gpu_forward(); });
+  const double g_ms = time_loop([&]() { G4_CHECK(cudaGraphLaunch(exec, stream_)); });
+
+  const double ng_per = ng_ms / iters, g_per = g_ms / iters;
+  std::printf("[graph-bench] iters=%d  non-graph %.3f ms/tok (%.1f tok/s)  graph %.3f ms/tok "
+              "(%.1f tok/s)  speedup %.2fx\n",
+              iters, ng_per, 1000.0 / ng_per, g_per, 1000.0 / g_per, ng_per / g_per);
+
+  cudaGraphExecDestroy(exec);
+  cudaGraphDestroy(graph);
+  device_pos_mode_ = false;
 }
 
 void PlanCudaEngine::initialize(const EngineOptions& options) {
