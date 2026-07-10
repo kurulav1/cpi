@@ -54,7 +54,7 @@ PlanCudaEngine::~PlanCudaEngine() {
   cudaFree(d_q_); cudaFree(d_k_); cudaFree(d_v_); cudaFree(d_att_);
   cudaFree(d_gate_); cudaFree(d_up_); cudaFree(d_inter_);
   cudaFree(d_ple_raw_); cudaFree(d_ple_); cudaFree(d_ple_gate_);
-  cudaFree(d_logits_); cudaFree(d_tok_); cudaFree(d_position_);
+  cudaFree(d_logits_); cudaFree(d_tok_); cudaFree(d_position_); cudaFree(d_argmax_);
   if (decode_graph_exec_) cudaGraphExecDestroy(decode_graph_exec_);
   if (decode_graph_) cudaGraphDestroy(decode_graph_);
   if (stream_) cudaStreamDestroy(stream_);
@@ -213,6 +213,7 @@ void PlanCudaEngine::allocate_buffers() {
   G4_CHECK(cudaMalloc(&d_logits_, static_cast<std::size_t>(cfg_.vocab) * sizeof(float)));
   G4_CHECK(cudaMalloc(&d_tok_, sizeof(int)));
   G4_CHECK(cudaMalloc(&d_position_, sizeof(int)));
+  G4_CHECK(cudaMalloc(&d_argmax_, sizeof(int)));
   // ones for weightless v-norm
   std::vector<__half> ones(maxhd, __float2half(1.0f));
   G4_CHECK(cudaMalloc(&d_ones_, ones.size() * sizeof(__half)));
@@ -577,13 +578,9 @@ void PlanCudaEngine::forward_one(int token, int position, bool compute_logits,
     G4_CHECK(cudaMemcpyAsync(d_tok_, &token, sizeof(int), cudaMemcpyHostToDevice, stream_));
     G4_CHECK(cudaMemcpyAsync(d_position_, &position, sizeof(int), cudaMemcpyHostToDevice, stream_));
     G4_CHECK(cudaGraphLaunch(decode_graph_exec_, stream_));
-    last_logits_.resize(cfg_.vocab);
-    G4_CHECK(cudaStreamSynchronize(stream_));
-    G4_CHECK(cudaMemcpy(last_logits_.data(), d_logits_, cfg_.vocab * sizeof(float),
-                        cudaMemcpyDeviceToHost));
-    const float cap = cfg_.final_logit_softcapping;
-    if (cap > 0.0f)
-      for (float& v : last_logits_) v = cap * std::tanh(v / cap);
+    // Shared-loop path leaves logits on-device for sample() (greedy argmax / lazy
+    // host copy); other callers get host logits now.
+    if (!defer_host_logits_) publish_host_logits();
     return;
   }
 
@@ -610,6 +607,12 @@ void PlanCudaEngine::forward_one(int token, int position, bool compute_logits,
   }
   if (!compute_logits) return;
   execute_ops(plan_.epilogue.data(), plan_.epilogue.size(), -1, position);
+  if (!defer_host_logits_) publish_host_logits();
+}
+
+// Copy d_logits_ to host (last_logits_) and apply the final logit softcap. Used by
+// the non-greedy sample path and the host-logits callers (forward_logits/inspect).
+void PlanCudaEngine::publish_host_logits() {
   last_logits_.resize(cfg_.vocab);
   G4_CHECK(cudaStreamSynchronize(stream_));
   G4_CHECK(cudaMemcpy(last_logits_.data(), d_logits_, cfg_.vocab * sizeof(float),
@@ -619,11 +622,30 @@ void PlanCudaEngine::forward_one(int token, int position, bool compute_logits,
     for (float& v : last_logits_) v = cap * std::tanh(v / cap);
 }
 
+// Device-argmax greedy fast path (monotonic softcap ⇒ argmax(softcap)==argmax);
+// non-greedy brings logits to host (softcapped) and reuses the shared sampler.
+int PlanCudaEngine::sample(const runtime::DecodeParams& params,
+                           const std::vector<int>& history) {
+  const bool greedy_fast_path = params.temperature <= 0.0f && params.repetition_penalty <= 1.0f &&
+                                params.no_repeat_ngram_size <= 1 && !params.grammar_mask;
+  if (greedy_fast_path) {
+    kernels::launch_argmax_float(static_cast<const float*>(d_logits_), cfg_.vocab, d_argmax_,
+                                 stream_);
+    G4_CHECK(cudaStreamSynchronize(stream_));
+    int next = 0;
+    G4_CHECK(cudaMemcpy(&next, d_argmax_, sizeof(int), cudaMemcpyDeviceToHost));
+    return next;
+  }
+  publish_host_logits();
+  return runtime::SequenceModel::sample(params, history);
+}
+
 
 std::vector<float> PlanCudaEngine::forward_logits(const std::vector<int>& tokens,
                                                     std::vector<float>* per_layer_rms) {
   // Parity/debug entry: fresh sequence from position 0. Drives forward_one; the
   // last token requests the per-layer dump for oracle comparison.
+  defer_host_logits_ = false;  // this entry returns host logits
   for (int pos = 0; pos < static_cast<int>(tokens.size()); ++pos) {
     const bool last = pos == static_cast<int>(tokens.size()) - 1;
     forward_one(tokens[pos], pos, last, last ? per_layer_rms : nullptr);
@@ -759,6 +781,9 @@ std::vector<int> PlanCudaEngine::generate_stream(const std::vector<int>& prompt,
   p.top_p = samp_top_p_;
   p.repetition_penalty = samp_rep_penalty_;
   p.no_repeat_ngram_size = samp_no_repeat_ngram_;
+  // sample() pulls logits off the device lazily (greedy argmax / host copy), so
+  // step() need not copy 262K floats to host every token.
+  defer_host_logits_ = true;
   return runtime::run_decode(*this, prompt, p, on_token, &stats_);
 }
 
@@ -769,6 +794,7 @@ std::vector<int> PlanCudaEngine::generate(const std::vector<int>& prompt, int ma
 
 std::vector<std::pair<int, float>> PlanCudaEngine::inspect_next_logits(
     const std::vector<int>& prompt, int top_k) {
+  defer_host_logits_ = false;  // needs host logits for the top-k sort
   for (int i = 0; i < static_cast<int>(prompt.size()); ++i)
     forward_one(prompt[i], i, i == static_cast<int>(prompt.size()) - 1);
   std::vector<int> idx(last_logits_.size());

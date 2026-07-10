@@ -81,7 +81,13 @@ class PlanCudaEngine : public runtime::SequenceModel {
   void step(int token, int position, bool want_logits) override {
     forward_one(token, position, want_logits);
   }
+  void synchronize() override { cudaStreamSynchronize(stream_); }
   std::vector<float>& logits() override { return last_logits_; }
+  // Device-argmax greedy fast path: for greedy decode the final softcap is
+  // monotonic (argmax(softcap(x)) == argmax(x)), so we argmax d_logits_ on device
+  // and copy back one int — skipping the 262K-vocab D2H + host softcap that
+  // otherwise dominate E2B decode. Non-greedy falls back to the host sampler.
+  int sample(const runtime::DecodeParams& params, const std::vector<int>& history) override;
 
  private:
   struct Config {
@@ -133,6 +139,7 @@ class PlanCudaEngine : public runtime::SequenceModel {
   // hidden to $G4_DUMP_DIR if set) — the oracle parity path.
   void forward_one(int token, int position, bool compute_logits,
                    std::vector<float>* per_layer_rms = nullptr);
+  void publish_host_logits();  // d_logits_ -> last_logits_ (softcapped)
 
   std::vector<float> last_logits_;
   BenchmarkStats stats_;
@@ -192,6 +199,11 @@ class PlanCudaEngine : public runtime::SequenceModel {
   float* d_logits_ = nullptr;    // [vocab]
   int* d_tok_ = nullptr;         // current token id (device); EmbeddingLookup reads it
   int* d_position_ = nullptr;    // current decode position (device); device-pos ops read it
+  int* d_argmax_ = nullptr;      // device-argmax result (greedy fast path)
+  // When true (the shared decode-loop path), forward_one leaves the logits on the
+  // device (d_logits_) instead of copying 262K floats to host + softcapping every
+  // step; sample() then does the device argmax (greedy) or a lazy host copy.
+  bool defer_host_logits_ = false;
   // When true, execute_ops uses the device-position kernel variants (RoPE / KV
   // store / attention read d_position_) so the op sequence is CUDA-graph capturable.
   bool device_pos_mode_ = false;
