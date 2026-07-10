@@ -36,6 +36,8 @@ enum class Slot : std::uint8_t {
   Gate, Up,  // MLP gate/up projections
   Inter,     // MLP intermediate (post GeGLU)
   PleGate,   // per-layer-input gate scratch
+  PleRaw,    // per-layer-input raw embedding (prologue scratch)
+  PleAll,    // all layers' per-layer inputs [num_layers * ple] (prologue output)
   Count
 };
 
@@ -56,7 +58,9 @@ enum class OpKind : std::uint8_t {
   KvStore,      // append K,V slots to this layer's cache at `position`
   Attention,    // single-query attention over the cache (sliding window aware)
   GeluMul,      // out = gelu(a) * b   (GeGLU / PLE gate)
-  AddInplace,   // X += in            (residual)
+  AddInplace,   // out += in           (residual; out defaults to X)
+  EmbeddingLookup,  // out = embed_table[token]  (token from the executor's device buffer)
+  LmHead,       // logits[vocab] (float) = W[vocab×in_dim] · in   (writes the executor's logits)
 };
 
 // One resolved op. Fields are a union-by-convention keyed on `kind`; only the
@@ -89,7 +93,9 @@ struct LayerPlan {
 };
 
 struct ModelPlan {
-  std::vector<LayerPlan> layers;
+  std::vector<Op> prologue;        // token → embeddings (+ scale, PLE build)
+  std::vector<LayerPlan> layers;   // the tower
+  std::vector<Op> epilogue;        // final norm → LM head (logits); softcap is host-side
 };
 
 }  // namespace opplan

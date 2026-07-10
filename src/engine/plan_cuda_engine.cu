@@ -208,6 +208,7 @@ void PlanCudaEngine::allocate_buffers() {
   al(&d_gate_, maxinter); al(&d_up_, maxinter); al(&d_inter_, maxinter);
   al(&d_ple_raw_, ple_tot); al(&d_ple_, ple_tot); al(&d_ple_gate_, cfg_.hidden_size_per_layer_input);
   G4_CHECK(cudaMalloc(&d_logits_, static_cast<std::size_t>(cfg_.vocab) * sizeof(float)));
+  G4_CHECK(cudaMalloc(&d_tok_, sizeof(int)));
   // ones for weightless v-norm
   std::vector<__half> ones(maxhd, __float2half(1.0f));
   G4_CHECK(cudaMalloc(&d_ones_, ones.size() * sizeof(__half)));
@@ -282,28 +283,6 @@ void PlanCudaEngine::open(const std::string& cpi_path, int max_context) {
   G4_CHECK(cudaStreamSynchronize(stream_));
 }
 
-void PlanCudaEngine::build_per_layer_inputs(int token) {
-  const int ple = cfg_.hidden_size_per_layer_input;
-  const int tot = cfg_.num_layers * ple;
-  static int* d_tok = nullptr;
-  if (!d_tok) G4_CHECK(cudaMalloc(&d_tok, sizeof(int)));
-  G4_CHECK(cudaMemcpyAsync(d_tok, &token, sizeof(int), cudaMemcpyHostToDevice, stream_));
-  // ple_raw = embed_tokens_per_layer[token] * sqrt(ple)
-  kernels::launch_embedding_lookup(static_cast<const __half*>(dev_["embed_tokens_per_layer.weight"]),
-                                   d_tok, d_ple_raw_, 1, tot, stream_);
-  kernels::launch_scale_copy(d_ple_raw_, d_ple_raw_, tot, std::sqrt((float)ple), stream_);
-  // ple_proj = rmsnorm( (W_proj · embeds) * hidden^-0.5 )  [d_x_ currently = embeds]
-  kernels::launch_rowmajor_half_gemv_f16(
-      static_cast<const __half*>(dev_["per_layer_model_projection.weight"]), d_x_, d_ple_, tot,
-      cfg_.hidden, stream_);
-  kernels::launch_scale_copy(d_ple_, d_ple_, tot, std::pow((float)cfg_.hidden, -0.5f), stream_);
-  kernels::launch_rmsnorm(d_ple_, static_cast<const __half*>(dev_["per_layer_projection_norm.weight"]),
-                          d_ple_, cfg_.num_layers, ple, cfg_.rms_eps, stream_);
-  // per_layer_inputs = (proj + raw) * 2^-0.5
-  kernels::launch_add_inplace(d_ple_, d_ple_raw_, tot, stream_);
-  kernels::launch_scale_copy(d_ple_, d_ple_, tot, std::pow(2.0f, -0.5f), stream_);
-}
-
 // Resolve the per-layer forward into a data op-plan once at load. This is the
 // exact op sequence the former imperative run_layer emitted, with the per-layer
 // conditionals (shared / keqv / full / PLE) decided here and weights + geometry
@@ -321,8 +300,49 @@ void PlanCudaEngine::build_plan() {
   slot_ptr_[static_cast<int>(Slot::Up)] = d_up_;
   slot_ptr_[static_cast<int>(Slot::Inter)] = d_inter_;
   slot_ptr_[static_cast<int>(Slot::PleGate)] = d_ple_gate_;
+  slot_ptr_[static_cast<int>(Slot::PleRaw)] = d_ple_raw_;
+  slot_ptr_[static_cast<int>(Slot::PleAll)] = d_ple_;
 
   const int H = cfg_.hidden;
+
+  // --- prologue: token -> embeddings (+ scale, and the PLE build when present) ---
+  // Mirrors the former forward_one head + build_per_layer_inputs, as data.
+  {
+    std::vector<Op>& pro = plan_.prologue;
+    auto emb = [&](const char* name, Slot out, int dim) {
+      Op o; o.kind = OpKind::EmbeddingLookup; o.out = out; o.cols = dim;
+      o.weight = static_cast<const __half*>(dev_[name]);
+      pro.push_back(o);
+    };
+    auto sc = [&](Slot s, int len, float scl) {
+      Op o; o.kind = OpKind::ScaleCopy; o.in = s; o.out = s; o.cols = len; o.scale = scl;
+      pro.push_back(o);
+    };
+    emb("embed_tokens.weight", Slot::X, H);
+    sc(Slot::X, H, std::sqrt((float)H));  // embed * sqrt(hidden)
+    if (has_ple()) {
+      const int ple = cfg_.hidden_size_per_layer_input;
+      const int tot = cfg_.num_layers * ple;
+      // ple_raw = embed_tokens_per_layer[token] * sqrt(ple)
+      emb("embed_tokens_per_layer.weight", Slot::PleRaw, tot);
+      sc(Slot::PleRaw, tot, std::sqrt((float)ple));
+      // ple = rmsnorm( (W_proj · x) * hidden^-0.5 )   [x = the scaled embeds in Slot::X]
+      Op g; g.kind = OpKind::Gemv; g.in = Slot::X; g.out = Slot::PleAll;
+      g.weight = static_cast<const __half*>(dev_["per_layer_model_projection.weight"]);
+      g.cols = tot; g.in_dim = cfg_.hidden;
+      pro.push_back(g);
+      sc(Slot::PleAll, tot, std::pow((float)cfg_.hidden, -0.5f));
+      Op n; n.kind = OpKind::RmsNorm; n.in = Slot::PleAll; n.out = Slot::PleAll;
+      n.weight = static_cast<const __half*>(dev_["per_layer_projection_norm.weight"]);
+      n.rows = cfg_.num_layers; n.cols = ple;
+      pro.push_back(n);
+      // per_layer_inputs = (ple + ple_raw) * 2^-0.5
+      Op a; a.kind = OpKind::AddInplace; a.out = Slot::PleAll; a.in = Slot::PleRaw; a.cols = tot;
+      pro.push_back(a);
+      sc(Slot::PleAll, tot, std::pow(2.0f, -0.5f));
+    }
+  }
+
   plan_.layers.assign(cfg_.num_layers, LayerPlan{});
   for (int L = 0; L < cfg_.num_layers; ++L) {
     const std::string p = "layers." + std::to_string(L) + ".";
@@ -356,7 +376,7 @@ void PlanCudaEngine::build_plan() {
       ops.push_back(o);
     };
     auto add_x = [&](Slot src) {
-      Op o; o.kind = OpKind::AddInplace; o.in = src; o.cols = H;
+      Op o; o.kind = OpKind::AddInplace; o.out = Slot::X; o.in = src; o.cols = H;
       ops.push_back(o);
     };
 
@@ -419,17 +439,37 @@ void PlanCudaEngine::build_plan() {
     // --- per-layer scalar ---
     scale(Slot::X, H, layer_scalar_host_[L]);
   }
+
+  // --- epilogue: final norm -> LM head (float logits). Softcap stays host-side. ---
+  {
+    std::vector<Op>& epi = plan_.epilogue;
+    Op n; n.kind = OpKind::RmsNorm; n.in = Slot::X; n.out = Slot::XNorm;
+    n.weight = static_cast<const __half*>(dev_["norm.weight"]); n.rows = 1; n.cols = H;
+    epi.push_back(n);
+    Op h; h.kind = OpKind::LmHead; h.in = Slot::XNorm;
+    h.weight = static_cast<const __half*>(dev_["embed_tokens.weight"]);
+    h.cols = cfg_.vocab; h.in_dim = H;
+    epi.push_back(h);
+  }
 }
 
-// Hot loop: execute layer L's resolved op-plan at `position`. Branch-free over
-// model identity — the only runtime-varying input is `position` (RoPE / KV
-// store / attention window). Mirrors the former imperative run_layer exactly.
-void PlanCudaEngine::run_layer(int layer, int position) {
+// Execute an op list at `position`. Branch-free over model identity — the only
+// runtime-varying inputs are `position` (RoPE / KV store / attention window) and
+// the executor's device token buffer (EmbeddingLookup). `layer` selects the
+// cache for KvStore/Attention; the prologue/epilogue pass -1 (no such ops).
+void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer, int position) {
   using namespace opplan;
-  const LayerPlan& lp = plan_.layers[layer];
   auto S = [&](Slot s) -> __half* { return slot_ptr_[static_cast<int>(s)]; };
-  for (const Op& op : lp.ops) {
+  for (std::size_t idx = 0; idx < n; ++idx) {
+    const Op& op = ops[idx];
     switch (op.kind) {
+      case OpKind::EmbeddingLookup:
+        kernels::launch_embedding_lookup(op.weight, d_tok_, S(op.out), 1, op.cols, stream_);
+        break;
+      case OpKind::LmHead:
+        kernels::launch_rowmajor_half_gemv_f32(op.weight, S(op.in), d_logits_, op.cols, op.in_dim,
+                                               stream_);
+        break;
       case OpKind::RmsNorm:
         kernels::launch_rmsnorm(S(op.in), op.weight ? op.weight : d_ones_, S(op.out), op.rows,
                                 op.cols, cfg_.rms_eps, stream_);
@@ -482,10 +522,16 @@ void PlanCudaEngine::run_layer(int layer, int position) {
         break;
       }
       case OpKind::AddInplace:
-        kernels::launch_add_inplace(S(Slot::X), S(op.in), op.cols, stream_);
+        kernels::launch_add_inplace(S(op.out), S(op.in), op.cols, stream_);
         break;
     }
   }
+}
+
+// Hot loop for one tower layer: execute its resolved op-plan at `position`.
+void PlanCudaEngine::run_layer(int layer, int position) {
+  const std::vector<opplan::Op>& ops = plan_.layers[layer].ops;
+  execute_ops(ops.data(), ops.size(), layer, position);
 }
 
 // Process one token at `position`, reusing the KV cache from earlier positions.
@@ -494,13 +540,9 @@ void PlanCudaEngine::run_layer(int layer, int position) {
 void PlanCudaEngine::forward_one(int token, int position, bool compute_logits,
                                    std::vector<float>* per_layer_rms) {
   const int H = cfg_.hidden;
-  static int* d_tok = nullptr;
-  if (!d_tok) G4_CHECK(cudaMalloc(&d_tok, sizeof(int)));
-  G4_CHECK(cudaMemcpyAsync(d_tok, &token, sizeof(int), cudaMemcpyHostToDevice, stream_));
-  kernels::launch_embedding_lookup(static_cast<const __half*>(dev_["embed_tokens.weight"]), d_tok,
-                                   d_x_, 1, H, stream_);
-  kernels::launch_scale_copy(d_x_, d_x_, H, std::sqrt((float)H), stream_);  // embed * sqrt(hidden)
-  if (has_ple()) build_per_layer_inputs(token);  // uses d_x_ (= embeds) before layers mutate it
+  // Publish the token; the prologue's EmbeddingLookup ops read d_tok_ on-device.
+  G4_CHECK(cudaMemcpyAsync(d_tok_, &token, sizeof(int), cudaMemcpyHostToDevice, stream_));
+  execute_ops(plan_.prologue.data(), plan_.prologue.size(), -1, position);
   for (int L = 0; L < cfg_.num_layers; ++L) {
     run_layer(L, position);
     if (per_layer_rms) {  // oracle parity: capture this layer's output hidden
@@ -520,10 +562,7 @@ void PlanCudaEngine::forward_one(int token, int position, bool compute_logits,
     }
   }
   if (!compute_logits) return;
-  kernels::launch_rmsnorm(d_x_, static_cast<const __half*>(dev_["norm.weight"]), d_x_norm_, 1, H,
-                          cfg_.rms_eps, stream_);
-  kernels::launch_rowmajor_half_gemv_f32(static_cast<const __half*>(dev_["embed_tokens.weight"]),
-                                         d_x_norm_, d_logits_, cfg_.vocab, H, stream_);
+  execute_ops(plan_.epilogue.data(), plan_.epilogue.size(), -1, position);
   last_logits_.resize(cfg_.vocab);
   G4_CHECK(cudaStreamSynchronize(stream_));
   G4_CHECK(cudaMemcpy(last_logits_.data(), d_logits_, cfg_.vocab * sizeof(float),

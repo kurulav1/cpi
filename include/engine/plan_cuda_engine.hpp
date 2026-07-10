@@ -108,8 +108,11 @@ class PlanCudaEngine : public runtime::SequenceModel {
   // shared/keqv/full/PLE decided here, weights + geometry bound); the hot loop
   // then just iterates it. See include/engine/op_plan.hpp.
   void build_plan();
-  void run_layer(int layer, int position);  // executes plan_.layers[layer]
-  void build_per_layer_inputs(int token);
+  // Execute an op list against `position` (RoPE/KV/attention need it). `layer` is
+  // the owning layer for cache-indexed ops (KvStore/Attention); pass -1 for the
+  // prologue/epilogue, which contain none.
+  void execute_ops(const opplan::Op* ops, std::size_t n, int layer, int position);
+  void run_layer(int layer, int position);  // executes plan_.layers[layer].ops
   // Process one token at `position` (reusing the KV cache from prior positions).
   // When compute_logits, fills last_logits_ with softcapped logits. When
   // per_layer_rms != nullptr, appends each layer's output RMS (and dumps the
@@ -173,6 +176,7 @@ class PlanCudaEngine : public runtime::SequenceModel {
   __half* d_ple_ = nullptr;      // [num_layers * ple_dim] per-layer inputs
   __half* d_ple_gate_ = nullptr; // [ple_dim]
   float* d_logits_ = nullptr;    // [vocab]
+  int* d_tok_ = nullptr;         // current token id (device); EmbeddingLookup reads it
 
   // The forward as data (built once in build_plan) + the Slot→device-buffer map
   // the executor dereferences. plan_.layers[L] is layer L's resolved op list.
