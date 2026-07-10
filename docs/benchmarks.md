@@ -193,6 +193,38 @@ runs MoE parity and performance gate checks on every push. Gate thresholds
 are defined in `tools/ci/moe_gate_thresholds.json`. Results are uploaded as
 workflow artifacts and rendered in the job summary.
 
+### Per-kernel perf regression gate
+
+`tools/ci/kernel_perf_gate.py` guards the low-level CUDA kernels independently
+of any model. It runs the microbenchmarks (`int4_gemv_bench`,
+`attention_decode_bench`), parses achieved GB/s for every shape, and compares
+against a committed baseline (`tools/ci/kernel_perf_baseline.json`).
+
+```bash
+python tools/ci/kernel_perf_gate.py --update   # (re)capture the baseline
+python tools/ci/kernel_perf_gate.py            # gate; nonzero exit on regression
+```
+
+- Each shape is measured **best-of-N** (`--repeat`, default 3); the max over
+  runs is the least clock/thermal/contention-perturbed estimate.
+- **Run with the GPU idle** (stop the web server) — a co-resident model adds
+  contention/clock noise that inflates false positives.
+- Per-bench tolerance: `int4_gemv` 12% (rock-stable across independent
+  windows — a real, tight gate, and the load-bearing decode signal),
+  `attention_decode` 50% (a **coarse** gate). The attention microbench has a
+  ~40-45% run-to-run *noise floor* on a consumer WDDM GPU: best-of-N absorbs
+  drift within a capture window but not the GPU-temperature difference between a
+  baseline and a gate run minutes later. So the attention gate catches only
+  gross (2-10x) regressions — a fallback kernel, wrong head_dim path, disabled
+  coarsening; for a tight attention signal, run the microbench standalone on an
+  idle, thermally-steady GPU and read %-of-roofline directly. Override the
+  tolerance for all benches with `--tolerance`.
+
+The refactors that share the sampler and decode loop across engines touch only
+host-side orchestration — the CUDA kernels and the LlamaEngine forward are
+byte-identical — so these kernel numbers are unchanged by construction; the gate
+is what keeps them that way going forward.
+
 ---
 
 ## Latest Results
