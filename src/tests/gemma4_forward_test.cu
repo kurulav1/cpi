@@ -9,7 +9,7 @@
 #include <string>
 #include <vector>
 
-#include "engine/gemma4_cuda_engine.hpp"
+#include "engine/plan_cuda_engine.hpp"
 
 int main(int argc, char** argv) {
   std::string cpi = "artifacts/hub/google__gemma-4-E2B-it/gemma4-e2b.cpi";
@@ -32,7 +32,7 @@ int main(int argc, char** argv) {
   }
 
   try {
-    engine::Gemma4CudaEngine eng;
+    engine::PlanCudaEngine eng;
     std::printf("loading %s ...\n", cpi.c_str());
     eng.open(cpi);
     std::printf("loaded. vocab=%d\n", eng.vocab());

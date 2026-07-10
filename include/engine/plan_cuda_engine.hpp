@@ -1,14 +1,23 @@
-// Gemma 4 (E2B) CUDA inference engine — a dedicated fork (not a LlamaEngine
-// absorb), token-at-a-time, correctness-first. Implements the MatFormer text
-// tower: Per-Layer Embeddings, dual head_dim (256 sliding / 512 full), partial +
-// dual RoPE, weightless V-norm, QK-norm, sandwich norms, KV-cache sharing,
-// per-layer scalar, GeGLU (double-wide on shared layers), final logit softcap.
-// See memory: cpi-gemma4-arch for the full spec + parity oracle.
+// Generic per-layer op-plan CUDA executor. The forward is resolved at load into
+// a data op-plan (include/engine/op_plan.hpp) and the hot loop just executes it —
+// no model-specific control flow. This is the "exotic model" tier: it runs
+// architectures whose per-layer geometry breaks LlamaEngine's uniform-geometry
+// fast path (per-layer head_dim / kv-heads, cross-layer KV sharing, PLE, …).
+//
+// Gemma 4 is currently its sole tenant (MatFormer text tower: Per-Layer
+// Embeddings, dual head_dim 256/512, partial+dual RoPE, weightless V-norm,
+// QK-norm, sandwich norms, KV-cache sharing, per-layer scalar, GeGLU, logit
+// softcap). Adding another exotic model = a new descriptor + plan recipe, not a
+// new engine. The load path still parses the .cpi/Gemma descriptor; that is the
+// model-specific *configuration* (params), which is expected — the goal is no
+// model-specific *code* in the forward, which is now met.
+// See memory: cpi-gemma4-arch for Gemma's full spec + parity oracle.
 #pragma once
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -17,6 +26,7 @@
 
 #include "engine/decode_driver.hpp"
 #include "engine/engine_types.hpp"
+#include "engine/op_plan.hpp"
 
 namespace engine {
 
@@ -24,12 +34,12 @@ struct GenerationConstraints;  // fwd (generation_constraints.hpp)
 
 // Derives from runtime::SequenceModel so generate/generate_stream reuse the
 // shared decode driver (loop + sampler + stops) instead of a bespoke greedy loop.
-class Gemma4CudaEngine : public runtime::SequenceModel {
+class PlanCudaEngine : public runtime::SequenceModel {
  public:
-  Gemma4CudaEngine() = default;
-  ~Gemma4CudaEngine();
-  Gemma4CudaEngine(const Gemma4CudaEngine&) = delete;
-  Gemma4CudaEngine& operator=(const Gemma4CudaEngine&) = delete;
+  PlanCudaEngine() = default;
+  ~PlanCudaEngine();
+  PlanCudaEngine(const PlanCudaEngine&) = delete;
+  PlanCudaEngine& operator=(const PlanCudaEngine&) = delete;
 
   // Load from a .cpi blob produced by tools/convert_gemma4.py (reads the sibling
   // .manifest for config + tensor directory).
@@ -94,7 +104,11 @@ class Gemma4CudaEngine : public runtime::SequenceModel {
   float scalar_value(const std::string& name);             // read a [1] tensor to host
   void build_rope_tables();
   void allocate_buffers();
-  void run_layer(int layer, int position);
+  // Resolve the per-layer forward into a data op-plan once at load (conditionals
+  // shared/keqv/full/PLE decided here, weights + geometry bound); the hot loop
+  // then just iterates it. See include/engine/op_plan.hpp.
+  void build_plan();
+  void run_layer(int layer, int position);  // executes plan_.layers[layer]
   void build_per_layer_inputs(int token);
   // Process one token at `position` (reusing the KV cache from prior positions).
   // When compute_logits, fills last_logits_ with softcapped logits. When
@@ -159,6 +173,11 @@ class Gemma4CudaEngine : public runtime::SequenceModel {
   __half* d_ple_ = nullptr;      // [num_layers * ple_dim] per-layer inputs
   __half* d_ple_gate_ = nullptr; // [ple_dim]
   float* d_logits_ = nullptr;    // [vocab]
+
+  // The forward as data (built once in build_plan) + the Slot→device-buffer map
+  // the executor dereferences. plan_.layers[L] is layer L's resolved op list.
+  opplan::ModelPlan plan_;
+  std::array<__half*, static_cast<std::size_t>(opplan::Slot::Count)> slot_ptr_{};
 };
 
 }  // namespace engine

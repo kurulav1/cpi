@@ -72,4 +72,23 @@ struct ModelProbe {
 
 ModelProbe probe_model(const std::string& model_path);
 
+// The concrete engine to construct for a resolved (model, device) combination.
+// Dispatch resolves this once and switches on it, replacing the former scattered
+// is_X/use_X boolean cascade. CPU-vs-CUDA is a runtime decision captured here, not
+// a model property (see ModelFamilyKind).
+enum class EngineChoice {
+  LlamaCuda,   // default fast path (.ll2c and anything not otherwise classified)
+  LlamaCpu,    // CpuLlamaEngine (force_cpu / no CUDA device / no-CUDA build)
+  PlanCuda,    // generic per-layer op-plan executor (Gemma 4 .cpi today) — CUDA only
+  Qwen35Cuda,
+  Qwen35Cpu,
+  Llama4Cuda,
+  Llama4Cpu,
+};
+
+// Resolves the model family (from a probe) plus the runtime device situation into
+// a single engine choice — the whole dispatch decision in one place. Throws if the
+// model cannot run on the available device (Gemma 4 currently requires CUDA).
+EngineChoice resolve_engine(const ModelProbe& probe, bool cuda_available, bool force_cpu);
+
 }  // namespace app::main_helpers

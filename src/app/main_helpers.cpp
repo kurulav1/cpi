@@ -849,6 +849,24 @@ ModelProbe probe_model(const std::string& model_path) {
   return p;
 }
 
+EngineChoice resolve_engine(const ModelProbe& probe, bool cuda_available, bool force_cpu) {
+  const bool use_gpu = cuda_available && !force_cpu;
+  switch (probe.kind) {
+    case ModelFamilyKind::Gemma4:
+      if (!use_gpu) {
+        throw std::runtime_error("Gemma 4 (.cpi) currently requires a CUDA device");
+      }
+      return EngineChoice::PlanCuda;
+    case ModelFamilyKind::Qwen35:
+      return use_gpu ? EngineChoice::Qwen35Cuda : EngineChoice::Qwen35Cpu;
+    case ModelFamilyKind::Llama4:
+      return use_gpu ? EngineChoice::Llama4Cuda : EngineChoice::Llama4Cpu;
+    case ModelFamilyKind::Llama:
+    default:
+      return use_gpu ? EngineChoice::LlamaCuda : EngineChoice::LlamaCpu;
+  }
+}
+
 std::string guess_chat_template_from_model_path(const std::string& model_path) {
   const std::string name = to_lower_copy(model_path);
   if (name.find("gemma") != std::string::npos || name.find(".cpi") != std::string::npos) {

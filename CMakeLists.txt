@@ -143,7 +143,7 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
     src/engine/llama4_cuda_engine.cu
     src/engine/llama4_cuda_engine_setup.cu
     src/engine/qwen35_cuda_engine.cu
-    src/engine/gemma4_cuda_engine.cu
+    src/engine/plan_cuda_engine.cu
     src/engine/decode_driver.cpp
     src/engine/bert_embedder.cu
   )

@@ -21,7 +21,7 @@
 #include "engine/llama4_cpu_engine.hpp"
 #include "engine/qwen35_cpu_engine.hpp"
 #if LLAMA_ENGINE_HAS_CUDA
-#include "engine/gemma4_cuda_engine.hpp"
+#include "engine/plan_cuda_engine.hpp"
 #include "engine/llama4_cuda_engine.hpp"
 #include "engine/llama_engine.hpp"
 #include "engine/qwen35_cuda_engine.hpp"
@@ -203,51 +203,52 @@ int main(int argc, char** argv) {
 #else
     const int cuda_device_count = 0;
 #endif
-    // Gemma 4 (MatFormer fork): a single .cpi blob from tools/convert_gemma4.py.
-    const bool is_gemma4_model = model_probe.kind == app::main_helpers::ModelFamilyKind::Gemma4;
+    // Resolve the whole dispatch decision — model family (probe) + device
+    // situation — into a single engine choice, replacing the former is_X/use_X
+    // boolean tangle. (Gemma 4 without CUDA throws here, as before.)
 #if LLAMA_ENGINE_HAS_CUDA
-    const bool use_gemma4_cuda_engine = is_gemma4_model && !cli.force_cpu && cuda_device_count > 0;
+    const bool cuda_available = cuda_device_count > 0;
 #else
-    const bool use_gemma4_cuda_engine = false;
+    const bool cuda_available = false;
 #endif
-    if (is_gemma4_model && !use_gemma4_cuda_engine)
-      throw std::runtime_error("Gemma 4 (.cpi) currently requires a CUDA device");
-    const bool is_llama4_model = !is_gemma4_model && is_llama4_safetensors;
-    const bool is_qwen35_model = safetensors_family == "qwen3_5";
-    const bool use_qwen35_cpu_engine = is_qwen35_model && (cli.force_cpu || cuda_device_count == 0);
-    const bool use_llama4_cpu_engine =
-        is_llama4_model && !is_qwen35_model && (cli.force_cpu || cuda_device_count == 0);
-#if LLAMA_ENGINE_HAS_CUDA
-    const bool use_qwen35_cuda_engine = is_qwen35_model && !cli.force_cpu && cuda_device_count > 0;
-    const bool use_llama4_cuda_engine =
-        is_llama4_model && !is_qwen35_model && !cli.force_cpu && cuda_device_count > 0;
-#else
-    const bool use_qwen35_cuda_engine = false;
-    const bool use_llama4_cuda_engine = false;
-#endif
-    const bool use_cpu_engine = use_qwen35_cpu_engine || use_llama4_cpu_engine ||
-                                (!is_llama4_model && (cli.force_cpu || cuda_device_count == 0));
+    const app::main_helpers::EngineChoice engine_choice =
+        app::main_helpers::resolve_engine(model_probe, cuda_available, cli.force_cpu);
+
     if (!quiet_output) {
-      if (use_qwen35_cpu_engine) {
-        std::cout << "[info] Detected a Qwen3.5 safetensors model. Using the Qwen3.5 CPU engine.\n";
-      } else if (use_qwen35_cuda_engine) {
-        std::cout
-            << "[info] Detected a Qwen3.5 safetensors model. Using the Qwen3.5 CUDA engine.\n";
-      } else if (use_llama4_cuda_engine) {
-        std::cout << "[info] Detected a safetensors model. Using the Llama4 CUDA engine.\n";
-      } else if (use_llama4_cpu_engine) {
-        std::cout << "[info] Detected a safetensors model. Using the Llama4 CPU engine.\n";
-      } else if (use_cpu_engine) {
+      using app::main_helpers::EngineChoice;
+      switch (engine_choice) {
+        case EngineChoice::PlanCuda:
+          std::cout << "[info] Detected a Gemma 4 (.cpi) model. Using the generic op-plan CUDA "
+                       "engine.\n";
+          break;
+        case EngineChoice::Qwen35Cuda:
+          std::cout
+              << "[info] Detected a Qwen3.5 safetensors model. Using the Qwen3.5 CUDA engine.\n";
+          break;
+        case EngineChoice::Qwen35Cpu:
+          std::cout << "[info] Detected a Qwen3.5 safetensors model. Using the Qwen3.5 CPU engine.\n";
+          break;
+        case EngineChoice::Llama4Cuda:
+          std::cout << "[info] Detected a safetensors model. Using the Llama4 CUDA engine.\n";
+          break;
+        case EngineChoice::Llama4Cpu:
+          std::cout << "[info] Detected a safetensors model. Using the Llama4 CPU engine.\n";
+          break;
+        case EngineChoice::LlamaCpu:
 #if LLAMA_ENGINE_HAS_CUDA
-        std::cout << "[info] "
-                  << (cli.force_cpu ? "CPU engine forced via --cpu flag." : "No CUDA device found.")
-                  << " Using CPU inference engine.\n";
+          std::cout << "[info] "
+                    << (cli.force_cpu ? "CPU engine forced via --cpu flag."
+                                      : "No CUDA device found.")
+                    << " Using CPU inference engine.\n";
 #else
-        std::cout << "[info] "
-                  << (cli.force_cpu ? "CPU engine forced via --cpu flag."
-                                    : "This binary was built without CUDA support.")
-                  << " Using CPU inference engine.\n";
+          std::cout << "[info] "
+                    << (cli.force_cpu ? "CPU engine forced via --cpu flag."
+                                      : "This binary was built without CUDA support.")
+                    << " Using CPU inference engine.\n";
 #endif
+          break;
+        case EngineChoice::LlamaCuda:
+          break;  // default fast path — no banner
       }
     }
 
@@ -316,35 +317,42 @@ int main(int argc, char** argv) {
           [&]() -> const engine::BenchmarkStats& { return eng.last_benchmark_stats(); });
     };
 
+    using app::main_helpers::EngineChoice;
+    switch (engine_choice) {
 #if LLAMA_ENGINE_HAS_CUDA
-    if (use_gemma4_cuda_engine) {
-      if (!quiet_output)
-        std::cout << "[info] Detected a Gemma 4 (.cpi) model. Using the Gemma4 CUDA engine.\n";
-      engine::Gemma4CudaEngine gemma4_cuda_eng;
-      run_with_engine(gemma4_cuda_eng);
-    } else if (use_qwen35_cuda_engine) {
-      engine::Qwen35CudaEngine qwen35_cuda_eng;
-      run_with_engine(qwen35_cuda_eng);
-    } else if (use_llama4_cuda_engine) {
-      engine::Llama4CudaEngine llama4_cuda_eng;
-      run_with_engine(llama4_cuda_eng);
-    } else if (use_qwen35_cpu_engine) {
-      engine::Qwen35CpuEngine qwen35_cpu_eng;
-      run_with_engine(qwen35_cpu_eng);
-    } else if (use_llama4_cpu_engine) {
-#else
-    if (use_qwen35_cpu_engine) {
-      engine::Qwen35CpuEngine qwen35_cpu_eng;
-      run_with_engine(qwen35_cpu_eng);
-    } else if (use_llama4_cpu_engine) {
+      case EngineChoice::PlanCuda: {
+        engine::PlanCudaEngine plan_eng;
+        run_with_engine(plan_eng);
+        break;
+      }
+      case EngineChoice::Qwen35Cuda: {
+        engine::Qwen35CudaEngine qwen35_cuda_eng;
+        run_with_engine(qwen35_cuda_eng);
+        break;
+      }
+      case EngineChoice::Llama4Cuda: {
+        engine::Llama4CudaEngine llama4_cuda_eng;
+        run_with_engine(llama4_cuda_eng);
+        break;
+      }
 #endif
-      engine::Llama4CpuEngine llama4_cpu_eng;
-      run_with_engine(llama4_cpu_eng);
-    } else if (use_cpu_engine) {
-      engine::CpuLlamaEngine cpu_eng;
-      run_with_engine(cpu_eng);
-    } else {
+      case EngineChoice::Qwen35Cpu: {
+        engine::Qwen35CpuEngine qwen35_cpu_eng;
+        run_with_engine(qwen35_cpu_eng);
+        break;
+      }
+      case EngineChoice::Llama4Cpu: {
+        engine::Llama4CpuEngine llama4_cpu_eng;
+        run_with_engine(llama4_cpu_eng);
+        break;
+      }
+      case EngineChoice::LlamaCpu: {
+        engine::CpuLlamaEngine cpu_eng;
+        run_with_engine(cpu_eng);
+        break;
+      }
 #if LLAMA_ENGINE_HAS_CUDA
+      case EngineChoice::LlamaCuda: {
       if (!cli.draft_model_path.empty()) {
         // Speculative decoding: target (this model) + a small draft model that
         // shares the tokenizer. Initialize the target first so the draft's VRAM
@@ -404,10 +412,14 @@ int main(int argc, char** argv) {
         engine::LlamaEngine gpu_eng;
         run_with_engine(gpu_eng);
       }
-#else
-      throw std::runtime_error(
-          "CUDA inference was requested, but this binary was built without CUDA support");
+        break;
+      }
 #endif
+      default:
+        // Reachable only in a no-CUDA build if a *Cuda choice were resolved, which
+        // resolve_engine never returns without a CUDA device.
+        throw std::runtime_error(
+            "CUDA inference was requested, but this binary was built without CUDA support");
     }
   } catch (const std::exception& e) {
     std::cerr << "Fatal: " << e.what() << "\n";
