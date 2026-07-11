@@ -915,7 +915,7 @@ void launch_split_interleaved_head_halves(const half* src, half* first, half* se
   split_interleaved_head_halves_kernel<<<grid, threads, 0, stream>>>(src, first, second, head_dim);
 }
 
-void launch_qwen35_linear_conv1d_silu(const half* conv_weight, float* conv_state, half* qkv_mix,
+void launch_linear_conv1d_silu(const half* conv_weight, float* conv_state, half* qkv_mix,
                                       int channels, int kernel_size, cudaStream_t stream) {
   constexpr int threads = 256;
   const int blocks = (channels + threads - 1) / threads;
@@ -923,7 +923,7 @@ void launch_qwen35_linear_conv1d_silu(const half* conv_weight, float* conv_state
                                                                    channels, kernel_size);
 }
 
-void launch_qwen35_repeat_linear_heads(const half* qkv_mix, half* q_out, half* k_out, half* v_out,
+void launch_repeat_linear_heads(const half* qkv_mix, half* q_out, half* k_out, half* v_out,
                                        int num_key_heads, int num_value_heads, int key_head_dim,
                                        int value_head_dim, cudaStream_t stream) {
   constexpr int threads = 256;
@@ -935,7 +935,7 @@ void launch_qwen35_repeat_linear_heads(const half* qkv_mix, half* q_out, half* k
       qkv_mix, q_out, k_out, v_out, num_key_heads, head_repeat, key_head_dim, value_head_dim);
 }
 
-void launch_qwen35_linear_attention_step(const half* q, const half* k, const half* v, const half* z,
+void launch_linear_attention_step(const half* q, const half* k, const half* v, const half* z,
                                          const half* a, const half* b, const float* norm_weight,
                                          const float* a_log, const half* dt_bias,
                                          float* recurrent_state, half* out, int num_heads,

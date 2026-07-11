@@ -24,7 +24,6 @@
 #include "engine/plan_cuda_engine.hpp"
 #include "engine/llama4_cuda_engine.hpp"
 #include "engine/llama_engine.hpp"
-#include "engine/qwen35_cuda_engine.hpp"
 #include "engine/speculative_decoder.hpp"
 #endif
 #include "model/tokenizer.hpp"
@@ -320,14 +319,11 @@ int main(int argc, char** argv) {
     using app::main_helpers::EngineChoice;
     switch (engine_choice) {
 #if LLAMA_ENGINE_HAS_CUDA
-      case EngineChoice::PlanCuda: {
+      // Gemma 4 and Qwen3.5 are both just op plans; the executor is the same.
+      case EngineChoice::PlanCuda:
+      case EngineChoice::Qwen35Cuda: {
         engine::PlanCudaEngine plan_eng;
         run_with_engine(plan_eng);
-        break;
-      }
-      case EngineChoice::Qwen35Cuda: {
-        engine::Qwen35CudaEngine qwen35_cuda_eng;
-        run_with_engine(qwen35_cuda_eng);
         break;
       }
       case EngineChoice::Llama4Cuda: {
