@@ -390,6 +390,10 @@ void PlanCudaEngine::build_plan() {
   slot_ptr_[static_cast<int>(Slot::PleGate)] = d_ple_gate_;
   slot_ptr_[static_cast<int>(Slot::PleRaw)] = d_ple_raw_;
   slot_ptr_[static_cast<int>(Slot::PleAll)] = d_ple_;
+  // Linear-attention slots stay null until a plan that emits those ops allocates
+  // them; Gemma never touches them, so its plan is byte-for-byte unchanged.
+  for (int s = static_cast<int>(Slot::QPair); s < static_cast<int>(Slot::Count); ++s)
+    slot_ptr_[s] = nullptr;
 
   const int H = cfg_.hidden;
 
@@ -570,8 +574,14 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
                                                stream_);
         break;
       case OpKind::RmsNorm:
-        kernels::launch_rmsnorm(S(op.in), op.weight ? op.weight : d_ones_, S(op.out), op.rows,
-                                op.cols, cfg_.rms_eps, stream_);
+        // norm_offset ⇒ the weight is applied as (1 + w) (Qwen3.5-style).
+        if (op.norm_offset) {
+          kernels::launch_rmsnorm_offset(S(op.in), op.weight, S(op.out), op.rows, op.cols,
+                                         cfg_.rms_eps, stream_);
+        } else {
+          kernels::launch_rmsnorm(S(op.in), op.weight ? op.weight : d_ones_, S(op.out), op.rows,
+                                  op.cols, cfg_.rms_eps, stream_);
+        }
         break;
       case OpKind::Gemv:
         // Weight encoding was chosen at load; the op just carries it.
@@ -589,7 +599,14 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
       case OpKind::Rope: {
         const float* cosT = op.rope_table == RopeTable::Full ? d_cos_full_ : d_cos_sliding_;
         const float* sinT = op.rope_table == RopeTable::Full ? d_sin_full_ : d_sin_sliding_;
-        if (device_pos_mode_) {
+        if (op.rotary_dim > 0) {
+          // Partial RoPE over Q (in) and K (in2) together. No device-position
+          // variant exists, so a plan using it runs without the decode graph
+          // (capability tiering: the plan decides, not the model name).
+          kernels::launch_rope_inplace_partial_table(S(op.in), S(op.in2), op.heads, op.kv_heads,
+                                                     op.head_dim, op.rotary_dim, position, cosT,
+                                                     sinT, stream_);
+        } else if (device_pos_mode_) {
           // Single-tensor RoPE via the device-position kernel (k-branch guarded off
           // by num_heads_k=0). Graph-capturable: position read from d_position_.
           kernels::launch_rope_inplace_device_pos(S(op.in), nullptr, op.heads, 0, op.head_dim,
@@ -653,8 +670,45 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
       case OpKind::AddInplace:
         kernels::launch_add_inplace(S(op.out), S(op.in), op.cols, stream_);
         break;
+
+      // ── gated / linear-attention ("delta-net") extensions ──
+      case OpKind::SiluMul: {
+        const __half* b = op.aux_ptr ? op.aux_ptr : S(op.in2);
+        kernels::launch_silu_mul(S(op.in), b, S(op.out), op.cols, stream_);
+        break;
+      }
+      case OpKind::SplitHeadHalves:
+        kernels::launch_split_interleaved_head_halves(S(op.in), S(op.out), S(op.out2), op.heads,
+                                                      op.head_dim, stream_);
+        break;
+      case OpKind::SigmoidGate:
+        kernels::launch_apply_sigmoid_gate_inplace(S(op.out), S(op.in2), op.cols, stream_);
+        break;
+      case OpKind::LinearConv1d:
+        kernels::launch_qwen35_linear_conv1d_silu(op.weight, lin_conv_state(layer), S(op.in),
+                                                  op.cols, op.conv_kernel, stream_);
+        break;
+      case OpKind::RepeatLinearHeads:
+        kernels::launch_qwen35_repeat_linear_heads(S(op.in), S(Slot::LinQ), S(Slot::LinK),
+                                                   S(Slot::LinV), op.num_k_heads, op.num_v_heads,
+                                                   op.key_head_dim, op.value_head_dim, stream_);
+        break;
+      case OpKind::LinearAttentionStep:
+        kernels::launch_qwen35_linear_attention_step(
+            S(Slot::LinQ), S(Slot::LinK), S(Slot::LinV), S(Slot::LinZ), S(Slot::LinA),
+            S(Slot::LinB), op.auxf_a, op.auxf_b, op.aux_ptr, lin_recurrent_state(layer),
+            S(Slot::LinAtt), op.num_v_heads, op.key_head_dim, op.value_head_dim, op.eps, stream_);
+        break;
     }
   }
+}
+
+float* PlanCudaEngine::lin_conv_state(int layer) {
+  return d_lin_conv_state_ + static_cast<std::size_t>(layer) * lin_conv_state_stride_;
+}
+
+float* PlanCudaEngine::lin_recurrent_state(int layer) {
+  return d_lin_recurrent_state_ + static_cast<std::size_t>(layer) * lin_recurrent_state_stride_;
 }
 
 // Hot loop for one tower layer: execute its resolved op-plan at `position`.

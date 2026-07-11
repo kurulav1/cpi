@@ -34,10 +34,18 @@ enum class Slot : std::uint8_t {
   Att,       // attention output (pre o_proj)
   Tmp,       // block output staged before the residual add
   Gate, Up,  // MLP gate/up projections
-  Inter,     // MLP intermediate (post GeGLU)
+  Inter,     // MLP intermediate (post GeGLU / SwiGLU)
   PleGate,   // per-layer-input gate scratch
   PleRaw,    // per-layer-input raw embedding (prologue scratch)
   PleAll,    // all layers' per-layer inputs [num_layers * ple] (prologue output)
+  // Gated-attention / linear-attention (delta-net) working set. Models that don't
+  // use these simply never emit ops touching them.
+  QPair,     // fused q|gate projection, before it is split into Q and QGate
+  QGate,     // sigmoid gate applied to the attention output
+  LinMix,    // fused linear-attention qkv mixture (post conv1d+silu)
+  LinZ, LinA, LinB,      // delta-net gate / A / B projections
+  LinQ, LinK, LinV,      // delta-net q/k/v after head expansion
+  LinAtt,    // delta-net output (pre out-projection)
   Count
 };
 
@@ -61,6 +69,18 @@ enum class OpKind : std::uint8_t {
   AddInplace,   // out += in           (residual; out defaults to X)
   EmbeddingLookup,  // out = embed_table[token]  (token from the executor's device buffer)
   LmHead,       // logits[vocab] (float) = W[vocab×in_dim] · in   (writes the executor's logits)
+
+  // ── extensions for gated / linear-attention ("delta-net") architectures ──
+  // These are general OPS, not a model: any architecture that needs them declares
+  // them in its plan. The kernels already exist in the shared kernel library.
+  SiluMul,          // out = silu(a) * b   (SwiGLU; the SiLU sibling of GeluMul)
+  SplitHeadHalves,  // fused q|gate -> out (Q) + out2 (QGate), interleaved per head
+  SigmoidGate,      // in-place: out *= sigmoid(aux slot)   (gated attention output)
+  LinearConv1d,     // short causal depthwise conv + SiLU over the fused qkv mixture;
+                    // reads/writes this layer's rolling CONV STATE
+  RepeatLinearHeads,// expand the fused mixture into per-head q/k/v (GQA-style repeat)
+  LinearAttentionStep,  // gated delta-net recurrence; reads/writes this layer's
+                        // RECURRENT STATE. The linear-attention analogue of Attention.
 };
 
 // One resolved op. Fields are a union-by-convention keyed on `kind`; only the
@@ -91,6 +111,22 @@ struct Op {
   bool full_attention = false; // Attention: full (no window) vs sliding
   int sliding_window = 0;      // Attention: window size (0 = unbounded)
   float scale = 1.0f;          // ScaleCopy multiplier (SqrtHeadDim/layer scalar folded in)
+
+  // ── extension fields (gated / linear-attention) ──
+  Slot out2 = Slot::X;         // SplitHeadHalves' second output (the gate half)
+  bool norm_offset = false;    // RmsNorm uses (1 + weight) instead of weight
+  int rotary_dim = 0;          // Rope: >0 rotates only the first rotary_dim of each
+                               // head (partial RoPE) and pairs Q (in) with K (in2)
+  // Delta-net geometry + its extra weights. The recurrence needs a float RMS-norm
+  // weight, a float A_log, and an fp16 dt_bias alongside the usual projections.
+  int num_k_heads = 0;
+  int num_v_heads = 0;
+  int key_head_dim = 0;
+  int value_head_dim = 0;
+  int conv_kernel = 0;         // LinearConv1d: causal kernel width
+  float eps = 1e-6f;           // RmsNorm / LinearAttentionStep epsilon
+  const float* auxf_a = nullptr;  // delta-net RMS-norm weight (float)
+  const float* auxf_b = nullptr;  // delta-net A_log (float)
 };
 
 // The forward as data: one op list per layer (conditionals already resolved —

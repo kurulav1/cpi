@@ -135,6 +135,8 @@ class PlanCudaEngine : public runtime::SequenceModel {
   // prologue/epilogue, which contain none.
   void execute_ops(const opplan::Op* ops, std::size_t n, int layer, int position);
   void run_layer(int layer, int position);  // executes plan_.layers[layer].ops
+  float* lin_conv_state(int layer);         // this layer's rolling causal-conv window
+  float* lin_recurrent_state(int layer);    // this layer's delta-net recurrent state
   // Capture the single-token forward (device-position ops) into a CUDA graph once,
   // for reuse across every logits step. See forward_one.
   void capture_decode_graph();
@@ -197,6 +199,14 @@ class PlanCudaEngine : public runtime::SequenceModel {
   // per-layer K/V caches: caches_k_[L] is [max_ctx, kv_dim(L)]
   std::vector<__half*> caches_k_;
   std::vector<__half*> caches_v_;
+
+  // Per-layer state for linear-attention ("delta-net") layers: a rolling causal
+  // conv window and the recurrent state. The analogue of the KV cache for that op
+  // family — allocated only when the plan actually emits those ops.
+  float* d_lin_conv_state_ = nullptr;
+  float* d_lin_recurrent_state_ = nullptr;
+  int lin_conv_state_stride_ = 0;
+  int lin_recurrent_state_stride_ = 0;
 
   // scratch
   __half* d_x_ = nullptr;        // [hidden] — also holds the residual (adds are in-place)
