@@ -7,7 +7,7 @@ import { spawn, execFileSync } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { randomUUID } from "node:crypto";
 
-import { getRuntimeConfig, publicRuntimeSummary, setPreferredModelDir, reasoningCapability } from "./config.mjs";
+import { getRuntimeConfig, publicRuntimeSummary, setPreferredModelDir } from "./config.mjs";
 import { createBatchWorker, toBatchArgs } from "./batch_worker.mjs";
 import {
   buildInternalBodyFromChatRequest,
@@ -835,10 +835,13 @@ function buildCliArgs(config, body) {
     : isTruthyFlag(body.autoMaxTokens);
   const longFormMode = isTruthyFlag(body.longFormMode);
   // Reasoning ("thinking") mode: the model emits a reasoning block before its
-  // answer, which the stream splitter separates out. Driven by the template's
-  // declared capability (config.mjs reasoningCapability) — "always" reasons
-  // unconditionally, "optional" honours the request flag, "none" never reasons.
-  const reasoningCap = reasoningCapability(requestTemplate);
+  // answer, which the stream splitter separates out. Driven by the descriptor the
+  // MODEL ships (profile.reasoning, read from its manifest / cpi.json sidecar) —
+  // "always" reasons unconditionally, "optional" honours the request flag, "none"
+  // never reasons. Reasoning is a property of the model, not of the template.
+  const reasoningCap = selectedProfile?.reasoning ?? {
+    mode: "none", enable: "", open: "", close: "", markers: []
+  };
   const thinking =
     reasoningCap.mode === "always" ||
     (reasoningCap.mode === "optional" && isTruthyFlag(body.thinking));

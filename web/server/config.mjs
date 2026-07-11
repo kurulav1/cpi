@@ -1242,42 +1242,56 @@ function discoverSafetensorsModelDirs(scanRoots) {
   );
 }
 
-// Single source of truth for a model's reasoning ("thinking") capability, keyed
-// by chat template. One generic descriptor the core interprets — the request
-// gate, prompt enable-injection, stream splitter, and UI toggle all read it, so
-// adding a reasoning model is one data entry here (no per-model code anywhere).
+// A model's reasoning ("thinking") capability is a DESCRIPTOR THAT SHIPS WITH THE
+// MODEL — the core holds no per-model knowledge and never names a model. It is read
+// from, in order:
+//   1. a .cpi model's sibling .manifest, line:  CFGJSON reasoning {…}
+//   2. a `cpi.json` sidecar in the model's directory:  { "reasoning": {…} }
+// Absent ⇒ the model does not reason. Supporting a new reasoning model = shipping
+// its descriptor next to it; no core edit, no redeploy.
+//
 // Every model difference we've hit is a FIELD, not a branch:
 //   mode:    "none" | "optional" (user toggles) | "always" (model always reasons)
-//   enable:  prompt text injected when thinking is on (e.g. Gemma's system turn);
-//            "" for models primed by their own chat template (Qwen/R1).
-//   open:    reasoning-open marker in the OUTPUT; "" means the block is primed by
-//            the prompt so the stream starts already inside reasoning (Qwen/R1).
+//   enable:  prompt text injected when thinking is on (e.g. Gemma's <|think|> system
+//            turn); "" for models primed by their own chat template (Qwen/R1).
+//   open:    reasoning-open marker in the OUTPUT; "" means the block is primed by the
+//            prompt so the stream starts already inside reasoning (Qwen/R1).
 //   close:   reasoning-close marker in the output.
 //   markers: delimiter strings the worker must PRESERVE through detokenization
-//            (Gemma's <|channel> tokens are `special` and get dropped by default;
-//            Qwen's </think> is non-special text and survives, so this is []).
-// (L1: this table lives in-core; L2 target = ship the descriptor in each model's
-// manifest so the core carries zero model knowledge.)
-export function reasoningCapability(template) {
-  switch (template) {
-    case "deepseek-r1":
-      return { mode: "always", enable: "", open: "", close: "</think>", markers: [] };
-    case "qwen3_5":
-    case "qwen3":
-      return { mode: "optional", enable: "", open: "", close: "</think>", markers: [] };
-    case "gemma":
-      // Gemma 4: enable via a system turn; the model wraps reasoning in the special
-      // tokens <|channel> … <channel|> (verified empirically on E2B + per Google's
-      // docs for 12B+), which decode drops unless preserved.
-      return {
-        mode: "optional",
-        enable: "<|turn>system\n<|think|><turn|>\n",
-        open: "<|channel>",
-        close: "<channel|>",
-        markers: ["<|channel>", "<channel|>"]
-      };
-    default:
-      return { mode: "none", enable: "", open: "", close: "</think>", markers: [] };
+//            (Gemma's <|channel> tokens are `special` and dropped by default; Qwen's
+//            </think> is non-special text and survives, so it needs none).
+const NO_REASONING = { mode: "none", enable: "", open: "", close: "", markers: [] };
+
+function normalizeReasoning(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const mode = raw.mode === "always" || raw.mode === "optional" ? raw.mode : "none";
+  if (mode === "none") return { ...NO_REASONING };
+  return {
+    mode,
+    enable: typeof raw.enable === "string" ? raw.enable : "",
+    open: typeof raw.open === "string" ? raw.open : "",
+    close: typeof raw.close === "string" ? raw.close : "</think>",
+    markers: Array.isArray(raw.markers) ? raw.markers.filter((s) => typeof s === "string") : []
+  };
+}
+
+export function readModelReasoning(modelPath) {
+  if (!modelPath) return { ...NO_REASONING };
+  if (path.extname(modelPath).toLowerCase() === ".cpi") {
+    try {
+      const manifestPath = modelPath.slice(0, -path.extname(modelPath).length) + ".manifest";
+      const m = fs.readFileSync(manifestPath, "utf8").match(/^CFGJSON\s+reasoning\s+(.+)$/m);
+      if (m) return normalizeReasoning(JSON.parse(m[1])) ?? { ...NO_REASONING };
+    } catch { /* no manifest / unparseable → fall through */ }
+    return { ...NO_REASONING };
+  }
+  try {
+    const isDir = fs.existsSync(modelPath) && fs.statSync(modelPath).isDirectory();
+    const sidecar = path.join(isDir ? modelPath : path.dirname(modelPath), "cpi.json");
+    const parsed = JSON.parse(fs.readFileSync(sidecar, "utf8"));
+    return normalizeReasoning(parsed?.reasoning) ?? { ...NO_REASONING };
+  } catch {
+    return { ...NO_REASONING };
   }
 }
 
@@ -1365,7 +1379,7 @@ function buildProfile(modelPath, tokenizerPath, baseConfig, source = "discovered
     tokenizerPath,
     tokenizerFormat,
     template,
-    reasoning: reasoningCapability(template),
+    reasoning: readModelReasoning(modelPath),
     tokenizerChatTemplatePath: hfTokenizerConfig?.path || "",
     tokenizerUsesDefaultSystemPrompt:
       hfTokenizerConfig?.useDefaultSystemPrompt,

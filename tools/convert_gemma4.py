@@ -219,6 +219,19 @@ def main():
                 f.write(f"CFGJSON {k} {json.dumps(v)}\n")
             else:
                 f.write(f"CFG {k} {v}\n")
+        # Reasoning ("thinking") descriptor — SHIPS WITH THE MODEL so the runtime
+        # carries no per-model knowledge (it just reads this). Gemma 4 enables
+        # thinking with a <|think|> system turn and delimits the reasoning block in
+        # its output with the special tokens <|channel> … <channel|>, which the
+        # detokenizer must preserve (hence `markers`). The engine's manifest parser
+        # ignores unknown CFGJSON keys, so this is inert for inference.
+        f.write("CFGJSON reasoning " + json.dumps({
+            "mode": "optional",
+            "enable": "<|turn>system\n<|think|><turn|>\n",
+            "open": "<|channel>",
+            "close": "<channel|>",
+            "markers": ["<|channel>", "<channel|>"],
+        }) + "\n")
         for name, meta in out_hdr.items():
             if name == "__metadata__":
                 continue
