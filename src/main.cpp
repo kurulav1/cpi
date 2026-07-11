@@ -24,7 +24,6 @@
 #include "engine/plan_cuda_engine.hpp"
 #include "engine/llama4_cuda_engine.hpp"
 #include "engine/llama_engine.hpp"
-#include "engine/qwen35_cuda_engine.hpp"
 #include "engine/speculative_decoder.hpp"
 #endif
 #include "model/tokenizer.hpp"
@@ -320,22 +319,11 @@ int main(int argc, char** argv) {
     using app::main_helpers::EngineChoice;
     switch (engine_choice) {
 #if LLAMA_ENGINE_HAS_CUDA
-      case EngineChoice::PlanCuda: {
+      // Gemma 4 and Qwen3.5 are both just op plans; the executor is the same.
+      case EngineChoice::PlanCuda:
+      case EngineChoice::Qwen35Cuda: {
         engine::PlanCudaEngine plan_eng;
         run_with_engine(plan_eng);
-        break;
-      }
-      case EngineChoice::Qwen35Cuda: {
-        // Qwen3.5 now runs on the generic op-plan executor (verified byte-identical
-        // to the old fork engine, same throughput). LLAMA_INFER_QWEN35_FORK=1 is a
-        // temporary escape hatch back to the fork; it goes away with the fork.
-        if (std::getenv("LLAMA_INFER_QWEN35_FORK")) {
-          engine::Qwen35CudaEngine qwen35_cuda_eng;
-          run_with_engine(qwen35_cuda_eng);
-          break;
-        }
-        engine::PlanCudaEngine qwen35_plan_eng;
-        run_with_engine(qwen35_plan_eng);
         break;
       }
       case EngineChoice::Llama4Cuda: {

@@ -401,14 +401,14 @@ void launch_split_interleaved_head_halves(const half* src, half* first, half* se
                                           int head_dim, cudaStream_t stream);
 
 // Qwen3.5 linear-attention helpers.
-void launch_qwen35_linear_conv1d_silu(const half* conv_weight, float* conv_state, half* qkv_mix,
+void launch_linear_conv1d_silu(const half* conv_weight, float* conv_state, half* qkv_mix,
                                       int channels, int kernel_size, cudaStream_t stream);
 
-void launch_qwen35_repeat_linear_heads(const half* qkv_mix, half* q_out, half* k_out, half* v_out,
+void launch_repeat_linear_heads(const half* qkv_mix, half* q_out, half* k_out, half* v_out,
                                        int num_key_heads, int num_value_heads, int key_head_dim,
                                        int value_head_dim, cudaStream_t stream);
 
-void launch_qwen35_linear_attention_step(const half* q, const half* k, const half* v, const half* z,
+void launch_linear_attention_step(const half* q, const half* k, const half* v, const half* z,
                                          const half* a, const half* b, const float* norm_weight,
                                          const float* a_log, const half* dt_bias,
                                          float* recurrent_state, half* out, int num_heads,

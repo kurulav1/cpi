@@ -931,16 +931,16 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
         kernels::launch_apply_sigmoid_gate_inplace(S(op.out), S(op.in2), op.cols, stream_);
         break;
       case OpKind::LinearConv1d:
-        kernels::launch_qwen35_linear_conv1d_silu(op.weight, lin_conv_state(layer), S(op.in),
+        kernels::launch_linear_conv1d_silu(op.weight, lin_conv_state(layer), S(op.in),
                                                   op.cols, op.conv_kernel, stream_);
         break;
       case OpKind::RepeatLinearHeads:
-        kernels::launch_qwen35_repeat_linear_heads(S(op.in), S(Slot::LinQ), S(Slot::LinK),
+        kernels::launch_repeat_linear_heads(S(op.in), S(Slot::LinQ), S(Slot::LinK),
                                                    S(Slot::LinV), op.num_k_heads, op.num_v_heads,
                                                    op.key_head_dim, op.value_head_dim, stream_);
         break;
       case OpKind::LinearAttentionStep:
-        kernels::launch_qwen35_linear_attention_step(
+        kernels::launch_linear_attention_step(
             S(Slot::LinQ), S(Slot::LinK), S(Slot::LinV), S(Slot::LinZ), S(Slot::LinA),
             S(Slot::LinB), op.auxf_a, op.auxf_b, op.aux_ptr, lin_recurrent_state(layer),
             S(Slot::LinAtt), op.num_v_heads, op.key_head_dim, op.value_head_dim, op.eps, stream_);
