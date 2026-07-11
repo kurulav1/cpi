@@ -4,6 +4,7 @@
 // weight-only matvec, projection GEMV, and argmax helpers.
 
 #include <cuda_fp16.h>
+#include <math_constants.h>  // CUDART_INF_F (device top-k reductions)
 #include <sm_61_intrinsics.h>
 
 #include <cstddef>
@@ -970,6 +971,130 @@ void launch_rowmajor_half_gemv_f32(const half* w, const half* x, float* y, int o
 void launch_argmax_float(const float* logits, int n, int* out_index, cudaStream_t stream) {
   constexpr int threads = 256;
   argmax_float_kernel<<<1, threads, 0, stream>>>(logits, n, out_index);
+}
+
+// ── device top-k candidate selection (sampled decode) ────────────────────────
+namespace {
+
+constexpr int kTopkChunk = 2048;    // elements per partition block (8 KB shared)
+constexpr int kTopkThreads = 256;
+
+// Block-wide argmax over a shared buffer; returns {value,index} on thread 0 and
+// masks the winner so the next iteration finds the next-largest.
+template <int THREADS>
+__device__ __forceinline__ void block_argmax_mask(float* s, int len, float* red_v, int* red_i,
+                                                  float* out_v, int* out_i) {
+  float bv = -CUDART_INF_F;
+  int bi = -1;
+  for (int i = threadIdx.x; i < len; i += THREADS) {
+    const float v = s[i];
+    if (v > bv) { bv = v; bi = i; }
+  }
+  for (int off = 16; off > 0; off >>= 1) {
+    const float ov = __shfl_down_sync(0xffffffffu, bv, off);
+    const int oi = __shfl_down_sync(0xffffffffu, bi, off);
+    if (ov > bv) { bv = ov; bi = oi; }
+  }
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  if (lane == 0) { red_v[warp] = bv; red_i[warp] = bi; }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float mv = -CUDART_INF_F;
+    int mi = -1;
+    for (int w = 0; w < THREADS / 32; ++w) {
+      if (red_v[w] > mv) { mv = red_v[w]; mi = red_i[w]; }
+    }
+    *out_v = mv;
+    *out_i = mi;
+    if (mi >= 0) s[mi] = -CUDART_INF_F;  // mask for the next iteration
+  }
+  __syncthreads();
+}
+
+// Phase 1: each block takes the top-k of its own chunk (kept in shared memory).
+__global__ void topk_partial_kernel(const float* __restrict__ logits, int n, int k,
+                                    float* __restrict__ part_val, int* __restrict__ part_idx) {
+  __shared__ float s[kTopkChunk];
+  __shared__ float red_v[kTopkThreads / 32];
+  __shared__ int red_i[kTopkThreads / 32];
+  __shared__ float win_v;
+  __shared__ int win_i;
+
+  const int base = blockIdx.x * kTopkChunk;
+  for (int i = threadIdx.x; i < kTopkChunk; i += kTopkThreads) {
+    const int g = base + i;
+    s[i] = (g < n) ? logits[g] : -CUDART_INF_F;
+  }
+  __syncthreads();
+
+  for (int t = 0; t < k; ++t) {
+    block_argmax_mask<kTopkThreads>(s, kTopkChunk, red_v, red_i, &win_v, &win_i);
+    if (threadIdx.x == 0) {
+      const int slot = blockIdx.x * k + t;
+      part_val[slot] = win_v;
+      part_idx[slot] = (win_i >= 0) ? (base + win_i) : -1;
+    }
+    __syncthreads();
+  }
+}
+
+// Phase 2: one block merges the per-block partials into the final top-k.
+__global__ void topk_merge_kernel(float* __restrict__ part_val, const int* __restrict__ part_idx,
+                                  int m, int k, float* __restrict__ out_val,
+                                  int* __restrict__ out_idx) {
+  __shared__ float red_v[kTopkThreads / 32];
+  __shared__ int red_i[kTopkThreads / 32];
+  __shared__ float win_v;
+  __shared__ int win_i;
+  for (int t = 0; t < k; ++t) {
+    // Same reduction, but masking the (global) partial buffer rather than shared.
+    block_argmax_mask<kTopkThreads>(part_val, m, red_v, red_i, &win_v, &win_i);
+    if (threadIdx.x == 0) {
+      out_val[t] = win_v;
+      out_idx[t] = (win_i >= 0) ? part_idx[win_i] : -1;
+    }
+    __syncthreads();
+  }
+}
+
+// Gathers every finite logit >= *threshold. Reproduces the host sampler's
+// candidate set exactly, ties at the k-th value included.
+__global__ void gather_ge_threshold_kernel(const float* __restrict__ logits, int n,
+                                           const float* __restrict__ threshold,
+                                           int* __restrict__ out_idx, float* __restrict__ out_val,
+                                           int* __restrict__ out_count, int capacity) {
+  const float thr = *threshold;
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+    const float v = logits[i];
+    if (!isfinite(v) || v < thr) continue;
+    const int slot = atomicAdd(out_count, 1);
+    if (slot < capacity) {
+      out_idx[slot] = i;
+      out_val[slot] = v;
+    }
+  }
+}
+
+}  // namespace
+
+int topk_partition_count(int n) { return (n + kTopkChunk - 1) / kTopkChunk; }
+
+void launch_topk_float(const float* logits, int n, int k, float* part_val, int* part_idx,
+                       float* out_val, int* out_idx, cudaStream_t stream) {
+  const int blocks = topk_partition_count(n);
+  topk_partial_kernel<<<blocks, kTopkThreads, 0, stream>>>(logits, n, k, part_val, part_idx);
+  topk_merge_kernel<<<1, kTopkThreads, 0, stream>>>(part_val, part_idx, blocks * k, k, out_val,
+                                                    out_idx);
+}
+
+void launch_gather_ge_threshold(const float* logits, int n, const float* threshold, int* out_idx,
+                                float* out_val, int* out_count, int capacity,
+                                cudaStream_t stream) {
+  constexpr int threads = 256;
+  const int blocks = min(1024, (n + threads - 1) / threads);
+  gather_ge_threshold_kernel<<<blocks, threads, 0, stream>>>(logits, n, threshold, out_idx, out_val,
+                                                             out_count, capacity);
 }
 
 void launch_convert_bf16_to_fp16(const std::uint16_t* src, half* dst, int n, cudaStream_t stream) {

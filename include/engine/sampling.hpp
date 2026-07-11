@@ -25,5 +25,20 @@ bool dispatch_has_degenerate_tail(const std::vector<int>& ids, std::size_t promp
 // Reseeds the shared sampling RNG for reproducible temperature>0 sampling.
 void dispatch_seed_sampler_rng(unsigned seed);
 
+// One candidate token: its id and (in turn) its logit, then its probability.
+struct SampleCandidate {
+  int id;
+  float value;
+};
+
+// Draws a token from an already-selected candidate set (temperature scaling →
+// softmax → top-p truncation → RNG draw). This is the second half of the top-k
+// sampler, factored out so a device-side top-k path can reuse the EXACT same math
+// and RNG: given the same candidates it returns the same token, so a seeded run is
+// byte-identical whether the candidates were selected on host or on GPU.
+// `cand` is modified in place; values are clamped to [-80, 80] internally.
+int dispatch_sample_from_candidates(std::vector<SampleCandidate>& cand, float temperature,
+                                    float top_p);
+
 }  // namespace detail
 }  // namespace engine

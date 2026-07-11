@@ -721,6 +721,30 @@ void launch_rowmajor_half_gemv_f32(const half* w, const half* x, float* y, int o
 // warp 0) within a single block of 256 threads.
 void launch_argmax_float(const float* logits, int n, int* out_index, cudaStream_t stream);
 
+// launch_topk_float / launch_gather_ge_threshold
+//
+// Device-side top-k candidate selection for sampled decode. Together these let a
+// large-vocab model sample without copying the whole logit vector to the host:
+// the host only ever sees the ~k candidates.
+//
+// launch_topk_float: writes the k largest values (descending) and their indices.
+//   part_val/part_idx - scratch, must hold topk_partition_count(n) * k entries
+//   out_val/out_idx   - device [k]; out_val[k-1] is the k-th largest ("kth")
+// Two phases: each block takes the top-k of its chunk in shared memory, then one
+// block merges the partials. Cost is a few passes over the logits, not a sort.
+//
+// launch_gather_ge_threshold: appends every finite logit >= *threshold to
+// out_idx/out_val and writes the count to out_count (capped at `capacity`).
+// Taking the threshold from out_val[k-1] reproduces the host sampler exactly,
+// INCLUDING ties at the k-th value (which can yield more than k candidates).
+// out_count must be zeroed before launch. If the count exceeds capacity the
+// caller should fall back to the host path.
+int topk_partition_count(int n);
+void launch_topk_float(const float* logits, int n, int k, float* part_val, int* part_idx,
+                       float* out_val, int* out_idx, cudaStream_t stream);
+void launch_gather_ge_threshold(const float* logits, int n, const float* threshold, int* out_idx,
+                                float* out_val, int* out_count, int capacity, cudaStream_t stream);
+
 // launch_convert_bf16_to_fp16
 //
 // Converts raw BF16 bit patterns to fp16:

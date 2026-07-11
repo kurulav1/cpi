@@ -28,36 +28,22 @@ std::mt19937& sampler_rng() {
 // sort to an O(top_k log top_k) one. The resulting distribution is identical to
 // the full path: top_k keeps exactly the entries >= the k-th largest logit
 // (ties included), and the nucleus for top_p is always a subset of that set.
-int sample_from_logits_topk(const std::vector<float>& logits, float temperature, int top_k,
-                            float top_p) {
-  struct Candidate {
-    int id;
-    float value;  // logit, then reused as probability
-  };
-
-  // Threshold = the k-th largest logit. nth_element is O(vocab) (no full sort).
-  std::vector<float> partitioned(logits);
-  std::nth_element(partitioned.begin(), partitioned.begin() + (top_k - 1), partitioned.end(),
-                   std::greater<float>());
-  const float kth = partitioned[static_cast<std::size_t>(top_k - 1)];
-
-  // Gather the finite candidates at or above the threshold, applying the same
-  // [-80, 80] clamp the full path uses to keep exp() well-behaved.
-  std::vector<Candidate> cand;
-  cand.reserve(static_cast<std::size_t>(top_k) + 8);
-  for (std::size_t i = 0; i < logits.size(); ++i) {
-    float v = logits[i];
-    if (!std::isfinite(v) || v < kth) {
-      continue;
-    }
-    if (v > 80.0f)
-      v = 80.0f;
-    else if (v < -80.0f)
-      v = -80.0f;
-    cand.push_back({static_cast<int>(i), v});
-  }
+// Draws a token from an already-selected candidate set. Factored out of the top-k
+// sampler so the device-side top-k path can reuse the identical math + RNG: given
+// the same candidates it returns the same token (see sampling.hpp).
+int sample_from_candidates(std::vector<engine::detail::SampleCandidate>& cand, float temperature,
+                           float top_p) {
+  using Candidate = engine::detail::SampleCandidate;
   if (cand.empty()) {
     return 0;
+  }
+  // Same [-80, 80] clamp the full path uses, to keep exp() well-behaved. Applied
+  // to the VALUES only — candidate selection already happened on the raw logits.
+  for (Candidate& c : cand) {
+    if (c.value > 80.0f)
+      c.value = 80.0f;
+    else if (c.value < -80.0f)
+      c.value = -80.0f;
   }
 
   const float inv_temp = 1.0f / temperature;
@@ -116,6 +102,28 @@ int sample_from_logits_topk(const std::vector<float>& logits, float temperature,
     }
   }
   return cand[keep - 1].id;
+}
+
+int sample_from_logits_topk(const std::vector<float>& logits, float temperature, int top_k,
+                            float top_p) {
+  // Threshold = the k-th largest logit. nth_element is O(vocab) (no full sort).
+  std::vector<float> partitioned(logits);
+  std::nth_element(partitioned.begin(), partitioned.begin() + (top_k - 1), partitioned.end(),
+                   std::greater<float>());
+  const float kth = partitioned[static_cast<std::size_t>(top_k - 1)];
+
+  // Every finite logit at or above the threshold — ties at kth included, which is
+  // why this can yield more than top_k candidates (the device path mirrors this).
+  std::vector<engine::detail::SampleCandidate> cand;
+  cand.reserve(static_cast<std::size_t>(top_k) + 8);
+  for (std::size_t i = 0; i < logits.size(); ++i) {
+    const float v = logits[i];
+    if (!std::isfinite(v) || v < kth) {
+      continue;
+    }
+    cand.push_back({static_cast<int>(i), v});
+  }
+  return sample_from_candidates(cand, temperature, top_p);
 }
 
 int sample_from_logits(std::vector<float>& logits, float temperature, int top_k, float top_p,
@@ -371,6 +379,11 @@ bool dispatch_has_degenerate_tail(const std::vector<int>& ids, std::size_t promp
 
 void dispatch_seed_sampler_rng(unsigned seed) {
   sampler_rng().seed(seed);
+}
+
+int dispatch_sample_from_candidates(std::vector<SampleCandidate>& cand, float temperature,
+                                    float top_p) {
+  return sample_from_candidates(cand, temperature, top_p);
 }
 }  // namespace detail
 }  // namespace engine

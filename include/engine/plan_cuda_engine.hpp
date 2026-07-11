@@ -200,6 +200,20 @@ class PlanCudaEngine : public runtime::SequenceModel {
   int* d_tok_ = nullptr;         // current token id (device); EmbeddingLookup reads it
   int* d_position_ = nullptr;    // current decode position (device); device-pos ops read it
   int* d_argmax_ = nullptr;      // device-argmax result (greedy fast path)
+
+  // Device top-k sampling (temperature>0 — the real chat path, since greedy only
+  // covers temp<=0). Selects the candidate set on the GPU so the host never sees
+  // the full vocab-sized logit vector; only the ~k candidates come back.
+  static constexpr int kMaxDeviceTopK = 256;
+  static constexpr int kCandCapacity = kMaxDeviceTopK + 64;  // slack for ties at the k-th logit
+  float* d_topk_part_val_ = nullptr;  // per-partition scratch
+  int* d_topk_part_idx_ = nullptr;
+  float* d_topk_val_ = nullptr;       // [k] descending; [k-1] is the threshold
+  int* d_topk_idx_ = nullptr;
+  int* d_cand_idx_ = nullptr;         // gathered candidates (>= threshold)
+  float* d_cand_val_ = nullptr;
+  int* d_cand_count_ = nullptr;
+  bool device_topk_enabled_ = true;   // env LLAMA_INFER_PLAN_NO_DEVICE_TOPK=1 disables (A/B)
   // When true (the shared decode-loop path), forward_one leaves the logits on the
   // device (d_logits_) instead of copying 262K floats to host + softcapping every
   // step; sample() then does the device argmax (greedy) or a lazy host copy.

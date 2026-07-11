@@ -16,6 +16,8 @@
 #include <stdexcept>
 #include <utility>
 
+#include "engine/generation_constraints.hpp"
+#include "engine/sampling.hpp"
 #include "runtime/kernels.cuh"
 
 namespace engine {
@@ -55,6 +57,9 @@ PlanCudaEngine::~PlanCudaEngine() {
   cudaFree(d_gate_); cudaFree(d_up_); cudaFree(d_inter_);
   cudaFree(d_ple_raw_); cudaFree(d_ple_); cudaFree(d_ple_gate_);
   cudaFree(d_logits_); cudaFree(d_tok_); cudaFree(d_position_); cudaFree(d_argmax_);
+  cudaFree(d_topk_part_val_); cudaFree(d_topk_part_idx_);
+  cudaFree(d_topk_val_); cudaFree(d_topk_idx_);
+  cudaFree(d_cand_idx_); cudaFree(d_cand_val_); cudaFree(d_cand_count_);
   if (decode_graph_exec_) cudaGraphExecDestroy(decode_graph_exec_);
   if (decode_graph_) cudaGraphDestroy(decode_graph_);
   if (stream_) cudaStreamDestroy(stream_);
@@ -214,6 +219,16 @@ void PlanCudaEngine::allocate_buffers() {
   G4_CHECK(cudaMalloc(&d_tok_, sizeof(int)));
   G4_CHECK(cudaMalloc(&d_position_, sizeof(int)));
   G4_CHECK(cudaMalloc(&d_argmax_, sizeof(int)));
+  // Device top-k sampling scratch (sized for the largest k we accept).
+  const int topk_parts = kernels::topk_partition_count(cfg_.vocab);
+  const std::size_t part_n = static_cast<std::size_t>(topk_parts) * kMaxDeviceTopK;
+  G4_CHECK(cudaMalloc(&d_topk_part_val_, part_n * sizeof(float)));
+  G4_CHECK(cudaMalloc(&d_topk_part_idx_, part_n * sizeof(int)));
+  G4_CHECK(cudaMalloc(&d_topk_val_, kMaxDeviceTopK * sizeof(float)));
+  G4_CHECK(cudaMalloc(&d_topk_idx_, kMaxDeviceTopK * sizeof(int)));
+  G4_CHECK(cudaMalloc(&d_cand_idx_, kCandCapacity * sizeof(int)));
+  G4_CHECK(cudaMalloc(&d_cand_val_, kCandCapacity * sizeof(float)));
+  G4_CHECK(cudaMalloc(&d_cand_count_, sizeof(int)));
   // ones for weightless v-norm
   std::vector<__half> ones(maxhd, __float2half(1.0f));
   G4_CHECK(cudaMalloc(&d_ones_, ones.size() * sizeof(__half)));
@@ -271,6 +286,7 @@ void PlanCudaEngine::load_all(const std::string& cpi_path) {
 void PlanCudaEngine::open(const std::string& cpi_path, int max_context) {
   max_ctx_ = max_context;
   if (std::getenv("LLAMA_INFER_PLAN_NO_GRAPH")) decode_graph_enabled_ = false;
+  if (std::getenv("LLAMA_INFER_PLAN_NO_DEVICE_TOPK")) device_topk_enabled_ = false;
   std::string manifest = cpi_path.substr(0, cpi_path.find_last_of('.')) + ".manifest";
   parse_manifest(manifest);
   if (static_cast<int>(cfg_.layer_full.size()) != cfg_.num_layers)
@@ -636,6 +652,51 @@ int PlanCudaEngine::sample(const runtime::DecodeParams& params,
     G4_CHECK(cudaMemcpy(&next, d_argmax_, sizeof(int), cudaMemcpyDeviceToHost));
     return next;
   }
+
+  // Device top-k: select the candidate set on the GPU so the host never touches the
+  // full vocab (temperature>0 is the real chat path — greedy only covers temp<=0).
+  // Eligibility mirrors the shared host top-k sampler exactly.
+  const bool device_topk = device_topk_enabled_ && params.temperature > 0.0f &&
+                           params.top_k > 0 && params.top_k <= kMaxDeviceTopK &&
+                           params.top_k < cfg_.vocab && params.repetition_penalty <= 1.0f &&
+                           params.no_repeat_ngram_size <= 1 && !params.grammar_mask;
+  if (device_topk) {
+    const int k = params.top_k;
+    G4_CHECK(cudaMemsetAsync(d_cand_count_, 0, sizeof(int), stream_));
+    kernels::launch_topk_float(d_logits_, cfg_.vocab, k, d_topk_part_val_, d_topk_part_idx_,
+                               d_topk_val_, d_topk_idx_, stream_);
+    // Threshold = the k-th largest RAW logit. The final softcap is monotonic, so
+    // {i : raw_i >= raw_kth} is exactly the host's softcapped candidate set.
+    kernels::launch_gather_ge_threshold(d_logits_, cfg_.vocab, d_topk_val_ + (k - 1), d_cand_idx_,
+                                        d_cand_val_, d_cand_count_, kCandCapacity, stream_);
+    G4_CHECK(cudaStreamSynchronize(stream_));
+
+    int count = 0;
+    G4_CHECK(cudaMemcpy(&count, d_cand_count_, sizeof(int), cudaMemcpyDeviceToHost));
+    if (count > 0 && count <= kCandCapacity) {
+      std::vector<int> idx(count);
+      std::vector<float> val(count);
+      G4_CHECK(cudaMemcpy(idx.data(), d_cand_idx_, count * sizeof(int), cudaMemcpyDeviceToHost));
+      G4_CHECK(cudaMemcpy(val.data(), d_cand_val_, count * sizeof(float), cudaMemcpyDeviceToHost));
+
+      const float cap = cfg_.final_logit_softcapping;
+      std::vector<detail::SampleCandidate> cand(static_cast<std::size_t>(count));
+      for (int i = 0; i < count; ++i) {
+        const float v = val[i];
+        cand[i] = {idx[i], cap > 0.0f ? cap * std::tanh(v / cap) : v};
+      }
+      // The gather appends atomically (arbitrary order); the host gathers in index
+      // order. Sort to match so the shared sampler sees an identical candidate
+      // vector — that is what makes a seeded run byte-identical across both paths.
+      std::sort(cand.begin(), cand.end(),
+                [](const detail::SampleCandidate& a, const detail::SampleCandidate& b) {
+                  return a.id < b.id;
+                });
+      return detail::dispatch_sample_from_candidates(cand, params.temperature, params.top_p);
+    }
+    // Pathological tie count overflowed the buffer → fall through to the host path.
+  }
+
   publish_host_logits();
   return runtime::SequenceModel::sample(params, history);
 }
@@ -769,7 +830,7 @@ void PlanCudaEngine::initialize(const EngineOptions& options) {
 std::vector<int> PlanCudaEngine::generate_stream(const std::vector<int>& prompt, int max_new,
                                                    float temperature,
                                                    const std::function<bool(int)>& on_token,
-                                                   const GenerationConstraints* /*constraints*/) {
+                                                   const GenerationConstraints* constraints) {
   // Delegate the prefill+decode+sample+stop loop to the shared driver (which
   // reuses the canonical sampler); this engine only supplies step()/logits().
   // Incremental: positions advance monotonically so the KV-share sources stay
@@ -781,6 +842,9 @@ std::vector<int> PlanCudaEngine::generate_stream(const std::vector<int>& prompt,
   p.top_p = samp_top_p_;
   p.repetition_penalty = samp_rep_penalty_;
   p.no_repeat_ngram_size = samp_no_repeat_ngram_;
+  // Honour a caller-supplied seed so temperature>0 generation is reproducible
+  // (this engine previously ignored it, unlike the other engines).
+  p.seed = constraints ? constraints->seed : -1;
   // sample() pulls logits off the device lazily (greedy argmax / host copy), so
   // step() need not copy 262K floats to host every token.
   defer_host_logits_ = true;
