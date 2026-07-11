@@ -174,6 +174,17 @@ inline int json_get_int(const std::string& json, const std::string& key, int def
   }
 }
 
+// Note: a JSON `null` (Gemma writes "num_experts": null on its dense checkpoints)
+// matches neither "true" nor "false", so it correctly yields the default.
+inline bool json_get_bool(const std::string& json, const std::string& key, bool def = false) {
+  std::size_t pos = json_find_key(json, key);
+  if (pos == std::string::npos) return def;
+  skip_ws(json, pos);
+  if (json.compare(pos, 4, "true") == 0) return true;
+  if (json.compare(pos, 5, "false") == 0) return false;
+  return def;
+}
+
 inline float json_get_float(const std::string& json, const std::string& key, float def = 0.0f) {
   std::size_t pos = json_find_key(json, key);
   if (pos == std::string::npos) return def;

@@ -139,6 +139,13 @@ class PlanCudaEngine : public runtime::SequenceModel {
   void parse_qwen35_config(const std::string& model_dir);
   void load_qwen35_weights();
   void build_qwen35_plan();
+  // Gemma 4 from a HuggingFace safetensors directory (the MoE checkpoint ships that
+  // way). Fills Config + st_shapes_ so the SHARED Gemma loader and plan builder run
+  // unchanged -- only the tensor-name prefix and the shape source differ.
+  void parse_gemma4_st_config(const std::string& model_dir);
+  // The MoE feed-forward block, appended to a layer's ops. Emitted only when the
+  // config declares experts, so non-MoE Gemma plans are byte-for-byte unchanged.
+  void append_moe_ffn_ops(std::vector<opplan::Op>& ops, const std::string& p, int L);
   // Host fp16 bytes for a tensor, from whichever container backs this model.
   // Safetensors carries no shape/dtype we can use, so dims come from the config
   // and bf16 is converted to fp16 (the .cpi path already stores fp16 + shapes).
@@ -150,6 +157,8 @@ class PlanCudaEngine : public runtime::SequenceModel {
   // first and quantizing afterwards would peak at the fp16 footprint — exactly the
   // OOM this exists to avoid (Gemma 12B is ~24 GB fp16). Peak here is one tensor.
   void upload_int4(const std::string& name, int rows = 0, int cols = 0);
+  std::pair<int, int> shape_of(const std::string& name) const;
+  const __half* dev_at(const std::string& name) const;
   float scalar_value(const std::string& name);             // read a [1] tensor to host
   void build_rope_tables();
   void allocate_buffers();
@@ -243,6 +252,15 @@ class PlanCudaEngine : public runtime::SequenceModel {
   // other weight in the row, and the error compounds across layers (this is what
   // made int4 unusable on Gemma 12B). int8's 255 levels tolerate per-row.
   int weight_quant_group_ = 0;
+
+  // Weight-name prefix. Empty for a .cpi container (its manifest already stores
+  // stripped names); "model.language_model." for a HuggingFace safetensors dir.
+  // Keeping it here means ONE Gemma plan builder serves both containers instead of
+  // a second copy that differs only in string keys.
+  std::string wprefix_;
+  // Tensor shapes for the safetensors path, where the container carries no shape
+  // index (unlike .cpi's manifest) -- derived from config.json at load.
+  std::unordered_map<std::string, std::pair<int, int>> st_shapes_;
   std::vector<float> layer_scalar_host_;         // per-layer scalar values
 
   cudaStream_t stream_ = nullptr;
@@ -280,6 +298,18 @@ class PlanCudaEngine : public runtime::SequenceModel {
   __half* d_ple_raw_ = nullptr;  // [num_layers * ple_dim]
   __half* d_ple_ = nullptr;      // [num_layers * ple_dim] per-layer inputs
   __half* d_ple_gate_ = nullptr; // [ple_dim]
+
+  // ── Mixture-of-Experts working set ──
+  // The expert selection lives on the DEVICE: the router writes d_moe_idx_/d_moe_w_
+  // and the expert kernels read them there. Nothing round-trips to the host between
+  // the router and the experts (a sync per layer per token would cost more than the
+  // experts themselves, and would make the decode graph uncapturable).
+  __half* d_moe_router_in_ = nullptr;  // [hidden]
+  __half* d_moe_logits_ = nullptr;     // [num_experts]
+  __half* d_moe_inter_ = nullptr;      // [top_k * moe_intermediate]
+  __half* d_moe_out_ = nullptr;        // [hidden]
+  int* d_moe_idx_ = nullptr;           // [top_k] selected experts
+  float* d_moe_w_ = nullptr;           // [top_k] routing weights
   float* d_logits_ = nullptr;    // [vocab]
   int* d_tok_ = nullptr;         // current token id (device); EmbeddingLookup reads it
   int* d_position_ = nullptr;    // current decode position (device); device-pos ops read it

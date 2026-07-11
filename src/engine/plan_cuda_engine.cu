@@ -181,7 +181,33 @@ std::vector<__half> PlanCudaEngine::read_host_fp16(const std::string& name, int 
   return out;
 }
 
+// Shapes for the safetensors path. A .cpi carries them in its manifest; a HF
+// directory does not, so they are derived from config.json into st_shapes_ at load.
+// Resolving here is what lets the SHARED Gemma loader call upload("...") with no
+// dims and still work against either container.
+std::pair<int, int> PlanCudaEngine::shape_of(const std::string& name) const {
+  auto it = st_shapes_.find(name);
+  if (it == st_shapes_.end()) throw std::runtime_error("no shape registered for: " + name);
+  return it->second;
+}
+
+// Weight lookup that FAILS LOUDLY. dev_ is a map, so dev_[name] on a missing key
+// silently inserts nullptr -- which the ops then read as "weightless norm" or a GEMV
+// against a null matrix, producing zeros instead of an error. Every bound weight goes
+// through here; genuinely weightless ops pass nullptr explicitly.
+const __half* PlanCudaEngine::dev_at(const std::string& name) const {
+  auto it = dev_.find(name);
+  if (it == dev_.end() || it->second == nullptr)
+    throw std::runtime_error("weight not loaded: " + name);
+  return static_cast<const __half*>(it->second);
+}
+
 __half* PlanCudaEngine::upload(const std::string& name, int rows, int cols) {
+  if (from_safetensors_ && (rows == 0 || cols == 0)) {
+    const auto s = shape_of(name);
+    rows = s.first;
+    cols = s.second;
+  }
   const auto host = read_host_fp16(name, rows, cols);
   __half* d = nullptr;
   G4_CHECK(cudaMalloc(&d, host.size() * sizeof(__half)));
@@ -206,6 +232,11 @@ float* PlanCudaEngine::upload_f32(const std::string& name, int n) {
 // the fp16 straight away. Per-tensor so peak VRAM is one tensor, not the whole
 // fp16 model (Gemma 12B is ~24 GB in fp16 and would OOM before we could shrink it).
 void PlanCudaEngine::upload_int4(const std::string& name, int rows, int cols) {
+  if (from_safetensors_ && (rows == 0 || cols == 0)) {
+    const auto s = shape_of(name);
+    rows = s.first;
+    cols = s.second;
+  }
   if (rows == 0 || cols == 0) {  // .cpi: shapes come from the manifest
     auto it = meta_.find(name);
     if (it == meta_.end()) throw std::runtime_error("missing tensor: " + name);
@@ -218,11 +249,21 @@ void PlanCudaEngine::upload_int4(const std::string& name, int rows, int cols) {
     cols = shape[1];
   }
   const int bits = weight_quant_bits_;
-  // A group must divide the row evenly and be a power of two, else fall back to
-  // per-row for this tensor rather than mis-indexing its scales.
+  // A group must be a power of two that divides the row evenly. When the requested
+  // group does not divide it, HALVE until it does rather than dropping to per-row:
+  // per-row IS the failure mode group-wise scales exist to fix, so falling back to
+  // it would silently reintroduce it on exactly the tensors that need it. Gemma MoE
+  // hits this -- its down projections are 704 and 2112 wide, neither divisible by
+  // 128, so they land on 64.
   int group = weight_quant_group_;
-  if (group > 0 && (group > cols || (cols % group) != 0 || (group & (group - 1)) != 0)) {
-    group = 0;
+  if (group > 0 && (group & (group - 1)) != 0) {
+    group = 0;  // not a power of two: caller error, take the safe path
+  }
+  while (group > 0 && (group > cols || (cols % group) != 0)) {
+    group /= 2;
+  }
+  if (group == 1) {
+    group = 0;  // a scale per weight is just fp16 with extra steps
   }
 
   auto host = read_host_fp16(name, rows, cols);
@@ -264,6 +305,12 @@ void PlanCudaEngine::upload_int4(const std::string& name, int rows, int cols) {
 }
 
 float PlanCudaEngine::scalar_value(const std::string& name) {
+  if (from_safetensors_) {
+    // Optional: a checkpoint with no layer_scalar means a 1.0 (no-op) gain.
+    if (!st_.has_tensor(name)) return 1.0f;
+    const auto* src = reinterpret_cast<const std::uint16_t*>(st_.tensor_ptr(name));
+    return mini::bf16_to_float(src[0]);
+  }
   auto it = meta_.find(name);
   if (it == meta_.end()) throw std::runtime_error("missing scalar: " + name);
   std::ifstream f(cpi_path_, std::ios::binary);
@@ -387,6 +434,14 @@ void PlanCudaEngine::allocate_buffers() {
   al(&d_x_, H); al(&d_x_norm_, H); al(&d_tmp_, H);
   al(&d_q_, maxq); al(&d_k_, maxkv); al(&d_v_, maxkv); al(&d_att_, maxq);
   al(&d_gate_, maxinter); al(&d_up_, maxinter); al(&d_inter_, maxinter);
+  if (cfg_.enable_moe_block) {
+    al(&d_moe_router_in_, H);
+    al(&d_moe_logits_, cfg_.num_experts);
+    al(&d_moe_inter_, static_cast<std::size_t>(cfg_.top_k_experts) * cfg_.moe_intermediate_size);
+    al(&d_moe_out_, H);
+    G4_CHECK(cudaMalloc(&d_moe_idx_, static_cast<std::size_t>(cfg_.top_k_experts) * sizeof(int)));
+    G4_CHECK(cudaMalloc(&d_moe_w_, static_cast<std::size_t>(cfg_.top_k_experts) * sizeof(float)));
+  }
   al(&d_ple_raw_, ple_tot); al(&d_ple_, ple_tot); al(&d_ple_gate_, cfg_.hidden_size_per_layer_input);
   G4_CHECK(cudaMalloc(&d_logits_, static_cast<std::size_t>(cfg_.vocab) * sizeof(float)));
   G4_CHECK(cudaMalloc(&d_tok_, sizeof(int)));
@@ -430,6 +485,102 @@ void PlanCudaEngine::allocate_buffers() {
 // ── Qwen3.5 recipe ───────────────────────────────────────────────────────────
 // Config + weights + plan. Everything else (executor, sampler, quantizer, decode
 // graph, KV/state) is the SAME shared machinery Gemma runs on.
+
+// Gemma 4 from a HuggingFace safetensors directory. The .cpi path gets its config
+// from the container manifest; this reads the same facts out of config.json and,
+// crucially, registers every tensor's SHAPE (the safetensors header carries none we
+// use). With Config + st_shapes_ + wprefix_ filled in, the shared Gemma loader and
+// plan builder run unchanged -- the MoE checkpoint is not a second Gemma port.
+void PlanCudaEngine::parse_gemma4_st_config(const std::string& model_dir) {
+  const std::string raw = mini::read_text_file(std::filesystem::path(model_dir) / "config.json");
+  const std::string tc = mini::json_extract_object(raw, "text_config");
+  if (tc.empty()) throw std::runtime_error("Gemma 4 config is missing text_config");
+
+  cfg_.family = Family::Gemma4;
+  cfg_.vocab = mini::json_get_int(tc, "vocab_size", 0);
+  cfg_.hidden = mini::json_get_int(tc, "hidden_size", 0);
+  cfg_.intermediate = mini::json_get_int(tc, "intermediate_size", 0);
+  cfg_.num_layers = mini::json_get_int(tc, "num_hidden_layers", 0);
+  cfg_.num_heads = mini::json_get_int(tc, "num_attention_heads", 0);
+  cfg_.head_dim = mini::json_get_int(tc, "head_dim", 256);
+  cfg_.head_dim_sliding = cfg_.head_dim;
+  cfg_.head_dim_full = mini::json_get_int(tc, "global_head_dim", cfg_.head_dim);
+  cfg_.num_kv_heads_sliding = mini::json_get_int(tc, "num_key_value_heads", 1);
+  cfg_.num_kv_heads_full = mini::json_get_int(tc, "num_global_key_value_heads",
+                                              cfg_.num_kv_heads_sliding);
+  cfg_.num_kv_heads = cfg_.num_kv_heads_sliding;
+  cfg_.hidden_size_per_layer_input = mini::json_get_int(tc, "hidden_size_per_layer_input", 0);
+  cfg_.num_kv_shared_layers = mini::json_get_int(tc, "num_kv_shared_layers", 0);
+  cfg_.sliding_window = mini::json_get_int(tc, "sliding_window", 0);
+  cfg_.rms_eps = mini::json_get_float(tc, "rms_norm_eps", 1e-6f);
+  cfg_.final_logit_softcapping = mini::json_get_float(tc, "final_logit_softcapping", 0.0f);
+  cfg_.attention_k_eq_v = mini::json_get_bool(tc, "attention_k_eq_v", false);
+  cfg_.use_double_wide_mlp = mini::json_get_bool(tc, "use_double_wide_mlp", false);
+  cfg_.tie_word_embeddings = mini::json_get_bool(tc, "tie_word_embeddings", true);
+  cfg_.eos_token_id = mini::json_get_int(tc, "eos_token_id", 1);
+  cfg_.bos_token_id = mini::json_get_int(tc, "bos_token_id", 2);
+
+  cfg_.enable_moe_block = mini::json_get_bool(tc, "enable_moe_block", false);
+  cfg_.num_experts = mini::json_get_int(tc, "num_experts", 0);
+  cfg_.top_k_experts = mini::json_get_int(tc, "top_k_experts", 0);
+  cfg_.moe_intermediate_size = mini::json_get_int(tc, "moe_intermediate_size", 0);
+  if (cfg_.enable_moe_block &&
+      (cfg_.num_experts <= 0 || cfg_.top_k_experts <= 0 || cfg_.moe_intermediate_size <= 0))
+    throw std::runtime_error("Gemma 4 MoE config is missing num_experts/top_k/moe_intermediate");
+
+  // layer_types: "full_attention" vs "sliding_attention", per layer.
+  const auto types = mini::json_get_string_array(tc, "layer_types");
+  cfg_.layer_full.assign(cfg_.num_layers, 0);
+  for (int L = 0; L < cfg_.num_layers && L < static_cast<int>(types.size()); ++L)
+    cfg_.layer_full[L] = (types[L] == "full_attention") ? 1 : 0;
+  cfg_.kv_source.clear();
+  for (int i = 0; i < cfg_.num_layers; ++i) cfg_.kv_source.push_back(i);
+  cfg_.first_shared_layer = 0;
+
+  if (cfg_.vocab <= 0 || cfg_.hidden <= 0 || cfg_.num_layers <= 0)
+    throw std::runtime_error("Gemma 4 config.json is missing required text_config fields");
+
+  // --- shape registry (see shape_of) ---
+  const int H = cfg_.hidden;
+  const int E = cfg_.num_experts;
+  const int MI = cfg_.moe_intermediate_size;
+  auto put = [&](const std::string& n, int r, int c) { st_shapes_[wprefix_ + n] = {r, c}; };
+  put("embed_tokens.weight", cfg_.vocab, H);
+  put("norm.weight", 1, H);
+  for (int L = 0; L < cfg_.num_layers; ++L) {
+    const std::string p = "layers." + std::to_string(L) + ".";
+    const bool full = cfg_.layer_full[L] != 0;
+    const int hd = full ? cfg_.head_dim_full : cfg_.head_dim_sliding;
+    const int nkv = full ? cfg_.num_kv_heads_full : cfg_.num_kv_heads_sliding;
+    const int qdim = cfg_.num_heads * hd, kvdim = nkv * hd;
+    put(p + "input_layernorm.weight", 1, H);
+    put(p + "post_attention_layernorm.weight", 1, H);
+    put(p + "pre_feedforward_layernorm.weight", 1, H);
+    put(p + "post_feedforward_layernorm.weight", 1, H);
+    put(p + "self_attn.q_proj.weight", qdim, H);
+    put(p + "self_attn.k_proj.weight", kvdim, H);
+    put(p + "self_attn.v_proj.weight", kvdim, H);
+    put(p + "self_attn.o_proj.weight", H, qdim);
+    put(p + "self_attn.q_norm.weight", 1, hd);
+    put(p + "self_attn.k_norm.weight", 1, hd);
+    put(p + "mlp.gate_proj.weight", cfg_.intermediate, H);
+    put(p + "mlp.up_proj.weight", cfg_.intermediate, H);
+    put(p + "mlp.down_proj.weight", H, cfg_.intermediate);
+    if (cfg_.enable_moe_block) {
+      put(p + "pre_feedforward_layernorm_2.weight", 1, H);
+      put(p + "post_feedforward_layernorm_1.weight", 1, H);
+      put(p + "post_feedforward_layernorm_2.weight", 1, H);
+      put(p + "router.proj.weight", E, H);
+      put(p + "router.scale", 1, H);
+      put(p + "router.per_expert_scale", 1, E);
+      // The experts ship as 3-D [E, ...] but are contiguous, so they are indexed as
+      // one tall 2-D matrix and quantised like any other weight; picking an expert is
+      // just a row offset.
+      put(p + "experts.gate_up_proj", E * 2 * MI, H);
+      put(p + "experts.down_proj", E * H, MI);
+    }
+  }
+}
 
 void PlanCudaEngine::parse_qwen35_config(const std::string& model_dir) {
   const std::string raw =
@@ -527,13 +678,14 @@ void PlanCudaEngine::load_qwen35_weights() {
 
 void PlanCudaEngine::load_all(const std::string& cpi_path) {
   cpi_path_ = cpi_path;
+  const std::string& W = wprefix_;  // "" for .cpi, "model.language_model." for HF
   // large tables + per-layer weights to device
-  upload("embed_tokens.weight");
-  upload("norm.weight");
+  upload(W + "embed_tokens.weight");
+  upload(W + "norm.weight");
   if (has_ple()) {  // E2B has Per-Layer Embeddings; 12B does not
-    upload("embed_tokens_per_layer.weight");
-    upload("per_layer_model_projection.weight");
-    upload("per_layer_projection_norm.weight");
+    upload(W + "embed_tokens_per_layer.weight");
+    upload(W + "per_layer_model_projection.weight");
+    upload(W + "per_layer_projection_norm.weight");
   }
   layer_scalar_host_.assign(cfg_.num_layers, 1.0f);
   // The dense projections carry ~all the weight; norms/embeddings stay fp16.
@@ -554,7 +706,7 @@ void PlanCudaEngine::load_all(const std::string& cpi_path) {
     else upload(full);
   };
   for (int L = 0; L < cfg_.num_layers; ++L) {
-    const std::string p = "layers." + std::to_string(L) + ".";
+    const std::string p = W + "layers." + std::to_string(L) + ".";
     for (const char* t : {"input_layernorm.weight", "post_attention_layernorm.weight",
                           "pre_feedforward_layernorm.weight", "post_feedforward_layernorm.weight",
                           "self_attn.q_proj.weight", "self_attn.k_proj.weight",
@@ -568,6 +720,23 @@ void PlanCudaEngine::load_all(const std::string& cpi_path) {
       for (const char* t : {"per_layer_input_gate.weight", "per_layer_projection.weight",
                             "post_per_layer_input_norm.weight"})
         upload(p + t);
+    if (cfg_.enable_moe_block) {
+      // Norms and the tiny router stay fp16; the EXPERTS are ~90% of the model, so
+      // they go through the same quantiser as any other projection (they are plain
+      // 2-D matrices here -- see parse_gemma4_st_config).
+      for (const char* t : {"pre_feedforward_layernorm_2.weight",
+                            "post_feedforward_layernorm_1.weight",
+                            "post_feedforward_layernorm_2.weight", "router.proj.weight",
+                            "router.scale", "router.per_expert_scale"})
+        upload(p + t);
+      if (quantize) {
+        upload_int4(p + "experts.gate_up_proj");
+        upload_int4(p + "experts.down_proj");
+      } else {
+        upload(p + "experts.gate_up_proj");
+        upload(p + "experts.down_proj");
+      }
+    }
     layer_scalar_host_[L] = scalar_value(p + "layer_scalar");
   }
 }
@@ -577,12 +746,32 @@ void PlanCudaEngine::open(const std::string& cpi_path, int max_context) {
   if (std::getenv("LLAMA_INFER_PLAN_NO_GRAPH")) decode_graph_enabled_ = false;
   if (std::getenv("LLAMA_INFER_PLAN_NO_DEVICE_TOPK")) device_topk_enabled_ = false;
 
-  // A directory ⇒ safetensors (Qwen3.5); a file ⇒ .cpi (Gemma). The engine reads
-  // whichever container the model actually ships.
+  // A directory ⇒ HuggingFace safetensors; a file ⇒ .cpi. Within a directory the
+  // architecture comes from config.json's model_type -- the engine reads whichever
+  // container and architecture the model actually ships, with no name matching on
+  // the path.
   std::error_code ec;
   if (std::filesystem::is_directory(cpi_path, ec) && !ec) {
     from_safetensors_ = true;
     st_.open(cpi_path);
+    const std::string raw =
+        mini::read_text_file(std::filesystem::path(cpi_path) / "config.json");
+    const std::string tc = mini::json_extract_object(raw, "text_config");
+    const std::string mt = mini::json_get_string(tc.empty() ? raw : tc, "model_type", "");
+    if (mt.rfind("gemma4", 0) == 0) {
+      wprefix_ = "model.language_model.";
+      parse_gemma4_st_config(cpi_path);
+      if (max_ctx_ <= 0) max_ctx_ = 4096;
+      // Gemma's dual/partial RoPE has no device-position kernel, same as Qwen's.
+      decode_graph_enabled_ = false;
+      G4_CHECK(cudaStreamCreate(&stream_));
+      load_all(cpi_path);
+      build_rope_tables();
+      allocate_buffers();
+      build_plan();
+      G4_CHECK(cudaStreamSynchronize(stream_));
+      return;
+    }
     parse_qwen35_config(cpi_path);
     if (max_ctx_ <= 0 || (cfg_.max_position_embeddings > 0 &&
                           max_ctx_ > cfg_.max_position_embeddings))
@@ -621,6 +810,97 @@ void PlanCudaEngine::open(const std::string& cpi_path, int max_context) {
 // exact op sequence the former imperative run_layer emitted, with the per-layer
 // conditionals (shared / keqv / full / PLE) decided here and weights + geometry
 // bound — so the hot loop (run_layer, below) is branch-free over identity.
+// The MoE feed-forward, appended to a layer whose dense MLP output is already in
+// Slot::Tmp (pre-norm). Transcribed from Gemma4TextDecoderLayer.forward:
+//
+//   h1 = post_ffn_norm_1(dense_mlp_out)
+//   tkw, tki = router(X)                       <-- the PRE-MLP residual, not the MLP output
+//   h2 = post_ffn_norm_2( experts( pre_ffn_norm_2(X), tki, tkw ) )
+//   Tmp = h1 + h2                              <-- caller then applies post_ffn_norm + residual
+//
+// Note both branches read X, which no op here writes, so the ordering is safe.
+void PlanCudaEngine::append_moe_ffn_ops(std::vector<opplan::Op>& ops, const std::string& p, int L) {
+  using namespace opplan;
+  const int H = cfg_.hidden;
+  const int E = cfg_.num_experts;
+  const int K = cfg_.top_k_experts;
+  const int MI = cfg_.moe_intermediate_size;
+  auto W = [&](const char* t) { return dev_at(p + t); };
+
+  // h1 = post_feedforward_layernorm_1(dense MLP output), left in Tmp.
+  {
+    Op o; o.kind = OpKind::RmsNorm; o.in = Slot::Tmp; o.out = Slot::Tmp;
+    o.weight = W("post_feedforward_layernorm_1.weight"); o.rows = 1; o.cols = H;
+    ops.push_back(o);
+  }
+
+  // --- router(X): weightless RMS norm -> * scale * H^-0.5 -> proj -> top-k ---
+  {
+    Op o; o.kind = OpKind::RmsNorm; o.in = Slot::X; o.out = Slot::MoeRouterIn;
+    o.weight = nullptr; o.rows = 1; o.cols = H;  // with_scale=False in HF
+    ops.push_back(o);
+  }
+  {
+    Op o; o.kind = OpKind::MulVec; o.in = Slot::MoeRouterIn; o.out = Slot::MoeRouterIn;
+    o.weight = W("router.scale"); o.cols = H;
+    o.scale = std::pow(static_cast<float>(H), -0.5f);
+    ops.push_back(o);
+  }
+  {
+    Op o; o.kind = OpKind::Gemv; o.in = Slot::MoeRouterIn; o.out = Slot::MoeLogits;
+    o.weight = W("router.proj.weight"); o.cols = E; o.in_dim = H;  // tiny: stays fp16
+    ops.push_back(o);
+  }
+  {
+    Op o; o.kind = OpKind::MoeRouterTopk; o.in = Slot::MoeLogits;
+    o.weight = W("router.per_expert_scale"); o.cols = E; o.heads = K;
+    ops.push_back(o);
+  }
+
+  // --- experts(pre_feedforward_layernorm_2(X)) ---
+  // XNorm is free here: the dense MLP already consumed it.
+  {
+    Op o; o.kind = OpKind::RmsNorm; o.in = Slot::X; o.out = Slot::XNorm;
+    o.weight = W("pre_feedforward_layernorm_2.weight"); o.rows = 1; o.cols = H;
+    ops.push_back(o);
+  }
+  auto bind_expert = [&](Op& o, const char* t) {
+    const auto q = qdev_.find(p + t);
+    if (q != qdev_.end()) {
+      o.qweight = q->second.packed;
+      o.qscales = q->second.scales;
+      o.qbits = weight_quant_bits_;
+      o.qgroup = q->second.group;
+    } else {
+      o.weight = dev_at(p + t);
+    }
+  };
+  {
+    Op o; o.kind = OpKind::MoeGateUpGeglu; o.in = Slot::XNorm; o.out = Slot::MoeInter;
+    o.cols = MI; o.in_dim = H; o.heads = K;
+    bind_expert(o, "experts.gate_up_proj");
+    ops.push_back(o);
+  }
+  {
+    Op o; o.kind = OpKind::MoeDownAccum; o.in = Slot::MoeInter; o.out = Slot::MoeOut;
+    o.cols = H; o.in_dim = MI; o.heads = K;
+    bind_expert(o, "experts.down_proj");
+    ops.push_back(o);
+  }
+  {
+    Op o; o.kind = OpKind::RmsNorm; o.in = Slot::MoeOut; o.out = Slot::MoeOut;
+    o.weight = W("post_feedforward_layernorm_2.weight"); o.rows = 1; o.cols = H;
+    ops.push_back(o);
+  }
+
+  // Tmp = h1 + h2
+  {
+    Op o; o.kind = OpKind::AddInplace; o.out = Slot::Tmp; o.in = Slot::MoeOut; o.cols = H;
+    ops.push_back(o);
+  }
+  (void)L;
+}
+
 void PlanCudaEngine::build_plan() {
   using namespace opplan;
   slot_ptr_[static_cast<int>(Slot::X)] = d_x_;
@@ -648,6 +928,10 @@ void PlanCudaEngine::build_plan() {
   slot_ptr_[static_cast<int>(Slot::LinK)] = d_lin_k_;
   slot_ptr_[static_cast<int>(Slot::LinV)] = d_lin_v_;
   slot_ptr_[static_cast<int>(Slot::LinAtt)] = d_lin_att_;
+  slot_ptr_[static_cast<int>(Slot::MoeRouterIn)] = d_moe_router_in_;
+  slot_ptr_[static_cast<int>(Slot::MoeLogits)] = d_moe_logits_;
+  slot_ptr_[static_cast<int>(Slot::MoeInter)] = d_moe_inter_;
+  slot_ptr_[static_cast<int>(Slot::MoeOut)] = d_moe_out_;
 
   if (cfg_.family == Family::Qwen35) {
     build_qwen35_plan();
@@ -662,29 +946,29 @@ void PlanCudaEngine::build_plan() {
     std::vector<Op>& pro = plan_.prologue;
     auto emb = [&](const char* name, Slot out, int dim) {
       Op o; o.kind = OpKind::EmbeddingLookup; o.out = out; o.cols = dim;
-      o.weight = static_cast<const __half*>(dev_[name]);
+      o.weight = dev_at(name);
       pro.push_back(o);
     };
     auto sc = [&](Slot s, int len, float scl) {
       Op o; o.kind = OpKind::ScaleCopy; o.in = s; o.out = s; o.cols = len; o.scale = scl;
       pro.push_back(o);
     };
-    emb("embed_tokens.weight", Slot::X, H);
+    emb((wprefix_ + "embed_tokens.weight").c_str(), Slot::X, H);
     sc(Slot::X, H, std::sqrt((float)H));  // embed * sqrt(hidden)
     if (has_ple()) {
       const int ple = cfg_.hidden_size_per_layer_input;
       const int tot = cfg_.num_layers * ple;
       // ple_raw = embed_tokens_per_layer[token] * sqrt(ple)
-      emb("embed_tokens_per_layer.weight", Slot::PleRaw, tot);
+      emb((wprefix_ + "embed_tokens_per_layer.weight").c_str(), Slot::PleRaw, tot);
       sc(Slot::PleRaw, tot, std::sqrt((float)ple));
       // ple = rmsnorm( (W_proj · x) * hidden^-0.5 )   [x = the scaled embeds in Slot::X]
       Op g; g.kind = OpKind::Gemv; g.in = Slot::X; g.out = Slot::PleAll;
-      g.weight = static_cast<const __half*>(dev_["per_layer_model_projection.weight"]);
+      g.weight = dev_at(wprefix_ + "per_layer_model_projection.weight");
       g.cols = tot; g.in_dim = cfg_.hidden;
       pro.push_back(g);
       sc(Slot::PleAll, tot, std::pow((float)cfg_.hidden, -0.5f));
       Op n; n.kind = OpKind::RmsNorm; n.in = Slot::PleAll; n.out = Slot::PleAll;
-      n.weight = static_cast<const __half*>(dev_["per_layer_projection_norm.weight"]);
+      n.weight = dev_at(wprefix_ + "per_layer_projection_norm.weight");
       n.rows = cfg_.num_layers; n.cols = ple;
       pro.push_back(n);
       // per_layer_inputs = (ple + ple_raw) * 2^-0.5
@@ -696,8 +980,8 @@ void PlanCudaEngine::build_plan() {
 
   plan_.layers.assign(cfg_.num_layers, LayerPlan{});
   for (int L = 0; L < cfg_.num_layers; ++L) {
-    const std::string p = "layers." + std::to_string(L) + ".";
-    auto W = [&](const char* t) { return static_cast<const __half*>(dev_[p + t]); };
+    const std::string p = wprefix_ + "layers." + std::to_string(L) + ".";
+    auto W = [&](const char* t) { return dev_at(p + t); };
     const int hd = head_dim_of(L);
     const int nq = cfg_.num_heads, nkv = kv_heads_of(L);
     const int qdim = nq * hd, kvdim = nkv * hd;
@@ -726,7 +1010,7 @@ void PlanCudaEngine::build_plan() {
         o.qbits = weight_quant_bits_;
         o.qgroup = q->second.group;
       } else {
-        o.weight = static_cast<const __half*>(dev_[full]);
+        o.weight = dev_at(full);
       }
       ops.push_back(o);
     };
@@ -783,6 +1067,14 @@ void PlanCudaEngine::build_plan() {
       ops.push_back(o);
     }
     gemv(Slot::Inter, Slot::Tmp, "mlp.down_proj.weight", H, inter);
+    // MoE models run a second, ROUTED feed-forward in parallel with the dense one and
+    // sum them. Slot::Tmp holds the dense output (pre-norm) on entry, and the summed
+    // result on exit, so the shared tail below is identical either way.
+    // LLAMA_INFER_PLAN_NO_MOE=1 drops the routed branch, leaving the dense MLP only.
+    // Bisection aid: it separates "the shared Gemma path is wrong" from "the MoE ops
+    // are wrong" (the model is degraded but must stay finite and coherent-ish).
+    if (cfg_.enable_moe_block && !std::getenv("LLAMA_INFER_PLAN_NO_MOE"))
+      append_moe_ffn_ops(ops, p, L);
     rms(Slot::Tmp, Slot::Tmp, W("post_feedforward_layernorm.weight"), 1, H);
     add_x(Slot::Tmp);
 
@@ -807,10 +1099,10 @@ void PlanCudaEngine::build_plan() {
   {
     std::vector<Op>& epi = plan_.epilogue;
     Op n; n.kind = OpKind::RmsNorm; n.in = Slot::X; n.out = Slot::XNorm;
-    n.weight = static_cast<const __half*>(dev_["norm.weight"]); n.rows = 1; n.cols = H;
+    n.weight = dev_at(wprefix_ + "norm.weight"); n.rows = 1; n.cols = H;
     epi.push_back(n);
     Op h; h.kind = OpKind::LmHead; h.in = Slot::XNorm;
-    h.weight = static_cast<const __half*>(dev_["embed_tokens.weight"]);
+    h.weight = dev_at(wprefix_ + "embed_tokens.weight");
     h.cols = cfg_.vocab; h.in_dim = H;
     epi.push_back(h);
   }
@@ -864,6 +1156,27 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
           kernels::launch_rowmajor_half_gemv_f16(op.weight, S(op.in), S(op.out), op.cols, op.in_dim,
                                                  stream_);
         }
+        break;
+      case OpKind::MulVec:
+        kernels::launch_mul_vec(S(op.in), op.weight, S(op.out), op.cols, op.scale, stream_);
+        break;
+      case OpKind::MoeRouterTopk:
+        // Writes the selected experts to DEVICE buffers; the expert ops below read
+        // them there, so a token never round-trips to the host mid-layer.
+        kernels::launch_moe_router_topk_softmax(S(op.in), op.cols, op.heads, d_moe_idx_, d_moe_w_,
+                                                stream_, op.weight);
+        break;
+      case OpKind::MoeGateUpGeglu:
+        kernels::launch_moe_gate_up_geglu(
+            op.qbits ? static_cast<const void*>(op.qweight) : static_cast<const void*>(op.weight),
+            op.qscales, op.qbits, op.qgroup, S(op.in), d_moe_idx_, S(op.out), op.cols, op.in_dim,
+            op.heads, stream_);
+        break;
+      case OpKind::MoeDownAccum:
+        kernels::launch_moe_down_accum(
+            op.qbits ? static_cast<const void*>(op.qweight) : static_cast<const void*>(op.weight),
+            op.qscales, op.qbits, op.qgroup, S(op.in), d_moe_idx_, d_moe_w_, S(op.out), op.cols,
+            op.in_dim, op.heads, stream_);
         break;
       case OpKind::Rope: {
         const float* cosT = op.rope_table == RopeTable::Full ? d_cos_full_ : d_cos_sliding_;

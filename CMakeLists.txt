@@ -121,6 +121,7 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
     src/kernels/kernels_attention_decode.cu
     src/kernels/kernels_attention_decode_int4.cu
     src/kernels/kernels_ops_matvec.cu
+    src/kernels/kernels_moe_experts.cu
     src/kernels/kernels_weight_only_matvec.cu
     src/kernels/kernels_turboquant.cu
     src/engine/tensor_parallel.cpp

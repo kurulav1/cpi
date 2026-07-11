@@ -46,6 +46,11 @@ enum class Slot : std::uint8_t {
   LinZ, LinA, LinB,      // delta-net gate / A / B projections
   LinQ, LinK, LinV,      // delta-net q/k/v after head expansion
   LinAtt,    // delta-net output (pre out-projection)
+  // Mixture-of-Experts working set.
+  MoeRouterIn,  // hidden after the router's weightless norm + learned scale
+  MoeLogits,    // router logits [num_experts]
+  MoeInter,     // [top_k, moe_inter] gelu(gate)*up, per selected expert
+  MoeOut,       // [hidden] routing-weighted sum over the selected experts
   Count
 };
 
@@ -81,6 +86,20 @@ enum class OpKind : std::uint8_t {
   RepeatLinearHeads,// expand the fused mixture into per-head q/k/v (GQA-style repeat)
   LinearAttentionStep,  // gated delta-net recurrence; reads/writes this layer's
                         // RECURRENT STATE. The linear-attention analogue of Attention.
+
+  // ── extensions for Mixture-of-Experts ──
+  // Also general ops. The selected experts stay on the DEVICE end to end: the
+  // router writes indices/weights to device buffers and the expert ops read them
+  // there, so a token never round-trips to the host mid-layer and the decode graph
+  // remains capturable.
+  MulVec,        // out = in * weight_vector * scale   (router pre-projection gain)
+  MoeRouterTopk, // logits -> softmax -> top-k -> renormalise -> *per_expert_scale;
+                 // writes the executor's device topk index/weight buffers.
+                 // `weight` = optional per-expert gain. cols = experts, heads = top_k.
+  MoeGateUpGeglu,// per selected expert: gelu(gate)*up  -> MoeInter
+                 // cols = moe_inter, in_dim = hidden, heads = top_k
+  MoeDownAccum,  // sum_k topk_weight[k] * down[expert_k] . MoeInter[k]  -> MoeOut
+                 // cols = hidden, in_dim = moe_inter, heads = top_k
 };
 
 // One resolved op. Fields are a union-by-convention keyed on `kind`; only the

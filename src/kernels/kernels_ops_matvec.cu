@@ -368,7 +368,8 @@ __global__ void scale_add_inplace_kernel(half* dst, const half* src, int n, floa
 }
 
 __global__ void moe_router_topk_softmax_kernel(const half* logits, int experts, int top_k,
-                                               int* topk_idx, float* topk_prob) {
+                                               int* topk_idx, float* topk_prob,
+                                               const half* per_expert_scale) {
   extern __shared__ float probs[];
   if (threadIdx.x != 0) {
     return;
@@ -435,8 +436,13 @@ __global__ void moe_router_topk_softmax_kernel(const half* logits, int experts, 
 
   for (int k = 0; k < top_k; ++k) {
     if (k < capped_topk) {
-      topk_idx[k] = picked[k] >= 0 ? picked[k] : 0;
-      topk_prob[k] = picked_prob[k] * inv_pick_sum;
+      const int e = picked[k] >= 0 ? picked[k] : 0;
+      topk_idx[k] = e;
+      // A learned per-expert gain on the routing weight, applied after the top-k
+      // renormalisation (Gemma MoE). Null for routers that do not have one, which
+      // leaves the weight exactly as before.
+      const float gain = per_expert_scale ? __half2float(per_expert_scale[e]) : 1.0f;
+      topk_prob[k] = picked_prob[k] * inv_pick_sum * gain;
     } else {
       topk_idx[k] = 0;
       topk_prob[k] = 0.0f;
@@ -853,13 +859,14 @@ void launch_scale_add_inplace(half* dst, const half* src, int n, float scale, cu
 }
 
 void launch_moe_router_topk_softmax(const half* logits, int experts, int top_k, int* topk_idx,
-                                    float* topk_prob, cudaStream_t stream) {
+                                    float* topk_prob, cudaStream_t stream,
+                                    const half* per_expert_scale) {
   if (experts <= 0 || top_k <= 0) {
     return;
   }
   const std::size_t smem = static_cast<std::size_t>(experts) * sizeof(float);
   moe_router_topk_softmax_kernel<<<1, 32, smem, stream>>>(logits, experts, top_k, topk_idx,
-                                                          topk_prob);
+                                                          topk_prob, per_expert_scale);
 }
 
 void launch_dequant_int8_to_fp16(const int8_t* src, half* dst, int n, float scale,

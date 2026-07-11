@@ -110,6 +110,10 @@ int main(int argc, char** argv) {
           cli.chat_template = "qwen3_5";
           info_out << "[info] defaulting to --chat-template qwen3_5 for the configured Qwen3.5 "
                       "safetensors model directory.\n";
+        } else if (safetensors_family == "gemma4") {
+          cli.chat_template = "gemma";
+          info_out << "[info] defaulting to --chat-template gemma for the configured Gemma 4 "
+                      "safetensors model directory.\n";
         } else {
           cli.chat_template = "llama4";
           info_out << "[info] defaulting to --chat-template llama4 for the configured safetensors "

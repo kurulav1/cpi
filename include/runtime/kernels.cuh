@@ -453,8 +453,44 @@ void launch_scale_add_inplace(half* dst, const half* src, int n, float scale, cu
 //   topk_idx    - selected expert indices [top_k]
 //   topk_prob   - selected normalized gate probabilities [top_k]
 //   stream      - CUDA stream
+//   per_expert_scale - optional learned per-expert gain, fp16 [experts], applied to
+//                      the weight AFTER the top-k renormalisation (Gemma MoE has
+//                      one; pass nullptr for routers that do not, which leaves the
+//                      result exactly as it was).
 void launch_moe_router_topk_softmax(const half* logits, int experts, int top_k, int* topk_idx,
-                                    float* topk_prob, cudaStream_t stream);
+                                    float* topk_prob, cudaStream_t stream,
+                                    const half* per_expert_scale = nullptr);
+
+// launch_moe_gate_up_geglu / launch_moe_down_accum
+//
+// The expert feed-forward, with the selected experts read from DEVICE memory
+// (topk_idx, written by the router) -- no host round-trip, so the decode graph
+// stays capturable.
+//
+// Experts are one contiguous matrix each, so selecting expert e is a row offset:
+//   gate_up: [num_experts * 2*inter, hidden]   rows e*2*inter .. +2*inter
+//   down:    [num_experts * hidden,  inter ]   rows e*hidden  .. +hidden
+// which means the ordinary weight quantiser applies to them unchanged.
+//
+//   w/scales/qbits/group - weight encoding (qbits 0 = fp16, 8 = int8, 4 = int4;
+//                          group 0 = per-row scales, >0 = group-wise)
+//   inter_out            - [top_k, inter] gelu(gate)*up per selected expert
+//   topk_weight          - routing weight per selected expert [top_k]
+//   y                    - [hidden], the routing-weighted sum over the top_k experts
+void launch_moe_gate_up_geglu(const void* w, const float* scales, int qbits, int group,
+                              const half* x, const int* topk_idx, half* inter_out, int inter,
+                              int hidden, int top_k, cudaStream_t stream);
+
+void launch_moe_down_accum(const void* w, const float* scales, int qbits, int group,
+                           const half* inter_in, const int* topk_idx, const float* topk_weight,
+                           half* y, int hidden, int inter, int top_k, cudaStream_t stream);
+
+// launch_mul_vec
+//
+// out[i] = in[i] * vec[i] * scale. Elementwise gain by a learned vector plus a
+// constant (the MoE router's pre-projection scaling).
+void launch_mul_vec(const half* in, const half* vec, half* out, int n, float scale,
+                    cudaStream_t stream);
 
 // launch_dequant_int8_to_fp16
 //

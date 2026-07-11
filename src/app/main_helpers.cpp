@@ -823,6 +823,11 @@ std::string infer_safetensors_model_family(const std::string& path) {
       return "qwen3_5";
     }
   }
+  if (root_model_type.find("gemma4") != std::string::npos ||
+      json.find("\"architectures\":[\"Gemma4") != std::string::npos ||
+      json.find("\"Gemma4ForConditionalGeneration\"") != std::string::npos) {
+    return "gemma4";
+  }
   if (root_model_type.find("llama4") != std::string::npos ||
       json.find("\"architectures\":[\"Llama4") != std::string::npos) {
     return "llama4";
@@ -839,6 +844,10 @@ ModelProbe probe_model(const std::string& model_path) {
   p.safetensors_family = p.is_cpi ? "" : infer_safetensors_model_family(model_path);
   if (p.is_cpi) {
     p.kind = ModelFamilyKind::Gemma4;
+  } else if (p.safetensors_family == "gemma4") {
+    // Gemma 4 also ships as a HuggingFace directory (the MoE checkpoint does); the
+    // plan executor reads either container.
+    p.kind = ModelFamilyKind::Gemma4;
   } else if (p.safetensors_family == "qwen3_5") {
     p.kind = ModelFamilyKind::Qwen35;
   } else if (p.is_safetensors_dir) {
@@ -854,7 +863,7 @@ EngineChoice resolve_engine(const ModelProbe& probe, bool cuda_available, bool f
   switch (probe.kind) {
     case ModelFamilyKind::Gemma4:
       if (!use_gpu) {
-        throw std::runtime_error("Gemma 4 (.cpi) currently requires a CUDA device");
+        throw std::runtime_error("Gemma 4 currently requires a CUDA device");
       }
       return EngineChoice::PlanCuda;
     case ModelFamilyKind::Qwen35:
