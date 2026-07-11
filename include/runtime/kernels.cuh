@@ -504,10 +504,44 @@ void launch_dequant_rowwise_int8_to_fp16(const std::int8_t* src, const float* sc
 void launch_quantize_rowwise_fp16_to_int8(const half* src, std::int8_t* dst, float* scales,
                                           int rows, int cols, cudaStream_t stream, int max_q = 127);
 
+// launch_quantize_groupwise_fp16_to_int8
+//
+// Weight quantisation with one scale per GROUP of `group` contiguous columns
+// instead of one scale per row:
+//   g              = col >> log2(group)
+//   scales[row, g] = max(abs(src[row, g*group : (g+1)*group])) / max_q
+//   dst[row, col]  = clamp(round(src[row, col] / scales[row, g]), -max_q, max_q)
+//
+// Why: a single row scale must span the row's largest magnitude, so one outlier
+// weight coarsens every other weight in that row. At int8 (255 levels) that is
+// survivable; at int4 (16 levels) across thousands of columns it is not, and the
+// error compounds across layers. Narrowing each scale to ~128 columns keeps the
+// outlier local. Cost is 32 bits per group, i.e. 4 + 32/group bits per weight
+// (4.25 bits at group=128).
+//
+// `group` must be a positive power of two and <= cols. Scales are [rows,
+// n_groups] row-major with n_groups = ceil(cols / group); use
+// quant_group_count() to size the buffer. This is the LOAD-time weight path --
+// activation quantisation stays per-row (launch_quantize_rowwise_fp16_to_int8).
+void launch_quantize_groupwise_fp16_to_int8(const half* src, std::int8_t* dst, float* scales,
+                                            int rows, int cols, int group, cudaStream_t stream,
+                                            int max_q = 127);
+
+// Number of groups per row, i.e. the second dimension of the scales buffer.
+// group <= 0 means "one scale per row" (n_groups == 1).
+inline int quant_group_count(int cols, int group) {
+  if (group <= 0 || group >= cols) {
+    return 1;
+  }
+  return (cols + group - 1) / group;
+}
+
 // launch_pack_rowwise_int8_to_int4
 //
 // Packs row-major signed int8 values into signed int4 (two values per byte).
 // Input is expected to be within the int4 range [-8, 7]; values are clamped.
+// Layout-only: it does not touch scales, so it serves both the per-row and the
+// group-wise quantisers.
 void launch_pack_rowwise_int8_to_int4(const std::int8_t* src, std::int8_t* dst, int rows, int cols,
                                       cudaStream_t stream);
 
@@ -627,6 +661,23 @@ void launch_weight_only_int8_matvec_dual_dp4a(const std::int8_t* w_a, const floa
 void launch_weight_only_int4_matvec(const std::int8_t* w_packed, const float* scales, const half* x,
                                     half* y, int out_features, int in_features,
                                     cudaStream_t stream);
+
+// launch_weight_only_int{4,8}_matvec_grouped
+//
+// As above, but the weight scales are per GROUP of `group` contiguous input
+// features rather than per row (see launch_quantize_groupwise_fp16_to_int8).
+// The scale can no longer be hoisted out of the dot product, so it is applied
+// per element: y[row] = sum_col q[row,col] * scales[row, col>>shift] * x[col].
+//
+// `group` must be a positive power of two; `scales` is [out_features,
+// quant_group_count(in_features, group)] row-major.
+void launch_weight_only_int4_matvec_grouped(const std::int8_t* w_packed, const float* scales,
+                                            const half* x, half* y, int out_features,
+                                            int in_features, int group, cudaStream_t stream);
+
+void launch_weight_only_int8_matvec_grouped(const std::int8_t* w, const float* scales, const half* x,
+                                            half* y, int out_features, int in_features, int group,
+                                            cudaStream_t stream);
 
 // launch_weight_only_int4_matvec_batched
 //

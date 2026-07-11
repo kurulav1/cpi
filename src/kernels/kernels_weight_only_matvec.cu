@@ -384,6 +384,90 @@ __global__ void weight_only_int4_matvec_kernel(const int8_t* w_packed, const flo
   }
 }
 
+// Group-wise scales: the scale varies along the row, so it cannot be hoisted out
+// of the dot product the way the per-row kernels do. Each weight is dequantised
+// with its own group's scale before it is accumulated. `group_shift` is
+// log2(group), so the group index is a shift rather than an integer divide.
+__global__ void weight_only_int4_matvec_grouped_kernel(const int8_t* w_packed, const float* scales,
+                                                       const half* x, half* y, int out_features,
+                                                       int in_features, int group_shift,
+                                                       int n_groups) {
+  extern __shared__ float ssum[];
+  const int row = blockIdx.x;
+  const int tid = threadIdx.x;
+  if (row >= out_features) {
+    return;
+  }
+
+  const int packed_cols = (in_features + 1) / 2;
+  const int8_t* row_w =
+      w_packed + static_cast<std::size_t>(row) * static_cast<std::size_t>(packed_cols);
+  const float* row_s = scales + static_cast<std::size_t>(row) * static_cast<std::size_t>(n_groups);
+
+  float local = 0.0f;
+  for (int col = tid; col < in_features; col += blockDim.x) {
+    const float w = static_cast<float>(load_signed_int4(row_w, col)) * row_s[col >> group_shift];
+    local += w * __half2float(x[col]);
+  }
+
+  {
+    const int lane = tid & (warpSize - 1);
+    const int warp_id = tid / warpSize;
+    float dot = warp_sum(local);
+    if (lane == 0) {
+      ssum[warp_id] = dot;
+    }
+  }
+  __syncthreads();
+
+  if (tid == 0) {
+    float total = 0.0f;
+    for (int w = 0; w < blockDim.x / warpSize; ++w) {
+      total += ssum[w];
+    }
+    y[row] = __float2half(total);
+  }
+}
+
+__global__ void weight_only_int8_matvec_grouped_kernel(const int8_t* w, const float* scales,
+                                                       const half* x, half* y, int out_features,
+                                                       int in_features, int group_shift,
+                                                       int n_groups) {
+  extern __shared__ float ssum[];
+  const int row = blockIdx.x;
+  const int tid = threadIdx.x;
+  if (row >= out_features) {
+    return;
+  }
+
+  const int8_t* row_w = w + static_cast<std::size_t>(row) * static_cast<std::size_t>(in_features);
+  const float* row_s = scales + static_cast<std::size_t>(row) * static_cast<std::size_t>(n_groups);
+
+  float local = 0.0f;
+  for (int col = tid; col < in_features; col += blockDim.x) {
+    const float wq = static_cast<float>(row_w[col]) * row_s[col >> group_shift];
+    local += wq * __half2float(x[col]);
+  }
+
+  {
+    const int lane = tid & (warpSize - 1);
+    const int warp_id = tid / warpSize;
+    float dot = warp_sum(local);
+    if (lane == 0) {
+      ssum[warp_id] = dot;
+    }
+  }
+  __syncthreads();
+
+  if (tid == 0) {
+    float total = 0.0f;
+    for (int w = 0; w < blockDim.x / warpSize; ++w) {
+      total += ssum[w];
+    }
+    y[row] = __float2half(total);
+  }
+}
+
 __global__ void weight_only_int4_matvec_batched_kernel(const int8_t* w_packed, const float* scales,
                                                        const half* x, half* y, int batch_size,
                                                        int out_features, int in_features) {
@@ -622,6 +706,51 @@ void launch_weight_only_int8_matvec(const int8_t* w, const float* scales, const 
   weight_only_int8_matvec_kernel<<<out_features, threads,
                                    static_cast<std::size_t>(threads) * sizeof(float), stream>>>(
       w, scales, x, y, out_features, in_features);
+}
+
+namespace {
+
+// log2 of a power-of-two group. Returns -1 for anything else, which the grouped
+// launchers reject rather than silently mis-indexing the scales.
+int group_shift_of(int group) {
+  if (group <= 0 || (group & (group - 1)) != 0) {
+    return -1;
+  }
+  int shift = 0;
+  while ((1 << shift) < group) {
+    ++shift;
+  }
+  return shift;
+}
+
+}  // namespace
+
+void launch_weight_only_int4_matvec_grouped(const int8_t* w_packed, const float* scales,
+                                            const half* x, half* y, int out_features,
+                                            int in_features, int group, cudaStream_t stream) {
+  const int shift = group_shift_of(group);
+  if (shift < 0) {
+    return;  // caller bug: group must be a positive power of two
+  }
+  const int n_groups = quant_group_count(in_features, group);
+  const int threads = choose_reduction_threads(in_features);
+  weight_only_int4_matvec_grouped_kernel<<<
+      out_features, threads, static_cast<std::size_t>(threads) * sizeof(float), stream>>>(
+      w_packed, scales, x, y, out_features, in_features, shift, n_groups);
+}
+
+void launch_weight_only_int8_matvec_grouped(const int8_t* w, const float* scales, const half* x,
+                                            half* y, int out_features, int in_features, int group,
+                                            cudaStream_t stream) {
+  const int shift = group_shift_of(group);
+  if (shift < 0) {
+    return;
+  }
+  const int n_groups = quant_group_count(in_features, group);
+  const int threads = choose_reduction_threads(in_features);
+  weight_only_int8_matvec_grouped_kernel<<<
+      out_features, threads, static_cast<std::size_t>(threads) * sizeof(float), stream>>>(
+      w, scales, x, y, out_features, in_features, shift, n_groups);
 }
 
 void launch_weight_only_int8_matvec_batched(const int8_t* w, const float* scales, const half* x,

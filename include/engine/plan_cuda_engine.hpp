@@ -231,11 +231,18 @@ class PlanCudaEngine : public runtime::SequenceModel {
   // projections takes the transformer from ~22 GB to ~5.5 GB. Embeddings stay fp16
   // (the token lookup and the tied LM head both need them).
   struct QuantWeight {
-    std::int8_t* packed = nullptr;  // int4, two values per byte, row-major
-    float* scales = nullptr;        // per-row dequant scale
+    std::int8_t* packed = nullptr;  // int4: two values per byte, row-major
+    float* scales = nullptr;        // dequant scales, [rows, groups] row-major
+    int group = 0;                  // 0 = one scale per row; >0 = group-wise
   };
-  std::unordered_map<std::string, QuantWeight> qdev_;  // name -> int4 weight
-  int weight_quant_bits_ = 0;                          // 0 = fp16, 4 = int4
+  std::unordered_map<std::string, QuantWeight> qdev_;  // name -> quantized weight
+  int weight_quant_bits_ = 0;                          // 0 = fp16, 4 = int4, 8 = int8
+  // Scale granularity for quantized weights (input features per scale, a power of
+  // two; 0 = one scale per row). int4 defaults to 128: a per-row scale must span
+  // the row's largest weight, so at 16 levels a single outlier coarsens every
+  // other weight in the row, and the error compounds across layers (this is what
+  // made int4 unusable on Gemma 12B). int8's 255 levels tolerate per-row.
+  int weight_quant_group_ = 0;
   std::vector<float> layer_scalar_host_;         // per-layer scalar values
 
   cudaStream_t stream_ = nullptr;

@@ -218,21 +218,34 @@ void PlanCudaEngine::upload_int4(const std::string& name, int rows, int cols) {
     cols = shape[1];
   }
   const int bits = weight_quant_bits_;
+  // A group must divide the row evenly and be a power of two, else fall back to
+  // per-row for this tensor rather than mis-indexing its scales.
+  int group = weight_quant_group_;
+  if (group > 0 && (group > cols || (cols % group) != 0 || (group & (group - 1)) != 0)) {
+    group = 0;
+  }
 
   auto host = read_host_fp16(name, rows, cols);
   __half* d_fp16 = nullptr;
   G4_CHECK(cudaMalloc(&d_fp16, host.size() * sizeof(__half)));
   G4_CHECK(cudaMemcpy(d_fp16, host.data(), host.size() * sizeof(__half), cudaMemcpyHostToDevice));
 
-  // fp16 -> int8 with a per-row symmetric scale. max_q sets the level count:
-  // 127 for int8, 7 for int4 (which is then packed two-per-byte).
+  // fp16 -> int8 with a symmetric scale. max_q sets the level count: 127 for int8,
+  // 7 for int4 (which is then packed two-per-byte). group picks the granularity.
   std::int8_t* d_i8 = nullptr;
   float* d_scales = nullptr;
   const std::size_t n = static_cast<std::size_t>(rows) * cols;
+  const int n_groups = kernels::quant_group_count(cols, group);
   G4_CHECK(cudaMalloc(&d_i8, n));
-  G4_CHECK(cudaMalloc(&d_scales, static_cast<std::size_t>(rows) * sizeof(float)));
-  kernels::launch_quantize_rowwise_fp16_to_int8(d_fp16, d_i8, d_scales, rows, cols, stream_,
-                                                bits == 4 ? 7 : 127);
+  G4_CHECK(
+      cudaMalloc(&d_scales, static_cast<std::size_t>(rows) * n_groups * sizeof(float)));
+  if (group > 0) {
+    kernels::launch_quantize_groupwise_fp16_to_int8(d_fp16, d_i8, d_scales, rows, cols, group,
+                                                    stream_, bits == 4 ? 7 : 127);
+  } else {
+    kernels::launch_quantize_rowwise_fp16_to_int8(d_fp16, d_i8, d_scales, rows, cols, stream_,
+                                                  bits == 4 ? 7 : 127);
+  }
 
   std::int8_t* d_w = d_i8;
   if (bits == 4) {
@@ -247,7 +260,7 @@ void PlanCudaEngine::upload_int4(const std::string& name, int rows, int cols) {
   }
 
   cudaFree(d_fp16);  // the whole point: the fp16 never coexists with the next tensor
-  qdev_[name] = {d_w, d_scales};
+  qdev_[name] = {d_w, d_scales, group};
 }
 
 float PlanCudaEngine::scalar_value(const std::string& name) {
@@ -711,6 +724,7 @@ void PlanCudaEngine::build_plan() {
         o.qweight = q->second.packed;
         o.qscales = q->second.scales;
         o.qbits = weight_quant_bits_;
+        o.qgroup = q->second.group;
       } else {
         o.weight = static_cast<const __half*>(dev_[full]);
       }
@@ -830,8 +844,17 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
         }
         break;
       case OpKind::Gemv:
-        // Weight encoding was chosen at load; the op just carries it.
-        if (op.qbits == 4) {
+        // Weight encoding AND scale granularity were chosen at load; the op just
+        // carries them.
+        if (op.qbits == 4 && op.qgroup > 0) {
+          kernels::launch_weight_only_int4_matvec_grouped(op.qweight, op.qscales, S(op.in),
+                                                          S(op.out), op.cols, op.in_dim, op.qgroup,
+                                                          stream_);
+        } else if (op.qbits == 8 && op.qgroup > 0) {
+          kernels::launch_weight_only_int8_matvec_grouped(op.qweight, op.qscales, S(op.in),
+                                                          S(op.out), op.cols, op.in_dim, op.qgroup,
+                                                          stream_);
+        } else if (op.qbits == 4) {
           kernels::launch_weight_only_int4_matvec(op.qweight, op.qscales, S(op.in), S(op.out),
                                                   op.cols, op.in_dim, stream_);
         } else if (op.qbits == 8) {
@@ -988,7 +1011,7 @@ void PlanCudaEngine::build_qwen35_plan() {
       Op o; o.kind = OpKind::Gemv; o.in = in; o.out = out; o.cols = out_dim; o.in_dim = in_dim;
       const auto q = qdev_.find(p + t);
       if (q != qdev_.end()) { o.qweight = q->second.packed; o.qscales = q->second.scales;
-                              o.qbits = weight_quant_bits_; }
+                              o.qbits = weight_quant_bits_; o.qgroup = q->second.group; }
       else { o.weight = W(t); }
       ops.push_back(o);
     };
@@ -1329,12 +1352,22 @@ void PlanCudaEngine::initialize(const EngineOptions& options) {
   // Weight-only quantization (--weight-quant int8|int4). Must be set BEFORE open():
   // load_all quantizes each projection as it streams in, so the fp16 model never
   // lands on the GPU whole (Gemma 12B is ~24 GB fp16 and would OOM first).
-  // NOTE: Gemma 12B degrades badly under naive per-row int4 (16 levels across
-  // 3840-15360 weights compounds over 48 layers x 7 matmuls); int8 is the usable
-  // setting and still takes it from ~24 GB to ~13 GB.
   if (options.int8_streaming) {
     if (options.streaming_quant_bits == 4) weight_quant_bits_ = 4;
     else if (options.streaming_quant_bits == 8) weight_quant_bits_ = 8;
+  }
+  // Scale granularity. int4 defaults to group-wise (128 input features per scale):
+  // per-row int4 gives one scale for a whole 3840-15360-wide row, so a single
+  // outlier weight coarsens the entire row, and over 48 layers x 7 matmuls that
+  // compounds into garbage (Gemma 12B produced "t/t/t/t/..."). Group-wise costs
+  // 32 bits per group -- 4.25 bits/weight instead of 4. int8's 255 levels do not
+  // need it, so it stays per-row and byte-identical to before.
+  // Override with LLAMA_INFER_PLAN_QUANT_GROUP (0 = per-row, else a power of two).
+  if (weight_quant_bits_ == 4) {
+    weight_quant_group_ = 128;
+  }
+  if (const char* g = std::getenv("LLAMA_INFER_PLAN_QUANT_GROUP")) {
+    weight_quant_group_ = std::atoi(g);
   }
   open(options.model_path, options.max_context > 0 ? options.max_context : 4096);
 }

@@ -540,6 +540,59 @@ __global__ void quantize_rowwise_fp16_to_int8_kernel(const half* src, int8_t* ds
   }
 }
 
+// One block per (row, group). The group's max is reduced in shared memory, its
+// scale written to scales[row, g], and the group's elements quantised with it.
+// Deliberately separate from quantize_rowwise_fp16_to_int8_kernel rather than a
+// generalisation of it: that kernel runs per-token inside LlamaEngine's captured
+// decode graphs, and this one only ever runs at load time on weights.
+__global__ void quantize_groupwise_fp16_to_int8_kernel(const half* src, int8_t* dst, float* scales,
+                                                       int cols, int group, int n_groups,
+                                                       int max_q) {
+  extern __shared__ float smax[];
+  const int row = blockIdx.x;
+  const int g = blockIdx.y;
+  const int tid = threadIdx.x;
+  const int lane = tid & (warpSize - 1);
+  const int warp = tid / warpSize;
+  const int warp_count = (blockDim.x + warpSize - 1) / warpSize;
+
+  const int col0 = g * group;
+  const int col1 = min(col0 + group, cols);
+  const std::size_t base = static_cast<std::size_t>(row) * static_cast<std::size_t>(cols);
+
+  float local_max = 0.0f;
+  for (int col = col0 + tid; col < col1; col += blockDim.x) {
+    local_max = fmaxf(local_max, fabsf(__half2float(src[base + col])));
+  }
+
+  local_max = warp_max(local_max);
+  if (lane == 0) {
+    smax[warp] = local_max;
+  }
+  __syncthreads();
+
+  if (warp == 0) {
+    float block_max = (lane < warp_count) ? smax[lane] : 0.0f;
+    block_max = warp_max(block_max);
+    if (lane == 0) {
+      float scale = block_max / static_cast<float>(max_q);
+      if (scale < 1.0e-8f) {
+        scale = 1.0e-8f;
+      }
+      scales[static_cast<std::size_t>(row) * n_groups + g] = scale;
+      smax[0] = 1.0f / scale;
+    }
+  }
+  __syncthreads();
+
+  const float inv_scale = smax[0];
+  for (int col = col0 + tid; col < col1; col += blockDim.x) {
+    int q = __float2int_rn(__half2float(src[base + col]) * inv_scale);
+    q = max(-max_q, min(max_q, q));
+    dst[base + col] = static_cast<int8_t>(q);
+  }
+}
+
 __global__ void pack_rowwise_int8_to_int4_kernel(const int8_t* src, int8_t* dst, int rows,
                                                  int cols) {
   const int row = blockIdx.x;
@@ -835,6 +888,24 @@ void launch_quantize_rowwise_fp16_to_int8(const half* src, int8_t* dst, float* s
   quantize_rowwise_fp16_to_int8_kernel<<<
       rows, threads, static_cast<std::size_t>(warp_count) * sizeof(float), stream>>>(
       src, dst, scales, cols, max_q);
+}
+
+void launch_quantize_groupwise_fp16_to_int8(const half* src, int8_t* dst, float* scales, int rows,
+                                            int cols, int group, cudaStream_t stream, int max_q) {
+  if (max_q <= 0) {
+    max_q = 127;
+  }
+  if (group <= 0 || group > cols) {
+    group = cols;  // degenerates to one scale per row
+  }
+  const int n_groups = quant_group_count(cols, group);
+  const int threads = choose_reduction_threads(group);
+  constexpr int kWarpSize = 32;
+  const int warp_count = (threads + kWarpSize - 1) / kWarpSize;
+  const dim3 grid(static_cast<unsigned int>(rows), static_cast<unsigned int>(n_groups));
+  quantize_groupwise_fp16_to_int8_kernel<<<
+      grid, threads, static_cast<std::size_t>(warp_count) * sizeof(float), stream>>>(
+      src, dst, scales, cols, group, n_groups, max_q);
 }
 
 void launch_pack_rowwise_int8_to_int4(const int8_t* src, int8_t* dst, int rows, int cols,
