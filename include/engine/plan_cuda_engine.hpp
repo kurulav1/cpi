@@ -27,6 +27,7 @@
 #include "engine/decode_driver.hpp"
 #include "engine/engine_types.hpp"
 #include "engine/op_plan.hpp"
+#include "model/safetensors_loader.hpp"
 
 namespace engine {
 
@@ -90,7 +91,13 @@ class PlanCudaEngine : public runtime::SequenceModel {
   int sample(const runtime::DecodeParams& params, const std::vector<int>& history) override;
 
  private:
+  // Which model recipe builds the plan. The EXECUTOR, sampler, quantizer, decode
+  // graph and KV/state machinery are shared; only the config parse, weight load and
+  // plan recipe differ — so a "new model" is a recipe, not an engine.
+  enum class Family { Gemma4, Qwen35 };
+
   struct Config {
+    Family family = Family::Gemma4;
     int num_layers = 0, hidden = 0, num_heads = 0, num_kv_heads = 1;
     int head_dim = 256, global_head_dim = 512, intermediate = 0, vocab = 0;
     // Actual per-layer-type head_dim from the weights (E2B: 256/512; 12B: 256/512).
@@ -105,8 +112,18 @@ class PlanCudaEngine : public runtime::SequenceModel {
     bool use_double_wide_mlp = false, tie_word_embeddings = true;
     bool enable_moe_block = false;  // 26B-A4B: dense-MLP + top-k experts (not yet run)
     int num_experts = 0, top_k_experts = 0, moe_intermediate_size = 0;
-    std::vector<int> layer_full;    // 1 if full_attention, 0 if sliding
+    std::vector<int> layer_full;    // 1 if full_attention, 0 if sliding/linear
     std::vector<int> kv_source;     // which layer's K/V each layer uses
+
+    // ── Qwen3.5 (hybrid full-attention + gated delta-net) ──
+    // layer_full doubles as the layer-kind mask here: 1 = full_attention,
+    // 0 = linear_attention (delta-net), exactly as for Gemma's sliding layers.
+    int linear_num_key_heads = 0, linear_num_value_heads = 0;
+    int linear_key_head_dim = 0, linear_value_head_dim = 0;
+    int linear_conv_kernel_dim = 0;
+    int max_position_embeddings = 0;
+    float rope_theta = 1e7f;
+    float partial_rotary_factor = 1.0f;
   };
 
   struct TensorMeta {
@@ -117,12 +134,22 @@ class PlanCudaEngine : public runtime::SequenceModel {
 
   void parse_manifest(const std::string& manifest_path);
   void load_all(const std::string& cpi_path);
-  __half* upload(const std::string& name);                 // load a tensor to device (fp16)
+  // ── Qwen3.5 recipe (config parse + weight load + plan build). The executor,
+  //    sampler, quantizer, graph and state machinery below are all SHARED. ──
+  void parse_qwen35_config(const std::string& model_dir);
+  void load_qwen35_weights();
+  void build_qwen35_plan();
+  // Host fp16 bytes for a tensor, from whichever container backs this model.
+  // Safetensors carries no shape/dtype we can use, so dims come from the config
+  // and bf16 is converted to fp16 (the .cpi path already stores fp16 + shapes).
+  std::vector<__half> read_host_fp16(const std::string& name, int rows, int cols);
+  float* upload_f32(const std::string& name, int n);       // float weights (delta-net norm / A_log)
+  __half* upload(const std::string& name, int rows = 0, int cols = 0);
   // Loads a weight and quantizes it to int4 on the GPU, freeing the fp16 copy
   // immediately. Done PER TENSOR during load: uploading the whole model in fp16
   // first and quantizing afterwards would peak at the fp16 footprint — exactly the
   // OOM this exists to avoid (Gemma 12B is ~24 GB fp16). Peak here is one tensor.
-  void upload_int4(const std::string& name);
+  void upload_int4(const std::string& name, int rows = 0, int cols = 0);
   float scalar_value(const std::string& name);             // read a [1] tensor to host
   void build_rope_tables();
   void allocate_buffers();
@@ -174,6 +201,30 @@ class PlanCudaEngine : public runtime::SequenceModel {
   std::size_t data_start_ = 0;
   std::unordered_map<std::string, TensorMeta> meta_;
   std::unordered_map<std::string, void*> dev_;   // name -> device fp16 ptr
+  std::unordered_map<std::string, float*> devf_; // name -> device float ptr (delta-net norm/A_log)
+
+  // Weight source. Gemma ships a .cpi (fp16 + shapes in the manifest); Qwen3.5
+  // ships safetensors (bf16, shapes only in its config), so the engine reads
+  // whichever the model actually has rather than forcing a conversion.
+  model::SafetensorsLoader st_;
+  bool from_safetensors_ = false;
+
+  // Derived geometry (Qwen3.5).
+  int rotary_dim_ = 0;      // partial RoPE width (head_dim * partial_rotary_factor)
+  int full_q_dim_ = 0, full_kv_dim_ = 0;
+  int linear_k_dim_ = 0, linear_v_dim_ = 0, linear_conv_dim_ = 0;
+
+  // Delta-net / gated-attention working buffers (allocated only for that family).
+  __half* d_q_pair_ = nullptr;   // fused q|gate before the split
+  __half* d_q_gate_ = nullptr;
+  __half* d_lin_mix_ = nullptr;  // fused linear qkv mixture
+  __half* d_lin_z_ = nullptr;
+  __half* d_lin_a_ = nullptr;
+  __half* d_lin_b_ = nullptr;
+  __half* d_lin_q_ = nullptr;
+  __half* d_lin_k_ = nullptr;
+  __half* d_lin_v_ = nullptr;
+  __half* d_lin_att_ = nullptr;
 
   // int4 weight-only quantization (--weight-quant int4). Gemma 12B is ~24 GB in
   // fp16 and OOMs on a 32 GB card alongside the desktop; int4 on the per-layer

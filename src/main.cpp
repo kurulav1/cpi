@@ -326,8 +326,16 @@ int main(int argc, char** argv) {
         break;
       }
       case EngineChoice::Qwen35Cuda: {
-        engine::Qwen35CudaEngine qwen35_cuda_eng;
-        run_with_engine(qwen35_cuda_eng);
+        // Qwen3.5 now runs on the generic op-plan executor (verified byte-identical
+        // to the old fork engine, same throughput). LLAMA_INFER_QWEN35_FORK=1 is a
+        // temporary escape hatch back to the fork; it goes away with the fork.
+        if (std::getenv("LLAMA_INFER_QWEN35_FORK")) {
+          engine::Qwen35CudaEngine qwen35_cuda_eng;
+          run_with_engine(qwen35_cuda_eng);
+          break;
+        }
+        engine::PlanCudaEngine qwen35_plan_eng;
+        run_with_engine(qwen35_plan_eng);
         break;
       }
       case EngineChoice::Llama4Cuda: {

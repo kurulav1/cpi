@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -18,6 +19,7 @@
 
 #include "engine/generation_constraints.hpp"
 #include "engine/sampling.hpp"
+#include "model/json_mini.hpp"
 #include "runtime/kernels.cuh"
 
 namespace engine {
@@ -45,6 +47,11 @@ std::vector<__half> read_fp16(std::ifstream& f, std::size_t data_start, std::siz
 PlanCudaEngine::~PlanCudaEngine() {
   for (auto& kv : dev_) cudaFree(kv.second);
   for (auto& kv : qdev_) { cudaFree(kv.second.packed); cudaFree(kv.second.scales); }
+  for (auto& kv : devf_) cudaFree(kv.second);
+  cudaFree(d_q_pair_); cudaFree(d_q_gate_);
+  cudaFree(d_lin_mix_); cudaFree(d_lin_z_); cudaFree(d_lin_a_); cudaFree(d_lin_b_);
+  cudaFree(d_lin_q_); cudaFree(d_lin_k_); cudaFree(d_lin_v_); cudaFree(d_lin_att_);
+  cudaFree(d_lin_conv_state_); cudaFree(d_lin_recurrent_state_);
   // shared-layer caches are aliases; free only the owning (< first_shared) ones.
   for (int L = 0; L < cfg_.first_shared_layer && L < static_cast<int>(caches_k_.size()); ++L) {
     cudaFree(caches_k_[L]);
@@ -153,11 +160,29 @@ void PlanCudaEngine::parse_manifest(const std::string& manifest_path) {
     for (int i = 0; i < cfg_.num_layers; ++i) cfg_.kv_source.push_back(i);
 }
 
-__half* PlanCudaEngine::upload(const std::string& name) {
-  auto it = meta_.find(name);
-  if (it == meta_.end()) throw std::runtime_error("missing tensor: " + name);
-  std::ifstream f(cpi_path_, std::ios::binary);
-  auto host = read_fp16(f, data_start_, it->second.offset, it->second.bytes);
+// Host fp16 for a tensor, from whichever container backs this model.
+//  .cpi        : already fp16, shapes in the manifest (rows/cols ignored).
+//  safetensors : bf16, and the header carries no shape we use — so the caller
+//                passes the dims from the config, and we convert bf16 -> fp16.
+std::vector<__half> PlanCudaEngine::read_host_fp16(const std::string& name, int rows, int cols) {
+  if (!from_safetensors_) {
+    auto it = meta_.find(name);
+    if (it == meta_.end()) throw std::runtime_error("missing tensor: " + name);
+    std::ifstream f(cpi_path_, std::ios::binary);
+    return read_fp16(f, data_start_, it->second.offset, it->second.bytes);
+  }
+  if (!st_.has_tensor(name)) throw std::runtime_error("missing tensor: " + name);
+  const auto* src = reinterpret_cast<const std::uint16_t*>(st_.tensor_ptr(name));
+  const std::size_t n = static_cast<std::size_t>(rows) * static_cast<std::size_t>(cols);
+  if (n * sizeof(std::uint16_t) > st_.tensor_bytes(name))
+    throw std::runtime_error("tensor smaller than declared dims: " + name);
+  std::vector<__half> out(n);
+  for (std::size_t i = 0; i < n; ++i) out[i] = __float2half(mini::bf16_to_float(src[i]));
+  return out;
+}
+
+__half* PlanCudaEngine::upload(const std::string& name, int rows, int cols) {
+  const auto host = read_host_fp16(name, rows, cols);
   __half* d = nullptr;
   G4_CHECK(cudaMalloc(&d, host.size() * sizeof(__half)));
   G4_CHECK(cudaMemcpy(d, host.data(), host.size() * sizeof(__half), cudaMemcpyHostToDevice));
@@ -165,23 +190,36 @@ __half* PlanCudaEngine::upload(const std::string& name) {
   return d;
 }
 
+// float32 weights (the delta-net RMS-norm weight and A_log ship as f32).
+float* PlanCudaEngine::upload_f32(const std::string& name, int n) {
+  if (!st_.has_tensor(name)) throw std::runtime_error("missing tensor: " + name);
+  const auto* src = reinterpret_cast<const float*>(st_.tensor_ptr(name));
+  float* d = nullptr;
+  G4_CHECK(cudaMalloc(&d, static_cast<std::size_t>(n) * sizeof(float)));
+  G4_CHECK(cudaMemcpy(d, src, static_cast<std::size_t>(n) * sizeof(float),
+                      cudaMemcpyHostToDevice));
+  devf_[name] = d;
+  return d;
+}
+
 // Upload a [rows, cols] weight and quantize it on-device to int8 or int4, freeing
 // the fp16 straight away. Per-tensor so peak VRAM is one tensor, not the whole
 // fp16 model (Gemma 12B is ~24 GB in fp16 and would OOM before we could shrink it).
-void PlanCudaEngine::upload_int4(const std::string& name) {
-  auto it = meta_.find(name);
-  if (it == meta_.end()) throw std::runtime_error("missing tensor: " + name);
-  const auto& shape = it->second.shape;
-  if (shape.size() != 2) {  // only 2-D projections are quantized
-    upload(name);
-    return;
+void PlanCudaEngine::upload_int4(const std::string& name, int rows, int cols) {
+  if (rows == 0 || cols == 0) {  // .cpi: shapes come from the manifest
+    auto it = meta_.find(name);
+    if (it == meta_.end()) throw std::runtime_error("missing tensor: " + name);
+    const auto& shape = it->second.shape;
+    if (shape.size() != 2) {  // only 2-D projections are quantized
+      upload(name);
+      return;
+    }
+    rows = shape[0];
+    cols = shape[1];
   }
-  const int rows = shape[0];
-  const int cols = shape[1];
   const int bits = weight_quant_bits_;
 
-  std::ifstream f(cpi_path_, std::ios::binary);
-  auto host = read_fp16(f, data_start_, it->second.offset, it->second.bytes);
+  auto host = read_host_fp16(name, rows, cols);
   __half* d_fp16 = nullptr;
   G4_CHECK(cudaMalloc(&d_fp16, host.size() * sizeof(__half)));
   G4_CHECK(cudaMemcpy(d_fp16, host.data(), host.size() * sizeof(__half), cudaMemcpyHostToDevice));
@@ -221,6 +259,27 @@ float PlanCudaEngine::scalar_value(const std::string& name) {
 }
 
 void PlanCudaEngine::build_rope_tables() {
+  if (cfg_.family == Family::Qwen35) {
+    // One partial-rotary table: [max_ctx, rotary_dim/2], inv_freq = theta^(-2i/rotary_dim).
+    const int half = rotary_dim_ / 2;
+    std::vector<float> cs(static_cast<std::size_t>(max_ctx_) * half), ss(cs.size());
+    for (int pos = 0; pos < max_ctx_; ++pos) {
+      for (int i = 0; i < half; ++i) {
+        const float inv = std::pow(cfg_.rope_theta,
+                                   -2.0f * static_cast<float>(i) / static_cast<float>(rotary_dim_));
+        const float ang = static_cast<float>(pos) * inv;
+        cs[static_cast<std::size_t>(pos) * half + i] = std::cos(ang);
+        ss[static_cast<std::size_t>(pos) * half + i] = std::sin(ang);
+      }
+    }
+    G4_CHECK(cudaMalloc(&d_cos_full_, cs.size() * sizeof(float)));
+    G4_CHECK(cudaMalloc(&d_sin_full_, ss.size() * sizeof(float)));
+    G4_CHECK(cudaMemcpy(d_cos_full_, cs.data(), cs.size() * sizeof(float),
+                        cudaMemcpyHostToDevice));
+    G4_CHECK(cudaMemcpy(d_sin_full_, ss.data(), ss.size() * sizeof(float),
+                        cudaMemcpyHostToDevice));
+    return;
+  }
   // Tables sized to the ACTUAL per-layer-type head_dim (E2B full=512, 12B full=256).
   const int hd_s = cfg_.head_dim_sliding, hd_f = cfg_.head_dim_full;
   const int hs = hd_s / 2;  // sliding pairs
@@ -251,6 +310,59 @@ void PlanCudaEngine::build_rope_tables() {
 }
 
 void PlanCudaEngine::allocate_buffers() {
+  if (cfg_.family == Family::Qwen35) {
+    const int H = cfg_.hidden;
+    const int nvh = cfg_.linear_num_value_heads;
+    auto al = [&](__half** p, std::size_t n) { G4_CHECK(cudaMalloc(p, n * sizeof(__half))); };
+    al(&d_x_, H); al(&d_x_norm_, H); al(&d_tmp_, H);
+    al(&d_q_pair_, static_cast<std::size_t>(full_q_dim_) * 2);
+    al(&d_q_, full_q_dim_); al(&d_q_gate_, full_q_dim_);
+    al(&d_k_, full_kv_dim_); al(&d_v_, full_kv_dim_);
+    al(&d_att_, std::max(full_q_dim_, H));
+    al(&d_gate_, cfg_.intermediate); al(&d_up_, cfg_.intermediate);
+    al(&d_inter_, cfg_.intermediate);
+    al(&d_lin_mix_, linear_conv_dim_); al(&d_lin_z_, linear_v_dim_);
+    al(&d_lin_a_, nvh); al(&d_lin_b_, nvh);
+    al(&d_lin_q_, static_cast<std::size_t>(nvh) * cfg_.linear_key_head_dim);
+    al(&d_lin_k_, static_cast<std::size_t>(nvh) * cfg_.linear_key_head_dim);
+    al(&d_lin_v_, static_cast<std::size_t>(nvh) * cfg_.linear_value_head_dim);
+    al(&d_lin_att_, linear_v_dim_);
+    G4_CHECK(cudaMalloc(&d_logits_, static_cast<std::size_t>(cfg_.vocab) * sizeof(float)));
+    G4_CHECK(cudaMalloc(&d_tok_, sizeof(int)));
+    G4_CHECK(cudaMalloc(&d_position_, sizeof(int)));
+    G4_CHECK(cudaMalloc(&d_argmax_, sizeof(int)));
+    const int topk_parts = kernels::topk_partition_count(cfg_.vocab);
+    const std::size_t part_n = static_cast<std::size_t>(topk_parts) * kMaxDeviceTopK;
+    G4_CHECK(cudaMalloc(&d_topk_part_val_, part_n * sizeof(float)));
+    G4_CHECK(cudaMalloc(&d_topk_part_idx_, part_n * sizeof(int)));
+    G4_CHECK(cudaMalloc(&d_topk_val_, kMaxDeviceTopK * sizeof(float)));
+    G4_CHECK(cudaMalloc(&d_topk_idx_, kMaxDeviceTopK * sizeof(int)));
+    G4_CHECK(cudaMalloc(&d_cand_idx_, kCandCapacity * sizeof(int)));
+    G4_CHECK(cudaMalloc(&d_cand_val_, kCandCapacity * sizeof(float)));
+    G4_CHECK(cudaMalloc(&d_cand_count_, sizeof(int)));
+
+    // KV cache only for full-attention layers; delta-net layers carry state instead.
+    caches_k_.assign(cfg_.num_layers, nullptr);
+    caches_v_.assign(cfg_.num_layers, nullptr);
+    for (int L = 0; L < cfg_.num_layers; ++L) {
+      if (!cfg_.layer_full[L]) continue;
+      const std::size_t bytes =
+          static_cast<std::size_t>(max_ctx_) * full_kv_dim_ * sizeof(__half);
+      G4_CHECK(cudaMalloc(&caches_k_[L], bytes));
+      G4_CHECK(cudaMalloc(&caches_v_[L], bytes));
+    }
+    // Delta-net state (zeroed: the recurrence starts empty).
+    const std::size_t conv_n =
+        static_cast<std::size_t>(cfg_.num_layers) * std::max(1, lin_conv_state_stride_);
+    const std::size_t rec_n =
+        static_cast<std::size_t>(cfg_.num_layers) * std::max(1, lin_recurrent_state_stride_);
+    G4_CHECK(cudaMalloc(&d_lin_conv_state_, conv_n * sizeof(float)));
+    G4_CHECK(cudaMalloc(&d_lin_recurrent_state_, rec_n * sizeof(float)));
+    G4_CHECK(cudaMemset(d_lin_conv_state_, 0, conv_n * sizeof(float)));
+    G4_CHECK(cudaMemset(d_lin_recurrent_state_, 0, rec_n * sizeof(float)));
+    return;
+  }
+
   const int H = cfg_.hidden;
   const int maxhd = std::max(cfg_.head_dim_full, cfg_.head_dim_sliding);
   const int maxq = cfg_.num_heads * maxhd;
@@ -299,6 +411,104 @@ void PlanCudaEngine::allocate_buffers() {
     int src = cfg_.kv_source[L];
     caches_k_[L] = caches_k_[src];
     caches_v_[L] = caches_v_[src];
+  }
+}
+
+// ── Qwen3.5 recipe ───────────────────────────────────────────────────────────
+// Config + weights + plan. Everything else (executor, sampler, quantizer, decode
+// graph, KV/state) is the SAME shared machinery Gemma runs on.
+
+void PlanCudaEngine::parse_qwen35_config(const std::string& model_dir) {
+  const std::string raw =
+      mini::read_text_file(std::filesystem::path(model_dir) / "config.json");
+  const std::string tc = mini::json_extract_object(raw, "text_config");
+  if (tc.empty()) throw std::runtime_error("Qwen3.5 config is missing text_config");
+
+  cfg_.family = Family::Qwen35;
+  cfg_.vocab = mini::json_get_int(tc, "vocab_size", 0);
+  cfg_.hidden = mini::json_get_int(tc, "hidden_size", 0);
+  cfg_.intermediate = mini::json_get_int(tc, "intermediate_size", 0);
+  cfg_.num_layers = mini::json_get_int(tc, "num_hidden_layers", 0);
+  cfg_.num_heads = mini::json_get_int(tc, "num_attention_heads", 0);
+  cfg_.num_kv_heads = mini::json_get_int(tc, "num_key_value_heads", 0);
+  cfg_.head_dim = mini::json_get_int(tc, "head_dim", 0);
+  cfg_.linear_num_key_heads = mini::json_get_int(tc, "linear_num_key_heads", 0);
+  cfg_.linear_num_value_heads = mini::json_get_int(tc, "linear_num_value_heads", 0);
+  cfg_.linear_key_head_dim = mini::json_get_int(tc, "linear_key_head_dim", 0);
+  cfg_.linear_value_head_dim = mini::json_get_int(tc, "linear_value_head_dim", 0);
+  cfg_.linear_conv_kernel_dim = mini::json_get_int(tc, "linear_conv_kernel_dim", 0);
+  cfg_.max_position_embeddings = mini::json_get_int(tc, "max_position_embeddings", 0);
+  cfg_.eos_token_id =
+      mini::json_get_int(tc, "eos_token_id", mini::json_get_int(raw, "eos_token_id", -1));
+  cfg_.rms_eps = mini::json_get_float(tc, "rms_norm_eps", 1e-6f);
+  const std::string rope = mini::json_extract_object(tc, "rope_parameters");
+  cfg_.rope_theta = mini::json_get_float(rope, "rope_theta", 1e7f);
+  cfg_.partial_rotary_factor = mini::json_get_float(rope, "partial_rotary_factor", 1.0f);
+
+  // layer_full doubles as the layer-kind mask: 1 = full attention, 0 = delta-net.
+  cfg_.layer_full.clear();
+  for (const std::string& t : mini::json_get_string_array(tc, "layer_types"))
+    cfg_.layer_full.push_back(t == "full_attention" ? 1 : 0);
+  if (static_cast<int>(cfg_.layer_full.size()) != cfg_.num_layers)
+    throw std::runtime_error("Qwen3.5 layer_types does not match num_hidden_layers");
+
+  // Derived geometry.
+  rotary_dim_ = static_cast<int>(
+      std::lround(static_cast<float>(cfg_.head_dim) * cfg_.partial_rotary_factor));
+  if (rotary_dim_ <= 0 || (rotary_dim_ % 2) != 0) rotary_dim_ = cfg_.head_dim - (cfg_.head_dim % 2);
+  full_q_dim_ = cfg_.num_heads * cfg_.head_dim;
+  full_kv_dim_ = cfg_.num_kv_heads * cfg_.head_dim;
+  linear_k_dim_ = cfg_.linear_num_key_heads * cfg_.linear_key_head_dim;
+  linear_v_dim_ = cfg_.linear_num_value_heads * cfg_.linear_value_head_dim;
+  linear_conv_dim_ = linear_k_dim_ * 2 + linear_v_dim_;
+  lin_conv_state_stride_ = linear_conv_dim_ * std::max(0, cfg_.linear_conv_kernel_dim - 1);
+  lin_recurrent_state_stride_ =
+      cfg_.linear_num_value_heads * cfg_.linear_key_head_dim * cfg_.linear_value_head_dim;
+  cfg_.bos_token_id = cfg_.eos_token_id >= 0 ? cfg_.eos_token_id : 0;
+
+  if (cfg_.vocab <= 0 || cfg_.hidden <= 0 || cfg_.num_layers <= 0 || cfg_.head_dim <= 0 ||
+      cfg_.linear_num_value_heads <= 0 || cfg_.linear_conv_kernel_dim <= 0)
+    throw std::runtime_error("Qwen3.5 config.json is missing required text_config fields");
+}
+
+void PlanCudaEngine::load_qwen35_weights() {
+  const bool quant = weight_quant_bits_ == 4 || weight_quant_bits_ == 8;
+  const int H = cfg_.hidden;
+  auto proj = [&](const std::string& n, int rows, int cols) {
+    if (quant) upload_int4(n, rows, cols);
+    else upload(n, rows, cols);
+  };
+
+  upload("model.language_model.embed_tokens.weight", cfg_.vocab, H);
+  upload("model.language_model.norm.weight", 1, H);
+  if (st_.has_tensor("lm_head.weight")) upload("lm_head.weight", cfg_.vocab, H);
+
+  for (int L = 0; L < cfg_.num_layers; ++L) {
+    const std::string p = "model.language_model.layers." + std::to_string(L) + ".";
+    upload(p + "input_layernorm.weight", 1, H);
+    upload(p + "post_attention_layernorm.weight", 1, H);
+    proj(p + "mlp.gate_proj.weight", cfg_.intermediate, H);
+    proj(p + "mlp.up_proj.weight", cfg_.intermediate, H);
+    proj(p + "mlp.down_proj.weight", H, cfg_.intermediate);
+
+    if (cfg_.layer_full[L]) {  // full attention (q_proj is a FUSED q|gate)
+      proj(p + "self_attn.q_proj.weight", full_q_dim_ * 2, H);
+      proj(p + "self_attn.k_proj.weight", full_kv_dim_, H);
+      proj(p + "self_attn.v_proj.weight", full_kv_dim_, H);
+      proj(p + "self_attn.o_proj.weight", H, full_q_dim_);
+      upload(p + "self_attn.q_norm.weight", 1, cfg_.head_dim);
+      upload(p + "self_attn.k_norm.weight", 1, cfg_.head_dim);
+    } else {                   // gated delta-net
+      proj(p + "linear_attn.in_proj_qkv.weight", linear_conv_dim_, H);
+      proj(p + "linear_attn.in_proj_z.weight", linear_v_dim_, H);
+      proj(p + "linear_attn.in_proj_a.weight", cfg_.linear_num_value_heads, H);
+      proj(p + "linear_attn.in_proj_b.weight", cfg_.linear_num_value_heads, H);
+      proj(p + "linear_attn.out_proj.weight", H, linear_v_dim_);
+      upload(p + "linear_attn.conv1d.weight", linear_conv_dim_, cfg_.linear_conv_kernel_dim);
+      upload(p + "linear_attn.dt_bias", 1, cfg_.linear_num_value_heads);
+      upload_f32(p + "linear_attn.norm.weight", cfg_.linear_value_head_dim);
+      upload_f32(p + "linear_attn.A_log", cfg_.linear_num_value_heads);
+    }
   }
 }
 
@@ -353,6 +563,29 @@ void PlanCudaEngine::open(const std::string& cpi_path, int max_context) {
   max_ctx_ = max_context;
   if (std::getenv("LLAMA_INFER_PLAN_NO_GRAPH")) decode_graph_enabled_ = false;
   if (std::getenv("LLAMA_INFER_PLAN_NO_DEVICE_TOPK")) device_topk_enabled_ = false;
+
+  // A directory ⇒ safetensors (Qwen3.5); a file ⇒ .cpi (Gemma). The engine reads
+  // whichever container the model actually ships.
+  std::error_code ec;
+  if (std::filesystem::is_directory(cpi_path, ec) && !ec) {
+    from_safetensors_ = true;
+    st_.open(cpi_path);
+    parse_qwen35_config(cpi_path);
+    if (max_ctx_ <= 0 || (cfg_.max_position_embeddings > 0 &&
+                          max_ctx_ > cfg_.max_position_embeddings))
+      max_ctx_ = std::min(max_ctx_ > 0 ? max_ctx_ : 2048, cfg_.max_position_embeddings);
+    // Partial RoPE has no device-position kernel, so this plan cannot be graphed.
+    // A capability decision made on the PLAN, not on a model name.
+    decode_graph_enabled_ = false;
+    G4_CHECK(cudaStreamCreate(&stream_));
+    load_qwen35_weights();
+    build_rope_tables();
+    allocate_buffers();
+    build_plan();
+    G4_CHECK(cudaStreamSynchronize(stream_));
+    return;
+  }
+
   std::string manifest = cpi_path.substr(0, cpi_path.find_last_of('.')) + ".manifest";
   parse_manifest(manifest);
   if (static_cast<int>(cfg_.layer_full.size()) != cfg_.num_layers)
@@ -390,10 +623,23 @@ void PlanCudaEngine::build_plan() {
   slot_ptr_[static_cast<int>(Slot::PleGate)] = d_ple_gate_;
   slot_ptr_[static_cast<int>(Slot::PleRaw)] = d_ple_raw_;
   slot_ptr_[static_cast<int>(Slot::PleAll)] = d_ple_;
-  // Linear-attention slots stay null until a plan that emits those ops allocates
-  // them; Gemma never touches them, so its plan is byte-for-byte unchanged.
-  for (int s = static_cast<int>(Slot::QPair); s < static_cast<int>(Slot::Count); ++s)
-    slot_ptr_[s] = nullptr;
+  // Gated / linear-attention working set (null for models that never emit those
+  // ops, so Gemma's plan is byte-for-byte unchanged).
+  slot_ptr_[static_cast<int>(Slot::QPair)] = d_q_pair_;
+  slot_ptr_[static_cast<int>(Slot::QGate)] = d_q_gate_;
+  slot_ptr_[static_cast<int>(Slot::LinMix)] = d_lin_mix_;
+  slot_ptr_[static_cast<int>(Slot::LinZ)] = d_lin_z_;
+  slot_ptr_[static_cast<int>(Slot::LinA)] = d_lin_a_;
+  slot_ptr_[static_cast<int>(Slot::LinB)] = d_lin_b_;
+  slot_ptr_[static_cast<int>(Slot::LinQ)] = d_lin_q_;
+  slot_ptr_[static_cast<int>(Slot::LinK)] = d_lin_k_;
+  slot_ptr_[static_cast<int>(Slot::LinV)] = d_lin_v_;
+  slot_ptr_[static_cast<int>(Slot::LinAtt)] = d_lin_att_;
+
+  if (cfg_.family == Family::Qwen35) {
+    build_qwen35_plan();
+    return;
+  }
 
   const int H = cfg_.hidden;
 
@@ -711,6 +957,122 @@ float* PlanCudaEngine::lin_recurrent_state(int layer) {
   return d_lin_recurrent_state_ + static_cast<std::size_t>(layer) * lin_recurrent_state_stride_;
 }
 
+// Qwen3.5 as a PLAN: hybrid full-attention + gated delta-net. Mirrors the fork's
+// forward exactly; the ops, state and executor are all shared machinery.
+void PlanCudaEngine::build_qwen35_plan() {
+  using namespace opplan;
+  const int H = cfg_.hidden;
+  const float eps = cfg_.rms_eps;
+
+  // Prologue: embed only (no scale, no PLE).
+  {
+    Op e; e.kind = OpKind::EmbeddingLookup; e.out = Slot::X; e.cols = H;
+    e.weight = static_cast<const __half*>(dev_["model.language_model.embed_tokens.weight"]);
+    plan_.prologue.push_back(e);
+  }
+
+  plan_.layers.assign(cfg_.num_layers, LayerPlan{});
+  for (int L = 0; L < cfg_.num_layers; ++L) {
+    const std::string p = "model.language_model.layers." + std::to_string(L) + ".";
+    LayerPlan& lp = plan_.layers[L];
+    lp.layer_index = L;
+    auto& ops = lp.ops;
+
+    auto W = [&](const char* t) { return static_cast<const __half*>(dev_[p + t]); };
+    auto rms = [&](Slot in, Slot out, const char* t, int rows, int cols) {
+      Op o; o.kind = OpKind::RmsNorm; o.in = in; o.out = out; o.weight = W(t);
+      o.rows = rows; o.cols = cols; o.norm_offset = true;  // Qwen3.5 uses (1 + w)
+      ops.push_back(o);
+    };
+    auto gemv = [&](Slot in, Slot out, const char* t, int out_dim, int in_dim) {
+      Op o; o.kind = OpKind::Gemv; o.in = in; o.out = out; o.cols = out_dim; o.in_dim = in_dim;
+      const auto q = qdev_.find(p + t);
+      if (q != qdev_.end()) { o.qweight = q->second.packed; o.qscales = q->second.scales;
+                              o.qbits = weight_quant_bits_; }
+      else { o.weight = W(t); }
+      ops.push_back(o);
+    };
+    auto add_x = [&](Slot src) {
+      Op o; o.kind = OpKind::AddInplace; o.out = Slot::X; o.in = src; o.cols = H;
+      ops.push_back(o);
+    };
+
+    rms(Slot::X, Slot::XNorm, "input_layernorm.weight", 1, H);
+
+    if (cfg_.layer_full[L]) {
+      // ── full attention (q_proj is a fused q|gate) ──
+      gemv(Slot::XNorm, Slot::QPair, "self_attn.q_proj.weight", full_q_dim_ * 2, H);
+      gemv(Slot::XNorm, Slot::K, "self_attn.k_proj.weight", full_kv_dim_, H);
+      gemv(Slot::XNorm, Slot::V, "self_attn.v_proj.weight", full_kv_dim_, H);
+      { Op o; o.kind = OpKind::SplitHeadHalves; o.in = Slot::QPair; o.out = Slot::Q;
+        o.out2 = Slot::QGate; o.heads = cfg_.num_heads; o.head_dim = cfg_.head_dim;
+        ops.push_back(o); }
+      rms(Slot::Q, Slot::Q, "self_attn.q_norm.weight", cfg_.num_heads, cfg_.head_dim);
+      rms(Slot::K, Slot::K, "self_attn.k_norm.weight", cfg_.num_kv_heads, cfg_.head_dim);
+      { Op o; o.kind = OpKind::Rope; o.in = Slot::Q; o.in2 = Slot::K;   // partial, Q+K together
+        o.heads = cfg_.num_heads; o.kv_heads = cfg_.num_kv_heads; o.head_dim = cfg_.head_dim;
+        o.rotary_dim = rotary_dim_; o.rope_table = RopeTable::Full;
+        ops.push_back(o); }
+      { Op o; o.kind = OpKind::KvStore; o.cols = full_kv_dim_; ops.push_back(o); }
+      { Op o; o.kind = OpKind::Attention; o.in = Slot::Q; o.out = Slot::Att;
+        o.heads = cfg_.num_heads; o.kv_heads = cfg_.num_kv_heads; o.head_dim = cfg_.head_dim;
+        o.full_attention = true; o.sliding_window = 0;
+        ops.push_back(o); }
+      { Op o; o.kind = OpKind::SigmoidGate; o.out = Slot::Att; o.in2 = Slot::QGate;
+        o.cols = full_q_dim_; ops.push_back(o); }
+      gemv(Slot::Att, Slot::Tmp, "self_attn.o_proj.weight", H, full_q_dim_);
+    } else {
+      // ── gated delta-net ──
+      gemv(Slot::XNorm, Slot::LinMix, "linear_attn.in_proj_qkv.weight", linear_conv_dim_, H);
+      gemv(Slot::XNorm, Slot::LinZ, "linear_attn.in_proj_z.weight", linear_v_dim_, H);
+      gemv(Slot::XNorm, Slot::LinA, "linear_attn.in_proj_a.weight", cfg_.linear_num_value_heads, H);
+      gemv(Slot::XNorm, Slot::LinB, "linear_attn.in_proj_b.weight", cfg_.linear_num_value_heads, H);
+      { Op o; o.kind = OpKind::LinearConv1d; o.in = Slot::LinMix;
+        o.weight = W("linear_attn.conv1d.weight");
+        o.cols = linear_conv_dim_; o.conv_kernel = cfg_.linear_conv_kernel_dim;
+        ops.push_back(o); }
+      { Op o; o.kind = OpKind::RepeatLinearHeads; o.in = Slot::LinMix;
+        o.num_k_heads = cfg_.linear_num_key_heads; o.num_v_heads = cfg_.linear_num_value_heads;
+        o.key_head_dim = cfg_.linear_key_head_dim; o.value_head_dim = cfg_.linear_value_head_dim;
+        ops.push_back(o); }
+      { Op o; o.kind = OpKind::LinearAttentionStep;
+        o.auxf_a = devf_[p + "linear_attn.norm.weight"];
+        o.auxf_b = devf_[p + "linear_attn.A_log"];
+        o.aux_ptr = W("linear_attn.dt_bias");
+        o.num_v_heads = cfg_.linear_num_value_heads;
+        o.key_head_dim = cfg_.linear_key_head_dim;
+        o.value_head_dim = cfg_.linear_value_head_dim;
+        o.eps = eps;
+        ops.push_back(o); }
+      gemv(Slot::LinAtt, Slot::Tmp, "linear_attn.out_proj.weight", H, linear_v_dim_);
+    }
+    add_x(Slot::Tmp);
+
+    // ── MLP (SwiGLU — SiLU, not GeLU) ──
+    rms(Slot::X, Slot::XNorm, "post_attention_layernorm.weight", 1, H);
+    gemv(Slot::XNorm, Slot::Gate, "mlp.gate_proj.weight", cfg_.intermediate, H);
+    gemv(Slot::XNorm, Slot::Up, "mlp.up_proj.weight", cfg_.intermediate, H);
+    { Op o; o.kind = OpKind::SiluMul; o.in = Slot::Gate; o.in2 = Slot::Up; o.out = Slot::Inter;
+      o.cols = cfg_.intermediate; ops.push_back(o); }
+    gemv(Slot::Inter, Slot::Tmp, "mlp.down_proj.weight", H, cfg_.intermediate);
+    add_x(Slot::Tmp);
+  }
+
+  // Epilogue: final (1+w) norm -> LM head.
+  {
+    Op n; n.kind = OpKind::RmsNorm; n.in = Slot::X; n.out = Slot::XNorm;
+    n.weight = static_cast<const __half*>(dev_["model.language_model.norm.weight"]);
+    n.rows = 1; n.cols = H; n.norm_offset = true;
+    plan_.epilogue.push_back(n);
+    Op h; h.kind = OpKind::LmHead; h.in = Slot::XNorm;
+    const char* head = dev_.count("lm_head.weight") ? "lm_head.weight"
+                                                    : "model.language_model.embed_tokens.weight";
+    h.weight = static_cast<const __half*>(dev_[head]);
+    h.cols = cfg_.vocab; h.in_dim = H;
+    plan_.epilogue.push_back(h);
+  }
+}
+
 // Hot loop for one tower layer: execute its resolved op-plan at `position`.
 void PlanCudaEngine::run_layer(int layer, int position) {
   const std::vector<opplan::Op>& ops = plan_.layers[layer].ops;
@@ -995,6 +1357,11 @@ std::vector<int> PlanCudaEngine::generate_stream(const std::vector<int>& prompt,
   // Honour a caller-supplied seed so temperature>0 generation is reproducible
   // (this engine previously ignored it, unlike the other engines).
   p.seed = constraints ? constraints->seed : -1;
+  // Contract: generate_stream returns prompt+generated. main_modes strips
+  // prompt_tokens.size(), and ONLY when the result is longer than the prompt — so
+  // returning generated-only silently produced an EMPTY final "Decoded text".
+  // It went unnoticed because the streamed on_token text still looked correct.
+  p.include_prompt = !prompt.empty();
   // sample() pulls logits off the device lazily (greedy argmax / host copy), so
   // step() need not copy 262K floats to host every token.
   defer_host_logits_ = true;
