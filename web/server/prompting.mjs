@@ -502,6 +502,58 @@ function formatPlain(turns, systemPrompt) {
   return lines.join("\n\n").trim();
 }
 
+// ── Chat template as DATA ────────────────────────────────────────────────────
+// A model's chat format is a descriptor it ships, not a function in the core.
+// Every modern template is the same shape — per-role prefix/suffix, a generation
+// prompt for the pending turn, and a join — so one generic renderer covers them:
+//
+//   { join, trim, bosLiteral,
+//     system: { mode: "block"|"fold"|"prepend"|"none", prefix, suffix,
+//               foldSeparator, emitWhenEmpty },
+//     user:      { prefix, suffix },
+//     assistant: { prefix, suffix },
+//     generationPrompt, stop: [...] }
+//
+// system.mode captures the only real structural variation:
+//   block   — its own turn (ChatML, Llama3, Phi-3)
+//   fold    — folded into the first user turn (Gemma, Mistral)
+//   prepend — emitted raw before the turns (DeepSeek-R1)
+// `prime` is appended to the generation prompt (a reasoning model's <think> open);
+// it comes from the reasoning descriptor, so reasoning stays out of the template.
+//
+// NOTE: llama2/tinyllama are deliberately NOT expressible here — they aren't chat
+// templates, they're bespoke prompt STRATEGIES (history compaction, injected
+// instructions). Those stay as code; see formatLlama2.
+export function renderChat(turns, systemPrompt, chat, prime = "") {
+  const sys = systemPrompt || "";
+  const S = chat.system || { mode: "none" };
+  const blocks = [];
+
+  if (S.mode === "block" && (sys || S.emitWhenEmpty)) {
+    blocks.push(`${S.prefix ?? ""}${sys}${S.suffix ?? ""}`);
+  }
+  turns.forEach((turn, i) => {
+    let user = turn.user;
+    if (S.mode === "fold" && i === 0 && sys) {
+      user = `${sys}${S.foldSeparator ?? "\n\n"}${user}`;
+    }
+    blocks.push(`${chat.user?.prefix ?? ""}${user}${chat.user?.suffix ?? ""}`);
+    if (turn.assistant) {
+      blocks.push(`${chat.assistant?.prefix ?? ""}${turn.assistant}${chat.assistant?.suffix ?? ""}`);
+    } else {
+      // Pending turn: the generation prompt (+ any reasoning prime). Some templates
+      // (Mistral) have none — the user suffix itself is the cue — so emit nothing.
+      const gen = `${chat.generationPrompt ?? ""}${prime}`;
+      if (gen) blocks.push(gen);
+    }
+  });
+
+  let out = blocks.join(chat.join ?? "");
+  if (S.mode === "prepend" && sys) out = sys + out;
+  out = (chat.bosLiteral ?? "") + out;
+  return chat.trim ? out.trim() : out;
+}
+
 export function buildPromptPackage(messages, options = {}) {
   const normalized = normalizeMessages(messages, options);
   const messageSystemPrompt = normalized
@@ -528,6 +580,27 @@ export function buildPromptPackage(messages, options = {}) {
       template,
       stopTexts: STOP_SEQUENCES[template] ?? STOP_SEQUENCES.plain,
       addBos: template === "plain"
+    };
+  }
+
+  // The model ships a chat descriptor → render it with the generic renderer. The
+  // legacy per-template formatters below are the fallback for models that don't
+  // (and for llama2/tinyllama, which are strategies, not templates).
+  if (options.chat?.user) {
+    const prime = options.thinking
+      ? (options.reasoning?.primeOn ?? "")
+      : (options.reasoning?.primeOff ?? "");
+    // system.source "explicit" = forward ONLY a caller-supplied system prompt, not
+    // system messages merged from the conversation (DeepSeek-R1 recommends none).
+    const sys = options.chat.system?.source === "explicit"
+      ? (hasExplicitSystemPrompt ? systemPrompt : "")
+      : effectiveSystemPrompt;
+    return {
+      messages: chatMessages,
+      prompt: renderChat(turns, sys, options.chat, prime),
+      template,
+      stopTexts: options.chat.stop ?? STOP_SEQUENCES[template] ?? STOP_SEQUENCES.plain,
+      addBos: options.chat.addBos ?? true
     };
   }
 

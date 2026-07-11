@@ -1260,39 +1260,61 @@ function discoverSafetensorsModelDirs(scanRoots) {
 //   markers: delimiter strings the worker must PRESERVE through detokenization
 //            (Gemma's <|channel> tokens are `special` and dropped by default; Qwen's
 //            </think> is non-special text and survives, so it needs none).
-const NO_REASONING = { mode: "none", enable: "", open: "", close: "", markers: [] };
+// primeOn/primeOff are appended to the chat descriptor's generationPrompt (a
+// reasoning model's <think> opener) — so the prime lives with REASONING, not in
+// the chat template.
+const NO_REASONING = {
+  mode: "none", enable: "", open: "", close: "", markers: [], primeOn: "", primeOff: ""
+};
 
 function normalizeReasoning(raw) {
   if (!raw || typeof raw !== "object") return null;
   const mode = raw.mode === "always" || raw.mode === "optional" ? raw.mode : "none";
   if (mode === "none") return { ...NO_REASONING };
+  const str = (v, d = "") => (typeof v === "string" ? v : d);
   return {
     mode,
-    enable: typeof raw.enable === "string" ? raw.enable : "",
-    open: typeof raw.open === "string" ? raw.open : "",
-    close: typeof raw.close === "string" ? raw.close : "</think>",
-    markers: Array.isArray(raw.markers) ? raw.markers.filter((s) => typeof s === "string") : []
+    enable: str(raw.enable),
+    open: str(raw.open),
+    close: str(raw.close, "</think>"),
+    markers: Array.isArray(raw.markers) ? raw.markers.filter((s) => typeof s === "string") : [],
+    primeOn: str(raw.primeOn),
+    primeOff: str(raw.primeOff)
   };
 }
 
-export function readModelReasoning(modelPath) {
-  if (!modelPath) return { ...NO_REASONING };
+// Reads one key of the descriptor the MODEL ships. Same two homes for every key
+// (reasoning, chat, …), so new model-declared capabilities need no new plumbing.
+function readModelDescriptorKey(modelPath, key) {
+  if (!modelPath) return null;
   if (path.extname(modelPath).toLowerCase() === ".cpi") {
     try {
       const manifestPath = modelPath.slice(0, -path.extname(modelPath).length) + ".manifest";
-      const m = fs.readFileSync(manifestPath, "utf8").match(/^CFGJSON\s+reasoning\s+(.+)$/m);
-      if (m) return normalizeReasoning(JSON.parse(m[1])) ?? { ...NO_REASONING };
-    } catch { /* no manifest / unparseable → fall through */ }
-    return { ...NO_REASONING };
+      const re = new RegExp(`^CFGJSON\\s+${key}\\s+(.+)$`, "m");
+      const m = fs.readFileSync(manifestPath, "utf8").match(re);
+      return m ? JSON.parse(m[1]) : null;
+    } catch {
+      return null;
+    }
   }
   try {
     const isDir = fs.existsSync(modelPath) && fs.statSync(modelPath).isDirectory();
     const sidecar = path.join(isDir ? modelPath : path.dirname(modelPath), "cpi.json");
-    const parsed = JSON.parse(fs.readFileSync(sidecar, "utf8"));
-    return normalizeReasoning(parsed?.reasoning) ?? { ...NO_REASONING };
+    return JSON.parse(fs.readFileSync(sidecar, "utf8"))?.[key] ?? null;
   } catch {
-    return { ...NO_REASONING };
+    return null;
   }
+}
+
+export function readModelReasoning(modelPath) {
+  return normalizeReasoning(readModelDescriptorKey(modelPath, "reasoning")) ?? { ...NO_REASONING };
+}
+
+// The model's chat format as DATA (see prompting.mjs renderChat). Null ⇒ fall back
+// to the legacy hand-written formatter for its template.
+export function readModelChat(modelPath) {
+  const chat = readModelDescriptorKey(modelPath, "chat");
+  return chat && typeof chat === "object" && chat.user ? chat : null;
 }
 
 function buildProfile(modelPath, tokenizerPath, baseConfig, source = "discovered") {
@@ -1380,6 +1402,7 @@ function buildProfile(modelPath, tokenizerPath, baseConfig, source = "discovered
     tokenizerFormat,
     template,
     reasoning: readModelReasoning(modelPath),
+    chat: readModelChat(modelPath),  // model-shipped chat format (null ⇒ legacy formatter)
     tokenizerChatTemplatePath: hfTokenizerConfig?.path || "",
     tokenizerUsesDefaultSystemPrompt:
       hfTokenizerConfig?.useDefaultSystemPrompt,

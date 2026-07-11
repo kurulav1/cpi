@@ -853,7 +853,13 @@ function buildCliArgs(config, body) {
     historyStrategy: policy.historyStrategy,
     maxTurns: promptBudget.maxTurns,
     maxChars: promptBudget.maxChars,
-    thinking
+    thinking,
+    // The model's own chat format + reasoning descriptor. When the model ships a
+    // chat descriptor it is rendered generically (renderChat); otherwise the legacy
+    // per-template formatter is used. The reasoning descriptor supplies the <think>
+    // prime, so reasoning stays out of the chat template.
+    chat: selectedProfile?.chat ?? null,
+    reasoning: reasoningCap
   });
 
   if (!promptPackage.prompt) {
