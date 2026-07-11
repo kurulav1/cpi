@@ -73,6 +73,14 @@ struct Op {
   Slot in2 = Slot::X;          // GeluMul's second operand (when aux_ptr is null)
   const __half* weight = nullptr;  // bound at build; nullptr = weightless norm
   const __half* aux_ptr = nullptr; // GeluMul raw 2nd operand (PLE per-layer input); overrides in2
+  // Quantized Gemv: when qweight is set the op runs a weight-only matvec instead
+  // of the fp16 one, with per-row `qscales`. qbits picks the encoding: 8 = int8,
+  // 4 = int4 (packed two-per-byte). Resolved at LOAD like everything else, so the
+  // hot loop stays branch-free over model identity — the op just carries a
+  // different weight encoding.
+  const std::int8_t* qweight = nullptr;
+  const float* qscales = nullptr;
+  int qbits = 0;
   int rows = 1;                // RmsNorm groups (heads for q/k norm, else 1)
   int cols = 0;                // RmsNorm width / Gemv out_dim / GeluMul length
   int in_dim = 0;              // Gemv in_dim

@@ -44,6 +44,7 @@ std::vector<__half> read_fp16(std::ifstream& f, std::size_t data_start, std::siz
 
 PlanCudaEngine::~PlanCudaEngine() {
   for (auto& kv : dev_) cudaFree(kv.second);
+  for (auto& kv : qdev_) { cudaFree(kv.second.packed); cudaFree(kv.second.scales); }
   // shared-layer caches are aliases; free only the owning (< first_shared) ones.
   for (int L = 0; L < cfg_.first_shared_layer && L < static_cast<int>(caches_k_.size()); ++L) {
     cudaFree(caches_k_[L]);
@@ -164,6 +165,53 @@ __half* PlanCudaEngine::upload(const std::string& name) {
   return d;
 }
 
+// Upload a [rows, cols] weight and quantize it on-device to int8 or int4, freeing
+// the fp16 straight away. Per-tensor so peak VRAM is one tensor, not the whole
+// fp16 model (Gemma 12B is ~24 GB in fp16 and would OOM before we could shrink it).
+void PlanCudaEngine::upload_int4(const std::string& name) {
+  auto it = meta_.find(name);
+  if (it == meta_.end()) throw std::runtime_error("missing tensor: " + name);
+  const auto& shape = it->second.shape;
+  if (shape.size() != 2) {  // only 2-D projections are quantized
+    upload(name);
+    return;
+  }
+  const int rows = shape[0];
+  const int cols = shape[1];
+  const int bits = weight_quant_bits_;
+
+  std::ifstream f(cpi_path_, std::ios::binary);
+  auto host = read_fp16(f, data_start_, it->second.offset, it->second.bytes);
+  __half* d_fp16 = nullptr;
+  G4_CHECK(cudaMalloc(&d_fp16, host.size() * sizeof(__half)));
+  G4_CHECK(cudaMemcpy(d_fp16, host.data(), host.size() * sizeof(__half), cudaMemcpyHostToDevice));
+
+  // fp16 -> int8 with a per-row symmetric scale. max_q sets the level count:
+  // 127 for int8, 7 for int4 (which is then packed two-per-byte).
+  std::int8_t* d_i8 = nullptr;
+  float* d_scales = nullptr;
+  const std::size_t n = static_cast<std::size_t>(rows) * cols;
+  G4_CHECK(cudaMalloc(&d_i8, n));
+  G4_CHECK(cudaMalloc(&d_scales, static_cast<std::size_t>(rows) * sizeof(float)));
+  kernels::launch_quantize_rowwise_fp16_to_int8(d_fp16, d_i8, d_scales, rows, cols, stream_,
+                                                bits == 4 ? 7 : 127);
+
+  std::int8_t* d_w = d_i8;
+  if (bits == 4) {
+    std::int8_t* d_packed = nullptr;
+    G4_CHECK(cudaMalloc(&d_packed, static_cast<std::size_t>(rows) * ((cols + 1) / 2)));
+    kernels::launch_pack_rowwise_int8_to_int4(d_i8, d_packed, rows, cols, stream_);
+    G4_CHECK(cudaStreamSynchronize(stream_));
+    cudaFree(d_i8);
+    d_w = d_packed;
+  } else {
+    G4_CHECK(cudaStreamSynchronize(stream_));
+  }
+
+  cudaFree(d_fp16);  // the whole point: the fp16 never coexists with the next tensor
+  qdev_[name] = {d_w, d_scales};
+}
+
 float PlanCudaEngine::scalar_value(const std::string& name) {
   auto it = meta_.find(name);
   if (it == meta_.end()) throw std::runtime_error("missing scalar: " + name);
@@ -265,6 +313,23 @@ void PlanCudaEngine::load_all(const std::string& cpi_path) {
     upload("per_layer_projection_norm.weight");
   }
   layer_scalar_host_.assign(cfg_.num_layers, 1.0f);
+  // The dense projections carry ~all the weight; norms/embeddings stay fp16.
+  const bool quantize = weight_quant_bits_ == 4 || weight_quant_bits_ == 8;
+  // LLAMA_INFER_PLAN_INT4_GROUP=attn|mlp restricts quantization to one group
+  // (bisection aid when a model degrades under int4).
+  const char* group_env = std::getenv("LLAMA_INFER_PLAN_INT4_GROUP");
+  const std::string group = group_env ? group_env : "";
+  const auto quantizable = [&group](const char* t) {
+    const bool is_attn = std::strncmp(t, "self_attn.", 10) == 0 && std::strstr(t, "_proj.") != nullptr;
+    const bool is_mlp = std::strncmp(t, "mlp.", 4) == 0 && std::strstr(t, "_proj.") != nullptr;
+    if (group == "attn") return is_attn;
+    if (group == "mlp") return is_mlp;
+    return is_attn || is_mlp;
+  };
+  const auto load_weight = [&](const std::string& full, const char* t) {
+    if (quantize && quantizable(t)) upload_int4(full);  // quantizes per weight_quant_bits_
+    else upload(full);
+  };
   for (int L = 0; L < cfg_.num_layers; ++L) {
     const std::string p = "layers." + std::to_string(L) + ".";
     for (const char* t : {"input_layernorm.weight", "post_attention_layernorm.weight",
@@ -273,8 +338,9 @@ void PlanCudaEngine::load_all(const std::string& cpi_path) {
                           "self_attn.o_proj.weight",
                           "self_attn.q_norm.weight", "self_attn.k_norm.weight",
                           "mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight"})
-      upload(p + t);
-    if (!k_eq_v(L)) upload(p + "self_attn.v_proj.weight");  // k_eq_v full layers have none
+      load_weight(p + t, t);
+    // k_eq_v full layers have no v_proj (V reuses the raw k_proj output).
+    if (!k_eq_v(L)) load_weight(p + "self_attn.v_proj.weight", "self_attn.v_proj.weight");
     if (has_ple())
       for (const char* t : {"per_layer_input_gate.weight", "per_layer_projection.weight",
                             "post_per_layer_input_norm.weight"})
@@ -385,8 +451,19 @@ void PlanCudaEngine::build_plan() {
       Op o; o.kind = OpKind::RmsNorm; o.in = in; o.out = out; o.weight = w; o.rows = rows; o.cols = cols;
       ops.push_back(o);
     };
-    auto gemv = [&](Slot in, Slot out, const __half* w, int out_dim, int in_dim) {
-      Op o; o.kind = OpKind::Gemv; o.in = in; o.out = out; o.weight = w; o.cols = out_dim; o.in_dim = in_dim;
+    // Resolved by NAME so a weight that was quantized at load binds its int4 form.
+    // The choice is made here, once — the hot loop just runs whatever the op holds.
+    auto gemv = [&](Slot in, Slot out, const char* t, int out_dim, int in_dim) {
+      Op o; o.kind = OpKind::Gemv; o.in = in; o.out = out; o.cols = out_dim; o.in_dim = in_dim;
+      const std::string full = p + t;
+      const auto q = qdev_.find(full);
+      if (q != qdev_.end()) {
+        o.qweight = q->second.packed;
+        o.qscales = q->second.scales;
+        o.qbits = weight_quant_bits_;
+      } else {
+        o.weight = static_cast<const __half*>(dev_[full]);
+      }
       ops.push_back(o);
     };
     auto rope = [&](Slot s, int heads) {
@@ -404,16 +481,16 @@ void PlanCudaEngine::build_plan() {
 
     // --- attention block ---
     rms(Slot::X, Slot::XNorm, W("input_layernorm.weight"), 1, H);
-    gemv(Slot::XNorm, Slot::Q, W("self_attn.q_proj.weight"), qdim, H);
+    gemv(Slot::XNorm, Slot::Q, "self_attn.q_proj.weight", qdim, H);
     rms(Slot::Q, Slot::Q, W("self_attn.q_norm.weight"), nq, hd);
     rope(Slot::Q, nq);
     if (!shared) {
-      gemv(Slot::XNorm, Slot::K, W("self_attn.k_proj.weight"), kvdim, H);
+      gemv(Slot::XNorm, Slot::K, "self_attn.k_proj.weight", kvdim, H);
       if (keqv) {  // V shares the raw k_proj output (before k_norm/rope)
         Op o; o.kind = OpKind::CopySlot; o.in = Slot::K; o.out = Slot::V; o.cols = kvdim;
         ops.push_back(o);
       } else {
-        gemv(Slot::XNorm, Slot::V, W("self_attn.v_proj.weight"), kvdim, H);
+        gemv(Slot::XNorm, Slot::V, "self_attn.v_proj.weight", kvdim, H);
       }
       rms(Slot::K, Slot::K, W("self_attn.k_norm.weight"), nkv, hd);
       rope(Slot::K, nkv);
@@ -429,19 +506,19 @@ void PlanCudaEngine::build_plan() {
       o.full_attention = full; o.sliding_window = cfg_.sliding_window;
       ops.push_back(o);
     }
-    gemv(Slot::Att, Slot::Tmp, W("self_attn.o_proj.weight"), H, qdim);
+    gemv(Slot::Att, Slot::Tmp, "self_attn.o_proj.weight", H, qdim);
     rms(Slot::Tmp, Slot::Tmp, W("post_attention_layernorm.weight"), 1, H);
     add_x(Slot::Tmp);
 
     // --- MLP block (GeGLU; double-wide on shared layers) ---
     rms(Slot::X, Slot::XNorm, W("pre_feedforward_layernorm.weight"), 1, H);
-    gemv(Slot::XNorm, Slot::Gate, W("mlp.gate_proj.weight"), inter, H);
-    gemv(Slot::XNorm, Slot::Up, W("mlp.up_proj.weight"), inter, H);
+    gemv(Slot::XNorm, Slot::Gate, "mlp.gate_proj.weight", inter, H);
+    gemv(Slot::XNorm, Slot::Up, "mlp.up_proj.weight", inter, H);
     {
       Op o; o.kind = OpKind::GeluMul; o.in = Slot::Gate; o.in2 = Slot::Up; o.out = Slot::Inter; o.cols = inter;
       ops.push_back(o);
     }
-    gemv(Slot::Inter, Slot::Tmp, W("mlp.down_proj.weight"), H, inter);
+    gemv(Slot::Inter, Slot::Tmp, "mlp.down_proj.weight", H, inter);
     rms(Slot::Tmp, Slot::Tmp, W("post_feedforward_layernorm.weight"), 1, H);
     add_x(Slot::Tmp);
 
@@ -449,11 +526,11 @@ void PlanCudaEngine::build_plan() {
     if (has_ple()) {
       const int ple = cfg_.hidden_size_per_layer_input;
       const __half* ple_L = d_ple_ + static_cast<std::size_t>(L) * ple;
-      gemv(Slot::X, Slot::PleGate, W("per_layer_input_gate.weight"), ple, H);
+      gemv(Slot::X, Slot::PleGate, "per_layer_input_gate.weight", ple, H);
       Op g; g.kind = OpKind::GeluMul; g.in = Slot::PleGate; g.out = Slot::PleGate; g.cols = ple;
       g.aux_ptr = ple_L;  // gelu(gate) * ple_L
       ops.push_back(g);
-      gemv(Slot::PleGate, Slot::Tmp, W("per_layer_projection.weight"), H, ple);
+      gemv(Slot::PleGate, Slot::Tmp, "per_layer_projection.weight", H, ple);
       rms(Slot::Tmp, Slot::Tmp, W("post_per_layer_input_norm.weight"), 1, H);
       add_x(Slot::Tmp);
     }
@@ -497,8 +574,17 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
                                 op.cols, cfg_.rms_eps, stream_);
         break;
       case OpKind::Gemv:
-        kernels::launch_rowmajor_half_gemv_f16(op.weight, S(op.in), S(op.out), op.cols, op.in_dim,
-                                               stream_);
+        // Weight encoding was chosen at load; the op just carries it.
+        if (op.qbits == 4) {
+          kernels::launch_weight_only_int4_matvec(op.qweight, op.qscales, S(op.in), S(op.out),
+                                                  op.cols, op.in_dim, stream_);
+        } else if (op.qbits == 8) {
+          kernels::launch_weight_only_int8_matvec(op.qweight, op.qscales, S(op.in), S(op.out),
+                                                  op.cols, op.in_dim, stream_);
+        } else {
+          kernels::launch_rowmajor_half_gemv_f16(op.weight, S(op.in), S(op.out), op.cols, op.in_dim,
+                                                 stream_);
+        }
         break;
       case OpKind::Rope: {
         const float* cosT = op.rope_table == RopeTable::Full ? d_cos_full_ : d_cos_sliding_;
@@ -824,6 +910,16 @@ void PlanCudaEngine::initialize(const EngineOptions& options) {
   samp_top_p_ = options.top_p;
   samp_rep_penalty_ = options.repetition_penalty;
   samp_no_repeat_ngram_ = options.no_repeat_ngram_size;
+  // Weight-only quantization (--weight-quant int8|int4). Must be set BEFORE open():
+  // load_all quantizes each projection as it streams in, so the fp16 model never
+  // lands on the GPU whole (Gemma 12B is ~24 GB fp16 and would OOM first).
+  // NOTE: Gemma 12B degrades badly under naive per-row int4 (16 levels across
+  // 3840-15360 weights compounds over 48 layers x 7 matmuls); int8 is the usable
+  // setting and still takes it from ~24 GB to ~13 GB.
+  if (options.int8_streaming) {
+    if (options.streaming_quant_bits == 4) weight_quant_bits_ = 4;
+    else if (options.streaming_quant_bits == 8) weight_quant_bits_ = 8;
+  }
   open(options.model_path, options.max_context > 0 ? options.max_context : 4096);
 }
 

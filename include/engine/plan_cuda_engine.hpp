@@ -118,6 +118,11 @@ class PlanCudaEngine : public runtime::SequenceModel {
   void parse_manifest(const std::string& manifest_path);
   void load_all(const std::string& cpi_path);
   __half* upload(const std::string& name);                 // load a tensor to device (fp16)
+  // Loads a weight and quantizes it to int4 on the GPU, freeing the fp16 copy
+  // immediately. Done PER TENSOR during load: uploading the whole model in fp16
+  // first and quantizing afterwards would peak at the fp16 footprint — exactly the
+  // OOM this exists to avoid (Gemma 12B is ~24 GB fp16). Peak here is one tensor.
+  void upload_int4(const std::string& name);
   float scalar_value(const std::string& name);             // read a [1] tensor to host
   void build_rope_tables();
   void allocate_buffers();
@@ -167,6 +172,17 @@ class PlanCudaEngine : public runtime::SequenceModel {
   std::size_t data_start_ = 0;
   std::unordered_map<std::string, TensorMeta> meta_;
   std::unordered_map<std::string, void*> dev_;   // name -> device fp16 ptr
+
+  // int4 weight-only quantization (--weight-quant int4). Gemma 12B is ~24 GB in
+  // fp16 and OOMs on a 32 GB card alongside the desktop; int4 on the per-layer
+  // projections takes the transformer from ~22 GB to ~5.5 GB. Embeddings stay fp16
+  // (the token lookup and the tied LM head both need them).
+  struct QuantWeight {
+    std::int8_t* packed = nullptr;  // int4, two values per byte, row-major
+    float* scales = nullptr;        // per-row dequant scale
+  };
+  std::unordered_map<std::string, QuantWeight> qdev_;  // name -> int4 weight
+  int weight_quant_bits_ = 0;                          // 0 = fp16, 4 = int4
   std::vector<float> layer_scalar_host_;         // per-layer scalar values
 
   cudaStream_t stream_ = nullptr;
