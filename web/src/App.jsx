@@ -1794,11 +1794,12 @@ export default function App() {
           onClick={() => setModelPickerOpen(true)}
           title="Choose a model — see what each one supports"
         >
+          {/* Name + caret only. The capability chips live in the strip below and in the
+              picker itself -- crowding them in here made the topbar overflow. */}
           <span className="topbar-model-name">
             {selectedGroup?.base || (health.config ? "No models found" : "Loading")}
           </span>
-          {selectedGroup?.caps && <CapsInline caps={selectedGroup.caps} compact />}
-          <span className="topbar-model-caret">v</span>
+          <span className="topbar-model-caret">▾</span>
         </button>
         <ModelPicker
           open={modelPickerOpen}

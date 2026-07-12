@@ -1021,9 +1021,9 @@ input[type="range"] { width: 100%; accent-color: var(--accent); cursor: pointer;
   gap: 0.5rem;
   padding: 0.4rem 0.5rem;
   margin-bottom: 0.35rem;
-  border: 1px solid var(--border, #2a2f3a);
+  border: 1px solid var(--border);
   border-radius: 8px;
-  background: var(--surface-2, rgba(255, 255, 255, 0.04));
+  background: var(--surface-2);
 }
 .composer-attach-thumb {
   width: 34px;
@@ -1069,8 +1069,8 @@ input[type="range"] { width: 100%; accent-color: var(--accent); cursor: pointer;
   flex-wrap: wrap;
   gap: 0.35rem;
   padding: 0.4rem 0.9rem;
-  border-bottom: 1px solid var(--border, #2a2f3a);
-  background: var(--surface-2, rgba(255, 255, 255, 0.02));
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-2);
   font-size: 0.74rem;
 }
 .caps-label {
@@ -1092,20 +1092,20 @@ input[type="range"] { width: 100%; accent-color: var(--accent); cursor: pointer;
 }
 /* Supported: quietly affirmative. */
 .caps-on {
-  color: #86e39b;
-  border-color: rgba(134, 227, 155, 0.28);
-  background: rgba(134, 227, 155, 0.08);
+  color: var(--green);
+  border-color: var(--border);
+  background: var(--green-bg);
 }
 /* NOT supported: shown, not hidden — the absence is the information. */
 .caps-off {
-  color: var(--muted, #8a92a6);
-  border-color: var(--border, #2a2f3a);
+  color: var(--muted, var(--text));
+  border-color: var(--border);
   background: transparent;
-  opacity: 0.62;
+  opacity: 0.55;
 }
 .caps-info {
-  color: var(--muted, #8a92a6);
-  border-color: var(--border, #2a2f3a);
+  color: var(--muted, var(--text));
+  border-color: var(--border);
 }
 
 /* --- capability chips shared by the strip, the topbar button and the picker --- */
@@ -1115,138 +1115,151 @@ input[type="range"] { width: 100%; accent-color: var(--accent); cursor: pointer;
   align-items: center;
   padding: 0.05rem 0.4rem;
   border-radius: 999px;
-  border: 1px solid rgba(134, 227, 155, 0.28);
-  background: rgba(134, 227, 155, 0.08);
-  color: #86e39b;
+  border: 1px solid var(--border);
+  background: var(--green-bg);
+  color: var(--green);
   font-size: 0.65rem;
   line-height: 1.5;
   white-space: nowrap;
   cursor: help;
 }
 .capsline-dim {
-  color: var(--muted, #8a92a6);
-  border-color: var(--border, #2a2f3a);
+  color: var(--muted, var(--text));
+  border-color: var(--border);
   background: transparent;
 }
 .capsline-compact .capsline-chip { font-size: 0.6rem; padding: 0.02rem 0.32rem; }
 
-/* --- topbar model button --- */
+/* --- topbar model button (matches .topbar-select: slim, borderless) --- */
 .topbar-model {
   display: inline-flex;
   align-items: center;
-  gap: 0.45rem;
-  max-width: 42ch;
-  padding: 0.3rem 0.6rem;
-  border-radius: 8px;
-  border: 1px solid var(--border, #2a2f3a);
-  background: var(--surface-2, rgba(255, 255, 255, 0.04));
-  color: inherit;
+  gap: 0.3rem;
+  max-width: 28ch;
+  background: transparent;
+  border: none;
+  color: var(--text);
   font: inherit;
   font-size: 0.82rem;
   cursor: pointer;
+  outline: none;
+  padding: 0.25rem 0.4rem;
+  border-radius: 0.35rem;
+  transition: background 0.1s;
 }
-
-.topbar-model:hover:not(:disabled) { background: rgba(255, 255, 255, 0.07); }
+.topbar-model:hover:not(:disabled) { background: var(--surface-2); }
 .topbar-model:disabled { opacity: 0.55; cursor: default; }
 .topbar-model-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.topbar-model-caret { opacity: 0.45; font-size: 0.7rem; }
+.topbar-model-caret { opacity: 0.4; font-size: 0.6rem; }
 
-/* --- model picker --- */
+/* --- model picker (same overlay language as the settings drawer) --- */
 .mp-backdrop {
   position: fixed;
   inset: 0;
   z-index: 60;
-  background: rgba(0, 0, 0, 0.45);
+  background: rgba(5, 5, 7, 0.56);
+  backdrop-filter: blur(6px);
   display: flex;
   align-items: flex-start;
   justify-content: center;
   padding: 4.5rem 1rem 1rem;
 }
 .mp {
-  width: min(760px, 100%);
-  max-height: min(72vh, 720px);
+  width: min(720px, 100%);
+  max-height: min(70vh, 660px);
   display: flex;
   flex-direction: column;
-  border: 1px solid var(--border, #2a2f3a);
+  border: 1px solid var(--border-2, var(--border));
   border-radius: 12px;
-  background: var(--surface, #14171e);
-  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.5);
+  /* --surface is translucent by design, so the panel needs its own glass blur --
+     without it the chat shows straight through and both become unreadable. */
+  background: var(--surface);
+  backdrop-filter: blur(16px);
+  box-shadow: var(--shadow-card);
   overflow: hidden;
+  animation: mp-in 0.14s ease-out;
 }
-.mp-head { display: flex; gap: 0.5rem; padding: 0.7rem; border-bottom: 1px solid var(--border, #2a2f3a); }
+@keyframes mp-in {
+  from { opacity: 0; transform: translateY(-6px); }
+  to   { opacity: 1; transform: none; }
+}
+.mp-head { display: flex; gap: 0.5rem; padding: 0.65rem; border-bottom: 1px solid var(--border); }
 .mp-search {
   flex: 1 1 auto;
-  padding: 0.5rem 0.65rem;
+  padding: 0.45rem 0.6rem;
   border-radius: 8px;
-  border: 1px solid var(--border, #2a2f3a);
-  background: var(--surface-2, rgba(255, 255, 255, 0.04));
-  color: inherit;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text);
   font: inherit;
-  font-size: 0.86rem;
+  font-size: 0.84rem;
+  outline: none;
 }
-.mp-search:focus { outline: none; border-color: #5b7cfa; }
+.mp-search:focus { border-color: var(--accent); }
 .mp-close {
   flex: 0 0 auto;
   width: 2rem;
   border-radius: 8px;
-  border: 1px solid var(--border, #2a2f3a);
+  border: 1px solid var(--border);
   background: transparent;
-  color: inherit;
-  opacity: 0.65;
+  color: var(--muted, var(--text));
   cursor: pointer;
 }
-.mp-close:hover { opacity: 1; background: rgba(255, 255, 255, 0.06); }
+.mp-close:hover { color: var(--text); background: var(--surface-2); }
 .mp-list { overflow-y: auto; padding: 0.35rem; }
 .mp-empty { padding: 1.5rem; text-align: center; opacity: 0.6; font-size: 0.85rem; }
 .mp-row {
   display: flex;
   align-items: center;
   gap: 0.75rem;
-  padding: 0.6rem 0.65rem;
+  padding: 0.55rem 0.6rem;
   border-radius: 9px;
   border: 1px solid transparent;
 }
-.mp-row + .mp-row { margin-top: 0.15rem; }
-.mp-row:hover { background: rgba(255, 255, 255, 0.035); }
-.mp-row-on { border-color: rgba(91, 124, 250, 0.45); background: rgba(91, 124, 250, 0.08); }
+.mp-row + .mp-row { margin-top: 0.1rem; }
+.mp-row:hover { background: var(--surface-2); }
+.mp-row-on { border-color: var(--accent); background: var(--accent-bg); }
 .mp-row-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 0.3rem; }
 .mp-name {
   display: flex;
   align-items: center;
   gap: 0.45rem;
-  font-size: 0.9rem;
+  font-size: 0.88rem;
   font-weight: 600;
+  color: var(--text);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 .mp-current {
-  font-size: 0.6rem;
+  font-size: 0.58rem;
   font-weight: 500;
   text-transform: uppercase;
   letter-spacing: 0.06em;
   padding: 0.05rem 0.35rem;
   border-radius: 999px;
-  background: rgba(91, 124, 250, 0.2);
-  color: #9db2ff;
+  background: var(--accent-bg);
+  color: var(--accent);
 }
 .mp-variants { flex: 0 0 auto; display: flex; gap: 0.3rem; flex-wrap: wrap; justify-content: flex-end; }
 .mp-var {
-  padding: 0.28rem 0.55rem;
+  padding: 0.26rem 0.5rem;
   border-radius: 7px;
-  border: 1px solid var(--border, #2a2f3a);
-  background: var(--surface-2, rgba(255, 255, 255, 0.04));
-  color: inherit;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text);
   font: inherit;
   font-size: 0.72rem;
   cursor: pointer;
   white-space: nowrap;
 }
-.mp-var:hover { background: rgba(255, 255, 255, 0.09); }
-.mp-var-on { border-color: #5b7cfa; background: rgba(91, 124, 250, 0.18); color: #cdd8ff; }
+.mp-var:hover { border-color: var(--accent); }
+.mp-var-on { border-color: var(--accent); background: var(--accent-bg); color: var(--accent); }
 .mp-foot {
-  padding: 0.55rem 0.75rem;
-  border-top: 1px solid var(--border, #2a2f3a);
-  font-size: 0.7rem;
-  opacity: 0.5;
+  padding: 0.5rem 0.7rem;
+  border-top: 1px solid var(--border);
+  font-size: 0.68rem;
+  color: var(--muted, var(--text));
+  opacity: 0.65;
 }
+
