@@ -1061,3 +1061,49 @@ input[type="range"] { width: 100%; accent-color: var(--accent); cursor: pointer;
   border-radius: 8px;
   margin-bottom: 0.45rem;
 }
+
+/* --- model capability strip --- */
+.caps {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  padding: 0.4rem 0.9rem;
+  border-bottom: 1px solid var(--border, #2a2f3a);
+  background: var(--surface-2, rgba(255, 255, 255, 0.02));
+  font-size: 0.74rem;
+}
+.caps-label {
+  opacity: 0.45;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 0.66rem;
+  margin-right: 0.2rem;
+}
+.caps-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.14rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  white-space: nowrap;
+  cursor: help;
+}
+/* Supported: quietly affirmative. */
+.caps-on {
+  color: #86e39b;
+  border-color: rgba(134, 227, 155, 0.28);
+  background: rgba(134, 227, 155, 0.08);
+}
+/* NOT supported: shown, not hidden — the absence is the information. */
+.caps-off {
+  color: var(--muted, #8a92a6);
+  border-color: var(--border, #2a2f3a);
+  background: transparent;
+  opacity: 0.62;
+}
+.caps-info {
+  color: var(--muted, #8a92a6);
+  border-color: var(--border, #2a2f3a);
+}

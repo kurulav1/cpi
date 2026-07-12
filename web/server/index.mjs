@@ -7,7 +7,7 @@ import { spawn, execFileSync } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { randomUUID } from "node:crypto";
 
-import { getRuntimeConfig, publicRuntimeSummary, setPreferredModelDir } from "./config.mjs";
+import { getRuntimeConfig, publicRuntimeSummary, setPreferredModelDir, profileBatchable, NON_BATCH_FAMILIES } from "./config.mjs";
 import { createBatchWorker, toBatchArgs } from "./batch_worker.mjs";
 import {
   buildInternalBodyFromChatRequest,
@@ -1530,23 +1530,17 @@ function batchWorkerEnabled() {
 // Families that run on their own engine (NOT LlamaEngine) can't be batched: the
 // --interactive-batch loop is LlamaEngine-only (see main.cpp), so the worker
 // would load the model but never speak the batch protocol and hang the request.
-const NON_LLAMA_ENGINE_FAMILIES = new Set(["qwen3_5", "llama4", "cpt_gpt", "gemma4"]);
+const NON_LLAMA_ENGINE_FAMILIES = NON_BATCH_FAMILIES;
 
 function isBatchCompatible(cliConfig) {
   const p = cliConfig.profile || {};
-  const family = String(p.family || cliConfig.meta?.template || "").toLowerCase();
-  if (NON_LLAMA_ENGINE_FAMILIES.has(family)) return false;                  // separate engine (incl. gemma4)
+  // Profile-level rules (separate engine, MoE, streamed weights, pre-packed quant,
+  // SentencePiece tokenizer) live in config.mjs so the UI can SHOW them as capabilities
+  // without re-deriving them here. What is left is request-level.
+  if (!profileBatchable({ ...p, template: p.template ?? cliConfig.meta?.template })) return false;
   if (cliConfig.imagePath) return false;                                   // images: single-flight only
   if (cliConfig.meta?.thinking) return false;                              // reasoning split needs the single-flight splitter
   if (cliConfig.quantMode && cliConfig.quantMode !== "none") return false; // runtime quantization
-  const label = String(p.label || "").toLowerCase();
-  if (label.includes("streaming")) return false;                           // streamed weights
-  if (/(^|[-_])int4([-_]|$)|(^|[-_])int8([-_]|$)/.test(label)) return false; // pre-packed quant
-  if (p.moe) return false;                                                  // MoE
-  // SentencePiece (.model) tokenizers hang the node-spawned batch worker mid
-  // decode (works fine in the single-flight worker) — route them there until the
-  // worker-side interaction is root-caused.
-  if (String(p.tokenizerFormat || "").toLowerCase() === ".model") return false;
   return true;
 }
 

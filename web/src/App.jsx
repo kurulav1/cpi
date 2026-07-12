@@ -313,6 +313,75 @@ function CodeBlock({ language, children }) {
   );
 }
 
+// What the selected model can and cannot do. The server computes this
+// (profileCapabilities in config.mjs) from what the MODEL declares -- its config.json,
+// its shipped chat/reasoning descriptors -- so the UI just renders it and no capability
+// rule is duplicated here.
+function CapabilityBar({ profile }) {
+  const caps = profile?.capabilities;
+  if (!caps) return null;
+
+  const fmtCtx = (n) =>
+    !n ? null : n >= 1024 * 1024 ? `${Math.round(n / 1024 / 1024)}M` : n >= 1024 ? `${Math.round(n / 1024)}K` : String(n);
+
+  // { label, on, title }  -- `on: false` renders as a struck-through "not supported" chip
+  // rather than being hidden, so the absence of a capability is visible too.
+  const chips = [
+    {
+      label: "Images",
+      on: caps.vision,
+      title: caps.vision
+        ? "Attach a PNG in the composer (or paste one). The vision tower encodes it into soft tokens."
+        : "This model has no vision tower — it cannot take images.",
+    },
+    {
+      label: caps.reasoning === "always" ? "Thinking (always)" : "Thinking",
+      on: caps.reasoning !== "none",
+      title:
+        caps.reasoning === "always"
+          ? "This model always reasons before answering."
+          : caps.reasoning === "optional"
+            ? "Reasoning can be turned on per request (Settings > Thinking)."
+            : "This model does not expose a reasoning channel.",
+    },
+    {
+      label: "Batching",
+      on: caps.batching,
+      title: caps.batching
+        ? "Eligible for continuous batching (many requests share one worker)."
+        : "Runs single-flight: its own engine, MoE, streamed weights, or a pre-packed quant.",
+    },
+    {
+      label: caps.quant.length ? `Quant ${caps.quant.map((q) => q.toUpperCase()).join(" / ")}` : "Quant",
+      on: caps.quant.length > 0,
+      title: caps.quant.length
+        ? `Can be run quantized: ${caps.quant.join(", ")}. Smaller and faster, slight quality cost.`
+        : "No quantized variant available for this model.",
+    },
+  ];
+  if (caps.moe) chips.push({ label: "MoE", on: true, title: "Mixture of experts: only a few experts run per token." });
+  if (caps.streamingWeights)
+    chips.push({ label: "Streamed weights", on: true, title: "Weights stream from disk — runs models larger than VRAM." });
+
+  const ctx = fmtCtx(caps.maxContext);
+
+  return (
+    <div className="caps" title="What this model supports">
+      <span className="caps-label">Supports</span>
+      {chips.map((c) => (
+        <span key={c.label} className={`caps-chip ${c.on ? "caps-on" : "caps-off"}`} title={c.title}>
+          {c.on ? "✓" : "✕"} {c.label}
+        </span>
+      ))}
+      {ctx && (
+        <span className="caps-chip caps-info" title={`Maximum context: ${caps.maxContext.toLocaleString()} tokens`}>
+          {ctx} ctx
+        </span>
+      )}
+    </div>
+  );
+}
+
 // Collapsible reasoning ("thinking") block shown above a reasoning model's
 // answer. Auto-expanded while the model is still thinking (no answer yet),
 // auto-collapses once the answer starts; the user can toggle either way.
@@ -1670,6 +1739,8 @@ export default function App() {
           Cfg
         </button>
       </header>
+
+      {view !== "hub" && <CapabilityBar profile={selProfile} />}
 
       {/*  Content  */}
       <div className="content">

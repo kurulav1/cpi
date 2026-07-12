@@ -540,7 +540,12 @@ function inspectLl2cQuantInfo(modelPath) {
 function buildQuantState(modelPath, extraArgs, { isSafetensorsDir = false, family = "" } = {}) {
   const configuredMode = parseConfiguredQuantMode(extraArgs);
   const normalizedFamily = String(family || "").toLowerCase();
-  const qwen35Safetensors = isSafetensorsDir && normalizedFamily === "qwen3_5";
+  // Engines that quantize weights at LOAD from a safetensors directory (--weight-quant).
+  // Gemma 4 runs on the same plan executor as Qwen3.5 and quantizes the same way; leaving
+  // it out reported the model as having no quantized variants when it plainly does.
+  const nativeQuantSafetensors =
+    isSafetensorsDir && (normalizedFamily === "qwen3_5" || normalizedFamily === "gemma4");
+  const qwen35Safetensors = nativeQuantSafetensors;
   const fallback = {
     format: isSafetensorsDir ? "safetensors" : "unknown",
     configuredMode,
@@ -1352,6 +1357,45 @@ export function readModelChat(modelPath) {
   return chat && typeof chat === "object" && chat.user ? chat : null;
 }
 
+// Families that run on their own engine rather than LlamaEngine's batched path.
+// (Shared with index.mjs's isBatchCompatible, which adds the REQUEST-level checks --
+// thinking, runtime quantization, images. One source of truth for the profile-level part.)
+export const NON_BATCH_FAMILIES = new Set(["qwen3_5", "llama4", "cpt_gpt", "gemma4"]);
+
+// Can this MODEL ever use continuous batching? Request-level reasons to fall back to
+// single-flight (thinking, images, runtime quant) are checked separately.
+export function profileBatchable(profile) {
+  const family = String(profile?.family || profile?.template || "").toLowerCase();
+  if (NON_BATCH_FAMILIES.has(family)) return false;
+  if (profile?.moe) return false;
+  const label = String(profile?.label || "").toLowerCase();
+  if (label.includes("streaming")) return false;
+  if (/(^|[-_])int4([-_]|$)|(^|[-_])int8([-_]|$)/.test(label)) return false;
+  if (String(profile?.tokenizerFormat || "").toLowerCase() === ".model") return false;
+  return true;
+}
+
+// What this model CAN and CANNOT do, as data. The UI renders it directly rather than
+// re-deriving the rules -- capabilities live in one place, next to the code that enforces
+// them.
+export function profileCapabilities(profile) {
+  const reasoningMode = profile?.reasoning?.mode ?? "none";
+  const quantModes = profile?.quant?.selectableModes ?? ["none"];
+  const label = String(profile?.label || "").toLowerCase();
+  return {
+    vision: Boolean(profile?.vision?.supported),
+    reasoning: reasoningMode,                       // "none" | "optional" | "always"
+    batching: profileBatchable(profile),
+    quant: quantModes.filter((m) => m && m !== "none"),
+    moe: Boolean(profile?.moe),
+    streamingWeights: label.includes("streaming"),
+    maxContext: Number(profile?.maxPositionEmbeddings) || 0,
+    // A model that ships its own chat format is rendered generically; the rest fall back
+    // to a hand-written template.
+    modelChatFormat: Boolean(profile?.chat),
+  };
+}
+
 function buildProfile(modelPath, tokenizerPath, baseConfig, source = "discovered") {
   const ll2cConfig = readLl2cModelConfig(modelPath);
   const cpiConfig = readCpiModelConfig(modelPath);
@@ -1476,6 +1520,7 @@ function publicModelProfile(profile) {
     unsupportedReason: profile.unsupportedReason || "",
     quant: profile.quant,
     moe: profile.moe,
+    capabilities: profileCapabilities(profile),
     ready: profile.ready,
     status: profile.status
   };
