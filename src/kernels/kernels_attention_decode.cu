@@ -1095,23 +1095,35 @@ void launch_attention_step(const half* q, const half* k_cache, const half* v_cac
   // long context (e.g. 4 blocks on a 170-SM GPU at 2k+ tokens dominated decode).
   // Above this length, fall through to the split-K path (parallel over KV
   // chunks, ~num_heads×ceil(seq/32) blocks).
+  // head_dim 64 and 128 both matter: 128 is Llama's, 64 is Qwen2.5's (and plenty of
+  // small models'). Gating these fast paths on 128 ALONE dropped every head_dim-64 model
+  // onto the fallback kernel, which runs ONE BLOCK PER HEAD (14 blocks on a 170-SM GPU)
+  // and walks the whole KV inside it -- so decode got slower the longer the context grew.
   if (num_kv_heads > 0 && num_heads > num_kv_heads && (num_heads % num_kv_heads) == 0 &&
-      head_dim == 128 && seq_len <= kGqaFusedMaxSeq) {
+      (head_dim == 64 || head_dim == 128) && seq_len <= kGqaFusedMaxSeq) {
     const int group_size_val = num_heads / num_kv_heads;
     if (group_size_val <= 32) {
       const int threads_gqa = group_size_val * 32;
       const std::size_t smem_gqa = static_cast<std::size_t>(group_size_val + 1) *
                                        static_cast<std::size_t>(head_dim) * sizeof(half) +
                                    static_cast<std::size_t>(group_size_val) * sizeof(float);
-      gqa_decode_kernel<128><<<num_kv_heads, threads_gqa, smem_gqa, stream>>>(
-          q, k_cache, v_cache, out, seq_len, num_heads, num_kv_heads, group_size_val);
+      if (head_dim == 128) {
+        gqa_decode_kernel<128><<<num_kv_heads, threads_gqa, smem_gqa, stream>>>(
+            q, k_cache, v_cache, out, seq_len, num_heads, num_kv_heads, group_size_val);
+      } else {
+        gqa_decode_kernel<64><<<num_kv_heads, threads_gqa, smem_gqa, stream>>>(
+            q, k_cache, v_cache, out, seq_len, num_heads, num_kv_heads, group_size_val);
+      }
       return;
     }
   }
 
   constexpr int split_chunk_size = 32;
-  if (allow_split && scratch_m && scratch_l && scratch_o && scratch_chunks > 0 && head_dim == 128 &&
-      seq_len >= 64) {
+  // Split-K over KV chunks: grid is num_heads x ceil(seq/32) blocks instead of num_heads,
+  // which is what stops per-token cost from growing with context. The generic chunk-stats
+  // kernel takes head_dim at RUNTIME -- only this gate was pinning it to 128.
+  if (allow_split && scratch_m && scratch_l && scratch_o && scratch_chunks > 0 &&
+      (head_dim == 64 || head_dim == 128) && seq_len >= 64) {
     constexpr int warps = 4;
     constexpr int threads = warps * 32;
     const int sub_chunks = min(scratch_chunks, (seq_len + split_chunk_size - 1) / split_chunk_size);
@@ -1131,10 +1143,17 @@ void launch_attention_step(const half* q, const half* k_cache, const half* v_cac
               sizeof(half) +
           static_cast<std::size_t>(group_size_val) * split_chunk_size * sizeof(float);
       const dim3 grid(num_kv_heads, coarse_chunks);
-      attention_step_chunk_stats_gqa_split_kernel<128>
-          <<<grid, group_size_val * 32, smem_gqa, stream>>>(
-              q, k_cache, v_cache, scratch_m, scratch_l, scratch_o, seq_len, num_kv_heads,
-              group_size_val, split_chunk_size, G, scratch_chunks);
+      if (head_dim == 128) {
+        attention_step_chunk_stats_gqa_split_kernel<128>
+            <<<grid, group_size_val * 32, smem_gqa, stream>>>(
+                q, k_cache, v_cache, scratch_m, scratch_l, scratch_o, seq_len, num_kv_heads,
+                group_size_val, split_chunk_size, G, scratch_chunks);
+      } else {
+        attention_step_chunk_stats_gqa_split_kernel<64>
+            <<<grid, group_size_val * 32, smem_gqa, stream>>>(
+                q, k_cache, v_cache, scratch_m, scratch_l, scratch_o, seq_len, num_kv_heads,
+                group_size_val, split_chunk_size, G, scratch_chunks);
+      }
     } else {
       const std::size_t smem = static_cast<std::size_t>(head_dim) * sizeof(half) +
                                static_cast<std::size_t>(2 * warps + 4) * sizeof(float) +
@@ -1629,16 +1648,25 @@ void launch_attention_step_device_pos(const half* q, const half* k_cache, const 
   // and avoids the GQA-fused kernel's num_kv_heads-block serial scan that
   // dominated long-context decode. GQA-fused stays as the fallback when split is
   // disabled (--no-split-attention).
-  const bool split_available =
-      allow_split && scratch_m && scratch_l && scratch_o && scratch_chunks > 0 && head_dim == 128;
+  // Same head_dim widening as the host-position launcher. This is the launcher the CUDA
+  // DECODE GRAPH captures, so it is the one that actually runs during generation --
+  // widening only the host-position one changed nothing measurable.
+  const bool head_dim_fast = (head_dim == 64 || head_dim == 128);
+  const bool split_available = allow_split && scratch_m && scratch_l && scratch_o &&
+                               scratch_chunks > 0 && head_dim_fast;
   if (window <= 0 && !split_available && num_kv_heads > 0 && num_heads > num_kv_heads &&
-      (num_heads % num_kv_heads) == 0 && head_dim == 128) {
+      (num_heads % num_kv_heads) == 0 && head_dim_fast) {
     const int group_size_val = num_heads / num_kv_heads;
     if (group_size_val <= 32) {
       const int threads_gqa = group_size_val * 32;
       const std::size_t smem_gqa = static_cast<std::size_t>(group_size_val + 1) *
                                        static_cast<std::size_t>(head_dim) * sizeof(half) +
                                    static_cast<std::size_t>(group_size_val) * sizeof(float);
+      if (head_dim == 64) {
+        gqa_decode_kernel_device_pos<64><<<num_kv_heads, threads_gqa, smem_gqa, stream>>>(
+            q, k_cache, v_cache, out, position, num_heads, num_kv_heads, group_size_val);
+        return;
+      }
       gqa_decode_kernel_device_pos<128><<<num_kv_heads, threads_gqa, smem_gqa, stream>>>(
           q, k_cache, v_cache, out, position, num_heads, num_kv_heads, group_size_val);
       return;
@@ -1646,7 +1674,7 @@ void launch_attention_step_device_pos(const half* q, const half* k_cache, const 
   }
 
   constexpr int split_chunk_size = 32;
-  if (allow_split && scratch_m && scratch_l && scratch_o && scratch_chunks > 0 && head_dim == 128) {
+  if (allow_split && scratch_m && scratch_l && scratch_o && scratch_chunks > 0 && head_dim_fast) {
     constexpr int warps = 4;
     constexpr int threads = warps * 32;
     // GQA models: share each K/V read across the query-head group (grid.x =
@@ -1669,10 +1697,17 @@ void launch_attention_step_device_pos(const half* q, const half* k_cache, const 
               sizeof(half) +
           static_cast<std::size_t>(group_size_val) * split_chunk_size * sizeof(float);
       const dim3 grid(num_kv_heads, coarse_chunks);
-      attention_step_chunk_stats_gqa_split_device_pos_kernel<128>
-          <<<grid, group_size_val * 32, smem_gqa, stream>>>(
-              q, k_cache, v_cache, scratch_m, scratch_l, scratch_o, position, num_kv_heads,
-              group_size_val, split_chunk_size, G, scratch_chunks);
+      if (head_dim == 64) {
+        attention_step_chunk_stats_gqa_split_device_pos_kernel<64>
+            <<<grid, group_size_val * 32, smem_gqa, stream>>>(
+                q, k_cache, v_cache, scratch_m, scratch_l, scratch_o, position, num_kv_heads,
+                group_size_val, split_chunk_size, G, scratch_chunks);
+      } else {
+        attention_step_chunk_stats_gqa_split_device_pos_kernel<128>
+            <<<grid, group_size_val * 32, smem_gqa, stream>>>(
+                q, k_cache, v_cache, scratch_m, scratch_l, scratch_o, position, num_kv_heads,
+                group_size_val, split_chunk_size, G, scratch_chunks);
+      }
     } else {
       const std::size_t smem = static_cast<std::size_t>(head_dim) * sizeof(half) +
                                static_cast<std::size_t>(2 * warps + 4) * sizeof(float) +
