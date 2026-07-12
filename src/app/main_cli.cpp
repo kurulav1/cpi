@@ -238,6 +238,10 @@ ParsedArgs parse_args(int argc, char** argv) {
       return std::string(argv[++i]);
     };
 
+    if (arg == "--image") {
+      args.image_path = need_val("--image");
+      continue;
+    }
     if (arg == "--prompt") {
       args.prompt_text = need_val("--prompt");
     } else if (arg == "--tokenizer") {

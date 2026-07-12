@@ -206,6 +206,15 @@ public:
                         const std::vector<int>& limits);
   bool can_sequence_prefill() const { return seq_prefill_ok_; }
 
+  // Prompt containing image soft tokens: one sequence prefill (which splices the
+  // embeddings and applies the bidirectional span limits), then the ordinary decode
+  // loop with the ordinary sampler. Returns the generated tokens.
+  std::vector<int> generate_multimodal(const std::vector<int>& tokens,
+                                       const std::vector<std::vector<float>>& embeds,
+                                       const std::vector<int>& limits, int max_new,
+                                       float temperature,
+                                       const std::function<bool(int)>& on_token);
+
   std::vector<float> encode_image(const std::vector<float>& pixels, const std::vector<int>& pos_x,
                                   const std::vector<int>& pos_y, int out_tokens);
   // Stage taps for the parity gate: 1 = after the patch embedder, 2 = after the

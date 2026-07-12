@@ -186,6 +186,12 @@ struct LayerPlan {
 };
 
 struct ModelPlan {
+  // Index into `prologue` at which the token embeddings are FINAL -- i.e. straight after
+  // the embedding lookup and its scale, and BEFORE anything that reads them. Multimodal
+  // prefill splices image embeddings in here. It matters: Gemma E2B projects its
+  // per-layer inputs FROM the embeddings, so splicing after the prologue would compute
+  // them from the placeholder token instead of the image (HF projects them post-scatter).
+  std::size_t embed_ready = 0;
   std::vector<Op> prologue;        // token → embeddings (+ scale, PLE build)
   std::vector<LayerPlan> layers;   // the tower
   std::vector<Op> epilogue;        // final norm → LM head (logits); softcap is host-side

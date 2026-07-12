@@ -11,6 +11,7 @@ namespace app::main_cli {
 struct ParsedArgs {
   engine::EngineOptions opts{};
   std::string prompt_text;
+  std::string image_path;  // --image: a PNG to place before the prompt text
   std::string chat_template;
   std::string tokenizer_path;
   // Speculative decoding: a small draft model (same tokenizer/vocab as the

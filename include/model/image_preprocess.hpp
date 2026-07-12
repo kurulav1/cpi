@@ -18,7 +18,13 @@ struct PatchGrid {
   std::vector<int> pos_x;     // patch grid coords; -1 marks a padding patch
   std::vector<int> pos_y;
   int num_patches = 0;   // including padding
-  int soft_tokens = 0;   // num_patches / pooling^2 -- what the text stream must reserve
+  // What the ENCODER emits: padded_patches / pooling^2 (HF's output_length).
+  int soft_tokens = 0;
+  // What the TEXT STREAM reserves: the LIVE grid only, (grid_w/k) * (grid_h/k). The
+  // trailing padded cells are not image tokens -- inserting them shifts the whole span
+  // out of alignment with the real soft tokens, and the model then reports seeing no
+  // image at all.
+  int live_soft_tokens = 0;
   int grid_w = 0;
   int grid_h = 0;
 };

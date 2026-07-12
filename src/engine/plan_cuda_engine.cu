@@ -1370,6 +1370,10 @@ void PlanCudaEngine::build_plan() {
     };
     emb((wprefix_ + "embed_tokens.weight").c_str(), Slot::X, H);
     sc(Slot::X, H, std::sqrt((float)H));  // embed * sqrt(hidden)
+    // Image embeddings are spliced in HERE -- before anything reads X. In particular the
+    // per-layer-input projection below reads X, and HF projects it from the POST-scatter
+    // embeddings.
+    plan_.embed_ready = pro.size();
     if (has_ple()) {
       const int ple = cfg_.hidden_size_per_layer_input;
       const int tot = cfg_.num_layers * ple;
@@ -1980,22 +1984,34 @@ void PlanCudaEngine::prefill_sequence(const std::vector<int>& tokens, int start_
   }
 
   ExecCtx ctx{sslot_ptr_.data(), T, /*causal=*/true, /*cached=*/true, dlimits};
-  execute_ops(plan_.prologue.data(), plan_.prologue.size(), 0, start_position, ctx);
 
-  // Splice image soft tokens over the placeholder tokens' embeddings. This happens AFTER
-  // the prologue (which did the lookup and the sqrt(hidden) scale) and overwrites those
-  // rows outright -- image embeddings are NOT scaled.
-  for (std::size_t i = 0; i < embeds.size() && i < static_cast<std::size_t>(T); ++i) {
-    if (embeds[i].empty()) continue;
-    if (static_cast<int>(embeds[i].size()) != H)
-      throw std::runtime_error("embedding override has the wrong width");
-    std::vector<__half> row(static_cast<std::size_t>(H));
-    for (int j = 0; j < H; ++j) row[static_cast<std::size_t>(j)] = __float2half(embeds[i][j]);
-    G4_CHECK(cudaMemcpyAsync(sslot_ptr_[static_cast<int>(Slot::X)] + i * static_cast<std::size_t>(H),
-                             row.data(), static_cast<std::size_t>(H) * sizeof(__half),
-                             cudaMemcpyHostToDevice, stream_));
-    G4_CHECK(cudaStreamSynchronize(stream_));  // row is a host temporary
+  // Prologue up to the point where the token embeddings are final...
+  const std::size_t ready = std::min(plan_.embed_ready, plan_.prologue.size());
+  execute_ops(plan_.prologue.data(), ready, 0, start_position, ctx);
+
+  // ...splice the image soft tokens over the placeholder tokens' embeddings (used AS-IS:
+  // unlike text embeddings they get no sqrt(hidden) scale)...
+  if (!embeds.empty()) {
+    std::vector<__half> rows(static_cast<std::size_t>(T) * H);
+    G4_CHECK(cudaMemcpy(rows.data(), sslot_ptr_[static_cast<int>(Slot::X)],
+                        rows.size() * sizeof(__half), cudaMemcpyDeviceToHost));
+    bool any = false;
+    for (std::size_t i = 0; i < embeds.size() && i < static_cast<std::size_t>(T); ++i) {
+      if (embeds[i].empty()) continue;
+      if (static_cast<int>(embeds[i].size()) != H)
+        throw std::runtime_error("embedding override has the wrong width");
+      for (int j = 0; j < H; ++j)
+        rows[i * static_cast<std::size_t>(H) + j] = __float2half(embeds[i][j]);
+      any = true;
+    }
+    if (any)
+      G4_CHECK(cudaMemcpy(sslot_ptr_[static_cast<int>(Slot::X)], rows.data(),
+                          rows.size() * sizeof(__half), cudaMemcpyHostToDevice));
   }
+
+  // ...and only THEN the rest of the prologue, which reads X (the per-layer-input
+  // projection does, and HF projects it from the post-splice embeddings).
+  execute_ops(plan_.prologue.data() + ready, plan_.prologue.size() - ready, 0, start_position, ctx);
 
   for (int L = 0; L < cfg_.num_layers; ++L)
     execute_ops(plan_.layers[L].ops.data(), plan_.layers[L].ops.size(), L, start_position, ctx);
@@ -2298,6 +2314,35 @@ std::vector<int> PlanCudaEngine::generate_stream(const std::vector<int>& prompt,
   // step() need not copy 262K floats to host every token.
   defer_host_logits_ = true;
   return runtime::run_decode(*this, prompt, p, on_token, &stats_);
+}
+
+std::vector<int> PlanCudaEngine::generate_multimodal(
+    const std::vector<int>& tokens, const std::vector<std::vector<float>>& embeds,
+    const std::vector<int>& limits, int max_new, float temperature,
+    const std::function<bool(int)>& on_token) {
+  defer_host_logits_ = false;  // the shared sampler reads host logits
+  prefill_sequence(tokens, 0, embeds, limits);
+
+  runtime::DecodeParams p;
+  p.max_new_tokens = max_new;
+  p.temperature = temperature;
+  p.top_k = samp_top_k_;
+  p.top_p = samp_top_p_;
+  p.repetition_penalty = samp_rep_penalty_;
+  p.seed = -1;
+
+  std::vector<int> history = tokens;
+  std::vector<int> out;
+  int pos = static_cast<int>(tokens.size());
+  for (int i = 0; i < max_new; ++i) {
+    const int next = sample(p, history);  // logits() already holds the last token's
+    if (next == cfg_.eos_token_id) break;
+    out.push_back(next);
+    history.push_back(next);
+    if (on_token && !on_token(next)) break;
+    step(next, pos++, /*want_logits=*/true);
+  }
+  return out;
 }
 
 std::vector<int> PlanCudaEngine::generate(const std::vector<int>& prompt, int max_new,

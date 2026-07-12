@@ -148,6 +148,7 @@ PatchGrid to_patches(const Image& img, int patch_size, int pooling_kernel, int m
   g.pos_y.assign(static_cast<std::size_t>(total), -1);
   g.num_patches = total;
   g.soft_tokens = total / (pooling_kernel * pooling_kernel);
+  g.live_soft_tokens = (g.grid_w / pooling_kernel) * (g.grid_h / pooling_kernel);
 
   for (int py = 0; py < g.grid_h; ++py) {
     for (int px = 0; px < g.grid_w; ++px) {
