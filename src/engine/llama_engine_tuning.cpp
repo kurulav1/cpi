@@ -13,29 +13,89 @@
 #include "runtime/kernels.cuh"
 namespace engine {
 namespace {
+// Times the launch INSIDE A CUDA GRAPH, because decode runs inside a CUDA graph.
+//
+// This used to time back-to-back launches on a stream. On Windows/WDDM every stream launch
+// carries ~5-7 us of DRIVER overhead, so that measured the driver, not the kernel -- and it
+// added the SAME constant to both candidates. A tuner that then asks for
+// `custom < cublas * 0.95` can never fire: a real 0.4 us difference is invisible next to a
+// shared +7 us. That is why wqkv and wo were dispatched to cuBLAS and left running at 29-37%
+// of bandwidth. The tuner was not wrong about the kernels; it was blind to them.
+//
+// A graph pays the launch cost once at instantiation, not per node, so this measures the
+// kernel. Every tuning decision in the engine goes through here.
 template <typename Launch>
 double timed_cuda_launch_ms(cudaStream_t stream, int warmup, int iters, Launch&& launch) {
   const int safe_warmup = std::max(0, warmup);
   const int safe_iters = std::max(1, iters);
+
+  // Capture the launch into a graph. If capture fails for any reason (a launch that is not
+  // capturable), fall back to the old stream timing rather than losing the tuning entirely.
+  cudaGraph_t graph = nullptr;
+  cudaGraphExec_t exec = nullptr;
+  constexpr int kChain = 16;  // amortise graph-launch cost across several nodes
+  bool captured = false;
+  if (cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal) == cudaSuccess) {
+    for (int i = 0; i < kChain; ++i) {
+      launch();
+    }
+    if (cudaStreamEndCapture(stream, &graph) == cudaSuccess && graph != nullptr &&
+        cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0) == cudaSuccess) {
+      captured = true;
+    } else {
+      cudaGetLastError();
+    }
+  } else {
+    cudaGetLastError();
+  }
+
   cudaEvent_t start = nullptr;
   cudaEvent_t stop = nullptr;
   CUDA_CHECK(cudaEventCreate(&start));
   CUDA_CHECK(cudaEventCreate(&stop));
-  for (int i = 0; i < safe_warmup; ++i) {
-    launch();
+
+  double ms_per_launch = 0.0;
+  if (captured) {
+    for (int i = 0; i < std::max(1, safe_warmup / kChain + 1); ++i) {
+      CUDA_CHECK(cudaGraphLaunch(exec, stream));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    const int reps = std::max(1, safe_iters / kChain);
+    CUDA_CHECK(cudaEventRecord(start, stream));
+    for (int i = 0; i < reps; ++i) {
+      CUDA_CHECK(cudaGraphLaunch(exec, stream));
+    }
+    CUDA_CHECK(cudaEventRecord(stop, stream));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+    float ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+    // Report as "time for safe_iters launches" so callers' comparisons are unchanged.
+    ms_per_launch = static_cast<double>(ms) / (reps * kChain) * safe_iters;
+  } else {
+    for (int i = 0; i < safe_warmup; ++i) {
+      launch();
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaEventRecord(start, stream));
+    for (int i = 0; i < safe_iters; ++i) {
+      launch();
+    }
+    CUDA_CHECK(cudaEventRecord(stop, stream));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+    float ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+    ms_per_launch = static_cast<double>(ms);
   }
-  CUDA_CHECK(cudaStreamSynchronize(stream));
-  CUDA_CHECK(cudaEventRecord(start, stream));
-  for (int i = 0; i < safe_iters; ++i) {
-    launch();
-  }
-  CUDA_CHECK(cudaEventRecord(stop, stream));
-  CUDA_CHECK(cudaEventSynchronize(stop));
-  float ms = 0.0f;
-  CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+
   CUDA_CHECK(cudaEventDestroy(stop));
   CUDA_CHECK(cudaEventDestroy(start));
-  return static_cast<double>(ms);
+  if (exec) {
+    cudaGraphExecDestroy(exec);
+  }
+  if (graph) {
+    cudaGraphDestroy(graph);
+  }
+  return ms_per_launch;
 }
 
 template <typename Launch>

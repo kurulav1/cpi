@@ -1051,17 +1051,43 @@ __global__ void gemv_wide_kernel(const half* __restrict__ w, const half* __restr
       w + static_cast<std::size_t>(row) * static_cast<std::size_t>(in_features));
   const int4* xv = reinterpret_cast<const int4*>(x);
 
+  // Prefetch kUnroll chunks BEFORE consuming any of them.
+  //
+  // The obvious loop -- load one int4, immediately use it -- keeps only ~1 load in flight per
+  // thread, because `vecs` is a runtime value so nvcc cannot unroll it and every iteration's
+  // math depends on that iteration's load. The thread then just sits in HBM latency. That is
+  // why the short-and-wide projections (wqkv, wo) ran at 29-37% of bandwidth: not too few
+  // threads, too few OUTSTANDING LOADS per thread.
+  //
+  // Issuing kUnroll loads up front turns latency into throughput. The accumulation ORDER is
+  // unchanged (lane, lane+32, lane+64, ... exactly as before), so this stays BIT-IDENTICAL to
+  // the un-prefetched kernel -- a pure scheduling win, no numerics change.
+  constexpr int kUnroll = 4;
   float acc = 0.0f;
-  for (int i = lane; i < vecs; i += warpSize) {
-    const int4 wpack = wrow[i];
-    const int4 xpack = xv[i];
-    const half2* wh = reinterpret_cast<const half2*>(&wpack);
-    const half2* xh = reinterpret_cast<const half2*>(&xpack);
+  int4 wbuf[kUnroll];
+  int4 xbuf[kUnroll];
+  for (int base = lane; base < vecs; base += warpSize * kUnroll) {
 #pragma unroll
-    for (int j = 0; j < 4; ++j) {
-      const float2 a = __half22float2(wh[j]);
-      const float2 b = __half22float2(xh[j]);
-      acc += a.x * b.x + a.y * b.y;
+    for (int u = 0; u < kUnroll; ++u) {
+      const int i = base + u * warpSize;
+      if (i < vecs) {
+        wbuf[u] = wrow[i];
+        xbuf[u] = xv[i];
+      }
+    }
+#pragma unroll
+    for (int u = 0; u < kUnroll; ++u) {
+      const int i = base + u * warpSize;
+      if (i < vecs) {
+        const half2* wh = reinterpret_cast<const half2*>(&wbuf[u]);
+        const half2* xh = reinterpret_cast<const half2*>(&xbuf[u]);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          const float2 a = __half22float2(wh[j]);
+          const float2 b = __half22float2(xh[j]);
+          acc += a.x * b.x + a.y * b.y;
+        }
+      }
     }
   }
   // Tail for in_features not divisible by 8.
@@ -1095,6 +1121,13 @@ static void launch_rowmajor_half_gemv(const half* w, const half* x, OutT* y, int
                                       int tile_pairs, int rows_per_warp,
                                       half* residual = nullptr) {
   if (use_wide_gemv() && (in_features % 8) == 0) {
+    // TRIED AND REJECTED: routing the short shapes (wqkv 1152 rows, wo 896, w2 896) to the
+    // split-K kernel -- one block per row, 8 warps splitting the input -- on the theory that
+    // one-warp-per-row leaves them at ~10% occupancy. It measured SLOWER end to end
+    // (833 -> 823 tok/s): the shared-memory reduction costs more than the extra parallelism
+    // buys at these sizes, and cuBLAS still wins wqkv/wo on the (now graph-timed, honest)
+    // tuner anyway. Their remaining gap to roofline is a kernel-duration floor, not occupancy.
+    // Don't re-litigate this without a profile that says otherwise.
     constexpr int kWarps = 4;
     const int blocks = (out_features + kWarps - 1) / kWarps;
     gemv_wide_kernel<kWarps, OutT>
