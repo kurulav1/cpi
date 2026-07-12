@@ -55,6 +55,21 @@ void LlamaEngine::resident_projection_half(const void* w, const void* x, void* y
       out_features, in_features, compute_stream_, warps_per_block, tile_pairs, rows_per_warp);
 }
 
+// Same projection, but the residual add is folded into the kernel's epilogue:
+//   residual[i] = __hadd(residual[i], (half)dot)
+// so the separate add_inplace launch disappears. At batch 1 a kernel costs a fixed ~1.7 us
+// whatever it does, and an add over `hidden` elements is far cheaper than launching it.
+// Byte-identical: same accumulation, same fp16 rounding, same __hadd.
+void LlamaEngine::resident_projection_half_residual(const void* w, const void* x, void* residual,
+                                                    int out_features, int in_features,
+                                                    int warps_per_block, int tile_pairs,
+                                                    int rows_per_warp) {
+  kernels::launch_rowmajor_half_gemv_f16(
+      static_cast<const __half*>(w), static_cast<const __half*>(x), nullptr, out_features,
+      in_features, compute_stream_, warps_per_block, tile_pairs, rows_per_warp,
+      static_cast<__half*>(residual));
+}
+
 void LlamaEngine::resident_projection_float(const void* w, const void* x, void* y, int out_features,
                                             int in_features, int warps_per_block, int tile_pairs,
                                             int rows_per_warp) {

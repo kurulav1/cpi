@@ -299,6 +299,12 @@ private:
   void resident_projection_half(const void* w, const void* x, void* y, int out_features,
                                 int in_features, int warps_per_block = 0, int tile_pairs = 0,
                                 int rows_per_warp = 1);
+  // Same projection with the residual add FOLDED INTO the epilogue, so the separate
+  // add_inplace launch disappears. At batch 1 a kernel costs a fixed ~1.7 us whatever it
+  // does, and adding `hidden` elements is far cheaper than launching a kernel to do it.
+  void resident_projection_half_residual(const void* w, const void* x, void* residual,
+                                         int out_features, int in_features, int warps_per_block = 0,
+                                         int tile_pairs = 0, int rows_per_warp = 1);
 
   // Float32 variant of resident_projection_half() for models using fp32 weights.
   void resident_projection_float(const void* w, const void* x, void* y, int out_features,

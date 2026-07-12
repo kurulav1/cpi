@@ -198,6 +198,10 @@ void LlamaEngine::init_greedy_decode_graph() {
                                    static_cast<__half*>(d_x_), 1, hidden, compute_stream_);
 
   for (int layer = 0; layer < cfg.num_layers; ++layer) {
+    // Set when a projection folded the residual add into its own epilogue, so the shared
+    // add_inplace below is skipped. The int8 / tq3 branches do NOT fold it and still need
+    // the add -- moving the add into one branch would silently drop the residual for them.
+    bool fused_residual = false;
     const auto* lw = &layer_cache_[static_cast<std::size_t>(layer)];
     // Include lw_i8 when either int8 MLP weights (w1) OR int8 projection weights
     // (wqkv) are present.  Using only w1 as the gate causes lw_i8=nullptr for
@@ -308,16 +312,22 @@ void LlamaEngine::init_greedy_decode_graph() {
             resident_int8_wo_warps_per_row_);
       }
     } else if (resident_custom_wo_) {
-      resident_projection_half(lw->wo, d_att_, d_ff3_, hidden, hidden, resident_wo_warps_,
-                               resident_wo_tile_pairs_, resident_wo_rows_per_warp_);
+      // Residual add folded into this projection's EPILOGUE, so the shared add_inplace
+      // below is skipped. At batch 1 a kernel costs a fixed ~1.7 us whatever it does.
+      resident_projection_half_residual(lw->wo, d_att_, d_x_, hidden, hidden, resident_wo_warps_,
+                                        resident_wo_tile_pairs_, resident_wo_rows_per_warp_);
+      fused_residual = true;
     } else {
       detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
                                               lt_workspace_bytes_, compute_stream_, lw->wo, d_att_,
                                               d_ff3_, hidden, hidden, 1, CUDA_R_16F);
     }
 
-    kernels::launch_add_inplace(static_cast<__half*>(d_x_), static_cast<const __half*>(d_ff3_),
-                                hidden, compute_stream_);
+    if (!fused_residual) {
+      kernels::launch_add_inplace(static_cast<__half*>(d_x_), static_cast<const __half*>(d_ff3_),
+                                  hidden, compute_stream_);
+    }
+    fused_residual = false;
 
     kernels::launch_rmsnorm(static_cast<const __half*>(d_x_),
                             static_cast<const __half*>(lw->norm_ffn),
@@ -407,12 +417,16 @@ void LlamaEngine::init_greedy_decode_graph() {
             static_cast<__half*>(d_ff3_), hidden, inter, compute_stream_);
       }
     } else {
-      resident_projection_half(lw->w2, d_ff2_, d_ff3_, hidden, inter, resident_wo_warps_,
-                               resident_wo_tile_pairs_, resident_wo_rows_per_warp_);
+      // Residual add folded into the down-projection's epilogue.
+      resident_projection_half_residual(lw->w2, d_ff2_, d_x_, hidden, inter, resident_wo_warps_,
+                                        resident_wo_tile_pairs_, resident_wo_rows_per_warp_);
+      fused_residual = true;
     }
 
-    kernels::launch_add_inplace(static_cast<__half*>(d_x_), static_cast<const __half*>(d_ff3_),
-                                hidden, compute_stream_);
+    if (!fused_residual) {
+      kernels::launch_add_inplace(static_cast<__half*>(d_x_), static_cast<const __half*>(d_ff3_),
+                                  hidden, compute_stream_);
+    }
   }
 
   kernels::launch_rmsnorm(static_cast<const __half*>(d_x_), static_cast<const __half*>(d_norm_out_),
@@ -580,6 +594,10 @@ void LlamaEngine::init_logits_decode_graph() {
                                    static_cast<__half*>(d_x_), 1, hidden, compute_stream_);
 
   for (int layer = 0; layer < cfg.num_layers; ++layer) {
+    // Set when a projection folded the residual add into its own epilogue, so the shared
+    // add_inplace below is skipped. The int8 / tq3 branches do NOT fold it and still need
+    // the add -- moving the add into one branch would silently drop the residual for them.
+    bool fused_residual = false;
     const auto* lw = &layer_cache_[static_cast<std::size_t>(layer)];
     const LayerDeviceInt8Weights* lw_i8 = (layer < static_cast<int>(layer_cache_i8_.size()) &&
                                            (layer_cache_i8_[static_cast<std::size_t>(layer)].w1 ||
@@ -686,16 +704,22 @@ void LlamaEngine::init_logits_decode_graph() {
             resident_int8_wo_warps_per_row_);
       }
     } else if (resident_custom_wo_) {
-      resident_projection_half(lw->wo, d_att_, d_ff3_, hidden, hidden, resident_wo_warps_,
-                               resident_wo_tile_pairs_, resident_wo_rows_per_warp_);
+      // Residual add folded into this projection's EPILOGUE, so the shared add_inplace
+      // below is skipped. At batch 1 a kernel costs a fixed ~1.7 us whatever it does.
+      resident_projection_half_residual(lw->wo, d_att_, d_x_, hidden, hidden, resident_wo_warps_,
+                                        resident_wo_tile_pairs_, resident_wo_rows_per_warp_);
+      fused_residual = true;
     } else {
       detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
                                               lt_workspace_bytes_, compute_stream_, lw->wo, d_att_,
                                               d_ff3_, hidden, hidden, 1, CUDA_R_16F);
     }
 
-    kernels::launch_add_inplace(static_cast<__half*>(d_x_), static_cast<const __half*>(d_ff3_),
-                                hidden, compute_stream_);
+    if (!fused_residual) {
+      kernels::launch_add_inplace(static_cast<__half*>(d_x_), static_cast<const __half*>(d_ff3_),
+                                  hidden, compute_stream_);
+    }
+    fused_residual = false;
 
     kernels::launch_rmsnorm(static_cast<const __half*>(d_x_),
                             static_cast<const __half*>(lw->norm_ffn),
@@ -761,12 +785,16 @@ void LlamaEngine::init_logits_decode_graph() {
             static_cast<__half*>(d_ff3_), hidden, inter, compute_stream_);
       }
     } else {
-      resident_projection_half(lw->w2, d_ff2_, d_ff3_, hidden, inter, resident_wo_warps_,
-                               resident_wo_tile_pairs_, resident_wo_rows_per_warp_);
+      // Residual add folded into the down-projection's epilogue.
+      resident_projection_half_residual(lw->w2, d_ff2_, d_x_, hidden, inter, resident_wo_warps_,
+                                        resident_wo_tile_pairs_, resident_wo_rows_per_warp_);
+      fused_residual = true;
     }
 
-    kernels::launch_add_inplace(static_cast<__half*>(d_x_), static_cast<const __half*>(d_ff3_),
-                                hidden, compute_stream_);
+    if (!fused_residual) {
+      kernels::launch_add_inplace(static_cast<__half*>(d_x_), static_cast<const __half*>(d_ff3_),
+                                  hidden, compute_stream_);
+    }
   }
 
   kernels::launch_rmsnorm(static_cast<const __half*>(d_x_), static_cast<const __half*>(d_norm_out_),

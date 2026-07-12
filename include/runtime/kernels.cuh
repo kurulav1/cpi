@@ -873,9 +873,14 @@ void launch_rowmajor_half_gemm_f16(const half* w, const half* x, half* y, int ou
                                    float in_min = -INFINITY, float in_max = INFINITY,
                                    float out_min = -INFINITY, float out_max = INFINITY);
 
+//   residual (optional): fuses the residual add into the epilogue --
+//     residual[row] = __hadd(residual[row], (half)dot)   and `y` is left untouched.
+//   Saves a whole add_inplace launch. BYTE-IDENTICAL: the dot is rounded to fp16 first
+//   (what the unfused store does) and combined with __hadd (what add_inplace does).
 void launch_rowmajor_half_gemv_f16(const half* w, const half* x, half* y, int out_features,
                                    int in_features, cudaStream_t stream, int warps_per_block = 0,
-                                   int tile_pairs = 0, int rows_per_warp = 1);
+                                   int tile_pairs = 0, int rows_per_warp = 1,
+                                   half* residual = nullptr);
 
 // launch_rowmajor_half_gemv_f32
 //

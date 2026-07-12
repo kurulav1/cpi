@@ -644,9 +644,15 @@ __device__ __forceinline__ void store_projection_value<float>(float* y, int row,
 }
 
 // Shared-memory half2 GEMV used by resident projection layers and the LM head.
+// `residual` (optional): fuse the residual add into the epilogue --
+//     residual[row] = __hadd(residual[row], (half)dot)
+// instead of storing the dot and running a separate add_inplace kernel over it.
+// BYTE-IDENTICAL: the dot is rounded to fp16 first (exactly what the unfused store does)
+// and combined with __hadd (exactly what add_inplace does). At batch 1 a kernel costs a
+// fixed ~1.7 us however little it does, so deleting the add is worth more than the add.
 template <int WarpsPerBlock, int TilePairs, int RowsPerWarp, typename OutT>
 __global__ void rowmajor_half_gemv_kernel(const half* w, const half* x, OutT* y, int out_features,
-                                          int in_features) {
+                                          int in_features, half* residual = nullptr) {
   static_assert(RowsPerWarp >= 1, "RowsPerWarp must be >= 1");
   __shared__ half2 x_tile[TilePairs];
   const int warp_id = threadIdx.x / warpSize;
@@ -712,7 +718,11 @@ __global__ void rowmajor_half_gemv_kernel(const half* w, const half* x, OutT* y,
     if (lane == 0) {
       const int row = row_base + r;
       if (row < out_features) {
-        store_projection_value<OutT>(y, row, local[r]);
+        if (residual != nullptr) {
+          residual[row] = __hadd(residual[row], __float2half(local[r]));
+        } else {
+          store_projection_value<OutT>(y, row, local[r]);
+        }
       }
     }
   }
@@ -927,7 +937,8 @@ void launch_pack_rowwise_int8_to_int4(const int8_t* src, int8_t* dst, int rows, 
 template <typename OutT>
 static void launch_rowmajor_half_gemv(const half* w, const half* x, OutT* y, int out_features,
                                       int in_features, cudaStream_t stream, int warps_per_block,
-                                      int tile_pairs, int rows_per_warp) {
+                                      int tile_pairs, int rows_per_warp,
+                                      half* residual = nullptr) {
   const int warps = (warps_per_block > 0) ? warps_per_block : ((out_features >= 8192) ? 8 : 4);
   const int tile = (tile_pairs > 0) ? tile_pairs : 128;
   const int rows = (rows_per_warp > 0) ? rows_per_warp : 1;
@@ -938,7 +949,7 @@ static void launch_rowmajor_half_gemv(const half* w, const half* x, OutT* y, int
     constexpr int kThreads = kWarps * 32;
     const int blocks = (out_features + kWarps * kRows - 1) / (kWarps * kRows);
     rowmajor_half_gemv_kernel<kWarps, kTile, kRows>
-        <<<blocks, kThreads, 0, stream>>>(w, x, y, out_features, in_features);
+        <<<blocks, kThreads, 0, stream>>>(w, x, y, out_features, in_features, residual);
   };
   auto launch_rows = [&](auto warps_tag, auto tile_tag) {
     if (rows >= 2) {
@@ -1034,9 +1045,9 @@ void launch_linear_attention_step(const half* q, const half* k, const half* v, c
 
 void launch_rowmajor_half_gemv_f16(const half* w, const half* x, half* y, int out_features,
                                    int in_features, cudaStream_t stream, int warps_per_block,
-                                   int tile_pairs, int rows_per_warp) {
+                                   int tile_pairs, int rows_per_warp, half* residual) {
   launch_rowmajor_half_gemv(w, x, y, out_features, in_features, stream, warps_per_block, tile_pairs,
-                            rows_per_warp);
+                            rows_per_warp, residual);
 }
 
 void launch_rowmajor_half_gemv_f32(const half* w, const half* x, float* y, int out_features,
