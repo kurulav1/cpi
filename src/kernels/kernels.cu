@@ -5,6 +5,7 @@
 // the performance-critical implementation details used by RMSNorm, embedding,
 // RoPE, and prefill-attention kernels.
 
+#include <cstdlib>
 #include <cuda_fp16.h>
 
 #include <cstdint>
@@ -823,12 +824,105 @@ __global__ void store_kv_batched_paged_kernel(half* k_pool, half* v_pool, const 
   }
 }
 
+// Decode-shaped RMSNorm.
+//
+// The simple kernel above cost 3.12 us per call in-graph for a 896-element row -- 48 calls a
+// token = 204 us, 16% of a Qwen2.5-0.5B decode step, to move 90 KB. Three reasons, all fixed
+// here:
+//   1. it reads x from global TWICE (once for the sum of squares, once to normalize);
+//   2. it loads x one half at a time (16 bits per thread) -- far too little in flight;
+//   3. its shared-memory tree reduction costs log2(threads) = 7 __syncthreads.
+// So: load x once with 128-bit int4 loads, KEEP IT IN REGISTERS across both passes, and
+// reduce with warp shuffles (1 __syncthreads instead of 7).
+//
+// A single row is still one block on a 170-SM GPU -- that is inherent to a batch-1 norm and
+// is not what made it slow.
+//
+// NOT bit-identical to rmsnorm_kernel_simple: the sum of squares is accumulated in a
+// different order, so it differs in the last fp32 bits. Gated on decoded text, same as the
+// wide GEMV.
+template <int Threads>
+__global__ void rmsnorm_fast_kernel(const half* __restrict__ x, const half* __restrict__ w,
+                                    half* __restrict__ y, int cols, float eps) {
+  constexpr int kMaxVecs = 8;  // int4 chunks per thread => cols <= Threads * 8 * 8
+  const int row = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int vecs = cols / 8;
+  const int4* x4 =
+      reinterpret_cast<const int4*>(x + static_cast<std::size_t>(row) * static_cast<std::size_t>(cols));
+
+  int4 buf[kMaxVecs];
+  float acc = 0.0f;
+  int n = 0;
+  for (int i = tid; i < vecs; i += Threads, ++n) {
+    buf[n] = x4[i];
+    const half2* h = reinterpret_cast<const half2*>(&buf[n]);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const float2 v = __half22float2(h[j]);
+      acc += v.x * v.x + v.y * v.y;
+    }
+  }
+
+#pragma unroll
+  for (int off = warpSize / 2; off > 0; off >>= 1) {
+    acc += __shfl_down_sync(0xffffffffu, acc, off);
+  }
+  __shared__ float partial[Threads / 32];
+  __shared__ float inv_shared;
+  const int warp = tid / warpSize;
+  const int lane = tid & (warpSize - 1);
+  if (lane == 0) {
+    partial[warp] = acc;
+  }
+  __syncthreads();
+  if (tid == 0) {
+    float total = 0.0f;
+#pragma unroll
+    for (int i = 0; i < Threads / 32; ++i) {
+      total += partial[i];
+    }
+    inv_shared = rsqrtf(total / static_cast<float>(cols) + eps);
+  }
+  __syncthreads();
+
+  const float inv = inv_shared;
+  const int4* w4 = reinterpret_cast<const int4*>(w);
+  int4* y4 =
+      reinterpret_cast<int4*>(y + static_cast<std::size_t>(row) * static_cast<std::size_t>(cols));
+  n = 0;
+  for (int i = tid; i < vecs; i += Threads, ++n) {
+    const int4 wpack = w4[i];
+    const half2* xh = reinterpret_cast<const half2*>(&buf[n]);  // still in registers
+    const half2* wh = reinterpret_cast<const half2*>(&wpack);
+    int4 out;
+    half2* oh = reinterpret_cast<half2*>(&out);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const float2 xv = __half22float2(xh[j]);
+      const float2 wv = __half22float2(wh[j]);
+      oh[j] = __floats2half2_rn(xv.x * inv * wv.x, xv.y * inv * wv.y);
+    }
+    y4[i] = out;
+  }
+}
+
 }  // namespace
 
 // Host launch wrappers keep kernel-selection policy out of the runtime call
 // sites.
 void launch_rmsnorm(const half* x, const half* weight, half* y, int rows, int cols, float eps,
                     cudaStream_t stream) {
+  // Fast path needs 128-bit alignment (cols % 8) and the row to fit in registers.
+  constexpr int kThreads = 256;
+  const bool legacy = [] {
+    const char* e = std::getenv("LLAMA_INFER_LEGACY_RMSNORM");
+    return e && *e == '1';
+  }();
+  if (!legacy && (cols % 8) == 0 && (cols / 8) <= kThreads * 8) {
+    rmsnorm_fast_kernel<kThreads><<<rows, kThreads, 0, stream>>>(x, weight, y, cols, eps);
+    return;
+  }
   const int threads = choose_rmsnorm_threads(cols);
   rmsnorm_kernel_simple<<<rows, threads, 0, stream>>>(x, weight, y, cols, eps);
 }

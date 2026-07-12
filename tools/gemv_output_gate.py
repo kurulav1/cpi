@@ -33,11 +33,29 @@ MODELS = [
 ]
 
 
+# Every kernel whose numerics we deliberately changed needs its opt-out set TOGETHER, or the
+# gate compares new-against-new and passes without testing anything. (It did exactly that
+# once: it toggled only the GEMV while the fast RMSNorm stayed on in both runs.)
+LEGACY_ENV = {
+    "LLAMA_INFER_TILED_GEMV": "1",     # tiled half2 GEMV (pre-128-bit-load)
+    "LLAMA_INFER_LEGACY_RMSNORM": "1", # shared-tree RMSNorm (pre-register-cached)
+    "LLAMA_INFER_HOST_SAMPLING": "1",  # full-vocab host sampler (pre-device-topk)
+}
+
+
 def run(weights, tokenizer, tiled):
-    env = dict(os.environ, LLAMA_INFER_TILED_GEMV="1" if tiled else "0")
+    env = dict(os.environ)
+    for k, v in LEGACY_ENV.items():
+        env[k] = v if tiled else "0"
+    # GREEDY (--temp 0). The default is temp=0.8, i.e. RNG sampling: there, a last-bit logit
+    # change eventually flips a draw and the texts diverge for a legitimate reason, so the
+    # gate could not tell a real numerics change from a bug. Greedy is deterministic, so a
+    # text difference means an argmax actually flipped -- which is the signal we want.
+    # (The device-topk sampler is validated separately: at a collapsed temperature the
+    # softmax becomes an argmax, so it must reproduce greedy exactly. It does.)
     out = subprocess.run(
         [EXE, weights, "--tokenizer", tokenizer, "--prompt", PROMPT,
-         "--max-new", str(MAX_NEW), "--gpu-cache-all"],
+         "--max-new", str(MAX_NEW), "--gpu-cache-all", "--temp", "0"],
         capture_output=True, text=True, env=env, timeout=900, encoding="utf-8", errors="replace")
     if out.returncode != 0:
         return None
