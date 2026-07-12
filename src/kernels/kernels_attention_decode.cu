@@ -965,12 +965,33 @@ __device__ __forceinline__ void gqa_split_chunk_stats_core(const half* q, const 
     const int tile_tokens = min(chunk_size, seq_len - sub_start);
 
     __syncthreads();  // protect the K/V tiles from the prior sub-chunk's V sum
-    for (int idx = tid; idx < tile_tokens * HeadDim; idx += blockDim.x) {
-      const int t = idx / HeadDim;
-      const int d = idx - t * HeadDim;
+    // Stage K/V into shared with 128-bit loads.
+    //
+    // This loop used to copy ONE half at a time -- 16 bits per thread, plus an integer
+    // div/mod per element -- which is why Nsight reported the warps spending 38.2 of 60.2
+    // cycles stalled on an L1TEX scoreboard dependency while DRAM throughput sat at 0.23%.
+    // The kernel was never bandwidth-bound; it simply never had enough loads in flight to
+    // cover their latency. Same disease the projection GEMV and RMSNorm had.
+    //
+    // Reading int4 (8 halves) cuts the request count 8x and puts 8x the bytes in flight.
+    //
+    // BIT-IDENTICAL: this only stages values into shared memory. The bytes that land in
+    // k_tile/v_tile are the same either way; every arithmetic op below reads from shared and
+    // is untouched. Alignment holds because each (token, kv_head) row is HeadDim halves and
+    // HeadDim is 64 or 128, so both the cache offsets and the shared tiles are 16-byte
+    // aligned.
+    constexpr int kHalvesPerVec = 8;  // int4 = 128 bits
+    constexpr int kVecPerRow = HeadDim / kHalvesPerVec;
+    static_assert(HeadDim % kHalvesPerVec == 0, "HeadDim must be a multiple of 8 for int4 staging");
+    int4* k_tile4 = reinterpret_cast<int4*>(k_tile);
+    int4* v_tile4 = reinterpret_cast<int4*>(v_tile);
+    const int tile_vecs = tile_tokens * kVecPerRow;
+    for (int idx = tid; idx < tile_vecs; idx += blockDim.x) {
+      const int t = idx / kVecPerRow;
+      const int dv = idx - t * kVecPerRow;
       const int base = cache_index(sub_start + t, kv_head, 0, num_kv_heads, HeadDim);
-      k_tile[idx] = k_cache[base + d];
-      v_tile[idx] = v_cache[base + d];
+      k_tile4[idx] = reinterpret_cast<const int4*>(k_cache + base)[dv];
+      v_tile4[idx] = reinterpret_cast<const int4*>(v_cache + base)[dv];
     }
     __syncthreads();
 
