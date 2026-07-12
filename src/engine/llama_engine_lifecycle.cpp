@@ -14,6 +14,7 @@
 
 #include "common.hpp"
 #include "llama_engine_internal.hpp"
+#include "runtime/kernels.cuh"
 #include "runtime/cuda_utils.cuh"
 #include "runtime/system_info.hpp"
 namespace engine {
@@ -280,6 +281,14 @@ void LlamaEngine::allocate_runtime_buffers() {
   CUDA_CHECK(cudaMalloc(&d_ff3_, bytes_for_matrix(rows, hidden)));
   CUDA_CHECK(cudaMalloc(&d_logits_, static_cast<std::size_t>(cfg.vocab_size) * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_argmax_, sizeof(int)));
+  // Scratch for the two-phase argmax. Without it the greedy argmax runs as ONE BLOCK over the
+  // whole vocab (one SM out of 170) and cost ~150 us/token on a 151936-wide head -- 12% of all
+  // GPU time, to read 608 KB that peak bandwidth delivers in 0.34 us.
+  argmax_parts_ = kernels::argmax_partition_count(cfg.vocab_size);
+  CUDA_CHECK(
+      cudaMalloc(&d_argmax_part_val_, static_cast<std::size_t>(argmax_parts_) * sizeof(float)));
+  CUDA_CHECK(
+      cudaMalloc(&d_argmax_part_idx_, static_cast<std::size_t>(argmax_parts_) * sizeof(int)));
   CUDA_CHECK(cudaMalloc(&d_decode_position_, sizeof(int)));
   const int half_dim = head_dim / 2;
   const std::size_t rope_table_elems =

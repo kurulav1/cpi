@@ -564,6 +564,9 @@ private:
   void* d_ff3_ = nullptr;             // Up-projection (w3) output buffer (SwiGLU second operand).
   void* d_logits_ = nullptr;          // Raw logit vector output from the LM head.
   int* d_argmax_ = nullptr;           // Single-element device buffer for the argmax result.
+  float* d_argmax_part_val_ = nullptr;  // Per-block partials for the two-phase greedy argmax.
+  int* d_argmax_part_idx_ = nullptr;
+  int argmax_parts_ = 0;
   // Device top-k sampling scratch (see decode_next_token_device_topk). Allocated lazily on
   // the first sampled token, so greedy-only runs never pay for them.
   float* d_topk_part_val_ = nullptr;

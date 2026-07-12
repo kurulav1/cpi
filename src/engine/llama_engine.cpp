@@ -693,6 +693,8 @@ LlamaEngine::~LlamaEngine() {
       p = nullptr;
     }
   };
+  free_typed(d_argmax_part_val_);
+  free_typed(d_argmax_part_idx_);
   free_typed(d_topk_part_val_);
   free_typed(d_topk_part_idx_);
   free_typed(d_topk_val_);

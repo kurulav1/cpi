@@ -86,8 +86,9 @@ void LlamaEngine::forward_token(int token, int position, bool compute_logits,
     CUDA_CHECK(cudaMemcpy(out_logits->data(), d_logits_, out_logits->size() * sizeof(float),
                           cudaMemcpyDeviceToHost));
   } else if (out_argmax) {
-    kernels::launch_argmax_float(static_cast<const float*>(d_logits_), cfg.vocab_size, d_argmax_,
-                                 compute_stream_);
+    kernels::launch_argmax_float(static_cast<const float*>(d_logits_), cfg.vocab_size,
+                               d_argmax_, compute_stream_, d_argmax_part_val_,
+                               d_argmax_part_idx_, argmax_parts_);
     CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
     CUDA_CHECK(cudaMemcpy(out_argmax, d_argmax_, sizeof(int), cudaMemcpyDeviceToHost));
   }

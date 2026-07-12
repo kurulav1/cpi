@@ -921,7 +921,14 @@ void launch_rowmajor_half_gemv_f32(const half* w, const half* x, float* y, int o
 //
 // Uses a two-level warp-argmax reduction (per-warp then across warps in
 // warp 0) within a single block of 256 threads.
-void launch_argmax_float(const float* logits, int n, int* out_index, cudaStream_t stream);
+// Two-phase when part_val/part_idx scratch is supplied (sized argmax_partition_count(n)),
+// otherwise a single block scans the whole vector. Supply the scratch: the single-block form
+// launches <<<1,256>>> over the entire vocab -- one SM out of 170 -- and measured 149.6 us on
+// Qwen2.5's 151936-wide head, 12% of all GPU time, to read 608 KB.
+constexpr int kArgmaxMaxParts = 1024;
+int argmax_partition_count(int n);
+void launch_argmax_float(const float* logits, int n, int* out_index, cudaStream_t stream,
+                         float* part_val = nullptr, int* part_idx = nullptr, int parts = 0);
 
 // launch_topk_float / launch_gather_ge_threshold
 //

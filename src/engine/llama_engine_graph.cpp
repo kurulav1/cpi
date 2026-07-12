@@ -438,8 +438,9 @@ void LlamaEngine::init_greedy_decode_graph() {
   resident_projection_float(d_lm_head_, d_x_norm_, d_logits_, cfg.vocab_size, hidden,
                             resident_lm_head_warps_, resident_lm_head_tile_pairs_,
                             resident_lm_head_rows_per_warp_);
-  kernels::launch_argmax_float(static_cast<const float*>(d_logits_), cfg.vocab_size, d_argmax_,
-                               compute_stream_);
+  kernels::launch_argmax_float(static_cast<const float*>(d_logits_), cfg.vocab_size,
+                               d_argmax_, compute_stream_, d_argmax_part_val_,
+                               d_argmax_part_idx_, argmax_parts_);
   kernels::launch_copy_int(d_argmax_, d_token_id_, compute_stream_);
   kernels::launch_increment_int(d_decode_position_, compute_stream_);
 

@@ -730,6 +730,92 @@ __global__ void rowmajor_half_gemv_kernel(const half* w, const half* x, OutT* y,
 }
 
 // Single-block argmax for the final logits vector.
+// Phase 1: each block takes a contiguous slice of the logits and reduces it to one
+// (value, index) pair. Phase 2: one block reduces the per-block pairs. Together these do the
+// same job as argmax_float_kernel with the whole GPU instead of a single SM.
+//
+// Tie-break: `>` (strictly greater) everywhere, exactly as the single-block kernel, so a
+// duplicated maximum resolves the same way it always did within a slice. Across slices the
+// decomposition differs, so an EXACT tie between two equal maxima in different blocks could
+// resolve differently -- the greedy 6-model gate is what proves this does not bite.
+__global__ void argmax_partial_kernel(const float* __restrict__ logits, int n,
+                                      float* __restrict__ part_val, int* __restrict__ part_idx) {
+  const int tid = threadIdx.x;
+  const int lane = tid & (warpSize - 1);
+  const int warp = tid / warpSize;
+  const int warp_count = (blockDim.x + warpSize - 1) / warpSize;
+  __shared__ float warp_max[32];
+  __shared__ int warp_idx[32];
+
+  const int chunk = (n + gridDim.x - 1) / gridDim.x;
+  const int begin = blockIdx.x * chunk;
+  const int end = min(begin + chunk, n);
+
+  float local_max = -3.402823466e+38F;
+  int local_idx = begin;
+  for (int i = begin + tid; i < end; i += blockDim.x) {
+    const float v = logits[i];
+    if (v > local_max) {
+      local_max = v;
+      local_idx = i;
+    }
+  }
+
+  warp_argmax(local_max, local_idx);
+  if (lane == 0) {
+    warp_max[warp] = local_max;
+    warp_idx[warp] = local_idx;
+  }
+  __syncthreads();
+
+  if (warp == 0) {
+    float v = (lane < warp_count) ? warp_max[lane] : -3.402823466e+38F;
+    int i = (lane < warp_count) ? warp_idx[lane] : begin;
+    warp_argmax(v, i);
+    if (lane == 0) {
+      part_val[blockIdx.x] = v;
+      part_idx[blockIdx.x] = i;
+    }
+  }
+}
+
+__global__ void argmax_reduce_kernel(const float* __restrict__ part_val,
+                                     const int* __restrict__ part_idx, int parts,
+                                     int* __restrict__ out_index) {
+  const int tid = threadIdx.x;
+  const int lane = tid & (warpSize - 1);
+  const int warp = tid / warpSize;
+  const int warp_count = (blockDim.x + warpSize - 1) / warpSize;
+  __shared__ float warp_max[32];
+  __shared__ int warp_idx[32];
+
+  float local_max = -3.402823466e+38F;
+  int local_idx = 0;
+  for (int i = tid; i < parts; i += blockDim.x) {
+    const float v = part_val[i];
+    if (v > local_max) {
+      local_max = v;
+      local_idx = part_idx[i];
+    }
+  }
+
+  warp_argmax(local_max, local_idx);
+  if (lane == 0) {
+    warp_max[warp] = local_max;
+    warp_idx[warp] = local_idx;
+  }
+  __syncthreads();
+
+  if (warp == 0) {
+    float v = (lane < warp_count) ? warp_max[lane] : -3.402823466e+38F;
+    int i = (lane < warp_count) ? warp_idx[lane] : 0;
+    warp_argmax(v, i);
+    if (lane == 0) {
+      *out_index = i;
+    }
+  }
+}
+
 __global__ void argmax_float_kernel(const float* logits, int n, int* out_index) {
   const int tid = threadIdx.x;
   const int lane = tid & (warpSize - 1);
@@ -1133,8 +1219,25 @@ void launch_rowmajor_half_gemv_f32(const half* w, const half* x, float* y, int o
                             rows_per_warp);
 }
 
-void launch_argmax_float(const float* logits, int n, int* out_index, cudaStream_t stream) {
+int argmax_partition_count(int n) {
+  constexpr int kItemsPerBlock = 256 * 8;
+  const int parts = (n + kItemsPerBlock - 1) / kItemsPerBlock;
+  return (parts < 1) ? 1 : ((parts > kArgmaxMaxParts) ? kArgmaxMaxParts : parts);
+}
+
+void launch_argmax_float(const float* logits, int n, int* out_index, cudaStream_t stream,
+                         float* part_val, int* part_idx, int parts) {
   constexpr int threads = 256;
+  // Two-phase when the caller supplies scratch. The single-block kernel below launches
+  // <<<1, 256>>> over the WHOLE vocab -- one SM out of 170, each thread walking ~594 logits
+  // in a serial dependent max-chain. It measured 149.6 us per token on Qwen2.5's 151936-wide
+  // head: 12% of all GPU time, to read 608 KB that peak bandwidth would deliver in 0.34 us.
+  // It cost as much as the LM head GEMV, which reads 272 MB.
+  if (part_val != nullptr && part_idx != nullptr && parts > 1) {
+    argmax_partial_kernel<<<parts, threads, 0, stream>>>(logits, n, part_val, part_idx);
+    argmax_reduce_kernel<<<1, threads, 0, stream>>>(part_val, part_idx, parts, out_index);
+    return;
+  }
   argmax_float_kernel<<<1, threads, 0, stream>>>(logits, n, out_index);
 }
 
