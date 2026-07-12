@@ -1273,6 +1273,7 @@ export default function App() {
   // The MODEL declares whether it can take images (config.json's vision_config), the
   // same way it declares its reasoning and chat formats. No name matching here.
   const visionOK     = Boolean(selProfile?.vision?.supported);
+  const reasoningMode = selProfile?.reasoning?.mode ?? "none";  // none | optional | always
 
   const attachImage = (file) => {
     if (!file) return;
@@ -2045,6 +2046,30 @@ export default function App() {
                   <div className="composer-foot">
                     <span className="composer-hint">Enter to send - Shift+Enter for newline</span>
                     <div className="composer-acts">
+                      {/* Reasoning is a per-MESSAGE decision ("think hard about this one"),
+                          not a preference, so it belongs next to Send rather than buried in
+                          settings. Shown only when the model declares it. */}
+                      {reasoningMode === "optional" && (
+                        <button
+                          type="button"
+                          className={`btn btn-ghost btn-toggle ${settings.thinking ? "btn-toggle-on" : ""}`}
+                          disabled={streaming}
+                          aria-pressed={Boolean(settings.thinking)}
+                          title={
+                            settings.thinking
+                              ? "Thinking ON — the model reasons first; its chain of thought streams above the answer. Slower, better on math and multi-step questions."
+                              : "Thinking OFF — the model answers directly. Turn on for math and multi-step questions."
+                          }
+                          onClick={() => setSettings((c) => ({ ...c, thinking: !c.thinking }))}
+                        >
+                          Think
+                        </button>
+                      )}
+                      {reasoningMode === "always" && (
+                        <span className="composer-always" title="This model always reasons before answering.">
+                          Thinking always on
+                        </span>
+                      )}
                       {visionOK && (
                         <>
                           <input
@@ -2147,24 +2172,6 @@ export default function App() {
                         : "Manual upper bound for generated tokens."}
                     </p>
                   </div>
-
-                  {selProfile?.reasoning?.mode === "optional" && (
-                    <div className="field">
-                      <label className="field-label">Reasoning</label>
-                      <label className="field-check">
-                        <input
-                          type="checkbox"
-                          checked={Boolean(settings.thinking)}
-                          onChange={(e) => setSettings((c) => ({ ...c, thinking: e.target.checked }))}
-                        />
-                        <span>Let the model think before answering.</span>
-                      </label>
-                      <p className="field-help">
-                        Streams a collapsible chain-of-thought above the answer. Slower, but
-                        stronger on math and multi-step questions.
-                      </p>
-                    </div>
-                  )}
 
                   <div className="field">
                     <label className="field-label">Long-form mode</label>

@@ -1263,3 +1263,23 @@ input[type="range"] { width: 100%; accent-color: var(--accent); cursor: pointer;
   opacity: 0.65;
 }
 
+
+/* --- composer toggles (Think) --- */
+.btn-toggle-on {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-bg);
+}
+.btn-toggle-on:hover:not(:disabled) { color: var(--accent); background: var(--accent-bg); }
+.composer-always {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.2rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--accent-bg);
+  color: var(--accent);
+  font-size: 0.68rem;
+  white-space: nowrap;
+  cursor: help;
+}
