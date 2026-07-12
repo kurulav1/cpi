@@ -48,6 +48,19 @@ int LlamaEngine::decode_next_token(int token, int position, float temperature,
     return next;
   }
 
+  // Sampled decode (temperature>0) -- the path real chat takes. Select the candidate set on
+  // the GPU so the host never sees the full vocab. Only eligible when the shared host
+  // sampler's semantics are exactly reproducible from a top-k candidate set: a repetition
+  // penalty or an n-gram block rescores logits OUTSIDE the top-k (a penalised token can fall
+  // out of the set, and one below the k-th can rise into it), so those keep the host path.
+  // Grammar and EOS suppression were already routed to the host path above.
+  if (options_.repetition_penalty <= 1.0f && options_.no_repeat_ngram_size <= 1) {
+    int next = 0;
+    if (decode_next_token_device_topk(token, position, temperature, history, &next)) {
+      return next;
+    }
+  }
+
   std::vector<float> h_logits;
   if (can_use_greedy_decode_graph()) {
     decode_next_token_logits_graph(token, position, h_logits);

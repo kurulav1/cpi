@@ -687,6 +687,20 @@ LlamaEngine::~LlamaEngine() {
     cudaFree(d_argmax_);
     d_argmax_ = nullptr;
   }
+  const auto free_typed = [](auto*& p) {
+    if (p) {
+      cudaFree(p);
+      p = nullptr;
+    }
+  };
+  free_typed(d_topk_part_val_);
+  free_typed(d_topk_part_idx_);
+  free_typed(d_topk_val_);
+  free_typed(d_topk_idx_);
+  free_typed(d_cand_idx_);
+  free_typed(d_cand_val_);
+  free_typed(d_cand_count_);
+  device_topk_ready_ = false;
   if (d_decode_position_) {
     cudaFree(d_decode_position_);
     d_decode_position_ = nullptr;

@@ -270,6 +270,24 @@ private:
   // Replays the logits-decode CUDA graph and copies the full logit vector to h_logits.
   void decode_next_token_logits_graph(int token, int position, std::vector<float>& h_logits);
 
+  // Runs the logits decode graph and LEAVES the logits on the device. Returns false if the
+  // graph is unavailable (caller must fall back). This is the half of
+  // decode_next_token_logits_graph that does not pay for the D2H copy.
+  bool run_logits_decode_graph(int token, int position);
+
+  // Device-side top-k sampling. The host-logits path copies the whole vocab to the host
+  // every token -- 608 KB for Qwen2.5's 151936 logits -- and then sorts it there. Measured
+  // at 0.73 ms/token, which is 45% of a 0.5B decode step and DWARFS every kernel in it.
+  // Greedy (temp<=0) already argmaxes on-device and avoids this; temperature>0 is the path
+  // real chat actually takes, and it was paying full price.
+  //
+  // Selects the candidate set on the GPU so the host only ever sees ~k entries. Returns
+  // false when not eligible or when a pathological tie count overflows the buffer, in which
+  // case the caller must use the host path. Mirrors PlanCudaEngine, which already does this.
+  bool decode_next_token_device_topk(int token, int position, float temperature,
+                                     const std::vector<int>& history, int* out_token);
+  void ensure_device_topk_buffers();
+
   // Runs a full forward pass for a single token at position, writes the
   // full logit vector to *out_logits, and the argmax index to *out_argmax.
   void forward_token_logits(int token, int position, std::vector<float>* out_logits,
@@ -546,6 +564,16 @@ private:
   void* d_ff3_ = nullptr;             // Up-projection (w3) output buffer (SwiGLU second operand).
   void* d_logits_ = nullptr;          // Raw logit vector output from the LM head.
   int* d_argmax_ = nullptr;           // Single-element device buffer for the argmax result.
+  // Device top-k sampling scratch (see decode_next_token_device_topk). Allocated lazily on
+  // the first sampled token, so greedy-only runs never pay for them.
+  float* d_topk_part_val_ = nullptr;
+  int* d_topk_part_idx_ = nullptr;
+  float* d_topk_val_ = nullptr;
+  int* d_topk_idx_ = nullptr;
+  int* d_cand_idx_ = nullptr;
+  float* d_cand_val_ = nullptr;
+  int* d_cand_count_ = nullptr;
+  bool device_topk_ready_ = false;
   int* d_decode_position_ = nullptr;  // Device copy of the current decode position index.
   float* d_rope_cos_ = nullptr;       // Precomputed RoPE cosine table [max_seq_len x head_dim].
   float* d_rope_sin_ = nullptr;       // Precomputed RoPE sine table [max_seq_len x head_dim].

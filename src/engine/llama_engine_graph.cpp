@@ -1,10 +1,12 @@
 #include <cstdlib>
 #include <cuda_fp16.h>
 
+#include <algorithm>
 #include <iostream>
 
 #include "common.hpp"
 #include "engine/llama_engine.hpp"
+#include "engine/sampling.hpp"
 #include "llama_engine_internal.hpp"
 #include "runtime/cuda_utils.cuh"
 #include "runtime/kernels.cuh"
@@ -814,14 +816,12 @@ void LlamaEngine::init_logits_decode_graph() {
   }
 }
 
-void LlamaEngine::decode_next_token_logits_graph(int token, int position,
-                                                 std::vector<float>& h_logits) {
+bool LlamaEngine::run_logits_decode_graph(int token, int position) {
   if (!logits_decode_graph_ready_) {
     init_logits_decode_graph();
   }
   if (!logits_decode_graph_ready_) {
-    forward_token_logits(token, position, &h_logits, nullptr);
-    return;
+    return false;
   }
   // Always upload token+position since the graph doesn't auto-increment position.
   CUDA_CHECK(
@@ -829,11 +829,107 @@ void LlamaEngine::decode_next_token_logits_graph(int token, int position,
   CUDA_CHECK(cudaMemcpyAsync(d_decode_position_, &position, sizeof(int), cudaMemcpyHostToDevice,
                              compute_stream_));
   CUDA_CHECK(cudaGraphLaunch(logits_decode_graph_exec_, compute_stream_));
+  return true;
+}
+
+void LlamaEngine::decode_next_token_logits_graph(int token, int position,
+                                                 std::vector<float>& h_logits) {
+  if (!run_logits_decode_graph(token, position)) {
+    forward_token_logits(token, position, &h_logits, nullptr);
+    return;
+  }
   CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
   const int vocab = weights_.config().vocab_size;
   h_logits.resize(static_cast<std::size_t>(vocab));
   CUDA_CHECK(cudaMemcpy(h_logits.data(), d_logits_, static_cast<std::size_t>(vocab) * sizeof(float),
                         cudaMemcpyDeviceToHost));
+}
+
+namespace {
+// Device top-k limits. kCandCapacity leaves room for ties at the k-th logit, which can push
+// the candidate set past k; overflowing it falls back to the host path rather than silently
+// sampling from a truncated set.
+constexpr int kMaxDeviceTopK = 1024;
+constexpr int kCandCapacity = 4096;
+}  // namespace
+
+void LlamaEngine::ensure_device_topk_buffers() {
+  if (device_topk_ready_) {
+    return;
+  }
+  const int vocab = weights_.config().vocab_size;
+  const int parts = kernels::topk_partition_count(vocab);
+  const std::size_t part_n = static_cast<std::size_t>(parts) * kMaxDeviceTopK;
+  CUDA_CHECK(cudaMalloc(&d_topk_part_val_, part_n * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&d_topk_part_idx_, part_n * sizeof(int)));
+  CUDA_CHECK(cudaMalloc(&d_topk_val_, static_cast<std::size_t>(kMaxDeviceTopK) * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&d_topk_idx_, static_cast<std::size_t>(kMaxDeviceTopK) * sizeof(int)));
+  CUDA_CHECK(cudaMalloc(&d_cand_idx_, static_cast<std::size_t>(kCandCapacity) * sizeof(int)));
+  CUDA_CHECK(cudaMalloc(&d_cand_val_, static_cast<std::size_t>(kCandCapacity) * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&d_cand_count_, sizeof(int)));
+  device_topk_ready_ = true;
+}
+
+// Opt-out for A/B and bisection: LLAMA_INFER_HOST_SAMPLING=1 forces the old full-vocab
+// host path. Used by tools/gemv_output_gate.py to prove the two agree token-for-token.
+static bool host_sampling_forced() {
+  static const bool v = [] {
+    const char* e = std::getenv("LLAMA_INFER_HOST_SAMPLING");
+    return e && *e == '1';
+  }();
+  return v;
+}
+
+bool LlamaEngine::decode_next_token_device_topk(int token, int position, float temperature,
+                                                const std::vector<int>& history, int* out_token) {
+  (void)history;  // eligibility already excludes the history-dependent penalties
+  const int vocab = weights_.config().vocab_size;
+  const int k = options_.top_k;
+  if (host_sampling_forced() || !can_use_greedy_decode_graph() || temperature <= 0.0f || k <= 0 ||
+      k > kMaxDeviceTopK || k >= vocab) {
+    return false;
+  }
+  ensure_device_topk_buffers();
+
+  if (!run_logits_decode_graph(token, position)) {
+    return false;
+  }
+  CUDA_CHECK(cudaMemsetAsync(d_cand_count_, 0, sizeof(int), compute_stream_));
+  kernels::launch_topk_float(static_cast<const float*>(d_logits_), vocab, k, d_topk_part_val_,
+                             d_topk_part_idx_, d_topk_val_, d_topk_idx_, compute_stream_);
+  // Threshold = the k-th largest logit, so {i : logit_i >= kth} is exactly the candidate set
+  // the host sampler would have built -- ties at the k-th value included.
+  kernels::launch_gather_ge_threshold(static_cast<const float*>(d_logits_), vocab,
+                                      d_topk_val_ + (k - 1), d_cand_idx_, d_cand_val_,
+                                      d_cand_count_, kCandCapacity, compute_stream_);
+  CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
+
+  int count = 0;
+  CUDA_CHECK(cudaMemcpy(&count, d_cand_count_, sizeof(int), cudaMemcpyDeviceToHost));
+  if (count <= 0 || count > kCandCapacity) {
+    return false;  // pathological tie count -- let the host path handle it
+  }
+  std::vector<int> idx(static_cast<std::size_t>(count));
+  std::vector<float> val(static_cast<std::size_t>(count));
+  CUDA_CHECK(cudaMemcpy(idx.data(), d_cand_idx_, static_cast<std::size_t>(count) * sizeof(int),
+                        cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(val.data(), d_cand_val_, static_cast<std::size_t>(count) * sizeof(float),
+                        cudaMemcpyDeviceToHost));
+
+  std::vector<detail::SampleCandidate> cand(static_cast<std::size_t>(count));
+  for (int i = 0; i < count; ++i) {
+    cand[static_cast<std::size_t>(i)] = {idx[static_cast<std::size_t>(i)],
+                                         val[static_cast<std::size_t>(i)]};
+  }
+  // The gather appends atomically, so its order is arbitrary; the host builds candidates in
+  // index order. Sort to match, so the shared sampler sees an identical vector and a seeded
+  // run produces the same token on both paths.
+  std::sort(cand.begin(), cand.end(),
+            [](const detail::SampleCandidate& a, const detail::SampleCandidate& b) {
+              return a.id < b.id;
+            });
+  *out_token = detail::dispatch_sample_from_candidates(cand, temperature, options_.top_p);
+  return true;
 }
 
 int LlamaEngine::decode_next_token_graph(int token, int position) {

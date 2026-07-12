@@ -21,6 +21,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 
 #include "runtime/kernels.cuh"
@@ -261,6 +262,75 @@ int main() {
     cudaStreamDestroy(s);
     cudaFree(x); cudaFree(wt); cudaFree(y); cudaFree(q); cudaFree(kc); cudaFree(vc);
     cudaFree(ao); cudaFree(ct); cudaFree(st); cudaFree(sm); cudaFree(sl); cudaFree(so);
+  }
+
+  // ---------------------------------------------------------------------------------
+  // What does a host sync between graph launches actually cost?
+  //
+  // The profile says decode spends ~1 ms/token with the GPU IDLE: we launch the decode
+  // graph, then block the host on it, every single token. On WDDM each submit-then-sync
+  // round trip carries scheduling latency that has nothing to do with the model. If that
+  // is real, the SAME graph replayed N times should be dramatically cheaper when we sync
+  // once at the end instead of after every launch. Measure it rather than assume it.
+  // ---------------------------------------------------------------------------------
+  {
+    constexpr int kNodes = 300;  // ~ the real decode graph (294)
+    constexpr int kLaunches = 200;
+    __half *w = nullptr, *x = nullptr;
+    float* y = nullptr;
+    CK(cudaMalloc(&w, 1152ull * 896 * sizeof(__half)));
+    CK(cudaMalloc(&x, 896 * sizeof(__half)));
+    CK(cudaMalloc(&y, 1152 * sizeof(float)));
+    CK(cudaMemset(w, 0x11, 1152ull * 896 * sizeof(__half)));
+
+    cudaStream_t s;
+    cudaStreamCreate(&s);
+    cudaGraph_t g;
+    cudaGraphExec_t ge;
+    cudaStreamBeginCapture(s, cudaStreamCaptureModeGlobal);
+    for (int i = 0; i < kNodes; ++i)
+      kernels::launch_rowmajor_half_gemv_f32(w, x, y, 1152, 896, s, 4, 128, 1);
+    cudaStreamEndCapture(s, &g);
+    cudaGraphInstantiate(&ge, g, nullptr, nullptr, 0);
+    for (int i = 0; i < 3; ++i) cudaGraphLaunch(ge, s);
+    cudaStreamSynchronize(s);
+
+    cudaEvent_t a, b;
+    cudaEventCreate(&a);
+    cudaEventCreate(&b);
+
+    // (1) sync after EVERY launch -- what decode does today.
+    auto t0 = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < kLaunches; ++i) {
+      cudaGraphLaunch(ge, s);
+      cudaStreamSynchronize(s);
+    }
+    auto t1 = std::chrono::high_resolution_clock::now();
+    const double per_sync =
+        std::chrono::duration<double, std::milli>(t1 - t0).count() / kLaunches;
+
+    // (2) launch back-to-back, sync ONCE at the end.
+    t0 = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < kLaunches; ++i) cudaGraphLaunch(ge, s);
+    cudaStreamSynchronize(s);
+    t1 = std::chrono::high_resolution_clock::now();
+    const double per_pipelined =
+        std::chrono::duration<double, std::milli>(t1 - t0).count() / kLaunches;
+
+    std::printf("\n  Cost of a host sync between graph launches (%d-node graph):\n\n", kNodes);
+    std::printf("    sync after every launch : %7.3f ms   <- what decode does per token\n",
+                per_sync);
+    std::printf("    sync once at the end    : %7.3f ms\n", per_pipelined);
+    std::printf("    HOST-SYNC TAX           : %7.3f ms per launch\n", per_sync - per_pipelined);
+
+    cudaEventDestroy(a);
+    cudaEventDestroy(b);
+    cudaGraphExecDestroy(ge);
+    cudaGraphDestroy(g);
+    cudaStreamDestroy(s);
+    cudaFree(w);
+    cudaFree(x);
+    cudaFree(y);
   }
 
   const double ideal = total_mb / 1e3 / kPeak * 1e3;
