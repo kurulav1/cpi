@@ -458,7 +458,11 @@ void PlanCudaEngine::allocate_buffers() {
   G4_CHECK(cudaMalloc(&d_cand_val_, kCandCapacity * sizeof(float)));
   G4_CHECK(cudaMalloc(&d_cand_count_, sizeof(int)));
   // ones for weightless v-norm
-  std::vector<__half> ones(maxhd, __float2half(1.0f));
+  // d_ones_ backs every WEIGHTLESS norm, so it must be as long as the widest vector any
+  // of them normalises -- not just the widest head. The vision projector normalises over
+  // the vision hidden size, which is far wider than a head: sizing this to maxhd read off
+  // the end of the buffer (silently, with garbage "ones").
+  std::vector<__half> ones(std::max(maxhd, cfg_.hidden), __float2half(1.0f));
   G4_CHECK(cudaMalloc(&d_ones_, ones.size() * sizeof(__half)));
   G4_CHECK(cudaMemcpy(d_ones_, ones.data(), ones.size() * sizeof(__half), cudaMemcpyHostToDevice));
 
@@ -533,9 +537,23 @@ void PlanCudaEngine::parse_gemma4_st_config(const std::string& model_dir) {
   cfg_.layer_full.assign(cfg_.num_layers, 0);
   for (int L = 0; L < cfg_.num_layers && L < static_cast<int>(types.size()); ++L)
     cfg_.layer_full[L] = (types[L] == "full_attention") ? 1 : 0;
-  cfg_.kv_source.clear();
-  for (int i = 0; i < cfg_.num_layers; ++i) cfg_.kv_source.push_back(i);
-  cfg_.first_shared_layer = 0;
+  // KV sharing: the last num_kv_shared_layers layers do NOT project their own K/V --
+  // they reuse the cache of the LAST NON-SHARED LAYER OF THE SAME TYPE (sliding vs
+  // full). E2B shares 20 of its 35 layers; the MoE and 12B share none. Getting this
+  // wrong still runs, and still produces fluent-looking garbage.
+  cfg_.first_shared_layer =
+      cfg_.num_kv_shared_layers > 0 ? cfg_.num_layers - cfg_.num_kv_shared_layers : 0;
+  cfg_.kv_source.assign(cfg_.num_layers, 0);
+  for (int L = 0; L < cfg_.num_layers; ++L) {
+    if (cfg_.first_shared_layer > 0 && L >= cfg_.first_shared_layer) {
+      int src = L;
+      for (int i = 0; i < cfg_.first_shared_layer; ++i)
+        if (cfg_.layer_full[i] == cfg_.layer_full[L]) src = i;  // last match wins
+      cfg_.kv_source[L] = src;
+    } else {
+      cfg_.kv_source[L] = L;
+    }
+  }
 
   if (cfg_.vocab <= 0 || cfg_.hidden <= 0 || cfg_.num_layers <= 0)
     throw std::runtime_error("Gemma 4 config.json is missing required text_config fields");
@@ -547,6 +565,14 @@ void PlanCudaEngine::parse_gemma4_st_config(const std::string& model_dir) {
   auto put = [&](const std::string& n, int r, int c) { st_shapes_[wprefix_ + n] = {r, c}; };
   put("embed_tokens.weight", cfg_.vocab, H);
   put("norm.weight", 1, H);
+  // Per-Layer Embeddings (E2B has them; 12B and the MoE do not).
+  const int ple = cfg_.hidden_size_per_layer_input;
+  if (ple > 0) {
+    const int ple_vocab = mini::json_get_int(tc, "vocab_size_per_layer_input", cfg_.vocab);
+    put("embed_tokens_per_layer.weight", ple_vocab, cfg_.num_layers * ple);
+    put("per_layer_model_projection.weight", cfg_.num_layers * ple, H);
+    put("per_layer_projection_norm.weight", 1, ple);
+  }
   for (int L = 0; L < cfg_.num_layers; ++L) {
     const std::string p = "layers." + std::to_string(L) + ".";
     const bool full = cfg_.layer_full[L] != 0;
@@ -566,6 +592,19 @@ void PlanCudaEngine::parse_gemma4_st_config(const std::string& model_dir) {
     put(p + "mlp.gate_proj.weight", cfg_.intermediate, H);
     put(p + "mlp.up_proj.weight", cfg_.intermediate, H);
     put(p + "mlp.down_proj.weight", H, cfg_.intermediate);
+    // The KV-shared layers run a DOUBLE-WIDE MLP. This override must come AFTER the
+    // puts above -- registering it first just gets overwritten, which silently reads
+    // half of each shared layer's weight and produces garbage.
+    if (cfg_.use_double_wide_mlp && cfg_.first_shared_layer > 0 && L >= cfg_.first_shared_layer) {
+      put(p + "mlp.gate_proj.weight", cfg_.intermediate * 2, H);
+      put(p + "mlp.up_proj.weight", cfg_.intermediate * 2, H);
+      put(p + "mlp.down_proj.weight", H, cfg_.intermediate * 2);
+    }
+    if (ple > 0) {
+      put(p + "per_layer_input_gate.weight", ple, H);
+      put(p + "per_layer_projection.weight", H, ple);
+      put(p + "post_per_layer_input_norm.weight", 1, H);
+    }
     if (cfg_.enable_moe_block) {
       put(p + "pre_feedforward_layernorm_2.weight", 1, H);
       put(p + "post_feedforward_layernorm_1.weight", 1, H);
@@ -769,6 +808,18 @@ void PlanCudaEngine::open(const std::string& cpi_path, int max_context) {
       build_rope_tables();
       allocate_buffers();
       build_plan();
+      // The vision tower, when the checkpoint ships one. Opt out with
+      // LLAMA_INFER_NO_VISION=1 (it costs VRAM even on text-only prompts).
+      parse_vision_config(cpi_path);
+      if (vcfg_.present && !std::getenv("LLAMA_INFER_NO_VISION")) {
+        vis_max_patches_ = 4096;
+        load_vision_weights();
+        build_vision_rope_tables();
+        allocate_vision_buffers();
+        build_vision_plan();
+      } else {
+        vcfg_.present = false;
+      }
       G4_CHECK(cudaStreamSynchronize(stream_));
       return;
     }
@@ -899,6 +950,365 @@ void PlanCudaEngine::append_moe_ffn_ops(std::vector<opplan::Op>& ops, const std:
     ops.push_back(o);
   }
   (void)L;
+}
+
+// ───────────────────────── vision tower ─────────────────────────
+// Same executor, same ops, sequence mode. Only the config, slots and plan differ.
+
+void PlanCudaEngine::parse_vision_config(const std::string& model_dir) {
+  const std::string raw = mini::read_text_file(std::filesystem::path(model_dir) / "config.json");
+  const std::string vc = mini::json_extract_object(raw, "vision_config");
+  if (vc.empty()) return;
+
+  vcfg_.hidden = mini::json_get_int(vc, "hidden_size", 0);
+  vcfg_.layers = mini::json_get_int(vc, "num_hidden_layers", 0);
+  vcfg_.heads = mini::json_get_int(vc, "num_attention_heads", 0);
+  vcfg_.kv_heads = mini::json_get_int(vc, "num_key_value_heads", vcfg_.heads);
+  vcfg_.head_dim = mini::json_get_int(vc, "head_dim", 0);
+  vcfg_.intermediate = mini::json_get_int(vc, "intermediate_size", 0);
+  vcfg_.patch_size = mini::json_get_int(vc, "patch_size", 0);
+  vcfg_.pos_table_size = mini::json_get_int(vc, "position_embedding_size", 0);
+  vcfg_.pooling_kernel = mini::json_get_int(vc, "pooling_kernel_size", 1);
+  vcfg_.rms_eps = mini::json_get_float(vc, "rms_norm_eps", 1e-6f);
+  vcfg_.standardize = mini::json_get_bool(vc, "standardize", false);
+  vcfg_.clipped_linears = mini::json_get_bool(vc, "use_clipped_linears", false);
+  const std::string rp = mini::json_extract_object(vc, "rope_parameters");
+  vcfg_.rope_theta = mini::json_get_float(rp.empty() ? vc : rp, "rope_theta", 100.0f);
+
+  vcfg_.present = vcfg_.hidden > 0 && vcfg_.layers > 0 && vcfg_.patch_size > 0;
+}
+
+// cos/sin over the SPATIAL half-dim: inv_freq = theta^(-2j/spatial_dim) with
+// spatial_dim = head_dim/2, giving head_dim/4 entries per position. Both axes share
+// the table -- x and y get identical frequency ranges (they are separate positions,
+// not separate frequency bands).
+void PlanCudaEngine::build_vision_rope_tables() {
+  const int pairs = vcfg_.head_dim / 4;
+  const int spatial_dim = vcfg_.head_dim / 2;
+  const int max_pos = 4096;  // patch-grid coordinates; far above any real image
+  std::vector<float> cs(static_cast<std::size_t>(max_pos) * pairs), ss(cs.size());
+  for (int p = 0; p < max_pos; ++p) {
+    for (int j = 0; j < pairs; ++j) {
+      const float inv = std::pow(vcfg_.rope_theta,
+                                 -static_cast<float>(2 * j) / static_cast<float>(spatial_dim));
+      const float ang = static_cast<float>(p) * inv;
+      cs[static_cast<std::size_t>(p) * pairs + j] = std::cos(ang);
+      ss[static_cast<std::size_t>(p) * pairs + j] = std::sin(ang);
+    }
+  }
+  G4_CHECK(cudaMalloc(&d_vrope_cos_, cs.size() * sizeof(float)));
+  G4_CHECK(cudaMalloc(&d_vrope_sin_, ss.size() * sizeof(float)));
+  G4_CHECK(cudaMemcpy(d_vrope_cos_, cs.data(), cs.size() * sizeof(float), cudaMemcpyHostToDevice));
+  G4_CHECK(cudaMemcpy(d_vrope_sin_, ss.data(), ss.size() * sizeof(float), cudaMemcpyHostToDevice));
+}
+
+void PlanCudaEngine::load_vision_weights() {
+  const int H = vcfg_.hidden;
+  const int patch_dim = 3 * vcfg_.patch_size * vcfg_.patch_size;
+  const std::string v = "model.vision_tower.";
+
+  // Vision weights stay fp16: the tower is small (E2B ~100M params) and runs once per
+  // image, so quantising it would trade real accuracy for irrelevant savings.
+  st_shapes_[v + "patch_embedder.input_proj.weight"] = {H, patch_dim};
+  st_shapes_[v + "patch_embedder.position_embedding_table"] = {2 * vcfg_.pos_table_size, H};
+  upload(v + "patch_embedder.input_proj.weight");
+  upload(v + "patch_embedder.position_embedding_table");
+  if (vcfg_.standardize) {
+    st_shapes_[v + "std_bias"] = {1, H};
+    st_shapes_[v + "std_scale"] = {1, H};
+    upload(v + "std_bias");
+    upload(v + "std_scale");
+  }
+
+  const int qdim = vcfg_.heads * vcfg_.head_dim;
+  const int kvdim = vcfg_.kv_heads * vcfg_.head_dim;
+  for (int L = 0; L < vcfg_.layers; ++L) {
+    const std::string p = v + "encoder.layers." + std::to_string(L) + ".";
+    auto put = [&](const std::string& n, int r, int c) { st_shapes_[p + n] = {r, c}; };
+    // NOTE the ".linear." infix: the projections are wrapped in Gemma4ClippableLinear.
+    // Its clamp bounds are +-inf and are absent from the checkpoint, so it is a plain
+    // Linear -- do not implement the clipping.
+    put("input_layernorm.weight", 1, H);
+    put("post_attention_layernorm.weight", 1, H);
+    put("pre_feedforward_layernorm.weight", 1, H);
+    put("post_feedforward_layernorm.weight", 1, H);
+    put("self_attn.q_proj.linear.weight", qdim, H);
+    put("self_attn.k_proj.linear.weight", kvdim, H);
+    put("self_attn.v_proj.linear.weight", kvdim, H);
+    put("self_attn.o_proj.linear.weight", H, qdim);
+    put("self_attn.q_norm.weight", 1, vcfg_.head_dim);
+    put("self_attn.k_norm.weight", 1, vcfg_.head_dim);
+    put("mlp.gate_proj.linear.weight", vcfg_.intermediate, H);
+    put("mlp.up_proj.linear.weight", vcfg_.intermediate, H);
+    put("mlp.down_proj.linear.weight", H, vcfg_.intermediate);
+    // Clipped projections: E2B ships input/output activation bounds per linear and HF
+    // CLAMPS with them. The 26B sets use_clipped_linears=false and ships none. Skipping
+    // these does not crash -- it silently changes the numbers, which is why the gate
+    // caught it and inspection did not.
+    if (vcfg_.clipped_linears) {
+      for (const char* proj : {"self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
+                               "self_attn.o_proj", "mlp.gate_proj", "mlp.up_proj",
+                               "mlp.down_proj"}) {
+        const std::string base = p + proj + ".";
+        vclip_[base] = ClipBounds{scalar_value(base + "input_min"),
+                                  scalar_value(base + "input_max"),
+                                  scalar_value(base + "output_min"),
+                                  scalar_value(base + "output_max")};
+      }
+    }
+    const char* tensors[] = {
+        "input_layernorm.weight",          "post_attention_layernorm.weight",
+        "pre_feedforward_layernorm.weight", "post_feedforward_layernorm.weight",
+        "self_attn.q_proj.linear.weight",  "self_attn.k_proj.linear.weight",
+        "self_attn.v_proj.linear.weight",  "self_attn.o_proj.linear.weight",
+        "self_attn.q_norm.weight",         "self_attn.k_norm.weight",
+        "mlp.gate_proj.linear.weight",     "mlp.up_proj.linear.weight",
+        "mlp.down_proj.linear.weight"};
+    for (const char* t : tensors) upload(p + t);
+  }
+
+  // The projector into text-embedding space.
+  st_shapes_["model.embed_vision.embedding_projection.weight"] = {cfg_.hidden, H};
+  upload("model.embed_vision.embedding_projection.weight");
+}
+
+void PlanCudaEngine::allocate_vision_buffers() {
+  const int H = vcfg_.hidden;
+  const int patch_dim = 3 * vcfg_.patch_size * vcfg_.patch_size;
+  const int P = vis_max_patches_;
+  const int qdim = vcfg_.heads * vcfg_.head_dim;
+  const int kvdim = vcfg_.kv_heads * vcfg_.head_dim;
+
+  auto al = [&](opplan::Slot slot, std::size_t per_token) {
+    __half* d = nullptr;
+    G4_CHECK(cudaMalloc(&d, static_cast<std::size_t>(P) * per_token * sizeof(__half)));
+    vslot_ptr_[static_cast<int>(slot)] = d;
+    vis_buffers_.push_back(d);
+  };
+  using opplan::Slot;
+  al(Slot::X, H);
+  al(Slot::XNorm, H);
+  al(Slot::Tmp, static_cast<std::size_t>(std::max(H, cfg_.hidden)));  // also the projector output
+  al(Slot::Q, qdim);
+  al(Slot::K, kvdim);
+  al(Slot::V, kvdim);
+  al(Slot::Att, qdim);
+  al(Slot::Gate, vcfg_.intermediate);
+  al(Slot::Up, vcfg_.intermediate);
+  al(Slot::Inter, vcfg_.intermediate);
+
+  // Defensive: a tower whose hidden exceeds the text hidden would still overrun d_ones_.
+  if (vcfg_.hidden > std::max(cfg_.hidden, std::max(cfg_.head_dim_full, cfg_.head_dim_sliding))) {
+    std::vector<__half> ones(vcfg_.hidden, __float2half(1.0f));
+    cudaFree(d_ones_);
+    G4_CHECK(cudaMalloc(&d_ones_, ones.size() * sizeof(__half)));
+    G4_CHECK(cudaMemcpy(d_ones_, ones.data(), ones.size() * sizeof(__half),
+                        cudaMemcpyHostToDevice));
+  }
+
+  G4_CHECK(cudaMalloc(&d_vis_pixels_, static_cast<std::size_t>(P) * patch_dim * sizeof(float)));
+  G4_CHECK(cudaMalloc(&d_vis_pos_x_, static_cast<std::size_t>(P) * sizeof(int)));
+  G4_CHECK(cudaMalloc(&d_vis_pos_y_, static_cast<std::size_t>(P) * sizeof(int)));
+}
+
+void PlanCudaEngine::build_vision_plan() {
+  using namespace opplan;
+  const int H = vcfg_.hidden;
+  const int patch_dim = 3 * vcfg_.patch_size * vcfg_.patch_size;
+  const std::string v = "model.vision_tower.";
+
+  {  // prologue: pixels -> patch embeddings (+ the two-axis learned position table)
+    Op o;
+    o.kind = OpKind::PatchEmbed;
+    o.out = Slot::X;
+    o.cols = H;
+    o.in_dim = patch_dim;
+    o.rows = vcfg_.pos_table_size;
+    o.weight = dev_at(v + "patch_embedder.input_proj.weight");
+    o.aux_ptr = dev_at(v + "patch_embedder.position_embedding_table");
+    vplan_.prologue.push_back(o);
+  }
+
+  vplan_.layers.assign(vcfg_.layers, LayerPlan{});
+  for (int L = 0; L < vcfg_.layers; ++L) {
+    const std::string p = v + "encoder.layers." + std::to_string(L) + ".";
+    auto& ops = vplan_.layers[L].ops;
+    vplan_.layers[L].layer_index = L;
+    auto W = [&](const char* t) { return dev_at(p + t); };
+    const int nq = vcfg_.heads, nkv = vcfg_.kv_heads, hd = vcfg_.head_dim;
+    const int qdim = nq * hd, kvdim = nkv * hd;
+
+    auto rms = [&](Slot in, Slot out, const __half* w, int rows, int cols) {
+      Op o; o.kind = OpKind::RmsNorm; o.in = in; o.out = out; o.weight = w;
+      o.rows = rows; o.cols = cols; ops.push_back(o);
+    };
+    auto gemv = [&](Slot in, Slot out, const char* t, int out_dim, int in_dim) {
+      Op o; o.kind = OpKind::Gemv; o.in = in; o.out = out; o.cols = out_dim; o.in_dim = in_dim;
+      o.weight = dev_at(p + t);
+      // "<proj>.linear.weight" -> "<proj>." is the key the bounds were stored under.
+      const std::string tn(t);
+      const std::string base = p + tn.substr(0, tn.find("linear.weight"));
+      const auto c = vclip_.find(base);
+      if (c != vclip_.end()) {
+        o.clip_in_min = c->second.in_min;
+        o.clip_in_max = c->second.in_max;
+        o.clip_out_min = c->second.out_min;
+        o.clip_out_max = c->second.out_max;
+      }
+      ops.push_back(o);
+    };
+    auto rope2d = [&](Slot s, int heads) {
+      Op o; o.kind = OpKind::Rope2D; o.in = s; o.out = s; o.heads = heads; o.head_dim = hd;
+      ops.push_back(o);
+    };
+    auto add_x = [&](Slot src) {
+      Op o; o.kind = OpKind::AddInplace; o.out = Slot::X; o.in = src; o.cols = H;
+      ops.push_back(o);
+    };
+
+    // The same sandwich-norm shape as a Gemma TEXT layer. The differences are that
+    // attention is bidirectional and the positions are 2-D.
+    rms(Slot::X, Slot::XNorm, W("input_layernorm.weight"), 1, H);
+    gemv(Slot::XNorm, Slot::Q, "self_attn.q_proj.linear.weight", qdim, H);
+    gemv(Slot::XNorm, Slot::K, "self_attn.k_proj.linear.weight", kvdim, H);
+    gemv(Slot::XNorm, Slot::V, "self_attn.v_proj.linear.weight", kvdim, H);
+    rms(Slot::Q, Slot::Q, W("self_attn.q_norm.weight"), nq, hd);
+    rms(Slot::K, Slot::K, W("self_attn.k_norm.weight"), nkv, hd);
+    rms(Slot::V, Slot::V, nullptr, nkv, hd);  // weightless v-norm, as in the text tower
+    rope2d(Slot::Q, nq);
+    rope2d(Slot::K, nkv);
+    {  // scaling = 1.0: pre-scale q by sqrt(hd) to cancel the kernel's 1/sqrt(hd)
+      Op o; o.kind = OpKind::ScaleCopy; o.in = Slot::Q; o.out = Slot::Q; o.cols = qdim;
+      o.scale = std::sqrt(static_cast<float>(hd));
+      ops.push_back(o);
+    }
+    {
+      Op o; o.kind = OpKind::Attention; o.in = Slot::Q; o.out = Slot::Att;
+      o.heads = nq; o.kv_heads = nkv; o.head_dim = hd; o.full_attention = true;
+      ops.push_back(o);
+    }
+    gemv(Slot::Att, Slot::Tmp, "self_attn.o_proj.linear.weight", H, qdim);
+    rms(Slot::Tmp, Slot::Tmp, W("post_attention_layernorm.weight"), 1, H);
+    add_x(Slot::Tmp);
+
+    rms(Slot::X, Slot::XNorm, W("pre_feedforward_layernorm.weight"), 1, H);
+    gemv(Slot::XNorm, Slot::Gate, "mlp.gate_proj.linear.weight", vcfg_.intermediate, H);
+    gemv(Slot::XNorm, Slot::Up, "mlp.up_proj.linear.weight", vcfg_.intermediate, H);
+    {
+      Op o; o.kind = OpKind::GeluMul; o.in = Slot::Gate; o.in2 = Slot::Up; o.out = Slot::Inter;
+      o.cols = vcfg_.intermediate;
+      ops.push_back(o);
+    }
+    gemv(Slot::Inter, Slot::Tmp, "mlp.down_proj.linear.weight", H, vcfg_.intermediate);
+    rms(Slot::Tmp, Slot::Tmp, W("post_feedforward_layernorm.weight"), 1, H);
+    add_x(Slot::Tmp);
+  }
+
+  // Epilogue: standardize, when the checkpoint has it. Pooling and projection are NOT
+  // ops -- pooling changes the token count, so the executor has to be re-entered with
+  // the new count; see encode_image.
+  if (vcfg_.standardize) {
+    Op o; o.kind = OpKind::Standardize; o.in = Slot::X; o.out = Slot::X; o.cols = H;
+    o.weight = dev_at(v + "std_bias");
+    o.aux_ptr = dev_at(v + "std_scale");
+    vplan_.epilogue.push_back(o);
+  }
+  (void)patch_dim;
+}
+
+std::vector<float> PlanCudaEngine::encode_image_stage(const std::vector<float>& pixels,
+                                                     const std::vector<int>& pos_x,
+                                                     const std::vector<int>& pos_y, int stage) {
+  using namespace opplan;
+  const int P = static_cast<int>(pos_x.size());
+  const int H = vcfg_.hidden;
+  G4_CHECK(cudaMemcpyAsync(d_vis_pixels_, pixels.data(), pixels.size() * sizeof(float),
+                           cudaMemcpyHostToDevice, stream_));
+  G4_CHECK(cudaMemcpyAsync(d_vis_pos_x_, pos_x.data(), pos_x.size() * sizeof(int),
+                           cudaMemcpyHostToDevice, stream_));
+  G4_CHECK(cudaMemcpyAsync(d_vis_pos_y_, pos_y.data(), pos_y.size() * sizeof(int),
+                           cudaMemcpyHostToDevice, stream_));
+  ExecCtx ctx{vslot_ptr_.data(), P, /*causal=*/false};
+  execute_ops(vplan_.prologue.data(), vplan_.prologue.size(), 0, 0, ctx);
+  // stage >= 0: run that many whole layers, return Slot::X.
+  // stage <  0: run the first |stage| OPS of layer 0 and return Slot::Q -- lets the
+  //             gate look inside a layer (e.g. Q straight after RoPE).
+  std::size_t n;
+  const __half* src;
+  if (stage < 0) {
+    const auto& ops = vplan_.layers[0].ops;
+    const std::size_t take = std::min<std::size_t>(static_cast<std::size_t>(-stage), ops.size());
+    execute_ops(ops.data(), take, 0, 0, ctx);
+    if (take <= 1) {  // only the input norm has run; Q is not written yet
+      n = static_cast<std::size_t>(P) * H;
+      src = vslot_ptr_[static_cast<int>(Slot::XNorm)];
+    } else {
+      n = static_cast<std::size_t>(P) * vcfg_.heads * vcfg_.head_dim;
+      src = vslot_ptr_[static_cast<int>(Slot::Q)];
+    }
+  } else {
+    const int nl = std::min(stage, vcfg_.layers);
+    for (int L = 0; L < nl; ++L)
+      execute_ops(vplan_.layers[L].ops.data(), vplan_.layers[L].ops.size(), L, 0, ctx);
+    n = static_cast<std::size_t>(P) * H;
+    src = vslot_ptr_[static_cast<int>(Slot::X)];
+  }
+  G4_CHECK(cudaStreamSynchronize(stream_));
+
+  std::vector<__half> host(n);
+  G4_CHECK(cudaMemcpy(host.data(), src, n * sizeof(__half), cudaMemcpyDeviceToHost));
+  std::vector<float> out(n);
+  for (std::size_t i = 0; i < n; ++i) out[i] = __half2float(host[i]);
+  return out;
+}
+
+std::vector<float> PlanCudaEngine::encode_image(const std::vector<float>& pixels,
+                                                const std::vector<int>& pos_x,
+                                                const std::vector<int>& pos_y, int out_tokens) {
+  using namespace opplan;
+  if (!vcfg_.present) throw std::runtime_error("this model has no vision tower");
+  const int P = static_cast<int>(pos_x.size());
+  if (P > vis_max_patches_) throw std::runtime_error("too many patches for the vision buffers");
+  const int H = vcfg_.hidden;
+
+  G4_CHECK(cudaMemcpyAsync(d_vis_pixels_, pixels.data(), pixels.size() * sizeof(float),
+                           cudaMemcpyHostToDevice, stream_));
+  G4_CHECK(cudaMemcpyAsync(d_vis_pos_x_, pos_x.data(), pos_x.size() * sizeof(int),
+                           cudaMemcpyHostToDevice, stream_));
+  G4_CHECK(cudaMemcpyAsync(d_vis_pos_y_, pos_y.data(), pos_y.size() * sizeof(int),
+                           cudaMemcpyHostToDevice, stream_));
+
+  // The tower is bidirectional and cacheless: ONE sequence pass over all P patches.
+  ExecCtx ctx{vslot_ptr_.data(), P, /*causal=*/false};
+  execute_ops(vplan_.prologue.data(), vplan_.prologue.size(), 0, 0, ctx);
+  for (int L = 0; L < vcfg_.layers; ++L)
+    execute_ops(vplan_.layers[L].ops.data(), vplan_.layers[L].ops.size(), L, 0, ctx);
+  execute_ops(vplan_.epilogue.data(), vplan_.epilogue.size(), 0, 0, ctx);
+
+  // Pool the patches down to out_tokens soft tokens, then project into text space.
+  const int k = vcfg_.pooling_kernel;
+  int max_x = 0;
+  for (int i = 0; i < P; ++i) max_x = std::max(max_x, pos_x[i]);
+  const int cells_x = (max_x / k) + 1;
+  __half* pooled = vslot_ptr_[static_cast<int>(Slot::XNorm)];
+  kernels::launch_avg_pool_patches(vslot_ptr_[static_cast<int>(Slot::X)], d_vis_pos_x_,
+                                   d_vis_pos_y_, pooled, P, H, k, cells_x, out_tokens,
+                                   std::sqrt(static_cast<float>(H)), stream_);
+
+  // projector: weightless RMS norm -> linear into the text hidden size
+  kernels::launch_rmsnorm(pooled, d_ones_, pooled, out_tokens, H, vcfg_.rms_eps, stream_);
+  __half* proj_out = vslot_ptr_[static_cast<int>(Slot::Tmp)];
+  kernels::launch_rowmajor_half_gemm_f16(
+      dev_at("model.embed_vision.embedding_projection.weight"), pooled, proj_out, cfg_.hidden, H,
+      out_tokens, stream_);
+  G4_CHECK(cudaStreamSynchronize(stream_));
+
+  const std::size_t n = static_cast<std::size_t>(out_tokens) * cfg_.hidden;
+  std::vector<__half> host(n);
+  G4_CHECK(cudaMemcpy(host.data(), proj_out, n * sizeof(__half), cudaMemcpyDeviceToHost));
+  std::vector<float> out(n);
+  for (std::size_t i = 0; i < n; ++i) out[i] = __half2float(host[i]);
+  return out;
 }
 
 void PlanCudaEngine::build_plan() {
@@ -1162,11 +1572,29 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
                                                   op.cols, op.in_dim, stream_);
         } else if (seq) {
           kernels::launch_rowmajor_half_gemm_f16(op.weight, S(op.in), S(op.out), op.cols, op.in_dim,
-                                                 T, stream_);
+                                                 T, stream_, op.clip_in_min, op.clip_in_max,
+                                                 op.clip_out_min, op.clip_out_max);
         } else {
           kernels::launch_rowmajor_half_gemv_f16(op.weight, S(op.in), S(op.out), op.cols, op.in_dim,
                                                  stream_);
         }
+        break;
+      case OpKind::PatchEmbed:
+        kernels::launch_patch_embed(op.weight, d_vis_pixels_, op.aux_ptr, d_vis_pos_x_,
+                                    d_vis_pos_y_, S(op.out), T, op.cols, op.in_dim, op.rows,
+                                    stream_);
+        break;
+      case OpKind::Rope2D:
+        kernels::launch_rope_2d_inplace(S(op.in), d_vis_pos_x_, d_vis_pos_y_, op.heads,
+                                        op.head_dim, T, d_vrope_cos_, d_vrope_sin_, stream_);
+        break;
+      case OpKind::AvgPoolPatches:
+        kernels::launch_avg_pool_patches(S(op.in), d_vis_pos_x_, d_vis_pos_y_, S(op.out), T,
+                                         op.cols, op.heads, op.kv_heads, op.rows, op.scale,
+                                         stream_);
+        break;
+      case OpKind::Standardize:
+        kernels::launch_standardize(S(op.in), op.weight, op.aux_ptr, T, op.cols, stream_);
         break;
       case OpKind::MulVec:
         kernels::launch_mul_vec(S(op.in), op.weight, S(op.out), op.cols, op.scale, stream_);

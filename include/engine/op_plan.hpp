@@ -3,6 +3,7 @@
 #include <cuda_fp16.h>
 
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 // Op-plan IR for the generic per-layer decode executor.
@@ -100,6 +101,20 @@ enum class OpKind : std::uint8_t {
                  // cols = moe_inter, in_dim = hidden, heads = top_k
   MoeDownAccum,  // sum_k topk_weight[k] * down[expert_k] . MoeInter[k]  -> MoeOut
                  // cols = hidden, in_dim = moe_inter, heads = top_k
+
+  // ── extensions for vision encoders ──
+  // A vision tower differs from a text decoder in only a few places: positions are
+  // 2-D, the input is pixels not token ids, and the patch grid is pooled to a fixed
+  // number of soft tokens. Each is one op; norms/GEMM/GeGLU/attention are shared.
+  PatchEmbed,    // pixels -> embeddings (+ two-axis learned position table)
+                 // cols = hidden, in_dim = patch_dim, rows = pos_table_size,
+                 // weight = input_proj, aux_ptr = position table
+  Rope2D,        // in-place 2-D RoPE: first half of each head rotates by the patch's
+                 // x coord, second half by its y. heads, head_dim.
+  AvgPoolPatches,// k x k spatial average pool + gain
+                 // cols = hidden, heads = k, kv_heads = cells_x, rows = out_tokens,
+                 // scale = gain
+  Standardize,   // x = (x - weight) * aux_ptr, broadcast over tokens. cols = hidden.
 };
 
 // One resolved op. Fields are a union-by-convention keyed on `kind`; only the
@@ -147,6 +162,14 @@ struct Op {
   int value_head_dim = 0;
   int conv_kernel = 0;         // LinearConv1d: causal kernel width
   float eps = 1e-6f;           // RmsNorm / LinearAttentionStep epsilon
+  // Clipped projections (Gemma 4 E2B's vision tower ships per-projection activation
+  // bounds and CLAMPS both the input and the output of every linear). Infinite by
+  // default, so every other model's Gemv is untouched. The INPUT clamp is the one
+  // that matters numerically -- it changes the dot product, not just its range.
+  float clip_in_min = -std::numeric_limits<float>::infinity();
+  float clip_in_max = std::numeric_limits<float>::infinity();
+  float clip_out_min = -std::numeric_limits<float>::infinity();
+  float clip_out_max = std::numeric_limits<float>::infinity();
   const float* auxf_a = nullptr;  // delta-net RMS-norm weight (float)
   const float* auxf_b = nullptr;  // delta-net A_log (float)
 };

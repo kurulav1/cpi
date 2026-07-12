@@ -777,6 +777,51 @@ void launch_weight_only_int4_matvec_dual_dp4a(
 //                     out_features >= 8192 heuristic when 0)
 //   tile_pairs      - half2 elements staged per shared-memory tile (128 or 256)
 //   rows_per_warp   - output rows assigned to each warp (1 or 2)
+// ── vision-encoder ops ──
+//
+// launch_rope_2d_inplace
+//
+// 2-D RoPE over a sequence of patches. A head's channels split into two halves: the
+// FIRST rotates by the patch's x coordinate, the SECOND by its y. Within each half the
+// rotation is rotate_half (channel j pairs with j + half/2) -- the same convention the
+// 1-D table kernel uses, so cos/sin tables are built identically (here over the SPATIAL
+// half-dim: head_dim/4 entries per position).
+//
+//   x        - q or k, fp16 [tokens, num_heads, head_dim]; modified in place
+//   pos_x/y  - per-patch integer coordinates on device [tokens]
+void launch_rope_2d_inplace(half* x, const int* pos_x, const int* pos_y, int num_heads, int head_dim,
+                            int tokens, const float* cos_table, const float* sin_table,
+                            cudaStream_t stream);
+
+// launch_patch_embed
+//
+// out[t] = proj . (2*(pixels[t] - 0.5)) + pos_table[0][x_t] + pos_table[1][y_t]
+//
+// Gemma applies no mean/std image normalisation -- it rescales [0,1] to [-1,1] here.
+// The position table is [2, pos_table_size, hidden]: x indexes plane 0, y plane 1, and
+// the two are summed. Patches with a negative coordinate are padding and emit zeros.
+//
+//   pixels   - fp32 [tokens, patch_dim], patch_dim = 3 * patch_size^2
+void launch_patch_embed(const half* proj, const float* pixels, const half* pos_table,
+                        const int* pos_x, const int* pos_y, half* out, int tokens, int hidden,
+                        int patch_dim, int pos_table_size, cudaStream_t stream);
+
+// launch_avg_pool_patches
+//
+// 2-D average pool over k x k patch cells, then a `gain` (sqrt(hidden)) multiply.
+// Padding patches are zero and contribute nothing, but the divisor stays k*k (as HF
+// does) -- dividing by the live count instead would change the numbers.
+void launch_avg_pool_patches(const half* in, const int* pos_x, const int* pos_y, half* out,
+                             int tokens, int hidden, int k, int cells_x, int out_tokens, float gain,
+                             cudaStream_t stream);
+
+// launch_standardize
+//
+// x = (x - bias) * scale, broadcast over tokens. Null on checkpoints with
+// standardize=false (Gemma 4 E2B); present on the 26B.
+void launch_standardize(half* x, const half* bias, const half* scale, int tokens, int hidden,
+                        cudaStream_t stream);
+
 // launch_rowmajor_half_gemm_f16
 //
 // Sequence-mode GEMM: y[t, m] = sum_k w[m, k] * x[t, k], for `tokens` rows of x.
@@ -784,8 +829,12 @@ void launch_weight_only_int4_matvec_dual_dp4a(
 //
 // A tiled GEMM sums K in a different order than the GEMV, so the two do NOT agree
 // bit-for-bit -- single-token work must keep using the GEMV or decode output shifts.
+// in_min/in_max/out_min/out_max: clipped projections (Gemma 4 E2B's vision tower)
+// clamp the activation on the way IN and the result on the way OUT. +-inf = no clamp.
 void launch_rowmajor_half_gemm_f16(const half* w, const half* x, half* y, int out_features,
-                                   int in_features, int tokens, cudaStream_t stream);
+                                   int in_features, int tokens, cudaStream_t stream,
+                                   float in_min = -INFINITY, float in_max = INFINITY,
+                                   float out_min = -INFINITY, float out_max = INFINITY);
 
 void launch_rowmajor_half_gemv_f16(const half* w, const half* x, half* y, int out_features,
                                    int in_features, cudaStream_t stream, int warps_per_block = 0,

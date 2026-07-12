@@ -143,6 +143,58 @@ class PlanCudaEngine : public runtime::SequenceModel {
   // way). Fills Config + st_shapes_ so the SHARED Gemma loader and plan builder run
   // unchanged -- only the tensor-name prefix and the shape source differ.
   void parse_gemma4_st_config(const std::string& model_dir);
+
+  // ── vision tower ──
+  // Its own config, slots and plan, but the SAME executor (in sequence mode) and the
+  // same ops. A vision encoder is a capability, not a second engine.
+  struct VisionConfig {
+    bool present = false;
+    int hidden = 0, layers = 0, heads = 0, kv_heads = 0, head_dim = 0, intermediate = 0;
+    int patch_size = 0, pos_table_size = 0, pooling_kernel = 1;
+    float rms_eps = 1e-6f, rope_theta = 100.0f;
+    bool standardize = false;
+    bool clipped_linears = false;  // E2B: every projection clamps its input AND output
+  };
+  // Per-projection activation bounds, keyed by the projection's tensor prefix.
+  struct ClipBounds {
+    float in_min, in_max, out_min, out_max;
+  };
+  std::unordered_map<std::string, ClipBounds> vclip_;
+  VisionConfig vcfg_;
+  opplan::ModelPlan vplan_;
+  std::array<__half*, static_cast<std::size_t>(opplan::Slot::Count)> vslot_ptr_{};
+  float* d_vis_pixels_ = nullptr;   // [max_patches, patch_dim]
+  int* d_vis_pos_x_ = nullptr;      // [max_patches]
+  int* d_vis_pos_y_ = nullptr;      // [max_patches]
+  float* d_vrope_cos_ = nullptr;    // [max_pos, head_dim/4]
+  float* d_vrope_sin_ = nullptr;
+  int vis_max_patches_ = 0;
+  // Vision slot buffers (vision hidden != text hidden, so they cannot share the text
+  // slots). Freed with the rest.
+  std::vector<__half*> vis_buffers_;
+
+  void parse_vision_config(const std::string& model_dir);
+  void load_vision_weights();
+  void build_vision_plan();
+  void allocate_vision_buffers();
+  void build_vision_rope_tables();
+
+public:
+  // Encodes one image into soft tokens in the TEXT embedding space.
+  //   pixels  - [num_patches, 3*patch^2], row-major, channel-last, values in [0,1]
+  //   pos_x/y - patch grid coordinates; -1 marks a padding patch
+  // Returns [out_tokens, text_hidden] on the host.
+  std::vector<float> encode_image(const std::vector<float>& pixels, const std::vector<int>& pos_x,
+                                  const std::vector<int>& pos_y, int out_tokens);
+  // Stage taps for the parity gate: 1 = after the patch embedder, 2 = after the
+  // encoder stack (pre-pool). Both return [num_patches, vision_hidden].
+  std::vector<float> encode_image_stage(const std::vector<float>& pixels,
+                                        const std::vector<int>& pos_x,
+                                        const std::vector<int>& pos_y, int stage);
+  bool has_vision() const { return vcfg_.present; }
+  const VisionConfig& vision_config() const { return vcfg_; }
+
+private:
   // The MoE feed-forward block, appended to a layer's ops. Emitted only when the
   // config declares experts, so non-MoE Gemma plans are byte-for-byte unchanged.
   void append_moe_ffn_ops(std::vector<opplan::Op>& ops, const std::string& p, int L);

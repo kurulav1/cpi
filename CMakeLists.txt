@@ -123,6 +123,7 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
     src/kernels/kernels_ops_matvec.cu
     src/kernels/kernels_moe_experts.cu
     src/kernels/kernels_gemm.cu
+    src/kernels/kernels_vision.cu
     src/kernels/kernels_weight_only_matvec.cu
     src/kernels/kernels_turboquant.cu
     src/engine/tensor_parallel.cpp
@@ -292,6 +293,17 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
   )
   add_test(NAME moe_kernel_parity_test COMMAND moe_kernel_parity_test)
+
+  # Vision-tower parity against the HF oracle (tools/gemma4_vision_oracle.py).
+  add_executable(vision_forward_test
+    src/tests/vision_forward_test.cu
+  )
+  target_include_directories(vision_forward_test PRIVATE include)
+  target_link_libraries(vision_forward_test PRIVATE llama_engine)
+  set_target_properties(vision_forward_test PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+  )
 
   # Sequence-mode fp16 GEMM parity (vs a CPU reference and vs the GEMV).
   add_executable(gemm_parity_test

@@ -26,7 +26,8 @@ constexpr int kTile = 32;
 
 __global__ void rowmajor_half_gemm_f16_kernel(const half* __restrict__ w, const half* __restrict__ x,
                                              half* __restrict__ y, int out_features, int in_features,
-                                             int tokens) {
+                                             int tokens, float in_min, float in_max, float out_min,
+                                             float out_max) {
   // +1 column of padding: the compute step reads Ws down a column, which would
   // otherwise hit the same shared-memory bank for every thread in a warp.
   __shared__ half Xs[kTile][kTile + 1];
@@ -43,8 +44,13 @@ __global__ void rowmajor_half_gemm_f16_kernel(const half* __restrict__ w, const 
     // Each thread stages one element of X and one of W. Out-of-range lanes stage
     // zeros so the multiply-accumulate below needs no bounds check.
     const int xt = blockIdx.y * kTile + ty;
+    // Clipped projections clamp the ACTIVATION as it is read. Defaults are +-inf, so
+    // this is a no-op for every model that does not use them.
     Xs[ty][tx] = (xt < tokens && kx < in_features)
-                     ? x[static_cast<std::size_t>(xt) * in_features + kx]
+                     ? __float2half(fminf(fmaxf(__half2float(
+                                              x[static_cast<std::size_t>(xt) * in_features + kx]),
+                                          in_min),
+                                      in_max))
                      : __float2half(0.0f);
     const int wm = blockIdx.x * kTile + ty;
     Ws[ty][tx] = (wm < out_features && kx < in_features)
@@ -59,22 +65,24 @@ __global__ void rowmajor_half_gemm_f16_kernel(const half* __restrict__ w, const 
   }
 
   if (t < tokens && m < out_features) {
-    y[static_cast<std::size_t>(t) * out_features + m] = __float2half(acc);
+    y[static_cast<std::size_t>(t) * out_features + m] =
+        __float2half(fminf(fmaxf(acc, out_min), out_max));
   }
 }
 
 }  // namespace
 
 void launch_rowmajor_half_gemm_f16(const half* w, const half* x, half* y, int out_features,
-                                   int in_features, int tokens, cudaStream_t stream) {
+                                   int in_features, int tokens, cudaStream_t stream, float in_min,
+                                   float in_max, float out_min, float out_max) {
   if (out_features <= 0 || in_features <= 0 || tokens <= 0) {
     return;
   }
   const dim3 threads(kTile, kTile);
   const dim3 grid(static_cast<unsigned>((out_features + kTile - 1) / kTile),
                   static_cast<unsigned>((tokens + kTile - 1) / kTile));
-  rowmajor_half_gemm_f16_kernel<<<grid, threads, 0, stream>>>(w, x, y, out_features, in_features,
-                                                              tokens);
+  rowmajor_half_gemm_f16_kernel<<<grid, threads, 0, stream>>>(
+      w, x, y, out_features, in_features, tokens, in_min, in_max, out_min, out_max);
 }
 
 }  // namespace kernels
