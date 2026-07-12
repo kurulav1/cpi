@@ -1801,14 +1801,6 @@ export default function App() {
           </span>
           <span className="topbar-model-caret">▾</span>
         </button>
-        <ModelPicker
-          open={modelPickerOpen}
-          groups={modelGroups}
-          currentProfileId={settings.profileId}
-          currentKey={currentVarKey}
-          onPick={applyVariant}
-          onClose={() => setModelPickerOpen(false)}
-        />
 
         {/* Variant / precision selector (FP16 · INT8 · INT4 · streaming) */}
         <select
@@ -2094,6 +2086,19 @@ export default function App() {
         )}
 
         {/*  Settings drawer  */}
+        {/* Rendered at the ROOT, not inside <header>: the topbar sets backdrop-filter,
+            which makes it the containing block for position:fixed children -- a modal
+            nested in there is laid out inside the topbar's box instead of the viewport,
+            so its backdrop never covers the page and the chat shows through. */}
+        <ModelPicker
+          open={modelPickerOpen}
+          groups={modelGroups}
+          currentProfileId={settings.profileId}
+          currentKey={currentVarKey}
+          onPick={applyVariant}
+          onClose={() => setModelPickerOpen(false)}
+        />
+
         {showCfg && (
           <div className="overlay" onClick={() => setShowCfg(false)}>
             <div className="drawer" onClick={(e) => e.stopPropagation()}>
