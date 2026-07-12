@@ -42,11 +42,8 @@ __device__ __forceinline__ int8_t load_signed_int4(const int8_t* row_packed, int
   return static_cast<int8_t>(decode_signed_int4(nibble));
 }
 
-// Decodes 4 consecutive signed int4 values into one packed int32 suitable for dp4a.
-__device__ __forceinline__ int load_packed_int4x4(const int8_t* row_packed, int packed4_index) {
-  const int byte_index = packed4_index * 2;
-  const std::uint8_t b0 = static_cast<std::uint8_t>(row_packed[byte_index + 0]);
-  const std::uint8_t b1 = static_cast<std::uint8_t>(row_packed[byte_index + 1]);
+// Decodes the two packed bytes of a dp4a group into one int32 of four int8 lanes.
+__device__ __forceinline__ int unpack_int4x4(std::uint8_t b0, std::uint8_t b1) {
   const std::uint8_t q0 =
       static_cast<std::uint8_t>(static_cast<int8_t>(decode_signed_int4(b0 & 0x0Fu)));
   const std::uint8_t q1 =
@@ -57,6 +54,34 @@ __device__ __forceinline__ int load_packed_int4x4(const int8_t* row_packed, int 
       static_cast<std::uint8_t>(static_cast<int8_t>(decode_signed_int4((b1 >> 4) & 0x0Fu)));
   return static_cast<int>(q0) | (static_cast<int>(q1) << 8) | (static_cast<int>(q2) << 16) |
          (static_cast<int>(q3) << 24);
+}
+
+// Decodes 4 consecutive signed int4 values into one packed int32 suitable for dp4a.
+//
+// ⚠ This reads the two packed bytes as a SINGLE 16-bit load, not two 8-bit loads.
+//
+// It used to do:   b0 = row_packed[i];  b1 = row_packed[i + 1];
+// i.e. TWO SEPARATE ONE-BYTE LOADS for every dp4a. Nsight on the int4 matvec: DRAM 30%,
+// compute 19%, but occupancy 98% and 1.0 waves/SM -- the GPU was completely full of warps
+// that were all stalled issuing 8-bit requests. The narrowest possible load, in the kernel
+// that dominates quantized decode.
+//
+// The two bytes are adjacent and byte_index = packed4_index * 2 is always even, so they can
+// be fetched as one aligned 16-bit access whenever the row itself is 2-byte aligned (true
+// when packed_cols is even, which holds for every real in_features -- they are powers of two
+// or multiples of 256). The odd-row case keeps the byte-wise path.
+//
+// BIT-IDENTICAL: same bytes, same nibble decode, same dp4a. Only the access width changes.
+__device__ __forceinline__ int load_packed_int4x4(const int8_t* row_packed, int packed4_index) {
+  const int byte_index = packed4_index * 2;
+  if ((reinterpret_cast<std::uintptr_t>(row_packed) & 1u) == 0u) {
+    const std::uint16_t pair =
+        reinterpret_cast<const std::uint16_t*>(row_packed)[packed4_index];
+    return unpack_int4x4(static_cast<std::uint8_t>(pair & 0xFFu),
+                         static_cast<std::uint8_t>((pair >> 8) & 0xFFu));
+  }
+  return unpack_int4x4(static_cast<std::uint8_t>(row_packed[byte_index + 0]),
+                       static_cast<std::uint8_t>(row_packed[byte_index + 1]));
 }
 
 __global__ void weight_only_int8_matvec_kernel(const int8_t* w, const float* scales, const half* x,
@@ -226,13 +251,24 @@ __global__ void weight_only_int8_matvec_dp4a_tiled_kernel(const int8_t* w, const
 
     // Split the K work across several warps that collaborate on the same row
     // while still processing two packed fragments per loop step when possible.
-    for (int idx = split_warp * warpSize + lane; idx < tile_count;
-         idx += WarpsPerRow * warpSize * 2) {
+    // Fetch weights 128 bits at a time: one uint4 = 4 dp4a groups = 16 int8 weights.
+    // The loop above read w4[] one int (32 bits) per dp4a. Same width problem the int4 kernel
+    // had, one step less severe. Consecutive lanes now read consecutive 16-byte chunks.
+    // BIT-IDENTICAL: __dp4a accumulates in int32, so re-ordering the sum is exact.
+    const int* tile_w4 = w4 + tile_base;
+    const bool aligned16 = (reinterpret_cast<std::uintptr_t>(tile_w4) & 15u) == 0u;
+    const int vec_groups = aligned16 ? (tile_count >> 2) : 0;  // groups of 4 dp4a units
+    for (int v = split_warp * warpSize + lane; v < vec_groups; v += WarpsPerRow * warpSize) {
+      const uint4 packed = reinterpret_cast<const uint4*>(tile_w4)[v];
+      const int g0 = v << 2;
+      local = __dp4a(static_cast<int>(packed.x), x_tile[g0 + 0], local);
+      local = __dp4a(static_cast<int>(packed.y), x_tile[g0 + 1], local);
+      local = __dp4a(static_cast<int>(packed.z), x_tile[g0 + 2], local);
+      local = __dp4a(static_cast<int>(packed.w), x_tile[g0 + 3], local);
+    }
+    for (int idx = (vec_groups << 2) + split_warp * warpSize + lane; idx < tile_count;
+         idx += WarpsPerRow * warpSize) {
       local = __dp4a(w4[tile_base + idx], x_tile[idx], local);
-      const int idx_next = idx + WarpsPerRow * warpSize;
-      if (idx_next < tile_count) {
-        local = __dp4a(w4[tile_base + idx_next], x_tile[idx_next], local);
-      }
     }
     __syncthreads();
   }
@@ -586,13 +622,40 @@ __global__ void weight_only_int4_matvec_dp4a_tiled_kernel(const int8_t* w_packed
     }
     __syncthreads();
 
-    for (int idx = split_warp * warpSize + lane; idx < tile_count;
-         idx += WarpsPerRow * warpSize * 2) {
-      local = __dp4a(load_packed_int4x4(row_w, tile_base + idx), x_tile[idx], local);
-      const int idx_next = idx + WarpsPerRow * warpSize;
-      if (idx_next < tile_count) {
-        local = __dp4a(load_packed_int4x4(row_w, tile_base + idx_next), x_tile[idx_next], local);
+    // Fetch the packed weights 128 bits at a time: one uint4 = 16 bytes = 8 dp4a groups
+    // = 32 int4 weights.
+    //
+    // Even after collapsing the two 8-bit loads into one 16-bit load, Nsight still showed the
+    // int4 matvec at 30% DRAM with 98% occupancy -- the GPU was full of warps all issuing
+    // 16-bit requests. Width, not parallelism, is the whole problem. Consecutive lanes now
+    // read consecutive 16-byte chunks, so a warp pulls 512 contiguous bytes per request.
+    //
+    // BIT-IDENTICAL BY CONSTRUCTION, and this is the reason a rewrite this aggressive is safe
+    // here but was not in the fp16 kernels: __dp4a accumulates in INT32, so the sum is exact
+    // and integer addition is associative. Re-ordering the accumulation cannot change a single
+    // bit. (In the fp16 GEMVs, reordering changes fp32 rounding -- hence the text gate there.)
+    const int8_t* tile_w = row_w + static_cast<std::size_t>(tile_base) * 2;
+    const bool aligned16 = (reinterpret_cast<std::uintptr_t>(tile_w) & 15u) == 0u;
+    const int vec_groups = aligned16 ? (tile_count >> 3) : 0;  // groups of 8 dp4a units
+    for (int v = split_warp * warpSize + lane; v < vec_groups; v += WarpsPerRow * warpSize) {
+      const uint4 packed = reinterpret_cast<const uint4*>(tile_w)[v];
+      const unsigned words[4] = {packed.x, packed.y, packed.z, packed.w};
+      const int g0 = v << 3;
+#pragma unroll
+      for (int wi = 0; wi < 4; ++wi) {
+        const unsigned wd = words[wi];
+        local = __dp4a(unpack_int4x4(static_cast<std::uint8_t>(wd & 0xFFu),
+                                     static_cast<std::uint8_t>((wd >> 8) & 0xFFu)),
+                       x_tile[g0 + wi * 2], local);
+        local = __dp4a(unpack_int4x4(static_cast<std::uint8_t>((wd >> 16) & 0xFFu),
+                                     static_cast<std::uint8_t>((wd >> 24) & 0xFFu)),
+                       x_tile[g0 + wi * 2 + 1], local);
       }
+    }
+    // Tail: whatever the 8-group stride could not cover (and the unaligned-row case).
+    for (int idx = (vec_groups << 3) + split_warp * warpSize + lane; idx < tile_count;
+         idx += WarpsPerRow * warpSize) {
+      local = __dp4a(load_packed_int4x4(row_w, tile_base + idx), x_tile[idx], local);
     }
     __syncthreads();
   }
