@@ -310,6 +310,17 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
   target_include_directories(png_test PRIVATE include)
   target_link_libraries(png_test PRIVATE llama_engine)
 
+  # Sequence prefill == token-by-token prefill (incl. beyond the sliding window).
+  add_executable(seq_prefill_test
+    src/tests/seq_prefill_test.cu
+  )
+  target_include_directories(seq_prefill_test PRIVATE include)
+  target_link_libraries(seq_prefill_test PRIVATE llama_engine)
+  set_target_properties(seq_prefill_test PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+  )
+
   # Vision-tower parity against the HF oracle (tools/gemma4_vision_oracle.py).
   add_executable(vision_forward_test
     src/tests/vision_forward_test.cu

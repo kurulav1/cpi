@@ -315,9 +315,18 @@ void launch_increment_int(int* value, cudaStream_t stream);
 //   causal       - true (default): each token attends only to its own prefix.
 //                  false: every token attends to the WHOLE sequence -- the
 //                  bidirectional self-attention a vision encoder needs.
+//   limits       - optional DEVICE array [num_tokens]: the exclusive key limit for each
+//                  token, overriding `causal`. This is what makes an image span
+//                  bidirectional (every token in the span sees the whole span) while the
+//                  surrounding text stays causal.
+//   window       - sliding-window width; 0 = unlimited. Keys before (limit - window) are
+//                  skipped. The decode path always did this; prefill did not (Llama has
+//                  no windows), so a windowed model with a prompt longer than the window
+//                  was silently wrong here.
 void launch_attention_prefill(const half* q, const half* k_cache, const half* v_cache, half* out,
                               int num_tokens, int start_position, int num_heads, int num_kv_heads,
-                              int head_dim, cudaStream_t stream, bool causal = true);
+                              int head_dim, cudaStream_t stream, bool causal = true,
+                              const int* limits = nullptr, int window = 0);
 
 // Paged prefill attention + paged KV scatter (P3 phase 2d). K/V live in a block
 // pool; block_table maps logical chunk -> physical block (block_size tokens each).
@@ -821,6 +830,23 @@ void launch_avg_pool_patches(const half* in, const int* pos_x, const int* pos_y,
 // standardize=false (Gemma 4 E2B); present on the 26B.
 void launch_standardize(half* x, const half* bias, const half* scale, int tokens, int hidden,
                         cudaStream_t stream);
+
+// launch_gelu_mul_strided
+//
+// out[t][i] = gelu(a[t][i]) * b[t*b_stride + i]. The per-layer-input gate multiplies by a
+// slice of a wider per-token tensor, so b strides differently from a/out.
+void launch_gelu_mul_strided(const half* a, const half* b, half* out, int n, int tokens,
+                             int b_stride, cudaStream_t stream);
+
+// launch_rope_seq_table
+//
+// RoPE over a whole prompt chunk: token t sits at position start_position + t. Same
+// rotate_half table convention as the single-token kernel, so a chunk prefilled here and
+// the same tokens decoded one at a time agree exactly.
+//   rotary_dim - 0 = rotate the full head; >0 = partial RoPE over the first rotary_dim
+void launch_rope_seq_table(half* x, int num_heads, int head_dim, int start_position, int tokens,
+                           const float* cos_table, const float* sin_table, int rotary_dim,
+                           cudaStream_t stream);
 
 // launch_rowmajor_half_gemm_f16
 //

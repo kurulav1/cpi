@@ -173,6 +173,18 @@ class PlanCudaEngine : public runtime::SequenceModel {
   // slots). Freed with the rest.
   std::vector<__half*> vis_buffers_;
 
+  // Sequence-mode text prefill buffers. seq_prefill_ok_ is false for plans the sequence
+  // path cannot yet run (partial RoPE / delta-net), which then keep the token-by-token
+  // prefill -- a capability decision on the PLAN, not on a model name.
+  bool seq_prefill_ok_ = false;
+  int seq_max_tokens_ = 0;
+  std::vector<__half*> seq_buffers_;
+  std::array<__half*, static_cast<std::size_t>(opplan::Slot::Count)> sslot_ptr_{};
+  int* d_seq_tokens_ = nullptr;
+  int* d_seq_limits_ = nullptr;
+  void allocate_sequence_buffers(int max_tokens);
+  bool plan_can_sequence_prefill() const;
+
   void parse_vision_config(const std::string& model_dir);
   void load_vision_weights();
   void build_vision_plan();
@@ -184,6 +196,16 @@ public:
   //   pixels  - [num_patches, 3*patch^2], row-major, channel-last, values in [0,1]
   //   pos_x/y - patch grid coordinates; -1 marks a padding patch
   // Returns [out_tokens, text_hidden] on the host.
+  // Prefill a whole prompt in ONE sequence pass (instead of token-by-token).
+  //   embeds  - optional per-token embedding overrides (image soft tokens); an entry
+  //             with an empty vector means "look the token up as usual"
+  //   limits  - optional per-token key limits (bidirectional image spans)
+  // Returns logits for the LAST token.
+  void prefill_sequence(const std::vector<int>& tokens, int start_position,
+                        const std::vector<std::vector<float>>& embeds,
+                        const std::vector<int>& limits);
+  bool can_sequence_prefill() const { return seq_prefill_ok_; }
+
   std::vector<float> encode_image(const std::vector<float>& pixels, const std::vector<int>& pos_x,
                                   const std::vector<int>& pos_y, int out_tokens);
   // Stage taps for the parity gate: 1 = after the patch embedder, 2 = after the
@@ -233,6 +255,13 @@ private:
     __half* const* slots = nullptr;  // which slot table (text or vision)
     int tokens = 1;                  // 1 = decode; N = sequence
     bool causal = true;              // false = bidirectional (vision)
+    // cached: a TEXT prefill -- K/V are appended to this layer's KV cache and attention
+    // runs over the cache. A vision tower sets this false: it keeps no cache and attends
+    // over the K/V slots directly.
+    bool cached = false;
+    // Optional per-token key limits (device). Text prefill with an image uses this to
+    // make the image span bidirectional while the surrounding text stays causal.
+    const int* limits = nullptr;
   };
   ExecCtx decode_ctx() const { return ExecCtx{slot_ptr_.data(), 1, true}; }
 

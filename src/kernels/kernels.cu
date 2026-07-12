@@ -441,7 +441,8 @@ __device__ __forceinline__ int cache_index(int t, int head, int d, int num_heads
 __global__ void attention_prefill_kernel_fallback(const half* q, const half* k_cache,
                                                   const half* v_cache, half* out, int num_tokens,
                                                   int start_position, int num_heads,
-                                                  int num_kv_heads, int head_dim, int causal) {
+                                                  int num_kv_heads, int head_dim, int causal,
+                                                  const int* limits, int window) {
   extern __shared__ unsigned char smem_bytes[];
   half* q_shared = reinterpret_cast<half*>(smem_bytes);
   float* red = reinterpret_cast<float*>(q_shared + head_dim);
@@ -462,7 +463,11 @@ __global__ void attention_prefill_kernel_fallback(const half* q, const half* k_c
   const int group_size = ((num_heads / kv_heads_safe) > 0) ? (num_heads / kv_heads_safe) : 1;
   const int kv_head =
       ((head / group_size) < kv_heads_safe) ? (head / group_size) : (kv_heads_safe - 1);
-  const bool active_dim = tid < head_dim;
+  // Each thread owns head_dim/blockDim OUTPUT channels. A SCALAR accumulator silently
+  // drops every channel past blockDim -- with Gemma's head_dim=512 full layers on 128
+  // threads that is 3/4 of the head, computed and written as if it did not exist. The
+  // decode kernel was fixed for exactly this; the prefill fallback never was, because
+  // Llama's head_dim (128) always fit in one thread's slot.
 
   for (int d = tid; d < head_dim; d += blockDim.x) {
     q_shared[d] = q[q_base + d];
@@ -471,11 +476,24 @@ __global__ void attention_prefill_kernel_fallback(const half* q, const half* k_c
 
   float running_m = -1.0e30f;
   float running_l = 0.0f;
-  float acc = 0.0f;
-  // causal: this token sees only the prefix. Non-causal (the vision encoder):
-  // every token sees the whole sequence.
-  const int limit = causal ? (start_position + token + 1) : (start_position + num_tokens);
-  for (int t = 0; t < limit; ++t) {
+  constexpr int kOutPer = kAccPerThread;  // covers head_dim up to blockDim * kAccPerThread
+  float acc[kOutPer];
+#pragma unroll
+  for (int j = 0; j < kOutPer; ++j) acc[j] = 0.0f;
+  // How far this token may see:
+  //   limits != null : per-token key limit -- this is what makes an IMAGE SPAN
+  //                    bidirectional (every token in the span sees the whole span)
+  //                    while the surrounding text stays causal.
+  //   causal         : its own prefix.
+  //   otherwise      : the whole sequence (a vision encoder).
+  const int limit = limits ? limits[token]
+                           : (causal ? (start_position + token + 1)
+                                     : (start_position + num_tokens));
+  // Sliding-window layers only see the last `window` keys. The decode path has always
+  // done this; the prefill kernel never did (Llama has no windows), so a Gemma prompt
+  // longer than the window would have been silently wrong.
+  const int k_start = (window > 0 && limit > window) ? (limit - window) : 0;
+  for (int t = k_start; t < limit; ++t) {
     float partial_dot = 0.0f;
     const int base = cache_index(t, kv_head, 0, num_kv_heads, head_dim);
     for (int d = tid; d < head_dim; d += blockDim.x) {
@@ -508,14 +526,22 @@ __global__ void attention_prefill_kernel_fallback(const half* q, const half* k_c
     }
     __syncthreads();
 
-    if (active_dim) {
-      acc = acc * alpha_shared[0] + beta_shared[0] * __half2float(v_cache[base + tid]);
+#pragma unroll
+    for (int j = 0; j < kOutPer; ++j) {
+      const int d = tid + j * static_cast<int>(blockDim.x);
+      if (d < head_dim) {
+        acc[j] = acc[j] * alpha_shared[0] + beta_shared[0] * __half2float(v_cache[base + d]);
+      }
     }
     __syncthreads();
   }
 
-  if (active_dim) {
-    out[out_base + tid] = __float2half(acc * inv_l_shared[0]);
+#pragma unroll
+  for (int j = 0; j < kOutPer; ++j) {
+    const int d = tid + j * static_cast<int>(blockDim.x);
+    if (d < head_dim) {
+      out[out_base + d] = __float2half(acc[j] * inv_l_shared[0]);
+    }
   }
 }
 
@@ -525,7 +551,8 @@ template <int WarpsPerBlock>
 __global__ void attention_prefill_kernel_tiled(const half* q, const half* k_cache,
                                                const half* v_cache, half* out, int num_tokens,
                                                int start_position, int num_heads, int num_kv_heads,
-                                               int head_dim, int causal) {
+                                               int head_dim, int causal, const int* limits,
+                                               int window) {
   extern __shared__ unsigned char smem_bytes[];
   half* q_shared = reinterpret_cast<half*>(smem_bytes);
   float* score_shared = reinterpret_cast<float*>(q_shared + head_dim);
@@ -551,9 +578,19 @@ __global__ void attention_prefill_kernel_tiled(const half* q, const half* k_cach
   const int kv_head =
       ((head / group_size) < kv_heads_safe) ? (head / group_size) : (kv_heads_safe - 1);
   const int head_pairs = head_dim / 2;
-  // causal: this token sees only the prefix. Non-causal (the vision encoder):
-  // every token sees the whole sequence.
-  const int limit = causal ? (start_position + token + 1) : (start_position + num_tokens);
+  // How far this token may see:
+  //   limits != null : per-token key limit -- this is what makes an IMAGE SPAN
+  //                    bidirectional (every token in the span sees the whole span)
+  //                    while the surrounding text stays causal.
+  //   causal         : its own prefix.
+  //   otherwise      : the whole sequence (a vision encoder).
+  const int limit = limits ? limits[token]
+                           : (causal ? (start_position + token + 1)
+                                     : (start_position + num_tokens));
+  // Sliding-window layers only see the last `window` keys. The decode path has always
+  // done this; the prefill kernel never did (Llama has no windows), so a Gemma prompt
+  // longer than the window would have been silently wrong.
+  const int k_start = (window > 0 && limit > window) ? (limit - window) : 0;
 
   for (int d = tid; d < head_dim; d += blockDim.x) {
     q_shared[d] = q[q_base + d];
@@ -571,7 +608,7 @@ __global__ void attention_prefill_kernel_tiled(const half* q, const half* k_cach
   float acc[kOutPerThread];
 #pragma unroll
   for (int j = 0; j < kOutPerThread; ++j) acc[j] = 0.0f;
-  for (int tile_base = 0; tile_base < limit; tile_base += WarpsPerBlock) {
+  for (int tile_base = k_start; tile_base < limit; tile_base += WarpsPerBlock) {
     const int t = tile_base + warp_id;
     float score = -1.0e30f;
     if (warp_id < WarpsPerBlock && t < limit) {
@@ -879,7 +916,8 @@ void launch_rope_inplace_perpos(half* q, half* k, int num_tokens, int num_heads_
 }
 void launch_attention_prefill(const half* q, const half* k_cache, const half* v_cache, half* out,
                               int num_tokens, int start_position, int num_heads, int num_kv_heads,
-                              int head_dim, cudaStream_t stream, bool causal) {
+                              int head_dim, cudaStream_t stream, bool causal, const int* limits,
+                              int window) {
   const int causal_i = causal ? 1 : 0;
   const dim3 grid(num_heads, num_tokens);
   if (head_dim > 0 && (head_dim % 2) == 0 && head_dim <= 256) {
@@ -890,7 +928,7 @@ void launch_attention_prefill(const half* q, const half* k_cache, const half* v_
                                static_cast<std::size_t>(3 * warps + 2) * sizeof(float);
       attention_prefill_kernel_tiled<warps><<<grid, threads, smem, stream>>>(
           q, k_cache, v_cache, out, num_tokens, start_position, num_heads, num_kv_heads, head_dim,
-          causal_i);
+          causal_i, limits, window);
       return;
     }
 
@@ -900,7 +938,7 @@ void launch_attention_prefill(const half* q, const half* k_cache, const half* v_
                              static_cast<std::size_t>(3 * warps + 2) * sizeof(float);
     attention_prefill_kernel_tiled<warps><<<grid, threads, smem, stream>>>(
         q, k_cache, v_cache, out, num_tokens, start_position, num_heads, num_kv_heads, head_dim,
-        causal_i);
+        causal_i, limits, window);
     return;
   }
 
@@ -909,7 +947,7 @@ void launch_attention_prefill(const half* q, const half* k_cache, const half* v_
                            static_cast<std::size_t>(threads + 3) * sizeof(float);
   attention_prefill_kernel_fallback<<<grid, threads, smem, stream>>>(
       q, k_cache, v_cache, out, num_tokens, start_position, num_heads, num_kv_heads, head_dim,
-      causal_i);
+      causal_i, limits, window);
 }
 
 // Paged prefill attention (P3 phase 2d). K/V gathered via block_table from a

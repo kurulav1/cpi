@@ -161,6 +161,10 @@ struct Op {
   int key_head_dim = 0;
   int value_head_dim = 0;
   int conv_kernel = 0;         // LinearConv1d: causal kernel width
+  // Offset into the aux SLOT (not a raw pointer): the per-layer-input gate reads layer
+  // L's window of the wide PLE tensor. A baked raw pointer works at one token and reads
+  // the wrong rows over a sequence, so the slot + offset is the addressable form.
+  int aux_offset = 0;
   float eps = 1e-6f;           // RmsNorm / LinearAttentionStep epsilon
   // Clipped projections (Gemma 4 E2B's vision tower ships per-projection activation
   // bounds and CLAMPS both the input and the output of every linear). Infinite by

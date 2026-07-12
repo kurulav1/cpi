@@ -810,6 +810,11 @@ void PlanCudaEngine::open(const std::string& cpi_path, int max_context) {
       build_plan();
       // The vision tower, when the checkpoint ships one. Opt out with
       // LLAMA_INFER_NO_VISION=1 (it costs VRAM even on text-only prompts).
+      // Sequence prefill is a capability of the PLAN: partial RoPE and delta-net have no
+      // sequence kernels yet, so those plans keep the token-by-token prefill.
+      seq_prefill_ok_ = plan_can_sequence_prefill();
+      if (seq_prefill_ok_) allocate_sequence_buffers(std::min(max_ctx_, 4096));
+
       parse_vision_config(cpi_path);
       if (vcfg_.present && !std::getenv("LLAMA_INFER_NO_VISION")) {
         vis_max_patches_ = 4096;
@@ -1491,10 +1496,10 @@ void PlanCudaEngine::build_plan() {
     // --- Per-Layer Input injection (only when the model has PLE) ---
     if (has_ple()) {
       const int ple = cfg_.hidden_size_per_layer_input;
-      const __half* ple_L = d_ple_ + static_cast<std::size_t>(L) * ple;
       gemv(Slot::X, Slot::PleGate, "per_layer_input_gate.weight", ple, H);
       Op g; g.kind = OpKind::GeluMul; g.in = Slot::PleGate; g.out = Slot::PleGate; g.cols = ple;
-      g.aux_ptr = ple_L;  // gelu(gate) * ple_L
+      g.in2 = Slot::PleAll;                    // gelu(gate) * per_layer_input[L]
+      g.aux_offset = L * ple;                  // ...which is layer L's window of it
       ops.push_back(g);
       gemv(Slot::PleGate, Slot::Tmp, "per_layer_projection.weight", H, ple);
       rms(Slot::Tmp, Slot::Tmp, W("post_per_layer_input_norm.weight"), 1, H);
@@ -1537,11 +1542,16 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
     const Op& op = ops[idx];
     switch (op.kind) {
       case OpKind::EmbeddingLookup:
-        kernels::launch_embedding_lookup(op.weight, d_tok_, S(op.out), 1, op.cols, stream_);
+        kernels::launch_embedding_lookup(op.weight, seq ? d_seq_tokens_ : d_tok_, S(op.out), T,
+                                         op.cols, stream_);
         break;
       case OpKind::LmHead:
-        kernels::launch_rowmajor_half_gemv_f32(op.weight, S(op.in), d_logits_, op.cols, op.in_dim,
-                                               stream_);
+        // In sequence mode only the LAST token's logits are wanted -- running the head
+        // over the whole prompt would cost a 262K-wide GEMM per token for nothing.
+        kernels::launch_rowmajor_half_gemv_f32(
+            op.weight,
+            S(op.in) + static_cast<std::size_t>(T - 1) * static_cast<std::size_t>(op.in_dim),
+            d_logits_, op.cols, op.in_dim, stream_);
         break;
       case OpKind::RmsNorm:
         // norm_offset ⇒ the weight is applied as (1 + w) (Qwen3.5-style).
@@ -1627,6 +1637,10 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
           kernels::launch_rope_inplace_partial_table(S(op.in), S(op.in2), op.heads, op.kv_heads,
                                                      op.head_dim, op.rotary_dim, position, cosT,
                                                      sinT, stream_);
+        } else if (seq) {
+          // Sequence prefill: token t sits at position (chunk start + t).
+          kernels::launch_rope_seq_table(S(op.in), op.heads, op.head_dim, position, T, cosT, sinT,
+                                         0, stream_);
         } else if (device_pos_mode_) {
           // Single-tensor RoPE via the device-position kernel (k-branch guarded off
           // by num_heads_k=0). Graph-capturable: position read from d_position_.
@@ -1654,18 +1668,32 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
           kernels::launch_store_kv_device_pos(S(Slot::K), S(Slot::V), kc, vc, d_position_,
                                               static_cast<int>(kvdim), max_ctx_, stream_);
         } else {
+          // Sequence prefill appends T rows at once: the K/V slots are [T][kvdim] and the
+          // cache rows are contiguous, so it is the same copy, T times as long.
+          const std::size_t rows = static_cast<std::size_t>(T);
           G4_CHECK(cudaMemcpyAsync(kc + static_cast<std::size_t>(position) * kvdim, S(Slot::K),
-                                   kvdim * sizeof(__half), cudaMemcpyDeviceToDevice, stream_));
+                                   rows * kvdim * sizeof(__half), cudaMemcpyDeviceToDevice,
+                                   stream_));
           G4_CHECK(cudaMemcpyAsync(vc + static_cast<std::size_t>(position) * kvdim, S(Slot::V),
-                                   kvdim * sizeof(__half), cudaMemcpyDeviceToDevice, stream_));
+                                   rows * kvdim * sizeof(__half), cudaMemcpyDeviceToDevice,
+                                   stream_));
         }
         break;
       }
       case OpKind::Attention: {
+        if (seq && ctx.cached) {
+          // TEXT prefill: K/V were appended to this layer's cache by KvStore, so attend
+          // over the CACHE (it also holds any earlier context). Sliding layers pass their
+          // window, and ctx.limits (when set) makes an image span bidirectional.
+          const int window = op.full_attention ? 0 : op.sliding_window;
+          kernels::launch_attention_prefill(S(op.in), caches_k_[layer], caches_v_[layer], S(op.out),
+                                            T, position, op.heads, op.kv_heads, op.head_dim, stream_,
+                                            /*causal=*/true, ctx.limits, window);
+          break;
+        }
         if (seq) {
-          // Sequence mode: Q/K/V for the whole sequence are in the slots, so the K/V
-          // slots ARE the "cache" -- a vision encoder keeps no KV cache at all. causal
-          // comes from the context (false for a bidirectional tower).
+          // Cacheless sequence (a vision tower): the K/V slots ARE the "cache", and
+          // causal comes from the context (false for a bidirectional encoder).
           kernels::launch_attention_prefill(S(op.in), S(Slot::K), S(Slot::V), S(op.out), T, 0,
                                             op.heads, op.kv_heads, op.head_dim, stream_,
                                             ctx.causal);
@@ -1694,8 +1722,14 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
         break;
       }
       case OpKind::GeluMul: {
-        const __half* b = op.aux_ptr ? op.aux_ptr : S(op.in2);
-        kernels::launch_gelu_mul(S(op.in), b, S(op.out), len_x(op.cols), stream_);
+        const __half* b = op.aux_ptr ? op.aux_ptr : (S(op.in2) + op.aux_offset);
+        if (seq && op.in2 == Slot::PleAll) {
+          // b is a window of a WIDER per-token tensor, so it strides differently.
+          const int stride = cfg_.num_layers * cfg_.hidden_size_per_layer_input;
+          kernels::launch_gelu_mul_strided(S(op.in), b, S(op.out), op.cols, T, stride, stream_);
+        } else {
+          kernels::launch_gelu_mul(S(op.in), b, S(op.out), len_x(op.cols), stream_);
+        }
         break;
       }
       case OpKind::AddInplace:
@@ -1867,6 +1901,109 @@ void PlanCudaEngine::run_layer(int layer, int position) {
 // Process one token at `position`, reusing the KV cache from earlier positions.
 // Positions must be presented in increasing order (prefill then decode) so the
 // cache and the KV-share sources are populated before dependent layers read them.
+// Sequence-mode buffers: the same slots as decode, but [max_tokens] deep.
+// Can this plan run a sequence prefill? Decided by the OPS it emits, not by a model
+// name: partial RoPE (Qwen) and the delta-net ops have no sequence kernels yet.
+bool PlanCudaEngine::plan_can_sequence_prefill() const {
+  using namespace opplan;
+  for (const auto& lp : plan_.layers) {
+    for (const Op& o : lp.ops) {
+      if (o.kind == OpKind::Rope && o.rotary_dim > 0) return false;
+      if (o.kind == OpKind::LinearAttentionStep || o.kind == OpKind::LinearConv1d) return false;
+    }
+  }
+  return !plan_.layers.empty();
+}
+
+void PlanCudaEngine::allocate_sequence_buffers(int max_tokens) {
+  const int H = cfg_.hidden;
+  const int maxhd = std::max(cfg_.head_dim_full, cfg_.head_dim_sliding);
+  const int maxq = cfg_.num_heads * maxhd;
+  const int maxkv = std::max(cfg_.num_kv_heads_sliding * cfg_.head_dim_sliding,
+                             cfg_.num_kv_heads_full * cfg_.head_dim_full);
+  const int maxinter = cfg_.intermediate * (cfg_.use_double_wide_mlp ? 2 : 1);
+  seq_max_tokens_ = max_tokens;
+
+  auto al = [&](opplan::Slot slot, std::size_t per_token) {
+    __half* d = nullptr;
+    G4_CHECK(cudaMalloc(&d, static_cast<std::size_t>(max_tokens) * per_token * sizeof(__half)));
+    sslot_ptr_[static_cast<int>(slot)] = d;
+    seq_buffers_.push_back(d);
+  };
+  using opplan::Slot;
+  al(Slot::X, H);
+  al(Slot::XNorm, H);
+  al(Slot::Tmp, H);
+  al(Slot::Q, maxq);
+  al(Slot::K, maxkv);
+  al(Slot::V, maxkv);
+  al(Slot::Att, maxq);
+  al(Slot::Gate, maxinter);
+  al(Slot::Up, maxinter);
+  al(Slot::Inter, maxinter);
+  if (has_ple()) {
+    const int ple = cfg_.hidden_size_per_layer_input;
+    al(Slot::PleGate, ple);
+    al(Slot::PleRaw, static_cast<std::size_t>(cfg_.num_layers) * ple);
+    al(Slot::PleAll, static_cast<std::size_t>(cfg_.num_layers) * ple);
+  }
+  G4_CHECK(cudaMalloc(&d_seq_tokens_, static_cast<std::size_t>(max_tokens) * sizeof(int)));
+  G4_CHECK(cudaMalloc(&d_seq_limits_, static_cast<std::size_t>(max_tokens) * sizeof(int)));
+}
+
+// Prefill a whole prompt in ONE pass instead of token by token.
+//
+// Two things this buys, beyond speed:
+//   - image soft tokens can be spliced over the embeddings of the image placeholder
+//     tokens (they are used AS-IS: unlike text embeddings they get no sqrt(hidden) scale);
+//   - a per-token key limit makes an image span BIDIRECTIONAL while the surrounding text
+//     stays causal, which is what Gemma's use_bidirectional_attention="vision" means.
+void PlanCudaEngine::prefill_sequence(const std::vector<int>& tokens, int start_position,
+                                      const std::vector<std::vector<float>>& embeds,
+                                      const std::vector<int>& limits) {
+  using namespace opplan;
+  const int T = static_cast<int>(tokens.size());
+  if (T == 0) return;
+  if (!seq_prefill_ok_) throw std::runtime_error("this plan cannot sequence-prefill");
+  if (T > seq_max_tokens_) throw std::runtime_error("prompt longer than the sequence buffers");
+  const int H = cfg_.hidden;
+
+  G4_CHECK(cudaMemcpyAsync(d_seq_tokens_, tokens.data(), static_cast<std::size_t>(T) * sizeof(int),
+                           cudaMemcpyHostToDevice, stream_));
+  const int* dlimits = nullptr;
+  if (!limits.empty()) {
+    if (static_cast<int>(limits.size()) != T)
+      throw std::runtime_error("limits must have one entry per token");
+    G4_CHECK(cudaMemcpyAsync(d_seq_limits_, limits.data(), static_cast<std::size_t>(T) * sizeof(int),
+                             cudaMemcpyHostToDevice, stream_));
+    dlimits = d_seq_limits_;
+  }
+
+  ExecCtx ctx{sslot_ptr_.data(), T, /*causal=*/true, /*cached=*/true, dlimits};
+  execute_ops(plan_.prologue.data(), plan_.prologue.size(), 0, start_position, ctx);
+
+  // Splice image soft tokens over the placeholder tokens' embeddings. This happens AFTER
+  // the prologue (which did the lookup and the sqrt(hidden) scale) and overwrites those
+  // rows outright -- image embeddings are NOT scaled.
+  for (std::size_t i = 0; i < embeds.size() && i < static_cast<std::size_t>(T); ++i) {
+    if (embeds[i].empty()) continue;
+    if (static_cast<int>(embeds[i].size()) != H)
+      throw std::runtime_error("embedding override has the wrong width");
+    std::vector<__half> row(static_cast<std::size_t>(H));
+    for (int j = 0; j < H; ++j) row[static_cast<std::size_t>(j)] = __float2half(embeds[i][j]);
+    G4_CHECK(cudaMemcpyAsync(sslot_ptr_[static_cast<int>(Slot::X)] + i * static_cast<std::size_t>(H),
+                             row.data(), static_cast<std::size_t>(H) * sizeof(__half),
+                             cudaMemcpyHostToDevice, stream_));
+    G4_CHECK(cudaStreamSynchronize(stream_));  // row is a host temporary
+  }
+
+  for (int L = 0; L < cfg_.num_layers; ++L)
+    execute_ops(plan_.layers[L].ops.data(), plan_.layers[L].ops.size(), L, start_position, ctx);
+  execute_ops(plan_.epilogue.data(), plan_.epilogue.size(), 0, start_position, ctx);
+  G4_CHECK(cudaStreamSynchronize(stream_));
+  publish_host_logits();  // logits of the LAST prompt token, ready for the first sample
+}
+
 void PlanCudaEngine::forward_one(int token, int position, bool compute_logits,
                                    std::vector<float>* per_layer_rms) {
   const int H = cfg_.hidden;

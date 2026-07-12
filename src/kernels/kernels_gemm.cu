@@ -85,4 +85,32 @@ void launch_rowmajor_half_gemm_f16(const half* w, const half* x, half* y, int ou
       w, x, y, out_features, in_features, tokens, in_min, in_max, out_min, out_max);
 }
 
+// out[t][i] = gelu(a[t][i]) * b[t*b_stride + i]
+//
+// The per-layer-input gate multiplies by a slice of a WIDER per-token tensor (the PLE
+// table is [tokens][num_layers * ple], and layer L wants its own ple-wide window), so b
+// advances by a different stride than a and out. At one token this is just the flat
+// kernel; over a sequence it is not, and a flat kernel silently reads the wrong rows.
+__global__ void gelu_mul_strided_kernel(const half* a, const half* b, half* out, int n, int tokens,
+                                        int b_stride) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  const int t = blockIdx.y;
+  if (i >= n || t >= tokens) {
+    return;
+  }
+  const float g = __half2float(a[static_cast<std::size_t>(t) * n + i]);
+  const float u = __half2float(b[static_cast<std::size_t>(t) * b_stride + i]);
+  const float x3 = g * g * g;
+  const float gelu = 0.5f * g * (1.0f + tanhf(0.7978845608028654f * (g + 0.044715f * x3)));
+  out[static_cast<std::size_t>(t) * n + i] = __float2half(gelu * u);
+}
+
+void launch_gelu_mul_strided(const half* a, const half* b, half* out, int n, int tokens,
+                             int b_stride, cudaStream_t stream) {
+  constexpr int kThreads = 256;
+  const dim3 grid(static_cast<unsigned>((n + kThreads - 1) / kThreads),
+                  static_cast<unsigned>(tokens));
+  gelu_mul_strided_kernel<<<grid, kThreads, 0, stream>>>(a, b, out, n, tokens, b_stride);
+}
+
 }  // namespace kernels
