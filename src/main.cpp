@@ -28,8 +28,7 @@
 #include "engine/llama_engine.hpp"
 #include "engine/speculative_decoder.hpp"
 #endif
-#include "model/image_preprocess.hpp"
-#include "model/png.hpp"
+#include "app/image_prompt.hpp"
 #include "model/tokenizer.hpp"
 
 #ifdef _WIN32
@@ -51,90 +50,23 @@ using app::main_helpers::SingleInstanceGuard;
 
 namespace {
 
-// One image + a text question, end to end.
-//
-// The token stream is:  <bos> <turn>user  <boi> <image>x280 <eoi>  <text>  <turn|> ...
-// The 280 image tokens are placeholders: their EMBEDDINGS are replaced by the vision
-// tower's soft tokens (used as-is -- unlike text embeddings they get no sqrt(hidden)
-// scale). Their attention limit is set to the end of the span, which makes the image
-// bidirectional while the surrounding text stays causal.
+// One image + a text question, end to end. The chat text carries a single `<|image|>`
+// placeholder; app::image_prompt::expand turns it into the real image span.
 void run_with_image(engine::PlanCudaEngine& eng, const app::main_cli::ParsedArgs& cli,
                     model::Tokenizer& tokenizer, std::ostream& info_out) {
   eng.open(cli.opts.model_path, cli.opts.max_context);
-  if (!eng.has_vision()) throw std::runtime_error("this model has no vision tower");
-  if (!eng.can_sequence_prefill())
-    throw std::runtime_error("this plan cannot sequence-prefill, which images require");
 
-  const auto& v = eng.vision_config();
-  const model::image::Image img = model::image::load_png(cli.image_path);
-  info_out << "[image] " << cli.image_path << "  " << img.width << "x" << img.height << "\n";
-
-  const int soft_budget = 280;  // vision_soft_tokens_per_image
-  // NOT padded. HF pads the patch grid (for batching) and then masks the padding out of
-  // attention; we encode one image, so simply not padding is equivalent -- and it avoids
-  // the trap that without such a mask the padding patches take part in the encoder's
-  // bidirectional attention as zero-valued keys and dilute every softmax. The oracle gate
-  // missed this: its synthetic grid happened to need no padding.
-  const model::image::PatchGrid grid = model::image::to_patches(
-      img, v.patch_size, v.pooling_kernel, soft_budget, /*pad_to_budget=*/false);
-  const std::vector<float> soft =
-      eng.encode_image(grid.pixels, grid.pos_x, grid.pos_y, grid.soft_tokens);
-  const int H = static_cast<int>(soft.size()) / grid.soft_tokens;
-  // The text stream reserves one token per LIVE pooled cell, not per padded cell: the
-  // processor inserts (grid_w/k)*(grid_h/k) image tokens. Using the padded budget
-  // instead misaligns the span against the real soft tokens, and the model then reports
-  // seeing no image at all.
-  const int n_image = grid.live_soft_tokens;
-  if (const char* dump = std::getenv("CPI_DUMP_SOFT")) {  // debug tap for the parity check
-    std::ofstream df(dump, std::ios::binary);
-    const int dims[2] = {n_image, H};
-    df.write(reinterpret_cast<const char*>(dims), sizeof(dims));
-    df.write(reinterpret_cast<const char*>(soft.data()),
-             static_cast<std::streamsize>(static_cast<std::size_t>(n_image) * H * sizeof(float)));
-  }
-  info_out << "[image] " << grid.grid_w << "x" << grid.grid_h << " patches -> " << n_image
-           << " image tokens (the encoder emits " << grid.soft_tokens
-           << "; the rest are padding cells)\n";
-
-  // Gemma 4's image markers.
-  constexpr int kBoi = 255999, kImage = 258880, kEoi = 258882;
-
-  std::vector<int> tokens;
-  std::vector<std::vector<float>> embeds;
-  auto push_text = [&](const std::string& text, bool add_bos) {
-    for (int t : tokenizer.encode(text, add_bos)) {
-      tokens.push_back(t);
-      embeds.emplace_back();
-    }
-  };
-
-  push_text("<|turn>user\n", /*add_bos=*/true);
-  const int span_start = static_cast<int>(tokens.size());
-  tokens.push_back(kBoi);
-  embeds.emplace_back();
-  for (int i = 0; i < n_image; ++i) {
-    tokens.push_back(kImage);
-    embeds.emplace_back(soft.begin() + static_cast<std::size_t>(i) * H,
-                        soft.begin() + static_cast<std::size_t>(i + 1) * H);
-  }
-  tokens.push_back(kEoi);
-  embeds.emplace_back();
-  const int span_end = static_cast<int>(tokens.size());
-  push_text("\n" + cli.prompt_text + "<turn|>\n<|turn>model\n", /*add_bos=*/false);
-
-  // Bidirectional image span: every token inside it sees the whole span; text is causal.
-  // CPI_IMAGE_CAUSAL=1 falls back to a fully causal prompt (bisection aid).
-  std::vector<int> limits(tokens.size());
-  for (int i = 0; i < static_cast<int>(tokens.size()); ++i)
-    limits[static_cast<std::size_t>(i)] = (i >= span_start && i < span_end) ? span_end : i + 1;
-  if (std::getenv("CPI_IMAGE_CAUSAL")) limits.clear();
-
-  info_out << "[image] prompt = " << tokens.size() << " tokens (" << (span_end - span_start)
-           << " of them the image)\n\n";
+  const std::string text = "<|turn>user\n<|image|>\n" + cli.prompt_text + "<turn|>\n<|turn>model\n";
+  const std::vector<int> base = tokenizer.encode(text, /*add_bos=*/true);
+  const auto ip = app::image_prompt::expand(eng, base, cli.image_path,
+                                            std::getenv("CPI_IMAGE_CAUSAL") != nullptr);
+  info_out << "[image] " << cli.image_path << "  " << ip.grid_w << "x" << ip.grid_h
+           << " patches -> " << ip.image_tokens << " image tokens; prompt = " << ip.tokens.size()
+           << " tokens\n\n";
 
   const auto t0 = std::chrono::steady_clock::now();
   const std::vector<int> out =
-      eng.generate_multimodal(tokens, embeds, limits, cli.max_new, cli.temp, nullptr);
+      eng.generate_multimodal(ip.tokens, ip.embeds, ip.limits, cli.max_new, cli.temp, nullptr);
   const auto t1 = std::chrono::steady_clock::now();
   const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
   // Decode the whole sequence at once -- decoding token by token loses the word-boundary
@@ -142,6 +74,22 @@ void run_with_image(engine::PlanCudaEngine& eng, const app::main_cli::ParsedArgs
   std::cout << tokenizer.decode(out) << "\n";
   std::cout << "\n[perf] generated_tokens=" << out.size() << " elapsed_ms=" << ms
             << " tok_per_s=" << (out.empty() ? 0.0 : out.size() / (ms / 1000.0)) << "\n";
+}
+
+// Binds the multimodal generator when the engine actually has a vision tower. The
+// overload for every other engine type returns null, so this is resolved by TYPE rather
+// than by a runtime model-name check.
+app::main_modes::GenerateMultimodalFn make_multimodal_fn(engine::PlanCudaEngine& eng) {
+  return [&eng](const std::vector<int>& base, const std::string& image_path, int max_new,
+                float temp, const std::function<bool(int)>& on_token) {
+    const auto ip = app::image_prompt::expand(eng, base, image_path,
+                                              std::getenv("CPI_IMAGE_CAUSAL") != nullptr);
+    return eng.generate_multimodal(ip.tokens, ip.embeds, ip.limits, max_new, temp, on_token);
+  };
+}
+template <typename E>
+app::main_modes::GenerateMultimodalFn make_multimodal_fn(E&) {
+  return nullptr;
 }
 
 }  // namespace
@@ -418,7 +366,11 @@ int main(int argc, char** argv) {
             return eng.generate_stream(p, max_new, temperature, on_token, constraints);
           },
           [&](const std::vector<int>& p, int top_k) { return eng.inspect_next_logits(p, top_k); },
-          [&]() -> const engine::BenchmarkStats& { return eng.last_benchmark_stats(); });
+          [&]() -> const engine::BenchmarkStats& { return eng.last_benchmark_stats(); },
+          // Images: only the plan executor has a vision tower. Everything else passes
+          // null, and an image request against it fails cleanly rather than quietly
+          // dropping the picture.
+          make_multimodal_fn(eng));
     };
 
     using app::main_helpers::EngineChoice;

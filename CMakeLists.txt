@@ -102,6 +102,7 @@ set(LLAMA_ENGINE_SOURCES
   src/model/safetensors_loader.cpp
   src/model/hf_bpe_tokenizer.cpp
   src/model/tokenizer.cpp
+  src/app/image_prompt.cpp
   src/model/png.cpp
   src/model/image_preprocess.cpp
   src/model/wordpiece_tokenizer.cpp

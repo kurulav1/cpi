@@ -1013,3 +1013,51 @@ input[type="range"] { width: 100%; accent-color: var(--accent); cursor: pointer;
   max-height: 22rem;
   overflow-y: auto;
 }
+
+/* --- image attachment (vision models) --- */
+.composer-attach {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 0.5rem;
+  margin-bottom: 0.35rem;
+  border: 1px solid var(--border, #2a2f3a);
+  border-radius: 8px;
+  background: var(--surface-2, rgba(255, 255, 255, 0.04));
+}
+.composer-attach-thumb {
+  width: 34px;
+  height: 34px;
+  object-fit: cover;
+  border-radius: 5px;
+  flex: 0 0 auto;
+}
+.composer-attach-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.82rem;
+  opacity: 0.85;
+}
+.composer-attach-x {
+  flex: 0 0 auto;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  opacity: 0.6;
+  cursor: pointer;
+  font-size: 0.95rem;
+  line-height: 1;
+  padding: 0.2rem 0.35rem;
+  border-radius: 5px;
+}
+.composer-attach-x:hover { opacity: 1; background: rgba(255, 255, 255, 0.08); }
+.msg-user-image {
+  display: block;
+  max-width: min(320px, 100%);
+  max-height: 320px;
+  border-radius: 8px;
+  margin-bottom: 0.45rem;
+}

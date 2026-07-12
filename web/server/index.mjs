@@ -847,7 +847,36 @@ function buildCliArgs(config, body) {
     (reasoningCap.mode === "optional" && isTruthyFlag(body.thinking));
   const promptBudget = computePromptBudget(maxContext, performanceMode);
 
-  const promptPackage = buildPromptPackage(body.messages, {
+  // --- image (optional) ---
+  // The model DECLARES whether it can take one (profile.vision, read from its
+  // config.json). The placeholder goes into the last user turn, so the ordinary chat
+  // renderer needs no image-awareness: it just leaves a marker where the picture goes.
+  const visionCap = selectedProfile?.vision ?? null;
+  let imagePath = null;
+  let requestMessages = body.messages;
+  if (body.image) {
+    if (!visionCap?.supported) {
+      const err = new Error(`${selectedProfile?.label ?? "this model"} cannot take images`);
+      err.status = 400;
+      throw err;
+    }
+    imagePath = writeUploadedImage(body.image);
+    const msgs = Array.isArray(body.messages) ? [...body.messages] : [];
+    let last = -1;
+    for (let i = msgs.length - 1; i >= 0; i -= 1) {
+      if (msgs[i]?.role === "user") { last = i; break; }
+    }
+    if (last < 0) {
+      msgs.push({ role: "user", content: "" });
+      last = msgs.length - 1;
+    }
+    const placeholder = visionCap.placeholder || "<|image|>";
+    msgs[last] = { ...msgs[last], content: `${placeholder}
+${msgs[last].content ?? ""}` };
+    requestMessages = msgs;
+  }
+
+  const promptPackage = buildPromptPackage(requestMessages, {
     template: requestTemplate,
     systemPrompt: requestSystemPrompt,
     historyStrategy: policy.historyStrategy,
@@ -894,6 +923,7 @@ function buildCliArgs(config, body) {
     profileExtraArgs,
     quantMode,
     messages: promptPackage.messages,
+    imagePath,  // null for a text-only request
     // Generic reasoning enable-injection: prepend the descriptor's enable fragment
     // (e.g. Gemma's <|think|> system turn) when thinking is on. "" for models that
     // prime via their own chat template (Qwen/R1), so this is a no-op for them.
@@ -1506,6 +1536,7 @@ function isBatchCompatible(cliConfig) {
   const p = cliConfig.profile || {};
   const family = String(p.family || cliConfig.meta?.template || "").toLowerCase();
   if (NON_LLAMA_ENGINE_FAMILIES.has(family)) return false;                  // separate engine (incl. gemma4)
+  if (cliConfig.imagePath) return false;                                   // images: single-flight only
   if (cliConfig.meta?.thinking) return false;                              // reasoning split needs the single-flight splitter
   if (cliConfig.quantMode && cliConfig.quantMode !== "none") return false; // runtime quantization
   const label = String(p.label || "").toLowerCase();
@@ -1528,6 +1559,37 @@ function killBatchWorker() {
     batchWorkerKey = null;
     try { old.kill(); } catch { /* ignore */ }
   }
+}
+
+// An uploaded image arrives as a data URL. Decode it to a temp PNG the engine can open,
+// and reap old ones so the directory does not grow without bound. Only PNG: the decoder
+// is hand-rolled and PNG is what it speaks (JPEG is a bigger codec, not yet written).
+const IMAGE_TMP_DIR = path.join(os.tmpdir(), "cpi-images");
+function writeUploadedImage(dataUrl) {
+  const m = /^data:image\/png;base64,([A-Za-z0-9+/=]+)$/.exec(String(dataUrl || "").trim());
+  if (!m) {
+    const err = new Error("image must be a PNG data URL (data:image/png;base64,...)");
+    err.status = 400;
+    throw err;
+  }
+  const bytes = Buffer.from(m[1], "base64");
+  if (bytes.length > 20 * 1024 * 1024) {
+    const err = new Error("image is larger than 20 MB");
+    err.status = 400;
+    throw err;
+  }
+  fs.mkdirSync(IMAGE_TMP_DIR, { recursive: true });
+  // reap anything older than an hour
+  const cutoff = Date.now() - 60 * 60 * 1000;
+  for (const f of fs.readdirSync(IMAGE_TMP_DIR)) {
+    const full = path.join(IMAGE_TMP_DIR, f);
+    try {
+      if (fs.statSync(full).mtimeMs < cutoff) fs.unlinkSync(full);
+    } catch { /* raced with another reap; fine */ }
+  }
+  const file = path.join(IMAGE_TMP_DIR, `img-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.png`);
+  fs.writeFileSync(file, bytes);
+  return file;
 }
 
 async function getBatchWorker(config, cliConfig) {
@@ -1748,6 +1810,9 @@ function runGeneration(
     temp: cliConfig.meta.temperature,
     stop_texts: cliConfig.stopTexts,
     add_bos: cliConfig.addBos,
+    // The rendered chat carries a single <|image|> placeholder; the engine expands it
+    // into <boi> + N image tokens + <eoi> and splices in the vision tower's soft tokens.
+    ...(cliConfig.imagePath ? { image: cliConfig.imagePath } : {}),
     // TinyLlama often starts with a short lead-in sentence before the real
     // answer. Cutting on the first sentence boundary turns sane answers into
     // fragments like "Sure, who is Elon Musk?".

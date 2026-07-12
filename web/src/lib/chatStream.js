@@ -35,9 +35,12 @@ export async function fetchHealth() {
   return response.json();
 }
 
-export async function streamChat({ messages, settings, signal, onEvent }) {
+export async function streamChat({ messages, settings, image, signal, onEvent }) {
   const payload = {
     messages,
+    // A PNG data URL. Only sent for models that declare a vision tower; the server
+    // decodes it to a temp file and the engine expands the <|image|> placeholder.
+    ...(image ? { image } : {}),
     profileId: settings.profileId,
     template: settings.template,
     systemPrompt: settings.systemPrompt,

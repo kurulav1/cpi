@@ -1310,6 +1310,41 @@ export function readModelReasoning(modelPath) {
   return normalizeReasoning(readModelDescriptorKey(modelPath, "reasoning")) ?? { ...NO_REASONING };
 }
 
+// Does this model ship a VISION tower? Read from the model itself (config.json's
+// vision_config), not from its name -- same principle as reasoning and chat: the model
+// declares its capabilities, the core just reads them.
+//
+// Only a HuggingFace safetensors DIRECTORY can carry one today; a .cpi container's
+// converter strips the vision tower.
+export function readModelVision(modelPath) {
+  try {
+    if (!modelPath || !fs.existsSync(modelPath) || !fs.statSync(modelPath).isDirectory()) {
+      return null;
+    }
+    const cfgPath = path.join(modelPath, "config.json");
+    if (!fs.existsSync(cfgPath)) return null;
+    const cfg = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
+    const v = cfg?.vision_config;
+    if (!v || !v.hidden_size || !v.patch_size) return null;
+    // A vision_config alone is not enough: the capability must be one the ENGINE can
+    // actually run. Only the Gemma 4 vision tower is implemented today -- Qwen3.5 also
+    // ships a vision_config, and reporting it as supported would offer an attach button
+    // that then fails at generation time.
+    const arch = String(
+      cfg?.model_type ?? (Array.isArray(cfg?.architectures) ? cfg.architectures[0] : "") ?? ""
+    ).toLowerCase();
+    if (!arch.includes("gemma4")) return null;
+    return {
+      supported: true,
+      // The single placeholder token the engine expands into the real image span.
+      placeholder: "<|image|>",
+      softTokens: cfg?.vision_soft_tokens_per_image ?? 280,
+    };
+  } catch {
+    return null;
+  }
+}
+
 // The model's chat format as DATA (see prompting.mjs renderChat). Null ⇒ fall back
 // to the legacy hand-written formatter for its template.
 export function readModelChat(modelPath) {
@@ -1342,8 +1377,11 @@ function buildProfile(modelPath, tokenizerPath, baseConfig, source = "discovered
   // lightweight Python worker until the native engine grows this architecture.
   const isSafetensorsDir = isSafetensorsModelDir(modelPath);
   const supportsCptGpt = isSafetensorsDir && family === "cpt_gpt";
+  // Gemma 4 loads natively from a safetensors DIRECTORY now (that is also the only
+  // container that still carries its vision tower -- the .cpi converter strips it), so it
+  // no longer "needs conversion".
   const supportsNativeSafetensors =
-    isSafetensorsDir && (family === "llama4" || family === "qwen3_5");
+    isSafetensorsDir && (family === "llama4" || family === "qwen3_5" || family === "gemma4");
   const modelExists = Boolean(modelPath) && fs.existsSync(modelPath);
   const tokenizerExists = Boolean(tokenizerPath) && fs.existsSync(tokenizerPath);
   const filesExist =
@@ -1403,6 +1441,7 @@ function buildProfile(modelPath, tokenizerPath, baseConfig, source = "discovered
     template,
     reasoning: readModelReasoning(modelPath),
     chat: readModelChat(modelPath),  // model-shipped chat format (null ⇒ legacy formatter)
+    vision: readModelVision(modelPath),  // null ⇒ text only
     tokenizerChatTemplatePath: hfTokenizerConfig?.path || "",
     tokenizerUsesDefaultSystemPrompt:
       hfTokenizerConfig?.useDefaultSystemPrompt,
@@ -1428,6 +1467,7 @@ function publicModelProfile(profile) {
     tokenizerFormat: profile.tokenizerFormat,
     template: profile.template,
     reasoning: profile.reasoning,
+    vision: profile.vision,
     tokenizerChatTemplatePath: profile.tokenizerChatTemplatePath,
     tokenizerUsesDefaultSystemPrompt: profile.tokenizerUsesDefaultSystemPrompt,
     extraArgs: profile.extraArgs,

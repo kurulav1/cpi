@@ -1018,6 +1018,9 @@ export default function App() {
   const [activeChatId, setActiveChatId] = useState(initialChatState.activeChatId);
   const [messages,     setMessages]     = useState(initialChatState.messages);
   const [draft,    setDraft]    = useState("");
+  // Attached image (PNG data URL) for models that declare a vision tower.
+  const [image,    setImage]    = useState(null);   // { dataUrl, name }
+  const fileRef = useRef(null);
   const [health,   setHealth]   = useState({ ready:false, busy:false, activeKind:null, config:null });
   const [settings, setSettings] = useState(() => ({
     profileId: "",
@@ -1059,6 +1062,21 @@ export default function App() {
     profiles.find((p) => p.id === settings.profileId) ||
     health.config?.selectedProfile || null;
   const selDisplay   = selProfile ? modelDisplay(selProfile) : { base:"", tag:"", isStreaming:false, fmt:"", pinned:false };
+  // The MODEL declares whether it can take images (config.json's vision_config), the
+  // same way it declares its reasoning and chat formats. No name matching here.
+  const visionOK     = Boolean(selProfile?.vision?.supported);
+
+  const attachImage = (file) => {
+    if (!file) return;
+    if (file.type !== "image/png") {
+      setError("Only PNG images are supported (the decoder is hand-rolled; JPEG is not written yet).");
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => setImage({ dataUrl: String(reader.result), name: file.name });
+    reader.onerror = () => setError("Could not read that image.");
+    reader.readAsDataURL(file);
+  };
   // Consolidated model + precision/variant selection.
   const modelGroups  = buildModelGroups(readyProfiles);
   const currentVarKey = `${settings.profileId}|${settings.quantMode || "none"}`;
@@ -1460,9 +1478,11 @@ export default function App() {
 
   async function submit(override) {
     const text = (override ?? draft).trim();
-    if (!text || streaming) return;
+    // An image alone is a valid message ("what is this?" is implied by the picture).
+    if ((!text && !image) || streaming) return;
 
-    const userMsg = createMsg("user", text);
+    const sentImage = image;
+    const userMsg = createMsg("user", text, sentImage ? { image: sentImage.dataUrl } : {});
     const asstMsg = createMsg("assistant", "", { streaming:true });
     const thread  = normalise([...snapshotMessages(), userMsg]);
     const ctrl    = new AbortController();
@@ -1470,11 +1490,12 @@ export default function App() {
     setError(""); setRunMeta({ state:"starting" }); setStreaming(true);
     abortRef.current = ctrl;
     updateMessages((cur) => [...cur, userMsg, asstMsg]);
-    setDraft(""); requestAnimationFrame(() => growTa(""));
+    setDraft(""); setImage(null); requestAnimationFrame(() => growTa(""));
 
     try {
       const done = await streamChat({
         messages: thread, settings,
+        image: sentImage?.dataUrl ?? null,
         signal: ctrl.signal,
         onEvent: (ev) => {
           if (ev.type === "start") {
@@ -1748,7 +1769,12 @@ export default function App() {
                   if (m.role === "user") {
                     return (
                       <div key={m.id} className="msg msg-user">
-                        <div className="msg-user-bubble">{m.content}</div>
+                        <div className="msg-user-bubble">
+                          {m.image && (
+                            <img src={m.image} alt="attached" className="msg-user-image" />
+                          )}
+                          {m.content}
+                        </div>
                       </div>
                     );
                   }
@@ -1782,13 +1808,32 @@ export default function App() {
             <div className="composer-wrap">
               <div className="composer-inner">
                 <div className="composer-box">
+                  {image && (
+                    <div className="composer-attach">
+                      <img src={image.dataUrl} alt="" className="composer-attach-thumb" />
+                      <span className="composer-attach-name">{image.name}</span>
+                      <button
+                        type="button"
+                        className="composer-attach-x"
+                        title="Remove image"
+                        onClick={() => setImage(null)}
+                      >
+                        x
+                      </button>
+                    </div>
+                  )}
                   <textarea
                     ref={taRef}
                     className="composer-ta"
                     value={draft}
                     rows={1}
-                    placeholder="Message..."
+                    placeholder={image ? "Ask about the image..." : "Message..."}
                     onChange={(e) => { setDraft(e.target.value); growTa(e.target.value); }}
+                    onPaste={(e) => {
+                      if (!visionOK) return;
+                      const f = [...(e.clipboardData?.files ?? [])][0];
+                      if (f) { e.preventDefault(); attachImage(f); }
+                    }}
                     onKeyDown={(e) => {
                       if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submit(); }
                     }}
@@ -1796,13 +1841,33 @@ export default function App() {
                   <div className="composer-foot">
                     <span className="composer-hint">Enter to send - Shift+Enter for newline</span>
                     <div className="composer-acts">
+                      {visionOK && (
+                        <>
+                          <input
+                            ref={fileRef}
+                            type="file"
+                            accept="image/png"
+                            style={{ display: "none" }}
+                            onChange={(e) => { attachImage(e.target.files?.[0]); e.target.value = ""; }}
+                          />
+                          <button
+                            type="button"
+                            className="btn btn-ghost"
+                            title="Attach a PNG image"
+                            disabled={streaming}
+                            onClick={() => fileRef.current?.click()}
+                          >
+                            Image
+                          </button>
+                        </>
+                      )}
                       {streaming && (
                         <button type="button" className="btn btn-ghost" onClick={() => abortRef.current?.abort()}>Stop</button>
                       )}
                       <button
                         type="button"
                         className="btn btn-primary"
-                        disabled={!draft.trim() || streaming || !health.ready}
+                        disabled={(!draft.trim() && !image) || streaming || !health.ready}
                         onClick={() => submit()}
                       >
                         Send

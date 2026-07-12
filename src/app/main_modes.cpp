@@ -43,7 +43,8 @@ void execute_engine_modes(const RunExecutionOptions& options, const std::vector<
                           const std::vector<std::string>& stop_texts, model::Tokenizer* tokenizer,
                           const GenerateFn& generate, const GenerateStreamFn& generate_stream,
                           const InspectNextLogitsFn& inspect_next_logits,
-                          const LastBenchmarkStatsFn& last_benchmark_stats) {
+                          const LastBenchmarkStatsFn& last_benchmark_stats,
+                          const GenerateMultimodalFn& generate_multimodal) {
   if (options.use_tokenizer && tokenizer == nullptr) {
     throw std::runtime_error("tokenizer is required for tokenizer-backed execution");
   }
@@ -121,6 +122,9 @@ void execute_engine_modes(const RunExecutionOptions& options, const std::vector<
 
       try {
         const std::string req_prompt = json_get_string(request_json, "prompt");
+        // A PNG path. The rendered chat text carries a single <|image|> placeholder token
+        // where the picture goes; the engine expands it into the real image span.
+        const std::string req_image = json_get_string(request_json, "image");
         if (req_prompt.empty()) {
           throw std::runtime_error("interactive request missing 'prompt'");
         }
@@ -243,9 +247,7 @@ void execute_engine_modes(const RunExecutionOptions& options, const std::vector<
 
         int emitted_count = 0;
         try {
-          (void)generate_stream(
-              req_prompt_tokens, req_max_new, req_temp,
-              [&](int tok) {
+          const auto on_token = [&](int tok) -> bool {
                 // Until min_new tokens are produced, don't honour stop conditions
                 // either (the engine also masks EOS); keeps greedy from truncating early.
                 const bool may_stop = emitted_count >= req_min_new;
@@ -290,8 +292,16 @@ void execute_engine_modes(const RunExecutionOptions& options, const std::vector<
                   return false;
                 }
                 return true;
-              },
-              req_constraints_ptr);
+          };
+          if (!req_image.empty()) {
+            if (!generate_multimodal)
+              throw std::runtime_error("this model cannot take images (no vision tower)");
+            (void)generate_multimodal(req_prompt_tokens, req_image, req_max_new, req_temp,
+                                      on_token);
+          } else {
+            (void)generate_stream(req_prompt_tokens, req_max_new, req_temp, on_token,
+                                  req_constraints_ptr);
+          }
         } catch (...) {
           // Join the streaming thread before the exception propagates: a joinable
           // std::thread destroyed during stack unwinding calls std::terminate and
