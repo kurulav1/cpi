@@ -1,8 +1,9 @@
-// kernels_ops_matvec.cu
+﻿// kernels_ops_matvec.cu
 //
 // CUDA kernels and host launch wrappers for pointwise ops, quant/dequant,
 // weight-only matvec, projection GEMV, and argmax helpers.
 
+#include <cstdlib>
 #include <cuda_fp16.h>
 #include <math_constants.h>  // CUDART_INF_F (device top-k reductions)
 #include <sm_61_intrinsics.h>
@@ -934,11 +935,86 @@ void launch_pack_rowwise_int8_to_int4(const int8_t* src, int8_t* dst, int rows, 
   pack_rowwise_int8_to_int4_kernel<<<grid, threads, 0, stream>>>(src, dst, rows, cols);
 }
 
+// HBM-shaped GEMV: one warp per output row, 128-bit loads, no shared tile.
+//
+// The tiled kernel above loads the weight row as half2 -- 32 BITS PER THREAD -- and syncs
+// every tile. Out of L2 that is fine, which is why every micro-benchmark of it looked good
+// (re-running one matrix in a loop keeps it cached). Real decode streams each weight from
+// HBM exactly ONCE, and at 32 bits per request there are nowhere near enough bytes in
+// flight to cover HBM latency. Profiling the real run is what exposed it: these kernels
+// took 12-13.5 us while cuBLAS did the same shapes in 3.15 us.
+//
+// So: read the row as int4 (128 bits = 8 halves), which quarters the request count and
+// keeps 4 loads in flight per thread, and drop the shared-memory staging of x entirely --
+// x is a few KB, every block reads it, and it is served from cache anyway.
+//
+// !! NOT BIT-IDENTICAL to the tiled kernel: each lane now accumulates a different subset of
+// the row, so the fp32 summation ORDER differs. Values agree to fp32 rounding. This is a
+// deliberate, validated numerics change, not an accident -- see the parity gate. !!
+template <int Warps, typename OutT>
+__global__ void gemv_wide_kernel(const half* __restrict__ w, const half* __restrict__ x,
+                                 OutT* __restrict__ y, int out_features, int in_features,
+                                 half* __restrict__ residual) {
+  const int row = blockIdx.x * Warps + (threadIdx.x / warpSize);
+  if (row >= out_features) {
+    return;
+  }
+  const int lane = threadIdx.x & (warpSize - 1);
+  const int vecs = in_features / 8;  // 8 halves per int4
+  const int4* wrow = reinterpret_cast<const int4*>(
+      w + static_cast<std::size_t>(row) * static_cast<std::size_t>(in_features));
+  const int4* xv = reinterpret_cast<const int4*>(x);
+
+  float acc = 0.0f;
+  for (int i = lane; i < vecs; i += warpSize) {
+    const int4 wpack = wrow[i];
+    const int4 xpack = xv[i];
+    const half2* wh = reinterpret_cast<const half2*>(&wpack);
+    const half2* xh = reinterpret_cast<const half2*>(&xpack);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const float2 a = __half22float2(wh[j]);
+      const float2 b = __half22float2(xh[j]);
+      acc += a.x * b.x + a.y * b.y;
+    }
+  }
+  // Tail for in_features not divisible by 8.
+  for (int i = vecs * 8 + lane; i < in_features; i += warpSize) {
+    acc += __half2float(w[static_cast<std::size_t>(row) * in_features + i]) * __half2float(x[i]);
+  }
+
+  acc = warp_sum(acc);
+  if (lane == 0) {
+    if (residual != nullptr) {
+      residual[row] = __hadd(residual[row], __float2half(acc));
+    } else {
+      store_projection_value<OutT>(y, row, acc);
+    }
+  }
+}
+
+// Opt-out, not opt-in: the wide kernel is the default because the profile says the tiled one
+// is 4x off. LLAMA_INFER_TILED_GEMV=1 restores the old kernel for A/B and bisection.
+static bool use_wide_gemv() {
+  static const bool v = [] {
+    const char* e = std::getenv("LLAMA_INFER_TILED_GEMV");
+    return !(e && *e == '1');
+  }();
+  return v;
+}
+
 template <typename OutT>
 static void launch_rowmajor_half_gemv(const half* w, const half* x, OutT* y, int out_features,
                                       int in_features, cudaStream_t stream, int warps_per_block,
                                       int tile_pairs, int rows_per_warp,
                                       half* residual = nullptr) {
+  if (use_wide_gemv() && (in_features % 8) == 0) {
+    constexpr int kWarps = 4;
+    const int blocks = (out_features + kWarps - 1) / kWarps;
+    gemv_wide_kernel<kWarps, OutT>
+        <<<blocks, kWarps * 32, 0, stream>>>(w, x, y, out_features, in_features, residual);
+    return;
+  }
   const int warps = (warps_per_block > 0) ? warps_per_block : ((out_features >= 8192) ? 8 : 4);
   const int tile = (tile_pairs > 0) ? tile_pairs : 128;
   const int rows = (rows_per_warp > 0) ? rows_per_warp : 1;
@@ -1062,7 +1138,7 @@ void launch_argmax_float(const float* logits, int n, int* out_index, cudaStream_
   argmax_float_kernel<<<1, threads, 0, stream>>>(logits, n, out_index);
 }
 
-// ── device top-k candidate selection (sampled decode) ────────────────────────
+// â”€â”€ device top-k candidate selection (sampled decode) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 namespace {
 
 constexpr int kTopkChunk = 2048;    // elements per partition block (8 KB shared)
