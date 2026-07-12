@@ -22,6 +22,14 @@
 namespace kernels {
 namespace {
 
+__device__ __forceinline__ float warp_sum_f(float v) {
+  for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+    v += __shfl_down_sync(0xffffffffu, v, offset);
+  }
+  return v;
+}
+
+
 constexpr int kTile = 32;
 
 __global__ void rowmajor_half_gemm_f16_kernel(const half* __restrict__ w, const half* __restrict__ x,
@@ -111,6 +119,85 @@ void launch_gelu_mul_strided(const half* a, const half* b, half* out, int n, int
   const dim3 grid(static_cast<unsigned>((n + kThreads - 1) / kThreads),
                   static_cast<unsigned>(tokens));
   gelu_mul_strided_kernel<<<grid, kThreads, 0, stream>>>(a, b, out, n, tokens, b_stride);
+}
+
+
+
+// Fused SwiGLU projection: gate-GEMV + up-GEMV + silu_mul in ONE kernel.
+//
+//   out[i] = silu( dot(w_gate[i], x) ) * dot(w_up[i], x)
+//
+// Why: at batch 1 each kernel costs a fixed ~2.7 us of scheduling no matter how little
+// it does, and a 0.5B model spends over HALF its per-token budget on that tax rather
+// than on memory traffic. gate/up/silu were three kernels touching the same x; now they
+// are one. No weight relayout -- the kernel simply takes both weight pointers.
+//
+// BYTE-IDENTICAL by construction: g and u are rounded to fp16 BEFORE silu(g)*u, exactly
+// as the three-kernel version does when it stores them. Accumulating in fp32 straight
+// through would be more accurate and would silently change every model's output.
+template <int WarpsPerBlock, int TilePairs>
+__global__ void swiglu_gemv_f16_kernel(const half* __restrict__ w_gate,
+                                       const half* __restrict__ w_up, const half* __restrict__ x,
+                                       half* __restrict__ out, int inter, int in_features) {
+  __shared__ half2 x_tile[TilePairs];
+  const int warp_id = threadIdx.x / warpSize;
+  const int lane = threadIdx.x & (warpSize - 1);
+  const int row = blockIdx.x * WarpsPerBlock + warp_id;
+
+  const bool active = row < inter;
+  const half* g_row =
+      active ? w_gate + static_cast<std::size_t>(row) * in_features : nullptr;
+  const half* u_row = active ? w_up + static_cast<std::size_t>(row) * in_features : nullptr;
+
+  float gacc = 0.0f, uacc = 0.0f;
+  if ((in_features & 1) == 0) {
+    const int pairs = in_features / 2;
+    const half2* x2 = reinterpret_cast<const half2*>(x);
+    const half2* g2 = active ? reinterpret_cast<const half2*>(g_row) : nullptr;
+    const half2* u2 = active ? reinterpret_cast<const half2*>(u_row) : nullptr;
+    for (int tile_base = 0; tile_base < pairs; tile_base += TilePairs) {
+      const int tile_count = min(TilePairs, pairs - tile_base);
+      for (int idx = threadIdx.x; idx < tile_count; idx += blockDim.x) {
+        x_tile[idx] = x2[tile_base + idx];
+      }
+      __syncthreads();
+      if (active) {
+        for (int idx = lane; idx < tile_count; idx += warpSize) {
+          const float2 xv = __half22float2(x_tile[idx]);
+          const float2 gv = __half22float2(g2[tile_base + idx]);
+          const float2 uv = __half22float2(u2[tile_base + idx]);
+          gacc += gv.x * xv.x + gv.y * xv.y;
+          uacc += uv.x * xv.x + uv.y * xv.y;
+        }
+      }
+      __syncthreads();
+    }
+  } else if (active) {
+    for (int col = lane; col < in_features; col += warpSize) {
+      const float xv = __half2float(x[col]);
+      gacc += __half2float(g_row[col]) * xv;
+      uacc += __half2float(u_row[col]) * xv;
+    }
+  }
+
+  gacc = warp_sum_f(gacc);
+  uacc = warp_sum_f(uacc);
+  if (active && lane == 0) {
+    // Round to fp16 first -- this is what the unfused path stores between kernels.
+    const float g = __half2float(__float2half(gacc));
+    const float u = __half2float(__float2half(uacc));
+    const float silu = g / (1.0f + __expf(-g));
+    out[row] = __float2half(silu * u);
+  }
+}
+
+void launch_swiglu_gemv_f16(const half* w_gate, const half* w_up, const half* x, half* out,
+                            int inter, int in_features, cudaStream_t stream) {
+  constexpr int kWarps = 4;
+  constexpr int kTile = 128;
+  const int blocks = (inter + kWarps - 1) / kWarps;
+  swiglu_gemv_f16_kernel<kWarps, kTile>
+      <<<blocks, kWarps * 32, 0, stream>>>(w_gate, w_up, x, out, inter, in_features);
 }
 
 }  // namespace kernels

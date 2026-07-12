@@ -528,6 +528,8 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
 
     launch_norm(d_x_, lw->norm_ffn, lw->norm_ffn_bias, d_x_norm_, 1, hidden);
 
+    // True when the gate+up GEMV and silu_mul collapsed into one kernel.
+    bool fused_swiglu = false;
     if (lw_i8 && lw_i8->w1 && lw_i8->w2 && lw_i8->w3) {
       if (lw_i8->mlp_int4) {
         kernels::launch_weight_only_int4_matvec(
@@ -544,13 +546,28 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
             lw_i8->w3, lw_i8->s_w3, static_cast<const __half*>(d_x_norm_),
             static_cast<__half*>(d_ff2_), inter, hidden, compute_stream_);
       }
+      fused_swiglu = false;
+    } else if (!weights_.config().mlp_gelu) {
+      // gate+up GEMV and silu_mul fused into ONE kernel. At batch 1 every kernel costs a
+      // fixed ~2.7us of scheduling no matter how little it does, and that tax -- not
+      // bandwidth -- is what holds a small model off the roofline.
+      kernels::launch_swiglu_gemv_f16(
+          static_cast<const __half*>(lw->w13),
+          static_cast<const __half*>(lw->w13) + static_cast<std::size_t>(inter) * hidden,
+          static_cast<const __half*>(d_x_norm_), static_cast<__half*>(d_ff2_), inter, hidden,
+          compute_stream_);
+      fused_swiglu = true;
     } else {
       resident_projection_half(lw->w13, d_x_norm_, d_ff1_, 2 * inter, hidden, resident_qkv_warps_,
                                resident_qkv_tile_pairs_, resident_qkv_rows_per_warp_);
+      fused_swiglu = false;
     }
 
-    detail::launch_gated_glu(weights_.config().mlp_gelu, static_cast<const __half*>(d_ff1_), static_cast<const __half*>(d_ff2_),
-                             static_cast<__half*>(d_ff2_), inter, compute_stream_);
+    if (!fused_swiglu) {
+      detail::launch_gated_glu(weights_.config().mlp_gelu, static_cast<const __half*>(d_ff1_),
+                               static_cast<const __half*>(d_ff2_), static_cast<__half*>(d_ff2_),
+                               inter, compute_stream_);
+    }
 
     if (lw_i8 && lw_i8->w1 && lw_i8->w2 && lw_i8->w3) {
       if (lw_i8->mlp_int4) {
@@ -686,12 +703,21 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
                  [&] { launch_norm(d_x_, lw->norm_ffn, lw->norm_ffn_bias, d_x_norm_, 1, hidden); });
 
     run_profiled(last_benchmark_stats_.decode_mlp_ms, [&] {
-      resident_projection_half(lw->w13, d_x_norm_, d_ff1_, 2 * inter, hidden, resident_qkv_warps_,
-                               resident_qkv_tile_pairs_, resident_qkv_rows_per_warp_);
-
-      detail::launch_gated_glu(weights_.config().mlp_gelu, static_cast<const __half*>(d_ff1_),
-                               static_cast<const __half*>(d_ff2_), static_cast<__half*>(d_ff2_),
-                               inter, compute_stream_);
+      if (!weights_.config().mlp_gelu) {
+        // Fused: gate+up GEMV and silu_mul in one kernel (see launch_swiglu_gemv_f16).
+        kernels::launch_swiglu_gemv_f16(
+            static_cast<const __half*>(lw->w13),
+            static_cast<const __half*>(lw->w13) + static_cast<std::size_t>(inter) * hidden,
+            static_cast<const __half*>(d_x_norm_), static_cast<__half*>(d_ff2_), inter, hidden,
+            compute_stream_);
+      } else {
+        resident_projection_half(lw->w13, d_x_norm_, d_ff1_, 2 * inter, hidden,
+                                 resident_qkv_warps_, resident_qkv_tile_pairs_,
+                                 resident_qkv_rows_per_warp_);
+        detail::launch_gated_glu(weights_.config().mlp_gelu, static_cast<const __half*>(d_ff1_),
+                                 static_cast<const __half*>(d_ff2_), static_cast<__half*>(d_ff2_),
+                                 inter, compute_stream_);
+      }
 
       resident_projection_half(lw->w2, d_ff2_, d_ff3_, hidden, inter, resident_wo_warps_,
                                resident_wo_tile_pairs_, resident_wo_rows_per_warp_);

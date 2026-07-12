@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <cuda_fp16.h>
 
 #include <iostream>
@@ -322,6 +323,8 @@ void LlamaEngine::init_greedy_decode_graph() {
                             static_cast<const __half*>(lw->norm_ffn),
                             static_cast<__half*>(d_x_norm_), 1, hidden, norm_eps, compute_stream_);
 
+    // True when the gate+up GEMV and silu_mul collapsed into one kernel.
+    bool fused_glu = false;
     if (tq && tq->w13) {
       // TQ3 w13: hadamard-rotate x_norm, then packed GEMV.
       CUDA_CHECK(cudaMemcpyAsync(d_x_tq3_, d_x_norm_,
@@ -355,16 +358,33 @@ void LlamaEngine::init_greedy_decode_graph() {
             lw_i8->w3, lw_i8->s_w3, static_cast<const __half*>(d_x_norm_),
             static_cast<__half*>(d_ff2_), inter, hidden, compute_stream_);
       }
+      fused_glu = false;
+    } else if (!weights_.config().mlp_gelu) {
+      // FUSED: gate+up GEMV and silu_mul in ONE kernel. At batch 1 every kernel costs a
+      // fixed ~2.7 us of scheduling regardless of how little it does, and that tax -- not
+      // bandwidth -- is what holds a small model off the roofline. The fused kernel rounds
+      // g and u to fp16 before silu(g)*u, exactly as the unfused path does when it stores
+      // them between kernels, so the output is byte-identical.
+      kernels::launch_swiglu_gemv_f16(
+          static_cast<const __half*>(lw->w13),
+          static_cast<const __half*>(lw->w13) + static_cast<std::size_t>(inter) * hidden,
+          static_cast<const __half*>(d_x_norm_), static_cast<__half*>(d_ff2_), inter, hidden,
+          compute_stream_);
+      fused_glu = true;
     } else {
       // FP16 MLP fallback in graph capture: use resident_projection_half (always
       // graph-capturable) instead of linear_rowmajor_weight / cuBLASLt which may
       // fall through to cublasGemmEx and cause CUDA_STATUS_INVALID_VALUE crashes.
       resident_projection_half(lw->w13, d_x_norm_, d_ff1_, 2 * inter, hidden, resident_qkv_warps_,
                                resident_qkv_tile_pairs_, resident_qkv_rows_per_warp_);
+      fused_glu = false;
     }
 
-    detail::launch_gated_glu(weights_.config().mlp_gelu, static_cast<const __half*>(d_ff1_), static_cast<const __half*>(d_ff2_),
-                             static_cast<__half*>(d_ff2_), inter, compute_stream_);
+    if (!fused_glu) {
+      detail::launch_gated_glu(weights_.config().mlp_gelu, static_cast<const __half*>(d_ff1_),
+                               static_cast<const __half*>(d_ff2_), static_cast<__half*>(d_ff2_),
+                               inter, compute_stream_);
+    }
 
     if (tq) {
       // w2 stays fp16 for TQ3 (intermediate_size is not power-of-2).
@@ -413,6 +433,17 @@ void LlamaEngine::init_greedy_decode_graph() {
   }
   CUDA_CHECK(
       cudaGraphInstantiate(&greedy_decode_graph_exec_, greedy_decode_graph_, nullptr, nullptr, 0));
+
+  // How many kernels does one decoded token actually cost? At batch 1 on a small model,
+  // per-kernel scheduling overhead -- not bandwidth -- is what separates us from the
+  // roofline, so the node count is the number to optimise against.
+  if (std::getenv("LLAMA_INFER_GRAPH_NODES")) {
+    std::size_t n = 0;
+    cudaGraphGetNodes(greedy_decode_graph_, nullptr, &n);
+    std::cerr << "[graph] greedy decode graph: " << n << " nodes ("
+              << (cfg.num_layers > 0 ? static_cast<double>(n) / cfg.num_layers : 0.0)
+              << " per layer)\n";
+  }
   greedy_decode_graph_ready_ = true;
   greedy_decode_graph_state_valid_ = false;
   if (options_.verbose) {

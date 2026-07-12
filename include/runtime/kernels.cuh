@@ -838,6 +838,17 @@ void launch_standardize(half* x, const half* bias, const half* scale, int tokens
 void launch_gelu_mul_strided(const half* a, const half* b, half* out, int n, int tokens,
                              int b_stride, cudaStream_t stream);
 
+// launch_swiglu_gemv_f16
+//
+// Fused SwiGLU projection: out[i] = silu(dot(w_gate[i], x)) * dot(w_up[i], x).
+// Replaces gate-GEMV + up-GEMV + silu_mul (3 kernels -> 1). At batch 1 each kernel costs
+// a fixed ~2.7us of scheduling regardless of its size, and that tax -- not bandwidth --
+// is what separates a small model from the roofline.
+// g and u are rounded to fp16 before the multiply, exactly as the unfused path does when
+// it stores them between kernels, so the result is BYTE-IDENTICAL.
+void launch_swiglu_gemv_f16(const half* w_gate, const half* w_up, const half* x, half* out,
+                            int inter, int in_features, cudaStream_t stream);
+
 // launch_rope_seq_table
 //
 // RoPE over a whole prompt chunk: token t sits at position start_position + t. Same
