@@ -540,14 +540,17 @@ function inspectLl2cQuantInfo(modelPath) {
 function buildQuantState(modelPath, extraArgs, { isSafetensorsDir = false, family = "" } = {}) {
   const configuredMode = parseConfiguredQuantMode(extraArgs);
   const normalizedFamily = String(family || "").toLowerCase();
-  // Engines that quantize weights at LOAD from a safetensors directory (--weight-quant).
-  // Gemma 4 runs on the same plan executor as Qwen3.5 and quantizes the same way; leaving
-  // it out reported the model as having no quantized variants when it plainly does.
-  const nativeQuantSafetensors =
-    isSafetensorsDir && (normalizedFamily === "qwen3_5" || normalizedFamily === "gemma4");
-  const qwen35Safetensors = nativeQuantSafetensors;
+  // Engines that quantize weights at LOAD (--weight-quant), needing no LL2C conversion.
+  // That is the PLAN EXECUTOR's capability, not one model's: it serves Gemma 4 (from a
+  // .cpi container OR a safetensors directory) and Qwen3.5 alike. Keying this on
+  // "qwen3_5 + safetensors" reported Gemma as having no quantized variants at all --
+  // while we run it at int8/int4 daily.
+  const isCpi = String(modelPath || "").toLowerCase().endsWith(".cpi");
+  const nativeRuntimeQuant =
+    isCpi || (isSafetensorsDir && (normalizedFamily === "qwen3_5" || normalizedFamily === "gemma4"));
+  const qwen35Safetensors = nativeRuntimeQuant;
   const fallback = {
-    format: isSafetensorsDir ? "safetensors" : "unknown",
+    format: isSafetensorsDir ? "safetensors" : isCpi ? "cpi" : "unknown",
     configuredMode,
     recommendedMode: configuredMode,
     effectiveMode: qwen35Safetensors
@@ -565,11 +568,11 @@ function buildQuantState(modelPath, extraArgs, { isSafetensorsDir = false, famil
       expertIntermediateSize: 0
     },
     conversion: {
-      int8: qwen35Safetensors
-        ? { state: "native-runtime", reason: "Native Qwen3.5 safetensors runtime supports explicit int8 execution without LL2C conversion." }
+      int8: nativeRuntimeQuant
+        ? { state: "native-runtime", reason: "The plan executor quantizes this model's weights at load; no LL2C conversion needed." }
         : { state: "unavailable", reason: "LL2C model required for streaming quant conversion." },
-      int4: qwen35Safetensors
-        ? { state: "native-runtime", reason: "Native Qwen3.5 safetensors runtime supports explicit int4 execution without LL2C conversion." }
+      int4: nativeRuntimeQuant
+        ? { state: "native-runtime", reason: "The plan executor quantizes this model's weights at load; no LL2C conversion needed." }
         : { state: "unavailable", reason: "LL2C model required for streaming quant conversion." }
     }
   };

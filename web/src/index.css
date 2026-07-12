@@ -1107,3 +1107,146 @@ input[type="range"] { width: 100%; accent-color: var(--accent); cursor: pointer;
   color: var(--muted, #8a92a6);
   border-color: var(--border, #2a2f3a);
 }
+
+/* --- capability chips shared by the strip, the topbar button and the picker --- */
+.capsline { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 0.25rem; }
+.capsline-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.05rem 0.4rem;
+  border-radius: 999px;
+  border: 1px solid rgba(134, 227, 155, 0.28);
+  background: rgba(134, 227, 155, 0.08);
+  color: #86e39b;
+  font-size: 0.65rem;
+  line-height: 1.5;
+  white-space: nowrap;
+  cursor: help;
+}
+.capsline-dim {
+  color: var(--muted, #8a92a6);
+  border-color: var(--border, #2a2f3a);
+  background: transparent;
+}
+.capsline-compact .capsline-chip { font-size: 0.6rem; padding: 0.02rem 0.32rem; }
+
+/* --- topbar model button --- */
+.topbar-model {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  max-width: 42ch;
+  padding: 0.3rem 0.6rem;
+  border-radius: 8px;
+  border: 1px solid var(--border, #2a2f3a);
+  background: var(--surface-2, rgba(255, 255, 255, 0.04));
+  color: inherit;
+  font: inherit;
+  font-size: 0.82rem;
+  cursor: pointer;
+}
+
+.topbar-model:hover:not(:disabled) { background: rgba(255, 255, 255, 0.07); }
+.topbar-model:disabled { opacity: 0.55; cursor: default; }
+.topbar-model-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.topbar-model-caret { opacity: 0.45; font-size: 0.7rem; }
+
+/* --- model picker --- */
+.mp-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 4.5rem 1rem 1rem;
+}
+.mp {
+  width: min(760px, 100%);
+  max-height: min(72vh, 720px);
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border, #2a2f3a);
+  border-radius: 12px;
+  background: var(--surface, #14171e);
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.5);
+  overflow: hidden;
+}
+.mp-head { display: flex; gap: 0.5rem; padding: 0.7rem; border-bottom: 1px solid var(--border, #2a2f3a); }
+.mp-search {
+  flex: 1 1 auto;
+  padding: 0.5rem 0.65rem;
+  border-radius: 8px;
+  border: 1px solid var(--border, #2a2f3a);
+  background: var(--surface-2, rgba(255, 255, 255, 0.04));
+  color: inherit;
+  font: inherit;
+  font-size: 0.86rem;
+}
+.mp-search:focus { outline: none; border-color: #5b7cfa; }
+.mp-close {
+  flex: 0 0 auto;
+  width: 2rem;
+  border-radius: 8px;
+  border: 1px solid var(--border, #2a2f3a);
+  background: transparent;
+  color: inherit;
+  opacity: 0.65;
+  cursor: pointer;
+}
+.mp-close:hover { opacity: 1; background: rgba(255, 255, 255, 0.06); }
+.mp-list { overflow-y: auto; padding: 0.35rem; }
+.mp-empty { padding: 1.5rem; text-align: center; opacity: 0.6; font-size: 0.85rem; }
+.mp-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.6rem 0.65rem;
+  border-radius: 9px;
+  border: 1px solid transparent;
+}
+.mp-row + .mp-row { margin-top: 0.15rem; }
+.mp-row:hover { background: rgba(255, 255, 255, 0.035); }
+.mp-row-on { border-color: rgba(91, 124, 250, 0.45); background: rgba(91, 124, 250, 0.08); }
+.mp-row-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 0.3rem; }
+.mp-name {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 0.9rem;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mp-current {
+  font-size: 0.6rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 0.05rem 0.35rem;
+  border-radius: 999px;
+  background: rgba(91, 124, 250, 0.2);
+  color: #9db2ff;
+}
+.mp-variants { flex: 0 0 auto; display: flex; gap: 0.3rem; flex-wrap: wrap; justify-content: flex-end; }
+.mp-var {
+  padding: 0.28rem 0.55rem;
+  border-radius: 7px;
+  border: 1px solid var(--border, #2a2f3a);
+  background: var(--surface-2, rgba(255, 255, 255, 0.04));
+  color: inherit;
+  font: inherit;
+  font-size: 0.72rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.mp-var:hover { background: rgba(255, 255, 255, 0.09); }
+.mp-var-on { border-color: #5b7cfa; background: rgba(91, 124, 250, 0.18); color: #cdd8ff; }
+.mp-foot {
+  padding: 0.55rem 0.75rem;
+  border-top: 1px solid var(--border, #2a2f3a);
+  font-size: 0.7rem;
+  opacity: 0.5;
+}

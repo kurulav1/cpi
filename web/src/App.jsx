@@ -200,8 +200,9 @@ function buildModelGroups(profiles) {
   const byBase = new Map();
   for (const p of profiles || []) {
     const d = modelDisplay(p);
-    if (!byBase.has(d.base)) byBase.set(d.base, { base: d.base, variants: [] });
+    if (!byBase.has(d.base)) byBase.set(d.base, { base: d.base, variants: [], profiles: [] });
     const g = byBase.get(d.base);
+    g.profiles.push(p);
     if (d.pinned) {
       // Pre-packed / streaming file → one fixed variant (its baked format).
       const fmtRank = d.fmt === "int4" ? 2 : d.fmt === "int8" ? 1 : 0;
@@ -236,9 +237,146 @@ function buildModelGroups(profiles) {
     const hasFullPrecision = g.variants.some((v) => v.order < 10);
     if (hasFullPrecision) g.variants = g.variants.filter((v) => v.order < 10);
     g.variants.sort((a, b) => a.order - b.order);
+    // Capabilities are a property of the MODEL, so take them from its full-precision
+    // profile when there is one (a pre-packed streaming build reports no batching, which
+    // would misrepresent the model itself).
+    const primary = g.profiles.find((p) => !modelDisplay(p).pinned) ?? g.profiles[0];
+    g.caps = primary?.capabilities ?? null;
+    g.family = primary?.family ?? "";
   }
   groups.sort((a, b) => a.base.localeCompare(b.base));
   return groups;
+}
+
+// Compact capability chips, shown for EVERY model in the picker so you can compare
+// before selecting instead of choosing blind and finding out afterwards.
+function CapsInline({ caps, compact = false }) {
+  if (!caps) return null;
+  const ctx = !caps.maxContext
+    ? null
+    : caps.maxContext >= 1048576
+      ? `${Math.round(caps.maxContext / 1048576)}M`
+      : `${Math.round(caps.maxContext / 1024)}K`;
+  const on = [];
+  if (caps.vision) on.push({ k: "Images", t: "Can take images (attach or paste a PNG)." });
+  if (caps.reasoning !== "none")
+    on.push({
+      k: caps.reasoning === "always" ? "Thinking*" : "Thinking",
+      t: caps.reasoning === "always" ? "Always reasons before answering." : "Reasoning can be switched on per request.",
+    });
+  if (caps.batching) on.push({ k: "Batching", t: "Continuous batching: many requests share one worker." });
+  if (caps.moe) on.push({ k: "MoE", t: "Mixture of experts — only a few experts run per token." });
+  if (caps.streamingWeights) on.push({ k: "Streamed", t: "Weights stream from disk; runs models larger than VRAM." });
+  return (
+    <span className={`capsline ${compact ? "capsline-compact" : ""}`}>
+      {on.map((c) => (
+        <span key={c.k} className="capsline-chip" title={c.t}>{c.k}</span>
+      ))}
+      {caps.quant?.length > 0 && (
+        <span className="capsline-chip capsline-dim" title={`Quantizable: ${caps.quant.join(", ")}`}>
+          {caps.quant.map((q) => q.toUpperCase()).join("/")}
+        </span>
+      )}
+      {ctx && <span className="capsline-chip capsline-dim" title={`${caps.maxContext.toLocaleString()} token context`}>{ctx}</span>}
+      {on.length === 0 && !caps.quant?.length && <span className="capsline-chip capsline-dim">text only</span>}
+    </span>
+  );
+}
+
+// Model picker. A dropdown of bare names makes you choose blind; this shows what each
+// model can DO before you pick it, and lets you land directly on a precision variant.
+function ModelPicker({ open, groups, currentProfileId, currentKey, onPick, onClose }) {
+  const [q, setQ] = useState("");
+  const boxRef = useRef(null);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    const onClick = (e) => { if (boxRef.current && !boxRef.current.contains(e.target)) onClose(); };
+    document.addEventListener("keydown", onKey);
+    document.addEventListener("mousedown", onClick);
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      document.removeEventListener("mousedown", onClick);
+    };
+  }, [open, onClose]);
+
+  if (!open) return null;
+
+  const needle = q.trim().toLowerCase();
+  const shown = groups.filter((g) => {
+    if (!needle) return true;
+    if (g.base.toLowerCase().includes(needle)) return true;
+    // Let people search by capability: "image", "thinking", "moe", "batch"...
+    const caps = g.caps || {};
+    const words = [
+      caps.vision ? "image vision" : "",
+      caps.reasoning !== "none" ? "thinking reasoning" : "",
+      caps.batching ? "batching" : "",
+      caps.moe ? "moe" : "",
+      caps.streamingWeights ? "streaming" : "",
+      ...(caps.quant ?? []),
+      g.family || "",
+    ].join(" ").toLowerCase();
+    return words.includes(needle);
+  });
+
+  return (
+    <div className="mp-backdrop">
+      <div className="mp" ref={boxRef} role="dialog" aria-label="Choose a model">
+        <div className="mp-head">
+          <input
+            className="mp-search"
+            autoFocus
+            placeholder="Search models or capabilities (image, thinking, moe...)"
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+          />
+          <button type="button" className="mp-close" onClick={onClose} title="Close">x</button>
+        </div>
+
+        <div className="mp-list">
+          {shown.length === 0 && <div className="mp-empty">Nothing matches "{q}".</div>}
+          {shown.map((g) => {
+            const isCurrent = g.variants.some((v) => v.profileId === currentProfileId);
+            return (
+              <div key={g.base} className={`mp-row ${isCurrent ? "mp-row-on" : ""}`}>
+                <div className="mp-row-main">
+                  <div className="mp-name">
+                    {g.base}
+                    {isCurrent && <span className="mp-current">current</span>}
+                  </div>
+                  <CapsInline caps={g.caps} />
+                </div>
+                <div className="mp-variants">
+                  {g.variants.map((v) => (
+                    <button
+                      key={v.key}
+                      type="button"
+                      className={`mp-var ${v.key === currentKey ? "mp-var-on" : ""}`}
+                      title={
+                        v.quantMode === "none"
+                          ? "Full precision"
+                          : `Quantized at load (${v.quantMode}) — smaller and faster, slight quality cost`
+                      }
+                      onClick={() => { onPick(v); onClose(); }}
+                    >
+                      {v.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        <div className="mp-foot">
+          Capabilities come from each model itself (its config and shipped descriptors) --
+          nothing here is hard-coded per model.
+        </div>
+      </div>
+    </div>
+  );
 }
 
 // Turn low-level engine errors into something a user can act on.
@@ -1089,6 +1227,7 @@ export default function App() {
   const [draft,    setDraft]    = useState("");
   // Attached image (PNG data URL) for models that declare a vision tower.
   const [image,    setImage]    = useState(null);   // { dataUrl, name }
+  const [modelPickerOpen, setModelPickerOpen] = useState(false);
   const fileRef = useRef(null);
   const [health,   setHealth]   = useState({ ready:false, busy:false, activeKind:null, config:null });
   const [settings, setSettings] = useState(() => ({
@@ -1647,27 +1786,28 @@ export default function App() {
         <span className="topbar-brand">CPI</span>
         <span className="topbar-sep" />
 
-        {/* Model selector (base name) */}
-        <select
-          className="topbar-select"
-          value={selectedGroup?.base || ""}
-          disabled={streaming}
-          onChange={(e) => {
-            const g = modelGroups.find((x) => x.base === e.target.value);
-            // Default to FP16 (non-streaming) if available, else the first variant.
-            const def = g?.variants.find((v) => v.quantMode === "none" && !v.label.includes("streaming"))
-              || g?.variants[0];
-            applyVariant(def);
-          }}
-          title="Model"
+        {/* Model selector — opens a picker that shows each model's capabilities. */}
+        <button
+          type="button"
+          className="topbar-model"
+          disabled={streaming || modelGroups.length === 0}
+          onClick={() => setModelPickerOpen(true)}
+          title="Choose a model — see what each one supports"
         >
-          {modelGroups.length === 0 && (
-            <option value="">{health.config ? "No models found" : "Loading"}</option>
-          )}
-          {modelGroups.map((g) => (
-            <option key={g.base} value={g.base}>{g.base}</option>
-          ))}
-        </select>
+          <span className="topbar-model-name">
+            {selectedGroup?.base || (health.config ? "No models found" : "Loading")}
+          </span>
+          {selectedGroup?.caps && <CapsInline caps={selectedGroup.caps} compact />}
+          <span className="topbar-model-caret">v</span>
+        </button>
+        <ModelPicker
+          open={modelPickerOpen}
+          groups={modelGroups}
+          currentProfileId={settings.profileId}
+          currentKey={currentVarKey}
+          onPick={applyVariant}
+          onClose={() => setModelPickerOpen(false)}
+        />
 
         {/* Variant / precision selector (FP16 · INT8 · INT4 · streaming) */}
         <select
