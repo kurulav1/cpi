@@ -838,6 +838,17 @@ void launch_standardize(half* x, const half* bias, const half* scale, int tokens
 void launch_gelu_mul_strided(const half* a, const half* b, half* out, int n, int tokens,
                              int b_stride, cudaStream_t stream);
 
+// launch_gemv_splitk_f16
+//
+// GEMV with one BLOCK per output row and 8 warps splitting the input dimension.
+// The default GEMV gives one WARP per row, so its parallelism is the ROW COUNT -- ample for
+// a 151936-row LM head, and only ~10% of the GPU for a 896-row o_proj, which then runs 8x
+// off peak because memory latency is never hidden. Use this for SHORT-and-wide GEMVs.
+// Reduction order differs from the one-warp kernel, so results are equal to fp32 rounding
+// but NOT bit-identical -- opt in per call site.
+void launch_gemv_splitk_f16(const half* w, const half* x, half* y, int out_features,
+                            int in_features, cudaStream_t stream, half* residual = nullptr);
+
 // launch_swiglu_gemv_f16
 //
 // Fused SwiGLU projection: out[i] = silu(dot(w_gate[i], x)) * dot(w_up[i], x).
