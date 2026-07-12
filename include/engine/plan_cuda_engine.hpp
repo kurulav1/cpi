@@ -169,7 +169,26 @@ class PlanCudaEngine : public runtime::SequenceModel {
   // Execute an op list against `position` (RoPE/KV/attention need it). `layer` is
   // the owning layer for cache-indexed ops (KvStore/Attention); pass -1 for the
   // prologue/epilogue, which contain none.
-  void execute_ops(const opplan::Op* ops, std::size_t n, int layer, int position);
+  // Execution context. Decode runs one token against a KV cache; a vision encoder
+  // runs a whole SEQUENCE of patches with no cache and no causal mask. Both drive the
+  // same op list through the same executor -- only the context differs.
+  //
+  // INVARIANT: at tokens == 1 every op takes the identical kernel + arguments it took
+  // before sequence mode existed. Byte-identical decode is therefore structural, not
+  // something we test for and hope: a GEMM and a GEMV do not sum K in the same order
+  // (measured drift 1e-3), so single-token work must never wander onto the GEMM path.
+  struct ExecCtx {
+    __half* const* slots = nullptr;  // which slot table (text or vision)
+    int tokens = 1;                  // 1 = decode; N = sequence
+    bool causal = true;              // false = bidirectional (vision)
+  };
+  ExecCtx decode_ctx() const { return ExecCtx{slot_ptr_.data(), 1, true}; }
+
+  void execute_ops(const opplan::Op* ops, std::size_t n, int layer, int position) {
+    execute_ops(ops, n, layer, position, decode_ctx());
+  }
+  void execute_ops(const opplan::Op* ops, std::size_t n, int layer, int position,
+                   const ExecCtx& ctx);
   void run_layer(int layer, int position);  // executes plan_.layers[layer].ops
   float* lin_conv_state(int layer);         // this layer's rolling causal-conv window
   float* lin_recurrent_state(int layer);    // this layer's delta-net recurrent state

@@ -122,6 +122,7 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
     src/kernels/kernels_attention_decode_int4.cu
     src/kernels/kernels_ops_matvec.cu
     src/kernels/kernels_moe_experts.cu
+    src/kernels/kernels_gemm.cu
     src/kernels/kernels_weight_only_matvec.cu
     src/kernels/kernels_turboquant.cu
     src/engine/tensor_parallel.cpp
@@ -291,6 +292,17 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
   )
   add_test(NAME moe_kernel_parity_test COMMAND moe_kernel_parity_test)
+
+  # Sequence-mode fp16 GEMM parity (vs a CPU reference and vs the GEMV).
+  add_executable(gemm_parity_test
+    src/tests/gemm_parity_test.cu
+  )
+  target_include_directories(gemm_parity_test PRIVATE include)
+  target_link_libraries(gemm_parity_test PRIVATE llama_engine)
+  set_target_properties(gemm_parity_test PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+  )
 
   # Gemma 4 forward parity driver (checks the fork engine against the HF oracle).
   add_executable(gemma4_forward_test

@@ -1112,9 +1112,17 @@ void PlanCudaEngine::build_plan() {
 // runtime-varying inputs are `position` (RoPE / KV store / attention window) and
 // the executor's device token buffer (EmbeddingLookup). `layer` selects the
 // cache for KvStore/Attention; the prologue/epilogue pass -1 (no such ops).
-void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer, int position) {
+void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer, int position,
+                                 const ExecCtx& ctx) {
   using namespace opplan;
-  auto S = [&](Slot s) -> __half* { return slot_ptr_[static_cast<int>(s)]; };
+  auto S = [&](Slot s) -> __half* { return const_cast<__half*>(ctx.slots[static_cast<int>(s)]); };
+  // Sequence mode multiplies an op's extent by the token count. RmsNorm normalises
+  // over `cols` in groups of `rows`, and slots are [tokens][rows*cols] contiguous, so
+  // N tokens is just N times as many groups -- no new kernel.
+  const int T = ctx.tokens;
+  const bool seq = T > 1;
+  auto rows_x = [&](int rows) { return rows * T; };
+  auto len_x = [&](int len) { return len * T; };
   for (std::size_t idx = 0; idx < n; ++idx) {
     const Op& op = ops[idx];
     switch (op.kind) {
@@ -1128,11 +1136,11 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
       case OpKind::RmsNorm:
         // norm_offset ⇒ the weight is applied as (1 + w) (Qwen3.5-style).
         if (op.norm_offset) {
-          kernels::launch_rmsnorm_offset(S(op.in), op.weight, S(op.out), op.rows, op.cols,
+          kernels::launch_rmsnorm_offset(S(op.in), op.weight, S(op.out), rows_x(op.rows), op.cols,
                                          cfg_.rms_eps, stream_);
         } else {
-          kernels::launch_rmsnorm(S(op.in), op.weight ? op.weight : d_ones_, S(op.out), op.rows,
-                                  op.cols, cfg_.rms_eps, stream_);
+          kernels::launch_rmsnorm(S(op.in), op.weight ? op.weight : d_ones_, S(op.out),
+                                  rows_x(op.rows), op.cols, cfg_.rms_eps, stream_);
         }
         break;
       case OpKind::Gemv:
@@ -1152,6 +1160,9 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
         } else if (op.qbits == 8) {
           kernels::launch_weight_only_int8_matvec(op.qweight, op.qscales, S(op.in), S(op.out),
                                                   op.cols, op.in_dim, stream_);
+        } else if (seq) {
+          kernels::launch_rowmajor_half_gemm_f16(op.weight, S(op.in), S(op.out), op.cols, op.in_dim,
+                                                 T, stream_);
         } else {
           kernels::launch_rowmajor_half_gemv_f16(op.weight, S(op.in), S(op.out), op.cols, op.in_dim,
                                                  stream_);
@@ -1200,10 +1211,11 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
         break;
       }
       case OpKind::ScaleCopy:
-        kernels::launch_scale_copy(S(op.in), S(op.out), op.cols, op.scale, stream_);
+        kernels::launch_scale_copy(S(op.in), S(op.out), len_x(op.cols), op.scale, stream_);
         break;
       case OpKind::CopySlot:
-        G4_CHECK(cudaMemcpyAsync(S(op.out), S(op.in), static_cast<std::size_t>(op.cols) * sizeof(__half),
+        G4_CHECK(cudaMemcpyAsync(S(op.out), S(op.in),
+                                 static_cast<std::size_t>(len_x(op.cols)) * sizeof(__half),
                                  cudaMemcpyDeviceToDevice, stream_));
         break;
       case OpKind::KvStore: {
@@ -1222,6 +1234,15 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
         break;
       }
       case OpKind::Attention: {
+        if (seq) {
+          // Sequence mode: Q/K/V for the whole sequence are in the slots, so the K/V
+          // slots ARE the "cache" -- a vision encoder keeps no KV cache at all. causal
+          // comes from the context (false for a bidirectional tower).
+          kernels::launch_attention_prefill(S(op.in), S(Slot::K), S(Slot::V), S(op.out), T, 0,
+                                            op.heads, op.kv_heads, op.head_dim, stream_,
+                                            ctx.causal);
+          break;
+        }
         __half* kc = caches_k_[layer];
         __half* vc = caches_v_[layer];
         const std::size_t kvdim = static_cast<std::size_t>(op.kv_heads) * op.head_dim;
@@ -1246,17 +1267,17 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
       }
       case OpKind::GeluMul: {
         const __half* b = op.aux_ptr ? op.aux_ptr : S(op.in2);
-        kernels::launch_gelu_mul(S(op.in), b, S(op.out), op.cols, stream_);
+        kernels::launch_gelu_mul(S(op.in), b, S(op.out), len_x(op.cols), stream_);
         break;
       }
       case OpKind::AddInplace:
-        kernels::launch_add_inplace(S(op.out), S(op.in), op.cols, stream_);
+        kernels::launch_add_inplace(S(op.out), S(op.in), len_x(op.cols), stream_);
         break;
 
       // ── gated / linear-attention ("delta-net") extensions ──
       case OpKind::SiluMul: {
         const __half* b = op.aux_ptr ? op.aux_ptr : S(op.in2);
-        kernels::launch_silu_mul(S(op.in), b, S(op.out), op.cols, stream_);
+        kernels::launch_silu_mul(S(op.in), b, S(op.out), len_x(op.cols), stream_);
         break;
       }
       case OpKind::SplitHeadHalves:

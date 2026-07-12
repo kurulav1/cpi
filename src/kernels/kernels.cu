@@ -441,7 +441,7 @@ __device__ __forceinline__ int cache_index(int t, int head, int d, int num_heads
 __global__ void attention_prefill_kernel_fallback(const half* q, const half* k_cache,
                                                   const half* v_cache, half* out, int num_tokens,
                                                   int start_position, int num_heads,
-                                                  int num_kv_heads, int head_dim) {
+                                                  int num_kv_heads, int head_dim, int causal) {
   extern __shared__ unsigned char smem_bytes[];
   half* q_shared = reinterpret_cast<half*>(smem_bytes);
   float* red = reinterpret_cast<float*>(q_shared + head_dim);
@@ -472,7 +472,9 @@ __global__ void attention_prefill_kernel_fallback(const half* q, const half* k_c
   float running_m = -1.0e30f;
   float running_l = 0.0f;
   float acc = 0.0f;
-  const int limit = start_position + token + 1;
+  // causal: this token sees only the prefix. Non-causal (the vision encoder):
+  // every token sees the whole sequence.
+  const int limit = causal ? (start_position + token + 1) : (start_position + num_tokens);
   for (int t = 0; t < limit; ++t) {
     float partial_dot = 0.0f;
     const int base = cache_index(t, kv_head, 0, num_kv_heads, head_dim);
@@ -523,7 +525,7 @@ template <int WarpsPerBlock>
 __global__ void attention_prefill_kernel_tiled(const half* q, const half* k_cache,
                                                const half* v_cache, half* out, int num_tokens,
                                                int start_position, int num_heads, int num_kv_heads,
-                                               int head_dim) {
+                                               int head_dim, int causal) {
   extern __shared__ unsigned char smem_bytes[];
   half* q_shared = reinterpret_cast<half*>(smem_bytes);
   float* score_shared = reinterpret_cast<float*>(q_shared + head_dim);
@@ -549,7 +551,9 @@ __global__ void attention_prefill_kernel_tiled(const half* q, const half* k_cach
   const int kv_head =
       ((head / group_size) < kv_heads_safe) ? (head / group_size) : (kv_heads_safe - 1);
   const int head_pairs = head_dim / 2;
-  const int limit = start_position + token + 1;
+  // causal: this token sees only the prefix. Non-causal (the vision encoder):
+  // every token sees the whole sequence.
+  const int limit = causal ? (start_position + token + 1) : (start_position + num_tokens);
 
   for (int d = tid; d < head_dim; d += blockDim.x) {
     q_shared[d] = q[q_base + d];
@@ -875,7 +879,8 @@ void launch_rope_inplace_perpos(half* q, half* k, int num_tokens, int num_heads_
 }
 void launch_attention_prefill(const half* q, const half* k_cache, const half* v_cache, half* out,
                               int num_tokens, int start_position, int num_heads, int num_kv_heads,
-                              int head_dim, cudaStream_t stream) {
+                              int head_dim, cudaStream_t stream, bool causal) {
+  const int causal_i = causal ? 1 : 0;
   const dim3 grid(num_heads, num_tokens);
   if (head_dim > 0 && (head_dim % 2) == 0 && head_dim <= 256) {
     if (head_dim <= 64) {
@@ -884,7 +889,8 @@ void launch_attention_prefill(const half* q, const half* k_cache, const half* v_
       const std::size_t smem = static_cast<std::size_t>(head_dim) * sizeof(half) +
                                static_cast<std::size_t>(3 * warps + 2) * sizeof(float);
       attention_prefill_kernel_tiled<warps><<<grid, threads, smem, stream>>>(
-          q, k_cache, v_cache, out, num_tokens, start_position, num_heads, num_kv_heads, head_dim);
+          q, k_cache, v_cache, out, num_tokens, start_position, num_heads, num_kv_heads, head_dim,
+          causal_i);
       return;
     }
 
@@ -893,7 +899,8 @@ void launch_attention_prefill(const half* q, const half* k_cache, const half* v_
     const std::size_t smem = static_cast<std::size_t>(head_dim) * sizeof(half) +
                              static_cast<std::size_t>(3 * warps + 2) * sizeof(float);
     attention_prefill_kernel_tiled<warps><<<grid, threads, smem, stream>>>(
-        q, k_cache, v_cache, out, num_tokens, start_position, num_heads, num_kv_heads, head_dim);
+        q, k_cache, v_cache, out, num_tokens, start_position, num_heads, num_kv_heads, head_dim,
+        causal_i);
     return;
   }
 
@@ -901,7 +908,8 @@ void launch_attention_prefill(const half* q, const half* k_cache, const half* v_
   const std::size_t smem = static_cast<std::size_t>(head_dim) * sizeof(half) +
                            static_cast<std::size_t>(threads + 3) * sizeof(float);
   attention_prefill_kernel_fallback<<<grid, threads, smem, stream>>>(
-      q, k_cache, v_cache, out, num_tokens, start_position, num_heads, num_kv_heads, head_dim);
+      q, k_cache, v_cache, out, num_tokens, start_position, num_heads, num_kv_heads, head_dim,
+      causal_i);
 }
 
 // Paged prefill attention (P3 phase 2d). K/V gathered via block_table from a

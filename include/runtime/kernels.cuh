@@ -312,9 +312,12 @@ void launch_increment_int(int* value, cudaStream_t stream);
 // Grid: (num_heads, num_tokens); one block per (head, token) pair.
 // Kernel selection: tiled (flash-attention style) when head_dim even and
 // <=256, otherwise scalar per-token online softmax fallback.
+//   causal       - true (default): each token attends only to its own prefix.
+//                  false: every token attends to the WHOLE sequence -- the
+//                  bidirectional self-attention a vision encoder needs.
 void launch_attention_prefill(const half* q, const half* k_cache, const half* v_cache, half* out,
                               int num_tokens, int start_position, int num_heads, int num_kv_heads,
-                              int head_dim, cudaStream_t stream);
+                              int head_dim, cudaStream_t stream, bool causal = true);
 
 // Paged prefill attention + paged KV scatter (P3 phase 2d). K/V live in a block
 // pool; block_table maps logical chunk -> physical block (block_size tokens each).
@@ -774,6 +777,16 @@ void launch_weight_only_int4_matvec_dual_dp4a(
 //                     out_features >= 8192 heuristic when 0)
 //   tile_pairs      - half2 elements staged per shared-memory tile (128 or 256)
 //   rows_per_warp   - output rows assigned to each warp (1 or 2)
+// launch_rowmajor_half_gemm_f16
+//
+// Sequence-mode GEMM: y[t, m] = sum_k w[m, k] * x[t, k], for `tokens` rows of x.
+// Same weight layout as the GEMV below, so one bound weight serves both.
+//
+// A tiled GEMM sums K in a different order than the GEMV, so the two do NOT agree
+// bit-for-bit -- single-token work must keep using the GEMV or decode output shifts.
+void launch_rowmajor_half_gemm_f16(const half* w, const half* x, half* y, int out_features,
+                                   int in_features, int tokens, cudaStream_t stream);
+
 void launch_rowmajor_half_gemv_f16(const half* w, const half* x, half* y, int out_features,
                                    int in_features, cudaStream_t stream, int warps_per_block = 0,
                                    int tile_pairs = 0, int rows_per_warp = 1);
