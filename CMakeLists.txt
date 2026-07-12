@@ -102,6 +102,7 @@ set(LLAMA_ENGINE_SOURCES
   src/model/safetensors_loader.cpp
   src/model/hf_bpe_tokenizer.cpp
   src/model/tokenizer.cpp
+  src/model/png.cpp
   src/model/wordpiece_tokenizer.cpp
   src/engine/embedding_config.cpp
   src/grammar/grammar.cpp
@@ -293,6 +294,13 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
   )
   add_test(NAME moe_kernel_parity_test COMMAND moe_kernel_parity_test)
+
+  # Hand-rolled PNG decoder: byte-exact vs fixtures made with a real DEFLATE encoder.
+  add_executable(png_test
+    src/tests/png_test.cpp
+  )
+  target_include_directories(png_test PRIVATE include)
+  target_link_libraries(png_test PRIVATE llama_engine)
 
   # Vision-tower parity against the HF oracle (tools/gemma4_vision_oracle.py).
   add_executable(vision_forward_test
