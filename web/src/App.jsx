@@ -3,6 +3,9 @@ import ReactMarkdown from "react-markdown";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
+import rehypeKatex from "rehype-katex";
+import remarkMath from "remark-math";
+import "katex/dist/katex.min.css";
 import { fetchHealth, streamChat } from "./lib/chatStream";
 
 const TEMPLATES = [
@@ -591,8 +594,14 @@ function MsgContent({ text }) {
   return (
     <div className="msg-rich">
       <ReactMarkdown
-        remarkPlugins={[remarkGfm, remarkBreaks]}
-        rehypePlugins={[[rehypeHighlight, { detect: true, ignoreMissing: true }]]}
+        remarkPlugins={[remarkGfm, remarkMath, remarkBreaks]}
+        rehypePlugins={[
+          // throwOnError: a half-streamed formula ("$O(n \lo") is a normal intermediate
+          // state, not an error -- KaTeX must render what it can and leave the rest as
+          // text rather than blowing up the whole message mid-stream.
+          [rehypeKatex, { throwOnError: false, errorColor: "var(--red)", strict: false }],
+          [rehypeHighlight, { detect: true, ignoreMissing: true }],
+        ]}
         components={{
           p: ({ children }) => <p className="msg-paragraph">{children}</p>,
           h1: ({ children }) => <h1 className="msg-heading">{children}</h1>,
@@ -646,6 +655,23 @@ function formatModelMarkdown(text) {
     .replace(/\r/g, "")
     .replace(/^\n+/, "")
     .replace(/\n{3,}/g, "\n\n");
+
+  // Models are inconsistent about math delimiters. remark-math understands $…$ and
+  // $$…$$; plenty of models emit \( … \) and \[ … \] instead, which would otherwise leak
+  // backslashes and brackets into the prose. Normalise them so all of it renders.
+  clean = clean
+    .replace(/\\\[([\s\S]+?)\\\]/g, (_m, body) => `$$${body}$$`)
+    .replace(/\\\(([\s\S]+?)\\\)/g, (_m, body) => `$${body}$`);
+
+  // A dollar sign is usually MONEY. "It costs $5 and the other is $7" otherwise pairs up
+  // into inline math and renders as garbage. Deciding by pairing is hopeless (a line can
+  // hold both money and math), so target the thing that is actually recognisable: a $
+  // directly followed by a number that ENDS at a word boundary. That escapes "$5" and
+  // "$1,000.50" while leaving "$2x + 1$" alone — there the digits run into the maths.
+  clean = clean.replace(
+    /(^|[\s(])\$(\d[\d,]*(?:\.\d+)?)(?=$|[\s.,;:!?)])/gm,
+    (_m, pre, num) => `${pre}\\$${num}`
+  );
 
   // Many models emit list markers inline in one paragraph. Split those into
   // real markdown blocks so the final render preserves the intended layout.
