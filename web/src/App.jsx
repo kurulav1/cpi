@@ -520,27 +520,67 @@ function CapabilityBar({ profile }) {
   );
 }
 
-// Collapsible reasoning ("thinking") block shown above a reasoning model's
-// answer. Auto-expanded while the model is still thinking (no answer yet),
-// auto-collapses once the answer starts; the user can toggle either way.
+// Collapsible reasoning ("thinking") block shown above a reasoning model's answer.
+// Auto-expanded while the model is still thinking, auto-collapses once the answer starts;
+// the user can toggle either way, and a manual toggle wins from then on.
 function ReasoningBlock({ text, active }) {
   const [open, setOpen] = useState(true);
   const userToggled = useRef(false);
+  const startedAt = useRef(null);
+  const [seconds, setSeconds] = useState(null);   // how long it thought for
+  const bodyRef = useRef(null);
+
+  // Time the thinking, so a collapsed block still tells you what it cost.
+  useEffect(() => {
+    if (active && startedAt.current == null) startedAt.current = Date.now();
+    if (!active && startedAt.current != null && seconds == null) {
+      setSeconds((Date.now() - startedAt.current) / 1000);
+    }
+  }, [active, seconds]);
+
   useEffect(() => {
     if (!active && !userToggled.current) setOpen(false);
   }, [active]);
+
+  // Keep the newest reasoning in view while it streams (it can outrun the box).
+  useEffect(() => {
+    if (active && open && bodyRef.current) {
+      bodyRef.current.scrollTop = bodyRef.current.scrollHeight;
+    }
+  }, [text, active, open]);
+
   if (!text) return null;
+
+  const title = active
+    ? "Thinking"
+    : seconds != null
+      ? `Thought for ${seconds < 10 ? seconds.toFixed(1) : Math.round(seconds)}s`
+      : "Thought process";
+
   return (
     <div className={`reasoning ${active ? "reasoning-active" : ""}`}>
       <button
         type="button"
         className="reasoning-toggle"
+        aria-expanded={open}
         onClick={() => { userToggled.current = true; setOpen((o) => !o); }}
       >
-        <span className="reasoning-caret">{open ? "▾" : "▸"}</span>
-        {active ? "Thinking…" : "Thought process"}
+        <span className={`reasoning-caret ${open ? "reasoning-caret-open" : ""}`}>▸</span>
+        <span>{title}</span>
+        {active && (
+          <span className="think-dots" aria-hidden="true">
+            <i /><i /><i />
+          </span>
+        )}
+        {!active && <span className="reasoning-hint">{open ? "hide" : "show"}</span>}
       </button>
-      {open && <div className="reasoning-body">{text}</div>}
+      {/* grid 0fr -> 1fr animates to the content's natural height, which a plain
+          max-height transition cannot do without guessing a magic number. */}
+      <div className={`reasoning-wrap ${open ? "reasoning-wrap-open" : ""}`}>
+        <div className="reasoning-clip">
+          <div className="reasoning-body" ref={bodyRef}>{text}</div>
+        </div>
+      </div>
     </div>
   );
 }
