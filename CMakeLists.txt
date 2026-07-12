@@ -333,6 +333,17 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
   )
 
+  # LM-head GEMV bandwidth: it is ~28% of a small model's entire weight traffic.
+  add_executable(lm_head_bench
+    src/tests/lm_head_bench.cu
+  )
+  target_include_directories(lm_head_bench PRIVATE include)
+  target_link_libraries(lm_head_bench PRIVATE llama_engine)
+  set_target_properties(lm_head_bench PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+  )
+
   # Sequence-mode fp16 GEMM parity (vs a CPU reference and vs the GEMV).
   add_executable(gemm_parity_test
     src/tests/gemm_parity_test.cu
