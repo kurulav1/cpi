@@ -372,8 +372,9 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
   // only cure is to measure which op actually owns the seconds.
   static const bool profile = std::getenv("CPI_METAL_PROFILE") != nullptr;
 
+  if (profile) profile_last_ = std::chrono::steady_clock::now();
+
   for (const opplan::Op& op : ops) {
-    const auto t0 = std::chrono::steady_clock::now();
     switch (op.kind) {
       case OpKind::EmbeddingLookup: {
         EmbedParams p{static_cast<std::uint32_t>(op.cols), static_cast<std::uint32_t>(T)};
@@ -424,6 +425,7 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
           const bool qgemm_ok = op.cols % 64 == 0 && op.in_dim % 32 == 0;
           const int qgemm_tokens = qgemm_ok ? (T / kGemmBN) * kGemmBN : 0;
 
+          if (profile) profile_tick("(before gemm)");
           if (qgemm_tokens >= kGemmBN) {
             QuantParams gp = p;
             gp.tokens = static_cast<std::uint32_t>(qgemm_tokens);
@@ -431,6 +433,7 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
                                        (static_cast<std::size_t>(qgemm_tokens) / kGemmBN);
             ctx_.dispatch("cpi_gemm_quant", G::Groups, groups, kGemmTG, bufs, offs, 5, &gp,
                           sizeof(gp));
+            if (profile) profile_tick("Gemm(quant)");
           }
 
           const int qrest = T - qgemm_tokens;
@@ -445,6 +448,7 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
             ctx_.dispatch("cpi_gemv_quant", G::Groups,
                           groups_for_rows(static_cast<std::size_t>(op.cols)) * tiles, kTG, bufs,
                           roffs, 5, &rp, sizeof(rp));
+            if (profile) profile_tick("Gemv(quant remainder)");
           }
           break;
         }
@@ -605,13 +609,7 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
       default:
         throw std::runtime_error("PlanMetalEngine: unimplemented op kind");
     }
-    if (profile) {
-      ctx_.commit_and_wait();
-      const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
-                                                                  t0)
-                            .count();
-      profile_ms_[static_cast<int>(op.kind)] += ms;
-    }
+    if (profile) profile_tick(op_kind_name(static_cast<int>(op.kind)));
   }
 }
 
@@ -635,12 +633,21 @@ const char* op_kind_name(int k) {
 }
 }  // namespace
 
+// Commits what is encoded, waits, and charges the elapsed time to `name`. Only ever called
+// under CPI_METAL_PROFILE -- it serialises the pass.
+void PlanMetalEngine::profile_tick(const char* name) {
+  ctx_.commit_and_wait();
+  const auto now = std::chrono::steady_clock::now();
+  profile_ms_[name] += std::chrono::duration<double, std::milli>(now - profile_last_).count();
+  profile_last_ = now;
+}
+
 void PlanMetalEngine::dump_profile() const {
   double total = 0.0;
   for (const auto& kv : profile_ms_) total += kv.second;
   if (total <= 0.0) return;
   std::fprintf(stderr, "[metal profile] %.0f ms of GPU work, by op:\n", total);
-  std::vector<std::pair<int, double>> rows(profile_ms_.begin(), profile_ms_.end());
+  std::vector<std::pair<std::string, double>> rows(profile_ms_.begin(), profile_ms_.end());
   std::sort(rows.begin(), rows.end(),
             [](const auto& a, const auto& b) { return a.second > b.second; });
   for (const auto& r : rows) {

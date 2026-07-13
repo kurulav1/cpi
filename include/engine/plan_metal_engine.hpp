@@ -20,6 +20,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <chrono>
 #include <map>
 #include <vector>
 
@@ -100,7 +101,9 @@ private:
   void dump_profile() const;
 
  private:
-  std::map<int, double> profile_ms_;
+  void profile_tick(const char* name);
+  std::map<std::string, double> profile_ms_;
+  std::chrono::steady_clock::time_point profile_last_{};
   void encode_forward(int token, int position);
   // Encodes a whole prefill chunk: T tokens through the tower in one pass.
   void encode_prefill(const std::vector<int>& tokens, int start_position);
