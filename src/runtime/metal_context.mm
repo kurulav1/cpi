@@ -117,15 +117,18 @@ bool MetalContext::load_library(const std::string& path_hint) {
     // No prebuilt library. Fall back to compiling the MSL source at runtime, which
     // needs only the Metal framework -- so a Mac with no Xcode still works.
     const char* srcpath = std::getenv("CPI_METAL_SOURCE");
-    if (srcpath != nullptr && load_library_from_source(srcpath)) {
-      return true;
+    if (srcpath != nullptr) {
+      if (load_library_from_source(srcpath)) return true;
+      // KEEP the compiler's message. Overwriting it with a generic "failed to load"
+      // hides the one thing that says what is actually wrong with the shader.
+      return false;
     }
     last_error_ = "failed to load metallib";
     if (err != nil) {
       last_error_ += ": ";
       last_error_ += [[err localizedDescription] UTF8String];
     }
-    last_error_ += " (and CPI_METAL_SOURCE was unset or failed to compile)";
+    last_error_ += " (and CPI_METAL_SOURCE was unset)";
     return false;
   }
   library_ = (void*)lib;  // +1
