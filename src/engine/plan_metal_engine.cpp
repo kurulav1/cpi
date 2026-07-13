@@ -49,7 +49,9 @@ struct EmbedParams {
 
 // fp16 -> fp32, for the host-side quantizer. The weights are raw fp16 bytes in the
 // mmap; nothing else in this file needs to interpret them.
-namespace detail {
+//
+// NOT in a namespace called `detail`: engine::detail is the shared sampler's namespace,
+// and clang rightly calls the lookup ambiguous (MSVC silently picked one).
 inline float fp16_to_f32(std::uint16_t h) {
   const std::uint32_t sign = static_cast<std::uint32_t>(h >> 15) << 31;
   const std::uint32_t exp = (h >> 10) & 0x1F;
@@ -66,7 +68,6 @@ inline float fp16_to_f32(std::uint16_t h) {
   std::memcpy(&f, &bits, 4);
   return f;
 }
-}  // namespace detail
 
 struct QuantParams {
   std::uint32_t out_dim, in_dim, tokens, bits, group, groups, has_bias;
@@ -142,7 +143,7 @@ public:
 
           float amax = 0.0f;
           for (int j = j0; j < j1; ++j) {
-            amax = std::max(amax, std::fabs(detail::fp16_to_f32(row[j])));
+            amax = std::max(amax, std::fabs(fp16_to_f32(row[j])));
           }
           float scale = amax / max_q;
           if (scale < 1.0e-8f) scale = 1.0e-8f;
@@ -150,7 +151,7 @@ public:
 
           const float inv = 1.0f / scale;
           for (int j = j0; j < j1; ++j) {
-            int q = static_cast<int>(std::lround(detail::fp16_to_f32(row[j]) * inv));
+            int q = static_cast<int>(std::lround(fp16_to_f32(row[j]) * inv));
             if (bits_ == 4) {
               q = std::max(-8, std::min(7, q));
               const std::uint8_t nib = static_cast<std::uint8_t>(q < 0 ? q + 16 : q);
