@@ -87,7 +87,8 @@ constexpr int kGemmTG = 32 * (64 / 32) * (kGemmBN / 32);  // one simdgroup per 3
 // Below this many tokens the GEMV wins: a GEMM tile is padded out to kGemmBN and the padding
 // is wasted arithmetic. Above it the GEMV is a catastrophe -- see the dispatch below.
 constexpr int kGemmMinTokens = 16;
-constexpr int kGemmBK = 64;  // MUST match GEMM_BK in the shader
+constexpr int kGemmBK = 64;   // MUST match GEMM_BK in the shader (fp16)
+constexpr int kGemmQBK = 32;  // MUST match GEMM_QBK in the shader (quantized)
 constexpr int kQBlock = 8;  // MUST match Q_BLOCK in cpi_kernels.metal
 constexpr int kArgmaxParts = 256;
 constexpr int kGemvTile = 8;  // MUST match GEMV_TILE in cpi_kernels.metal
@@ -456,7 +457,7 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
           // group. gsz is 64 by default, which is exactly kGemmBK; a smaller group would
           // straddle, and those ops fall back to the GEMV rather than reading a wrong scale.
           const bool qgemm_ok =
-              op.cols % 64 == 0 && op.in_dim % kGemmBK == 0 && gsz >= kGemmBK;
+              op.cols % 64 == 0 && op.in_dim % kGemmQBK == 0 && gsz >= kGemmQBK;
           const int qgemm_tokens = (qgemm_ok && T >= kGemmMinTokens) ? T : 0;
 
           if (profile) profile_tick("(before gemm)");

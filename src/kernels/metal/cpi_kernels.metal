@@ -289,11 +289,19 @@ kernel void cpi_lm_head(
 #define GEMM_BN 64
 // Simdgroups tile the 64xGEMM_BN output as a grid, each owning 32x32 (4x4 fragments).
 #define GEMM_SG_COLS (GEMM_BN / 32)
-// K per stage. The fill and the matrix ops are separated by barriers, so this sets how much
-// arithmetic each barrier buys: at 64 a threadgroup fills once and then runs EIGHT matrix
-// steps, halving the barrier count against 32. It must not exceed the quantization group
-// (64 by default) or a K-block would straddle two scales -- the dispatch guards that.
+// K per stage: how much arithmetic each barrier buys, since the fill and the matrix ops are
+// separated by barriers. The two GEMMs want DIFFERENT depths, which is worth stating plainly
+// because one define for both is the obvious thing to write and it costs 8% on the 8B:
+//
+//   fp16  (GEMM_BK 64): deeper is better -- 8 matrix steps per fill instead of 4.
+//   quant (GEMM_QBK 32): deeper is WORSE. The quant tile also holds a scale row, so doubling
+//     K doubles its threadgroup memory, and the 8B's GEMM is compute-bound -- it needs the
+//     occupancy to hide latency more than it needs fewer barriers. Measured: 161 -> 148 tok/s.
+//
+// GEMM_QBK must also not exceed the quantization group (64 by default), or a K-block would
+// straddle two scales. The dispatch guards that.
 #define GEMM_BK 64
+#define GEMM_QBK 32
 
 // ---------------------------------------------------------------------------
 // Blocked fp16 GEMM (prefill). A K-block of both operands is staged in threadgroup memory,
@@ -404,7 +412,7 @@ static inline void load_qblock(threadgroup half* Ws, threadgroup float* sc_row,
 
   // One 8-weight chunk per thread per pass: a single wide load, no byte read twice. Reading
   // the packed weights a byte at a time is the defect that has bitten every kernel here.
-  const uint chunks = GEMM_BK / 8u;
+  const uint chunks = GEMM_QBK / 8u;
   for (uint c = lid; c < GEMM_BM * chunks; c += nthr) {
     const uint r = c / chunks, sub = c % chunks;
     const uint col0 = k0 + sub * 8u;
@@ -454,8 +462,8 @@ kernel void cpi_gemm_quant(device const uchar* qw [[buffer(0)]],
   const uint tok0 = (tgid / row_blocks) * GEMM_BN;
   if (tok0 >= p.tokens) return;
 
-  threadgroup half Ws[GEMM_BM * GEMM_BK];
-  threadgroup half As[GEMM_BN * GEMM_BK];
+  threadgroup half Ws[GEMM_BM * GEMM_QBK];
+  threadgroup half As[GEMM_BN * GEMM_QBK];
   threadgroup float sc_row[GEMM_BM];
 
   simdgroup_float8x8 acc[4][4];
@@ -464,14 +472,14 @@ kernel void cpi_gemm_quant(device const uchar* qw [[buffer(0)]],
 
   const uint gsz = (p.group == 0u) ? p.in_dim : p.group;
   const uint packed_row = (p.bits == 4u) ? ((p.in_dim + 1u) / 2u) : p.in_dim;
-  const uint chunks = GEMM_BK / 8u;
+  const uint chunks = GEMM_QBK / 8u;
 
-  for (uint k0 = 0u; k0 < p.in_dim; k0 += GEMM_BK) {
+  for (uint k0 = 0u; k0 < p.in_dim; k0 += GEMM_QBK) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
     load_qblock(Ws, sc_row, qw, scales, row0, k0, p.groups, gsz, p.bits, packed_row, lid, nthr);
     for (uint c = lid; c < GEMM_BN * chunks; c += nthr) {
       const uint t = c / chunks, sub = c % chunks;
-      threadgroup uint4* dst = (threadgroup uint4*)(As + t * GEMM_BK + sub * 8u);
+      threadgroup uint4* dst = (threadgroup uint4*)(As + t * GEMM_QBK + sub * 8u);
       if (tok0 + t < p.tokens) {
         *dst = *(device const uint4*)(in + (ulong)(tok0 + t) * (ulong)p.in_dim + k0 + sub * 8u);
       } else {
@@ -480,13 +488,13 @@ kernel void cpi_gemm_quant(device const uchar* qw [[buffer(0)]],
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint kk = 0u; kk < GEMM_BK; kk += 8u) {
+    for (uint kk = 0u; kk < GEMM_QBK; kk += 8u) {
       simdgroup_half8x8 wf[4], af[4];
       // Ws is K-major, so [8k x 8rows] loads straight -- no transpose.
       for (uint i = 0u; i < 4u; ++i)
         simdgroup_load(wf[i], Ws + kk * GEMM_BM + sg_row * 32u + i * 8u, GEMM_BM);
       for (uint j = 0u; j < 4u; ++j)
-        simdgroup_load(af[j], As + (sg_col * 32u + j * 8u) * GEMM_BK + kk, GEMM_BK);
+        simdgroup_load(af[j], As + (sg_col * 32u + j * 8u) * GEMM_QBK + kk, GEMM_QBK);
       for (uint i = 0u; i < 4u; ++i)
         for (uint j = 0u; j < 4u; ++j)
           simdgroup_multiply_accumulate(acc[i][j], af[j], wf[i], acc[i][j]);
