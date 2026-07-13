@@ -253,20 +253,29 @@ endif()
 # AVX2 + F16C for the CPU engine GEMV (8-wide FP32 SIMD, on-the-fly FP16
 # conversion).  Applied only to cpu_engine.cpp to avoid forcing AVX2 on CUDA
 # or kernels that do not benefit from it.
-if(MSVC)
-  set_source_files_properties(src/engine/cpu_engine.cpp PROPERTIES
-    COMPILE_OPTIONS "/arch:AVX2")
-  set_source_files_properties(src/engine/llama4_cpu_engine.cpp PROPERTIES
-    COMPILE_OPTIONS "/arch:AVX2")
-  set_source_files_properties(src/engine/qwen35_cpu_engine.cpp PROPERTIES
-    COMPILE_OPTIONS "/arch:AVX2")
+#
+# These are x86 flags and must be gated on the target ISA. Apple Silicon's clang 21
+# rejects -mavx2 outright ("unsupported option for target arm64-apple-darwin"); older
+# Apple clangs merely ignored it, which is why CI's macOS runner did not catch this.
+# The sources already compile to scalar fallbacks on non-x86.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|X86_64|amd64|AMD64|i386|i686)$")
+  if(MSVC)
+    set_source_files_properties(src/engine/cpu_engine.cpp PROPERTIES
+      COMPILE_OPTIONS "/arch:AVX2")
+    set_source_files_properties(src/engine/llama4_cpu_engine.cpp PROPERTIES
+      COMPILE_OPTIONS "/arch:AVX2")
+    set_source_files_properties(src/engine/qwen35_cpu_engine.cpp PROPERTIES
+      COMPILE_OPTIONS "/arch:AVX2")
+  else()
+    set_source_files_properties(src/engine/cpu_engine.cpp PROPERTIES
+      COMPILE_OPTIONS "-mavx2;-mf16c;-mfma")
+    set_source_files_properties(src/engine/llama4_cpu_engine.cpp PROPERTIES
+      COMPILE_OPTIONS "-mavx2;-mfma")
+    set_source_files_properties(src/engine/qwen35_cpu_engine.cpp PROPERTIES
+      COMPILE_OPTIONS "-mavx2;-mfma")
+  endif()
 else()
-  set_source_files_properties(src/engine/cpu_engine.cpp PROPERTIES
-    COMPILE_OPTIONS "-mavx2;-mf16c;-mfma")
-  set_source_files_properties(src/engine/llama4_cpu_engine.cpp PROPERTIES
-    COMPILE_OPTIONS "-mavx2;-mfma")
-  set_source_files_properties(src/engine/qwen35_cpu_engine.cpp PROPERTIES
-    COMPILE_OPTIONS "-mavx2;-mfma")
+  message(STATUS "CPU engines: non-x86 target (${CMAKE_SYSTEM_PROCESSOR}); using scalar fallbacks")
 endif()
 
 set_target_properties(llama_engine PROPERTIES POSITION_INDEPENDENT_CODE ON)
