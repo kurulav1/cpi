@@ -123,5 +123,6 @@ int main(int argc, char** argv) {
   }
   std::fprintf(stderr, "[perf] decode:  %zu tokens in %.0f ms = %.1f tok/s\n", out.size(), ms - pms,
                static_cast<double>(out.size()) / ((ms - pms) / 1000.0));
+  eng.dump_profile();  // no-op unless CPI_METAL_PROFILE is set
   return 0;
 }

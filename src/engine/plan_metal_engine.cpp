@@ -7,7 +7,11 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
+#include <map>
 #include <stdexcept>
+#include <utility>
+#include <vector>
 
 #include "engine/sampling.hpp"
 
@@ -360,7 +364,14 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
   using opplan::OpKind;
   using G = runtime::MetalContext::Grid;
 
+  // CPI_METAL_PROFILE serialises the pass -- one commit per op -- and accumulates GPU time
+  // by op kind. It makes the pass slower, so it reports SHARE, not speed. Two GEMM inner-loop
+  // optimizations in a row bought nothing, which is what a wrong bottleneck feels like; the
+  // only cure is to measure which op actually owns the seconds.
+  static const bool profile = std::getenv("CPI_METAL_PROFILE") != nullptr;
+
   for (const opplan::Op& op : ops) {
+    const auto t0 = std::chrono::steady_clock::now();
     switch (op.kind) {
       case OpKind::EmbeddingLookup: {
         EmbedParams p{static_cast<std::uint32_t>(op.cols), static_cast<std::uint32_t>(T)};
@@ -592,6 +603,48 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
       default:
         throw std::runtime_error("PlanMetalEngine: unimplemented op kind");
     }
+    if (profile) {
+      ctx_.commit_and_wait();
+      const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                                  t0)
+                            .count();
+      profile_ms_[static_cast<int>(op.kind)] += ms;
+    }
+  }
+}
+
+namespace {
+const char* op_kind_name(int k) {
+  switch (static_cast<opplan::OpKind>(k)) {
+    case opplan::OpKind::RmsNorm: return "RmsNorm";
+    case opplan::OpKind::Gemv: return "Gemv/Gemm";
+    case opplan::OpKind::Rope: return "Rope";
+    case opplan::OpKind::ScaleCopy: return "ScaleCopy";
+    case opplan::OpKind::CopySlot: return "CopySlot";
+    case opplan::OpKind::KvStore: return "KvStore";
+    case opplan::OpKind::Attention: return "Attention";
+    case opplan::OpKind::GeluMul: return "GeluMul";
+    case opplan::OpKind::SiluMul: return "SiluMul";
+    case opplan::OpKind::AddInplace: return "AddInplace";
+    case opplan::OpKind::EmbeddingLookup: return "Embedding";
+    case opplan::OpKind::LmHead: return "LmHead";
+    default: return "other";
+  }
+}
+}  // namespace
+
+void PlanMetalEngine::dump_profile() const {
+  double total = 0.0;
+  for (const auto& kv : profile_ms_) total += kv.second;
+  if (total <= 0.0) return;
+  std::fprintf(stderr, "[metal profile] %.0f ms of GPU work, by op:
+", total);
+  std::vector<std::pair<int, double>> rows(profile_ms_.begin(), profile_ms_.end());
+  std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+  for (const auto& r : rows) {
+    std::fprintf(stderr, "  %-16s %8.0f ms  %5.1f%%
+", op_kind_name(r.first), r.second,
+                 100.0 * r.second / total);
   }
 }
 

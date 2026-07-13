@@ -20,6 +20,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <map>
 #include <vector>
 
 #include "engine/op_plan.hpp"
@@ -93,6 +94,13 @@ public:
 
 private:
   void execute_ops(const std::vector<opplan::Op>& ops, int layer, int position, int tokens);
+
+ public:
+  // CPI_METAL_PROFILE=1 accumulates GPU time by op kind; dump_profile() prints the split.
+  void dump_profile() const;
+
+ private:
+  std::map<int, double> profile_ms_;
   void encode_forward(int token, int position);
   // Encodes a whole prefill chunk: T tokens through the tower in one pass.
   void encode_prefill(const std::vector<int>& tokens, int start_position);
