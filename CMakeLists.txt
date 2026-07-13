@@ -168,7 +168,10 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
 endif()
 
 if(LLAMA_ENGINE_ENABLE_METAL)
-  list(APPEND LLAMA_ENGINE_SOURCES src/runtime/metal_context.mm)
+  list(APPEND LLAMA_ENGINE_SOURCES
+    src/runtime/metal_context.mm
+    src/engine/plan_metal_engine.cpp
+  )
 endif()
 
 add_library(llama_engine ${LLAMA_ENGINE_SOURCES})
@@ -315,6 +318,15 @@ if(LLAMA_ENGINE_ENABLE_METAL)
   target_include_directories(metal_smoke PRIVATE include)
   add_test(NAME metal_smoke COMMAND metal_smoke)
   set_tests_properties(metal_smoke PROPERTIES
+    ENVIRONMENT "CPI_METALLIB=${CPI_METALLIB}")
+
+  # Metal decode vs the CPU engine on the same weights. Needs a model, so it SKIPs
+  # (exit 0) with no argument and ctest stays green without one.
+  add_executable(metal_decode_test src/tests/metal_decode_test.cpp)
+  target_link_libraries(metal_decode_test PRIVATE llama_engine)
+  target_include_directories(metal_decode_test PRIVATE include)
+  add_test(NAME metal_decode_test COMMAND metal_decode_test)
+  set_tests_properties(metal_decode_test PROPERTIES
     ENVIRONMENT "CPI_METALLIB=${CPI_METALLIB}")
 endif()
 
