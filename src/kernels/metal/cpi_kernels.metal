@@ -471,9 +471,19 @@ kernel void cpi_gemm_quant(device const uchar* qw [[buffer(0)]],
   threadgroup half Ws[GEMM_BM * GEMM_QBK];
   threadgroup float sc_row[GEMM_BM];
 
-  simdgroup_float8x8 acc[4][4];
+  // HALF accumulators, not float. Apple's GPU runs fp16 arithmetic at twice the fp32 rate,
+  // and with float accumulators this GEMM measured ~3.6 TFLOP/s -- about 85% of this chip's
+  // rated FP32 peak, which is why eight straight attempts at the inner loop all landed within
+  // 5%. There was nothing left to win at fp32 rate. The fp32 peak is the wall; fp16 is the
+  // only way through it.
+  //
+  // The risk is precision: this sums in_dim (up to 14336) products in fp16. It is affordable
+  // HERE and only here -- the operands are already int4-quantized weights, so the rounding
+  // this adds is small against the quantization error the model has already accepted. The
+  // goldens and the CPU-oracle logit bound gate it.
+  simdgroup_half8x8 acc[4][4];
   for (uint i = 0u; i < 4u; ++i)
-    for (uint j = 0u; j < 4u; ++j) acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    for (uint j = 0u; j < 4u; ++j) acc[i][j] = make_filled_simdgroup_matrix<half, 8, 8>(0.0h);
 
   const uint gsz = (p.group == 0u) ? p.in_dim : p.group;
   const uint packed_row = (p.bits == 4u) ? ((p.in_dim + 1u) / 2u) : p.in_dim;
@@ -501,7 +511,7 @@ kernel void cpi_gemm_quant(device const uchar* qw [[buffer(0)]],
     }
   }
 
-  threadgroup float* mine = (threadgroup float*)Ws + sgid * 64u;
+  threadgroup half* mine = Ws + sgid * 64u;
   for (uint i = 0u; i < 4u; ++i) {
     for (uint j = 0u; j < 4u; ++j) {
       threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -513,7 +523,7 @@ kernel void cpi_gemm_quant(device const uchar* qw [[buffer(0)]],
         const uint tok = tok0 + sg_col * 32u + j * 8u + t;
         if (tok >= p.tokens) continue;
         const uint row = row0 + sg_row * 32u + i * 8u + r;
-        float v = mine[t * 8u + r];
+        float v = float(mine[t * 8u + r]);
         if (p.has_bias != 0u) v += float(bias[row]);
         out[(ulong)tok * (ulong)p.out_dim + row] = half(v);
       }
