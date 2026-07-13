@@ -1,6 +1,12 @@
 #include "engine/llama4_cpu_engine.hpp"
 
+// The AVX2 GEMVs below are x86-only; <immintrin.h> does not exist on other ISAs.
+// Gate on the ISA rather than on __AVX2__ so x86 codegen is unchanged, and give
+// every SIMD path a scalar fallback for Apple Silicon / ARM.
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+#define CPI_X86_SIMD 1
 #include <immintrin.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -31,6 +37,7 @@ static inline float bf16_to_f32(std::uint16_t h) {
   return f;
 }
 
+#if defined(CPI_X86_SIMD)
 static inline __m256 load_bf16_to_fp32(const std::uint16_t* ptr) {
   const __m128i h = _mm_loadu_si128(reinterpret_cast<const __m128i*>(ptr));
   const __m256i e = _mm256_cvtepu16_epi32(h);
@@ -46,6 +53,7 @@ static inline float hsum256(__m256 v) {
   sum = _mm_hadd_ps(sum, sum);
   return _mm_cvtss_f32(sum);
 }
+#endif  // CPI_X86_SIMD
 
 void rmsnorm_optional_weight(const float* x, const std::uint16_t* w, float* out, int n) {
   float ss = 0.0f;
@@ -71,6 +79,20 @@ float silu(float x) {
 }  // namespace
 
 void Llama4CpuEngine::gemv_bf16(const std::uint16_t* W, const float* x, float* y, int M, int N) {
+#if !defined(CPI_X86_SIMD)
+  // Scalar fallback (Apple Silicon / ARM). Accumulation order differs from the
+  // AVX2 path, so results are not bit-identical across ISAs -- expected, and
+  // this is a reference path, not a serving one.
+#pragma omp parallel for schedule(static)
+  for (int i = 0; i < M; ++i) {
+    const std::uint16_t* row = W + static_cast<std::size_t>(i) * static_cast<std::size_t>(N);
+    float sum = 0.0f;
+    for (int j = 0; j < N; ++j) {
+      sum += bf16_to_f32(row[j]) * x[j];
+    }
+    y[i] = sum;
+  }
+#else
   const int M4 = (M / 4) * 4;
 
 #pragma omp parallel for schedule(static)
@@ -130,6 +152,7 @@ void Llama4CpuEngine::gemv_bf16(const std::uint16_t* W, const float* x, float* y
     }
     y[i] = sum;
   }
+#endif  // CPI_X86_SIMD
 }
 
 void Llama4CpuEngine::gemv_bf16_T(const std::uint16_t* W, const float* x, float* y, int in_dim,
@@ -146,18 +169,20 @@ void Llama4CpuEngine::gemv_bf16_T(const std::uint16_t* W, const float* x, float*
       if (xi == 0.0f) {
         continue;
       }
-      const __m256 xv = _mm256_set1_ps(xi);
       const std::uint16_t* row = W +
                                  static_cast<std::size_t>(i) * static_cast<std::size_t>(out_dim) +
                                  static_cast<std::size_t>(j0);
       float* yp = y + j0;
       int j = 0;
+#if defined(CPI_X86_SIMD)
+      const __m256 xv = _mm256_set1_ps(xi);
       for (; j + 8 <= jlen; j += 8) {
         const __m256 wv = load_bf16_to_fp32(row + j);
         __m256 yv = _mm256_loadu_ps(yp + j);
         yv = _mm256_fmadd_ps(xv, wv, yv);
         _mm256_storeu_ps(yp + j, yv);
       }
+#endif
       for (; j < jlen; ++j) {
         yp[j] += xi * bf16_to_f32(row[j]);
       }

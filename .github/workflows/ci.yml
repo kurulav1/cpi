@@ -76,7 +76,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        # macos-14 is Apple Silicon (arm64). It is the only non-x86 target in CI,
+        # so it is what keeps the CPU engines' scalar fallbacks honest -- the AVX2
+        # paths compile out there, and nothing else would catch a stray intrinsic.
+        # Apple clang ships no OpenMP; the build degrades to single-threaded.
+        os: [ubuntu-latest, windows-latest, macos-14]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

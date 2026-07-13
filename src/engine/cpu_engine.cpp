@@ -43,10 +43,16 @@
 
 // SIMD headers Ã¢â‚¬â€ included unconditionally; individual code paths are
 // guarded by feature macros set by the compiler when AVX2 / F16C are enabled.
+// The x86 intrinsic headers do not exist on other ISAs (Apple Silicon / ARM),
+// so the include itself must be gated, not just the code paths below. Every
+// SIMD path in this file has a scalar fallback.
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+#define CPI_X86 1
 #if defined(_MSC_VER)
 #include <intrin.h>
 #else
 #include <immintrin.h>
+#endif
 #endif
 
 // OpenMP
@@ -67,7 +73,7 @@ namespace {
 // Platform-portable prefetch
 // ============================================================
 inline void prefetch_r(const void* p) {
-#if defined(_MSC_VER)
+#if defined(_MSC_VER) && defined(CPI_X86)
   _mm_prefetch(reinterpret_cast<const char*>(p), _MM_HINT_T0);
 #elif defined(__GNUC__) || defined(__clang__)
   __builtin_prefetch(p, 0, 1);
