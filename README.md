@@ -237,9 +237,11 @@ Line Tools, so CPI compiles its shaders at runtime via `newLibraryWithSource` �
 only the Metal framework, which every Mac has. A stock Mac with the CLT is enough. If Xcode
 *is* present, CMake precompiles a `.metallib` instead and skips the runtime step.
 
-**Scope.** fp16, dense, uniform-geometry decoders (Llama 2/3, Qwen2.5, Mistral), one token at
-a time. Quantized weights are rejected outright rather than half-supported: Metal has no
-`__dp4a`, so the int4/int8 matvecs need genuinely different kernels.
+**Scope.** fp16, dense, uniform-geometry decoders — Llama 2/3, Qwen2.5, Mistral, Qwen3 (per-head
+QK-norm). Batched prefill and single-token decode. Quantized weights are rejected outright rather
+than half-supported: Metal has no `__dp4a`, so the int4/int8 matvecs need genuinely different
+kernels. MoE, GeGLU/Gemma and the vision tower are op-plan ops that exist but have no Metal
+kernels yet.
 
 **Correctness.** The Metal backend reproduces the CUDA backend's greedy token stream exactly —
 128 tokens, real prompt, verified on an Apple M4 (`src/tests/golden/`). Note the CPU engine
@@ -247,9 +249,17 @@ cannot gate a long GPU stream: it keeps activations in fp32 while both GPU backe
 in fp16, and across a greedy stream that gap eventually flips a near-tie. It is still the right
 oracle for the first forward (argmax + top-5 ranking), which is how `metal_decode_test` uses it.
 
-**Measured** (Apple M4, 10-core GPU, 16 GB): Qwen2.5-0.5B fp16 decode, **64–69 tok/s**. This is
-a portability result, not a tuned one — no kernel here has been optimised, and an M4's ~120 GB/s
-is a different world from a discrete GPU.
+**Measured** (Apple M4, 10-core GPU, 16 GB), Qwen2.5-0.5B fp16:
+
+| | tok/s |
+|---|---|
+| decode | **86.5** |
+| prefill (301-token prompt) | **549** |
+
+Both kernels are bandwidth-shaped: the GEMV reads weights 128 bits at a time, and prefill tiles
+8 tokens per weight row so the matrix is streamed once per tile rather than once per token. An
+M4's ~120 GB/s is still a different world from a discrete GPU — this is a portability result, not
+a competitive one.
 
 ## Build Modes
 
