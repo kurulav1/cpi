@@ -23,12 +23,12 @@
 #include "engine/llama4_cpu_engine.hpp"
 #include "engine/qwen35_cpu_engine.hpp"
 #if LLAMA_ENGINE_HAS_CUDA
+#include "app/image_prompt.hpp"
 #include "engine/plan_cuda_engine.hpp"
 #include "engine/llama4_cuda_engine.hpp"
 #include "engine/llama_engine.hpp"
 #include "engine/speculative_decoder.hpp"
 #endif
-#include "app/image_prompt.hpp"
 #include "model/tokenizer.hpp"
 
 #ifdef _WIN32
@@ -49,6 +49,8 @@ using app::main_helpers::SingleInstanceGuard;
 }  // namespace
 
 namespace {
+
+#if LLAMA_ENGINE_HAS_CUDA
 
 // One image + a text question, end to end. The chat text carries a single `<|image|>`
 // placeholder; app::image_prompt::expand turns it into the real image span.
@@ -87,6 +89,11 @@ app::main_modes::GenerateMultimodalFn make_multimodal_fn(engine::PlanCudaEngine&
     return eng.generate_multimodal(ip.tokens, ip.embeds, ip.limits, max_new, temp, on_token);
   };
 }
+
+#endif  // LLAMA_ENGINE_HAS_CUDA
+
+// The fallback for every engine without a vision tower -- including all of them in a
+// CUDA-free build, where the overload above does not exist.
 template <typename E>
 app::main_modes::GenerateMultimodalFn make_multimodal_fn(E&) {
   return nullptr;

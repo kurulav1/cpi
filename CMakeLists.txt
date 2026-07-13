@@ -102,7 +102,6 @@ set(LLAMA_ENGINE_SOURCES
   src/model/safetensors_loader.cpp
   src/model/hf_bpe_tokenizer.cpp
   src/model/tokenizer.cpp
-  src/app/image_prompt.cpp
   src/model/png.cpp
   src/model/image_preprocess.cpp
   src/model/wordpiece_tokenizer.cpp
@@ -117,6 +116,9 @@ set(LLAMA_ENGINE_SOURCES
 
 if(LLAMA_ENGINE_ENABLE_CUDA)
   list(APPEND LLAMA_ENGINE_SOURCES
+    # Splices an encoded image into the prompt -- calls PlanCudaEngine directly,
+    # so it belongs to the CUDA path, not the portable one.
+    src/app/image_prompt.cpp
     src/runtime/system_info.cpp
     src/runtime/cuda_utils.cu
     src/runtime/kv_cache.cpp
