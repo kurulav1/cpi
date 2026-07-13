@@ -12,7 +12,6 @@ Only the vision weights are loaded (~100M params for E2B), not the whole model.
 """
 
 import argparse
-import json
 import struct
 from pathlib import Path
 

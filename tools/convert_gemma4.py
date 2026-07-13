@@ -16,7 +16,10 @@ Usage:
       --model artifacts/hub/google__gemma-4-E2B-it/hf \
       --out   artifacts/hub/google__gemma-4-E2B-it/gemma4-e2b.cpi
 """
-import argparse, json, os, struct, sys
+import argparse
+import json
+import os
+import struct
 import numpy as np
 
 PREFIX = "model.language_model."
@@ -212,7 +215,7 @@ def main():
     data_start = 8 + len(hdr_json)
     man = os.path.splitext(args.out)[0] + ".manifest"
     with open(man, "w", encoding="utf-8") as f:
-        f.write(f"CPI_GEMMA4_MANIFEST 1\n")
+        f.write("CPI_GEMMA4_MANIFEST 1\n")
         f.write(f"DATA_START {data_start}\n")
         for k, v in cfg.items():
             if isinstance(v, (list, dict)):
