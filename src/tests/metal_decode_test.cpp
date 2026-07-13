@@ -158,6 +158,21 @@ int main(int argc, char** argv) {
   const bool argmax_ok = !cpu_top.empty() && cpu_top[0].first == m_top;
   std::printf("  argmax agreement: %s\n", argmax_ok ? "PASS" : "FAIL");
 
+  // A quantized model legitimately deviates from the fp16 oracle, so the bound is
+  // looser -- but it is still a BOUND, not an exemption. These are set from measured
+  // behaviour, an order of magnitude above the observed error and far below what a
+  // structural break produces (a bad kernel yields hundreds, or NaN):
+  //
+  //   mode   observed max_abs   bound
+  //   fp16   0.014               0.05
+  //   int8   0.16                1.0
+  //   int4   1.6  (group 64)     8.0
+  //
+  // The int4 figure is real quantization loss, not slop: the error scales monotonically
+  // with group size (per-row 6.1 -> g128 2.7 -> g64 1.6), which is exactly what a
+  // correct group-scaled quantizer does and what a broken one would not.
+  const double logit_tol = (quant == 0) ? 0.05 : (quant == 8 ? 1.0 : 8.0);
+
   double max_abs = 0.0;
   for (const auto& p : cpu_top) {
     const double d = std::fabs(static_cast<double>(mlogits[static_cast<std::size_t>(p.first)]) -
@@ -207,7 +222,13 @@ int main(int argc, char** argv) {
   std::printf("\n  agrees with the CPU engine for %zu/%zu tokens\n", cpu_agree, c_out.size());
 
   bool golden_ok = true;
-  if (golden.empty()) {
+  if (quant != 0) {
+    // A quantized model is a different model -- it cannot reproduce the fp16 golden and
+    // should not be asked to. Its gate is the CPU oracle above (argmax + a bound).
+    std::printf("
+  quantized: golden-stream gate skipped (gated on the CPU oracle instead)
+");
+  } else if (golden.empty()) {
     std::printf("\n  no golden stream given; gating on argmax only\n");
   } else {
     const std::size_t n = std::min(golden.size(), m_out.size());
@@ -242,7 +263,7 @@ int main(int argc, char** argv) {
     }
   }
 
-  if (!argmax_ok || !golden_ok) {
+  if (!argmax_ok || !logits_ok || !golden_ok) {
     std::printf("\n[metal_decode] FAIL\n");
     return 1;
   }
