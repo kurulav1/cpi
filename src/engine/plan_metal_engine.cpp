@@ -87,6 +87,7 @@ constexpr int kGemmTG = 32 * (64 / 32) * (kGemmBN / 32);  // one simdgroup per 3
 // Below this many tokens the GEMV wins: a GEMM tile is padded out to kGemmBN and the padding
 // is wasted arithmetic. Above it the GEMV is a catastrophe -- see the dispatch below.
 constexpr int kGemmMinTokens = 16;
+constexpr int kQBlock = 8;  // MUST match Q_BLOCK in cpi_kernels.metal
 constexpr int kArgmaxParts = 256;
 constexpr int kGemvTile = 8;  // MUST match GEMV_TILE in cpi_kernels.metal
 
@@ -599,9 +600,21 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
         const void* bufs[] = {slot(op.in), k_cache_[static_cast<std::size_t>(layer)].handle(),
                               v_cache_[static_cast<std::size_t>(layer)].handle(), slot(op.out),
                               pos_buf_.handle()};
-        ctx_.dispatch("cpi_attention_decode", G::Groups,
-                      static_cast<std::size_t>(op.heads) * static_cast<std::size_t>(T), kTG, bufs,
-                      nullptr, 5, &p, sizeof(p));
+        // A prefill's threadgroups each walk the whole KV cache, so per-token attention is
+        // O(T^2) in DEVICE traffic and was 23% of the 8B's prefill. The prefill kernel gives
+        // one threadgroup a BLOCK of queries, so a key block it pulls in serves kQBlock of
+        // them. Decode is a single query and has nothing to block over -- it keeps the
+        // per-token kernel.
+        if (T >= kQBlock) {
+          const std::size_t blocks = static_cast<std::size_t>((T + kQBlock - 1) / kQBlock);
+          ctx_.dispatch("cpi_attention_prefill", G::Groups,
+                        static_cast<std::size_t>(op.heads) * blocks, kTG, bufs, nullptr, 5, &p,
+                        sizeof(p));
+        } else {
+          ctx_.dispatch("cpi_attention_decode", G::Groups,
+                        static_cast<std::size_t>(op.heads) * static_cast<std::size_t>(T), kTG,
+                        bufs, nullptr, 5, &p, sizeof(p));
+        }
         break;
       }
       case OpKind::SiluMul:

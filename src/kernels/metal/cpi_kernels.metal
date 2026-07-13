@@ -861,6 +861,142 @@ kernel void cpi_kv_store(
 // cache: track the running max and the running sum, rescaling the accumulator
 // when a new max appears. Same algorithm as the CUDA decode kernel.
 // ---------------------------------------------------------------------------
+// Prefill attention: one threadgroup per (QUERY BLOCK, head).
+//
+// The decode kernel below takes one threadgroup per (query token, head), and each of those
+// walks the whole KV cache itself. Across a prompt that is O(T^2) of DEVICE traffic, and on
+// the 8B it measured ~80 GB at ~73 GB/s -- genuinely bandwidth-bound, and 23% of prefill.
+//
+// A query block fixes it: the block of keys a threadgroup pulls in now serves Q_BLOCK
+// queries instead of one, so the same answer costs Q_BLOCK times less traffic. The keys and
+// values are re-read once per query WITHIN the block, but that is an L1 hit -- a key block
+// is a few KB and the reuse is immediate.
+//
+// Each query keeps its OWN online-softmax state (running max, running sum), because each
+// attends to a different prefix: causality masks key > that query's position.
+// ---------------------------------------------------------------------------
+#define Q_BLOCK 8
+
+kernel void cpi_attention_prefill(device const half* q [[buffer(0)]],
+                                  device const half* k_cache [[buffer(1)]],
+                                  device const half* v_cache [[buffer(2)]],
+                                  device half* out [[buffer(3)]],
+                                  device const int* positions [[buffer(4)]],
+                                  constant AttnParams& p [[buffer(5)]],
+                                  uint gid [[threadgroup_position_in_grid]],
+                                  uint lid [[thread_position_in_threadgroup]],
+                                  uint nthr [[threads_per_threadgroup]]) {
+  const uint head = gid % p.heads;
+  const uint t0 = (gid / p.heads) * Q_BLOCK;
+  if (t0 >= p.tokens) return;
+  const uint nq = min((uint)Q_BLOCK, p.tokens - t0);
+
+  uint base = p.position;
+  if (p.use_position_buffer != 0u) base = uint(positions[0]);
+
+  const uint group = p.heads / p.kv_heads;
+  const uint kv_head = head / group;
+  const uint kv_dim = p.kv_heads * p.head_dim;
+  const uint q_dim = p.heads * p.head_dim;
+  const uint hd = p.head_dim;
+
+  const uint simd_id = lid / 32u;
+  const uint lane = lid % 32u;
+  const uint n_simd = nthr / 32u;
+
+  threadgroup float q_sh[Q_BLOCK * 256];
+  threadgroup float acc[Q_BLOCK * 256];
+  threadgroup float sc_sh[Q_BLOCK * KEY_BLOCK];
+  threadgroup float w_sh[Q_BLOCK * KEY_BLOCK];
+  threadgroup float m_sh[Q_BLOCK];  // running max, per query
+  threadgroup float l_sh[Q_BLOCK];  // running sum, per query
+  threadgroup float r_sh[Q_BLOCK];  // this block's rescale, per query
+
+  for (uint c = lid; c < nq * hd; c += nthr) {
+    const uint qi = c / hd, i = c % hd;
+    q_sh[qi * hd + i] = float(q[(ulong)(t0 + qi) * (ulong)q_dim + head * hd + i]);
+    acc[qi * hd + i] = 0.0f;
+  }
+  for (uint qi = lid; qi < nq; qi += nthr) {
+    m_sh[qi] = -INFINITY;
+    l_sh[qi] = 0.0f;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  // The block's queries span positions [base+t0, base+t0+nq-1]; the last one reaches
+  // furthest, and the first one's window (if any) starts earliest.
+  const uint last_pos = base + t0 + nq - 1u;
+  const uint first_pos = base + t0;
+  uint start = 0u;
+  if (p.window != 0u && first_pos + 1u > p.window) start = first_pos + 1u - p.window;
+
+  for (uint kb = start; kb <= last_pos; kb += KEY_BLOCK) {
+    const uint nk = min((uint)KEY_BLOCK, last_pos - kb + 1u);
+
+    // Score every (query, key) pair in the block; one simdgroup reduces one pair.
+    for (uint pidx = simd_id; pidx < nq * nk; pidx += n_simd) {
+      const uint qi = pidx / nk, j = pidx % nk;
+      const uint key = kb + j;
+      const uint pos_i = base + t0 + qi;
+
+      uint start_i = 0u;
+      if (p.window != 0u && pos_i + 1u > p.window) start_i = pos_i + 1u - p.window;
+
+      float d = -INFINITY;
+      if (key <= pos_i && key >= start_i) {  // causal mask, plus the sliding window
+        device const half* kt = k_cache + (ulong)key * (ulong)kv_dim + kv_head * hd;
+        float acc_d = 0.0f;
+        for (uint i = lane; i < hd; i += 32u) acc_d += q_sh[qi * hd + i] * float(kt[i]);
+        d = simd_sum(acc_d) * p.scale;
+      }
+      if (lane == 0u) sc_sh[qi * KEY_BLOCK + j] = d;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Fold the block into each query's own online softmax.
+    if (lid < nq) {
+      const uint qi = lid;
+      float bmax = -INFINITY;
+      for (uint j = 0u; j < nk; ++j) bmax = max(bmax, sc_sh[qi * KEY_BLOCK + j]);
+
+      const float old_max = m_sh[qi];
+      const float new_max = max(old_max, bmax);
+      const float rescale = (old_max == -INFINITY) ? 0.0f : exp(old_max - new_max);
+
+      float bsum = 0.0f;
+      for (uint j = 0u; j < nk; ++j) {
+        // A fully masked block leaves new_max at -INFINITY; exp(-inf - -inf) is NaN.
+        const float sc = sc_sh[qi * KEY_BLOCK + j];
+        const float w = (sc == -INFINITY || new_max == -INFINITY) ? 0.0f : exp(sc - new_max);
+        w_sh[qi * KEY_BLOCK + j] = w;
+        bsum += w;
+      }
+      l_sh[qi] = l_sh[qi] * rescale + bsum;
+      m_sh[qi] = new_max;
+      r_sh[qi] = rescale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint c = lid; c < nq * hd; c += nthr) {
+      const uint qi = c / hd, i = c % hd;
+      float a = acc[qi * hd + i] * r_sh[qi];
+      for (uint j = 0u; j < nk; ++j) {
+        device const half* vt = v_cache + (ulong)(kb + j) * (ulong)kv_dim + kv_head * hd;
+        a += w_sh[qi * KEY_BLOCK + j] * float(vt[i]);
+      }
+      acc[qi * hd + i] = a;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  for (uint c = lid; c < nq * hd; c += nthr) {
+    const uint qi = c / hd, i = c % hd;
+    const float inv = (l_sh[qi] > 0.0f) ? 1.0f / l_sh[qi] : 0.0f;
+    out[(ulong)(t0 + qi) * (ulong)q_dim + head * hd + i] = half(acc[qi * hd + i] * inv);
+  }
+}
+
+// ---------------------------------------------------------------------------
 
 kernel void cpi_attention_decode(
     device const half*  q         [[buffer(0)]],
