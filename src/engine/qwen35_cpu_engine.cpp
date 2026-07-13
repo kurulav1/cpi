@@ -1,6 +1,12 @@
 #include "engine/qwen35_cpu_engine.hpp"
 
+// The AVX2 GEMV below is x86-only; <immintrin.h> does not exist on other ISAs.
+// Gate on the ISA rather than on __AVX2__ so x86 codegen is unchanged, and give
+// every SIMD path a scalar fallback for Apple Silicon / ARM.
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+#define CPI_X86_SIMD 1
 #include <immintrin.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -35,6 +41,7 @@ static inline float bf16_to_f32(std::uint16_t h) {
   return f;
 }
 
+#if defined(CPI_X86_SIMD)
 static inline __m256 load_bf16_to_fp32(const std::uint16_t* ptr) {
   const __m128i h = _mm_loadu_si128(reinterpret_cast<const __m128i*>(ptr));
   const __m256i e = _mm256_cvtepu16_epi32(h);
@@ -50,6 +57,7 @@ static inline float hsum256(__m256 v) {
   sum = _mm_hadd_ps(sum, sum);
   return _mm_cvtss_f32(sum);
 }
+#endif  // CPI_X86_SIMD
 
 float silu(float x) {
   return x / (1.0f + std::exp(-x));
@@ -299,6 +307,20 @@ void l2norm_inplace(float* x, int n, float eps = 1e-6f) {
 }  // namespace
 
 void Qwen35CpuEngine::gemv_bf16(const std::uint16_t* W, const float* x, float* y, int M, int N) {
+#if !defined(CPI_X86_SIMD)
+  // Scalar fallback (Apple Silicon / ARM). Accumulation order differs from the
+  // AVX2 path, so results are not bit-identical across ISAs -- expected, and
+  // this is a reference path, not a serving one.
+#pragma omp parallel for schedule(static)
+  for (int i = 0; i < M; ++i) {
+    const std::uint16_t* row = W + static_cast<std::size_t>(i) * static_cast<std::size_t>(N);
+    float sum = 0.0f;
+    for (int j = 0; j < N; ++j) {
+      sum += bf16_to_f32(row[j]) * x[j];
+    }
+    y[i] = sum;
+  }
+#else
   const int M4 = (M / 4) * 4;
 
 #pragma omp parallel for schedule(static)
@@ -357,6 +379,7 @@ void Qwen35CpuEngine::gemv_bf16(const std::uint16_t* W, const float* x, float* y
     }
     y[i] = sum;
   }
+#endif  // CPI_X86_SIMD
 }
 
 void Qwen35CpuEngine::rmsnorm_offset(const float* x, const std::uint16_t* weight, float* out, int n,

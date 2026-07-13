@@ -1,0 +1,15 @@
+# Golden greedy token stream for Qwen2.5-0.5B-Instruct, produced by the CUDA backend.
+#
+# WHY A GOLDEN FROM CUDA:
+# CUDA is the reference implementation, so a second backend is correct exactly when it
+# reproduces it token-for-token.
+#
+# HISTORY WORTH KEEPING: the CPU engine used to disagree with both GPU backends here, and
+# that was first written off as "the fp16/fp32 activation gap". It was not -- CpuLlamaEngine
+# had rope_theta hardcoded to 10000 and was rotating Q/K by the wrong angle for every model
+# that does not use that base (Qwen2.5, Qwen3, Llama 3). The new backend was right and the
+# ORACLE was broken. With that fixed, CPU, CUDA and Metal all agree token-for-token.
+#
+
+prompt: 1,2,3,4,5
+expect: 6,25010,10,4999,1725,25,35058,2179,30,31,1294,61

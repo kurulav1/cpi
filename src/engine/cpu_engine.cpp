@@ -43,10 +43,16 @@
 
 // SIMD headers Ã¢â‚¬â€ included unconditionally; individual code paths are
 // guarded by feature macros set by the compiler when AVX2 / F16C are enabled.
+// The x86 intrinsic headers do not exist on other ISAs (Apple Silicon / ARM),
+// so the include itself must be gated, not just the code paths below. Every
+// SIMD path in this file has a scalar fallback.
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+#define CPI_X86 1
 #if defined(_MSC_VER)
 #include <intrin.h>
 #else
 #include <immintrin.h>
+#endif
 #endif
 
 // OpenMP
@@ -67,7 +73,7 @@ namespace {
 // Platform-portable prefetch
 // ============================================================
 inline void prefetch_r(const void* p) {
-#if defined(_MSC_VER)
+#if defined(_MSC_VER) && defined(CPI_X86)
   _mm_prefetch(reinterpret_cast<const char*>(p), _MM_HINT_T0);
 #elif defined(__GNUC__) || defined(__clang__)
   __builtin_prefetch(p, 0, 1);
@@ -423,6 +429,23 @@ void CpuLlamaEngine::normalize(const float* x, const uint16_t* w, const uint16_t
 // Rotary position embeddings (in-place) for q and k.
 // Uses precomputed cos/sin tables built in initialize().
 // For GQA, q has n_heads heads and k has n_kv_heads heads.
+// Per-head RMSNorm over `heads` heads of `head_dim`, with one shared [head_dim]
+// weight. Qwen3 applies this to Q and K after projection and before RoPE.
+void CpuLlamaEngine::qk_norm_heads(float* x, const uint16_t* w, int heads, int head_dim) {
+  const float eps = cfg_.norm_eps > 0.0f ? cfg_.norm_eps : 1e-6f;
+  for (int h = 0; h < heads; ++h) {
+    float* v = x + static_cast<std::ptrdiff_t>(h) * head_dim;
+    float ss = 0.0f;
+    for (int i = 0; i < head_dim; ++i) {
+      ss += v[i] * v[i];
+    }
+    const float inv = 1.0f / std::sqrt(ss / static_cast<float>(head_dim) + eps);
+    for (int i = 0; i < head_dim; ++i) {
+      v[i] = v[i] * inv * fp16_to_fp32(w[i]);
+    }
+  }
+}
+
 void CpuLlamaEngine::rope(float* q, float* k, int pos, int n_heads, int n_kv_heads, int head_dim) {
   const float* cos_row = rope_cos_.data() + static_cast<std::ptrdiff_t>(pos) * (head_dim / 2);
   const float* sin_row = rope_sin_.data() + static_cast<std::ptrdiff_t>(pos) * (head_dim / 2);
@@ -679,6 +702,18 @@ void CpuLlamaEngine::forward_token(int token, int pos) {
         k_[i] += fp16_to_fp32(lw.bqkv[q_dim_ + i]);
         v_[i] += fp16_to_fp32(lw.bqkv[q_dim_ + kv_dim_ + i]);
       }
+    }
+
+    // Per-head QK-norm (Qwen3): RMS-normalise each head of Q and of K with a shared
+    // [head_dim] weight, AFTER projection and BEFORE RoPE. Order matters -- doing it
+    // after RoPE changes the result. Mirrors the CUDA path exactly
+    // (llama_engine_forward_decode.cpp: launch_rmsnorm over num_heads x head_dim).
+
+    if (lw.q_norm) {
+      qk_norm_heads(q_.data(), lw.q_norm, NH, head_dim_);
+    }
+    if (lw.k_norm) {
+      qk_norm_heads(k_.data(), lw.k_norm, NKV, head_dim_);
     }
 
     rope(q_.data(), k_.data(), pos, NH, NKV, head_dim_);
@@ -943,6 +978,10 @@ void CpuLlamaEngine::initialize(const EngineOptions& options) {
     lw.wo = ptr16(p + ".attention.wo");
     lw.bo = weights_.has_tensor(p + ".attention.bo") ? ptr16(p + ".attention.bo") : nullptr;
     lw.bqkv = weights_.has_tensor(p + ".attention.bqkv") ? ptr16(p + ".attention.bqkv") : nullptr;
+    lw.q_norm =
+        weights_.has_tensor(p + ".attention.q_norm") ? ptr16(p + ".attention.q_norm") : nullptr;
+    lw.k_norm =
+        weights_.has_tensor(p + ".attention.k_norm") ? ptr16(p + ".attention.k_norm") : nullptr;
 
     auto& buf_w1 = dequant_mlp_[static_cast<std::size_t>(l) * 3 + 0];
     auto& buf_w2 = dequant_mlp_[static_cast<std::size_t>(l) * 3 + 1];
@@ -1032,15 +1071,21 @@ void CpuLlamaEngine::initialize(const EngineOptions& options) {
   }
 
   // --- Precompute RoPE tables ---
-  // cos[pos][d] = cos(pos / 10000^(2d/head_dim))
-  // sin[pos][d] = sin(pos / 10000^(2d/head_dim))
+  // cos[pos][d] = cos(pos / theta^(2d/head_dim))
+  //
+  // The base is the MODEL'S rope_theta, not 10000. It was hardcoded to 10000 here,
+  // which is right for Llama 2 and wrong for most things since: Qwen2.5 and Qwen3 use
+  // 1e6, Llama 3 uses 5e5. A wrong base does not crash and does not produce obvious
+  // garbage -- it rotates every query and key by the wrong angle, which degrades the
+  // model in a way that looks like ordinary numerical drift.
+  const float rope_theta = cfg_.effective_rope_theta();
   const int half_hd = head_dim_ / 2;
   rope_cos_.resize(static_cast<std::size_t>(max_ctx) * static_cast<std::size_t>(half_hd));
   rope_sin_.resize(static_cast<std::size_t>(max_ctx) * static_cast<std::size_t>(half_hd));
   for (int p = 0; p < max_ctx; ++p) {
     for (int d = 0; d < half_hd; ++d) {
       const float freq =
-          1.f / std::pow(10000.f, static_cast<float>(2 * d) / static_cast<float>(head_dim_));
+          1.f / std::pow(rope_theta, static_cast<float>(2 * d) / static_cast<float>(head_dim_));
       rope_cos_[static_cast<std::size_t>(p) * half_hd + d] = std::cos(static_cast<float>(p) * freq);
       rope_sin_[static_cast<std::size_t>(p) * half_hd + d] = std::sin(static_cast<float>(p) * freq);
     }

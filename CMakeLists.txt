@@ -7,6 +7,14 @@ include(CTest)
 enable_testing()
 
 option(LLAMA_ENGINE_ENABLE_CUDA "Enable CUDA GPU inference and tools" ON)
+# Metal is the Apple Silicon backend. Defaults ON only on Apple, and is the exact
+# analogue of LLAMA_ENGINE_ENABLE_CUDA: the two are independent, and a machine
+# with neither still gets the portable CPU engines.
+if(APPLE)
+  option(LLAMA_ENGINE_ENABLE_METAL "Enable the Metal GPU backend (Apple Silicon)" ON)
+else()
+  option(LLAMA_ENGINE_ENABLE_METAL "Enable the Metal GPU backend (Apple Silicon)" OFF)
+endif()
 option(LLAMA_ENGINE_ENABLE_LTO "Enable LTO" ON)
 option(LLAMA_ENGINE_WARNINGS_AS_ERRORS "Treat warnings as errors" OFF)
 option(LLAMA_ENGINE_ENABLE_CLANG_TIDY "Enable clang-tidy during build" OFF)
@@ -106,6 +114,9 @@ set(LLAMA_ENGINE_SOURCES
   src/model/image_preprocess.cpp
   src/model/wordpiece_tokenizer.cpp
   src/engine/embedding_config.cpp
+  # Backend-neutral: a plan is just data, so the builder belongs outside any
+  # GPU backend and is shared by the CUDA and Metal executors alike.
+  src/engine/op_plan_builder.cpp
   src/grammar/grammar.cpp
   src/grammar/json_schema_to_grammar.cpp
   src/grammar/grammar_sampler.cpp
@@ -156,6 +167,13 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
   )
 endif()
 
+if(LLAMA_ENGINE_ENABLE_METAL)
+  list(APPEND LLAMA_ENGINE_SOURCES
+    src/runtime/metal_context.mm
+    src/engine/plan_metal_engine.cpp
+  )
+endif()
+
 add_library(llama_engine ${LLAMA_ENGINE_SOURCES})
 target_include_directories(llama_engine PUBLIC include)
 
@@ -170,6 +188,58 @@ endif()
 
 target_compile_definitions(llama_engine PUBLIC LLAMA_ENGINE_HAS_CUDA=$<BOOL:${LLAMA_ENGINE_ENABLE_CUDA}>)
 
+# ---------------------------------------------------------------------------
+# Metal backend (Apple Silicon)
+# ---------------------------------------------------------------------------
+if(LLAMA_ENGINE_ENABLE_METAL)
+  # metal_context.mm is Objective-C++ and is deliberately built WITHOUT ARC, so a
+  # Metal object can live behind a plain void* in a header that knows nothing
+  # about Objective-C.
+  set_source_files_properties(src/runtime/metal_context.mm PROPERTIES
+    COMPILE_FLAGS "-fno-objc-arc")
+
+  target_link_libraries(llama_engine PUBLIC
+    "-framework Metal"
+    "-framework Foundation"
+  )
+
+  set(CPI_METAL_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/metal/cpi_kernels.metal)
+
+  # The offline `metal` compiler ships with XCODE, not with the Command Line Tools.
+  # A bare Mac (a fresh cloud rental, say) has clang but no `metal`, and pulling
+  # ~15 GB of Xcode just to build a shader is not a reasonable requirement.
+  #
+  # So the metallib is OPTIONAL. When the toolchain is present we precompile, which
+  # is faster to start and type-checks at build time. When it is not, the engine
+  # compiles the MSL from source at runtime via newLibraryWithSource -- that needs
+  # only the Metal framework, which every Mac has. CPI_METAL_SOURCE points at it.
+  execute_process(
+    COMMAND xcrun -sdk macosx metal --version
+    RESULT_VARIABLE CPI_METAL_CC_MISSING
+    OUTPUT_QUIET ERROR_QUIET
+  )
+
+  if(CPI_METAL_CC_MISSING EQUAL 0)
+    set(CPI_METAL_AIR ${CMAKE_CURRENT_BINARY_DIR}/cpi_kernels.air)
+    set(CPI_METALLIB  ${CMAKE_CURRENT_BINARY_DIR}/cpi_kernels.metallib)
+    add_custom_command(
+      OUTPUT ${CPI_METALLIB}
+      COMMAND xcrun -sdk macosx metal -Werror -c ${CPI_METAL_SRC} -o ${CPI_METAL_AIR}
+      COMMAND xcrun -sdk macosx metallib ${CPI_METAL_AIR} -o ${CPI_METALLIB}
+      DEPENDS ${CPI_METAL_SRC}
+      COMMENT "Compiling Metal shaders -> cpi_kernels.metallib"
+      VERBATIM
+    )
+    add_custom_target(cpi_metallib ALL DEPENDS ${CPI_METALLIB})
+    add_dependencies(llama_engine cpi_metallib)
+    message(STATUS "Metal: offline toolchain found; precompiling cpi_kernels.metallib")
+  else()
+    set(CPI_METALLIB "")
+    message(STATUS "Metal: no offline `metal` compiler (Xcode absent); "
+                   "shaders will be compiled at runtime from source")
+  endif()
+endif()
+
 if(sentencepiece_FOUND)
   target_link_libraries(llama_engine PUBLIC sentencepiece::sentencepiece)
   target_compile_definitions(llama_engine PUBLIC LLAMA_ENGINE_HAS_SENTENCEPIECE=1)
@@ -183,20 +253,29 @@ endif()
 # AVX2 + F16C for the CPU engine GEMV (8-wide FP32 SIMD, on-the-fly FP16
 # conversion).  Applied only to cpu_engine.cpp to avoid forcing AVX2 on CUDA
 # or kernels that do not benefit from it.
-if(MSVC)
-  set_source_files_properties(src/engine/cpu_engine.cpp PROPERTIES
-    COMPILE_OPTIONS "/arch:AVX2")
-  set_source_files_properties(src/engine/llama4_cpu_engine.cpp PROPERTIES
-    COMPILE_OPTIONS "/arch:AVX2")
-  set_source_files_properties(src/engine/qwen35_cpu_engine.cpp PROPERTIES
-    COMPILE_OPTIONS "/arch:AVX2")
+#
+# These are x86 flags and must be gated on the target ISA. Apple Silicon's clang 21
+# rejects -mavx2 outright ("unsupported option for target arm64-apple-darwin"); older
+# Apple clangs merely ignored it, which is why CI's macOS runner did not catch this.
+# The sources already compile to scalar fallbacks on non-x86.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|X86_64|amd64|AMD64|i386|i686)$")
+  if(MSVC)
+    set_source_files_properties(src/engine/cpu_engine.cpp PROPERTIES
+      COMPILE_OPTIONS "/arch:AVX2")
+    set_source_files_properties(src/engine/llama4_cpu_engine.cpp PROPERTIES
+      COMPILE_OPTIONS "/arch:AVX2")
+    set_source_files_properties(src/engine/qwen35_cpu_engine.cpp PROPERTIES
+      COMPILE_OPTIONS "/arch:AVX2")
+  else()
+    set_source_files_properties(src/engine/cpu_engine.cpp PROPERTIES
+      COMPILE_OPTIONS "-mavx2;-mf16c;-mfma")
+    set_source_files_properties(src/engine/llama4_cpu_engine.cpp PROPERTIES
+      COMPILE_OPTIONS "-mavx2;-mfma")
+    set_source_files_properties(src/engine/qwen35_cpu_engine.cpp PROPERTIES
+      COMPILE_OPTIONS "-mavx2;-mfma")
+  endif()
 else()
-  set_source_files_properties(src/engine/cpu_engine.cpp PROPERTIES
-    COMPILE_OPTIONS "-mavx2;-mf16c;-mfma")
-  set_source_files_properties(src/engine/llama4_cpu_engine.cpp PROPERTIES
-    COMPILE_OPTIONS "-mavx2;-mfma")
-  set_source_files_properties(src/engine/qwen35_cpu_engine.cpp PROPERTIES
-    COMPILE_OPTIONS "-mavx2;-mfma")
+  message(STATUS "CPU engines: non-x86 target (${CMAKE_SYSTEM_PROCESSOR}); using scalar fallbacks")
 endif()
 
 set_target_properties(llama_engine PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -246,6 +325,46 @@ add_executable(grammar_test
 )
 target_include_directories(grammar_test PRIVATE include)
 add_test(NAME grammar_test COMMAND grammar_test)
+
+# Plan-builder test. CUDA-free and GPU-free, so it runs in CI on every platform --
+# it is the one part of the Metal bring-up that can be verified without a Mac.
+add_executable(op_plan_builder_test
+  src/tests/op_plan_builder_test.cpp
+  src/engine/op_plan_builder.cpp
+)
+target_include_directories(op_plan_builder_test PRIVATE include)
+add_test(NAME op_plan_builder_test COMMAND op_plan_builder_test)
+
+# Metal kernel smoke test: runs each shader against a CPU reference. On a machine
+# with no Metal GPU (any VM, including GitHub's macOS runners) it reports SKIP and
+# passes -- so a green run here proves it COMPILES AND LINKS, never that the
+# kernels are correct. Only real Apple Silicon can prove that.
+if(LLAMA_ENGINE_ENABLE_METAL)
+  # Text generation on Apple Silicon. Separate from llama_infer, whose engine dispatch
+  # is templated over the CUDA engines -- keeping this standalone means the Metal path
+  # has no CUDA anywhere in its dependency graph.
+  add_executable(metal_infer src/app/metal_infer.cpp)
+  target_link_libraries(metal_infer PRIVATE llama_engine)
+  target_include_directories(metal_infer PRIVATE include)
+
+  add_executable(metal_smoke src/tests/metal_smoke.cpp)
+  target_link_libraries(metal_smoke PRIVATE llama_engine)
+  target_include_directories(metal_smoke PRIVATE include)
+  add_test(NAME metal_smoke COMMAND metal_smoke)
+  # Both are set: the metallib if we have one, and the source path as the fallback
+  # the engine uses when there is no offline toolchain.
+  set_tests_properties(metal_smoke PROPERTIES
+    ENVIRONMENT "CPI_METALLIB=${CPI_METALLIB};CPI_METAL_SOURCE=${CPI_METAL_SRC}")
+
+  # Metal decode vs the CPU engine on the same weights. Needs a model, so it SKIPs
+  # (exit 0) with no argument and ctest stays green without one.
+  add_executable(metal_decode_test src/tests/metal_decode_test.cpp)
+  target_link_libraries(metal_decode_test PRIVATE llama_engine)
+  target_include_directories(metal_decode_test PRIVATE include)
+  add_test(NAME metal_decode_test COMMAND metal_decode_test)
+  set_tests_properties(metal_decode_test PROPERTIES
+    ENVIRONMENT "CPI_METALLIB=${CPI_METALLIB};CPI_METAL_SOURCE=${CPI_METAL_SRC}")
+endif()
 
 # Tokenizer byte-table test. CUDA-free: built from the self-contained HfBpe
 # tokenizer backend so it runs in CI without a GPU.

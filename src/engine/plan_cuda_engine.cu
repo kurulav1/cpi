@@ -3,8 +3,6 @@
 // Gemma 4 is currently its sole tenant; see memory:cpi-gemma4-arch for that
 // model's spec. Reuses the shared kernels (rmsnorm scale=w, rope table, tiled
 // decode attention, gelu-mul, gemv).
-#include "engine/plan_cuda_engine.hpp"
-
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -18,6 +16,7 @@
 #include <utility>
 
 #include "engine/generation_constraints.hpp"
+#include "engine/plan_cuda_engine.hpp"
 #include "engine/sampling.hpp"
 #include "model/json_mini.hpp"
 #include "runtime/kernels.cuh"
@@ -25,12 +24,12 @@
 namespace engine {
 
 namespace {
-#define G4_CHECK(x)                                                                        \
-  do {                                                                                     \
-    cudaError_t _e = (x);                                                                  \
-    if (_e != cudaSuccess)                                                                 \
-      throw std::runtime_error(std::string("cuda error ") + cudaGetErrorString(_e) + " @" \
-                               + __FILE__ + ":" + std::to_string(__LINE__));               \
+#define G4_CHECK(x)                                                                         \
+  do {                                                                                      \
+    cudaError_t _e = (x);                                                                   \
+    if (_e != cudaSuccess)                                                                  \
+      throw std::runtime_error(std::string("cuda error ") + cudaGetErrorString(_e) + " @" + \
+                               __FILE__ + ":" + std::to_string(__LINE__));                  \
   } while (0)
 
 // the .cpi stores F16, so host reads are raw uint16 halves.
@@ -46,28 +45,57 @@ std::vector<__half> read_fp16(std::ifstream& f, std::size_t data_start, std::siz
 
 PlanCudaEngine::~PlanCudaEngine() {
   for (auto& kv : dev_) cudaFree(kv.second);
-  for (auto& kv : qdev_) { cudaFree(kv.second.packed); cudaFree(kv.second.scales); }
+  for (auto& kv : qdev_) {
+    cudaFree(kv.second.packed);
+    cudaFree(kv.second.scales);
+  }
   for (auto& kv : devf_) cudaFree(kv.second);
-  cudaFree(d_q_pair_); cudaFree(d_q_gate_);
-  cudaFree(d_lin_mix_); cudaFree(d_lin_z_); cudaFree(d_lin_a_); cudaFree(d_lin_b_);
-  cudaFree(d_lin_q_); cudaFree(d_lin_k_); cudaFree(d_lin_v_); cudaFree(d_lin_att_);
-  cudaFree(d_lin_conv_state_); cudaFree(d_lin_recurrent_state_);
+  cudaFree(d_q_pair_);
+  cudaFree(d_q_gate_);
+  cudaFree(d_lin_mix_);
+  cudaFree(d_lin_z_);
+  cudaFree(d_lin_a_);
+  cudaFree(d_lin_b_);
+  cudaFree(d_lin_q_);
+  cudaFree(d_lin_k_);
+  cudaFree(d_lin_v_);
+  cudaFree(d_lin_att_);
+  cudaFree(d_lin_conv_state_);
+  cudaFree(d_lin_recurrent_state_);
   // shared-layer caches are aliases; free only the owning (< first_shared) ones.
   for (int L = 0; L < cfg_.first_shared_layer && L < static_cast<int>(caches_k_.size()); ++L) {
     cudaFree(caches_k_[L]);
     cudaFree(caches_v_[L]);
   }
-  cudaFree(d_cos_sliding_); cudaFree(d_sin_sliding_);
-  cudaFree(d_cos_full_); cudaFree(d_sin_full_);
+  cudaFree(d_cos_sliding_);
+  cudaFree(d_sin_sliding_);
+  cudaFree(d_cos_full_);
+  cudaFree(d_sin_full_);
   cudaFree(d_ones_);
-  cudaFree(d_x_); cudaFree(d_x_norm_); cudaFree(d_tmp_);
-  cudaFree(d_q_); cudaFree(d_k_); cudaFree(d_v_); cudaFree(d_att_);
-  cudaFree(d_gate_); cudaFree(d_up_); cudaFree(d_inter_);
-  cudaFree(d_ple_raw_); cudaFree(d_ple_); cudaFree(d_ple_gate_);
-  cudaFree(d_logits_); cudaFree(d_tok_); cudaFree(d_position_); cudaFree(d_argmax_);
-  cudaFree(d_topk_part_val_); cudaFree(d_topk_part_idx_);
-  cudaFree(d_topk_val_); cudaFree(d_topk_idx_);
-  cudaFree(d_cand_idx_); cudaFree(d_cand_val_); cudaFree(d_cand_count_);
+  cudaFree(d_x_);
+  cudaFree(d_x_norm_);
+  cudaFree(d_tmp_);
+  cudaFree(d_q_);
+  cudaFree(d_k_);
+  cudaFree(d_v_);
+  cudaFree(d_att_);
+  cudaFree(d_gate_);
+  cudaFree(d_up_);
+  cudaFree(d_inter_);
+  cudaFree(d_ple_raw_);
+  cudaFree(d_ple_);
+  cudaFree(d_ple_gate_);
+  cudaFree(d_logits_);
+  cudaFree(d_tok_);
+  cudaFree(d_position_);
+  cudaFree(d_argmax_);
+  cudaFree(d_topk_part_val_);
+  cudaFree(d_topk_part_idx_);
+  cudaFree(d_topk_val_);
+  cudaFree(d_topk_idx_);
+  cudaFree(d_cand_idx_);
+  cudaFree(d_cand_val_);
+  cudaFree(d_cand_count_);
   if (decode_graph_exec_) cudaGraphExecDestroy(decode_graph_exec_);
   if (decode_graph_) cudaGraphDestroy(decode_graph_);
   if (stream_) cudaStreamDestroy(stream_);
@@ -80,8 +108,14 @@ void PlanCudaEngine::parse_manifest(const std::string& manifest_path) {
     std::vector<int> out;
     std::string cur;
     for (char c : js) {
-      if (c == '-' || (c >= '0' && c <= '9')) cur += c;
-      else { if (!cur.empty()) { out.push_back(std::stoi(cur)); cur.clear(); } }
+      if (c == '-' || (c >= '0' && c <= '9'))
+        cur += c;
+      else {
+        if (!cur.empty()) {
+          out.push_back(std::stoi(cur));
+          cur.clear();
+        }
+      }
     }
     if (!cur.empty()) out.push_back(std::stoi(cur));
     return out;
@@ -97,42 +131,73 @@ void PlanCudaEngine::parse_manifest(const std::string& manifest_path) {
     } else if (kind == "CFG") {
       std::string k, v;
       ss >> k >> v;
-      if (k == "num_layers") cfg_.num_layers = std::stoi(v);
-      else if (k == "hidden") cfg_.hidden = std::stoi(v);
-      else if (k == "num_heads") cfg_.num_heads = std::stoi(v);
-      else if (k == "num_kv_heads") cfg_.num_kv_heads = std::stoi(v);
-      else if (k == "head_dim") cfg_.head_dim = std::stoi(v);
-      else if (k == "global_head_dim") cfg_.global_head_dim = std::stoi(v);
-      else if (k == "head_dim_sliding") cfg_.head_dim_sliding = std::stoi(v);
-      else if (k == "head_dim_full") cfg_.head_dim_full = std::stoi(v);
-      else if (k == "num_kv_heads_sliding") cfg_.num_kv_heads_sliding = std::stoi(v);
-      else if (k == "num_kv_heads_full") cfg_.num_kv_heads_full = std::stoi(v);
-      else if (k == "attention_k_eq_v") cfg_.attention_k_eq_v = (v == "True" || v == "true" || v == "1");
-      else if (k == "intermediate") cfg_.intermediate = std::stoi(v);
-      else if (k == "vocab") cfg_.vocab = std::stoi(v);
-      else if (k == "rms_eps") cfg_.rms_eps = std::stof(v);
-      else if (k == "sliding_window") cfg_.sliding_window = std::stoi(v);
-      else if (k == "final_logit_softcapping") cfg_.final_logit_softcapping = std::stof(v);
-      else if (k == "hidden_size_per_layer_input") cfg_.hidden_size_per_layer_input = std::stoi(v);
-      else if (k == "num_kv_shared_layers") cfg_.num_kv_shared_layers = std::stoi(v);
-      else if (k == "first_shared_layer") cfg_.first_shared_layer = std::stoi(v);
-      else if (k == "rope_theta_full") cfg_.rope_theta_full = std::stof(v);
-      else if (k == "rope_theta_sliding") cfg_.rope_theta_sliding = std::stof(v);
-      else if (k == "partial_rotary_full") cfg_.partial_rotary_full = std::stof(v);
-      else if (k == "bos_token_id") cfg_.bos_token_id = std::stoi(v);
-      else if (k == "eos_token_id") cfg_.eos_token_id = std::stoi(v);
-      else if (k == "use_double_wide_mlp") cfg_.use_double_wide_mlp = (v == "True" || v == "true" || v == "1");
-      else if (k == "enable_moe_block") cfg_.enable_moe_block = (v == "True" || v == "true" || v == "1");
-      else if (k == "num_experts") cfg_.num_experts = std::stoi(v);
-      else if (k == "top_k_experts") cfg_.top_k_experts = std::stoi(v);
-      else if (k == "moe_intermediate_size") cfg_.moe_intermediate_size = std::stoi(v);
-      else if (k == "tie_word_embeddings") cfg_.tie_word_embeddings = (v == "True" || v == "true" || v == "1");
+      if (k == "num_layers")
+        cfg_.num_layers = std::stoi(v);
+      else if (k == "hidden")
+        cfg_.hidden = std::stoi(v);
+      else if (k == "num_heads")
+        cfg_.num_heads = std::stoi(v);
+      else if (k == "num_kv_heads")
+        cfg_.num_kv_heads = std::stoi(v);
+      else if (k == "head_dim")
+        cfg_.head_dim = std::stoi(v);
+      else if (k == "global_head_dim")
+        cfg_.global_head_dim = std::stoi(v);
+      else if (k == "head_dim_sliding")
+        cfg_.head_dim_sliding = std::stoi(v);
+      else if (k == "head_dim_full")
+        cfg_.head_dim_full = std::stoi(v);
+      else if (k == "num_kv_heads_sliding")
+        cfg_.num_kv_heads_sliding = std::stoi(v);
+      else if (k == "num_kv_heads_full")
+        cfg_.num_kv_heads_full = std::stoi(v);
+      else if (k == "attention_k_eq_v")
+        cfg_.attention_k_eq_v = (v == "True" || v == "true" || v == "1");
+      else if (k == "intermediate")
+        cfg_.intermediate = std::stoi(v);
+      else if (k == "vocab")
+        cfg_.vocab = std::stoi(v);
+      else if (k == "rms_eps")
+        cfg_.rms_eps = std::stof(v);
+      else if (k == "sliding_window")
+        cfg_.sliding_window = std::stoi(v);
+      else if (k == "final_logit_softcapping")
+        cfg_.final_logit_softcapping = std::stof(v);
+      else if (k == "hidden_size_per_layer_input")
+        cfg_.hidden_size_per_layer_input = std::stoi(v);
+      else if (k == "num_kv_shared_layers")
+        cfg_.num_kv_shared_layers = std::stoi(v);
+      else if (k == "first_shared_layer")
+        cfg_.first_shared_layer = std::stoi(v);
+      else if (k == "rope_theta_full")
+        cfg_.rope_theta_full = std::stof(v);
+      else if (k == "rope_theta_sliding")
+        cfg_.rope_theta_sliding = std::stof(v);
+      else if (k == "partial_rotary_full")
+        cfg_.partial_rotary_full = std::stof(v);
+      else if (k == "bos_token_id")
+        cfg_.bos_token_id = std::stoi(v);
+      else if (k == "eos_token_id")
+        cfg_.eos_token_id = std::stoi(v);
+      else if (k == "use_double_wide_mlp")
+        cfg_.use_double_wide_mlp = (v == "True" || v == "true" || v == "1");
+      else if (k == "enable_moe_block")
+        cfg_.enable_moe_block = (v == "True" || v == "true" || v == "1");
+      else if (k == "num_experts")
+        cfg_.num_experts = std::stoi(v);
+      else if (k == "top_k_experts")
+        cfg_.top_k_experts = std::stoi(v);
+      else if (k == "moe_intermediate_size")
+        cfg_.moe_intermediate_size = std::stoi(v);
+      else if (k == "tie_word_embeddings")
+        cfg_.tie_word_embeddings = (v == "True" || v == "true" || v == "1");
     } else if (kind == "CFGJSON") {
       std::string k;
       ss >> k;
       std::string rest;
       std::getline(ss, rest);
-      if (k == "kv_source") cfg_.kv_source = get_int_list(rest);
+      if (k == "kv_source")
+        cfg_.kv_source = get_int_list(rest);
       else if (k == "layer_types") {
         // parse quoted strings; mark 1 for full_attention
         cfg_.layer_full.clear();
@@ -151,7 +216,13 @@ void PlanCudaEngine::parse_manifest(const std::string& manifest_path) {
       ss >> name >> m.dtype >> shp >> m.offset >> bytes;
       m.bytes = bytes;
       std::string cur;
-      for (char c : shp) { if (c == ',') { m.shape.push_back(std::stoi(cur)); cur.clear(); } else cur += c; }
+      for (char c : shp) {
+        if (c == ',') {
+          m.shape.push_back(std::stoi(cur));
+          cur.clear();
+        } else
+          cur += c;
+      }
       if (!cur.empty()) m.shape.push_back(std::stoi(cur));
       meta_[name] = m;
     }
@@ -222,8 +293,7 @@ float* PlanCudaEngine::upload_f32(const std::string& name, int n) {
   const auto* src = reinterpret_cast<const float*>(st_.tensor_ptr(name));
   float* d = nullptr;
   G4_CHECK(cudaMalloc(&d, static_cast<std::size_t>(n) * sizeof(float)));
-  G4_CHECK(cudaMemcpy(d, src, static_cast<std::size_t>(n) * sizeof(float),
-                      cudaMemcpyHostToDevice));
+  G4_CHECK(cudaMemcpy(d, src, static_cast<std::size_t>(n) * sizeof(float), cudaMemcpyHostToDevice));
   devf_[name] = d;
   return d;
 }
@@ -278,8 +348,7 @@ void PlanCudaEngine::upload_int4(const std::string& name, int rows, int cols) {
   const std::size_t n = static_cast<std::size_t>(rows) * cols;
   const int n_groups = kernels::quant_group_count(cols, group);
   G4_CHECK(cudaMalloc(&d_i8, n));
-  G4_CHECK(
-      cudaMalloc(&d_scales, static_cast<std::size_t>(rows) * n_groups * sizeof(float)));
+  G4_CHECK(cudaMalloc(&d_scales, static_cast<std::size_t>(rows) * n_groups * sizeof(float)));
   if (group > 0) {
     kernels::launch_quantize_groupwise_fp16_to_int8(d_fp16, d_i8, d_scales, rows, cols, group,
                                                     stream_, bits == 4 ? 7 : 127);
@@ -334,10 +403,8 @@ void PlanCudaEngine::build_rope_tables() {
     }
     G4_CHECK(cudaMalloc(&d_cos_full_, cs.size() * sizeof(float)));
     G4_CHECK(cudaMalloc(&d_sin_full_, ss.size() * sizeof(float)));
-    G4_CHECK(cudaMemcpy(d_cos_full_, cs.data(), cs.size() * sizeof(float),
-                        cudaMemcpyHostToDevice));
-    G4_CHECK(cudaMemcpy(d_sin_full_, ss.data(), ss.size() * sizeof(float),
-                        cudaMemcpyHostToDevice));
+    G4_CHECK(cudaMemcpy(d_cos_full_, cs.data(), cs.size() * sizeof(float), cudaMemcpyHostToDevice));
+    G4_CHECK(cudaMemcpy(d_sin_full_, ss.data(), ss.size() * sizeof(float), cudaMemcpyHostToDevice));
     return;
   }
   // Tables sized to the ACTUAL per-layer-type head_dim (E2B full=512, 12B full=256).
@@ -365,8 +432,10 @@ void PlanCudaEngine::build_rope_tables() {
     G4_CHECK(cudaMalloc(d, v.size() * sizeof(float)));
     G4_CHECK(cudaMemcpy(*d, v.data(), v.size() * sizeof(float), cudaMemcpyHostToDevice));
   };
-  up(cs, &d_cos_sliding_); up(ss, &d_sin_sliding_);
-  up(cf, &d_cos_full_); up(sf, &d_sin_full_);
+  up(cs, &d_cos_sliding_);
+  up(ss, &d_sin_sliding_);
+  up(cf, &d_cos_full_);
+  up(sf, &d_sin_full_);
 }
 
 void PlanCudaEngine::allocate_buffers() {
@@ -374,15 +443,22 @@ void PlanCudaEngine::allocate_buffers() {
     const int H = cfg_.hidden;
     const int nvh = cfg_.linear_num_value_heads;
     auto al = [&](__half** p, std::size_t n) { G4_CHECK(cudaMalloc(p, n * sizeof(__half))); };
-    al(&d_x_, H); al(&d_x_norm_, H); al(&d_tmp_, H);
+    al(&d_x_, H);
+    al(&d_x_norm_, H);
+    al(&d_tmp_, H);
     al(&d_q_pair_, static_cast<std::size_t>(full_q_dim_) * 2);
-    al(&d_q_, full_q_dim_); al(&d_q_gate_, full_q_dim_);
-    al(&d_k_, full_kv_dim_); al(&d_v_, full_kv_dim_);
+    al(&d_q_, full_q_dim_);
+    al(&d_q_gate_, full_q_dim_);
+    al(&d_k_, full_kv_dim_);
+    al(&d_v_, full_kv_dim_);
     al(&d_att_, std::max(full_q_dim_, H));
-    al(&d_gate_, cfg_.intermediate); al(&d_up_, cfg_.intermediate);
+    al(&d_gate_, cfg_.intermediate);
+    al(&d_up_, cfg_.intermediate);
     al(&d_inter_, cfg_.intermediate);
-    al(&d_lin_mix_, linear_conv_dim_); al(&d_lin_z_, linear_v_dim_);
-    al(&d_lin_a_, nvh); al(&d_lin_b_, nvh);
+    al(&d_lin_mix_, linear_conv_dim_);
+    al(&d_lin_z_, linear_v_dim_);
+    al(&d_lin_a_, nvh);
+    al(&d_lin_b_, nvh);
     al(&d_lin_q_, static_cast<std::size_t>(nvh) * cfg_.linear_key_head_dim);
     al(&d_lin_k_, static_cast<std::size_t>(nvh) * cfg_.linear_key_head_dim);
     al(&d_lin_v_, static_cast<std::size_t>(nvh) * cfg_.linear_value_head_dim);
@@ -406,8 +482,7 @@ void PlanCudaEngine::allocate_buffers() {
     caches_v_.assign(cfg_.num_layers, nullptr);
     for (int L = 0; L < cfg_.num_layers; ++L) {
       if (!cfg_.layer_full[L]) continue;
-      const std::size_t bytes =
-          static_cast<std::size_t>(max_ctx_) * full_kv_dim_ * sizeof(__half);
+      const std::size_t bytes = static_cast<std::size_t>(max_ctx_) * full_kv_dim_ * sizeof(__half);
       G4_CHECK(cudaMalloc(&caches_k_[L], bytes));
       G4_CHECK(cudaMalloc(&caches_v_[L], bytes));
     }
@@ -431,9 +506,16 @@ void PlanCudaEngine::allocate_buffers() {
   const int maxinter = cfg_.intermediate * (cfg_.use_double_wide_mlp ? 2 : 1);
   const int ple_tot = cfg_.num_layers * cfg_.hidden_size_per_layer_input;
   auto al = [&](__half** p, std::size_t n) { G4_CHECK(cudaMalloc(p, n * sizeof(__half))); };
-  al(&d_x_, H); al(&d_x_norm_, H); al(&d_tmp_, H);
-  al(&d_q_, maxq); al(&d_k_, maxkv); al(&d_v_, maxkv); al(&d_att_, maxq);
-  al(&d_gate_, maxinter); al(&d_up_, maxinter); al(&d_inter_, maxinter);
+  al(&d_x_, H);
+  al(&d_x_norm_, H);
+  al(&d_tmp_, H);
+  al(&d_q_, maxq);
+  al(&d_k_, maxkv);
+  al(&d_v_, maxkv);
+  al(&d_att_, maxq);
+  al(&d_gate_, maxinter);
+  al(&d_up_, maxinter);
+  al(&d_inter_, maxinter);
   if (cfg_.enable_moe_block) {
     al(&d_moe_router_in_, H);
     al(&d_moe_logits_, cfg_.num_experts);
@@ -442,7 +524,9 @@ void PlanCudaEngine::allocate_buffers() {
     G4_CHECK(cudaMalloc(&d_moe_idx_, static_cast<std::size_t>(cfg_.top_k_experts) * sizeof(int)));
     G4_CHECK(cudaMalloc(&d_moe_w_, static_cast<std::size_t>(cfg_.top_k_experts) * sizeof(float)));
   }
-  al(&d_ple_raw_, ple_tot); al(&d_ple_, ple_tot); al(&d_ple_gate_, cfg_.hidden_size_per_layer_input);
+  al(&d_ple_raw_, ple_tot);
+  al(&d_ple_, ple_tot);
+  al(&d_ple_gate_, cfg_.hidden_size_per_layer_input);
   G4_CHECK(cudaMalloc(&d_logits_, static_cast<std::size_t>(cfg_.vocab) * sizeof(float)));
   G4_CHECK(cudaMalloc(&d_tok_, sizeof(int)));
   G4_CHECK(cudaMalloc(&d_position_, sizeof(int)));
@@ -475,8 +559,10 @@ void PlanCudaEngine::allocate_buffers() {
   for (int L = 0; L < cfg_.num_layers; ++L) {
     if (L < cfg_.first_shared_layer || cfg_.first_shared_layer == 0) {
       const int kvd = head_dim_of(L) * kv_heads_of(L);
-      G4_CHECK(cudaMalloc(&caches_k_[L], static_cast<std::size_t>(max_ctx_) * kvd * sizeof(__half)));
-      G4_CHECK(cudaMalloc(&caches_v_[L], static_cast<std::size_t>(max_ctx_) * kvd * sizeof(__half)));
+      G4_CHECK(
+          cudaMalloc(&caches_k_[L], static_cast<std::size_t>(max_ctx_) * kvd * sizeof(__half)));
+      G4_CHECK(
+          cudaMalloc(&caches_v_[L], static_cast<std::size_t>(max_ctx_) * kvd * sizeof(__half)));
     }
   }
   for (int L = cfg_.first_shared_layer; L < cfg_.num_layers && cfg_.first_shared_layer > 0; ++L) {
@@ -510,8 +596,8 @@ void PlanCudaEngine::parse_gemma4_st_config(const std::string& model_dir) {
   cfg_.head_dim_sliding = cfg_.head_dim;
   cfg_.head_dim_full = mini::json_get_int(tc, "global_head_dim", cfg_.head_dim);
   cfg_.num_kv_heads_sliding = mini::json_get_int(tc, "num_key_value_heads", 1);
-  cfg_.num_kv_heads_full = mini::json_get_int(tc, "num_global_key_value_heads",
-                                              cfg_.num_kv_heads_sliding);
+  cfg_.num_kv_heads_full =
+      mini::json_get_int(tc, "num_global_key_value_heads", cfg_.num_kv_heads_sliding);
   cfg_.num_kv_heads = cfg_.num_kv_heads_sliding;
   cfg_.hidden_size_per_layer_input = mini::json_get_int(tc, "hidden_size_per_layer_input", 0);
   cfg_.num_kv_shared_layers = mini::json_get_int(tc, "num_kv_shared_layers", 0);
@@ -622,8 +708,7 @@ void PlanCudaEngine::parse_gemma4_st_config(const std::string& model_dir) {
 }
 
 void PlanCudaEngine::parse_qwen35_config(const std::string& model_dir) {
-  const std::string raw =
-      mini::read_text_file(std::filesystem::path(model_dir) / "config.json");
+  const std::string raw = mini::read_text_file(std::filesystem::path(model_dir) / "config.json");
   const std::string tc = mini::json_extract_object(raw, "text_config");
   if (tc.empty()) throw std::runtime_error("Qwen3.5 config is missing text_config");
 
@@ -656,8 +741,8 @@ void PlanCudaEngine::parse_qwen35_config(const std::string& model_dir) {
     throw std::runtime_error("Qwen3.5 layer_types does not match num_hidden_layers");
 
   // Derived geometry.
-  rotary_dim_ = static_cast<int>(
-      std::lround(static_cast<float>(cfg_.head_dim) * cfg_.partial_rotary_factor));
+  rotary_dim_ =
+      static_cast<int>(std::lround(static_cast<float>(cfg_.head_dim) * cfg_.partial_rotary_factor));
   if (rotary_dim_ <= 0 || (rotary_dim_ % 2) != 0) rotary_dim_ = cfg_.head_dim - (cfg_.head_dim % 2);
   full_q_dim_ = cfg_.num_heads * cfg_.head_dim;
   full_kv_dim_ = cfg_.num_kv_heads * cfg_.head_dim;
@@ -678,8 +763,10 @@ void PlanCudaEngine::load_qwen35_weights() {
   const bool quant = weight_quant_bits_ == 4 || weight_quant_bits_ == 8;
   const int H = cfg_.hidden;
   auto proj = [&](const std::string& n, int rows, int cols) {
-    if (quant) upload_int4(n, rows, cols);
-    else upload(n, rows, cols);
+    if (quant)
+      upload_int4(n, rows, cols);
+    else
+      upload(n, rows, cols);
   };
 
   upload("model.language_model.embed_tokens.weight", cfg_.vocab, H);
@@ -701,7 +788,7 @@ void PlanCudaEngine::load_qwen35_weights() {
       proj(p + "self_attn.o_proj.weight", H, full_q_dim_);
       upload(p + "self_attn.q_norm.weight", 1, cfg_.head_dim);
       upload(p + "self_attn.k_norm.weight", 1, cfg_.head_dim);
-    } else {                   // gated delta-net
+    } else {  // gated delta-net
       proj(p + "linear_attn.in_proj_qkv.weight", linear_conv_dim_, H);
       proj(p + "linear_attn.in_proj_z.weight", linear_v_dim_, H);
       proj(p + "linear_attn.in_proj_a.weight", cfg_.linear_num_value_heads, H);
@@ -734,24 +821,27 @@ void PlanCudaEngine::load_all(const std::string& cpi_path) {
   const char* group_env = std::getenv("LLAMA_INFER_PLAN_INT4_GROUP");
   const std::string group = group_env ? group_env : "";
   const auto quantizable = [&group](const char* t) {
-    const bool is_attn = std::strncmp(t, "self_attn.", 10) == 0 && std::strstr(t, "_proj.") != nullptr;
+    const bool is_attn =
+        std::strncmp(t, "self_attn.", 10) == 0 && std::strstr(t, "_proj.") != nullptr;
     const bool is_mlp = std::strncmp(t, "mlp.", 4) == 0 && std::strstr(t, "_proj.") != nullptr;
     if (group == "attn") return is_attn;
     if (group == "mlp") return is_mlp;
     return is_attn || is_mlp;
   };
   const auto load_weight = [&](const std::string& full, const char* t) {
-    if (quantize && quantizable(t)) upload_int4(full);  // quantizes per weight_quant_bits_
-    else upload(full);
+    if (quantize && quantizable(t))
+      upload_int4(full);  // quantizes per weight_quant_bits_
+    else
+      upload(full);
   };
   for (int L = 0; L < cfg_.num_layers; ++L) {
     const std::string p = W + "layers." + std::to_string(L) + ".";
-    for (const char* t : {"input_layernorm.weight", "post_attention_layernorm.weight",
-                          "pre_feedforward_layernorm.weight", "post_feedforward_layernorm.weight",
-                          "self_attn.q_proj.weight", "self_attn.k_proj.weight",
-                          "self_attn.o_proj.weight",
-                          "self_attn.q_norm.weight", "self_attn.k_norm.weight",
-                          "mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight"})
+    for (const char* t :
+         {"input_layernorm.weight", "post_attention_layernorm.weight",
+          "pre_feedforward_layernorm.weight", "post_feedforward_layernorm.weight",
+          "self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.o_proj.weight",
+          "self_attn.q_norm.weight", "self_attn.k_norm.weight", "mlp.gate_proj.weight",
+          "mlp.up_proj.weight", "mlp.down_proj.weight"})
       load_weight(p + t, t);
     // k_eq_v full layers have no v_proj (V reuses the raw k_proj output).
     if (!k_eq_v(L)) load_weight(p + "self_attn.v_proj.weight", "self_attn.v_proj.weight");
@@ -763,10 +853,10 @@ void PlanCudaEngine::load_all(const std::string& cpi_path) {
       // Norms and the tiny router stay fp16; the EXPERTS are ~90% of the model, so
       // they go through the same quantiser as any other projection (they are plain
       // 2-D matrices here -- see parse_gemma4_st_config).
-      for (const char* t : {"pre_feedforward_layernorm_2.weight",
-                            "post_feedforward_layernorm_1.weight",
-                            "post_feedforward_layernorm_2.weight", "router.proj.weight",
-                            "router.scale", "router.per_expert_scale"})
+      for (const char* t :
+           {"pre_feedforward_layernorm_2.weight", "post_feedforward_layernorm_1.weight",
+            "post_feedforward_layernorm_2.weight", "router.proj.weight", "router.scale",
+            "router.per_expert_scale"})
         upload(p + t);
       if (quantize) {
         upload_int4(p + "experts.gate_up_proj");
@@ -793,8 +883,7 @@ void PlanCudaEngine::open(const std::string& cpi_path, int max_context) {
   if (std::filesystem::is_directory(cpi_path, ec) && !ec) {
     from_safetensors_ = true;
     st_.open(cpi_path);
-    const std::string raw =
-        mini::read_text_file(std::filesystem::path(cpi_path) / "config.json");
+    const std::string raw = mini::read_text_file(std::filesystem::path(cpi_path) / "config.json");
     const std::string tc = mini::json_extract_object(raw, "text_config");
     const std::string mt = mini::json_get_string(tc.empty() ? raw : tc, "model_type", "");
     if (mt.rfind("gemma4", 0) == 0) {
@@ -829,8 +918,8 @@ void PlanCudaEngine::open(const std::string& cpi_path, int max_context) {
       return;
     }
     parse_qwen35_config(cpi_path);
-    if (max_ctx_ <= 0 || (cfg_.max_position_embeddings > 0 &&
-                          max_ctx_ > cfg_.max_position_embeddings))
+    if (max_ctx_ <= 0 ||
+        (cfg_.max_position_embeddings > 0 && max_ctx_ > cfg_.max_position_embeddings))
       max_ctx_ = std::min(max_ctx_ > 0 ? max_ctx_ : 2048, cfg_.max_position_embeddings);
     // Partial RoPE has no device-position kernel, so this plan cannot be graphed.
     // A capability decision made on the PLAN, not on a model name.
@@ -885,39 +974,67 @@ void PlanCudaEngine::append_moe_ffn_ops(std::vector<opplan::Op>& ops, const std:
 
   // h1 = post_feedforward_layernorm_1(dense MLP output), left in Tmp.
   {
-    Op o; o.kind = OpKind::RmsNorm; o.in = Slot::Tmp; o.out = Slot::Tmp;
-    o.weight = W("post_feedforward_layernorm_1.weight"); o.rows = 1; o.cols = H;
+    Op o;
+    o.kind = OpKind::RmsNorm;
+    o.in = Slot::Tmp;
+    o.out = Slot::Tmp;
+    o.weight = W("post_feedforward_layernorm_1.weight");
+    o.rows = 1;
+    o.cols = H;
     ops.push_back(o);
   }
 
   // --- router(X): weightless RMS norm -> * scale * H^-0.5 -> proj -> top-k ---
   {
-    Op o; o.kind = OpKind::RmsNorm; o.in = Slot::X; o.out = Slot::MoeRouterIn;
-    o.weight = nullptr; o.rows = 1; o.cols = H;  // with_scale=False in HF
+    Op o;
+    o.kind = OpKind::RmsNorm;
+    o.in = Slot::X;
+    o.out = Slot::MoeRouterIn;
+    o.weight = nullptr;
+    o.rows = 1;
+    o.cols = H;  // with_scale=False in HF
     ops.push_back(o);
   }
   {
-    Op o; o.kind = OpKind::MulVec; o.in = Slot::MoeRouterIn; o.out = Slot::MoeRouterIn;
-    o.weight = W("router.scale"); o.cols = H;
+    Op o;
+    o.kind = OpKind::MulVec;
+    o.in = Slot::MoeRouterIn;
+    o.out = Slot::MoeRouterIn;
+    o.weight = W("router.scale");
+    o.cols = H;
     o.scale = std::pow(static_cast<float>(H), -0.5f);
     ops.push_back(o);
   }
   {
-    Op o; o.kind = OpKind::Gemv; o.in = Slot::MoeRouterIn; o.out = Slot::MoeLogits;
-    o.weight = W("router.proj.weight"); o.cols = E; o.in_dim = H;  // tiny: stays fp16
+    Op o;
+    o.kind = OpKind::Gemv;
+    o.in = Slot::MoeRouterIn;
+    o.out = Slot::MoeLogits;
+    o.weight = W("router.proj.weight");
+    o.cols = E;
+    o.in_dim = H;  // tiny: stays fp16
     ops.push_back(o);
   }
   {
-    Op o; o.kind = OpKind::MoeRouterTopk; o.in = Slot::MoeLogits;
-    o.weight = W("router.per_expert_scale"); o.cols = E; o.heads = K;
+    Op o;
+    o.kind = OpKind::MoeRouterTopk;
+    o.in = Slot::MoeLogits;
+    o.weight = W("router.per_expert_scale");
+    o.cols = E;
+    o.heads = K;
     ops.push_back(o);
   }
 
   // --- experts(pre_feedforward_layernorm_2(X)) ---
   // XNorm is free here: the dense MLP already consumed it.
   {
-    Op o; o.kind = OpKind::RmsNorm; o.in = Slot::X; o.out = Slot::XNorm;
-    o.weight = W("pre_feedforward_layernorm_2.weight"); o.rows = 1; o.cols = H;
+    Op o;
+    o.kind = OpKind::RmsNorm;
+    o.in = Slot::X;
+    o.out = Slot::XNorm;
+    o.weight = W("pre_feedforward_layernorm_2.weight");
+    o.rows = 1;
+    o.cols = H;
     ops.push_back(o);
   }
   auto bind_expert = [&](Op& o, const char* t) {
@@ -932,26 +1049,45 @@ void PlanCudaEngine::append_moe_ffn_ops(std::vector<opplan::Op>& ops, const std:
     }
   };
   {
-    Op o; o.kind = OpKind::MoeGateUpGeglu; o.in = Slot::XNorm; o.out = Slot::MoeInter;
-    o.cols = MI; o.in_dim = H; o.heads = K;
+    Op o;
+    o.kind = OpKind::MoeGateUpGeglu;
+    o.in = Slot::XNorm;
+    o.out = Slot::MoeInter;
+    o.cols = MI;
+    o.in_dim = H;
+    o.heads = K;
     bind_expert(o, "experts.gate_up_proj");
     ops.push_back(o);
   }
   {
-    Op o; o.kind = OpKind::MoeDownAccum; o.in = Slot::MoeInter; o.out = Slot::MoeOut;
-    o.cols = H; o.in_dim = MI; o.heads = K;
+    Op o;
+    o.kind = OpKind::MoeDownAccum;
+    o.in = Slot::MoeInter;
+    o.out = Slot::MoeOut;
+    o.cols = H;
+    o.in_dim = MI;
+    o.heads = K;
     bind_expert(o, "experts.down_proj");
     ops.push_back(o);
   }
   {
-    Op o; o.kind = OpKind::RmsNorm; o.in = Slot::MoeOut; o.out = Slot::MoeOut;
-    o.weight = W("post_feedforward_layernorm_2.weight"); o.rows = 1; o.cols = H;
+    Op o;
+    o.kind = OpKind::RmsNorm;
+    o.in = Slot::MoeOut;
+    o.out = Slot::MoeOut;
+    o.weight = W("post_feedforward_layernorm_2.weight");
+    o.rows = 1;
+    o.cols = H;
     ops.push_back(o);
   }
 
   // Tmp = h1 + h2
   {
-    Op o; o.kind = OpKind::AddInplace; o.out = Slot::Tmp; o.in = Slot::MoeOut; o.cols = H;
+    Op o;
+    o.kind = OpKind::AddInplace;
+    o.out = Slot::Tmp;
+    o.in = Slot::MoeOut;
+    o.cols = H;
     ops.push_back(o);
   }
   (void)L;
@@ -994,8 +1130,8 @@ void PlanCudaEngine::build_vision_rope_tables() {
   std::vector<float> cs(static_cast<std::size_t>(max_pos) * pairs), ss(cs.size());
   for (int p = 0; p < max_pos; ++p) {
     for (int j = 0; j < pairs; ++j) {
-      const float inv = std::pow(vcfg_.rope_theta,
-                                 -static_cast<float>(2 * j) / static_cast<float>(spatial_dim));
+      const float inv =
+          std::pow(vcfg_.rope_theta, -static_cast<float>(2 * j) / static_cast<float>(spatial_dim));
       const float ang = static_cast<float>(p) * inv;
       cs[static_cast<std::size_t>(p) * pairs + j] = std::cos(ang);
       ss[static_cast<std::size_t>(p) * pairs + j] = std::sin(ang);
@@ -1051,23 +1187,22 @@ void PlanCudaEngine::load_vision_weights() {
     // these does not crash -- it silently changes the numbers, which is why the gate
     // caught it and inspection did not.
     if (vcfg_.clipped_linears) {
-      for (const char* proj : {"self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
-                               "self_attn.o_proj", "mlp.gate_proj", "mlp.up_proj",
-                               "mlp.down_proj"}) {
+      for (const char* proj :
+           {"self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
+            "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"}) {
         const std::string base = p + proj + ".";
-        vclip_[base] = ClipBounds{scalar_value(base + "input_min"),
-                                  scalar_value(base + "input_max"),
-                                  scalar_value(base + "output_min"),
-                                  scalar_value(base + "output_max")};
+        vclip_[base] =
+            ClipBounds{scalar_value(base + "input_min"), scalar_value(base + "input_max"),
+                       scalar_value(base + "output_min"), scalar_value(base + "output_max")};
       }
     }
     const char* tensors[] = {
-        "input_layernorm.weight",          "post_attention_layernorm.weight",
+        "input_layernorm.weight",           "post_attention_layernorm.weight",
         "pre_feedforward_layernorm.weight", "post_feedforward_layernorm.weight",
-        "self_attn.q_proj.linear.weight",  "self_attn.k_proj.linear.weight",
-        "self_attn.v_proj.linear.weight",  "self_attn.o_proj.linear.weight",
-        "self_attn.q_norm.weight",         "self_attn.k_norm.weight",
-        "mlp.gate_proj.linear.weight",     "mlp.up_proj.linear.weight",
+        "self_attn.q_proj.linear.weight",   "self_attn.k_proj.linear.weight",
+        "self_attn.v_proj.linear.weight",   "self_attn.o_proj.linear.weight",
+        "self_attn.q_norm.weight",          "self_attn.k_norm.weight",
+        "mlp.gate_proj.linear.weight",      "mlp.up_proj.linear.weight",
         "mlp.down_proj.linear.weight"};
     for (const char* t : tensors) upload(p + t);
   }
@@ -1107,8 +1242,8 @@ void PlanCudaEngine::allocate_vision_buffers() {
     std::vector<__half> ones(vcfg_.hidden, __float2half(1.0f));
     cudaFree(d_ones_);
     G4_CHECK(cudaMalloc(&d_ones_, ones.size() * sizeof(__half)));
-    G4_CHECK(cudaMemcpy(d_ones_, ones.data(), ones.size() * sizeof(__half),
-                        cudaMemcpyHostToDevice));
+    G4_CHECK(
+        cudaMemcpy(d_ones_, ones.data(), ones.size() * sizeof(__half), cudaMemcpyHostToDevice));
   }
 
   G4_CHECK(cudaMalloc(&d_vis_pixels_, static_cast<std::size_t>(P) * patch_dim * sizeof(float)));
@@ -1144,11 +1279,22 @@ void PlanCudaEngine::build_vision_plan() {
     const int qdim = nq * hd, kvdim = nkv * hd;
 
     auto rms = [&](Slot in, Slot out, const __half* w, int rows, int cols) {
-      Op o; o.kind = OpKind::RmsNorm; o.in = in; o.out = out; o.weight = w;
-      o.rows = rows; o.cols = cols; ops.push_back(o);
+      Op o;
+      o.kind = OpKind::RmsNorm;
+      o.in = in;
+      o.out = out;
+      o.weight = w;
+      o.rows = rows;
+      o.cols = cols;
+      ops.push_back(o);
     };
     auto gemv = [&](Slot in, Slot out, const char* t, int out_dim, int in_dim) {
-      Op o; o.kind = OpKind::Gemv; o.in = in; o.out = out; o.cols = out_dim; o.in_dim = in_dim;
+      Op o;
+      o.kind = OpKind::Gemv;
+      o.in = in;
+      o.out = out;
+      o.cols = out_dim;
+      o.in_dim = in_dim;
       o.weight = dev_at(p + t);
       // "<proj>.linear.weight" -> "<proj>." is the key the bounds were stored under.
       const std::string tn(t);
@@ -1163,11 +1309,20 @@ void PlanCudaEngine::build_vision_plan() {
       ops.push_back(o);
     };
     auto rope2d = [&](Slot s, int heads) {
-      Op o; o.kind = OpKind::Rope2D; o.in = s; o.out = s; o.heads = heads; o.head_dim = hd;
+      Op o;
+      o.kind = OpKind::Rope2D;
+      o.in = s;
+      o.out = s;
+      o.heads = heads;
+      o.head_dim = hd;
       ops.push_back(o);
     };
     auto add_x = [&](Slot src) {
-      Op o; o.kind = OpKind::AddInplace; o.out = Slot::X; o.in = src; o.cols = H;
+      Op o;
+      o.kind = OpKind::AddInplace;
+      o.out = Slot::X;
+      o.in = src;
+      o.cols = H;
       ops.push_back(o);
     };
 
@@ -1183,13 +1338,23 @@ void PlanCudaEngine::build_vision_plan() {
     rope2d(Slot::Q, nq);
     rope2d(Slot::K, nkv);
     {  // scaling = 1.0: pre-scale q by sqrt(hd) to cancel the kernel's 1/sqrt(hd)
-      Op o; o.kind = OpKind::ScaleCopy; o.in = Slot::Q; o.out = Slot::Q; o.cols = qdim;
+      Op o;
+      o.kind = OpKind::ScaleCopy;
+      o.in = Slot::Q;
+      o.out = Slot::Q;
+      o.cols = qdim;
       o.scale = std::sqrt(static_cast<float>(hd));
       ops.push_back(o);
     }
     {
-      Op o; o.kind = OpKind::Attention; o.in = Slot::Q; o.out = Slot::Att;
-      o.heads = nq; o.kv_heads = nkv; o.head_dim = hd; o.full_attention = true;
+      Op o;
+      o.kind = OpKind::Attention;
+      o.in = Slot::Q;
+      o.out = Slot::Att;
+      o.heads = nq;
+      o.kv_heads = nkv;
+      o.head_dim = hd;
+      o.full_attention = true;
       ops.push_back(o);
     }
     gemv(Slot::Att, Slot::Tmp, "self_attn.o_proj.linear.weight", H, qdim);
@@ -1200,7 +1365,11 @@ void PlanCudaEngine::build_vision_plan() {
     gemv(Slot::XNorm, Slot::Gate, "mlp.gate_proj.linear.weight", vcfg_.intermediate, H);
     gemv(Slot::XNorm, Slot::Up, "mlp.up_proj.linear.weight", vcfg_.intermediate, H);
     {
-      Op o; o.kind = OpKind::GeluMul; o.in = Slot::Gate; o.in2 = Slot::Up; o.out = Slot::Inter;
+      Op o;
+      o.kind = OpKind::GeluMul;
+      o.in = Slot::Gate;
+      o.in2 = Slot::Up;
+      o.out = Slot::Inter;
       o.cols = vcfg_.intermediate;
       ops.push_back(o);
     }
@@ -1213,7 +1382,11 @@ void PlanCudaEngine::build_vision_plan() {
   // ops -- pooling changes the token count, so the executor has to be re-entered with
   // the new count; see encode_image.
   if (vcfg_.standardize) {
-    Op o; o.kind = OpKind::Standardize; o.in = Slot::X; o.out = Slot::X; o.cols = H;
+    Op o;
+    o.kind = OpKind::Standardize;
+    o.in = Slot::X;
+    o.out = Slot::X;
+    o.cols = H;
     o.weight = dev_at(v + "std_bias");
     o.aux_ptr = dev_at(v + "std_scale");
     vplan_.epilogue.push_back(o);
@@ -1222,8 +1395,8 @@ void PlanCudaEngine::build_vision_plan() {
 }
 
 std::vector<float> PlanCudaEngine::encode_image_stage(const std::vector<float>& pixels,
-                                                     const std::vector<int>& pos_x,
-                                                     const std::vector<int>& pos_y, int stage) {
+                                                      const std::vector<int>& pos_x,
+                                                      const std::vector<int>& pos_y, int stage) {
   using namespace opplan;
   const int P = static_cast<int>(pos_x.size());
   const int H = vcfg_.hidden;
@@ -1303,9 +1476,8 @@ std::vector<float> PlanCudaEngine::encode_image(const std::vector<float>& pixels
   // projector: weightless RMS norm -> linear into the text hidden size
   kernels::launch_rmsnorm(pooled, d_ones_, pooled, out_tokens, H, vcfg_.rms_eps, stream_);
   __half* proj_out = vslot_ptr_[static_cast<int>(Slot::Tmp)];
-  kernels::launch_rowmajor_half_gemm_f16(
-      dev_at("model.embed_vision.embedding_projection.weight"), pooled, proj_out, cfg_.hidden, H,
-      out_tokens, stream_);
+  kernels::launch_rowmajor_half_gemm_f16(dev_at("model.embed_vision.embedding_projection.weight"),
+                                         pooled, proj_out, cfg_.hidden, H, out_tokens, stream_);
   G4_CHECK(cudaStreamSynchronize(stream_));
 
   const std::size_t n = static_cast<std::size_t>(out_tokens) * cfg_.hidden;
@@ -1360,12 +1532,20 @@ void PlanCudaEngine::build_plan() {
   {
     std::vector<Op>& pro = plan_.prologue;
     auto emb = [&](const char* name, Slot out, int dim) {
-      Op o; o.kind = OpKind::EmbeddingLookup; o.out = out; o.cols = dim;
+      Op o;
+      o.kind = OpKind::EmbeddingLookup;
+      o.out = out;
+      o.cols = dim;
       o.weight = dev_at(name);
       pro.push_back(o);
     };
     auto sc = [&](Slot s, int len, float scl) {
-      Op o; o.kind = OpKind::ScaleCopy; o.in = s; o.out = s; o.cols = len; o.scale = scl;
+      Op o;
+      o.kind = OpKind::ScaleCopy;
+      o.in = s;
+      o.out = s;
+      o.cols = len;
+      o.scale = scl;
       pro.push_back(o);
     };
     emb((wprefix_ + "embed_tokens.weight").c_str(), Slot::X, H);
@@ -1381,17 +1561,29 @@ void PlanCudaEngine::build_plan() {
       emb((wprefix_ + "embed_tokens_per_layer.weight").c_str(), Slot::PleRaw, tot);
       sc(Slot::PleRaw, tot, std::sqrt((float)ple));
       // ple = rmsnorm( (W_proj · x) * hidden^-0.5 )   [x = the scaled embeds in Slot::X]
-      Op g; g.kind = OpKind::Gemv; g.in = Slot::X; g.out = Slot::PleAll;
+      Op g;
+      g.kind = OpKind::Gemv;
+      g.in = Slot::X;
+      g.out = Slot::PleAll;
       g.weight = dev_at(wprefix_ + "per_layer_model_projection.weight");
-      g.cols = tot; g.in_dim = cfg_.hidden;
+      g.cols = tot;
+      g.in_dim = cfg_.hidden;
       pro.push_back(g);
       sc(Slot::PleAll, tot, std::pow((float)cfg_.hidden, -0.5f));
-      Op n; n.kind = OpKind::RmsNorm; n.in = Slot::PleAll; n.out = Slot::PleAll;
+      Op n;
+      n.kind = OpKind::RmsNorm;
+      n.in = Slot::PleAll;
+      n.out = Slot::PleAll;
       n.weight = dev_at(wprefix_ + "per_layer_projection_norm.weight");
-      n.rows = cfg_.num_layers; n.cols = ple;
+      n.rows = cfg_.num_layers;
+      n.cols = ple;
       pro.push_back(n);
       // per_layer_inputs = (ple + ple_raw) * 2^-0.5
-      Op a; a.kind = OpKind::AddInplace; a.out = Slot::PleAll; a.in = Slot::PleRaw; a.cols = tot;
+      Op a;
+      a.kind = OpKind::AddInplace;
+      a.out = Slot::PleAll;
+      a.in = Slot::PleRaw;
+      a.cols = tot;
       pro.push_back(a);
       sc(Slot::PleAll, tot, std::pow(2.0f, -0.5f));
     }
@@ -1414,13 +1606,24 @@ void PlanCudaEngine::build_plan() {
     lp.layer_index = L;
     auto& ops = lp.ops;
     auto rms = [&](Slot in, Slot out, const __half* w, int rows, int cols) {
-      Op o; o.kind = OpKind::RmsNorm; o.in = in; o.out = out; o.weight = w; o.rows = rows; o.cols = cols;
+      Op o;
+      o.kind = OpKind::RmsNorm;
+      o.in = in;
+      o.out = out;
+      o.weight = w;
+      o.rows = rows;
+      o.cols = cols;
       ops.push_back(o);
     };
     // Resolved by NAME so a weight that was quantized at load binds its int4 form.
     // The choice is made here, once — the hot loop just runs whatever the op holds.
     auto gemv = [&](Slot in, Slot out, const char* t, int out_dim, int in_dim) {
-      Op o; o.kind = OpKind::Gemv; o.in = in; o.out = out; o.cols = out_dim; o.in_dim = in_dim;
+      Op o;
+      o.kind = OpKind::Gemv;
+      o.in = in;
+      o.out = out;
+      o.cols = out_dim;
+      o.in_dim = in_dim;
       const std::string full = p + t;
       const auto q = qdev_.find(full);
       if (q != qdev_.end()) {
@@ -1434,15 +1637,30 @@ void PlanCudaEngine::build_plan() {
       ops.push_back(o);
     };
     auto rope = [&](Slot s, int heads) {
-      Op o; o.kind = OpKind::Rope; o.in = s; o.out = s; o.heads = heads; o.head_dim = hd; o.rope_table = rt;
+      Op o;
+      o.kind = OpKind::Rope;
+      o.in = s;
+      o.out = s;
+      o.heads = heads;
+      o.head_dim = hd;
+      o.rope_table = rt;
       ops.push_back(o);
     };
     auto scale = [&](Slot s, int len, float sc) {
-      Op o; o.kind = OpKind::ScaleCopy; o.in = s; o.out = s; o.cols = len; o.scale = sc;
+      Op o;
+      o.kind = OpKind::ScaleCopy;
+      o.in = s;
+      o.out = s;
+      o.cols = len;
+      o.scale = sc;
       ops.push_back(o);
     };
     auto add_x = [&](Slot src) {
-      Op o; o.kind = OpKind::AddInplace; o.out = Slot::X; o.in = src; o.cols = H;
+      Op o;
+      o.kind = OpKind::AddInplace;
+      o.out = Slot::X;
+      o.in = src;
+      o.cols = H;
       ops.push_back(o);
     };
 
@@ -1454,7 +1672,11 @@ void PlanCudaEngine::build_plan() {
     if (!shared) {
       gemv(Slot::XNorm, Slot::K, "self_attn.k_proj.weight", kvdim, H);
       if (keqv) {  // V shares the raw k_proj output (before k_norm/rope)
-        Op o; o.kind = OpKind::CopySlot; o.in = Slot::K; o.out = Slot::V; o.cols = kvdim;
+        Op o;
+        o.kind = OpKind::CopySlot;
+        o.in = Slot::K;
+        o.out = Slot::V;
+        o.cols = kvdim;
         ops.push_back(o);
       } else {
         gemv(Slot::XNorm, Slot::V, "self_attn.v_proj.weight", kvdim, H);
@@ -1462,15 +1684,23 @@ void PlanCudaEngine::build_plan() {
       rms(Slot::K, Slot::K, W("self_attn.k_norm.weight"), nkv, hd);
       rope(Slot::K, nkv);
       rms(Slot::V, Slot::V, nullptr, nkv, hd);  // weightless v-norm (ones)
-      Op st; st.kind = OpKind::KvStore; st.cols = kvdim;
+      Op st;
+      st.kind = OpKind::KvStore;
+      st.cols = kvdim;
       ops.push_back(st);
     }
     // net attention scale = 1.0: pre-scale q by sqrt(hd) to cancel the kernel's 1/sqrt(hd).
     scale(Slot::Q, qdim, std::sqrt((float)hd));
     {
-      Op o; o.kind = OpKind::Attention; o.in = Slot::Q; o.out = Slot::Att;
-      o.heads = nq; o.kv_heads = nkv; o.head_dim = hd;
-      o.full_attention = full; o.sliding_window = cfg_.sliding_window;
+      Op o;
+      o.kind = OpKind::Attention;
+      o.in = Slot::Q;
+      o.out = Slot::Att;
+      o.heads = nq;
+      o.kv_heads = nkv;
+      o.head_dim = hd;
+      o.full_attention = full;
+      o.sliding_window = cfg_.sliding_window;
       ops.push_back(o);
     }
     gemv(Slot::Att, Slot::Tmp, "self_attn.o_proj.weight", H, qdim);
@@ -1482,7 +1712,12 @@ void PlanCudaEngine::build_plan() {
     gemv(Slot::XNorm, Slot::Gate, "mlp.gate_proj.weight", inter, H);
     gemv(Slot::XNorm, Slot::Up, "mlp.up_proj.weight", inter, H);
     {
-      Op o; o.kind = OpKind::GeluMul; o.in = Slot::Gate; o.in2 = Slot::Up; o.out = Slot::Inter; o.cols = inter;
+      Op o;
+      o.kind = OpKind::GeluMul;
+      o.in = Slot::Gate;
+      o.in2 = Slot::Up;
+      o.out = Slot::Inter;
+      o.cols = inter;
       ops.push_back(o);
     }
     gemv(Slot::Inter, Slot::Tmp, "mlp.down_proj.weight", H, inter);
@@ -1501,9 +1736,13 @@ void PlanCudaEngine::build_plan() {
     if (has_ple()) {
       const int ple = cfg_.hidden_size_per_layer_input;
       gemv(Slot::X, Slot::PleGate, "per_layer_input_gate.weight", ple, H);
-      Op g; g.kind = OpKind::GeluMul; g.in = Slot::PleGate; g.out = Slot::PleGate; g.cols = ple;
-      g.in2 = Slot::PleAll;                    // gelu(gate) * per_layer_input[L]
-      g.aux_offset = L * ple;                  // ...which is layer L's window of it
+      Op g;
+      g.kind = OpKind::GeluMul;
+      g.in = Slot::PleGate;
+      g.out = Slot::PleGate;
+      g.cols = ple;
+      g.in2 = Slot::PleAll;    // gelu(gate) * per_layer_input[L]
+      g.aux_offset = L * ple;  // ...which is layer L's window of it
       ops.push_back(g);
       gemv(Slot::PleGate, Slot::Tmp, "per_layer_projection.weight", H, ple);
       rms(Slot::Tmp, Slot::Tmp, W("post_per_layer_input_norm.weight"), 1, H);
@@ -1517,12 +1756,20 @@ void PlanCudaEngine::build_plan() {
   // --- epilogue: final norm -> LM head (float logits). Softcap stays host-side. ---
   {
     std::vector<Op>& epi = plan_.epilogue;
-    Op n; n.kind = OpKind::RmsNorm; n.in = Slot::X; n.out = Slot::XNorm;
-    n.weight = dev_at(wprefix_ + "norm.weight"); n.rows = 1; n.cols = H;
+    Op n;
+    n.kind = OpKind::RmsNorm;
+    n.in = Slot::X;
+    n.out = Slot::XNorm;
+    n.weight = dev_at(wprefix_ + "norm.weight");
+    n.rows = 1;
+    n.cols = H;
     epi.push_back(n);
-    Op h; h.kind = OpKind::LmHead; h.in = Slot::XNorm;
+    Op h;
+    h.kind = OpKind::LmHead;
+    h.in = Slot::XNorm;
     h.weight = dev_at(wprefix_ + "embed_tokens.weight");
-    h.cols = cfg_.vocab; h.in_dim = H;
+    h.cols = cfg_.vocab;
+    h.in_dim = H;
     epi.push_back(h);
   }
 }
@@ -1535,6 +1782,9 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
                                  const ExecCtx& ctx) {
   using namespace opplan;
   auto S = [&](Slot s) -> __half* { return const_cast<__half*>(ctx.slots[static_cast<int>(s)]); };
+  // The plan holds weights as opaque void* so the IR stays backend-neutral (see
+  // op_plan.hpp). This is the CUDA executor's cast back to its own half type.
+  auto HW = [](const void* p) { return static_cast<const __half*>(p); };
   // Sequence mode multiplies an op's extent by the token count. RmsNorm normalises
   // over `cols` in groups of `rows`, and slots are [tokens][rows*cols] contiguous, so
   // N tokens is just N times as many groups -- no new kernel.
@@ -1546,24 +1796,24 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
     const Op& op = ops[idx];
     switch (op.kind) {
       case OpKind::EmbeddingLookup:
-        kernels::launch_embedding_lookup(op.weight, seq ? d_seq_tokens_ : d_tok_, S(op.out), T,
+        kernels::launch_embedding_lookup(HW(op.weight), seq ? d_seq_tokens_ : d_tok_, S(op.out), T,
                                          op.cols, stream_);
         break;
       case OpKind::LmHead:
         // In sequence mode only the LAST token's logits are wanted -- running the head
         // over the whole prompt would cost a 262K-wide GEMM per token for nothing.
         kernels::launch_rowmajor_half_gemv_f32(
-            op.weight,
+            HW(op.weight),
             S(op.in) + static_cast<std::size_t>(T - 1) * static_cast<std::size_t>(op.in_dim),
             d_logits_, op.cols, op.in_dim, stream_);
         break;
       case OpKind::RmsNorm:
         // norm_offset ⇒ the weight is applied as (1 + w) (Qwen3.5-style).
         if (op.norm_offset) {
-          kernels::launch_rmsnorm_offset(S(op.in), op.weight, S(op.out), rows_x(op.rows), op.cols,
-                                         cfg_.rms_eps, stream_);
+          kernels::launch_rmsnorm_offset(S(op.in), HW(op.weight), S(op.out), rows_x(op.rows),
+                                         op.cols, cfg_.rms_eps, stream_);
         } else {
-          kernels::launch_rmsnorm(S(op.in), op.weight ? op.weight : d_ones_, S(op.out),
+          kernels::launch_rmsnorm(S(op.in), HW(op.weight) ? HW(op.weight) : d_ones_, S(op.out),
                                   rows_x(op.rows), op.cols, cfg_.rms_eps, stream_);
         }
         break;
@@ -1571,13 +1821,11 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
         // Weight encoding AND scale granularity were chosen at load; the op just
         // carries them.
         if (op.qbits == 4 && op.qgroup > 0) {
-          kernels::launch_weight_only_int4_matvec_grouped(op.qweight, op.qscales, S(op.in),
-                                                          S(op.out), op.cols, op.in_dim, op.qgroup,
-                                                          stream_);
+          kernels::launch_weight_only_int4_matvec_grouped(
+              op.qweight, op.qscales, S(op.in), S(op.out), op.cols, op.in_dim, op.qgroup, stream_);
         } else if (op.qbits == 8 && op.qgroup > 0) {
-          kernels::launch_weight_only_int8_matvec_grouped(op.qweight, op.qscales, S(op.in),
-                                                          S(op.out), op.cols, op.in_dim, op.qgroup,
-                                                          stream_);
+          kernels::launch_weight_only_int8_matvec_grouped(
+              op.qweight, op.qscales, S(op.in), S(op.out), op.cols, op.in_dim, op.qgroup, stream_);
         } else if (op.qbits == 4) {
           kernels::launch_weight_only_int4_matvec(op.qweight, op.qscales, S(op.in), S(op.out),
                                                   op.cols, op.in_dim, stream_);
@@ -1585,22 +1833,22 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
           kernels::launch_weight_only_int8_matvec(op.qweight, op.qscales, S(op.in), S(op.out),
                                                   op.cols, op.in_dim, stream_);
         } else if (seq) {
-          kernels::launch_rowmajor_half_gemm_f16(op.weight, S(op.in), S(op.out), op.cols, op.in_dim,
-                                                 T, stream_, op.clip_in_min, op.clip_in_max,
-                                                 op.clip_out_min, op.clip_out_max);
+          kernels::launch_rowmajor_half_gemm_f16(HW(op.weight), S(op.in), S(op.out), op.cols,
+                                                 op.in_dim, T, stream_, op.clip_in_min,
+                                                 op.clip_in_max, op.clip_out_min, op.clip_out_max);
         } else {
-          kernels::launch_rowmajor_half_gemv_f16(op.weight, S(op.in), S(op.out), op.cols, op.in_dim,
-                                                 stream_);
+          kernels::launch_rowmajor_half_gemv_f16(HW(op.weight), S(op.in), S(op.out), op.cols,
+                                                 op.in_dim, stream_);
         }
         break;
       case OpKind::PatchEmbed:
-        kernels::launch_patch_embed(op.weight, d_vis_pixels_, op.aux_ptr, d_vis_pos_x_,
+        kernels::launch_patch_embed(HW(op.weight), d_vis_pixels_, HW(op.aux_ptr), d_vis_pos_x_,
                                     d_vis_pos_y_, S(op.out), T, op.cols, op.in_dim, op.rows,
                                     stream_);
         break;
       case OpKind::Rope2D:
-        kernels::launch_rope_2d_inplace(S(op.in), d_vis_pos_x_, d_vis_pos_y_, op.heads,
-                                        op.head_dim, T, d_vrope_cos_, d_vrope_sin_, stream_);
+        kernels::launch_rope_2d_inplace(S(op.in), d_vis_pos_x_, d_vis_pos_y_, op.heads, op.head_dim,
+                                        T, d_vrope_cos_, d_vrope_sin_, stream_);
         break;
       case OpKind::AvgPoolPatches:
         kernels::launch_avg_pool_patches(S(op.in), d_vis_pos_x_, d_vis_pos_y_, S(op.out), T,
@@ -1608,16 +1856,16 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
                                          stream_);
         break;
       case OpKind::Standardize:
-        kernels::launch_standardize(S(op.in), op.weight, op.aux_ptr, T, op.cols, stream_);
+        kernels::launch_standardize(S(op.in), HW(op.weight), HW(op.aux_ptr), T, op.cols, stream_);
         break;
       case OpKind::MulVec:
-        kernels::launch_mul_vec(S(op.in), op.weight, S(op.out), op.cols, op.scale, stream_);
+        kernels::launch_mul_vec(S(op.in), HW(op.weight), S(op.out), op.cols, op.scale, stream_);
         break;
       case OpKind::MoeRouterTopk:
         // Writes the selected experts to DEVICE buffers; the expert ops below read
         // them there, so a token never round-trips to the host mid-layer.
         kernels::launch_moe_router_topk_softmax(S(op.in), op.cols, op.heads, d_moe_idx_, d_moe_w_,
-                                                stream_, op.weight);
+                                                stream_, HW(op.weight));
         break;
       case OpKind::MoeGateUpGeglu:
         kernels::launch_moe_gate_up_geglu(
@@ -1649,10 +1897,10 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
           // Single-tensor RoPE via the device-position kernel (k-branch guarded off
           // by num_heads_k=0). Graph-capturable: position read from d_position_.
           kernels::launch_rope_inplace_device_pos(S(op.in), nullptr, op.heads, 0, op.head_dim,
-                                                   d_position_, cosT, sinT, stream_);
+                                                  d_position_, cosT, sinT, stream_);
         } else {
-          kernels::launch_rope_inplace_table(S(op.in), S(op.out), op.heads, 0, op.head_dim, position,
-                                             cosT, sinT, stream_);
+          kernels::launch_rope_inplace_table(S(op.in), S(op.out), op.heads, 0, op.head_dim,
+                                             position, cosT, sinT, stream_);
         }
         break;
       }
@@ -1691,7 +1939,8 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
           // window, and ctx.limits (when set) makes an image span bidirectional.
           const int window = op.full_attention ? 0 : op.sliding_window;
           kernels::launch_attention_prefill(S(op.in), caches_k_[layer], caches_v_[layer], S(op.out),
-                                            T, position, op.heads, op.kv_heads, op.head_dim, stream_,
+                                            T, position, op.heads, op.kv_heads, op.head_dim,
+                                            stream_,
                                             /*causal=*/true, ctx.limits, window);
           break;
         }
@@ -1711,8 +1960,8 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
           // safe). Sliding layers pass their window so k_start is computed on device.
           const int window = op.full_attention ? 0 : op.sliding_window;
           kernels::launch_attention_step_device_pos(S(op.in), kc, vc, S(op.out), d_position_,
-                                                     op.heads, op.kv_heads, op.head_dim, stream_,
-                                                     nullptr, nullptr, nullptr, 0, true, window);
+                                                    op.heads, op.kv_heads, op.head_dim, stream_,
+                                                    nullptr, nullptr, nullptr, 0, true, window);
         } else {
           const int seq = position + 1;
           int k_start = 0;
@@ -1726,7 +1975,7 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
         break;
       }
       case OpKind::GeluMul: {
-        const __half* b = op.aux_ptr ? op.aux_ptr : (S(op.in2) + op.aux_offset);
+        const __half* b = HW(op.aux_ptr) ? HW(op.aux_ptr) : (S(op.in2) + op.aux_offset);
         if (seq && op.in2 == Slot::PleAll) {
           // b is a window of a WIDER per-token tensor, so it strides differently.
           const int stride = cfg_.num_layers * cfg_.hidden_size_per_layer_input;
@@ -1742,7 +1991,7 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
 
       // ── gated / linear-attention ("delta-net") extensions ──
       case OpKind::SiluMul: {
-        const __half* b = op.aux_ptr ? op.aux_ptr : S(op.in2);
+        const __half* b = HW(op.aux_ptr) ? HW(op.aux_ptr) : S(op.in2);
         kernels::launch_silu_mul(S(op.in), b, S(op.out), len_x(op.cols), stream_);
         break;
       }
@@ -1754,18 +2003,18 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
         kernels::launch_apply_sigmoid_gate_inplace(S(op.out), S(op.in2), op.cols, stream_);
         break;
       case OpKind::LinearConv1d:
-        kernels::launch_linear_conv1d_silu(op.weight, lin_conv_state(layer), S(op.in),
-                                                  op.cols, op.conv_kernel, stream_);
+        kernels::launch_linear_conv1d_silu(HW(op.weight), lin_conv_state(layer), S(op.in), op.cols,
+                                           op.conv_kernel, stream_);
         break;
       case OpKind::RepeatLinearHeads:
-        kernels::launch_repeat_linear_heads(S(op.in), S(Slot::LinQ), S(Slot::LinK),
-                                                   S(Slot::LinV), op.num_k_heads, op.num_v_heads,
-                                                   op.key_head_dim, op.value_head_dim, stream_);
+        kernels::launch_repeat_linear_heads(S(op.in), S(Slot::LinQ), S(Slot::LinK), S(Slot::LinV),
+                                            op.num_k_heads, op.num_v_heads, op.key_head_dim,
+                                            op.value_head_dim, stream_);
         break;
       case OpKind::LinearAttentionStep:
         kernels::launch_linear_attention_step(
             S(Slot::LinQ), S(Slot::LinK), S(Slot::LinV), S(Slot::LinZ), S(Slot::LinA),
-            S(Slot::LinB), op.auxf_a, op.auxf_b, op.aux_ptr, lin_recurrent_state(layer),
+            S(Slot::LinB), op.auxf_a, op.auxf_b, HW(op.aux_ptr), lin_recurrent_state(layer),
             S(Slot::LinAtt), op.num_v_heads, op.key_head_dim, op.value_head_dim, op.eps, stream_);
         break;
     }
@@ -1789,7 +2038,10 @@ void PlanCudaEngine::build_qwen35_plan() {
 
   // Prologue: embed only (no scale, no PLE).
   {
-    Op e; e.kind = OpKind::EmbeddingLookup; e.out = Slot::X; e.cols = H;
+    Op e;
+    e.kind = OpKind::EmbeddingLookup;
+    e.out = Slot::X;
+    e.cols = H;
     e.weight = static_cast<const __half*>(dev_["model.language_model.embed_tokens.weight"]);
     plan_.prologue.push_back(e);
   }
@@ -1803,20 +2055,40 @@ void PlanCudaEngine::build_qwen35_plan() {
 
     auto W = [&](const char* t) { return static_cast<const __half*>(dev_[p + t]); };
     auto rms = [&](Slot in, Slot out, const char* t, int rows, int cols) {
-      Op o; o.kind = OpKind::RmsNorm; o.in = in; o.out = out; o.weight = W(t);
-      o.rows = rows; o.cols = cols; o.norm_offset = true;  // Qwen3.5 uses (1 + w)
+      Op o;
+      o.kind = OpKind::RmsNorm;
+      o.in = in;
+      o.out = out;
+      o.weight = W(t);
+      o.rows = rows;
+      o.cols = cols;
+      o.norm_offset = true;  // Qwen3.5 uses (1 + w)
       ops.push_back(o);
     };
     auto gemv = [&](Slot in, Slot out, const char* t, int out_dim, int in_dim) {
-      Op o; o.kind = OpKind::Gemv; o.in = in; o.out = out; o.cols = out_dim; o.in_dim = in_dim;
+      Op o;
+      o.kind = OpKind::Gemv;
+      o.in = in;
+      o.out = out;
+      o.cols = out_dim;
+      o.in_dim = in_dim;
       const auto q = qdev_.find(p + t);
-      if (q != qdev_.end()) { o.qweight = q->second.packed; o.qscales = q->second.scales;
-                              o.qbits = weight_quant_bits_; o.qgroup = q->second.group; }
-      else { o.weight = W(t); }
+      if (q != qdev_.end()) {
+        o.qweight = q->second.packed;
+        o.qscales = q->second.scales;
+        o.qbits = weight_quant_bits_;
+        o.qgroup = q->second.group;
+      } else {
+        o.weight = W(t);
+      }
       ops.push_back(o);
     };
     auto add_x = [&](Slot src) {
-      Op o; o.kind = OpKind::AddInplace; o.out = Slot::X; o.in = src; o.cols = H;
+      Op o;
+      o.kind = OpKind::AddInplace;
+      o.out = Slot::X;
+      o.in = src;
+      o.cols = H;
       ops.push_back(o);
     };
 
@@ -1827,22 +2099,56 @@ void PlanCudaEngine::build_qwen35_plan() {
       gemv(Slot::XNorm, Slot::QPair, "self_attn.q_proj.weight", full_q_dim_ * 2, H);
       gemv(Slot::XNorm, Slot::K, "self_attn.k_proj.weight", full_kv_dim_, H);
       gemv(Slot::XNorm, Slot::V, "self_attn.v_proj.weight", full_kv_dim_, H);
-      { Op o; o.kind = OpKind::SplitHeadHalves; o.in = Slot::QPair; o.out = Slot::Q;
-        o.out2 = Slot::QGate; o.heads = cfg_.num_heads; o.head_dim = cfg_.head_dim;
-        ops.push_back(o); }
+      {
+        Op o;
+        o.kind = OpKind::SplitHeadHalves;
+        o.in = Slot::QPair;
+        o.out = Slot::Q;
+        o.out2 = Slot::QGate;
+        o.heads = cfg_.num_heads;
+        o.head_dim = cfg_.head_dim;
+        ops.push_back(o);
+      }
       rms(Slot::Q, Slot::Q, "self_attn.q_norm.weight", cfg_.num_heads, cfg_.head_dim);
       rms(Slot::K, Slot::K, "self_attn.k_norm.weight", cfg_.num_kv_heads, cfg_.head_dim);
-      { Op o; o.kind = OpKind::Rope; o.in = Slot::Q; o.in2 = Slot::K;   // partial, Q+K together
-        o.heads = cfg_.num_heads; o.kv_heads = cfg_.num_kv_heads; o.head_dim = cfg_.head_dim;
-        o.rotary_dim = rotary_dim_; o.rope_table = RopeTable::Full;
-        ops.push_back(o); }
-      { Op o; o.kind = OpKind::KvStore; o.cols = full_kv_dim_; ops.push_back(o); }
-      { Op o; o.kind = OpKind::Attention; o.in = Slot::Q; o.out = Slot::Att;
-        o.heads = cfg_.num_heads; o.kv_heads = cfg_.num_kv_heads; o.head_dim = cfg_.head_dim;
-        o.full_attention = true; o.sliding_window = 0;
-        ops.push_back(o); }
-      { Op o; o.kind = OpKind::SigmoidGate; o.out = Slot::Att; o.in2 = Slot::QGate;
-        o.cols = full_q_dim_; ops.push_back(o); }
+      {
+        Op o;
+        o.kind = OpKind::Rope;
+        o.in = Slot::Q;
+        o.in2 = Slot::K;  // partial, Q+K together
+        o.heads = cfg_.num_heads;
+        o.kv_heads = cfg_.num_kv_heads;
+        o.head_dim = cfg_.head_dim;
+        o.rotary_dim = rotary_dim_;
+        o.rope_table = RopeTable::Full;
+        ops.push_back(o);
+      }
+      {
+        Op o;
+        o.kind = OpKind::KvStore;
+        o.cols = full_kv_dim_;
+        ops.push_back(o);
+      }
+      {
+        Op o;
+        o.kind = OpKind::Attention;
+        o.in = Slot::Q;
+        o.out = Slot::Att;
+        o.heads = cfg_.num_heads;
+        o.kv_heads = cfg_.num_kv_heads;
+        o.head_dim = cfg_.head_dim;
+        o.full_attention = true;
+        o.sliding_window = 0;
+        ops.push_back(o);
+      }
+      {
+        Op o;
+        o.kind = OpKind::SigmoidGate;
+        o.out = Slot::Att;
+        o.in2 = Slot::QGate;
+        o.cols = full_q_dim_;
+        ops.push_back(o);
+      }
       gemv(Slot::Att, Slot::Tmp, "self_attn.o_proj.weight", H, full_q_dim_);
     } else {
       // ── gated delta-net ──
@@ -1850,15 +2156,28 @@ void PlanCudaEngine::build_qwen35_plan() {
       gemv(Slot::XNorm, Slot::LinZ, "linear_attn.in_proj_z.weight", linear_v_dim_, H);
       gemv(Slot::XNorm, Slot::LinA, "linear_attn.in_proj_a.weight", cfg_.linear_num_value_heads, H);
       gemv(Slot::XNorm, Slot::LinB, "linear_attn.in_proj_b.weight", cfg_.linear_num_value_heads, H);
-      { Op o; o.kind = OpKind::LinearConv1d; o.in = Slot::LinMix;
+      {
+        Op o;
+        o.kind = OpKind::LinearConv1d;
+        o.in = Slot::LinMix;
         o.weight = W("linear_attn.conv1d.weight");
-        o.cols = linear_conv_dim_; o.conv_kernel = cfg_.linear_conv_kernel_dim;
-        ops.push_back(o); }
-      { Op o; o.kind = OpKind::RepeatLinearHeads; o.in = Slot::LinMix;
-        o.num_k_heads = cfg_.linear_num_key_heads; o.num_v_heads = cfg_.linear_num_value_heads;
-        o.key_head_dim = cfg_.linear_key_head_dim; o.value_head_dim = cfg_.linear_value_head_dim;
-        ops.push_back(o); }
-      { Op o; o.kind = OpKind::LinearAttentionStep;
+        o.cols = linear_conv_dim_;
+        o.conv_kernel = cfg_.linear_conv_kernel_dim;
+        ops.push_back(o);
+      }
+      {
+        Op o;
+        o.kind = OpKind::RepeatLinearHeads;
+        o.in = Slot::LinMix;
+        o.num_k_heads = cfg_.linear_num_key_heads;
+        o.num_v_heads = cfg_.linear_num_value_heads;
+        o.key_head_dim = cfg_.linear_key_head_dim;
+        o.value_head_dim = cfg_.linear_value_head_dim;
+        ops.push_back(o);
+      }
+      {
+        Op o;
+        o.kind = OpKind::LinearAttentionStep;
         o.auxf_a = devf_[p + "linear_attn.norm.weight"];
         o.auxf_b = devf_[p + "linear_attn.A_log"];
         o.aux_ptr = W("linear_attn.dt_bias");
@@ -1866,7 +2185,8 @@ void PlanCudaEngine::build_qwen35_plan() {
         o.key_head_dim = cfg_.linear_key_head_dim;
         o.value_head_dim = cfg_.linear_value_head_dim;
         o.eps = eps;
-        ops.push_back(o); }
+        ops.push_back(o);
+      }
       gemv(Slot::LinAtt, Slot::Tmp, "linear_attn.out_proj.weight", H, linear_v_dim_);
     }
     add_x(Slot::Tmp);
@@ -1875,23 +2195,38 @@ void PlanCudaEngine::build_qwen35_plan() {
     rms(Slot::X, Slot::XNorm, "post_attention_layernorm.weight", 1, H);
     gemv(Slot::XNorm, Slot::Gate, "mlp.gate_proj.weight", cfg_.intermediate, H);
     gemv(Slot::XNorm, Slot::Up, "mlp.up_proj.weight", cfg_.intermediate, H);
-    { Op o; o.kind = OpKind::SiluMul; o.in = Slot::Gate; o.in2 = Slot::Up; o.out = Slot::Inter;
-      o.cols = cfg_.intermediate; ops.push_back(o); }
+    {
+      Op o;
+      o.kind = OpKind::SiluMul;
+      o.in = Slot::Gate;
+      o.in2 = Slot::Up;
+      o.out = Slot::Inter;
+      o.cols = cfg_.intermediate;
+      ops.push_back(o);
+    }
     gemv(Slot::Inter, Slot::Tmp, "mlp.down_proj.weight", H, cfg_.intermediate);
     add_x(Slot::Tmp);
   }
 
   // Epilogue: final (1+w) norm -> LM head.
   {
-    Op n; n.kind = OpKind::RmsNorm; n.in = Slot::X; n.out = Slot::XNorm;
+    Op n;
+    n.kind = OpKind::RmsNorm;
+    n.in = Slot::X;
+    n.out = Slot::XNorm;
     n.weight = static_cast<const __half*>(dev_["model.language_model.norm.weight"]);
-    n.rows = 1; n.cols = H; n.norm_offset = true;
+    n.rows = 1;
+    n.cols = H;
+    n.norm_offset = true;
     plan_.epilogue.push_back(n);
-    Op h; h.kind = OpKind::LmHead; h.in = Slot::XNorm;
+    Op h;
+    h.kind = OpKind::LmHead;
+    h.in = Slot::XNorm;
     const char* head = dev_.count("lm_head.weight") ? "lm_head.weight"
                                                     : "model.language_model.embed_tokens.weight";
     h.weight = static_cast<const __half*>(dev_[head]);
-    h.cols = cfg_.vocab; h.in_dim = H;
+    h.cols = cfg_.vocab;
+    h.in_dim = H;
     plan_.epilogue.push_back(h);
   }
 }
@@ -1978,8 +2313,9 @@ void PlanCudaEngine::prefill_sequence(const std::vector<int>& tokens, int start_
   if (!limits.empty()) {
     if (static_cast<int>(limits.size()) != T)
       throw std::runtime_error("limits must have one entry per token");
-    G4_CHECK(cudaMemcpyAsync(d_seq_limits_, limits.data(), static_cast<std::size_t>(T) * sizeof(int),
-                             cudaMemcpyHostToDevice, stream_));
+    G4_CHECK(cudaMemcpyAsync(d_seq_limits_, limits.data(),
+                             static_cast<std::size_t>(T) * sizeof(int), cudaMemcpyHostToDevice,
+                             stream_));
     dlimits = d_seq_limits_;
   }
 
@@ -2021,7 +2357,7 @@ void PlanCudaEngine::prefill_sequence(const std::vector<int>& tokens, int start_
 }
 
 void PlanCudaEngine::forward_one(int token, int position, bool compute_logits,
-                                   std::vector<float>* per_layer_rms) {
+                                 std::vector<float>* per_layer_rms) {
   const int H = cfg_.hidden;
 
   // Fast path: every logits step is the same single-token forward, so replay a
@@ -2050,14 +2386,20 @@ void PlanCudaEngine::forward_one(int token, int position, bool compute_logits,
       G4_CHECK(cudaStreamSynchronize(stream_));
       G4_CHECK(cudaMemcpy(h.data(), d_x_, H * sizeof(__half), cudaMemcpyDeviceToHost));
       double ss = 0;
-      for (auto v : h) { float fv = __half2float(v); ss += (double)fv * fv; }
+      for (auto v : h) {
+        float fv = __half2float(v);
+        ss += (double)fv * fv;
+      }
       per_layer_rms->push_back((float)std::sqrt(ss / H));
       if (const char* dir = std::getenv("G4_DUMP_DIR")) {
         std::vector<float> hf(H);
         for (int i = 0; i < H; ++i) hf[i] = __half2float(h[i]);
         std::string fn = std::string(dir) + "/cpi_layer_" + std::to_string(L) + ".f32";
         std::FILE* fp = std::fopen(fn.c_str(), "wb");
-        if (fp) { std::fwrite(hf.data(), sizeof(float), H, fp); std::fclose(fp); }
+        if (fp) {
+          std::fwrite(hf.data(), sizeof(float), H, fp);
+          std::fclose(fp);
+        }
       }
     }
   }
@@ -2080,8 +2422,7 @@ void PlanCudaEngine::publish_host_logits() {
 
 // Device-argmax greedy fast path (monotonic softcap ⇒ argmax(softcap)==argmax);
 // non-greedy brings logits to host (softcapped) and reuses the shared sampler.
-int PlanCudaEngine::sample(const runtime::DecodeParams& params,
-                           const std::vector<int>& history) {
+int PlanCudaEngine::sample(const runtime::DecodeParams& params, const std::vector<int>& history) {
   const bool greedy_fast_path = params.temperature <= 0.0f && params.repetition_penalty <= 1.0f &&
                                 params.no_repeat_ngram_size <= 1 && !params.grammar_mask;
   if (greedy_fast_path) {
@@ -2096,10 +2437,10 @@ int PlanCudaEngine::sample(const runtime::DecodeParams& params,
   // Device top-k: select the candidate set on the GPU so the host never touches the
   // full vocab (temperature>0 is the real chat path — greedy only covers temp<=0).
   // Eligibility mirrors the shared host top-k sampler exactly.
-  const bool device_topk = device_topk_enabled_ && params.temperature > 0.0f &&
-                           params.top_k > 0 && params.top_k <= kMaxDeviceTopK &&
-                           params.top_k < cfg_.vocab && params.repetition_penalty <= 1.0f &&
-                           params.no_repeat_ngram_size <= 1 && !params.grammar_mask;
+  const bool device_topk = device_topk_enabled_ && params.temperature > 0.0f && params.top_k > 0 &&
+                           params.top_k <= kMaxDeviceTopK && params.top_k < cfg_.vocab &&
+                           params.repetition_penalty <= 1.0f && params.no_repeat_ngram_size <= 1 &&
+                           !params.grammar_mask;
   if (device_topk) {
     const int k = params.top_k;
     G4_CHECK(cudaMemsetAsync(d_cand_count_, 0, sizeof(int), stream_));
@@ -2141,9 +2482,8 @@ int PlanCudaEngine::sample(const runtime::DecodeParams& params,
   return runtime::SequenceModel::sample(params, history);
 }
 
-
 std::vector<float> PlanCudaEngine::forward_logits(const std::vector<int>& tokens,
-                                                    std::vector<float>* per_layer_rms) {
+                                                  std::vector<float>* per_layer_rms) {
   // Parity/debug entry: fresh sequence from position 0. Drives forward_one; the
   // last token requests the per-layer dump for oracle comparison.
   defer_host_logits_ = false;  // this entry returns host logits
@@ -2174,7 +2514,10 @@ void PlanCudaEngine::capture_decode_graph() {
 void PlanCudaEngine::benchmark_graph_decode(const std::vector<int>& prompt, int iters,
                                             int pos_override) {
   using clock = std::chrono::steady_clock;
-  if (prompt.empty()) { std::printf("[graph-bench] empty prompt\n"); return; }
+  if (prompt.empty()) {
+    std::printf("[graph-bench] empty prompt\n");
+    return;
+  }
   const int token = prompt.back();
   // Effective prefill: the prompt, padded with its last token up to pos_override.
   std::vector<int> pre = prompt;
@@ -2197,11 +2540,15 @@ void PlanCudaEngine::benchmark_graph_decode(const std::vector<int>& prompt, int 
     std::vector<float> lg(cfg_.vocab);
     G4_CHECK(cudaMemcpy(lg.data(), d_logits_, cfg_.vocab * sizeof(float), cudaMemcpyDeviceToHost));
     const float cap = cfg_.final_logit_softcapping;
-    if (cap > 0.0f) for (float& v : lg) v = cap * std::tanh(v / cap);
+    if (cap > 0.0f)
+      for (float& v : lg) v = cap * std::tanh(v / cap);
     return lg;
   };
   auto argmax = [&](const std::vector<float>& v) {
-    int a = 0; for (int i = 1; i < (int)v.size(); ++i) if (v[i] > v[a]) a = i; return a;
+    int a = 0;
+    for (int i = 1; i < (int)v.size(); ++i)
+      if (v[i] > v[a]) a = i;
+    return a;
   };
 
   // Reference: non-graph forward at (token, pos).
@@ -2231,8 +2578,8 @@ void PlanCudaEngine::benchmark_graph_decode(const std::vector<int>& prompt, int 
   float maxdiff = 0.0f;
   for (int i = 0; i < cfg_.vocab; ++i) maxdiff = std::max(maxdiff, std::fabs(glog[i] - ref[i]));
   const int a_ref = argmax(ref), a_g = argmax(glog);
-  std::printf("[graph-bench] pos=%d argmax non-graph=%d graph=%d %s | max|logit diff|=%.4f\n",
-              pos, a_ref, a_g, a_ref == a_g ? "MATCH" : "MISMATCH", maxdiff);
+  std::printf("[graph-bench] pos=%d argmax non-graph=%d graph=%d %s | max|logit diff|=%.4f\n", pos,
+              a_ref, a_g, a_ref == a_g ? "MATCH" : "MISMATCH", maxdiff);
 
   auto time_loop = [&](const std::function<void()>& fn) {
     G4_CHECK(cudaStreamSynchronize(stream_));
@@ -2247,9 +2594,10 @@ void PlanCudaEngine::benchmark_graph_decode(const std::vector<int>& prompt, int 
   const double g_ms = time_loop([&]() { G4_CHECK(cudaGraphLaunch(exec, stream_)); });
 
   const double ng_per = ng_ms / iters, g_per = g_ms / iters;
-  std::printf("[graph-bench] iters=%d  non-graph %.3f ms/tok (%.1f tok/s)  graph %.3f ms/tok "
-              "(%.1f tok/s)  speedup %.2fx\n",
-              iters, ng_per, 1000.0 / ng_per, g_per, 1000.0 / g_per, ng_per / g_per);
+  std::printf(
+      "[graph-bench] iters=%d  non-graph %.3f ms/tok (%.1f tok/s)  graph %.3f ms/tok "
+      "(%.1f tok/s)  speedup %.2fx\n",
+      iters, ng_per, 1000.0 / ng_per, g_per, 1000.0 / g_per, ng_per / g_per);
 
   cudaGraphExecDestroy(exec);
   cudaGraphDestroy(graph);
@@ -2268,8 +2616,10 @@ void PlanCudaEngine::initialize(const EngineOptions& options) {
   // load_all quantizes each projection as it streams in, so the fp16 model never
   // lands on the GPU whole (Gemma 12B is ~24 GB fp16 and would OOM first).
   if (options.int8_streaming) {
-    if (options.streaming_quant_bits == 4) weight_quant_bits_ = 4;
-    else if (options.streaming_quant_bits == 8) weight_quant_bits_ = 8;
+    if (options.streaming_quant_bits == 4)
+      weight_quant_bits_ = 4;
+    else if (options.streaming_quant_bits == 8)
+      weight_quant_bits_ = 8;
   }
   // Scale granularity. int4 defaults to group-wise (128 input features per scale):
   // per-row int4 gives one scale for a whole 3840-15360-wide row, so a single
@@ -2288,9 +2638,9 @@ void PlanCudaEngine::initialize(const EngineOptions& options) {
 }
 
 std::vector<int> PlanCudaEngine::generate_stream(const std::vector<int>& prompt, int max_new,
-                                                   float temperature,
-                                                   const std::function<bool(int)>& on_token,
-                                                   const GenerationConstraints* constraints) {
+                                                 float temperature,
+                                                 const std::function<bool(int)>& on_token,
+                                                 const GenerationConstraints* constraints) {
   // Delegate the prefill+decode+sample+stop loop to the shared driver (which
   // reuses the canonical sampler); this engine only supplies step()/logits().
   // Incremental: positions advance monotonically so the KV-share sources stay
@@ -2316,10 +2666,11 @@ std::vector<int> PlanCudaEngine::generate_stream(const std::vector<int>& prompt,
   return runtime::run_decode(*this, prompt, p, on_token, &stats_);
 }
 
-std::vector<int> PlanCudaEngine::generate_multimodal(
-    const std::vector<int>& tokens, const std::vector<std::vector<float>>& embeds,
-    const std::vector<int>& limits, int max_new, float temperature,
-    const std::function<bool(int)>& on_token) {
+std::vector<int> PlanCudaEngine::generate_multimodal(const std::vector<int>& tokens,
+                                                     const std::vector<std::vector<float>>& embeds,
+                                                     const std::vector<int>& limits, int max_new,
+                                                     float temperature,
+                                                     const std::function<bool(int)>& on_token) {
   defer_host_logits_ = false;  // the shared sampler reads host logits
   prefill_sequence(tokens, 0, embeds, limits);
 
@@ -2346,7 +2697,7 @@ std::vector<int> PlanCudaEngine::generate_multimodal(
 }
 
 std::vector<int> PlanCudaEngine::generate(const std::vector<int>& prompt, int max_new,
-                                            float temperature) {
+                                          float temperature) {
   return generate_stream(prompt, max_new, temperature, nullptr, nullptr);
 }
 
