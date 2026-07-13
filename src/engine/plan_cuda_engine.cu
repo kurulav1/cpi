@@ -1535,6 +1535,9 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
                                  const ExecCtx& ctx) {
   using namespace opplan;
   auto S = [&](Slot s) -> __half* { return const_cast<__half*>(ctx.slots[static_cast<int>(s)]); };
+  // The plan holds weights as opaque void* so the IR stays backend-neutral (see
+  // op_plan.hpp). This is the CUDA executor's cast back to its own half type.
+  auto HW = [](const void* p) { return static_cast<const __half*>(p); };
   // Sequence mode multiplies an op's extent by the token count. RmsNorm normalises
   // over `cols` in groups of `rows`, and slots are [tokens][rows*cols] contiguous, so
   // N tokens is just N times as many groups -- no new kernel.
@@ -1546,24 +1549,24 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
     const Op& op = ops[idx];
     switch (op.kind) {
       case OpKind::EmbeddingLookup:
-        kernels::launch_embedding_lookup(op.weight, seq ? d_seq_tokens_ : d_tok_, S(op.out), T,
+        kernels::launch_embedding_lookup(HW(op.weight), seq ? d_seq_tokens_ : d_tok_, S(op.out), T,
                                          op.cols, stream_);
         break;
       case OpKind::LmHead:
         // In sequence mode only the LAST token's logits are wanted -- running the head
         // over the whole prompt would cost a 262K-wide GEMM per token for nothing.
         kernels::launch_rowmajor_half_gemv_f32(
-            op.weight,
+            HW(op.weight),
             S(op.in) + static_cast<std::size_t>(T - 1) * static_cast<std::size_t>(op.in_dim),
             d_logits_, op.cols, op.in_dim, stream_);
         break;
       case OpKind::RmsNorm:
         // norm_offset ⇒ the weight is applied as (1 + w) (Qwen3.5-style).
         if (op.norm_offset) {
-          kernels::launch_rmsnorm_offset(S(op.in), op.weight, S(op.out), rows_x(op.rows), op.cols,
+          kernels::launch_rmsnorm_offset(S(op.in), HW(op.weight), S(op.out), rows_x(op.rows), op.cols,
                                          cfg_.rms_eps, stream_);
         } else {
-          kernels::launch_rmsnorm(S(op.in), op.weight ? op.weight : d_ones_, S(op.out),
+          kernels::launch_rmsnorm(S(op.in), HW(op.weight) ? HW(op.weight) : d_ones_, S(op.out),
                                   rows_x(op.rows), op.cols, cfg_.rms_eps, stream_);
         }
         break;
@@ -1585,16 +1588,16 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
           kernels::launch_weight_only_int8_matvec(op.qweight, op.qscales, S(op.in), S(op.out),
                                                   op.cols, op.in_dim, stream_);
         } else if (seq) {
-          kernels::launch_rowmajor_half_gemm_f16(op.weight, S(op.in), S(op.out), op.cols, op.in_dim,
+          kernels::launch_rowmajor_half_gemm_f16(HW(op.weight), S(op.in), S(op.out), op.cols, op.in_dim,
                                                  T, stream_, op.clip_in_min, op.clip_in_max,
                                                  op.clip_out_min, op.clip_out_max);
         } else {
-          kernels::launch_rowmajor_half_gemv_f16(op.weight, S(op.in), S(op.out), op.cols, op.in_dim,
+          kernels::launch_rowmajor_half_gemv_f16(HW(op.weight), S(op.in), S(op.out), op.cols, op.in_dim,
                                                  stream_);
         }
         break;
       case OpKind::PatchEmbed:
-        kernels::launch_patch_embed(op.weight, d_vis_pixels_, op.aux_ptr, d_vis_pos_x_,
+        kernels::launch_patch_embed(HW(op.weight), d_vis_pixels_, HW(op.aux_ptr), d_vis_pos_x_,
                                     d_vis_pos_y_, S(op.out), T, op.cols, op.in_dim, op.rows,
                                     stream_);
         break;
@@ -1608,16 +1611,16 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
                                          stream_);
         break;
       case OpKind::Standardize:
-        kernels::launch_standardize(S(op.in), op.weight, op.aux_ptr, T, op.cols, stream_);
+        kernels::launch_standardize(S(op.in), HW(op.weight), HW(op.aux_ptr), T, op.cols, stream_);
         break;
       case OpKind::MulVec:
-        kernels::launch_mul_vec(S(op.in), op.weight, S(op.out), op.cols, op.scale, stream_);
+        kernels::launch_mul_vec(S(op.in), HW(op.weight), S(op.out), op.cols, op.scale, stream_);
         break;
       case OpKind::MoeRouterTopk:
         // Writes the selected experts to DEVICE buffers; the expert ops below read
         // them there, so a token never round-trips to the host mid-layer.
         kernels::launch_moe_router_topk_softmax(S(op.in), op.cols, op.heads, d_moe_idx_, d_moe_w_,
-                                                stream_, op.weight);
+                                                stream_, HW(op.weight));
         break;
       case OpKind::MoeGateUpGeglu:
         kernels::launch_moe_gate_up_geglu(
@@ -1726,7 +1729,7 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
         break;
       }
       case OpKind::GeluMul: {
-        const __half* b = op.aux_ptr ? op.aux_ptr : (S(op.in2) + op.aux_offset);
+        const __half* b = HW(op.aux_ptr) ? HW(op.aux_ptr) : (S(op.in2) + op.aux_offset);
         if (seq && op.in2 == Slot::PleAll) {
           // b is a window of a WIDER per-token tensor, so it strides differently.
           const int stride = cfg_.num_layers * cfg_.hidden_size_per_layer_input;
@@ -1742,7 +1745,7 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
 
       // ── gated / linear-attention ("delta-net") extensions ──
       case OpKind::SiluMul: {
-        const __half* b = op.aux_ptr ? op.aux_ptr : S(op.in2);
+        const __half* b = HW(op.aux_ptr) ? HW(op.aux_ptr) : S(op.in2);
         kernels::launch_silu_mul(S(op.in), b, S(op.out), len_x(op.cols), stream_);
         break;
       }
@@ -1754,7 +1757,7 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
         kernels::launch_apply_sigmoid_gate_inplace(S(op.out), S(op.in2), op.cols, stream_);
         break;
       case OpKind::LinearConv1d:
-        kernels::launch_linear_conv1d_silu(op.weight, lin_conv_state(layer), S(op.in),
+        kernels::launch_linear_conv1d_silu(HW(op.weight), lin_conv_state(layer), S(op.in),
                                                   op.cols, op.conv_kernel, stream_);
         break;
       case OpKind::RepeatLinearHeads:
@@ -1765,7 +1768,7 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
       case OpKind::LinearAttentionStep:
         kernels::launch_linear_attention_step(
             S(Slot::LinQ), S(Slot::LinK), S(Slot::LinV), S(Slot::LinZ), S(Slot::LinA),
-            S(Slot::LinB), op.auxf_a, op.auxf_b, op.aux_ptr, lin_recurrent_state(layer),
+            S(Slot::LinB), op.auxf_a, op.auxf_b, HW(op.aux_ptr), lin_recurrent_state(layer),
             S(Slot::LinAtt), op.num_v_heads, op.key_head_dim, op.value_head_dim, op.eps, stream_);
         break;
     }

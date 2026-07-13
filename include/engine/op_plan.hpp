@@ -1,7 +1,5 @@
 #pragma once
 
-#include <cuda_fp16.h>
-
 #include <cstdint>
 #include <limits>
 #include <vector>
@@ -125,8 +123,12 @@ struct Op {
   Slot in = Slot::X;
   Slot out = Slot::X;
   Slot in2 = Slot::X;          // GeluMul's second operand (when aux_ptr is null)
-  const __half* weight = nullptr;  // bound at build; nullptr = weightless norm
-  const __half* aux_ptr = nullptr; // GeluMul raw 2nd operand (PLE per-layer input); overrides in2
+  // Opaque device handles to fp16 weights. Deliberately void*, not __half*: this
+  // IR is the backend seam, and a Metal executor must be able to include it with
+  // no CUDA toolkit present. Each backend casts to its own half type on read;
+  // writes need no cast (any object pointer converts to void* implicitly).
+  const void* weight = nullptr;   // bound at build; nullptr = weightless norm
+  const void* aux_ptr = nullptr;  // GeluMul raw 2nd operand (PLE per-layer input); overrides in2
   // Quantized Gemv: when qweight is set the op runs a weight-only matvec instead
   // of the fp16 one. qbits picks the encoding: 8 = int8, 4 = int4 (packed
   // two-per-byte). qgroup picks the scale granularity: 0 = one scale per row,
