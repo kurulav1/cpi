@@ -1,0 +1,22 @@
+# Golden greedy token stream for Qwen2.5-0.5B-Instruct, produced by the CUDA backend.
+#
+# WHY CUDA IS THE ORACLE HERE, NOT THE CPU ENGINE:
+#
+# Both GPU backends keep activations in fp16; CpuLlamaEngine keeps them in fp32. Over a
+# greedy stream that difference compounds and eventually flips a near-tie -- for this
+# prompt, at token 11 (CPU says 508, both GPUs say 1294). That is not a bug in either
+# engine, it is the fp16/fp32 activation gap, and it means the CPU engine cannot be used
+# to gate a long GPU token stream. It IS still a good check on the first forward (argmax
+# and the top-5 ranking), which is what metal_decode_test uses it for.
+#
+# The CUDA backend is the reference implementation for this model, so a second backend is
+# correct exactly when it reproduces CUDA token-for-token. Metal does.
+#
+# Regenerate with:
+#   llama_infer <model>.ll2c --tokenizer <tok>.json --tokens 1,2,3,4,5 \
+#               --temp 0 --max-new 12 --gpu-cache-all
+#
+# Format: "prompt:" then the token ids; "expect:" then the greedy continuation.
+
+prompt: 1,2,3,4,5
+expect: 6,25010,10,4999,1725,25,35058,2179,30,31,1294,61
