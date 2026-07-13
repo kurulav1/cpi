@@ -1,5 +1,9 @@
 #include <cuda_fp16.h>
 
+#include <cmath>
+#include <cstdlib>
+#include <vector>
+
 #include <algorithm>
 #include <utility>
 
@@ -92,6 +96,135 @@ void LlamaEngine::forward_token(int token, int position, bool compute_logits,
     CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
     CUDA_CHECK(cudaMemcpy(out_argmax, d_argmax_, sizeof(int), cudaMemcpyDeviceToHost));
   }
+}
+
+
+
+// ---------------------------------------------------------------------------------------
+// Tensor-core prefill attention.
+//
+// The hand-written attention_prefill_kernel_tiled was 84% of ALL prefill GPU time and ran on
+// the plain FMA pipe (Nsight: compute 31%, DRAM 0.2%, occupancy 45%). CPI's prefill was 3-5x
+// behind llama.cpp for exactly this reason -- the prefill GEMMs were already on cutlass tensor
+// cores; only attention was not. Widening the block bought 4% and changed model output, so
+// occupancy was never the lever: math throughput was.
+//
+// Q.K^T and P.V are just GEMMs. Handing them to cuBLAS puts them on the tensor cores.
+//
+// Done in CHUNKS of query rows so the score matrix stays bounded: a full [heads][seq][seq]
+// matrix is 32 x 32768^2 x 2 B = 68 GB at long context. Chunked it is heads x chunk x keys.
+//
+// GQA forces cublasGemmBatchedEx (pointer arrays) rather than the strided-batched call: the
+// K/V pointer for query head h is (h / group) * head_dim, which is not a constant stride in h,
+// so a single strideA cannot express it.
+// ---------------------------------------------------------------------------------------
+bool LlamaEngine::prefill_attention_tensorcore(const void* q, const void* k_layer,
+                                               const void* v_layer, void* out, int rows,
+                                               int base_pos, int num_heads, int num_kv_heads,
+                                               int head_dim) {
+  static const bool legacy = [] {
+    const char* e = std::getenv("LLAMA_INFER_LEGACY_PREFILL_ATTN");
+    return e && *e == '1';
+  }();
+  if (legacy || rows <= 0 || num_kv_heads <= 0 || head_dim <= 0 ||
+      (num_heads % num_kv_heads) != 0) {
+    return false;
+  }
+
+  // 256, not 128: halves the number of chunk iterations (each carries a pointer-array copy
+  // and three launches) and gives the GEMMs twice the n dimension to work with.
+  constexpr int kChunk = 256;
+  const int keys = base_pos + rows;  // this chunk's KV is already stored; the mask does the rest
+  const int group = num_heads / num_kv_heads;
+  const int q_stride = num_heads * head_dim;   // d_prefill_q_ rows are [num_heads, head_dim]
+  const int kv_stride = num_kv_heads * head_dim;
+  const int out_stride = num_heads * head_dim;
+
+  // Score scratch: [heads][chunk][keys]. Bail out rather than allocate something absurd.
+  const std::size_t need = static_cast<std::size_t>(num_heads) * kChunk *
+                           static_cast<std::size_t>(keys) * sizeof(__half);
+  if (need > (std::size_t{1} << 30)) {
+    return false;  // > 1 GB: let the kernel handle it
+  }
+  if (need > attn_scores_bytes_) {
+    if (d_attn_scores_) {
+      cudaFree(d_attn_scores_);
+      d_attn_scores_ = nullptr;
+    }
+    if (cudaMalloc(&d_attn_scores_, need) != cudaSuccess) {
+      d_attn_scores_ = nullptr;
+      attn_scores_bytes_ = 0;
+      return false;
+    }
+    attn_scores_bytes_ = need;
+  }
+  const __half* qh = static_cast<const __half*>(q);
+  const __half* kh = static_cast<const __half*>(k_layer);
+  const __half* vh = static_cast<const __half*>(v_layer);
+  __half* oh = static_cast<__half*>(out);
+  __half* sh = static_cast<__half*>(d_attn_scores_);
+
+  const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+  const float zero = 0.0f;
+  const float one = 1.0f;
+
+
+  const std::size_t ptrs_needed = 6 * static_cast<std::size_t>(num_heads);
+  if (ptrs_needed > gemm_ptrs_capacity_) {
+    if (d_gemm_ptrs_) {
+      cudaFree(d_gemm_ptrs_);
+      d_gemm_ptrs_ = nullptr;
+    }
+    gemm_ptrs_capacity_ = 0;
+    if (cudaMalloc(&d_gemm_ptrs_, sizeof(void*) * ptrs_needed) != cudaSuccess) {
+      d_gemm_ptrs_ = nullptr;
+      return false;
+    }
+    gemm_ptrs_capacity_ = ptrs_needed;
+  }
+
+  for (int c0 = 0; c0 < rows; c0 += kChunk) {
+    const int chunk = std::min(kChunk, rows - c0);
+
+    // Pointer arrays are built ON DEVICE, on this stream. Staging them from the host into a
+    // reused pinned buffer was a race -- this function runs once per LAYER, so the next layer
+    // overwrote the buffer while the previous async copy was still in flight, and the GEMMs
+    // could read the wrong layer's K/V. It gave different logits on every run.
+    kernels::launch_build_attention_ptrs(kh, vh, qh, sh, oh, d_gemm_ptrs_, num_heads, group,
+                                         head_dim, kChunk, keys, q_stride, out_stride, c0,
+                                         compute_stream_);
+
+    const void* const* A1 = const_cast<const void* const*>(d_gemm_ptrs_);
+    const void* const* B1 = const_cast<const void* const*>(d_gemm_ptrs_ + num_heads);
+    void* const* C1 = d_gemm_ptrs_ + 2 * num_heads;
+    const void* const* A2 = const_cast<const void* const*>(d_gemm_ptrs_ + 3 * num_heads);
+    const void* const* B2 = const_cast<const void* const*>(d_gemm_ptrs_ + 4 * num_heads);
+    void* const* C2 = d_gemm_ptrs_ + 5 * num_heads;
+
+    // S(keys x chunk, col-major, ld=keys) = alpha * K^T(keys x D) * Q(D x chunk)
+    //
+    // K is row-major [keys, D] with row stride kv_stride, which cuBLAS reads column-major as
+    // [D, keys] with ld=kv_stride -- so OP_T gives [keys, D]. Q is row-major [chunk, D] with row
+    // stride q_stride, read column-major as [D, chunk] -- OP_N. The column-major result
+    // [keys, chunk] with ld=keys IS the row-major [chunk, keys] the softmax wants.
+    // 1/sqrt(head_dim) rides in as alpha, so no separate scaling pass.
+    CUBLAS_CHECK(cublasGemmBatchedEx(
+        cublas_, CUBLAS_OP_T, CUBLAS_OP_N, keys, chunk, head_dim, &scale, A1, CUDA_R_16F,
+        kv_stride, B1, CUDA_R_16F, q_stride, &zero, C1, CUDA_R_16F, keys, num_heads,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+
+    kernels::launch_softmax_causal_rows(sh, num_heads, kChunk, chunk, keys, base_pos + c0,
+                                        compute_stream_);
+
+    // O(D x chunk, col-major, ld=out_stride) = V(D x keys) * P(keys x chunk)
+    // V is row-major [keys, D] -> column-major [D, keys], OP_N. P is the row-major
+    // [chunk, keys] we just wrote -> column-major [keys, chunk] with ld=keys, OP_N.
+    CUBLAS_CHECK(cublasGemmBatchedEx(
+        cublas_, CUBLAS_OP_N, CUBLAS_OP_N, head_dim, chunk, keys, &one, A2, CUDA_R_16F, kv_stride,
+        B2, CUDA_R_16F, keys, &zero, C2, CUDA_R_16F, out_stride, num_heads, CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+  }
+  return true;
 }
 
 }  // namespace engine

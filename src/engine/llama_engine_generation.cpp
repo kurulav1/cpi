@@ -205,9 +205,17 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
                                    kv_row_bytes, d_prefill_v_, kv_row_bytes, kv_row_bytes, rows,
                                    cudaMemcpyDeviceToDevice, compute_stream_));
 
-      kernels::launch_attention_prefill(static_cast<const __half*>(d_prefill_q_), k_layer, v_layer,
-                                        static_cast<__half*>(d_att_), rows, base_pos, cfg.num_heads,
-                                        cfg.num_kv_heads, head_dim, compute_stream_);
+      // Tensor cores first: Q.K^T and P.V as cuBLAS batched GEMMs. Falls back to the kernel if
+      // the geometry is unsupported or the score matrix would be too big. This is plain causal
+      // text prefill -- no per-token limits, no sliding window -- which is exactly the case the
+      // GEMM path covers; the vision/bidirectional paths never reach here.
+      if (!prefill_attention_tensorcore(d_prefill_q_, k_layer, v_layer, d_att_, rows, base_pos,
+                                        cfg.num_heads, cfg.num_kv_heads, head_dim)) {
+        kernels::launch_attention_prefill(static_cast<const __half*>(d_prefill_q_), k_layer,
+                                          v_layer, static_cast<__half*>(d_att_), rows, base_pos,
+                                          cfg.num_heads, cfg.num_kv_heads, head_dim,
+                                          compute_stream_);
+      }
     }
 
     if (lowbit_proj && can_use_dp4a_proj) {

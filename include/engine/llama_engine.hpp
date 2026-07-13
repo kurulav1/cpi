@@ -270,6 +270,21 @@ private:
   // Replays the logits-decode CUDA graph and copies the full logit vector to h_logits.
   void decode_next_token_logits_graph(int token, int position, std::vector<float>& h_logits);
 
+  // Tensor-core prefill attention: Q.K^T and P.V as cuBLAS batched GEMMs (which run on the
+  // tensor cores) with a masked softmax between, over chunks of query rows.
+  //
+  // The hand-written attention_prefill_kernel_tiled is 84% of ALL prefill GPU time and runs on
+  // the plain FMA pipe -- Nsight: compute 31%, DRAM 0.2%. That is why CPI's prefill was 3-5x
+  // behind llama.cpp while its prefill GEMMs (already cutlass tensor-core) were fine.
+  //
+  // Returns false when not eligible (odd geometry, or the score matrix would be too large), and
+  // the caller must fall back to the kernel. Only used for LlamaEngine's plain causal text
+  // prefill -- the vision/bidirectional paths (per-token `limits`, sliding `window`) keep the
+  // kernel, which is the only thing that implements them.
+  bool prefill_attention_tensorcore(const void* q, const void* k_layer, const void* v_layer,
+                                    void* out, int rows, int base_pos, int num_heads,
+                                    int num_kv_heads, int head_dim);
+
   // Runs the logits decode graph and LEAVES the logits on the device. Returns false if the
   // graph is unavailable (caller must fall back). This is the half of
   // decode_next_token_logits_graph that does not pay for the D2H copy.
@@ -570,6 +585,11 @@ private:
   void* d_ff3_ = nullptr;             // Up-projection (w3) output buffer (SwiGLU second operand).
   void* d_logits_ = nullptr;          // Raw logit vector output from the LM head.
   int* d_argmax_ = nullptr;           // Single-element device buffer for the argmax result.
+  // Tensor-core prefill attention (see prefill_attention_tensorcore).
+  void* d_attn_scores_ = nullptr;        // [heads][chunk][keys] score matrix, fp16.
+  std::size_t attn_scores_bytes_ = 0;
+  void** d_gemm_ptrs_ = nullptr;         // device pointer arrays for cublasGemmBatchedEx (6 x heads)
+  std::size_t gemm_ptrs_capacity_ = 0;   // pointers, not bytes
   float* d_argmax_part_val_ = nullptr;  // Per-block partials for the two-phase greedy argmax.
   int* d_argmax_part_idx_ = nullptr;
   int argmax_parts_ = 0;

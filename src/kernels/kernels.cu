@@ -36,6 +36,13 @@ __device__ __forceinline__ float warp_sum(float v) {
   return v;
 }
 
+__device__ __forceinline__ float warp_max_f(float v) {
+  for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+    v = fmaxf(v, __shfl_down_sync(0xffffffffu, v, offset));
+  }
+  return v;
+}
+
 // Basic normalization, embedding, and RoPE kernels.
 __global__ void rmsnorm_kernel(const half* x, const half* w, half* y, int cols, float eps) {
   const int row = blockIdx.x;
@@ -907,6 +914,112 @@ __global__ void rmsnorm_fast_kernel(const half* __restrict__ x, const half* __re
   }
 }
 
+// Causal row-softmax over an attention score matrix, in place.
+//
+// Used by the tensor-core prefill attention: Q.K^T comes out of a cuBLAS batched GEMM as a
+// [heads][chunk][keys] score matrix, this masks and normalises each query's row, and the
+// result feeds straight back into a second GEMM as P.
+//
+// Row (h, i) is query token (q_start + i), so it may attend to keys j <= q_start + i. Masked
+// entries are written as ZERO, not -inf: they are consumed by a GEMM, not another softmax, so
+// a zero weight is what drops them from the P.V product.
+__global__ void softmax_causal_rows_kernel(half* s, int chunk_stride, int keys, int q_start) {
+  const int i = blockIdx.x;   // query within the chunk
+  const int h = blockIdx.y;   // head
+  // chunk_stride is the ALLOCATED rows per head (kChunk), not the rows in flight: the GEMM
+  // writes its per-head slice at h * kChunk * keys, so the stride must match that even when
+  // the final chunk is short. grid.x carries the rows actually written.
+  half* row = s + (static_cast<std::size_t>(h) * chunk_stride + i) * keys;
+
+  const int valid = min(keys, q_start + i + 1);  // causal bound
+  const int tid = threadIdx.x;
+
+  __shared__ float sh_max;
+  __shared__ float sh_sum;
+
+  float m = -3.402823466e+38F;
+  for (int j = tid; j < valid; j += blockDim.x) {
+    m = fmaxf(m, __half2float(row[j]));
+  }
+  m = warp_max_f(m);
+  __shared__ float warp_m[32];
+  const int lane = tid & 31, warp = tid / 32;
+  const int warps = (blockDim.x + 31) / 32;
+  if (lane == 0) warp_m[warp] = m;
+  __syncthreads();
+  if (tid == 0) {
+    float mm = -3.402823466e+38F;
+    for (int w = 0; w < warps; ++w) mm = fmaxf(mm, warp_m[w]);
+    sh_max = mm;
+  }
+  __syncthreads();
+  const float mx = sh_max;
+
+  // Sum WITHOUT writing: the scores stay in fp16-from-the-GEMM until the single final store.
+  //
+  // The first version wrote exp() back into the row here and then multiplied by 1/sum in a
+  // second pass -- rounding every probability to fp16 TWICE. The old kernel keeps them in fp32
+  // throughout, so that doubled the precision loss for no reason. One rounding is unavoidable
+  // (the second GEMM consumes P as fp16); two is just sloppy.
+  float sum = 0.0f;
+  for (int j = tid; j < valid; j += blockDim.x) {
+    sum += __expf(__half2float(row[j]) - mx);
+  }
+  sum = warp_sum(sum);
+  __shared__ float warp_s[32];
+  if (lane == 0) warp_s[warp] = sum;
+  __syncthreads();
+  if (tid == 0) {
+    float ss = 0.0f;
+    for (int w = 0; w < warps; ++w) ss += warp_s[w];
+    sh_sum = (ss > 0.0f) ? ss : 1.0f;
+  }
+  __syncthreads();
+  const float inv = 1.0f / sh_sum;
+
+  for (int j = tid; j < valid; j += blockDim.x) {
+    row[j] = __float2half(__expf(__half2float(row[j]) - mx) * inv);
+  }
+  // Zero the future: these keys must not contribute to P.V.
+  for (int j = valid + tid; j < keys; j += blockDim.x) {
+    row[j] = __float2half(0.0f);
+  }
+}
+
+// Builds the pointer arrays for the tensor-core prefill attention's batched GEMMs, ON DEVICE.
+//
+// These used to be built on the host into a pinned buffer and cudaMemcpyAsync'd. That is a
+// RACE: prefill_attention_tensorcore runs once per LAYER, so layer L+1 overwrote the staging
+// buffer while layer L's async copy was still in flight, and layer L's GEMMs could pick up
+// layer L+1's K/V pointers. It produced DIFFERENT LOGITS ON EVERY RUN.
+//
+// (It hid at first because the staging buffer was a pageable std::vector, and a pageable
+// cudaMemcpyAsync is effectively synchronous. "Optimising" it to pinned memory made the copy
+// genuinely async and exposed the bug that had been there all along.)
+//
+// Building them in a kernel on the compute stream makes the ordering structural: the pointers
+// cannot be written late or early relative to the GEMMs that consume them.
+__global__ void build_attention_ptrs_kernel(const half* k_layer, const half* v_layer,
+                                            const half* q, half* scores, half* out, void** ptrs,
+                                            int num_heads, int group, int head_dim, int kchunk,
+                                            int keys, int q_stride, int out_stride, int c0) {
+  const int h = blockIdx.x * blockDim.x + threadIdx.x;
+  if (h >= num_heads) {
+    return;
+  }
+  const int kvh = h / group;
+  half* srow = scores + static_cast<std::size_t>(h) * kchunk * keys;
+
+  ptrs[h] = const_cast<half*>(k_layer + static_cast<std::size_t>(kvh) * head_dim);
+  ptrs[num_heads + h] = const_cast<half*>(
+      q + static_cast<std::size_t>(c0) * q_stride + static_cast<std::size_t>(h) * head_dim);
+  ptrs[2 * num_heads + h] = srow;
+  ptrs[3 * num_heads + h] = const_cast<half*>(v_layer + static_cast<std::size_t>(kvh) * head_dim);
+  ptrs[4 * num_heads + h] = srow;
+  ptrs[5 * num_heads + h] =
+      out + static_cast<std::size_t>(c0) * out_stride + static_cast<std::size_t>(h) * head_dim;
+}
+
 }  // namespace
 
 // Host launch wrappers keep kernel-selection policy out of the runtime call
@@ -1008,6 +1121,24 @@ void launch_rope_inplace_perpos(half* q, half* k, int num_tokens, int num_heads_
   rope_inplace_perpos_kernel<<<grid, threads, 0, stream>>>(
       q, k, num_tokens, num_heads_q, num_heads_k, head_dim, positions, cos_table, sin_table);
 }
+void launch_build_attention_ptrs(const half* k_layer, const half* v_layer, const half* q,
+                                 half* scores, half* out, void** ptrs, int num_heads, int group,
+                                 int head_dim, int kchunk, int keys, int q_stride, int out_stride,
+                                 int c0, cudaStream_t stream) {
+  const int threads = 64;
+  const int blocks = (num_heads + threads - 1) / threads;
+  build_attention_ptrs_kernel<<<blocks, threads, 0, stream>>>(k_layer, v_layer, q, scores, out,
+                                                              ptrs, num_heads, group, head_dim,
+                                                              kchunk, keys, q_stride, out_stride,
+                                                              c0);
+}
+
+void launch_softmax_causal_rows(half* scores, int heads, int chunk_stride, int rows, int keys,
+                                int q_start, cudaStream_t stream) {
+  const dim3 grid(static_cast<unsigned>(rows), static_cast<unsigned>(heads));
+  softmax_causal_rows_kernel<<<grid, 256, 0, stream>>>(scores, chunk_stride, keys, q_start);
+}
+
 void launch_attention_prefill(const half* q, const half* k_cache, const half* v_cache, half* out,
                               int num_tokens, int start_position, int num_heads, int num_kv_heads,
                               int head_dim, cudaStream_t stream, bool causal, const int* limits,

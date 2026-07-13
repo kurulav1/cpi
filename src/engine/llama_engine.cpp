@@ -651,6 +651,12 @@ LlamaEngine::~LlamaEngine() {
   free_ptr(d_tok_embeddings_);
   free_ptr(d_norm_out_);
   free_ptr(d_norm_out_bias_);
+  free_ptr(d_attn_scores_);
+  if (d_gemm_ptrs_) {
+    cudaFree(d_gemm_ptrs_);
+    d_gemm_ptrs_ = nullptr;
+  }
+  attn_scores_bytes_ = 0;
   free_ptr(d_lm_head_);
   if (d_lm_head_i8_) {
     cudaFree(d_lm_head_i8_);

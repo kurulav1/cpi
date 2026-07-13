@@ -323,6 +323,28 @@ void launch_increment_int(int* value, cudaStream_t stream);
 //                  skipped. The decode path always did this; prefill did not (Llama has
 //                  no windows), so a windowed model with a prompt longer than the window
 //                  was silently wrong here.
+// launch_build_attention_ptrs
+//
+// Builds the cublasGemmBatchedEx pointer arrays for the tensor-core prefill attention ON THE
+// DEVICE. Doing this from the host into a reused pinned buffer is a race -- the function runs
+// once per layer, so the next layer overwrites the staging buffer while the previous async copy
+// is still in flight. Building them on the compute stream makes the ordering structural.
+void launch_build_attention_ptrs(const half* k_layer, const half* v_layer, const half* q,
+                                 half* scores, half* out, void** ptrs, int num_heads, int group,
+                                 int head_dim, int kchunk, int keys, int q_stride, int out_stride,
+                                 int c0, cudaStream_t stream);
+
+// launch_softmax_causal_rows
+//
+// In-place causal row-softmax over a [heads][chunk][keys] score matrix. Row (h, i) belongs to
+// query token (q_start + i) and may attend to keys j <= q_start + i; masked entries are set to
+// ZERO (they feed a GEMM, not another softmax, so zero is what drops them).
+//
+// This is the middle of the tensor-core prefill attention: cuBLAS batched GEMM produces the
+// scores, this normalises them, and a second GEMM consumes them as P.
+void launch_softmax_causal_rows(half* scores, int heads, int chunk_stride, int rows, int keys,
+                                int q_start, cudaStream_t stream);
+
 void launch_attention_prefill(const half* q, const half* k_cache, const half* v_cache, half* out,
                               int num_tokens, int start_position, int num_heads, int num_kv_heads,
                               int head_dim, cudaStream_t stream, bool causal = true,
