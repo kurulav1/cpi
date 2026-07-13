@@ -383,6 +383,101 @@ kernel void cpi_gemm_f16(
   }
 }
 
+// QUANTIZED BLOCKED GEMM. The 8B's prefill is the case that matters on a Mac, and it is
+// quantized -- so an fp16-only GEMM does nothing for it. This is where the whole 10x
+// prefill gap against llama.cpp lives.
+//
+// The trick is that quantization only changes how the weight tile is FILLED. Dequantize
+// the block into threadgroup memory once (each weight is unpacked exactly once), and from
+// there it is an ordinary fp16 matmul: the same simdgroup ops, the same reuse across all
+// 32 tokens in the tile. The dequant cost is amortised over the whole tile instead of
+// being paid per token, which is what the quantized GEMV was doing.
+kernel void cpi_gemm_quant(
+    device const uchar*  qw     [[buffer(0)]],
+    device const half*   in     [[buffer(1)]],
+    device half*         out    [[buffer(2)]],
+    device const float*  scales [[buffer(3)]],
+    device const half*   bias   [[buffer(4)]],
+    constant QuantParams& p     [[buffer(5)]],
+    uint  tgid [[threadgroup_position_in_grid]],
+    uint  lid  [[thread_position_in_threadgroup]],
+    uint  nthr [[threads_per_threadgroup]]) {
+  const uint sgid = lid / 32u;
+  const uint lane = lid % 32u;
+
+  const uint row_blocks = p.out_dim / GEMM_BM;
+  const uint row0 = (tgid % row_blocks) * GEMM_BM;
+  const uint tok0 = (tgid / row_blocks) * GEMM_BN;
+  if (tok0 >= p.tokens) return;
+
+  threadgroup half Ws[GEMM_BM * GEMM_BK];
+  threadgroup half As[GEMM_BN * GEMM_BK];
+
+  simdgroup_float8x8 acc[4];
+  for (uint j = 0u; j < 4u; ++j) acc[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+  const uint srow = row0 + sgid * 8u;
+  const uint gsz = (p.group == 0u) ? p.in_dim : p.group;
+  const uint packed_row = (p.bits == 4u) ? ((p.in_dim + 1u) / 2u) : p.in_dim;
+
+  for (uint k0 = 0u; k0 < p.in_dim; k0 += GEMM_BK) {
+    // DEQUANTIZE the weight block into threadgroup memory. Each weight is unpacked once
+    // and then reused by all 32 tokens -- the quantized GEMV unpacked it per token tile.
+    for (uint i = lid; i < GEMM_BM * GEMM_BK; i += nthr) {
+      const uint r = i / GEMM_BK, kk = i % GEMM_BK;
+      const uint row = row0 + r;
+      const uint col = k0 + kk;
+      const float sc = scales[(ulong)row * (ulong)p.groups + col / gsz];
+
+      int q;
+      if (p.bits == 4u) {
+        const uchar byte = qw[(ulong)row * (ulong)packed_row + (col >> 1)];
+        const uint nib = ((col & 1u) == 0u) ? (byte & 0x0Fu) : ((byte >> 4) & 0x0Fu);
+        q = int(nib ^ 0x8u) - 0x8;
+      } else {
+        q = int(as_type<char>(qw[(ulong)row * (ulong)packed_row + col]));
+      }
+      Ws[i] = half(float(q) * sc);
+    }
+    for (uint i = lid; i < GEMM_BN * GEMM_BK; i += nthr) {
+      const uint t = i / GEMM_BK, kk = i % GEMM_BK;
+      const uint tok = tok0 + t;
+      As[i] = (tok < p.tokens) ? in[(ulong)tok * (ulong)p.in_dim + k0 + kk] : half(0.0h);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint kk = 0u; kk < GEMM_BK; kk += 8u) {
+      simdgroup_half8x8 b;
+      simdgroup_load(b, Ws + (sgid * 8u) * GEMM_BK + kk, GEMM_BK, ulong2(0, 0), true);
+      for (uint j = 0u; j < 4u; ++j) {
+        simdgroup_half8x8 a;
+        simdgroup_load(a, As + (j * 8u) * GEMM_BK + kk, GEMM_BK);
+        simdgroup_multiply_accumulate(acc[j], a, b, acc[j]);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  threadgroup float* stage = (threadgroup float*)Ws;
+  threadgroup float* mine = stage + sgid * 64u;
+
+  for (uint j = 0u; j < 4u; ++j) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_store(acc[j], mine, 8);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = lane; i < 64u; i += 32u) {
+      const uint t = i / 8u;
+      const uint r = i % 8u;
+      const uint tok = tok0 + j * 8u + t;
+      if (tok >= p.tokens) continue;
+      float v = mine[t * 8u + r];
+      if (p.has_bias != 0u) v += float(bias[srow + r]);
+      out[(ulong)tok * (ulong)p.out_dim + srow + r] = half(v);
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Weight-only int4 / int8 GEMV.
 //

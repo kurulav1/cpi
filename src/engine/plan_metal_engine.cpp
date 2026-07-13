@@ -399,10 +399,35 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
           const void* bufs[] = {op.qweight, slot(op.in), slot(op.out), op.qscales, bb};
           const std::size_t offs[] = {
               0, 0, 0, 0, static_cast<std::size_t>(op.bias_offset) * sizeof(std::uint16_t)};
-          const std::size_t tiles = static_cast<std::size_t>((T + kGemvTile - 1) / kGemvTile);
-          ctx_.dispatch("cpi_gemv_quant", G::Groups,
-                        groups_for_rows(static_cast<std::size_t>(op.cols)) * tiles, kTG, bufs, offs,
-                        5, &p, sizeof(p));
+
+          // The 8B's prefill is quantized, and that is where the whole prefill gap lives:
+          // an fp16-only GEMM does nothing for it. Send the full 32-token tiles to the
+          // QUANTIZED blocked GEMM, which dequantizes each weight once into threadgroup
+          // memory and then reuses it across all 32 tokens.
+          const bool qgemm_ok = op.cols % 64 == 0 && op.in_dim % 32 == 0;
+          const int qgemm_tokens = qgemm_ok ? (T / 32) * 32 : 0;
+
+          if (qgemm_tokens >= 32) {
+            QuantParams gp = p;
+            gp.tokens = static_cast<std::uint32_t>(qgemm_tokens);
+            const std::size_t groups = (static_cast<std::size_t>(op.cols) / 64) *
+                                       (static_cast<std::size_t>(qgemm_tokens) / 32);
+            ctx_.dispatch("cpi_gemm_quant", G::Groups, groups, kTG, bufs, offs, 5, &gp, sizeof(gp));
+          }
+
+          const int qrest = T - qgemm_tokens;
+          if (qrest > 0) {
+            QuantParams rp = p;
+            rp.tokens = static_cast<std::uint32_t>(qrest);
+            const std::size_t roffs[] = {
+                0, static_cast<std::size_t>(qgemm_tokens) * static_cast<std::size_t>(op.in_dim) * 2,
+                static_cast<std::size_t>(qgemm_tokens) * static_cast<std::size_t>(op.cols) * 2, 0,
+                static_cast<std::size_t>(op.bias_offset) * sizeof(std::uint16_t)};
+            const std::size_t tiles = static_cast<std::size_t>((qrest + kGemvTile - 1) / kGemvTile);
+            ctx_.dispatch("cpi_gemv_quant", G::Groups,
+                          groups_for_rows(static_cast<std::size_t>(op.cols)) * tiles, kTG, bufs,
+                          roffs, 5, &rp, sizeof(rp));
+          }
           break;
         }
         const void* bb = op.bias != nullptr ? op.bias : op.weight;  // bound, unread when absent
