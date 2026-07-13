@@ -563,8 +563,7 @@ void PlanMetalEngine::encode_forward(int token, int position) {
       if (v != v) nan = true;
       m = std::max(m, std::fabs(v));
     }
-    std::fprintf(stderr, "  [dbg] %-12s max|X|=%.1f%s
-", what, m, nan ? "  <-- NaN" : "");
+    std::fprintf(stderr, "  [dbg] %-12s max|X|=%.1f%s\n", what, m, nan ? "  <-- NaN" : "");
   };
 
   execute_ops(plan_.prologue, -1, position, 1);
