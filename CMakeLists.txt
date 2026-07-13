@@ -7,6 +7,14 @@ include(CTest)
 enable_testing()
 
 option(LLAMA_ENGINE_ENABLE_CUDA "Enable CUDA GPU inference and tools" ON)
+# Metal is the Apple Silicon backend. Defaults ON only on Apple, and is the exact
+# analogue of LLAMA_ENGINE_ENABLE_CUDA: the two are independent, and a machine
+# with neither still gets the portable CPU engines.
+if(APPLE)
+  option(LLAMA_ENGINE_ENABLE_METAL "Enable the Metal GPU backend (Apple Silicon)" ON)
+else()
+  option(LLAMA_ENGINE_ENABLE_METAL "Enable the Metal GPU backend (Apple Silicon)" OFF)
+endif()
 option(LLAMA_ENGINE_ENABLE_LTO "Enable LTO" ON)
 option(LLAMA_ENGINE_WARNINGS_AS_ERRORS "Treat warnings as errors" OFF)
 option(LLAMA_ENGINE_ENABLE_CLANG_TIDY "Enable clang-tidy during build" OFF)
@@ -156,6 +164,10 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
   )
 endif()
 
+if(LLAMA_ENGINE_ENABLE_METAL)
+  list(APPEND LLAMA_ENGINE_SOURCES src/runtime/metal_context.mm)
+endif()
+
 add_library(llama_engine ${LLAMA_ENGINE_SOURCES})
 target_include_directories(llama_engine PUBLIC include)
 
@@ -169,6 +181,40 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
 endif()
 
 target_compile_definitions(llama_engine PUBLIC LLAMA_ENGINE_HAS_CUDA=$<BOOL:${LLAMA_ENGINE_ENABLE_CUDA}>)
+
+# ---------------------------------------------------------------------------
+# Metal backend (Apple Silicon)
+# ---------------------------------------------------------------------------
+if(LLAMA_ENGINE_ENABLE_METAL)
+  # metal_context.mm is Objective-C++ and is deliberately built WITHOUT ARC, so a
+  # Metal object can live behind a plain void* in a header that knows nothing
+  # about Objective-C.
+  set_source_files_properties(src/runtime/metal_context.mm PROPERTIES
+    COMPILE_FLAGS "-fno-objc-arc")
+
+  target_link_libraries(llama_engine PUBLIC
+    "-framework Metal"
+    "-framework Foundation"
+  )
+
+  # Compile the shaders to a .metallib next to the binaries. `metal` is an offline
+  # compiler, so this step works even on a machine with no GPU (a CI VM) -- only
+  # RUNNING the kernels needs real hardware.
+  set(CPI_METAL_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/metal/cpi_kernels.metal)
+  set(CPI_METAL_AIR ${CMAKE_CURRENT_BINARY_DIR}/cpi_kernels.air)
+  set(CPI_METALLIB  ${CMAKE_CURRENT_BINARY_DIR}/cpi_kernels.metallib)
+
+  add_custom_command(
+    OUTPUT ${CPI_METALLIB}
+    COMMAND xcrun -sdk macosx metal -Werror -c ${CPI_METAL_SRC} -o ${CPI_METAL_AIR}
+    COMMAND xcrun -sdk macosx metallib ${CPI_METAL_AIR} -o ${CPI_METALLIB}
+    DEPENDS ${CPI_METAL_SRC}
+    COMMENT "Compiling Metal shaders -> cpi_kernels.metallib"
+    VERBATIM
+  )
+  add_custom_target(cpi_metallib ALL DEPENDS ${CPI_METALLIB})
+  add_dependencies(llama_engine cpi_metallib)
+endif()
 
 if(sentencepiece_FOUND)
   target_link_libraries(llama_engine PUBLIC sentencepiece::sentencepiece)
@@ -246,6 +292,19 @@ add_executable(grammar_test
 )
 target_include_directories(grammar_test PRIVATE include)
 add_test(NAME grammar_test COMMAND grammar_test)
+
+# Metal kernel smoke test: runs each shader against a CPU reference. On a machine
+# with no Metal GPU (any VM, including GitHub's macOS runners) it reports SKIP and
+# passes -- so a green run here proves it COMPILES AND LINKS, never that the
+# kernels are correct. Only real Apple Silicon can prove that.
+if(LLAMA_ENGINE_ENABLE_METAL)
+  add_executable(metal_smoke src/tests/metal_smoke.cpp)
+  target_link_libraries(metal_smoke PRIVATE llama_engine)
+  target_include_directories(metal_smoke PRIVATE include)
+  add_test(NAME metal_smoke COMMAND metal_smoke)
+  set_tests_properties(metal_smoke PROPERTIES
+    ENVIRONMENT "CPI_METALLIB=${CPI_METALLIB}")
+endif()
 
 # Tokenizer byte-table test. CUDA-free: built from the self-contained HfBpe
 # tokenizer backend so it runs in CI without a GPU.
