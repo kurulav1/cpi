@@ -438,23 +438,30 @@ kernel void cpi_gemm_quant(
   const uint packed_row = (p.bits == 4u) ? ((p.in_dim + 1u) / 2u) : p.in_dim;
 
   for (uint k0 = 0u; k0 < p.in_dim; k0 += GEMM_BK) {
+    // The scale is constant per ROW across a K-block: the block is 32 wide and aligned, and
+    // the group size is a multiple of 32, so every column in it falls in the same group.
+    // Looking it up per ELEMENT meant 2048 scattered float loads per block instead of 64.
+    threadgroup float sc_row[GEMM_BM];
+    for (uint r = lid; r < GEMM_BM; r += nthr) {
+      sc_row[r] = scales[(ulong)(row0 + r) * (ulong)p.groups + k0 / gsz];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
     // DEQUANTIZE the weight block into threadgroup memory. Each weight is unpacked once
-    // and then reused by all 32 tokens -- the quantized GEMV unpacked it per token tile.
+    // and then reused by all 64 tokens -- the quantized GEMV unpacked it per token tile.
     for (uint i = lid; i < GEMM_BM * GEMM_BK; i += nthr) {
       const uint r = i / GEMM_BK, kk = i % GEMM_BK;
-      const uint row = row0 + r;
       const uint col = k0 + kk;
-      const float sc = scales[(ulong)row * (ulong)p.groups + col / gsz];
 
       int q;
       if (p.bits == 4u) {
-        const uchar byte = qw[(ulong)row * (ulong)packed_row + (col >> 1)];
+        const uchar byte = qw[(ulong)(row0 + r) * (ulong)packed_row + (col >> 1)];
         const uint nib = ((col & 1u) == 0u) ? (byte & 0x0Fu) : ((byte >> 4) & 0x0Fu);
         q = int(nib ^ 0x8u) - 0x8;
       } else {
-        q = int(as_type<char>(qw[(ulong)row * (ulong)packed_row + col]));
+        q = int(as_type<char>(qw[(ulong)(row0 + r) * (ulong)packed_row + col]));
       }
-      Ws[i] = half(float(q) * sc);
+      Ws[i] = half(float(q) * sc_row[r]);
     }
     for (uint i = lid; i < GEMM_BN * GEMM_BK; i += nthr) {
       const uint t = i / GEMM_BK, kk = i % GEMM_BK;
