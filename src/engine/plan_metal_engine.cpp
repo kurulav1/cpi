@@ -287,7 +287,13 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
   g.has_qk_norm = cfg_.has_qk_norm;
   g.scale_embeddings = cfg_.scale_embeddings;
   g.mlp_gelu = cfg_.mlp_gelu;
-  g.norm_offset = cfg_.mlp_gelu;  // Gemma stores its RMSNorm weights as (w - 1)
+  // norm_offset stays FALSE for the .ll2c path. Gemma's HF checkpoint stores its RMSNorm
+  // weights as (w - 1), but CPI's converter already folds the +1 in -- which is why
+  // LlamaEngine runs gemma-2b through plain launch_rmsnorm, not launch_rmsnorm_offset.
+  // Adding it again scales by ~2 at every norm; that compounds and overflows fp16 by
+  // layer 2, which is exactly how this was found (NaN at layers=2, finite at layers=1).
+  // The (1+w) form is still needed for Gemma 4, which comes from the .cpi container.
+  g.norm_offset = false;
 
   wsrc_ = std::make_unique<MetalWeights>(ctx_, weights_, wbuf_);
   if (quant_bits == 4 || quant_bits == 8) {
