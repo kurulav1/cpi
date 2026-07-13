@@ -16,6 +16,7 @@
 
 #include "runtime/metal_context.hpp"
 
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -113,13 +114,51 @@ bool MetalContext::load_library(const std::string& path_hint) {
   }
 
   if (lib == nil) {
+    // No prebuilt library. Fall back to compiling the MSL source at runtime, which
+    // needs only the Metal framework -- so a Mac with no Xcode still works.
+    const char* srcpath = std::getenv("CPI_METAL_SOURCE");
+    if (srcpath != nullptr && load_library_from_source(srcpath)) {
+      return true;
+    }
     last_error_ = "failed to load metallib";
+    if (err != nil) {
+      last_error_ += ": ";
+      last_error_ += [[err localizedDescription] UTF8String];
+    }
+    last_error_ += " (and CPI_METAL_SOURCE was unset or failed to compile)";
+    return false;
+  }
+  library_ = (void*)lib;  // +1
+  return true;
+}
+
+bool MetalContext::load_library_from_source(const std::string& metal_source_path) {
+  if (device_ == nullptr) return false;
+  id<MTLDevice> dev = (id<MTLDevice>)device_;
+
+  NSError* err = nil;
+  NSString* path = [NSString stringWithUTF8String:metal_source_path.c_str()];
+  NSString* src = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:&err];
+  if (src == nil) {
+    last_error_ = "could not read the shader source: " + metal_source_path;
+    return false;
+  }
+
+  MTLCompileOptions* opts = [[MTLCompileOptions alloc] init];
+  id<MTLLibrary> lib = [dev newLibraryWithSource:src options:opts error:&err];
+  [opts release];
+
+  if (lib == nil) {
+    // A compile error here is a real shader bug -- surface the driver's message
+    // verbatim rather than a generic failure.
+    last_error_ = "runtime shader compilation failed";
     if (err != nil) {
       last_error_ += ": ";
       last_error_ += [[err localizedDescription] UTF8String];
     }
     return false;
   }
+  if (library_ != nullptr) [(id<MTLLibrary>)library_ release];
   library_ = (void*)lib;  // +1
   return true;
 }

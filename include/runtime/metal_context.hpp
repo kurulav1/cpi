@@ -68,6 +68,18 @@ public:
   // CPI_METALLIB env var, the default library next to the executable.
   bool load_library(const std::string& path_hint = "");
 
+  // Compiles the shaders from MSL SOURCE at runtime, via newLibraryWithSource.
+  //
+  // This is what makes a bare Mac usable. The offline `metal` compiler ships with
+  // Xcode -- NOT with the Command Line Tools -- so requiring a .metallib would mean
+  // a ~15 GB Xcode download just to run a kernel. But the Metal *framework* carries
+  // its own compiler service, which is present on every Mac, so the shader source
+  // can simply be handed to the driver.
+  //
+  // Slower to start (compiles at load), irrelevant for our purposes, and the
+  // metallib path stays for builds that have the toolchain.
+  bool load_library_from_source(const std::string& metal_source_path);
+
   MetalBuffer alloc(std::size_t bytes);
   MetalBuffer alloc_from(const void* src, std::size_t bytes);
 

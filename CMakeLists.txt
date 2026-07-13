@@ -203,23 +203,41 @@ if(LLAMA_ENGINE_ENABLE_METAL)
     "-framework Foundation"
   )
 
-  # Compile the shaders to a .metallib next to the binaries. `metal` is an offline
-  # compiler, so this step works even on a machine with no GPU (a CI VM) -- only
-  # RUNNING the kernels needs real hardware.
   set(CPI_METAL_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/metal/cpi_kernels.metal)
-  set(CPI_METAL_AIR ${CMAKE_CURRENT_BINARY_DIR}/cpi_kernels.air)
-  set(CPI_METALLIB  ${CMAKE_CURRENT_BINARY_DIR}/cpi_kernels.metallib)
 
-  add_custom_command(
-    OUTPUT ${CPI_METALLIB}
-    COMMAND xcrun -sdk macosx metal -Werror -c ${CPI_METAL_SRC} -o ${CPI_METAL_AIR}
-    COMMAND xcrun -sdk macosx metallib ${CPI_METAL_AIR} -o ${CPI_METALLIB}
-    DEPENDS ${CPI_METAL_SRC}
-    COMMENT "Compiling Metal shaders -> cpi_kernels.metallib"
-    VERBATIM
+  # The offline `metal` compiler ships with XCODE, not with the Command Line Tools.
+  # A bare Mac (a fresh cloud rental, say) has clang but no `metal`, and pulling
+  # ~15 GB of Xcode just to build a shader is not a reasonable requirement.
+  #
+  # So the metallib is OPTIONAL. When the toolchain is present we precompile, which
+  # is faster to start and type-checks at build time. When it is not, the engine
+  # compiles the MSL from source at runtime via newLibraryWithSource -- that needs
+  # only the Metal framework, which every Mac has. CPI_METAL_SOURCE points at it.
+  execute_process(
+    COMMAND xcrun -sdk macosx metal --version
+    RESULT_VARIABLE CPI_METAL_CC_MISSING
+    OUTPUT_QUIET ERROR_QUIET
   )
-  add_custom_target(cpi_metallib ALL DEPENDS ${CPI_METALLIB})
-  add_dependencies(llama_engine cpi_metallib)
+
+  if(CPI_METAL_CC_MISSING EQUAL 0)
+    set(CPI_METAL_AIR ${CMAKE_CURRENT_BINARY_DIR}/cpi_kernels.air)
+    set(CPI_METALLIB  ${CMAKE_CURRENT_BINARY_DIR}/cpi_kernels.metallib)
+    add_custom_command(
+      OUTPUT ${CPI_METALLIB}
+      COMMAND xcrun -sdk macosx metal -Werror -c ${CPI_METAL_SRC} -o ${CPI_METAL_AIR}
+      COMMAND xcrun -sdk macosx metallib ${CPI_METAL_AIR} -o ${CPI_METALLIB}
+      DEPENDS ${CPI_METAL_SRC}
+      COMMENT "Compiling Metal shaders -> cpi_kernels.metallib"
+      VERBATIM
+    )
+    add_custom_target(cpi_metallib ALL DEPENDS ${CPI_METALLIB})
+    add_dependencies(llama_engine cpi_metallib)
+    message(STATUS "Metal: offline toolchain found; precompiling cpi_kernels.metallib")
+  else()
+    set(CPI_METALLIB "")
+    message(STATUS "Metal: no offline `metal` compiler (Xcode absent); "
+                   "shaders will be compiled at runtime from source")
+  endif()
 endif()
 
 if(sentencepiece_FOUND)
@@ -317,8 +335,10 @@ if(LLAMA_ENGINE_ENABLE_METAL)
   target_link_libraries(metal_smoke PRIVATE llama_engine)
   target_include_directories(metal_smoke PRIVATE include)
   add_test(NAME metal_smoke COMMAND metal_smoke)
+  # Both are set: the metallib if we have one, and the source path as the fallback
+  # the engine uses when there is no offline toolchain.
   set_tests_properties(metal_smoke PROPERTIES
-    ENVIRONMENT "CPI_METALLIB=${CPI_METALLIB}")
+    ENVIRONMENT "CPI_METALLIB=${CPI_METALLIB};CPI_METAL_SOURCE=${CPI_METAL_SRC}")
 
   # Metal decode vs the CPU engine on the same weights. Needs a model, so it SKIPs
   # (exit 0) with no argument and ctest stays green without one.
@@ -327,7 +347,7 @@ if(LLAMA_ENGINE_ENABLE_METAL)
   target_include_directories(metal_decode_test PRIVATE include)
   add_test(NAME metal_decode_test COMMAND metal_decode_test)
   set_tests_properties(metal_decode_test PROPERTIES
-    ENVIRONMENT "CPI_METALLIB=${CPI_METALLIB}")
+    ENVIRONMENT "CPI_METALLIB=${CPI_METALLIB};CPI_METAL_SOURCE=${CPI_METAL_SRC}")
 endif()
 
 # Tokenizer byte-table test. CUDA-free: built from the self-contained HfBpe
