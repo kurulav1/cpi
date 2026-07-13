@@ -415,7 +415,21 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
         // (Metal's matrix units) and let the GEMV mop up the remainder. Decode is T=1 and
         // stays entirely on the GEMV -- a matrix unit cannot help when one operand is a
         // vector.
-        const int gemm_tokens = (op.cols % 8 == 0 && op.in_dim % 8 == 0) ? (T / 8) * 8 : 0;
+        // The simdgroup-matrix GEMM is written (cpi_gemm_f16) but is DISABLED: measured, it
+        // is SLOWER than the token-tiled GEMV (479 vs 549 tok/s prefill on Qwen2.5-0.5B).
+        //
+        // The matrix units are not the problem. The kernel loads both operands straight
+        // from DEVICE memory on every K-step, so it runs at ~0.5 TFLOP/s against the M4's
+        // ~4 TFLOP/s -- about 8x off peak, while llama.cpp's prefill sits near peak. A GEMM
+        // only pays once it stages a K-block of BOTH operands into threadgroup memory and
+        // issues many simdgroup ops out of that, amortising the device traffic. Until that
+        // is done, the GEMV is genuinely the faster kernel and shipping the GEMM would be a
+        // regression dressed up as an optimisation.
+        //
+        // Set CPI_METAL_GEMM=1 to A/B it.
+        static const bool use_gemm = std::getenv("CPI_METAL_GEMM") != nullptr;
+        const int gemm_tokens =
+            (use_gemm && op.cols % 8 == 0 && op.in_dim % 8 == 0) ? (T / 8) * 8 : 0;
 
         if (gemm_tokens >= 8) {
           GemvParams gp{static_cast<std::uint32_t>(op.cols), static_cast<std::uint32_t>(op.in_dim),
