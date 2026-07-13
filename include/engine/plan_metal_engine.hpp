@@ -59,6 +59,7 @@ public:
 
 private:
   void execute_ops(const std::vector<opplan::Op>& ops, int layer, int position);
+  void encode_forward(int token, int position);
   void* slot(opplan::Slot s) const;
 
   runtime::MetalContext ctx_;

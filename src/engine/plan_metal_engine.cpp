@@ -316,7 +316,9 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
   }
 }
 
-const std::vector<float>& PlanMetalEngine::forward_token(int token, int position) {
+// Encodes a whole forward WITHOUT committing, so the caller can append more work
+// (the argmax) to the same command buffer and sync once instead of twice.
+void PlanMetalEngine::encode_forward(int token, int position) {
   // Unified memory: writing the token and the position IS the H2D transfer.
   *static_cast<std::int32_t*>(tok_buf_.contents()) = static_cast<std::int32_t>(token);
   *static_cast<std::int32_t*>(pos_buf_.contents()) = static_cast<std::int32_t>(position);
@@ -326,6 +328,10 @@ const std::vector<float>& PlanMetalEngine::forward_token(int token, int position
     execute_ops(lp.ops, lp.layer_index, position);
   }
   execute_ops(plan_.epilogue, -1, position);
+}
+
+const std::vector<float>& PlanMetalEngine::forward_token(int token, int position) {
+  encode_forward(token, position);
   ctx_.commit_and_wait();
 
   if (!ctx_.last_error().empty()) {
@@ -351,7 +357,9 @@ std::vector<int> PlanMetalEngine::generate_greedy(const std::vector<int>& prompt
 
   int next = prompt.back();
   for (int i = 0; i < max_new; ++i, ++pos) {
-    forward_token(next, pos);
+    // Forward + argmax in ONE command buffer: the logits never leave the GPU, so
+    // there is no reason to sync between them. Two syncs per token was pure latency.
+    encode_forward(next, pos);
 
     // Argmax on the GPU: the vocab never crosses to the host.
     ElemParams p1{static_cast<std::uint32_t>(cfg_.vocab_size), 0.0f};

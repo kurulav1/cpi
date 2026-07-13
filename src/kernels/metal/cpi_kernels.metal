@@ -131,7 +131,28 @@ kernel void cpi_rmsnorm(
 // ---------------------------------------------------------------------------
 // GEMV: out[out_dim] = W[out_dim x in_dim] . in[in_dim], row-major, fp16.
 // One simdgroup per output row; each lane strides the row, fp32 accumulate.
+//
+// The weights are read 128 BITS AT A TIME (uint4 = 8 halves), not one half at a
+// time. A decode GEMV is pure bandwidth -- it touches every weight exactly once and
+// never reuses one -- so the load width IS the kernel. Reading 16-bit scalars leaves
+// most of each memory transaction unused and cannot keep enough requests in flight to
+// cover DRAM latency. The same mistake, and the same fix, as the CUDA backend.
+//
+// Requires in_dim % 8 == 0 for the wide path (true of every shape here: 896, 1024,
+// 2048, 3072, 4864). The scalar loop remains as the tail and the fallback.
 // ---------------------------------------------------------------------------
+
+// Dot-product of 8 halves packed in a uint4 against another, accumulating in fp32.
+static inline float dot8_f32(uint4 a, uint4 b) {
+  const half2 a0 = as_type<half2>(a.x), a1 = as_type<half2>(a.y);
+  const half2 a2 = as_type<half2>(a.z), a3 = as_type<half2>(a.w);
+  const half2 b0 = as_type<half2>(b.x), b1 = as_type<half2>(b.y);
+  const half2 b2 = as_type<half2>(b.z), b3 = as_type<half2>(b.w);
+  return float(a0.x) * float(b0.x) + float(a0.y) * float(b0.y) +
+         float(a1.x) * float(b1.x) + float(a1.y) * float(b1.y) +
+         float(a2.x) * float(b2.x) + float(a2.y) * float(b2.y) +
+         float(a3.x) * float(b3.x) + float(a3.y) * float(b3.y);
+}
 
 kernel void cpi_gemv_f16(
     device const half*  W     [[buffer(0)]],
@@ -157,9 +178,23 @@ kernel void cpi_gemv_f16(
   device const half* xrow = in + (ulong)token * (ulong)p.in_dim;
 
   float acc = 0.0f;
-  for (uint i = lane; i < p.in_dim; i += 32u) {
-    acc += float(wrow[i]) * float(xrow[i]);
+  uint i = 0u;
+
+  if ((p.in_dim & 7u) == 0u) {
+    // 128-bit loads: each lane pulls 8 halves, and consecutive lanes pull
+    // consecutive 16-byte chunks.
+    device const uint4* w4 = (device const uint4*)wrow;
+    device const uint4* x4 = (device const uint4*)xrow;
+    const uint n4 = p.in_dim >> 3;
+    for (uint k = lane; k < n4; k += 32u) {
+      acc += dot8_f32(w4[k], x4[k]);
+    }
+    i = n4 << 3;
   }
+  for (uint k = i + lane; k < p.in_dim; k += 32u) {  // tail / fallback
+    acc += float(wrow[k]) * float(xrow[k]);
+  }
+
   acc = simd_sum(acc);
   if (lane == 0u) {
     if (p.has_bias != 0u) acc += float(bias[row]);
@@ -184,10 +219,24 @@ kernel void cpi_lm_head(
 
   device const half* wrow = W + (ulong)row * (ulong)p.in_dim;
 
+  // The LM head is the biggest single read of a decode step (vocab x hidden), so the
+  // load width matters most here.
   float acc = 0.0f;
-  for (uint i = lane; i < p.in_dim; i += 32u) {
-    acc += float(wrow[i]) * float(in[i]);
+  uint i = 0u;
+
+  if ((p.in_dim & 7u) == 0u) {
+    device const uint4* w4 = (device const uint4*)wrow;
+    device const uint4* x4 = (device const uint4*)in;
+    const uint n4 = p.in_dim >> 3;
+    for (uint k = lane; k < n4; k += 32u) {
+      acc += dot8_f32(w4[k], x4[k]);
+    }
+    i = n4 << 3;
   }
+  for (uint k = i + lane; k < p.in_dim; k += 32u) {
+    acc += float(wrow[k]) * float(in[k]);
+  }
+
   acc = simd_sum(acc);
   if (lane == 0u) out[row] = acc;
 }
