@@ -220,46 +220,62 @@ This starts:
 ## Apple Silicon (Metal)
 
 CPI has a second GPU backend. Both execute the same op-plan IR (`include/engine/op_plan.hpp`)
-and the same plan built by `build_llama_plan()` — Metal is a backend, not a fork.
+and the same plan built by `build_llama_plan()` — Metal is a backend, not a fork. Adding Qwen3
+(per-head QK-norm) and Gemma (GeGLU, embedding scale) needed **zero new kernels**: they are
+capability flags on the geometry, not forks.
 
 ```bash
-cmake -S . -B build -DLLAMA_ENGINE_ENABLE_CUDA=OFF -DLLAMA_ENGINE_ENABLE_METAL=ON \
-      -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build -DLLAMA_ENGINE_ENABLE_CUDA=OFF -DLLAMA_ENGINE_ENABLE_METAL=ON       -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 
 export CPI_METAL_SOURCE=$PWD/src/kernels/metal/cpi_kernels.metal
-./build/metal_infer model.ll2c --tokenizer tokenizer.json \
-    --prompt "Explain in two sentences why the sky is blue." --max-new 80
+./build/metal_infer model.ll2c --tokenizer tokenizer.json     --prompt "Explain in two sentences why the sky is blue."     --max-new 80 --temp 0.8 --top-p 0.95 --quant 4
 ```
 
 **No Xcode required.** The offline `metal` compiler ships with Xcode, not with the Command
-Line Tools, so CPI compiles its shaders at runtime via `newLibraryWithSource` — that needs
-only the Metal framework, which every Mac has. A stock Mac with the CLT is enough. If Xcode
-*is* present, CMake precompiles a `.metallib` instead and skips the runtime step.
+Line Tools, so CPI compiles its shaders at runtime via `newLibraryWithSource` — that needs only
+the Metal framework, which every Mac has. A stock Mac with the CLT is enough. If Xcode *is*
+present, CMake precompiles a `.metallib` and skips the runtime step.
 
-**Scope.** fp16, dense, uniform-geometry decoders — Llama 2/3, Qwen2.5, Mistral, Qwen3 (per-head
-QK-norm). Batched prefill and single-token decode. Quantized weights are rejected outright rather
-than half-supported: Metal has no `__dp4a`, so the int4/int8 matvecs need genuinely different
-kernels. MoE, GeGLU/Gemma and the vision tower are op-plan ops that exist but have no Metal
-kernels yet.
+**Supported.** fp16 and weight-only int4/int8, dense uniform-geometry decoders (Llama 2/3,
+Mistral, Qwen2.5, Qwen3, Gemma), batched prefill, single-token decode, and the full sampler
+(temperature, top-k, top-p, repetition penalty, n-gram blocking) via CPI's shared implementation.
 
-**Correctness.** The Metal backend reproduces the CUDA backend's greedy token stream exactly —
-128 tokens, real prompt, verified on an Apple M4 (`src/tests/golden/`). Note the CPU engine
-cannot gate a long GPU stream: it keeps activations in fp32 while both GPU backends keep them
-in fp16, and across a greedy stream that gap eventually flips a near-tie. It is still the right
-oracle for the first forward (argmax + top-5 ranking), which is how `metal_decode_test` uses it.
+**Not supported**, and rejected loudly rather than half-done: MoE, the vision tower, linear
+attention (Qwen3.5), and the serving stack — REST API, web UI, continuous batching, paged KV.
+Those are wired to the CUDA engines and would need a backend abstraction above the engine, not
+just kernels. CPI's inference *core* runs on a Mac; CPI-the-product does not.
 
-**Measured** (Apple M4, 10-core GPU, 16 GB), Qwen2.5-0.5B fp16:
+**Measured** (Apple M4, 10-core GPU, 16 GB), Qwen2.5-0.5B:
 
-| | tok/s |
-|---|---|
-| decode | **86.5** |
-| prefill (301-token prompt) | **549** |
+| | GPU weights | decode | prefill (301 tok) |
+| --- | --- | --- | --- |
+| fp16 | 1.17 GB | 86.5 tok/s | 549 tok/s |
+| int8 | 0.74 GB | 118.8 tok/s | — |
+| int4 | 0.51 GB | 146.7 tok/s | — |
 
 Both kernels are bandwidth-shaped: the GEMV reads weights 128 bits at a time, and prefill tiles
 8 tokens per weight row so the matrix is streamed once per tile rather than once per token. An
-M4's ~120 GB/s is still a different world from a discrete GPU — this is a portability result, not
-a competitive one.
+M4's ~120 GB/s is a different world from a discrete GPU — this is a portability result, not a
+competitive one.
+
+**Correctness.** Qwen2.5-0.5B, Qwen3-0.6B and gemma-2b each reproduce the CUDA backend's greedy
+token stream exactly on an Apple M4 (`src/tests/golden/`). `metal_decode_test` gates on two
+oracles: the fp32 CPU engine for the first forward (argmax + a bounded logit diff), and a CUDA
+golden for the whole stream. Quantized runs keep the CPU-oracle bound (looser, but still a bound)
+and skip the golden — a quantized model is a *different* model and cannot reproduce an fp16 stream.
+
+**Two traps worth knowing, both found the hard way:**
+
+- **Metal's `tanh` overflows to NaN.** It evaluates as `(exp(2z)-1)/(exp(2z)+1)`, and `exp(2z)`
+  exceeds fp32 past `z ≈ 44`, where CUDA's `tanhf` saturates. Gemma reaches `z ≈ 62` on ordinary
+  activations, so the GeGLU produced NaN on real inputs. Use the sigmoid form:
+  `0.5*(1+tanh(z))` **is** `sigmoid(2z)`, which is safe at both ends.
+- **When a new backend disagrees with a reference, the reference is a suspect too.** Bringing this
+  backend up surfaced three long-standing bugs in `CpuLlamaEngine` — a hardcoded `rope_theta`,
+  missing QK-norm, and no Gemma support at all — each producing a fluent, plausible, *wrong* model.
+  All three were briefly mistaken for "expected numerical drift" in the new backend. That
+  explanation is exactly what makes a real bug invisible.
 
 ## Build Modes
 
