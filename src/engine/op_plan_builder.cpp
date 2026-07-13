@@ -13,18 +13,33 @@ namespace opplan {
 
 namespace {
 
-Op gemv(Slot in, Slot out, const void* w, int out_dim, int in_dim) {
+// A projection. Asks the backend whether it wants this weight quantized; if so the op
+// carries the packed handle and its scales instead of the fp16 one, and the executor
+// dispatches a weight-only matvec. Norms and the embedding table are never quantized --
+// they are lookups and elementwise scales, not matmuls, and quantizing them buys
+// nothing while costing accuracy.
+Op gemv(Slot in, Slot out, const WeightSource& w, const std::string& name, int out_dim,
+        int in_dim) {
   Op o;
   o.kind = OpKind::Gemv;
   o.in = in;
   o.out = out;
-  o.weight = w;
   o.cols = out_dim;
   o.in_dim = in_dim;
+
+  const QuantWeight q = w.quant(name, out_dim, in_dim);
+  if (q.bits != 0) {
+    o.qweight = q.packed;
+    o.qscales = q.scales;
+    o.qbits = q.bits;
+    o.qgroup = q.group;
+  } else {
+    o.weight = w.fp16(name);
+  }
   return o;
 }
 
-Op rmsnorm(Slot in, Slot out, const void* w, int cols, float eps) {
+Op rmsnorm(Slot in, Slot out, const void* w, int cols, float eps, bool offset = false) {
   Op o;
   o.kind = OpKind::RmsNorm;
   o.in = in;
@@ -33,6 +48,7 @@ Op rmsnorm(Slot in, Slot out, const void* w, int cols, float eps) {
   o.rows = 1;
   o.cols = cols;
   o.eps = eps;
+  o.norm_offset = offset;  // Gemma: scale by (1 + w)
   return o;
 }
 
@@ -89,12 +105,12 @@ ModelPlan build_llama_plan(const LlamaGeometry& g, const WeightSource& w) {
     lp.layer_index = L;
 
     // Attention block.
-    lp.ops.push_back(
-        rmsnorm(Slot::X, Slot::XNorm, w.fp16(p + "attention_norm.weight"), g.hidden, g.rms_eps));
+    lp.ops.push_back(rmsnorm(Slot::X, Slot::XNorm, w.fp16(p + "attention_norm.weight"), g.hidden,
+                             g.rms_eps, g.norm_offset));
     {
-      Op q = gemv(Slot::XNorm, Slot::Q, w.fp16(p + "attention.wq"), q_dim, g.hidden);
-      Op k = gemv(Slot::XNorm, Slot::K, w.fp16(p + "attention.wk"), kv_dim, g.hidden);
-      Op v = gemv(Slot::XNorm, Slot::V, w.fp16(p + "attention.wv"), kv_dim, g.hidden);
+      Op q = gemv(Slot::XNorm, Slot::Q, w, p + "attention.wq", q_dim, g.hidden);
+      Op k = gemv(Slot::XNorm, Slot::K, w, p + "attention.wk", kv_dim, g.hidden);
+      Op v = gemv(Slot::XNorm, Slot::V, w, p + "attention.wv", kv_dim, g.hidden);
       if (g.has_qkv_bias) {
         // One fused tensor, laid out [bq (q_dim) | bk (kv_dim) | bv (kv_dim)].
         const void* bqkv = w.fp16(p + "attention.bqkv");
@@ -114,11 +130,13 @@ ModelPlan build_llama_plan(const LlamaGeometry& g, const WeightSource& w) {
     // [head_dim] weight shared across heads, so it is the ordinary RmsNorm op with
     // rows = heads -- a new capability, not a new kernel.
     if (g.has_qk_norm) {
-      Op qn = rmsnorm(Slot::Q, Slot::Q, w.fp16(p + "attention.q_norm"), g.head_dim, g.rms_eps);
+      Op qn = rmsnorm(Slot::Q, Slot::Q, w.fp16(p + "attention.q_norm"), g.head_dim, g.rms_eps,
+                      g.norm_offset);
       qn.rows = g.heads;
       lp.ops.push_back(qn);
 
-      Op kn = rmsnorm(Slot::K, Slot::K, w.fp16(p + "attention.k_norm"), g.head_dim, g.rms_eps);
+      Op kn = rmsnorm(Slot::K, Slot::K, w.fp16(p + "attention.k_norm"), g.head_dim, g.rms_eps,
+                      g.norm_offset);
       kn.rows = g.kv_heads;
       lp.ops.push_back(kn);
     }
@@ -169,26 +187,26 @@ ModelPlan build_llama_plan(const LlamaGeometry& g, const WeightSource& w) {
       lp.ops.push_back(a);
     }
 
-    lp.ops.push_back(gemv(Slot::Att, Slot::Tmp, w.fp16(p + "attention.wo"), g.hidden, q_dim));
+    lp.ops.push_back(gemv(Slot::Att, Slot::Tmp, w, p + "attention.wo", g.hidden, q_dim));
     lp.ops.push_back(add_inplace(Slot::Tmp));
 
     // MLP block (SwiGLU).
-    lp.ops.push_back(
-        rmsnorm(Slot::X, Slot::XNorm, w.fp16(p + "ffn_norm.weight"), g.hidden, g.rms_eps));
-    lp.ops.push_back(
-        gemv(Slot::XNorm, Slot::Gate, w.fp16(p + "feed_forward.w1"), g.inter, g.hidden));
-    lp.ops.push_back(gemv(Slot::XNorm, Slot::Up, w.fp16(p + "feed_forward.w3"), g.inter, g.hidden));
+    lp.ops.push_back(rmsnorm(Slot::X, Slot::XNorm, w.fp16(p + "ffn_norm.weight"), g.hidden,
+                             g.rms_eps, g.norm_offset));
+    lp.ops.push_back(gemv(Slot::XNorm, Slot::Gate, w, p + "feed_forward.w1", g.inter, g.hidden));
+    lp.ops.push_back(gemv(Slot::XNorm, Slot::Up, w, p + "feed_forward.w3", g.inter, g.hidden));
     {
+      // Gemma uses GeGLU where Llama uses SwiGLU. Both kernels already exist; the
+      // model just picks one.
       Op s;
-      s.kind = OpKind::SiluMul;
+      s.kind = g.mlp_gelu ? OpKind::GeluMul : OpKind::SiluMul;
       s.in = Slot::Gate;
       s.in2 = Slot::Up;
       s.out = Slot::Inter;
       s.cols = g.inter;
       lp.ops.push_back(s);
     }
-    lp.ops.push_back(
-        gemv(Slot::Inter, Slot::Tmp, w.fp16(p + "feed_forward.w2"), g.hidden, g.inter));
+    lp.ops.push_back(gemv(Slot::Inter, Slot::Tmp, w, p + "feed_forward.w2", g.hidden, g.inter));
     lp.ops.push_back(add_inplace(Slot::Tmp));
 
     plan.layers.push_back(std::move(lp));
@@ -196,16 +214,30 @@ ModelPlan build_llama_plan(const LlamaGeometry& g, const WeightSource& w) {
 
   // ---- epilogue: final norm -> logits -------------------------------------
   plan.epilogue.push_back(
-      rmsnorm(Slot::X, Slot::XNorm, w.fp16("norm.weight"), g.hidden, g.rms_eps));
+      rmsnorm(Slot::X, Slot::XNorm, w.fp16("norm.weight"), g.hidden, g.rms_eps, g.norm_offset));
   {
     // A tied LM head reuses the embedding table -- same weights, transposed use.
-    const char* head = w.has("output.weight") ? "output.weight" : "tok_embeddings.weight";
+    const bool untied = w.has("output.weight");
+    const std::string head = untied ? "output.weight" : "tok_embeddings.weight";
     Op o;
     o.kind = OpKind::LmHead;
     o.in = Slot::XNorm;
-    o.weight = w.fp16(head);
     o.cols = g.vocab;
     o.in_dim = g.hidden;
+
+    // The LM head is the single biggest read of a decode step (vocab x hidden), so it
+    // is the most valuable thing to quantize. But only when it is UNTIED: a tied head
+    // shares storage with the embedding table, which is looked up as fp16, and
+    // quantizing it would corrupt the lookup.
+    const QuantWeight q = untied ? w.quant(head, g.vocab, g.hidden) : QuantWeight{};
+    if (q.bits != 0) {
+      o.qweight = q.packed;
+      o.qscales = q.scales;
+      o.qbits = q.bits;
+      o.qgroup = q.group;
+    } else {
+      o.weight = w.fp16(head);
+    }
     plan.epilogue.push_back(o);
   }
 

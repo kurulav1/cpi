@@ -5,8 +5,11 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+
+#include "engine/sampling.hpp"
 
 namespace engine {
 
@@ -43,6 +46,32 @@ struct AttnParams {
 };
 struct EmbedParams {
   std::uint32_t hidden, tokens;
+};
+
+// fp16 -> fp32, for the host-side quantizer. The weights are raw fp16 bytes in the
+// mmap; nothing else in this file needs to interpret them.
+//
+// NOT in a namespace called `detail`: engine::detail is the shared sampler's namespace,
+// and clang rightly calls the lookup ambiguous (MSVC silently picked one).
+inline float fp16_to_f32(std::uint16_t h) {
+  const std::uint32_t sign = static_cast<std::uint32_t>(h >> 15) << 31;
+  const std::uint32_t exp = (h >> 10) & 0x1F;
+  const std::uint32_t mant = h & 0x3FF;
+  std::uint32_t bits;
+  if (exp == 0) {
+    bits = sign;  // denormals flush to zero; they are far below any quantization level
+  } else if (exp == 31) {
+    bits = sign | 0x7F800000u | (mant << 13);
+  } else {
+    bits = sign | ((exp + 112) << 23) | (mant << 13);
+  }
+  float f;
+  std::memcpy(&f, &bits, 4);
+  return f;
+}
+
+struct QuantParams {
+  std::uint32_t out_dim, in_dim, tokens, bits, group, groups, has_bias;
 };
 
 constexpr int kTG = 256;               // threads per group
@@ -84,10 +113,105 @@ public:
     return wl_.has_tensor(name);
   }
 
+  // Quantizes on the HOST at load. CUDA quantizes on the GPU, but that is only worth
+  // two extra kernels when you already have them; this runs once per tensor at startup.
+  //
+  // The format must match kernels_weight_only_matvec.cu EXACTLY, or the model produces
+  // fluent nonsense rather than failing:
+  //   scale = group_max_abs / 7   (7 = int4's max level; 127 for int8), floored at 1e-8
+  //   q     = round(w / scale), clamped to [-8, 7]
+  //   nibble = q < 0 ? q + 16 : q, packed low-then-high within each byte
+  opplan::QuantWeight quant(const std::string& name, int out_dim, int in_dim) const override {
+    if (bits_ == 0 || !wl_.has_tensor(name)) return {};
+
+    auto it = qbufs_.find(name);
+    if (it == qbufs_.end()) {
+      const auto* src = reinterpret_cast<const std::uint16_t*>(wl_.tensor_data(name));
+      const int gsz = (group_ > 0) ? group_ : in_dim;
+      const int groups = (in_dim + gsz - 1) / gsz;
+      const float max_q = (bits_ == 4) ? 7.0f : 127.0f;
+
+      const std::size_t packed_row = (bits_ == 4) ? static_cast<std::size_t>((in_dim + 1) / 2)
+                                                  : static_cast<std::size_t>(in_dim);
+      std::vector<std::uint8_t> packed(static_cast<std::size_t>(out_dim) * packed_row, 0);
+      std::vector<float> scales(static_cast<std::size_t>(out_dim) * groups, 0.0f);
+
+      for (int r = 0; r < out_dim; ++r) {
+        const std::uint16_t* row = src + static_cast<std::size_t>(r) * in_dim;
+        for (int g = 0; g < groups; ++g) {
+          const int j0 = g * gsz;
+          const int j1 = std::min(in_dim, j0 + gsz);
+
+          float amax = 0.0f;
+          for (int j = j0; j < j1; ++j) {
+            amax = std::max(amax, std::fabs(fp16_to_f32(row[j])));
+          }
+          float scale = amax / max_q;
+          if (scale < 1.0e-8f) scale = 1.0e-8f;
+          scales[static_cast<std::size_t>(r) * groups + g] = scale;
+
+          const float inv = 1.0f / scale;
+          for (int j = j0; j < j1; ++j) {
+            int q = static_cast<int>(std::lround(fp16_to_f32(row[j]) * inv));
+            if (bits_ == 4) {
+              q = std::max(-8, std::min(7, q));
+              const std::uint8_t nib = static_cast<std::uint8_t>(q < 0 ? q + 16 : q);
+              std::uint8_t& byte = packed[static_cast<std::size_t>(r) * packed_row +
+                                          static_cast<std::size_t>(j / 2)];
+              if ((j & 1) == 0) {
+                byte = static_cast<std::uint8_t>((byte & 0xF0u) | nib);  // even column = low
+              } else {
+                byte = static_cast<std::uint8_t>((byte & 0x0Fu) | (nib << 4));  // odd = high
+              }
+            } else {
+              q = std::max(-127, std::min(127, q));
+              packed[static_cast<std::size_t>(r) * packed_row + static_cast<std::size_t>(j)] =
+                  static_cast<std::uint8_t>(static_cast<std::int8_t>(q));
+            }
+          }
+        }
+      }
+
+      QBuf qb;
+      qb.packed = ctx_.alloc_from(packed.data(), packed.size());
+      qb.scales = ctx_.alloc_from(scales.data(), scales.size() * sizeof(float));
+      qb.groups = groups;
+      it = qbufs_.emplace(name, std::move(qb)).first;
+    }
+
+    opplan::QuantWeight q;
+    q.packed = it->second.packed.handle();
+    q.scales = it->second.scales.handle();
+    q.bits = bits_;
+    q.group = group_;
+    return q;
+  }
+
+  void set_quant(int bits, int group) {
+    bits_ = bits;
+    group_ = group;
+  }
+  std::size_t bytes() const {
+    std::size_t n = 0;
+    for (const auto& kv : qbufs_) {
+      n += kv.second.packed.size() + kv.second.scales.size();
+    }
+    return n;
+  }
+
 private:
+  struct QBuf {
+    runtime::MetalBuffer packed;
+    runtime::MetalBuffer scales;
+    int groups = 1;
+  };
+
   runtime::MetalContext& ctx_;
   model::WeightLoader& wl_;
   std::unordered_map<std::string, runtime::MetalBuffer>& bufs_;
+  mutable std::unordered_map<std::string, QBuf> qbufs_;
+  int bits_ = 0;
+  int group_ = 0;
 };
 
 PlanMetalEngine::PlanMetalEngine() = default;
@@ -101,11 +225,19 @@ std::string PlanMetalEngine::device_name() const {
   return ctx_.device_name();
 }
 
+std::size_t PlanMetalEngine::weight_bytes() const {
+  std::size_t n = 0;
+  for (const auto& kv : wbuf_) n += kv.second.size();  // fp16 (embeddings, norms, ...)
+  if (wsrc_) n += wsrc_->bytes();                      // quantized projections
+  return n;
+}
+
 void* PlanMetalEngine::slot(opplan::Slot s) const {
   return slots_[static_cast<int>(s)].handle();
 }
 
-void PlanMetalEngine::open(const std::string& weights_path, int max_context) {
+void PlanMetalEngine::open(const std::string& weights_path, int max_context, int quant_bits,
+                           int quant_group) {
   if (!ctx_.available()) {
     throw std::runtime_error("no Metal GPU: " + ctx_.last_error());
   }
@@ -120,9 +252,11 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context) {
   // intermediate) is only a few MB, and unified memory means it costs nothing to move.
   max_prefill_ = std::min(512, max_context);
 
-  if (cfg_.is_moe() || cfg_.mlp_gelu) {
-    throw std::runtime_error(
-        "PlanMetalEngine handles dense SwiGLU decoders only (no MoE / GeGLU yet)");
+  if (cfg_.is_moe()) {
+    throw std::runtime_error("PlanMetalEngine: MoE models are not supported yet");
+  }
+  if (cfg_.use_layernorm) {
+    throw std::runtime_error("PlanMetalEngine: true LayerNorm (mean+variance) is not implemented");
   }
 
   const int H = cfg_.hidden_size;
@@ -152,8 +286,22 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context) {
   g.has_qkv_bias = cfg_.has_qkv_bias;
   g.has_qk_norm = cfg_.has_qk_norm;
   g.scale_embeddings = cfg_.scale_embeddings;
+  g.mlp_gelu = cfg_.mlp_gelu;
+  // norm_offset stays FALSE for the .ll2c path. Gemma's HF checkpoint stores its RMSNorm
+  // weights as (w - 1), but CPI's converter already folds the +1 in -- which is why
+  // LlamaEngine runs gemma-2b through plain launch_rmsnorm, not launch_rmsnorm_offset.
+  // Adding it again scales by ~2 at every norm; that compounds and overflows fp16 by
+  // layer 2, which is exactly how this was found (NaN at layers=2, finite at layers=1).
+  // The (1+w) form is still needed for Gemma 4, which comes from the .cpi container.
+  g.norm_offset = false;
 
   wsrc_ = std::make_unique<MetalWeights>(ctx_, weights_, wbuf_);
+  if (quant_bits == 4 || quant_bits == 8) {
+    // A group size that is a multiple of 8 keeps each 8-weight chunk the int4 kernel
+    // loads inside a single scale group.
+    wsrc_->set_quant(quant_bits, quant_group > 0 ? quant_group : 64);
+    quant_bits_ = quant_bits;
+  }
   plan_ = opplan::build_llama_plan(g, *wsrc_);
 
   // Slots, sized for a whole prefill chunk: [tokens][dim] contiguous, which is the
@@ -235,7 +383,25 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
       }
       case OpKind::Gemv: {
         if (op.qbits != 0) {
-          throw std::runtime_error("PlanMetalEngine: quantized Gemv is not implemented");
+          const int gsz = (op.qgroup > 0) ? op.qgroup : op.in_dim;
+          QuantParams p{static_cast<std::uint32_t>(op.cols),
+                        static_cast<std::uint32_t>(op.in_dim),
+                        static_cast<std::uint32_t>(T),
+                        static_cast<std::uint32_t>(op.qbits),
+                        static_cast<std::uint32_t>(op.qgroup),
+                        static_cast<std::uint32_t>((op.in_dim + gsz - 1) / gsz),
+                        op.bias != nullptr ? 1u : 0u};
+          // Quantizing the WEIGHTS does not remove the bias. Qwen2's Q/K/V have one,
+          // and dropping it yields fluent nonsense rather than an error.
+          const void* bb = op.bias != nullptr ? op.bias : op.qweight;  // bound, unread if absent
+          const void* bufs[] = {op.qweight, slot(op.in), slot(op.out), op.qscales, bb};
+          const std::size_t offs[] = {
+              0, 0, 0, 0, static_cast<std::size_t>(op.bias_offset) * sizeof(std::uint16_t)};
+          const std::size_t tiles = static_cast<std::size_t>((T + kGemvTile - 1) / kGemvTile);
+          ctx_.dispatch("cpi_gemv_quant", G::Groups,
+                        groups_for_rows(static_cast<std::size_t>(op.cols)) * tiles, kTG, bufs, offs,
+                        5, &p, sizeof(p));
+          break;
         }
         GemvParams p{static_cast<std::uint32_t>(op.cols), static_cast<std::uint32_t>(op.in_dim),
                      static_cast<std::uint32_t>(T), op.bias != nullptr ? 1u : 0u};
@@ -253,6 +419,23 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
         break;
       }
       case OpKind::LmHead: {
+        if (op.qbits != 0) {
+          const int gsz = (op.qgroup > 0) ? op.qgroup : op.in_dim;
+          QuantParams p{static_cast<std::uint32_t>(op.cols),
+                        static_cast<std::uint32_t>(op.in_dim),
+                        1,
+                        static_cast<std::uint32_t>(op.qbits),
+                        static_cast<std::uint32_t>(op.qgroup),
+                        static_cast<std::uint32_t>((op.in_dim + gsz - 1) / gsz),
+                        0};
+          const void* bufs[] = {op.qweight, slot(op.in), logits_buf_.handle(), op.qscales};
+          const std::size_t offs[] = {
+              0, static_cast<std::size_t>(T - 1) * static_cast<std::size_t>(op.in_dim) * 2, 0, 0};
+          ctx_.dispatch("cpi_lm_head_quant", G::Groups,
+                        groups_for_rows(static_cast<std::size_t>(op.cols)), kTG, bufs, offs, 4, &p,
+                        sizeof(p));
+          break;
+        }
         // Only the LAST token of a chunk needs logits -- the others exist only to fill the
         // KV cache. Running the vocab GEMV for all T would dominate a prefill.
         GemvParams p{static_cast<std::uint32_t>(op.cols), static_cast<std::uint32_t>(op.in_dim), 1,
@@ -353,15 +536,126 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
 // Encodes a whole forward WITHOUT committing, so the caller can append more work
 // (the argmax) to the same command buffer and sync once instead of twice.
 void PlanMetalEngine::encode_forward(int token, int position) {
+  // CPI_METAL_LAYERS=N runs only the first N layers. A NaN has to start SOMEWHERE, and
+  // bisecting on the layer count finds where far faster than reasoning about which op
+  // could overflow.
+  static const int layer_limit = [] {
+    const char* e = std::getenv("CPI_METAL_LAYERS");
+    return e != nullptr ? std::atoi(e) : -1;
+  }();
+
   // Unified memory: writing the token and the position IS the H2D transfer.
   *static_cast<std::int32_t*>(tok_buf_.contents()) = static_cast<std::int32_t>(token);
   *static_cast<std::int32_t*>(pos_buf_.contents()) = static_cast<std::int32_t>(position);
 
+  // CPI_METAL_DEBUG prints max|X| after every layer. Unified memory makes this almost
+  // free to do: the residual stream is host-addressable, so an explosion can simply be
+  // WATCHED rather than deduced.
+  static const bool dbg = std::getenv("CPI_METAL_DEBUG") != nullptr;
+  auto peek = [&](const char* what) {
+    if (!dbg) return;
+    ctx_.commit_and_wait();
+    const auto* x = static_cast<const std::uint16_t*>(slots_[0].contents());
+    float m = 0.0f;
+    bool nan = false;
+    for (int i = 0; i < cfg_.hidden_size; ++i) {
+      const float v = fp16_to_f32(x[i]);
+      if (v != v) nan = true;
+      m = std::max(m, std::fabs(v));
+    }
+    std::fprintf(stderr, "  [dbg] %-12s max|X|=%.1f%s\n", what, m, nan ? "  <-- NaN" : "");
+  };
+
+  // Peeks an arbitrary slot, so a NaN can be traced to the exact op that made it.
+  auto peek_slot = [&](opplan::Slot sl, int n, const char* what) {
+    if (!dbg) return;
+    ctx_.commit_and_wait();
+    const auto* p = static_cast<const std::uint16_t*>(slots_[static_cast<int>(sl)].contents());
+    float m = 0.0f;
+    bool nan = false;
+    for (int i = 0; i < n; ++i) {
+      const float v = fp16_to_f32(p[i]);
+      if (v != v) nan = true;
+      m = std::max(m, std::fabs(v));
+    }
+    std::fprintf(stderr, "  [dbg]   %-8s max=%.1f%s\n", what, m, nan ? "  <-- NaN" : "");
+
+    // On the first NaN, print the index and the two INPUTS at that index. A NaN out of
+    // finite inputs is impossible, so this says which assumption is wrong.
+    if (nan && sl == opplan::Slot::Inter) {
+      const auto* ga = static_cast<const std::uint16_t*>(
+          slots_[static_cast<int>(opplan::Slot::Gate)].contents());
+      const auto* up =
+          static_cast<const std::uint16_t*>(slots_[static_cast<int>(opplan::Slot::Up)].contents());
+      for (int i = 0; i < n; ++i) {
+        const float v = fp16_to_f32(p[i]);
+        if (v != v) {
+          std::fprintf(stderr, "  [dbg]     first NaN at i=%d of %d: gate=%.4f up=%.4f\n", i, n,
+                       fp16_to_f32(ga[i]), fp16_to_f32(up[i]));
+          break;
+        }
+      }
+    }
+  };
+
   execute_ops(plan_.prologue, -1, position, 1);
+  peek("prologue");
+  int done = 0;
   for (const opplan::LayerPlan& lp : plan_.layers) {
+    if (layer_limit >= 0 && done >= layer_limit) break;
+    if (dbg && lp.layer_index == 0) {
+      // Walk layer 0 op by op, so the exact op that produces the NaN is visible.
+      for (const opplan::Op& op : lp.ops) {
+        execute_ops({op}, lp.layer_index, position, 1);
+        if (op.kind == opplan::OpKind::Gemv || op.kind == opplan::OpKind::Attention ||
+            op.kind == opplan::OpKind::SiluMul || op.kind == opplan::OpKind::GeluMul ||
+            op.kind == opplan::OpKind::RmsNorm) {
+          const int n = (op.out == opplan::Slot::Inter || op.out == opplan::Slot::Gate ||
+                         op.out == opplan::Slot::Up)
+                            ? cfg_.intermediate_size
+                            : cfg_.hidden_size;
+          static const char* kn[] = {"RmsNorm",  "Gemv",    "Rope",   "ScaleCopy",
+                                     "CopySlot", "KvStore", "Attn",   "GeluMul",
+                                     "AddInpl",  "Embed",   "LmHead", "SiluMul"};
+          peek_slot(op.out, n, kn[static_cast<int>(op.kind)]);
+        }
+      }
+      ++done;
+      continue;
+    }
     execute_ops(lp.ops, lp.layer_index, position, 1);
+    if (dbg) {
+      char b[32];
+      std::snprintf(b, sizeof(b), "layer %d", lp.layer_index);
+      peek(b);
+    }
+    ++done;
   }
   execute_ops(plan_.epilogue, -1, position, 1);
+
+  if (dbg) {
+    // The epilogue (final norm -> LM head) is the only thing between a finite X and a
+    // NaN logit, so look at both ends of it.
+    ctx_.commit_and_wait();
+    const auto* xn =
+        static_cast<const std::uint16_t*>(slots_[static_cast<int>(opplan::Slot::XNorm)].contents());
+    float mn = 0.0f;
+    bool nn = false;
+    for (int i = 0; i < cfg_.hidden_size; ++i) {
+      const float v = fp16_to_f32(xn[i]);
+      if (v != v) nn = true;
+      mn = std::max(mn, std::fabs(v));
+    }
+    const auto* lg = static_cast<const float*>(logits_buf_.contents());
+    float ml = 0.0f;
+    bool nl = false;
+    for (int i = 0; i < cfg_.vocab_size; ++i) {
+      if (lg[i] != lg[i]) nl = true;
+      ml = std::max(ml, std::fabs(lg[i]));
+    }
+    std::fprintf(stderr, "  [dbg] XNorm        max=%.2f%s\n", mn, nn ? "  <-- NaN" : "");
+    std::fprintf(stderr, "  [dbg] logits       max=%.2f%s\n", ml, nl ? "  <-- NaN" : "");
+  }
 }
 
 // Runs T tokens through the whole tower in ONE pass, instead of T passes of one token.
@@ -403,6 +697,47 @@ const std::vector<float>& PlanMetalEngine::forward_token(int token, int position
   const float* src = static_cast<const float*>(logits_buf_.contents());
   std::memcpy(logits_.data(), src, logits_.size() * sizeof(float));
   return logits_;
+}
+
+std::vector<int> PlanMetalEngine::generate(const std::vector<int>& prompt, int max_new,
+                                           const Sampling& s) {
+  // Greedy keeps the on-GPU argmax: the vocab never crosses to the host, which is
+  // worth a lot at 152k tokens.
+  if (s.temperature <= 0.0f && s.repetition_penalty <= 1.0f && s.no_repeat_ngram_size <= 1) {
+    return generate_greedy(prompt, max_new);
+  }
+  if (prompt.empty()) throw std::runtime_error("empty prompt");
+
+  detail::dispatch_seed_sampler_rng(s.seed);
+
+  std::vector<int> out;
+  std::vector<int> history = prompt;  // the sampler needs it for penalties / n-grams
+  int pos = 0;
+
+  const int n_pre = static_cast<int>(prompt.size()) - 1;
+  const auto pre0 = std::chrono::steady_clock::now();
+  for (int off = 0; off < n_pre; off += max_prefill_) {
+    const int chunk = std::min(max_prefill_, n_pre - off);
+    const std::vector<int> ids(prompt.begin() + off, prompt.begin() + off + chunk);
+    encode_prefill(ids, pos);
+    ctx_.commit_and_wait();
+    pos += chunk;
+  }
+  prefill_ms_ =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pre0).count();
+  prefill_tokens_ = n_pre;
+
+  int next = prompt.back();
+  for (int i = 0; i < max_new; ++i, ++pos) {
+    std::vector<float> lg = forward_token(next, pos);  // a copy: the sampler edits in place
+    next = detail::dispatch_sample_from_logits(
+        lg, s.temperature, s.top_k, s.top_p, s.repetition_penalty, s.no_repeat_ngram_size, history);
+    if (s.eos_id >= 0 && next == s.eos_id) break;
+    out.push_back(next);
+    history.push_back(next);
+    if (pos + 1 >= max_context_) break;
+  }
+  return out;
 }
 
 std::vector<int> PlanMetalEngine::generate_greedy(const std::vector<int>& prompt, int max_new) {

@@ -44,7 +44,18 @@ public:
   }
 
   // Loads a .ll2c model, uploads its weights, and builds the plan.
-  void open(const std::string& weights_path, int max_context = 2048);
+  // quant_bits: 0 = fp16, or 4 / 8 for weight-only quantization of every projection
+  // and the (untied) LM head. quant_group 0 defaults to 64.
+  void open(const std::string& weights_path, int max_context = 2048, int quant_bits = 0,
+            int quant_group = 0);
+  int quant_bits() const {
+    return quant_bits_;
+  }
+
+  // Bytes of GPU-resident WEIGHT buffers. This -- not RSS -- is the number that says
+  // whether a model fits: the mmap'd fp16 file stays resident because the quantizer
+  // reads it, but those pages are clean and file-backed, so they are evictable.
+  std::size_t weight_bytes() const;
 
   const model::LlamaConfig& config() const {
     return cfg_;
@@ -56,6 +67,21 @@ public:
 
   // Greedy decode. Argmax runs on the GPU so the vocab never crosses to the host.
   std::vector<int> generate_greedy(const std::vector<int>& prompt, int max_new);
+
+  // Sampled decode, through CPI's shared sampler -- the same code path LlamaEngine
+  // uses, not a second implementation. Greedy (temperature <= 0) still takes the
+  // on-GPU argmax; anything else needs the logits on the host anyway, because
+  // repetition penalty and n-gram blocking rescore tokens outside any top-k set.
+  struct Sampling {
+    float temperature = 0.0f;
+    int top_k = 0;
+    float top_p = 1.0f;
+    float repetition_penalty = 1.0f;
+    int no_repeat_ngram_size = 0;
+    int eos_id = -1;
+    unsigned seed = 0;
+  };
+  std::vector<int> generate(const std::vector<int>& prompt, int max_new, const Sampling& s);
 
   // Wall time of the last prompt prefill, and how many tokens it covered.
   double last_prefill_ms() const {
@@ -78,6 +104,7 @@ private:
   opplan::ModelPlan plan_;
   int max_context_ = 0;
   int max_prefill_ = 0;  // slots are sized for this many tokens at once
+  int quant_bits_ = 0;
 
   // name -> device buffer. Owns every weight for the model's lifetime.
   std::unordered_map<std::string, runtime::MetalBuffer> wbuf_;

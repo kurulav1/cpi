@@ -220,6 +220,76 @@ int main() {
     check("silu_mul", compare(got, want), 0.01);
   }
 
+  // ---- Quantized GEMV (int4 and int8) ------------------------------------
+  // Quantize a known matrix on the host exactly as PlanMetalEngine does, run the
+  // Metal kernel, and compare against a CPU dot product of the DEQUANTIZED weights.
+  // That separates two questions the end-to-end test conflates: is the kernel right,
+  // and is the quantization format right. Comparing against the dequantized weights
+  // (not the originals) means quantization ERROR cannot mask a kernel BUG.
+  for (int bits : {8, 4}) {
+    const std::uint32_t out_dim = 64, in_dim = 256, group = 64;
+    const std::uint32_t groups = in_dim / group;
+    const float max_q = (bits == 4) ? 7.0f : 127.0f;
+
+    std::vector<float> W(out_dim * in_dim);
+    std::vector<std::uint16_t> xin(in_dim);
+    for (auto& v : W) v = dist(rng);
+    for (auto& v : xin) v = f32_to_f16(dist(rng));
+
+    const std::size_t packed_row = (bits == 4) ? (in_dim + 1) / 2 : in_dim;
+    std::vector<std::uint8_t> packed(out_dim * packed_row, 0);
+    std::vector<float> scales(out_dim * groups);
+    std::vector<float> deq(out_dim * in_dim);  // what the kernel SHOULD compute with
+
+    for (std::uint32_t r = 0; r < out_dim; ++r) {
+      for (std::uint32_t g = 0; g < groups; ++g) {
+        float amax = 0.0f;
+        for (std::uint32_t j = g * group; j < (g + 1) * group; ++j) {
+          amax = std::max(amax, std::fabs(W[r * in_dim + j]));
+        }
+        float sc = std::max(amax / max_q, 1e-8f);
+        scales[r * groups + g] = sc;
+        for (std::uint32_t j = g * group; j < (g + 1) * group; ++j) {
+          int q = static_cast<int>(std::lround(W[r * in_dim + j] / sc));
+          q = (bits == 4) ? std::max(-8, std::min(7, q)) : std::max(-127, std::min(127, q));
+          deq[r * in_dim + j] = static_cast<float>(q) * sc;
+          if (bits == 4) {
+            const std::uint8_t nib = static_cast<std::uint8_t>(q < 0 ? q + 16 : q);
+            std::uint8_t& b = packed[r * packed_row + j / 2];
+            b = (j & 1) == 0 ? static_cast<std::uint8_t>((b & 0xF0u) | nib)
+                             : static_cast<std::uint8_t>((b & 0x0Fu) | (nib << 4));
+          } else {
+            packed[r * packed_row + j] = static_cast<std::uint8_t>(static_cast<std::int8_t>(q));
+          }
+        }
+      }
+    }
+
+    auto bq = ctx.alloc_from(packed.data(), packed.size());
+    auto bx = ctx.alloc_from(xin.data(), xin.size() * 2);
+    auto bo = ctx.alloc(out_dim * 2);
+    auto bs = ctx.alloc_from(scales.data(), scales.size() * sizeof(float));
+
+    struct QP {
+      std::uint32_t out_dim, in_dim, tokens, bits, group, groups, has_bias;
+    } p{out_dim, in_dim, 1, static_cast<std::uint32_t>(bits), group, groups, 0};
+
+    const void* bufs[] = {bq.handle(), bx.handle(), bo.handle(), bs.handle(), bq.handle()};
+    ctx.dispatch("cpi_gemv_quant", runtime::MetalContext::Grid::Groups, (out_dim + 7) / 8, 256,
+                 bufs, nullptr, 5, &p, sizeof(p));
+    ctx.commit_and_wait();
+
+    std::vector<float> want(out_dim), got(out_dim);
+    for (std::uint32_t r = 0; r < out_dim; ++r) {
+      float acc = 0.0f;
+      for (std::uint32_t j = 0; j < in_dim; ++j) acc += deq[r * in_dim + j] * f16_to_f32(xin[j]);
+      want[r] = acc;
+    }
+    const auto* o = static_cast<const std::uint16_t*>(bo.contents());
+    for (std::size_t i = 0; i < got.size(); ++i) got[i] = f16_to_f32(o[i]);
+    check(bits == 4 ? "gemv_int4" : "gemv_int8", compare(got, want), 0.05);
+  }
+
   // ---- Argmax ------------------------------------------------------------
   {
     const std::uint32_t n = 151936;  // a real vocab size

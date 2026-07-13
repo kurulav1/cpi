@@ -39,6 +39,9 @@ int main(int argc, char** argv) {
   std::string prompt;
   int max_new = 64;
   int max_context = 2048;
+  int quant_bits = 0;
+  int quant_group = 0;
+  engine::PlanMetalEngine::Sampling samp;
 
   for (int i = 2; i < argc; ++i) {
     const std::string a = argv[i];
@@ -57,6 +60,20 @@ int main(int argc, char** argv) {
       max_new = std::atoi(val("--max-new").c_str());
     } else if (a == "--max-context") {
       max_context = std::atoi(val("--max-context").c_str());
+    } else if (a == "--quant") {
+      quant_bits = std::atoi(val("--quant").c_str());
+    } else if (a == "--quant-group") {
+      quant_group = std::atoi(val("--quant-group").c_str());
+    } else if (a == "--temp") {
+      samp.temperature = std::stof(val("--temp"));
+    } else if (a == "--top-k") {
+      samp.top_k = std::atoi(val("--top-k").c_str());
+    } else if (a == "--top-p") {
+      samp.top_p = std::stof(val("--top-p"));
+    } else if (a == "--repeat-penalty") {
+      samp.repetition_penalty = std::stof(val("--repeat-penalty"));
+    } else if (a == "--seed") {
+      samp.seed = static_cast<unsigned>(std::atoi(val("--seed").c_str()));
     } else {
       std::printf("unknown argument: %s\n", a.c_str());
       usage();
@@ -78,17 +95,20 @@ int main(int argc, char** argv) {
   model::Tokenizer tok;
   tok.load(tokenizer_path);
 
-  eng.open(model, max_context);
+  eng.open(model, max_context, quant_bits, quant_group);
   const auto& cfg = eng.config();
-  std::fprintf(stderr, "[metal] %s | layers=%d hidden=%d heads=%d kv_heads=%d vocab=%d\n",
+  std::fprintf(stderr, "[metal] %s | layers=%d hidden=%d heads=%d kv_heads=%d vocab=%d | %s\n",
                eng.device_name().c_str(), cfg.num_layers, cfg.hidden_size, cfg.num_heads,
-               cfg.num_kv_heads, cfg.vocab_size);
+               cfg.num_kv_heads, cfg.vocab_size,
+               eng.quant_bits() == 0 ? "fp16" : (eng.quant_bits() == 4 ? "int4" : "int8"));
+  std::fprintf(stderr, "[metal] weights on GPU: %.2f GB\n",
+               static_cast<double>(eng.weight_bytes()) / 1073741824.0);
 
   const std::vector<int> ids = tok.encode(prompt, /*add_bos=*/true);
   std::fprintf(stderr, "[metal] prompt: %zu tokens\n", ids.size());
 
   const auto t0 = std::chrono::steady_clock::now();
-  const std::vector<int> out = eng.generate_greedy(ids, max_new);
+  const std::vector<int> out = eng.generate(ids, max_new, samp);
   const auto t1 = std::chrono::steady_clock::now();
   const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 

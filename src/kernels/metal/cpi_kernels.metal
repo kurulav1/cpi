@@ -268,6 +268,170 @@ kernel void cpi_lm_head(
 }
 
 // ---------------------------------------------------------------------------
+// Weight-only int4 / int8 GEMV.
+//
+// Metal has NO __dp4a, so this does not try to mirror the CUDA kernel's packed
+// integer dot product. It does not need to: an int4 decode is BANDWIDTH-bound, and
+// reading 0.5 bytes per weight instead of 2 is itself the whole win. Dequantise on
+// the fly and multiply in fp32.
+//
+// Format (identical to the CUDA path -- see kernels_weight_only_matvec.cu):
+//   * nibble -> signed:  (n ^ 0x8) - 0x8   [so 0..15 maps to -8..7]
+//   * a byte packs two weights: low nibble = even column, high nibble = odd column
+//   * y[row] = sum_g scale[row][g] * sum_{j in g} (q[j] * x[j])
+//     -- weight-only: activations stay fp32, and the scale is applied per group.
+// ---------------------------------------------------------------------------
+
+struct QuantParams {
+  uint out_dim;
+  uint in_dim;
+  uint tokens;
+  uint bits;      // 4 or 8
+  uint group;     // 0 = one scale per row
+  uint groups;    // scales per row
+  uint has_bias;  // Qwen2's Q/K/V carry one; quantizing the weights does not remove it
+};
+
+kernel void cpi_gemv_quant(
+    device const uchar*  qw     [[buffer(0)]],
+    device const half*   in     [[buffer(1)]],
+    device half*         out    [[buffer(2)]],
+    device const float*  scales [[buffer(3)]],
+    device const half*   bias   [[buffer(4)]],
+    constant QuantParams& p     [[buffer(5)]],
+    uint gid   [[threadgroup_position_in_grid]],
+    uint lid   [[thread_position_in_threadgroup]],
+    uint nthr  [[threads_per_threadgroup]]) {
+  const uint simds_per_tg = nthr / 32u;
+  const uint simd_id      = lid / 32u;
+  const uint lane         = lid % 32u;
+
+  const uint row_blocks = (p.out_dim + simds_per_tg - 1u) / simds_per_tg;
+  const uint tile = gid / row_blocks;
+  const uint blk  = gid % row_blocks;
+  const uint row  = blk * simds_per_tg + simd_id;
+  const uint t0   = tile * GEMV_TILE;
+  if (t0 >= p.tokens || row >= p.out_dim) return;
+  const uint nt = min((uint)GEMV_TILE, p.tokens - t0);
+
+  device const float* srow = scales + (ulong)row * (ulong)p.groups;
+  const uint gsz = (p.group == 0u) ? p.in_dim : p.group;
+
+  float acc[GEMV_TILE];
+  for (uint t = 0u; t < GEMV_TILE; ++t) acc[t] = 0.0f;
+
+  if (p.bits == 4u) {
+    // A row is (in_dim + 1) / 2 bytes. Each lane takes 8 weights (4 bytes) at a time;
+    // a group size that is a multiple of 8 keeps all 8 inside one scale group.
+    device const uint* w32 = (device const uint*)(qw + (ulong)row * (ulong)((p.in_dim + 1u) / 2u));
+    const uint n8 = p.in_dim >> 3;
+    for (uint k = lane; k < n8; k += 32u) {
+      const uint packed = w32[k];
+      const uint j0 = k << 3;
+      const float sc = srow[j0 / gsz];
+
+      for (uint t = 0u; t < nt; ++t) {
+        device const half* x = in + (ulong)(t0 + t) * (ulong)p.in_dim + j0;
+        float sub = 0.0f;
+        for (uint e = 0u; e < 8u; ++e) {
+          const int nib = int((packed >> (4u * e)) & 0xFu);
+          const int q = (nib ^ 0x8) - 0x8;
+          sub += float(q) * float(x[e]);
+        }
+        acc[t] += sub * sc;  // the scale is per GROUP, so it folds in here
+      }
+    }
+  } else {
+    // int8, 128 bits at a time: a uint4 is SIXTEEN weights. Loading them one byte at a
+    // time made int8 slower than fp16 -- which is absurd, since it reads half the bytes
+    // -- for exactly the reason the fp16 GEMV needed 128-bit loads. Narrow loads waste
+    // the transaction and cannot cover DRAM latency, whatever the element size.
+    device const uint4* w16 = (device const uint4*)(qw + (ulong)row * (ulong)p.in_dim);
+    const uint n16 = p.in_dim >> 4;  // 16 int8s per uint4
+    for (uint k = lane; k < n16; k += 32u) {
+      const uint4 packed = w16[k];
+      const uint j0 = k << 4;
+      const float sc = srow[j0 / gsz];  // gsz is a multiple of 16 here
+
+      for (uint t = 0u; t < nt; ++t) {
+        device const half* x = in + (ulong)(t0 + t) * (ulong)p.in_dim + j0;
+        float sub = 0.0f;
+        for (uint w = 0u; w < 4u; ++w) {
+          const uint word = (w == 0u) ? packed.x : (w == 1u) ? packed.y
+                          : (w == 2u) ? packed.z : packed.w;
+          for (uint e = 0u; e < 4u; ++e) {
+            const int q = int(char((word >> (8u * e)) & 0xFFu));
+            sub += float(q) * float(x[w * 4u + e]);
+          }
+        }
+        acc[t] += sub * sc;
+      }
+    }
+    // Tail: whatever does not fill a uint4.
+    for (uint k = (n16 << 4) + lane; k < p.in_dim; k += 32u) {
+      const int q = int(((device const char*)(qw + (ulong)row * (ulong)p.in_dim))[k]);
+      const float sc = srow[k / gsz];
+      for (uint t = 0u; t < nt; ++t) {
+        acc[t] += float(q) * sc * float(in[(ulong)(t0 + t) * (ulong)p.in_dim + k]);
+      }
+    }
+  }
+
+  for (uint t = 0u; t < nt; ++t) {
+    float s = simd_sum(acc[t]);
+    if (lane == 0u) {
+      if (p.has_bias != 0u) s += float(bias[row]);
+      out[(ulong)(t0 + t) * (ulong)p.out_dim + row] = half(s);
+    }
+  }
+}
+
+// Same, but fp32 output: the LM head feeds the sampler.
+kernel void cpi_lm_head_quant(
+    device const uchar*  qw     [[buffer(0)]],
+    device const half*   in     [[buffer(1)]],
+    device float*        out    [[buffer(2)]],
+    device const float*  scales [[buffer(3)]],
+    constant QuantParams& p     [[buffer(4)]],
+    uint gid   [[threadgroup_position_in_grid]],
+    uint lid   [[thread_position_in_threadgroup]],
+    uint nthr  [[threads_per_threadgroup]]) {
+  const uint simds_per_tg = nthr / 32u;
+  const uint simd_id      = lid / 32u;
+  const uint lane         = lid % 32u;
+  const uint row = gid * simds_per_tg + simd_id;
+  if (row >= p.out_dim) return;
+
+  device const float* srow = scales + (ulong)row * (ulong)p.groups;
+  const uint gsz = (p.group == 0u) ? p.in_dim : p.group;
+  float acc = 0.0f;
+
+  if (p.bits == 4u) {
+    device const uint* w32 = (device const uint*)(qw + (ulong)row * (ulong)((p.in_dim + 1u) / 2u));
+    const uint n8 = p.in_dim >> 3;
+    for (uint k = lane; k < n8; k += 32u) {
+      const uint packed = w32[k];
+      const uint j0 = k << 3;
+      float sub = 0.0f;
+      for (uint e = 0u; e < 8u; ++e) {
+        const int nib = int((packed >> (4u * e)) & 0xFu);
+        const int q = (nib ^ 0x8) - 0x8;
+        sub += float(q) * float(in[j0 + e]);
+      }
+      acc += sub * srow[j0 / gsz];
+    }
+  } else {
+    device const char* w8 = (device const char*)(qw + (ulong)row * (ulong)p.in_dim);
+    for (uint k = lane; k < p.in_dim; k += 32u) {
+      acc += float(w8[k]) * srow[k / gsz] * float(in[k]);
+    }
+  }
+
+  acc = simd_sum(acc);
+  if (lane == 0u) out[row] = acc;
+}
+
+// ---------------------------------------------------------------------------
 // RoPE, half-split (NeoX) convention: element i is paired with i + head_dim/2.
 // In-place over `heads` heads of `head_dim`.
 // ---------------------------------------------------------------------------
@@ -353,7 +517,19 @@ kernel void cpi_silu_mul(
   out[gid] = half(silu * float(b[gid]));
 }
 
-// GeGLU: out = gelu(a) * b. Tanh approximation -- matches the CUDA kernel.
+// GeGLU: out = gelu(a) * b. Tanh approximation, same as the CUDA kernel.
+//
+// ⚠ DO NOT write this as 0.5 * x * (1 + tanh(inner)).
+//
+// Metal's tanh overflows. It evaluates as (exp(2z) - 1) / (exp(2z) + 1), and exp(2z)
+// exceeds fp32 for z beyond ~44, giving inf/inf = NaN -- where CUDA's tanhf saturates
+// to 1 and is fine. Gemma reaches z ~ 62 on ordinary activations, so this produced NaN
+// on real inputs, for some tokens and not others (it depends on the gate value). Llama
+// never hit it because SwiGLU uses a sigmoid, which is naturally safe.
+//
+// 0.5 * (1 + tanh(z)) is exactly sigmoid(2z), and sigmoid is safe at BOTH ends:
+// exp(-large) -> 0 gives 1, and exp(+large) -> inf gives 1/(1+inf) = 0. Same maths, no
+// overflow.
 kernel void cpi_gelu_mul(
     device const half*  a   [[buffer(0)]],
     device const half*  b   [[buffer(1)]],
@@ -364,7 +540,7 @@ kernel void cpi_gelu_mul(
   const float x = float(a[gid]);
   const float k = 0.7978845608028654f;  // sqrt(2/pi)
   const float inner = k * (x + 0.044715f * x * x * x);
-  const float gelu = 0.5f * x * (1.0f + tanh(inner));
+  const float gelu = x / (1.0f + exp(-2.0f * inner));  // == 0.5*x*(1 + tanh(inner))
   out[gid] = half(gelu * float(b[gid]));
 }
 

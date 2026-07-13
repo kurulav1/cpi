@@ -562,11 +562,24 @@ void CpuLlamaEngine::mlp(int layer) {
   mlp_gemv(lw.w1_fp16, lw.w1_fp32, ff1_.data(), I, H);
   mlp_gemv(lw.w3_fp16, lw.w3_fp32, ff3_.data(), I, H);
 
-  // SiLU activation fused with gating: ff1[i] = SiLU(ff1[i]) * ff3[i]
-  // SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
-  for (int i = 0; i < I; ++i) {
-    const float g = ff1_[i];
-    ff1_[i] = (g / (1.f + std::exp(-g))) * ff3_[i];
+  // Gated activation: ff1[i] = act(ff1[i]) * ff3[i].
+  //
+  // Gemma uses GeGLU (tanh-GELU), everything else SwiGLU. This engine had no mlp_gelu
+  // branch at all, so it silently ran Gemma with SiLU -- a different model. Written in
+  // the sigmoid form, which is what the Metal kernel uses too: 0.5*(1+tanh(z)) IS
+  // sigmoid(2z), and sigmoid does not overflow at either end.
+  if (cfg_.mlp_gelu) {
+    for (int i = 0; i < I; ++i) {
+      const float g = ff1_[i];
+      const float inner = 0.7978845608028654f * (g + 0.044715f * g * g * g);  // sqrt(2/pi)
+      ff1_[i] = (g / (1.f + std::exp(-2.f * inner))) * ff3_[i];
+    }
+  } else {
+    // SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
+    for (int i = 0; i < I; ++i) {
+      const float g = ff1_[i];
+      ff1_[i] = (g / (1.f + std::exp(-g))) * ff3_[i];
+    }
   }
 
   if (lw.w2_fp32)
@@ -676,9 +689,14 @@ void CpuLlamaEngine::forward_token(int token, int pos) {
   const int NKV = cfg_.num_kv_heads;
 
   // 1. Token embedding lookup: x = embed[token]
+  //
+  // Gemma scales the embeddings by sqrt(hidden). This engine did not, so it ran a
+  // completely different model for every Gemma checkpoint -- no crash, just wrong. It
+  // went unnoticed because nothing cross-checked the CPU engine against CUDA on Gemma.
   const uint16_t* emb_row = tok_embeddings_ + static_cast<std::ptrdiff_t>(token) * H;
+  const float emb_scale = cfg_.scale_embeddings ? std::sqrt(static_cast<float>(H)) : 1.0f;
   for (int i = 0; i < H; ++i) {
-    x_[i] = fp16_to_fp32(emb_row[i]);
+    x_[i] = fp16_to_fp32(emb_row[i]) * emb_scale;
   }
 
   // 2. Transformer layers

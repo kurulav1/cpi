@@ -21,6 +21,15 @@
 namespace engine {
 namespace opplan {
 
+// A quantized weight: the packed values plus their scales. bits == 0 means the
+// backend is not quantizing this tensor and the fp16 handle should be used instead.
+struct QuantWeight {
+  const void* packed = nullptr;  // int4 (two per byte) or int8
+  const void* scales = nullptr;  // float[out_dim, groups]
+  int bits = 0;                  // 0 = not quantized, 4, or 8
+  int group = 0;                 // 0 = one scale per row
+};
+
 // How the builder asks a backend for a weight. The returned handle is opaque and
 // is only ever dereferenced by that backend's executor.
 class WeightSource {
@@ -33,6 +42,18 @@ public:
   // True when the tensor exists at all -- used for optional weights (a model may
   // or may not have QK-norm, a bias, a tied LM head...).
   virtual bool has(const std::string& name) const = 0;
+
+  // Quantized form of a projection, when the backend wants one. The default is "no",
+  // which keeps every existing caller on the fp16 path.
+  //
+  // The backend decides, not the builder: whether to quantize is a memory/bandwidth
+  // policy, and only the backend knows what it can execute.
+  virtual QuantWeight quant(const std::string& name, int out_dim, int in_dim) const {
+    (void)name;
+    (void)out_dim;
+    (void)in_dim;
+    return {};
+  }
 };
 
 // Geometry of a uniform-geometry, Llama-style decoder: every layer identical,
@@ -63,6 +84,12 @@ struct LlamaGeometry {
   // NOTE head_dim is NOT hidden/heads in general. Qwen3-0.6B has hidden=1024,
   // heads=16 and head_dim=128 (so q_dim=2048 != hidden). Deriving it from hidden
   // silently builds the wrong model -- callers must set it from the weights.
+
+  // Gemma's MLP is GeGLU (tanh-GELU), not SwiGLU, and its RMSNorm weights are stored
+  // as (w - 1) so the norm scales by (1 + w). Both are ops that already exist -- a
+  // capability flag, not a fork.
+  bool mlp_gelu = false;
+  bool norm_offset = false;
 
   // Some models (Gemma-style) scale the token embedding by sqrt(hidden). Llama and
   // Qwen do not. Kept here because it is geometry, not identity.

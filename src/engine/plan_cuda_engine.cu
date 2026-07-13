@@ -1785,6 +1785,8 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
   // The plan holds weights as opaque void* so the IR stays backend-neutral (see
   // op_plan.hpp). This is the CUDA executor's cast back to its own half type.
   auto HW = [](const void* p) { return static_cast<const __half*>(p); };
+  auto QW = [](const void* p) { return static_cast<const std::int8_t*>(p); };
+  auto QS = [](const void* p) { return static_cast<const float*>(p); };
   // Sequence mode multiplies an op's extent by the token count. RmsNorm normalises
   // over `cols` in groups of `rows`, and slots are [tokens][rows*cols] contiguous, so
   // N tokens is just N times as many groups -- no new kernel.
@@ -1821,17 +1823,19 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
         // Weight encoding AND scale granularity were chosen at load; the op just
         // carries them.
         if (op.qbits == 4 && op.qgroup > 0) {
-          kernels::launch_weight_only_int4_matvec_grouped(
-              op.qweight, op.qscales, S(op.in), S(op.out), op.cols, op.in_dim, op.qgroup, stream_);
+          kernels::launch_weight_only_int4_matvec_grouped(QW(op.qweight), QS(op.qscales), S(op.in),
+                                                          S(op.out), op.cols, op.in_dim, op.qgroup,
+                                                          stream_);
         } else if (op.qbits == 8 && op.qgroup > 0) {
-          kernels::launch_weight_only_int8_matvec_grouped(
-              op.qweight, op.qscales, S(op.in), S(op.out), op.cols, op.in_dim, op.qgroup, stream_);
+          kernels::launch_weight_only_int8_matvec_grouped(QW(op.qweight), QS(op.qscales), S(op.in),
+                                                          S(op.out), op.cols, op.in_dim, op.qgroup,
+                                                          stream_);
         } else if (op.qbits == 4) {
-          kernels::launch_weight_only_int4_matvec(op.qweight, op.qscales, S(op.in), S(op.out),
-                                                  op.cols, op.in_dim, stream_);
+          kernels::launch_weight_only_int4_matvec(QW(op.qweight), QS(op.qscales), S(op.in),
+                                                  S(op.out), op.cols, op.in_dim, stream_);
         } else if (op.qbits == 8) {
-          kernels::launch_weight_only_int8_matvec(op.qweight, op.qscales, S(op.in), S(op.out),
-                                                  op.cols, op.in_dim, stream_);
+          kernels::launch_weight_only_int8_matvec(QW(op.qweight), QS(op.qscales), S(op.in),
+                                                  S(op.out), op.cols, op.in_dim, stream_);
         } else if (seq) {
           kernels::launch_rowmajor_half_gemm_f16(HW(op.weight), S(op.in), S(op.out), op.cols,
                                                  op.in_dim, T, stream_, op.clip_in_min,
@@ -1870,13 +1874,13 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
       case OpKind::MoeGateUpGeglu:
         kernels::launch_moe_gate_up_geglu(
             op.qbits ? static_cast<const void*>(op.qweight) : static_cast<const void*>(op.weight),
-            op.qscales, op.qbits, op.qgroup, S(op.in), d_moe_idx_, S(op.out), op.cols, op.in_dim,
-            op.heads, stream_);
+            QS(op.qscales), op.qbits, op.qgroup, S(op.in), d_moe_idx_, S(op.out), op.cols,
+            op.in_dim, op.heads, stream_);
         break;
       case OpKind::MoeDownAccum:
         kernels::launch_moe_down_accum(
             op.qbits ? static_cast<const void*>(op.qweight) : static_cast<const void*>(op.weight),
-            op.qscales, op.qbits, op.qgroup, S(op.in), d_moe_idx_, d_moe_w_, S(op.out), op.cols,
+            QS(op.qscales), op.qbits, op.qgroup, S(op.in), d_moe_idx_, d_moe_w_, S(op.out), op.cols,
             op.in_dim, op.heads, stream_);
         break;
       case OpKind::Rope: {

@@ -152,8 +152,10 @@ struct Op {
   // `qscales` laid out [out_dim, quant_group_count(in_dim, qgroup)] row-major.
   // Resolved at LOAD like everything else, so the hot loop stays branch-free over
   // model identity — the op just carries a different weight encoding.
-  const std::int8_t* qweight = nullptr;
-  const float* qscales = nullptr;
+  // Opaque, for the same reason `weight` is: on Metal a quantized weight is an
+  // MTLBuffer object, not an address, so the IR cannot name its element type.
+  const void* qweight = nullptr;  // packed int4 (two per byte) or int8
+  const void* qscales = nullptr;  // float[out_dim, quant_group_count(in_dim, qgroup)]
   int qbits = 0;
   int qgroup = 0;
   int rows = 1;      // RmsNorm groups (heads for q/k norm, else 1)
