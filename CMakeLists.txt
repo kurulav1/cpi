@@ -114,6 +114,9 @@ set(LLAMA_ENGINE_SOURCES
   src/model/image_preprocess.cpp
   src/model/wordpiece_tokenizer.cpp
   src/engine/embedding_config.cpp
+  # Backend-neutral: a plan is just data, so the builder belongs outside any
+  # GPU backend and is shared by the CUDA and Metal executors alike.
+  src/engine/op_plan_builder.cpp
   src/grammar/grammar.cpp
   src/grammar/json_schema_to_grammar.cpp
   src/grammar/grammar_sampler.cpp
@@ -292,6 +295,15 @@ add_executable(grammar_test
 )
 target_include_directories(grammar_test PRIVATE include)
 add_test(NAME grammar_test COMMAND grammar_test)
+
+# Plan-builder test. CUDA-free and GPU-free, so it runs in CI on every platform --
+# it is the one part of the Metal bring-up that can be verified without a Mac.
+add_executable(op_plan_builder_test
+  src/tests/op_plan_builder_test.cpp
+  src/engine/op_plan_builder.cpp
+)
+target_include_directories(op_plan_builder_test PRIVATE include)
+add_test(NAME op_plan_builder_test COMMAND op_plan_builder_test)
 
 # Metal kernel smoke test: runs each shader against a CPU reference. On a machine
 # with no Metal GPU (any VM, including GitHub's macOS runners) it reports SKIP and
