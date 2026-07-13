@@ -48,6 +48,7 @@ struct EmbedParams {
 constexpr int kTG = 256;               // threads per group
 constexpr int kSimdsPerTG = kTG / 32;  // = rows per threadgroup in the GEMV
 constexpr int kArgmaxParts = 256;
+constexpr int kGemvTile = 8;  // MUST match GEMV_TILE in cpi_kernels.metal
 
 std::size_t groups_for_rows(std::size_t rows) {
   return (rows + kSimdsPerTG - 1) / kSimdsPerTG;
@@ -243,10 +244,12 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
         // Q/K/V share one fused bqkv tensor; bias_offset selects this op's slice.
         const std::size_t offs[] = {
             0, 0, 0, static_cast<std::size_t>(op.bias_offset) * sizeof(std::uint16_t)};
-        ctx_.dispatch(
-            "cpi_gemv_f16", G::Groups,
-            groups_for_rows(static_cast<std::size_t>(op.cols)) * static_cast<std::size_t>(T), kTG,
-            bufs, offs, 4, &p, sizeof(p));
+        // One threadgroup per (token TILE, row block): the weight row is read once per
+        // tile, not once per token.
+        const std::size_t tiles = static_cast<std::size_t>((T + kGemvTile - 1) / kGemvTile);
+        ctx_.dispatch("cpi_gemv_f16", G::Groups,
+                      groups_for_rows(static_cast<std::size_t>(op.cols)) * tiles, kTG, bufs, offs,
+                      4, &p, sizeof(p));
         break;
       }
       case OpKind::LmHead: {

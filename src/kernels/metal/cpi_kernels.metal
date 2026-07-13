@@ -17,6 +17,11 @@
 
 using namespace metal;
 
+// Tokens per threadgroup in the GEMV. The weight row is read once and reused across
+// the tile, so this is the prefill's bandwidth-amplification factor. 8 fits in
+// registers comfortably; decode uses a single token and is unaffected.
+#define GEMV_TILE 8
+
 // ---------------------------------------------------------------------------
 // Parameter blocks. One per op family, bound at buffer(N) as a `constant` ref.
 // Kept flat and POD so the C++ side can memcpy them without a shared header.
@@ -170,37 +175,56 @@ kernel void cpi_gemv_f16(
   const uint simd_id      = lid / 32u;
   const uint lane         = lid % 32u;
 
+  // TOKEN TILING. A prefill pushes T tokens through the same weights, so the weight
+  // row is loaded ONCE and reused across a tile of tokens. Without this, a "batched"
+  // GEMV is really T separate GEMVs: it re-streams the entire weight matrix per token
+  // and saves nothing on a bandwidth-bound machine. With it, a tile of TILE tokens
+  // reads the weights once, so prefill traffic drops by up to TILE-fold.
+  //
+  // Decode is TILE=1 and behaves exactly as before.
   const uint rows_per_tg = simds_per_tg;
-  const uint token = gid / ((p.out_dim + rows_per_tg - 1u) / rows_per_tg);
-  const uint blk   = gid % ((p.out_dim + rows_per_tg - 1u) / rows_per_tg);
-  const uint row   = blk * rows_per_tg + simd_id;
-  if (token >= p.tokens || row >= p.out_dim) return;
+  const uint row_blocks  = (p.out_dim + rows_per_tg - 1u) / rows_per_tg;
+
+  const uint tile = gid / row_blocks;          // which group of tokens
+  const uint blk  = gid % row_blocks;          // which group of rows
+  const uint row  = blk * rows_per_tg + simd_id;
+  const uint t0   = tile * GEMV_TILE;
+  if (t0 >= p.tokens || row >= p.out_dim) return;
+
+  const uint nt = min((uint)GEMV_TILE, p.tokens - t0);  // tokens actually in this tile
 
   device const half* wrow = W + (ulong)row * (ulong)p.in_dim;
-  device const half* xrow = in + (ulong)token * (ulong)p.in_dim;
 
-  float acc = 0.0f;
+  float acc[GEMV_TILE];
+  for (uint t = 0u; t < GEMV_TILE; ++t) acc[t] = 0.0f;
+
   uint i = 0u;
-
   if ((p.in_dim & 7u) == 0u) {
-    // 128-bit loads: each lane pulls 8 halves, and consecutive lanes pull
-    // consecutive 16-byte chunks.
     device const uint4* w4 = (device const uint4*)wrow;
-    device const uint4* x4 = (device const uint4*)xrow;
     const uint n4 = p.in_dim >> 3;
     for (uint k = lane; k < n4; k += 32u) {
-      acc += dot8_f32(w4[k], x4[k]);
+      const uint4 wv = w4[k];  // <-- read once, used by every token in the tile
+      for (uint t = 0u; t < nt; ++t) {
+        device const uint4* x4 = (device const uint4*)(in + (ulong)(t0 + t) * (ulong)p.in_dim);
+        acc[t] += dot8_f32(wv, x4[k]);
+      }
     }
     i = n4 << 3;
   }
   for (uint k = i + lane; k < p.in_dim; k += 32u) {  // tail / fallback
-    acc += float(wrow[k]) * float(xrow[k]);
+    const float wv = float(wrow[k]);
+    for (uint t = 0u; t < nt; ++t) {
+      acc[t] += wv * float(in[(ulong)(t0 + t) * (ulong)p.in_dim + k]);
+    }
   }
 
-  acc = simd_sum(acc);
-  if (lane == 0u) {
-    if (p.has_bias != 0u) acc += float(bias[row]);
-    out[(ulong)token * (ulong)p.out_dim + row] = half(acc);
+  for (uint t = 0u; t < nt; ++t) {
+    const float s = simd_sum(acc[t]);
+    if (lane == 0u) {
+      float v = s;
+      if (p.has_bias != 0u) v += float(bias[row]);
+      out[(ulong)(t0 + t) * (ulong)p.out_dim + row] = half(v);
+    }
   }
 }
 

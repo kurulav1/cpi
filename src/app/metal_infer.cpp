@@ -95,7 +95,13 @@ int main(int argc, char** argv) {
   // Decode the whole sequence at once. Decoding token by token loses the word
   // boundaries and runs every word together.
   std::printf("%s\n", tok.decode(out).c_str());
-  std::fprintf(stderr, "\n[perf] %zu tokens in %.0f ms = %.1f tok/s\n", out.size(), ms,
-               static_cast<double>(out.size()) / (ms / 1000.0));
+  const double pms = eng.last_prefill_ms();
+  const int ptok = eng.last_prefill_tokens();
+  if (ptok > 0) {
+    std::fprintf(stderr, "\n[perf] prefill: %d tokens in %.0f ms = %.0f tok/s\n", ptok, pms,
+                 static_cast<double>(ptok) / (pms / 1000.0));
+  }
+  std::fprintf(stderr, "[perf] decode:  %zu tokens in %.0f ms = %.1f tok/s\n", out.size(), ms - pms,
+               static_cast<double>(out.size()) / ((ms - pms) / 1000.0));
   return 0;
 }
