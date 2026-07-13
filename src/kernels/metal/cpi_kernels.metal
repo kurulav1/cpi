@@ -197,10 +197,14 @@ kernel void cpi_lm_head(
 // In-place over `heads` heads of `head_dim`.
 // ---------------------------------------------------------------------------
 
+// NOTE the buffer order: the params block is ALWAYS the last binding, in every
+// kernel here. MetalContext::dispatch() binds it at index n_buffers, so a kernel
+// that puts it anywhere else would have its params written over another buffer --
+// which compiles cleanly and only misbehaves on real hardware.
 kernel void cpi_rope(
     device half*        x         [[buffer(0)]],
-    constant RopeParams& p        [[buffer(1)]],
-    device const int*   positions [[buffer(2)]],
+    device const int*   positions [[buffer(1)]],
+    constant RopeParams& p        [[buffer(2)]],
     uint gid [[thread_position_in_grid]]) {
   const uint half_dim = p.head_dim / 2u;
   const uint per_token = p.heads * half_dim;
@@ -318,8 +322,8 @@ kernel void cpi_kv_store(
     device const half*  v         [[buffer(1)]],
     device half*        k_cache   [[buffer(2)]],
     device half*        v_cache   [[buffer(3)]],
-    constant KvParams&  p         [[buffer(4)]],
-    device const int*   positions [[buffer(5)]],
+    device const int*   positions [[buffer(4)]],
+    constant KvParams&  p         [[buffer(5)]],
     uint gid [[thread_position_in_grid]]) {
   const uint kv_dim = p.kv_heads * p.head_dim;
   if (gid >= kv_dim) return;
@@ -347,8 +351,8 @@ kernel void cpi_attention_decode(
     device const half*  k_cache   [[buffer(1)]],
     device const half*  v_cache   [[buffer(2)]],
     device half*        out       [[buffer(3)]],
-    constant AttnParams& p        [[buffer(4)]],
-    device const int*   positions [[buffer(5)]],
+    device const int*   positions [[buffer(4)]],
+    constant AttnParams& p        [[buffer(5)]],
     uint gid  [[threadgroup_position_in_grid]],
     uint lid  [[thread_position_in_threadgroup]],
     uint nthr [[threads_per_threadgroup]]) {
