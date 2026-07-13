@@ -147,22 +147,8 @@ int main(int argc, char** argv) {
   }
   std::printf("  top-5 ranking agreement: %d/5\n", rank_matches);
 
-  // CpuLlamaEngine does not fully implement Qwen3 -- it now applies QK-norm, but it
-  // still does not reproduce CUDA on those checkpoints, so it is NOT a usable oracle
-  // for them. (Found by this very test: Metal matched CUDA token-for-token while
-  // disagreeing with the CPU engine by 7.1 -- far past any fp16/fp32 gap. The CPU
-  // engine is the broken one; see the note in cpu_engine.cpp.) Report the comparison,
-  // but do not gate on it for a model the oracle cannot model.
-  const bool cpu_oracle_trustworthy = !cfg.has_qk_norm;
   const bool argmax_ok = !cpu_top.empty() && cpu_top[0].first == m_top;
-  if (cpu_oracle_trustworthy) {
-    std::printf("  argmax agreement: %s\n", argmax_ok ? "PASS" : "FAIL");
-  } else {
-    std::printf(
-        "  argmax agreement: %s (NOT GATED -- CpuLlamaEngine's Qwen3 support is\n"
-        "                    incomplete, so it is not a valid oracle here)\n",
-        argmax_ok ? "match" : "differs");
-  }
+  std::printf("  argmax agreement: %s\n", argmax_ok ? "PASS" : "FAIL");
 
   double max_abs = 0.0;
   for (const auto& p : cpu_top) {
