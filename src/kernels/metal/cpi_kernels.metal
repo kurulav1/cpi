@@ -517,7 +517,19 @@ kernel void cpi_silu_mul(
   out[gid] = half(silu * float(b[gid]));
 }
 
-// GeGLU: out = gelu(a) * b. Tanh approximation -- matches the CUDA kernel.
+// GeGLU: out = gelu(a) * b. Tanh approximation, same as the CUDA kernel.
+//
+// ⚠ DO NOT write this as 0.5 * x * (1 + tanh(inner)).
+//
+// Metal's tanh overflows. It evaluates as (exp(2z) - 1) / (exp(2z) + 1), and exp(2z)
+// exceeds fp32 for z beyond ~44, giving inf/inf = NaN -- where CUDA's tanhf saturates
+// to 1 and is fine. Gemma reaches z ~ 62 on ordinary activations, so this produced NaN
+// on real inputs, for some tokens and not others (it depends on the gate value). Llama
+// never hit it because SwiGLU uses a sigmoid, which is naturally safe.
+//
+// 0.5 * (1 + tanh(z)) is exactly sigmoid(2z), and sigmoid is safe at BOTH ends:
+// exp(-large) -> 0 gives 1, and exp(+large) -> inf gives 1/(1+inf) = 0. Same maths, no
+// overflow.
 kernel void cpi_gelu_mul(
     device const half*  a   [[buffer(0)]],
     device const half*  b   [[buffer(1)]],
@@ -528,7 +540,7 @@ kernel void cpi_gelu_mul(
   const float x = float(a[gid]);
   const float k = 0.7978845608028654f;  // sqrt(2/pi)
   const float inner = k * (x + 0.044715f * x * x * x);
-  const float gelu = 0.5f * x * (1.0f + tanh(inner));
+  const float gelu = x / (1.0f + exp(-2.0f * inner));  // == 0.5*x*(1 + tanh(inner))
   out[gid] = half(gelu * float(b[gid]));
 }
 
