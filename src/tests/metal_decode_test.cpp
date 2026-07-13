@@ -179,7 +179,9 @@ int main(int argc, char** argv) {
                                static_cast<double>(p.second));
     max_abs = std::max(max_abs, d);
   }
-  std::printf("  max_abs_diff over the CPU's top-5: %.4f\n", max_abs);
+  const bool logits_ok = max_abs <= logit_tol && std::isfinite(max_abs);
+  std::printf("  max_abs_diff over the CPU's top-5: %.4f  (bound %.2f) %s\n", max_abs, logit_tol,
+              logits_ok ? "PASS" : "FAIL");
 
   // ---- the gate: does Metal reproduce CUDA's greedy stream? ----------------
   //
