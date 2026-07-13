@@ -89,6 +89,24 @@ constexpr int kGemmBN = 128;
 constexpr int kArgmaxParts = 256;
 constexpr int kGemvTile = 8;  // MUST match GEMV_TILE in cpi_kernels.metal
 
+const char* op_kind_name(int k) {
+  switch (static_cast<opplan::OpKind>(k)) {
+    case opplan::OpKind::RmsNorm: return "RmsNorm";
+    case opplan::OpKind::Gemv: return "Gemv/Gemm";
+    case opplan::OpKind::Rope: return "Rope";
+    case opplan::OpKind::ScaleCopy: return "ScaleCopy";
+    case opplan::OpKind::CopySlot: return "CopySlot";
+    case opplan::OpKind::KvStore: return "KvStore";
+    case opplan::OpKind::Attention: return "Attention";
+    case opplan::OpKind::GeluMul: return "GeluMul";
+    case opplan::OpKind::SiluMul: return "SiluMul";
+    case opplan::OpKind::AddInplace: return "AddInplace";
+    case opplan::OpKind::EmbeddingLookup: return "Embedding";
+    case opplan::OpKind::LmHead: return "LmHead";
+    default: return "other";
+  }
+}
+
 std::size_t groups_for_rows(std::size_t rows) {
   return (rows + kSimdsPerTG - 1) / kSimdsPerTG;
 }
@@ -613,25 +631,6 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
   }
 }
 
-namespace {
-const char* op_kind_name(int k) {
-  switch (static_cast<opplan::OpKind>(k)) {
-    case opplan::OpKind::RmsNorm: return "RmsNorm";
-    case opplan::OpKind::Gemv: return "Gemv/Gemm";
-    case opplan::OpKind::Rope: return "Rope";
-    case opplan::OpKind::ScaleCopy: return "ScaleCopy";
-    case opplan::OpKind::CopySlot: return "CopySlot";
-    case opplan::OpKind::KvStore: return "KvStore";
-    case opplan::OpKind::Attention: return "Attention";
-    case opplan::OpKind::GeluMul: return "GeluMul";
-    case opplan::OpKind::SiluMul: return "SiluMul";
-    case opplan::OpKind::AddInplace: return "AddInplace";
-    case opplan::OpKind::EmbeddingLookup: return "Embedding";
-    case opplan::OpKind::LmHead: return "LmHead";
-    default: return "other";
-  }
-}
-}  // namespace
 
 // Commits what is encoded, waits, and charges the elapsed time to `name`. Only ever called
 // under CPI_METAL_PROFILE -- it serialises the pass.
@@ -651,7 +650,7 @@ void PlanMetalEngine::dump_profile() const {
   std::sort(rows.begin(), rows.end(),
             [](const auto& a, const auto& b) { return a.second > b.second; });
   for (const auto& r : rows) {
-    std::fprintf(stderr, "  %-16s %8.0f ms  %5.1f%%\n", op_kind_name(r.first), r.second,
+    std::fprintf(stderr, "  %-22s %8.0f ms  %5.1f%%\n", r.first.c_str(), r.second,
                  100.0 * r.second / total);
   }
 }
