@@ -600,7 +600,7 @@ void PlanMetalEngine::encode_forward(int token, int position) {
           static const char* kn[] = {"RmsNorm",  "Gemv",    "Rope",   "ScaleCopy",
                                      "CopySlot", "KvStore", "Attn",   "GeluMul",
                                      "AddInpl",  "Embed",   "LmHead", "SiluMul"};
-          peek_slot(op.out, std::min(n, 4096), kn[static_cast<int>(op.kind)]);
+          peek_slot(op.out, n, kn[static_cast<int>(op.kind)]);
         }
       }
       ++done;
