@@ -1,0 +1,16 @@
+# Golden greedy stream for Llama-3.1-8B-Instruct, from the CUDA backend.
+#
+# A FOURTH model family, and the plainest one: no QKV bias, no QK-norm, SwiGLU,
+# rope_theta = 500000. Nothing exotic -- which is exactly why it is worth testing. It
+# was assumed to work because it shares the uniform-geometry path, and an assumption is
+# not a result.
+#
+# It is also the int4 payoff: this model is ~15 GB at fp16 and does NOT fit in a 16 GB
+# Mac. At int4 it does.
+#
+# Prompt: "Explain in two sentences why the sky is blue."
+#
+# Format: "prompt:" then the token ids; "expect:" then the greedy continuation.
+
+prompt: 128000,849,21435,304,1403,23719,3249,279,13180,374,6437,13
+expect: 578,13180,8111,6437,1606,315,264,25885,2663,13558,64069,72916,11,304,902,24210,320,12481,8,93959,315,3177,527,38067,810,1109,5129,320,1171,8,93959,555,279,13987,35715,315,45612,304,279,9420,596,16975,13,1115,72916,2515,6835,279
