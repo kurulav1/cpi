@@ -197,10 +197,7 @@ int main(int argc, char** argv) {
          m_out[cpu_agree] == c_out[cpu_agree]) {
     ++cpu_agree;
   }
-  std::printf(
-      "\n  (agrees with the fp32 CPU engine for %zu tokens, then the fp16/fp32\n"
-      "   activation gap flips a near-tie -- expected, not a failure)\n",
-      cpu_agree);
+  std::printf("\n  agrees with the CPU engine for %zu/%zu tokens\n", cpu_agree, c_out.size());
 
   bool golden_ok = true;
   if (golden.empty()) {
