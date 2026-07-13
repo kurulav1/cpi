@@ -72,12 +72,33 @@ int main(int argc, char** argv) {
   const int m_top = top1(mlogits);
   std::printf("\n  CPU  top-5:");
   for (const auto& p : cpu_top) std::printf("  %d(%.3f)", p.first, p.second);
-  std::printf("\n  METAL top-1: %d(%.3f)\n", m_top, mlogits[static_cast<std::size_t>(m_top)]);
+
+  // Metal's own top-5, so the RANKING can be compared -- not just the winner. An
+  // argmax can agree by luck on an easy token while the distribution underneath is
+  // quietly wrong; the ordering of the runners-up is far more sensitive.
+  std::vector<int> idx(mlogits.size());
+  for (std::size_t i = 0; i < idx.size(); ++i) idx[i] = static_cast<int>(i);
+  std::partial_sort(idx.begin(), idx.begin() + 5, idx.end(), [&](int a, int b) {
+    return mlogits[static_cast<std::size_t>(a)] > mlogits[static_cast<std::size_t>(b)];
+  });
+  std::printf("\n  METAL top-5:");
+  for (int i = 0; i < 5; ++i) {
+    std::printf("  %d(%.3f)", idx[static_cast<std::size_t>(i)],
+                mlogits[static_cast<std::size_t>(idx[static_cast<std::size_t>(i)])]);
+  }
+  std::printf("\n");
+
+  int rank_matches = 0;
+  for (int i = 0; i < 5 && i < static_cast<int>(cpu_top.size()); ++i) {
+    if (cpu_top[static_cast<std::size_t>(i)].first == idx[static_cast<std::size_t>(i)]) {
+      ++rank_matches;
+    }
+  }
+  std::printf("  top-5 ranking agreement: %d/5\n", rank_matches);
 
   const bool argmax_ok = !cpu_top.empty() && cpu_top[0].first == m_top;
-  std::printf("\n  argmax agreement: %s\n", argmax_ok ? "PASS" : "FAIL");
+  std::printf("  argmax agreement: %s\n", argmax_ok ? "PASS" : "FAIL");
 
-  // How far apart are the logits the CPU reported, on the values Metal produced?
   double max_abs = 0.0;
   for (const auto& p : cpu_top) {
     const double d = std::fabs(static_cast<double>(mlogits[static_cast<std::size_t>(p.first)]) -
@@ -86,15 +107,30 @@ int main(int argc, char** argv) {
   }
   std::printf("  max_abs_diff over the CPU's top-5: %.4f\n", max_abs);
 
-  if (!argmax_ok) {
-    std::printf("\n[metal_decode] FAIL: the two engines disagree on the next token.\n");
+  // ---- the real gate: do the two engines decode the SAME TOKEN STREAM? -----
+  //
+  // One matching argmax proves little. A greedy stream is unforgiving: it re-enters
+  // the model with its own output, so any drift compounds and a wrong RoPE or a
+  // mis-strided KV cache diverges within a few tokens.
+  const std::vector<int> m_out = metal.generate_greedy(prompt, n_new);
+  const std::vector<int> c_out = cpu.generate(prompt, n_new, /*temperature=*/0.0f);
+
+  std::printf("\n  CPU   greedy:");
+  for (int t : c_out) std::printf(" %d", t);
+  std::printf("\n  METAL greedy:");
+  for (int t : m_out) std::printf(" %d", t);
+  std::printf("\n");
+
+  std::size_t agree = 0;
+  while (agree < m_out.size() && agree < c_out.size() && m_out[agree] == c_out[agree]) ++agree;
+  const bool stream_ok = agree == c_out.size() && !c_out.empty();
+  std::printf("\n  token streams agree for %zu/%zu tokens: %s\n", agree, c_out.size(),
+              stream_ok ? "PASS" : "FAIL");
+
+  if (!argmax_ok || !stream_ok) {
+    std::printf("\n[metal_decode] FAIL\n");
     return 1;
   }
-
-  // ---- greedy decode, just to see it run ----------------------------------
-  const std::vector<int> out = metal.generate_greedy(prompt, n_new);
-  std::printf("\n  greedy(%d):", n_new);
-  for (int t : out) std::printf(" %d", t);
-  std::printf("\n\n[metal_decode] PASS\n");
+  std::printf("\n[metal_decode] PASS\n");
   return 0;
 }
