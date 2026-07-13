@@ -22,6 +22,10 @@ using namespace metal;
 // registers comfortably; decode uses a single token and is unaffected.
 #define GEMV_TILE 8
 
+// Keys scored per pass in the attention kernel. The online softmax folds in one block at
+// a time, so this is the barrier-amortisation factor.
+#define KEY_BLOCK 32
+
 // ---------------------------------------------------------------------------
 // Parameter blocks. One per op family, bound at buffer(N) as a `constant` ref.
 // Kept flat and POD so the C++ side can memcpy them without a shared header.
@@ -852,82 +856,94 @@ kernel void cpi_attention_decode(
     uint gid  [[threadgroup_position_in_grid]],
     uint lid  [[thread_position_in_threadgroup]],
     uint nthr [[threads_per_threadgroup]]) {
-  // One threadgroup per (query token, head). Decode is just T = 1, so prefill and
-  // decode share this kernel instead of duplicating the softmax and the GQA maths.
+  // One threadgroup per (query token, head). Decode is just T = 1, so prefill and decode
+  // share this kernel instead of duplicating the softmax and the GQA maths.
+  //
+  // KEYS ARE PROCESSED IN BLOCKS. The first version walked the cache ONE KEY AT A TIME,
+  // with two threadgroup barriers per key -- about 1100 barriers per (token, head) on a
+  // 551-token prompt, which made prefill attention O(T^2) in barriers as well as in work.
+  // Scoring a block of 32 keys and folding it into the online softmax ONCE cuts the
+  // barrier count ~20x and lets the score dot-products run across all simdgroups at once.
   const uint total = p.heads * p.tokens;
   if (gid >= total) return;
-  const uint t    = gid / p.heads;  // which query token in the batch
+  const uint t    = gid / p.heads;
   const uint head = gid % p.heads;
 
   uint base = p.position;
   if (p.use_position_buffer != 0u) base = uint(positions[0]);
+  const uint pos = base + t;  // causality: token t attends to keys [start, base+t]
 
-  // This query's absolute position. CAUSALITY falls straight out of it: token t
-  // attends to keys [start, base+t] and no further, so no explicit mask is needed.
-  const uint pos = base + t;
-
-  const uint group   = p.heads / p.kv_heads;   // query heads per kv head
+  const uint group   = p.heads / p.kv_heads;
   const uint kv_head = head / group;
   const uint kv_dim  = p.kv_heads * p.head_dim;
   const uint q_dim   = p.heads * p.head_dim;
 
-  // Causal window: attend to [start, pos].
   uint start = 0u;
   if (p.window != 0u && pos + 1u > p.window) start = pos + 1u - p.window;
 
   device const half* qh = q + (ulong)t * (ulong)q_dim + head * p.head_dim;
 
+  const uint simd_id = lid / 32u;
+  const uint lane    = lid % 32u;
+  const uint n_simd  = nthr / 32u;
+
+  threadgroup float q_sh[256];    // the query, read once instead of per key
+  threadgroup float sc_sh[KEY_BLOCK];
+  threadgroup float w_sh[KEY_BLOCK];
+  threadgroup float tg_acc[256];
   threadgroup float tg_max;
   threadgroup float tg_sum;
-  threadgroup float tg_acc[256];   // head_dim accumulator (head_dim <= 256)
-  threadgroup float tg_red[32];
 
-  for (uint i = lid; i < p.head_dim; i += nthr) tg_acc[i] = 0.0f;
-  if (lid == 0u) { tg_max = -INFINITY; tg_sum = 0.0f; }
+  for (uint i = lid; i < p.head_dim; i += nthr) {
+    q_sh[i] = float(qh[i]);
+    tg_acc[i] = 0.0f;
+  }
+  if (lid == 0u) {
+    tg_max = -INFINITY;
+    tg_sum = 0.0f;
+  }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  // Walk the cache one key at a time. Each thread handles a slice of head_dim
-  // for the dot product; the threadgroup reduces to one score per key.
-  for (uint t = start; t <= pos; ++t) {
-    device const half* kt = k_cache + (ulong)t * (ulong)kv_dim + kv_head * p.head_dim;
+  for (uint kb = start; kb <= pos; kb += KEY_BLOCK) {
+    const uint nk = min((uint)KEY_BLOCK, pos - kb + 1u);
 
-    float dot = 0.0f;
-    for (uint i = lid; i < p.head_dim; i += nthr) {
-      dot += float(qh[i]) * float(kt[i]);
-    }
-    dot = simd_sum(dot);
-
-    const uint simd_id   = lid / 32u;
-    const uint simd_lane = lid % 32u;
-    const uint n_simd    = (nthr + 31u) / 32u;
-    if (simd_lane == 0u) tg_red[simd_id] = dot;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (simd_id == 0u) {
-      float v = (simd_lane < n_simd) ? tg_red[simd_lane] : 0.0f;
-      v = simd_sum(v);
-      if (simd_lane == 0u) tg_red[0] = v * p.scale;
+    // Score the whole block: each simdgroup takes a key and reduces its dot product.
+    for (uint j = simd_id; j < nk; j += n_simd) {
+      device const half* kt = k_cache + (ulong)(kb + j) * (ulong)kv_dim + kv_head * p.head_dim;
+      float d = 0.0f;
+      for (uint i = lane; i < p.head_dim; i += 32u) d += q_sh[i] * float(kt[i]);
+      d = simd_sum(d);
+      if (lane == 0u) sc_sh[j] = d * p.scale;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    const float score = tg_red[0];
+    // Online softmax, folded in ONCE for the block rather than once per key.
+    float bmax = -INFINITY;
+    for (uint j = 0u; j < nk; ++j) bmax = max(bmax, sc_sh[j]);
 
-    // Online softmax rescale.
     const float old_max = tg_max;
-    const float new_max = max(old_max, score);
+    const float new_max = max(old_max, bmax);
     const float rescale = (old_max == -INFINITY) ? 0.0f : exp(old_max - new_max);
-    const float w = exp(score - new_max);
 
-    device const half* vt = v_cache + (ulong)t * (ulong)kv_dim + kv_head * p.head_dim;
+    for (uint j = lid; j < nk; j += nthr) w_sh[j] = exp(sc_sh[j] - new_max);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float bsum = 0.0f;
+    for (uint j = 0u; j < nk; ++j) bsum += w_sh[j];
+
     for (uint i = lid; i < p.head_dim; i += nthr) {
-      tg_acc[i] = tg_acc[i] * rescale + w * float(vt[i]);
+      float a = tg_acc[i] * rescale;
+      for (uint j = 0u; j < nk; ++j) {
+        device const half* vt = v_cache + (ulong)(kb + j) * (ulong)kv_dim + kv_head * p.head_dim;
+        a += w_sh[j] * float(vt[i]);
+      }
+      tg_acc[i] = a;
     }
-    // Every thread read tg_max above to get old_max. Thread 0 is about to overwrite
-    // it. Without this barrier a fast thread 0 could publish the NEW max before a
-    // slower thread has read the old one, which silently corrupts that thread's
-    // rescale factor -- wrong attention, non-deterministically, only on hardware.
+
+    // Every thread read tg_max above; thread 0 is about to overwrite it.
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (lid == 0u) {
-      tg_sum = tg_sum * rescale + w;
+      tg_sum = tg_sum * rescale + bsum;
       tg_max = new_max;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
