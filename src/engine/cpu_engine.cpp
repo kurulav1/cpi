@@ -429,6 +429,23 @@ void CpuLlamaEngine::normalize(const float* x, const uint16_t* w, const uint16_t
 // Rotary position embeddings (in-place) for q and k.
 // Uses precomputed cos/sin tables built in initialize().
 // For GQA, q has n_heads heads and k has n_kv_heads heads.
+// Per-head RMSNorm over `heads` heads of `head_dim`, with one shared [head_dim]
+// weight. Qwen3 applies this to Q and K after projection and before RoPE.
+void CpuLlamaEngine::qk_norm_heads(float* x, const uint16_t* w, int heads, int head_dim) {
+  const float eps = cfg_.norm_eps > 0.0f ? cfg_.norm_eps : 1e-6f;
+  for (int h = 0; h < heads; ++h) {
+    float* v = x + static_cast<std::ptrdiff_t>(h) * head_dim;
+    float ss = 0.0f;
+    for (int i = 0; i < head_dim; ++i) {
+      ss += v[i] * v[i];
+    }
+    const float inv = 1.0f / std::sqrt(ss / static_cast<float>(head_dim) + eps);
+    for (int i = 0; i < head_dim; ++i) {
+      v[i] = v[i] * inv * fp16_to_fp32(w[i]);
+    }
+  }
+}
+
 void CpuLlamaEngine::rope(float* q, float* k, int pos, int n_heads, int n_kv_heads, int head_dim) {
   const float* cos_row = rope_cos_.data() + static_cast<std::ptrdiff_t>(pos) * (head_dim / 2);
   const float* sin_row = rope_sin_.data() + static_cast<std::ptrdiff_t>(pos) * (head_dim / 2);
@@ -685,6 +702,23 @@ void CpuLlamaEngine::forward_token(int token, int pos) {
         k_[i] += fp16_to_fp32(lw.bqkv[q_dim_ + i]);
         v_[i] += fp16_to_fp32(lw.bqkv[q_dim_ + kv_dim_ + i]);
       }
+    }
+
+    // Per-head QK-norm (Qwen3): RMS-normalise each head of Q and of K with a shared
+    // [head_dim] weight, AFTER projection and BEFORE RoPE. Order matters -- doing it
+    // after RoPE changes the result. Mirrors the CUDA path exactly
+    // (llama_engine_forward_decode.cpp: launch_rmsnorm over num_heads x head_dim).
+    //
+    // KNOWN GAP: this engine STILL does not reproduce CUDA on Qwen3 even with the norm
+    // applied, so something else in its Qwen3 path is wrong and it is NOT a usable
+    // oracle for those checkpoints. It was silently producing a wrong model before this
+    // (no q_norm/k_norm at all); this closes one hole, not all of them. Found by the
+    // Metal backend disagreeing with it while matching CUDA token-for-token.
+    if (lw.q_norm) {
+      qk_norm_heads(q_.data(), lw.q_norm, NH, head_dim_);
+    }
+    if (lw.k_norm) {
+      qk_norm_heads(k_.data(), lw.k_norm, NKV, head_dim_);
     }
 
     rope(q_.data(), k_.data(), pos, NH, NKV, head_dim_);
@@ -949,6 +983,10 @@ void CpuLlamaEngine::initialize(const EngineOptions& options) {
     lw.wo = ptr16(p + ".attention.wo");
     lw.bo = weights_.has_tensor(p + ".attention.bo") ? ptr16(p + ".attention.bo") : nullptr;
     lw.bqkv = weights_.has_tensor(p + ".attention.bqkv") ? ptr16(p + ".attention.bqkv") : nullptr;
+    lw.q_norm =
+        weights_.has_tensor(p + ".attention.q_norm") ? ptr16(p + ".attention.q_norm") : nullptr;
+    lw.k_norm =
+        weights_.has_tensor(p + ".attention.k_norm") ? ptr16(p + ".attention.k_norm") : nullptr;
 
     auto& buf_w1 = dequant_mlp_[static_cast<std::size_t>(l) * 3 + 0];
     auto& buf_w2 = dequant_mlp_[static_cast<std::size_t>(l) * 3 + 1];

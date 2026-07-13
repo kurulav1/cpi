@@ -45,6 +45,12 @@ private:
     const uint16_t* wo = nullptr;
     const uint16_t* bo = nullptr;
     const uint16_t* bqkv = nullptr;  // fused q||k||v projection bias (Qwen2 et al.)
+    // Per-head RMSNorm on Q and K, applied after projection and before RoPE (Qwen3).
+    // One [head_dim] weight shared across heads. Without these the CPU engine
+    // silently produces a WRONG model for every Qwen3 checkpoint -- it does not
+    // crash, it just computes something else.
+    const uint16_t* q_norm = nullptr;
+    const uint16_t* k_norm = nullptr;
 
     const uint16_t* w1_fp16 = nullptr;
     const uint16_t* w2_fp16 = nullptr;
@@ -64,6 +70,7 @@ private:
   };
 
   void normalize(const float* x, const uint16_t* w, const uint16_t* b, float* out, int n);
+  void qk_norm_heads(float* x, const uint16_t* w, int heads, int head_dim);
 
   void gemv_fp16(const uint16_t* W, const float* x, float* y, int M, int N);
   void gemv_fp32(const float* W, const float* x, float* y, int M, int N);
