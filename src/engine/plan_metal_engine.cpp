@@ -420,9 +420,10 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
         if (gemm_tokens >= 8) {
           GemvParams gp{static_cast<std::uint32_t>(op.cols), static_cast<std::uint32_t>(op.in_dim),
                         static_cast<std::uint32_t>(gemm_tokens), op.bias != nullptr ? 1u : 0u};
-          // One simdgroup per 8x8 output tile; 8 simdgroups per threadgroup.
-          const std::size_t tiles =
-              (static_cast<std::size_t>(op.cols) / 8) * (static_cast<std::size_t>(gemm_tokens) / 8);
+          // Each simdgroup owns 8 rows x 32 tokens, so a weight tile serves four token
+          // tiles. That reuse -- not the matrix units on their own -- is what beats the GEMV.
+          const std::size_t tiles = (static_cast<std::size_t>(op.cols) / 8) *
+                                    ((static_cast<std::size_t>(gemm_tokens) + 31) / 32);
           const std::size_t groups = (tiles + kSimdsPerTG - 1) / kSimdsPerTG;
           ctx_.dispatch("cpi_gemm_f16", G::Groups, groups, kTG, bufs, offs, 4, &gp, sizeof(gp));
         }

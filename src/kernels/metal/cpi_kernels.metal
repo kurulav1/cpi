@@ -298,42 +298,58 @@ kernel void cpi_gemm_f16(
   const uint sgid = lid / 32u;
   const uint lane = lid % 32u;
 
-  const uint row_tiles = p.out_dim / 8u;               // out_dim is a multiple of 8
+  // The matrix units are NOT the win by themselves -- DATA REUSE is. A first attempt gave
+  // each simdgroup one 8x8 tile, so the weight matrix was re-read once per token tile (69
+  // times for a 551-token prompt) and it lost to the plain GEMV. Each simdgroup now owns
+  // 8 rows x 32 TOKENS: one weight tile is loaded and fed to FOUR token tiles, so weight
+  // traffic drops 4x on top of what the matrix units buy.
+  const uint row_tiles = p.out_dim / 8u;  // out_dim is a multiple of 8
   const uint tile = tgid * simds_per_tg + sgid;
   const uint row_tile = tile % row_tiles;
   const uint tok_tile = tile / row_tiles;
 
   const uint row0 = row_tile * 8u;
-  const uint tok0 = tok_tile * 8u;
-  if (row0 >= p.out_dim || tok0 + 8u > p.tokens) return;
+  const uint tok0 = tok_tile * 32u;  // 4 x 8 tokens
+  if (row0 >= p.out_dim || tok0 >= p.tokens) return;
 
-  simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  const uint ntok = min(32u, p.tokens - tok0);
+  const uint nsub = (ntok + 7u) / 8u;  // how many of the 4 sub-tiles are live
+
+  simdgroup_float8x8 acc[4];
+  for (uint j = 0u; j < 4u; ++j) acc[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
 
   for (uint k = 0u; k < p.in_dim; k += 8u) {
-    simdgroup_half8x8 a;  // [8 tokens x 8 k]
-    simdgroup_half8x8 b;  // [8 k x 8 rows]  <- W loaded transposed
-    simdgroup_load(a, in + (ulong)tok0 * (ulong)p.in_dim + k, p.in_dim);
+    simdgroup_half8x8 b;  // [8 k x 8 rows] -- W is [out_dim, in_dim], so load TRANSPOSED
     simdgroup_load(b, W + (ulong)row0 * (ulong)p.in_dim + k, p.in_dim, ulong2(0, 0), true);
-    // The 4-argument form (d = a*b + c). There is no 3-argument overload that takes a
-    // float accumulator with half operands -- and a HALF accumulator would be wrong here:
-    // K runs to 4096+, and fp16 accumulation over that many terms loses real precision.
-    simdgroup_multiply_accumulate(acc, a, b, acc);
+
+    for (uint j = 0u; j < nsub; ++j) {
+      simdgroup_half8x8 a;  // [8 tokens x 8 k]
+      simdgroup_load(a, in + (ulong)(tok0 + j * 8u) * (ulong)p.in_dim + k, p.in_dim);
+      // The 4-argument form (d = a*b + c). There is no 3-arg overload taking a float
+      // accumulator with half operands -- and a HALF accumulator would be wrong here: K
+      // runs past 4096, and fp16 accumulation over that many terms loses real precision.
+      simdgroup_multiply_accumulate(acc[j], a, b, acc[j]);
+    }
   }
 
-  // Stage the tile through threadgroup memory so each lane can add the bias and narrow
-  // to half on the way out. Sized for the MAXIMUM simdgroups a threadgroup can have here
-  // (256 threads / 32 = 8), each owning its own 8x8 = 64 floats.
+  // Stage through threadgroup memory so each lane can add the bias and narrow to half.
   threadgroup float tile_buf[8 * 64];
   threadgroup float* mine = tile_buf + sgid * 64u;
-  simdgroup_store(acc, mine, 8);
-  simdgroup_barrier(mem_flags::mem_threadgroup);
 
-  for (uint i = lane; i < 64u; i += 32u) {
-    const uint t = i / 8u;  // token within the tile
-    const uint r = i % 8u;  // row within the tile
-    float v = mine[t * 8u + r];
-    if (p.has_bias != 0u) v += float(bias[row0 + r]);
-    out[(ulong)(tok0 + t) * (ulong)p.out_dim + row0 + r] = half(v);
+  for (uint j = 0u; j < nsub; ++j) {
+    simdgroup_store(acc[j], mine, 8);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = lane; i < 64u; i += 32u) {
+      const uint t = i / 8u;  // token within this 8-token sub-tile
+      const uint r = i % 8u;  // row within the 8-row tile
+      const uint tok = tok0 + j * 8u + t;
+      if (tok >= p.tokens) continue;
+      float v = mine[t * 8u + r];
+      if (p.has_bias != 0u) v += float(bias[row0 + r]);
+      out[(ulong)tok * (ulong)p.out_dim + row0 + r] = half(v);
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
   }
 }
 
