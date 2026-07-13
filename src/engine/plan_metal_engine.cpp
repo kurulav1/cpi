@@ -637,13 +637,12 @@ void PlanMetalEngine::dump_profile() const {
   double total = 0.0;
   for (const auto& kv : profile_ms_) total += kv.second;
   if (total <= 0.0) return;
-  std::fprintf(stderr, "[metal profile] %.0f ms of GPU work, by op:
-", total);
+  std::fprintf(stderr, "[metal profile] %.0f ms of GPU work, by op:\n", total);
   std::vector<std::pair<int, double>> rows(profile_ms_.begin(), profile_ms_.end());
-  std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+  std::sort(rows.begin(), rows.end(),
+            [](const auto& a, const auto& b) { return a.second > b.second; });
   for (const auto& r : rows) {
-    std::fprintf(stderr, "  %-16s %8.0f ms  %5.1f%%
-", op_kind_name(r.first), r.second,
+    std::fprintf(stderr, "  %-16s %8.0f ms  %5.1f%%\n", op_kind_name(r.first), r.second,
                  100.0 * r.second / total);
   }
 }
