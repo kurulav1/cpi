@@ -270,17 +270,14 @@ private:
   // Replays the logits-decode CUDA graph and copies the full logit vector to h_logits.
   void decode_next_token_logits_graph(int token, int position, std::vector<float>& h_logits);
 
-  // Tensor-core prefill attention: Q.K^T and P.V as cuBLAS batched GEMMs (which run on the
-  // tensor cores) with a masked softmax between, over chunks of query rows.
+  // Tensor-core prefill attention: Q.K^T and P.V as cuBLAS batched GEMMs, with a masked softmax
+  // between, over chunks of query rows. attention_prefill_kernel_tiled runs on the plain FMA
+  // pipe; routing these two matmuls through cuBLAS puts them on the tensor cores.
   //
-  // The hand-written attention_prefill_kernel_tiled is 84% of ALL prefill GPU time and runs on
-  // the plain FMA pipe -- Nsight: compute 31%, DRAM 0.2%. That is why CPI's prefill was 3-5x
-  // behind llama.cpp while its prefill GEMMs (already cutlass tensor-core) were fine.
-  //
-  // Returns false when not eligible (odd geometry, or the score matrix would be too large), and
-  // the caller must fall back to the kernel. Only used for LlamaEngine's plain causal text
-  // prefill -- the vision/bidirectional paths (per-token `limits`, sliding `window`) keep the
-  // kernel, which is the only thing that implements them.
+  // Returns false when not eligible (unsupported geometry, or the score matrix would be too
+  // large), in which case the caller must fall back to the kernel. Only used for plain causal
+  // text prefill: the vision/bidirectional paths need a per-token `limits` or sliding `window`
+  // mask, which only the kernel implements.
   bool prefill_attention_tensorcore(const void* q, const void* k_layer, const void* v_layer,
                                     void* out, int rows, int base_pos, int num_heads,
                                     int num_kv_heads, int head_dim, int q_stride);

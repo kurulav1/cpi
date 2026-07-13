@@ -13,17 +13,15 @@
 #include "runtime/kernels.cuh"
 namespace engine {
 namespace {
-// Times the launch INSIDE A CUDA GRAPH, because decode runs inside a CUDA graph.
+// Times the launch inside a CUDA graph, because decode runs inside a CUDA graph.
 //
-// This used to time back-to-back launches on a stream. On Windows/WDDM every stream launch
-// carries ~5-7 us of DRIVER overhead, so that measured the driver, not the kernel -- and it
-// added the SAME constant to both candidates. A tuner that then asks for
-// `custom < cublas * 0.95` can never fire: a real 0.4 us difference is invisible next to a
-// shared +7 us. That is why wqkv and wo were dispatched to cuBLAS and left running at 29-37%
-// of bandwidth. The tuner was not wrong about the kernels; it was blind to them.
+// Timing back-to-back launches on a stream measures the driver as much as the kernel: each
+// launch carries several microseconds of submission overhead, and it lands on every candidate
+// equally. That constant swamps the sub-microsecond differences this tuner is comparing, so
+// ratio tests against it can never fire. A graph pays the launch cost once at instantiation
+// rather than per node, so the measurement is of the kernel.
 //
-// A graph pays the launch cost once at instantiation, not per node, so this measures the
-// kernel. Every tuning decision in the engine goes through here.
+// Every tuning decision in the engine goes through here.
 template <typename Launch>
 double timed_cuda_launch_ms(cudaStream_t stream, int warmup, int iters, Launch&& launch) {
   const int safe_warmup = std::max(0, warmup);

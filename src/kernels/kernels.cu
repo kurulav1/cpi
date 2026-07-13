@@ -836,23 +836,12 @@ __global__ void store_kv_batched_paged_kernel(half* k_pool, half* v_pool, const 
   }
 }
 
-// Decode-shaped RMSNorm.
+// Decode-shaped RMSNorm: loads x once with 128-bit loads, keeps it in registers across both
+// passes (rmsnorm_kernel_simple re-reads it from global for the normalise step), and reduces
+// with warp shuffles instead of a shared-memory tree.
 //
-// The simple kernel above cost 3.12 us per call in-graph for a 896-element row -- 48 calls a
-// token = 204 us, 16% of a Qwen2.5-0.5B decode step, to move 90 KB. Three reasons, all fixed
-// here:
-//   1. it reads x from global TWICE (once for the sum of squares, once to normalize);
-//   2. it loads x one half at a time (16 bits per thread) -- far too little in flight;
-//   3. its shared-memory tree reduction costs log2(threads) = 7 __syncthreads.
-// So: load x once with 128-bit int4 loads, KEEP IT IN REGISTERS across both passes, and
-// reduce with warp shuffles (1 __syncthreads instead of 7).
-//
-// A single row is still one block on a 170-SM GPU -- that is inherent to a batch-1 norm and
-// is not what made it slow.
-//
-// NOT bit-identical to rmsnorm_kernel_simple: the sum of squares is accumulated in a
-// different order, so it differs in the last fp32 bits. Gated on decoded text, same as the
-// wide GEMV.
+// Not bit-identical to rmsnorm_kernel_simple: the sum of squares accumulates in a different
+// order, so it differs in the last fp32 bits.
 template <int Threads>
 __global__ void rmsnorm_fast_kernel(const half* __restrict__ x, const half* __restrict__ w,
                                     half* __restrict__ y, int cols, float eps) {
@@ -1161,28 +1150,19 @@ void launch_attention_prefill(const half* q, const half* k_cache, const half* v_
                               int window) {
   const int causal_i = causal ? 1 : 0;
   const dim3 grid(num_heads, num_tokens);
-  // Prefill attention is 84% of all prefill GPU time and CPI's prefill is 3-5x behind
-  // llama.cpp (the prefill GEMMs are already on cutlass tensor cores; this kernel is not).
-  // Nsight: compute 31%, DRAM 0.2%, ACHIEVED OCCUPANCY 45.5% with a 64-thread block -- bound
-  // by neither compute nor memory, just under-occupied. Widening the block is the cheap half
-  // of the fix; tensor cores are the other half. LLAMA_INFER_PREFILL_WARPS overrides for A/B.
+  // Fallback kernel: only reached when the engine's tensor-core prefill path is unavailable
+  // (unsupported geometry, or a per-token `limits` / sliding `window` mask, which only this
+  // kernel implements). LLAMA_INFER_PREFILL_WARPS overrides the block width.
   static const int env_warps = [] {
     const char* e = std::getenv("LLAMA_INFER_PREFILL_WARPS");
     return e ? atoi(e) : 0;
   }();
   if (head_dim > 0 && (head_dim % 2) == 0 && head_dim <= 256) {
     if (head_dim <= 64) {
-      // Default stays at 2 warps. TRIED 4: it is +4% prefill (16440 -> 17097 tok/s) but it
-      // CHANGES MODEL OUTPUT -- more warps means a different fp32 accumulation order in the
-      // softmax/dot reduction, which shifts logits enough to flip a greedy argmax, and the
-      // 6-model text gate caught it (5 identical, 1 differing). 4% is not worth perturbing
-      // every model's output. (8 warps is also just slower: 11440.)
-      //
-      // Occupancy is NOT the lever here anyway. Nsight: compute 31% on the PLAIN FMA PIPE,
-      // DRAM 0.2%, occupancy 45%. The kernel is 84% of prefill and CPI's prefill is 3-5x
-      // behind llama.cpp because this runs scalar FMA while llama.cpp runs flash-attention on
-      // TENSOR CORES. That is the real 5x, and it is a kernel rewrite, not a launch-config
-      // tweak. LLAMA_INFER_PREFILL_WARPS is kept for experimenting.
+      // Do not change the default width: the warp count sets the fp32 accumulation order in
+      // the softmax/dot reduction, so a different value shifts logits and can flip a greedy
+      // argmax. Wider blocks are not worth that here -- this kernel is bound by scalar-FMA
+      // throughput, not occupancy.
       const int w = (env_warps > 0) ? env_warps : 2;
       const std::size_t smem64 = static_cast<std::size_t>(head_dim) * sizeof(half) +
                                  static_cast<std::size_t>(3 * w + 2) * sizeof(float);

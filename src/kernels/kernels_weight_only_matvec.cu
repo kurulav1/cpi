@@ -58,20 +58,12 @@ __device__ __forceinline__ int unpack_int4x4(std::uint8_t b0, std::uint8_t b1) {
 
 // Decodes 4 consecutive signed int4 values into one packed int32 suitable for dp4a.
 //
-// ⚠ This reads the two packed bytes as a SINGLE 16-bit load, not two 8-bit loads.
+// Fetches the two packed bytes as a single 16-bit load rather than two 8-bit loads. They are
+// adjacent and byte_index is always even, so the access is aligned whenever the row itself is
+// 2-byte aligned (packed_cols even, which holds for every real in_features). The odd-row case
+// falls back to byte-wise reads.
 //
-// It used to do:   b0 = row_packed[i];  b1 = row_packed[i + 1];
-// i.e. TWO SEPARATE ONE-BYTE LOADS for every dp4a. Nsight on the int4 matvec: DRAM 30%,
-// compute 19%, but occupancy 98% and 1.0 waves/SM -- the GPU was completely full of warps
-// that were all stalled issuing 8-bit requests. The narrowest possible load, in the kernel
-// that dominates quantized decode.
-//
-// The two bytes are adjacent and byte_index = packed4_index * 2 is always even, so they can
-// be fetched as one aligned 16-bit access whenever the row itself is 2-byte aligned (true
-// when packed_cols is even, which holds for every real in_features -- they are powers of two
-// or multiples of 256). The odd-row case keeps the byte-wise path.
-//
-// BIT-IDENTICAL: same bytes, same nibble decode, same dp4a. Only the access width changes.
+// Same bytes, same nibble decode, same dp4a: only the access width differs.
 __device__ __forceinline__ int load_packed_int4x4(const int8_t* row_packed, int packed4_index) {
   const int byte_index = packed4_index * 2;
   if ((reinterpret_cast<std::uintptr_t>(row_packed) & 1u) == 0u) {
@@ -84,20 +76,16 @@ __device__ __forceinline__ int load_packed_int4x4(const int8_t* row_packed, int 
                        static_cast<std::uint8_t>(row_packed[byte_index + 1]));
 }
 
-// int8 weight-only GEMV with fp16 activations and FLOAT output -- the LM head.
+// int8 weight-only GEMV with fp16 activations and fp32 output: the LM head.
 //
-// Why a new kernel rather than the dp4a ones: the LM head must emit fp32 logits (the argmax
-// and the top-k sampler read floats), and every existing int8 matvec writes half. It also
-// keeps the ACTIVATION in fp16 and accumulates in fp32 -- only the weights are quantized.
-// That matters here: the dp4a path would additionally quantize x to int8, and stacking
-// activation error on top of weight error in the one layer that decides the output token is a
-// bad trade for the ~nothing it saves (x is 8 KB; the weight is 1 GB).
+// Separate from the dp4a matvecs for two reasons. The LM head must emit fp32 logits (the argmax
+// and the top-k sampler read floats) and every dp4a kernel writes half; and it quantizes the
+// WEIGHTS ONLY -- x stays fp16 and the dot accumulates in fp32. The dp4a path would also
+// quantize x, which is the wrong trade in the layer that selects the output token: the
+// activation is a few KB against a weight matrix measured in GB.
 //
-// Bandwidth is the whole point: an 8B's LM head is 128256 x 4096 fp16 = 1.05 GB, which is 22%
-// of everything an int4 8B reads per token. int8 halves it.
-//
-// 128-bit loads on both operands (one int4 = 16 int8 weights = 16 halves of x, so two x
-// vectors per weight vector), per the lesson that keeps repeating in this engine.
+// 128-bit loads on both operands: one int4 holds 16 int8 weights or 8 halves of x, so each
+// weight vector pairs with two x vectors.
 template <int Warps>
 __global__ void weight_only_int8_gemv_f32_kernel(const int8_t* __restrict__ w,
                                                  const float* __restrict__ scales,
@@ -304,10 +292,9 @@ __global__ void weight_only_int8_matvec_dp4a_tiled_kernel(const int8_t* w, const
 
     // Split the K work across several warps that collaborate on the same row
     // while still processing two packed fragments per loop step when possible.
-    // Fetch weights 128 bits at a time: one uint4 = 4 dp4a groups = 16 int8 weights.
-    // The loop above read w4[] one int (32 bits) per dp4a. Same width problem the int4 kernel
-    // had, one step less severe. Consecutive lanes now read consecutive 16-byte chunks.
-    // BIT-IDENTICAL: __dp4a accumulates in int32, so re-ordering the sum is exact.
+    // Fetch weights 128 bits at a time: one uint4 = 4 dp4a groups = 16 int8 weights, so
+    // consecutive lanes read consecutive 16-byte chunks. Reading one int (32 bits) per dp4a
+    // leaves too few bytes in flight. Bit-identical: __dp4a accumulates in int32.
     const int* tile_w4 = w4 + tile_base;
     const bool aligned16 = (reinterpret_cast<std::uintptr_t>(tile_w4) & 15u) == 0u;
     const int vec_groups = aligned16 ? (tile_count >> 2) : 0;  // groups of 4 dp4a units
@@ -675,18 +662,13 @@ __global__ void weight_only_int4_matvec_dp4a_tiled_kernel(const int8_t* w_packed
     }
     __syncthreads();
 
-    // Fetch the packed weights 128 bits at a time: one uint4 = 16 bytes = 8 dp4a groups
-    // = 32 int4 weights.
+    // Fetch the packed weights 128 bits at a time: one uint4 = 8 dp4a groups = 32 int4 weights.
+    // Consecutive lanes read consecutive 16-byte chunks, so a warp pulls 512 contiguous bytes.
+    // Narrower requests leave the warps stalled on memory latency even at full occupancy.
     //
-    // Even after collapsing the two 8-bit loads into one 16-bit load, Nsight still showed the
-    // int4 matvec at 30% DRAM with 98% occupancy -- the GPU was full of warps all issuing
-    // 16-bit requests. Width, not parallelism, is the whole problem. Consecutive lanes now
-    // read consecutive 16-byte chunks, so a warp pulls 512 contiguous bytes per request.
-    //
-    // BIT-IDENTICAL BY CONSTRUCTION, and this is the reason a rewrite this aggressive is safe
-    // here but was not in the fp16 kernels: __dp4a accumulates in INT32, so the sum is exact
-    // and integer addition is associative. Re-ordering the accumulation cannot change a single
-    // bit. (In the fp16 GEMVs, reordering changes fp32 rounding -- hence the text gate there.)
+    // Reordering the accumulation is safe here (unlike in the fp16 GEMVs): __dp4a accumulates
+    // in int32, so the sum is exact and integer addition is associative -- the result is
+    // bit-identical whatever the order.
     const int8_t* tile_w = row_w + static_cast<std::size_t>(tile_base) * 2;
     const bool aligned16 = (reinterpret_cast<std::uintptr_t>(tile_w) & 15u) == 0u;
     const int vec_groups = aligned16 ? (tile_count >> 3) : 0;  // groups of 8 dp4a units

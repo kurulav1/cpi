@@ -148,24 +148,23 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
     }
     maybe_add_half_bias(d_ff3_, lw->bo, rows, hidden);
 
-    // Keep Q's split copy; drop K's and V's, and fold the bias into one broadcast.
+    // Keep Q's split copy; drop K's and V's, and fold the QKV bias into one broadcast.
     //
-    // Prefill is host-bound (nsys: 7 cudaMemcpy2DAsync per layer = 1.87 ms of a 7.53 ms prefill).
-    // Three of those seven only un-interleave Q/K/V out of the fused QKV buffer. RoPE now takes
-    // independent row strides and the K/V cache stores can read strided, so K and V never need to
-    // be materialised. The bias vector is exactly one fused QKV row wide, so ONE broadcast over
-    // the fused buffer replaces three.
+    // Prefill is bound by host-side CUDA API calls, and three of the seven per-layer 2-D copies
+    // exist only to un-interleave Q/K/V out of the fused QKV buffer. RoPE takes independent row
+    // strides and the K/V cache stores can read strided, so K and V never need materialising.
+    // The bias vector is exactly one fused QKV row wide, so one broadcast replaces three.
     //
-    // ⚠ Q'S COPY STAYS, ON PURPOSE. Reading Q in place changes the attention GEMM's leading
-    // dimension (q_hidden -> the full QKV row), which makes cuBLAS pick a DIFFERENT algorithm,
-    // which sums in a different order. That was +13% but it changed the output of 2 of the 6 gate
-    // models. Keeping the copy keeps the stride, keeps cuBLAS's choice, and keeps the result
-    // BIT-IDENTICAL -- for the price of one copy per layer out of seven.
+    // Q's copy stays deliberately: reading Q in place changes the attention GEMM's leading
+    // dimension, which makes cuBLAS select a different algorithm that sums in a different order
+    // and perturbs the logits. Keeping the copy pins the stride and the result stays
+    // bit-identical -- and it also measured faster, the better-aligned GEMM more than paying for
+    // the copy.
     //
-    // NOT eligible when:
+    // Not eligible when:
     //   - QK-norm (Qwen3): launch_rmsnorm treats its input as contiguous [rows*heads, head_dim],
-    //     which K inside the strided QKV buffer is not. It would silently normalise wrong slices.
-    //   - paged blocks: launch_store_kv_paged wants contiguous K/V.
+    //     which K inside the strided QKV buffer is not -- it would normalise the wrong slices.
+    //   - paged blocks: launch_store_kv_paged requires contiguous K/V.
     const bool fused_kv = !(lw->q_norm && lw->k_norm) &&
                           !(options_.paged_blocks && d_block_table_ != nullptr);
     auto* qkv_rw = static_cast<__half*>(d_qkv_);
@@ -340,10 +339,8 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
           cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,
           lw->w13, d_x_norm_, d_ff13_, 2 * inter, hidden, rows, CUDA_R_16F);
 
-      // Read gate/up straight off the fused [rows, 2*inter] w13 output instead of splitting it
-      // into two buffers with a pair of cudaMemcpy2DAsync. Those copies only un-interleaved data
-      // the GLU reads elementwise anyway, and prefill is HOST-bound: nsys counts 168
-      // cudaMemcpy2DAsync per prefill costing 1.87 ms of a 7.53 ms prefill.
+      // Read gate/up straight off the fused [rows, 2*inter] w13 output rather than splitting it
+      // into two buffers first: those copies only un-interleave data the GLU reads elementwise.
       kernels::launch_gated_glu_interleaved(ff13_base, static_cast<__half*>(d_prefill_ff2_), inter,
                                             rows, weights_.config().mlp_gelu, compute_stream_);
       fused_glu = true;

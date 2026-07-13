@@ -103,27 +103,22 @@ void LlamaEngine::forward_token(int token, int position, bool compute_logits,
 // ---------------------------------------------------------------------------------------
 // Tensor-core prefill attention.
 //
-// The hand-written attention_prefill_kernel_tiled was 84% of ALL prefill GPU time and ran on
-// the plain FMA pipe (Nsight: compute 31%, DRAM 0.2%, occupancy 45%). CPI's prefill was 3-5x
-// behind llama.cpp for exactly this reason -- the prefill GEMMs were already on cutlass tensor
-// cores; only attention was not. Widening the block bought 4% and changed model output, so
-// occupancy was never the lever: math throughput was.
+// Q.K^T and P.V are ordinary GEMMs; routing them through cuBLAS runs them on the tensor cores,
+// where attention_prefill_kernel_tiled uses only the scalar FMA pipe.
 //
-// Q.K^T and P.V are just GEMMs. Handing them to cuBLAS puts them on the tensor cores.
+// Done in chunks of query rows so the score matrix stays bounded -- a full [heads][seq][seq]
+// matrix is tens of GB at long context, whereas chunked it is heads x chunk x keys.
 //
-// Done in CHUNKS of query rows so the score matrix stays bounded: a full [heads][seq][seq]
-// matrix is 32 x 32768^2 x 2 B = 68 GB at long context. Chunked it is heads x chunk x keys.
-//
-// GQA forces cublasGemmBatchedEx (pointer arrays) rather than the strided-batched call: the
+// GQA requires cublasGemmBatchedEx (pointer arrays) rather than the strided-batched call: the
 // K/V pointer for query head h is (h / group) * head_dim, which is not a constant stride in h,
 // so a single strideA cannot express it.
 // ---------------------------------------------------------------------------------------
-// Eligibility + scratch allocation, decided ONCE per prefill chunk.
+
+// Eligibility and scratch allocation, decided once per prefill chunk.
 //
-// Separate from the attention call because the caller must know the answer BEFORE the layer
-// loop: if it skips the Q/K/V split copies (reading Q in place out of the fused QKV buffer) and
-// the tensor-core path then declined at, say, layer 7, there would be no contiguous Q left to
-// fall back to. Decide first, then commit.
+// Kept separate from the attention call because the caller must know the answer before the
+// layer loop: it skips the Q/K/V split copies when the tensor-core path is available, so a
+// mid-loop refusal would leave no contiguous Q to fall back to.
 bool LlamaEngine::prefill_tc_prepare(int rows, int base_pos, int num_heads, int num_kv_heads,
                                      int head_dim) {
   static const bool legacy = [] {

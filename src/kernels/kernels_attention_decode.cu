@@ -967,19 +967,12 @@ __device__ __forceinline__ void gqa_split_chunk_stats_core(const half* q, const 
     __syncthreads();  // protect the K/V tiles from the prior sub-chunk's V sum
     // Stage K/V into shared with 128-bit loads.
     //
-    // This loop used to copy ONE half at a time -- 16 bits per thread, plus an integer
-    // div/mod per element -- which is why Nsight reported the warps spending 38.2 of 60.2
-    // cycles stalled on an L1TEX scoreboard dependency while DRAM throughput sat at 0.23%.
-    // The kernel was never bandwidth-bound; it simply never had enough loads in flight to
-    // cover their latency. Same disease the projection GEMV and RMSNorm had.
+    // Copying one half at a time leaves the warps stalled on memory latency with too few
+    // requests in flight; reading int4 (8 halves) cuts the request count 8x.
     //
-    // Reading int4 (8 halves) cuts the request count 8x and puts 8x the bytes in flight.
-    //
-    // BIT-IDENTICAL: this only stages values into shared memory. The bytes that land in
-    // k_tile/v_tile are the same either way; every arithmetic op below reads from shared and
-    // is untouched. Alignment holds because each (token, kv_head) row is HeadDim halves and
-    // HeadDim is 64 or 128, so both the cache offsets and the shared tiles are 16-byte
-    // aligned.
+    // Only the staging width changes, so this is bit-identical: the bytes landing in
+    // k_tile/v_tile are the same and every arithmetic op below reads from shared. Alignment
+    // holds because each (token, kv_head) row is HeadDim halves and HeadDim is 64 or 128.
     constexpr int kHalvesPerVec = 8;  // int4 = 128 bits
     constexpr int kVecPerRow = HeadDim / kHalvesPerVec;
     static_assert(HeadDim % kHalvesPerVec == 0, "HeadDim must be a multiple of 8 for int4 staging");
@@ -1113,13 +1106,13 @@ void launch_attention_step(const half* q, const half* k_cache, const half* v_cac
   // Gives group_size× KV-bandwidth reduction vs. per-Q-head kernels — but it
   // launches only num_kv_heads blocks and scans the sequence serially per block,
   // so it is bandwidth-optimal at SHORT context yet badly under-parallelized at
-  // long context (e.g. 4 blocks on a 170-SM GPU at 2k+ tokens dominated decode).
+  // long context (only num_kv_heads blocks, which starves a large GPU at 2k+ tokens).
   // Above this length, fall through to the split-K path (parallel over KV
   // chunks, ~num_heads×ceil(seq/32) blocks).
   // head_dim 64 and 128 both matter: 128 is Llama's, 64 is Qwen2.5's (and plenty of
   // small models'). Gating these fast paths on 128 ALONE dropped every head_dim-64 model
-  // onto the fallback kernel, which runs ONE BLOCK PER HEAD (14 blocks on a 170-SM GPU)
-  // and walks the whole KV inside it -- so decode got slower the longer the context grew.
+  // onto the fallback kernel, which runs one block per head and walks the whole KV inside
+  // it -- so decode got slower the longer the context grew.
   if (num_kv_heads > 0 && num_heads > num_kv_heads && (num_heads % num_kv_heads) == 0 &&
       (head_dim == 64 || head_dim == 128) && seq_len <= kGqaFusedMaxSeq) {
     const int group_size_val = num_heads / num_kv_heads;
@@ -1593,8 +1586,8 @@ void launch_attention_step_batched_paged(const half* q, const half* k_pool, cons
   // batch-1 long-context attention latency-bound at ~14% of peak). Keep the grid
   // (num_kv_heads*chunks*batch) above a floor so SMs stay filled, and cap the
   // coarsening so no single block streams too serially.
-  // Measured on a 5090: at long context bigger blocks win at every batch (batch-1
-  // 32K 14%->48% peak; batch-32 ->87%), while short context keeps ~1 block/chunk.
+  // Long context favours fewer, larger blocks (better latency hiding); short context keeps
+  // roughly one block per chunk. Tuned empirically -- see attention_decode_bench.
   const int blocks_per_chunk =
       gqa_shared ? pick_blocks_per_chunk(total_blocks, static_cast<long long>(num_kv_heads) * batch)
                  : 1;

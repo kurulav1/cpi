@@ -32,7 +32,7 @@
 namespace {
 // Peak DRAM bandwidth for the "% of roofline" column. Auto-detected from the
 // active GPU (memory clock x bus width); override with CPI_PEAK_GBS=<GB/s> if the
-// query is off for your card. Falls back to an RTX 5090 reference (~1.79 TB/s).
+// query is off for your card. Falls back to a high-end desktop reference (~1.79 TB/s).
 double peak_gbs() {
   static const double v = [] {
     if (const char* e = std::getenv("CPI_PEAK_GBS")) {

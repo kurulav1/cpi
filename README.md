@@ -26,6 +26,28 @@ Peak VRAM is total GPU memory during the run (includes ~1 GB desktop compositor)
 omitted: its int4 weights dequantize past the 32 GB of system RAM (out-of-memory). See
 [docs/benchmarks.md](docs/benchmarks.md) for methodology and the full context × quant sweep.
 
+### vs llama.cpp
+
+Same fp16 weights on both sides (llama.cpp gets a GGUF converted from the identical checkpoint),
+same GPU, greedy, and the two engines are run **interleaved** — the GPU throttles over a long
+session, so numbers taken minutes apart are not comparable.
+
+| Model | Test | llama.cpp | CPI | CPI / llama.cpp |
+| ----- | ---- | --------- | --- | --------------- |
+| Qwen2.5-0.5B | decode 256 | 820 tok/s | 851 tok/s | **104%** |
+| Qwen2.5-0.5B | prefill 1024 | 53,252 tok/s | 117,884 tok/s | **221%** |
+| Llama-3.1-8B | decode 256 | ~97 tok/s | ~99 tok/s | **~101%** (parity) |
+| Llama-3.1-8B | prefill 1024 | 12,768 tok/s | 16,148 tok/s | **126%** |
+
+At 8B, decode is bandwidth-bound — the weights alone are 16 GB per token — so both engines sit near
+the same memory roofline and parity is the ceiling for either of them. The small-model decode gap
+comes from per-kernel and per-call overhead, which is a large share of a 0.5B token and negligible
+on an 8B one.
+
+Reproduce with `llama-bench` (`-p 0 -n 256` for decode, `-p 1024 -n 0` for prefill) against
+`--benchmark --temp 0 --eos-token -1 --no-prefix-reuse`. `--no-prefix-reuse` is required for the
+prefill numbers: without it a repeated prompt hits CPI's prefix cache and skips prefill entirely.
+
 ### Concurrent throughput (continuous batching)
 
 For multi-user serving, continuous batching is CPI's default serving path (paged KV cache + batched

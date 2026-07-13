@@ -1,28 +1,27 @@
-﻿// Achieved bandwidth of EVERY GEMV a decode step reads, for Qwen2.5-0.5B.
+// Achieved bandwidth of every GEMV a decode step reads, plus the non-GEMV decode kernels.
 //
-// Batch-1 decode streams each weight once per token, so if every GEMV ran at peak
-// bandwidth the whole token would cost weights/bandwidth. It does not -- and this shows
-// exactly which ones fall short and by how much, so the optimisation targets itself
-// instead of being guessed at.
+// Batch-1 decode streams each weight once per token, so if every GEMV ran at peak bandwidth a
+// token would cost weights/bandwidth. It does not, and this shows which shapes fall short and
+// by how much, so the optimisation targets itself instead of being guessed at.
 //
-// A small GEMV cannot reach peak: it is latency-bound, not bandwidth-bound. That is the
-// point of the measurement.
+// Read the numbers with two caveats:
 //
-// !! READ THE NUMBERS WITH THIS IN MIND !!
-// The RTX 5090 has ~128 MB of L2, so every matrix here EXCEPT the LM head fits in cache
-// across the timing loop. The small-GEMV figures are therefore BEST CASE -- they are being
-// served from L2, not HBM -- and they are STILL only 12-15% of peak, taking a flat ~7.6 us
-// each regardless of size. That is a LATENCY FLOOR, not a bandwidth limit. It is the same
-// per-kernel tax the decode-graph node count exposes, seen from the other side.
-// The LM head (272 MB) is the only shape that genuinely streams from HBM, and it lands at
-// 93% of peak -- i.e. it is NOT the problem, despite being 28% of the weight traffic.
-
+//   * TIME KERNELS IN A CUDA GRAPH, not back-to-back on a stream. A stream launch carries
+//     several microseconds of driver submission overhead, which is what you end up timing --
+//     it makes unrelated kernels of different sizes all look like they cost the same. Decode
+//     runs inside a graph anyway. bench_graph() below does this; bench() is kept for contrast.
+//
+//   * A LOOP OVER ONE MATRIX MEASURES L2, NOT HBM. Everything but the LM head fits in cache
+//     here, so those figures are best-case. Real decode streams each weight from HBM once.
+//
+// Neither caveat is academic: both will happily report a starved kernel as a fast one.
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 
 #include "runtime/kernels.cuh"
 
@@ -43,6 +42,25 @@ struct Shape {
   int in;
   int per_token;  // how many times a decode step runs this shape
 };
+
+// Peak DRAM bandwidth for the "% of roofline" column, auto-detected from the active GPU
+// (memory clock x bus width). Override with CPI_PEAK_GBS=<GB/s> if the query is off.
+double peak_gbs() {
+  static const double v = [] {
+    if (const char* e = std::getenv("CPI_PEAK_GBS")) {
+      const double x = std::atof(e);
+      if (x > 0.0) return x;
+    }
+    int dev = 0;
+    cudaGetDevice(&dev);
+    int mem_clock_khz = 0, bus_bits = 0;
+    cudaDeviceGetAttribute(&mem_clock_khz, cudaDevAttrMemoryClockRate, dev);
+    cudaDeviceGetAttribute(&bus_bits, cudaDevAttrGlobalMemoryBusWidth, dev);
+    const double g = 2.0 * (mem_clock_khz * 1.0e3) * (bus_bits / 8.0) / 1.0e9;
+    return g > 1.0 ? g : 1792.0;
+  }();
+  return v;
+}
 
 double bench(const __half* w, const __half* x, float* y, int out, int in, int warps, int tile,
              int rows, int iters) {
@@ -81,15 +99,8 @@ double bench_splitk(const __half* w, const __half* x, __half* y, int out, int in
   return ms / iters;
 }
 
-// Time the kernel INSIDE A CUDA GRAPH -- which is what decode actually runs.
-//
-// Timing back-to-back launches on a stream (bench() above) does NOT measure the kernel: on
-// Windows/WDDM each stream launch carries several microseconds of driver overhead, and that
-// overhead is what you end up timing. It is why wqkv and wo both came out at a flat ~7.6 us
-// despite being different sizes, and why giving them 8x the parallelism (split-K) changed
-// nothing -- there was nothing to speed up, they were WAITING on the driver, not computing.
-// A graph pays that cost once at instantiation, not per node. Capture N launches, replay,
-// and the per-kernel number is a real duration.
+// Times the kernel inside a CUDA graph -- which is what decode actually runs, and which
+// excludes the per-launch driver overhead that stream timing folds into the result.
 double bench_graph(const __half* w, const __half* x, float* y, int out, int in, int warps,
                    int tile, int rows, int reps) {
   constexpr int kChain = 50;
@@ -133,10 +144,10 @@ int main() {
       {"wqkv", 1152, 896, 24},
       {"wo", 896, 896, 24},
   };
-  constexpr double kPeak = 1790.0;  // GB/s, RTX 5090 spec
+  const double kPeak = peak_gbs();  // GB/s, queried from the active device
   constexpr int kIters = 300;
 
-  std::printf("Decode GEMVs, Qwen2.5-0.5B, RTX 5090 (peak %.0f GB/s)\n\n", kPeak);
+  std::printf("Decode GEMVs, Qwen2.5-0.5B (peak %.0f GB/s)\n\n", kPeak);
   std::printf("  %-14s %8s %7s %10s %8s %10s %8s %9s\n", "weight", "MB", "rows", "1warp/row",
               "of peak", "split-K", "of peak", "speedup");
 
@@ -185,10 +196,7 @@ int main() {
   }
 
   // ---------------------------------------------------------------------------------
-  // The GEMVs turned out to be ~88% of roofline, i.e. innocent. So the rest of the token
-  // is the ~197 NON-GEMV kernels. Time those in-graph too, at the 0.5B's real shapes,
-  // before optimising anything -- the last two hypotheses died on measurements like this.
-  // ---------------------------------------------------------------------------------
+  // Non-GEMV decode kernels, at the same shapes, timed the same way.
   {
     constexpr int kHidden = 896, kHeads = 14, kKv = 2, kHeadDim = 64, kSeq = 512, kLayers = 24;
     constexpr int kChain = 50, kReps = 20;
@@ -237,10 +245,8 @@ int main() {
     const double t_rope = time_graph([&] {
       kernels::launch_rope_inplace_table(q, q, kHeads, kKv, kHeadDim, 100, ct, st, s);
     });
-    // Give attention the SAME split-K scratch the engine's graph gives it. Without the
-    // scratch it silently drops to the fallback path and reports ~255 us -- which would make
-    // a token 6 ms when a real one is 1.75 ms. Whenever a micro-bench claims a single op
-    // costs more than the whole operation containing it, the BENCH is wrong, not the engine.
+    // Attention needs the same split-K scratch the engine gives it; without it the kernel
+    // silently drops to the fallback path and the timing is meaningless.
     constexpr int kChunks = 64;
     float *sm = nullptr, *sl = nullptr, *so = nullptr;
     CK(cudaMalloc(&sm, kHeads * kChunks * sizeof(float)));
@@ -265,14 +271,8 @@ int main() {
   }
 
   // ---------------------------------------------------------------------------------
-  // What does a host sync between graph launches actually cost?
-  //
-  // The profile says decode spends ~1 ms/token with the GPU IDLE: we launch the decode
-  // graph, then block the host on it, every single token. On WDDM each submit-then-sync
-  // round trip carries scheduling latency that has nothing to do with the model. If that
-  // is real, the SAME graph replayed N times should be dramatically cheaper when we sync
-  // once at the end instead of after every launch. Measure it rather than assume it.
-  // ---------------------------------------------------------------------------------
+  // Cost of a host sync between graph launches: decode launches the graph and then blocks on
+  // it once per token, so this measures whether that round trip is significant.
   {
     constexpr int kNodes = 300;  // ~ the real decode graph (294)
     constexpr int kLaunches = 200;

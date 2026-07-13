@@ -104,17 +104,14 @@ __device__ __forceinline__ float gelu_tanh_f32(float x) {
   return 0.5f * x * (1.0f + tanhf(k * (x + 0.044715f * x * x * x)));
 }
 
-// Gated GLU straight off the FUSED gate+up buffer -- no split copy.
+// Gated GLU read straight off the fused gate+up buffer.
 //
-// The prefill MLP produces w13 as one [tokens, 2*inter] matrix, then split it into two
-// [tokens, inter] buffers with a pair of cudaMemcpy2DAsync before running silu(gate)*up. Those
-// two copies exist purely to un-interleave data the very next kernel reads elementwise anyway.
+// The prefill MLP emits w13 as one [tokens, 2*inter] matrix. Reading gate at [t][i] and up at
+// [t][inter+i] avoids splitting it into two buffers first -- those copies only un-interleave
+// data this kernel reads elementwise anyway, and prefill is bound by host-side API calls, so a
+// copy that buys nothing still costs.
 //
-// Prefill is HOST-bound (nsys: 168 cudaMemcpy2DAsync per prefill, 1.87 ms of a 7.53 ms prefill),
-// so a copy that buys nothing costs real time. This reads gate at [t][i] and up at [t][inter+i]
-// directly.
-//
-// BIT-IDENTICAL: the copies were exact, and the math per element is unchanged.
+// Elementwise math is unchanged, so this is bit-identical to split-then-glu.
 __global__ void gated_glu_interleaved_kernel(const half* __restrict__ ff13, half* __restrict__ out,
                                              int inter, int tokens, int gelu) {
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1060,22 +1057,17 @@ void launch_pack_rowwise_int8_to_int4(const int8_t* src, int8_t* dst, int rows, 
   pack_rowwise_int8_to_int4_kernel<<<grid, threads, 0, stream>>>(src, dst, rows, cols);
 }
 
-// HBM-shaped GEMV: one warp per output row, 128-bit loads, no shared tile.
+// GEMV shaped for streaming weights from HBM: one warp per output row, 128-bit loads, no
+// shared tile.
 //
-// The tiled kernel above loads the weight row as half2 -- 32 BITS PER THREAD -- and syncs
-// every tile. Out of L2 that is fine, which is why every micro-benchmark of it looked good
-// (re-running one matrix in a loop keeps it cached). Real decode streams each weight from
-// HBM exactly ONCE, and at 32 bits per request there are nowhere near enough bytes in
-// flight to cover HBM latency. Profiling the real run is what exposed it: these kernels
-// took 12-13.5 us while cuBLAS did the same shapes in 3.15 us.
+// The tiled kernel above reads the weight row as half2 -- 32 bits per thread. That is fine
+// out of L2, but decode streams each weight from HBM exactly once, and 32-bit requests leave
+// far too few bytes in flight to cover the latency. Reading int4 (8 halves) quarters the
+// request count and keeps several loads in flight per thread. The shared staging of x is
+// dropped: x is a few KB, every block reads it, and it is served from cache anyway.
 //
-// So: read the row as int4 (128 bits = 8 halves), which quarters the request count and
-// keeps 4 loads in flight per thread, and drop the shared-memory staging of x entirely --
-// x is a few KB, every block reads it, and it is served from cache anyway.
-//
-// !! NOT BIT-IDENTICAL to the tiled kernel: each lane now accumulates a different subset of
-// the row, so the fp32 summation ORDER differs. Values agree to fp32 rounding. This is a
-// deliberate, validated numerics change, not an accident -- see the parity gate. !!
+// Not bit-identical to the tiled kernel: each lane accumulates a different subset of the row,
+// so the fp32 summation order differs. Values agree to fp32 rounding.
 template <int Warps, typename OutT>
 __global__ void gemv_wide_kernel(const half* __restrict__ w, const half* __restrict__ x,
                                  OutT* __restrict__ y, int out_features, int in_features,
@@ -1090,17 +1082,14 @@ __global__ void gemv_wide_kernel(const half* __restrict__ w, const half* __restr
       w + static_cast<std::size_t>(row) * static_cast<std::size_t>(in_features));
   const int4* xv = reinterpret_cast<const int4*>(x);
 
-  // Prefetch kUnroll chunks BEFORE consuming any of them.
+  // Prefetch kUnroll chunks before consuming any of them.
   //
-  // The obvious loop -- load one int4, immediately use it -- keeps only ~1 load in flight per
-  // thread, because `vecs` is a runtime value so nvcc cannot unroll it and every iteration's
-  // math depends on that iteration's load. The thread then just sits in HBM latency. That is
-  // why the short-and-wide projections (wqkv, wo) ran at 29-37% of bandwidth: not too few
-  // threads, too few OUTSTANDING LOADS per thread.
+  // Loading one int4 and immediately using it keeps only ~1 load in flight per thread: `vecs`
+  // is a runtime value, so nvcc cannot unroll the loop, and each iteration's math depends on
+  // that iteration's load. Issuing several loads up front turns latency into throughput.
   //
-  // Issuing kUnroll loads up front turns latency into throughput. The accumulation ORDER is
-  // unchanged (lane, lane+32, lane+64, ... exactly as before), so this stays BIT-IDENTICAL to
-  // the un-prefetched kernel -- a pure scheduling win, no numerics change.
+  // The accumulation order is unchanged (lane, lane+32, lane+64, ...), so this is bit-identical
+  // to the un-prefetched kernel -- purely a scheduling change.
   constexpr int kUnroll = 4;
   float acc = 0.0f;
   int4 wbuf[kUnroll];
@@ -1160,13 +1149,10 @@ static void launch_rowmajor_half_gemv(const half* w, const half* x, OutT* y, int
                                       int tile_pairs, int rows_per_warp,
                                       half* residual = nullptr) {
   if (use_wide_gemv() && (in_features % 8) == 0) {
-    // TRIED AND REJECTED: routing the short shapes (wqkv 1152 rows, wo 896, w2 896) to the
-    // split-K kernel -- one block per row, 8 warps splitting the input -- on the theory that
-    // one-warp-per-row leaves them at ~10% occupancy. It measured SLOWER end to end
-    // (833 -> 823 tok/s): the shared-memory reduction costs more than the extra parallelism
-    // buys at these sizes, and cuBLAS still wins wqkv/wo on the (now graph-timed, honest)
-    // tuner anyway. Their remaining gap to roofline is a kernel-duration floor, not occupancy.
-    // Don't re-litigate this without a profile that says otherwise.
+    // Do not route the short shapes here to the split-K kernel: it measured slower end to end.
+    // The shared-memory reduction costs more than the extra parallelism buys at these sizes,
+    // and the tuner still picks cuBLAS for wqkv/wo regardless. Their remaining gap to roofline
+    // is a kernel-duration floor, not an occupancy problem.
     constexpr int kWarps = 4;
     const int blocks = (out_features + kWarps - 1) / kWarps;
     gemv_wide_kernel<kWarps, OutT>

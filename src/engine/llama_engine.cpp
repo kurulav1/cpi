@@ -69,25 +69,16 @@ bool linear_rowmajor_weight_lt(cublasLtHandle_t handle, std::vector<LtMatmulPlan
                                cudaDataType_t output_type) {
   constexpr float alpha = 1.0f;
   constexpr float beta = 0.0f;
-  // fp16 ACCUMULATION -- for PREFILL GEMMs only (batch_size > 1).
+  // fp16 accumulation, for prefill GEMMs only (batch_size > 1).
   //
-  // On GeForce silicon, fp16 tensor ops that accumulate in FP32 run at roughly half the rate of
-  // ones that accumulate in FP16. 8B prefill is 84% GEMM, so this is worth +30% there
-  // (12.4k -> 16.1k tok/s, which takes CPI from 91% of llama.cpp to ~120%).
+  // On GeForce parts, fp16 tensor ops that accumulate in fp32 run at roughly half the rate of
+  // ones that accumulate in fp16, and prefill is dominated by these GEMMs. The precision cost is
+  // small (logit differences well under a percent) and matches what ggml does for fp16 matmuls.
   //
-  // This is NOT us lowering the bar to win: llama.cpp does exactly this. ggml-cuda's
-  // batched_mul_mat_traits<GGML_TYPE_F16> uses CUBLAS_COMPUTE_16F with half alpha/beta. Our
-  // fp32 accumulate was strictly MORE accurate than the reference -- and slower for it. Matching
-  // it makes the comparison apples-to-apples.
+  // Decode deliberately keeps fp32: at batch 1 the projections are memory-bound GEMVs, so fp16
+  // accumulation buys nothing there, and decode is where a logit error selects the wrong token.
   //
-  // ⚠ DECODE KEEPS FP32. At batch 1 the projections are memory-bound GEMVs: fp16 accumulate buys
-  // nothing there, and decode is exactly where a logit error picks the wrong output token. So the
-  // precision is only spent where it buys speed.
-  //
-  // Measured cost on Llama-3.1-8B (1000-token prompt): top-4 next-token logits identical in id
-  // AND order, values within 0.13%. Only rank 5 flips, between two logits 0.0002 apart.
-  //
-  // LLAMA_INFER_GEMM_FP32_ACC=1 forces fp32 everywhere for A/B and bisection.
+  // LLAMA_INFER_GEMM_FP32_ACC=1 forces fp32 everywhere.
   static const bool force_fp32 = [] {
     const char* e = std::getenv("LLAMA_INFER_GEMM_FP32_ACC");
     return e && *e == '1';
@@ -1178,23 +1169,16 @@ void LlamaEngine::initialize(const EngineOptions& options) {
   }
 
   CUDA_CHECK(cudaSetDevice(0));
-  // Prefill chunk = tokens per batched prefill pass. Bigger is better, and by a LOT more than
-  // the old comment here claimed ("512 for a marginal further gain").
+  // Prefill chunk = tokens per batched prefill pass.
   //
-  // That was true when the hand-written attention kernel dominated prefill. It no longer does:
-  // attention now runs on the tensor cores, GPU time collapsed, and prefill became HOST-bound
-  // -- nsys shows only ~11 ms of GPU work in a 46 ms prefill, with ~31 ms in CUDA API calls
-  // (~3800 of them at 5-9 us each on WDDM). Every doubling of the chunk halves the pass count
-  // and therefore the API traffic:
+  // With attention on the tensor cores, prefill is limited by host-side CUDA API calls rather
+  // than by GPU work, so every doubling of the chunk roughly halves the number of passes and
+  // the API traffic with it. Bigger is substantially better.
   //
-  //   Qwen2.5-0.5B:  256 -> 24.8k | 512 -> 33.9k | 1024 -> 43.4k | 2048 -> 63.6k tok/s
-  //   Llama-3.1-8B:  256 ->  8.9k |                1024 -> 10.2k | 2048 -> 12.0k tok/s
+  // Chunking is exact: output is unchanged whatever the size.
   //
-  // Chunking is exact, so output is unchanged whatever the size.
-  //
-  // The cost is VRAM: the prefill activation buffers all scale with the chunk. So size it from
-  // a memory BUDGET rather than hard-coding 2048, which would hurt small-VRAM GPUs -- a 32B's
-  // activations run ~222 KB/token, so 2048 tokens is ~455 MB.
+  // The cost is VRAM -- every prefill activation buffer scales with the chunk -- so size it from
+  // a memory budget rather than a fixed constant, which would hurt small-VRAM GPUs.
   int prefill_chunk_target = env_int_or_default("LLAMA_INFER_PREFILL_CHUNK_SIZE", 0);
   if (prefill_chunk_target <= 0) {
     const int kv_dim = cfg.num_kv_heads * (cfg.hidden_size / std::max(1, cfg.num_heads));
