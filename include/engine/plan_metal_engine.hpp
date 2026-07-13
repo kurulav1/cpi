@@ -52,6 +52,11 @@ public:
     return quant_bits_;
   }
 
+  // Bytes of GPU-resident WEIGHT buffers. This -- not RSS -- is the number that says
+  // whether a model fits: the mmap'd fp16 file stays resident because the quantizer
+  // reads it, but those pages are clean and file-backed, so they are evictable.
+  std::size_t weight_bytes() const;
+
   const model::LlamaConfig& config() const {
     return cfg_;
   }

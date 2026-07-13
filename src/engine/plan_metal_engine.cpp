@@ -187,9 +187,12 @@ public:
     bits_ = bits;
     group_ = group;
   }
-  int groups_for(const std::string& name) const {
-    auto it = qbufs_.find(name);
-    return it == qbufs_.end() ? 1 : it->second.groups;
+  std::size_t bytes() const {
+    std::size_t n = 0;
+    for (const auto& kv : qbufs_) {
+      n += kv.second.packed.size() + kv.second.scales.size();
+    }
+    return n;
   }
 
 private:
@@ -216,6 +219,13 @@ bool PlanMetalEngine::available() const {
 
 std::string PlanMetalEngine::device_name() const {
   return ctx_.device_name();
+}
+
+std::size_t PlanMetalEngine::weight_bytes() const {
+  std::size_t n = 0;
+  for (const auto& kv : wbuf_) n += kv.second.size();  // fp16 (embeddings, norms, ...)
+  if (wsrc_) n += wsrc_->bytes();                      // quantized projections
+  return n;
 }
 
 void* PlanMetalEngine::slot(opplan::Slot s) const {
