@@ -248,22 +248,45 @@ just kernels. CPI's inference *core* runs on a Mac; CPI-the-product does not.
 
 **Measured** (Apple M4, 10-core GPU, 16 GB):
 
-| Model | | GPU weights | decode | prefill (301 tok) |
+| Model | | GPU weights | decode | prefill (551 tok) |
 | --- | --- | --- | --- | --- |
-| Qwen2.5-0.5B | fp16 | 1.17 GB | 86.5 tok/s | 549 tok/s |
+| Qwen2.5-0.5B | fp16 | 1.17 GB | 86.5 tok/s | 1360 tok/s |
 | Qwen2.5-0.5B | int8 | 0.74 GB | 118.8 tok/s | — |
 | Qwen2.5-0.5B | int4 | 0.51 GB | 146.7 tok/s | — |
-| **Llama-3.1-8B** | **int4** | **4.91 GB** | **15.0 tok/s** | — |
+| **Llama-3.1-8B** | **int4** | **4.91 GB** | **20.5 tok/s** | **161 tok/s** |
 
 The 8B is the point of quantization: at fp16 its weights are ~15 GB and it does **not** fit in a
 16 GB Mac — attempting it drives the machine into swap. At int4 it runs in 4.91 GB with zero
 swaps. (The 3.05x saving beats Qwen2.5's 2.3x because the 8B's LM head is untied and gets
 quantized too; Qwen2.5 ties its head to the embedding table, which must stay fp16 for the lookup.)
 
-Both kernels are bandwidth-shaped: the GEMV reads weights 128 bits at a time, and prefill tiles
-8 tokens per weight row so the matrix is streamed once per tile rather than once per token. An
-M4's ~120 GB/s is a different world from a discrete GPU — this is a portability result, not a
-competitive one.
+### vs llama.cpp, same machine, same weights
+
+llama.cpp's GGUF is rebuilt from CPI's own `.ll2c` checkpoint (`tools/ll2c_to_hf_safetensors.py`
+→ `convert_hf_to_gguf.py` → `llama-quantize Q4_0`), so both sides run the same 4-bit
+Llama-3.1-8B on the same M4.
+
+| | llama.cpp | CPI | CPI / llama.cpp |
+| --- | --- | --- | --- |
+| decode (64 tok) | 22.9 tok/s | 20.5 tok/s | 90% |
+| prefill (551 tok) | 241 tok/s | 161 tok/s | 67% |
+
+Decode is measured from a short prompt on both sides; it falls to ~17.8 tok/s once the KV cache
+holds 551 tokens, which is the shape of attention, not of the backend.
+
+Not parity, and worth being precise about where the remaining gap is rather than rounding it
+off. Prefill is 75% one kernel — the quantized blocked GEMM — running at ~3.0 TFLOP/s, roughly
+70% of this chip's peak. There is no cheap multiple left in it.
+
+The road here is a useful record of how to *not* find a bottleneck. Four changes aimed at that
+GEMM's inner loop — double-buffered K-blocks, 4×4 register tiling, a wider token tile, dropping
+a transposed fragment load — each moved prefill by under 5%, because the inner loop was never
+the problem. Per-kernel profiling (`CPI_METAL_PROFILE=1`) found the real one immediately: a
+551-token prompt chunks into 512 + 39, and the 39-token tail could not fill a GEMM tile, so it
+fell to the scalar GEMV — which re-streams the entire model once per 8-token tile. Those 39
+tokens swept 4.9 GB of weights five times and cost **a third of the prefill**. Letting the GEMM
+take the tail as a masked tile: 104 → 142 tok/s. Blocking prefill attention over queries, so a
+key block serves 8 of them instead of one: 142 → 161.
 
 **Correctness.** Qwen2.5-0.5B, Qwen3-0.6B and gemma-2b each reproduce the CUDA backend's greedy
 token stream exactly on an Apple M4 (`src/tests/golden/`). `metal_decode_test` gates on two
