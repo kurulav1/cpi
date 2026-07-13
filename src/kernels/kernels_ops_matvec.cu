@@ -104,6 +104,33 @@ __device__ __forceinline__ float gelu_tanh_f32(float x) {
   return 0.5f * x * (1.0f + tanhf(k * (x + 0.044715f * x * x * x)));
 }
 
+// Gated GLU straight off the FUSED gate+up buffer -- no split copy.
+//
+// The prefill MLP produces w13 as one [tokens, 2*inter] matrix, then split it into two
+// [tokens, inter] buffers with a pair of cudaMemcpy2DAsync before running silu(gate)*up. Those
+// two copies exist purely to un-interleave data the very next kernel reads elementwise anyway.
+//
+// Prefill is HOST-bound (nsys: 168 cudaMemcpy2DAsync per prefill, 1.87 ms of a 7.53 ms prefill),
+// so a copy that buys nothing costs real time. This reads gate at [t][i] and up at [t][inter+i]
+// directly.
+//
+// BIT-IDENTICAL: the copies were exact, and the math per element is unchanged.
+__global__ void gated_glu_interleaved_kernel(const half* __restrict__ ff13, half* __restrict__ out,
+                                             int inter, int tokens, int gelu) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = tokens * inter;
+  if (idx >= total) {
+    return;
+  }
+  const int t = idx / inter;
+  const int i = idx - t * inter;
+  const std::size_t base = static_cast<std::size_t>(t) * 2 * inter;
+  const float g = __half2float(ff13[base + i]);
+  const float u = __half2float(ff13[base + inter + i]);
+  const float act = gelu ? gelu_tanh_f32(g) : (g / (1.0f + expf(-g)));
+  out[idx] = __float2half(act * u);
+}
+
 __global__ void gelu_mul_kernel(const half* gate, const half* up, half* out, int n) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) {
@@ -904,6 +931,18 @@ void launch_add_inplace(half* x, const half* y, int n, cudaStream_t stream) {
 
   const int blocks = (n + threads - 1) / threads;
   add_inplace_kernel<<<blocks, threads, 0, stream>>>(x, y, n);
+}
+
+void launch_gated_glu_interleaved(const half* ff13, half* out, int inter, int tokens, bool gelu,
+                                  cudaStream_t stream) {
+  const int total = tokens * inter;
+  if (total <= 0) {
+    return;
+  }
+  constexpr int kThreads = 256;
+  const int blocks = (total + kThreads - 1) / kThreads;
+  gated_glu_interleaved_kernel<<<blocks, kThreads, 0, stream>>>(ff13, out, inter, tokens,
+                                                                gelu ? 1 : 0);
 }
 
 void launch_silu_mul(const half* gate, const half* up, half* out, int n, cudaStream_t stream) {

@@ -334,6 +334,16 @@ void launch_build_attention_ptrs(const half* k_layer, const half* v_layer, const
                                  int head_dim, int kchunk, int keys, int q_stride, int out_stride,
                                  int c0, cudaStream_t stream);
 
+// launch_gated_glu_interleaved
+//
+// silu(gate)*up (or gelu) read straight off the FUSED w13 output [tokens, 2*inter]: gate at
+// [t][i], up at [t][inter+i]. Prefill used to split that into two buffers with a pair of
+// cudaMemcpy2DAsync first -- copies that only un-interleaved data the next kernel reads
+// elementwise anyway. Prefill is host-bound, so those copies cost real time.
+// Bit-identical to split-then-glu.
+void launch_gated_glu_interleaved(const half* ff13, half* out, int inter, int tokens, bool gelu,
+                                  cudaStream_t stream);
+
 // launch_softmax_causal_rows
 //
 // In-place causal row-softmax over a [heads][chunk][keys] score matrix. Row (h, i) belongs to

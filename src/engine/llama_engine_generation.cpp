@@ -114,6 +114,7 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
     // projection weights (fp16 wqkv/wo are freed after quantisation), so the
     // projections go through the batched low-bit kernels, mirroring the MLP.
     const bool lowbit_proj = cached_int8_proj_enabled_ && lw_i8 && lw_i8->wqkv && lw_i8->wo;
+    bool fused_glu = false;  // fp16 path reads gate/up in place; quant paths still need the split
 
     launch_norm(d_x_, lw->norm_att, lw->norm_att_bias, d_x_norm_, rows, hidden);
 
@@ -292,16 +293,24 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
           cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,
           lw->w13, d_x_norm_, d_ff13_, 2 * inter, hidden, rows, CUDA_R_16F);
 
-      CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_ff1_, ff_row_bytes, ff13_base, ff13_stride_bytes,
-                                   ff_row_bytes, rows, cudaMemcpyDeviceToDevice, compute_stream_));
-      CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_ff2_, ff_row_bytes, ff13_base + inter,
-                                   ff13_stride_bytes, ff_row_bytes, rows, cudaMemcpyDeviceToDevice,
-                                   compute_stream_));
+      // Read gate/up straight off the fused [rows, 2*inter] w13 output instead of splitting it
+      // into two buffers with a pair of cudaMemcpy2DAsync. Those copies only un-interleaved data
+      // the GLU reads elementwise anyway, and prefill is HOST-bound: nsys counts 168
+      // cudaMemcpy2DAsync per prefill costing 1.87 ms of a 7.53 ms prefill.
+      kernels::launch_gated_glu_interleaved(ff13_base, static_cast<__half*>(d_prefill_ff2_), inter,
+                                            rows, weights_.config().mlp_gelu, compute_stream_);
+      fused_glu = true;
     }
 
-    detail::launch_gated_glu(weights_.config().mlp_gelu, static_cast<const __half*>(d_prefill_ff1_),
-                             static_cast<const __half*>(d_prefill_ff2_),
-                             static_cast<__half*>(d_prefill_ff2_), rows * inter, compute_stream_);
+    // NOT inside the else: the quantized branches above fill d_prefill_ff1_/ff2_ with separate
+    // GEMMs and still need this. Folding it into the fp16 branch would compile, run, and
+    // silently skip the activation for int8/int4.
+    if (!fused_glu) {
+      detail::launch_gated_glu(
+          weights_.config().mlp_gelu, static_cast<const __half*>(d_prefill_ff1_),
+          static_cast<const __half*>(d_prefill_ff2_), static_cast<__half*>(d_prefill_ff2_),
+          rows * inter, compute_stream_);
+    }
 
     if (lw_i8 && lw_i8->w1 && lw_i8->w2 && lw_i8->w3 && can_use_dp4a_prefill) {
       kernels::launch_quantize_rowwise_fp16_to_int8(static_cast<const __half*>(d_prefill_ff2_),
