@@ -110,6 +110,19 @@ ModelPlan build_llama_plan(const LlamaGeometry& g, const WeightSource& w) {
       lp.ops.push_back(v);
     }
 
+    // Qwen3: per-head RMSNorm on Q and K, after projection and BEFORE RoPE. One
+    // [head_dim] weight shared across heads, so it is the ordinary RmsNorm op with
+    // rows = heads -- a new capability, not a new kernel.
+    if (g.has_qk_norm) {
+      Op qn = rmsnorm(Slot::Q, Slot::Q, w.fp16(p + "attention.q_norm"), g.head_dim, g.rms_eps);
+      qn.rows = g.heads;
+      lp.ops.push_back(qn);
+
+      Op kn = rmsnorm(Slot::K, Slot::K, w.fp16(p + "attention.k_norm"), g.head_dim, g.rms_eps);
+      kn.rows = g.kv_heads;
+      lp.ops.push_back(kn);
+    }
+
     // RoPE rotates Q and K in place. Two ops -- they differ only in head count,
     // and keeping them separate is what lets a GQA model share one kernel.
     {

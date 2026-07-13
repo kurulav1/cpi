@@ -55,6 +55,15 @@ struct LlamaGeometry {
   // nonsense -- so it is explicit rather than inferred.
   bool has_qkv_bias = false;
 
+  // Qwen3 applies a per-head RMSNorm to Q and to K after projection, before RoPE.
+  // The weight is one [head_dim] vector shared across heads, so it is a plain
+  // RmsNorm with rows = heads rather than a new op.
+  bool has_qk_norm = false;
+
+  // NOTE head_dim is NOT hidden/heads in general. Qwen3-0.6B has hidden=1024,
+  // heads=16 and head_dim=128 (so q_dim=2048 != hidden). Deriving it from hidden
+  // silently builds the wrong model -- callers must set it from the weights.
+
   // Some models (Gemma-style) scale the token embedding by sqrt(hidden). Llama and
   // Qwen do not. Kept here because it is geometry, not identity.
   bool scale_embeddings = false;

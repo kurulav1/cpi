@@ -1,0 +1,14 @@
+# Golden greedy stream for Qwen3-0.6B, from the CUDA backend.
+#
+# A SECOND model family on Metal, and a deliberately awkward one:
+#   * per-head QK-norm (RMSNorm with rows=heads, applied to Q and K before RoPE)
+#   * head_dim=128 with hidden=1024 and heads=16 -- so q_dim=2048 is TWICE the hidden
+#     size. Deriving head_dim as hidden/heads (the obvious guess) silently builds the
+#     wrong model, which is why PlanMetalEngine reads it off the Q projection's shape.
+#
+# Prompt: "Explain in two sentences why the sky is blue."
+#
+# Format: "prompt:" then the token ids; "expect:" then the greedy continuation.
+
+prompt: 128245,840,20772,304,1378,22870,3170,279,12884,374,6303,13
+expect: 576,4226,374,304,1378,22870,13,576,4226,374,304,1378,22870,13,576,4226,374,304,1378,22870,13,576,4226,374,304,1378,22870,624,840,20772,304,1378,22870,3170,279,12884,374,6303,13,576,4226,374,304,1378,22870,13,576,4226,374,304,1378,22870,13,576,4226,374,304,1378,22870,13,576,4226,374,304

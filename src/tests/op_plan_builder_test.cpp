@@ -206,6 +206,37 @@ int main() {
     expect(ops[11].bias == nullptr, "the MLP has no bias");
   }
 
+  // ---- Qwen3's per-head QK-norm -------------------------------------------
+  // A per-head RMSNorm on Q and K, after projection and BEFORE RoPE. It is the
+  // ordinary RmsNorm op with rows = heads, not a new kernel -- that is the point of
+  // the seam. Note Qwen3's head_dim is NOT hidden/heads.
+  {
+    LlamaGeometry gq;
+    gq.num_layers = 2;
+    gq.hidden = 1024;
+    gq.inter = 3072;
+    gq.heads = 16;
+    gq.kv_heads = 8;
+    gq.head_dim = 128;  // q_dim = 2048 != hidden
+    gq.vocab = 151936;
+    gq.has_qk_norm = true;
+    FakeWeights wq;
+    const ModelPlan pq = build_llama_plan(gq, wq);
+    const auto& ops = pq.layers[1].ops;
+
+    expect(ops[4].kind == OpKind::RmsNorm, "Q-norm sits right after the Q/K/V projections");
+    expect(ops[5].kind == OpKind::RmsNorm, "K-norm follows it");
+    expect(ops[6].kind == OpKind::Rope, "and QK-norm comes BEFORE RoPE");
+
+    expect(ops[4].rows == 16 && ops[4].cols == 128,
+           "Q-norm is per-head: rows=heads, cols=head_dim");
+    expect(ops[5].rows == 8 && ops[5].cols == 128, "K-norm uses the KV head count");
+    expect(ops[4].weight == wq.handle_for("layers.1.attention.q_norm"), "Q-norm bound to q_norm");
+    expect(ops[5].weight == wq.handle_for("layers.1.attention.k_norm"), "K-norm bound to k_norm");
+
+    expect(ops[1].cols == 16 * 128, "wq out_dim = heads*head_dim = 2048, NOT hidden");
+  }
+
   // ---- epilogue -----------------------------------------------------------
   expect(plan.epilogue.size() == 2, "epilogue is norm + lm_head");
   expect(plan.epilogue[0].kind == OpKind::RmsNorm, "epilogue[0] is the final norm");

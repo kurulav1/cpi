@@ -114,15 +114,24 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context) {
   cfg_ = weights_.config();
   max_context_ = max_context;
 
-  if (cfg_.is_moe() || cfg_.has_qk_norm || cfg_.mlp_gelu) {
+  if (cfg_.is_moe() || cfg_.mlp_gelu) {
     throw std::runtime_error(
-        "PlanMetalEngine handles dense SwiGLU decoders only (no MoE / QK-norm / GeGLU yet)");
+        "PlanMetalEngine handles dense SwiGLU decoders only (no MoE / GeGLU yet)");
   }
 
   const int H = cfg_.hidden_size;
-  const int head_dim = H / cfg_.num_heads;
-  const int q_dim = cfg_.num_heads * head_dim;
+
+  // head_dim is NOT hidden/heads in general. Qwen3-0.6B has hidden=1024, heads=16,
+  // head_dim=128 -- so q_dim (2048) is twice the hidden size. Derive it from the Q
+  // projection's actual shape; assuming hidden/heads builds a wrong model silently.
+  const std::size_t wq_bytes = weights_.tensor_bytes("layers.0.attention.wq");
+  const int q_dim =
+      static_cast<int>(wq_bytes / (static_cast<std::size_t>(H) * sizeof(std::uint16_t)));
+  const int head_dim = q_dim / cfg_.num_heads;
   const int kv_dim = cfg_.num_kv_heads * head_dim;
+  if (head_dim <= 0 || q_dim != cfg_.num_heads * head_dim) {
+    throw std::runtime_error("could not derive head_dim from the Q projection's shape");
+  }
 
   opplan::LlamaGeometry g;
   g.num_layers = cfg_.num_layers;
@@ -135,6 +144,7 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context) {
   g.rms_eps = cfg_.norm_eps;
   g.rope_theta = cfg_.effective_rope_theta();
   g.has_qkv_bias = cfg_.has_qkv_bias;
+  g.has_qk_norm = cfg_.has_qk_norm;
   g.scale_embeddings = cfg_.scale_embeddings;
 
   wsrc_ = std::make_unique<MetalWeights>(ctx_, weights_, wbuf_);
