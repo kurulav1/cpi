@@ -57,6 +57,14 @@ public:
   // Greedy decode. Argmax runs on the GPU so the vocab never crosses to the host.
   std::vector<int> generate_greedy(const std::vector<int>& prompt, int max_new);
 
+  // Wall time of the last prompt prefill, and how many tokens it covered.
+  double last_prefill_ms() const {
+    return prefill_ms_;
+  }
+  int last_prefill_tokens() const {
+    return prefill_tokens_;
+  }
+
 private:
   void execute_ops(const std::vector<opplan::Op>& ops, int layer, int position, int tokens);
   void encode_forward(int token, int position);
@@ -87,6 +95,8 @@ private:
   runtime::MetalBuffer argmax_out_;   // int32[1]
 
   std::vector<float> logits_;
+  double prefill_ms_ = 0.0;
+  int prefill_tokens_ = 0;
   std::string last_error_;
 
   class MetalWeights;

@@ -3,6 +3,7 @@
 #include "engine/plan_metal_engine.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
@@ -410,6 +411,7 @@ std::vector<int> PlanMetalEngine::generate_greedy(const std::vector<int>& prompt
   // Prefill the prompt in chunks: one pass over the weights serves the whole chunk.
   // The last prompt token is left for the decode loop, which needs its logits anyway.
   const int n_pre = static_cast<int>(prompt.size()) - 1;
+  const auto pre0 = std::chrono::steady_clock::now();
   for (int off = 0; off < n_pre; off += max_prefill_) {
     const int chunk = std::min(max_prefill_, n_pre - off);
     const std::vector<int> ids(prompt.begin() + off, prompt.begin() + off + chunk);
@@ -417,6 +419,9 @@ std::vector<int> PlanMetalEngine::generate_greedy(const std::vector<int>& prompt
     ctx_.commit_and_wait();
     pos += chunk;
   }
+  const auto pre1 = std::chrono::steady_clock::now();
+  prefill_ms_ = std::chrono::duration<double, std::milli>(pre1 - pre0).count();
+  prefill_tokens_ = n_pre;
 
   int next = prompt.back();
   for (int i = 0; i < max_new; ++i, ++pos) {
