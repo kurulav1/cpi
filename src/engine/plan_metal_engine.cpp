@@ -415,30 +415,22 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
         // (Metal's matrix units) and let the GEMV mop up the remainder. Decode is T=1 and
         // stays entirely on the GEMV -- a matrix unit cannot help when one operand is a
         // vector.
-        // The simdgroup-matrix GEMM is written (cpi_gemm_f16) but is DISABLED: measured, it
-        // is SLOWER than the token-tiled GEMV (479 vs 549 tok/s prefill on Qwen2.5-0.5B).
+        // BLOCKED GEMM for prefill. It stages a K-block of both operands into threadgroup
+        // memory, so each weight byte loaded from device is reused by all 32 tokens in the
+        // tile. The two earlier attempts streamed operands from device on every K-step and
+        // LOST to the GEMV -- the matrix units were never the bottleneck, the traffic
+        // feeding them was.
         //
-        // The matrix units are not the problem. The kernel loads both operands straight
-        // from DEVICE memory on every K-step, so it runs at ~0.5 TFLOP/s against the M4's
-        // ~4 TFLOP/s -- about 8x off peak, while llama.cpp's prefill sits near peak. A GEMM
-        // only pays once it stages a K-block of BOTH operands into threadgroup memory and
-        // issues many simdgroup ops out of that, amortising the device traffic. Until that
-        // is done, the GEMV is genuinely the faster kernel and shipping the GEMM would be a
-        // regression dressed up as an optimisation.
-        //
-        // Set CPI_METAL_GEMM=1 to A/B it.
-        static const bool use_gemm = std::getenv("CPI_METAL_GEMM") != nullptr;
-        const int gemm_tokens =
-            (use_gemm && op.cols % 8 == 0 && op.in_dim % 8 == 0) ? (T / 8) * 8 : 0;
+        // Decode (T=1) stays on the GEMV: a matrix unit cannot help when one operand is a
+        // vector. Token remainders below 32 do too.
+        const bool gemm_ok = op.cols % 64 == 0 && op.in_dim % 32 == 0;
+        const int gemm_tokens = gemm_ok ? (T / 32) * 32 : 0;
 
-        if (gemm_tokens >= 8) {
+        if (gemm_tokens >= 32) {
           GemvParams gp{static_cast<std::uint32_t>(op.cols), static_cast<std::uint32_t>(op.in_dim),
                         static_cast<std::uint32_t>(gemm_tokens), op.bias != nullptr ? 1u : 0u};
-          // Each simdgroup owns 8 rows x 32 tokens, so a weight tile serves four token
-          // tiles. That reuse -- not the matrix units on their own -- is what beats the GEMV.
-          const std::size_t tiles = (static_cast<std::size_t>(op.cols) / 8) *
-                                    ((static_cast<std::size_t>(gemm_tokens) + 31) / 32);
-          const std::size_t groups = (tiles + kSimdsPerTG - 1) / kSimdsPerTG;
+          const std::size_t groups = (static_cast<std::size_t>(op.cols) / 64) *
+                                     (static_cast<std::size_t>(gemm_tokens) / 32);
           ctx_.dispatch("cpi_gemm_f16", G::Groups, groups, kTG, bufs, offs, 4, &gp, sizeof(gp));
         }
 
