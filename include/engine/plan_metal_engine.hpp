@@ -58,8 +58,10 @@ public:
   std::vector<int> generate_greedy(const std::vector<int>& prompt, int max_new);
 
 private:
-  void execute_ops(const std::vector<opplan::Op>& ops, int layer, int position);
+  void execute_ops(const std::vector<opplan::Op>& ops, int layer, int position, int tokens);
   void encode_forward(int token, int position);
+  // Encodes a whole prefill chunk: T tokens through the tower in one pass.
+  void encode_prefill(const std::vector<int>& tokens, int start_position);
   void* slot(opplan::Slot s) const;
 
   runtime::MetalContext ctx_;
@@ -67,6 +69,7 @@ private:
   model::LlamaConfig cfg_{};
   opplan::ModelPlan plan_;
   int max_context_ = 0;
+  int max_prefill_ = 0;  // slots are sized for this many tokens at once
 
   // name -> device buffer. Owns every weight for the model's lifetime.
   std::unordered_map<std::string, runtime::MetalBuffer> wbuf_;
@@ -75,12 +78,13 @@ private:
   std::vector<runtime::MetalBuffer> k_cache_;
   std::vector<runtime::MetalBuffer> v_cache_;
 
-  runtime::MetalBuffer tok_buf_;     // int32[1]
-  runtime::MetalBuffer pos_buf_;     // int32[1]
-  runtime::MetalBuffer logits_buf_;  // float[vocab]
-  runtime::MetalBuffer argmax_val_;  // float[parts]
-  runtime::MetalBuffer argmax_idx_;  // int32[parts]
-  runtime::MetalBuffer argmax_out_;  // int32[1]
+  runtime::MetalBuffer tok_buf_;      // int32[1]
+  runtime::MetalBuffer seq_tok_buf_;  // int32[max_prefill] -- a whole prompt chunk
+  runtime::MetalBuffer pos_buf_;      // int32[1]
+  runtime::MetalBuffer logits_buf_;   // float[vocab]
+  runtime::MetalBuffer argmax_val_;   // float[parts]
+  runtime::MetalBuffer argmax_idx_;   // int32[parts]
+  runtime::MetalBuffer argmax_out_;   // int32[1]
 
   std::vector<float> logits_;
   std::string last_error_;

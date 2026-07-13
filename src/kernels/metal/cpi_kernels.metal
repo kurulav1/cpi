@@ -55,20 +55,22 @@ struct ElemParams {
 struct KvParams {
   uint kv_heads;
   uint head_dim;
-  uint position;
+  uint position;  // position of the FIRST token in the batch
   uint max_context;
   uint use_position_buffer;
+  uint tokens;  // T: 1 for decode, N for a prefill chunk
 };
 
 struct AttnParams {
   uint heads;
   uint kv_heads;
   uint head_dim;
-  uint position;      // index of the query token (0-based)
+  uint position;  // position of the FIRST query token (0-based)
   uint max_context;
-  uint window;        // 0 = full causal; else sliding window length
-  float scale;        // usually 1/sqrt(head_dim)
+  uint window;  // 0 = full causal; else sliding window length
+  float scale;  // usually 1/sqrt(head_dim)
   uint use_position_buffer;
+  uint tokens;  // T: 1 for decode, N for a prefill chunk
 };
 
 struct EmbedParams {
@@ -375,15 +377,20 @@ kernel void cpi_kv_store(
     constant KvParams&  p         [[buffer(5)]],
     uint gid [[thread_position_in_grid]]) {
   const uint kv_dim = p.kv_heads * p.head_dim;
-  if (gid >= kv_dim) return;
+  const uint total = kv_dim * p.tokens;
+  if (gid >= total) return;
 
-  uint pos = p.position;
-  if (p.use_position_buffer != 0u) pos = uint(positions[0]);
+  const uint t = gid / kv_dim;   // which token in the batch
+  const uint i = gid % kv_dim;   // which element of its K/V
+
+  uint base = p.position;
+  if (p.use_position_buffer != 0u) base = uint(positions[0]);
+  const uint pos = base + t;
   if (pos >= p.max_context) return;
 
-  const ulong dst = (ulong)pos * (ulong)kv_dim + gid;
-  k_cache[dst] = k[gid];
-  v_cache[dst] = v[gid];
+  const ulong dst = (ulong)pos * (ulong)kv_dim + i;
+  k_cache[dst] = k[(ulong)t * (ulong)kv_dim + i];
+  v_cache[dst] = v[(ulong)t * (ulong)kv_dim + i];
 }
 
 // ---------------------------------------------------------------------------
@@ -405,21 +412,30 @@ kernel void cpi_attention_decode(
     uint gid  [[threadgroup_position_in_grid]],
     uint lid  [[thread_position_in_threadgroup]],
     uint nthr [[threads_per_threadgroup]]) {
-  const uint head = gid;
-  if (head >= p.heads) return;
+  // One threadgroup per (query token, head). Decode is just T = 1, so prefill and
+  // decode share this kernel instead of duplicating the softmax and the GQA maths.
+  const uint total = p.heads * p.tokens;
+  if (gid >= total) return;
+  const uint t    = gid / p.heads;  // which query token in the batch
+  const uint head = gid % p.heads;
 
-  uint pos = p.position;
-  if (p.use_position_buffer != 0u) pos = uint(positions[0]);
+  uint base = p.position;
+  if (p.use_position_buffer != 0u) base = uint(positions[0]);
+
+  // This query's absolute position. CAUSALITY falls straight out of it: token t
+  // attends to keys [start, base+t] and no further, so no explicit mask is needed.
+  const uint pos = base + t;
 
   const uint group   = p.heads / p.kv_heads;   // query heads per kv head
   const uint kv_head = head / group;
   const uint kv_dim  = p.kv_heads * p.head_dim;
+  const uint q_dim   = p.heads * p.head_dim;
 
   // Causal window: attend to [start, pos].
   uint start = 0u;
   if (p.window != 0u && pos + 1u > p.window) start = pos + 1u - p.window;
 
-  device const half* qh = q + head * p.head_dim;
+  device const half* qh = q + (ulong)t * (ulong)q_dim + head * p.head_dim;
 
   threadgroup float tg_max;
   threadgroup float tg_sum;
@@ -479,7 +495,7 @@ kernel void cpi_attention_decode(
 
   const float inv = 1.0f / tg_sum;
   for (uint i = lid; i < p.head_dim; i += nthr) {
-    out[head * p.head_dim + i] = half(tg_acc[i] * inv);
+    out[(ulong)t * (ulong)q_dim + head * p.head_dim + i] = half(tg_acc[i] * inv);
   }
 }
 

@@ -2,6 +2,7 @@
 
 #include "engine/plan_metal_engine.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
@@ -32,12 +33,12 @@ struct ElemParams {
   float scale;
 };
 struct KvParams {
-  std::uint32_t kv_heads, head_dim, position, max_context, use_position_buffer;
+  std::uint32_t kv_heads, head_dim, position, max_context, use_position_buffer, tokens;
 };
 struct AttnParams {
   std::uint32_t heads, kv_heads, head_dim, position, max_context, window;
   float scale;
-  std::uint32_t use_position_buffer;
+  std::uint32_t use_position_buffer, tokens;
 };
 struct EmbedParams {
   std::uint32_t hidden, tokens;
@@ -113,6 +114,9 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context) {
   weights_.open(weights_path);
   cfg_ = weights_.config();
   max_context_ = max_context;
+  // Slots must hold a whole prefill chunk. 512 tokens of the widest slot (the MLP
+  // intermediate) is only a few MB, and unified memory means it costs nothing to move.
+  max_prefill_ = std::min(512, max_context);
 
   if (cfg_.is_moe() || cfg_.mlp_gelu) {
     throw std::runtime_error(
@@ -150,7 +154,8 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context) {
   wsrc_ = std::make_unique<MetalWeights>(ctx_, weights_, wbuf_);
   plan_ = opplan::build_llama_plan(g, *wsrc_);
 
-  // Slots. Sized for one token; a slot is just scratch.
+  // Slots, sized for a whole prefill chunk: [tokens][dim] contiguous, which is the
+  // layout every batched kernel assumes.
   auto slot_elems = [&](opplan::Slot s) -> std::size_t {
     switch (s) {
       case opplan::Slot::Q:
@@ -169,7 +174,8 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context) {
   };
   slots_.resize(static_cast<int>(opplan::Slot::Count));
   for (int i = 0; i < static_cast<int>(opplan::Slot::Count); ++i) {
-    slots_[i] = ctx_.alloc(slot_elems(static_cast<opplan::Slot>(i)) * sizeof(std::uint16_t));
+    slots_[i] = ctx_.alloc(slot_elems(static_cast<opplan::Slot>(i)) *
+                           static_cast<std::size_t>(max_prefill_) * sizeof(std::uint16_t));
   }
 
   // KV cache: [max_context][kv_dim] fp16, per layer.
@@ -183,6 +189,7 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context) {
   }
 
   tok_buf_ = ctx_.alloc(sizeof(std::int32_t));
+  seq_tok_buf_ = ctx_.alloc(static_cast<std::size_t>(max_prefill_) * sizeof(std::int32_t));
   pos_buf_ = ctx_.alloc(sizeof(std::int32_t));
   logits_buf_ = ctx_.alloc(static_cast<std::size_t>(cfg_.vocab_size) * sizeof(float));
   argmax_val_ = ctx_.alloc(kArgmaxParts * sizeof(float));
@@ -192,76 +199,95 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context) {
   logits_.resize(static_cast<std::size_t>(cfg_.vocab_size));
 }
 
-void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer, int position) {
+void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer, int position,
+                                  int T) {
   using opplan::OpKind;
   using G = runtime::MetalContext::Grid;
 
   for (const opplan::Op& op : ops) {
     switch (op.kind) {
       case OpKind::EmbeddingLookup: {
-        EmbedParams p{static_cast<std::uint32_t>(op.cols), 1};
-        const void* bufs[] = {op.weight, tok_buf_.handle(), slot(op.out)};
-        ctx_.dispatch("cpi_embedding_lookup", G::Threads, static_cast<std::size_t>(op.cols), kTG,
-                      bufs, nullptr, 3, &p, sizeof(p));
+        EmbedParams p{static_cast<std::uint32_t>(op.cols), static_cast<std::uint32_t>(T)};
+        // A prefill chunk reads the whole prompt from the sequence buffer; decode reads
+        // the single-token one.
+        const void* tb = (T > 1) ? seq_tok_buf_.handle() : tok_buf_.handle();
+        const void* bufs[] = {op.weight, tb, slot(op.out)};
+        ctx_.dispatch("cpi_embedding_lookup", G::Threads,
+                      static_cast<std::size_t>(op.cols) * static_cast<std::size_t>(T), kTG, bufs,
+                      nullptr, 3, &p, sizeof(p));
         break;
       }
       case OpKind::RmsNorm: {
-        NormParams p{static_cast<std::uint32_t>(op.rows), static_cast<std::uint32_t>(op.cols),
-                     op.eps, op.norm_offset ? 1u : 0u, op.weight != nullptr ? 1u : 0u};
+        // Slots are [token][rows*cols] contiguous, so N tokens is simply N times as many
+        // normalisation groups -- no separate kernel.
+        const int rows = op.rows * T;
+        NormParams p{static_cast<std::uint32_t>(rows), static_cast<std::uint32_t>(op.cols), op.eps,
+                     op.norm_offset ? 1u : 0u, op.weight != nullptr ? 1u : 0u};
         // A weightless norm still needs something bound at index 1; has_weight
         // being 0 means the shader never reads it.
         const void* wb = op.weight != nullptr ? op.weight : slot(op.in);
         const void* bufs[] = {slot(op.in), wb, slot(op.out)};
-        ctx_.dispatch("cpi_rmsnorm", G::Groups, static_cast<std::size_t>(op.rows), kTG, bufs,
-                      nullptr, 3, &p, sizeof(p));
+        ctx_.dispatch("cpi_rmsnorm", G::Groups, static_cast<std::size_t>(rows), kTG, bufs, nullptr,
+                      3, &p, sizeof(p));
         break;
       }
       case OpKind::Gemv: {
         if (op.qbits != 0) {
           throw std::runtime_error("PlanMetalEngine: quantized Gemv is not implemented");
         }
-        GemvParams p{static_cast<std::uint32_t>(op.cols), static_cast<std::uint32_t>(op.in_dim), 1,
-                     op.bias != nullptr ? 1u : 0u};
+        GemvParams p{static_cast<std::uint32_t>(op.cols), static_cast<std::uint32_t>(op.in_dim),
+                     static_cast<std::uint32_t>(T), op.bias != nullptr ? 1u : 0u};
         const void* bb = op.bias != nullptr ? op.bias : op.weight;  // bound, unread when absent
         const void* bufs[] = {op.weight, slot(op.in), slot(op.out), bb};
         // Q/K/V share one fused bqkv tensor; bias_offset selects this op's slice.
         const std::size_t offs[] = {
             0, 0, 0, static_cast<std::size_t>(op.bias_offset) * sizeof(std::uint16_t)};
-        ctx_.dispatch("cpi_gemv_f16", G::Groups, groups_for_rows(static_cast<std::size_t>(op.cols)),
-                      kTG, bufs, offs, 4, &p, sizeof(p));
+        ctx_.dispatch(
+            "cpi_gemv_f16", G::Groups,
+            groups_for_rows(static_cast<std::size_t>(op.cols)) * static_cast<std::size_t>(T), kTG,
+            bufs, offs, 4, &p, sizeof(p));
         break;
       }
       case OpKind::LmHead: {
+        // Only the LAST token of a chunk needs logits -- the others exist only to fill the
+        // KV cache. Running the vocab GEMV for all T would dominate a prefill.
         GemvParams p{static_cast<std::uint32_t>(op.cols), static_cast<std::uint32_t>(op.in_dim), 1,
                      0};
         const void* bufs[] = {op.weight, slot(op.in), logits_buf_.handle()};
+        const std::size_t offs[] = {
+            0, static_cast<std::size_t>(T - 1) * static_cast<std::size_t>(op.in_dim) * 2, 0};
         ctx_.dispatch("cpi_lm_head", G::Groups, groups_for_rows(static_cast<std::size_t>(op.cols)),
-                      kTG, bufs, nullptr, 3, &p, sizeof(p));
+                      kTG, bufs, offs, 3, &p, sizeof(p));
         break;
       }
       case OpKind::Rope: {
         RopeParams p{static_cast<std::uint32_t>(op.heads),
                      static_cast<std::uint32_t>(op.head_dim),
                      static_cast<std::uint32_t>(position),
-                     1,
+                     static_cast<std::uint32_t>(T),
                      op.scale,  // the builder folds rope_theta into scale
                      1,
                      0};
         const void* bufs[] = {slot(op.in), pos_buf_.handle()};
-        const std::size_t total =
-            static_cast<std::size_t>(op.heads) * static_cast<std::size_t>(op.head_dim / 2);
+        const std::size_t total = static_cast<std::size_t>(op.heads) *
+                                  static_cast<std::size_t>(op.head_dim / 2) *
+                                  static_cast<std::size_t>(T);
         ctx_.dispatch("cpi_rope", G::Threads, total, kTG, bufs, nullptr, 2, &p, sizeof(p));
         break;
       }
       case OpKind::KvStore: {
-        KvParams p{static_cast<std::uint32_t>(op.kv_heads), static_cast<std::uint32_t>(op.head_dim),
-                   static_cast<std::uint32_t>(position), static_cast<std::uint32_t>(max_context_),
-                   1};
+        KvParams p{static_cast<std::uint32_t>(op.kv_heads),
+                   static_cast<std::uint32_t>(op.head_dim),
+                   static_cast<std::uint32_t>(position),
+                   static_cast<std::uint32_t>(max_context_),
+                   1,
+                   static_cast<std::uint32_t>(T)};
         const void* bufs[] = {
             slot(op.in), slot(op.in2), k_cache_[static_cast<std::size_t>(layer)].handle(),
             v_cache_[static_cast<std::size_t>(layer)].handle(), pos_buf_.handle()};
-        const std::size_t total =
-            static_cast<std::size_t>(op.kv_heads) * static_cast<std::size_t>(op.head_dim);
+        const std::size_t total = static_cast<std::size_t>(op.kv_heads) *
+                                  static_cast<std::size_t>(op.head_dim) *
+                                  static_cast<std::size_t>(T);
         ctx_.dispatch("cpi_kv_store", G::Threads, total, kTG, bufs, nullptr, 5, &p, sizeof(p));
         break;
       }
@@ -273,41 +299,45 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
                      static_cast<std::uint32_t>(max_context_),
                      static_cast<std::uint32_t>(op.full_attention ? 0 : op.sliding_window),
                      op.scale,
-                     1};
+                     1,
+                     static_cast<std::uint32_t>(T)};
         const void* bufs[] = {slot(op.in), k_cache_[static_cast<std::size_t>(layer)].handle(),
                               v_cache_[static_cast<std::size_t>(layer)].handle(), slot(op.out),
                               pos_buf_.handle()};
-        ctx_.dispatch("cpi_attention_decode", G::Groups, static_cast<std::size_t>(op.heads), kTG,
-                      bufs, nullptr, 5, &p, sizeof(p));
+        ctx_.dispatch("cpi_attention_decode", G::Groups,
+                      static_cast<std::size_t>(op.heads) * static_cast<std::size_t>(T), kTG, bufs,
+                      nullptr, 5, &p, sizeof(p));
         break;
       }
       case OpKind::SiluMul:
       case OpKind::GeluMul: {
-        ElemParams p{static_cast<std::uint32_t>(op.cols), 0.0f};
+        const std::size_t n = static_cast<std::size_t>(op.cols) * static_cast<std::size_t>(T);
+        ElemParams p{static_cast<std::uint32_t>(n), 0.0f};
         const void* bufs[] = {slot(op.in), slot(op.in2), slot(op.out)};
-        ctx_.dispatch(op.kind == OpKind::SiluMul ? "cpi_silu_mul" : "cpi_gelu_mul", G::Threads,
-                      static_cast<std::size_t>(op.cols), kTG, bufs, nullptr, 3, &p, sizeof(p));
+        ctx_.dispatch(op.kind == OpKind::SiluMul ? "cpi_silu_mul" : "cpi_gelu_mul", G::Threads, n,
+                      kTG, bufs, nullptr, 3, &p, sizeof(p));
         break;
       }
       case OpKind::AddInplace: {
-        ElemParams p{static_cast<std::uint32_t>(cfg_.hidden_size), 0.0f};
+        const std::size_t n =
+            static_cast<std::size_t>(cfg_.hidden_size) * static_cast<std::size_t>(T);
+        ElemParams p{static_cast<std::uint32_t>(n), 0.0f};
         const void* bufs[] = {slot(op.in), slot(op.out)};
-        ctx_.dispatch("cpi_add_inplace", G::Threads, static_cast<std::size_t>(cfg_.hidden_size),
-                      kTG, bufs, nullptr, 2, &p, sizeof(p));
+        ctx_.dispatch("cpi_add_inplace", G::Threads, n, kTG, bufs, nullptr, 2, &p, sizeof(p));
         break;
       }
       case OpKind::ScaleCopy: {
-        ElemParams p{static_cast<std::uint32_t>(op.cols), op.scale};
+        const std::size_t n = static_cast<std::size_t>(op.cols) * static_cast<std::size_t>(T);
+        ElemParams p{static_cast<std::uint32_t>(n), op.scale};
         const void* bufs[] = {slot(op.in), slot(op.out)};
-        ctx_.dispatch("cpi_scale_copy", G::Threads, static_cast<std::size_t>(op.cols), kTG, bufs,
-                      nullptr, 2, &p, sizeof(p));
+        ctx_.dispatch("cpi_scale_copy", G::Threads, n, kTG, bufs, nullptr, 2, &p, sizeof(p));
         break;
       }
       case OpKind::CopySlot: {
-        ElemParams p{static_cast<std::uint32_t>(op.cols), 0.0f};
+        const std::size_t n = static_cast<std::size_t>(op.cols) * static_cast<std::size_t>(T);
+        ElemParams p{static_cast<std::uint32_t>(n), 0.0f};
         const void* bufs[] = {slot(op.in), slot(op.out)};
-        ctx_.dispatch("cpi_copy", G::Threads, static_cast<std::size_t>(op.cols), kTG, bufs, nullptr,
-                      2, &p, sizeof(p));
+        ctx_.dispatch("cpi_copy", G::Threads, n, kTG, bufs, nullptr, 2, &p, sizeof(p));
         break;
       }
       default:
@@ -323,11 +353,39 @@ void PlanMetalEngine::encode_forward(int token, int position) {
   *static_cast<std::int32_t*>(tok_buf_.contents()) = static_cast<std::int32_t>(token);
   *static_cast<std::int32_t*>(pos_buf_.contents()) = static_cast<std::int32_t>(position);
 
-  execute_ops(plan_.prologue, -1, position);
+  execute_ops(plan_.prologue, -1, position, 1);
   for (const opplan::LayerPlan& lp : plan_.layers) {
-    execute_ops(lp.ops, lp.layer_index, position);
+    execute_ops(lp.ops, lp.layer_index, position, 1);
   }
-  execute_ops(plan_.epilogue, -1, position);
+  execute_ops(plan_.epilogue, -1, position, 1);
+}
+
+// Runs T tokens through the whole tower in ONE pass, instead of T passes of one token.
+// Every op already knows its token count, so nothing here is prefill-specific except
+// staging the ids and the count -- which is the point of having the op-plan.
+//
+// The win is not arithmetic (a batched GEMV still touches every weight) but TRAFFIC:
+// one pass over the weights serves T tokens instead of one, so a 12-token prompt reads
+// the model once rather than twelve times. On a bandwidth-bound machine that is the
+// whole game.
+void PlanMetalEngine::encode_prefill(const std::vector<int>& tokens, int start_position) {
+  const int T = static_cast<int>(tokens.size());
+  if (T <= 0) return;
+  if (T > max_prefill_) {
+    throw std::runtime_error("prefill chunk larger than the slots were sized for");
+  }
+
+  auto* ids = static_cast<std::int32_t*>(seq_tok_buf_.contents());
+  for (int i = 0; i < T; ++i) {
+    ids[i] = static_cast<std::int32_t>(tokens[static_cast<std::size_t>(i)]);
+  }
+  *static_cast<std::int32_t*>(pos_buf_.contents()) = static_cast<std::int32_t>(start_position);
+
+  execute_ops(plan_.prologue, -1, start_position, T);
+  for (const opplan::LayerPlan& lp : plan_.layers) {
+    execute_ops(lp.ops, lp.layer_index, start_position, T);
+  }
+  execute_ops(plan_.epilogue, -1, start_position, T);
 }
 
 const std::vector<float>& PlanMetalEngine::forward_token(int token, int position) {
@@ -349,10 +407,15 @@ std::vector<int> PlanMetalEngine::generate_greedy(const std::vector<int>& prompt
   std::vector<int> out;
   int pos = 0;
 
-  // Prefill runs the same decode path one token at a time. Slow, but this backend
-  // exists to be correct first; a batched prefill is a later kernel.
-  for (std::size_t i = 0; i + 1 < prompt.size(); ++i, ++pos) {
-    forward_token(prompt[i], pos);
+  // Prefill the prompt in chunks: one pass over the weights serves the whole chunk.
+  // The last prompt token is left for the decode loop, which needs its logits anyway.
+  const int n_pre = static_cast<int>(prompt.size()) - 1;
+  for (int off = 0; off < n_pre; off += max_prefill_) {
+    const int chunk = std::min(max_prefill_, n_pre - off);
+    const std::vector<int> ids(prompt.begin() + off, prompt.begin() + off + chunk);
+    encode_prefill(ids, pos);
+    ctx_.commit_and_wait();
+    pos += chunk;
   }
 
   int next = prompt.back();
