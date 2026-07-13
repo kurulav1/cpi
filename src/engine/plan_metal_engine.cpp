@@ -579,6 +579,23 @@ void PlanMetalEngine::encode_forward(int token, int position) {
       m = std::max(m, std::fabs(v));
     }
     std::fprintf(stderr, "  [dbg]   %-8s max=%.1f%s\n", what, m, nan ? "  <-- NaN" : "");
+
+    // On the first NaN, print the index and the two INPUTS at that index. A NaN out of
+    // finite inputs is impossible, so this says which assumption is wrong.
+    if (nan && sl == opplan::Slot::Inter) {
+      const auto* ga = static_cast<const std::uint16_t*>(
+          slots_[static_cast<int>(opplan::Slot::Gate)].contents());
+      const auto* up =
+          static_cast<const std::uint16_t*>(slots_[static_cast<int>(opplan::Slot::Up)].contents());
+      for (int i = 0; i < n; ++i) {
+        const float v = fp16_to_f32(p[i]);
+        if (v != v) {
+          std::fprintf(stderr, "  [dbg]     first NaN at i=%d of %d: gate=%.4f up=%.4f\n", i, n,
+                       fp16_to_f32(ga[i]), fp16_to_f32(up[i]));
+          break;
+        }
+      }
+    }
   };
 
   execute_ops(plan_.prologue, -1, position, 1);
