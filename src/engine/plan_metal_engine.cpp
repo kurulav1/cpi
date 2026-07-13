@@ -405,19 +405,42 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
                         5, &p, sizeof(p));
           break;
         }
-        GemvParams p{static_cast<std::uint32_t>(op.cols), static_cast<std::uint32_t>(op.in_dim),
-                     static_cast<std::uint32_t>(T), op.bias != nullptr ? 1u : 0u};
         const void* bb = op.bias != nullptr ? op.bias : op.weight;  // bound, unread when absent
         const void* bufs[] = {op.weight, slot(op.in), slot(op.out), bb};
         // Q/K/V share one fused bqkv tensor; bias_offset selects this op's slice.
         const std::size_t offs[] = {
             0, 0, 0, static_cast<std::size_t>(op.bias_offset) * sizeof(std::uint16_t)};
-        // One threadgroup per (token TILE, row block): the weight row is read once per
-        // tile, not once per token.
-        const std::size_t tiles = static_cast<std::size_t>((T + kGemvTile - 1) / kGemvTile);
-        ctx_.dispatch("cpi_gemv_f16", G::Groups,
-                      groups_for_rows(static_cast<std::size_t>(op.cols)) * tiles, kTG, bufs, offs,
-                      4, &p, sizeof(p));
+
+        // A prefill is a MATMUL. Send the full 8-token tiles to the simdgroup-matrix GEMM
+        // (Metal's matrix units) and let the GEMV mop up the remainder. Decode is T=1 and
+        // stays entirely on the GEMV -- a matrix unit cannot help when one operand is a
+        // vector.
+        const int gemm_tokens = (op.cols % 8 == 0 && op.in_dim % 8 == 0) ? (T / 8) * 8 : 0;
+
+        if (gemm_tokens >= 8) {
+          GemvParams gp{static_cast<std::uint32_t>(op.cols), static_cast<std::uint32_t>(op.in_dim),
+                        static_cast<std::uint32_t>(gemm_tokens), op.bias != nullptr ? 1u : 0u};
+          // One simdgroup per 8x8 output tile; 8 simdgroups per threadgroup.
+          const std::size_t tiles =
+              (static_cast<std::size_t>(op.cols) / 8) * (static_cast<std::size_t>(gemm_tokens) / 8);
+          const std::size_t groups = (tiles + kSimdsPerTG - 1) / kSimdsPerTG;
+          ctx_.dispatch("cpi_gemm_f16", G::Groups, groups, kTG, bufs, offs, 4, &gp, sizeof(gp));
+        }
+
+        const int rest = T - gemm_tokens;
+        if (rest > 0) {
+          GemvParams p{static_cast<std::uint32_t>(op.cols), static_cast<std::uint32_t>(op.in_dim),
+                       static_cast<std::uint32_t>(rest), op.bias != nullptr ? 1u : 0u};
+          // The remainder tokens start at gemm_tokens: offset both in and out.
+          const std::size_t roffs[] = {
+              0, static_cast<std::size_t>(gemm_tokens) * static_cast<std::size_t>(op.in_dim) * 2,
+              static_cast<std::size_t>(gemm_tokens) * static_cast<std::size_t>(op.cols) * 2,
+              static_cast<std::size_t>(op.bias_offset) * sizeof(std::uint16_t)};
+          const std::size_t tiles = static_cast<std::size_t>((rest + kGemvTile - 1) / kGemvTile);
+          ctx_.dispatch("cpi_gemv_f16", G::Groups,
+                        groups_for_rows(static_cast<std::size_t>(op.cols)) * tiles, kTG, bufs,
+                        roffs, 4, &p, sizeof(p));
+        }
         break;
       }
       case OpKind::LmHead: {

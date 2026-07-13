@@ -268,6 +268,73 @@ kernel void cpi_lm_head(
 }
 
 // ---------------------------------------------------------------------------
+// GEMM: out[T, out_dim] = in[T, in_dim] . W[out_dim, in_dim]^T, fp16.
+//
+// A prefill is a MATMUL, not a batch of matvecs. The token-tiled GEMV cuts memory
+// traffic (one weight row serves 8 tokens) but still does scalar fused-multiply-adds,
+// so it is bound by ALU issue rate, not bandwidth. Metal has dedicated matrix units --
+// simdgroup_matrix, the same silicon CUDA calls tensor cores -- and a prompt is exactly
+// the shape they exist for. Decode (T=1) stays on the GEMV: a matrix unit is useless
+// when one operand is a vector.
+//
+// Each simdgroup owns one 8x8 output tile and walks K in steps of 8. B is loaded
+// TRANSPOSED, because the weights are [out_dim, in_dim] row-major and the product needs
+// in . W^T.
+//
+// Only full 8-token tiles go here; a remainder of fewer than 8 tokens falls back to the
+// GEMV, which has no alignment constraints.
+// ---------------------------------------------------------------------------
+
+kernel void cpi_gemm_f16(
+    device const half*  W     [[buffer(0)]],
+    device const half*  in    [[buffer(1)]],
+    device half*        out   [[buffer(2)]],
+    device const half*  bias  [[buffer(3)]],
+    constant GemvParams& p    [[buffer(4)]],
+    uint  tgid [[threadgroup_position_in_grid]],
+    uint  lid  [[thread_position_in_threadgroup]],
+    uint  nthr [[threads_per_threadgroup]]) {
+  const uint simds_per_tg = nthr / 32u;
+  const uint sgid = lid / 32u;
+  const uint lane = lid % 32u;
+
+  const uint row_tiles = p.out_dim / 8u;               // out_dim is a multiple of 8
+  const uint tile = tgid * simds_per_tg + sgid;
+  const uint row_tile = tile % row_tiles;
+  const uint tok_tile = tile / row_tiles;
+
+  const uint row0 = row_tile * 8u;
+  const uint tok0 = tok_tile * 8u;
+  if (row0 >= p.out_dim || tok0 + 8u > p.tokens) return;
+
+  simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+  for (uint k = 0u; k < p.in_dim; k += 8u) {
+    simdgroup_half8x8 a;  // [8 tokens x 8 k]
+    simdgroup_half8x8 b;  // [8 k x 8 rows]  <- W loaded transposed
+    simdgroup_load(a, in + (ulong)tok0 * (ulong)p.in_dim + k, p.in_dim);
+    simdgroup_load(b, W + (ulong)row0 * (ulong)p.in_dim + k, p.in_dim, ulong2(0, 0), true);
+    simdgroup_multiply_accumulate(acc, a, b);
+  }
+
+  // Stage the tile through threadgroup memory so each lane can add the bias and narrow
+  // to half on the way out. Sized for the MAXIMUM simdgroups a threadgroup can have here
+  // (256 threads / 32 = 8), each owning its own 8x8 = 64 floats.
+  threadgroup float tile_buf[8 * 64];
+  threadgroup float* mine = tile_buf + sgid * 64u;
+  simdgroup_store(acc, mine, 8);
+  simdgroup_barrier(mem_flags::mem_threadgroup);
+
+  for (uint i = lane; i < 64u; i += 32u) {
+    const uint t = i / 8u;  // token within the tile
+    const uint r = i % 8u;  // row within the tile
+    float v = mine[t * 8u + r];
+    if (p.has_bias != 0u) v += float(bias[row0 + r]);
+    out[(ulong)(tok0 + t) * (ulong)p.out_dim + row0 + r] = half(v);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Weight-only int4 / int8 GEMV.
 //
 // Metal has NO __dp4a, so this does not try to mirror the CUDA kernel's packed
