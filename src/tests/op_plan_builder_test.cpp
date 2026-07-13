@@ -193,9 +193,15 @@ int main() {
     FakeWeights wq;
     const ModelPlan pq = build_llama_plan(gq, wq);
     const auto& ops = pq.layers[1].ops;
-    expect(ops[1].bias == wq.handle_for("layers.1.attention.bq"), "Q bias bound to bq");
-    expect(ops[2].bias == wq.handle_for("layers.1.attention.bk"), "K bias bound to bk");
-    expect(ops[3].bias == wq.handle_for("layers.1.attention.bv"), "V bias bound to bv");
+    // The .ll2c fuses the three biases into one [bq | bk | bv] tensor, so all three
+    // ops share a handle and differ only by offset. Getting the offsets wrong would
+    // feed K the tail of Q's bias -- fluent nonsense, not a crash.
+    const void* bqkv = wq.handle_for("layers.1.attention.bqkv");
+    expect(ops[1].bias == bqkv && ops[2].bias == bqkv && ops[3].bias == bqkv,
+           "Q/K/V biases all point at the fused bqkv tensor");
+    expect(ops[1].bias_offset == 0, "Q bias starts at 0");
+    expect(ops[2].bias_offset == 14 * 64, "K bias starts after Q (q_dim)");
+    expect(ops[3].bias_offset == 14 * 64 + 2 * 64, "V bias starts after Q and K (q_dim + kv_dim)");
     expect(ops[8].bias == nullptr, "the o_proj has no bias");
     expect(ops[11].bias == nullptr, "the MLP has no bias");
   }

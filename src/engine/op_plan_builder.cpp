@@ -96,9 +96,14 @@ ModelPlan build_llama_plan(const LlamaGeometry& g, const WeightSource& w) {
       Op k = gemv(Slot::XNorm, Slot::K, w.fp16(p + "attention.wk"), kv_dim, g.hidden);
       Op v = gemv(Slot::XNorm, Slot::V, w.fp16(p + "attention.wv"), kv_dim, g.hidden);
       if (g.has_qkv_bias) {
-        q.bias = w.fp16(p + "attention.bq");
-        k.bias = w.fp16(p + "attention.bk");
-        v.bias = w.fp16(p + "attention.bv");
+        // One fused tensor, laid out [bq (q_dim) | bk (kv_dim) | bv (kv_dim)].
+        const void* bqkv = w.fp16(p + "attention.bqkv");
+        q.bias = bqkv;
+        q.bias_offset = 0;
+        k.bias = bqkv;
+        k.bias_offset = q_dim;
+        v.bias = bqkv;
+        v.bias_offset = q_dim + kv_dim;
       }
       lp.ops.push_back(q);
       lp.ops.push_back(k);

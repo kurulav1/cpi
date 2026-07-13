@@ -214,8 +214,11 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
                      op.bias != nullptr ? 1u : 0u};
         const void* bb = op.bias != nullptr ? op.bias : op.weight;  // bound, unread when absent
         const void* bufs[] = {op.weight, slot(op.in), slot(op.out), bb};
+        // Q/K/V share one fused bqkv tensor; bias_offset selects this op's slice.
+        const std::size_t offs[] = {
+            0, 0, 0, static_cast<std::size_t>(op.bias_offset) * sizeof(std::uint16_t)};
         ctx_.dispatch("cpi_gemv_f16", G::Groups, groups_for_rows(static_cast<std::size_t>(op.cols)),
-                      kTG, bufs, nullptr, 4, &p, sizeof(p));
+                      kTG, bufs, offs, 4, &p, sizeof(p));
         break;
       }
       case OpKind::LmHead: {

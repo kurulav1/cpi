@@ -139,7 +139,12 @@ struct Op {
   // Gemv: optional additive bias over out_dim (Qwen2's Q/K/V projections have one;
   // Llama's do not). nullptr = no bias, which is every model the CUDA executor
   // currently plans, so its behaviour is unchanged.
+  //
+  // The .ll2c stores Q/K/V's biases FUSED as one `attention.bqkv` tensor laid out
+  // [bq | bk | bv], so all three ops point at the same handle and are distinguished
+  // by bias_offset (in elements, not bytes).
   const void* bias = nullptr;
+  int bias_offset = 0;
   // Quantized Gemv: when qweight is set the op runs a weight-only matvec instead
   // of the fp16 one. qbits picks the encoding: 8 = int8, 4 = int4 (packed
   // two-per-byte). qgroup picks the scale granularity: 0 = one scale per row,
