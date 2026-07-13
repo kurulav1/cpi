@@ -87,6 +87,7 @@ constexpr int kGemmTG = 32 * (64 / 32) * (kGemmBN / 32);  // one simdgroup per 3
 // Below this many tokens the GEMV wins: a GEMM tile is padded out to kGemmBN and the padding
 // is wasted arithmetic. Above it the GEMV is a catastrophe -- see the dispatch below.
 constexpr int kGemmMinTokens = 16;
+constexpr int kGemmBK = 64;  // MUST match GEMM_BK in the shader
 constexpr int kQBlock = 8;  // MUST match Q_BLOCK in cpi_kernels.metal
 constexpr int kArgmaxParts = 256;
 constexpr int kGemvTile = 8;  // MUST match GEMV_TILE in cpi_kernels.metal
@@ -451,7 +452,11 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
           // model once per 8-token tile, so the tail swept 4.9 GB of weights five times over.
           // Padding the tail out to one masked GEMM tile wastes some arithmetic and is still
           // far cheaper.
-          const bool qgemm_ok = op.cols % 64 == 0 && op.in_dim % 32 == 0;
+          // A K-block carries ONE scale per row, so it must sit inside one quantization
+          // group. gsz is 64 by default, which is exactly kGemmBK; a smaller group would
+          // straddle, and those ops fall back to the GEMV rather than reading a wrong scale.
+          const bool qgemm_ok =
+              op.cols % 64 == 0 && op.in_dim % kGemmBK == 0 && gsz >= kGemmBK;
           const int qgemm_tokens = (qgemm_ok && T >= kGemmMinTokens) ? T : 0;
 
           if (profile) profile_tick("(before gemm)");
@@ -500,7 +505,7 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
         //
         // Decode (T=1) stays on the GEMV: a matrix unit cannot help when one operand is a
         // vector. Token remainders below 32 do too.
-        const bool gemm_ok = op.cols % 64 == 0 && op.in_dim % 32 == 0;
+        const bool gemm_ok = op.cols % 64 == 0 && op.in_dim % kGemmBK == 0;
         const int gemm_tokens = (gemm_ok && T >= kGemmMinTokens) ? T : 0;
 
         if (gemm_tokens > 0) {

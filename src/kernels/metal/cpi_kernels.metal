@@ -289,9 +289,11 @@ kernel void cpi_lm_head(
 #define GEMM_BN 64
 // Simdgroups tile the 64xGEMM_BN output as a grid, each owning 32x32 (4x4 fragments).
 #define GEMM_SG_COLS (GEMM_BN / 32)
-// K per stage. 32 halves == a 64-byte cache line per row, and 8 per thread == one 128-bit
-// load, so a K-block fill is exactly one wide load per thread and no byte is read twice.
-#define GEMM_BK 32
+// K per stage. The fill and the matrix ops are separated by barriers, so this sets how much
+// arithmetic each barrier buys: at 64 a threadgroup fills once and then runs EIGHT matrix
+// steps, halving the barrier count against 32. It must not exceed the quantization group
+// (64 by default) or a K-block would straddle two scales -- the dispatch guards that.
+#define GEMM_BK 64
 
 // ---------------------------------------------------------------------------
 // Blocked fp16 GEMM (prefill). A K-block of both operands is staged in threadgroup memory,
