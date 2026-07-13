@@ -87,6 +87,8 @@ int main(int argc, char** argv) {
   // should do, and quantization error is measured AGAINST that rather than hidden.
   const char* qenv = std::getenv("CPI_METAL_QUANT");
   const int quant = qenv != nullptr ? std::atoi(qenv) : 0;
+  const char* genv = std::getenv("CPI_METAL_QGROUP");
+  const int qgroup = genv != nullptr ? std::atoi(genv) : 0;
 
   // Default prompt (token ids, so no tokenizer is needed). A golden file overrides it.
   std::vector<int> prompt = {1, 2, 3, 4, 5};
@@ -107,7 +109,7 @@ int main(int argc, char** argv) {
   }
   std::printf("[metal_decode] device: %s\n", metal.device_name().c_str());
 
-  metal.open(model, /*max_context=*/512, quant);
+  metal.open(model, /*max_context=*/512, quant, qgroup);
   const auto& cfg = metal.config();
   std::printf("[metal_decode] layers=%d hidden=%d heads=%d kv_heads=%d vocab=%d qkv_bias=%d\n",
               cfg.num_layers, cfg.hidden_size, cfg.num_heads, cfg.num_kv_heads, cfg.vocab_size,
