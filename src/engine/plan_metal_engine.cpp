@@ -548,11 +548,36 @@ void PlanMetalEngine::encode_forward(int token, int position) {
   *static_cast<std::int32_t*>(tok_buf_.contents()) = static_cast<std::int32_t>(token);
   *static_cast<std::int32_t*>(pos_buf_.contents()) = static_cast<std::int32_t>(position);
 
+  // CPI_METAL_DEBUG prints max|X| after every layer. Unified memory makes this almost
+  // free to do: the residual stream is host-addressable, so an explosion can simply be
+  // WATCHED rather than deduced.
+  static const bool dbg = std::getenv("CPI_METAL_DEBUG") != nullptr;
+  auto peek = [&](const char* what) {
+    if (!dbg) return;
+    ctx_.commit_and_wait();
+    const auto* x = static_cast<const std::uint16_t*>(slots_[0].contents());
+    float m = 0.0f;
+    bool nan = false;
+    for (int i = 0; i < cfg_.hidden_size; ++i) {
+      const float v = fp16_to_f32(x[i]);
+      if (v != v) nan = true;
+      m = std::max(m, std::fabs(v));
+    }
+    std::fprintf(stderr, "  [dbg] %-12s max|X|=%.1f%s
+", what, m, nan ? "  <-- NaN" : "");
+  };
+
   execute_ops(plan_.prologue, -1, position, 1);
+  peek("prologue");
   int done = 0;
   for (const opplan::LayerPlan& lp : plan_.layers) {
     if (layer_limit >= 0 && done >= layer_limit) break;
     execute_ops(lp.ops, lp.layer_index, position, 1);
+    if (dbg) {
+      char b[32];
+      std::snprintf(b, sizeof(b), "layer %d", lp.layer_index);
+      peek(b);
+    }
     ++done;
   }
   execute_ops(plan_.epilogue, -1, position, 1);
