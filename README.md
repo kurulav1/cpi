@@ -246,13 +246,19 @@ attention (Qwen3.5), and the serving stack — REST API, web UI, continuous batc
 Those are wired to the CUDA engines and would need a backend abstraction above the engine, not
 just kernels. CPI's inference *core* runs on a Mac; CPI-the-product does not.
 
-**Measured** (Apple M4, 10-core GPU, 16 GB), Qwen2.5-0.5B:
+**Measured** (Apple M4, 10-core GPU, 16 GB):
 
-| | GPU weights | decode | prefill (301 tok) |
-| --- | --- | --- | --- |
-| fp16 | 1.17 GB | 86.5 tok/s | 549 tok/s |
-| int8 | 0.74 GB | 118.8 tok/s | — |
-| int4 | 0.51 GB | 146.7 tok/s | — |
+| Model | | GPU weights | decode | prefill (301 tok) |
+| --- | --- | --- | --- | --- |
+| Qwen2.5-0.5B | fp16 | 1.17 GB | 86.5 tok/s | 549 tok/s |
+| Qwen2.5-0.5B | int8 | 0.74 GB | 118.8 tok/s | — |
+| Qwen2.5-0.5B | int4 | 0.51 GB | 146.7 tok/s | — |
+| **Llama-3.1-8B** | **int4** | **4.91 GB** | **15.0 tok/s** | — |
+
+The 8B is the point of quantization: at fp16 its weights are ~15 GB and it does **not** fit in a
+16 GB Mac — attempting it drives the machine into swap. At int4 it runs in 4.91 GB with zero
+swaps. (The 3.05x saving beats Qwen2.5's 2.3x because the 8B's LM head is untied and gets
+quantized too; Qwen2.5 ties its head to the embedding table, which must stay fp16 for the lookup.)
 
 Both kernels are bandwidth-shaped: the GEMV reads weights 128 bits at a time, and prefill tiles
 8 tokens per weight row so the matrix is streamed once per tile rather than once per token. An
