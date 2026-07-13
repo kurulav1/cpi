@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -155,7 +156,14 @@ int main(int argc, char** argv) {
   std::printf("  max_abs_diff over the CPU's top-5: %.4f\n", max_abs);
 
   // ---- the real gate: does Metal reproduce CUDA's greedy stream? -----------
+  const auto t0 = std::chrono::steady_clock::now();
   const std::vector<int> m_out = metal.generate_greedy(prompt, n_new);
+  const auto t1 = std::chrono::steady_clock::now();
+  const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+  std::printf("\n  metal decode: %.1f tok/s (%d tokens in %.0f ms)\n",
+              static_cast<double>(m_out.size()) / (ms / 1000.0), static_cast<int>(m_out.size()),
+              ms);
+
   std::vector<int> c_out = cpu.generate(prompt, n_new, /*temperature=*/0.0f);
 
   // CpuLlamaEngine::generate returns PROMPT + continuation; PlanMetalEngine returns
