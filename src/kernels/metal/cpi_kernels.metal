@@ -416,6 +416,11 @@ kernel void cpi_attention_decode(
     for (uint i = lid; i < p.head_dim; i += nthr) {
       tg_acc[i] = tg_acc[i] * rescale + w * float(vt[i]);
     }
+    // Every thread read tg_max above to get old_max. Thread 0 is about to overwrite
+    // it. Without this barrier a fast thread 0 could publish the NEW max before a
+    // slower thread has read the old one, which silently corrupts that thread's
+    // rescale factor -- wrong attention, non-deterministically, only on hardware.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (lid == 0u) {
       tg_sum = tg_sum * rescale + w;
       tg_max = new_max;
