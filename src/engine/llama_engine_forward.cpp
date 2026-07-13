@@ -118,10 +118,14 @@ void LlamaEngine::forward_token(int token, int position, bool compute_logits,
 // K/V pointer for query head h is (h / group) * head_dim, which is not a constant stride in h,
 // so a single strideA cannot express it.
 // ---------------------------------------------------------------------------------------
-bool LlamaEngine::prefill_attention_tensorcore(const void* q, const void* k_layer,
-                                               const void* v_layer, void* out, int rows,
-                                               int base_pos, int num_heads, int num_kv_heads,
-                                               int head_dim) {
+// Eligibility + scratch allocation, decided ONCE per prefill chunk.
+//
+// Separate from the attention call because the caller must know the answer BEFORE the layer
+// loop: if it skips the Q/K/V split copies (reading Q in place out of the fused QKV buffer) and
+// the tensor-core path then declined at, say, layer 7, there would be no contiguous Q left to
+// fall back to. Decide first, then commit.
+bool LlamaEngine::prefill_tc_prepare(int rows, int base_pos, int num_heads, int num_kv_heads,
+                                     int head_dim) {
   static const bool legacy = [] {
     const char* e = std::getenv("LLAMA_INFER_LEGACY_PREFILL_ATTN");
     return e && *e == '1';
@@ -130,21 +134,12 @@ bool LlamaEngine::prefill_attention_tensorcore(const void* q, const void* k_laye
       (num_heads % num_kv_heads) != 0) {
     return false;
   }
-
-  // 256, not 128: halves the number of chunk iterations (each carries a pointer-array copy
-  // and three launches) and gives the GEMMs twice the n dimension to work with.
-  constexpr int kChunk = 256;
-  const int keys = base_pos + rows;  // this chunk's KV is already stored; the mask does the rest
-  const int group = num_heads / num_kv_heads;
-  const int q_stride = num_heads * head_dim;   // d_prefill_q_ rows are [num_heads, head_dim]
-  const int kv_stride = num_kv_heads * head_dim;
-  const int out_stride = num_heads * head_dim;
-
-  // Score scratch: [heads][chunk][keys]. Bail out rather than allocate something absurd.
-  const std::size_t need = static_cast<std::size_t>(num_heads) * kChunk *
-                           static_cast<std::size_t>(keys) * sizeof(__half);
+  constexpr int kPrepChunk = 256;
+  const int prep_keys = base_pos + rows;
+  const std::size_t need = static_cast<std::size_t>(num_heads) * kPrepChunk *
+                           static_cast<std::size_t>(prep_keys) * sizeof(__half);
   if (need > (std::size_t{1} << 30)) {
-    return false;  // > 1 GB: let the kernel handle it
+    return false;
   }
   if (need > attn_scores_bytes_) {
     if (d_attn_scores_) {
@@ -158,6 +153,40 @@ bool LlamaEngine::prefill_attention_tensorcore(const void* q, const void* k_laye
     }
     attn_scores_bytes_ = need;
   }
+  const std::size_t ptrs_needed = 6 * static_cast<std::size_t>(num_heads);
+  if (ptrs_needed > gemm_ptrs_capacity_) {
+    if (d_gemm_ptrs_) {
+      cudaFree(d_gemm_ptrs_);
+      d_gemm_ptrs_ = nullptr;
+    }
+    gemm_ptrs_capacity_ = 0;
+    if (cudaMalloc(&d_gemm_ptrs_, sizeof(void*) * ptrs_needed) != cudaSuccess) {
+      d_gemm_ptrs_ = nullptr;
+      return false;
+    }
+    gemm_ptrs_capacity_ = ptrs_needed;
+  }
+  return true;
+}
+
+bool LlamaEngine::prefill_attention_tensorcore(const void* q, const void* k_layer,
+                                               const void* v_layer, void* out, int rows,
+                                               int base_pos, int num_heads, int num_kv_heads,
+                                               int head_dim, int q_stride) {
+  if (!prefill_tc_prepare(rows, base_pos, num_heads, num_kv_heads, head_dim)) {
+    return false;
+  }
+
+  // 256, not 128: halves the number of chunk iterations (each carries a pointer-array copy
+  // and three launches) and gives the GEMMs twice the n dimension to work with.
+  constexpr int kChunk = 256;
+  const int keys = base_pos + rows;  // this chunk's KV is already stored; the mask does the rest
+  const int group = num_heads / num_kv_heads;
+  // q_stride comes from the caller: num_heads*head_dim for a split Q buffer, or the full
+  // fused QKV row stride when Q is read in place.
+  const int kv_stride = num_kv_heads * head_dim;
+  const int out_stride = num_heads * head_dim;
+
   const __half* qh = static_cast<const __half*>(q);
   const __half* kh = static_cast<const __half*>(k_layer);
   const __half* vh = static_cast<const __half*>(v_layer);

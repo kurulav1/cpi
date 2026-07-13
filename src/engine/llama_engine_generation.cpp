@@ -148,27 +148,59 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
     }
     maybe_add_half_bias(d_ff3_, lw->bo, rows, hidden);
 
+    // Keep Q's split copy; drop K's and V's, and fold the bias into one broadcast.
+    //
+    // Prefill is host-bound (nsys: 7 cudaMemcpy2DAsync per layer = 1.87 ms of a 7.53 ms prefill).
+    // Three of those seven only un-interleave Q/K/V out of the fused QKV buffer. RoPE now takes
+    // independent row strides and the K/V cache stores can read strided, so K and V never need to
+    // be materialised. The bias vector is exactly one fused QKV row wide, so ONE broadcast over
+    // the fused buffer replaces three.
+    //
+    // ⚠ Q'S COPY STAYS, ON PURPOSE. Reading Q in place changes the attention GEMM's leading
+    // dimension (q_hidden -> the full QKV row), which makes cuBLAS pick a DIFFERENT algorithm,
+    // which sums in a different order. That was +13% but it changed the output of 2 of the 6 gate
+    // models. Keeping the copy keeps the stride, keeps cuBLAS's choice, and keeps the result
+    // BIT-IDENTICAL -- for the price of one copy per layer out of seven.
+    //
+    // NOT eligible when:
+    //   - QK-norm (Qwen3): launch_rmsnorm treats its input as contiguous [rows*heads, head_dim],
+    //     which K inside the strided QKV buffer is not. It would silently normalise wrong slices.
+    //   - paged blocks: launch_store_kv_paged wants contiguous K/V.
+    const bool fused_kv = !(lw->q_norm && lw->k_norm) &&
+                          !(options_.paged_blocks && d_block_table_ != nullptr);
+    auto* qkv_rw = static_cast<__half*>(d_qkv_);
+    const int qkv_row = q_hidden + 2 * kv_hidden;
+
+    // Bias BEFORE the split, so the copy carries the biased values (it used to be applied to the
+    // three split buffers afterwards -- same arithmetic, one launch instead of three).
+    if (lw->bqkv && fused_kv) {
+      kernels::launch_add_bias_broadcast(qkv_rw, static_cast<const __half*>(lw->bqkv), rows,
+                                         qkv_row, compute_stream_);
+    }
+
     CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_q_, q_row_bytes, qkv_base, qkv_stride_bytes, q_row_bytes,
                                  rows, cudaMemcpyDeviceToDevice, compute_stream_));
-    CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_k_, kv_row_bytes, qkv_base + q_hidden, qkv_stride_bytes,
-                                 kv_row_bytes, rows, cudaMemcpyDeviceToDevice, compute_stream_));
-    CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_v_, kv_row_bytes, qkv_base + q_hidden + kv_hidden,
-                                 qkv_stride_bytes, kv_row_bytes, rows, cudaMemcpyDeviceToDevice,
-                                 compute_stream_));
-
-    if (lw->bqkv) {
-      const auto* bqkv_half = static_cast<const __half*>(lw->bqkv);
-      kernels::launch_add_bias_broadcast(static_cast<__half*>(d_prefill_q_), bqkv_half, rows,
-                                         q_hidden, compute_stream_);
-      kernels::launch_add_bias_broadcast(static_cast<__half*>(d_prefill_k_), bqkv_half + q_hidden,
-                                         rows, kv_hidden, compute_stream_);
-      kernels::launch_add_bias_broadcast(static_cast<__half*>(d_prefill_v_),
-                                         bqkv_half + q_hidden + kv_hidden, rows, kv_hidden,
-                                         compute_stream_);
+    if (!fused_kv) {
+      CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_k_, kv_row_bytes, qkv_base + q_hidden,
+                                   qkv_stride_bytes, kv_row_bytes, rows, cudaMemcpyDeviceToDevice,
+                                   compute_stream_));
+      CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_v_, kv_row_bytes, qkv_base + q_hidden + kv_hidden,
+                                   qkv_stride_bytes, kv_row_bytes, rows, cudaMemcpyDeviceToDevice,
+                                   compute_stream_));
+      if (lw->bqkv) {
+        const auto* bqkv_half = static_cast<const __half*>(lw->bqkv);
+        kernels::launch_add_bias_broadcast(static_cast<__half*>(d_prefill_q_), bqkv_half, rows,
+                                           q_hidden, compute_stream_);
+        kernels::launch_add_bias_broadcast(static_cast<__half*>(d_prefill_k_), bqkv_half + q_hidden,
+                                           rows, kv_hidden, compute_stream_);
+        kernels::launch_add_bias_broadcast(static_cast<__half*>(d_prefill_v_),
+                                           bqkv_half + q_hidden + kv_hidden, rows, kv_hidden,
+                                           compute_stream_);
+      }
     }
 
     if (lw->q_norm && lw->k_norm) {
-      // Qwen3: per-head RMSNorm on Q and K (each head's head_dim slice), pre-RoPE.
+      // Qwen3: per-head RMSNorm on Q and K, pre-RoPE. Only reachable on the split path.
       kernels::launch_rmsnorm(static_cast<const __half*>(d_prefill_q_),
                                      static_cast<const __half*>(lw->q_norm),
                                      static_cast<__half*>(d_prefill_q_), rows * cfg.num_heads,
@@ -179,9 +211,12 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
                                      head_dim, cfg.norm_eps, compute_stream_);
     }
 
-    kernels::launch_rope_inplace_batched(
-        static_cast<__half*>(d_prefill_q_), static_cast<__half*>(d_prefill_k_), rows, cfg.num_heads,
-        cfg.num_kv_heads, head_dim, base_pos, d_rope_cos_, d_rope_sin_, compute_stream_);
+    // Q is contiguous (its copy stayed); K lives in the fused buffer. Independent strides.
+    kernels::launch_rope_inplace_batched_strided(
+        static_cast<__half*>(d_prefill_q_), fused_kv ? (qkv_rw + q_hidden)
+                                                     : static_cast<__half*>(d_prefill_k_),
+        rows, cfg.num_heads, cfg.num_kv_heads, head_dim, base_pos, d_rope_cos_, d_rope_sin_,
+        q_hidden, fused_kv ? qkv_row : kv_hidden, compute_stream_);
 
     auto* k_layer =
         static_cast<__half*>(d_k_cache_) + static_cast<std::size_t>(layer) * layer_stride;
@@ -199,19 +234,31 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
                                               rows, base_pos, cfg.num_heads, cfg.num_kv_heads,
                                               head_dim, bs, compute_stream_);
     } else {
+      // Store K/V into the cache. On the in-place path these read straight out of the fused QKV
+      // buffer (source pitch = the whole QKV row) instead of from the split copies -- same bytes,
+      // one fewer copy each to produce them.
+      const __half* k_src = fused_kv ? (qkv_rw + q_hidden) : static_cast<__half*>(d_prefill_k_);
+      const __half* v_src =
+          fused_kv ? (qkv_rw + q_hidden + kv_hidden) : static_cast<__half*>(d_prefill_v_);
+      const std::size_t kv_src_pitch = fused_kv ? qkv_stride_bytes : kv_row_bytes;
       CUDA_CHECK(cudaMemcpy2DAsync(k_layer + static_cast<std::size_t>(base_pos) * kv_hidden,
-                                   kv_row_bytes, d_prefill_k_, kv_row_bytes, kv_row_bytes, rows,
+                                   kv_row_bytes, k_src, kv_src_pitch, kv_row_bytes, rows,
                                    cudaMemcpyDeviceToDevice, compute_stream_));
       CUDA_CHECK(cudaMemcpy2DAsync(v_layer + static_cast<std::size_t>(base_pos) * kv_hidden,
-                                   kv_row_bytes, d_prefill_v_, kv_row_bytes, kv_row_bytes, rows,
+                                   kv_row_bytes, v_src, kv_src_pitch, kv_row_bytes, rows,
                                    cudaMemcpyDeviceToDevice, compute_stream_));
 
       // Tensor cores first: Q.K^T and P.V as cuBLAS batched GEMMs. Falls back to the kernel if
       // the geometry is unsupported or the score matrix would be too big. This is plain causal
       // text prefill -- no per-token limits, no sliding window -- which is exactly the case the
       // GEMM path covers; the vision/bidirectional paths never reach here.
+      //
+      // On the in-place path Q lives in the fused buffer, so the stride is a whole QKV row.
+      // The fallback kernel cannot take a stride -- which is why inplace_qkv requires tc_ready.
+      // q_hidden, always: Q keeps its contiguous copy so cuBLAS sees the same leading dimension
+      // and picks the same algorithm -- which is what keeps this bit-identical.
       if (!prefill_attention_tensorcore(d_prefill_q_, k_layer, v_layer, d_att_, rows, base_pos,
-                                        cfg.num_heads, cfg.num_kv_heads, head_dim)) {
+                                        cfg.num_heads, cfg.num_kv_heads, head_dim, q_hidden)) {
         kernels::launch_attention_prefill(static_cast<const __half*>(d_prefill_q_), k_layer,
                                           v_layer, static_cast<__half*>(d_att_), rows, base_pos,
                                           cfg.num_heads, cfg.num_kv_heads, head_dim,

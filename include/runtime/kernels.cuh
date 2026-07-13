@@ -170,6 +170,17 @@ void launch_rope_inplace_device_pos(half* q, half* k, int num_heads_q, int num_h
 //   stream       - CUDA stream for async launch
 //
 // Grid: (max(num_heads_q, num_heads_k), num_tokens), head_dim/2 threads.
+// launch_rope_inplace_batched_strided
+//
+// Batched RoPE where Q and K rows carry an explicit stride, so they can be rotated IN PLACE
+// inside the fused QKV buffer instead of being copied out to contiguous buffers first. Prefill
+// is host-bound and those copies were 3 of the 7 cudaMemcpy2DAsync per layer.
+// launch_rope_inplace_batched is this with the natural strides -- bit-identical.
+void launch_rope_inplace_batched_strided(half* q, half* k, int num_tokens, int num_heads_q,
+                                         int num_heads_k, int head_dim, int start_position,
+                                         const float* cos_table, const float* sin_table,
+                                         int q_row_stride, int k_row_stride, cudaStream_t stream);
+
 void launch_rope_inplace_batched(half* q, half* k, int num_tokens, int num_heads_q, int num_heads_k,
                                  int head_dim, int start_position, const float* cos_table,
                                  const float* sin_table, cudaStream_t stream);

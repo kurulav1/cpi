@@ -407,9 +407,14 @@ __global__ void rope_inplace_perpos_kernel(half* q, half* k, int num_tokens, int
   }
 }
 
+// q_row_stride / k_row_stride let this rotate Q and K IN PLACE inside the fused QKV buffer,
+// rather than requiring them to be copied out into contiguous [tokens, heads*head_dim] buffers
+// first. Prefill is host-bound and those copies were 3 of the 7 cudaMemcpy2DAsync per layer.
+// Passing the natural strides (num_heads * head_dim) reproduces the old behaviour EXACTLY.
 __global__ void rope_inplace_batched_kernel(half* q, half* k, int num_tokens, int num_heads_q,
                                             int num_heads_k, int head_dim, int start_position,
-                                            const float* cos_table, const float* sin_table) {
+                                            const float* cos_table, const float* sin_table,
+                                            int q_row_stride, int k_row_stride) {
   const int head = blockIdx.x;
   const int token = blockIdx.y;
   const int pair = threadIdx.x;
@@ -423,14 +428,14 @@ __global__ void rope_inplace_batched_kernel(half* q, half* k, int num_tokens, in
   const float s = sin_table[table_idx];
 
   if (head < num_heads_q) {
-    const int base = token * num_heads_q * head_dim + head * head_dim;
+    const int base = token * q_row_stride + head * head_dim;
     const float q0 = __half2float(q[base + pair]);
     const float q1 = __half2float(q[base + pair + half_dim]);
     q[base + pair] = __float2half(q0 * c - q1 * s);
     q[base + pair + half_dim] = __float2half(q1 * c + q0 * s);
   }
   if (head < num_heads_k) {
-    const int base = token * num_heads_k * head_dim + head * head_dim;
+    const int base = token * k_row_stride + head * head_dim;
     const float k0 = __half2float(k[base + pair]);
     const float k1 = __half2float(k[base + pair + half_dim]);
     k[base + pair] = __float2half(k0 * c - k1 * s);
@@ -1100,14 +1105,25 @@ void launch_rope_inplace_device_pos(half* q, half* k, int num_heads_q, int num_h
       q, k, num_heads_q, num_heads_k, head_dim, position, cos_table, sin_table);
 }
 
-void launch_rope_inplace_batched(half* q, half* k, int num_tokens, int num_heads_q, int num_heads_k,
-                                 int head_dim, int start_position, const float* cos_table,
-                                 const float* sin_table, cudaStream_t stream) {
+void launch_rope_inplace_batched_strided(half* q, half* k, int num_tokens, int num_heads_q,
+                                        int num_heads_k, int head_dim, int start_position,
+                                        const float* cos_table, const float* sin_table,
+                                        int q_row_stride, int k_row_stride, cudaStream_t stream) {
   const int threads = head_dim / 2;
   const int blocks = (num_heads_q > num_heads_k) ? num_heads_q : num_heads_k;
   const dim3 grid(blocks, num_tokens);
   rope_inplace_batched_kernel<<<grid, threads, 0, stream>>>(
-      q, k, num_tokens, num_heads_q, num_heads_k, head_dim, start_position, cos_table, sin_table);
+      q, k, num_tokens, num_heads_q, num_heads_k, head_dim, start_position, cos_table, sin_table,
+      q_row_stride, k_row_stride);
+}
+
+void launch_rope_inplace_batched(half* q, half* k, int num_tokens, int num_heads_q, int num_heads_k,
+                                 int head_dim, int start_position, const float* cos_table,
+                                 const float* sin_table, cudaStream_t stream) {
+  // Natural (contiguous) strides -> identical to before the stride parameters existed.
+  launch_rope_inplace_batched_strided(q, k, num_tokens, num_heads_q, num_heads_k, head_dim,
+                                      start_position, cos_table, sin_table,
+                                      num_heads_q * head_dim, num_heads_k * head_dim, stream);
 }
 
 // Per-position RoPE (P2 batched decode): each of num_tokens rows uses its own

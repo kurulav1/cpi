@@ -283,7 +283,12 @@ private:
   // kernel, which is the only thing that implements them.
   bool prefill_attention_tensorcore(const void* q, const void* k_layer, const void* v_layer,
                                     void* out, int rows, int base_pos, int num_heads,
-                                    int num_kv_heads, int head_dim);
+                                    int num_kv_heads, int head_dim, int q_stride);
+
+  // Eligibility + scratch allocation for the above, decided ONCE per chunk. The caller needs the
+  // answer BEFORE the layer loop: if it skips the Q/K/V split copies and the tensor-core path
+  // then declined mid-loop, there would be no contiguous Q left to fall back to.
+  bool prefill_tc_prepare(int rows, int base_pos, int num_heads, int num_kv_heads, int head_dim);
 
   // Runs the logits decode graph and LEAVES the logits on the device. Returns false if the
   // graph is unavailable (caller must fall back). This is the half of
