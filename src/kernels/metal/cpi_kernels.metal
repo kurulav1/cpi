@@ -378,6 +378,12 @@ kernel void cpi_gemm_f16(device const half* w [[buffer(0)]], device const half* 
 }
 
 // Fills one K-block of the weight tile, dequantizing on the way in.
+//
+// The tile is stored K-MAJOR -- Ws[k][row], not Ws[row][k]. The weights are [out_dim, in_dim]
+// row-major, so a matrix fragment of them is [8k x 8rows]: the TRANSPOSE of how they sit in
+// memory. Taking that transpose in simdgroup_load costs real time on every K-step. The
+// dequant loop writes scalars anyway, so it can just as easily scatter them into K-major
+// order once, and the fragment load becomes an ordinary one.
 static inline void load_qblock(threadgroup half* Ws, threadgroup float* sc_row,
                                device const uchar* qw, device const float* scales, uint row0,
                                uint k0, uint groups, uint gsz, uint bits, uint packed_row, uint lid,
@@ -400,14 +406,14 @@ static inline void load_qblock(threadgroup half* Ws, threadgroup float* sc_row,
           *(device const uint*)(qw + (ulong)(row0 + r) * (ulong)packed_row + (col0 >> 1));
       for (uint e = 0u; e < 8u; ++e) {
         const int nib = int((packed >> (4u * e)) & 0xFu);
-        Ws[r * GEMM_BK + sub * 8u + e] = half(float((nib ^ 0x8) - 0x8) * sc);
+        Ws[(sub * 8u + e) * GEMM_BM + r] = half(float((nib ^ 0x8) - 0x8) * sc);
       }
     } else {
       const uint2 packed = *(device const uint2*)(qw + (ulong)(row0 + r) * (ulong)packed_row + col0);
       for (uint e = 0u; e < 8u; ++e) {
         const uint word = (e < 4u) ? packed.x : packed.y;
         const int q = int(as_type<char>(uchar((word >> (8u * (e & 3u))) & 0xFFu)));
-        Ws[r * GEMM_BK + sub * 8u + e] = half(float(q) * sc);
+        Ws[(sub * 8u + e) * GEMM_BM + r] = half(float(q) * sc);
       }
     }
   }
@@ -468,9 +474,9 @@ kernel void cpi_gemm_quant(device const uchar* qw [[buffer(0)]],
 
     for (uint kk = 0u; kk < GEMM_BK; kk += 8u) {
       simdgroup_half8x8 wf[4], af[4];
+      // Ws is K-major, so [8k x 8rows] loads straight -- no transpose.
       for (uint i = 0u; i < 4u; ++i)
-        simdgroup_load(wf[i], Ws + (sg_row * 32u + i * 8u) * GEMM_BK + kk, GEMM_BK, ulong2(0, 0),
-                       true);
+        simdgroup_load(wf[i], Ws + kk * GEMM_BM + sg_row * 32u + i * 8u, GEMM_BM);
       for (uint j = 0u; j < 4u; ++j)
         simdgroup_load(af[j], As + (sg_col * 32u + j * 8u) * GEMM_BK + kk, GEMM_BK);
       for (uint i = 0u; i < 4u; ++i)
