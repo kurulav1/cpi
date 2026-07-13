@@ -275,18 +275,44 @@ Decode is measured from a short prompt on both sides; it falls to ~17.8 tok/s on
 holds 551 tokens, which is the shape of attention, not of the backend.
 
 Not parity, and worth being precise about where the remaining gap is rather than rounding it
-off. Prefill is 75% one kernel — the quantized blocked GEMM — running at ~3.0 TFLOP/s, roughly
-70% of this chip's peak. There is no cheap multiple left in it.
+off. Both figures above are from `llama-bench -p 512 -n 64` and CPI's `--benchmark` on the same
+machine, same weights, minutes apart.
 
-The road here is a useful record of how to *not* find a bottleneck. Four changes aimed at that
-GEMM's inner loop — double-buffered K-blocks, 4×4 register tiling, a wider token tile, dropping
-a transposed fragment load — each moved prefill by under 5%, because the inner loop was never
-the problem. Per-kernel profiling (`CPI_METAL_PROFILE=1`) found the real one immediately: a
-551-token prompt chunks into 512 + 39, and the 39-token tail could not fill a GEMM tile, so it
-fell to the scalar GEMV — which re-streams the entire model once per 8-token tile. Those 39
-tokens swept 4.9 GB of weights five times and cost **a third of the prefill**. Letting the GEMM
-take the tail as a masked tile: 104 → 142 tok/s. Blocking prefill attention over queries, so a
-key block serves 8 of them instead of one: 142 → 161.
+Prefill is 75% one kernel — the quantized blocked GEMM — and it runs at **~3.5 TFLOP/s, about
+85% of this chip's rated 4.26 TFLOPS FP32 peak.** llama.cpp sustains ~3.9 TFLOP/s across its
+*whole* prefill, so its GEMM is faster than the FP32 peak: it is reaching fp16 rate somewhere we
+are not. Where, we don't know yet — and the honest version of that sentence is more useful than a
+guess.
+
+What is known, because it was measured and not assumed:
+
+| tried | result |
+| --- | --- |
+| double-buffered K-blocks | +1 tok/s — reverted |
+| 4×4 register tiling (16 matrix ops per 8 loads, was 8 per 9) | +4 |
+| widened the token tile 64 → 128 (halves weight traffic) | 0 |
+| K-major weight tile, dropping the transposed fragment load | +1 |
+| deepening the K-block 32 → 64 | **−13** (costs occupancy) |
+| activation fragments straight from device (frees threadgroup memory) | **−7** |
+| padding the tile stride to break 8-way bank conflicts | **−4** |
+| **half accumulators** (the only path past the FP32 peak) | **−107** — Apple's matrix units have no fast half-accumulate path |
+
+Eight attempts at that inner loop, none worth more than 5%, and the two that *should* have been
+free both lost. That is what a kernel sitting on a hardware wall looks like. The wins that did
+land came from structure, not from the loop:
+
+- **The token tail was falling to the scalar GEMV.** A 551-token prompt chunks into 512 + 39, and
+  the 39-token tail could not fill a GEMM tile, so it went to the GEMV — which re-streams the
+  whole model once per 8-token tile. Those 39 tokens swept 4.9 GB of weights five times and cost
+  **a third of the prefill**. Letting the GEMM take the tail as a masked tile: **104 → 142 tok/s**.
+- **Prefill attention was O(T²) in device traffic.** Each (token, head) threadgroup walked the
+  whole KV cache alone — ~80 GB at ~73 GB/s. Blocking over 8 queries, so a key block serves eight
+  of them: **142 → 161**.
+
+Both were found by per-kernel profiling (`CPI_METAL_PROFILE=1`), in one shot, after four
+inner-loop optimizations had each moved nothing. The op-level profile said "GEMM = 75%" and was
+technically true and completely misleading: `OpKind::Gemv` dispatches two different kernels, and
+the cheap-looking one was eating a third of the run.
 
 **Correctness.** Qwen2.5-0.5B, Qwen3-0.6B and gemma-2b each reproduce the CUDA backend's greedy
 token stream exactly on an Apple M4 (`src/tests/golden/`). `metal_decode_test` gates on two
