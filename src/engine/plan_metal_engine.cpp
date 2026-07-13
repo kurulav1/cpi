@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
@@ -529,13 +530,24 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
 // Encodes a whole forward WITHOUT committing, so the caller can append more work
 // (the argmax) to the same command buffer and sync once instead of twice.
 void PlanMetalEngine::encode_forward(int token, int position) {
+  // CPI_METAL_LAYERS=N runs only the first N layers. A NaN has to start SOMEWHERE, and
+  // bisecting on the layer count finds where far faster than reasoning about which op
+  // could overflow.
+  static const int layer_limit = [] {
+    const char* e = std::getenv("CPI_METAL_LAYERS");
+    return e != nullptr ? std::atoi(e) : -1;
+  }();
+
   // Unified memory: writing the token and the position IS the H2D transfer.
   *static_cast<std::int32_t*>(tok_buf_.contents()) = static_cast<std::int32_t>(token);
   *static_cast<std::int32_t*>(pos_buf_.contents()) = static_cast<std::int32_t>(position);
 
   execute_ops(plan_.prologue, -1, position, 1);
+  int done = 0;
   for (const opplan::LayerPlan& lp : plan_.layers) {
+    if (layer_limit >= 0 && done >= layer_limit) break;
     execute_ops(lp.ops, lp.layer_index, position, 1);
+    ++done;
   }
   execute_ops(plan_.epilogue, -1, position, 1);
 }
