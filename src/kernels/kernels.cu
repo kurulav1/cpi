@@ -1014,8 +1014,43 @@ void launch_attention_prefill(const half* q, const half* k_cache, const half* v_
                               int window) {
   const int causal_i = causal ? 1 : 0;
   const dim3 grid(num_heads, num_tokens);
+  // Prefill attention is 84% of all prefill GPU time and CPI's prefill is 3-5x behind
+  // llama.cpp (the prefill GEMMs are already on cutlass tensor cores; this kernel is not).
+  // Nsight: compute 31%, DRAM 0.2%, ACHIEVED OCCUPANCY 45.5% with a 64-thread block -- bound
+  // by neither compute nor memory, just under-occupied. Widening the block is the cheap half
+  // of the fix; tensor cores are the other half. LLAMA_INFER_PREFILL_WARPS overrides for A/B.
+  static const int env_warps = [] {
+    const char* e = std::getenv("LLAMA_INFER_PREFILL_WARPS");
+    return e ? atoi(e) : 0;
+  }();
   if (head_dim > 0 && (head_dim % 2) == 0 && head_dim <= 256) {
     if (head_dim <= 64) {
+      // Default stays at 2 warps. TRIED 4: it is +4% prefill (16440 -> 17097 tok/s) but it
+      // CHANGES MODEL OUTPUT -- more warps means a different fp32 accumulation order in the
+      // softmax/dot reduction, which shifts logits enough to flip a greedy argmax, and the
+      // 6-model text gate caught it (5 identical, 1 differing). 4% is not worth perturbing
+      // every model's output. (8 warps is also just slower: 11440.)
+      //
+      // Occupancy is NOT the lever here anyway. Nsight: compute 31% on the PLAIN FMA PIPE,
+      // DRAM 0.2%, occupancy 45%. The kernel is 84% of prefill and CPI's prefill is 3-5x
+      // behind llama.cpp because this runs scalar FMA while llama.cpp runs flash-attention on
+      // TENSOR CORES. That is the real 5x, and it is a kernel rewrite, not a launch-config
+      // tweak. LLAMA_INFER_PREFILL_WARPS is kept for experimenting.
+      const int w = (env_warps > 0) ? env_warps : 2;
+      const std::size_t smem64 = static_cast<std::size_t>(head_dim) * sizeof(half) +
+                                 static_cast<std::size_t>(3 * w + 2) * sizeof(float);
+      if (w >= 8) {
+        attention_prefill_kernel_tiled<8><<<grid, 8 * 32, smem64, stream>>>(
+            q, k_cache, v_cache, out, num_tokens, start_position, num_heads, num_kv_heads, head_dim,
+            causal_i, limits, window);
+        return;
+      }
+      if (w >= 4) {
+        attention_prefill_kernel_tiled<4><<<grid, 4 * 32, smem64, stream>>>(
+            q, k_cache, v_cache, out, num_tokens, start_position, num_heads, num_kv_heads, head_dim,
+            causal_i, limits, window);
+        return;
+      }
       constexpr int warps = 2;
       constexpr int threads = warps * 32;
       const std::size_t smem = static_cast<std::size_t>(head_dim) * sizeof(half) +
