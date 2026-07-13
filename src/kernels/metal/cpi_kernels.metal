@@ -281,8 +281,13 @@ kernel void cpi_lm_head(
   if (lane == 0u) out[row] = acc;
 }
 
-#define GEMM_BM 64  // rows per threadgroup
-#define GEMM_BN 64  // tokens per threadgroup
+#define GEMM_BM 64   // rows per threadgroup
+// Tokens per threadgroup. This is the WEIGHT-TRAFFIC knob, and it is the one that matters:
+// a threadgroup streams the whole row-block's weights from device memory to serve its token
+// tile, so a prefill of T tokens re-reads every weight T/GEMM_BN times. At 64 the 8B's 4.9 GB
+// of int4 weights were pulled 8 times over. Nothing in the inner loop -- prefetch, register
+// tiling, dropping the transposed load -- moved the kernel, because none of them touched this.
+#define GEMM_BN 128
 // K per stage. 32 halves == a 64-byte cache line per row, and 8 per thread == one 128-bit
 // load, so a K-block fill is exactly one wide load per thread and no byte is read twice.
 #define GEMM_BK 32
@@ -307,8 +312,8 @@ kernel void cpi_gemm_f16(device const half* w [[buffer(0)]], device const half* 
                          uint nthr [[threads_per_threadgroup]]) {
   const uint sgid = lid / 32u;
   const uint lane = lid % 32u;
-  const uint sg_row = sgid / 2u;  // 2x2 grid of simdgroups over the 64x64 tile
-  const uint sg_col = sgid % 2u;
+  const uint sg_row = sgid / 4u;  // 2x4 grid of simdgroups over the 64x128 tile
+  const uint sg_col = sgid % 4u;
 
   const uint row_blocks = p.out_dim / GEMM_BM;
   const uint row0 = (tgid % row_blocks) * GEMM_BM;
@@ -438,8 +443,8 @@ kernel void cpi_gemm_quant(device const uchar* qw [[buffer(0)]],
                            uint nthr [[threads_per_threadgroup]]) {
   const uint sgid = lid / 32u;
   const uint lane = lid % 32u;
-  const uint sg_row = sgid / 2u;
-  const uint sg_col = sgid % 2u;
+  const uint sg_row = sgid / 4u;
+  const uint sg_col = sgid % 4u;
 
   const uint row_blocks = p.out_dim / GEMM_BM;
   const uint row0 = (tgid % row_blocks) * GEMM_BM;

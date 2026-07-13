@@ -80,10 +80,12 @@ struct QuantParams {
 
 constexpr int kTG = 256;               // threads per group
 constexpr int kSimdsPerTG = kTG / 32;  // = rows per threadgroup in the GEMV
-// The blocked GEMMs run 128 threads, not 256: each of their 4 simdgroups owns a 32x32
-// output tile (4x4 fragments), so fewer threads each hold more accumulators. That is what
-// pays for the matrix units -- 16 matrix ops per 8 fragment loads instead of 8 per 9.
-constexpr int kGemmTG = 128;
+// The blocked GEMMs tile 64 rows x 128 tokens: 8 simdgroups (256 threads), each owning a
+// 32x32 output tile of 4x4 fragments. The token width is the weight-traffic knob -- a
+// threadgroup streams its row-block's whole weight strip from device memory, so the wider
+// the token tile, the fewer times a prefill re-reads the model.
+constexpr int kGemmTG = 256;
+constexpr int kGemmBN = 128;
 constexpr int kArgmaxParts = 256;
 constexpr int kGemvTile = 8;  // MUST match GEMV_TILE in cpi_kernels.metal
 
@@ -420,13 +422,13 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
           // QUANTIZED blocked GEMM, which dequantizes each weight once into threadgroup
           // memory and then reuses it across all 32 tokens.
           const bool qgemm_ok = op.cols % 64 == 0 && op.in_dim % 32 == 0;
-          const int qgemm_tokens = qgemm_ok ? (T / 64) * 64 : 0;
+          const int qgemm_tokens = qgemm_ok ? (T / kGemmBN) * kGemmBN : 0;
 
-          if (qgemm_tokens >= 64) {
+          if (qgemm_tokens >= kGemmBN) {
             QuantParams gp = p;
             gp.tokens = static_cast<std::uint32_t>(qgemm_tokens);
             const std::size_t groups = (static_cast<std::size_t>(op.cols) / 64) *
-                                       (static_cast<std::size_t>(qgemm_tokens) / 64);
+                                       (static_cast<std::size_t>(qgemm_tokens) / kGemmBN);
             ctx_.dispatch("cpi_gemm_quant", G::Groups, groups, kGemmTG, bufs, offs, 5, &gp,
                           sizeof(gp));
           }
@@ -465,13 +467,13 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
         // Decode (T=1) stays on the GEMV: a matrix unit cannot help when one operand is a
         // vector. Token remainders below 32 do too.
         const bool gemm_ok = op.cols % 64 == 0 && op.in_dim % 32 == 0;
-        const int gemm_tokens = gemm_ok ? (T / 64) * 64 : 0;
+        const int gemm_tokens = gemm_ok ? (T / kGemmBN) * kGemmBN : 0;
 
-        if (gemm_tokens >= 64) {
+        if (gemm_tokens >= kGemmBN) {
           GemvParams gp{static_cast<std::uint32_t>(op.cols), static_cast<std::uint32_t>(op.in_dim),
                         static_cast<std::uint32_t>(gemm_tokens), op.bias != nullptr ? 1u : 0u};
           const std::size_t groups = (static_cast<std::size_t>(op.cols) / 64) *
-                                     (static_cast<std::size_t>(gemm_tokens) / 64);
+                                     (static_cast<std::size_t>(gemm_tokens) / kGemmBN);
           ctx_.dispatch("cpi_gemm_f16", G::Groups, groups, kGemmTG, bufs, offs, 4, &gp, sizeof(gp));
         }
 
