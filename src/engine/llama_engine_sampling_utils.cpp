@@ -5,7 +5,6 @@
 #include <unordered_set>
 #include <vector>
 
-#include "llama_engine_internal.hpp"
 #include "engine/sampling.hpp"  // shared decls — compile-time check the sampler signatures match
 namespace engine {
 namespace {

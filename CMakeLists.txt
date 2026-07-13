@@ -117,6 +117,10 @@ set(LLAMA_ENGINE_SOURCES
   # Backend-neutral: a plan is just data, so the builder belongs outside any
   # GPU backend and is shared by the CUDA and Metal executors alike.
   src/engine/op_plan_builder.cpp
+  # The shared sampler (temperature / top-k / top-p / repetition penalty / n-gram).
+  # It has no CUDA in it and never did; it was only ever in the CUDA block because it
+  # lived next to LlamaEngine. Metal needs it, so it moves to the portable list.
+  src/engine/llama_engine_sampling_utils.cpp
   src/grammar/grammar.cpp
   src/grammar/json_schema_to_grammar.cpp
   src/grammar/grammar_sampler.cpp
@@ -152,7 +156,6 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
     src/engine/llama_engine_graph.cpp
     src/engine/llama_engine_forward.cpp
     src/engine/llama_engine_forward_decode.cpp
-    src/engine/llama_engine_sampling_utils.cpp
     src/engine/llama_engine_generation.cpp
     src/engine/llama_engine_batched_decode.cpp
     src/engine/llama_engine_sampling.cpp
@@ -331,6 +334,10 @@ add_test(NAME grammar_test COMMAND grammar_test)
 add_executable(op_plan_builder_test
   src/tests/op_plan_builder_test.cpp
   src/engine/op_plan_builder.cpp
+  # The shared sampler (temperature / top-k / top-p / repetition penalty / n-gram).
+  # It has no CUDA in it and never did; it was only ever in the CUDA block because it
+  # lived next to LlamaEngine. Metal needs it, so it moves to the portable list.
+  src/engine/llama_engine_sampling_utils.cpp
 )
 target_include_directories(op_plan_builder_test PRIVATE include)
 add_test(NAME op_plan_builder_test COMMAND op_plan_builder_test)

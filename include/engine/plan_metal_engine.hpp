@@ -68,6 +68,21 @@ public:
   // Greedy decode. Argmax runs on the GPU so the vocab never crosses to the host.
   std::vector<int> generate_greedy(const std::vector<int>& prompt, int max_new);
 
+  // Sampled decode, through CPI's shared sampler -- the same code path LlamaEngine
+  // uses, not a second implementation. Greedy (temperature <= 0) still takes the
+  // on-GPU argmax; anything else needs the logits on the host anyway, because
+  // repetition penalty and n-gram blocking rescore tokens outside any top-k set.
+  struct Sampling {
+    float temperature = 0.0f;
+    int top_k = 0;
+    float top_p = 1.0f;
+    float repetition_penalty = 1.0f;
+    int no_repeat_ngram_size = 0;
+    int eos_id = -1;
+    unsigned seed = 0;
+  };
+  std::vector<int> generate(const std::vector<int>& prompt, int max_new, const Sampling& s);
+
   // Wall time of the last prompt prefill, and how many tokens it covered.
   double last_prefill_ms() const {
     return prefill_ms_;

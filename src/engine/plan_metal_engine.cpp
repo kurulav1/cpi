@@ -8,6 +8,8 @@
 #include <cstring>
 #include <stdexcept>
 
+#include "engine/sampling.hpp"
+
 namespace engine {
 
 namespace {
@@ -248,9 +250,11 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
   // intermediate) is only a few MB, and unified memory means it costs nothing to move.
   max_prefill_ = std::min(512, max_context);
 
-  if (cfg_.is_moe() || cfg_.mlp_gelu) {
-    throw std::runtime_error(
-        "PlanMetalEngine handles dense SwiGLU decoders only (no MoE / GeGLU yet)");
+  if (cfg_.is_moe()) {
+    throw std::runtime_error("PlanMetalEngine: MoE models are not supported yet");
+  }
+  if (cfg_.use_layernorm) {
+    throw std::runtime_error("PlanMetalEngine: true LayerNorm (mean+variance) is not implemented");
   }
 
   const int H = cfg_.hidden_size;
@@ -280,6 +284,8 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
   g.has_qkv_bias = cfg_.has_qkv_bias;
   g.has_qk_norm = cfg_.has_qk_norm;
   g.scale_embeddings = cfg_.scale_embeddings;
+  g.mlp_gelu = cfg_.mlp_gelu;
+  g.norm_offset = cfg_.mlp_gelu;  // Gemma stores its RMSNorm weights as (w - 1)
 
   wsrc_ = std::make_unique<MetalWeights>(ctx_, weights_, wbuf_);
   if (quant_bits == 4 || quant_bits == 8) {
@@ -572,6 +578,47 @@ const std::vector<float>& PlanMetalEngine::forward_token(int token, int position
   const float* src = static_cast<const float*>(logits_buf_.contents());
   std::memcpy(logits_.data(), src, logits_.size() * sizeof(float));
   return logits_;
+}
+
+std::vector<int> PlanMetalEngine::generate(const std::vector<int>& prompt, int max_new,
+                                           const Sampling& s) {
+  // Greedy keeps the on-GPU argmax: the vocab never crosses to the host, which is
+  // worth a lot at 152k tokens.
+  if (s.temperature <= 0.0f && s.repetition_penalty <= 1.0f && s.no_repeat_ngram_size <= 1) {
+    return generate_greedy(prompt, max_new);
+  }
+  if (prompt.empty()) throw std::runtime_error("empty prompt");
+
+  detail::dispatch_seed_sampler_rng(s.seed);
+
+  std::vector<int> out;
+  std::vector<int> history = prompt;  // the sampler needs it for penalties / n-grams
+  int pos = 0;
+
+  const int n_pre = static_cast<int>(prompt.size()) - 1;
+  const auto pre0 = std::chrono::steady_clock::now();
+  for (int off = 0; off < n_pre; off += max_prefill_) {
+    const int chunk = std::min(max_prefill_, n_pre - off);
+    const std::vector<int> ids(prompt.begin() + off, prompt.begin() + off + chunk);
+    encode_prefill(ids, pos);
+    ctx_.commit_and_wait();
+    pos += chunk;
+  }
+  prefill_ms_ =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pre0).count();
+  prefill_tokens_ = n_pre;
+
+  int next = prompt.back();
+  for (int i = 0; i < max_new; ++i, ++pos) {
+    std::vector<float> lg = forward_token(next, pos);  // a copy: the sampler edits in place
+    next = detail::dispatch_sample_from_logits(
+        lg, s.temperature, s.top_k, s.top_p, s.repetition_penalty, s.no_repeat_ngram_size, history);
+    if (s.eos_id >= 0 && next == s.eos_id) break;
+    out.push_back(next);
+    history.push_back(next);
+    if (pos + 1 >= max_context_) break;
+  }
+  return out;
 }
 
 std::vector<int> PlanMetalEngine::generate_greedy(const std::vector<int>& prompt, int max_new) {

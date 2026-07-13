@@ -41,6 +41,7 @@ int main(int argc, char** argv) {
   int max_context = 2048;
   int quant_bits = 0;
   int quant_group = 0;
+  engine::PlanMetalEngine::Sampling samp;
 
   for (int i = 2; i < argc; ++i) {
     const std::string a = argv[i];
@@ -63,6 +64,16 @@ int main(int argc, char** argv) {
       quant_bits = std::atoi(val("--quant").c_str());
     } else if (a == "--quant-group") {
       quant_group = std::atoi(val("--quant-group").c_str());
+    } else if (a == "--temp") {
+      samp.temperature = std::stof(val("--temp"));
+    } else if (a == "--top-k") {
+      samp.top_k = std::atoi(val("--top-k").c_str());
+    } else if (a == "--top-p") {
+      samp.top_p = std::stof(val("--top-p"));
+    } else if (a == "--repeat-penalty") {
+      samp.repetition_penalty = std::stof(val("--repeat-penalty"));
+    } else if (a == "--seed") {
+      samp.seed = static_cast<unsigned>(std::atoi(val("--seed").c_str()));
     } else {
       std::printf("unknown argument: %s\n", a.c_str());
       usage();
@@ -97,7 +108,7 @@ int main(int argc, char** argv) {
   std::fprintf(stderr, "[metal] prompt: %zu tokens\n", ids.size());
 
   const auto t0 = std::chrono::steady_clock::now();
-  const std::vector<int> out = eng.generate_greedy(ids, max_new);
+  const std::vector<int> out = eng.generate(ids, max_new, samp);
   const auto t1 = std::chrono::steady_clock::now();
   const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 

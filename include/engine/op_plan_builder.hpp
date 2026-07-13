@@ -85,6 +85,12 @@ struct LlamaGeometry {
   // heads=16 and head_dim=128 (so q_dim=2048 != hidden). Deriving it from hidden
   // silently builds the wrong model -- callers must set it from the weights.
 
+  // Gemma's MLP is GeGLU (tanh-GELU), not SwiGLU, and its RMSNorm weights are stored
+  // as (w - 1) so the norm scales by (1 + w). Both are ops that already exist -- a
+  // capability flag, not a fork.
+  bool mlp_gelu = false;
+  bool norm_offset = false;
+
   // Some models (Gemma-style) scale the token embedding by sqrt(hidden). Llama and
   // Qwen do not. Kept here because it is geometry, not identity.
   bool scale_embeddings = false;
