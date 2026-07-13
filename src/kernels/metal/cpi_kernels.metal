@@ -314,7 +314,10 @@ kernel void cpi_gemm_f16(
     simdgroup_half8x8 b;  // [8 k x 8 rows]  <- W loaded transposed
     simdgroup_load(a, in + (ulong)tok0 * (ulong)p.in_dim + k, p.in_dim);
     simdgroup_load(b, W + (ulong)row0 * (ulong)p.in_dim + k, p.in_dim, ulong2(0, 0), true);
-    simdgroup_multiply_accumulate(acc, a, b);
+    // The 4-argument form (d = a*b + c). There is no 3-argument overload that takes a
+    // float accumulator with half operands -- and a HALF accumulator would be wrong here:
+    // K runs to 4096+, and fp16 accumulation over that many terms loses real precision.
+    simdgroup_multiply_accumulate(acc, a, b, acc);
   }
 
   // Stage the tile through threadgroup memory so each lane can add the bias and narrow
