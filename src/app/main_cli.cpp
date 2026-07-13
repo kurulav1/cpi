@@ -326,6 +326,11 @@ ParsedArgs parse_args(int argc, char** argv) {
       args.opts.eos_token_id = std::stoi(need_val("--eos-token"));
     } else if (arg == "--no-loop-guard") {
       args.opts.loop_guard = false;
+    } else if (arg == "--no-prefix-reuse") {
+      // Required to BENCHMARK prefill. With reuse on, a repeated prompt skips prefill entirely
+      // (prefill_ms=0.00), so the only prefill that can be timed is a COLD one -- and a cold
+      // prefill is dominated by one-time cuBLAS plan setup, not by prefill work.
+      args.opts.disable_prefix_reuse = true;
     } else if (arg == "--stop-text") {
       args.stop_texts.push_back(need_val("--stop-text"));
     } else if (arg == "--rope-theta") {

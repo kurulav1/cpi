@@ -19,6 +19,12 @@ struct EngineOptions {
   float top_p = 0.9f;
   float repetition_penalty = 1.0f;
   int no_repeat_ngram_size = 0;
+  // Disables reuse of the previous request's KV prefix. Off by default (reuse is a real win for
+  // chat, where every turn re-sends the history). Needed for BENCHMARKING prefill: with reuse on,
+  // a second run of the same prompt skips prefill entirely and reports prefill_ms=0.00, so the
+  // only prefill you can ever time is a COLD one -- which is dominated by one-time cuBLAS plan
+  // setup and is not a steady-state number.
+  bool disable_prefix_reuse = false;
   bool int8_streaming = false;
   int streaming_quant_bits = 8;
   bool prefer_lowbit_cache = false;

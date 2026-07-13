@@ -446,6 +446,7 @@ std::vector<int> LlamaEngine::generate_stream(const std::vector<int>& prompt_tok
   // the simple contiguous fp16 KV layout is eligible; paged / int4-KV / TQ3 /
   // MoE / sliding-window configs take a full reset + prefill.
   const bool prefix_cacheable =
+      !options_.disable_prefix_reuse &&                      // benchmarking wants a real prefill
       !options_.paged_kv_cache && !options_.paged_blocks &&  // paged: each request gets its own
       !kv_int4_enabled_ && !tq3_enabled_ &&             // block table, so prior KV isn't at the
       !cfg.is_moe() && !cfg.uses_non_full_attention();  // same physical blocks (paged shared-prefix
