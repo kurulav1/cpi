@@ -146,6 +146,37 @@ void LlamaEngine::load_static_weights() {
   CUDA_CHECK(cudaMalloc(&d_lm_head_, out_bytes));
   CUDA_CHECK(
       cudaMemcpy(d_lm_head_, weights_.tensor_data(out_name), out_bytes, cudaMemcpyHostToDevice));
+
+  // Weight-only int8 LM head, when the user asked for a quantized model.
+  //
+  // Only the WEIGHTS are quantized -- the activation stays fp16 and the dot accumulates in
+  // fp32 (see launch_weight_only_int8_gemv_f32). This is the one layer that decides the output
+  // token, so it does NOT go through the dp4a path that would also quantize the activation.
+  //
+  // Row-wise scales: one per vocabulary row, so a few loud rows cannot squash the rest.
+  // LLAMA_INFER_FP16_LM_HEAD=1 keeps the LM head in fp16 even under --weight-quant. This is
+  // the ONE change in the engine that alters model output (quantization error lands directly in
+  // the logits), so it needs an A/B switch for the perplexity gate.
+  const bool force_fp16_lm_head = [] {
+    const char* e = std::getenv("LLAMA_INFER_FP16_LM_HEAD");
+    return e && *e == '1';
+  }();
+  if (lowbit_streaming_enabled(options_) && !force_fp16_lm_head) {
+    const auto& lm_cfg = weights_.config();
+    const int vocab = lm_cfg.vocab_size;
+    const int lm_in = lm_cfg.hidden_size;
+    CUDA_CHECK(cudaMalloc(&d_lm_head_i8_,
+                          static_cast<std::size_t>(vocab) * static_cast<std::size_t>(lm_in)));
+    CUDA_CHECK(cudaMalloc(&d_lm_head_i8_scales_, static_cast<std::size_t>(vocab) * sizeof(float)));
+    kernels::launch_quantize_rowwise_fp16_to_int8(static_cast<const __half*>(d_lm_head_),
+                                                  d_lm_head_i8_, d_lm_head_i8_scales_, vocab, lm_in,
+                                                  compute_stream_);
+    CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
+    lm_head_int8_ = true;
+    if (options_.verbose) {
+      std::cout << "[engine] lm_head=int8 (" << vocab << "x" << lm_in << ")\n";
+    }
+  }
   if (weights_.has_tensor("output.bias")) {
     const std::size_t out_bias_bytes = static_cast<std::size_t>(cfg.vocab_size) * sizeof(__half);
     CUDA_CHECK(cudaMalloc(&d_lm_head_bias_, out_bias_bytes));

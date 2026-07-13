@@ -540,6 +540,12 @@ private:
   void* d_norm_out_ = nullptr;        // Final RMSNorm scale vector on device.
   void* d_norm_out_bias_ = nullptr;   // Optional final norm bias [hidden].
   void* d_lm_head_ = nullptr;         // LM-head projection weight matrix on device.
+  // int8 LM head (weight-only). An 8B's LM head is 1.05 GB in fp16 -- 22% of everything an
+  // int4 8B reads per token. Built only when weight quantization is on. The fp16 copy is KEPT:
+  // the batched-decode path drives the LM head through cuBLAS and still needs it.
+  std::int8_t* d_lm_head_i8_ = nullptr;
+  float* d_lm_head_i8_scales_ = nullptr;
+  bool lm_head_int8_ = false;
   void* d_lm_head_bias_ = nullptr;    // Optional lm_head bias [vocab].
 
   // Per-step decode scratch buffers on device.

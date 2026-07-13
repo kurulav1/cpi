@@ -606,6 +606,18 @@ void launch_pack_rowwise_int8_to_int4(const std::int8_t* src, std::int8_t* dst, 
 //   out_features - number of output rows (one block per row)
 //   in_features  - inner dimension; reduction done with shared-memory tree
 //   stream       - CUDA stream
+// launch_weight_only_int8_gemv_f32
+//
+// int8 weight-only GEMV with fp16 activations and FLOAT output: the LM head.
+//   y[row] = scales[row] * sum_k w[row, k] * x[k]
+// Only the WEIGHTS are quantized -- x stays fp16 and the dot accumulates in fp32. The dp4a
+// kernels quantize the activation too, which is the wrong trade in the one layer that decides
+// the output token (x is 8 KB; the weight is 1 GB). An 8B LM head is 1.05 GB fp16; int8 halves
+// it, and that is 22% of everything an int4 8B reads per token.
+void launch_weight_only_int8_gemv_f32(const std::int8_t* w, const float* scales, const half* x,
+                                      float* y, int out_features, int in_features,
+                                      cudaStream_t stream);
+
 void launch_weight_only_int8_matvec(const std::int8_t* w, const float* scales, const half* x,
                                     half* y, int out_features, int in_features,
                                     cudaStream_t stream);

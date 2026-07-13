@@ -84,6 +84,59 @@ __device__ __forceinline__ int load_packed_int4x4(const int8_t* row_packed, int 
                        static_cast<std::uint8_t>(row_packed[byte_index + 1]));
 }
 
+// int8 weight-only GEMV with fp16 activations and FLOAT output -- the LM head.
+//
+// Why a new kernel rather than the dp4a ones: the LM head must emit fp32 logits (the argmax
+// and the top-k sampler read floats), and every existing int8 matvec writes half. It also
+// keeps the ACTIVATION in fp16 and accumulates in fp32 -- only the weights are quantized.
+// That matters here: the dp4a path would additionally quantize x to int8, and stacking
+// activation error on top of weight error in the one layer that decides the output token is a
+// bad trade for the ~nothing it saves (x is 8 KB; the weight is 1 GB).
+//
+// Bandwidth is the whole point: an 8B's LM head is 128256 x 4096 fp16 = 1.05 GB, which is 22%
+// of everything an int4 8B reads per token. int8 halves it.
+//
+// 128-bit loads on both operands (one int4 = 16 int8 weights = 16 halves of x, so two x
+// vectors per weight vector), per the lesson that keeps repeating in this engine.
+template <int Warps>
+__global__ void weight_only_int8_gemv_f32_kernel(const int8_t* __restrict__ w,
+                                                 const float* __restrict__ scales,
+                                                 const half* __restrict__ x, float* __restrict__ y,
+                                                 int out_features, int in_features) {
+  const int row = blockIdx.x * Warps + (threadIdx.x / warpSize);
+  if (row >= out_features) {
+    return;
+  }
+  const int lane = threadIdx.x & (warpSize - 1);
+  const int8_t* wrow = w + static_cast<std::size_t>(row) * static_cast<std::size_t>(in_features);
+  const int vecs = in_features / 16;  // 16 int8 weights per 128-bit load
+
+  float acc = 0.0f;
+  for (int v = lane; v < vecs; v += warpSize) {
+    const int4 wp = reinterpret_cast<const int4*>(wrow)[v];
+    const int8_t* wb = reinterpret_cast<const int8_t*>(&wp);
+    const int4 xa = reinterpret_cast<const int4*>(x)[v * 2];
+    const int4 xb = reinterpret_cast<const int4*>(x)[v * 2 + 1];
+    const half2* xh0 = reinterpret_cast<const half2*>(&xa);
+    const half2* xh1 = reinterpret_cast<const half2*>(&xb);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const float2 a = __half22float2(xh0[j]);
+      acc += static_cast<float>(wb[j * 2 + 0]) * a.x + static_cast<float>(wb[j * 2 + 1]) * a.y;
+      const float2 b = __half22float2(xh1[j]);
+      acc += static_cast<float>(wb[8 + j * 2 + 0]) * b.x + static_cast<float>(wb[8 + j * 2 + 1]) * b.y;
+    }
+  }
+  for (int c = vecs * 16 + lane; c < in_features; c += warpSize) {
+    acc += static_cast<float>(wrow[c]) * __half2float(x[c]);
+  }
+
+  acc = warp_sum(acc);
+  if (lane == 0) {
+    y[row] = acc * scales[row];
+  }
+}
+
 __global__ void weight_only_int8_matvec_kernel(const int8_t* w, const float* scales, const half* x,
                                                half* y, int out_features, int in_features) {
   extern __shared__ float ssum[];
@@ -763,6 +816,15 @@ __global__ void weight_only_int4_matvec_dual_dp4a_tiled_kernel(
 }  // namespace
 
 // Host launch wrappers for weight-only int8/int4 matvec kernels.
+void launch_weight_only_int8_gemv_f32(const int8_t* w, const float* scales, const half* x,
+                                      float* y, int out_features, int in_features,
+                                      cudaStream_t stream) {
+  constexpr int kWarps = 4;
+  const int blocks = (out_features + kWarps - 1) / kWarps;
+  weight_only_int8_gemv_f32_kernel<kWarps>
+      <<<blocks, kWarps * 32, 0, stream>>>(w, scales, x, y, out_features, in_features);
+}
+
 void launch_weight_only_int8_matvec(const int8_t* w, const float* scales, const half* x, half* y,
                                     int out_features, int in_features, cudaStream_t stream) {
   const int threads = choose_reduction_threads(in_features);

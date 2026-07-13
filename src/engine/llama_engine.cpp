@@ -652,6 +652,15 @@ LlamaEngine::~LlamaEngine() {
   free_ptr(d_norm_out_);
   free_ptr(d_norm_out_bias_);
   free_ptr(d_lm_head_);
+  if (d_lm_head_i8_) {
+    cudaFree(d_lm_head_i8_);
+    d_lm_head_i8_ = nullptr;
+  }
+  if (d_lm_head_i8_scales_) {
+    cudaFree(d_lm_head_i8_scales_);
+    d_lm_head_i8_scales_ = nullptr;
+  }
+  lm_head_int8_ = false;
   free_ptr(d_lm_head_bias_);
   free_ptr(lt_workspace_);
   if (d_token_id_) {

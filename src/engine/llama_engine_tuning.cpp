@@ -133,6 +133,16 @@ void LlamaEngine::resident_projection_half_residual(const void* w, const void* x
 void LlamaEngine::resident_projection_float(const void* w, const void* x, void* y, int out_features,
                                             int in_features, int warps_per_block, int tile_pairs,
                                             int rows_per_warp) {
+  // The LM head is the only fp32-output projection, and when it is quantized this is the one
+  // place that has to know. Every caller -- the eager forward and BOTH decode-graph captures --
+  // funnels through here, so routing it here means the graph picks it up too. (Two launchers
+  // have bitten this engine before: the graph has its own copy of the layer code.)
+  if (lm_head_int8_ && w == d_lm_head_ && d_lm_head_i8_ != nullptr) {
+    kernels::launch_weight_only_int8_gemv_f32(d_lm_head_i8_, d_lm_head_i8_scales_,
+                                              static_cast<const __half*>(x), static_cast<float*>(y),
+                                              out_features, in_features, compute_stream_);
+    return;
+  }
   kernels::launch_rowmajor_half_gemv_f32(
       static_cast<const __half*>(w), static_cast<const __half*>(x), static_cast<float*>(y),
       out_features, in_features, compute_stream_, warps_per_block, tile_pairs, rows_per_warp);

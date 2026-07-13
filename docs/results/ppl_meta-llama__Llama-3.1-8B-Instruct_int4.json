@@ -1,0 +1,19 @@
+{
+  "schema": "cpi-ppl-v1",
+  "timestamp": "2026-07-13T07:57:53.858562Z",
+  "host": "DESKTOP-31S0GEM",
+  "platform": "Windows-11-10.0.26200-SP0",
+  "cpu": "AMD64 Family 26 Model 68 Stepping 0, AuthenticAMD",
+  "gpu": "NVIDIA GeForce RTX 5090, 32607 MiB",
+  "model_name": "meta-llama__Llama-3.1-8B-Instruct",
+  "model_dir": "artifacts/hub/meta-llama__Llama-3.1-8B-Instruct",
+  "corpus": "wikitext-2-v1/test",
+  "stride": 512,
+  "max_length": 1024,
+  "results": {
+    "int4": {
+      "mode": "int4",
+      "error": "Couldn't instantiate the backend tokenizer from one of: \n(1) a `tokenizers` library serialization file, \n(2) a slow tokenizer instance to convert or \n(3) an equivalent slow tokenizer class to instantiate and convert. \nYou need to have sentencepiece or tiktoken installed to convert a slow tokenizer to a fast one."
+    }
+  }
+}
