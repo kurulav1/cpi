@@ -282,272 +282,213 @@ kernel void cpi_lm_head(
 }
 
 // ---------------------------------------------------------------------------
-// GEMM: out[T, out_dim] = in[T, in_dim] . W[out_dim, in_dim]^T, fp16.
+// Blocked fp16 GEMM (prefill). A K-block of both operands is staged in threadgroup memory,
+// so a weight loaded from device is reused by every token in the tile. Two earlier attempts
+// streamed the operands from device on every K-step and LOST to the plain GEMV: the matrix
+// units were never the bottleneck, the traffic feeding them was.
 //
-// A prefill is a MATMUL, not a batch of matvecs. The token-tiled GEMV cuts memory
-// traffic (one weight row serves 8 tokens) but still does scalar fused-multiply-adds,
-// so it is bound by ALU issue rate, not bandwidth. Metal has dedicated matrix units --
-// simdgroup_matrix, the same silicon CUDA calls tensor cores -- and a prompt is exactly
-// the shape they exist for. Decode (T=1) stays on the GEMV: a matrix unit is useless
-// when one operand is a vector.
-//
-// Each simdgroup owns one 8x8 output tile and walks K in steps of 8. B is loaded
-// TRANSPOSED, because the weights are [out_dim, in_dim] row-major and the product needs
-// in . W^T.
-//
-// Only full 8-token tiles go here; a remainder of fewer than 8 tokens falls back to the
-// GEMV, which has no alignment constraints.
+// REGISTER TILING is the second half of that same idea. With one 8x64 strip per simdgroup
+// the inner loop issued nine fragment loads to do eight matrix ops -- starved on
+// threadgroup traffic instead of device traffic. Each simdgroup now owns a 32x32 output
+// tile (4x4 fragments), so the same eight loads feed sixteen matrix ops. The threadgroup is
+// 128 threads rather than 256: fewer threads each holding more accumulators is the point.
 // ---------------------------------------------------------------------------
-
-// BLOCKED GEMM. The two earlier attempts lost to the plain GEMV because they pulled both
-// operands out of DEVICE memory on every K-step: ~0.5 TFLOP/s against the M4's ~4. The
-// matrix units were never the bottleneck -- the memory traffic feeding them was.
-//
-// This one stages a K-block of BOTH operands into threadgroup memory once, then issues
-// many simdgroup ops out of it, so each device byte is reused many times:
-//
-//   threadgroup tile : 64 rows (out_dim) x 32 tokens, K-block of 32
-//   Ws[64][32] half  : 4 KB   -- reused by all 32 tokens
-//   As[32][32] half  : 2 KB   -- reused by all 64 rows
-//   8 simdgroups     : simdgroup s owns rows [8s, 8s+8) and all 32 tokens (4 accumulators)
-//
-// Each weight element loaded from device is used 32 times (once per token) instead of
-// once. That reuse is the whole point; the matrix units are just how you spend it.
-//
-// Requires out_dim % 64 == 0 and in_dim % 32 == 0 (true of every projection here). The
-// GEMV handles anything else, and the token remainder below 32.
-#define GEMM_BM 64  // rows per threadgroup
-#define GEMM_BN 64  // tokens per threadgroup
-// 64 rather than 32: arithmetic intensity is (BM*BN*BK) MACs per (BM*BK + BN*BK) loads,
-// so widening the token dimension raises MACs-per-byte from 21 to 32. On a machine whose
-// matrix units idle waiting for memory, that ratio IS the throughput.
-#define GEMM_BK 32  // K per stage
-
-kernel void cpi_gemm_f16(
-    device const half*  W     [[buffer(0)]],
-    device const half*  in    [[buffer(1)]],
-    device half*        out   [[buffer(2)]],
-    device const half*  bias  [[buffer(3)]],
-    constant GemvParams& p    [[buffer(4)]],
-    uint  tgid [[threadgroup_position_in_grid]],
-    uint  lid  [[thread_position_in_threadgroup]],
-    uint  nthr [[threads_per_threadgroup]]) {
-  const uint sgid = lid / 32u;   // 8 simdgroups
+kernel void cpi_gemm_f16(device const half* w [[buffer(0)]], device const half* in [[buffer(1)]],
+                         device half* out [[buffer(2)]], device const half* bias [[buffer(3)]],
+                         constant GemvParams& p [[buffer(4)]],
+                         uint tgid [[threadgroup_position_in_grid]],
+                         uint lid [[thread_position_in_threadgroup]],
+                         uint nthr [[threads_per_threadgroup]]) {
+  const uint sgid = lid / 32u;
   const uint lane = lid % 32u;
+  const uint sg_row = sgid / 2u;  // 2x2 grid of simdgroups over the 64x64 tile
+  const uint sg_col = sgid % 2u;
 
-  const uint row_blocks = p.out_dim / GEMM_BM;
+  const uint row_blocks = p.rows / GEMM_BM;
   const uint row0 = (tgid % row_blocks) * GEMM_BM;
   const uint tok0 = (tgid / row_blocks) * GEMM_BN;
   if (tok0 >= p.tokens) return;
 
-  threadgroup half Ws[GEMM_BM * GEMM_BK];  // [64][32] weights
-  threadgroup half As[GEMM_BN * GEMM_BK];  // [32][32] activations
+  threadgroup half Ws[GEMM_BM * GEMM_BK];
+  threadgroup half As[GEMM_BN * GEMM_BK];
 
-  simdgroup_float8x8 acc[8];  // 8 rows x 64 tokens
-  for (uint j = 0u; j < 8u; ++j) acc[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  simdgroup_float8x8 acc[4][4];
+  for (uint i = 0u; i < 4u; ++i)
+    for (uint j = 0u; j < 4u; ++j) acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
 
-  const uint srow = row0 + sgid * 8u;  // this simdgroup's 8 rows
+  const uint chunks = GEMM_BK / 8u;  // 8 halves == one 128-bit load
 
-  for (uint k0 = 0u; k0 < p.in_dim; k0 += GEMM_BK) {
-    // Cooperative load of the K-block. Every thread pulls a few elements; after this the
-    // whole threadgroup reads them from fast threadgroup memory instead of device.
-    // 128-bit cooperative loads: 64*32 halves / 8 = 256, one uint4 per thread.
-    {
-      const uint chunks_per_row = GEMM_BK / 8u;
-      const uint c = lid;
-      const uint r = c / chunks_per_row;
-      const uint sub = c % chunks_per_row;
-      threadgroup uint4* wdst = (threadgroup uint4*)(Ws + r * GEMM_BK + sub * 8u);
-      *wdst = *(device const uint4*)(W + (ulong)(row0 + r) * (ulong)p.in_dim + k0 + sub * 8u);
-
-      // The activations reuse the same chunk mapping. This is only valid because
-      // GEMM_BM == GEMM_BN; if they ever diverge, split these into two loops.
-      const uint tok = tok0 + r;
-      threadgroup uint4* adst = (threadgroup uint4*)(As + r * GEMM_BK + sub * 8u);
-      if (tok < p.tokens) {
-        *adst = *(device const uint4*)(in + (ulong)tok * (ulong)p.in_dim + k0 + sub * 8u);
+  for (uint k0 = 0u; k0 < p.cols; k0 += GEMM_BK) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint c = lid; c < GEMM_BM * chunks; c += nthr) {
+      const uint r = c / chunks, sub = c % chunks;
+      *(threadgroup uint4*)(Ws + r * GEMM_BK + sub * 8u) =
+          *(device const uint4*)(w + (ulong)(row0 + r) * (ulong)p.cols + k0 + sub * 8u);
+    }
+    for (uint c = lid; c < GEMM_BN * chunks; c += nthr) {
+      const uint t = c / chunks, sub = c % chunks;
+      threadgroup uint4* dst = (threadgroup uint4*)(As + t * GEMM_BK + sub * 8u);
+      if (tok0 + t < p.tokens) {
+        *dst = *(device const uint4*)(in + (ulong)(tok0 + t) * (ulong)p.cols + k0 + sub * 8u);
       } else {
-        *adst = uint4(0u);
+        *dst = uint4(0u);
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint kk = 0u; kk < GEMM_BK; kk += 8u) {
-      // b = [8k x 8rows]: W is [out_dim, in_dim], so the tile is loaded TRANSPOSED.
-      simdgroup_half8x8 b;
-      simdgroup_load(b, Ws + (sgid * 8u) * GEMM_BK + kk, GEMM_BK, ulong2(0, 0), true);
-
-      for (uint j = 0u; j < 8u; ++j) {
-        simdgroup_half8x8 a;  // [8 tokens x 8k]
-        simdgroup_load(a, As + (j * 8u) * GEMM_BK + kk, GEMM_BK);
-        // 4-arg form (d = a*b + c). A half accumulator would be wrong: K runs past 4096
-        // and fp16 accumulation over that many terms loses real precision.
-        simdgroup_multiply_accumulate(acc[j], a, b, acc[j]);
-      }
+      simdgroup_half8x8 wf[4], af[4];
+      // W is [rows, cols], so a weight fragment loads TRANSPOSED: [8k x 8rows].
+      for (uint i = 0u; i < 4u; ++i)
+        simdgroup_load(wf[i], Ws + (sg_row * 32u + i * 8u) * GEMM_BK + kk, GEMM_BK, ulong2(0, 0),
+                       true);
+      for (uint j = 0u; j < 4u; ++j)
+        simdgroup_load(af[j], As + (sg_col * 32u + j * 8u) * GEMM_BK + kk, GEMM_BK);
+      for (uint i = 0u; i < 4u; ++i)
+        for (uint j = 0u; j < 4u; ++j)
+          simdgroup_multiply_accumulate(acc[i][j], af[j], wf[i], acc[i][j]);
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
   }
 
-  // acc[j] is [8 tokens x 8 rows]. Stage through threadgroup memory to add the bias and
-  // narrow to half. Reuse Ws' storage -- the K-loop is done with it.
-  threadgroup float* stage = (threadgroup float*)Ws;
-  threadgroup float* mine = stage + sgid * 64u;
-
-  for (uint j = 0u; j < 8u; ++j) {
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    simdgroup_store(acc[j], mine, 8);
-    simdgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint i = lane; i < 64u; i += 32u) {
-      const uint t = i / 8u;  // token in this sub-tile
-      const uint r = i % 8u;  // row in this simdgroup's 8
-      const uint tok = tok0 + j * 8u + t;
-      if (tok >= p.tokens) continue;
-      float v = mine[t * 8u + r];
-      if (p.has_bias != 0u) v += float(bias[srow + r]);
-      out[(ulong)tok * (ulong)p.out_dim + srow + r] = half(v);
+  // The K-loop is done with the weight tile; reuse it to stage the accumulators out.
+  threadgroup float* mine = (threadgroup float*)Ws + sgid * 64u;
+  for (uint i = 0u; i < 4u; ++i) {
+    for (uint j = 0u; j < 4u; ++j) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      simdgroup_store(acc[i][j], mine, 8);
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+      for (uint e = lane; e < 64u; e += 32u) {
+        const uint t = e / 8u;  // token within the fragment
+        const uint r = e % 8u;  // row within the fragment
+        const uint tok = tok0 + sg_col * 32u + j * 8u + t;
+        if (tok >= p.tokens) continue;
+        const uint row = row0 + sg_row * 32u + i * 8u + r;
+        float v = mine[t * 8u + r];
+        if (p.has_bias != 0u) v += float(bias[row]);
+        out[(ulong)tok * (ulong)p.rows + row] = half(v);
+      }
     }
   }
 }
 
-// Fills one K-block of the weight tile, dequantizing on the way in. Split out so the
-// double-buffered loop can fill block n+1 while the matrix units chew on block n.
+// Fills one K-block of the weight tile, dequantizing on the way in.
 static inline void load_qblock(threadgroup half* Ws, threadgroup float* sc_row,
                                device const uchar* qw, device const float* scales, uint row0,
-                               uint k0, uint groups, uint gsz, uint bits, uint packed_row,
-                               uint lid) {
-  for (uint r = lid; r < GEMM_BM; r += 256u) {
+                               uint k0, uint groups, uint gsz, uint bits, uint packed_row, uint lid,
+                               uint nthr) {
+  // Hoisted out of the dequant inner loop: one scale load per row, not one per weight.
+  for (uint r = lid; r < GEMM_BM; r += nthr) {
     sc_row[r] = scales[(ulong)(row0 + r) * (ulong)groups + k0 / gsz];
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  // One 8-weight chunk per thread: 64 rows * 32 k / 8 == 256 threads, so every thread
-  // issues exactly one wide load and no byte is read twice.
-  const uint chunks_per_row = GEMM_BK / 8u;
-  const uint r = lid / chunks_per_row;
-  const uint sub = lid % chunks_per_row;
-  const uint col0 = k0 + sub * 8u;
-  const float sc = sc_row[r];
-
-  if (bits == 4u) {
-    device const uint* wp =
-        (device const uint*)(qw + (ulong)(row0 + r) * (ulong)packed_row + (col0 >> 1));
-    const uint packed = *wp;  // 4 bytes == 8 packed int4 weights
-    for (uint e = 0u; e < 8u; ++e) {
-      const int nib = int((packed >> (4u * e)) & 0xFu);
-      Ws[r * GEMM_BK + sub * 8u + e] = half(float((nib ^ 0x8) - 0x8) * sc);
+  // One 8-weight chunk per thread per pass: a single wide load, no byte read twice. Reading
+  // the packed weights a byte at a time is the defect that has bitten every kernel here.
+  const uint chunks = GEMM_BK / 8u;
+  for (uint c = lid; c < GEMM_BM * chunks; c += nthr) {
+    const uint r = c / chunks, sub = c % chunks;
+    const uint col0 = k0 + sub * 8u;
+    const float sc = sc_row[r];
+    if (bits == 4u) {
+      const uint packed =  // 4 bytes == 8 packed int4 weights
+          *(device const uint*)(qw + (ulong)(row0 + r) * (ulong)packed_row + (col0 >> 1));
+      for (uint e = 0u; e < 8u; ++e) {
+        const int nib = int((packed >> (4u * e)) & 0xFu);
+        Ws[r * GEMM_BK + sub * 8u + e] = half(float((nib ^ 0x8) - 0x8) * sc);
+      }
+    } else {
+      const uint2 packed = *(device const uint2*)(qw + (ulong)(row0 + r) * (ulong)packed_row + col0);
+      for (uint e = 0u; e < 8u; ++e) {
+        const uint word = (e < 4u) ? packed.x : packed.y;
+        const int q = int(as_type<char>(uchar((word >> (8u * (e & 3u))) & 0xFFu)));
+        Ws[r * GEMM_BK + sub * 8u + e] = half(float(q) * sc);
+      }
     }
-  } else {
-    device const uint2* wp =
-        (device const uint2*)(qw + (ulong)(row0 + r) * (ulong)packed_row + col0);
-    const uint2 packed = *wp;
-    for (uint e = 0u; e < 8u; ++e) {
-      const uint word = (e < 4u) ? packed.x : packed.y;
-      const int q = int(as_type<char>(uchar((word >> (8u * (e & 3u))) & 0xFFu)));
-      Ws[r * GEMM_BK + sub * 8u + e] = half(float(q) * sc);
-    }
-  }
-}
-
-static inline void load_ablock(threadgroup half* As, device const half* in, uint tok0, uint k0,
-                               uint in_dim, uint tokens, uint lid) {
-  const uint chunks_per_row = GEMM_BK / 8u;
-  const uint t = lid / chunks_per_row;
-  const uint sub = lid % chunks_per_row;
-  const uint tok = tok0 + t;
-  threadgroup uint4* dst = (threadgroup uint4*)(As + t * GEMM_BK + sub * 8u);
-  if (tok < tokens) {
-    *dst = *(device const uint4*)(in + (ulong)tok * (ulong)in_dim + k0 + sub * 8u);
-  } else {
-    *dst = uint4(0u);
   }
 }
 
 // ---------------------------------------------------------------------------
 // Quantized blocked GEMM. The 8B's prefill is quantized, so an fp16-only GEMM did nothing
-// for it -- this is where the prefill gap actually lived.
+// for it -- this is where the prefill gap against llama.cpp actually lived.
 //
-// Quantization only changes how the weight TILE IS FILLED. Dequantize a K-block into
+// Quantization only changes how the weight tile is FILLED. Dequantize a K-block into
 // threadgroup memory once -- every weight unpacked exactly once -- and from there it is an
-// ordinary fp16 matmul: the same simdgroup ops, the same reuse across all 64 tokens. The
-// quantized GEMV re-unpacked every weight for every token.
-//
-// Double-buffered: the loads for block n+1 are issued BEFORE the matrix ops for block n, so
-// the memory latency hides behind the arithmetic instead of serialising with it.
+// ordinary fp16 matmul, identical to cpi_gemm_f16: the same 4x4 register tile, the same
+// reuse across every token. The quantized GEMV re-unpacked every weight for every token.
 // ---------------------------------------------------------------------------
 kernel void cpi_gemm_quant(device const uchar* qw [[buffer(0)]],
-                           device const half* in [[buffer(1)]],
-                           device half* out [[buffer(2)]],
+                           device const half* in [[buffer(1)]], device half* out [[buffer(2)]],
                            device const float* scales [[buffer(3)]],
                            device const half* bias [[buffer(4)]],
                            constant QuantParams& p [[buffer(5)]],
                            uint tgid [[threadgroup_position_in_grid]],
-                           uint lid [[thread_position_in_threadgroup]]) {
+                           uint lid [[thread_position_in_threadgroup]],
+                           uint nthr [[threads_per_threadgroup]]) {
   const uint sgid = lid / 32u;
   const uint lane = lid % 32u;
+  const uint sg_row = sgid / 2u;
+  const uint sg_col = sgid % 2u;
 
   const uint row_blocks = p.out_dim / GEMM_BM;
   const uint row0 = (tgid % row_blocks) * GEMM_BM;
   const uint tok0 = (tgid / row_blocks) * GEMM_BN;
   if (tok0 >= p.tokens) return;
 
-  threadgroup half Ws[2][GEMM_BM * GEMM_BK];
-  threadgroup half As[2][GEMM_BN * GEMM_BK];
-  threadgroup float sc_row[2][GEMM_BM];
+  threadgroup half Ws[GEMM_BM * GEMM_BK];
+  threadgroup half As[GEMM_BN * GEMM_BK];
+  threadgroup float sc_row[GEMM_BM];
 
-  simdgroup_float8x8 acc[8];
-  for (uint j = 0u; j < 8u; ++j) acc[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  simdgroup_float8x8 acc[4][4];
+  for (uint i = 0u; i < 4u; ++i)
+    for (uint j = 0u; j < 4u; ++j) acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
 
-  const uint srow = row0 + sgid * 8u;
   const uint gsz = (p.group == 0u) ? p.in_dim : p.group;
   const uint packed_row = (p.bits == 4u) ? ((p.in_dim + 1u) / 2u) : p.in_dim;
-  const uint nblk = p.in_dim / GEMM_BK;
+  const uint chunks = GEMM_BK / 8u;
 
-  load_qblock(Ws[0], sc_row[0], qw, scales, row0, 0u, p.groups, gsz, p.bits, packed_row, lid);
-  load_ablock(As[0], in, tok0, 0u, p.in_dim, p.tokens, lid);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-
-  for (uint b = 0u; b < nblk; ++b) {
-    const uint cur = b & 1u;
-    const uint nxt = cur ^ 1u;
-
-    // Issue the next block's loads FIRST: they are in flight while the matrix ops below
-    // run on the current block.
-    if (b + 1u < nblk) {
-      load_qblock(Ws[nxt], sc_row[nxt], qw, scales, row0, (b + 1u) * GEMM_BK, p.groups, gsz,
-                  p.bits, packed_row, lid);
-      load_ablock(As[nxt], in, tok0, (b + 1u) * GEMM_BK, p.in_dim, p.tokens, lid);
-    }
-
-    for (uint kk = 0u; kk < GEMM_BK; kk += 8u) {
-      // W is [out_dim, in_dim], so the weight fragment loads TRANSPOSED: [8k x 8rows].
-      simdgroup_half8x8 bm;
-      simdgroup_load(bm, Ws[cur] + (sgid * 8u) * GEMM_BK + kk, GEMM_BK, ulong2(0, 0), true);
-      for (uint j = 0u; j < 8u; ++j) {
-        simdgroup_half8x8 a;  // [8 tokens x 8k]
-        simdgroup_load(a, As[cur] + (j * 8u) * GEMM_BK + kk, GEMM_BK);
-        simdgroup_multiply_accumulate(acc[j], a, bm, acc[j]);
+  for (uint k0 = 0u; k0 < p.in_dim; k0 += GEMM_BK) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    load_qblock(Ws, sc_row, qw, scales, row0, k0, p.groups, gsz, p.bits, packed_row, lid, nthr);
+    for (uint c = lid; c < GEMM_BN * chunks; c += nthr) {
+      const uint t = c / chunks, sub = c % chunks;
+      threadgroup uint4* dst = (threadgroup uint4*)(As + t * GEMM_BK + sub * 8u);
+      if (tok0 + t < p.tokens) {
+        *dst = *(device const uint4*)(in + (ulong)(tok0 + t) * (ulong)p.in_dim + k0 + sub * 8u);
+      } else {
+        *dst = uint4(0u);
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint kk = 0u; kk < GEMM_BK; kk += 8u) {
+      simdgroup_half8x8 wf[4], af[4];
+      for (uint i = 0u; i < 4u; ++i)
+        simdgroup_load(wf[i], Ws + (sg_row * 32u + i * 8u) * GEMM_BK + kk, GEMM_BK, ulong2(0, 0),
+                       true);
+      for (uint j = 0u; j < 4u; ++j)
+        simdgroup_load(af[j], As + (sg_col * 32u + j * 8u) * GEMM_BK + kk, GEMM_BK);
+      for (uint i = 0u; i < 4u; ++i)
+        for (uint j = 0u; j < 4u; ++j)
+          simdgroup_multiply_accumulate(acc[i][j], af[j], wf[i], acc[i][j]);
+    }
   }
 
-  // Reuse the weight tile as the output staging area -- the K-loop is done with it.
-  threadgroup float* mine = (threadgroup float*)Ws[0] + sgid * 64u;
-
-  for (uint j = 0u; j < 8u; ++j) {
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    simdgroup_store(acc[j], mine, 8);
-    simdgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint i = lane; i < 64u; i += 32u) {
-      const uint t = i / 8u;
-      const uint r = i % 8u;
-      const uint tok = tok0 + j * 8u + t;
-      if (tok >= p.tokens) continue;
-      float v = mine[t * 8u + r];
-      if (p.has_bias != 0u) v += float(bias[srow + r]);
-      out[(ulong)tok * (ulong)p.out_dim + srow + r] = half(v);
+  threadgroup float* mine = (threadgroup float*)Ws + sgid * 64u;
+  for (uint i = 0u; i < 4u; ++i) {
+    for (uint j = 0u; j < 4u; ++j) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      simdgroup_store(acc[i][j], mine, 8);
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+      for (uint e = lane; e < 64u; e += 32u) {
+        const uint t = e / 8u;
+        const uint r = e % 8u;
+        const uint tok = tok0 + sg_col * 32u + j * 8u + t;
+        if (tok >= p.tokens) continue;
+        const uint row = row0 + sg_row * 32u + i * 8u + r;
+        float v = mine[t * 8u + r];
+        if (p.has_bias != 0u) v += float(bias[row]);
+        out[(ulong)tok * (ulong)p.out_dim + row] = half(v);
+      }
     }
   }
 }

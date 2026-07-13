@@ -76,6 +76,10 @@ struct QuantParams {
 
 constexpr int kTG = 256;               // threads per group
 constexpr int kSimdsPerTG = kTG / 32;  // = rows per threadgroup in the GEMV
+// The blocked GEMMs run 128 threads, not 256: each of their 4 simdgroups owns a 32x32
+// output tile (4x4 fragments), so fewer threads each hold more accumulators. That is what
+// pays for the matrix units -- 16 matrix ops per 8 fragment loads instead of 8 per 9.
+constexpr int kGemmTG = 128;
 constexpr int kArgmaxParts = 256;
 constexpr int kGemvTile = 8;  // MUST match GEMV_TILE in cpi_kernels.metal
 
@@ -412,7 +416,8 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
             gp.tokens = static_cast<std::uint32_t>(qgemm_tokens);
             const std::size_t groups = (static_cast<std::size_t>(op.cols) / 64) *
                                        (static_cast<std::size_t>(qgemm_tokens) / 64);
-            ctx_.dispatch("cpi_gemm_quant", G::Groups, groups, kTG, bufs, offs, 5, &gp, sizeof(gp));
+            ctx_.dispatch("cpi_gemm_quant", G::Groups, groups, kGemmTG, bufs, offs, 5, &gp,
+                          sizeof(gp));
           }
 
           const int qrest = T - qgemm_tokens;
@@ -456,7 +461,7 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
                         static_cast<std::uint32_t>(gemm_tokens), op.bias != nullptr ? 1u : 0u};
           const std::size_t groups = (static_cast<std::size_t>(op.cols) / 64) *
                                      (static_cast<std::size_t>(gemm_tokens) / 64);
-          ctx_.dispatch("cpi_gemm_f16", G::Groups, groups, kTG, bufs, offs, 4, &gp, sizeof(gp));
+          ctx_.dispatch("cpi_gemm_f16", G::Groups, groups, kGemmTG, bufs, offs, 4, &gp, sizeof(gp));
         }
 
         const int rest = T - gemm_tokens;
