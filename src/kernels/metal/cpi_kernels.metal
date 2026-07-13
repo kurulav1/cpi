@@ -342,12 +342,37 @@ kernel void cpi_gemv_quant(
       }
     }
   } else {
-    device const char* w8 = (device const char*)(qw + (ulong)row * (ulong)p.in_dim);
-    for (uint k = lane; k < p.in_dim; k += 32u) {
-      const float q = float(w8[k]);
+    // int8, 128 bits at a time: a uint4 is SIXTEEN weights. Loading them one byte at a
+    // time made int8 slower than fp16 -- which is absurd, since it reads half the bytes
+    // -- for exactly the reason the fp16 GEMV needed 128-bit loads. Narrow loads waste
+    // the transaction and cannot cover DRAM latency, whatever the element size.
+    device const uint4* w16 = (device const uint4*)(qw + (ulong)row * (ulong)p.in_dim);
+    const uint n16 = p.in_dim >> 4;  // 16 int8s per uint4
+    for (uint k = lane; k < n16; k += 32u) {
+      const uint4 packed = w16[k];
+      const uint j0 = k << 4;
+      const float sc = srow[j0 / gsz];  // gsz is a multiple of 16 here
+
+      for (uint t = 0u; t < nt; ++t) {
+        device const half* x = in + (ulong)(t0 + t) * (ulong)p.in_dim + j0;
+        float sub = 0.0f;
+        for (uint w = 0u; w < 4u; ++w) {
+          const uint word = (w == 0u) ? packed.x : (w == 1u) ? packed.y
+                          : (w == 2u) ? packed.z : packed.w;
+          for (uint e = 0u; e < 4u; ++e) {
+            const int q = int(char((word >> (8u * e)) & 0xFFu));
+            sub += float(q) * float(x[w * 4u + e]);
+          }
+        }
+        acc[t] += sub * sc;
+      }
+    }
+    // Tail: whatever does not fill a uint4.
+    for (uint k = (n16 << 4) + lane; k < p.in_dim; k += 32u) {
+      const int q = int(((device const char*)(qw + (ulong)row * (ulong)p.in_dim))[k]);
       const float sc = srow[k / gsz];
       for (uint t = 0u; t < nt; ++t) {
-        acc[t] += q * sc * float(in[(ulong)(t0 + t) * (ulong)p.in_dim + k]);
+        acc[t] += float(q) * sc * float(in[(ulong)(t0 + t) * (ulong)p.in_dim + k]);
       }
     }
   }
