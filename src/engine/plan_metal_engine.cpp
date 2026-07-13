@@ -80,12 +80,13 @@ struct QuantParams {
 
 constexpr int kTG = 256;               // threads per group
 constexpr int kSimdsPerTG = kTG / 32;  // = rows per threadgroup in the GEMV
-// The blocked GEMMs tile 64 rows x 128 tokens: 8 simdgroups (256 threads), each owning a
-// 32x32 output tile of 4x4 fragments. The token width is the weight-traffic knob -- a
-// threadgroup streams its row-block's whole weight strip from device memory, so the wider
-// the token tile, the fewer times a prefill re-reads the model.
-constexpr int kGemmTG = 256;
-constexpr int kGemmBN = 128;
+// The blocked GEMMs tile 64 rows x 64 tokens: 4 simdgroups (128 threads), each owning a 32x32
+// output tile of 4x4 fragments.
+constexpr int kGemmBN = 64;                              // MUST match GEMM_BN in the shader
+constexpr int kGemmTG = 32 * (64 / 32) * (kGemmBN / 32);  // one simdgroup per 32x32 sub-tile
+// Below this many tokens the GEMV wins: a GEMM tile is padded out to kGemmBN and the padding
+// is wasted arithmetic. Above it the GEMV is a catastrophe -- see the dispatch below.
+constexpr int kGemmMinTokens = 16;
 constexpr int kArgmaxParts = 256;
 constexpr int kGemvTile = 8;  // MUST match GEMV_TILE in cpi_kernels.metal
 
@@ -440,15 +441,25 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
           // an fp16-only GEMM does nothing for it. Send the full 32-token tiles to the
           // QUANTIZED blocked GEMM, which dequantizes each weight once into threadgroup
           // memory and then reuses it across all 32 tokens.
+          // The GEMM takes ALL the tokens, not just the whole tiles: its store already
+          // guards tok >= tokens, so a partial tail tile just masks off.
+          //
+          // Handing the tail to the GEMV instead was costing a THIRD of the 8B's prefill. A
+          // 551-token prompt chunks into 512 + 39, and those 39 leftover tokens took 1696 ms
+          // against the GEMM's 2755 ms for the other 512 -- the GEMV re-streams the whole
+          // model once per 8-token tile, so the tail swept 4.9 GB of weights five times over.
+          // Padding the tail out to one masked GEMM tile wastes some arithmetic and is still
+          // far cheaper.
           const bool qgemm_ok = op.cols % 64 == 0 && op.in_dim % 32 == 0;
-          const int qgemm_tokens = qgemm_ok ? (T / kGemmBN) * kGemmBN : 0;
+          const int qgemm_tokens = (qgemm_ok && T >= kGemmMinTokens) ? T : 0;
 
           if (profile) profile_tick("(before gemm)");
-          if (qgemm_tokens >= kGemmBN) {
+          if (qgemm_tokens > 0) {
             QuantParams gp = p;
             gp.tokens = static_cast<std::uint32_t>(qgemm_tokens);
-            const std::size_t groups = (static_cast<std::size_t>(op.cols) / 64) *
-                                       (static_cast<std::size_t>(qgemm_tokens) / kGemmBN);
+            const std::size_t tiles =
+                static_cast<std::size_t>((qgemm_tokens + kGemmBN - 1) / kGemmBN);
+            const std::size_t groups = (static_cast<std::size_t>(op.cols) / 64) * tiles;
             ctx_.dispatch("cpi_gemm_quant", G::Groups, groups, kGemmTG, bufs, offs, 5, &gp,
                           sizeof(gp));
             if (profile) profile_tick("Gemm(quant)");
@@ -489,13 +500,13 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
         // Decode (T=1) stays on the GEMV: a matrix unit cannot help when one operand is a
         // vector. Token remainders below 32 do too.
         const bool gemm_ok = op.cols % 64 == 0 && op.in_dim % 32 == 0;
-        const int gemm_tokens = gemm_ok ? (T / kGemmBN) * kGemmBN : 0;
+        const int gemm_tokens = (gemm_ok && T >= kGemmMinTokens) ? T : 0;
 
-        if (gemm_tokens >= kGemmBN) {
+        if (gemm_tokens > 0) {
           GemvParams gp{static_cast<std::uint32_t>(op.cols), static_cast<std::uint32_t>(op.in_dim),
                         static_cast<std::uint32_t>(gemm_tokens), op.bias != nullptr ? 1u : 0u};
-          const std::size_t groups = (static_cast<std::size_t>(op.cols) / 64) *
-                                     (static_cast<std::size_t>(gemm_tokens) / kGemmBN);
+          const std::size_t tiles = static_cast<std::size_t>((gemm_tokens + kGemmBN - 1) / kGemmBN);
+          const std::size_t groups = (static_cast<std::size_t>(op.cols) / 64) * tiles;
           ctx_.dispatch("cpi_gemm_f16", G::Groups, groups, kGemmTG, bufs, offs, 4, &gp, sizeof(gp));
         }
 
