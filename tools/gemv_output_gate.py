@@ -59,10 +59,21 @@ def run(weights, tokenizer, tiled):
         capture_output=True, text=True, env=env, timeout=900, encoding="utf-8", errors="replace")
     if out.returncode != 0:
         return None
-    # Drop ALL bracketed diagnostic lines ([perf], [startup], ...) -- they carry wall-clock
-    # timings that differ between every pair of runs, and comparing them would make the gate
-    # scream about a difference it created itself.
-    return "\n".join(l for l in out.stdout.splitlines() if not l.startswith("[")).strip()
+    # Compare the TOKEN IDS, not the prose.
+    #
+    # The CLI streams tokens to stdout as it decodes, and the engine's own [engine]/[perf] lines
+    # interleave with that stream -- so a token can land *inside* a diagnostic line
+    # (" The[engine] decode_step i=2 sky pos=13"). That interleaving is I/O-order dependent and
+    # varies run to run, which made the gate report a DIFF on a run whose token stream was
+    # bit-for-bit identical. Filtering lines that START with "[" does not help: the noise is
+    # mid-line.
+    #
+    # "Output tokens: ..." is the decoded id sequence and is immune to all of that. It is also
+    # what we actually care about: two runs agree iff they picked the same tokens.
+    for line in out.stdout.splitlines():
+        if line.startswith("Output tokens:"):
+            return line.strip()
+    return None  # no token line -> treat as a failed run
 
 
 def main():
