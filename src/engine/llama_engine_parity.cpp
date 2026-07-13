@@ -156,6 +156,17 @@ bool LlamaEngine::run_parity_check(const std::vector<int>& prompt_tokens) {
       x[i] =
           __half2float(emb[static_cast<std::size_t>(tok) * static_cast<std::size_t>(hidden) + i]);
     }
+    // Gemma: scale token embeddings by sqrt(hidden). The reference was missing this too, so the
+    // parity check was comparing a broken GPU path against a broken CPU path -- and the two
+    // brokennesses partially cancelled, which is worse than either alone: FIXING the GPU made the
+    // reported max_abs_diff go UP (35.8 -> 53.2). An oracle that shares the bug it is meant to
+    // catch will happily certify the bug and then flag the fix.
+    if (cfg.scale_embeddings) {
+      const float s = std::sqrt(static_cast<float>(hidden));
+      for (int i = 0; i < hidden; ++i) {
+        x[i] *= s;
+      }
+    }
 
     for (int layer = 0; layer < cfg.num_layers; ++layer) {
       const std::string p = "layers." + std::to_string(layer);
@@ -257,9 +268,16 @@ bool LlamaEngine::run_parity_check(const std::vector<int>& prompt_tokens) {
       normalize_cpu(x, norm_ffn, norm_ffn_bias, cfg.use_layernorm, cfg.norm_eps, &x_norm);
       matvec_rowmajor(w1, x_norm, inter, hidden, &ff1);
       matvec_rowmajor(w3, x_norm, inter, hidden, &ff2);
+      // SwiGLU, or GeGLU for Gemma. The reference hard-coded SiLU, so it ran the WRONG
+      // ACTIVATION for every gelu model -- it could never have validated one.
       for (int i = 0; i < inter; ++i) {
         const float g = ff1[static_cast<std::size_t>(i)];
-        ff2[static_cast<std::size_t>(i)] *= g / (1.0f + std::exp(-g));
+        const float act =
+            cfg.mlp_gelu
+                ? 0.5f * g *
+                      (1.0f + std::tanh(0.7978845608028654f * (g + 0.044715f * g * g * g)))
+                : g / (1.0f + std::exp(-g));
+        ff2[static_cast<std::size_t>(i)] *= act;
       }
       matvec_rowmajor(w2, ff2, hidden, inter, &ff3);
       for (int i = 0; i < hidden; ++i) {
