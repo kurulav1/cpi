@@ -302,6 +302,14 @@ kernel void cpi_lm_head(
 // straddle two scales. The dispatch guards that.
 #define GEMM_BK 64
 #define GEMM_QBK 32
+// PADDED STRIDES. Threadgroup memory has 32 banks of 4 bytes = 128 bytes, and an unpadded
+// K-major weight tile has a row stride of exactly GEMM_BM halves = 128 bytes -- so all eight
+// rows a simdgroup_load pulls for one fragment land in the SAME banks. Every weight fragment
+// load was an 8-way bank conflict. Padding the stride staggers the rows across banks.
+// Both paddings keep the stride a multiple of 8 halves, so the 128-bit tile writes stay
+// 16-byte aligned.
+#define GEMM_WS_STRIDE (GEMM_BM + 8)   // K-major: Ws[k][row]
+#define GEMM_AS_STRIDE (GEMM_QBK + 8)  // row-major: As[token][k]
 
 // ---------------------------------------------------------------------------
 // Blocked fp16 GEMM (prefill). A K-block of both operands is staged in threadgroup memory,
@@ -422,14 +430,14 @@ static inline void load_qblock(threadgroup half* Ws, threadgroup float* sc_row,
           *(device const uint*)(qw + (ulong)(row0 + r) * (ulong)packed_row + (col0 >> 1));
       for (uint e = 0u; e < 8u; ++e) {
         const int nib = int((packed >> (4u * e)) & 0xFu);
-        Ws[(sub * 8u + e) * GEMM_BM + r] = half(float((nib ^ 0x8) - 0x8) * sc);
+        Ws[(sub * 8u + e) * GEMM_WS_STRIDE + r] = half(float((nib ^ 0x8) - 0x8) * sc);
       }
     } else {
       const uint2 packed = *(device const uint2*)(qw + (ulong)(row0 + r) * (ulong)packed_row + col0);
       for (uint e = 0u; e < 8u; ++e) {
         const uint word = (e < 4u) ? packed.x : packed.y;
         const int q = int(as_type<char>(uchar((word >> (8u * (e & 3u))) & 0xFFu)));
-        Ws[(sub * 8u + e) * GEMM_BM + r] = half(float(q) * sc);
+        Ws[(sub * 8u + e) * GEMM_WS_STRIDE + r] = half(float(q) * sc);
       }
     }
   }
@@ -462,13 +470,8 @@ kernel void cpi_gemm_quant(device const uchar* qw [[buffer(0)]],
   const uint tok0 = (tgid / row_blocks) * GEMM_BN;
   if (tok0 >= p.tokens) return;
 
-  // The ACTIVATIONS are not staged. They could be -- and were -- but this GEMM turned out to
-  // be occupancy-limited rather than barrier-limited (deepening the K-block halves the
-  // barriers and made it 8% SLOWER), so threadgroup memory is the scarce resource. Fragments
-  // load straight from device instead: the token block's activations are a few hundred KB and
-  // every row-block threadgroup reads the same ones, so they sit in L2. Only the weights,
-  // which must be dequantized exactly once, are worth the staging.
-  threadgroup half Ws[GEMM_BM * GEMM_QBK];
+  threadgroup half Ws[GEMM_QBK * GEMM_WS_STRIDE];
+  threadgroup half As[GEMM_BN * GEMM_AS_STRIDE];
   threadgroup float sc_row[GEMM_BM];
 
   simdgroup_float8x8 acc[4][4];
@@ -477,24 +480,29 @@ kernel void cpi_gemm_quant(device const uchar* qw [[buffer(0)]],
 
   const uint gsz = (p.group == 0u) ? p.in_dim : p.group;
   const uint packed_row = (p.bits == 4u) ? ((p.in_dim + 1u) / 2u) : p.in_dim;
-
-  // A tail tile reads past p.tokens. That stays inside the slot buffer, which is sized for a
-  // whole prefill chunk, and a garbage token only ever corrupts its OWN output row -- which
-  // the store below drops. So there is nothing to mask here.
-  device const half* atile = in + (ulong)(tok0 + sg_col * 32u) * (ulong)p.in_dim;
+  const uint chunks = GEMM_QBK / 8u;
 
   for (uint k0 = 0u; k0 < p.in_dim; k0 += GEMM_QBK) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
     load_qblock(Ws, sc_row, qw, scales, row0, k0, p.groups, gsz, p.bits, packed_row, lid, nthr);
+    for (uint c = lid; c < GEMM_BN * chunks; c += nthr) {
+      const uint t = c / chunks, sub = c % chunks;
+      threadgroup uint4* dst = (threadgroup uint4*)(As + t * GEMM_AS_STRIDE + sub * 8u);
+      if (tok0 + t < p.tokens) {
+        *dst = *(device const uint4*)(in + (ulong)(tok0 + t) * (ulong)p.in_dim + k0 + sub * 8u);
+      } else {
+        *dst = uint4(0u);
+      }
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint kk = 0u; kk < GEMM_QBK; kk += 8u) {
       simdgroup_half8x8 wf[4], af[4];
       // Ws is K-major, so [8k x 8rows] loads straight -- no transpose.
       for (uint i = 0u; i < 4u; ++i)
-        simdgroup_load(wf[i], Ws + kk * GEMM_BM + sg_row * 32u + i * 8u, GEMM_BM);
+        simdgroup_load(wf[i], Ws + kk * GEMM_WS_STRIDE + sg_row * 32u + i * 8u, GEMM_WS_STRIDE);
       for (uint j = 0u; j < 4u; ++j)
-        simdgroup_load(af[j], atile + (ulong)(j * 8u) * (ulong)p.in_dim + k0 + kk, p.in_dim);
+        simdgroup_load(af[j], As + (sg_col * 32u + j * 8u) * GEMM_AS_STRIDE + kk, GEMM_AS_STRIDE);
       for (uint i = 0u; i < 4u; ++i)
         for (uint j = 0u; j < 4u; ++j)
           simdgroup_multiply_accumulate(acc[i][j], af[j], wf[i], acc[i][j]);
