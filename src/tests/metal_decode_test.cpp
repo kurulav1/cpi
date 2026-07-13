@@ -1,18 +1,20 @@
 // Metal decode, checked on real weights.
 //
-// TWO ORACLES, because neither alone is sufficient:
+// TWO ORACLES:
 //
-//   1. The CPU engine, on the FIRST forward. It is fp32 end to end, so it is the
-//      right check that the maths is right -- argmax and the top-5 ranking.
+//   1. The CPU engine (fp32 end to end) on the first forward -- argmax and top-5.
+//   2. A golden token stream from the CUDA backend for the whole greedy sequence.
 //
-//   2. A golden token stream from the CUDA backend, for the WHOLE greedy sequence.
-//      The CPU engine cannot do this job: it keeps activations in fp32 while both
-//      GPU backends keep them in fp16, and over a greedy stream that gap compounds
-//      until it flips a near-tie (for this prompt, at token 11). That is not a bug
-//      in anything -- it is what fp16 activations cost -- so gating a long stream on
-//      the CPU engine would fail a correct backend. CUDA is the reference
-//      implementation, and a second backend is correct exactly when it reproduces
-//      CUDA token-for-token.
+// A CAUTIONARY NOTE, because it nearly cost us a real bug. When Metal first diverged
+// from the CPU engine at token 11 with a 0.55 logit gap, that was diagnosed as "the
+// fp16/fp32 activation gap -- expected". It was not. The CPU engine had rope_theta
+// hardcoded to 10000 and was rotating every Q and K by the wrong angle for every
+// model that does not use that base (Qwen2.5, Qwen3, Llama 3). Metal was right and
+// the oracle was broken. With that fixed, all three engines agree token-for-token.
+//
+// The lesson: when a new backend disagrees with a reference, the reference is a
+// suspect too. Do not reach for "expected numerical drift" -- it is the explanation
+// that makes a bug invisible.
 //
 // Usage:  metal_decode_test <model.ll2c> [num_tokens] [golden.txt]
 // Skips (exit 0) when no model path is given, so ctest stays green without weights.
@@ -213,7 +215,7 @@ int main(int argc, char** argv) {
                 golden_ok ? "PASS" : "FAIL");
   }
 
-  if ((cpu_oracle_trustworthy && !argmax_ok) || !golden_ok) {
+  if (!argmax_ok || !golden_ok) {
     std::printf("\n[metal_decode] FAIL\n");
     return 1;
   }

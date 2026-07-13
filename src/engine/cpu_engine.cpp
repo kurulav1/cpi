@@ -708,12 +708,7 @@ void CpuLlamaEngine::forward_token(int token, int pos) {
     // [head_dim] weight, AFTER projection and BEFORE RoPE. Order matters -- doing it
     // after RoPE changes the result. Mirrors the CUDA path exactly
     // (llama_engine_forward_decode.cpp: launch_rmsnorm over num_heads x head_dim).
-    //
-    // KNOWN GAP: this engine STILL does not reproduce CUDA on Qwen3 even with the norm
-    // applied, so something else in its Qwen3 path is wrong and it is NOT a usable
-    // oracle for those checkpoints. It was silently producing a wrong model before this
-    // (no q_norm/k_norm at all); this closes one hole, not all of them. Found by the
-    // Metal backend disagreeing with it while matching CUDA token-for-token.
+
     if (lw.q_norm) {
       qk_norm_heads(q_.data(), lw.q_norm, NH, head_dim_);
     }
@@ -1076,15 +1071,21 @@ void CpuLlamaEngine::initialize(const EngineOptions& options) {
   }
 
   // --- Precompute RoPE tables ---
-  // cos[pos][d] = cos(pos / 10000^(2d/head_dim))
-  // sin[pos][d] = sin(pos / 10000^(2d/head_dim))
+  // cos[pos][d] = cos(pos / theta^(2d/head_dim))
+  //
+  // The base is the MODEL'S rope_theta, not 10000. It was hardcoded to 10000 here,
+  // which is right for Llama 2 and wrong for most things since: Qwen2.5 and Qwen3 use
+  // 1e6, Llama 3 uses 5e5. A wrong base does not crash and does not produce obvious
+  // garbage -- it rotates every query and key by the wrong angle, which degrades the
+  // model in a way that looks like ordinary numerical drift.
+  const float rope_theta = cfg_.effective_rope_theta();
   const int half_hd = head_dim_ / 2;
   rope_cos_.resize(static_cast<std::size_t>(max_ctx) * static_cast<std::size_t>(half_hd));
   rope_sin_.resize(static_cast<std::size_t>(max_ctx) * static_cast<std::size_t>(half_hd));
   for (int p = 0; p < max_ctx; ++p) {
     for (int d = 0; d < half_hd; ++d) {
       const float freq =
-          1.f / std::pow(10000.f, static_cast<float>(2 * d) / static_cast<float>(head_dim_));
+          1.f / std::pow(rope_theta, static_cast<float>(2 * d) / static_cast<float>(head_dim_));
       rope_cos_[static_cast<std::size_t>(p) * half_hd + d] = std::cos(static_cast<float>(p) * freq);
       rope_sin_[static_cast<std::size_t>(p) * half_hd + d] = std::sin(static_cast<float>(p) * freq);
     }

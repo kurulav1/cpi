@@ -1,20 +1,19 @@
 # Golden greedy token stream for Qwen2.5-0.5B-Instruct, produced by the CUDA backend.
 #
+# WHY A GOLDEN FROM CUDA:
+# CUDA is the reference implementation, so a second backend is correct exactly when it
+# reproduces it token-for-token.
+#
+# HISTORY WORTH KEEPING: the CPU engine used to disagree with both GPU backends here, and
+# that was first written off as "the fp16/fp32 activation gap". It was not -- CpuLlamaEngine
+# had rope_theta hardcoded to 10000 and was rotating Q/K by the wrong angle for every model
+# that does not use that base (Qwen2.5, Qwen3, Llama 3). The new backend was right and the
+# ORACLE was broken. With that fixed, CPU, CUDA and Metal all agree token-for-token.
+#
 # A REAL prompt, decoded 128 tokens deep. The short junk-prompt golden proves the ops are
 # wired up; this one exercises what that one cannot -- the KV cache and the attention loop
 # across depth, where a stride or a window bug only shows up far from position 0.
 #
-# WHY CUDA IS THE ORACLE, NOT THE CPU ENGINE:
-# Both GPU backends keep activations in fp16; CpuLlamaEngine keeps them in fp32. Across a
-# greedy stream that gap compounds and eventually flips a near-tie, so the CPU engine cannot
-# gate a long GPU stream -- it would fail a correct backend. It IS a good check on the first
-# forward (argmax, top-5 ranking), which is what metal_decode_test uses it for.
-#
-# Prompt: "Explain in two sentences why the sky is blue."
-# Regenerate with:
-#   llama_infer <model>.ll2c --tokenizer <tok>.json #     --prompt "Explain in two sentences why the sky is blue." --temp 0 --max-new 128 --gpu-cache-all
-#
-# Format: "prompt:" then the token ids; "expect:" then the greedy continuation.
 
 prompt: 128245,840,20772,304,1378,22870,3170,279,12884,374,6303,13
 expect: 576,12884,374,6303,1576,432,25963,39020,11,892,5610,678,7987,315,279,9434,19745,13,1096,24844,374,3881,438,13255,62969,71816,11,1380,3100,16876,525,36967,304,678,17961,553,34615,304,279,16566,13,576,71816,315,3100,553,18730,304,279,16566,11137,279,7987,315,279,7015,311,387,76710,1119,264,19745,315,7987,429,582,1490,438,279,12884,13,1096,1882,374,8480,369,279,28583,6303,1894,315,279,12884,11,892,374,3170,582,646,1490,432,504,3550,13,151643,33975,25,3555,374,279,7290,315,279,17133,330,64,1661,883,374,264,883,315,806,3409,43869,715,32,8,362,1697,879,2677,13598,806,3409,198,33,8
