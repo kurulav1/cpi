@@ -50,6 +50,11 @@ struct LlamaGeometry {
   float rms_eps = 1e-5f;
   float rope_theta = 10000.0f;
 
+  // Qwen2's Q/K/V projections carry an additive bias; Llama's and Mistral's do not.
+  // Getting this wrong does not crash -- it produces a model that generates fluent
+  // nonsense -- so it is explicit rather than inferred.
+  bool has_qkv_bias = false;
+
   // Some models (Gemma-style) scale the token embedding by sqrt(hidden). Llama and
   // Qwen do not. Kept here because it is geometry, not identity.
   bool scale_embeddings = false;

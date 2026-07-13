@@ -179,6 +179,25 @@ int main() {
     expect(ops[8].weight == w.handle_for("layers.1.attention.wo"), "wo bound to layer 1's wo");
     expect(ops[11].weight == w.handle_for("layers.1.feed_forward.w1"), "gate bound to w1");
     expect(ops[13].weight == nullptr, "SiluMul takes no weight");
+
+    // Llama/Mistral have no QKV bias. Binding one anyway would be silently wrong.
+    expect(ops[1].bias == nullptr && ops[2].bias == nullptr && ops[3].bias == nullptr,
+           "no QKV bias when has_qkv_bias is false");
+  }
+
+  // ---- Qwen2's QKV bias ---------------------------------------------------
+  // Dropping it does not crash -- it yields fluent nonsense -- so it is asserted.
+  {
+    LlamaGeometry gq = g;
+    gq.has_qkv_bias = true;
+    FakeWeights wq;
+    const ModelPlan pq = build_llama_plan(gq, wq);
+    const auto& ops = pq.layers[1].ops;
+    expect(ops[1].bias == wq.handle_for("layers.1.attention.bq"), "Q bias bound to bq");
+    expect(ops[2].bias == wq.handle_for("layers.1.attention.bk"), "K bias bound to bk");
+    expect(ops[3].bias == wq.handle_for("layers.1.attention.bv"), "V bias bound to bv");
+    expect(ops[8].bias == nullptr, "the o_proj has no bias");
+    expect(ops[11].bias == nullptr, "the MLP has no bias");
   }
 
   // ---- epilogue -----------------------------------------------------------

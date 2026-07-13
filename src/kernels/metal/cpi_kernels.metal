@@ -33,7 +33,8 @@ struct NormParams {
 struct GemvParams {
   uint out_dim;
   uint in_dim;
-  uint tokens;  // T: batched over tokens (sequence prefill); 1 for decode
+  uint tokens;    // T: batched over tokens (sequence prefill); 1 for decode
+  uint has_bias;  // 0 => the bias buffer is bound but never read (Llama); 1 => Qwen2's Q/K/V
 };
 
 struct RopeParams {
@@ -136,7 +137,8 @@ kernel void cpi_gemv_f16(
     device const half*  W     [[buffer(0)]],
     device const half*  in    [[buffer(1)]],
     device half*        out   [[buffer(2)]],
-    constant GemvParams& p    [[buffer(3)]],
+    device const half*  bias  [[buffer(3)]],
+    constant GemvParams& p    [[buffer(4)]],
     uint gid   [[threadgroup_position_in_grid]],
     uint lid   [[thread_position_in_threadgroup]],
     uint nthr  [[threads_per_threadgroup]]) {
@@ -160,6 +162,7 @@ kernel void cpi_gemv_f16(
   }
   acc = simd_sum(acc);
   if (lane == 0u) {
+    if (p.has_bias != 0u) acc += float(bias[row]);
     out[(ulong)token * (ulong)p.out_dim + row] = half(acc);
   }
 }

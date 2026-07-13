@@ -87,7 +87,7 @@ struct NormParams {
   std::uint32_t weight_offset, has_weight;
 };
 struct GemvParams {
-  std::uint32_t out_dim, in_dim, tokens;
+  std::uint32_t out_dim, in_dim, tokens, has_bias;
 };
 struct ElemParams {
   std::uint32_t n;
@@ -153,23 +153,29 @@ int main() {
     check("rmsnorm", compare(got, want), 0.01);
   }
 
-  // ---- GEMV --------------------------------------------------------------
-  {
+  // ---- GEMV, with and without a bias -------------------------------------
+  // Qwen2's Q/K/V projections carry a bias and Llama's do not, so both paths of
+  // the same kernel need exercising. A bias that is silently dropped still yields
+  // fluent-looking output, which is exactly why it gets its own check.
+  for (int with_bias = 0; with_bias <= 1; ++with_bias) {
     const std::uint32_t out_dim = 128, in_dim = 256;
-    std::vector<std::uint16_t> W(out_dim * in_dim), xin(in_dim);
+    std::vector<std::uint16_t> W(out_dim * in_dim), xin(in_dim), bias(out_dim);
     for (auto& v : W) v = f32_to_f16(dist(rng) * 0.1f);
     for (auto& v : xin) v = f32_to_f16(dist(rng));
+    for (auto& v : bias) v = f32_to_f16(dist(rng) * 2.0f);
 
     auto bW = ctx.alloc_from(W.data(), W.size() * 2);
     auto bx = ctx.alloc_from(xin.data(), xin.size() * 2);
     auto bo = ctx.alloc(out_dim * 2);
+    auto bb = ctx.alloc_from(bias.data(), bias.size() * 2);
 
-    GemvParams p{out_dim, in_dim, 1};
-    const void* bufs[] = {bW.handle(), bx.handle(), bo.handle()};
+    GemvParams p{out_dim, in_dim, 1, static_cast<std::uint32_t>(with_bias)};
+    // The bias buffer is always bound; has_bias decides whether it is read.
+    const void* bufs[] = {bW.handle(), bx.handle(), bo.handle(), bb.handle()};
     // 256 threads = 8 simdgroups = 8 rows per threadgroup.
     const std::size_t rows_per_tg = 8;
     const std::size_t groups = (out_dim + rows_per_tg - 1) / rows_per_tg;
-    ctx.dispatch("cpi_gemv_f16", runtime::MetalContext::Grid::Groups, groups, 256, bufs, nullptr, 3,
+    ctx.dispatch("cpi_gemv_f16", runtime::MetalContext::Grid::Groups, groups, 256, bufs, nullptr, 4,
                  &p, sizeof(p));
     ctx.commit_and_wait();
 
@@ -179,11 +185,12 @@ int main() {
       for (std::uint32_t c = 0; c < in_dim; ++c) {
         acc += f16_to_f32(W[r * in_dim + c]) * f16_to_f32(xin[c]);
       }
+      if (with_bias) acc += f16_to_f32(bias[r]);
       want[r] = acc;
     }
     const auto* out = static_cast<const std::uint16_t*>(bo.contents());
     for (std::size_t i = 0; i < got.size(); ++i) got[i] = f16_to_f32(out[i]);
-    check("gemv_f16", compare(got, want), 0.05);
+    check(with_bias ? "gemv_f16+bias" : "gemv_f16", compare(got, want), 0.05);
   }
 
   // ---- SiLU-mul (SwiGLU) -------------------------------------------------

@@ -136,6 +136,10 @@ struct Op {
   // writes need no cast (any object pointer converts to void* implicitly).
   const void* weight = nullptr;   // bound at build; nullptr = weightless norm
   const void* aux_ptr = nullptr;  // GeluMul raw 2nd operand (PLE per-layer input); overrides in2
+  // Gemv: optional additive bias over out_dim (Qwen2's Q/K/V projections have one;
+  // Llama's do not). nullptr = no bias, which is every model the CUDA executor
+  // currently plans, so its behaviour is unchanged.
+  const void* bias = nullptr;
   // Quantized Gemv: when qweight is set the op runs a weight-only matvec instead
   // of the fp16 one. qbits picks the encoding: 8 = int8, 4 = int4 (packed
   // two-per-byte). qgroup picks the scale granularity: 0 = one scale per row,

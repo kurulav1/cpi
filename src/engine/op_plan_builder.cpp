@@ -91,9 +91,19 @@ ModelPlan build_llama_plan(const LlamaGeometry& g, const WeightSource& w) {
     // Attention block.
     lp.ops.push_back(
         rmsnorm(Slot::X, Slot::XNorm, w.fp16(p + "attention_norm.weight"), g.hidden, g.rms_eps));
-    lp.ops.push_back(gemv(Slot::XNorm, Slot::Q, w.fp16(p + "attention.wq"), q_dim, g.hidden));
-    lp.ops.push_back(gemv(Slot::XNorm, Slot::K, w.fp16(p + "attention.wk"), kv_dim, g.hidden));
-    lp.ops.push_back(gemv(Slot::XNorm, Slot::V, w.fp16(p + "attention.wv"), kv_dim, g.hidden));
+    {
+      Op q = gemv(Slot::XNorm, Slot::Q, w.fp16(p + "attention.wq"), q_dim, g.hidden);
+      Op k = gemv(Slot::XNorm, Slot::K, w.fp16(p + "attention.wk"), kv_dim, g.hidden);
+      Op v = gemv(Slot::XNorm, Slot::V, w.fp16(p + "attention.wv"), kv_dim, g.hidden);
+      if (g.has_qkv_bias) {
+        q.bias = w.fp16(p + "attention.bq");
+        k.bias = w.fp16(p + "attention.bk");
+        v.bias = w.fp16(p + "attention.bv");
+      }
+      lp.ops.push_back(q);
+      lp.ops.push_back(k);
+      lp.ops.push_back(v);
+    }
 
     // RoPE rotates Q and K in place. Two ops -- they differ only in head count,
     // and keeping them separate is what lets a GQA model share one kernel.
