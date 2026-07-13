@@ -299,6 +299,8 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
   if (quant_bits == 4 || quant_bits == 8) {
     // A group size that is a multiple of 8 keeps each 8-weight chunk the int4 kernel
     // loads inside a single scale group.
+    // The int4 kernel loads 32 weights per uint4, so the group must be a multiple of 32
+    // for all 32 to share one scale.
     wsrc_->set_quant(quant_bits, quant_group > 0 ? quant_group : 64);
     quant_bits_ = quant_bits;
   }

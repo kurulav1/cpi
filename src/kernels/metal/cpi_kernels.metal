@@ -321,24 +321,49 @@ kernel void cpi_gemv_quant(
   for (uint t = 0u; t < GEMV_TILE; ++t) acc[t] = 0.0f;
 
   if (p.bits == 4u) {
-    // A row is (in_dim + 1) / 2 bytes. Each lane takes 8 weights (4 bytes) at a time;
-    // a group size that is a multiple of 8 keeps all 8 inside one scale group.
-    device const uint* w32 = (device const uint*)(qw + (ulong)row * (ulong)((p.in_dim + 1u) / 2u));
-    const uint n8 = p.in_dim >> 3;
-    for (uint k = lane; k < n8; k += 32u) {
-      const uint packed = w32[k];
-      const uint j0 = k << 3;
+    // 128-BIT loads: a uint4 is 32 packed int4 weights. This used to load a bare `uint`
+    // (8 weights, 32 bits) and it cost ~40% of decode throughput -- the same narrow-load
+    // mistake as the fp16 GEMV, made again in a new kernel. On a bandwidth-bound machine
+    // the LOAD WIDTH IS THE KERNEL, whatever the element size.
+    //
+    // A group size that is a multiple of 32 keeps all 32 weights inside one scale group.
+    device const uint4* w128 =
+        (device const uint4*)(qw + (ulong)row * (ulong)((p.in_dim + 1u) / 2u));
+    const uint n32 = p.in_dim >> 5;  // 32 int4 weights per uint4
+    for (uint k = lane; k < n32; k += 32u) {
+      const uint4 packed = w128[k];
+      const uint j0 = k << 5;
       const float sc = srow[j0 / gsz];
 
       for (uint t = 0u; t < nt; ++t) {
         device const half* x = in + (ulong)(t0 + t) * (ulong)p.in_dim + j0;
         float sub = 0.0f;
+        for (uint w = 0u; w < 4u; ++w) {
+          const uint word = (w == 0u) ? packed.x : (w == 1u) ? packed.y
+                          : (w == 2u) ? packed.z : packed.w;
+          for (uint e = 0u; e < 8u; ++e) {
+            const int nib = int((word >> (4u * e)) & 0xFu);
+            const int q = (nib ^ 0x8) - 0x8;
+            sub += float(q) * float(x[w * 8u + e]);
+          }
+        }
+        acc[t] += sub * sc;
+      }
+    }
+    // Tail: whatever does not fill a uint4.
+    device const uint* w32 = (device const uint*)(qw + (ulong)row * (ulong)((p.in_dim + 1u) / 2u));
+    for (uint k = (n32 << 2) + lane; k < (p.in_dim >> 3); k += 32u) {
+      const uint packed = w32[k];
+      const uint j0 = k << 3;
+      const float sc = srow[j0 / gsz];
+      for (uint t = 0u; t < nt; ++t) {
+        device const half* x = in + (ulong)(t0 + t) * (ulong)p.in_dim + j0;
+        float sub = 0.0f;
         for (uint e = 0u; e < 8u; ++e) {
           const int nib = int((packed >> (4u * e)) & 0xFu);
-          const int q = (nib ^ 0x8) - 0x8;
-          sub += float(q) * float(x[e]);
+          sub += float((nib ^ 0x8) - 0x8) * float(x[e]);
         }
-        acc[t] += sub * sc;  // the scale is per GROUP, so it folds in here
+        acc[t] += sub * sc;
       }
     }
   } else {
