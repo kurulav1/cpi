@@ -566,11 +566,46 @@ void PlanMetalEngine::encode_forward(int token, int position) {
     std::fprintf(stderr, "  [dbg] %-12s max|X|=%.1f%s\n", what, m, nan ? "  <-- NaN" : "");
   };
 
+  // Peeks an arbitrary slot, so a NaN can be traced to the exact op that made it.
+  auto peek_slot = [&](opplan::Slot sl, int n, const char* what) {
+    if (!dbg) return;
+    ctx_.commit_and_wait();
+    const auto* p = static_cast<const std::uint16_t*>(slots_[static_cast<int>(sl)].contents());
+    float m = 0.0f;
+    bool nan = false;
+    for (int i = 0; i < n; ++i) {
+      const float v = fp16_to_f32(p[i]);
+      if (v != v) nan = true;
+      m = std::max(m, std::fabs(v));
+    }
+    std::fprintf(stderr, "  [dbg]   %-8s max=%.1f%s\n", what, m, nan ? "  <-- NaN" : "");
+  };
+
   execute_ops(plan_.prologue, -1, position, 1);
   peek("prologue");
   int done = 0;
   for (const opplan::LayerPlan& lp : plan_.layers) {
     if (layer_limit >= 0 && done >= layer_limit) break;
+    if (dbg && lp.layer_index == 0) {
+      // Walk layer 0 op by op, so the exact op that produces the NaN is visible.
+      for (const opplan::Op& op : lp.ops) {
+        execute_ops({op}, lp.layer_index, position, 1);
+        if (op.kind == opplan::OpKind::Gemv || op.kind == opplan::OpKind::Attention ||
+            op.kind == opplan::OpKind::SiluMul || op.kind == opplan::OpKind::GeluMul ||
+            op.kind == opplan::OpKind::RmsNorm) {
+          const int n = (op.out == opplan::Slot::Inter || op.out == opplan::Slot::Gate ||
+                         op.out == opplan::Slot::Up)
+                            ? cfg_.intermediate_size
+                            : cfg_.hidden_size;
+          static const char* kn[] = {"RmsNorm",  "Gemv",    "Rope",   "ScaleCopy",
+                                     "CopySlot", "KvStore", "Attn",   "GeluMul",
+                                     "AddInpl",  "Embed",   "LmHead", "SiluMul"};
+          peek_slot(op.out, std::min(n, 4096), kn[static_cast<int>(op.kind)]);
+        }
+      }
+      ++done;
+      continue;
+    }
     execute_ops(lp.ops, lp.layer_index, position, 1);
     if (dbg) {
       char b[32];
