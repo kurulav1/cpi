@@ -27,24 +27,31 @@ namespace opplan {
 // Ops read/write these slots; the executor maps a slot to its device pointer.
 // Kept small and explicit — this is the whole working set of a decode step.
 enum class Slot : std::uint8_t {
-  X,         // residual stream (persists across ops/layers)
-  XNorm,     // normalized input to a projection
-  Q, K, V,   // attention projections
-  Att,       // attention output (pre o_proj)
-  Tmp,       // block output staged before the residual add
-  Gate, Up,  // MLP gate/up projections
-  Inter,     // MLP intermediate (post GeGLU / SwiGLU)
-  PleGate,   // per-layer-input gate scratch
-  PleRaw,    // per-layer-input raw embedding (prologue scratch)
-  PleAll,    // all layers' per-layer inputs [num_layers * ple] (prologue output)
+  X,      // residual stream (persists across ops/layers)
+  XNorm,  // normalized input to a projection
+  Q,
+  K,
+  V,    // attention projections
+  Att,  // attention output (pre o_proj)
+  Tmp,  // block output staged before the residual add
+  Gate,
+  Up,       // MLP gate/up projections
+  Inter,    // MLP intermediate (post GeGLU / SwiGLU)
+  PleGate,  // per-layer-input gate scratch
+  PleRaw,   // per-layer-input raw embedding (prologue scratch)
+  PleAll,   // all layers' per-layer inputs [num_layers * ple] (prologue output)
   // Gated-attention / linear-attention (delta-net) working set. Models that don't
   // use these simply never emit ops touching them.
-  QPair,     // fused q|gate projection, before it is split into Q and QGate
-  QGate,     // sigmoid gate applied to the attention output
-  LinMix,    // fused linear-attention qkv mixture (post conv1d+silu)
-  LinZ, LinA, LinB,      // delta-net gate / A / B projections
-  LinQ, LinK, LinV,      // delta-net q/k/v after head expansion
-  LinAtt,    // delta-net output (pre out-projection)
+  QPair,   // fused q|gate projection, before it is split into Q and QGate
+  QGate,   // sigmoid gate applied to the attention output
+  LinMix,  // fused linear-attention qkv mixture (post conv1d+silu)
+  LinZ,
+  LinA,
+  LinB,  // delta-net gate / A / B projections
+  LinQ,
+  LinK,
+  LinV,    // delta-net q/k/v after head expansion
+  LinAtt,  // delta-net output (pre out-projection)
   // Mixture-of-Experts working set.
   MoeRouterIn,  // hidden after the router's weightless norm + learned scale
   MoeLogits,    // router logits [num_experts]
@@ -62,27 +69,27 @@ enum class RopeTable : std::uint8_t { Sliding, Full };
 enum class ScaleKind : std::uint8_t { Constant };
 
 enum class OpKind : std::uint8_t {
-  RmsNorm,      // rows×cols groups; weight==nullptr ⇒ weightless (ones)
-  Gemv,         // rowmajor half GEMV: out[out_dim] = W[out_dim×in_dim] · in
-  Rope,         // in-place RoPE over `heads` heads of `head_dim`, at position
-  ScaleCopy,    // out = in * scale
-  CopySlot,     // out = in (device-to-device; e.g. V shares raw k_proj output)
-  KvStore,      // append K,V slots to this layer's cache at `position`
-  Attention,    // single-query attention over the cache (sliding window aware)
-  GeluMul,      // out = gelu(a) * b   (GeGLU / PLE gate)
-  AddInplace,   // out += in           (residual; out defaults to X)
+  RmsNorm,          // rows×cols groups; weight==nullptr ⇒ weightless (ones)
+  Gemv,             // rowmajor half GEMV: out[out_dim] = W[out_dim×in_dim] · in
+  Rope,             // in-place RoPE over `heads` heads of `head_dim`, at position
+  ScaleCopy,        // out = in * scale
+  CopySlot,         // out = in (device-to-device; e.g. V shares raw k_proj output)
+  KvStore,          // append K,V slots to this layer's cache at `position`
+  Attention,        // single-query attention over the cache (sliding window aware)
+  GeluMul,          // out = gelu(a) * b   (GeGLU / PLE gate)
+  AddInplace,       // out += in           (residual; out defaults to X)
   EmbeddingLookup,  // out = embed_table[token]  (token from the executor's device buffer)
-  LmHead,       // logits[vocab] (float) = W[vocab×in_dim] · in   (writes the executor's logits)
+  LmHead,           // logits[vocab] (float) = W[vocab×in_dim] · in   (writes the executor's logits)
 
   // ── extensions for gated / linear-attention ("delta-net") architectures ──
   // These are general OPS, not a model: any architecture that needs them declares
   // them in its plan. The kernels already exist in the shared kernel library.
-  SiluMul,          // out = silu(a) * b   (SwiGLU; the SiLU sibling of GeluMul)
-  SplitHeadHalves,  // fused q|gate -> out (Q) + out2 (QGate), interleaved per head
-  SigmoidGate,      // in-place: out *= sigmoid(aux slot)   (gated attention output)
-  LinearConv1d,     // short causal depthwise conv + SiLU over the fused qkv mixture;
-                    // reads/writes this layer's rolling CONV STATE
-  RepeatLinearHeads,// expand the fused mixture into per-head q/k/v (GQA-style repeat)
+  SiluMul,              // out = silu(a) * b   (SwiGLU; the SiLU sibling of GeluMul)
+  SplitHeadHalves,      // fused q|gate -> out (Q) + out2 (QGate), interleaved per head
+  SigmoidGate,          // in-place: out *= sigmoid(aux slot)   (gated attention output)
+  LinearConv1d,         // short causal depthwise conv + SiLU over the fused qkv mixture;
+                        // reads/writes this layer's rolling CONV STATE
+  RepeatLinearHeads,    // expand the fused mixture into per-head q/k/v (GQA-style repeat)
   LinearAttentionStep,  // gated delta-net recurrence; reads/writes this layer's
                         // RECURRENT STATE. The linear-attention analogue of Attention.
 
@@ -91,28 +98,28 @@ enum class OpKind : std::uint8_t {
   // router writes indices/weights to device buffers and the expert ops read them
   // there, so a token never round-trips to the host mid-layer and the decode graph
   // remains capturable.
-  MulVec,        // out = in * weight_vector * scale   (router pre-projection gain)
-  MoeRouterTopk, // logits -> softmax -> top-k -> renormalise -> *per_expert_scale;
-                 // writes the executor's device topk index/weight buffers.
-                 // `weight` = optional per-expert gain. cols = experts, heads = top_k.
-  MoeGateUpGeglu,// per selected expert: gelu(gate)*up  -> MoeInter
-                 // cols = moe_inter, in_dim = hidden, heads = top_k
-  MoeDownAccum,  // sum_k topk_weight[k] * down[expert_k] . MoeInter[k]  -> MoeOut
-                 // cols = hidden, in_dim = moe_inter, heads = top_k
+  MulVec,          // out = in * weight_vector * scale   (router pre-projection gain)
+  MoeRouterTopk,   // logits -> softmax -> top-k -> renormalise -> *per_expert_scale;
+                   // writes the executor's device topk index/weight buffers.
+                   // `weight` = optional per-expert gain. cols = experts, heads = top_k.
+  MoeGateUpGeglu,  // per selected expert: gelu(gate)*up  -> MoeInter
+                   // cols = moe_inter, in_dim = hidden, heads = top_k
+  MoeDownAccum,    // sum_k topk_weight[k] * down[expert_k] . MoeInter[k]  -> MoeOut
+                   // cols = hidden, in_dim = moe_inter, heads = top_k
 
   // ── extensions for vision encoders ──
   // A vision tower differs from a text decoder in only a few places: positions are
   // 2-D, the input is pixels not token ids, and the patch grid is pooled to a fixed
   // number of soft tokens. Each is one op; norms/GEMM/GeGLU/attention are shared.
-  PatchEmbed,    // pixels -> embeddings (+ two-axis learned position table)
-                 // cols = hidden, in_dim = patch_dim, rows = pos_table_size,
-                 // weight = input_proj, aux_ptr = position table
-  Rope2D,        // in-place 2-D RoPE: first half of each head rotates by the patch's
-                 // x coord, second half by its y. heads, head_dim.
-  AvgPoolPatches,// k x k spatial average pool + gain
-                 // cols = hidden, heads = k, kv_heads = cells_x, rows = out_tokens,
-                 // scale = gain
-  Standardize,   // x = (x - weight) * aux_ptr, broadcast over tokens. cols = hidden.
+  PatchEmbed,      // pixels -> embeddings (+ two-axis learned position table)
+                   // cols = hidden, in_dim = patch_dim, rows = pos_table_size,
+                   // weight = input_proj, aux_ptr = position table
+  Rope2D,          // in-place 2-D RoPE: first half of each head rotates by the patch's
+                   // x coord, second half by its y. heads, head_dim.
+  AvgPoolPatches,  // k x k spatial average pool + gain
+                   // cols = hidden, heads = k, kv_heads = cells_x, rows = out_tokens,
+                   // scale = gain
+  Standardize,     // x = (x - weight) * aux_ptr, broadcast over tokens. cols = hidden.
 };
 
 // One resolved op. Fields are a union-by-convention keyed on `kind`; only the
@@ -122,7 +129,7 @@ struct Op {
   OpKind kind;
   Slot in = Slot::X;
   Slot out = Slot::X;
-  Slot in2 = Slot::X;          // GeluMul's second operand (when aux_ptr is null)
+  Slot in2 = Slot::X;  // GeluMul's second operand (when aux_ptr is null)
   // Opaque device handles to fp16 weights. Deliberately void*, not __half*: this
   // IR is the backend seam, and a Metal executor must be able to include it with
   // no CUDA toolkit present. Each backend casts to its own half type on read;
@@ -140,34 +147,34 @@ struct Op {
   const float* qscales = nullptr;
   int qbits = 0;
   int qgroup = 0;
-  int rows = 1;                // RmsNorm groups (heads for q/k norm, else 1)
-  int cols = 0;                // RmsNorm width / Gemv out_dim / GeluMul length
-  int in_dim = 0;              // Gemv in_dim
-  int heads = 0;               // Rope/Attention query heads
-  int kv_heads = 0;            // Attention kv heads
-  int head_dim = 0;            // Rope/Attention head_dim
+  int rows = 1;      // RmsNorm groups (heads for q/k norm, else 1)
+  int cols = 0;      // RmsNorm width / Gemv out_dim / GeluMul length
+  int in_dim = 0;    // Gemv in_dim
+  int heads = 0;     // Rope/Attention query heads
+  int kv_heads = 0;  // Attention kv heads
+  int head_dim = 0;  // Rope/Attention head_dim
   RopeTable rope_table = RopeTable::Full;
-  bool full_attention = false; // Attention: full (no window) vs sliding
-  int sliding_window = 0;      // Attention: window size (0 = unbounded)
-  float scale = 1.0f;          // ScaleCopy multiplier (SqrtHeadDim/layer scalar folded in)
+  bool full_attention = false;  // Attention: full (no window) vs sliding
+  int sliding_window = 0;       // Attention: window size (0 = unbounded)
+  float scale = 1.0f;           // ScaleCopy multiplier (SqrtHeadDim/layer scalar folded in)
 
   // ── extension fields (gated / linear-attention) ──
-  Slot out2 = Slot::X;         // SplitHeadHalves' second output (the gate half)
-  bool norm_offset = false;    // RmsNorm uses (1 + weight) instead of weight
-  int rotary_dim = 0;          // Rope: >0 rotates only the first rotary_dim of each
-                               // head (partial RoPE) and pairs Q (in) with K (in2)
+  Slot out2 = Slot::X;       // SplitHeadHalves' second output (the gate half)
+  bool norm_offset = false;  // RmsNorm uses (1 + weight) instead of weight
+  int rotary_dim = 0;        // Rope: >0 rotates only the first rotary_dim of each
+                             // head (partial RoPE) and pairs Q (in) with K (in2)
   // Delta-net geometry + its extra weights. The recurrence needs a float RMS-norm
   // weight, a float A_log, and an fp16 dt_bias alongside the usual projections.
   int num_k_heads = 0;
   int num_v_heads = 0;
   int key_head_dim = 0;
   int value_head_dim = 0;
-  int conv_kernel = 0;         // LinearConv1d: causal kernel width
+  int conv_kernel = 0;  // LinearConv1d: causal kernel width
   // Offset into the aux SLOT (not a raw pointer): the per-layer-input gate reads layer
   // L's window of the wide PLE tensor. A baked raw pointer works at one token and reads
   // the wrong rows over a sequence, so the slot + offset is the addressable form.
   int aux_offset = 0;
-  float eps = 1e-6f;           // RmsNorm / LinearAttentionStep epsilon
+  float eps = 1e-6f;  // RmsNorm / LinearAttentionStep epsilon
   // Clipped projections (Gemma 4 E2B's vision tower ships per-projection activation
   // bounds and CLAMPS both the input and the output of every linear). Infinite by
   // default, so every other model's Gemv is untouched. The INPUT clamp is the one
@@ -194,9 +201,9 @@ struct ModelPlan {
   // per-layer inputs FROM the embeddings, so splicing after the prologue would compute
   // them from the placeholder token instead of the image (HF projects them post-scatter).
   std::size_t embed_ready = 0;
-  std::vector<Op> prologue;        // token → embeddings (+ scale, PLE build)
-  std::vector<LayerPlan> layers;   // the tower
-  std::vector<Op> epilogue;        // final norm → LM head (logits); softcap is host-side
+  std::vector<Op> prologue;       // token → embeddings (+ scale, PLE build)
+  std::vector<LayerPlan> layers;  // the tower
+  std::vector<Op> epilogue;       // final norm → LM head (logits); softcap is host-side
 };
 
 }  // namespace opplan
