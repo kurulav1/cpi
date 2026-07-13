@@ -15,7 +15,10 @@ Usage:
       --model artifacts/hub/google__gemma-4-E2B-it/hf \
       --prompt "The capital of France is" --outdir <scratch>/g4ref
 """
-import argparse, json, os, sys
+import argparse
+import json
+import os
+import sys
 import numpy as np
 
 
