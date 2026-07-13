@@ -580,6 +580,30 @@ void PlanMetalEngine::encode_forward(int token, int position) {
     ++done;
   }
   execute_ops(plan_.epilogue, -1, position, 1);
+
+  if (dbg) {
+    // The epilogue (final norm -> LM head) is the only thing between a finite X and a
+    // NaN logit, so look at both ends of it.
+    ctx_.commit_and_wait();
+    const auto* xn =
+        static_cast<const std::uint16_t*>(slots_[static_cast<int>(opplan::Slot::XNorm)].contents());
+    float mn = 0.0f;
+    bool nn = false;
+    for (int i = 0; i < cfg_.hidden_size; ++i) {
+      const float v = fp16_to_f32(xn[i]);
+      if (v != v) nn = true;
+      mn = std::max(mn, std::fabs(v));
+    }
+    const auto* lg = static_cast<const float*>(logits_buf_.contents());
+    float ml = 0.0f;
+    bool nl = false;
+    for (int i = 0; i < cfg_.vocab_size; ++i) {
+      if (lg[i] != lg[i]) nl = true;
+      ml = std::max(ml, std::fabs(lg[i]));
+    }
+    std::fprintf(stderr, "  [dbg] XNorm        max=%.2f%s\n", mn, nn ? "  <-- NaN" : "");
+    std::fprintf(stderr, "  [dbg] logits       max=%.2f%s\n", ml, nl ? "  <-- NaN" : "");
+  }
 }
 
 // Runs T tokens through the whole tower in ONE pass, instead of T passes of one token.
