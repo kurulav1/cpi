@@ -78,6 +78,16 @@ struct AttnParams {
   uint tokens;  // T: 1 for decode, N for a prefill chunk
 };
 
+struct QuantParams {
+  uint out_dim;
+  uint in_dim;
+  uint tokens;
+  uint bits;      // 4 or 8
+  uint group;     // 0 = one scale per row
+  uint groups;    // scales per row
+  uint has_bias;  // Qwen2's Q/K/V carry one; quantizing the weights does not remove it
+};
+
 struct EmbedParams {
   uint hidden;
   uint tokens;
@@ -493,15 +503,6 @@ kernel void cpi_gemm_quant(
 //     -- weight-only: activations stay fp32, and the scale is applied per group.
 // ---------------------------------------------------------------------------
 
-struct QuantParams {
-  uint out_dim;
-  uint in_dim;
-  uint tokens;
-  uint bits;      // 4 or 8
-  uint group;     // 0 = one scale per row
-  uint groups;    // scales per row
-  uint has_bias;  // Qwen2's Q/K/V carry one; quantizing the weights does not remove it
-};
 
 kernel void cpi_gemv_quant(
     device const uchar*  qw     [[buffer(0)]],
