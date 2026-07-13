@@ -1140,13 +1140,46 @@ void LlamaEngine::initialize(const EngineOptions& options) {
   }
 
   CUDA_CHECK(cudaSetDevice(0));
-  // 256 keeps the batched prefill GEMMs large enough to saturate the GPU; the
-  // old default of 16 left them tiny (e.g. a 6.4k-token prompt prefilled in 400
-  // passes), capping prefill at ~250 tok/s on a 5090. 256 measured ~5.3x faster
-  // cold prefill, byte-identical output (chunking is exact). Tune down via env
-  // for small-VRAM GPUs; up (512) for a marginal further gain.
-  const int prefill_chunk_target = env_int_or_default("LLAMA_INFER_PREFILL_CHUNK_SIZE", 256);
+  // Prefill chunk = tokens per batched prefill pass. Bigger is better, and by a LOT more than
+  // the old comment here claimed ("512 for a marginal further gain").
+  //
+  // That was true when the hand-written attention kernel dominated prefill. It no longer does:
+  // attention now runs on the tensor cores, GPU time collapsed, and prefill became HOST-bound
+  // -- nsys shows only ~11 ms of GPU work in a 46 ms prefill, with ~31 ms in CUDA API calls
+  // (~3800 of them at 5-9 us each on WDDM). Every doubling of the chunk halves the pass count
+  // and therefore the API traffic:
+  //
+  //   Qwen2.5-0.5B:  256 -> 24.8k | 512 -> 33.9k | 1024 -> 43.4k | 2048 -> 63.6k tok/s
+  //   Llama-3.1-8B:  256 ->  8.9k |                1024 -> 10.2k | 2048 -> 12.0k tok/s
+  //
+  // Chunking is exact, so output is unchanged whatever the size.
+  //
+  // The cost is VRAM: the prefill activation buffers all scale with the chunk. So size it from
+  // a memory BUDGET rather than hard-coding 2048, which would hurt small-VRAM GPUs -- a 32B's
+  // activations run ~222 KB/token, so 2048 tokens is ~455 MB.
+  int prefill_chunk_target = env_int_or_default("LLAMA_INFER_PREFILL_CHUNK_SIZE", 0);
+  if (prefill_chunk_target <= 0) {
+    const int kv_dim = cfg.num_kv_heads * (cfg.hidden_size / std::max(1, cfg.num_heads));
+    // x, x_norm, att, out + q/k/v + the three ff buffers, fp16.
+    const std::size_t per_token =
+        (static_cast<std::size_t>(cfg.hidden_size) * 4 +
+         static_cast<std::size_t>(cfg.intermediate_size) * 3 +
+         static_cast<std::size_t>(cfg.hidden_size + 2 * kv_dim)) *
+        sizeof(__half);
+
+    std::size_t free_bytes = 0, total_bytes = 0;
+    cudaMemGetInfo(&free_bytes, &total_bytes);
+    // Spend at most 512 MB, and never more than 5% of what is actually free.
+    const std::size_t budget =
+        std::min<std::size_t>(std::size_t{512} << 20, free_bytes / 20);
+    const std::size_t fits = (per_token > 0) ? (budget / per_token) : 2048;
+    prefill_chunk_target = static_cast<int>(
+        std::min<std::size_t>(2048, std::max<std::size_t>(256, fits)));
+  }
   prefill_chunk_size_ = std::max(1, std::min(options_.max_context, prefill_chunk_target));
+  if (options_.verbose) {
+    std::cout << "[engine] prefill_chunk=" << prefill_chunk_size_ << "\n";
+  }
   lt_workspace_bytes_ =
       env_workspace_bytes_or_default("LLAMA_INFER_LT_WORKSPACE_MB", lt_workspace_bytes_);
   CUDA_CHECK(cudaStreamCreateWithFlags(&compute_stream_, cudaStreamNonBlocking));
