@@ -340,6 +340,13 @@ add_test(NAME op_plan_builder_test COMMAND op_plan_builder_test)
 # passes -- so a green run here proves it COMPILES AND LINKS, never that the
 # kernels are correct. Only real Apple Silicon can prove that.
 if(LLAMA_ENGINE_ENABLE_METAL)
+  # Text generation on Apple Silicon. Separate from llama_infer, whose engine dispatch
+  # is templated over the CUDA engines -- keeping this standalone means the Metal path
+  # has no CUDA anywhere in its dependency graph.
+  add_executable(metal_infer src/app/metal_infer.cpp)
+  target_link_libraries(metal_infer PRIVATE llama_engine)
+  target_include_directories(metal_infer PRIVATE include)
+
   add_executable(metal_smoke src/tests/metal_smoke.cpp)
   target_link_libraries(metal_smoke PRIVATE llama_engine)
   target_include_directories(metal_smoke PRIVATE include)
