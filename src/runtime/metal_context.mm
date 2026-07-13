@@ -145,6 +145,16 @@ bool MetalContext::load_library_from_source(const std::string& metal_source_path
   }
 
   MTLCompileOptions* opts = [[MTLCompileOptions alloc] init];
+  // Metal enables FAST MATH by default, which lowers the precision of exactly the
+  // functions this engine leans on: sin/cos in RoPE, exp in the attention softmax,
+  // rsqrt in RMSNorm. Left on, logits drift ~0.5 against the fp32 CPU reference --
+  // an order of magnitude worse than the CUDA backend's 0.06 -- which is enough for
+  // a greedy stream to flip a token after a few steps. Correctness first.
+  if (@available(macOS 15.0, iOS 18.0, *)) {
+    opts.mathMode = MTLMathModeSafe;
+  } else {
+    opts.fastMathEnabled = NO;
+  }
   id<MTLLibrary> lib = [dev newLibraryWithSource:src options:opts error:&err];
   [opts release];
 

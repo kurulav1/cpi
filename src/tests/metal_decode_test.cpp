@@ -113,7 +113,14 @@ int main(int argc, char** argv) {
   // the model with its own output, so any drift compounds and a wrong RoPE or a
   // mis-strided KV cache diverges within a few tokens.
   const std::vector<int> m_out = metal.generate_greedy(prompt, n_new);
-  const std::vector<int> c_out = cpu.generate(prompt, n_new, /*temperature=*/0.0f);
+  std::vector<int> c_out = cpu.generate(prompt, n_new, /*temperature=*/0.0f);
+
+  // CpuLlamaEngine::generate returns PROMPT + continuation; PlanMetalEngine returns
+  // only the new tokens. Align them, or the comparison reports 0/N on two identical
+  // streams.
+  if (c_out.size() >= prompt.size() && std::equal(prompt.begin(), prompt.end(), c_out.begin())) {
+    c_out.erase(c_out.begin(), c_out.begin() + static_cast<long>(prompt.size()));
+  }
 
   std::printf("\n  CPU   greedy:");
   for (int t : c_out) std::printf(" %d", t);
