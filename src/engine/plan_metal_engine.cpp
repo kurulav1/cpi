@@ -67,7 +67,7 @@ inline float fp16_to_f32(std::uint16_t h) {
 }  // namespace detail
 
 struct QuantParams {
-  std::uint32_t out_dim, in_dim, tokens, bits, group, groups;
+  std::uint32_t out_dim, in_dim, tokens, bits, group, groups, has_bias;
 };
 
 constexpr int kTG = 256;               // threads per group
@@ -365,12 +365,18 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
                         static_cast<std::uint32_t>(T),
                         static_cast<std::uint32_t>(op.qbits),
                         static_cast<std::uint32_t>(op.qgroup),
-                        static_cast<std::uint32_t>((op.in_dim + gsz - 1) / gsz)};
-          const void* bufs[] = {op.qweight, slot(op.in), slot(op.out), op.qscales};
+                        static_cast<std::uint32_t>((op.in_dim + gsz - 1) / gsz),
+                        op.bias != nullptr ? 1u : 0u};
+          // Quantizing the WEIGHTS does not remove the bias. Qwen2's Q/K/V have one,
+          // and dropping it yields fluent nonsense rather than an error.
+          const void* bb = op.bias != nullptr ? op.bias : op.qweight;  // bound, unread if absent
+          const void* bufs[] = {op.qweight, slot(op.in), slot(op.out), op.qscales, bb};
+          const std::size_t offs[] = {
+              0, 0, 0, 0, static_cast<std::size_t>(op.bias_offset) * sizeof(std::uint16_t)};
           const std::size_t tiles = static_cast<std::size_t>((T + kGemvTile - 1) / kGemvTile);
           ctx_.dispatch("cpi_gemv_quant", G::Groups,
-                        groups_for_rows(static_cast<std::size_t>(op.cols)) * tiles, kTG, bufs,
-                        nullptr, 4, &p, sizeof(p));
+                        groups_for_rows(static_cast<std::size_t>(op.cols)) * tiles, kTG, bufs, offs,
+                        5, &p, sizeof(p));
           break;
         }
         GemvParams p{static_cast<std::uint32_t>(op.cols), static_cast<std::uint32_t>(op.in_dim),
@@ -396,7 +402,8 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
                         1,
                         static_cast<std::uint32_t>(op.qbits),
                         static_cast<std::uint32_t>(op.qgroup),
-                        static_cast<std::uint32_t>((op.in_dim + gsz - 1) / gsz)};
+                        static_cast<std::uint32_t>((op.in_dim + gsz - 1) / gsz),
+                        0};
           const void* bufs[] = {op.qweight, slot(op.in), logits_buf_.handle(), op.qscales};
           const std::size_t offs[] = {
               0, static_cast<std::size_t>(T - 1) * static_cast<std::size_t>(op.in_dim) * 2, 0, 0};

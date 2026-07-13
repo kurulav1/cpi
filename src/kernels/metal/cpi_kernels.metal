@@ -286,9 +286,10 @@ struct QuantParams {
   uint out_dim;
   uint in_dim;
   uint tokens;
-  uint bits;    // 4 or 8
-  uint group;   // 0 = one scale per row
-  uint groups;  // scales per row
+  uint bits;      // 4 or 8
+  uint group;     // 0 = one scale per row
+  uint groups;    // scales per row
+  uint has_bias;  // Qwen2's Q/K/V carry one; quantizing the weights does not remove it
 };
 
 kernel void cpi_gemv_quant(
@@ -296,7 +297,8 @@ kernel void cpi_gemv_quant(
     device const half*   in     [[buffer(1)]],
     device half*         out    [[buffer(2)]],
     device const float*  scales [[buffer(3)]],
-    constant QuantParams& p     [[buffer(4)]],
+    device const half*   bias   [[buffer(4)]],
+    constant QuantParams& p     [[buffer(5)]],
     uint gid   [[threadgroup_position_in_grid]],
     uint lid   [[thread_position_in_threadgroup]],
     uint nthr  [[threads_per_threadgroup]]) {
@@ -351,8 +353,11 @@ kernel void cpi_gemv_quant(
   }
 
   for (uint t = 0u; t < nt; ++t) {
-    const float s = simd_sum(acc[t]);
-    if (lane == 0u) out[(ulong)(t0 + t) * (ulong)p.out_dim + row] = half(s);
+    float s = simd_sum(acc[t]);
+    if (lane == 0u) {
+      if (p.has_bias != 0u) s += float(bias[row]);
+      out[(ulong)(t0 + t) * (ulong)p.out_dim + row] = half(s);
+    }
   }
 }
 
