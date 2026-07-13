@@ -281,6 +281,12 @@ kernel void cpi_lm_head(
   if (lane == 0u) out[row] = acc;
 }
 
+#define GEMM_BM 64  // rows per threadgroup
+#define GEMM_BN 64  // tokens per threadgroup
+// K per stage. 32 halves == a 64-byte cache line per row, and 8 per thread == one 128-bit
+// load, so a K-block fill is exactly one wide load per thread and no byte is read twice.
+#define GEMM_BK 32
+
 // ---------------------------------------------------------------------------
 // Blocked fp16 GEMM (prefill). A K-block of both operands is staged in threadgroup memory,
 // so a weight loaded from device is reused by every token in the tile. Two earlier attempts
@@ -304,7 +310,7 @@ kernel void cpi_gemm_f16(device const half* w [[buffer(0)]], device const half* 
   const uint sg_row = sgid / 2u;  // 2x2 grid of simdgroups over the 64x64 tile
   const uint sg_col = sgid % 2u;
 
-  const uint row_blocks = p.rows / GEMM_BM;
+  const uint row_blocks = p.out_dim / GEMM_BM;
   const uint row0 = (tgid % row_blocks) * GEMM_BM;
   const uint tok0 = (tgid / row_blocks) * GEMM_BN;
   if (tok0 >= p.tokens) return;
@@ -318,18 +324,18 @@ kernel void cpi_gemm_f16(device const half* w [[buffer(0)]], device const half* 
 
   const uint chunks = GEMM_BK / 8u;  // 8 halves == one 128-bit load
 
-  for (uint k0 = 0u; k0 < p.cols; k0 += GEMM_BK) {
+  for (uint k0 = 0u; k0 < p.in_dim; k0 += GEMM_BK) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint c = lid; c < GEMM_BM * chunks; c += nthr) {
       const uint r = c / chunks, sub = c % chunks;
       *(threadgroup uint4*)(Ws + r * GEMM_BK + sub * 8u) =
-          *(device const uint4*)(w + (ulong)(row0 + r) * (ulong)p.cols + k0 + sub * 8u);
+          *(device const uint4*)(w + (ulong)(row0 + r) * (ulong)p.in_dim + k0 + sub * 8u);
     }
     for (uint c = lid; c < GEMM_BN * chunks; c += nthr) {
       const uint t = c / chunks, sub = c % chunks;
       threadgroup uint4* dst = (threadgroup uint4*)(As + t * GEMM_BK + sub * 8u);
       if (tok0 + t < p.tokens) {
-        *dst = *(device const uint4*)(in + (ulong)(tok0 + t) * (ulong)p.cols + k0 + sub * 8u);
+        *dst = *(device const uint4*)(in + (ulong)(tok0 + t) * (ulong)p.in_dim + k0 + sub * 8u);
       } else {
         *dst = uint4(0u);
       }
@@ -365,7 +371,7 @@ kernel void cpi_gemm_f16(device const half* w [[buffer(0)]], device const half* 
         const uint row = row0 + sg_row * 32u + i * 8u + r;
         float v = mine[t * 8u + r];
         if (p.has_bias != 0u) v += float(bias[row]);
-        out[(ulong)tok * (ulong)p.rows + row] = half(v);
+        out[(ulong)tok * (ulong)p.out_dim + row] = half(v);
       }
     }
   }
