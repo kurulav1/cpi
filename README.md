@@ -217,6 +217,40 @@ This starts:
 - API on `http://localhost:3001`
 - Vite UI on `http://localhost:5173`
 
+## Apple Silicon (Metal)
+
+CPI has a second GPU backend. Both execute the same op-plan IR (`include/engine/op_plan.hpp`)
+and the same plan built by `build_llama_plan()` — Metal is a backend, not a fork.
+
+```bash
+cmake -S . -B build -DLLAMA_ENGINE_ENABLE_CUDA=OFF -DLLAMA_ENGINE_ENABLE_METAL=ON \
+      -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+
+export CPI_METAL_SOURCE=$PWD/src/kernels/metal/cpi_kernels.metal
+./build/metal_infer model.ll2c --tokenizer tokenizer.json \
+    --prompt "Explain in two sentences why the sky is blue." --max-new 80
+```
+
+**No Xcode required.** The offline `metal` compiler ships with Xcode, not with the Command
+Line Tools, so CPI compiles its shaders at runtime via `newLibraryWithSource` — that needs
+only the Metal framework, which every Mac has. A stock Mac with the CLT is enough. If Xcode
+*is* present, CMake precompiles a `.metallib` instead and skips the runtime step.
+
+**Scope.** fp16, dense, uniform-geometry decoders (Llama 2/3, Qwen2.5, Mistral), one token at
+a time. Quantized weights are rejected outright rather than half-supported: Metal has no
+`__dp4a`, so the int4/int8 matvecs need genuinely different kernels.
+
+**Correctness.** The Metal backend reproduces the CUDA backend's greedy token stream exactly —
+128 tokens, real prompt, verified on an Apple M4 (`src/tests/golden/`). Note the CPU engine
+cannot gate a long GPU stream: it keeps activations in fp32 while both GPU backends keep them
+in fp16, and across a greedy stream that gap eventually flips a near-tie. It is still the right
+oracle for the first forward (argmax + top-5 ranking), which is how `metal_decode_test` uses it.
+
+**Measured** (Apple M4, 10-core GPU, 16 GB): Qwen2.5-0.5B fp16 decode, **64–69 tok/s**. This is
+a portability result, not a tuned one — no kernel here has been optimised, and an M4's ~120 GB/s
+is a different world from a discrete GPU.
+
 ## Build Modes
 
 ### Default configure
