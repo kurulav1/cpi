@@ -351,14 +351,24 @@ kernel void cpi_gemm_f16(
   for (uint k0 = 0u; k0 < p.in_dim; k0 += GEMM_BK) {
     // Cooperative load of the K-block. Every thread pulls a few elements; after this the
     // whole threadgroup reads them from fast threadgroup memory instead of device.
-    for (uint i = lid; i < GEMM_BM * GEMM_BK; i += nthr) {
-      const uint r = i / GEMM_BK, kk = i % GEMM_BK;
-      Ws[i] = W[(ulong)(row0 + r) * (ulong)p.in_dim + k0 + kk];
-    }
-    for (uint i = lid; i < GEMM_BN * GEMM_BK; i += nthr) {
-      const uint t = i / GEMM_BK, kk = i % GEMM_BK;
-      const uint tok = tok0 + t;
-      As[i] = (tok < p.tokens) ? in[(ulong)tok * (ulong)p.in_dim + k0 + kk] : half(0.0h);
+    // 128-bit cooperative loads: 64*32 halves / 8 = 256, one uint4 per thread.
+    {
+      const uint chunks_per_row = GEMM_BK / 8u;
+      const uint c = lid;
+      const uint r = c / chunks_per_row;
+      const uint sub = c % chunks_per_row;
+      threadgroup uint4* wdst = (threadgroup uint4*)(Ws + r * GEMM_BK + sub * 8u);
+      *wdst = *(device const uint4*)(W + (ulong)(row0 + r) * (ulong)p.in_dim + k0 + sub * 8u);
+
+      // The activations reuse the same chunk mapping. This is only valid because
+      // GEMM_BM == GEMM_BN; if they ever diverge, split these into two loops.
+      const uint tok = tok0 + r;
+      threadgroup uint4* adst = (threadgroup uint4*)(As + r * GEMM_BK + sub * 8u);
+      if (tok < p.tokens) {
+        *adst = *(device const uint4*)(in + (ulong)tok * (ulong)p.in_dim + k0 + sub * 8u);
+      } else {
+        *adst = uint4(0u);
+      }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -447,26 +457,57 @@ kernel void cpi_gemm_quant(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // DEQUANTIZE the weight block into threadgroup memory. Each weight is unpacked once
-    // and then reused by all 64 tokens -- the quantized GEMV unpacked it per token tile.
-    for (uint i = lid; i < GEMM_BM * GEMM_BK; i += nthr) {
-      const uint r = i / GEMM_BK, kk = i % GEMM_BK;
-      const uint col = k0 + kk;
+    // DEQUANTIZE the weight block into threadgroup memory. Each weight is unpacked once and
+    // then reused by all 64 tokens -- the quantized GEMV unpacked it per token tile.
+    //
+    // The loads are WIDE. This loop used to read the packed weights ONE BYTE at a time,
+    // which is the same narrow-load defect that has now bitten five kernels in this
+    // backend. One uint is 8 packed int4 weights, and 64*32 / 8 = 256 -- exactly one
+    // vector load per thread, with no byte read twice.
+    {
+      const uint chunks_per_row = GEMM_BK / 8u;  // 4
+      const uint c = lid;                        // 256 threads == 256 chunks
+      const uint r = c / chunks_per_row;
+      const uint sub = c % chunks_per_row;
+      const uint col0 = k0 + sub * 8u;
+      const float sc = sc_row[r];
 
-      int q;
       if (p.bits == 4u) {
-        const uchar byte = qw[(ulong)(row0 + r) * (ulong)packed_row + (col >> 1)];
-        const uint nib = ((col & 1u) == 0u) ? (byte & 0x0Fu) : ((byte >> 4) & 0x0Fu);
-        q = int(nib ^ 0x8u) - 0x8;
+        // 4 bytes = 8 nibbles. Alignment holds: packed_row and k0/2 are both multiples of 16.
+        device const uint* wp = (device const uint*)(qw + (ulong)(row0 + r) * (ulong)packed_row +
+                                                     (col0 >> 1));
+        const uint packed = *wp;
+        for (uint e = 0u; e < 8u; ++e) {
+          const int nib = int((packed >> (4u * e)) & 0xFu);
+          const int q = (nib ^ 0x8) - 0x8;  // 0..15 -> -8..7
+          Ws[r * GEMM_BK + sub * 8u + e] = half(float(q) * sc);
+        }
       } else {
-        q = int(as_type<char>(qw[(ulong)(row0 + r) * (ulong)packed_row + col]));
+        device const uint2* wp =
+            (device const uint2*)(qw + (ulong)(row0 + r) * (ulong)packed_row + col0);
+        const uint2 packed = *wp;  // 8 bytes = 8 int8 weights
+        for (uint e = 0u; e < 8u; ++e) {
+          const uint word = (e < 4u) ? packed.x : packed.y;
+          const int sq = int(as_type<char>(uchar((word >> (8u * (e & 3u))) & 0xFFu)));
+          Ws[r * GEMM_BK + sub * 8u + e] = half(float(sq) * sc);
+        }
       }
-      Ws[i] = half(float(q) * sc_row[r]);
     }
-    for (uint i = lid; i < GEMM_BN * GEMM_BK; i += nthr) {
-      const uint t = i / GEMM_BK, kk = i % GEMM_BK;
+    // Activations: 128-bit loads. 64*32 halves / 8 = 256 -- again one uint4 per thread.
+    {
+      const uint chunks_per_row = GEMM_BK / 8u;
+      const uint c = lid;
+      const uint t = c / chunks_per_row;
+      const uint sub = c % chunks_per_row;
       const uint tok = tok0 + t;
-      As[i] = (tok < p.tokens) ? in[(ulong)tok * (ulong)p.in_dim + k0 + kk] : half(0.0h);
+      threadgroup uint4* dst = (threadgroup uint4*)(As + t * GEMM_BK + sub * 8u);
+      if (tok < p.tokens) {
+        device const uint4* src =
+            (device const uint4*)(in + (ulong)tok * (ulong)p.in_dim + k0 + sub * 8u);
+        *dst = *src;
+      } else {
+        *dst = uint4(0u);
+      }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
