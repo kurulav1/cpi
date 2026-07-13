@@ -20,7 +20,7 @@ namespace runtime {
 
 // An opaque device buffer. Owns its MTLBuffer; host-addressable via contents().
 class MetalBuffer {
- public:
+public:
   MetalBuffer() = default;
   ~MetalBuffer();
   MetalBuffer(const MetalBuffer&) = delete;
@@ -31,20 +31,26 @@ class MetalBuffer {
   // Host pointer into the shared allocation. No copy, no synchronisation beyond
   // having waited on any command buffer that writes it.
   void* contents() const;
-  std::size_t size() const { return size_; }
-  bool valid() const { return handle_ != nullptr; }
+  std::size_t size() const {
+    return size_;
+  }
+  bool valid() const {
+    return handle_ != nullptr;
+  }
 
   // The underlying id<MTLBuffer>, for the .mm layer only.
-  void* handle() const { return handle_; }
+  void* handle() const {
+    return handle_;
+  }
 
- private:
+private:
   friend class MetalContext;
   void* handle_ = nullptr;  // id<MTLBuffer>
   std::size_t size_ = 0;
 };
 
 class MetalContext {
- public:
+public:
   MetalContext();
   ~MetalContext();
   MetalContext(const MetalContext&) = delete;
@@ -53,7 +59,9 @@ class MetalContext {
   // True when a real GPU was found. This is FALSE on GitHub's macOS runners --
   // they are VMs with no GPU, so MTLCreateSystemDefaultDevice() returns nil.
   // Callers must check; do not assume a Mac has a usable Metal device.
-  bool available() const { return device_ != nullptr; }
+  bool available() const {
+    return device_ != nullptr;
+  }
   std::string device_name() const;
 
   // Loads the compiled shader library. Tries, in order: an explicit path, the
@@ -78,13 +86,15 @@ class MetalContext {
   // Submits everything encoded so far and blocks until the GPU is done.
   void commit_and_wait();
 
-  const std::string& last_error() const { return last_error_; }
+  const std::string& last_error() const {
+    return last_error_;
+  }
 
- private:
-  void* device_ = nullptr;   // id<MTLDevice>
-  void* queue_ = nullptr;    // id<MTLCommandQueue>
-  void* library_ = nullptr;  // id<MTLLibrary>
-  void* cmdbuf_ = nullptr;   // id<MTLCommandBuffer>, lazily opened
+private:
+  void* device_ = nullptr;     // id<MTLDevice>
+  void* queue_ = nullptr;      // id<MTLCommandQueue>
+  void* library_ = nullptr;    // id<MTLLibrary>
+  void* cmdbuf_ = nullptr;     // id<MTLCommandBuffer>, lazily opened
   void* pipelines_ = nullptr;  // NSMutableDictionary name -> MTLComputePipelineState
   std::string last_error_;
 };
