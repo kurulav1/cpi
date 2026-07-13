@@ -86,9 +86,12 @@ int main(int argc, char** argv) {
 
   eng.open(model, max_context, quant_bits, quant_group);
   const auto& cfg = eng.config();
-  std::fprintf(stderr, "[metal] %s | layers=%d hidden=%d heads=%d kv_heads=%d vocab=%d\n",
+  std::fprintf(stderr, "[metal] %s | layers=%d hidden=%d heads=%d kv_heads=%d vocab=%d | %s\n",
                eng.device_name().c_str(), cfg.num_layers, cfg.hidden_size, cfg.num_heads,
-               cfg.num_kv_heads, cfg.vocab_size);
+               cfg.num_kv_heads, cfg.vocab_size,
+               eng.quant_bits() == 0 ? "fp16" : (eng.quant_bits() == 4 ? "int4" : "int8"));
+  std::fprintf(stderr, "[metal] weights on GPU: %.2f GB\n",
+               static_cast<double>(eng.weight_bytes()) / 1073741824.0);
 
   const std::vector<int> ids = tok.encode(prompt, /*add_bos=*/true);
   std::fprintf(stderr, "[metal] prompt: %zu tokens\n", ids.size());
