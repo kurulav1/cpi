@@ -227,9 +227,7 @@ int main(int argc, char** argv) {
   if (quant != 0) {
     // A quantized model is a different model -- it cannot reproduce the fp16 golden and
     // should not be asked to. Its gate is the CPU oracle above (argmax + a bound).
-    std::printf("
-  quantized: golden-stream gate skipped (gated on the CPU oracle instead)
-");
+    std::printf("\n  quantized: golden-stream gate skipped (gated on the CPU oracle instead)\n");
   } else if (golden.empty()) {
     std::printf("\n  no golden stream given; gating on argmax only\n");
   } else {
