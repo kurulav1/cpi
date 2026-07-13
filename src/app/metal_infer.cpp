@@ -39,6 +39,8 @@ int main(int argc, char** argv) {
   std::string prompt;
   int max_new = 64;
   int max_context = 2048;
+  int quant_bits = 0;
+  int quant_group = 0;
 
   for (int i = 2; i < argc; ++i) {
     const std::string a = argv[i];
@@ -57,6 +59,10 @@ int main(int argc, char** argv) {
       max_new = std::atoi(val("--max-new").c_str());
     } else if (a == "--max-context") {
       max_context = std::atoi(val("--max-context").c_str());
+    } else if (a == "--quant") {
+      quant_bits = std::atoi(val("--quant").c_str());
+    } else if (a == "--quant-group") {
+      quant_group = std::atoi(val("--quant-group").c_str());
     } else {
       std::printf("unknown argument: %s\n", a.c_str());
       usage();
@@ -78,7 +84,7 @@ int main(int argc, char** argv) {
   model::Tokenizer tok;
   tok.load(tokenizer_path);
 
-  eng.open(model, max_context);
+  eng.open(model, max_context, quant_bits, quant_group);
   const auto& cfg = eng.config();
   std::fprintf(stderr, "[metal] %s | layers=%d hidden=%d heads=%d kv_heads=%d vocab=%d\n",
                eng.device_name().c_str(), cfg.num_layers, cfg.hidden_size, cfg.num_heads,

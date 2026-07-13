@@ -44,7 +44,13 @@ public:
   }
 
   // Loads a .ll2c model, uploads its weights, and builds the plan.
-  void open(const std::string& weights_path, int max_context = 2048);
+  // quant_bits: 0 = fp16, or 4 / 8 for weight-only quantization of every projection
+  // and the (untied) LM head. quant_group 0 defaults to 64.
+  void open(const std::string& weights_path, int max_context = 2048, int quant_bits = 0,
+            int quant_group = 0);
+  int quant_bits() const {
+    return quant_bits_;
+  }
 
   const model::LlamaConfig& config() const {
     return cfg_;
@@ -78,6 +84,7 @@ private:
   opplan::ModelPlan plan_;
   int max_context_ = 0;
   int max_prefill_ = 0;  // slots are sized for this many tokens at once
+  int quant_bits_ = 0;
 
   // name -> device buffer. Owns every weight for the model's lifetime.
   std::unordered_map<std::string, runtime::MetalBuffer> wbuf_;

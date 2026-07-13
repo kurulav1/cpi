@@ -268,6 +268,140 @@ kernel void cpi_lm_head(
 }
 
 // ---------------------------------------------------------------------------
+// Weight-only int4 / int8 GEMV.
+//
+// Metal has NO __dp4a, so this does not try to mirror the CUDA kernel's packed
+// integer dot product. It does not need to: an int4 decode is BANDWIDTH-bound, and
+// reading 0.5 bytes per weight instead of 2 is itself the whole win. Dequantise on
+// the fly and multiply in fp32.
+//
+// Format (identical to the CUDA path -- see kernels_weight_only_matvec.cu):
+//   * nibble -> signed:  (n ^ 0x8) - 0x8   [so 0..15 maps to -8..7]
+//   * a byte packs two weights: low nibble = even column, high nibble = odd column
+//   * y[row] = sum_g scale[row][g] * sum_{j in g} (q[j] * x[j])
+//     -- weight-only: activations stay fp32, and the scale is applied per group.
+// ---------------------------------------------------------------------------
+
+struct QuantParams {
+  uint out_dim;
+  uint in_dim;
+  uint tokens;
+  uint bits;    // 4 or 8
+  uint group;   // 0 = one scale per row
+  uint groups;  // scales per row
+};
+
+kernel void cpi_gemv_quant(
+    device const uchar*  qw     [[buffer(0)]],
+    device const half*   in     [[buffer(1)]],
+    device half*         out    [[buffer(2)]],
+    device const float*  scales [[buffer(3)]],
+    constant QuantParams& p     [[buffer(4)]],
+    uint gid   [[threadgroup_position_in_grid]],
+    uint lid   [[thread_position_in_threadgroup]],
+    uint nthr  [[threads_per_threadgroup]]) {
+  const uint simds_per_tg = nthr / 32u;
+  const uint simd_id      = lid / 32u;
+  const uint lane         = lid % 32u;
+
+  const uint row_blocks = (p.out_dim + simds_per_tg - 1u) / simds_per_tg;
+  const uint tile = gid / row_blocks;
+  const uint blk  = gid % row_blocks;
+  const uint row  = blk * simds_per_tg + simd_id;
+  const uint t0   = tile * GEMV_TILE;
+  if (t0 >= p.tokens || row >= p.out_dim) return;
+  const uint nt = min((uint)GEMV_TILE, p.tokens - t0);
+
+  device const float* srow = scales + (ulong)row * (ulong)p.groups;
+  const uint gsz = (p.group == 0u) ? p.in_dim : p.group;
+
+  float acc[GEMV_TILE];
+  for (uint t = 0u; t < GEMV_TILE; ++t) acc[t] = 0.0f;
+
+  if (p.bits == 4u) {
+    // A row is (in_dim + 1) / 2 bytes. Each lane takes 8 weights (4 bytes) at a time;
+    // a group size that is a multiple of 8 keeps all 8 inside one scale group.
+    device const uint* w32 = (device const uint*)(qw + (ulong)row * (ulong)((p.in_dim + 1u) / 2u));
+    const uint n8 = p.in_dim >> 3;
+    for (uint k = lane; k < n8; k += 32u) {
+      const uint packed = w32[k];
+      const uint j0 = k << 3;
+      const float sc = srow[j0 / gsz];
+
+      for (uint t = 0u; t < nt; ++t) {
+        device const half* x = in + (ulong)(t0 + t) * (ulong)p.in_dim + j0;
+        float sub = 0.0f;
+        for (uint e = 0u; e < 8u; ++e) {
+          const int nib = int((packed >> (4u * e)) & 0xFu);
+          const int q = (nib ^ 0x8) - 0x8;
+          sub += float(q) * float(x[e]);
+        }
+        acc[t] += sub * sc;  // the scale is per GROUP, so it folds in here
+      }
+    }
+  } else {
+    device const char* w8 = (device const char*)(qw + (ulong)row * (ulong)p.in_dim);
+    for (uint k = lane; k < p.in_dim; k += 32u) {
+      const float q = float(w8[k]);
+      const float sc = srow[k / gsz];
+      for (uint t = 0u; t < nt; ++t) {
+        acc[t] += q * sc * float(in[(ulong)(t0 + t) * (ulong)p.in_dim + k]);
+      }
+    }
+  }
+
+  for (uint t = 0u; t < nt; ++t) {
+    const float s = simd_sum(acc[t]);
+    if (lane == 0u) out[(ulong)(t0 + t) * (ulong)p.out_dim + row] = half(s);
+  }
+}
+
+// Same, but fp32 output: the LM head feeds the sampler.
+kernel void cpi_lm_head_quant(
+    device const uchar*  qw     [[buffer(0)]],
+    device const half*   in     [[buffer(1)]],
+    device float*        out    [[buffer(2)]],
+    device const float*  scales [[buffer(3)]],
+    constant QuantParams& p     [[buffer(4)]],
+    uint gid   [[threadgroup_position_in_grid]],
+    uint lid   [[thread_position_in_threadgroup]],
+    uint nthr  [[threads_per_threadgroup]]) {
+  const uint simds_per_tg = nthr / 32u;
+  const uint simd_id      = lid / 32u;
+  const uint lane         = lid % 32u;
+  const uint row = gid * simds_per_tg + simd_id;
+  if (row >= p.out_dim) return;
+
+  device const float* srow = scales + (ulong)row * (ulong)p.groups;
+  const uint gsz = (p.group == 0u) ? p.in_dim : p.group;
+  float acc = 0.0f;
+
+  if (p.bits == 4u) {
+    device const uint* w32 = (device const uint*)(qw + (ulong)row * (ulong)((p.in_dim + 1u) / 2u));
+    const uint n8 = p.in_dim >> 3;
+    for (uint k = lane; k < n8; k += 32u) {
+      const uint packed = w32[k];
+      const uint j0 = k << 3;
+      float sub = 0.0f;
+      for (uint e = 0u; e < 8u; ++e) {
+        const int nib = int((packed >> (4u * e)) & 0xFu);
+        const int q = (nib ^ 0x8) - 0x8;
+        sub += float(q) * float(in[j0 + e]);
+      }
+      acc += sub * srow[j0 / gsz];
+    }
+  } else {
+    device const char* w8 = (device const char*)(qw + (ulong)row * (ulong)p.in_dim);
+    for (uint k = lane; k < p.in_dim; k += 32u) {
+      acc += float(w8[k]) * srow[k / gsz] * float(in[k]);
+    }
+  }
+
+  acc = simd_sum(acc);
+  if (lane == 0u) out[row] = acc;
+}
+
+// ---------------------------------------------------------------------------
 // RoPE, half-split (NeoX) convention: element i is paired with i + head_dim/2.
 // In-place over `heads` heads of `head_dim`.
 // ---------------------------------------------------------------------------
