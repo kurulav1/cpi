@@ -405,13 +405,13 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
           // QUANTIZED blocked GEMM, which dequantizes each weight once into threadgroup
           // memory and then reuses it across all 32 tokens.
           const bool qgemm_ok = op.cols % 64 == 0 && op.in_dim % 32 == 0;
-          const int qgemm_tokens = qgemm_ok ? (T / 32) * 32 : 0;
+          const int qgemm_tokens = qgemm_ok ? (T / 64) * 64 : 0;
 
-          if (qgemm_tokens >= 32) {
+          if (qgemm_tokens >= 64) {
             QuantParams gp = p;
             gp.tokens = static_cast<std::uint32_t>(qgemm_tokens);
             const std::size_t groups = (static_cast<std::size_t>(op.cols) / 64) *
-                                       (static_cast<std::size_t>(qgemm_tokens) / 32);
+                                       (static_cast<std::size_t>(qgemm_tokens) / 64);
             ctx_.dispatch("cpi_gemm_quant", G::Groups, groups, kTG, bufs, offs, 5, &gp, sizeof(gp));
           }
 
@@ -449,13 +449,13 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
         // Decode (T=1) stays on the GEMV: a matrix unit cannot help when one operand is a
         // vector. Token remainders below 32 do too.
         const bool gemm_ok = op.cols % 64 == 0 && op.in_dim % 32 == 0;
-        const int gemm_tokens = gemm_ok ? (T / 32) * 32 : 0;
+        const int gemm_tokens = gemm_ok ? (T / 64) * 64 : 0;
 
-        if (gemm_tokens >= 32) {
+        if (gemm_tokens >= 64) {
           GemvParams gp{static_cast<std::uint32_t>(op.cols), static_cast<std::uint32_t>(op.in_dim),
                         static_cast<std::uint32_t>(gemm_tokens), op.bias != nullptr ? 1u : 0u};
           const std::size_t groups = (static_cast<std::size_t>(op.cols) / 64) *
-                                     (static_cast<std::size_t>(gemm_tokens) / 32);
+                                     (static_cast<std::size_t>(gemm_tokens) / 64);
           ctx_.dispatch("cpi_gemm_f16", G::Groups, groups, kTG, bufs, offs, 4, &gp, sizeof(gp));
         }
 

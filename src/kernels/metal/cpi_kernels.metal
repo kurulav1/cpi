@@ -313,7 +313,10 @@ kernel void cpi_lm_head(
 // Requires out_dim % 64 == 0 and in_dim % 32 == 0 (true of every projection here). The
 // GEMV handles anything else, and the token remainder below 32.
 #define GEMM_BM 64  // rows per threadgroup
-#define GEMM_BN 32  // tokens per threadgroup
+#define GEMM_BN 64  // tokens per threadgroup
+// 64 rather than 32: arithmetic intensity is (BM*BN*BK) MACs per (BM*BK + BN*BK) loads,
+// so widening the token dimension raises MACs-per-byte from 21 to 32. On a machine whose
+// matrix units idle waiting for memory, that ratio IS the throughput.
 #define GEMM_BK 32  // K per stage
 
 kernel void cpi_gemm_f16(
@@ -336,8 +339,8 @@ kernel void cpi_gemm_f16(
   threadgroup half Ws[GEMM_BM * GEMM_BK];  // [64][32] weights
   threadgroup half As[GEMM_BN * GEMM_BK];  // [32][32] activations
 
-  simdgroup_float8x8 acc[4];
-  for (uint j = 0u; j < 4u; ++j) acc[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  simdgroup_float8x8 acc[8];  // 8 rows x 64 tokens
+  for (uint j = 0u; j < 8u; ++j) acc[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
 
   const uint srow = row0 + sgid * 8u;  // this simdgroup's 8 rows
 
@@ -360,7 +363,7 @@ kernel void cpi_gemm_f16(
       simdgroup_half8x8 b;
       simdgroup_load(b, Ws + (sgid * 8u) * GEMM_BK + kk, GEMM_BK, ulong2(0, 0), true);
 
-      for (uint j = 0u; j < 4u; ++j) {
+      for (uint j = 0u; j < 8u; ++j) {
         simdgroup_half8x8 a;  // [8 tokens x 8k]
         simdgroup_load(a, As + (j * 8u) * GEMM_BK + kk, GEMM_BK);
         // 4-arg form (d = a*b + c). A half accumulator would be wrong: K runs past 4096
@@ -376,7 +379,7 @@ kernel void cpi_gemm_f16(
   threadgroup float* stage = (threadgroup float*)Ws;
   threadgroup float* mine = stage + sgid * 64u;
 
-  for (uint j = 0u; j < 4u; ++j) {
+  for (uint j = 0u; j < 8u; ++j) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
     simdgroup_store(acc[j], mine, 8);
     simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -423,8 +426,8 @@ kernel void cpi_gemm_quant(
   threadgroup half Ws[GEMM_BM * GEMM_BK];
   threadgroup half As[GEMM_BN * GEMM_BK];
 
-  simdgroup_float8x8 acc[4];
-  for (uint j = 0u; j < 4u; ++j) acc[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  simdgroup_float8x8 acc[8];  // 8 rows x 64 tokens
+  for (uint j = 0u; j < 8u; ++j) acc[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
 
   const uint srow = row0 + sgid * 8u;
   const uint gsz = (p.group == 0u) ? p.in_dim : p.group;
@@ -459,7 +462,7 @@ kernel void cpi_gemm_quant(
     for (uint kk = 0u; kk < GEMM_BK; kk += 8u) {
       simdgroup_half8x8 b;
       simdgroup_load(b, Ws + (sgid * 8u) * GEMM_BK + kk, GEMM_BK, ulong2(0, 0), true);
-      for (uint j = 0u; j < 4u; ++j) {
+      for (uint j = 0u; j < 8u; ++j) {
         simdgroup_half8x8 a;
         simdgroup_load(a, As + (j * 8u) * GEMM_BK + kk, GEMM_BK);
         simdgroup_multiply_accumulate(acc[j], a, b, acc[j]);
@@ -471,7 +474,7 @@ kernel void cpi_gemm_quant(
   threadgroup float* stage = (threadgroup float*)Ws;
   threadgroup float* mine = stage + sgid * 64u;
 
-  for (uint j = 0u; j < 4u; ++j) {
+  for (uint j = 0u; j < 8u; ++j) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
     simdgroup_store(acc[j], mine, 8);
     simdgroup_barrier(mem_flags::mem_threadgroup);
