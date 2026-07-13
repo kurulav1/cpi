@@ -71,6 +71,24 @@ jobs:
           printf 'checking:\n%s\n' "${files[*]}"
           clang-format --dry-run --Werror "${files[@]}"
 
+  metal-shaders:
+    name: Metal shaders (compile-check)
+    runs-on: macos-14
+    # GitHub's macOS runners are VMs with NO GPU -- MTLCreateSystemDefaultDevice()
+    # returns nil there, so Metal kernels cannot be RUN in CI. But `metal` is an
+    # offline compiler, so the shaders can still be fully type-checked on every
+    # push. That is the only fast feedback available without renting a Mac, and
+    # without it the shaders would be written blind. Running them for real is a
+    # separate, manual step on actual Apple Silicon.
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile the shaders to a metallib
+        run: |
+          set -euxo pipefail
+          xcrun -sdk macosx metal -Werror -c src/kernels/metal/cpi_kernels.metal -o cpi_kernels.air
+          xcrun -sdk macosx metallib cpi_kernels.air -o cpi_kernels.metallib
+          ls -l cpi_kernels.metallib
+
   build-cpu:
     name: Build (CPU-only) + tests
     strategy:
