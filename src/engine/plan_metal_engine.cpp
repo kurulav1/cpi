@@ -969,6 +969,7 @@ std::vector<int> PlanMetalEngine::generate(const std::vector<int>& prompt, int m
     if (s.eos_id >= 0 && next == s.eos_id) break;
     out.push_back(next);
     history.push_back(next);
+    if (detail::dispatch_has_degenerate_tail(out, prompt.size())) break;  // loop guard (parity)
     if (pos + 1 >= max_context_) break;
   }
   return out;
@@ -1041,6 +1042,10 @@ std::vector<int> PlanMetalEngine::generate_stream(const std::vector<int>& prompt
     out.push_back(next);
     history.push_back(next);
     if (!on_token(next)) break;
+    // Loop guard (parity with the CUDA/CPU path, on by default): stop once the output has
+    // collapsed into a repeated tail, so a degenerate distribution can't stream forever. A
+    // grammar already bounds the output, so skip it there.
+    if (grammar == nullptr && detail::dispatch_has_degenerate_tail(out, prompt.size())) break;
     if (pos + 1 >= max_context_) break;
   }
   const double decode_ms =
@@ -1125,6 +1130,7 @@ std::vector<int> PlanMetalEngine::generate_greedy(const std::vector<int>& prompt
 
     next = static_cast<int>(*static_cast<const std::int32_t*>(argmax_out_.contents()));
     out.push_back(next);
+    if (detail::dispatch_has_degenerate_tail(out, prompt.size())) break;  // loop guard (parity)
     if (pos + 1 >= max_context_) break;
   }
   return out;
