@@ -617,9 +617,11 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
         // per-token kernel.
         if (T >= kQBlock) {
           const std::size_t blocks = static_cast<std::size_t>((T + kQBlock - 1) / kQBlock);
-          ctx_.dispatch("cpi_attention_prefill", G::Groups,
-                        static_cast<std::size_t>(op.heads) * blocks, kTG, bufs, nullptr, 5, &p,
-                        sizeof(p));
+          // head_dim <= 128 runs the matrix-unit kernel; Gemma's 256 keeps the scalar one.
+          const char* kern =
+              (op.head_dim <= 128) ? "cpi_attention_prefill_mm" : "cpi_attention_prefill";
+          ctx_.dispatch(kern, G::Groups, static_cast<std::size_t>(op.heads) * blocks, kTG, bufs,
+                        nullptr, 5, &p, sizeof(p));
         } else {
           ctx_.dispatch("cpi_attention_decode", G::Groups,
                         static_cast<std::size_t>(op.heads) * static_cast<std::size_t>(T), kTG,

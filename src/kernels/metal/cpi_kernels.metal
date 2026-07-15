@@ -895,6 +895,156 @@ kernel void cpi_kv_store(
 // ---------------------------------------------------------------------------
 #define Q_BLOCK 8
 
+// ---------------------------------------------------------------------------
+// Prefill attention on the MATRIX UNITS (head_dim <= 128). The scalar kernel below scores
+// QK^T and does P.V with per-thread dot products -- the matrix units sit idle through the
+// whole of attention, which the RCA put at ~21% of prefill. This computes both products with
+// simdgroup_matrix (fp32 accumulate, the fast path), keeping the same per-query online softmax.
+//
+// One threadgroup per (query block of 8, head); 8 simdgroups. Q_BLOCK==8 is exactly one 8-row
+// matrix fragment. For a KEY_BLOCK of 32 keys:
+//   scoring  S[8q x 8k]  = sum over head_dim/8 of  Q[8q x 8d] @ (K[8k x 8d])^T   (K loaded transposed)
+//   P.V      O[8q x 8d] += sum over the key groups of  P[8q x 8k] @ V[8k x 8d]
+// The online rescale between key blocks is applied to the fp32 accumulator in threadgroup
+// memory (a per-row scalar, which a matrix fragment cannot scale), then the P.V matmul
+// accumulates into it. Gemma's head_dim 256 does not fit the fragment plan and keeps the
+// scalar kernel.
+// ---------------------------------------------------------------------------
+kernel void cpi_attention_prefill_mm(device const half* q [[buffer(0)]],
+                                     device const half* k_cache [[buffer(1)]],
+                                     device const half* v_cache [[buffer(2)]],
+                                     device half* out [[buffer(3)]],
+                                     device const int* positions [[buffer(4)]],
+                                     constant AttnParams& p [[buffer(5)]],
+                                     uint gid [[threadgroup_position_in_grid]],
+                                     uint lid [[thread_position_in_threadgroup]],
+                                     uint nthr [[threads_per_threadgroup]]) {
+  const uint head = gid % p.heads;
+  const uint t0 = (gid / p.heads) * Q_BLOCK;
+  if (t0 >= p.tokens) return;
+  const uint nq = min((uint)Q_BLOCK, p.tokens - t0);
+
+  uint base = p.position;
+  if (p.use_position_buffer != 0u) base = uint(positions[0]);
+
+  const uint group = p.heads / p.kv_heads;
+  const uint kv_head = head / group;
+  const uint kv_dim = p.kv_heads * p.head_dim;
+  const uint q_dim = p.heads * p.head_dim;
+  const uint hd = p.head_dim;  // <= 128
+
+  const uint simd_id = lid / 32u;
+  const uint lane = lid % 32u;
+  const uint n_simd = nthr / 32u;
+
+  threadgroup half q_sh[Q_BLOCK * 128];         // [query][d]
+  threadgroup float acc[Q_BLOCK * 128];         // [query][d] fp32 output accumulator
+  threadgroup float sc_sh[Q_BLOCK * KEY_BLOCK]; // scores [query][key]
+  threadgroup half pw_sh[Q_BLOCK * KEY_BLOCK];  // softmax weights [query][key], half for the matmul
+  threadgroup float m_sh[Q_BLOCK];              // running max per query
+  threadgroup float l_sh[Q_BLOCK];              // running sum per query
+  threadgroup float r_sh[Q_BLOCK];              // this block's rescale per query
+
+  // Zero the FULL Q_BLOCK rows, not just nq: the matrix ops load 8-row fragments, so the
+  // padding rows must be defined (0) rather than garbage that could turn into NaN.
+  for (uint c = lid; c < Q_BLOCK * hd; c += nthr) {
+    const uint qi = c / hd, i = c % hd;
+    q_sh[qi * hd + i] = (qi < nq) ? q[(ulong)(t0 + qi) * (ulong)q_dim + head * hd + i] : half(0);
+    acc[qi * hd + i] = 0.0f;
+  }
+  for (uint qi = lid; qi < Q_BLOCK; qi += nthr) {
+    m_sh[qi] = -INFINITY;
+    l_sh[qi] = 0.0f;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const uint last_pos = base + t0 + nq - 1u;
+  const uint first_pos = base + t0;
+  uint start = 0u;
+  if (p.window != 0u && first_pos + 1u > p.window) start = first_pos + 1u - p.window;
+
+  const uint dfs = hd / 8u;  // head_dim fragments
+
+  for (uint kb = start; kb <= last_pos; kb += KEY_BLOCK) {
+    const uint nk = min((uint)KEY_BLOCK, last_pos - kb + 1u);
+    const uint n_kg = (nk + 7u) / 8u;  // 8-key groups this block
+
+    // --- Scoring: one simdgroup per key group computes S[8q x 8k] over the head dim. ---
+    if (simd_id < n_kg) {
+      const uint kg = simd_id;
+      simdgroup_float8x8 S = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+      for (uint df = 0u; df < dfs; ++df) {
+        simdgroup_half8x8 Qf, Kf;
+        simdgroup_load(Qf, q_sh + df * 8u, hd);  // [8q x 8d]
+        // K is [key][d]; load the [8k x 8d] tile TRANSPOSED to get [8d x 8k].
+        simdgroup_load(Kf, k_cache + (ulong)(kb + kg * 8u) * (ulong)kv_dim + kv_head * hd + df * 8u,
+                       kv_dim, ulong2(0, 0), true);
+        simdgroup_multiply_accumulate(S, Qf, Kf, S);
+      }
+      // Store straight into sc_sh[query][key] at this key group's column offset.
+      simdgroup_store(S, sc_sh + kg * 8u, KEY_BLOCK);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Scale + causal/window mask, in place.
+    for (uint c = lid; c < nq * nk; c += nthr) {
+      const uint qi = c / nk, j = c % nk;
+      const uint key = kb + j;
+      const uint pos_i = base + t0 + qi;
+      uint start_i = 0u;
+      if (p.window != 0u && pos_i + 1u > p.window) start_i = pos_i + 1u - p.window;
+      const bool keep = (key <= pos_i && key >= start_i);
+      sc_sh[qi * KEY_BLOCK + j] = keep ? sc_sh[qi * KEY_BLOCK + j] * p.scale : -INFINITY;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Online softmax, one simdgroup per query; lane j owns key j (KEY_BLOCK == 32 == simd width).
+    const uint qi = simd_id;
+    if (qi < nq) {
+      const float sc = (lane < nk) ? sc_sh[qi * KEY_BLOCK + lane] : -INFINITY;
+      const float bmax = simd_max(sc);
+      const float old_max = m_sh[qi];
+      const float new_max = max(old_max, bmax);
+      const float rescale = (old_max == -INFINITY) ? 0.0f : exp(old_max - new_max);
+      const float w =
+          (lane < nk && sc != -INFINITY && new_max != -INFINITY) ? exp(sc - new_max) : 0.0f;
+      pw_sh[qi * KEY_BLOCK + lane] = half(w);  // all 32 lanes: 0 past nk, so P.V masks itself
+      const float bsum = simd_sum(w);
+      if (lane == 0u) {
+        l_sh[qi] = l_sh[qi] * rescale + bsum;
+        m_sh[qi] = new_max;
+        r_sh[qi] = rescale;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Rescale the running fp32 accumulator by this block's per-query factor.
+    for (uint c = lid; c < nq * hd; c += nthr) acc[c] = acc[c] * r_sh[c / hd];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // --- P.V: O[8q x 8d] += P[8q x 8k] @ V[8k x 8d], accumulated into the fp32 acc. ---
+    for (uint dg = simd_id; dg < dfs; dg += n_simd) {
+      simdgroup_float8x8 O;
+      simdgroup_load(O, acc + dg * 8u, hd);  // current (rescaled) accumulator
+      for (uint kg = 0u; kg < n_kg; ++kg) {
+        simdgroup_half8x8 Pf, Vf;
+        simdgroup_load(Pf, pw_sh + kg * 8u, KEY_BLOCK);  // [8q x 8k]
+        simdgroup_load(Vf, v_cache + (ulong)(kb + kg * 8u) * (ulong)kv_dim + kv_head * hd + dg * 8u,
+                       kv_dim);  // [8k x 8d]
+        simdgroup_multiply_accumulate(O, Pf, Vf, O);
+      }
+      simdgroup_store(O, acc + dg * 8u, hd);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  for (uint c = lid; c < nq * hd; c += nthr) {
+    const uint qi = c / hd, i = c % hd;
+    const float inv = (l_sh[qi] > 0.0f) ? 1.0f / l_sh[qi] : 0.0f;
+    out[(ulong)(t0 + qi) * (ulong)q_dim + head * hd + i] = half(acc[qi * hd + i] * inv);
+  }
+}
+
 kernel void cpi_attention_prefill(device const half* q [[buffer(0)]],
                                   device const half* k_cache [[buffer(1)]],
                                   device const half* v_cache [[buffer(2)]],
