@@ -35,6 +35,8 @@
 
 namespace engine {
 
+struct GenerationConstraints;  // fwd (generation_constraints.hpp) — grammar-constrained decode
+
 class PlanMetalEngine {
 public:
   PlanMetalEngine();
@@ -91,7 +93,8 @@ public:
   // Streaming sibling of generate(): calls on_token(id) for each new token and stops early if
   // it returns false. This is the interface the serving modes (REST / web bridge) drive.
   std::vector<int> generate_stream(const std::vector<int>& prompt, int max_new, const Sampling& s,
-                                   const std::function<bool(int)>& on_token);
+                                   const std::function<bool(int)>& on_token,
+                                   const GenerationConstraints* constraints = nullptr);
 
   // Top-k (id, logit) for the token that would follow `prompt`. Used by the inspect endpoint.
   std::vector<std::pair<int, float>> inspect_next_logits(const std::vector<int>& prompt, int top_k);

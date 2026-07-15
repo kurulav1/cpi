@@ -8,12 +8,15 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
+#include <limits>
 #include <map>
 #include <stdexcept>
 #include <utility>
 #include <vector>
 
+#include "engine/generation_constraints.hpp"
 #include "engine/sampling.hpp"
+#include "grammar/grammar_sampler.hpp"
 
 namespace engine {
 
@@ -975,9 +978,20 @@ std::vector<int> PlanMetalEngine::generate(const std::vector<int>& prompt, int m
 // for greedy) because streaming needs each token on the host anyway.
 std::vector<int> PlanMetalEngine::generate_stream(const std::vector<int>& prompt, int max_new,
                                                   const Sampling& s,
-                                                  const std::function<bool(int)>& on_token) {
+                                                  const std::function<bool(int)>& on_token,
+                                                  const GenerationConstraints* constraints) {
   if (prompt.empty()) throw std::runtime_error("empty prompt");
   detail::dispatch_seed_sampler_rng(s.seed);
+
+  // Grammar-constrained decode (JSON / structured output), at parity with the CUDA/CPU path:
+  // mask logits for tokens that cannot continue the grammar BEFORE sampling, then advance the
+  // grammar with the chosen token. min_new_tokens suppresses EOS so a collapsed distribution
+  // cannot terminate early.
+  grammar::GrammarSampler* grammar = constraints ? constraints->grammar : nullptr;
+  const int min_new = constraints ? std::max(0, constraints->min_new_tokens) : 0;
+  if (constraints != nullptr && constraints->seed >= 0) {
+    detail::dispatch_seed_sampler_rng(static_cast<unsigned>(constraints->seed));
+  }
 
   std::vector<int> out;
   std::vector<int> history = prompt;
@@ -1000,9 +1014,19 @@ std::vector<int> PlanMetalEngine::generate_stream(const std::vector<int>& prompt
   int next = prompt.back();
   for (int i = 0; i < max_new; ++i, ++pos) {
     std::vector<float> lg = forward_token(next, pos);
-    next = detail::dispatch_sample_from_logits(
-        lg, s.temperature, s.top_k, s.top_p, s.repetition_penalty, s.no_repeat_ngram_size, history);
+    if (grammar != nullptr) grammar->apply_mask(lg);
+    if (i < min_new && s.eos_id >= 0 && s.eos_id < static_cast<int>(lg.size())) {
+      lg[static_cast<std::size_t>(s.eos_id)] = -std::numeric_limits<float>::infinity();
+    }
+    // Grammar-constrained decode runs greedy: the mask already restricts to the valid
+    // continuations, and sampling within them (at whatever temperature the request carried)
+    // just picks a lower-probability valid token and wanders -- structured output wants the
+    // most likely valid token. This matches how the CUDA/CPU JSON path behaves.
+    const float temp = (grammar != nullptr) ? 0.0f : s.temperature;
+    next = detail::dispatch_sample_from_logits(lg, temp, s.top_k, s.top_p, s.repetition_penalty,
+                                               s.no_repeat_ngram_size, history);
     if (s.eos_id >= 0 && next == s.eos_id) break;
+    if (grammar != nullptr) grammar->accept(next);  // advance grammar state by the chosen token
     out.push_back(next);
     history.push_back(next);
     if (!on_token(next)) break;

@@ -452,8 +452,8 @@ int main(int argc, char** argv) {
             },
             [&](const std::vector<int>& p, int max_new, float temperature,
                 const std::function<bool(int)>& on_token,
-                const engine::GenerationConstraints* /*constraints*/) {
-              return meng.generate_stream(p, max_new, make_samp(temperature), on_token);
+                const engine::GenerationConstraints* constraints) {
+              return meng.generate_stream(p, max_new, make_samp(temperature), on_token, constraints);
             },
             [&](const std::vector<int>& p, int top_k) { return meng.inspect_next_logits(p, top_k); },
             [&]() -> const engine::BenchmarkStats& { return meng.last_benchmark_stats(); }, nullptr);
