@@ -126,6 +126,7 @@ private:
   void* queue_ = nullptr;      // id<MTLCommandQueue>
   void* library_ = nullptr;    // id<MTLLibrary>
   void* cmdbuf_ = nullptr;     // id<MTLCommandBuffer>, lazily opened
+  void* encoder_ = nullptr;    // id<MTLComputeCommandEncoder>, reused across dispatches
   void* pipelines_ = nullptr;  // NSMutableDictionary name -> MTLComputePipelineState
   std::string last_error_;
 

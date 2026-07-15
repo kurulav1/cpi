@@ -80,6 +80,7 @@ MetalContext::MetalContext() {
 }
 
 MetalContext::~MetalContext() {
+  if (encoder_ != nullptr) [(id<MTLComputeCommandEncoder>)encoder_ release];
   if (cmdbuf_ != nullptr) [(id<MTLCommandBuffer>)cmdbuf_ release];
   if (pipelines_ != nullptr) [(NSMutableDictionary*)pipelines_ release];
   if (library_ != nullptr) [(id<MTLLibrary>)library_ release];
@@ -242,7 +243,21 @@ void MetalContext::dispatch(const std::string& name, Grid grid, std::size_t tota
   }
   id<MTLCommandBuffer> cb = (id<MTLCommandBuffer>)cmdbuf_;
 
-  id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+  // ONE compute encoder is reused across every dispatch in the command buffer, closed only at
+  // commit. A decode step issues a few hundred dispatches; a fresh encoder per dispatch (the
+  // previous design) paid the driver's encoder setup and an implicit full barrier every time,
+  // which is a large fixed per-token cost -- and that overhead is a much bigger fraction of a
+  // bandwidth-light int4 decode than of a bandwidth-heavy fp16 one. Ordering between dependent
+  // dispatches is kept by an explicit memory barrier (below), which is far cheaper than an
+  // encoder boundary.
+  if (encoder_ == nullptr) {
+    encoder_ = (void*)[[cb computeCommandEncoder] retain];
+  }
+  // No explicit barrier: the slot/weight buffers are Shared and hazard-TRACKED, so Metal
+  // inserts a dependency barrier automatically wherever a dispatch reads what an earlier one
+  // wrote -- and only there. Independent ops in a layer (the Q/K/V projections, say) are then
+  // free to overlap on the GPU instead of being force-serialised as a per-op encoder did.
+  id<MTLComputeCommandEncoder> enc = (id<MTLComputeCommandEncoder>)encoder_;
   [enc setComputePipelineState:pso];
   ++dispatch_count_;
 
@@ -265,12 +280,16 @@ void MetalContext::dispatch(const std::string& name, Grid grid, std::size_t tota
     [enc dispatchThreads:MTLSizeMake((NSUInteger)total, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
   }
-  [enc endEncoding];
 }
 
 void MetalContext::commit_and_wait() {
   if (cmdbuf_ == nullptr) return;
   id<MTLCommandBuffer> cb = (id<MTLCommandBuffer>)cmdbuf_;
+  if (encoder_ != nullptr) {
+    [(id<MTLComputeCommandEncoder>)encoder_ endEncoding];
+    [(id<MTLComputeCommandEncoder>)encoder_ release];
+    encoder_ = nullptr;
+  }
   [cb commit];
   [cb waitUntilCompleted];
   // GPUStartTime/GPUEndTime bracket the actual on-GPU execution of this buffer. Summed
