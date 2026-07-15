@@ -943,8 +943,11 @@ kernel void cpi_attention_prefill(device const half* q [[buffer(0)]],
   for (uint kb = start; kb <= last_pos; kb += KEY_BLOCK) {
     const uint nk = min((uint)KEY_BLOCK, last_pos - kb + 1u);
 
-    // Score every (query, key) pair in the block; one simdgroup reduces one pair.
-    for (uint pidx = simd_id; pidx < nq * nk; pidx += n_simd) {
+    // Score every (query, key) pair: ONE THREAD per pair, a full dot product with no
+    // cross-lane reduction. The previous version gave each pair a whole simdgroup and summed
+    // across 32 lanes -- five shuffle steps of reduction overhead for ~two useful multiplies
+    // per lane. nq*nk <= Q_BLOCK*KEY_BLOCK == nthr, so this is a single pass at full occupancy.
+    for (uint pidx = lid; pidx < nq * nk; pidx += nthr) {
       const uint qi = pidx / nk, j = pidx % nk;
       const uint key = kb + j;
       const uint pos_i = base + t0 + qi;
@@ -956,10 +959,10 @@ kernel void cpi_attention_prefill(device const half* q [[buffer(0)]],
       if (key <= pos_i && key >= start_i) {  // causal mask, plus the sliding window
         device const half* kt = k_cache + (ulong)key * (ulong)kv_dim + kv_head * hd;
         float acc_d = 0.0f;
-        for (uint i = lane; i < hd; i += 32u) acc_d += q_sh[qi * hd + i] * float(kt[i]);
-        d = simd_sum(acc_d) * p.scale;
+        for (uint i = 0u; i < hd; ++i) acc_d += q_sh[qi * hd + i] * float(kt[i]);
+        d = acc_d * p.scale;
       }
-      if (lane == 0u) sc_sh[qi * KEY_BLOCK + j] = d;
+      sc_sh[qi * KEY_BLOCK + j] = d;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
