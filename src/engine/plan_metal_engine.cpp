@@ -400,7 +400,29 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
 
   if (profile) profile_last_ = std::chrono::steady_clock::now();
 
-  for (const opplan::Op& op : ops) {
+  for (std::size_t oi = 0; oi < ops.size(); ++oi) {
+    const opplan::Op& op = ops[oi];
+
+    // PEEPHOLE FUSION: `X += delta` (AddInplace) immediately followed by `XNorm = rmsnorm(X)`
+    // is one fused pass -- the residual is read and written once instead of twice. The two ops
+    // are adjacent within a layer (post-attention: the residual add and the ffn_norm). Done
+    // here rather than in the shared plan builder so the CUDA path is untouched.
+    if (op.kind == OpKind::AddInplace && oi + 1 < ops.size() &&
+        ops[oi + 1].kind == OpKind::RmsNorm && ops[oi + 1].in == op.out) {
+      const opplan::Op& nrm = ops[oi + 1];
+      const int rows = nrm.rows * T;
+      NormParams p{static_cast<std::uint32_t>(rows), static_cast<std::uint32_t>(nrm.cols), nrm.eps,
+                   nrm.norm_offset ? 1u : 0u, nrm.weight != nullptr ? 1u : 0u};
+      const void* wb = nrm.weight != nullptr ? nrm.weight : slot(op.out);
+      // x = residual (add.out == norm.in), delta = add.in, out = norm.out (XNorm).
+      const void* bufs[] = {slot(op.out), slot(op.in), wb, slot(nrm.out)};
+      ctx_.dispatch("cpi_add_rmsnorm", G::Groups, static_cast<std::size_t>(rows), kTG, bufs, nullptr,
+                    4, &p, sizeof(p));
+      ++oi;  // consume the fused RmsNorm
+      if (profile) profile_tick("AddRmsNorm(fused)");
+      continue;
+    }
+
     switch (op.kind) {
       case OpKind::EmbeddingLookup: {
         EmbedParams p{static_cast<std::uint32_t>(op.cols), static_cast<std::uint32_t>(T)};

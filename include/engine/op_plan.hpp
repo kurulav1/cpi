@@ -78,6 +78,10 @@ enum class OpKind : std::uint8_t {
   Attention,        // single-query attention over the cache (sliding window aware)
   GeluMul,          // out = gelu(a) * b   (GeGLU / PLE gate)
   AddInplace,       // out += in           (residual; out defaults to X)
+  AddRmsNorm,       // FUSED residual add + RMSNorm, never emitted by the builder: the Metal
+                    // engine folds an AddInplace(delta -> X) immediately followed by
+                    // RmsNorm(X -> XNorm) into one pass. in = delta, aux slot = X (residual,
+                    // updated in place), out = XNorm. Saves a full read+write of the residual.
   EmbeddingLookup,  // out = embed_table[token]  (token from the executor's device buffer)
   LmHead,           // logits[vocab] (float) = W[vocab×in_dim] · in   (writes the executor's logits)
 

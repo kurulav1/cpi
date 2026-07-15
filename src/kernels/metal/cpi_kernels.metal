@@ -150,6 +150,59 @@ kernel void cpi_rmsnorm(
 }
 
 // ---------------------------------------------------------------------------
+// Fused residual-add + RMSNorm. The plan does `X += delta` (AddInplace) then
+// `XNorm = rmsnorm(X)` back to back, each a full read+write of the residual. This does both
+// in one pass: add delta into X (written back), then normalise the summed value. Saves one
+// round-trip of the whole activation through device memory per fusion site.
+// ---------------------------------------------------------------------------
+kernel void cpi_add_rmsnorm(
+    device half*        x       [[buffer(0)]],  // residual, updated in place (X += delta)
+    device const half*  delta   [[buffer(1)]],  // block output to add
+    device const half*  weight  [[buffer(2)]],
+    device half*        out     [[buffer(3)]],  // normalised result (XNorm)
+    constant NormParams& p      [[buffer(4)]],
+    uint  gid  [[threadgroup_position_in_grid]],
+    uint  lid  [[thread_position_in_threadgroup]],
+    uint  nthr [[threads_per_threadgroup]]) {
+  if (gid >= p.rows) return;
+  const uint base = gid * p.cols;
+
+  // Add delta into the residual, write it back, and accumulate the sum of squares in one sweep.
+  float ss = 0.0f;
+  for (uint i = lid; i < p.cols; i += nthr) {
+    const float v = float(x[base + i]) + float(delta[base + i]);
+    x[base + i] = half(v);  // updated residual, read again below by this same thread
+    ss += v * v;
+  }
+  ss = simd_sum(ss);
+
+  threadgroup float partial[32];
+  const uint simd_id = lid / 32u;
+  const uint simd_lane = lid % 32u;
+  const uint n_simd = (nthr + 31u) / 32u;
+  if (simd_lane == 0u) partial[simd_id] = ss;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  if (simd_id == 0u) {
+    float v = (simd_lane < n_simd) ? partial[simd_lane] : 0.0f;
+    v = simd_sum(v);
+    if (simd_lane == 0u) partial[0] = v;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const float inv = rsqrt(partial[0] / float(p.cols) + p.eps);
+
+  for (uint i = lid; i < p.cols; i += nthr) {
+    float w = 1.0f;
+    if (p.has_weight != 0u) {
+      w = float(weight[i]);
+      if (p.weight_offset != 0u) w += 1.0f;
+    }
+    out[base + i] = half(float(x[base + i]) * inv * w);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // GEMV: out[out_dim] = W[out_dim x in_dim] . in[in_dim], row-major, fp16.
 // One simdgroup per output row; each lane strides the row, fp32 accumulate.
 //
