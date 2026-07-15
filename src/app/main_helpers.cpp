@@ -858,8 +858,13 @@ ModelProbe probe_model(const std::string& model_path) {
   return p;
 }
 
-EngineChoice resolve_engine(const ModelProbe& probe, bool cuda_available, bool force_cpu) {
+EngineChoice resolve_engine(const ModelProbe& probe, bool cuda_available, bool metal_available,
+                            bool force_cpu) {
   const bool use_gpu = cuda_available && !force_cpu;
+  // Metal is the Apple-Silicon fast path when there is no CUDA device: it covers the
+  // Llama family (dense .ll2c -- Llama/Qwen2/Qwen3/Gemma), the same scope PlanMetalEngine
+  // supports. CUDA wins when present; Metal beats CPU otherwise.
+  const bool use_metal = metal_available && !cuda_available && !force_cpu;
   switch (probe.kind) {
     case ModelFamilyKind::Gemma4:
       if (!use_gpu) {
@@ -872,7 +877,9 @@ EngineChoice resolve_engine(const ModelProbe& probe, bool cuda_available, bool f
       return use_gpu ? EngineChoice::Llama4Cuda : EngineChoice::Llama4Cpu;
     case ModelFamilyKind::Llama:
     default:
-      return use_gpu ? EngineChoice::LlamaCuda : EngineChoice::LlamaCpu;
+      if (use_gpu) return EngineChoice::LlamaCuda;
+      if (use_metal) return EngineChoice::LlamaMetal;
+      return EngineChoice::LlamaCpu;
   }
 }
 

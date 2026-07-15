@@ -78,6 +78,7 @@ ModelProbe probe_model(const std::string& model_path);
 // a model property (see ModelFamilyKind).
 enum class EngineChoice {
   LlamaCuda,   // default fast path (.ll2c and anything not otherwise classified)
+  LlamaMetal,  // PlanMetalEngine on Apple Silicon (no CUDA, Metal GPU present)
   LlamaCpu,    // CpuLlamaEngine (force_cpu / no CUDA device / no-CUDA build)
   PlanCuda,    // generic per-layer op-plan executor (Gemma 4 .cpi today) — CUDA only
   Qwen35Cuda,
@@ -89,6 +90,7 @@ enum class EngineChoice {
 // Resolves the model family (from a probe) plus the runtime device situation into
 // a single engine choice — the whole dispatch decision in one place. Throws if the
 // model cannot run on the available device (Gemma 4 currently requires CUDA).
-EngineChoice resolve_engine(const ModelProbe& probe, bool cuda_available, bool force_cpu);
+EngineChoice resolve_engine(const ModelProbe& probe, bool cuda_available, bool metal_available,
+                            bool force_cpu);
 
 }  // namespace app::main_helpers

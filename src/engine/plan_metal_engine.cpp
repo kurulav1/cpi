@@ -970,6 +970,78 @@ std::vector<int> PlanMetalEngine::generate(const std::vector<int>& prompt, int m
   return out;
 }
 
+// Streaming generate: the same prefill + decode as generate(), but every token is handed to
+// on_token so the serving layer can stream it. Always goes through the host-side sampler (even
+// for greedy) because streaming needs each token on the host anyway.
+std::vector<int> PlanMetalEngine::generate_stream(const std::vector<int>& prompt, int max_new,
+                                                  const Sampling& s,
+                                                  const std::function<bool(int)>& on_token) {
+  if (prompt.empty()) throw std::runtime_error("empty prompt");
+  detail::dispatch_seed_sampler_rng(s.seed);
+
+  std::vector<int> out;
+  std::vector<int> history = prompt;
+  int pos = 0;
+
+  const int n_pre = static_cast<int>(prompt.size()) - 1;
+  const auto pre0 = std::chrono::steady_clock::now();
+  for (int off = 0; off < n_pre; off += max_prefill_) {
+    const int chunk = std::min(max_prefill_, n_pre - off);
+    const std::vector<int> ids(prompt.begin() + off, prompt.begin() + off + chunk);
+    encode_prefill(ids, pos);
+    ctx_.commit_and_wait();
+    pos += chunk;
+  }
+  prefill_ms_ =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pre0).count();
+  prefill_tokens_ = n_pre;
+
+  const auto dec0 = std::chrono::steady_clock::now();
+  int next = prompt.back();
+  for (int i = 0; i < max_new; ++i, ++pos) {
+    std::vector<float> lg = forward_token(next, pos);
+    next = detail::dispatch_sample_from_logits(
+        lg, s.temperature, s.top_k, s.top_p, s.repetition_penalty, s.no_repeat_ngram_size, history);
+    if (s.eos_id >= 0 && next == s.eos_id) break;
+    out.push_back(next);
+    history.push_back(next);
+    if (!on_token(next)) break;
+    if (pos + 1 >= max_context_) break;
+  }
+  const double decode_ms =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - dec0).count();
+
+  bench_stats_ = BenchmarkStats{};
+  bench_stats_.prefill_ms = prefill_ms_;
+  bench_stats_.decode_ms = decode_ms;
+  bench_stats_.prompt_tokens = static_cast<int>(prompt.size());
+  bench_stats_.generated_tokens = static_cast<int>(out.size());
+  return out;
+}
+
+std::vector<std::pair<int, float>> PlanMetalEngine::inspect_next_logits(
+    const std::vector<int>& prompt, int top_k) {
+  if (prompt.empty()) throw std::runtime_error("empty prompt");
+  int pos = 0;
+  const int n_pre = static_cast<int>(prompt.size()) - 1;
+  for (int off = 0; off < n_pre; off += max_prefill_) {
+    const int chunk = std::min(max_prefill_, n_pre - off);
+    const std::vector<int> ids(prompt.begin() + off, prompt.begin() + off + chunk);
+    encode_prefill(ids, pos);
+    ctx_.commit_and_wait();
+    pos += chunk;
+  }
+  std::vector<float> lg = forward_token(prompt.back(), pos);
+
+  std::vector<std::pair<int, float>> ranked(lg.size());
+  for (std::size_t i = 0; i < lg.size(); ++i) ranked[i] = {static_cast<int>(i), lg[i]};
+  const int k = std::min<int>(top_k, static_cast<int>(ranked.size()));
+  std::partial_sort(ranked.begin(), ranked.begin() + k, ranked.end(),
+                    [](const auto& a, const auto& b) { return a.second > b.second; });
+  ranked.resize(k);
+  return ranked;
+}
+
 std::vector<int> PlanMetalEngine::generate_greedy(const std::vector<int>& prompt, int max_new) {
   if (prompt.empty()) throw std::runtime_error("empty prompt");
 

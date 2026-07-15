@@ -206,6 +206,10 @@ if(LLAMA_ENGINE_ENABLE_METAL)
     "-framework Foundation"
   )
 
+  # Exposed as a compile macro (PUBLIC, so llama_infer sees it) so the main binary can
+  # conditionally wire the Metal engine into its dispatch -- mirrors LLAMA_ENGINE_HAS_CUDA.
+  target_compile_definitions(llama_engine PUBLIC LLAMA_ENGINE_ENABLE_METAL=1)
+
   set(CPI_METAL_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/metal/cpi_kernels.metal)
 
   # The offline `metal` compiler ships with XCODE, not with the Command Line Tools.

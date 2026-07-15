@@ -17,13 +17,16 @@
 // deliberately out of scope here.
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
 #include <chrono>
 #include <map>
+#include <utility>
 #include <vector>
 
+#include "engine/engine_types.hpp"
 #include "engine/op_plan.hpp"
 #include "engine/op_plan_builder.hpp"
 #include "model/llama_config.hpp"
@@ -84,6 +87,18 @@ public:
     unsigned seed = 0;
   };
   std::vector<int> generate(const std::vector<int>& prompt, int max_new, const Sampling& s);
+
+  // Streaming sibling of generate(): calls on_token(id) for each new token and stops early if
+  // it returns false. This is the interface the serving modes (REST / web bridge) drive.
+  std::vector<int> generate_stream(const std::vector<int>& prompt, int max_new, const Sampling& s,
+                                   const std::function<bool(int)>& on_token);
+
+  // Top-k (id, logit) for the token that would follow `prompt`. Used by the inspect endpoint.
+  std::vector<std::pair<int, float>> inspect_next_logits(const std::vector<int>& prompt, int top_k);
+
+  const BenchmarkStats& last_benchmark_stats() const {
+    return bench_stats_;
+  }
 
   // Wall time of the last prompt prefill, and how many tokens it covered.
   double last_prefill_ms() const {
@@ -150,6 +165,7 @@ private:
   std::vector<float> logits_;
   double prefill_ms_ = 0.0;
   int prefill_tokens_ = 0;
+  BenchmarkStats bench_stats_{};
   std::string last_error_;
 
   class MetalWeights;

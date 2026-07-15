@@ -29,6 +29,10 @@
 #include "engine/llama_engine.hpp"
 #include "engine/speculative_decoder.hpp"
 #endif
+#if LLAMA_ENGINE_ENABLE_METAL
+#include "engine/plan_metal_engine.hpp"
+#include "runtime/metal_context.hpp"
+#endif
 #include "model/tokenizer.hpp"
 
 #ifdef _WIN32
@@ -270,8 +274,17 @@ int main(int argc, char** argv) {
 #else
     const bool cuda_available = false;
 #endif
-    const app::main_helpers::EngineChoice engine_choice =
-        app::main_helpers::resolve_engine(model_probe, cuda_available, cli.force_cpu);
+    // Apple Silicon: probe for a real Metal GPU (nil inside a GPU-less VM). Only matters when
+    // there is no CUDA device -- Metal is the Mac's GPU fast path.
+    bool metal_available = false;
+#if LLAMA_ENGINE_ENABLE_METAL
+    if (!cuda_available && !cli.force_cpu) {
+      runtime::MetalContext mctx;
+      metal_available = mctx.available();
+    }
+#endif
+    const app::main_helpers::EngineChoice engine_choice = app::main_helpers::resolve_engine(
+        model_probe, cuda_available, metal_available, cli.force_cpu);
 
     if (!quiet_output) {
       using app::main_helpers::EngineChoice;
@@ -305,6 +318,9 @@ int main(int argc, char** argv) {
                                       : "This binary was built without CUDA support.")
                     << " Using CPU inference engine.\n";
 #endif
+          break;
+        case EngineChoice::LlamaMetal:
+          std::cout << "[info] No CUDA device found. Using the Metal GPU engine (Apple Silicon).\n";
           break;
         case EngineChoice::LlamaCuda:
           break;  // default fast path — no banner
@@ -410,6 +426,37 @@ int main(int argc, char** argv) {
         run_with_engine(llama4_cpu_eng);
         break;
       }
+#if LLAMA_ENGINE_ENABLE_METAL
+      case EngineChoice::LlamaMetal: {
+        // Apple Silicon GPU path for the main binary -- the same PlanMetalEngine the metal_infer
+        // tool uses, wired into the standard serving modes so the REST/web bridge runs on a Mac.
+        // fp16 for now; grammar-constrained decode and a Metal vision tower are not yet wired.
+        engine::PlanMetalEngine meng;
+        meng.open(cli.opts.model_path, cli.opts.max_context, /*quant_bits=*/0, /*quant_group=*/0);
+        auto make_samp = [&](float temperature) {
+          engine::PlanMetalEngine::Sampling s;
+          s.temperature = temperature;
+          s.top_k = cli.opts.top_k;
+          s.top_p = cli.opts.top_p;
+          s.eos_id = cli.opts.eos_token_id;
+          return s;
+        };
+        app::main_modes::execute_engine_modes(
+            run_opts, prompt_tokens, stop_token_ids, cli.stop_texts,
+            use_tokenizer ? &tokenizer : nullptr,
+            [&](const std::vector<int>& p, int max_new, float temperature) {
+              return meng.generate(p, max_new, make_samp(temperature));
+            },
+            [&](const std::vector<int>& p, int max_new, float temperature,
+                const std::function<bool(int)>& on_token,
+                const engine::GenerationConstraints* /*constraints*/) {
+              return meng.generate_stream(p, max_new, make_samp(temperature), on_token);
+            },
+            [&](const std::vector<int>& p, int top_k) { return meng.inspect_next_logits(p, top_k); },
+            [&]() -> const engine::BenchmarkStats& { return meng.last_benchmark_stats(); }, nullptr);
+        break;
+      }
+#endif
       case EngineChoice::LlamaCpu: {
         engine::CpuLlamaEngine cpu_eng;
         run_with_engine(cpu_eng);
