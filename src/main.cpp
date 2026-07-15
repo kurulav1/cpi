@@ -432,7 +432,10 @@ int main(int argc, char** argv) {
         // tool uses, wired into the standard serving modes so the REST/web bridge runs on a Mac.
         // fp16 for now; grammar-constrained decode and a Metal vision tower are not yet wired.
         engine::PlanMetalEngine meng;
-        meng.open(cli.opts.model_path, cli.opts.max_context, /*quant_bits=*/0, /*quant_group=*/0);
+        // --weight-quant int4/int8 (a.k.a. --int4-streaming) maps to on-load host quantization;
+        // otherwise fp16. This is what lets a large model (e.g. an 8B) serve on a 16 GB Mac.
+        const int metal_quant_bits = cli.opts.int8_streaming ? cli.opts.streaming_quant_bits : 0;
+        meng.open(cli.opts.model_path, cli.opts.max_context, metal_quant_bits, /*quant_group=*/0);
         auto make_samp = [&](float temperature) {
           engine::PlanMetalEngine::Sampling s;
           s.temperature = temperature;
