@@ -361,8 +361,15 @@ kernel void cpi_lm_head(
 //
 // GEMM_QBK must also not exceed the quantization group (64 by default), or a K-block would
 // straddle two scales. The dispatch guards that.
+// The fp16 GEMM uses a TALLER row tile with MORE simdgroups: GEMM_FBM=128 rows over 8
+// simdgroups (256 threads) instead of 64 over 4. This was the real fix for its ~53%-of-peak
+// stall -- not the register file (accumulators stay 4x4), but too few simdgroups to hide the
+// inner-loop fragment-load latency. With 8, one simdgroup computes while another waits on a
+// simdgroup_load. Measured 2764 -> 3780 tok/s (0.5B fp16 prefill).
 #define GEMM_BK 64
 #define GEMM_QBK 32
+#define GEMM_FBM 128
+#define GEMM_FBK 32
 
 // ---------------------------------------------------------------------------
 // Blocked fp16 GEMM (prefill). A K-block of both operands is staged in threadgroup memory,
@@ -387,30 +394,30 @@ kernel void cpi_gemm_f16(device const half* w [[buffer(0)]], device const half* 
   const uint sg_row = sgid / GEMM_SG_COLS;
   const uint sg_col = sgid % GEMM_SG_COLS;
 
-  const uint row_blocks = p.out_dim / GEMM_BM;
-  const uint row0 = (tgid % row_blocks) * GEMM_BM;
+  const uint row_blocks = p.out_dim / GEMM_FBM;
+  const uint row0 = (tgid % row_blocks) * GEMM_FBM;
   const uint tok0 = (tgid / row_blocks) * GEMM_BN;
   if (tok0 >= p.tokens) return;
 
-  threadgroup half Ws[GEMM_BM * GEMM_BK];
-  threadgroup half As[GEMM_BN * GEMM_BK];
+  threadgroup half Ws[GEMM_FBM * GEMM_FBK];
+  threadgroup half As[GEMM_BN * GEMM_FBK];
 
   simdgroup_float8x8 acc[4][4];
   for (uint i = 0u; i < 4u; ++i)
     for (uint j = 0u; j < 4u; ++j) acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
 
-  const uint chunks = GEMM_BK / 8u;  // 8 halves == one 128-bit load
+  const uint chunks = GEMM_FBK / 8u;  // 8 halves == one 128-bit load
 
-  for (uint k0 = 0u; k0 < p.in_dim; k0 += GEMM_BK) {
+  for (uint k0 = 0u; k0 < p.in_dim; k0 += GEMM_FBK) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint c = lid; c < GEMM_BM * chunks; c += nthr) {
+    for (uint c = lid; c < GEMM_FBM * chunks; c += nthr) {
       const uint r = c / chunks, sub = c % chunks;
-      *(threadgroup uint4*)(Ws + r * GEMM_BK + sub * 8u) =
+      *(threadgroup uint4*)(Ws + r * GEMM_FBK + sub * 8u) =
           *(device const uint4*)(w + (ulong)(row0 + r) * (ulong)p.in_dim + k0 + sub * 8u);
     }
     for (uint c = lid; c < GEMM_BN * chunks; c += nthr) {
       const uint t = c / chunks, sub = c % chunks;
-      threadgroup uint4* dst = (threadgroup uint4*)(As + t * GEMM_BK + sub * 8u);
+      threadgroup uint4* dst = (threadgroup uint4*)(As + t * GEMM_FBK + sub * 8u);
       if (tok0 + t < p.tokens) {
         *dst = *(device const uint4*)(in + (ulong)(tok0 + t) * (ulong)p.in_dim + k0 + sub * 8u);
       } else {
@@ -419,14 +426,14 @@ kernel void cpi_gemm_f16(device const half* w [[buffer(0)]], device const half* 
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint kk = 0u; kk < GEMM_BK; kk += 8u) {
+    for (uint kk = 0u; kk < GEMM_FBK; kk += 8u) {
       simdgroup_half8x8 wf[4], af[4];
       // W is [rows, cols], so a weight fragment loads TRANSPOSED: [8k x 8rows].
       for (uint i = 0u; i < 4u; ++i)
-        simdgroup_load(wf[i], Ws + (sg_row * 32u + i * 8u) * GEMM_BK + kk, GEMM_BK, ulong2(0, 0),
+        simdgroup_load(wf[i], Ws + (sg_row * 32u + i * 8u) * GEMM_FBK + kk, GEMM_FBK, ulong2(0, 0),
                        true);
       for (uint j = 0u; j < 4u; ++j)
-        simdgroup_load(af[j], As + (sg_col * 32u + j * 8u) * GEMM_BK + kk, GEMM_BK);
+        simdgroup_load(af[j], As + (sg_col * 32u + j * 8u) * GEMM_FBK + kk, GEMM_FBK);
       for (uint i = 0u; i < 4u; ++i)
         for (uint j = 0u; j < 4u; ++j)
           simdgroup_multiply_accumulate(acc[i][j], af[j], wf[i], acc[i][j]);

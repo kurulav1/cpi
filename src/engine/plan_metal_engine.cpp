@@ -532,7 +532,7 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
         //
         // Decode (T=1) stays on the GEMV: a matrix unit cannot help when one operand is a
         // vector. Token remainders below 32 do too.
-        const bool gemm_ok = op.cols % 64 == 0 && op.in_dim % kGemmBK == 0;
+        const bool gemm_ok = op.cols % 128 == 0 && op.in_dim % 32 == 0;
         const int gemm_tokens = (gemm_ok && T >= kGemmMinTokens) ? T : 0;
 
         if (gemm_tokens > 0) {
