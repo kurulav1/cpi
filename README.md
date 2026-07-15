@@ -250,8 +250,8 @@ just kernels. CPI's inference *core* runs on a Mac; CPI-the-product does not.
 
 | Model | | GPU weights | decode | prefill (551 tok) |
 | --- | --- | --- | --- | --- |
-| Qwen2.5-0.5B | fp16 | 1.17 GB | 86.5 tok/s | 2668 tok/s |
-| Qwen2.5-0.5B | int4 | 0.51 GB | 146.7 tok/s | 2516 tok/s |
+| Qwen2.5-0.5B | fp16 | 1.17 GB | 86.5 tok/s | 3730 tok/s |
+| Qwen2.5-0.5B | int4 | 0.51 GB | 146.7 tok/s | 2600 tok/s |
 | **Llama-3.1-8B** | **int4** | **4.91 GB** | **20.5 tok/s** | **161 tok/s** |
 
 The 8B is the point of quantization: at fp16 its weights are ~15 GB and it does **not** fit in a
@@ -322,8 +322,8 @@ is *wider* than the 8B's, and the honest table is worth keeping:
 
 | | llama.cpp | CPI | CPI / llama.cpp |
 | --- | --- | --- | --- |
-| fp16 prefill (551) | 4181 | 2668 | 64% |
-| int4 prefill (551) | 4069 | 2516 | 62% |
+| fp16 prefill (551) | 4163 | 3730 | 90% |
+| int4 prefill (551) | 4066 | 2600 | 64% |
 | int4 decode (short ctx) | 198 | 176 | 89% |
 
 A counter (`MetalContext::gpu_busy_ms()`, GPU wall-clock via command-buffer timestamps) settled
@@ -345,9 +345,18 @@ to the 8B:
   from device, so a wider tile (128) adds weight reuse at no threadgroup-memory cost: **int4
   1527 → 1903**. The fp16 GEMM stages its activations, so the same widening drops occupancy and
   loses — it keeps 64.
+- **The fp16 GEMM was starved of simdgroups, not registers.** For two sessions it sat at ~53% of
+  peak and was diagnosed as a register-file wall (the 4×4 accumulator tile caps arithmetic
+  intensity, and every attempt to raise it — wider tiles, half accumulators, register tiling —
+  failed). The real cause was different: it ran **4 simdgroups (128 threads)**, too few to hide the
+  inner-loop `simdgroup_load` latency — while one simdgroup waits on a fragment, there was no other
+  ready to compute. Running the same 4×4 tile over a **taller 128-row block with 8 simdgroups (256
+  threads)** hides it: **fp16 prefill 2764 → 3730 tok/s**, ~90% of llama.cpp. (16 simdgroups is
+  worse — 8 is the sweet spot; the quantized GEMM was already at 8, which is why it was never the
+  one stuck.)
 
-The remaining ~1.6× on prefill is now GEMM-dominated: CPI's fp16 GEMM runs at ~53% of peak against
-llama.cpp's near-peak `mul_mm`. That one is a characterized hardware wall (below).
+The remaining gap is now almost entirely the quantized GEMM (int4 at 64%), which carries the
+dequantization work and reads activations from device; it is already at its 8-simdgroup optimum.
 
 **Correctness.** Qwen2.5-0.5B, Qwen3-0.6B and gemma-2b each reproduce the CUDA backend's greedy
 token stream exactly on an Apple M4 (`src/tests/golden/`). `metal_decode_test` gates on two
