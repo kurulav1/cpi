@@ -241,10 +241,17 @@ present, CMake precompiles a `.metallib` and skips the runtime step.
 Mistral, Qwen2.5, Qwen3, Gemma), batched prefill, single-token decode, and the full sampler
 (temperature, top-k, top-p, repetition penalty, n-gram blocking) via CPI's shared implementation.
 
-**Not supported**, and rejected loudly rather than half-done: MoE, the vision tower, linear
-attention (Qwen3.5), and the serving stack — REST API, web UI, continuous batching, paged KV.
-Those are wired to the CUDA engines and would need a backend abstraction above the engine, not
-just kernels. CPI's inference *core* runs on a Mac; CPI-the-product does not.
+**Single-request serving runs on Metal.** The main `cpi` binary — which the REST/web bridge spawns
+— dispatches to the Metal engine on Apple Silicon (it used to fall back to the scalar CPU engine).
+The interactive JSON streaming protocol the web UI uses works end to end (token deltas, temperature
+sampling, metrics), and `--weight-quant int4/int8` serves a quantized model, so a large model fits
+on a small Mac. On an M4, Qwen2.5-0.5B streams at ~54 tok/s (fp16) / ~87 tok/s (int4), versus
+~2 tok/s on the CPU fallback.
+
+**Still not on Metal**, and rejected loudly rather than half-done: continuous batching + paged KV
+(the multi-user batch worker is `LlamaEngine`-only), MoE, the vision tower, linear attention
+(Qwen3.5), and grammar-constrained decode. Those need work above the kernels. So single-request
+serving runs on a Mac; the batched multi-user server does not — yet.
 
 **Measured** (Apple M4, 10-core GPU, 16 GB):
 
