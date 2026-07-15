@@ -82,8 +82,12 @@ constexpr int kTG = 256;               // threads per group
 constexpr int kSimdsPerTG = kTG / 32;  // = rows per threadgroup in the GEMV
 // The blocked GEMMs tile 64 rows x 64 tokens: 4 simdgroups (128 threads), each owning a 32x32
 // output tile of 4x4 fragments.
-constexpr int kGemmBN = 64;                              // MUST match GEMM_BN in the shader
+constexpr int kGemmBN = 64;                               // MUST match GEMM_BN in the shader (fp16)
 constexpr int kGemmTG = 32 * (64 / 32) * (kGemmBN / 32);  // one simdgroup per 32x32 sub-tile
+// The quantized GEMM reads activations from device, not a staged tile, so a wider token tile
+// buys weight reuse at no threadgroup-memory cost. It wants 128 where fp16 wants 64.
+constexpr int kGemmQBN = 128;                              // MUST match GEMM_QBN in the shader
+constexpr int kGemmQTG = 32 * (64 / 32) * (kGemmQBN / 32);
 // Below this many tokens the GEMV wins: a GEMM tile is padded out to kGemmBN and the padding
 // is wasted arithmetic. Above it the GEMV is a catastrophe -- see the dispatch below.
 constexpr int kGemmMinTokens = 16;
@@ -465,9 +469,9 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
             QuantParams gp = p;
             gp.tokens = static_cast<std::uint32_t>(qgemm_tokens);
             const std::size_t tiles =
-                static_cast<std::size_t>((qgemm_tokens + kGemmBN - 1) / kGemmBN);
+                static_cast<std::size_t>((qgemm_tokens + kGemmQBN - 1) / kGemmQBN);
             const std::size_t groups = (static_cast<std::size_t>(op.cols) / 64) * tiles;
-            ctx_.dispatch("cpi_gemm_quant", G::Groups, groups, kGemmTG, bufs, offs, 5, &gp,
+            ctx_.dispatch("cpi_gemm_quant", G::Groups, groups, kGemmQTG, bufs, offs, 5, &gp,
                           sizeof(gp));
             if (profile) profile_tick("Gemm(quant)");
           }

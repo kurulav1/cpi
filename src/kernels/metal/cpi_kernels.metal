@@ -282,13 +282,21 @@ kernel void cpi_lm_head(
 }
 
 #define GEMM_BM 64  // rows per threadgroup
-// Tokens per threadgroup. Widening this to 128 halves the weight traffic and changed NOTHING,
-// which is how we learnt the GEMM is compute-bound, not traffic-bound (it runs at ~70% of the
-// M4's peak). Given that, narrow is better: the last tile of a prefill is padded out to
-// GEMM_BN and the padding is wasted arithmetic.
+// Tokens per threadgroup. Like the K-depth, the two GEMMs want DIFFERENT widths, measured on
+// the 0.5B fp16 prefill and the int4:
+//
+//   fp16  (GEMM_BN 64): narrow is better. This kernel STAGES the activation tile in
+//     threadgroup memory, so a wider tile costs more threadgroup memory and drops occupancy.
+//     128 measured 2017 -> 1663 tok/s.
+//   quant (GEMM_QBN 128): wide is better. The quant kernel reads activation fragments straight
+//     from device (no As tile), so widening only adds simdgroups and weight reuse -- the staged
+//     weight block now serves 128 tokens -- at the SAME threadgroup memory. 64 -> 128 measured
+//     1527 -> 1649 tok/s.
 #define GEMM_BN 64
-// Simdgroups tile the 64xGEMM_BN output as a grid, each owning 32x32 (4x4 fragments).
+#define GEMM_QBN 128
+// Simdgroups tile the 64-row output as a grid, each owning a 32x32 sub-tile (4x4 fragments).
 #define GEMM_SG_COLS (GEMM_BN / 32)
+#define GEMM_QSG_COLS (GEMM_QBN / 32)
 // K per stage: how much arithmetic each barrier buys, since the fill and the matrix ops are
 // separated by barriers. The two GEMMs want DIFFERENT depths, which is worth stating plainly
 // because one define for both is the obvious thing to write and it costs 8% on the 8B:
@@ -454,12 +462,12 @@ kernel void cpi_gemm_quant(device const uchar* qw [[buffer(0)]],
                            uint nthr [[threads_per_threadgroup]]) {
   const uint sgid = lid / 32u;
   const uint lane = lid % 32u;
-  const uint sg_row = sgid / GEMM_SG_COLS;
-  const uint sg_col = sgid % GEMM_SG_COLS;
+  const uint sg_row = sgid / GEMM_QSG_COLS;
+  const uint sg_col = sgid % GEMM_QSG_COLS;
 
   const uint row_blocks = p.out_dim / GEMM_BM;
   const uint row0 = (tgid % row_blocks) * GEMM_BM;
-  const uint tok0 = (tgid / row_blocks) * GEMM_BN;
+  const uint tok0 = (tgid / row_blocks) * GEMM_QBN;
   if (tok0 >= p.tokens) return;
 
   // The ACTIVATIONS are not staged. They could be -- and were -- but this GEMM turned out to
