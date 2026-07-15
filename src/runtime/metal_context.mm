@@ -244,6 +244,7 @@ void MetalContext::dispatch(const std::string& name, Grid grid, std::size_t tota
 
   id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
   [enc setComputePipelineState:pso];
+  ++dispatch_count_;
 
   for (int i = 0; i < n_buffers; ++i) {
     id<MTLBuffer> b = (id<MTLBuffer>)buffers[i];
@@ -272,6 +273,11 @@ void MetalContext::commit_and_wait() {
   id<MTLCommandBuffer> cb = (id<MTLCommandBuffer>)cmdbuf_;
   [cb commit];
   [cb waitUntilCompleted];
+  // GPUStartTime/GPUEndTime bracket the actual on-GPU execution of this buffer. Summed
+  // against wall-clock it separates kernel time from dispatch/CPU overhead.
+  const double busy = ([cb GPUEndTime] - [cb GPUStartTime]) * 1000.0;
+  if (busy > 0.0) gpu_busy_ms_ += busy;
+  ++cmdbuf_count_;
   if ([cb status] == MTLCommandBufferStatusError) {
     NSError* err = [cb error];
     last_error_ = "command buffer failed";

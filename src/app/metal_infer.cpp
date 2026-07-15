@@ -107,6 +107,7 @@ int main(int argc, char** argv) {
   const std::vector<int> ids = tok.encode(prompt, /*add_bos=*/true);
   std::fprintf(stderr, "[metal] prompt: %zu tokens\n", ids.size());
 
+  eng.reset_gpu_counters();
   const auto t0 = std::chrono::steady_clock::now();
   const std::vector<int> out = eng.generate(ids, max_new, samp);
   const auto t1 = std::chrono::steady_clock::now();
@@ -123,6 +124,12 @@ int main(int argc, char** argv) {
   }
   std::fprintf(stderr, "[perf] decode:  %zu tokens in %.0f ms = %.1f tok/s\n", out.size(), ms - pms,
                static_cast<double>(out.size()) / ((ms - pms) / 1000.0));
+  const double busy = eng.gpu_busy_ms();
+  std::fprintf(stderr,
+               "[perf] gpu-busy: %.0f ms of %.0f wall (%.0f%%), %llu dispatches, %llu cmdbufs\n",
+               busy, ms, 100.0 * busy / ms,
+               static_cast<unsigned long long>(eng.dispatch_count()),
+               static_cast<unsigned long long>(eng.cmdbuf_count()));
   eng.dump_profile();  // no-op unless CPI_METAL_PROFILE is set
   return 0;
 }

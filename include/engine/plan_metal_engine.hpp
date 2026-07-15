@@ -93,6 +93,21 @@ public:
     return prefill_tokens_;
   }
 
+  // GPU-busy time and dispatch/submission counts since the last reset -- for the
+  // overhead-vs-kernel question. See MetalContext.
+  double gpu_busy_ms() const {
+    return ctx_.gpu_busy_ms();
+  }
+  std::uint64_t dispatch_count() const {
+    return ctx_.dispatch_count();
+  }
+  std::uint64_t cmdbuf_count() const {
+    return ctx_.cmdbuf_count();
+  }
+  void reset_gpu_counters() {
+    ctx_.reset_counters();
+  }
+
 private:
   void execute_ops(const std::vector<opplan::Op>& ops, int layer, int position, int tokens);
 

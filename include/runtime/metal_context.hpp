@@ -102,6 +102,25 @@ public:
     return last_error_;
   }
 
+  // Instrumentation for the overhead-vs-kernel question. gpu_busy_ms is the summed
+  // GPUEndTime-GPUStartTime of every committed command buffer -- time the GPU was actually
+  // running kernels, which against wall-clock reveals how much is dispatch/CPU overhead.
+  // dispatches counts compute encoders created; cmdbufs counts submissions.
+  double gpu_busy_ms() const {
+    return gpu_busy_ms_;
+  }
+  std::uint64_t dispatch_count() const {
+    return dispatch_count_;
+  }
+  std::uint64_t cmdbuf_count() const {
+    return cmdbuf_count_;
+  }
+  void reset_counters() {
+    gpu_busy_ms_ = 0.0;
+    dispatch_count_ = 0;
+    cmdbuf_count_ = 0;
+  }
+
 private:
   void* device_ = nullptr;     // id<MTLDevice>
   void* queue_ = nullptr;      // id<MTLCommandQueue>
@@ -109,6 +128,10 @@ private:
   void* cmdbuf_ = nullptr;     // id<MTLCommandBuffer>, lazily opened
   void* pipelines_ = nullptr;  // NSMutableDictionary name -> MTLComputePipelineState
   std::string last_error_;
+
+  double gpu_busy_ms_ = 0.0;
+  std::uint64_t dispatch_count_ = 0;
+  std::uint64_t cmdbuf_count_ = 0;
 };
 
 }  // namespace runtime
