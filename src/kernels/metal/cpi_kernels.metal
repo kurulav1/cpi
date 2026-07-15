@@ -974,27 +974,30 @@ kernel void cpi_attention_prefill(device const half* q [[buffer(0)]],
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Fold the block into each query's own online softmax.
-    if (lid < nq) {
-      const uint qi = lid;
-      float bmax = -INFINITY;
-      for (uint j = 0u; j < nk; ++j) bmax = max(bmax, sc_sh[qi * KEY_BLOCK + j]);
+    // Fold the block into each query's own online softmax. ONE SIMDGROUP per query, so all
+    // 256 threads work -- the old thread-per-query version left 8 threads busy and 248 idle at
+    // the barrier below. KEY_BLOCK == 32 == simd width, so lane j owns key j and the max/sum are
+    // lane-parallel reductions.
+    const uint qi = simd_id;
+    if (qi < nq) {
+      // A fully masked block leaves new_max at -INFINITY; guard so exp(-inf - -inf) is not NaN.
+      const float sc = (lane < nk) ? sc_sh[qi * KEY_BLOCK + lane] : -INFINITY;
+      const float bmax = simd_max(sc);
 
       const float old_max = m_sh[qi];
       const float new_max = max(old_max, bmax);
       const float rescale = (old_max == -INFINITY) ? 0.0f : exp(old_max - new_max);
 
-      float bsum = 0.0f;
-      for (uint j = 0u; j < nk; ++j) {
-        // A fully masked block leaves new_max at -INFINITY; exp(-inf - -inf) is NaN.
-        const float sc = sc_sh[qi * KEY_BLOCK + j];
-        const float w = (sc == -INFINITY || new_max == -INFINITY) ? 0.0f : exp(sc - new_max);
-        w_sh[qi * KEY_BLOCK + j] = w;
-        bsum += w;
+      const float w =
+          (lane < nk && sc != -INFINITY && new_max != -INFINITY) ? exp(sc - new_max) : 0.0f;
+      if (lane < nk) w_sh[qi * KEY_BLOCK + lane] = w;
+      const float bsum = simd_sum(w);
+
+      if (lane == 0u) {
+        l_sh[qi] = l_sh[qi] * rescale + bsum;
+        m_sh[qi] = new_max;
+        r_sh[qi] = rescale;
       }
-      l_sh[qi] = l_sh[qi] * rescale + bsum;
-      m_sh[qi] = new_max;
-      r_sh[qi] = rescale;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
