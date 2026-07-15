@@ -724,6 +724,148 @@ kernel void cpi_gemv_quant(
   }
 }
 
+// ---------------------------------------------------------------------------
+// FUSED quantized GEMV over 2 or 3 concatenated weight matrices that share the same input.
+// Decode fires ~7 separate GEMV dispatches per layer; three of them (Q, K, V) read the same
+// normalized input, and two more (gate, up) do too. Each tiny GEMV is launch/latency-bound,
+// not bandwidth-bound, so collapsing the group into ONE dispatch removes that fixed per-token
+// cost -- which is the dominant share of a bandwidth-light int4 decode. No weight
+// pre-concatenation: each output row across the [n0 + n1 + n2] space is ROUTED to its matrix.
+// ---------------------------------------------------------------------------
+struct QCatParams {
+  uint n0, n1, n2;  // rows (out_dim) of each sub-matrix; n2 == 0 for the 2-way (gate/up) case
+  uint in_dim;
+  uint tokens;
+  uint bits;
+  uint group;
+  uint groups;
+  uint has_bias;  // bias is ONE concatenated tensor over the [n0+n1+n2] rows (Qwen's bqkv)
+};
+
+// One output row's quantized dot product against the token tile, written to `out`.
+static inline void qcat_row(device const uchar* qw, device const float* scales,
+                            device const half* in, device half* out, device const half* bias,
+                            uint row, uint global_row, uint out_dim_m, uint has_bias, uint in_dim,
+                            uint bits, uint gsz, uint groups, uint t0, uint tokens, uint lane) {
+  const uint packed_row = (bits == 4u) ? ((in_dim + 1u) / 2u) : in_dim;
+  device const float* srow = scales + (ulong)row * (ulong)groups;
+  const uint nt = min((uint)GEMV_TILE, tokens - t0);
+  float acc[GEMV_TILE];
+  for (uint t = 0u; t < GEMV_TILE; ++t) acc[t] = 0.0f;
+
+  if (bits == 4u) {
+    device const uint4* w128 = (device const uint4*)(qw + (ulong)row * (ulong)packed_row);
+    const uint n32 = in_dim >> 5;  // 32 int4 weights per uint4 (128-bit load)
+    for (uint k = lane; k < n32; k += 32u) {
+      const uint4 packed = w128[k];
+      const uint j0 = k << 5;
+      const float sc = srow[j0 / gsz];
+      for (uint t = 0u; t < nt; ++t) {
+        device const half* x = in + (ulong)(t0 + t) * (ulong)in_dim + j0;
+        float sub = 0.0f;
+        for (uint w = 0u; w < 4u; ++w) {
+          const uint word =
+              (w == 0u) ? packed.x : (w == 1u) ? packed.y : (w == 2u) ? packed.z : packed.w;
+          for (uint e = 0u; e < 8u; ++e) {
+            const int nib = int((word >> (4u * e)) & 0xFu);
+            sub += float((nib ^ 0x8) - 0x8) * float(x[w * 8u + e]);
+          }
+        }
+        acc[t] += sub * sc;
+      }
+    }
+    device const uint* w32 = (device const uint*)(qw + (ulong)row * (ulong)packed_row);
+    for (uint k = (n32 << 2) + lane; k < (in_dim >> 3); k += 32u) {
+      const uint packed = w32[k];
+      const uint j0 = k << 3;
+      const float sc = srow[j0 / gsz];
+      for (uint t = 0u; t < nt; ++t) {
+        device const half* x = in + (ulong)(t0 + t) * (ulong)in_dim + j0;
+        float sub = 0.0f;
+        for (uint e = 0u; e < 8u; ++e) {
+          const int nib = int((packed >> (4u * e)) & 0xFu);
+          sub += float((nib ^ 0x8) - 0x8) * float(x[e]);
+        }
+        acc[t] += sub * sc;
+      }
+    }
+  } else {
+    device const uint4* w16 = (device const uint4*)(qw + (ulong)row * (ulong)in_dim);
+    const uint n16 = in_dim >> 4;  // 16 int8s per uint4
+    for (uint k = lane; k < n16; k += 32u) {
+      const uint4 packed = w16[k];
+      const uint j0 = k << 4;
+      const float sc = srow[j0 / gsz];
+      for (uint t = 0u; t < nt; ++t) {
+        device const half* x = in + (ulong)(t0 + t) * (ulong)in_dim + j0;
+        float sub = 0.0f;
+        for (uint w = 0u; w < 4u; ++w) {
+          const uint word =
+              (w == 0u) ? packed.x : (w == 1u) ? packed.y : (w == 2u) ? packed.z : packed.w;
+          for (uint e = 0u; e < 4u; ++e) {
+            const int q = int(char((word >> (8u * e)) & 0xFFu));
+            sub += float(q) * float(x[w * 4u + e]);
+          }
+        }
+        acc[t] += sub * sc;
+      }
+    }
+    for (uint k = (n16 << 4) + lane; k < in_dim; k += 32u) {
+      const int q = int(((device const char*)(qw + (ulong)row * (ulong)in_dim))[k]);
+      const float sc = srow[k / gsz];
+      for (uint t = 0u; t < nt; ++t)
+        acc[t] += float(q) * sc * float(in[(ulong)(t0 + t) * (ulong)in_dim + k]);
+    }
+  }
+
+  for (uint t = 0u; t < nt; ++t) {
+    float s = simd_sum(acc[t]);
+    if (lane == 0u) {
+      if (has_bias != 0u) s += float(bias[global_row]);
+      out[(ulong)(t0 + t) * (ulong)out_dim_m + row] = half(s);
+    }
+  }
+}
+
+kernel void cpi_gemv_quant_cat(
+    device const half*   in   [[buffer(0)]],
+    device const uchar*  qw0  [[buffer(1)]], device const float* sc0 [[buffer(2)]],
+    device half*         out0 [[buffer(3)]],
+    device const uchar*  qw1  [[buffer(4)]], device const float* sc1 [[buffer(5)]],
+    device half*         out1 [[buffer(6)]],
+    device const uchar*  qw2  [[buffer(7)]], device const float* sc2 [[buffer(8)]],
+    device half*         out2 [[buffer(9)]],
+    device const half*   bias [[buffer(10)]],
+    constant QCatParams& p    [[buffer(11)]],
+    uint gid  [[threadgroup_position_in_grid]],
+    uint lid  [[thread_position_in_threadgroup]],
+    uint nthr [[threads_per_threadgroup]]) {
+  const uint simds_per_tg = nthr / 32u;
+  const uint simd_id = lid / 32u;
+  const uint lane = lid % 32u;
+
+  const uint total = p.n0 + p.n1 + p.n2;
+  const uint row_blocks = (total + simds_per_tg - 1u) / simds_per_tg;
+  const uint tile = gid / row_blocks;
+  const uint t0 = tile * GEMV_TILE;
+  const uint grow = (gid % row_blocks) * simds_per_tg + simd_id;  // global row
+  if (t0 >= p.tokens || grow >= total) return;
+
+  const uint gsz = (p.group == 0u) ? p.in_dim : p.group;
+  if (grow < p.n0) {
+    qcat_row(qw0, sc0, in, out0, bias, grow, grow, p.n0, p.has_bias, p.in_dim, p.bits, gsz,
+             p.groups, t0, p.tokens, lane);
+  } else if (grow < p.n0 + p.n1) {
+    const uint r = grow - p.n0;
+    qcat_row(qw1, sc1, in, out1, bias, r, grow, p.n1, p.has_bias, p.in_dim, p.bits, gsz, p.groups,
+             t0, p.tokens, lane);
+  } else {
+    const uint r = grow - p.n0 - p.n1;
+    qcat_row(qw2, sc2, in, out2, bias, r, grow, p.n2, p.has_bias, p.in_dim, p.bits, gsz, p.groups,
+             t0, p.tokens, lane);
+  }
+}
+
 // Same, but fp32 output: the LM head feeds the sampler.
 kernel void cpi_lm_head_quant(
     device const uchar*  qw     [[buffer(0)]],

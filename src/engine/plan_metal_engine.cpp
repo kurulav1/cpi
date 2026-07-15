@@ -77,6 +77,9 @@ inline float fp16_to_f32(std::uint16_t h) {
 struct QuantParams {
   std::uint32_t out_dim, in_dim, tokens, bits, group, groups, has_bias;
 };
+struct QCatParams {  // fused GEMV over 2-3 concatenated matrices; MUST match cpi_kernels.metal
+  std::uint32_t n0, n1, n2, in_dim, tokens, bits, group, groups, has_bias;
+};
 
 constexpr int kTG = 256;               // threads per group
 constexpr int kSimdsPerTG = kTG / 32;  // = rows per threadgroup in the GEMV
@@ -421,6 +424,53 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
       ++oi;  // consume the fused RmsNorm
       if (profile) profile_tick("AddRmsNorm(fused)");
       continue;
+    }
+
+    // PEEPHOLE FUSION: consecutive quantized GEMVs that share an input become ONE dispatch.
+    // Decode fires Q/K/V (all reading XNorm) and gate/up (both reading XNorm) as separate tiny
+    // GEMVs, each launch/latency-bound. Only in the GEMV regime (small T / decode); prefill
+    // uses the blocked GEMM per op. The fused kernel routes each output row to its matrix.
+    if (op.kind == OpKind::Gemv && op.qbits != 0 && T < kGemmMinTokens) {
+      auto is_qgemv = [&](std::size_t j, opplan::Slot out) {
+        return j < ops.size() && ops[j].kind == OpKind::Gemv && ops[j].qbits != 0 &&
+               ops[j].out == out && ops[j].in == op.in;
+      };
+      const bool qkv = op.out == opplan::Slot::Q && is_qgemv(oi + 1, opplan::Slot::K) &&
+                       is_qgemv(oi + 2, opplan::Slot::V);
+      const bool gu = op.out == opplan::Slot::Gate && is_qgemv(oi + 1, opplan::Slot::Up);
+      if (qkv || gu) {
+        const opplan::Op& a = op;
+        const opplan::Op& b = ops[oi + 1];
+        const opplan::Op& c = qkv ? ops[oi + 2] : op;  // c unused when n2 == 0
+        const std::uint32_t n0 = static_cast<std::uint32_t>(a.cols);
+        const std::uint32_t n1 = static_cast<std::uint32_t>(b.cols);
+        const std::uint32_t n2 = qkv ? static_cast<std::uint32_t>(c.cols) : 0u;
+        const int gsz = (a.qgroup > 0) ? a.qgroup : a.in_dim;
+        QCatParams gp{n0,
+                      n1,
+                      n2,
+                      static_cast<std::uint32_t>(a.in_dim),
+                      static_cast<std::uint32_t>(T),
+                      static_cast<std::uint32_t>(a.qbits),
+                      static_cast<std::uint32_t>(a.qgroup),
+                      static_cast<std::uint32_t>((a.in_dim + gsz - 1) / gsz),
+                      a.bias != nullptr ? 1u : 0u};
+        const void* bb = a.bias != nullptr ? a.bias : a.qweight;  // bound, unread if absent
+        const void* bufs[] = {slot(a.in),  a.qweight, a.qscales, slot(a.out),
+                              b.qweight,    b.qscales, slot(b.out), c.qweight,
+                              c.qscales,    slot(c.out), bb};
+        const std::size_t offs[] = {
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            static_cast<std::size_t>(a.bias_offset) * sizeof(std::uint16_t)};
+        const std::size_t total = static_cast<std::size_t>(n0 + n1 + n2);
+        const std::size_t rb = (total + kSimdsPerTG - 1) / kSimdsPerTG;
+        const std::size_t tiles = static_cast<std::size_t>((T + kGemvTile - 1) / kGemvTile);
+        ctx_.dispatch("cpi_gemv_quant_cat", G::Groups, rb * tiles, kTG, bufs, offs, 11, &gp,
+                      sizeof(gp));
+        oi += qkv ? 2 : 1;
+        if (profile) profile_tick(qkv ? "Gemv(qkv fused)" : "Gemv(gate/up fused)");
+        continue;
+      }
     }
 
     switch (op.kind) {
