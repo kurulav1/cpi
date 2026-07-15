@@ -250,9 +250,8 @@ just kernels. CPI's inference *core* runs on a Mac; CPI-the-product does not.
 
 | Model | | GPU weights | decode | prefill (551 tok) |
 | --- | --- | --- | --- | --- |
-| Qwen2.5-0.5B | fp16 | 1.17 GB | 86.5 tok/s | 1360 tok/s |
-| Qwen2.5-0.5B | int8 | 0.74 GB | 118.8 tok/s | — |
-| Qwen2.5-0.5B | int4 | 0.51 GB | 146.7 tok/s | — |
+| Qwen2.5-0.5B | fp16 | 1.17 GB | 86.5 tok/s | 2021 tok/s |
+| Qwen2.5-0.5B | int4 | 0.51 GB | 146.7 tok/s | 1903 tok/s |
 | **Llama-3.1-8B** | **int4** | **4.91 GB** | **20.5 tok/s** | **161 tok/s** |
 
 The 8B is the point of quantization: at fp16 its weights are ~15 GB and it does **not** fit in a
@@ -313,6 +312,36 @@ Both were found by per-kernel profiling (`CPI_METAL_PROFILE=1`), in one shot, af
 inner-loop optimizations had each moved nothing. The op-level profile said "GEMM = 75%" and was
 technically true and completely misleading: `OpKind::Gemv` dispatches two different kernels, and
 the cheap-looking one was eating a third of the run.
+
+### Small models, grounded against llama.cpp built on the same Mac
+
+The 8B numbers above compare against a llama.cpp figure taken separately. On a later machine
+llama.cpp was **built on the box with Metal** and a Qwen2.5-0.5B GGUF (same checkpoint as CPI's
+`.ll2c`, quantized to Q4_0 with `llama-quantize`), for a same-weights head-to-head. The 0.5B gap
+is *wider* than the 8B's, and the honest table is worth keeping:
+
+| | llama.cpp | CPI | CPI / llama.cpp |
+| --- | --- | --- | --- |
+| fp16 prefill (551) | 4173 | 2021 | 48% |
+| int4 prefill (551) | 4063 | 1903 | 47% |
+| int4 decode (short ctx) | 198 | 176 | 89% |
+
+A new counter (`MetalContext::gpu_busy_ms()`, GPU wall-clock via command-buffer timestamps)
+settled the first question: prefill is **97% GPU-busy**, so the gap is kernel efficiency, not
+dispatch overhead. Two kernel wins followed, both of which transfer to the 8B:
+
+- **Prefill attention scored QK^T with a 32-lane reduction** — each (query, key) pair got a whole
+  simdgroup and summed its dot product across 32 lanes, five shuffle steps for ~two useful
+  multiplies per lane. One thread per pair does the full dot product with no reduction, at full
+  occupancy: **fp16 prefill 1745 → 2023 tok/s**.
+- **The two GEMMs want different token-tile widths.** The quantized GEMM reads activation
+  fragments from device, so a wider tile (128) only adds simdgroups and weight reuse at no
+  threadgroup-memory cost: **int4 prefill 1527 → 1903**. The fp16 GEMM *stages* its activations,
+  so the same widening drops occupancy and *loses* — it keeps 64. (Dropping the fp16 stage to
+  read from device also loses: the strided reload costs more than the occupancy it frees.)
+
+The remaining ~2× on prefill is the fp16 GEMM at ~53% of peak against llama.cpp's near-peak
+`mul_mm` — the same hand-tuned-matmul wall as the 8B, with no cheap lever left.
 
 **Correctness.** Qwen2.5-0.5B, Qwen3-0.6B and gemma-2b each reproduce the CUDA backend's greedy
 token stream exactly on an Apple M4 (`src/tests/golden/`). `metal_decode_test` gates on two
