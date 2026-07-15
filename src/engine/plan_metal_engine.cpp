@@ -942,6 +942,7 @@ std::vector<int> PlanMetalEngine::generate(const std::vector<int>& prompt, int m
   if (prompt.empty()) throw std::runtime_error("empty prompt");
 
   detail::dispatch_seed_sampler_rng(s.seed);
+  prev_seq_.clear();  // this path rewrites the KV cache untracked; drop any shared-prefix state
 
   std::vector<int> out;
   std::vector<int> history = prompt;  // the sampler needs it for penalties / n-grams
@@ -995,22 +996,32 @@ std::vector<int> PlanMetalEngine::generate_stream(const std::vector<int>& prompt
 
   std::vector<int> out;
   std::vector<int> history = prompt;
-  int pos = 0;
 
   const int n_pre = static_cast<int>(prompt.size()) - 1;
+
+  // SHARED-PREFIX REUSE. If this prompt extends the last sequence this engine ran (a multi-turn
+  // chat, or many requests behind one system prompt), the KV cache still holds the common prefix
+  // -- same tokens at the same positions -- so re-prefill only the new suffix. This is the Metal
+  // sibling of the CUDA serving's prefix reuse; it cuts time-to-first-token on repeated prefixes.
+  int shared = 0;
+  while (shared < n_pre && shared < static_cast<int>(prev_seq_.size()) &&
+         prompt[shared] == prev_seq_[shared]) {
+    ++shared;
+  }
+
   const auto pre0 = std::chrono::steady_clock::now();
-  for (int off = 0; off < n_pre; off += max_prefill_) {
+  for (int off = shared; off < n_pre; off += max_prefill_) {
     const int chunk = std::min(max_prefill_, n_pre - off);
     const std::vector<int> ids(prompt.begin() + off, prompt.begin() + off + chunk);
-    encode_prefill(ids, pos);
+    encode_prefill(ids, off);  // start position == off, so reused-prefix positions line up
     ctx_.commit_and_wait();
-    pos += chunk;
   }
   prefill_ms_ =
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pre0).count();
-  prefill_tokens_ = n_pre;
+  prefill_tokens_ = n_pre - shared;
 
   const auto dec0 = std::chrono::steady_clock::now();
+  int pos = n_pre;
   int next = prompt.back();
   for (int i = 0; i < max_new; ++i, ++pos) {
     std::vector<float> lg = forward_token(next, pos);
@@ -1040,6 +1051,11 @@ std::vector<int> PlanMetalEngine::generate_stream(const std::vector<int>& prompt
   bench_stats_.decode_ms = decode_ms;
   bench_stats_.prompt_tokens = static_cast<int>(prompt.size());
   bench_stats_.generated_tokens = static_cast<int>(out.size());
+
+  // Record the full sequence (prompt + generated) so the next request can reuse its prefix.
+  // The KV cache now holds exactly these tokens at positions [0, prev_seq_.size()).
+  prev_seq_ = prompt;
+  prev_seq_.insert(prev_seq_.end(), out.begin(), out.end());
   return out;
 }
 
@@ -1068,6 +1084,8 @@ std::vector<std::pair<int, float>> PlanMetalEngine::inspect_next_logits(
 
 std::vector<int> PlanMetalEngine::generate_greedy(const std::vector<int>& prompt, int max_new) {
   if (prompt.empty()) throw std::runtime_error("empty prompt");
+
+  prev_seq_.clear();  // this path rewrites the KV cache untracked; drop any shared-prefix state
 
   std::vector<int> out;
   int pos = 0;

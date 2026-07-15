@@ -169,6 +169,7 @@ private:
   double prefill_ms_ = 0.0;
   int prefill_tokens_ = 0;
   BenchmarkStats bench_stats_{};
+  std::vector<int> prev_seq_;  // last (prompt + generated) sequence, for shared-prefix KV reuse
   std::string last_error_;
 
   class MetalWeights;
