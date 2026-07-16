@@ -78,7 +78,8 @@ jobs:
     # returns nil there, so Metal kernels cannot be RUN in CI, and metal_smoke
     # reports SKIP. A green job here means the shaders type-check, the Objective-C++
     # bridge compiles, and everything links. It does NOT mean the kernels are
-    # correct: that needs real Apple Silicon and is a separate, manual step.
+    # correct: that needs real Apple Silicon -- see metal-gpu.yml, which runs
+    # tools/metal_verify.sh on a self-hosted runner that has an actual Metal device.
     #
     # Worth having anyway -- `metal` is an offline compiler, so without this the
     # shaders would be written entirely blind from a Windows box.
@@ -101,6 +102,11 @@ jobs:
         run: cmake --build build --config Release -j
       - name: Test (metal_smoke SKIPs -- no GPU in the runner)
         run: ctest --test-dir build -C Release --output-on-failure
+      # Runs the real gate's script here too, where every check SKIPs. That proves only
+      # that the script itself still runs -- the checks it performs need a GPU and happen
+      # in metal-gpu.yml. Cheap insurance against the gate rotting unnoticed.
+      - name: Smoke the Metal gate script (every check SKIPs here)
+        run: ./tools/metal_verify.sh --build build
 
   build-cpu:
     name: Build (CPU-only) + tests

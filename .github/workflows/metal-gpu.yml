@@ -1,0 +1,75 @@
+# Metal kernel correctness on REAL Apple Silicon.
+#
+# The `metal` job in ci.yml is compile-only: GitHub's macOS runners are GPU-less VMs where
+# MTLCreateSystemDefaultDevice() returns nil, so the kernels there are type-checked and
+# linked but never executed. This workflow is the one that actually runs them.
+#
+# It needs a self-hosted runner with a Metal device. Note that "VM" is not the blocker --
+# GPU-less is. Tart (https://tart.run) VMs expose a real paravirtual MTLDevice, so a
+# Tart-based ephemeral runner works and is the recommended setup; a plugged-in Mac mini
+# with the runner agent works too.
+#
+# INERT UNTIL A RUNNER EXISTS. A job that targets a self-hosted label with no matching
+# runner does not fail -- it queues forever and hangs every PR. So this is gated on a repo
+# variable: it is skipped entirely until you set HAS_METAL_RUNNER=true
+# (Settings -> Secrets and variables -> Actions -> Variables). Until then this file costs
+# nothing and blocks nothing.
+#
+# Runner setup:
+#   1. Register the runner with labels: self-hosted, macOS, ARM64, metal-gpu
+#   2. Put the .ll2c checkpoints somewhere on it and point METAL_MODELS_DIR at them.
+#      Goldens whose checkpoint is missing are skipped loudly, so a runner with only the
+#      small models is still worth having -- it just covers less.
+#   3. Set the HAS_METAL_RUNNER variable to true.
+
+name: Metal GPU
+
+on:
+  push:
+    branches: [main]
+    paths:
+      # The shaders, the executor, the IR they share, and this gate itself.
+      - 'src/kernels/metal/**'
+      - 'src/engine/plan_metal_engine.cpp'
+      - 'src/runtime/metal_context.*'
+      - 'include/engine/op_plan*.hpp'
+      - 'src/engine/op_plan_builder.cpp'
+      - 'src/tests/metal_*'
+      - 'tools/metal_verify.sh'
+      - '.github/workflows/metal-gpu.yml'
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  metal-gpu:
+    name: Metal kernels on real hardware
+    if: vars.HAS_METAL_RUNNER == 'true'
+    runs-on: [self-hosted, macOS, ARM64, metal-gpu]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check kernel buffer bindings
+        run: python3 tools/check_metal_bindings.py
+
+      - name: Configure (Metal on, CUDA off)
+        run: >
+          cmake -S . -B build
+          -DLLAMA_ENGINE_ENABLE_CUDA=OFF
+          -DLLAMA_ENGINE_ENABLE_METAL=ON
+          -DLLAMA_ENGINE_ENABLE_SENTENCEPIECE=OFF
+          -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release -j
+
+      # The real gate: synthetic kernels vs a CPU reference, then the golden token streams
+      # (Metal must reproduce the CUDA backend's stream exactly at fp16). Fails the job if
+      # any check fails; skips are reported but do not fail.
+      - name: Verify Metal kernels
+        # --require-gpu: this runner exists to exercise the GPU, so a missing Metal device
+        # is a misconfigured host, not a skip. Without it the job would go green having
+        # verified nothing -- the exact failure mode this workflow exists to prevent.
+        run: ./tools/metal_verify.sh --build build --require-gpu --models "${METAL_MODELS_DIR:-$HOME}"
+        env:
+          METAL_MODELS_DIR: ${{ vars.METAL_MODELS_DIR }}
