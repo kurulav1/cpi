@@ -372,7 +372,7 @@ int main(int argc, char** argv) {
           }
           app::main_modes::run_interactive_batch(eng.batch_scheduler(), tokenizer, cli.stop_texts,
                                                  !cli.force_no_bos, cli.max_new, cli.temp);
-          return;
+          return 0;
         }
       }
 #endif
@@ -435,7 +435,42 @@ int main(int argc, char** argv) {
         // --weight-quant int4/int8 (a.k.a. --int4-streaming) maps to on-load host quantization;
         // otherwise fp16. This is what lets a large model (e.g. an 8B) serve on a 16 GB Mac.
         const int metal_quant_bits = cli.opts.int8_streaming ? cli.opts.streaming_quant_bits : 0;
+        // Continuous batching needs the KV as a paged pool, and the pool is sized by open(),
+        // so this has to be decided BEFORE the model loads -- not when the first request
+        // arrives. Sized to the same budget the CUDA path uses: enough blocks for
+        // --paged-blocks-tokens, defaulting to a few max_context-worth of concurrent sequences.
+        if (cli.interactive_batch) {
+          const int bs = cli.opts.paged_block_size > 0 ? cli.opts.paged_block_size : 32;
+          // Room for ~4 concurrent max_context sequences. CUDA instead sizes its pool from a
+          // VRAM budget, which does not transfer: on unified memory the KV competes with the
+          // weights and the OS for the same pool, so "how many bytes are free" is a different
+          // question here and deserves its own answer rather than a copied heuristic. Until
+          // then this is a fixed, stated default -- the scheduler preempts newest-first when
+          // it runs out, which is a real behaviour rather than a crash.
+          const int pool_tokens = cli.opts.max_context * 4;
+          meng.set_paged_kv((pool_tokens + bs - 1) / bs, bs);
+        }
         meng.open(cli.opts.model_path, cli.opts.max_context, metal_quant_bits, /*quant_group=*/0);
+
+        if (cli.interactive_batch) {
+          if (!use_tokenizer) {
+            throw std::runtime_error("--interactive-batch requires --tokenizer");
+          }
+          // The same worker and the same scheduler CUDA drives -- this branch exists only to
+          // build the engine, not to reimplement serving.
+          engine::BatchSchedulerOptions bo;
+          bo.max_context = cli.opts.max_context;
+          bo.eos_token_id = cli.opts.eos_token_id;
+          bo.top_k = cli.opts.top_k;
+          bo.top_p = cli.opts.top_p;
+          bo.repetition_penalty = cli.opts.repetition_penalty;
+          bo.no_repeat_ngram_size = cli.opts.no_repeat_ngram_size;
+          bo.verbose = cli.opts.verbose;
+          app::main_modes::run_interactive_batch(meng.batch_scheduler(bo), tokenizer,
+                                                 cli.stop_texts, !cli.force_no_bos, cli.max_new,
+                                                 cli.temp);
+          return 0;
+        }
         auto make_samp = [&](float temperature) {
           engine::PlanMetalEngine::Sampling s;
           s.temperature = temperature;
