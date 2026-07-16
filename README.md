@@ -263,6 +263,14 @@ CUDA's serving policy because it never states one. That scheduler used to live i
 `LlamaEngine`, which is the only reason batching was ever CUDA-only — of its ~200 lines, two
 touched a GPU.
 
+**Verifying it.** Every kernel family has a CPU-reference check (`metal_smoke`, 37 checks),
+plus golden token streams that must reproduce the CUDA backend exactly. `tools/metal_verify.sh`
+runs the lot in one command on any Mac. This is not ceremony: GitHub's macOS runners have no
+GPU, so CI can only compile Metal, never execute it — and a kernel that no gate executed was
+silently corrupting every fp16 prompt of >=16 tokens for weeks (see the GEMM note below).
+To make that check automatic you need an Apple Silicon runner —
+[docs/metal-ci-runner.md](docs/metal-ci-runner.md) is the recipe.
+
 **Measured** (Apple M4, 10-core GPU, 16 GB):
 
 | Model | | GPU weights | decode | prefill |

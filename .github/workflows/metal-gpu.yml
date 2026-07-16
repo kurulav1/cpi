@@ -16,6 +16,8 @@
 # nothing and blocks nothing.
 #
 # Runner setup:
+#   See docs/metal-ci-runner.md for the full recipe (Tart vs bare metal, why no
+#   Xcode, and how to prove the gate has teeth).
 #   1. Register the runner with labels: self-hosted, macOS, ARM64, metal-gpu
 #   2. Put the .ll2c checkpoints somewhere on it and point METAL_MODELS_DIR at them.
 #      Goldens whose checkpoint is missing are skipped loudly, so a runner with only the
