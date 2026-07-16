@@ -53,6 +53,9 @@ struct AttnParams {
   std::uint32_t heads, kv_heads, head_dim, position, max_context, window;
   float scale;
   std::uint32_t use_position_buffer, tokens;
+  // Paged prefill; read only by cpi_attention_prefill_mm. Defaulted so every existing
+  // construction keeps the contiguous meaning.
+  std::uint32_t paged = 0, block_size = 0;
 };
 // Batched paged decode. These mirror the structs in cpi_kernels.metal field for field --
 // a mismatch here is silent and shows up as garbage numbers, not as a build error.
@@ -120,7 +123,8 @@ constexpr int kGemmQTG = 32 * (64 / 32) * (kGemmQBN / 32);
 // is wasted arithmetic. Above it the GEMV is a catastrophe -- see the dispatch below.
 constexpr int kGemmMinTokens = 16;
 constexpr int kGemmQBK = 32;  // MUST match GEMM_QBK in the shader (quantized)
-constexpr int kQBlock = 8;  // MUST match Q_BLOCK in cpi_kernels.metal
+constexpr int kQBlock = 8;     // MUST match Q_BLOCK in cpi_kernels.metal
+constexpr int kKeyBlock = 32;  // MUST match KEY_BLOCK in cpi_kernels.metal
 constexpr int kArgmaxParts = 256;
 constexpr int kGemvTile = 8;  // MUST match GEMV_TILE in cpi_kernels.metal
 
@@ -763,6 +767,41 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
         break;
       }
       case OpKind::Attention: {
+        // A paged PREFILL is one sequence's consecutive tokens sharing one block table, so it
+        // can use the query-block matrix kernel instead of the decode kernel -- which matters:
+        // the decode kernel makes every query re-walk the whole history, measured at 2.81x the
+        // contiguous path's time on a 480-token prompt.
+        //
+        // The guards are what make the paged gather legal, not taste. block_size % KEY_BLOCK
+        // keeps a 32-key run inside one physical block, and no-window keeps every kb
+        // KEY_BLOCK-aligned (start == 0); together they mean a key block is contiguous and the
+        // kernel needs one address per block rather than per key. Anything else -- a window,
+        // an odd block size, Gemma's head_dim 256, a chunk below one query block -- falls
+        // through to the decode kernel, which handles any geometry at O(T^2).
+        if (batch_ != nullptr && batch_->logits_last_only && T >= kQBlock && op.head_dim <= 128 &&
+            (op.full_attention || op.sliding_window == 0) && batch_->block_size % kKeyBlock == 0) {
+          AttnParams p{static_cast<std::uint32_t>(op.heads),
+                       static_cast<std::uint32_t>(op.kv_heads),
+                       static_cast<std::uint32_t>(op.head_dim),
+                       static_cast<std::uint32_t>(position),
+                       static_cast<std::uint32_t>(max_context_),
+                       0,
+                       op.scale,
+                       1,
+                       static_cast<std::uint32_t>(T),
+                       1,
+                       static_cast<std::uint32_t>(batch_->block_size)};
+          // batch_bt_buf_ holds the sequence's table replicated per row; the mm kernel wants
+          // just the table, and row 0 sits at offset 0, so it reads the right thing.
+          const void* mmbufs[] = {slot(op.in), k_cache_[static_cast<std::size_t>(layer)].handle(),
+                                  v_cache_[static_cast<std::size_t>(layer)].handle(), slot(op.out),
+                                  pos_buf_.handle(), batch_bt_buf_.handle()};
+          const std::size_t blocks = static_cast<std::size_t>((T + kQBlock - 1) / kQBlock);
+          ctx_.dispatch("cpi_attention_prefill_mm", G::Groups,
+                        static_cast<std::size_t>(op.heads) * blocks, kTG, mmbufs, nullptr, 6, &p,
+                        sizeof(p));
+          break;
+        }
         if (batch_ != nullptr) {
           // Every row is one query attending over its OWN length, gathered through its own
           // block table -- the ragged batch the scheduler hands us.
@@ -803,10 +842,21 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
         if (T >= kQBlock) {
           const std::size_t blocks = static_cast<std::size_t>((T + kQBlock - 1) / kQBlock);
           // head_dim <= 128 runs the matrix-unit kernel; Gemma's 256 keeps the scalar one.
-          const char* kern =
-              (op.head_dim <= 128) ? "cpi_attention_prefill_mm" : "cpi_attention_prefill";
-          ctx_.dispatch(kern, G::Groups, static_cast<std::size_t>(op.heads) * blocks, kTG, bufs,
-                        nullptr, 5, &p, sizeof(p));
+          if (op.head_dim <= 128) {
+            // p.paged stays 0, so block_tables is never read -- but the binding must exist,
+            // because dispatch() puts the params block at index n_buffers.
+            const void* mmbufs[] = {slot(op.in), k_cache_[static_cast<std::size_t>(layer)].handle(),
+                                    v_cache_[static_cast<std::size_t>(layer)].handle(),
+                                    slot(op.out), pos_buf_.handle(),
+                                    k_cache_[static_cast<std::size_t>(layer)].handle()};
+            ctx_.dispatch("cpi_attention_prefill_mm", G::Groups,
+                          static_cast<std::size_t>(op.heads) * blocks, kTG, mmbufs, nullptr, 6, &p,
+                          sizeof(p));
+          } else {
+            ctx_.dispatch("cpi_attention_prefill", G::Groups,
+                          static_cast<std::size_t>(op.heads) * blocks, kTG, bufs, nullptr, 5, &p,
+                          sizeof(p));
+          }
         } else {
           ctx_.dispatch("cpi_attention_decode", G::Groups,
                         static_cast<std::size_t>(op.heads) * static_cast<std::size_t>(T), kTG,
@@ -1128,6 +1178,10 @@ void PlanMetalEngine::prefill_paged(const std::vector<int>& tokens, int start_po
           static_cast<std::int32_t>(block_table[static_cast<std::size_t>(j)]);
     }
   }
+
+  // The mm path reads the base position from pos_buf_[0] (per-row positions are only needed by
+  // the decode kernel's ragged batch), so stage it for whichever path the dispatch picks.
+  *static_cast<std::int32_t*>(pos_buf_.contents()) = static_cast<std::int32_t>(start_position);
 
   const BatchCtx bc{T, max_blocks, paged_block_size_, /*logits_last_only=*/true};
   batch_ = &bc;

@@ -84,6 +84,10 @@ struct AttnParams {
   float scale;  // usually 1/sqrt(head_dim)
   uint use_position_buffer;
   uint tokens;  // T: 1 for decode, N for a prefill chunk
+  // Paged prefill (cpi_attention_prefill_mm only; the others ignore these). 0 = the KV is one
+  // contiguous run and a key's row IS its position.
+  uint paged;
+  uint block_size;  // tokens per KV block; only meaningful when paged != 0
 };
 
 struct QuantParams {
@@ -1139,7 +1143,11 @@ kernel void cpi_attention_prefill_mm(device const half* q [[buffer(0)]],
                                      device const half* v_cache [[buffer(2)]],
                                      device half* out [[buffer(3)]],
                                      device const int* positions [[buffer(4)]],
-                                     constant AttnParams& p [[buffer(5)]],
+                                     // ONE sequence's logical->physical block map, used only when
+                                     // p.paged != 0. Bound to a dummy otherwise (the params block
+                                     // must stay last, so the slot cannot simply be absent).
+                                     device const int* block_tables [[buffer(5)]],
+                                     constant AttnParams& p [[buffer(6)]],
                                      uint gid [[threadgroup_position_in_grid]],
                                      uint lid [[thread_position_in_threadgroup]],
                                      uint nthr [[threads_per_threadgroup]]) {
@@ -1193,6 +1201,16 @@ kernel void cpi_attention_prefill_mm(device const half* q [[buffer(0)]],
     const uint nk = min((uint)KEY_BLOCK, last_pos - kb + 1u);
     const uint n_kg = (nk + 7u) / 8u;  // 8-key groups this block
 
+    // Where this key block physically lives. ONE lookup per block, not per key: the caller
+    // guarantees block_size % KEY_BLOCK == 0 and no sliding window (so start == 0 and every kb
+    // is KEY_BLOCK-aligned), which together mean the whole run [kb, kb+KEY_BLOCK) sits inside a
+    // single physical block and stays contiguous -- so the simdgroup_loads below keep working
+    // unchanged, just from a different base. Break either guarantee and a key block could
+    // straddle two blocks, which this addressing cannot express; the dispatch enforces both.
+    const uint kphys = (p.paged != 0u)
+                           ? uint(block_tables[kb / p.block_size]) * p.block_size + (kb % p.block_size)
+                           : kb;
+
     // --- Scoring: one simdgroup per key group computes S[8q x 8k] over the head dim. ---
     if (simd_id < n_kg) {
       const uint kg = simd_id;
@@ -1201,7 +1219,7 @@ kernel void cpi_attention_prefill_mm(device const half* q [[buffer(0)]],
         simdgroup_half8x8 Qf, Kf;
         simdgroup_load(Qf, q_sh + df * 8u, hd);  // [8q x 8d]
         // K is [key][d]; load the [8k x 8d] tile TRANSPOSED to get [8d x 8k].
-        simdgroup_load(Kf, k_cache + (ulong)(kb + kg * 8u) * (ulong)kv_dim + kv_head * hd + df * 8u,
+        simdgroup_load(Kf, k_cache + (ulong)(kphys + kg * 8u) * (ulong)kv_dim + kv_head * hd + df * 8u,
                        kv_dim, ulong2(0, 0), true);
         simdgroup_multiply_accumulate(S, Qf, Kf, S);
       }
@@ -1253,7 +1271,7 @@ kernel void cpi_attention_prefill_mm(device const half* q [[buffer(0)]],
       for (uint kg = 0u; kg < n_kg; ++kg) {
         simdgroup_half8x8 Pf, Vf;
         simdgroup_load(Pf, pw_sh + kg * 8u, KEY_BLOCK);  // [8q x 8k]
-        simdgroup_load(Vf, v_cache + (ulong)(kb + kg * 8u) * (ulong)kv_dim + kv_head * hd + dg * 8u,
+        simdgroup_load(Vf, v_cache + (ulong)(kphys + kg * 8u) * (ulong)kv_dim + kv_head * hd + dg * 8u,
                        kv_dim);  // [8k x 8d]
         simdgroup_multiply_accumulate(O, Pf, Vf, O);
       }

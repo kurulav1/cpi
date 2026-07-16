@@ -439,10 +439,11 @@ int main() {
   // kernels compute it with an ONLINE softmax over key blocks, which is a different order of
   // operations, so agreement here is meaningful rather than tautological.
   {
-    struct AP {
+    struct AP {  // MUST match AttnParams in cpi_kernels.metal
       std::uint32_t heads, kv_heads, head_dim, position, max_context, window;
       float scale;
       std::uint32_t use_position_buffer, tokens;
+      std::uint32_t paged, block_size;  // contiguous here: paged = 0
     };
     struct Case {
       const char* name;
@@ -489,15 +490,25 @@ int main() {
       const std::int32_t base = static_cast<std::int32_t>(c.base);
       auto bp = ctx.alloc_from(&base, sizeof(base));
 
-      AP p{c.heads, c.kv_heads, hd, 0, max_ctx, c.window, scale, 1, T};
+      AP p{c.heads, c.kv_heads, hd, 0, max_ctx, c.window, scale, 1, T, 0, 0};
       const void* bufs[] = {bq.handle(), bk.handle(), bv.handle(), bo.handle(), bp.handle()};
       // The engine's own choice, reproduced -- testing a kernel production does not pick
       // would prove nothing about production.
-      if (T >= kQBlockSmoke) {
+      if (T >= kQBlockSmoke && hd <= 128) {
+        // The matrix kernel takes a block table at buffer(5) for paged prefill, so its params
+        // block sits at 6. p.paged is 0 here, so the table is never read -- but the binding must
+        // exist or dispatch() would write the params over it. (This is what the gate caught when
+        // the kernel gained that buffer and this caller did not: check_metal_bindings.py checks
+        // the SHADER's ordering, not that a caller passes the right buffer count.)
         const std::size_t blocks = (T + kQBlockSmoke - 1) / kQBlockSmoke;
-        const char* kern = (hd <= 128) ? "cpi_attention_prefill_mm" : "cpi_attention_prefill";
-        ctx.dispatch(kern, runtime::MetalContext::Grid::Groups, c.heads * blocks, 256, bufs,
-                     nullptr, 5, &p, sizeof(p));
+        const void* mmbufs[] = {bq.handle(), bk.handle(), bv.handle(),
+                                bo.handle(), bp.handle(), bk.handle()};
+        ctx.dispatch("cpi_attention_prefill_mm", runtime::MetalContext::Grid::Groups,
+                     c.heads * blocks, 256, mmbufs, nullptr, 6, &p, sizeof(p));
+      } else if (T >= kQBlockSmoke) {
+        const std::size_t blocks = (T + kQBlockSmoke - 1) / kQBlockSmoke;
+        ctx.dispatch("cpi_attention_prefill", runtime::MetalContext::Grid::Groups,
+                     c.heads * blocks, 256, bufs, nullptr, 5, &p, sizeof(p));
       } else {
         ctx.dispatch("cpi_attention_decode", runtime::MetalContext::Grid::Groups, c.heads * T, 256,
                      bufs, nullptr, 5, &p, sizeof(p));

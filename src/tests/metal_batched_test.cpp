@@ -334,8 +334,9 @@ int main(int argc, char** argv) {
       paged_ms = std::min(paged_ms, std::chrono::duration<double, std::milli>(
                                         std::chrono::steady_clock::now() - t1).count());
     }
-    std::printf("\n  [timing] prefill %zu tok | contiguous (query-block) %.0f ms"
-                " | paged (decode kernel, O(T^2)) %.0f ms  -> %.2fx\n",
+    std::printf("\n  [timing] prefill %zu tok | contiguous %.0f ms | paged %.0f ms  -> %.2fx"
+                "   (paged takes the query-block kernel when block_size %% KEY_BLOCK == 0 and"
+                " there is no window; otherwise the O(T^2) decode kernel)\n",
                 longp.size(), contig_ms, paged_ms, paged_ms / contig_ms);
   }
   if (failures != 0) {
