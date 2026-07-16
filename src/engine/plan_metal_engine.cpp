@@ -114,7 +114,12 @@ constexpr int kGemmFBM = 64;  // MUST match GEMM_FBM in the shader (fp16 rows pe
 // the slot. Nothing failed: the GEMM only runs at T >= kGemmMinTokens and every golden prompt is
 // ~10 tokens, so no gate executed it, and the prefill benchmarks that did only timed it -- half
 // the writes read as a 37% speedup. metal_smoke now checks it against a CPU reference.
-constexpr int kGemmTG = 32 * (kGemmFBM / 32) * (kGemmBN / 32);
+// MUST match GEMM_RF / GEMM_CF in the shader: fragments of 8x8 per simdgroup.
+constexpr int kGemmRF = 4;
+constexpr int kGemmCF = 4;
+// One simdgroup per (8*RF rows x 8*CF tokens) sub-tile of the FBM x BN output tile. DERIVED,
+// never restated -- the literal that used to live here is what wrote half the rows.
+constexpr int kGemmTG = 32 * (kGemmFBM / (8 * kGemmRF)) * (kGemmBN / (8 * kGemmCF));
 // The quantized GEMM reads activations from device, not a staged tile, so a wider token tile
 // buys weight reuse at no threadgroup-memory cost. It wants 128 where fp16 wants 64.
 constexpr int kGemmQBN = 128;                              // MUST match GEMM_QBN in the shader

@@ -356,7 +356,34 @@ kernel void cpi_lm_head(
 #define GEMM_BN 64
 #define GEMM_QBN 128
 // Simdgroups tile the 64-row output as a grid, each owning a 32x32 sub-tile (4x4 fragments).
-#define GEMM_SG_COLS (GEMM_BN / 32)
+// Fragments of 8x8 each simdgroup owns: GEMM_RF rows x GEMM_CF cols. This sets arithmetic
+// intensity: per 8-deep step a simdgroup issues (RF + CF) simdgroup_loads to do (RF * CF) matrix
+// ops, so 4x4 is 8 loads per 16 ops (2.0) and 8x4 would be 12 per 32 (2.67). Everything else --
+// thread count, simdgroup grid, row offsets -- DERIVES from these two, so the tile can be swept
+// without a hardcoded number drifting out of step, which is how this kernel once came to write
+// half its rows.
+//
+// 4x4 IS THE CEILING, AND THE REASON IS THE REGISTER FILE. Measured with metal_gemm_bench
+// (correct at both settings, interleaved, warm):
+//
+//   RF=4, FBM=64  (32x32/simdgroup, 16 accumulator fragments)   2.90 TFLOP/s
+//   RF=8, FBM=128 (64x32/simdgroup, 32 accumulator fragments)   0.38 TFLOP/s   <- 7.6x SLOWER
+//
+// 32 accumulator fragments is 64 float registers per lane before wf/af, and it spills. Raising
+// arithmetic intensity by holding more of the output per thread is therefore not available on
+// this hardware: the trade buys fewer loads and pays for them in spill traffic, at a ruinous
+// rate.
+//
+// Worth stating plainly because this REINSTATES a finding that was wrongly overturned. Two
+// sessions concluded this kernel was against a register-file wall; that was then "corrected" to
+// a simdgroup-starvation diagnosis, on the strength of a 2764 -> 3780 tok/s result which turned
+// out to be the kernel skipping half its writes. The starvation theory is dead (more simdgroups
+// measured slower once the geometry was consistent). The register-file wall is real.
+#define GEMM_RF 4
+#define GEMM_CF 4
+#define GEMM_SG_ROWS (8u * GEMM_RF)  // rows per simdgroup
+#define GEMM_SG_TOKS (8u * GEMM_CF)  // tokens per simdgroup
+#define GEMM_SG_COLS (GEMM_BN / GEMM_SG_TOKS)
 #define GEMM_QSG_COLS (GEMM_QBN / 32)
 // K per stage: how much arithmetic each barrier buys, since the fill and the matrix ops are
 // separated by barriers.
@@ -424,9 +451,9 @@ kernel void cpi_gemm_f16(device const half* w [[buffer(0)]], device const half* 
   threadgroup half Ws[GEMM_FBM * GEMM_FBK];
   threadgroup half As[GEMM_BN * GEMM_FBK];
 
-  simdgroup_float8x8 acc[4][4];
-  for (uint i = 0u; i < 4u; ++i)
-    for (uint j = 0u; j < 4u; ++j) acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  simdgroup_float8x8 acc[GEMM_RF][GEMM_CF];
+  for (uint i = 0u; i < GEMM_RF; ++i)
+    for (uint j = 0u; j < GEMM_CF; ++j) acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
 
   const uint chunks = GEMM_FBK / 8u;  // 8 halves == one 128-bit load
 
@@ -449,32 +476,32 @@ kernel void cpi_gemm_f16(device const half* w [[buffer(0)]], device const half* 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint kk = 0u; kk < GEMM_FBK; kk += 8u) {
-      simdgroup_half8x8 wf[4], af[4];
+      simdgroup_half8x8 wf[GEMM_RF], af[GEMM_CF];
       // W is [rows, cols], so a weight fragment loads TRANSPOSED: [8k x 8rows].
-      for (uint i = 0u; i < 4u; ++i)
-        simdgroup_load(wf[i], Ws + (sg_row * 32u + i * 8u) * GEMM_FBK + kk, GEMM_FBK, ulong2(0, 0),
-                       true);
-      for (uint j = 0u; j < 4u; ++j)
-        simdgroup_load(af[j], As + (sg_col * 32u + j * 8u) * GEMM_FBK + kk, GEMM_FBK);
-      for (uint i = 0u; i < 4u; ++i)
-        for (uint j = 0u; j < 4u; ++j)
+      for (uint i = 0u; i < GEMM_RF; ++i)
+        simdgroup_load(wf[i], Ws + (sg_row * GEMM_SG_ROWS + i * 8u) * GEMM_FBK + kk, GEMM_FBK,
+                       ulong2(0, 0), true);
+      for (uint j = 0u; j < GEMM_CF; ++j)
+        simdgroup_load(af[j], As + (sg_col * GEMM_SG_TOKS + j * 8u) * GEMM_FBK + kk, GEMM_FBK);
+      for (uint i = 0u; i < GEMM_RF; ++i)
+        for (uint j = 0u; j < GEMM_CF; ++j)
           simdgroup_multiply_accumulate(acc[i][j], af[j], wf[i], acc[i][j]);
     }
   }
 
   // The K-loop is done with the weight tile; reuse it to stage the accumulators out.
   threadgroup float* mine = (threadgroup float*)Ws + sgid * 64u;
-  for (uint i = 0u; i < 4u; ++i) {
-    for (uint j = 0u; j < 4u; ++j) {
+  for (uint i = 0u; i < GEMM_RF; ++i) {
+    for (uint j = 0u; j < GEMM_CF; ++j) {
       threadgroup_barrier(mem_flags::mem_threadgroup);
       simdgroup_store(acc[i][j], mine, 8);
       simdgroup_barrier(mem_flags::mem_threadgroup);
       for (uint e = lane; e < 64u; e += 32u) {
         const uint t = e / 8u;  // token within the fragment
         const uint r = e % 8u;  // row within the fragment
-        const uint tok = tok0 + sg_col * 32u + j * 8u + t;
+        const uint tok = tok0 + sg_col * GEMM_SG_TOKS + j * 8u + t;
         if (tok >= p.tokens) continue;
-        const uint row = row0 + sg_row * 32u + i * 8u + r;
+        const uint row = row0 + sg_row * GEMM_SG_ROWS + i * 8u + r;
         float v = mine[t * 8u + r];
         if (p.has_bias != 0u) v += float(bias[row]);
         out[(ulong)tok * (ulong)p.out_dim + row] = half(v);

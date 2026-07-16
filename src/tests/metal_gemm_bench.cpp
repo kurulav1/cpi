@@ -60,8 +60,17 @@ float f16_to_f32(std::uint16_t h) {
 
 // MUST match the shader / engine. The whole bug was a copy of these drifting, so they are
 // stated once and everything below derives from them.
+//
+// And "everything" has to mean everything: this file previously derived the GRID from kFBM but
+// still computed the thread count as 32 * (kFBM/32) * (kBN/32) -- a formula that silently
+// assumed 32x32 per simdgroup. The moment the per-simdgroup tile became a variable, that line
+// handed the kernel twice the threads it wanted and the bench reported WRONG. The bench caught
+// it, which is the design working, but the lesson is the same one that started all this: a
+// restated formula is a bug with a delay.
 constexpr std::uint32_t kFBM = 64;  // GEMM_FBM: rows per threadgroup
 constexpr std::uint32_t kBN = 64;   // GEMM_BN:  tokens per tile
+constexpr std::uint32_t kRF = 4;    // GEMM_RF:  8x8 row fragments per simdgroup
+constexpr std::uint32_t kCF = 4;    // GEMM_CF:  8x8 col fragments per simdgroup
 
 struct Shape {
   const char* name;
@@ -114,7 +123,7 @@ int main(int argc, char** argv) {
 
     const std::size_t tiles = (T + kBN - 1) / kBN;
     const std::size_t grid = (s.out_dim / kFBM) * tiles;
-    const std::size_t threads = 32 * (kFBM / 32) * (kBN / 32);
+    const std::size_t threads = 32 * (kFBM / (8 * kRF)) * (kBN / (8 * kCF));
     const void* bufs[] = {bW.handle(), bA.handle(), bo.handle(), bW.handle()};
 
     // WARM UP UNTIL THE CLOCK STOPS RAMPING, not for a fixed few dispatches. Three was not
