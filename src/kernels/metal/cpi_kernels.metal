@@ -381,6 +381,31 @@ kernel void cpi_lm_head(
 // measured slower once the geometry was consistent). The register-file wall is real.
 #define GEMM_RF 4
 #define GEMM_CF 4
+
+// The fp16 GEMM's ACCUMULATOR type. 0 = fp32 (simdgroup_float8x8), 1 = fp16.
+//
+// This is the last open perf question. Xcode's counters say the kernel is F32-limited at
+// 90.86% while the **F16 pipe sits at 0.00% utilization** -- every MAC issues on F32 purely
+// because the accumulator is float. Apple's F16 pipe is typically ~2x the F32 rate, so if
+// half accumulators issue there natively, this kernel roughly doubles.
+//
+// An older note says half accumulators measured 3x SLOWER, which is why this is 0. Treat that
+// as unverified: it dates from the same period as a "+37%" that was a kernel skipping half its
+// writes, a "34% non-GEMM" that was a profiler artifact, and a "53% of peak" that used the
+// wrong denominator -- every measurement from then that has been re-checked was wrong. Flip
+// this and metal_gemm_bench will report a number only if the result is still correct.
+//
+// Accuracy is the other half of the trade: fp16 accumulation over an 896-deep dot product
+// loses precision, so a win here is only a win if the goldens still pass.
+#define GEMM_ACC_HALF 0
+
+#if GEMM_ACC_HALF
+typedef simdgroup_half8x8 gemm_acc_t;
+typedef half gemm_acc_e;
+#else
+typedef simdgroup_float8x8 gemm_acc_t;
+typedef float gemm_acc_e;
+#endif
 #define GEMM_SG_ROWS (8u * GEMM_RF)  // rows per simdgroup
 #define GEMM_SG_TOKS (8u * GEMM_CF)  // tokens per simdgroup
 #define GEMM_SG_COLS (GEMM_BN / GEMM_SG_TOKS)
@@ -451,9 +476,10 @@ kernel void cpi_gemm_f16(device const half* w [[buffer(0)]], device const half* 
   threadgroup half Ws[GEMM_FBM * GEMM_FBK];
   threadgroup half As[GEMM_BN * GEMM_FBK];
 
-  simdgroup_float8x8 acc[GEMM_RF][GEMM_CF];
+  gemm_acc_t acc[GEMM_RF][GEMM_CF];
   for (uint i = 0u; i < GEMM_RF; ++i)
-    for (uint j = 0u; j < GEMM_CF; ++j) acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    for (uint j = 0u; j < GEMM_CF; ++j)
+      acc[i][j] = make_filled_simdgroup_matrix<gemm_acc_e, 8, 8>(gemm_acc_e(0));
 
   const uint chunks = GEMM_FBK / 8u;  // 8 halves == one 128-bit load
 
@@ -490,7 +516,7 @@ kernel void cpi_gemm_f16(device const half* w [[buffer(0)]], device const half* 
   }
 
   // The K-loop is done with the weight tile; reuse it to stage the accumulators out.
-  threadgroup float* mine = (threadgroup float*)Ws + sgid * 64u;
+  threadgroup gemm_acc_e* mine = (threadgroup gemm_acc_e*)Ws + sgid * 64u;
   for (uint i = 0u; i < GEMM_RF; ++i) {
     for (uint j = 0u; j < GEMM_CF; ++j) {
       threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -502,7 +528,7 @@ kernel void cpi_gemm_f16(device const half* w [[buffer(0)]], device const half* 
         const uint tok = tok0 + sg_col * GEMM_SG_TOKS + j * 8u + t;
         if (tok >= p.tokens) continue;
         const uint row = row0 + sg_row * GEMM_SG_ROWS + i * 8u + r;
-        float v = mine[t * 8u + r];
+        float v = float(mine[t * 8u + r]);
         if (p.has_bias != 0u) v += float(bias[row]);
         out[(ulong)tok * (ulong)p.out_dim + row] = half(v);
       }
