@@ -376,6 +376,11 @@ if(LLAMA_ENGINE_ENABLE_METAL)
   set_tests_properties(metal_decode_test PROPERTIES
     ENVIRONMENT "CPI_METALLIB=${CPI_METALLIB};CPI_METAL_SOURCE=${CPI_METAL_SRC}")
 
+  # Isolated fp16 GEMM benchmark that verifies what it times. No model needed.
+  add_executable(metal_gemm_bench src/tests/metal_gemm_bench.cpp)
+  target_link_libraries(metal_gemm_bench PRIVATE llama_engine)
+  target_include_directories(metal_gemm_bench PRIVATE include)
+
   # Batched paged decode vs the single-sequence path. Needs a model, so it SKIPs without one.
   add_executable(metal_batched_test src/tests/metal_batched_test.cpp)
   target_link_libraries(metal_batched_test PRIVATE llama_engine)

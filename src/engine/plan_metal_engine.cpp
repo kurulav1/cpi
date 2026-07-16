@@ -119,7 +119,6 @@ constexpr int kGemmQTG = 32 * (64 / 32) * (kGemmQBN / 32);
 // Below this many tokens the GEMV wins: a GEMM tile is padded out to kGemmBN and the padding
 // is wasted arithmetic. Above it the GEMV is a catastrophe -- see the dispatch below.
 constexpr int kGemmMinTokens = 16;
-constexpr int kGemmBK = 64;   // MUST match GEMM_BK in the shader (fp16)
 constexpr int kGemmQBK = 32;  // MUST match GEMM_QBK in the shader (quantized)
 constexpr int kQBlock = 8;  // MUST match Q_BLOCK in cpi_kernels.metal
 constexpr int kArgmaxParts = 256;
@@ -562,8 +561,9 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
           // Padding the tail out to one masked GEMM tile wastes some arithmetic and is still
           // far cheaper.
           // A K-block carries ONE scale per row, so it must sit inside one quantization
-          // group. gsz is 64 by default, which is exactly kGemmBK; a smaller group would
-          // straddle, and those ops fall back to the GEMV rather than reading a wrong scale.
+          // group. gsz is 64 by default and kGemmQBK is 32, so a K-block sits inside one
+          // group; a smaller group would straddle, and those ops fall back to the GEMV rather
+          // than reading a wrong scale.
           const bool qgemm_ok =
               op.cols % 64 == 0 && op.in_dim % kGemmQBK == 0 && gsz >= kGemmQBK;
           const int qgemm_tokens = (qgemm_ok && T >= kGemmMinTokens) ? T : 0;

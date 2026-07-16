@@ -355,13 +355,19 @@ kernel void cpi_lm_head(
 #define GEMM_SG_COLS (GEMM_BN / 32)
 #define GEMM_QSG_COLS (GEMM_QBN / 32)
 // K per stage: how much arithmetic each barrier buys, since the fill and the matrix ops are
-// separated by barriers. The two GEMMs want DIFFERENT depths, which is worth stating plainly
-// because one define for both is the obvious thing to write and it costs 8% on the 8B:
+// separated by barriers.
 //
-//   fp16  (GEMM_BK 64): deeper is better -- 8 matrix steps per fill instead of 4.
+//   fp16  (GEMM_FBK 32): the depth does not matter. Measured with metal_gemm_bench at 16 / 32
+//     / 64: 2.85 / 2.89 / 2.86 TFLOP/s -- a 1.5% spread, i.e. nothing. This block used to
+//     claim "fp16 (GEMM_BK 64): deeper is better -- 8 matrix steps per fill instead of 4",
+//     describing a GEMM_BK that no kernel had read since the fp16 path moved to GEMM_FBK.
+//     The claim was documenting a constant that did nothing. It is deleted rather than
+//     corrected in place, because a dead define is how it survived.
 //   quant (GEMM_QBK 32): deeper is WORSE. The quant tile also holds a scale row, so doubling
 //     K doubles its threadgroup memory, and the 8B's GEMM is compute-bound -- it needs the
 //     occupancy to hide latency more than it needs fewer barriers. Measured: 161 -> 148 tok/s.
+//     (Unlike the fp16 claim above, GEMM_QBK is live and this has not been re-measured with
+//     the current harness.)
 //
 // GEMM_QBK must also not exceed the quantization group (64 by default), or a K-block would
 // straddle two scales. The dispatch guards that.
@@ -379,7 +385,6 @@ kernel void cpi_lm_head(
 //
 // Both configurations are now checked against a CPU reference in metal_smoke, which derives
 // its dispatch from these same constants rather than restating them.
-#define GEMM_BK 64
 #define GEMM_QBK 32
 #define GEMM_FBM 64
 #define GEMM_FBK 32
