@@ -23,6 +23,7 @@
 // order. Comparisons between two runs of the SAME kernel are held to EXACT equality -- that
 // is where batching contamination would show, and there is no excuse for a difference.
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -77,7 +78,7 @@ int main(int argc, char** argv) {
   // they would each fit in ONE block, so a "shuffled" table would never cross a block
   // boundary and the gather would go untested. At 8 a 24-token history spans three blocks.
   const int block_size = (argc > 2) ? std::atoi(argv[2]) : 8;
-  const int max_ctx = 256;
+  const int max_ctx = 1024;  // room for the long-prompt timing at the end
 
   engine::PlanMetalEngine eng;
   if (!eng.available()) {
@@ -298,6 +299,45 @@ int main(int argc, char** argv) {
     }
   }
 
+  // ---- What does the O(T^2) paged prefill actually cost? ----------------
+  //
+  // prefill_paged reuses the DECODE attention kernel, so every query re-walks the whole
+  // history -- O(T^2) device traffic, the very thing the contiguous path's query-block
+  // kernels exist to avoid. That shortcut was deliberate, but "known" is not "measured",
+  // and the size of it is what decides whether a paged query-block kernel is worth writing.
+  //
+  // Same engine, same weights, same tokens; only the prefill path differs. (inspect_next_logits
+  // prefills n-1 tokens and then runs one decode step, so it carries ~one step of overhead the
+  // paged side does not -- irrelevant unless the ratio comes out near 1.)
+  {
+    std::vector<int> longp;
+    // Under max_prefill_ (512): prefill_paged takes ONE chunk -- the BatchAdapter is what
+    // chunks longer prompts. 480 is still long enough for O(T^2) to show if it is there.
+    for (int i = 0; i < 480; ++i) longp.push_back(1000 + (i * 7) % 20000);
+    std::vector<int> tbl(static_cast<std::size_t>(blocks));
+    for (int i = 0; i < blocks; ++i) tbl[static_cast<std::size_t>(i)] = i;
+
+    // Warm BOTH paths first. The GPU clock ramps, and on this machine the first measurement
+    // of anything reads ~15% slow whichever path happens to go first -- that artifact already
+    // produced one wrong conclusion in this backend's history.
+    eng.prefill_paged(longp, 0, tbl);
+    eng.inspect_next_logits(longp, 1);
+
+    double contig_ms = 1e30, paged_ms = 1e30;
+    for (int rep = 0; rep < 3; ++rep) {  // best-of-3, interleaved
+      auto t0 = std::chrono::steady_clock::now();
+      eng.inspect_next_logits(longp, 1);
+      contig_ms = std::min(contig_ms, std::chrono::duration<double, std::milli>(
+                                          std::chrono::steady_clock::now() - t0).count());
+      auto t1 = std::chrono::steady_clock::now();
+      eng.prefill_paged(longp, 0, tbl);
+      paged_ms = std::min(paged_ms, std::chrono::duration<double, std::milli>(
+                                        std::chrono::steady_clock::now() - t1).count());
+    }
+    std::printf("\n  [timing] prefill %zu tok | contiguous (query-block) %.0f ms"
+                " | paged (decode kernel, O(T^2)) %.0f ms  -> %.2fx\n",
+                longp.size(), contig_ms, paged_ms, paged_ms / contig_ms);
+  }
   if (failures != 0) {
     std::printf("\n[metal_batched] FAIL\n");
     return 1;
