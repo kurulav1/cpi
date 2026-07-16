@@ -1034,6 +1034,54 @@ void PlanMetalEngine::set_paged_kv(int num_blocks, int block_size) {
   paged_block_size_ = block_size;
 }
 
+// This engine's half of continuous batching: the only two operations BatchScheduler needs
+// from a GPU. Everything else -- who gets admitted, who gets preempted, which prefix is
+// reused -- is the shared scheduler's, so Metal cannot drift from CUDA on any of it.
+class PlanMetalEngine::BatchAdapter final : public BatchBackend {
+public:
+  explicit BatchAdapter(PlanMetalEngine* e) : e_(e) {}
+
+  void prefill_suffix(const std::vector<int>& prompt_tokens, int shared_tokens,
+                      const std::vector<int>& block_table) override {
+    // [0, shared) is already in the pool through adopted blocks. Chunk the rest to the slot
+    // size; each chunk lands at its own absolute position, so a chunk boundary is not a
+    // sequence boundary. prefill_paged commits and waits, which is the contract.
+    const int n = static_cast<int>(prompt_tokens.size());
+    for (int off = shared_tokens; off < n; off += e_->max_prefill_) {
+      const int chunk = std::min(e_->max_prefill_, n - off);
+      const std::vector<int> ids(prompt_tokens.begin() + off, prompt_tokens.begin() + off + chunk);
+      e_->prefill_paged(ids, off, block_table);
+    }
+  }
+
+  void decode_batched_logits(const std::vector<int>& tokens, const std::vector<int>& positions,
+                             const std::vector<int>& block_tables_flat, int max_blocks,
+                             std::vector<std::vector<float>>& out_logits) override {
+    e_->decode_step_batched_logits(tokens, positions, block_tables_flat, max_blocks, out_logits);
+  }
+
+private:
+  PlanMetalEngine* e_;
+};
+
+BatchScheduler& PlanMetalEngine::batch_scheduler(const BatchSchedulerOptions& opts) {
+  if (!scheduler_) {
+    if (paged_blocks_ <= 0) {
+      throw std::runtime_error(
+          "batch_scheduler requires a paged KV pool: call set_paged_kv() before open()");
+    }
+    block_alloc_ = std::make_unique<BlockAllocator>(paged_blocks_);
+    batch_adapter_ = std::make_unique<BatchAdapter>(this);
+    BatchSchedulerOptions o = opts;
+    o.paged_block_size = paged_block_size_;  // must match the pool this engine allocated
+    scheduler_ = std::make_unique<BatchScheduler>(batch_adapter_.get(), block_alloc_.get(), o);
+    // Single-sequence prefix reuse tracks its own state and would now be wrong: the batched
+    // path rewrites KV through block tables it knows nothing about.
+    prev_seq_.clear();
+  }
+  return *scheduler_;
+}
+
 void PlanMetalEngine::prefill_paged(const std::vector<int>& tokens, int start_position,
                                     const std::vector<int>& block_table) {
   const int T = static_cast<int>(tokens.size());

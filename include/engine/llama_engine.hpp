@@ -471,6 +471,13 @@ public:
   // Number of requests currently running.
   int stream_active() const;
 
+  // The scheduler driving those methods, built on first use. Exposed because the app-layer
+  // batch worker now takes a BatchScheduler& directly -- it never needed the engine. No
+  // options argument: this engine already carries them in EngineOptions.
+  BatchScheduler& batch_scheduler() {
+    return ensure_scheduler();
+  }
+
 private:
   // Single-sequence greedy decode (reference for the scheduler gate).
   std::vector<int> greedy_generate_single(const std::vector<int>& prompt, int max_new, int eos_id);

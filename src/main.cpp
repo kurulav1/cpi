@@ -370,8 +370,8 @@ int main(int argc, char** argv) {
           if (!use_tokenizer) {
             throw std::runtime_error("--interactive-batch requires --tokenizer");
           }
-          app::main_modes::run_interactive_batch(eng, tokenizer, cli.stop_texts, !cli.force_no_bos,
-                                                 cli.max_new, cli.temp);
+          app::main_modes::run_interactive_batch(eng.batch_scheduler(), tokenizer, cli.stop_texts,
+                                                 !cli.force_no_bos, cli.max_new, cli.temp);
           return;
         }
       }

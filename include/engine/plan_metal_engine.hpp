@@ -26,6 +26,7 @@
 #include <utility>
 #include <vector>
 
+#include "engine/batch_scheduler.hpp"
 #include "engine/engine_types.hpp"
 #include "engine/op_plan.hpp"
 #include "engine/op_plan_builder.hpp"
@@ -115,6 +116,17 @@ public:
   // prefill pays this, and giving it the query-block treatment is a known follow-up.
   void prefill_paged(const std::vector<int>& tokens, int start_position,
                      const std::vector<int>& block_table);
+
+  // The continuous-batching scheduler for this engine, built on first use.
+  //
+  // It is engine::BatchScheduler -- the SAME class LlamaEngine drives, not a Metal
+  // reimplementation. Admission, newest-first preemption, block growth and the shared-prefix
+  // LRU are identical to CUDA's by construction rather than by agreement, because this engine
+  // supplies only the two operations that need a GPU (BatchBackend::prefill_suffix and
+  // ::decode_batched_logits) and inherits every policy decision.
+  //
+  // Requires set_paged_kv() before open(): the scheduler hands out blocks from that pool.
+  BatchScheduler& batch_scheduler(const BatchSchedulerOptions& opts);
 
   // Greedy decode. Argmax runs on the GPU so the vocab never crosses to the host.
   std::vector<int> generate_greedy(const std::vector<int>& prompt, int max_new);
@@ -242,6 +254,14 @@ private:
 
   class MetalWeights;
   std::unique_ptr<MetalWeights> wsrc_;
+
+  // Continuous batching. The allocator hands out block ids from the paged pool sized by
+  // set_paged_kv(); the adapter is this engine's half of BatchBackend. Held as the base
+  // pointer so the destructor does not need the adapter's definition.
+  class BatchAdapter;
+  std::unique_ptr<BlockAllocator> block_alloc_;
+  std::unique_ptr<BatchBackend> batch_adapter_;
+  std::unique_ptr<BatchScheduler> scheduler_;
 };
 
 }  // namespace engine

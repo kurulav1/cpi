@@ -8,10 +8,12 @@
 // single worker (start / delta / done / error), tagged by request id, so the
 // Node layer can multiplex several SSE streams onto one worker.
 //
-// Requires a tokenizer + --paged-blocks + --gpu-cache-all (LlamaEngine).
+// Requires a tokenizer + --paged-blocks. Takes the scheduler, NOT an engine: the worker only
+// ever needed admit/step/cancel/active, and engine::BatchScheduler is backend-free, so this
+// whole file no longer knows or cares which GPU is underneath it. That is what took the
+// #if LLAMA_ENGINE_HAS_CUDA off it.
 #include "app/main_modes.hpp"
 
-#if LLAMA_ENGINE_HAS_CUDA
 
 #include <algorithm>
 #include <atomic>
@@ -29,7 +31,7 @@
 #include <vector>
 
 #include "app/main_helpers.hpp"
-#include "engine/llama_engine.hpp"
+#include "engine/batch_scheduler.hpp"
 #include "grammar/grammar.hpp"
 #include "grammar/grammar_sampler.hpp"
 #include "grammar/json_schema_to_grammar.hpp"
@@ -46,7 +48,7 @@ using app::main_helpers::json_get_string;
 using app::main_helpers::json_get_string_array;
 using app::main_helpers::sanitize_stream_text;
 
-void run_interactive_batch(engine::LlamaEngine& eng, model::Tokenizer& tokenizer,
+void run_interactive_batch(engine::BatchScheduler& sched, model::Tokenizer& tokenizer,
                            const std::vector<std::string>& default_stop_texts, bool default_add_bos,
                            int default_max_new, float default_temp) {
   std::mutex out_mu;
@@ -62,7 +64,7 @@ void run_interactive_batch(engine::LlamaEngine& eng, model::Tokenizer& tokenizer
   struct Incoming {
     std::string id;
     std::vector<int> tokens;
-    engine::LlamaEngine::StreamParams params;
+    engine::StreamParams params;
     std::string json_schema;  // raw structural schema, compiled to a grammar at admit
   };
   std::mutex q_mu;
@@ -152,7 +154,7 @@ void run_interactive_batch(engine::LlamaEngine& eng, model::Tokenizer& tokenizer
   // request fits alone, so a preempted request always resumes eventually.
   struct ResumeInfo {
     std::vector<int> prompt;  // original prompt tokens (pre-generation)
-    engine::LlamaEngine::StreamParams params;  // original params (grammar ptr preserved)
+    engine::StreamParams params;  // original params (grammar ptr preserved)
     int orig_max_new = 0;
     int orig_min_new = 0;
     int retries = 0;
@@ -168,7 +170,7 @@ void run_interactive_batch(engine::LlamaEngine& eng, model::Tokenizer& tokenizer
     std::vector<std::string> cancel_ids;
     {
       std::unique_lock<std::mutex> lk(q_mu);
-      if (queue.empty() && cancels.empty() && waiting.empty() && eng.stream_active() == 0) {
+      if (queue.empty() && cancels.empty() && waiting.empty() && sched.active() == 0) {
         if (shutdown.load()) break;
         q_cv.wait(lk, [&]() { return !queue.empty() || !cancels.empty() || shutdown.load(); });
       }
@@ -193,7 +195,7 @@ void run_interactive_batch(engine::LlamaEngine& eng, model::Tokenizer& tokenizer
     }
     // Apply cancels for already-running requests (frees their KV blocks).
     for (const auto& cid : cancel_ids) {
-      const bool evicted = eng.stream_cancel(cid);
+      const bool evicted = sched.cancel(cid);
       detok.erase(cid);
       grammars.erase(cid);
       resume.erase(cid);
@@ -218,7 +220,7 @@ void run_interactive_batch(engine::LlamaEngine& eng, model::Tokenizer& tokenizer
                       << "); unconstrained\n";
           }
         }
-        eng.stream_admit(in.id, in.tokens, in.params);
+        sched.admit(in.id, in.tokens, in.params);
         DetokState st;
         st.t0 = std::chrono::steady_clock::now();
         detok[in.id] = std::move(st);
@@ -233,7 +235,7 @@ void run_interactive_batch(engine::LlamaEngine& eng, model::Tokenizer& tokenizer
     // Resume preempted requests once a slot has freed (a running request
     // finished) or the pool is now empty. Re-prefill prompt+generated so the
     // client stream continues; if the pool still can't fit it, keep it waiting.
-    if (!waiting.empty() && (slot_freed || eng.stream_active() == 0)) {
+    if (!waiting.empty() && (slot_freed || sched.active() == 0)) {
       slot_freed = false;
       std::deque<std::string> still_waiting;
       while (!waiting.empty()) {
@@ -255,11 +257,11 @@ void run_interactive_batch(engine::LlamaEngine& eng, model::Tokenizer& tokenizer
         }
         std::vector<int> full = rit->second.prompt;
         full.insert(full.end(), dit->second.ids.begin(), dit->second.ids.end());
-        engine::LlamaEngine::StreamParams p = rit->second.params;
+        engine::StreamParams p = rit->second.params;
         p.max_new_tokens = std::max(1, rit->second.orig_max_new - done_so_far);
         p.min_new_tokens = std::max(0, rit->second.orig_min_new - done_so_far);
         try {
-          eng.stream_admit(rid, full, p);  // no "start"/detok reset: stream continues
+          sched.admit(rid, full, p);  // no "start"/detok reset: stream continues
           std::fprintf(stderr, "[batch] resumed %s (tokens=%zu, budget=%d, try=%d)\n", rid.c_str(),
                        full.size(), p.max_new_tokens, rit->second.retries);
         } catch (const std::exception&) {
@@ -269,14 +271,14 @@ void run_interactive_batch(engine::LlamaEngine& eng, model::Tokenizer& tokenizer
       waiting = std::move(still_waiting);
     }
 
-    if (eng.stream_active() == 0) {
+    if (sched.active() == 0) {
       if (shutdown.load()) break;
       continue;
     }
 
     // One decode step over every running request.
-    std::vector<engine::LlamaEngine::StreamEvent> events;
-    eng.stream_step(events);
+    std::vector<engine::StreamEvent> events;
+    sched.step(events);
     for (const auto& e : events) {
       auto it = detok.find(e.id);
       if (it == detok.end()) continue;
@@ -329,4 +331,3 @@ void run_interactive_batch(engine::LlamaEngine& eng, model::Tokenizer& tokenizer
 
 }  // namespace app::main_modes
 
-#endif  // LLAMA_ENGINE_HAS_CUDA

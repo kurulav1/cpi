@@ -5,6 +5,7 @@
 #include <utility>
 #include <vector>
 
+#include "engine/batch_scheduler.hpp"
 #include "engine/engine_types.hpp"
 #include "engine/generation_constraints.hpp"
 
@@ -57,12 +58,14 @@ void execute_engine_modes(const RunExecutionOptions& options, const std::vector<
                           const LastBenchmarkStatsFn& last_benchmark_stats,
                           const GenerateMultimodalFn& generate_multimodal = nullptr);
 
-#if LLAMA_ENGINE_HAS_CUDA
 // Multiplexed continuous-batching interactive worker (opt-in, --interactive-batch).
-// Drives the engine's streaming batch scheduler; see main_interactive_batch.cpp.
-void run_interactive_batch(engine::LlamaEngine& eng, model::Tokenizer& tokenizer,
+// See main_interactive_batch.cpp.
+//
+// Takes the scheduler rather than an engine, and is NOT gated on CUDA: engine::BatchScheduler
+// is backend-free, so whichever engine built it (LlamaEngine or PlanMetalEngine) is invisible
+// here. The gate used to exist because the scheduler lived inside LlamaEngine.
+void run_interactive_batch(engine::BatchScheduler& sched, model::Tokenizer& tokenizer,
                            const std::vector<std::string>& default_stop_texts, bool default_add_bos,
                            int default_max_new, float default_temp);
-#endif
 
 }  // namespace app::main_modes
