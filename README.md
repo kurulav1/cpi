@@ -248,18 +248,49 @@ sampling, metrics), and `--weight-quant int4/int8` serves a quantized model, so 
 on a small Mac. On an M4, Qwen2.5-0.5B streams at ~54 tok/s (fp16) / ~87 tok/s (int4), versus
 ~2 tok/s on the CPU fallback.
 
-**Still not on Metal**, and rejected loudly rather than half-done: continuous batching + paged KV
-(the multi-user batch worker is `LlamaEngine`-only), MoE, the vision tower, linear attention
-(Qwen3.5), and grammar-constrained decode. Those need work above the kernels. So single-request
-serving runs on a Mac; the batched multi-user server does not — yet.
+**Still not on Metal**, and rejected loudly rather than half-done: MoE, the vision tower, and
+linear attention (Qwen3.5). Those need work above the kernels.
+
+Continuous batching is partly there. The kernels and the engine step exist — a paged KV pool,
+batched paged decode, and paged prefill, all sharing `engine::SequenceBlockTable`, the same
+backend-free allocator CUDA uses, so a block table means the same thing on both. What is still
+`LlamaEngine`-only is the layer above: the scheduler (admission, preemption, block growth) lives
+inside that class rather than behind an interface, and the batch worker is compiled out without
+CUDA. So single-request serving runs on a Mac today; the multi-user batched server does not yet.
 
 **Measured** (Apple M4, 10-core GPU, 16 GB):
 
-| Model | | GPU weights | decode | prefill (551 tok) |
+| Model | | GPU weights | decode | prefill |
 | --- | --- | --- | --- | --- |
-| Qwen2.5-0.5B | fp16 | 1.17 GB | 86.5 tok/s | 3730 tok/s |
-| Qwen2.5-0.5B | int4 | 0.51 GB | 146.7 tok/s | 2600 tok/s |
+| Qwen2.5-0.5B | fp16 | 1.17 GB | 86.5 tok/s | 2700 tok/s |
+| Qwen2.5-0.5B | int4 | 0.51 GB | 146.7 tok/s | 2510 tok/s |
 | **Llama-3.1-8B** | **int4** | **4.91 GB** | **20.5 tok/s** | **161 tok/s** |
+
+Prefill is a ~540-token prompt; decode is from a short one (it falls with KV length — see below).
+
+> **The fp16 prefill figure used to read 3730 tok/s, and that number was an artifact.** It is
+> worth keeping the story attached to the table it corrupted.
+>
+> `cpi_gemm_f16` gives each simdgroup a 32×32 sub-tile, so its thread count has to follow its
+> row tile. When that tile was raised 64 → 128, the shader changed and the host's thread count
+> did not — so it ran 4 simdgroups against a 128-row tile and **wrote only half the rows of
+> each one**. Every fp16 prompt of ≥16 tokens (where the GEMM replaces the GEMV) decoded from a
+> corrupted prefill.
+>
+> It survived because **a kernel that skips half its writes is not slower, it is faster**. The
+> benchmark rewarded it: re-running the same measurement on the broken kernel still reproduces
+> 3563–3720 tok/s, which is where 3730 came from. And no correctness gate ever executed it —
+> `metal_smoke` did not cover the GEMM at all, and every golden prompt is 10–12 tokens, below
+> the threshold. The engine's fastest fp16 path was benchmarked every session and verified
+> never.
+>
+> Two things fell out once it was fixed. The "+37% from a taller tile over 8 simdgroups" was
+> **the entire bug** — with the geometry consistent, 128 rows over 8 simdgroups is ~3% *slower*
+> than 64 over 4, so the tile is back to 64 and its rationale (more simdgroups hide fragment-load
+> latency) is unsupported. And the int4 GEMM, whose row tile really is 64, was never affected:
+> int4 prefill was long thought to lag fp16 badly, and a long hunt for the missing speed found
+> nothing because there was nothing to find. It was being compared against a number that did not
+> exist.
 
 The 8B is the point of quantization: at fp16 its weights are ~15 GB and it does **not** fit in a
 16 GB Mac — attempting it drives the machine into swap. At int4 it runs in 4.91 GB with zero
@@ -329,9 +360,15 @@ is *wider* than the 8B's, and the honest table is worth keeping:
 
 | | llama.cpp | CPI | CPI / llama.cpp |
 | --- | --- | --- | --- |
-| fp16 prefill (551) | 4163 | 3730 | 90% |
-| int4 prefill (551) | 4066 | 2600 | 64% |
+| fp16 prefill (~540) | 4163 | 2700 | 65% |
+| int4 prefill (~540) | 4066 | 2510 | 62% |
 | int4 decode (short ctx) | 198 | 176 | 89% |
+
+The fp16 prefill row read 3730 / 90% until the GEMM bug above was found; the corrected figure is
+2700 / 65%. That correction is what makes the table coherent: **both prefill paths sit at ~63%**,
+where the story used to be "fp16 is nearly there and int4 is mysteriously behind." There is one
+prefill gap, not an int4-specific one — which also means the long, fruitless hunt for int4's
+missing speed was chasing a difference that was never real.
 
 A counter (`MetalContext::gpu_busy_ms()`, GPU wall-clock via command-buffer timestamps) settled
 the first question: prefill is **97% GPU-busy**, so the gap is kernel efficiency, not dispatch
@@ -352,18 +389,26 @@ to the 8B:
   from device, so a wider tile (128) adds weight reuse at no threadgroup-memory cost: **int4
   1527 → 1903**. The fp16 GEMM stages its activations, so the same widening drops occupancy and
   loses — it keeps 64.
-- **The fp16 GEMM was starved of simdgroups, not registers.** For two sessions it sat at ~53% of
-  peak and was diagnosed as a register-file wall (the 4×4 accumulator tile caps arithmetic
-  intensity, and every attempt to raise it — wider tiles, half accumulators, register tiling —
-  failed). The real cause was different: it ran **4 simdgroups (128 threads)**, too few to hide the
-  inner-loop `simdgroup_load` latency — while one simdgroup waits on a fragment, there was no other
-  ready to compute. Running the same 4×4 tile over a **taller 128-row block with 8 simdgroups (256
-  threads)** hides it: **fp16 prefill 2764 → 3730 tok/s**, ~90% of llama.cpp. (16 simdgroups is
-  worse — 8 is the sweet spot; the quantized GEMM was already at 8, which is why it was never the
-  one stuck.)
+- **The fp16 GEMM "simdgroup starvation" finding was not real, and its retraction is the more
+  useful result.** For two sessions the GEMM sat at ~53% of peak and resisted every lever (wider
+  tiles, half accumulators, register tiling). It was then diagnosed as too few simdgroups to hide
+  inner-loop `simdgroup_load` latency, and running the 4×4 tile over a taller 128-row block with 8
+  simdgroups appeared to confirm it: **2764 → 3730 tok/s**. It was not a fix. The shader's tile
+  grew; the host's thread count stayed at 128, so the kernel ran 4 simdgroups over a 128-row tile
+  and wrote **half the rows**. The measurement was rewarding skipped work, and no gate caught it
+  (see the GEMM note above the benchmark table). Corrected, 128-over-8 is ~3% *slower* than
+  64-over-4; the tile is back to 64 and the latency-hiding premise has no evidence behind it. The
+  ~53%-of-peak question is **reopened and still unexplained.**
 
-The remaining gap is now almost entirely the quantized GEMM (int4 at 64%), which carries the
-dequantization work and reads activations from device; it is already at its 8-simdgroup optimum.
+The lesson generalizes past this kernel: **an optimization validated only by the metric it
+improves is not validated at all.** Every lever in this section was accepted or rejected on
+wall-clock alone, which cannot distinguish "faster" from "doing less." The GEMM now has a CPU
+reference check in `metal_smoke` across T = 1…100 that derives its dispatch from the tile
+constants instead of restating them, so the shader and host cannot drift apart again silently.
+`cpi_gemm_quant` and the attention kernels still have no such check.
+
+Both prefill paths now sit at ~63% of llama.cpp, so the remaining gap is common to both rather
+than something specific to the quantized GEMM.
 
 **Correctness.** Qwen2.5-0.5B, Qwen3-0.6B and gemma-2b each reproduce the CUDA backend's greedy
 token stream exactly on an Apple M4 (`src/tests/golden/`). `metal_decode_test` gates on two

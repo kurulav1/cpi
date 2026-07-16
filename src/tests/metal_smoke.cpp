@@ -154,6 +154,9 @@ int main() {
   }
 
   // ---- GEMM (fp16), the multi-token prefill path -------------------------
+  // MUST match GEMM_FBM / GEMM_BN in cpi_kernels.metal (and kGemmFBM / kGemmBN in the engine).
+  constexpr std::uint32_t kSmokeGemmFBM = 64;   // rows per threadgroup
+  constexpr std::uint32_t kSmokeGemmBN = 64;    // tokens per tile
   // This kernel had NO check of its own: it was benchmarked heavily and gated only
   // indirectly, through end-to-end goldens. A prefill chunk and a token-at-a-time run
   // disagreed on Metal, and the split fell exactly on the GEMV/GEMM boundary, so the
@@ -175,12 +178,15 @@ int main() {
 
     GemvParams p{out_dim, in_dim, T, 1};
     const void* bufs[] = {bW.handle(), bA.handle(), bo.handle(), bb.handle()};
-    // The engine's own geometry, verbatim -- testing a different grid than production runs
-    // would prove nothing about production.
-    const std::size_t tiles = (T + 64 - 1) / 64;
-    const std::size_t groups = (out_dim / 128) * tiles;  // out_dim / GEMM_FBM, as the engine does
-    ctx.dispatch("cpi_gemm_f16", runtime::MetalContext::Grid::Groups, groups, 256, bufs, nullptr, 4,
-                 &p, sizeof(p));
+    // Derive the dispatch from the tile constants with the same rule the engine uses, rather
+    // than restating 256/128 as literals. Restating them is exactly how this kernel broke: the
+    // shader's row tile moved and a hardcoded thread count stayed behind. If FBM changes and
+    // this test still passes, the test is worth something.
+    const std::size_t tiles = (T + kSmokeGemmBN - 1) / kSmokeGemmBN;
+    const std::size_t groups = (out_dim / kSmokeGemmFBM) * tiles;
+    const std::size_t threads = 32 * (kSmokeGemmFBM / 32) * (kSmokeGemmBN / 32);
+    ctx.dispatch("cpi_gemm_f16", runtime::MetalContext::Grid::Groups, groups, threads, bufs,
+                 nullptr, 4, &p, sizeof(p));
     ctx.commit_and_wait();
 
     std::vector<float> want(static_cast<std::size_t>(T) * out_dim), got(want.size());

@@ -365,14 +365,23 @@ kernel void cpi_lm_head(
 //
 // GEMM_QBK must also not exceed the quantization group (64 by default), or a K-block would
 // straddle two scales. The dispatch guards that.
-// The fp16 GEMM uses a TALLER row tile with MORE simdgroups: GEMM_FBM=128 rows over 8
-// simdgroups (256 threads) instead of 64 over 4. This was the real fix for its ~53%-of-peak
-// stall -- not the register file (accumulators stay 4x4), but too few simdgroups to hide the
-// inner-loop fragment-load latency. With 8, one simdgroup computes while another waits on a
-// simdgroup_load. Measured 2764 -> 3780 tok/s (0.5B fp16 prefill).
+// GEMM_FBM is the fp16 row tile, and it MUST stay in step with the host's kGemmFBM, which
+// derives both the thread count (one simdgroup per 32x32 sub-tile of FBM x BN) and the grid
+// (out_dim / FBM row blocks) from it. That coupling is the whole reason this comment exists:
+//
+// This tile was once raised 64 -> 128 "over 8 simdgroups (256 threads)", reported as
+// 2764 -> 3780 tok/s. The kernel changed; the host's thread count did not. So it ran 128
+// threads = 4 simdgroups against a 128-row tile and wrote only half the rows of each one --
+// and the "speedup" was simply the work it skipped. Nothing failed: the GEMM only runs at
+// T >= kGemmMinTokens, and no golden prompt is that long. Re-measured with the geometry
+// actually consistent, 128 rows over 8 simdgroups is ~3% SLOWER than 64 over 4, so the tile
+// is back to 64 and the premise (more simdgroups hide fragment-load latency) is unsupported.
+//
+// Both configurations are now checked against a CPU reference in metal_smoke, which derives
+// its dispatch from these same constants rather than restating them.
 #define GEMM_BK 64
 #define GEMM_QBK 32
-#define GEMM_FBM 128
+#define GEMM_FBM 64
 #define GEMM_FBK 32
 
 // ---------------------------------------------------------------------------

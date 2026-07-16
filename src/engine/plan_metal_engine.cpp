@@ -102,14 +102,15 @@ constexpr int kSimdsPerTG = kTG / 32;  // = rows per threadgroup in the GEMV
 // The blocked GEMMs tile 64 rows x 64 tokens: 4 simdgroups (128 threads), each owning a 32x32
 // output tile of 4x4 fragments.
 constexpr int kGemmBN = 64;    // MUST match GEMM_BN in the shader (fp16 tokens per tile)
-constexpr int kGemmFBM = 128;  // MUST match GEMM_FBM in the shader (fp16 rows per tile)
-// One simdgroup per 32x32 sub-tile of the FBM x BN output tile, so 4 x 2 = 8 simdgroups.
-// This used to read `32 * (64 / 32) * (kGemmBN / 32)` = 128 threads, a literal 64 left behind
-// when the row tile went 64 -> 128. The kernel derives its own row block from GEMM_FBM, so it
-// then had half the simdgroups it needed and silently wrote only rows row0..row0+63 of every
-// 128-row tile -- the other half kept whatever was in the slot. It was invisible because the
-// GEMM only runs at T >= kGemmMinTokens and every golden prompt is ~10 tokens, so no gate ever
-// executed this kernel; the prefill benchmarks did, but they time it, they do not check it.
+constexpr int kGemmFBM = 64;  // MUST match GEMM_FBM in the shader (fp16 rows per tile)
+// One simdgroup per 32x32 sub-tile of the FBM x BN output tile: at 64x64 that is 2 x 2 = 4
+// simdgroups, 128 threads. DERIVED from the tile, never restated -- this line used to read
+// `32 * (64 / 32) * (kGemmBN / 32)`, and when the row tile went 64 -> 128 the literal 64 stayed.
+// The kernel takes its row block from GEMM_FBM itself, so it then ran half the simdgroups it
+// needed and wrote only rows row0..row0+63 of every 128-row tile; the rest kept whatever was in
+// the slot. Nothing failed: the GEMM only runs at T >= kGemmMinTokens and every golden prompt is
+// ~10 tokens, so no gate executed it, and the prefill benchmarks that did only timed it -- half
+// the writes read as a 37% speedup. metal_smoke now checks it against a CPU reference.
 constexpr int kGemmTG = 32 * (kGemmFBM / 32) * (kGemmBN / 32);
 // The quantized GEMM reads activations from device, not a staged tile, so a wider token tile
 // buys weight reuse at no threadgroup-memory cost. It wants 128 where fp16 wants 64.
