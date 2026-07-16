@@ -96,10 +96,19 @@ int main(int argc, char** argv) {
               kFBM, kBN);
 
   // Qwen2.5-0.5B's projections. qkv is fused in the plan but the shapes are what matter.
+  // Qwen2.5-0.5B's SEVEN real projections per layer, not three. The k/v pair matters far more
+  // than its 1.5% of the FLOPs suggests: out_dim 128 gives a grid of (128/64) * tiles = 18
+  // threadgroups on a 10-core GPU, so it is launch/occupancy-bound rather than ALU-bound and
+  // its cost does not scale with its arithmetic. Leaving it out is how a bench reports 2.85
+  // TFLOP/s for a pass that really achieves ~1.87.
   const Shape shapes[] = {
-      {"q/o_proj  896x896", 896, 896},
-      {"gate/up   4864x896", 4864, 896},
-      {"down      896x4864", 896, 4864},
+      {"q_proj    896x896", 896, 896},
+      {"k_proj    128x896", 128, 896},
+      {"v_proj    128x896", 128, 896},
+      {"o_proj    896x896", 896, 896},
+      {"gate_proj 4864x896", 4864, 896},
+      {"up_proj   4864x896", 4864, 896},
+      {"down_proj 896x4864", 896, 4864},
   };
 
   std::mt19937 rng(1234);
@@ -108,10 +117,29 @@ int main(int argc, char** argv) {
   int failures = 0;
 
   for (const Shape& s : shapes) {
+    // CPI_METAL_GEMM_ROTATE=<n> allocates n DISTINCT weight matrices and cycles through them,
+    // instead of hammering one. This exists because the single-matrix default does not
+    // reproduce a prefill: a real pass walks 24 layers x 7 matrices (~716 MB) once each, while
+    // one matrix reused 20x sits in cache. The default reports 2.85 TFLOP/s where a real
+    // prefill achieves ~1.87 for the same shapes -- so the default is measuring the cache, and
+    // any limiter read from it describes the cache-hot case, not the one that matters.
+    const int rotate = [] {
+      const char* e = std::getenv("CPI_METAL_GEMM_ROTATE");
+      return e != nullptr ? std::max(1, std::atoi(e)) : 1;
+    }();
     std::vector<std::uint16_t> W(static_cast<std::size_t>(s.out_dim) * s.in_dim);
     std::vector<std::uint16_t> A(static_cast<std::size_t>(T) * s.in_dim);
     for (auto& v : W) v = f32_to_f16(dist(rng) * 0.1f);
     for (auto& v : A) v = f32_to_f16(dist(rng));
+
+    // The rotation set. Contents do not matter (the spot check uses W, so rotation>1 only
+    // times the traffic and the correctness check runs against the buffer it verified).
+    std::vector<runtime::MetalBuffer> wrot;
+    for (int i = 1; i < rotate; ++i) {
+      std::vector<std::uint16_t> Wi(W.size());
+      for (auto& v : Wi) v = f32_to_f16(dist(rng) * 0.1f);
+      wrot.push_back(ctx.alloc_from(Wi.data(), Wi.size() * 2));
+    }
 
     auto bW = ctx.alloc_from(W.data(), W.size() * 2);
     auto bA = ctx.alloc_from(A.data(), A.size() * 2);
@@ -149,7 +177,9 @@ int main(int argc, char** argv) {
       ctx.reset_counters();
       const auto t0 = std::chrono::steady_clock::now();
       for (int i = 0; i < reps; ++i) {
-        ctx.dispatch("cpi_gemm_f16", runtime::MetalContext::Grid::Groups, grid, threads, bufs,
+        const void* rb[] = {(i % rotate == 0) ? bW.handle() : wrot[(i % rotate) - 1].handle(),
+                            bA.handle(), bo.handle(), bW.handle()};
+        ctx.dispatch("cpi_gemm_f16", runtime::MetalContext::Grid::Groups, grid, threads, rb,
                      nullptr, 4, &p, sizeof(p));
       }
       ctx.commit_and_wait();
@@ -177,6 +207,16 @@ int main(int argc, char** argv) {
       } else {
         std::printf("  [capture] SKIPPED: %s\n", ctx.last_error().c_str());
       }
+    }
+
+    // Leave `bo` holding W's result: with rotate>1 the timed loop's last dispatch may have used
+    // a rotation matrix, and then the spot check below compares W's expected values against
+    // some other matrix's output and reports WRONG. (It did. The bench refusing to print a
+    // number it cannot verify is the design working -- the bug was mine, in the harness.)
+    if (rotate > 1) {
+      ctx.dispatch("cpi_gemm_f16", runtime::MetalContext::Grid::Groups, grid, threads, bufs,
+                   nullptr, 4, &p, sizeof(p));
+      ctx.commit_and_wait();
     }
 
     // CHECK WHAT WE TIMED. A spot check, not the full product: 128 random (token,row) dot
