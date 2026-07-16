@@ -98,6 +98,26 @@ struct LlamaGeometry {
   // Weight names follow the .ll2c convention (layers.N.attention.wq, ...). A model
   // whose tensors are named differently supplies its own prefix mapping.
   std::string layer_prefix = "layers.";
+
+  // ---- Mixture of Experts (Mixtral) ---------------------------------------
+  //
+  // num_experts == 0 is a dense SwiGLU/GeGLU MLP, i.e. everything above. Non-zero swaps the
+  // MLP block for router -> top-k -> per-expert FFN -> routing-weighted sum. Same attention,
+  // same norms, same everything else: MoE is a capability of this geometry, not a fork.
+  //
+  // NOTE this is MIXTRAL's MoE. Gemma 4's is a different animal (a weightless router norm, a
+  // learned per-expert gain, fused gate_up in the checkpoint) and keeps its own builder inside
+  // PlanCudaEngine. Sharing them would mean pretending two different models are one.
+  int num_experts = 0;
+  int experts_per_tok = 0;
+  int expert_inter = 0;  // per-expert FFN width; falls back to `inter` when 0
+
+  // The expert kernels want ONE tensor per layer, not one per expert:
+  //   <prefix>feed_forward.experts.gate_up  [num_experts * 2 * expert_inter, hidden]
+  //   <prefix>feed_forward.experts.down     [num_experts * hidden, expert_inter]
+  // A .ll2c stores them per expert (experts.<e>.w1 / .w3 / .w2), so a backend's WeightSource
+  // is what concatenates them -- the builder names what it needs and the backend materialises
+  // it, which keeps the layout decision next to the memory that holds it.
 };
 
 // Emits the decode plan: a prologue (embedding lookup), one op list per layer, and

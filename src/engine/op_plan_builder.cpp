@@ -190,9 +190,58 @@ ModelPlan build_llama_plan(const LlamaGeometry& g, const WeightSource& w) {
     lp.ops.push_back(gemv(Slot::Att, Slot::Tmp, w, p + "attention.wo", g.hidden, q_dim));
     lp.ops.push_back(add_inplace(Slot::Tmp));
 
-    // MLP block (SwiGLU).
+    // MLP block. Dense SwiGLU/GeGLU, or -- for an MoE model -- router + selected experts.
+    // The norm and the residual add are shared: only what sits between them differs.
     lp.ops.push_back(rmsnorm(Slot::X, Slot::XNorm, w.fp16(p + "ffn_norm.weight"), g.hidden,
                              g.rms_eps, g.norm_offset));
+    if (g.num_experts > 0) {
+      const int einter = g.expert_inter > 0 ? g.expert_inter : g.inter;
+      // Router logits: [experts]. Tiny (experts x hidden), so it stays fp16 even when the
+      // projections are quantized -- quantizing a matrix this small buys nothing and the
+      // routing decision is the one place an error picks a different expert outright.
+      lp.ops.push_back(gemv(Slot::XNorm, Slot::MoeLogits, w, p + "feed_forward.router",
+                            g.num_experts, g.hidden));
+      {
+        // softmax -> top-k -> renormalise over the picked ones. Mixtral has no per-expert
+        // gain (that is Gemma 4), so weight stays null and the kernel skips it.
+        Op o;
+        o.kind = OpKind::MoeRouterTopk;
+        o.in = Slot::MoeLogits;
+        o.cols = g.num_experts;
+        o.heads = g.experts_per_tok;
+        lp.ops.push_back(o);
+      }
+      {
+        // Per selected expert: act(gate) * up -> MoeInter[k]. Mixtral is SwiGLU, and the op
+        // name says Geglu for historical reasons -- the kernel takes the activation from the
+        // geometry, as the dense path does.
+        Op o;
+        o.kind = OpKind::MoeGateUpGeglu;
+        o.in = Slot::XNorm;
+        o.out = Slot::MoeInter;
+        o.weight = w.fp16(p + "feed_forward.experts.gate_up");
+        o.cols = einter;
+        o.in_dim = g.hidden;
+        o.heads = g.experts_per_tok;
+        o.mlp_gelu = g.mlp_gelu;
+        lp.ops.push_back(o);
+      }
+      {
+        // sum_k routing_weight[k] * down[expert_k] . MoeInter[k] -> Tmp.
+        Op o;
+        o.kind = OpKind::MoeDownAccum;
+        o.in = Slot::MoeInter;
+        o.out = Slot::Tmp;
+        o.weight = w.fp16(p + "feed_forward.experts.down");
+        o.cols = g.hidden;
+        o.in_dim = einter;
+        o.heads = g.experts_per_tok;
+        lp.ops.push_back(o);
+      }
+      lp.ops.push_back(add_inplace(Slot::Tmp));
+      plan.layers.push_back(std::move(lp));
+      continue;
+    }
     lp.ops.push_back(gemv(Slot::XNorm, Slot::Gate, w, p + "feed_forward.w1", g.inter, g.hidden));
     lp.ops.push_back(gemv(Slot::XNorm, Slot::Up, w, p + "feed_forward.w3", g.inter, g.hidden));
     {

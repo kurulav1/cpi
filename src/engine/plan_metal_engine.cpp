@@ -58,6 +58,12 @@ struct AttnParams {
   // construction keeps the contiguous meaning.
   std::uint32_t paged = 0, block_size = 0;
 };
+struct MoeRouterParams {
+  std::uint32_t experts, top_k, has_expert_scale;
+};
+struct MoeExpertParams {
+  std::uint32_t inter, hidden, top_k, use_gelu;
+};
 // Batched paged decode. These mirror the structs in cpi_kernels.metal field for field --
 // a mismatch here is silent and shows up as garbage numbers, not as a build error.
 struct KvPagedParams {
@@ -170,6 +176,15 @@ public:
   const void* fp16(const std::string& name) const override {
     auto it = bufs_.find(name);
     if (it != bufs_.end()) return it->second.handle();
+    // The MoE expert kernels want ONE tensor per layer, but a .ll2c stores one per expert.
+    // The builder asks for the fused name and this materialises it -- so the layout decision
+    // lives next to the memory that holds it, and the kernels stay identical to CUDA's.
+    const auto ends_with = [&name](const char* suf) {
+      const std::size_t n = std::strlen(suf);
+      return name.size() > n && name.compare(name.size() - n, n, suf) == 0;
+    };
+    if (ends_with(".experts.gate_up")) return fuse_experts(name, /*gate_up=*/true);
+    if (ends_with(".experts.down")) return fuse_experts(name, /*gate_up=*/false);
     if (!wl_.has_tensor(name)) {
       throw std::runtime_error("weight not in the model file: " + name);
     }
@@ -184,6 +199,38 @@ public:
 
   bool has(const std::string& name) const override {
     return wl_.has_tensor(name);
+  }
+
+  // Concatenate a layer's per-expert w1/w3 (or w2) into the one tensor the expert kernels
+  // index, matching the layout kernels_moe_experts.cu documents:
+  //   gate_up: [experts][2 * inter][hidden]   -- expert e's gate rows then its up rows
+  //   down:    [experts][hidden][inter]
+  //
+  // `name` is "<prefix>feed_forward.experts.gate_up" / ".down"; the per-expert tensors are
+  // "<prefix>feed_forward.experts.<e>.w1" / ".w3" / ".w2".
+  const void* fuse_experts(const std::string& name, bool gate_up) const {
+    const std::string base = name.substr(0, name.rfind('.') + 1);  // "...experts."
+    std::vector<std::uint16_t> fused;
+    for (int e = 0;; ++e) {
+      const std::string pe = base + std::to_string(e) + ".";
+      const std::string a = pe + (gate_up ? "w1" : "w2");
+      if (!wl_.has_tensor(a)) {
+        if (e == 0) throw std::runtime_error("MoE expert weights not in the model file: " + a);
+        break;  // ran out of experts
+      }
+      auto append = [&](const std::string& t) {
+        const std::size_t bytes = wl_.tensor_bytes(t);
+        const auto* src = reinterpret_cast<const std::uint16_t*>(wl_.tensor_data(t));
+        fused.insert(fused.end(), src, src + bytes / sizeof(std::uint16_t));
+      };
+      append(a);
+      if (gate_up) append(pe + "w3");  // up rows follow this expert's gate rows
+    }
+    runtime::MetalBuffer b = ctx_.alloc_from(fused.data(), fused.size() * sizeof(std::uint16_t));
+    if (!b.valid()) throw std::runtime_error("failed to allocate a device buffer for " + name);
+    const void* h = b.handle();
+    bufs_.emplace(name, std::move(b));
+    return h;
   }
 
   // Quantizes on the HOST at load. CUDA quantizes on the GPU, but that is only worth
@@ -326,7 +373,20 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
   max_prefill_ = std::min(512, max_context);
 
   if (cfg_.is_moe()) {
-    throw std::runtime_error("PlanMetalEngine: MoE models are not supported yet");
+    // MoE runs here now. The router's selection crosses ops in DEVICE buffers, so a token
+    // never round-trips to the host mid-layer.
+    //
+    // SIZED [max_prefill][top_k], NOT [top_k]. The router, the expert FFN and the accumulate
+    // are separate OPS, so execute_ops runs the router's whole token loop before the expert
+    // loop starts. One shared slot would therefore hold the LAST token's experts by the time
+    // the FFN reads it, and every token in the chunk would run the last token's experts. That
+    // produces confident wrong tokens rather than a crash, and it is exactly what the
+    // tiny-mixtral golden caught: a T=1 forward was exact (max_abs_diff 0.0005) while the
+    // T=12 prefill diverged.
+    const int topk = std::max(1, cfg_.num_experts_per_tok);
+    const std::size_t sel = static_cast<std::size_t>(topk) * static_cast<std::size_t>(max_prefill_);
+    moe_idx_buf_ = ctx_.alloc(sel * sizeof(std::int32_t));
+    moe_w_buf_ = ctx_.alloc(sel * sizeof(float));
   }
   if (cfg_.use_layernorm) {
     throw std::runtime_error("PlanMetalEngine: true LayerNorm (mean+variance) is not implemented");
@@ -360,6 +420,10 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
   g.has_qk_norm = cfg_.has_qk_norm;
   g.scale_embeddings = cfg_.scale_embeddings;
   g.mlp_gelu = cfg_.mlp_gelu;
+  // MoE (Mixtral). 0 experts leaves the dense MLP exactly as it was.
+  g.num_experts = cfg_.num_local_experts;
+  g.experts_per_tok = cfg_.num_experts_per_tok;
+  g.expert_inter = cfg_.expert_intermediate_size;
   // norm_offset stays FALSE for the .ll2c path. Gemma's HF checkpoint stores its RMSNorm
   // weights as (w - 1), but CPI's converter already folds the +1 in -- which is why
   // LlamaEngine runs gemma-2b through plain launch_rmsnorm, not launch_rmsnorm_offset.
@@ -393,6 +457,16 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
       case opplan::Slot::Up:
       case opplan::Slot::Inter:
         return static_cast<std::size_t>(cfg_.intermediate_size);
+      case opplan::Slot::MoeLogits:
+        return static_cast<std::size_t>(std::max(1, cfg_.num_local_experts));
+      case opplan::Slot::MoeInter: {
+        // [top_k, expert_inter]: every selected expert's act(gate)*up lives here at once, so
+        // MoeDownAccum walks them in one pass.
+        const int ei = cfg_.expert_intermediate_size > 0 ? cfg_.expert_intermediate_size
+                                                         : cfg_.intermediate_size;
+        return static_cast<std::size_t>(std::max(1, cfg_.num_experts_per_tok)) *
+               static_cast<std::size_t>(std::max(1, ei));
+      }
       default:
         return static_cast<std::size_t>(H);
     }
@@ -892,6 +966,76 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
           ctx_.dispatch("cpi_attention_decode", G::Groups,
                         static_cast<std::size_t>(op.heads) * static_cast<std::size_t>(T), kTG,
                         bufs, nullptr, 5, &p, sizeof(p));
+        }
+        break;
+      }
+      // ---- Mixture of Experts ------------------------------------------------
+      //
+      // ONE TOKEN AT A TIME, deliberately: routing is a per-token decision, so each token
+      // selects its own experts and there is no batched form to share. Every other op in this
+      // plan is row-independent and runs T rows at once; these cannot, because moe_idx_buf_
+      // holds ONE token's selection. A prefill chunk therefore walks these T times.
+      //
+      // Not doing that is a bug that hides well: with T rows in the slot and a kernel reading
+      // row 0, a prefill gives every token the FIRST token's experts and its FFN output. It
+      // does not crash, it produces confident wrong tokens -- which is exactly what the
+      // tiny-mixtral golden caught (divergence at token 0, logit gap 0.19, no tie).
+      case OpKind::MoeRouterTopk:
+      case OpKind::MoeGateUpGeglu:
+      case OpKind::MoeDownAccum: {
+        if (op.qbits != 0) {
+          throw std::runtime_error("PlanMetalEngine: quantized MoE experts are not implemented");
+        }
+        const std::size_t h2 = sizeof(std::uint16_t);  // fp16 element
+        for (int t = 0; t < T; ++t) {
+          if (op.kind == OpKind::MoeRouterTopk) {
+            MoeRouterParams p{static_cast<std::uint32_t>(op.cols),
+                              static_cast<std::uint32_t>(op.heads),
+                              op.weight != nullptr ? 1u : 0u};
+            // op.weight is the optional per-expert gain (Gemma 4 has one, Mixtral does not).
+            // Bind the logits as a stand-in when absent: params must stay the LAST binding,
+            // so the slot cannot simply be empty.
+            const void* bufs[] = {slot(op.in), op.weight != nullptr ? op.weight : slot(op.in),
+                                  moe_idx_buf_.handle(), moe_w_buf_.handle()};
+            const std::size_t sel_i = static_cast<std::size_t>(t) *
+                                      static_cast<std::size_t>(op.heads) * sizeof(std::int32_t);
+            const std::size_t sel_f = static_cast<std::size_t>(t) *
+                                      static_cast<std::size_t>(op.heads) * sizeof(float);
+            const std::size_t offs[] = {
+                static_cast<std::size_t>(t) * static_cast<std::size_t>(op.cols) * h2, 0, sel_i,
+                sel_f};
+            ctx_.dispatch("cpi_moe_router_topk", G::Threads, 1, 32, bufs, offs, 4, &p, sizeof(p));
+          } else if (op.kind == OpKind::MoeGateUpGeglu) {
+            MoeExpertParams p{static_cast<std::uint32_t>(op.cols),
+                              static_cast<std::uint32_t>(op.in_dim),
+                              static_cast<std::uint32_t>(op.heads), op.mlp_gelu ? 1u : 0u};
+            const void* bufs[] = {op.weight, slot(op.in), moe_idx_buf_.handle(), slot(op.out)};
+            const std::size_t offs[] = {
+                0, static_cast<std::size_t>(t) * static_cast<std::size_t>(op.in_dim) * h2,
+                static_cast<std::size_t>(t) * static_cast<std::size_t>(op.heads) *
+                    sizeof(std::int32_t),
+                static_cast<std::size_t>(t) * static_cast<std::size_t>(op.heads) *
+                    static_cast<std::size_t>(op.cols) * h2};
+            ctx_.dispatch("cpi_moe_gate_up", G::Groups,
+                          static_cast<std::size_t>(op.cols) * static_cast<std::size_t>(op.heads),
+                          kTG, bufs, offs, 4, &p, sizeof(p));
+          } else {
+            MoeExpertParams p{static_cast<std::uint32_t>(op.in_dim),
+                              static_cast<std::uint32_t>(op.cols),
+                              static_cast<std::uint32_t>(op.heads), 0u};
+            const void* bufs[] = {op.weight, slot(op.in), moe_idx_buf_.handle(),
+                                  moe_w_buf_.handle(), slot(op.out)};
+            const std::size_t offs[] = {
+                0,
+                static_cast<std::size_t>(t) * static_cast<std::size_t>(op.heads) *
+                    static_cast<std::size_t>(op.in_dim) * h2,
+                static_cast<std::size_t>(t) * static_cast<std::size_t>(op.heads) *
+                    sizeof(std::int32_t),
+                static_cast<std::size_t>(t) * static_cast<std::size_t>(op.heads) * sizeof(float),
+                static_cast<std::size_t>(t) * static_cast<std::size_t>(op.cols) * h2};
+            ctx_.dispatch("cpi_moe_down_accum", G::Groups, static_cast<std::size_t>(op.cols), kTG,
+                          bufs, offs, 5, &p, sizeof(p));
+          }
         }
         break;
       }

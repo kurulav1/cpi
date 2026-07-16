@@ -372,7 +372,11 @@ int main(int argc, char** argv) {
           }
           app::main_modes::run_interactive_batch(eng.batch_scheduler(), tokenizer, cli.stop_texts,
                                                  !cli.force_no_bos, cli.max_new, cli.temp);
-          return 0;
+          // Plain `return`: this block is inside a lambda, not main(). The Metal branch's
+          // identical-looking `return 0` IS in main(). Getting these the same way round breaks
+          // one compiler or the other, and each hides the other's error -- this one is behind
+          // #if LLAMA_ENGINE_HAS_CUDA, so a Mac build never sees it.
+          return;
         }
       }
 #endif

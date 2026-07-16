@@ -176,6 +176,15 @@ struct Op {
   // ── extension fields (gated / linear-attention) ──
   Slot out2 = Slot::X;       // SplitHeadHalves' second output (the gate half)
   bool norm_offset = false;  // RmsNorm uses (1 + weight) instead of weight
+  // MoeGateUpGeglu: the expert FFN's gate activation. The op's name says Geglu because Gemma 4
+  // -- its first tenant -- is GeGLU, but Mixtral's experts are SwiGLU, so the activation has to
+  // travel with the op rather than with its name.
+  //
+  // DEFAULTS TRUE, which is deliberate: Gemma 4's builder predates this field and does not set
+  // it, and the CUDA kernel hardcodes tanh-GELU. Defaulting false would make an unset field mean
+  // "SiLU", so the day someone wires this flag into that kernel, Gemma 4 would silently change
+  // activation and produce fluent nonsense. True means "unset == what it does today".
+  bool mlp_gelu = true;
   int rotary_dim = 0;        // Rope: >0 rotates only the first rotary_dim of each
                              // head (partial RoPE) and pairs Q (in) with K (in2)
   // Delta-net geometry + its extra weights. The recurrence needs a float RMS-norm

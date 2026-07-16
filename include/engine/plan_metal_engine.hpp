@@ -237,6 +237,11 @@ private:
   std::vector<runtime::MetalBuffer> k_cache_;
   std::vector<runtime::MetalBuffer> v_cache_;
 
+  // MoE: the router's selection, carried between ops on the device so a token never
+  // round-trips to the host mid-layer. Only allocated for MoE models.
+  runtime::MetalBuffer moe_idx_buf_;  // int32[top_k]  -- selected expert ids
+  runtime::MetalBuffer moe_w_buf_;    // float[top_k]  -- their renormalised routing weights
+
   runtime::MetalBuffer tok_buf_;      // int32[1]
   runtime::MetalBuffer seq_tok_buf_;  // int32[max_prefill] -- a whole prompt chunk
   runtime::MetalBuffer pos_buf_;      // int32[1]

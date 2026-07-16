@@ -136,6 +136,9 @@ else
   run_golden qwen3-0.6b-sky-64.txt 64 "" Qwen3-0.6B.ll2c
   # Gemma: GeGLU, sliding window, head_dim 256 -- the scalar attention path.
   run_golden gemma-2b-capital-32.txt 32 "" gemma-2b.ll2c
+  # Mixtral MoE: router + top-k + per-expert FFN. The ONLY golden whose plan is not a dense
+  # MLP, and the only one that can catch a routing bug.
+  run_golden tiny-mixtral-moe-24.txt 24 "" tiny-mixtral.ll2c
   # The 8B at int4: the only model that exercises a real quantized prefill.
   run_golden llama-3.1-8b-sky-48.txt 48 "4" llama8b.ll2c Llama-3.1-8B-Instruct.ll2c
 fi
