@@ -936,6 +936,8 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
 
 // Commits what is encoded, waits, and charges the elapsed time to `name`. Only ever called
 // under CPI_METAL_PROFILE -- it serialises the pass.
+// ⚠ THIS MEASURES A COMMAND-BUFFER ROUND TRIP, NOT THE OP. Read dump_profile()'s banner before
+// believing a number from here.
 void PlanMetalEngine::profile_tick(const char* name) {
   ctx_.commit_and_wait();
   const auto now = std::chrono::steady_clock::now();
@@ -947,7 +949,24 @@ void PlanMetalEngine::dump_profile() const {
   double total = 0.0;
   for (const auto& kv : profile_ms_) total += kv.second;
   if (total <= 0.0) return;
-  std::fprintf(stderr, "[metal profile] %.0f ms of GPU work, by op:\n", total);
+  // The banner is not decoration. These numbers are SHARES OF A DISTORTED TOTAL, and taking
+  // them at face value has already cost this project real time.
+  std::fprintf(
+      stderr,
+      "[metal profile] ⚠ READ THIS BEFORE BELIEVING THE TABLE.\n"
+      "  These are HOST times around a commit-and-wait PER OP, not GPU times. Every op pays a\n"
+      "  full command-buffer round trip it does not pay in a real pass, which is a fixed cost,\n"
+      "  so the SMALL ops are inflated most -- the exact ops one profiles to find. Below, the\n"
+      "  total comes to ~%.0f ms for a pass that really runs in ~190: it is ~3x, concentrated\n"
+      "  in the cheap rows. It once put the non-GEMM ops at 34%%; deleting them showed ~3.5%%,\n"
+      "  and a fusion plan was built on the difference.\n"
+      "  It cannot be fixed here: honest per-op GPU timing needs counter sampling at dispatch\n"
+      "  boundaries, and Apple Silicon (M4/AGXG16G) does not support it -- asking crashes the\n"
+      "  driver. Use this ONLY to compare an op against ITSELF across a change.\n"
+      "  To ask what an op COSTS, delete it: CPI_METAL_ABLATE=<OpKind>[,<OpKind>] and time the\n"
+      "  pass. No attribution error survives that.\n",
+      total);
+  std::fprintf(stderr, "[metal profile] %.0f ms (INFLATED, see above), by op:\n", total);
   std::vector<std::pair<std::string, double>> rows(profile_ms_.begin(), profile_ms_.end());
   std::sort(rows.begin(), rows.end(),
             [](const auto& a, const auto& b) { return a.second > b.second; });
