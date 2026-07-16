@@ -402,6 +402,35 @@ to the 8B:
   from device, so a wider tile (128) adds weight reuse at no threadgroup-memory cost: **int4
   1527 → 1903**. The fp16 GEMM stages its activations, so the same widening drops occupancy and
   loses — it keeps 64.
+- **THE fp16 GEMM IS F32-ALU BOUND AT ~91% OF ITS LIMITER. It is finished.** Xcode's Metal
+  Debugger, on a `.gputrace` from `metal_gemm_bench` (`CPI_METAL_GPUTRACE=<path>`):
+
+  | | |
+  | --- | --- |
+  | F32 limiter | **90.86%** (utilization 80.57%) |
+  | F16 limiter | **0.00%** (utilization 0.00%) |
+  | Occupancy target | 37.07% |
+  | MMU / last-level cache | 6.58% / 11.98% |
+
+  **F16 utilization is exactly zero**: the inputs are half, but every multiply-accumulate issues
+  on the F32 pipe, because the kernel accumulates into `simdgroup_float8x8`. That pipe is the
+  limiter. The kernel is not stalling — it is saturating the unit it runs on, and there is no
+  headroom in this design.
+
+  This also corrects the number quoted here for a long time. **"53% of peak" was measured against
+  the wrong peak** — a theoretical fp16 rate the matrix unit does not deliver when accumulating in
+  fp32. Against the F32 matrix rate it is ~91%, and the kernel was never leaving 20% on the table.
+
+  It retro-explains the entire lever sweep below: K-depth flat, taller tile slower, more
+  simdgroups slower, bigger accumulator tile spilling. **None could help, because none add F32
+  issue capacity.** Every one was aimed at a bottleneck that was not there. Occupancy at 37% is
+  likewise not a defect: when a kernel is ALU-bound, low occupancy is sufficient by definition.
+
+  The only route to the F16 pipe is half accumulators, and that measured **3x slower** on two
+  unrelated kernels (Apple's matrix unit accumulates in fp32 natively, so half-accumulate appears
+  to be emulated). So the remaining prefill gap to llama.cpp does not live in this kernel's
+  tiling, and further tuning here is a dead end with a receipt.
+
 - **The fp16 GEMM "simdgroup starvation" finding was not real, and its retraction is the more
   useful result.** For two sessions the GEMM sat at ~53% of peak and resisted every lever (wider
   tiles, half accumulators, register tiling). It was then diagnosed as too few simdgroups to hide
