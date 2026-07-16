@@ -400,228 +400,75 @@ std::vector<int> LlamaEngine::greedy_generate_single(const std::vector<int>& pro
   return out;
 }
 
-void LlamaEngine::stream_grow_table(StreamSeq& s, int upto_pos) {
-  const int bs = options_.paged_block_size > 0 ? options_.paged_block_size : 32;
-  if (!s.blocks->ensure_position(upto_pos)) {
-    // The prefix cache pins KV blocks that are pure optimization, not live state.
-    // Under pool pressure, drop it to reclaim those blocks and retry once before
-    // declaring exhaustion (callers then reject the admit / preempt in decode).
-    if (!prefix_cache_.empty()) {
-      prefix_cache_.clear();
-      if (options_.verbose || std::getenv("LLAMA_INFER_PREFIX_LOG")) {
-        std::fprintf(stderr, "[stream] prefix_cache evicted under KV pressure\n");
-      }
-    }
-    if (!s.blocks->ensure_position(upto_pos)) {
-      throw std::runtime_error(
-          "stream scheduler: paged KV pool exhausted (concurrent length > max_context budget)");
-    }
+// The backend half of continuous batching. Everything else the scheduler does -- admission,
+// preemption, block growth, the shared-prefix LRU, sampling, retirement -- is host logic and
+// now lives in engine::BatchScheduler, shared with Metal. These are the only two operations
+// that ever needed a GPU, which is why keeping the rest in this class made batching CUDA-only.
+class LlamaEngine::BatchAdapter final : public BatchBackend {
+public:
+  explicit BatchAdapter(LlamaEngine* e) : e_(e) {}
+
+  void prefill_suffix(const std::vector<int>& prompt_tokens, int shared_tokens,
+                      const std::vector<int>& block_table) override {
+    // d_block_table_ is shared engine state and a fully-cached prefill runs async on
+    // compute_stream_, so this must be settled before returning: a later admit or the decode
+    // loop would otherwise clobber it. That is the BatchBackend contract, not an internal
+    // detail.
+    e_->block_table_host_ = block_table;
+    CUDA_CHECK(cudaMemcpy(e_->d_block_table_, block_table.data(), block_table.size() * sizeof(int),
+                          cudaMemcpyHostToDevice));
+    e_->prefill_prompt(prompt_tokens, shared_tokens);
+    CUDA_CHECK(cudaStreamSynchronize(e_->compute_stream_));
   }
-  const int nblk = upto_pos / bs + 1;
-  if (static_cast<int>(s.table.size()) != nblk) {
-    s.table.resize(static_cast<std::size_t>(nblk));
-    for (int c = 0; c < nblk; ++c)
-      s.table[static_cast<std::size_t>(c)] = s.blocks->block_for(c * bs);
+
+  void decode_batched_logits(const std::vector<int>& tokens, const std::vector<int>& positions,
+                             const std::vector<int>& block_tables_flat, int max_blocks,
+                             std::vector<std::vector<float>>& out_logits) override {
+    e_->decode_step_batched_logits(tokens, positions, block_tables_flat, max_blocks, out_logits);
   }
+
+private:
+  LlamaEngine* e_;
+};
+
+BatchScheduler& LlamaEngine::ensure_scheduler() {
+  if (!scheduler_) {
+    if (!block_alloc_) throw std::runtime_error("stream_admit requires --paged-blocks");
+    require_batched_supported();
+    batch_adapter_ = std::make_unique<BatchAdapter>(this);
+    BatchSchedulerOptions o;
+    o.paged_block_size = options_.paged_block_size > 0 ? options_.paged_block_size : 32;
+    o.max_context = options_.max_context;
+    o.eos_token_id = options_.eos_token_id;
+    o.top_k = options_.top_k;
+    o.top_p = options_.top_p;
+    o.repetition_penalty = options_.repetition_penalty;
+    o.no_repeat_ngram_size = options_.no_repeat_ngram_size;
+    o.verbose = options_.verbose;
+    scheduler_ = std::make_unique<BatchScheduler>(batch_adapter_.get(), block_alloc_.get(), o);
+  }
+  return *scheduler_;
 }
 
 int LlamaEngine::stream_active() const {
-  return static_cast<int>(stream_seqs_.size());
+  return scheduler_ ? scheduler_->active() : 0;
 }
 
 void LlamaEngine::stream_admit(const std::string& id, const std::vector<int>& prompt_tokens,
                                const StreamParams& params) {
-  if (!block_alloc_) throw std::runtime_error("stream_admit requires --paged-blocks");
-  require_batched_supported();
-  if (prompt_tokens.empty()) throw std::runtime_error("stream_admit: empty prompt");
-  const int bs = options_.paged_block_size > 0 ? options_.paged_block_size : 32;
-
-  StreamSeq s;
-  s.id = id;
-  s.blocks = std::make_unique<SequenceBlockTable>(block_alloc_.get(), bs);
-  s.history = prompt_tokens;
-  s.last_token = prompt_tokens.back();
-  s.pos = static_cast<int>(prompt_tokens.size()) - 1;
-  s.params = params;
-
-  // Shared-prefix reuse (P4): adopt the cached prefix's KV blocks for the longest
-  // WHOLE-BLOCK common prefix, so only the suffix is prefilled. KV for identical
-  // tokens at identical positions is bit-exact (causal attention + position RoPE),
-  // so output is unchanged. Cap below prompt length so the final block is always
-  // (re)prefilled to seed decode. Must run before stream_grow_table allocates.
-  int shared_tokens = 0;
-  {
-    // Pick the cached entry sharing the longest whole-block common prefix.
-    const int cap = static_cast<int>(prompt_tokens.size()) - 1;
-    CachedPrefix* best = nullptr;
-    int best_whole = 0;
-    for (auto& e : prefix_cache_) {
-      const int mmax = std::min(static_cast<int>(e.tokens.size()), cap);
-      int match = 0;
-      while (match < mmax && prompt_tokens[static_cast<std::size_t>(match)] ==
-                                 e.tokens[static_cast<std::size_t>(match)]) {
-        ++match;
-      }
-      const int whole = (match / bs) * bs;  // share_prefix_from adopts whole blocks only
-      if (whole > best_whole) {
-        best_whole = whole;
-        best = &e;
-      }
-    }
-    if (best && best_whole >= bs && s.blocks->share_prefix_from(*best->table, best_whole)) {
-      shared_tokens = best_whole;
-      best->last_use = ++prefix_cache_tick_;
-    }
-  }
-
-  stream_grow_table(s, s.pos);
-
-  // Prefill only the suffix [shared_tokens, len). d_block_table_ is shared engine
-  // state and fully-cached prefill runs async on compute_stream_, so sync before
-  // returning (a later admit / the decode loop must not clobber it).
-  block_table_host_ = s.table;
-  CUDA_CHECK(cudaMemcpy(d_block_table_, s.table.data(), s.table.size() * sizeof(int),
-                        cudaMemcpyHostToDevice));
-  prefill_prompt(prompt_tokens, shared_tokens);
-  CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
-
-  // Refresh the cache with this sequence's block-aligned prefix (a fresh table
-  // that refcounts the blocks so they outlive this sequence). If this request
-  // exactly extends the entry it reused, update that entry in place so a growing
-  // chat stays one slot; otherwise insert a new entry and LRU-evict to the cap.
-  const int cache_tokens = (static_cast<int>(prompt_tokens.size()) / bs) * bs;
-  if (cache_tokens >= bs) {
-    auto next_table = std::make_unique<SequenceBlockTable>(block_alloc_.get(), bs);
-    if (next_table->share_prefix_from(*s.blocks, cache_tokens)) {
-      CachedPrefix* slot = nullptr;
-      for (auto& e : prefix_cache_) {
-        if (static_cast<int>(e.tokens.size()) == shared_tokens && shared_tokens > 0 &&
-            std::equal(e.tokens.begin(), e.tokens.end(), prompt_tokens.begin())) {
-          slot = &e;  // this request extends exactly this entry
-          break;
-        }
-      }
-      if (!slot) {
-        if (prefix_cache_.size() >= kPrefixCacheEntries) {
-          auto lru = std::min_element(
-              prefix_cache_.begin(), prefix_cache_.end(),
-              [](const CachedPrefix& a, const CachedPrefix& b) { return a.last_use < b.last_use; });
-          *lru = CachedPrefix{};  // release its block refs before reuse
-          slot = &*lru;
-        } else {
-          prefix_cache_.emplace_back();
-          slot = &prefix_cache_.back();
-        }
-      }
-      slot->table = std::move(next_table);
-      slot->tokens.assign(prompt_tokens.begin(), prompt_tokens.begin() + cache_tokens);
-      slot->last_use = ++prefix_cache_tick_;
-    }
-  }
-
-  if ((options_.verbose || std::getenv("LLAMA_INFER_PREFIX_LOG")) && shared_tokens > 0) {
-    std::fprintf(stderr, "[stream] prefix_reuse tokens=%d/%zu\n", shared_tokens,
-                 prompt_tokens.size());
-  }
-  stream_seqs_.push_back(std::move(s));
+  ensure_scheduler().admit(id, prompt_tokens, params);
 }
 
 bool LlamaEngine::stream_step(std::vector<StreamEvent>& events) {
-  events.clear();
-  if (stream_seqs_.empty()) return false;
-
-  // Grow each running sequence's table to cover the position we will write. Under
-  // KV-pool pressure stream_grow_table first reclaims prefix-cache blocks; if a
-  // sequence still cannot grow, preempt it (free its KV, report "preempted")
-  // rather than throwing and taking down the whole batch. Sequences are held in
-  // admission order and grown oldest-first, so the newest hit the wall first —
-  // preemption is newest-first, preserving older (closer-to-finish) requests.
-  for (std::size_t b = 0; b < stream_seqs_.size();) {
-    try {
-      stream_grow_table(stream_seqs_[b], stream_seqs_[b].pos);
-      ++b;
-    } catch (const std::exception&) {
-      std::fprintf(stderr, "[stream] preempted %s: paged KV pool exhausted (%d running)\n",
-                   stream_seqs_[b].id.c_str(), static_cast<int>(stream_seqs_.size()));
-      events.push_back(StreamEvent{stream_seqs_[b].id, -1, true, "preempted"});
-      stream_seqs_.erase(stream_seqs_.begin() + static_cast<std::ptrdiff_t>(b));
-    }
+  if (!scheduler_) {
+    events.clear();
+    return false;
   }
-  const int B = static_cast<int>(stream_seqs_.size());
-  if (B == 0) return !events.empty();  // deliver any preempt events, then idle
-
-  // Assemble the running batch over the survivors.
-  int max_blocks = 0;
-  for (auto& s : stream_seqs_) {
-    max_blocks = std::max(max_blocks, static_cast<int>(s.table.size()));
-  }
-  std::vector<int> toks(B), poss(B), flat(static_cast<std::size_t>(B) * max_blocks, 0);
-  for (int b = 0; b < B; ++b) {
-    toks[b] = stream_seqs_[b].last_token;
-    poss[b] = stream_seqs_[b].pos;
-    const auto& t = stream_seqs_[b].table;
-    for (std::size_t c = 0; c < t.size(); ++c)
-      flat[static_cast<std::size_t>(b) * max_blocks + c] = t[c];
-  }
-
-  std::vector<std::vector<float>> logits;
-  decode_step_batched_logits(toks, poss, flat, max_blocks, logits);
-
-  // Sample each row with its own params/grammar, then retire finished requests.
-  std::vector<int> finished;  // indices into stream_seqs_
-  for (int b = 0; b < B; ++b) {
-    StreamSeq& s = stream_seqs_[b];
-    std::vector<float>& lg = logits[b];
-
-    if (s.params.grammar) s.params.grammar->apply_mask(lg);
-    // Suppress EOS until min_new_tokens (skip when a grammar drives termination).
-    if (s.generated < s.params.min_new_tokens && !s.params.grammar && options_.eos_token_id >= 0 &&
-        static_cast<std::size_t>(options_.eos_token_id) < lg.size()) {
-      lg[static_cast<std::size_t>(options_.eos_token_id)] = -std::numeric_limits<float>::infinity();
-    }
-
-    const int tok = detail::dispatch_sample_from_logits(lg, s.params.temperature, options_.top_k,
-                                                        options_.top_p, options_.repetition_penalty,
-                                                        options_.no_repeat_ngram_size, s.history);
-    if (s.params.grammar) s.params.grammar->accept(tok);
-    s.history.push_back(tok);
-    s.last_token = tok;
-    ++s.pos;
-    ++s.generated;
-
-    const bool is_stop = std::find(s.params.stop_ids.begin(), s.params.stop_ids.end(), tok) !=
-                         s.params.stop_ids.end();
-    const char* reason = "";
-    bool fin = false;
-    if (is_stop) {
-      fin = true;
-      reason = (tok == options_.eos_token_id) ? "eos" : "stop";
-    } else if (s.generated >= s.params.max_new_tokens || s.pos >= options_.max_context) {
-      fin = true;
-      reason = "length";
-    }
-    events.push_back(StreamEvent{s.id, tok, fin, reason});
-    if (fin) finished.push_back(b);
-  }
-
-  // Free finished requests' blocks and remove them (iterate high->low to keep
-  // indices valid). RAII on the unique_ptr releases blocks to the pool.
-  for (auto it = finished.rbegin(); it != finished.rend(); ++it) {
-    stream_seqs_.erase(stream_seqs_.begin() + *it);
-  }
-  return true;
+  return scheduler_->step(events);
 }
 
 bool LlamaEngine::stream_cancel(const std::string& id) {
-  for (auto it = stream_seqs_.begin(); it != stream_seqs_.end(); ++it) {
-    if (it->id == id) {
-      // RAII on the SequenceBlockTable releases the request's KV blocks to the
-      // pool; erasing removes it from the running batch.
-      stream_seqs_.erase(it);
-      return true;
-    }
-  }
-  return false;
+  return scheduler_ && scheduler_->cancel(id);
 }
 
 std::vector<std::vector<int>> LlamaEngine::run_batch(const std::vector<BatchRequest>& requests) {

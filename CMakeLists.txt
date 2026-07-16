@@ -121,6 +121,13 @@ set(LLAMA_ENGINE_SOURCES
   # It has no CUDA in it and never did; it was only ever in the CUDA block because it
   # lived next to LlamaEngine. Metal needs it, so it moves to the portable list.
   src/engine/llama_engine_sampling_utils.cpp
+  # Paged KV bookkeeping (allocator + block tables) and the continuous-batching
+  # scheduler. Both are pure host logic with no GPU in them: the scheduler reaches a
+  # backend through exactly two virtual calls. paged_kv.cpp used to sit in the CUDA
+  # block, and that placement was the only reason continuous batching was CUDA-only --
+  # where the code lived, not what it needed.
+  src/engine/paged_kv.cpp
+  src/engine/batch_scheduler.cpp
   src/grammar/grammar.cpp
   src/grammar/json_schema_to_grammar.cpp
   src/grammar/grammar_sampler.cpp
@@ -159,7 +166,6 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
     src/engine/llama_engine_generation.cpp
     src/engine/llama_engine_batched_decode.cpp
     src/engine/llama_engine_sampling.cpp
-    src/engine/paged_kv.cpp
     src/engine/speculative_decoder.cpp
     src/engine/llama_engine_parity.cpp
     src/engine/llama4_cuda_engine.cu

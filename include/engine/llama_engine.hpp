@@ -30,6 +30,7 @@
 
 #include "engine/engine_types.hpp"
 #include "engine/generation_constraints.hpp"
+#include "engine/batch_scheduler.hpp"
 #include "engine/paged_kv.hpp"
 #include "model/weight_loader.hpp"
 
@@ -441,24 +442,19 @@ public:
   void run_batch_bench(const std::vector<int>& prompt, int max_new);
 
   // ---- Streaming batch scheduler (continuous batching for the server) --------
-  // Per-request generation parameters. top_k/top_p/repetition_penalty/no_repeat
-  // come from EngineOptions (shared); temperature/min_new/stop/grammar are
-  // per-request. `grammar` is optional and owned by the caller — it must outlive
-  // the request (until its finished StreamEvent is emitted).
-  struct StreamParams {
-    int max_new_tokens = 16;
-    int min_new_tokens = 0;
-    float temperature = 0.0f;
-    std::vector<int> stop_ids;
-    grammar::GrammarSampler* grammar = nullptr;
-  };
-  // One token emitted for a request during a decode step.
-  struct StreamEvent {
-    std::string id;
-    int token = 0;
-    bool finished = false;
-    const char* finish_reason = "";  // "eos" | "stop" | "length"
-  };
+  //
+  // The scheduler itself now lives in engine::BatchScheduler, which has no backend in it:
+  // admission, preemption, block growth, the shared-prefix LRU and per-request sampling are
+  // host bookkeeping, and it reaches a GPU through two virtual calls. It sat inside this class
+  // for no better reason than that, which is what made continuous batching CUDA-only. The
+  // methods below are thin delegations, kept so callers do not have to change and so the
+  // engine still owns the backend half (prefill + batched decode).
+  //
+  // The types are aliases rather than definitions: LlamaEngine::StreamParams and
+  // engine::StreamParams must be the same type, or the app layer could not be handed either
+  // backend's scheduler.
+  using StreamParams = engine::StreamParams;
+  using StreamEvent = engine::StreamEvent;
 
   // Admit a request into the running batch (prefills its prompt into its own
   // paged blocks). Requires --paged-blocks + --gpu-cache-all.
@@ -501,34 +497,15 @@ private:
   double prof_head_s_ = 0.0;
 
   // A running request in the streaming batch scheduler.
-  struct StreamSeq {
-    std::string id;
-    std::unique_ptr<SequenceBlockTable> blocks;
-    std::vector<int> table;    // logical chunk -> physical block, grown on demand
-    std::vector<int> history;  // full token history (prompt + generated)
-    int pos = 0;
-    int last_token = 0;
-    int generated = 0;
-    StreamParams params;
-  };
-  std::vector<StreamSeq> stream_seqs_;
-  // Paged shared-prefix cache (P4): a small LRU of independent cached prefixes,
-  // each a block-aligned token prefix + a block table holding (refcounted) its
-  // KV blocks. On admit we adopt the longest whole-block common prefix of the
-  // best-matching entry via share_prefix_from instead of re-prefilling it. A
-  // multi-entry cache (vs a single slot) keeps distinct prefixes — different
-  // system prompts, interleaved chats — from evicting each other; a full radix
-  // trie was measured to add <5pp reuse over this at far higher complexity.
-  struct CachedPrefix {
-    std::unique_ptr<SequenceBlockTable> table;
-    std::vector<int> tokens;  // block-aligned prompt prefix these blocks cover
-    std::uint64_t last_use = 0;
-  };
-  std::vector<CachedPrefix> prefix_cache_;
-  std::uint64_t prefix_cache_tick_ = 0;
-  static constexpr std::size_t kPrefixCacheEntries = 32;
-  // Grow a streaming request's block table so it covers `upto_pos`.
-  void stream_grow_table(StreamSeq& s, int upto_pos);
+  // The backend half of continuous batching: the two operations BatchScheduler needs from a
+  // GPU. Defined in llama_engine_batched_decode.cpp, where the CUDA state it touches lives.
+  // Held as the BASE pointer: BatchBackend is complete here and has a virtual destructor, so
+  // ~LlamaEngine (compiled where BatchAdapter is only forward-declared) can destroy it.
+  class BatchAdapter;
+  std::unique_ptr<BatchBackend> batch_adapter_;
+  std::unique_ptr<BatchScheduler> scheduler_;
+  // Built lazily on first admit, because it needs block_alloc_, which --paged-blocks creates.
+  BatchScheduler& ensure_scheduler();
 
 public:
 private:
