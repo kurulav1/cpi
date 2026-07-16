@@ -3,6 +3,38 @@
 `.github/workflows/metal-gpu.yml` is the only thing that runs CPI's Metal kernels against a
 reference. It is **inert until you give it a runner** — this is how.
 
+
+## ⚠ Read this first: THIS REPOSITORY IS PUBLIC
+
+A self-hosted runner executes whatever a workflow tells it to, on your machine, as the user
+that owns it, inside your network. On a **public** repo that is a live remote-code-execution
+path: anyone can fork it, open a pull request that edits `CMakeLists.txt` (or the workflow
+itself), and have your Mac run it. GitHub's own guidance is blunt about this — self-hosted
+runners are recommended for private repositories only.
+
+`metal-gpu.yml` therefore refuses to run for pull requests that come from a fork:
+
+```yaml
+if: >-
+  vars.HAS_METAL_RUNNER == 'true' &&
+  (github.event_name != 'pull_request' ||
+   github.event.pull_request.head.repo.full_name == github.repository)
+```
+
+Fork PRs never reach the runner; pushes to `main`, your own branches, and manual dispatch do.
+**Do not relax this** to give fork PRs coverage — that is the whole exposure. Also worth doing,
+belt and braces:
+
+- Settings → Actions → General → **Fork pull request workflows**: require approval for **all**
+  outside collaborators (the default only covers first-time ones).
+- Prefer an **ephemeral Tart VM** over your daily Mac, so a compromised job dies with the VM
+  and never sees your keys, your SSH agent or your home directory.
+- Do not put anything on that machine you would mind losing. The rented box this backend was
+  built on is a good shape for it: disposable, isolated, nothing personal on it.
+
+If you would rather not accept any of this, the honest alternative is to keep running
+`tools/metal_verify.sh --require-gpu` by hand (last section) and skip the runner. That is a
+real position — it just means the checks only run when someone remembers.
 ## Why it matters more than it looks
 
 The `metal` job in `ci.yml` is compile-only, and not by oversight: GitHub's macOS runners are

@@ -45,7 +45,22 @@ on:
 jobs:
   metal-gpu:
     name: Metal kernels on real hardware
-    if: vars.HAS_METAL_RUNNER == 'true'
+    # TWO conditions, and the second is a security control, not a nicety.
+    #
+    # HAS_METAL_RUNNER: a job targeting an absent self-hosted label does not fail -- it
+    # queues forever and hangs every PR. So this file stays inert until the hardware exists.
+    #
+    # THE FORK CHECK: THIS REPOSITORY IS PUBLIC, and a self-hosted runner executes whatever
+    # the workflow says on YOUR machine. Without this, anyone could fork the repo, open a PR
+    # touching CMakeLists.txt (or this file), and run arbitrary code on the Mac -- as the
+    # user who owns it, inside your network. GitHub's own guidance is to not put self-hosted
+    # runners on public repos for exactly this reason. Restricting to PRs whose head is this
+    # same repository means fork PRs never reach the runner; your own branches still do.
+    # Do not relax this to plain `pull_request` to "make fork PRs get coverage".
+    if: >-
+      vars.HAS_METAL_RUNNER == 'true' &&
+      (github.event_name != 'pull_request' ||
+       github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: [self-hosted, macOS, ARM64, metal-gpu]
     timeout-minutes: 45
     steps:
