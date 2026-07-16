@@ -251,12 +251,17 @@ on a small Mac. On an M4, Qwen2.5-0.5B streams at ~54 tok/s (fp16) / ~87 tok/s (
 **Still not on Metal**, and rejected loudly rather than half-done: MoE, the vision tower, and
 linear attention (Qwen3.5). Those need work above the kernels.
 
-Continuous batching is partly there. The kernels and the engine step exist — a paged KV pool,
-batched paged decode, and paged prefill, all sharing `engine::SequenceBlockTable`, the same
-backend-free allocator CUDA uses, so a block table means the same thing on both. What is still
-`LlamaEngine`-only is the layer above: the scheduler (admission, preemption, block growth) lives
-inside that class rather than behind an interface, and the batch worker is compiled out without
-CUDA. So single-request serving runs on a Mac today; the multi-user batched server does not yet.
+Continuous batching now runs on Metal — `--interactive-batch`, the same flag and the same
+multi-user worker the CUDA server uses. Verified on an M4 with two concurrent requests: the
+second is admitted while the first is mid-generation, both then advance one token per step
+interleaved, and the first retires without disturbing the second.
+
+It is the *same scheduler*, not a Metal port of one. `engine::BatchScheduler` owns admission,
+newest-first preemption, block growth and the shared-prefix LRU; a backend supplies only the two
+operations that need a GPU (a suffix prefill and a batched decode step). Metal cannot drift from
+CUDA's serving policy because it never states one. That scheduler used to live inside
+`LlamaEngine`, which is the only reason batching was ever CUDA-only — of its ~200 lines, two
+touched a GPU.
 
 **Measured** (Apple M4, 10-core GPU, 16 GB):
 
