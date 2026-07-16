@@ -420,8 +420,17 @@ reference check in `metal_smoke` across T = 1…100 that derives its dispatch fr
 constants instead of restating them, so the shader and host cannot drift apart again silently.
 `cpi_gemm_quant` and the attention kernels still have no such check.
 
-Both prefill paths now sit at ~63% of llama.cpp, so the remaining gap is common to both rather
-than something specific to the quantized GEMM.
+Both prefill paths sit at ~63% of llama.cpp, so the remaining gap is common to both rather than
+something specific to the quantized GEMM. And it is the GEMM: **every other op in prefill costs
+~3.5% combined**, measured by deleting them (`CPI_METAL_ABLATE`) rather than by profiling them.
+
+That number matters because the profiler says otherwise. `CPI_METAL_PROFILE` reported the
+non-GEMM ops at ~34%, which made fusing them look like the obvious next move — but it serialises
+the pass, giving every tiny dispatch its own command buffer, so it inflates precisely the small
+ops one is asking about (it charges 551 ms of GPU work to a pass that really takes ~190). Removing
+each op and re-timing puts SiluMul, KvStore and attention at ~0 apiece and all of them together
+at ~7 ms of 200. **Fusion is not the lever.** Prefill is 95% GPU-busy, so it is not dispatch
+overhead either.
 
 **Correctness.** Qwen2.5-0.5B, Qwen3-0.6B and gemma-2b each reproduce the CUDA backend's greedy
 token stream exactly on an Apple M4 (`src/tests/golden/`). `metal_decode_test` gates on two

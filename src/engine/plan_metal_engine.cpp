@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <limits>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -439,11 +440,36 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
   // optimizations in a row bought nothing, which is what a wrong bottleneck feels like; the
   // only cure is to measure which op actually owns the seconds.
   static const bool profile = std::getenv("CPI_METAL_PROFILE") != nullptr;
+  static const std::set<std::string> ablate_ = [] {
+    std::set<std::string> out;
+    const char* e = std::getenv("CPI_METAL_ABLATE");
+    if (e == nullptr) return out;
+    std::string cur;
+    for (const char* c = e;; ++c) {
+      if (*c == ',' || *c == 0) {
+        if (!cur.empty()) out.insert(cur);
+        cur.clear();
+        if (*c == 0) break;
+      } else {
+        cur.push_back(*c);
+      }
+    }
+    std::fprintf(stderr, "[metal] ABLATION ACTIVE -- output is deliberately WRONG (%s)\n", e);
+    return out;
+  }();
 
   if (profile) profile_last_ = std::chrono::steady_clock::now();
 
   for (std::size_t oi = 0; oi < ops.size(); ++oi) {
     const opplan::Op& op = ops[oi];
+
+    // CPI_METAL_ABLATE=<kind>[,<kind>] SKIPS those ops entirely. The output becomes garbage --
+    // that is the point: it answers "what does this op cost?" by removing it, which no profiler
+    // distortion can confuse. CPI_METAL_PROFILE cannot answer it, because serialising the pass
+    // gives every tiny dispatch its own command buffer and inflates exactly the small ops you
+    // are asking about (it reported 551 ms of GPU work for a pass that really takes ~190).
+    // Never set this outside an experiment.
+    if (!ablate_.empty() && ablate_.count(op_kind_name(static_cast<int>(op.kind))) != 0) continue;
 
     // PEEPHOLE FUSION: `X += delta` (AddInplace) immediately followed by `XNorm = rmsnorm(X)`
     // is one fused pass -- the residual is read and written once instead of twice. The two ops
