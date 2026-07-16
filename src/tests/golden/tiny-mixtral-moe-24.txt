@@ -1,0 +1,18 @@
+# Golden greedy token stream for TitanML/tiny-mixtral, produced by the CUDA backend.
+#
+# THE FIRST MoE GOLDEN, and the gate for MoE on any second backend.
+#
+# tiny-mixtral is the checkpoint the CUDA MoE regression already uses: 2 layers, hidden 1024,
+# 8 experts, top-2 routing, expert_inter 3584, head_dim 32, sliding window 4096. Its weights are
+# random, so the text is gibberish -- deliberately. This gates KERNELS, not quality: the router
+# picking the same experts and the expert FFNs accumulating in the same order is exactly what a
+# token-for-token match proves, and random weights make a routing bug MORE visible, not less
+# (no linguistic prior can paper over a wrong expert).
+#
+# Small enough to be free: 494 MB, so it fits a 16 GB Mac with room to spare and downloads in
+# seconds. There is no reason for a second backend's MoE to go ungated.
+#
+# Fed as raw token ids (--tokens), so no tokenizer is involved and nothing here depends on a
+# chat template.
+prompt: 1,2,3,4,5,6,7,8,9,10,11,12
+expect: 14207,14207,3237,14207,22133,28796,3237,3870,23152,3508,17682,2448,17682,2448,31618,31618,23083,30937,23499,12440,15861,17682,2756,27166
