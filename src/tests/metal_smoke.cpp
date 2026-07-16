@@ -341,6 +341,91 @@ int main() {
     check(bits == 4 ? "gemv_int4" : "gemv_int8", compare(got, want), 0.05);
   }
 
+  // ---- Quantized GEMM (int4/int8), the multi-token prefill path ----------
+  // Same story as the fp16 GEMM above: this kernel had no check of its own, and it only runs
+  // at T >= kGemmMinTokens, which no golden prompt reaches. It carries the 8B's entire
+  // quantized prefill.
+  // MUST match GEMM_BM / GEMM_QBN in cpi_kernels.metal (kGemmFBM's quant siblings).
+  constexpr std::uint32_t kSmokeGemmBM = 64;    // quant rows per threadgroup
+  constexpr std::uint32_t kSmokeGemmQBN = 128;  // quant tokens per tile
+  for (int bits : {8, 4}) {
+    for (int tokens : {1, 16, 24, 100, 128, 200}) {
+      // The engine's guard: cols % 64, in_dim % GEMM_QBK(32), and the quant group >= QBK
+      // (a K-block carries one scale per row, so it must sit inside one group).
+      const std::uint32_t out_dim = 128, in_dim = 256, group = 64;
+      const std::uint32_t groups_n = in_dim / group;
+      const std::uint32_t T = static_cast<std::uint32_t>(tokens);
+      const float max_q = (bits == 4) ? 7.0f : 127.0f;
+
+      std::vector<float> W(out_dim * in_dim);
+      std::vector<std::uint16_t> A(static_cast<std::size_t>(T) * in_dim);
+      for (auto& v : W) v = dist(rng);
+      for (auto& v : A) v = f32_to_f16(dist(rng));
+
+      const std::size_t packed_row = (bits == 4) ? (in_dim + 1) / 2 : in_dim;
+      std::vector<std::uint8_t> packed(out_dim * packed_row, 0);
+      std::vector<float> scales(out_dim * groups_n);
+      std::vector<float> deq(out_dim * in_dim);
+      for (std::uint32_t r = 0; r < out_dim; ++r) {
+        for (std::uint32_t g = 0; g < groups_n; ++g) {
+          float amax = 0.0f;
+          for (std::uint32_t j = g * group; j < (g + 1) * group; ++j) {
+            amax = std::max(amax, std::fabs(W[r * in_dim + j]));
+          }
+          const float sc = std::max(amax / max_q, 1e-8f);
+          scales[r * groups_n + g] = sc;
+          for (std::uint32_t j = g * group; j < (g + 1) * group; ++j) {
+            int q = static_cast<int>(std::lround(W[r * in_dim + j] / sc));
+            q = (bits == 4) ? std::max(-8, std::min(7, q)) : std::max(-127, std::min(127, q));
+            deq[r * in_dim + j] = static_cast<float>(q) * sc;
+            if (bits == 4) {
+              const std::uint8_t nib = static_cast<std::uint8_t>(q < 0 ? q + 16 : q);
+              std::uint8_t& b = packed[r * packed_row + j / 2];
+              b = (j & 1) == 0 ? static_cast<std::uint8_t>((b & 0xF0u) | nib)
+                               : static_cast<std::uint8_t>((b & 0x0Fu) | (nib << 4));
+            } else {
+              packed[r * packed_row + j] = static_cast<std::uint8_t>(static_cast<std::int8_t>(q));
+            }
+          }
+        }
+      }
+
+      auto bq = ctx.alloc_from(packed.data(), packed.size());
+      auto bx = ctx.alloc_from(A.data(), A.size() * 2);
+      auto bo = ctx.alloc(static_cast<std::size_t>(T) * out_dim * 2);
+      auto bs = ctx.alloc_from(scales.data(), scales.size() * sizeof(float));
+
+      struct QP {
+        std::uint32_t out_dim, in_dim, tokens, bits, group, groups, has_bias;
+      } p{out_dim, in_dim, T, static_cast<std::uint32_t>(bits), group, groups_n, 0};
+
+      // Derived from the tile constants, the same rule the engine uses -- never restated.
+      const std::size_t tiles = (T + kSmokeGemmQBN - 1) / kSmokeGemmQBN;
+      const std::size_t grid = (out_dim / kSmokeGemmBM) * tiles;
+      const std::size_t threads = 32 * (kSmokeGemmBM / 32) * (kSmokeGemmQBN / 32);
+      const void* bufs[] = {bq.handle(), bx.handle(), bo.handle(), bs.handle(), bq.handle()};
+      ctx.dispatch("cpi_gemm_quant", runtime::MetalContext::Grid::Groups, grid, threads, bufs,
+                   nullptr, 5, &p, sizeof(p));
+      ctx.commit_and_wait();
+
+      // Against the DEQUANTIZED weights, so quantization error cannot mask a kernel bug.
+      std::vector<float> want(static_cast<std::size_t>(T) * out_dim), got(want.size());
+      for (std::uint32_t t = 0; t < T; ++t) {
+        for (std::uint32_t r = 0; r < out_dim; ++r) {
+          float acc = 0.0f;
+          for (std::uint32_t j = 0; j < in_dim; ++j) {
+            acc += deq[r * in_dim + j] * f16_to_f32(A[t * in_dim + j]);
+          }
+          want[t * out_dim + r] = acc;
+        }
+      }
+      const auto* o = static_cast<const std::uint16_t*>(bo.contents());
+      for (std::size_t i = 0; i < got.size(); ++i) got[i] = f16_to_f32(o[i]);
+      check("gemm_int" + std::to_string(bits) + " T=" + std::to_string(tokens), compare(got, want),
+            0.05);
+    }
+  }
+
   // ---- Argmax ------------------------------------------------------------
   {
     const std::uint32_t n = 151936;  // a real vocab size

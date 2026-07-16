@@ -1,0 +1,22 @@
+# Golden greedy token stream for Qwen2.5-0.5B-Instruct, produced by the CUDA backend.
+#
+# THIS GOLDEN EXISTS FOR ITS PROMPT LENGTH, NOT ITS OUTPUT.
+#
+# Every other golden here has a 10-12 token prompt. That is below kGemmMinTokens (16), the
+# point at which the Metal backend's prefill switches from the GEMV to cpi_gemm_f16 -- so no
+# golden in this directory had ever executed that kernel. It was, meanwhile, the most heavily
+# benchmarked kernel in the engine.
+#
+# It was broken for weeks. Its thread count did not follow its row tile, so it wrote half the
+# rows of every tile and every fp16 prompt of >=16 tokens decoded from a corrupted prefill.
+# Nothing here failed, because nothing here ran it. The benchmarks did run it, and rewarded it:
+# a kernel that skips half its writes is not slower, it is faster.
+#
+# So: 86 tokens. Above the threshold, and deliberately NOT a multiple of GEMM_BN (64), so the
+# prefill covers a full tile plus a 22-token remainder -- the padded partial tile is where the
+# masking and the bounds checks actually get tested.
+#
+# If you add goldens, note that the number in the filename is the GENERATED length; the prompt
+# length is what decides which kernels run. Check the prompt.
+prompt: 128245,31772,73667,374,279,1882,553,892,6176,10779,11,67851,323,1045,23157,5508,3100,4802,1119,11483,4802,9768,304,33223,13,1084,4990,1992,14576,304,279,36733,91235,82,11,892,6644,279,76578,36733,5127,24705,13,91379,5127,24705,90011,3100,1429,16510,304,279,6303,323,2518,5479,315,279,9434,19745,11,323,25963,6176,3100,11,892,374,3170,10901,4994,6176,311,279,3738,7912,13,81917,304,1378,22870,3170,10901,525,6176,13
+expect: 77514,525,6176,1576,807,6644,36733,5127,24705,11,892,90011,3100,1429,16510,304,279,6303,323,2518,5479,315,279,9434,19745,11,323,8708,6176,3100,11,892,374,3170,807,4994,6176,311,279,3738,7912,13,91379,5127,24705,374,264,6176,76578,1730,304,279,36733,91235,82,315,10779,11,67851,11,323,1045,23157,11

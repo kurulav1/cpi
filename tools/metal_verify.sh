@@ -120,6 +120,18 @@ else
   run_golden qwen2.5-0.5b-sky-128.txt 128 ""  qwen.ll2c Qwen2.5-0.5B-Instruct.ll2c
   run_golden qwen2.5-0.5b-sky-128.txt 128 "4" qwen.ll2c Qwen2.5-0.5B-Instruct.ll2c
   run_golden qwen2.5-0.5b-sky-128.txt 128 "8" qwen.ll2c Qwen2.5-0.5B-Instruct.ll2c
+  # The ONLY golden whose prompt (86 tokens) exceeds kGemmMinTokens, so the only one that
+  # executes cpi_gemm_f16 at all. Every other prompt here prefills via the GEMV. Verified to
+  # catch the real thing: with the GEMM's thread count mismatched again, this FAILS and the
+  # 12-token goldens still pass.
+  #
+  # fp16 ONLY, deliberately. There is no int4 row because the quantized gate compares against
+  # the fp32 CPU engine, and across an 86-token prompt int4 legitimately picks a different
+  # (equally good) first token -- fp16 opens "Leaves are green because...", int4 opens with a
+  # numbered list. Both are correct; an fp32 oracle simply cannot adjudicate an int4 stream at
+  # the token level. The quantized GEMM is gated properly instead, by metal_smoke, against a
+  # CPU reference over T = 1..200 -- which is a stronger check than this would have been.
+  run_golden qwen2.5-0.5b-longprompt-86x64.txt 64 ""  qwen.ll2c Qwen2.5-0.5B-Instruct.ll2c
   # Qwen3: QK-norm, head_dim 128 (the 8B's attention path).
   run_golden qwen3-0.6b-sky-64.txt 64 "" Qwen3-0.6B.ll2c
   # Gemma: GeGLU, sliding window, head_dim 256 -- the scalar attention path.
