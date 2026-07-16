@@ -54,6 +54,10 @@ struct RopeParams {
   float theta;
   uint use_position_buffer;  // read the position from a device buffer instead
   uint row_stride;           // elements between consecutive tokens in the slot
+  // Batched decode: every row is a DIFFERENT sequence, so row t takes positions[t] rather
+  // than base+t. The default (0) keeps the prefill meaning, where the rows are consecutive
+  // tokens of one sequence.
+  uint per_row_positions;
 };
 
 struct ElemParams {
@@ -935,9 +939,13 @@ kernel void cpi_rope(
   const uint head  = rem / half_dim;
   const uint i     = rem % half_dim;
 
-  uint pos = p.position;
-  if (p.use_position_buffer != 0u) pos = uint(positions[0]);
-  pos += token;  // sequence prefill: token t sits at position base + t
+  uint pos;
+  if (p.per_row_positions != 0u) {
+    pos = uint(positions[token]);  // batched decode: row t is its own sequence
+  } else {
+    pos = (p.use_position_buffer != 0u) ? uint(positions[0]) : p.position;
+    pos += token;  // sequence prefill: token t sits at position base + t
+  }
 
   const float freq  = pow(p.theta, -float(2u * i) / float(p.head_dim));
   const float angle = float(pos) * freq;
@@ -1480,6 +1488,181 @@ kernel void cpi_attention_decode(
   const float inv = 1.0f / tg_sum;
   for (uint i = lid; i < p.head_dim; i += nthr) {
     out[(ulong)t * (ulong)q_dim + head * p.head_dim + i] = half(tg_acc[i] * inv);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Batched paged decode -- the kernels continuous batching needs.
+//
+// The kernels above serve ONE sequence, whose KV is contiguous: the key at logical
+// position p lives at p * kv_dim. Continuous batching cannot use that layout, because the
+// sequences in a batch start, grow and finish independently -- a contiguous per-sequence
+// cache would have to reserve max_context for every slot. Instead the cache is one pool per
+// layer, carved into fixed-size blocks, and each sequence owns a block table mapping its
+// logical positions onto physical blocks it does not have to own contiguously:
+//
+//   phys = block_table[b][pos / block_size] * block_size + (pos % block_size)
+//
+// That is deliberately the same arithmetic, pool layout and block-table encoding the CUDA
+// paged kernels use, so a block table built by the shared host-side allocator
+// (engine::SequenceBlockTable, which has no backend in it at all) means the same thing on
+// both backends. Blocks are refcounted, so two sequences sharing a system prompt share its
+// blocks outright -- which is why the table is a gather rather than a base offset.
+// ---------------------------------------------------------------------------
+
+struct KvPagedParams {
+  uint kv_hidden;   // kv_heads * head_dim
+  uint max_blocks;  // row stride of block_tables
+  uint block_size;  // tokens per block
+  uint batch;
+};
+
+// Scatter each sequence's one new K/V row into its own block. One threadgroup per sequence.
+kernel void cpi_kv_store_batched_paged(
+    device const half*  k_src        [[buffer(0)]],  // [batch][kv_hidden]
+    device const half*  v_src        [[buffer(1)]],
+    device half*        k_pool       [[buffer(2)]],
+    device half*        v_pool       [[buffer(3)]],
+    device const int*   block_tables [[buffer(4)]],  // [batch][max_blocks]
+    device const int*   positions    [[buffer(5)]],  // [batch] -- each row's own position
+    constant KvPagedParams& p        [[buffer(6)]],
+    uint b    [[threadgroup_position_in_grid]],
+    uint lid  [[thread_position_in_threadgroup]],
+    uint nthr [[threads_per_threadgroup]]) {
+  if (b >= p.batch) return;
+
+  const uint pos = uint(positions[b]);
+  device const int* bt = block_tables + (ulong)b * (ulong)p.max_blocks;
+  const uint phys = uint(bt[pos / p.block_size]) * p.block_size + (pos % p.block_size);
+
+  device half* kd = k_pool + (ulong)phys * (ulong)p.kv_hidden;
+  device half* vd = v_pool + (ulong)phys * (ulong)p.kv_hidden;
+  device const half* ks = k_src + (ulong)b * (ulong)p.kv_hidden;
+  device const half* vs = v_src + (ulong)b * (ulong)p.kv_hidden;
+  for (uint d = lid; d < p.kv_hidden; d += nthr) {
+    kd[d] = ks[d];
+    vd[d] = vs[d];
+  }
+}
+
+struct AttnPagedParams {
+  uint heads;
+  uint kv_heads;
+  uint head_dim;
+  uint max_blocks;
+  uint block_size;
+  uint window;  // 0 = full causal; else sliding window length
+  float scale;
+  uint batch;
+};
+
+// One threadgroup per (sequence, head). Each sequence attends over its OWN length, gathered
+// through its OWN block table -- the ragged batch the scheduler hands us. Structurally this
+// is cpi_attention_decode with the contiguous key address replaced by a paged gather; the
+// online softmax is unchanged, so the two agree key-for-key when a block table happens to be
+// identity (which is what the parity gate checks).
+kernel void cpi_attention_decode_batched_paged(
+    device const half*  q            [[buffer(0)]],  // [batch][heads*head_dim]
+    device const half*  k_pool       [[buffer(1)]],
+    device const half*  v_pool       [[buffer(2)]],
+    device half*        out          [[buffer(3)]],  // [batch][heads*head_dim]
+    device const int*   block_tables [[buffer(4)]],  // [batch][max_blocks]
+    device const int*   seq_lens     [[buffer(5)]],  // [batch] -- length INCLUDING the new token
+    constant AttnPagedParams& p      [[buffer(6)]],
+    uint gid  [[threadgroup_position_in_grid]],
+    uint lid  [[thread_position_in_threadgroup]],
+    uint nthr [[threads_per_threadgroup]]) {
+  const uint total = p.batch * p.heads;
+  if (gid >= total) return;
+  const uint b    = gid / p.heads;
+  const uint head = gid % p.heads;
+
+  const uint seq_len = uint(seq_lens[b]);
+  if (seq_len == 0u) return;
+  const uint pos = seq_len - 1u;  // the query is this sequence's newest token
+
+  const uint group   = p.heads / p.kv_heads;
+  const uint kv_head = head / group;
+  const uint kv_dim  = p.kv_heads * p.head_dim;
+  const uint q_dim   = p.heads * p.head_dim;
+
+  uint start = 0u;
+  if (p.window != 0u && seq_len > p.window) start = seq_len - p.window;
+
+  device const int* bt = block_tables + (ulong)b * (ulong)p.max_blocks;
+  device const half* qh = q + (ulong)b * (ulong)q_dim + head * p.head_dim;
+
+  const uint simd_id = lid / 32u;
+  const uint lane    = lid % 32u;
+  const uint n_simd  = nthr / 32u;
+
+  threadgroup float q_sh[256];
+  threadgroup float sc_sh[KEY_BLOCK];
+  threadgroup float w_sh[KEY_BLOCK];
+  threadgroup float tg_acc[256];
+  threadgroup float tg_max;
+  threadgroup float tg_sum;
+
+  for (uint i = lid; i < p.head_dim; i += nthr) {
+    q_sh[i] = float(qh[i]);
+    tg_acc[i] = 0.0f;
+  }
+  if (lid == 0u) {
+    tg_max = -INFINITY;
+    tg_sum = 0.0f;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  for (uint kb = start; kb <= pos; kb += KEY_BLOCK) {
+    const uint nk = min((uint)KEY_BLOCK, pos - kb + 1u);
+
+    for (uint j = simd_id; j < nk; j += n_simd) {
+      const uint kpos = kb + j;
+      const uint phys = uint(bt[kpos / p.block_size]) * p.block_size + (kpos % p.block_size);
+      device const half* kt = k_pool + (ulong)phys * (ulong)kv_dim + kv_head * p.head_dim;
+      float d = 0.0f;
+      for (uint i = lane; i < p.head_dim; i += 32u) d += q_sh[i] * float(kt[i]);
+      d = simd_sum(d);
+      if (lane == 0u) sc_sh[j] = d * p.scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float bmax = -INFINITY;
+    for (uint j = 0u; j < nk; ++j) bmax = max(bmax, sc_sh[j]);
+
+    const float old_max = tg_max;
+    const float new_max = max(old_max, bmax);
+    const float rescale = (old_max == -INFINITY) ? 0.0f : exp(old_max - new_max);
+
+    for (uint j = lid; j < nk; j += nthr) w_sh[j] = exp(sc_sh[j] - new_max);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float bsum = 0.0f;
+    for (uint j = 0u; j < nk; ++j) bsum += w_sh[j];
+
+    for (uint i = lid; i < p.head_dim; i += nthr) {
+      float a = tg_acc[i] * rescale;
+      for (uint j = 0u; j < nk; ++j) {
+        const uint kpos = kb + j;
+        const uint phys = uint(bt[kpos / p.block_size]) * p.block_size + (kpos % p.block_size);
+        device const half* vt = v_pool + (ulong)phys * (ulong)kv_dim + kv_head * p.head_dim;
+        a += w_sh[j] * float(vt[i]);
+      }
+      tg_acc[i] = a;
+    }
+
+    // Every thread read tg_max above; thread 0 is about to overwrite it.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0u) {
+      tg_sum = tg_sum * rescale + bsum;
+      tg_max = new_max;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  const float inv = 1.0f / tg_sum;
+  for (uint i = lid; i < p.head_dim; i += nthr) {
+    out[(ulong)b * (ulong)q_dim + head * p.head_dim + i] = half(tg_acc[i] * inv);
   }
 }
 

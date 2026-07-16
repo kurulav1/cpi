@@ -72,6 +72,34 @@ public:
   // valid until the next step).
   const std::vector<float>& forward_token(int token, int position);
 
+  // ---- Batched paged decode (continuous batching) --------------------------
+  //
+  // Sizes the KV as one paged POOL per layer -- num_blocks blocks of block_size tokens,
+  // shared by every sequence -- rather than a contiguous max_context run. A contiguous cache
+  // cannot serve concurrent sequences without reserving max_context per slot; paging lets
+  // them grow independently, and lets two sequences share an identical prompt prefix by
+  // refcounting its blocks. Call before open().
+  //
+  // The pool layout and block-table arithmetic match the CUDA paged path exactly, so a table
+  // built by the shared (and entirely backend-free) engine::SequenceBlockTable means the same
+  // thing on either backend. Note the two layouts coincide when a block table is the identity
+  // map -- which is what the parity gate exploits.
+  void set_paged_kv(int num_blocks, int block_size);
+  bool paged_kv() const {
+    return paged_blocks_ > 0;
+  }
+
+  // One decode step for N independent sequences at once. tokens[b] is sequence b's newest
+  // token, positions[b] its position, and block_tables_flat is a [N][max_blocks] row-major
+  // table of physical block ids. out_logits is resized to N rows of vocab_size.
+  //
+  // This walks the SAME op plan the single-sequence path walks. Only rope (per-row
+  // positions), the KV scatter and attention (paged gathers) differ, because every other op
+  // is row-independent and already runs T rows at once for prefill.
+  void decode_step_batched_logits(const std::vector<int>& tokens, const std::vector<int>& positions,
+                                  const std::vector<int>& block_tables_flat, int max_blocks,
+                                  std::vector<std::vector<float>>& out_logits);
+
   // Greedy decode. Argmax runs on the GPU so the vocab never crosses to the host.
   std::vector<int> generate_greedy(const std::vector<int>& prompt, int max_new);
 
@@ -149,6 +177,26 @@ private:
   int max_context_ = 0;
   int max_prefill_ = 0;  // slots are sized for this many tokens at once
   int quant_bits_ = 0;
+  int paged_blocks_ = 0;      // 0 = contiguous per-sequence KV (the single-request path)
+  int paged_block_size_ = 0;  // tokens per block
+
+  // Batched-decode scratch, grown on demand rather than sized for a worst-case batch.
+  runtime::MetalBuffer batch_pos_buf_;     // int32[B]   -- each row's own position
+  runtime::MetalBuffer batch_seqlen_buf_;  // int32[B]   -- each row's own length
+  runtime::MetalBuffer batch_bt_buf_;      // int32[B * max_blocks]
+  runtime::MetalBuffer batch_logits_buf_;  // float[B * vocab]
+  int batch_cap_ = 0;        // rows the scratch is sized for
+  int batch_bt_elems_ = 0;   // elements the block-table buffer is sized for
+
+  // Non-null only while decode_step_batched_logits is running: it tells execute_ops to take
+  // the per-row / paged variants of rope, KV store and attention. Everything else in the
+  // plan is row-independent and needs no knowledge of batching at all.
+  struct BatchCtx {
+    int batch;
+    int max_blocks;
+    int block_size;
+  };
+  const BatchCtx* batch_ = nullptr;
 
   // name -> device buffer. Owns every weight for the model's lifetime.
   std::unordered_map<std::string, runtime::MetalBuffer> wbuf_;

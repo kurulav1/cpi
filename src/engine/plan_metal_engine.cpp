@@ -38,6 +38,9 @@ struct RopeParams {
   std::uint32_t heads, head_dim, position, tokens;
   float theta;
   std::uint32_t use_position_buffer, row_stride;
+  // 0 (the default every existing call gets) keeps the prefill meaning: row t is token
+  // base+t of one sequence. Batched decode sets it, and then row t takes positions[t].
+  std::uint32_t per_row_positions = 0;
 };
 struct ElemParams {
   std::uint32_t n;
@@ -50,6 +53,16 @@ struct AttnParams {
   std::uint32_t heads, kv_heads, head_dim, position, max_context, window;
   float scale;
   std::uint32_t use_position_buffer, tokens;
+};
+// Batched paged decode. These mirror the structs in cpi_kernels.metal field for field --
+// a mismatch here is silent and shows up as garbage numbers, not as a build error.
+struct KvPagedParams {
+  std::uint32_t kv_hidden, max_blocks, block_size, batch;
+};
+struct AttnPagedParams {
+  std::uint32_t heads, kv_heads, head_dim, max_blocks, block_size, window;
+  float scale;
+  std::uint32_t batch;
 };
 struct EmbedParams {
   std::uint32_t hidden, tokens;
@@ -372,9 +385,15 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
                            static_cast<std::size_t>(max_prefill_) * sizeof(std::uint16_t));
   }
 
-  // KV cache: [max_context][kv_dim] fp16, per layer.
-  const std::size_t cache_bytes =
-      static_cast<std::size_t>(max_context_) * static_cast<std::size_t>(kv_dim) * 2;
+  // KV cache: [max_context][kv_dim] fp16, per layer -- or, in paged mode, one pool per layer
+  // of num_blocks * block_size token slots shared by every sequence. The two are the same
+  // bytes under different addressing: a paged slot is block * block_size + offset, which
+  // equals the token position exactly when the block table is the identity map.
+  const std::size_t cache_tokens =
+      paged_blocks_ > 0
+          ? static_cast<std::size_t>(paged_blocks_) * static_cast<std::size_t>(paged_block_size_)
+          : static_cast<std::size_t>(max_context_);
+  const std::size_t cache_bytes = cache_tokens * static_cast<std::size_t>(kv_dim) * 2;
   k_cache_.resize(static_cast<std::size_t>(cfg_.num_layers));
   v_cache_.resize(static_cast<std::size_t>(cfg_.num_layers));
   for (int L = 0; L < cfg_.num_layers; ++L) {
@@ -480,8 +499,9 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
       case OpKind::EmbeddingLookup: {
         EmbedParams p{static_cast<std::uint32_t>(op.cols), static_cast<std::uint32_t>(T)};
         // A prefill chunk reads the whole prompt from the sequence buffer; decode reads
-        // the single-token one.
-        const void* tb = (T > 1) ? seq_tok_buf_.handle() : tok_buf_.handle();
+        // the single-token one. Batched decode always uses the sequence buffer -- a batch
+        // of ONE is still T == 1, but its token is staged there, not in tok_buf_.
+        const void* tb = (T > 1 || batch_ != nullptr) ? seq_tok_buf_.handle() : tok_buf_.handle();
         const void* bufs[] = {op.weight, tb, slot(op.out)};
         ctx_.dispatch("cpi_embedding_lookup", G::Threads,
                       static_cast<std::size_t>(op.cols) * static_cast<std::size_t>(T), kTG, bufs,
@@ -613,6 +633,43 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
         break;
       }
       case OpKind::LmHead: {
+        // Batched decode needs logits for EVERY row -- each row is a different sequence's
+        // next token. (The single-sequence path below takes only the last row, because a
+        // prefill's earlier tokens exist solely to fill the KV cache.) One vocab GEMV per
+        // row: the rows are independent, so this is a GEMM's worth of work either way.
+        if (batch_ != nullptr) {
+          for (int b = 0; b < batch_->batch; ++b) {
+            const std::size_t in_off =
+                static_cast<std::size_t>(b) * static_cast<std::size_t>(op.in_dim) * 2;
+            const std::size_t out_off = static_cast<std::size_t>(b) *
+                                        static_cast<std::size_t>(cfg_.vocab_size) * sizeof(float);
+            if (op.qbits != 0) {
+              const int gsz = (op.qgroup > 0) ? op.qgroup : op.in_dim;
+              QuantParams p{static_cast<std::uint32_t>(op.cols),
+                            static_cast<std::uint32_t>(op.in_dim),
+                            1,
+                            static_cast<std::uint32_t>(op.qbits),
+                            static_cast<std::uint32_t>(op.qgroup),
+                            static_cast<std::uint32_t>((op.in_dim + gsz - 1) / gsz),
+                            0};
+              const void* bufs[] = {op.qweight, slot(op.in), batch_logits_buf_.handle(),
+                                    op.qscales};
+              const std::size_t offs[] = {0, in_off, out_off, 0};
+              ctx_.dispatch("cpi_lm_head_quant", G::Groups,
+                            groups_for_rows(static_cast<std::size_t>(op.cols)), kTG, bufs, offs, 4,
+                            &p, sizeof(p));
+            } else {
+              GemvParams p{static_cast<std::uint32_t>(op.cols),
+                           static_cast<std::uint32_t>(op.in_dim), 1, 0};
+              const void* bufs[] = {op.weight, slot(op.in), batch_logits_buf_.handle()};
+              const std::size_t offs[] = {0, in_off, out_off};
+              ctx_.dispatch("cpi_lm_head", G::Groups,
+                            groups_for_rows(static_cast<std::size_t>(op.cols)), kTG, bufs, offs, 3,
+                            &p, sizeof(p));
+            }
+          }
+          break;
+        }
         if (op.qbits != 0) {
           const int gsz = (op.qgroup > 0) ? op.qgroup : op.in_dim;
           QuantParams p{static_cast<std::uint32_t>(op.cols),
@@ -649,7 +706,11 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
                      op.scale,  // the builder folds rope_theta into scale
                      1,
                      0};
-        const void* bufs[] = {slot(op.in), pos_buf_.handle()};
+        // Batched decode: the rows are N different sequences, so each takes its own
+        // position rather than base+t.
+        if (batch_ != nullptr) p.per_row_positions = 1;
+        const void* bufs[] = {slot(op.in),
+                              batch_ != nullptr ? batch_pos_buf_.handle() : pos_buf_.handle()};
         const std::size_t total = static_cast<std::size_t>(op.heads) *
                                   static_cast<std::size_t>(op.head_dim / 2) *
                                   static_cast<std::size_t>(T);
@@ -657,6 +718,21 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
         break;
       }
       case OpKind::KvStore: {
+        if (batch_ != nullptr) {
+          // Each sequence scatters its one new row into its own block.
+          KvPagedParams p{static_cast<std::uint32_t>(op.kv_heads * op.head_dim),
+                          static_cast<std::uint32_t>(batch_->max_blocks),
+                          static_cast<std::uint32_t>(batch_->block_size),
+                          static_cast<std::uint32_t>(batch_->batch)};
+          const void* bufs[] = {
+              slot(op.in), slot(op.in2), k_cache_[static_cast<std::size_t>(layer)].handle(),
+              v_cache_[static_cast<std::size_t>(layer)].handle(), batch_bt_buf_.handle(),
+              batch_pos_buf_.handle()};
+          ctx_.dispatch("cpi_kv_store_batched_paged", G::Groups,
+                        static_cast<std::size_t>(batch_->batch), kTG, bufs, nullptr, 6, &p,
+                        sizeof(p));
+          break;
+        }
         KvParams p{static_cast<std::uint32_t>(op.kv_heads),
                    static_cast<std::uint32_t>(op.head_dim),
                    static_cast<std::uint32_t>(position),
@@ -673,6 +749,26 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
         break;
       }
       case OpKind::Attention: {
+        if (batch_ != nullptr) {
+          // Every row is one query attending over its OWN length, gathered through its own
+          // block table -- the ragged batch the scheduler hands us.
+          AttnPagedParams p{static_cast<std::uint32_t>(op.heads),
+                            static_cast<std::uint32_t>(op.kv_heads),
+                            static_cast<std::uint32_t>(op.head_dim),
+                            static_cast<std::uint32_t>(batch_->max_blocks),
+                            static_cast<std::uint32_t>(batch_->block_size),
+                            static_cast<std::uint32_t>(op.full_attention ? 0 : op.sliding_window),
+                            op.scale,
+                            static_cast<std::uint32_t>(batch_->batch)};
+          const void* bufs[] = {slot(op.in), k_cache_[static_cast<std::size_t>(layer)].handle(),
+                                v_cache_[static_cast<std::size_t>(layer)].handle(), slot(op.out),
+                                batch_bt_buf_.handle(), batch_seqlen_buf_.handle()};
+          ctx_.dispatch("cpi_attention_decode_batched_paged", G::Groups,
+                        static_cast<std::size_t>(batch_->batch) *
+                            static_cast<std::size_t>(op.heads),
+                        kTG, bufs, nullptr, 6, &p, sizeof(p));
+          break;
+        }
         AttnParams p{static_cast<std::uint32_t>(op.heads),
                      static_cast<std::uint32_t>(op.kv_heads),
                      static_cast<std::uint32_t>(op.head_dim),
@@ -917,6 +1013,91 @@ void PlanMetalEngine::encode_prefill(const std::vector<int>& tokens, int start_p
     execute_ops(lp.ops, lp.layer_index, start_position, T);
   }
   execute_ops(plan_.epilogue, -1, start_position, T);
+}
+
+void PlanMetalEngine::set_paged_kv(int num_blocks, int block_size) {
+  paged_blocks_ = num_blocks;
+  paged_block_size_ = block_size;
+}
+
+// One decode step for N independent sequences.
+//
+// Almost nothing here is batching-specific, and that is the point of the op-plan: the
+// embedding lookup, every projection, every norm and the activations are row-independent
+// and already run N rows at once for prefill. Only rope, the KV scatter and attention care
+// which sequence a row belongs to, and execute_ops swaps those three while batch_ is set.
+void PlanMetalEngine::decode_step_batched_logits(const std::vector<int>& tokens,
+                                                 const std::vector<int>& positions,
+                                                 const std::vector<int>& block_tables_flat,
+                                                 int max_blocks,
+                                                 std::vector<std::vector<float>>& out_logits) {
+  const int B = static_cast<int>(tokens.size());
+  out_logits.clear();
+  if (B <= 0) return;
+  if (paged_blocks_ <= 0) {
+    throw std::runtime_error("batched decode needs a paged KV pool: call set_paged_kv() before open()");
+  }
+  if (positions.size() != tokens.size()) {
+    throw std::runtime_error("batched decode: tokens and positions differ in length");
+  }
+  if (max_blocks <= 0 ||
+      static_cast<int>(block_tables_flat.size()) < B * max_blocks) {
+    throw std::runtime_error("batched decode: block table is smaller than batch * max_blocks");
+  }
+  if (B > max_prefill_) {
+    throw std::runtime_error("batch larger than the slots were sized for");
+  }
+
+  // Scratch grows on demand rather than being sized for a worst-case batch.
+  if (B > batch_cap_) {
+    batch_pos_buf_ = ctx_.alloc(static_cast<std::size_t>(B) * sizeof(std::int32_t));
+    batch_seqlen_buf_ = ctx_.alloc(static_cast<std::size_t>(B) * sizeof(std::int32_t));
+    batch_logits_buf_ = ctx_.alloc(static_cast<std::size_t>(B) *
+                                   static_cast<std::size_t>(cfg_.vocab_size) * sizeof(float));
+    batch_cap_ = B;
+  }
+  const int bt_elems = B * max_blocks;
+  if (bt_elems > batch_bt_elems_) {
+    batch_bt_buf_ = ctx_.alloc(static_cast<std::size_t>(bt_elems) * sizeof(std::int32_t));
+    batch_bt_elems_ = bt_elems;
+  }
+
+  // Unified memory: writing these IS the upload.
+  auto* ids = static_cast<std::int32_t*>(seq_tok_buf_.contents());
+  auto* ps = static_cast<std::int32_t*>(batch_pos_buf_.contents());
+  auto* sl = static_cast<std::int32_t*>(batch_seqlen_buf_.contents());
+  auto* bt = static_cast<std::int32_t*>(batch_bt_buf_.contents());
+  for (int b = 0; b < B; ++b) {
+    ids[b] = static_cast<std::int32_t>(tokens[static_cast<std::size_t>(b)]);
+    ps[b] = static_cast<std::int32_t>(positions[static_cast<std::size_t>(b)]);
+    // The attention kernel takes a LENGTH, so it is the new token's position plus one.
+    sl[b] = static_cast<std::int32_t>(positions[static_cast<std::size_t>(b)] + 1);
+  }
+  for (int i = 0; i < bt_elems; ++i) {
+    bt[i] = static_cast<std::int32_t>(block_tables_flat[static_cast<std::size_t>(i)]);
+  }
+
+  const BatchCtx bc{B, max_blocks, paged_block_size_};
+  batch_ = &bc;
+  // `position` is unused by every op that reads it while batched (rope and the paged ops
+  // take per-row positions instead), so 0 is not a lie here -- it is simply not consulted.
+  execute_ops(plan_.prologue, -1, 0, B);
+  for (const opplan::LayerPlan& lp : plan_.layers) {
+    execute_ops(lp.ops, lp.layer_index, 0, B);
+  }
+  execute_ops(plan_.epilogue, -1, 0, B);
+  ctx_.commit_and_wait();
+  batch_ = nullptr;
+
+  if (!ctx_.last_error().empty()) last_error_ = ctx_.last_error();
+
+  const float* src = static_cast<const float*>(batch_logits_buf_.contents());
+  out_logits.resize(static_cast<std::size_t>(B));
+  for (int b = 0; b < B; ++b) {
+    out_logits[static_cast<std::size_t>(b)].assign(
+        src + static_cast<std::size_t>(b) * static_cast<std::size_t>(cfg_.vocab_size),
+        src + static_cast<std::size_t>(b + 1) * static_cast<std::size_t>(cfg_.vocab_size));
+  }
 }
 
 const std::vector<float>& PlanMetalEngine::forward_token(int token, int position) {

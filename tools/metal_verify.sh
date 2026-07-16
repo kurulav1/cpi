@@ -129,6 +129,29 @@ else
 fi
 echo
 
+# ---------------------------------------------------------------------------
+# 3. Batched paged decode -- continuous batching's core primitive. Checks it against the
+#    single-sequence path on the same weights, and that a wrong block table actually
+#    changes the answer (otherwise the paged gather could be indexing by raw position).
+# ---------------------------------------------------------------------------
+echo "-- batched paged decode (vs the single-sequence path) --"
+if [ ! -x "$BUILD/metal_batched_test" ]; then
+  skip "metal_batched_test not built"
+elif ! path=$(find_model qwen.ll2c Qwen2.5-0.5B-Instruct.ll2c); then
+  skip "metal_batched_test -- no checkpoint"
+else
+  out=$("$BUILD/metal_batched_test" "$path" 2>&1)
+  if echo "$out" | grep -q "\[metal_batched\] PASS"; then
+    ok "metal_batched_test"
+  elif echo "$out" | grep -q "\[metal_batched\] SKIP"; then
+    echo "$out" | grep -q "no Metal GPU" && gpu_missing=1
+    skip "metal_batched_test -- $(echo "$out" | grep '\[metal_batched\] SKIP' | head -1)"
+  else
+    bad "metal_batched_test"; echo "$out" | tail -8
+  fi
+fi
+echo
+
 echo "== $ran checks ran, $failed failed, $skipped skipped =="
 if [ "$skipped" -gt 0 ]; then
   echo "   (skips are NOT passes -- a skipped golden means that path is unverified)"

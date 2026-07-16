@@ -375,6 +375,14 @@ if(LLAMA_ENGINE_ENABLE_METAL)
   add_test(NAME metal_decode_test COMMAND metal_decode_test)
   set_tests_properties(metal_decode_test PROPERTIES
     ENVIRONMENT "CPI_METALLIB=${CPI_METALLIB};CPI_METAL_SOURCE=${CPI_METAL_SRC}")
+
+  # Batched paged decode vs the single-sequence path. Needs a model, so it SKIPs without one.
+  add_executable(metal_batched_test src/tests/metal_batched_test.cpp)
+  target_link_libraries(metal_batched_test PRIVATE llama_engine)
+  target_include_directories(metal_batched_test PRIVATE include)
+  add_test(NAME metal_batched_test COMMAND metal_batched_test)
+  set_tests_properties(metal_batched_test PROPERTIES
+    ENVIRONMENT "CPI_METALLIB=${CPI_METALLIB};CPI_METAL_SOURCE=${CPI_METAL_SRC}")
 endif()
 
 # Tokenizer byte-table test. CUDA-free: built from the self-contained HfBpe
