@@ -158,6 +158,27 @@ int main(int argc, char** argv) {
                             .count());
     }
 
+    // CPI_METAL_GPUTRACE=<path> captures ONE dispatch of this shape into a .gputrace for
+    // Xcode's Metal Debugger, which is the only thing on Apple Silicon that reports occupancy
+    // and the limiter -- the numbers that would explain why this kernel sits at ~53% of peak
+    // when it does not spill and the GPU is at its Maximum performance state. One dispatch,
+    // because a capture records every command and the file grows fast.
+    //
+    // The timing above is already done, so the capture cannot distort the number this
+    // benchmark reports -- which matters, given a capture makes everything slower.
+    if (const char* gt = std::getenv("CPI_METAL_GPUTRACE")) {
+      const std::string path = std::string(gt) + "-" + std::to_string(s.out_dim) + "x" +
+                               std::to_string(s.in_dim) + ".gputrace";
+      if (ctx.begin_gputrace(path)) {
+        ctx.dispatch("cpi_gemm_f16", runtime::MetalContext::Grid::Groups, grid, threads, bufs,
+                     nullptr, 4, &p, sizeof(p));
+        ctx.end_gputrace();
+        std::printf("  [capture] %s\n", path.c_str());
+      } else {
+        std::printf("  [capture] SKIPPED: %s\n", ctx.last_error().c_str());
+      }
+    }
+
     // CHECK WHAT WE TIMED. A spot check, not the full product: 128 random (token,row) dot
     // products on the host. A kernel writing half its rows fails this immediately, which is
     // the entire reason the benchmark refuses to report a number without it.

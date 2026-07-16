@@ -121,6 +121,24 @@ public:
     cmdbuf_count_ = 0;
   }
 
+  // ---- GPU frame capture --------------------------------------------------
+  //
+  // Writes a .gputrace for the work between begin and end, which Xcode's Metal Debugger opens
+  // and annotates with the things that actually explain a kernel's speed: occupancy, the
+  // limiter, ALU vs memory. Those numbers are NOT available any other way on this hardware --
+  // MTLCounterSampleBuffer cannot sample at dispatch boundaries on Apple Silicon (asking
+  // aborts the process), and xctrace's Metal System Trace template captures exactly one GPU
+  // counter, "RT Unit Active", which is about raytracing.
+  //
+  // Requires MTL_CAPTURE_ENABLED=1 in the environment BEFORE the device is created; Metal
+  // refuses to arm capture otherwise, and says so. Returns false with last_error() set rather
+  // than throwing, because a profiling aid must never be able to break a normal run.
+  //
+  // Keep the captured region small. A capture records every command, and a trace of a few
+  // hundred dispatches is already hundreds of MB.
+  bool begin_gputrace(const std::string& path);
+  void end_gputrace();
+
 private:
   void* device_ = nullptr;     // id<MTLDevice>
   void* queue_ = nullptr;      // id<MTLCommandQueue>
@@ -128,6 +146,7 @@ private:
   void* cmdbuf_ = nullptr;     // id<MTLCommandBuffer>, lazily opened
   void* encoder_ = nullptr;    // id<MTLComputeCommandEncoder>, reused across dispatches
   void* pipelines_ = nullptr;  // NSMutableDictionary name -> MTLComputePipelineState
+  bool capturing_ = false;     // a .gputrace is open; end_gputrace() must close it
   std::string last_error_;
 
   double gpu_busy_ms_ = 0.0;

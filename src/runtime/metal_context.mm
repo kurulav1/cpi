@@ -282,6 +282,51 @@ void MetalContext::dispatch(const std::string& name, Grid grid, std::size_t tota
   }
 }
 
+bool MetalContext::begin_gputrace(const std::string& path) {
+  if (device_ == nullptr || queue_ == nullptr) {
+    last_error_ = "no Metal device/queue to capture";
+    return false;
+  }
+  MTLCaptureManager* mgr = [MTLCaptureManager sharedCaptureManager];
+  // A .gputrace DOCUMENT is the point -- the default destination is the Xcode UI over a live
+  // debug session, which is useless from a headless SSH run.
+  if (![mgr supportsDestination:MTLCaptureDestinationGPUTraceDocument]) {
+    last_error_ =
+        "GPU trace documents are not supported here; set MTL_CAPTURE_ENABLED=1 before starting "
+        "the process (Metal arms capture at device creation, not at startCapture)";
+    return false;
+  }
+  // Metal refuses to overwrite an existing trace, and the error it gives for that is not
+  // obvious, so clear it first.
+  NSString* p = [NSString stringWithUTF8String:path.c_str()];
+  [[NSFileManager defaultManager] removeItemAtPath:p error:nil];
+
+  MTLCaptureDescriptor* d = [[MTLCaptureDescriptor alloc] init];
+  // Capture the QUEUE, not the device: the device scope records every queue in the process,
+  // and this one only ever uses one.
+  d.captureObject = (id<MTLCommandQueue>)queue_;
+  d.destination = MTLCaptureDestinationGPUTraceDocument;
+  d.outputURL = [NSURL fileURLWithPath:p];
+  NSError* err = nil;
+  const bool ok = [mgr startCaptureWithDescriptor:d error:&err];
+  [d release];
+  if (!ok) {
+    last_error_ = std::string("startCapture failed: ") +
+                  (err != nil ? [[err localizedDescription] UTF8String] : "unknown");
+    return false;
+  }
+  capturing_ = true;
+  return true;
+}
+
+void MetalContext::end_gputrace() {
+  if (!capturing_) return;
+  // Anything still encoded but unsubmitted would be missing from the trace, so flush first.
+  commit_and_wait();
+  [[MTLCaptureManager sharedCaptureManager] stopCapture];
+  capturing_ = false;
+}
+
 void MetalContext::commit_and_wait() {
   if (cmdbuf_ == nullptr) return;
   id<MTLCommandBuffer> cb = (id<MTLCommandBuffer>)cmdbuf_;
