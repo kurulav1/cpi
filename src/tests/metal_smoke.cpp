@@ -426,6 +426,123 @@ int main() {
     }
   }
 
+  // ---- Attention (decode, prefill scalar, prefill matrix-unit) -----------
+  // The last kernel family with no reference check, and the largest. THREE kernels hide
+  // behind one op, chosen by (tokens, head_dim), so the sweep below is built to land on each:
+  //   T < Q_BLOCK(8)          -> cpi_attention_decode      (one threadgroup per query)
+  //   T >= 8, head_dim <= 128 -> cpi_attention_prefill_mm  (simdgroup matrix units)
+  //   T >= 8, head_dim > 128  -> cpi_attention_prefill     (scalar; Gemma's 256)
+  // A T that is not a multiple of Q_BLOCK matters (partial query block), as does GQA
+  // (heads != kv_heads, so several queries share a KV head) and the sliding window.
+  //
+  // The reference is a plain three-loop attention in fp32: scores, softmax, weighted V. The
+  // kernels compute it with an ONLINE softmax over key blocks, which is a different order of
+  // operations, so agreement here is meaningful rather than tautological.
+  {
+    struct AP {
+      std::uint32_t heads, kv_heads, head_dim, position, max_context, window;
+      float scale;
+      std::uint32_t use_position_buffer, tokens;
+    };
+    struct Case {
+      const char* name;
+      std::uint32_t heads, kv_heads, head_dim, tokens, window, base;
+    };
+    // `base` is the position of the first query, and for decode it is the whole point.
+    // A decode at position 0 attends to exactly ONE key: the softmax weight is 1 and the
+    // output is just V[0], so it exercises no softmax, no accumulation, no online rescale --
+    // it passes at max_abs == 0.00000 while proving nothing. Decode is tested at position 40,
+    // against a populated cache, which is the shape it actually runs in (one query, many keys,
+    // several KEY_BLOCK iterations with a running max).
+    const Case cases[] = {
+        {"decode hd64 @pos40", 4, 2, 64, 1, 0, 40},      // 41 keys: 2 key blocks
+        {"decode hd128 @pos40", 4, 4, 128, 1, 0, 40},    // no GQA
+        {"decode hd256 @pos40", 4, 2, 256, 1, 0, 40},    // Gemma's head_dim
+        {"decode hd64 @pos40 win16", 4, 2, 64, 1, 16, 40},  // windowed decode
+        {"decode hd128 T=4 @pos20", 4, 4, 128, 4, 0, 20},   // still decode: T < 8
+        {"prefill_mm hd64 T=8", 4, 2, 64, 8, 0, 0},         // exactly one query block
+        {"prefill_mm hd128 T=16", 8, 2, 128, 16, 0, 0},
+        {"prefill_mm hd128 T=33", 4, 2, 128, 33, 0, 0},     // partial query block (4x8 + 1)
+        {"prefill_mm hd64 window16", 4, 2, 64, 33, 16, 0},  // sliding window
+        {"prefill scalar hd256 T=16", 4, 2, 256, 16, 0, 0},  // Gemma's head_dim
+        {"prefill scalar hd256 T=33", 4, 1, 256, 33, 0, 0},  // MQA + partial block
+    };
+    constexpr std::uint32_t kQBlockSmoke = 8;  // MUST match Q_BLOCK in cpi_kernels.metal
+
+    for (const Case& c : cases) {
+      const std::uint32_t hd = c.head_dim, T = c.tokens;
+      const std::uint32_t q_dim = c.heads * hd, kv_dim = c.kv_heads * hd;
+      const std::uint32_t max_ctx = 64;
+      const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+
+      std::vector<std::uint16_t> q(static_cast<std::size_t>(T) * q_dim);
+      std::vector<std::uint16_t> kc(static_cast<std::size_t>(max_ctx) * kv_dim);
+      std::vector<std::uint16_t> vc(static_cast<std::size_t>(max_ctx) * kv_dim);
+      for (auto& v : q) v = f32_to_f16(dist(rng));
+      for (auto& v : kc) v = f32_to_f16(dist(rng));
+      for (auto& v : vc) v = f32_to_f16(dist(rng));
+
+      auto bq = ctx.alloc_from(q.data(), q.size() * 2);
+      auto bk = ctx.alloc_from(kc.data(), kc.size() * 2);
+      auto bv = ctx.alloc_from(vc.data(), vc.size() * 2);
+      auto bo = ctx.alloc(static_cast<std::size_t>(T) * q_dim * 2);
+      const std::int32_t base = static_cast<std::int32_t>(c.base);
+      auto bp = ctx.alloc_from(&base, sizeof(base));
+
+      AP p{c.heads, c.kv_heads, hd, 0, max_ctx, c.window, scale, 1, T};
+      const void* bufs[] = {bq.handle(), bk.handle(), bv.handle(), bo.handle(), bp.handle()};
+      // The engine's own choice, reproduced -- testing a kernel production does not pick
+      // would prove nothing about production.
+      if (T >= kQBlockSmoke) {
+        const std::size_t blocks = (T + kQBlockSmoke - 1) / kQBlockSmoke;
+        const char* kern = (hd <= 128) ? "cpi_attention_prefill_mm" : "cpi_attention_prefill";
+        ctx.dispatch(kern, runtime::MetalContext::Grid::Groups, c.heads * blocks, 256, bufs,
+                     nullptr, 5, &p, sizeof(p));
+      } else {
+        ctx.dispatch("cpi_attention_decode", runtime::MetalContext::Grid::Groups, c.heads * T, 256,
+                     bufs, nullptr, 5, &p, sizeof(p));
+      }
+      ctx.commit_and_wait();
+
+      std::vector<float> want(static_cast<std::size_t>(T) * q_dim), got(want.size());
+      const std::uint32_t group = c.heads / c.kv_heads;
+      for (std::uint32_t t = 0; t < T; ++t) {
+        const std::uint32_t pos = base + t;
+        std::uint32_t start = 0;
+        if (c.window != 0 && pos + 1 > c.window) start = pos + 1 - c.window;
+        for (std::uint32_t h = 0; h < c.heads; ++h) {
+          const std::uint32_t kvh = h / group;
+          std::vector<float> sc;
+          float mx = -1e30f;
+          for (std::uint32_t j = start; j <= pos; ++j) {
+            float d = 0.0f;
+            for (std::uint32_t i = 0; i < hd; ++i) {
+              d += f16_to_f32(q[t * q_dim + h * hd + i]) * f16_to_f32(kc[j * kv_dim + kvh * hd + i]);
+            }
+            d *= scale;
+            sc.push_back(d);
+            mx = std::max(mx, d);
+          }
+          float sum = 0.0f;
+          for (float& v : sc) {
+            v = std::exp(v - mx);
+            sum += v;
+          }
+          for (std::uint32_t i = 0; i < hd; ++i) {
+            float acc = 0.0f;
+            for (std::size_t jj = 0; jj < sc.size(); ++jj) {
+              acc += sc[jj] * f16_to_f32(vc[(start + jj) * kv_dim + kvh * hd + i]);
+            }
+            want[t * q_dim + h * hd + i] = acc / sum;
+          }
+        }
+      }
+      const auto* o = static_cast<const std::uint16_t*>(bo.contents());
+      for (std::size_t i = 0; i < got.size(); ++i) got[i] = f16_to_f32(o[i]);
+      check(std::string("attn ") + c.name, compare(got, want), 0.02);
+    }
+  }
+
   // ---- Argmax ------------------------------------------------------------
   {
     const std::uint32_t n = 151936;  // a real vocab size
