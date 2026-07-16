@@ -100,6 +100,22 @@ public:
                                   const std::vector<int>& block_tables_flat, int max_blocks,
                                   std::vector<std::vector<float>>& out_logits);
 
+  // Prefills `tokens` at start_position into ONE sequence's paged blocks. block_table maps
+  // that sequence's logical blocks to physical ones; it must already cover the whole range.
+  //
+  // This is the batched paged path with the rows being consecutive tokens of one sequence
+  // rather than different sequences: row t sits at start_position+t with a length of
+  // start_position+t+1, which is exactly the causal mask prefill needs, and every row shares
+  // the one block table. So it needs no kernels of its own.
+  //
+  // The catch, and it is deliberate for now: attention here is the DECODE kernel, so each
+  // query walks the whole history and the pass is O(T^2) in device traffic -- the very thing
+  // the single-sequence query-block prefill kernels exist to avoid. Correct first. The
+  // contiguous path is untouched and keeps its fast kernels; only the paged (batched-server)
+  // prefill pays this, and giving it the query-block treatment is a known follow-up.
+  void prefill_paged(const std::vector<int>& tokens, int start_position,
+                     const std::vector<int>& block_table);
+
   // Greedy decode. Argmax runs on the GPU so the vocab never crosses to the host.
   std::vector<int> generate_greedy(const std::vector<int>& prompt, int max_new);
 
@@ -195,6 +211,10 @@ private:
     int batch;
     int max_blocks;
     int block_size;
+    // Prefill wants logits for the LAST row only -- its earlier tokens exist to fill the KV
+    // cache, and a vocab GEMV per row would cost T of them instead of one. Batched DECODE
+    // wants every row, because there each row is a different sequence's next token.
+    bool logits_last_only;
   };
   const BatchCtx* batch_ = nullptr;
 

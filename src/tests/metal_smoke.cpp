@@ -153,6 +153,51 @@ int main() {
     check("rmsnorm", compare(got, want), 0.01);
   }
 
+  // ---- GEMM (fp16), the multi-token prefill path -------------------------
+  // This kernel had NO check of its own: it was benchmarked heavily and gated only
+  // indirectly, through end-to-end goldens. A prefill chunk and a token-at-a-time run
+  // disagreed on Metal, and the split fell exactly on the GEMV/GEMM boundary, so the
+  // question "is the GEMM itself right?" needs an answer that does not route through
+  // another Metal path. Sweeping the token count matters: the kernel pads its tile out to
+  // GEMM_BN, so partial tiles (T not a multiple of 64) are the interesting case.
+  for (int tokens : {1, 8, 16, 24, 64, 100}) {
+    const std::uint32_t out_dim = 256, in_dim = 128;  // out_dim % 128, in_dim % 32: the guard
+    const std::uint32_t T = static_cast<std::uint32_t>(tokens);
+    std::vector<std::uint16_t> W(out_dim * in_dim), A(T * in_dim), bias(out_dim);
+    for (auto& v : W) v = f32_to_f16(dist(rng) * 0.1f);
+    for (auto& v : A) v = f32_to_f16(dist(rng));
+    for (auto& v : bias) v = f32_to_f16(dist(rng) * 2.0f);
+
+    auto bW = ctx.alloc_from(W.data(), W.size() * 2);
+    auto bA = ctx.alloc_from(A.data(), A.size() * 2);
+    auto bo = ctx.alloc(static_cast<std::size_t>(T) * out_dim * 2);
+    auto bb = ctx.alloc_from(bias.data(), bias.size() * 2);
+
+    GemvParams p{out_dim, in_dim, T, 1};
+    const void* bufs[] = {bW.handle(), bA.handle(), bo.handle(), bb.handle()};
+    // The engine's own geometry, verbatim -- testing a different grid than production runs
+    // would prove nothing about production.
+    const std::size_t tiles = (T + 64 - 1) / 64;
+    const std::size_t groups = (out_dim / 128) * tiles;  // out_dim / GEMM_FBM, as the engine does
+    ctx.dispatch("cpi_gemm_f16", runtime::MetalContext::Grid::Groups, groups, 256, bufs, nullptr, 4,
+                 &p, sizeof(p));
+    ctx.commit_and_wait();
+
+    std::vector<float> want(static_cast<std::size_t>(T) * out_dim), got(want.size());
+    for (std::uint32_t t = 0; t < T; ++t) {
+      for (std::uint32_t r = 0; r < out_dim; ++r) {
+        float acc = 0.0f;
+        for (std::uint32_t c = 0; c < in_dim; ++c) {
+          acc += f16_to_f32(W[r * in_dim + c]) * f16_to_f32(A[t * in_dim + c]);
+        }
+        want[t * out_dim + r] = acc + f16_to_f32(bias[r]);
+      }
+    }
+    const auto* out = static_cast<const std::uint16_t*>(bo.contents());
+    for (std::size_t i = 0; i < got.size(); ++i) got[i] = f16_to_f32(out[i]);
+    check("gemm_f16 T=" + std::to_string(tokens), compare(got, want), 0.05);
+  }
+
   // ---- GEMV, with and without a bias -------------------------------------
   // Qwen2's Q/K/V projections carry a bias and Llama's do not, so both paths of
   // the same kernel need exercising. A bias that is silently dropped still yields

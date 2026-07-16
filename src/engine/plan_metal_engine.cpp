@@ -101,8 +101,16 @@ constexpr int kTG = 256;               // threads per group
 constexpr int kSimdsPerTG = kTG / 32;  // = rows per threadgroup in the GEMV
 // The blocked GEMMs tile 64 rows x 64 tokens: 4 simdgroups (128 threads), each owning a 32x32
 // output tile of 4x4 fragments.
-constexpr int kGemmBN = 64;                               // MUST match GEMM_BN in the shader (fp16)
-constexpr int kGemmTG = 32 * (64 / 32) * (kGemmBN / 32);  // one simdgroup per 32x32 sub-tile
+constexpr int kGemmBN = 64;    // MUST match GEMM_BN in the shader (fp16 tokens per tile)
+constexpr int kGemmFBM = 128;  // MUST match GEMM_FBM in the shader (fp16 rows per tile)
+// One simdgroup per 32x32 sub-tile of the FBM x BN output tile, so 4 x 2 = 8 simdgroups.
+// This used to read `32 * (64 / 32) * (kGemmBN / 32)` = 128 threads, a literal 64 left behind
+// when the row tile went 64 -> 128. The kernel derives its own row block from GEMM_FBM, so it
+// then had half the simdgroups it needed and silently wrote only rows row0..row0+63 of every
+// 128-row tile -- the other half kept whatever was in the slot. It was invisible because the
+// GEMM only runs at T >= kGemmMinTokens and every golden prompt is ~10 tokens, so no gate ever
+// executed this kernel; the prefill benchmarks did, but they time it, they do not check it.
+constexpr int kGemmTG = 32 * (kGemmFBM / 32) * (kGemmBN / 32);
 // The quantized GEMM reads activations from device, not a staged tile, so a wider token tile
 // buys weight reuse at no threadgroup-memory cost. It wants 128 where fp16 wants 64.
 constexpr int kGemmQBN = 128;                              // MUST match GEMM_QBN in the shader
@@ -612,7 +620,12 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
           GemvParams gp{static_cast<std::uint32_t>(op.cols), static_cast<std::uint32_t>(op.in_dim),
                         static_cast<std::uint32_t>(gemm_tokens), op.bias != nullptr ? 1u : 0u};
           const std::size_t tiles = static_cast<std::size_t>((gemm_tokens + kGemmBN - 1) / kGemmBN);
-          const std::size_t groups = (static_cast<std::size_t>(op.cols) / 64) * tiles;
+          // The kernel maps tgid -> (row block, token tile) using out_dim / GEMM_FBM row
+          // blocks, so the grid must agree. This read `op.cols / 64`, which launched exactly
+          // twice the threadgroups needed; the surplus all landed on tok0 >= tokens and
+          // returned immediately, so it was pure waste rather than a wrong answer -- but it
+          // hid the row-tile mismatch above by looking like it covered the rows.
+          const std::size_t groups = (static_cast<std::size_t>(op.cols) / kGemmFBM) * tiles;
           ctx_.dispatch("cpi_gemm_f16", G::Groups, groups, kGemmTG, bufs, offs, 4, &gp, sizeof(gp));
         }
 
@@ -634,10 +647,10 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
       }
       case OpKind::LmHead: {
         // Batched decode needs logits for EVERY row -- each row is a different sequence's
-        // next token. (The single-sequence path below takes only the last row, because a
-        // prefill's earlier tokens exist solely to fill the KV cache.) One vocab GEMV per
-        // row: the rows are independent, so this is a GEMM's worth of work either way.
-        if (batch_ != nullptr) {
+        // next token. One vocab GEMV per row: the rows are independent, so this is a GEMM's
+        // worth of work either way. A paged PREFILL takes the last-row path below instead
+        // (logits_last_only), exactly as a contiguous prefill does.
+        if (batch_ != nullptr && !batch_->logits_last_only) {
           for (int b = 0; b < batch_->batch; ++b) {
             const std::size_t in_off =
                 static_cast<std::size_t>(b) * static_cast<std::size_t>(op.in_dim) * 2;
@@ -1020,6 +1033,66 @@ void PlanMetalEngine::set_paged_kv(int num_blocks, int block_size) {
   paged_block_size_ = block_size;
 }
 
+void PlanMetalEngine::prefill_paged(const std::vector<int>& tokens, int start_position,
+                                    const std::vector<int>& block_table) {
+  const int T = static_cast<int>(tokens.size());
+  if (T <= 0) return;
+  if (paged_blocks_ <= 0) {
+    throw std::runtime_error("prefill_paged needs a paged KV pool: call set_paged_kv() before open()");
+  }
+  if (T > max_prefill_) {
+    throw std::runtime_error("prefill chunk larger than the slots were sized for");
+  }
+  const int max_blocks = static_cast<int>(block_table.size());
+  const int last_pos = start_position + T - 1;
+  if (max_blocks <= last_pos / paged_block_size_) {
+    throw std::runtime_error("prefill_paged: block table does not cover the chunk");
+  }
+
+  if (T > batch_cap_) {
+    batch_pos_buf_ = ctx_.alloc(static_cast<std::size_t>(T) * sizeof(std::int32_t));
+    batch_seqlen_buf_ = ctx_.alloc(static_cast<std::size_t>(T) * sizeof(std::int32_t));
+    batch_logits_buf_ = ctx_.alloc(static_cast<std::size_t>(T) *
+                                   static_cast<std::size_t>(cfg_.vocab_size) * sizeof(float));
+    batch_cap_ = T;
+  }
+  const int bt_elems = T * max_blocks;
+  if (bt_elems > batch_bt_elems_) {
+    batch_bt_buf_ = ctx_.alloc(static_cast<std::size_t>(bt_elems) * sizeof(std::int32_t));
+    batch_bt_elems_ = bt_elems;
+  }
+
+  auto* ids = static_cast<std::int32_t*>(seq_tok_buf_.contents());
+  auto* ps = static_cast<std::int32_t*>(batch_pos_buf_.contents());
+  auto* sl = static_cast<std::int32_t*>(batch_seqlen_buf_.contents());
+  auto* bt = static_cast<std::int32_t*>(batch_bt_buf_.contents());
+  for (int t = 0; t < T; ++t) {
+    ids[t] = static_cast<std::int32_t>(tokens[static_cast<std::size_t>(t)]);
+    ps[t] = static_cast<std::int32_t>(start_position + t);
+    // Row t's length is its own position + 1, which IS the causal mask: token t sees
+    // 0..start+t and nothing later, including the chunk-mates stored beside it.
+    sl[t] = static_cast<std::int32_t>(start_position + t + 1);
+    // Every row is the same sequence, so every row gets the same table. Replicating it costs
+    // a few KB and keeps the kernels unaware that this case exists at all.
+    for (int j = 0; j < max_blocks; ++j) {
+      bt[static_cast<std::size_t>(t) * max_blocks + j] =
+          static_cast<std::int32_t>(block_table[static_cast<std::size_t>(j)]);
+    }
+  }
+
+  const BatchCtx bc{T, max_blocks, paged_block_size_, /*logits_last_only=*/true};
+  batch_ = &bc;
+  execute_ops(plan_.prologue, -1, start_position, T);
+  for (const opplan::LayerPlan& lp : plan_.layers) {
+    execute_ops(lp.ops, lp.layer_index, start_position, T);
+  }
+  execute_ops(plan_.epilogue, -1, start_position, T);
+  ctx_.commit_and_wait();
+  batch_ = nullptr;
+
+  if (!ctx_.last_error().empty()) last_error_ = ctx_.last_error();
+}
+
 // One decode step for N independent sequences.
 //
 // Almost nothing here is batching-specific, and that is the point of the op-plan: the
@@ -1077,7 +1150,7 @@ void PlanMetalEngine::decode_step_batched_logits(const std::vector<int>& tokens,
     bt[i] = static_cast<std::int32_t>(block_tables_flat[static_cast<std::size_t>(i)]);
   }
 
-  const BatchCtx bc{B, max_blocks, paged_block_size_};
+  const BatchCtx bc{B, max_blocks, paged_block_size_, /*logits_last_only=*/false};
   batch_ = &bc;
   // `position` is unused by every op that reads it while batched (rope and the paged ops
   // take per-row positions instead), so 0 is not a lie here -- it is simply not consulted.
