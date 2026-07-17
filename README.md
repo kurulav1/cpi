@@ -594,6 +594,26 @@ to the 8B:
   incrementally and each intermediate is wrong), which is why it is scoped as its own effort rather
   than folded into a session about other things -- but it is engineering, not hope.
 
+  **The two separable levers were then measured, and neither transfers on its own.** The kernel is
+  parameterized, so the 64x32 tile (lever 1) is one constant change: it measured *worse* -- gate/up
+  3.20 -> 2.88 TFLOP/s -- because at 8 accumulators the inner loop does 8 MACs per 6 threadgroup
+  loads (intensity 1.33) where 16 accumulators do 16 per 8 (2.0), and this kernel is fed by
+  threadgroup traffic, not starved of registers at 16. Staging the weight tile K-major so the load
+  drops its transpose (lever 2) measured *neutral* -- 3.20 -> 3.16 -- the scatter-fill cost offset
+  the cheaper load, so Apple's transposing `simdgroup_load` is evidently near-free in hardware.
+  The file's own comments already record the other direction: 32 accumulators spills to 0.38
+  TFLOP/s. So **64x64 with 16 accumulators is a confirmed local optimum for this kernel structure** --
+  bigger spills, smaller loses intensity, and the transpose was not the cost.
+
+  That sharpens the conclusion rather than defeating it. llama.cpp's narrow tile wins only *in
+  combination* with its cheap loads and direct store -- the pieces are coupled and individually
+  neutral-to-negative, which is exactly why the rewrite has to be faithful and whole to pay off,
+  and why a piecemeal adoption cannot get there. It also lowers the expected prize: our per-shape
+  GEMM is already 3.20 TFLOP/s (~75% of the F32 peak), so much of the end-to-end 24% prefill gap is
+  the small grid-starved k/v, the attention, and dispatch structure -- not headroom sitting in the
+  big GEMM's inner loop. A faithful full rewrite remains the one path to the GEMM's share of it,
+  with tempered expectations now that the individual levers have been shown inert.
+
   What that gap IS was narrowed by ruling out the structural explanation. llama.cpp's backend
   prints `MTL,BLAS` and its binary links Accelerate (whose BLAS runs on Apple's AMX coprocessor),
   so the obvious theory was that its prefill GEMMs go through a vendor library we neither use nor
