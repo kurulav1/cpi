@@ -73,6 +73,23 @@ public:
   // valid until the next step).
   const std::vector<float>& forward_token(int token, int position);
 
+  // Capture a .gputrace of whatever runs between these, for Xcode's Metal Debugger.
+  //
+  // metal_gemm_bench can already capture ITS dispatches -- but a bench is not a prefill, and
+  // reading a limiter off one and calling it the kernel's was a real mistake here: the bench's
+  // own per-shape times predict 137 ms of GEMM for a 541-token prefill that actually spends
+  // ~207 ms. Same kernels, same shapes, 1.5x apart, and cache/shape-mix/chunking are all
+  // eliminated. Only a trace of the PASS can say where that goes.
+  //
+  // Requires MTL_CAPTURE_ENABLED=1 before the process starts. Returns false (with
+  // last_error()) rather than throwing: a profiling aid must not be able to break a run.
+  bool begin_gputrace(const std::string& path) {
+    return ctx_.begin_gputrace(path);
+  }
+  void end_gputrace() {
+    ctx_.end_gputrace();
+  }
+
   // ---- Batched paged decode (continuous batching) --------------------------
   //
   // Sizes the KV as one paged POOL per layer -- num_blocks blocks of block_size tokens,

@@ -107,10 +107,30 @@ int main(int argc, char** argv) {
   const std::vector<int> ids = tok.encode(prompt, /*add_bos=*/true);
   std::fprintf(stderr, "[metal] prompt: %zu tokens\n", ids.size());
 
+  // CPI_METAL_GPUTRACE=<path> captures this run for Xcode's Metal Debugger. Unlike
+  // metal_gemm_bench's capture, this is a REAL pass: real weights, real dependent ops, real
+  // slot reuse -- which matters, because the bench's per-shape times predict ~137 ms of GEMM
+  // for a 541-token prefill that really spends ~207 ms, and a limiter read off the bench
+  // describes the bench.
+  //
+  // Keep the prompt SHORT when using it. A capture records every command and every bound
+  // buffer, so a full model's worth is on the order of a gigabyte.
+  const char* gt = std::getenv("CPI_METAL_GPUTRACE");
+  bool capturing = false;
+  if (gt != nullptr) {
+    capturing = eng.begin_gputrace(gt);
+    if (!capturing) std::fprintf(stderr, "[metal] capture SKIPPED: %s\n", eng.last_error().c_str());
+  }
+
   eng.reset_gpu_counters();
   const auto t0 = std::chrono::steady_clock::now();
   const std::vector<int> out = eng.generate(ids, max_new, samp);
   const auto t1 = std::chrono::steady_clock::now();
+  if (capturing) {
+    eng.end_gputrace();
+    std::fprintf(stderr, "[metal] capture written: %s (timings above are NOT valid under a\n"
+                         "        capture -- it serialises and instruments everything)\n", gt);
+  }
   const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
   // Decode the whole sequence at once. Decoding token by token loses the word
