@@ -238,28 +238,51 @@ int main(int argc, char** argv) {
     if (agree == n) {
       std::printf("\n  Metal reproduces the CUDA stream (%zu tokens): PASS\n", n);
     } else {
-      // Replay to the divergence and ask how confident the model was there. A tie
-      // means the two backends were choosing between near-equal candidates; a
-      // confident token means one of them is wrong.
-      std::vector<int> ctx = prompt;
-      ctx.insert(ctx.end(), m_out.begin(), m_out.begin() + static_cast<long>(agree));
-      std::vector<float> lg;
-      for (std::size_t i = 0; i < ctx.size(); ++i) {
-        lg = metal.forward_token(ctx[i], static_cast<int>(i));
-      }
-      std::vector<float> sorted = lg;
-      std::partial_sort(sorted.begin(), sorted.begin() + 2, sorted.end(), std::greater<float>());
-      const double gap = static_cast<double>(sorted[0]) - static_cast<double>(sorted[1]);
+      // The streams forked. A tie at the fork explains THAT token -- fp32 sum ordering differs
+      // between backends, so a near-equal choice can fall either way -- but it explains nothing
+      // after it: once the two pick different tokens they are different sequences, and a forked
+      // continuation cannot be compared to the golden at all.
+      //
+      // This used to stop here and pass on the strength of that one tie. It was a false pass: a
+      // deliberately broken merge kernel forked at a tie, collapsed into repeated EOS for the
+      // next hundred tokens, agreed with the CPU engine on 21 of 128 -- and the gate went green.
+      //
+      // So teacher-force the GOLDEN prefix and judge every position on its own: at each step
+      // Metal sees the reference's tokens, not its own, and has to predict the reference's next
+      // one. A tie then excuses only the position it happens at, and a confident disagreement
+      // anywhere is a failure no later luck can hide.
+      std::printf("\n  Metal diverges from CUDA at token %zu of %zu (metal=%d cuda=%d)"
+                  " -- re-checking every position against the golden prefix\n",
+                  agree, n, m_out[agree], golden[agree]);
 
-      const bool tie = gap < kTieTol;
-      golden_ok = tie;
-      std::printf("\n  Metal diverges from CUDA at token %zu of %zu (metal=%d cuda=%d)\n", agree, n,
-                  m_out[agree], golden[agree]);
-      std::printf("    top-2 logit gap there: %.4f  (tie tolerance %.2f)\n", gap, kTieTol);
-      std::printf("    -> %s\n", tie ? "A TIE: fp32 sum ordering differs between backends, so a "
-                                       "near-equal choice can fall either way. PASS."
-                                     : "NOT A TIE: the model was confident, so one backend is "
-                                       "WRONG. FAIL.");
+      std::vector<int> ctx = prompt;
+      ctx.insert(ctx.end(), golden.begin(), golden.begin() + static_cast<long>(n));
+      std::size_t ties = 0;
+      for (std::size_t i = 0; i + 1 < ctx.size(); ++i) {
+        const std::vector<float> lg = metal.forward_token(ctx[i], static_cast<int>(i));
+        if (i + 1 < prompt.size()) continue;  // still feeding the prompt
+        const std::size_t k = i + 1 - prompt.size();
+        const int am = static_cast<int>(std::max_element(lg.begin(), lg.end()) - lg.begin());
+        if (am == golden[k]) continue;
+
+        std::vector<float> sorted = lg;
+        std::partial_sort(sorted.begin(), sorted.begin() + 2, sorted.end(), std::greater<float>());
+        const double gap = static_cast<double>(sorted[0]) - static_cast<double>(sorted[1]);
+        if (gap < kTieTol) {
+          ++ties;
+          continue;
+        }
+        golden_ok = false;
+        std::printf("    token %zu: metal=%d cuda=%d, top-2 gap %.4f (tie tolerance %.2f)\n", k, am,
+                    golden[k], gap, kTieTol);
+        std::printf("    -> NOT A TIE: the model was confident, so one backend is WRONG. FAIL.\n");
+        break;
+      }
+      if (golden_ok) {
+        std::printf("    -> every position matches the golden given the golden prefix"
+                    " (%zu tie%s). PASS.\n",
+                    ties, ties == 1 ? "" : "s");
+      }
     }
   }
 
