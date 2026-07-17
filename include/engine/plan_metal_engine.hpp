@@ -213,6 +213,12 @@ private:
   void encode_forward(int token, int position);
   // Encodes a whole prefill chunk: T tokens through the tower in one pass.
   void encode_prefill(const std::vector<int>& tokens, int start_position);
+  // How to cut a prefill of `n` tokens into chunks no larger than a slot. Splitting evenly
+  // beats filling greedily -- see the definition.
+  std::vector<int> prefill_chunks(int n) const;
+  // How many key chunks a decode's attention should split into at this position. 1 means the
+  // context is too short to be worth the merge pass.
+  int attn_split_chunks(const opplan::Op& op, int position) const;
   void* slot(opplan::Slot s) const;
 
   runtime::MetalContext ctx_;
@@ -262,6 +268,11 @@ private:
   runtime::MetalBuffer tok_buf_;      // int32[1]
   runtime::MetalBuffer seq_tok_buf_;  // int32[max_prefill] -- a whole prompt chunk
   runtime::MetalBuffer pos_buf_;      // int32[1]
+  // Split-KV decode attention scratch: per (head, chunk) softmax stats and the unnormalized
+  // partial accumulators the merge pass folds together.
+  runtime::MetalBuffer attn_part_m_;  // float[heads * maxchunks]
+  runtime::MetalBuffer attn_part_l_;  // float[heads * maxchunks]
+  runtime::MetalBuffer attn_part_o_;  // float[heads * maxchunks * head_dim]
   runtime::MetalBuffer logits_buf_;   // float[vocab]
   runtime::MetalBuffer argmax_val_;   // float[parts]
   runtime::MetalBuffer argmax_idx_;   // int32[parts]

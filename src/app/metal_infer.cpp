@@ -109,9 +109,9 @@ int main(int argc, char** argv) {
 
   // CPI_METAL_GPUTRACE=<path> captures this run for Xcode's Metal Debugger. Unlike
   // metal_gemm_bench's capture, this is a REAL pass: real weights, real dependent ops, real
-  // slot reuse -- which matters, because the bench's per-shape times predict ~137 ms of GEMM
-  // for a 541-token prefill that really spends ~207 ms, and a limiter read off the bench
-  // describes the bench.
+  // slot reuse, and the chunk sizes a prefill really issues -- all of which matter, because a
+  // limiter read off the bench describes the bench, and the bench is free to time a shape the
+  // engine never runs.
   //
   // Keep the prompt SHORT when using it. A capture records every command and every bound
   // buffer, so a full model's worth is on the order of a gigabyte.

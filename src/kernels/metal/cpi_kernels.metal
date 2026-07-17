@@ -1175,6 +1175,20 @@ kernel void cpi_kv_store(
 // attends to a different prefix: causality masks key > that query's position.
 // ---------------------------------------------------------------------------
 #define Q_BLOCK 8
+// The matrix-unit prefill kernel's query-block size. Separate from Q_BLOCK because the scalar
+// kernel sizes its shared arrays for head_dim 256 (Gemma) and cannot afford a wider block --
+// raising a shared constant would silently break a path whose golden is skipped on any host
+// without a Gemma checkpoint.
+//
+// IT CANNOT BE RAISED WITHOUT CHANGING THE KERNEL. The fragment plan below computes exactly one
+// simdgroup_float8x8 of scores -- `simdgroup_load(Qf, q_sh + df * 8u, hd)` always reads from row
+// 0 -- so a block of 16 computes its first 8 queries and leaves the rest as whatever was in
+// shared memory. That is the same failure the fp16 GEMM had (a tile widened past the threads
+// that served it), and it is worth fixing: this kernel re-reads K/V once per query block, so at
+// QMM_BLOCK 16 a 541-token prefill measured 193 -> 177 ms with attention's share falling 30 ->
+// 12 ms. Getting there needs the scoring and the softmax to loop over QMM_BLOCK/8 query
+// fragments, not a bigger number here.
+#define QMM_BLOCK 8
 
 // ---------------------------------------------------------------------------
 // Prefill attention on the MATRIX UNITS (head_dim <= 128). The scalar kernel below scores
@@ -1205,9 +1219,9 @@ kernel void cpi_attention_prefill_mm(device const half* q [[buffer(0)]],
                                      uint lid [[thread_position_in_threadgroup]],
                                      uint nthr [[threads_per_threadgroup]]) {
   const uint head = gid % p.heads;
-  const uint t0 = (gid / p.heads) * Q_BLOCK;
+  const uint t0 = (gid / p.heads) * QMM_BLOCK;
   if (t0 >= p.tokens) return;
-  const uint nq = min((uint)Q_BLOCK, p.tokens - t0);
+  const uint nq = min((uint)QMM_BLOCK, p.tokens - t0);
 
   uint base = p.position;
   if (p.use_position_buffer != 0u) base = uint(positions[0]);
@@ -1222,22 +1236,22 @@ kernel void cpi_attention_prefill_mm(device const half* q [[buffer(0)]],
   const uint lane = lid % 32u;
   const uint n_simd = nthr / 32u;
 
-  threadgroup half q_sh[Q_BLOCK * 128];         // [query][d]
-  threadgroup float acc[Q_BLOCK * 128];         // [query][d] fp32 output accumulator
-  threadgroup float sc_sh[Q_BLOCK * KEY_BLOCK]; // scores [query][key]
-  threadgroup half pw_sh[Q_BLOCK * KEY_BLOCK];  // softmax weights [query][key], half for the matmul
-  threadgroup float m_sh[Q_BLOCK];              // running max per query
-  threadgroup float l_sh[Q_BLOCK];              // running sum per query
-  threadgroup float r_sh[Q_BLOCK];              // this block's rescale per query
+  threadgroup half q_sh[QMM_BLOCK * 128];         // [query][d]
+  threadgroup float acc[QMM_BLOCK * 128];         // [query][d] fp32 output accumulator
+  threadgroup float sc_sh[QMM_BLOCK * KEY_BLOCK]; // scores [query][key]
+  threadgroup half pw_sh[QMM_BLOCK * KEY_BLOCK];  // softmax weights [query][key], half for the matmul
+  threadgroup float m_sh[QMM_BLOCK];              // running max per query
+  threadgroup float l_sh[QMM_BLOCK];              // running sum per query
+  threadgroup float r_sh[QMM_BLOCK];              // this block's rescale per query
 
-  // Zero the FULL Q_BLOCK rows, not just nq: the matrix ops load 8-row fragments, so the
+  // Zero the FULL QMM_BLOCK rows, not just nq: the matrix ops load 8-row fragments, so the
   // padding rows must be defined (0) rather than garbage that could turn into NaN.
-  for (uint c = lid; c < Q_BLOCK * hd; c += nthr) {
+  for (uint c = lid; c < QMM_BLOCK * hd; c += nthr) {
     const uint qi = c / hd, i = c % hd;
     q_sh[qi * hd + i] = (qi < nq) ? q[(ulong)(t0 + qi) * (ulong)q_dim + head * hd + i] : half(0);
     acc[qi * hd + i] = 0.0f;
   }
-  for (uint qi = lid; qi < Q_BLOCK; qi += nthr) {
+  for (uint qi = lid; qi < QMM_BLOCK; qi += nthr) {
     m_sh[qi] = -INFINITY;
     l_sh[qi] = 0.0f;
   }
@@ -1365,7 +1379,6 @@ kernel void cpi_attention_prefill(device const half* q [[buffer(0)]],
 
   const uint simd_id = lid / 32u;
   const uint lane = lid % 32u;
-  const uint n_simd = nthr / 32u;
 
   threadgroup float q_sh[Q_BLOCK * 256];
   threadgroup float acc[Q_BLOCK * 256];
@@ -1573,6 +1586,196 @@ kernel void cpi_attention_decode(
   const float inv = 1.0f / tg_sum;
   for (uint i = lid; i < p.head_dim; i += nthr) {
     out[(ulong)t * (ulong)q_dim + head * p.head_dim + i] = half(tg_acc[i] * inv);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Split-KV decode attention.
+//
+// cpi_attention_decode above gives one threadgroup to each (token, head) and walks the whole
+// cache inside it. For a PREFILL that is fine: T tokens x heads is thousands of threadgroups.
+// At DECODE T is 1, so the grid is just `heads` -- 14 threadgroups for Qwen2.5-0.5B, on a GPU
+// that wants hundreds. The cache walk becomes a serial loop in a nearly empty machine, so
+// decode slows down with context for a reason that has nothing to do with bandwidth: at 2048
+// keys the KV cache is ~25 MB against 1.17 GB of weights, 2% of the traffic for a 2.6x
+// slowdown (88 -> 34 tok/s, where llama.cpp holds 96 -> 89).
+//
+// So split the keys. Pass 1 gives each (head, chunk) its own threadgroup and an INDEPENDENT
+// online softmax over its slice, writing that slice's running max, running sum and an
+// UNNORMALIZED accumulator. Pass 2 merges the slices per head.
+//
+// The merge is exact, not an approximation: softmax combines under the standard log-sum-exp
+// rule, so rescaling each slice by exp(m_c - m) and summing reproduces the single-threadgroup
+// result. It is the same decomposition the CUDA split-K decode path uses
+// (kernels_attention_decode.cu), on purpose -- same statistics, same merge, so the backends
+// cannot drift and one golden covers both.
+// ---------------------------------------------------------------------------
+
+struct AttnSplitParams {
+  uint heads;
+  uint kv_heads;
+  uint head_dim;
+  uint position;
+  uint use_position_buffer;
+  uint window;
+  float scale;
+  uint chunk_size;  // keys per chunk
+  uint chunks;      // chunks per head, and the row stride of the partial buffers
+};
+
+kernel void cpi_attention_decode_split(
+    device const half*  q         [[buffer(0)]],
+    device const half*  k_cache   [[buffer(1)]],
+    device const half*  v_cache   [[buffer(2)]],
+    device float*       part_m    [[buffer(3)]],
+    device float*       part_l    [[buffer(4)]],
+    device float*       part_o    [[buffer(5)]],
+    device const int*   positions [[buffer(6)]],
+    constant AttnSplitParams& p   [[buffer(7)]],
+    uint gid  [[threadgroup_position_in_grid]],
+    uint lid  [[thread_position_in_threadgroup]],
+    uint nthr [[threads_per_threadgroup]]) {
+  const uint head  = gid / p.chunks;
+  const uint chunk = gid % p.chunks;
+  if (head >= p.heads) return;  // uniform across the threadgroup: gid is a threadgroup id
+
+  uint pos = p.position;
+  if (p.use_position_buffer != 0u) pos = uint(positions[0]);
+
+  uint start = 0u;
+  if (p.window != 0u && pos + 1u > p.window) start = pos + 1u - p.window;
+
+  const uint c0 = start + chunk * p.chunk_size;
+  const uint c1 = min(c0 + p.chunk_size, pos + 1u);
+  const uint slot = head * p.chunks + chunk;
+
+  // An empty chunk still has to say so: the merge reads every slot. -INF max with a zero sum
+  // is the identity of the log-sum-exp merge, and it lets pass 2 skip the accumulator without
+  // reading whatever was left in it.
+  if (c0 >= c1) {
+    if (lid == 0u) {
+      part_m[slot] = -INFINITY;
+      part_l[slot] = 0.0f;
+    }
+    return;
+  }
+
+  const uint group   = p.heads / p.kv_heads;
+  const uint kv_head = head / group;
+  const uint kv_dim  = p.kv_heads * p.head_dim;
+
+  device const half* qh = q + head * p.head_dim;  // decode: the query is the only token
+
+  const uint simd_id = lid / 32u;
+  const uint lane    = lid % 32u;
+  const uint n_simd  = nthr / 32u;
+
+  threadgroup float q_sh[256];
+  threadgroup float sc_sh[KEY_BLOCK];
+  threadgroup float w_sh[KEY_BLOCK];
+  threadgroup float tg_acc[256];
+  threadgroup float tg_max;
+  threadgroup float tg_sum;
+
+  for (uint i = lid; i < p.head_dim; i += nthr) {
+    q_sh[i] = float(qh[i]);
+    tg_acc[i] = 0.0f;
+  }
+  if (lid == 0u) {
+    tg_max = -INFINITY;
+    tg_sum = 0.0f;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  for (uint kb = c0; kb < c1; kb += KEY_BLOCK) {
+    const uint nk = min((uint)KEY_BLOCK, c1 - kb);
+
+    for (uint j = simd_id; j < nk; j += n_simd) {
+      device const half* kt = k_cache + (ulong)(kb + j) * (ulong)kv_dim + kv_head * p.head_dim;
+      float d = 0.0f;
+      for (uint i = lane; i < p.head_dim; i += 32u) d += q_sh[i] * float(kt[i]);
+      d = simd_sum(d);
+      if (lane == 0u) sc_sh[j] = d * p.scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float bmax = -INFINITY;
+    for (uint j = 0u; j < nk; ++j) bmax = max(bmax, sc_sh[j]);
+
+    const float old_max = tg_max;
+    const float new_max = max(old_max, bmax);
+    const float rescale = (old_max == -INFINITY) ? 0.0f : exp(old_max - new_max);
+
+    for (uint j = lid; j < nk; j += nthr) w_sh[j] = exp(sc_sh[j] - new_max);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float bsum = 0.0f;
+    for (uint j = 0u; j < nk; ++j) bsum += w_sh[j];
+
+    for (uint i = lid; i < p.head_dim; i += nthr) {
+      float a = tg_acc[i] * rescale;
+      for (uint j = 0u; j < nk; ++j) {
+        device const half* vt = v_cache + (ulong)(kb + j) * (ulong)kv_dim + kv_head * p.head_dim;
+        a += w_sh[j] * float(vt[i]);
+      }
+      tg_acc[i] = a;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0u) {
+      tg_sum = tg_sum * rescale + bsum;
+      tg_max = new_max;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  // Unnormalized on purpose: 1/sum belongs to the merge, which is the only place the whole
+  // sum is known.
+  if (lid == 0u) {
+    part_m[slot] = tg_max;
+    part_l[slot] = tg_sum;
+  }
+  for (uint i = lid; i < p.head_dim; i += nthr) {
+    part_o[(ulong)slot * (ulong)p.head_dim + i] = tg_acc[i];
+  }
+}
+
+kernel void cpi_attention_decode_merge(
+    device const float* part_m  [[buffer(0)]],
+    device const float* part_l  [[buffer(1)]],
+    device const float* part_o  [[buffer(2)]],
+    device half*        out     [[buffer(3)]],
+    constant AttnSplitParams& p [[buffer(4)]],
+    uint gid  [[threadgroup_position_in_grid]],
+    uint lid  [[thread_position_in_threadgroup]],
+    uint nthr [[threads_per_threadgroup]]) {
+  const uint head = gid;
+  if (head >= p.heads) return;
+  const uint row = head * p.chunks;
+
+  // Every thread redoes this reduction rather than staging it through threadgroup memory and
+  // two more barriers. chunks is small (tens), so the arithmetic is cheaper than the barriers.
+  float m = -INFINITY;
+  for (uint c = 0u; c < p.chunks; ++c) m = max(m, part_m[row + c]);
+  if (m == -INFINITY) {  // no keys at all: nothing to normalize by
+    for (uint i = lid; i < p.head_dim; i += nthr) out[head * p.head_dim + i] = half(0.0f);
+    return;
+  }
+
+  float l = 0.0f;
+  for (uint c = 0u; c < p.chunks; ++c) {
+    if (part_m[row + c] == -INFINITY) continue;
+    l += part_l[row + c] * exp(part_m[row + c] - m);
+  }
+  const float inv = (l > 0.0f) ? (1.0f / l) : 0.0f;
+
+  for (uint i = lid; i < p.head_dim; i += nthr) {
+    float a = 0.0f;
+    for (uint c = 0u; c < p.chunks; ++c) {
+      if (part_m[row + c] == -INFINITY) continue;
+      a += part_o[(ulong)(row + c) * (ulong)p.head_dim + i] * exp(part_m[row + c] - m);
+    }
+    out[head * p.head_dim + i] = half(a * inv);
   }
 }
 

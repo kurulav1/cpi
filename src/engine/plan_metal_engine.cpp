@@ -58,6 +58,12 @@ struct AttnParams {
   // construction keeps the contiguous meaning.
   std::uint32_t paged = 0, block_size = 0;
 };
+// MUST match AttnSplitParams in cpi_kernels.metal, field for field.
+struct AttnSplitParams {
+  std::uint32_t heads, kv_heads, head_dim, position, use_position_buffer, window;
+  float scale;
+  std::uint32_t chunk_size, chunks;
+};
 struct MoeRouterParams {
   std::uint32_t experts, top_k, has_expert_scale;
 };
@@ -111,6 +117,13 @@ constexpr int kTG = 256;               // threads per group
 constexpr int kSimdsPerTG = kTG / 32;  // = rows per threadgroup in the GEMV
 // The blocked GEMMs tile 64 rows x 64 tokens: 4 simdgroups (128 threads), each owning a 32x32
 // output tile of 4x4 fragments.
+// The ceiling on a prefill chunk, and what its slots may cost. Past ~1-2k tokens a chunk is long
+// since large enough to fill the GPU, so the ceiling is where the returns have gone flat rather
+// than a hardware limit; the budget is what keeps a wide model's slots from quietly reaching
+// hundreds of MB. See open() for why chunk size matters at all.
+constexpr int kPrefillMaxTokens = 2048;
+constexpr std::size_t kPrefillSlotBudget = 256u * 1024u * 1024u;
+
 constexpr int kGemmBN = 64;    // MUST match GEMM_BN in the shader (fp16 tokens per tile)
 constexpr int kGemmFBM = 64;  // MUST match GEMM_FBM in the shader (fp16 rows per tile)
 // One simdgroup per 32x32 sub-tile of the FBM x BN output tile: at 64x64 that is 2 x 2 = 4
@@ -135,8 +148,24 @@ constexpr int kGemmQTG = 32 * (64 / 32) * (kGemmQBN / 32);
 // is wasted arithmetic. Above it the GEMV is a catastrophe -- see the dispatch below.
 constexpr int kGemmMinTokens = 16;
 constexpr int kGemmQBK = 32;  // MUST match GEMM_QBK in the shader (quantized)
-constexpr int kQBlock = 8;     // MUST match Q_BLOCK in cpi_kernels.metal
-constexpr int kKeyBlock = 32;  // MUST match KEY_BLOCK in cpi_kernels.metal
+constexpr int kQBlock = 8;      // MUST match Q_BLOCK in cpi_kernels.metal (scalar prefill)
+constexpr int kQMMBlock = 8;    // MUST match QMM_BLOCK in cpi_kernels.metal (matrix-unit prefill)
+constexpr int kKeyBlock = 32;   // MUST match KEY_BLOCK in cpi_kernels.metal
+
+// Split-KV decode attention. A decode's attention grid is one threadgroup per head -- 14 of
+// them for Qwen2.5-0.5B, on a GPU sized for hundreds -- so past a few hundred keys the cache
+// walk is a serial loop in an idle machine. Splitting the keys across threadgroups costs a
+// second pass to merge them, which is why it is not worth it on a short context: below this
+// many keys the single-threadgroup kernel already wins.
+constexpr int kAttnSplitMinKeys = 256;
+// Enough (head, chunk) threadgroups to fill the GPU, with a ceiling so the partial buffers stay
+// small and the merge's per-thread loop over chunks stays short. 512 is measured, not reasoned:
+// decode at 2048 keys reads 61.7 / 64.4 / 66.5 / 65.9 / 66.0 tok/s at a target of 128 / 256 /
+// 512 / 1024 / 2048, so it climbs well past "one threadgroup per core" and then flattens. Far
+// more threadgroups than the GPU has cores is the point -- each one is a short serial walk, and
+// oversubscribing is what hides its latency.
+constexpr int kAttnSplitTargetGroups = 512;
+constexpr int kAttnSplitMaxChunks = 64;
 constexpr int kArgmaxParts = 256;
 constexpr int kGemvTile = 8;  // MUST match GEMV_TILE in cpi_kernels.metal
 
@@ -158,8 +187,44 @@ const char* op_kind_name(int k) {
   }
 }
 
+// Every name CPI_METAL_ABLATE accepts. MUST stay in step with op_kind_name above -- a name that
+// drifts out of this list stops being ablatable, and one that never matched an op is the bug the
+// validation below exists to catch.
+constexpr const char* kAblatableKinds[] = {"RmsNorm",  "Gemv/Gemm",  "Rope",       "ScaleCopy",
+                                           "CopySlot", "KvStore",    "Attention",  "GeluMul",
+                                           "SiluMul",  "AddInplace", "Embedding",  "LmHead"};
+
 std::size_t groups_for_rows(std::size_t rows) {
   return (rows + kSimdsPerTG - 1) / kSimdsPerTG;
+}
+
+// Cuts `n` tokens into chunks of at most `max_chunk`, each a whole number of `tile` rows.
+//
+// The obvious loop -- take max_chunk until the tokens run out -- leaves the remainder as the
+// final chunk, and a small chunk is far more expensive than its token count suggests. A GEMM's
+// cost follows its tile count and how much of the GPU its grid fills, and a narrow chunk fills
+// almost none of it: on an M4 a 28-token chunk of Qwen2.5-0.5B runs its projections at 0.69
+// TFLOP/s where a 512-token chunk reaches 2.96. Greedy chunking therefore spends 19% of a
+// 540-token prefill on the 5% of tokens that spill past the slot, and crossing 512 by two
+// tokens costs 19 ms.
+//
+// Splitting evenly keeps every chunk wide enough to fill the GPU, and rounding the split up to
+// a tile means no chunk wastes rows within one. Chunk boundaries carry absolute positions and
+// the GEMM reduces over in_dim (which no split touches), so this changes speed only -- the
+// token stream is unchanged, which is what the goldens check.
+std::vector<int> chunk_sizes(int n, int max_chunk, int tile) {
+  std::vector<int> out;
+  if (n <= 0) return out;
+  if (n <= max_chunk) {
+    out.push_back(n);
+    return out;
+  }
+  const int chunks = (n + max_chunk - 1) / max_chunk;  // the fewest that fit
+  int base = (n + chunks - 1) / chunks;                // an even split...
+  base = ((base + tile - 1) / tile) * tile;            // ...rounded up to whole tiles
+  base = std::min(base, max_chunk);
+  for (int off = 0; off < n; off += base) out.push_back(std::min(base, n - off));
+  return out;
 }
 
 }  // namespace
@@ -368,26 +433,8 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
   weights_.open(weights_path);
   cfg_ = weights_.config();
   max_context_ = max_context;
-  // Slots must hold a whole prefill chunk. 512 tokens of the widest slot (the MLP
-  // intermediate) is only a few MB, and unified memory means it costs nothing to move.
-  max_prefill_ = std::min(512, max_context);
+  // max_prefill_ is set once the slot widths are known -- see below, it is priced off them.
 
-  if (cfg_.is_moe()) {
-    // MoE runs here now. The router's selection crosses ops in DEVICE buffers, so a token
-    // never round-trips to the host mid-layer.
-    //
-    // SIZED [max_prefill][top_k], NOT [top_k]. The router, the expert FFN and the accumulate
-    // are separate OPS, so execute_ops runs the router's whole token loop before the expert
-    // loop starts. One shared slot would therefore hold the LAST token's experts by the time
-    // the FFN reads it, and every token in the chunk would run the last token's experts. That
-    // produces confident wrong tokens rather than a crash, and it is exactly what the
-    // tiny-mixtral golden caught: a T=1 forward was exact (max_abs_diff 0.0005) while the
-    // T=12 prefill diverged.
-    const int topk = std::max(1, cfg_.num_experts_per_tok);
-    const std::size_t sel = static_cast<std::size_t>(topk) * static_cast<std::size_t>(max_prefill_);
-    moe_idx_buf_ = ctx_.alloc(sel * sizeof(std::int32_t));
-    moe_w_buf_ = ctx_.alloc(sel * sizeof(float));
-  }
   if (cfg_.use_layernorm) {
     throw std::runtime_error("PlanMetalEngine: true LayerNorm (mean+variance) is not implemented");
   }
@@ -471,6 +518,42 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
         return static_cast<std::size_t>(H);
     }
   };
+  // How many tokens a prefill chunk may hold. This is the single biggest lever on prefill
+  // speed, because a GEMM's efficiency climbs with its token count: on an M4 this model's
+  // projections run at 0.69 TFLOP/s over 28 tokens and 2.96 over 512, so a chunk that spills a
+  // short remainder pays for it twice over. Bigger is simply better -- one 635-token chunk beats
+  // 512+123 by 10% -- and the only thing stopping us is the slots, which is why the budget is
+  // what gets bounded here and not some round token count. (512 used to be that round number,
+  // picked for being "a few MB".)
+  //
+  // Slots cost max_prefill * (every slot's width summed) * 2 bytes: ~37 KB per token for a 0.5B,
+  // ~123 KB for an 8B, so the cap only binds on the big models -- which is the point, since
+  // those are the ones that would otherwise quietly take hundreds of MB.
+  std::size_t slot_bytes_per_token = 0;
+  for (int i = 0; i < static_cast<int>(opplan::Slot::Count); ++i) {
+    slot_bytes_per_token += slot_elems(static_cast<opplan::Slot>(i)) * sizeof(std::uint16_t);
+  }
+  const int budget_tokens =
+      static_cast<int>(std::max<std::size_t>(1, kPrefillSlotBudget / slot_bytes_per_token));
+  max_prefill_ = std::max(1, std::min({kPrefillMaxTokens, max_context, budget_tokens}));
+
+  if (cfg_.is_moe()) {
+    // The router's selection crosses ops in DEVICE buffers, so a token never round-trips to the
+    // host mid-layer.
+    //
+    // SIZED [max_prefill][top_k], NOT [top_k]. The router, the expert FFN and the accumulate
+    // are separate OPS, so execute_ops runs the router's whole token loop before the expert
+    // loop starts. One shared slot would therefore hold the LAST token's experts by the time
+    // the FFN reads it, and every token in the chunk would run the last token's experts. That
+    // produces confident wrong tokens rather than a crash, and it is exactly what the
+    // tiny-mixtral golden caught: a T=1 forward was exact (max_abs_diff 0.0005) while the
+    // T=12 prefill diverged.
+    const int topk = std::max(1, cfg_.num_experts_per_tok);
+    const std::size_t sel = static_cast<std::size_t>(topk) * static_cast<std::size_t>(max_prefill_);
+    moe_idx_buf_ = ctx_.alloc(sel * sizeof(std::int32_t));
+    moe_w_buf_ = ctx_.alloc(sel * sizeof(float));
+  }
+
   slots_.resize(static_cast<int>(opplan::Slot::Count));
   for (int i = 0; i < static_cast<int>(opplan::Slot::Count); ++i) {
     slots_[i] = ctx_.alloc(slot_elems(static_cast<opplan::Slot>(i)) *
@@ -495,6 +578,15 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
 
   tok_buf_ = ctx_.alloc(sizeof(std::int32_t));
   seq_tok_buf_ = ctx_.alloc(static_cast<std::size_t>(max_prefill_) * sizeof(std::int32_t));
+
+  // Split-KV decode scratch, sized for the worst case (every head, every chunk) so the decode
+  // path never allocates. Small enough not to argue about: ~114 KB for a 0.5B, ~512 KB for an 8B.
+  const std::size_t split_slots =
+      static_cast<std::size_t>(cfg_.num_heads) * static_cast<std::size_t>(kAttnSplitMaxChunks);
+  attn_part_m_ = ctx_.alloc(split_slots * sizeof(float));
+  attn_part_l_ = ctx_.alloc(split_slots * sizeof(float));
+  attn_part_o_ =
+      ctx_.alloc(split_slots * static_cast<std::size_t>(head_dim) * sizeof(float));
   pos_buf_ = ctx_.alloc(sizeof(std::int32_t));
   logits_buf_ = ctx_.alloc(static_cast<std::size_t>(cfg_.vocab_size) * sizeof(float));
   argmax_val_ = ctx_.alloc(kArgmaxParts * sizeof(float));
@@ -526,6 +618,25 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
         if (*c == 0) break;
       } else {
         cur.push_back(*c);
+      }
+    }
+    // A name matching no op ablates NOTHING while still printing ABLATION ACTIVE below, which is
+    // far worse than not ablating: the run looks like the experiment you asked for and is the
+    // experiment you did not. "Attn" for "Attention" is how a prefill got profiled with all of
+    // its attention still in it, and the conclusions drawn off that trace were wrong for a week.
+    // So refuse to run rather than quietly measure the wrong thing.
+    for (const std::string& n : out) {
+      bool known = false;
+      for (const char* k : kAblatableKinds) {
+        if (n == k) {
+          known = true;
+          break;
+        }
+      }
+      if (!known) {
+        std::string msg = "CPI_METAL_ABLATE: '" + n + "' is not an op kind. Valid:";
+        for (const char* k : kAblatableKinds) msg += std::string(" ") + k;
+        throw std::runtime_error(msg);
       }
     }
     std::fprintf(stderr, "[metal] ABLATION ACTIVE -- output is deliberately WRONG (%s)\n", e);
@@ -945,9 +1056,12 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
         // them. Decode is a single query and has nothing to block over -- it keeps the
         // per-token kernel.
         if (T >= kQBlock) {
-          const std::size_t blocks = static_cast<std::size_t>((T + kQBlock - 1) / kQBlock);
-          // head_dim <= 128 runs the matrix-unit kernel; Gemma's 256 keeps the scalar one.
+          // head_dim <= 128 runs the matrix-unit kernel; Gemma's 256 keeps the scalar one. The
+          // two block over queries differently, so each derives its own grid -- sharing one
+          // `blocks` here would hand a kernel the other's tiling and quietly drop or double-run
+          // queries.
           if (op.head_dim <= 128) {
+            const std::size_t blocks = static_cast<std::size_t>((T + kQMMBlock - 1) / kQMMBlock);
             // p.paged stays 0, so block_tables is never read -- but the binding must exist,
             // because dispatch() puts the params block at index n_buffers.
             const void* mmbufs[] = {slot(op.in), k_cache_[static_cast<std::size_t>(layer)].handle(),
@@ -958,10 +1072,43 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
                           static_cast<std::size_t>(op.heads) * blocks, kTG, mmbufs, nullptr, 6, &p,
                           sizeof(p));
           } else {
+            const std::size_t blocks = static_cast<std::size_t>((T + kQBlock - 1) / kQBlock);
             ctx_.dispatch("cpi_attention_prefill", G::Groups,
                           static_cast<std::size_t>(op.heads) * blocks, kTG, bufs, nullptr, 5, &p,
                           sizeof(p));
           }
+        } else if (T == 1 && attn_split_chunks(op, position) > 1) {
+          // Split-KV: one threadgroup per (head, chunk), then a merge. See the kernels.
+          const int window = op.full_attention ? 0 : op.sliding_window;
+          const int seq = position + 1;
+          const int start = (window > 0 && seq > window) ? seq - window : 0;
+          const int chunks = attn_split_chunks(op, position);
+          const int chunk_size = ((seq - start) + chunks - 1) / chunks;
+
+          AttnSplitParams sp{static_cast<std::uint32_t>(op.heads),
+                             static_cast<std::uint32_t>(op.kv_heads),
+                             static_cast<std::uint32_t>(op.head_dim),
+                             static_cast<std::uint32_t>(position),
+                             1,
+                             static_cast<std::uint32_t>(window),
+                             op.scale,
+                             static_cast<std::uint32_t>(chunk_size),
+                             static_cast<std::uint32_t>(chunks)};
+          const void* sbufs[] = {slot(op.in),
+                                 k_cache_[static_cast<std::size_t>(layer)].handle(),
+                                 v_cache_[static_cast<std::size_t>(layer)].handle(),
+                                 attn_part_m_.handle(),
+                                 attn_part_l_.handle(),
+                                 attn_part_o_.handle(),
+                                 pos_buf_.handle()};
+          ctx_.dispatch("cpi_attention_decode_split", G::Groups,
+                        static_cast<std::size_t>(op.heads) * static_cast<std::size_t>(chunks), kTG,
+                        sbufs, nullptr, 7, &sp, sizeof(sp));
+          const void* mbufs[] = {attn_part_m_.handle(), attn_part_l_.handle(),
+                                 attn_part_o_.handle(), slot(op.out)};
+          ctx_.dispatch("cpi_attention_decode_merge", G::Groups,
+                        static_cast<std::size_t>(op.heads), kTG, mbufs, nullptr, 4, &sp,
+                        sizeof(sp));
         } else {
           ctx_.dispatch("cpi_attention_decode", G::Groups,
                         static_cast<std::size_t>(op.heads) * static_cast<std::size_t>(T), kTG,
@@ -1253,6 +1400,38 @@ void PlanMetalEngine::encode_forward(int token, int position) {
 // one pass over the weights serves T tokens instead of one, so a 12-token prompt reads
 // the model once rather than twelve times. On a bandwidth-bound machine that is the
 // whole game.
+int PlanMetalEngine::attn_split_chunks(const opplan::Op& op, int position) const {
+  // CPI_METAL_ATTN_SPLIT_MIN overrides the key count at which splitting starts, and it exists
+  // to make the split path TESTABLE rather than to tune it. The split is a pure optimization --
+  // it must produce the same tokens as the single-threadgroup kernel -- but every golden is
+  // short enough that no decode ever reaches the default threshold, so a green gate would say
+  // nothing about these kernels. Setting it to 1 forces the split on at any depth, which points
+  // the existing goldens straight at pass 1 and the merge; tools/metal_verify.sh does exactly
+  // that. Setting it very high turns the split off, for bisecting a suspected merge bug.
+  static const int min_keys = [] {
+    const char* e = std::getenv("CPI_METAL_ATTN_SPLIT_MIN");
+    if (e == nullptr) return kAttnSplitMinKeys;
+    const int v = std::atoi(e);
+    return v > 0 ? v : kAttnSplitMinKeys;
+  }();
+  if (position < 0 || op.heads <= 0) return 1;
+  const int window = op.full_attention ? 0 : op.sliding_window;
+  const int seq = position + 1;
+  const int start = (window > 0 && seq > window) ? seq - window : 0;
+  const int nkeys = seq - start;
+  if (nkeys < min_keys) return 1;  // the merge pass would cost more than it saves
+  int chunks = (kAttnSplitTargetGroups + op.heads - 1) / op.heads;
+  // Never cut finer than a key block (the chunk would not fill its threadgroup either).
+  chunks = std::min(chunks, (nkeys + kKeyBlock - 1) / kKeyBlock);
+  chunks = std::min(chunks, kAttnSplitMaxChunks);
+  return std::max(1, chunks);
+}
+
+std::vector<int> PlanMetalEngine::prefill_chunks(int n) const {
+  // The quantized GEMM tiles 128 tokens where the fp16 one tiles 64.
+  return chunk_sizes(n, max_prefill_, quant_bits_ != 0 ? kGemmQBN : kGemmBN);
+}
+
 void PlanMetalEngine::encode_prefill(const std::vector<int>& tokens, int start_position) {
   const int T = static_cast<int>(tokens.size());
   if (T <= 0) return;
@@ -1291,10 +1470,11 @@ public:
     // size; each chunk lands at its own absolute position, so a chunk boundary is not a
     // sequence boundary. prefill_paged commits and waits, which is the contract.
     const int n = static_cast<int>(prompt_tokens.size());
-    for (int off = shared_tokens; off < n; off += e_->max_prefill_) {
-      const int chunk = std::min(e_->max_prefill_, n - off);
+    int off = shared_tokens;
+    for (const int chunk : e_->prefill_chunks(n - shared_tokens)) {
       const std::vector<int> ids(prompt_tokens.begin() + off, prompt_tokens.begin() + off + chunk);
       e_->prefill_paged(ids, off, block_table);
+      off += chunk;
     }
   }
 
@@ -1501,9 +1681,8 @@ std::vector<int> PlanMetalEngine::generate(const std::vector<int>& prompt, int m
 
   const int n_pre = static_cast<int>(prompt.size()) - 1;
   const auto pre0 = std::chrono::steady_clock::now();
-  for (int off = 0; off < n_pre; off += max_prefill_) {
-    const int chunk = std::min(max_prefill_, n_pre - off);
-    const std::vector<int> ids(prompt.begin() + off, prompt.begin() + off + chunk);
+  for (const int chunk : prefill_chunks(n_pre)) {
+    const std::vector<int> ids(prompt.begin() + pos, prompt.begin() + pos + chunk);
     encode_prefill(ids, pos);
     ctx_.commit_and_wait();
     pos += chunk;
@@ -1562,11 +1741,12 @@ std::vector<int> PlanMetalEngine::generate_stream(const std::vector<int>& prompt
   }
 
   const auto pre0 = std::chrono::steady_clock::now();
-  for (int off = shared; off < n_pre; off += max_prefill_) {
-    const int chunk = std::min(max_prefill_, n_pre - off);
+  int off = shared;
+  for (const int chunk : prefill_chunks(n_pre - shared)) {
     const std::vector<int> ids(prompt.begin() + off, prompt.begin() + off + chunk);
     encode_prefill(ids, off);  // start position == off, so reused-prefix positions line up
     ctx_.commit_and_wait();
+    off += chunk;
   }
   prefill_ms_ =
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pre0).count();
@@ -1620,9 +1800,8 @@ std::vector<std::pair<int, float>> PlanMetalEngine::inspect_next_logits(
   if (prompt.empty()) throw std::runtime_error("empty prompt");
   int pos = 0;
   const int n_pre = static_cast<int>(prompt.size()) - 1;
-  for (int off = 0; off < n_pre; off += max_prefill_) {
-    const int chunk = std::min(max_prefill_, n_pre - off);
-    const std::vector<int> ids(prompt.begin() + off, prompt.begin() + off + chunk);
+  for (const int chunk : prefill_chunks(n_pre)) {
+    const std::vector<int> ids(prompt.begin() + pos, prompt.begin() + pos + chunk);
     encode_prefill(ids, pos);
     ctx_.commit_and_wait();
     pos += chunk;
@@ -1650,9 +1829,8 @@ std::vector<int> PlanMetalEngine::generate_greedy(const std::vector<int>& prompt
   // The last prompt token is left for the decode loop, which needs its logits anyway.
   const int n_pre = static_cast<int>(prompt.size()) - 1;
   const auto pre0 = std::chrono::steady_clock::now();
-  for (int off = 0; off < n_pre; off += max_prefill_) {
-    const int chunk = std::min(max_prefill_, n_pre - off);
-    const std::vector<int> ids(prompt.begin() + off, prompt.begin() + off + chunk);
+  for (const int chunk : prefill_chunks(n_pre)) {
+    const std::vector<int> ids(prompt.begin() + pos, prompt.begin() + pos + chunk);
     encode_prefill(ids, pos);
     ctx_.commit_and_wait();
     pos += chunk;
