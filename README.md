@@ -273,13 +273,16 @@ To make that check automatic you need an Apple Silicon runner —
 
 **Measured** (Apple M4, 10-core GPU, 16 GB):
 
-| Model | | GPU weights | decode | prefill |
-| --- | --- | --- | --- | --- |
-| Qwen2.5-0.5B | fp16 | 1.17 GB | 86.5 tok/s | 2700 tok/s |
-| Qwen2.5-0.5B | int4 | 0.51 GB | 146.7 tok/s | 2510 tok/s |
-| **Llama-3.1-8B** | **int4** | **4.91 GB** | **20.5 tok/s** | **161 tok/s** |
+| Model | | GPU weights | decode @64 | decode @256 | prefill |
+| --- | --- | --- | --- | --- | --- |
+| Qwen2.5-0.5B | fp16 | 1.17 GB | 88.2 tok/s | 82.4 tok/s | 2999 tok/s |
+| Qwen2.5-0.5B | int4 | 0.51 GB | 178.3 tok/s | 156.0 tok/s | 2800 tok/s |
+| **Llama-3.1-8B** | **int4** | **4.91 GB** | **20.5 tok/s** | — | **161 tok/s** |
 
-Prefill is a ~540-token prompt; decode is from a short one (it falls with KV length — see below).
+Prefill is a ~540-token prompt; decode is `--max-new N` from a short one. Decode is quoted at two
+lengths on purpose: it falls as the KV cache grows, so a single figure only means something next to
+the token count that produced it (below, that omission cost us a whole bogus comparison). The 8B row
+is carried from an earlier machine and was not re-measured here.
 
 > **The fp16 prefill figure used to read 3730 tok/s, and that number was an artifact.** It is
 > worth keeping the story attached to the table it corrupted.
@@ -371,17 +374,97 @@ llama.cpp was **built on the box with Metal** and a Qwen2.5-0.5B GGUF (same chec
 `.ll2c`, quantized to Q4_0 with `llama-quantize`), for a same-weights head-to-head. The 0.5B gap
 is *wider* than the 8B's, and the honest table is worth keeping:
 
+Both sides run the same protocol per row -- **the same token count on both**, which sounds too
+obvious to state and is exactly what went wrong twice below: `llama-bench -p N -n 0` / `-p 0 -n N`
+against CPI's `metal_infer` with an N-token prompt / `--max-new N`.
+
 | | llama.cpp | CPI | CPI / llama.cpp |
 | --- | --- | --- | --- |
-| fp16 prefill (~540) | 4163 | 2700 | 65% |
-| int4 prefill (~540) | 4066 | 2510 | 62% |
-| int4 decode (short ctx) | 198 | 176 | 89% |
+| fp16 prefill, 541 tok | 3943 | 2999 | 76% |
+| fp16 prefill, 640 tok | 4063 | 3128 | 77% |
+| fp16 prefill, 1024 tok | 4045 | 3057 | 76% |
+| int4 prefill, 541 tok | 3883 | 2800 | 72% |
+| int4 prefill, 640 tok | 3959 | 3055 | 77% |
+| int4 prefill, 1024 tok | 3921 | 2985 | 76% |
+| fp16 decode @ depth 16 | 96.0 | 89.2 | 93% |
+| fp16 decode @ depth 512 | 95.5 | 80.8 | 85% |
+| fp16 decode @ depth 2048 | 89.3 | 67.3 | 75% |
 
-The fp16 prefill row read 3730 / 90% until the GEMM bug above was found; the corrected figure is
-2700 / 65%. That correction is what makes the table coherent: **both prefill paths sit at ~63%**,
-where the story used to be "fp16 is nearly there and int4 is mysteriously behind." There is one
-prefill gap, not an int4-specific one — which also means the long, fruitless hunt for int4's
-missing speed was chasing a difference that was never real.
+> **The int4 decode row used to read 198 / 176 / 89%, and the 89% was not real.** Both numbers were
+> honestly measured and the comparison between them still wasn't: CPI's 176 came from a 64-token
+> decode, llama.cpp's 198 from `llama-bench`'s 256-token one. A decode's speed falls as the KV
+> cache grows, so that row raced our short run against their long one. Matched, it is 81% at 64
+> tokens and 72% at 256. Nothing regressed -- re-measuring at 64 still reproduces 87.3 / 179.5
+> against the old 86.5 / 176. The lesson is that two correct measurements do not make a correct
+> ratio, and a table has to state the protocol or it will eventually compare different ones.
+
+Splitting decode by length is what exposed the second gap, and it turned out to be a bug rather
+than a gap. Decode against context depth, fp16, 32 tokens generated at each:
+
+| depth | llama.cpp | CPI before | CPI now |
+| --- | --- | --- | --- |
+| ~16 | 96.0 | 88.4 | 89.2 |
+| 256 | 96.1 | 74.6 | 85.5 |
+| 512 | 95.5 | 63.6 | 80.8 |
+| 1024 | 94.6 | 49.2 | 76.1 |
+| 2048 | 89.3 | 34.0 | **67.3 (+98%)** |
+
+**Decode used to collapse 2.6x over 2048 tokens where llama.cpp stayed flat**, and the giveaway was
+that it could not possibly be bandwidth: at 2048 keys the KV cache is ~25 MB against 1.17 GB of
+weights, so 2% of the traffic was somehow costing 160% of the time. It was parallelism.
+`cpi_attention_decode` gives one threadgroup to each (token, head), which for a PREFILL is
+thousands of them -- but decode has one token, so the grid was `heads`: **14 threadgroups on a
+10-core GPU**, each serially walking the whole cache. Splitting the keys across threadgroups and
+merging the partial softmaxes (log-sum-exp, so the merge is exact and the tokens are unchanged)
+doubles decode at depth. The right split is measured, not reasoned: it keeps improving to ~512
+threadgroups, far past one-per-core, because oversubscription is what hides each one's latency.
+
+This is the same bug CUDA had and fixed (a31758c) -- a decode path that quietly degrades to one
+block per head. Worth knowing it is a *class* of bug, not an incident.
+
+> **The prefill rows read 63% until the token counts were matched, and that 63% was the same
+> mistake as the decode row above.** CPI's figure came from a 541-token prompt; llama.cpp's came
+> from `pp512`. Prefill is chunked at a slot's width, so 541 tokens is a full chunk *plus a stub* --
+> the worst case -- while 512 is one clean chunk, the best. llama.cpp pays this too (`pp541` is
+> 3943 against `pp512`'s 4159, -5.2%), so the honest comparison was never ours-at-worst against
+> theirs-at-best. Matched at every length it is a flat ~76%, and the four points above agree to
+> within 1% -- which is itself the tell that the earlier number was an artifact of one prompt.
+
+Chasing that artifact is what found the real bug. A GEMM's efficiency climbs with its token count
+(0.69 TFLOP/s over 28 tokens, 2.96 over 512), so the stub chunk that greedy chunking leaves behind
+is disproportionately expensive: **crossing 512 tokens by two cost 19 ms**, and a 540-token prefill
+spent 19% of itself on the 5% of tokens that spilled. The slot width was 512 because that was "a
+few MB", not because of anything about the hardware. Pricing it off a memory budget instead lets a
+1-2k prompt prefill in one chunk. Back-to-back against the pre-change binary, a 541-token prefill
+goes **199 ms → 180 ms (+10%)** and a 640-token one **223 → 203 (+10%)**; run-to-run spread is a
+couple of percent, so quote the A/B and not the best pair. Chunk
+boundaries are invisible to the arithmetic -- the GEMM reduces over `in_dim`, which no split
+touches -- so the token stream is bit-identical, which is what the goldens and a before/after diff
+at 541 tokens both confirm.
+
+**None of the goldens could have caught a chunking bug**: every one of them is under 128 tokens, so
+they never split at all. The gate went green on a change it did not execute, and the diff against
+the pre-change binary is what actually tested it.
+
+The split-KV decode above had the identical problem -- it waits for 256 keys and no golden reaches
+that depth -- which is why `CPI_METAL_ATTN_SPLIT_MIN` exists: setting it to 1 splits at any depth,
+so the existing CUDA-referenced goldens run straight through the new kernels. `metal_verify.sh`
+re-runs two of them that way, and a mutation (deleting the merge's `exp(m_c - m)` rescale) confirms
+the check fails when it should.
+
+> **That mutation also caught the gate lying.** `metal_decode_test` allowed a "tie": if the Metal
+> and CUDA streams first diverge where the top-2 logits are within 0.05, that is genuinely
+> explainable, because fp32 summation order differs between backends and a near-equal choice can
+> fall either way. But it set the whole verdict from that one token and stopped looking. The broken
+> merge forked at a tie, collapsed into repeated EOS for the next hundred tokens, agreed with the
+> CPU engine on **21 of 128** -- and the gate printed PASS. It printed that 21/128 too, and did not
+> gate on it.
+>
+> A tie explains the *fork*, not what follows: after it the two are different sequences and
+> comparing them to the golden is meaningless. The check now teacher-forces the golden prefix and
+> judges every position on its own, so a tie excuses only the token it occurs at. All 10 checks
+> still pass under the stricter rule -- nothing was hiding behind it -- but that was luck, and the
+> old rule would have passed an arbitrarily broken engine whose first fork happened to be close.
 
 A counter (`MetalContext::gpu_busy_ms()`, GPU wall-clock via command-buffer timestamps) settled
 the first question: prefill is **97% GPU-busy**, so the gap is kernel efficiency, not dispatch
@@ -442,22 +525,58 @@ to the 8B:
   64-over-4; the tile is back to 64 and the latency-hiding premise has no evidence behind it. The
   ~53%-of-peak question is **reopened and still unexplained.**
 
-- **The prefill gap is a 1.5x between our own kernels and our own pass, and it is unexplained.**
-  The GEMM bench's per-shape times sum to ~137 ms of GEMM for a 541-token prefill. The pass
-  spends ~190 ms. Same kernels, same shapes. At 137 ms prefill would be ~3950 tok/s against
-  llama.cpp's 4163 — so that 1.5x *is* the whole remaining gap, and it is not in the kernel.
+- **The prefill gap is a ~1.3x between our own kernels and our own pass, and it is unexplained.**
+  The GEMM bench's per-shape times sum to ~153 ms of GEMM for a 541-token prefill. The pass
+  spends ~190 ms. Same kernels, same shapes.
+
+  This entry read *1.5x* and *137 ms* for a while, and the 137 was measuring a shape the engine
+  cannot run: the bench defaults to one T=541 dispatch, where a 541-token prefill was really
+  512+28 against a 512-wide slot. Benching the chunks the pass actually issues (T=512 at 2.96
+  TFLOP/s **plus T=28 at 0.69**) predicts 153 ms, and the stub's cost is what led to the chunking
+  fix above. A benchmark has to run the shape the program runs, or it measures a program that
+  does not exist.
 
   Eliminated by measurement, not argument: cache residency (rotating 24 distinct weight
   matrices: 2.85 TFLOP/s, flat), shape mix (all 7 real projections: 2.83; k/v are half-rate at
-  1.38 but far too small to matter), prefill chunking (a 481-token prompt in one chunk: 2692
-  tok/s vs 2698 for a chunked 541), non-GEMM ops (~3.5% by ablation), GPU clock (Maximum
-  throughout the timed loops), fp16 accumulators (4.4x slower — the F16 pipe is emulated), and
-  serial dispatch (a concurrent encoder bought ~3%).
+  1.38 but far too small to matter), GPU clock (Maximum throughout the timed loops), fp16
+  accumulators (4.4x slower — the F16 pipe is emulated), and serial dispatch (a concurrent
+  encoder bought ~3%).
 
   Xcode's counters on a real prefill say **nothing is saturated**: F32 limiter 39.95%, ALU
   utilization 24.59%, occupancy target 100%, MMU 4%, LLC 6%, launch 8%. Threads are resident
   and waiting. On the *bench* the same kernel reads F32 90.86% — which is why a limiter read
   off a bench cannot be quoted as the kernel's.
+
+  > **Two entries were struck from that list because the experiments behind them never ran.**
+  > `CPI_METAL_ABLATE` took a comma-separated list of op-kind names and silently ignored any name
+  > that matched no op -- while still announcing `ABLATION ACTIVE`. The op is called `Attention`;
+  > the runs said `Attn`. So "non-GEMM ops cost ~3.5%" was measured with attention still running,
+  > and the "GEMM-only" `.gputrace` whose counters retired the dilution theory was never GEMM-only
+  > -- it contained every attention dispatch. Both conclusions are withdrawn. The switch now
+  > refuses to start on a name it does not know and prints the valid ones, because a profiling aid
+  > that quietly measures something other than what was asked is worse than not having one: it
+  > produces confident numbers, and confident numbers get written down. (Ablating `Attention` for
+  > real is what then found the decode collapse above, worth 2x.)
+  >
+  > The prefill-chunking entry is struck too, for a different reason: it was true and became
+  > obsolete. A 481-token prompt was one chunk against a 512-wide slot, so "one chunk vs chunked"
+  > compared 481-in-one against 541-as-512+28 and read the tail's cost as noise.
+
+- **Prefill attention costs 30 ms of a 193 ms prefill (15.5%) and runs at 0.42 TFLOP/s — a
+  SEVENTH of our own GEMM's 2.86.** It is the largest identified lever left, and the mechanism is
+  known: `cpi_attention_prefill_mm` blocks 8 queries per threadgroup, so each head re-reads the
+  whole K/V cache once per 8 queries — 68 passes at T=541. Widening the block to 16 measured
+  **193 → 177 ms with attention's share falling 30 → 12 ms**, and produced WRONG TOKENS: the
+  fragment plan computes exactly one `simdgroup_float8x8` of scores from row 0, so the second half
+  of a 16-query block is never written. That is the fp16 GEMM's bug precisely -- a tile widened
+  past the threads that serve it -- which is worth noticing as a pattern rather than an incident.
+  The win needs the scoring and softmax to loop over QMM_BLOCK/8 query fragments. `QMM_BLOCK`
+  exists (separate from the scalar kernel's `Q_BLOCK`, which is stuck at 8 by Gemma's head_dim 256)
+  and is set to 8 until that lands.
+
+  The same redundancy is the whole decode gap: ablating `Attention` at depth 2048 gives 66.9 →
+  **92.5 tok/s**, so attention is 4.16 ms of a 14.9 ms token where llama.cpp spends ~0.8 ms, and
+  decode without it is flat in context. **One fix, both gaps.**
 
 The lesson generalizes past this kernel: **an optimization validated only by the metric it
 improves is not validated at all.** Every lever in this section was accepted or rejected on
