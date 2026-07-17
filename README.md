@@ -442,6 +442,23 @@ to the 8B:
   64-over-4; the tile is back to 64 and the latency-hiding premise has no evidence behind it. The
   ~53%-of-peak question is **reopened and still unexplained.**
 
+- **The prefill gap is a 1.5x between our own kernels and our own pass, and it is unexplained.**
+  The GEMM bench's per-shape times sum to ~137 ms of GEMM for a 541-token prefill. The pass
+  spends ~190 ms. Same kernels, same shapes. At 137 ms prefill would be ~3950 tok/s against
+  llama.cpp's 4163 — so that 1.5x *is* the whole remaining gap, and it is not in the kernel.
+
+  Eliminated by measurement, not argument: cache residency (rotating 24 distinct weight
+  matrices: 2.85 TFLOP/s, flat), shape mix (all 7 real projections: 2.83; k/v are half-rate at
+  1.38 but far too small to matter), prefill chunking (a 481-token prompt in one chunk: 2692
+  tok/s vs 2698 for a chunked 541), non-GEMM ops (~3.5% by ablation), GPU clock (Maximum
+  throughout the timed loops), fp16 accumulators (4.4x slower — the F16 pipe is emulated), and
+  serial dispatch (a concurrent encoder bought ~3%).
+
+  Xcode's counters on a real prefill say **nothing is saturated**: F32 limiter 39.95%, ALU
+  utilization 24.59%, occupancy target 100%, MMU 4%, LLC 6%, launch 8%. Threads are resident
+  and waiting. On the *bench* the same kernel reads F32 90.86% — which is why a limiter read
+  off a bench cannot be quoted as the kernel's.
+
 The lesson generalizes past this kernel: **an optimization validated only by the metric it
 improves is not validated at all.** Every lever in this section was accepted or rejected on
 wall-clock alone, which cannot distinguish "faster" from "doing less." The GEMM now has a CPU
