@@ -136,24 +136,24 @@ kernel void cpi_attention_prefill_mm(device const half* q [[buffer(0)]],
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Scale + causal/window mask, in place.
-    for (uint c = lid; c < nq * nk; c += nthr) {
-      const uint qi = c / nk, j = c % nk;
-      const uint key = kb + j;
-      const uint pos_i = base + t0 + qi;
-      uint start_i = 0u;
-      if (p.window != 0u && pos_i + 1u > p.window) start_i = pos_i + 1u - p.window;
-      const bool keep = (key <= pos_i && key >= start_i);
-      sc_sh[qi * KEY_BLOCK + j] = keep ? sc_sh[qi * KEY_BLOCK + j] * p.scale : -INFINITY;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
     // Online softmax, a simdgroup per query; lane j owns key j (KEY_BLOCK == 32 == simd width).
     // LOOPS over queries rather than taking qi = simd_id: a block wider than n_simd would
     // otherwise leave its tail queries with no simdgroup, and they would silently keep the
     // -INFINITY max and zero sum they were initialised with.
+    //
+    // The scale and the causal/window mask are FOLDED IN here rather than run as a separate pass
+    // over sc_sh. That pass needed its own full sweep of the block and its own barrier; here the
+    // softmax already holds the query (qi) and the key (lane), so the same masked-and-scaled score
+    // feeds the reduction directly -- one fewer barrier and one fewer scalar sweep per key block,
+    // which matters because attention's key blocks are small (32) and the non-matrix phases
+    // between the two matmuls are what this kernel spends its time on.
     for (uint qi = simd_id; qi < nq; qi += n_simd) {
-      const float sc = (lane < nk) ? sc_sh[qi * KEY_BLOCK + lane] : -INFINITY;
+      const uint key = kb + lane;
+      const uint pos_i = base + t0 + qi;
+      uint start_i = 0u;
+      if (p.window != 0u && pos_i + 1u > p.window) start_i = pos_i + 1u - p.window;
+      const bool keep = (lane < nk) && (key <= pos_i) && (key >= start_i);
+      const float sc = keep ? sc_sh[qi * KEY_BLOCK + lane] * p.scale : -INFINITY;
       const float bmax = simd_max(sc);
       const float old_max = m_sh[qi];
       const float new_max = max(old_max, bmax);
