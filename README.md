@@ -548,11 +548,22 @@ to the 8B:
   > idles during fill" reading was true and the inference from it was wrong: at high occupancy an
   > idle in one threadgroup is not an idle in the machine. Reverted.
   >
-  > So the fill/compute-overlap lever is spent, and with it the last cheap prefill idea. What is
-  > left is a genuine formulation gap -- llama.cpp's `mul_mm` sustains more on the same F32 hardware
-  > -- plus dispatch-boundary overhead that fusing gate+up and q+k+v would trim by a few percent.
-  > Neither is a today-sized win, and the ~15% F32 headroom is now understood to be occupancy-hidden
-  > rather than recoverable by scheduling. The prefill number stands at ~76%.
+  > So the fill/compute-overlap lever is spent, and so is fusion. Fusing gate+up and q+k+v was the
+  > last standing prefill idea -- fewer dispatches, bigger grids -- and `metal_gemm_bench` now prices
+  > it directly (the `[fused ...]` rows). At T=512 a fused gate+up GEMM runs at 3.25 TFLOP/s against
+  > its parts' 3.20: the big MLP GEMMs are already grid-saturated, so fusing them saves only a
+  > dispatch. Fused qkv is a real 0.48 -> 0.37 ms/layer, but only because it rescues the grid-starved
+  > k/v projections (128 rows, 18 threadgroups), which are 1.5% of the FLOPs. Net ~1.8% of prefill at
+  > T=512 and shrinking with length -- not worth q/k/v sharing one buffer that RoPE and the KV-store
+  > must then slice. And the ceiling is confirmed independently: prefill is **90% GPU-busy at T=511
+  > and 98% at T=2041**, so there is almost no dispatch overhead left for fusion to reclaim; the GPU
+  > is already running the work near-continuously.
+  >
+  > So the ~15% F32 headroom is occupancy-hidden (double-buffering made it worse), the shape mix is
+  > grid-saturated (fusion barely moves it), and the machine is ~fully busy. The remaining gap to
+  > llama.cpp is a genuine GEMM-formulation difference -- their `mul_mm` sustains more per FLOP on the
+  > same F32 pipe -- which is a research-grade kernel rewrite, not a lever. **Prefill stands at ~76%,
+  > and it is now understood why, not merely unattempted.**
 
   What that gap IS was narrowed by ruling out the structural explanation. llama.cpp's backend
   prints `MTL,BLAS` and its binary links Accelerate (whose BLAS runs on Apple's AMX coprocessor),

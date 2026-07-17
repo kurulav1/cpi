@@ -109,6 +109,17 @@ int main(int argc, char** argv) {
       {"gate_proj 4864x896", 4864, 896},
       {"up_proj   4864x896", 4864, 896},
       {"down_proj 896x4864", 896, 4864},
+      // Fused shapes, pricing the fusion the plan does NOT do: qkv is q|k|v stacked (896+128+128)
+      // and gateup is gate|up stacked (2*4864), both from the same input. The measured verdict, at
+      // T=512: gateup fused is 3.25 TFLOP/s vs its parts' 3.20 -- the big MLP GEMMs are already
+      // grid-saturated, so fusing them saves only a dispatch (~0.4%). qkv fused is 2.87 vs its
+      // parts' effective ~1.6 -- a real 0.48 -> 0.37 ms/layer win, but ONLY because it rescues the
+      // grid-starved k_proj/v_proj (128 rows = 18 threadgroups), which are 1.5% of the FLOPs.
+      // Net prefill win ~1.8% at T=512, shrinking as T grows and k/v stop being starved -- not
+      // worth the weight-concat + slot-splitting plumbing (q/k/v would share one buffer that RoPE
+      // and the KV-store then slice). The GEMM is at its practical ceiling; this documents why.
+      {"[fused qkv    1152x896]", 1152, 896},
+      {"[fused gateup 9728x896]", 9728, 896},
   };
 
   std::mt19937 rng(1234);
@@ -246,6 +257,9 @@ int main(int argc, char** argv) {
     }
     std::printf("  %-20s  %7.2f ms/rep   %5.2f TFLOP/s   (max|d|=%.3g)\n", s.name, ms / reps,
                 flop / (ms / 1000.0) / 1e12, worst);
+    // The `[fused ...]` shapes are informational -- they price a fusion the plan does not do, so
+    // they must NOT enter the aggregate (that would double-count gate/up as both parts and fused).
+    if (s.name[0] == '[') continue;
     total_flop += flop;
     total_ms += ms;
   }
