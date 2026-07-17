@@ -378,17 +378,31 @@ Both sides run the same protocol per row -- **the same token count on both**, wh
 obvious to state and is exactly what went wrong twice below: `llama-bench -p N -n 0` / `-p 0 -n N`
 against CPI's `metal_infer` with an N-token prompt / `--max-new N`.
 
+Current numbers (fresh, both engines rebuilt on the box, matched token counts):
+
+| | llama.cpp | CPI | CPI / llama.cpp |
+| --- | --- | --- | --- |
+| fp16 prefill, 512 tok | 4139 | 2962 | 72% |
+| fp16 prefill, 1024 tok | 4043 | 3117 | 77% |
+| fp16 prefill, 2048 tok | 3776 | 2734 | 72% |
+| fp16 decode @ depth 16 | 96.3 | 88.3 | 92% |
+| fp16 decode @ depth 512 | 95.7 | 86.8 | 91% |
+| fp16 decode @ depth 2048 | 93.6 | 79.6 | 85% |
+| int4 decode @ depth 16 | 219.8 | 172.4 | 78% |
+| int4 decode @ depth 512 | 192.9 | 166.0 | 86% |
+| int4 decode @ depth 2048 | 184.1 | 142.2 | 77% |
+
+Those reflect the whole optimization arc below: decode is 85-92% of llama.cpp (it collapsed to 38%
+at depth 2048 before the split-KV attention fix), prefill is ~72-77% (attention softmax folds and
+the concurrent-dispatch overlap this session; the GEMM is at hardware ceiling and llama.cpp's method
+transplanted faithfully is 7% slower -- see the notes further down). An older snapshot of the same
+table, kept for the methodology lessons attached to it:
+
 | | llama.cpp | CPI | CPI / llama.cpp |
 | --- | --- | --- | --- |
 | fp16 prefill, 541 tok | 3943 | 2999 | 76% |
-| fp16 prefill, 640 tok | 4063 | 3128 | 77% |
 | fp16 prefill, 1024 tok | 4045 | 3057 | 76% |
-| int4 prefill, 541 tok | 3883 | 2800 | 72% |
-| int4 prefill, 640 tok | 3959 | 3055 | 77% |
-| int4 prefill, 1024 tok | 3921 | 2985 | 76% |
 | fp16 decode @ depth 256 | 96.1 | 87.1 | 91% |
-| fp16 decode @ depth 512 | 95.5 | 86.2 | 90% |
-| fp16 decode @ depth 1024 | 94.6 | 84.9 | 90% |
 | fp16 decode @ depth 2048 | 89.3 | 79.4 | 89% |
 
 > **The int4 decode row used to read 198 / 176 / 89%, and the 89% was not real.** Both numbers were
