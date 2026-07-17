@@ -1180,14 +1180,23 @@ kernel void cpi_kv_store(
 // raising a shared constant would silently break a path whose golden is skipped on any host
 // without a Gemma checkpoint.
 //
-// IT CANNOT BE RAISED WITHOUT CHANGING THE KERNEL. The fragment plan below computes exactly one
-// simdgroup_float8x8 of scores -- `simdgroup_load(Qf, q_sh + df * 8u, hd)` always reads from row
-// 0 -- so a block of 16 computes its first 8 queries and leaves the rest as whatever was in
-// shared memory. That is the same failure the fp16 GEMM had (a tile widened past the threads
-// that served it), and it is worth fixing: this kernel re-reads K/V once per query block, so at
-// QMM_BLOCK 16 a 541-token prefill measured 193 -> 177 ms with attention's share falling 30 ->
-// 12 ms. Getting there needs the scoring and the softmax to loop over QMM_BLOCK/8 query
-// fragments, not a bigger number here.
+// It sets how often attention re-reads K/V: a block of QMM_BLOCK queries pulls each key block in
+// ONCE and serves all of them from it, so doubling this halves the passes over the cache.
+//
+// THAT DOES NOT MAKE IT FASTER, which is worth writing down because it is the obvious thing to
+// try. Measured on a 541-token prefill: 8 -> 188/190 ms, 16 -> 187/187, 32 -> 194/194, while the
+// same runs with attention ablated read 166 / 158 / 161 -- a 5% spread on a figure that cannot
+// depend on this constant at all, so the noise floor is as big as the effect. The re-reads are
+// cache-served (a layer's K+V is ~277 KB at T=541, which the LLC holds without trying), so
+// removing passes over them buys nothing. Left at 8: no measured gain, half the threadgroup
+// memory.
+//
+// Raising it USED to compute garbage -- the fragment plan scored exactly one simdgroup_float8x8
+// from row 0, so a block of 16 wrote its first 8 queries and left the rest as whatever shared
+// memory held. That is the fp16 GEMM's bug exactly (a tile widened past the threads that serve
+// it), and it read as a 9% speedup because it was doing half the work. The matrix ops below now
+// loop over QMM_BLOCK/8 fragments, so the constant is a real knob and the landmine is gone --
+// which is the only reason to keep the loop after a negative result.
 #define QMM_BLOCK 8
 
 // ---------------------------------------------------------------------------
@@ -1196,8 +1205,9 @@ kernel void cpi_kv_store(
 // whole of attention, which the RCA put at ~21% of prefill. This computes both products with
 // simdgroup_matrix (fp32 accumulate, the fast path), keeping the same per-query online softmax.
 //
-// One threadgroup per (query block of 8, head); 8 simdgroups. Q_BLOCK==8 is exactly one 8-row
-// matrix fragment. For a KEY_BLOCK of 32 keys:
+// One threadgroup per (query block, head); 8 simdgroups. The block is QMM_BLOCK queries, which is
+// QMM_BLOCK/8 row fragments -- every matrix op below loops over them, so the constant can move
+// without the kernel silently computing only its first 8 rows. For a KEY_BLOCK of 32 keys:
 //   scoring  S[8q x 8k]  = sum over head_dim/8 of  Q[8q x 8d] @ (K[8k x 8d])^T   (K loaded transposed)
 //   P.V      O[8q x 8d] += sum over the key groups of  P[8q x 8k] @ V[8k x 8d]
 // The online rescale between key blocks is applied to the fp32 accumulator in threadgroup
@@ -1262,7 +1272,8 @@ kernel void cpi_attention_prefill_mm(device const half* q [[buffer(0)]],
   uint start = 0u;
   if (p.window != 0u && first_pos + 1u > p.window) start = first_pos + 1u - p.window;
 
-  const uint dfs = hd / 8u;  // head_dim fragments
+  const uint dfs = hd / 8u;              // head_dim fragments
+  const uint qfs = (nq + 7u) / 8u;       // query fragments actually occupied (<= QMM_BLOCK/8)
 
   for (uint kb = start; kb <= last_pos; kb += KEY_BLOCK) {
     const uint nk = min((uint)KEY_BLOCK, last_pos - kb + 1u);
@@ -1278,20 +1289,22 @@ kernel void cpi_attention_prefill_mm(device const half* q [[buffer(0)]],
                            ? uint(block_tables[kb / p.block_size]) * p.block_size + (kb % p.block_size)
                            : kb;
 
-    // --- Scoring: one simdgroup per key group computes S[8q x 8k] over the head dim. ---
-    if (simd_id < n_kg) {
-      const uint kg = simd_id;
+    // --- Scoring: a simdgroup per (query fragment, key group) computes S[8q x 8k]. ---
+    // One work item per fragment PAIR, not per key group: with 4 key groups this used to leave
+    // half of an 8-simdgroup threadgroup idle, and it is also what pins the query block to 8.
+    for (uint w = simd_id; w < qfs * n_kg; w += n_simd) {
+      const uint qf = w / n_kg, kg = w % n_kg;
       simdgroup_float8x8 S = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
       for (uint df = 0u; df < dfs; ++df) {
         simdgroup_half8x8 Qf, Kf;
-        simdgroup_load(Qf, q_sh + df * 8u, hd);  // [8q x 8d]
+        simdgroup_load(Qf, q_sh + qf * 8u * hd + df * 8u, hd);  // [8q x 8d] of THIS fragment
         // K is [key][d]; load the [8k x 8d] tile TRANSPOSED to get [8d x 8k].
         simdgroup_load(Kf, k_cache + (ulong)(kphys + kg * 8u) * (ulong)kv_dim + kv_head * hd + df * 8u,
                        kv_dim, ulong2(0, 0), true);
         simdgroup_multiply_accumulate(S, Qf, Kf, S);
       }
-      // Store straight into sc_sh[query][key] at this key group's column offset.
-      simdgroup_store(S, sc_sh + kg * 8u, KEY_BLOCK);
+      // Store straight into sc_sh[query][key] at this fragment's row and key group's column.
+      simdgroup_store(S, sc_sh + qf * 8u * KEY_BLOCK + kg * 8u, KEY_BLOCK);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1307,9 +1320,11 @@ kernel void cpi_attention_prefill_mm(device const half* q [[buffer(0)]],
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Online softmax, one simdgroup per query; lane j owns key j (KEY_BLOCK == 32 == simd width).
-    const uint qi = simd_id;
-    if (qi < nq) {
+    // Online softmax, a simdgroup per query; lane j owns key j (KEY_BLOCK == 32 == simd width).
+    // LOOPS over queries rather than taking qi = simd_id: a block wider than n_simd would
+    // otherwise leave its tail queries with no simdgroup, and they would silently keep the
+    // -INFINITY max and zero sum they were initialised with.
+    for (uint qi = simd_id; qi < nq; qi += n_simd) {
       const float sc = (lane < nk) ? sc_sh[qi * KEY_BLOCK + lane] : -INFINITY;
       const float bmax = simd_max(sc);
       const float old_max = m_sh[qi];
@@ -1332,17 +1347,19 @@ kernel void cpi_attention_prefill_mm(device const half* q [[buffer(0)]],
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // --- P.V: O[8q x 8d] += P[8q x 8k] @ V[8k x 8d], accumulated into the fp32 acc. ---
-    for (uint dg = simd_id; dg < dfs; dg += n_simd) {
+    // Again one work item per (query fragment, head-dim fragment).
+    for (uint w = simd_id; w < qfs * dfs; w += n_simd) {
+      const uint qf = w / dfs, dg = w % dfs;
       simdgroup_float8x8 O;
-      simdgroup_load(O, acc + dg * 8u, hd);  // current (rescaled) accumulator
+      simdgroup_load(O, acc + qf * 8u * hd + dg * 8u, hd);  // current (rescaled) accumulator
       for (uint kg = 0u; kg < n_kg; ++kg) {
         simdgroup_half8x8 Pf, Vf;
-        simdgroup_load(Pf, pw_sh + kg * 8u, KEY_BLOCK);  // [8q x 8k]
+        simdgroup_load(Pf, pw_sh + qf * 8u * KEY_BLOCK + kg * 8u, KEY_BLOCK);  // [8q x 8k]
         simdgroup_load(Vf, v_cache + (ulong)(kphys + kg * 8u) * (ulong)kv_dim + kv_head * hd + dg * 8u,
                        kv_dim);  // [8k x 8d]
         simdgroup_multiply_accumulate(O, Pf, Vf, O);
       }
-      simdgroup_store(O, acc + dg * 8u, hd);
+      simdgroup_store(O, acc + qf * 8u * hd + dg * 8u, hd);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }

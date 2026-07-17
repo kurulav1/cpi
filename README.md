@@ -566,13 +566,25 @@ to the 8B:
   SEVENTH of our own GEMM's 2.86.** It is the largest identified lever left, and the mechanism is
   known: `cpi_attention_prefill_mm` blocks 8 queries per threadgroup, so each head re-reads the
   whole K/V cache once per 8 queries — 68 passes at T=541. Widening the block to 16 measured
-  **193 → 177 ms with attention's share falling 30 → 12 ms**, and produced WRONG TOKENS: the
-  fragment plan computes exactly one `simdgroup_float8x8` of scores from row 0, so the second half
-  of a 16-query block is never written. That is the fp16 GEMM's bug precisely -- a tile widened
-  past the threads that serve it -- which is worth noticing as a pattern rather than an incident.
-  The win needs the scoring and softmax to loop over QMM_BLOCK/8 query fragments. `QMM_BLOCK`
-  exists (separate from the scalar kernel's `Q_BLOCK`, which is stuck at 8 by Gemma's head_dim 256)
-  and is set to 8 until that lands.
+  **193 → 177 ms with attention's share falling 30 → 12 ms** — and produced WRONG TOKENS. The
+  fragment plan scored exactly one `simdgroup_float8x8` from row 0, so the second half of a
+  16-query block was never written: the fp16 GEMM's bug precisely, a tile widened past the threads
+  that serve it, and **the 9% "win" was just doing half the work.** Third time in one day that a
+  speedup turned out to be a correctness bug.
+
+  Making the matrix ops loop over `QMM_BLOCK/8` fragments fixes it, and **the speedup does not
+  survive.** Correct, at 541 tokens: 8 → 188/190 ms, 16 → 187/187, 32 → 194/194. The same runs
+  with attention ablated read 166 / 158 / 161 ms — a 5% spread on a figure that cannot depend on
+  this constant at all, so the noise floor is the size of the effect. **The re-reads are
+  cache-served**: a layer's K+V is ~277 KB at T=541, which the LLC holds without trying, so
+  removing passes over them buys nothing and the "3 GB of redundant traffic" that motivated this
+  was DRAM-naive arithmetic. `QMM_BLOCK` stays 8 (separate from the scalar kernel's `Q_BLOCK`,
+  which is stuck at 8 by Gemma's head_dim 256 — whose golden *skips* without a checkpoint, so a
+  shared bump would have broken it invisibly). The fragment loop stays: it costs nothing at 8, one
+  iteration, and it disarms the landmine — the only reason to keep code from a failed experiment.
+
+  So attention's ~25 ms is **not** redundant KV traffic, and its mechanism is unidentified. The
+  decode half of the theory is untested and now doubtful for the same reason.
 
   The same redundancy is the whole decode gap: ablating `Attention` at depth 2048 gives 66.9 →
   **92.5 tok/s**, so attention is 4.16 ms of a 14.9 ms token where llama.cpp spends ~0.8 ms, and
