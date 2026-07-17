@@ -507,13 +507,29 @@ to the 8B:
 
   It retro-explains the entire lever sweep below: K-depth flat, taller tile slower, more
   simdgroups slower, bigger accumulator tile spilling. **None could help, because none add F32
-  issue capacity.** Every one was aimed at a bottleneck that was not there. Occupancy at 37% is
-  likewise not a defect: when a kernel is ALU-bound, low occupancy is sufficient by definition.
+  issue capacity.** Every one was aimed at a bottleneck that was not there.
 
   The only route to the F16 pipe is half accumulators, and that measured **3x slower** on two
   unrelated kernels (Apple's matrix unit accumulates in fp32 natively, so half-accumulate appears
-  to be emulated). So the remaining prefill gap to llama.cpp does not live in this kernel's
-  tiling, and further tuning here is a dead end with a receipt.
+  to be emulated). So further tuning of the *tile* here is a dead end with a receipt.
+
+  > **The "dead end" and the 37% occupancy were both the BENCH, and a clean capture of the real
+  > pass says something different.** Every reading above came from `metal_gemm_bench` -- one shape
+  > run hot, back to back. A genuinely GEMM-only capture of a real prefill (every other op ablated,
+  > which only became possible once `CPI_METAL_ABLATE` stopped silently ignoring misspelled names
+  > this session) reads: **occupancy 94%, F32 limiter 79%, F32 utilization 70%, and an
+  > instruction-throughput limiter of 69% with ~30% combined integer/conditional load.** So the
+  > real GEMM runs at high occupancy, not 37%, and it is *not* at the F32 ceiling -- it leaves ~20%
+  > of the F32 pipe idle while the inner loop's address math, bounds checks and loop control eat
+  > the issue slots. That is exactly the "issues F32 denser than we do" the thread-scaling test
+  > inferred about llama.cpp. Lifting F32 utilization from 70% toward 90% is ~+28% on a GEMM that
+  > is 80% of prefill -- prefill 76% -> ~93% of llama.cpp, close to the whole gap.
+  >
+  > The next step is therefore NOT another tile size. It is cutting the inner loop's non-F32
+  > instruction count (unroll the K loop, hoist the address arithmetic, drop redundant bounds
+  > checks), with a falsifiable prediction: **F32 utilization rises and the instruction-throughput
+  > limiter falls.** If F32 util does not move, the hypothesis is wrong -- the same before/after
+  > discipline that separated this session's real wins from its three fake ones.
 
   What that gap IS was narrowed by ruling out the structural explanation. llama.cpp's backend
   prints `MTL,BLAS` and its binary links Accelerate (whose BLAS runs on Apple's AMX coprocessor),
@@ -523,10 +539,11 @@ to the 8B:
   but idle; prefill runs on the Metal GPU via ggml's own `mul_mm` simdgroup kernels. So the gap is
   **kernel versus kernel** -- two hand-rolled Metal GEMMs -- not hand-rolled versus vendor, which
   is the answer to whether it is worth chasing at all: it is at least investigable. It does not
-  contradict the F32 receipt above (our big GEMM is near its F32 ceiling); it means if llama.cpp's
-  is genuinely faster on the same shapes it has found F32 issue density we have not, and the way to
-  see that is a clean GEMM-only `.gputrace` -- now finally possible, since the ablation that isolates
-  one op stopped being a silent no-op this session -- read for occupancy, not another blind tile sweep.
+  contradict the receipt above for the *tile*, but it means if llama.cpp's is faster on the same
+  shapes it has found F32 issue density we have not. That capture has now been read (see the note
+  above): the real GEMM is F32-limited at 79%, not 91%, with ~20% of the pipe lost to
+  instruction-throughput overhead -- so the density is there to be recovered, and the gap is
+  investigable rather than structural.
 
 - **The fp16 GEMM "simdgroup starvation" finding was not real, and its retraction is the more
   useful result.** For two sessions the GEMM sat at ~53% of peak and resisted every lever (wider
