@@ -605,14 +605,26 @@ to the 8B:
   TFLOP/s. So **64x64 with 16 accumulators is a confirmed local optimum for this kernel structure** --
   bigger spills, smaller loses intensity, and the transpose was not the cost.
 
-  That sharpens the conclusion rather than defeating it. llama.cpp's narrow tile wins only *in
-  combination* with its cheap loads and direct store -- the pieces are coupled and individually
-  neutral-to-negative, which is exactly why the rewrite has to be faithful and whole to pay off,
-  and why a piecemeal adoption cannot get there. It also lowers the expected prize: our per-shape
-  GEMM is already 3.20 TFLOP/s (~75% of the F32 peak), so much of the end-to-end 24% prefill gap is
-  the small grid-starved k/v, the attention, and dispatch structure -- not headroom sitting in the
-  big GEMM's inner loop. A faithful full rewrite remains the one path to the GEMM's share of it,
-  with tempered expectations now that the individual levers have been shown inert.
+  So the faithful whole rewrite was built (`cpi_gemm_f16_v2`, a separate kernel benched by name so
+  the production path was never at risk) with all the pieces at once: 64x32 tile, 8 accumulators,
+  both operands staged for a plain load, `simdgroup_barrier(mem_none)` pipelining. **It measured
+  correct and 22% SLOWER -- gate/up 3.20 -> 2.42 TFLOP/s -- and building it surfaced why the
+  approach cannot port.** llama.cpp's fourth lever, the direct `simdgroup_store` to device, rests on
+  its `mul_mm` emitting an **fp32** result to a float intermediate the graph converts later. This
+  engine is fp16 throughout, and a `simdgroup_float8x8` fragment has no fp16 store overload: float
+  must be converted to half, which forces the very threadgroup staging the direct store exists to
+  avoid. So the store lever -- the one that offsets the narrow tile's lower arithmetic intensity --
+  is architecturally unavailable to an fp16 pipeline, and without it the narrow tile is just slower.
+
+  **That is the real answer to "can we match it": not with this kernel's contract.** llama.cpp's
+  GEMM is faster partly *because* it computes into fp32 and defers the narrowing, which lets it pick
+  a tile and a store path an fp16-output kernel cannot. Matching it would mean making the GEMM emit
+  fp32 and adding a separate narrowing pass -- more memory traffic (write fp32, then read fp32 +
+  write fp16) on a step that is already ~90% GPU-busy, so almost certainly a net loss on this
+  hardware. The prefill GEMM stays at its measured local optimum: **64x64, 16 accumulators, 3.20
+  TFLOP/s, ~75% of the F32 peak.** The remaining ~24% of the prefill gap to llama.cpp is not
+  recoverable in the big GEMM without changing the engine's fp16 contract, and the pieces that would
+  are worth less than they cost. This thread is closed with a receipt, not a question.
 
   What that gap IS was narrowed by ruling out the structural explanation. llama.cpp's backend
   prints `MTL,BLAS` and its binary links Accelerate (whose BLAS runs on Apple's AMX coprocessor),
