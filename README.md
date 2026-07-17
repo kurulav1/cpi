@@ -515,6 +515,19 @@ to the 8B:
   to be emulated). So the remaining prefill gap to llama.cpp does not live in this kernel's
   tiling, and further tuning here is a dead end with a receipt.
 
+  What that gap IS was narrowed by ruling out the structural explanation. llama.cpp's backend
+  prints `MTL,BLAS` and its binary links Accelerate (whose BLAS runs on Apple's AMX coprocessor),
+  so the obvious theory was that its prefill GEMMs go through a vendor library we neither use nor
+  are allowed to. They do not: **pp512 is flat at 4142 / 4163 / 4163 / 4163 tok/s across 1 / 2 / 4 /
+  8 CPU threads**, and an AMX/Accelerate path would scale with threads. The BLAS backend is linked
+  but idle; prefill runs on the Metal GPU via ggml's own `mul_mm` simdgroup kernels. So the gap is
+  **kernel versus kernel** -- two hand-rolled Metal GEMMs -- not hand-rolled versus vendor, which
+  is the answer to whether it is worth chasing at all: it is at least investigable. It does not
+  contradict the F32 receipt above (our big GEMM is near its F32 ceiling); it means if llama.cpp's
+  is genuinely faster on the same shapes it has found F32 issue density we have not, and the way to
+  see that is a clean GEMM-only `.gputrace` -- now finally possible, since the ablation that isolates
+  one op stopped being a silent no-op this session -- read for occupancy, not another blind tile sweep.
+
 - **The fp16 GEMM "simdgroup starvation" finding was not real, and its retraction is the more
   useful result.** For two sessions the GEMM sat at ~53% of peak and resisted every lever (wider
   tiles, half accumulators, register tiling). It was then diagnosed as too few simdgroups to hide
