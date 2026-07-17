@@ -534,14 +534,25 @@ to the 8B:
   > is the FILL phase between barriers -- staging each K-block's operands into threadgroup memory
   > (integer address math, uint4 loads) while the matrix units wait.
   >
-  > So the lever is not a tile size and not the MAC loop -- it is **overlapping fill with compute**:
-  > double-buffer the K-block staging so block n+1 loads while block n multiplies, and the F32 pipe
-  > stops waiting. Predicted: F32 utilization rises toward the bench's 81%+ and the
-  > instruction-throughput limiter falls. It is a ~150-line change with real barrier subtlety and
-  > doubled threadgroup memory, deferred rather than rushed -- a half-correct GEMM behind a gate
-  > that (see three times this session) does not always catch a fast-but-wrong kernel is the worst
-  > outcome, not the best. The headroom is ~+7% on F32 util at real length, so prefill 76% -> low
-  > 80s% of llama.cpp: real, bounded, and smaller than the T=257 capture first suggested.
+  > So the phase that idles the F32 pipe is the fill, and the obvious fix -- **double-buffer the
+  > K-block staging so block n+1 loads while block n multiplies** -- was built and MEASURED, and it
+  > is slower. Two staging slots, one barrier per block instead of two, the fill's device loads in
+  > flight through the matmul: correct (541-token stream byte-identical, bench spot-checks pass) and
+  > a direct back-to-back A/B read **T=511 168 -> 177 ms and T=2041 769 -> 810 ms, ~5% WORSE**.
+  >
+  > The reason is the occupancy the same capture reported: **94%**. A threadgroup that stalls in its
+  > fill is already covered by the ~dozen other resident threadgroups running their matmuls -- the
+  > fill latency was hidden across threadgroups, never actually exposed, so there was nothing to
+  > overlap. Double-buffering only doubled the threadgroup memory (8 -> 16 KB), which lets fewer
+  > threadgroups be resident, LOWERING the occupancy that was doing the hiding. The per-encoder "F32
+  > idles during fill" reading was true and the inference from it was wrong: at high occupancy an
+  > idle in one threadgroup is not an idle in the machine. Reverted.
+  >
+  > So the fill/compute-overlap lever is spent, and with it the last cheap prefill idea. What is
+  > left is a genuine formulation gap -- llama.cpp's `mul_mm` sustains more on the same F32 hardware
+  > -- plus dispatch-boundary overhead that fusing gate+up and q+k+v would trim by a few percent.
+  > Neither is a today-sized win, and the ~15% F32 headroom is now understood to be occupancy-hidden
+  > rather than recoverable by scheduling. The prefill number stands at ~76%.
 
   What that gap IS was narrowed by ruling out the structural explanation. llama.cpp's backend
   prints `MTL,BLAS` and its binary links Accelerate (whose BLAS runs on Apple's AMX coprocessor),
