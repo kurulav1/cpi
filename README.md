@@ -635,6 +635,33 @@ to the 8B:
   accumulators, 3.20 TFLOP/s on gate/up, ~75% of F32 peak** -- and the thread is closed by
   transplant-and-measure, not by argument.
 
+- **So where DOES the prefill gap live? Decomposed, it is not the GEMM math -- it is structural.**
+  A 511-token prefill is 173 ms wall / 163 ms GPU-busy against llama.cpp's ~123 ms. Ablation and
+  the GEMM bench split our time into:
+
+  | | ms | note |
+  | --- | --- | --- |
+  | GEMM compute (bench-ideal) | ~123 | at the hardware ceiling; cold == hot (rotate=24 == rotate=1) |
+  | GEMM pipeline bubble | ~15 | real GEMM-only is 138 GPU-busy vs 123 bench: dependent dispatches drain the pipe between them |
+  | non-GEMM GPU (attention ~16, norm/rope/etc ~9) | ~25 | attention already cut 21% this session |
+  | CPU dispatch issue (wall - gpu_busy) | ~10 | ~752 dispatches |
+
+  The striking line is the first: **llama.cpp fits GEMM + attention + everything into ~123 ms,
+  which is our GEMM's compute time ALONE.** They are not running a faster GEMM (ours is at ceiling,
+  cold==hot, their structure transplanted is slower) -- they are OVERLAPPING the non-GEMM work with
+  the GEMM, and issuing dispatches with less drain between them. That is a scheduling property, not
+  a kernel one.
+
+  What is reachable from here is small and bounded: the 15 ms bubble is mostly irreducible (the big
+  gate/up GEMMs each already saturate all 10 cores, so a concurrent encoder found only +3% when it
+  was tried, and reverted on a hazard-tracking bug); qkv-fusion is ~1.5% (the bench prices the
+  fused 1152x896 at 0.37 vs 0.48 ms/layer, and the executor already fuses q/k/v for quantized
+  decode, so the pattern exists); another attention barrier could go. The bulk -- overlapping the
+  ~25 ms of non-GEMM with the GEMM -- needs async/multi-queue dispatch, a real re-architecture whose
+  upside is capped by the same GPU saturation. The honest close: **the prefill gap is understood to
+  the millisecond, the GEMM is not the cause, and what remains is a scheduling re-architecture for a
+  single-digit-percent return, not a kernel that is missing.**
+
   What that gap IS was narrowed by ruling out the structural explanation. llama.cpp's backend
   prints `MTL,BLAS` and its binary links Accelerate (whose BLAS runs on Apple's AMX coprocessor),
   so the obvious theory was that its prefill GEMMs go through a vendor library we neither use nor
