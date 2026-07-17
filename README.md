@@ -652,15 +652,25 @@ to the 8B:
   the GEMM, and issuing dispatches with less drain between them. That is a scheduling property, not
   a kernel one.
 
-  What is reachable from here is small and bounded: the 15 ms bubble is mostly irreducible (the big
-  gate/up GEMMs each already saturate all 10 cores, so a concurrent encoder found only +3% when it
-  was tried, and reverted on a hazard-tracking bug); qkv-fusion is ~1.5% (the bench prices the
-  fused 1152x896 at 0.37 vs 0.48 ms/layer, and the executor already fuses q/k/v for quantized
-  decode, so the pattern exists); another attention barrier could go. The bulk -- overlapping the
-  ~25 ms of non-GEMM with the GEMM -- needs async/multi-queue dispatch, a real re-architecture whose
-  upside is capped by the same GPU saturation. The honest close: **the prefill gap is understood to
-  the millisecond, the GEMM is not the cause, and what remains is a scheduling re-architecture for a
-  single-digit-percent return, not a kernel that is missing.**
+  Part of that bubble was then reclaimed. The encoder was serial, so the driver ordered EVERY
+  dispatch -- force-serialising even the independent projections. Switched to a concurrent encoder
+  with a memory barrier before each dispatch BY DEFAULT (serial-equivalent, always safe), the
+  barrier dropped only for a dispatch proven independent of the one before it: a Gemv that reads
+  the same post-norm slot and writes a different output, which is exactly q/k/v and gate/up. The
+  128-row k/v projections are grid-starved (18 threadgroups on 10 cores), so overlapping them is
+  where the idle actually is. **Prefill 2988 -> 3063 tok/s (+2.5% steady, +5.5% best run), gate
+  10/10.** A fully-unbarriered concurrent encoder measured +14% but wrong -- the extra was the real
+  dependency chain racing -- and a barrier-before-everything concurrent encoder measured the same
+  as serial, which is how we know the barrier is nearly free and the win is genuine overlap.
+
+  What is left is small and bounded: qkv-fusion is ~1.5% (the bench prices the fused 1152x896 at
+  0.37 vs 0.48 ms/layer, and the executor already fuses q/k/v for quantized decode, so the pattern
+  exists); another attention barrier could go. The bulk -- overlapping the ~25 ms of non-GEMM with
+  the GEMM -- is capped by the transformer being a sequential dependency chain (attention needs
+  q/k/v, o needs attention, the next layer needs this one), so the only parallelism is the
+  intra-layer projections, now captured. The honest close: **the prefill gap is understood to the
+  millisecond, the GEMM is not the cause, the safe scheduling overlap has been taken (+2.5-5%), and
+  the residual is a sequential-dependency wall, not a kernel that is missing.**
 
   What that gap IS was narrowed by ruling out the structural explanation. llama.cpp's backend
   prints `MTL,BLAS` and its binary links Accelerate (whose BLAS runs on Apple's AMX coprocessor),
