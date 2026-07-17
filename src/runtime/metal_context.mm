@@ -142,7 +142,39 @@ bool MetalContext::load_library_from_source(const std::string& metal_source_path
 
   NSError* err = nil;
   NSString* path = [NSString stringWithUTF8String:metal_source_path.c_str()];
-  NSString* src = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:&err];
+  NSFileManager* fm = [NSFileManager defaultManager];
+
+  // The shaders live as several family files (00_common, 10_dense, ...). The runtime compiler
+  // takes ONE source string and does not resolve #include from a source string, so a directory
+  // is concatenated here in filename order -- the numeric prefixes make that order the dependency
+  // order (common first). The offline CMake path cats the same files in the same order. A plain
+  // file path still works, for a prebuilt single-file blob or a caller that points straight at one.
+  NSString* src = nil;
+  BOOL is_dir = NO;
+  if ([fm fileExistsAtPath:path isDirectory:&is_dir] && is_dir) {
+    NSArray<NSString*>* entries = [[fm contentsOfDirectoryAtPath:path error:&err]
+        sortedArrayUsingSelector:@selector(compare:)];
+    if (entries == nil) {
+      last_error_ = "could not list the shader directory: " + metal_source_path;
+      return false;
+    }
+    NSMutableString* joined = [NSMutableString string];
+    for (NSString* name in entries) {
+      if (![[name pathExtension] isEqualToString:@"metal"]) continue;
+      NSString* fp = [path stringByAppendingPathComponent:name];
+      NSString* part = [NSString stringWithContentsOfFile:fp encoding:NSUTF8StringEncoding
+                                                    error:&err];
+      if (part == nil) {
+        last_error_ = "could not read shader part: " + std::string([fp UTF8String]);
+        return false;
+      }
+      [joined appendString:part];
+      [joined appendString:@"\n"];
+    }
+    src = joined;
+  } else {
+    src = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:&err];
+  }
   if (src == nil) {
     last_error_ = "could not read the shader source: " + metal_source_path;
     return false;

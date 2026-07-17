@@ -216,7 +216,14 @@ if(LLAMA_ENGINE_ENABLE_METAL)
   # conditionally wire the Metal engine into its dispatch -- mirrors LLAMA_ENGINE_HAS_CUDA.
   target_compile_definitions(llama_engine PUBLIC LLAMA_ENGINE_ENABLE_METAL=1)
 
-  set(CPI_METAL_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/metal/cpi_kernels.metal)
+  # The shaders are split into family files (00_common.metal, 10_dense.metal, ...) under this
+  # directory. CPI_METAL_SOURCE is the DIRECTORY: the runtime loader concatenates its *.metal in
+  # filename order (the numeric prefixes are the dependency order), and the offline metallib rule
+  # below cats the same files the same way. One place defines the order -- the filenames.
+  set(CPI_METAL_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/metal)
+  set(CPI_METAL_SRC ${CPI_METAL_DIR})
+  file(GLOB CPI_METAL_PARTS ${CPI_METAL_DIR}/[0-9][0-9]_*.metal)
+  list(SORT CPI_METAL_PARTS)
 
   # The offline `metal` compiler ships with XCODE, not with the Command Line Tools.
   # A bare Mac (a fresh cloud rental, say) has clang but no `metal`, and pulling
@@ -233,13 +240,19 @@ if(LLAMA_ENGINE_ENABLE_METAL)
   )
 
   if(CPI_METAL_CC_MISSING EQUAL 0)
+    set(CPI_METAL_COMBINED ${CMAKE_CURRENT_BINARY_DIR}/cpi_kernels.metal)
     set(CPI_METAL_AIR ${CMAKE_CURRENT_BINARY_DIR}/cpi_kernels.air)
     set(CPI_METALLIB  ${CMAKE_CURRENT_BINARY_DIR}/cpi_kernels.metallib)
     add_custom_command(
       OUTPUT ${CPI_METALLIB}
-      COMMAND xcrun -sdk macosx metal -Werror -c ${CPI_METAL_SRC} -o ${CPI_METAL_AIR}
+      # Concatenate the family files (sorted) into one translation unit, then compile. The
+      # offline `metal` compiler could resolve #include, but the runtime loader cannot, so the
+      # files carry no includes and both paths just concatenate -- same bytes, one source of order.
+      COMMAND ${CMAKE_COMMAND} -DOUT=${CPI_METAL_COMBINED} "-DPARTS=${CPI_METAL_PARTS}"
+              -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/concat_metal.cmake
+      COMMAND xcrun -sdk macosx metal -Werror -c ${CPI_METAL_COMBINED} -o ${CPI_METAL_AIR}
       COMMAND xcrun -sdk macosx metallib ${CPI_METAL_AIR} -o ${CPI_METALLIB}
-      DEPENDS ${CPI_METAL_SRC}
+      DEPENDS ${CPI_METAL_PARTS}
       COMMENT "Compiling Metal shaders -> cpi_kernels.metallib"
       VERBATIM
     )

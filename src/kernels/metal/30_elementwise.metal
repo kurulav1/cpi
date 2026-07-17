@@ -1,0 +1,179 @@
+kernel void cpi_rope(
+    device half*        x         [[buffer(0)]],
+    device const int*   positions [[buffer(1)]],
+    constant RopeParams& p        [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]) {
+  const uint half_dim = p.head_dim / 2u;
+  const uint per_token = p.heads * half_dim;
+  const uint total = per_token * p.tokens;
+  if (gid >= total) return;
+
+  const uint token = gid / per_token;
+  const uint rem   = gid % per_token;
+  const uint head  = rem / half_dim;
+  const uint i     = rem % half_dim;
+
+  uint pos;
+  if (p.per_row_positions != 0u) {
+    pos = uint(positions[token]);  // batched decode: row t is its own sequence
+  } else {
+    pos = (p.use_position_buffer != 0u) ? uint(positions[0]) : p.position;
+    pos += token;  // sequence prefill: token t sits at position base + t
+  }
+
+  const float freq  = pow(p.theta, -float(2u * i) / float(p.head_dim));
+  const float angle = float(pos) * freq;
+  const float c = cos(angle);
+  const float s = sin(angle);
+
+  const uint stride = (p.row_stride != 0u) ? p.row_stride : (p.heads * p.head_dim);
+  const uint base = token * stride + head * p.head_dim + i;
+
+  const float a = float(x[base]);
+  const float b = float(x[base + half_dim]);
+  x[base]            = half(a * c - b * s);
+  x[base + half_dim] = half(a * s + b * c);
+}
+
+// ---------------------------------------------------------------------------
+// Elementwise ops.
+// ---------------------------------------------------------------------------
+
+kernel void cpi_scale_copy(
+    device const half*  in  [[buffer(0)]],
+    device half*        out [[buffer(1)]],
+    constant ElemParams& p  [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid >= p.n) return;
+  out[gid] = half(float(in[gid]) * p.scale);
+}
+
+kernel void cpi_copy(
+    device const half*  in  [[buffer(0)]],
+    device half*        out [[buffer(1)]],
+    constant ElemParams& p  [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid >= p.n) return;
+  out[gid] = in[gid];
+}
+
+kernel void cpi_add_inplace(
+    device const half*  in  [[buffer(0)]],
+    device half*        out [[buffer(1)]],
+    constant ElemParams& p  [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid >= p.n) return;
+  out[gid] = half(float(out[gid]) + float(in[gid]));
+}
+
+// SwiGLU: out = silu(a) * b
+kernel void cpi_silu_mul(
+    device const half*  a   [[buffer(0)]],
+    device const half*  b   [[buffer(1)]],
+    device half*        out [[buffer(2)]],
+    constant ElemParams& p  [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid >= p.n) return;
+  const float av = float(a[gid]);
+  const float silu = av / (1.0f + exp(-av));
+  out[gid] = half(silu * float(b[gid]));
+}
+
+// GeGLU: out = gelu(a) * b. Tanh approximation, same as the CUDA kernel.
+//
+// ⚠ DO NOT write this as 0.5 * x * (1 + tanh(inner)).
+//
+// Metal's tanh overflows. It evaluates as (exp(2z) - 1) / (exp(2z) + 1), and exp(2z)
+// exceeds fp32 for z beyond ~44, giving inf/inf = NaN -- where CUDA's tanhf saturates
+// to 1 and is fine. Gemma reaches z ~ 62 on ordinary activations, so this produced NaN
+// on real inputs, for some tokens and not others (it depends on the gate value). Llama
+// never hit it because SwiGLU uses a sigmoid, which is naturally safe.
+//
+// 0.5 * (1 + tanh(z)) is exactly sigmoid(2z), and sigmoid is safe at BOTH ends:
+// exp(-large) -> 0 gives 1, and exp(+large) -> inf gives 1/(1+inf) = 0. Same maths, no
+// overflow.
+kernel void cpi_gelu_mul(
+    device const half*  a   [[buffer(0)]],
+    device const half*  b   [[buffer(1)]],
+    device half*        out [[buffer(2)]],
+    constant ElemParams& p  [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid >= p.n) return;
+  const float x = float(a[gid]);
+  const float k = 0.7978845608028654f;  // sqrt(2/pi)
+  const float inner = k * (x + 0.044715f * x * x * x);
+  const float gelu = x / (1.0f + exp(-2.0f * inner));  // == 0.5*x*(1 + tanh(inner))
+  out[gid] = half(gelu * float(b[gid]));
+}
+
+// ---------------------------------------------------------------------------
+// Embedding lookup. The token id lives in a device buffer so the whole decode
+// step stays on-GPU (the CUDA path does the same, for graph capture).
+// ---------------------------------------------------------------------------
+
+kernel void cpi_embedding_lookup(
+    device const half*  table  [[buffer(0)]],
+    device const int*   tokens [[buffer(1)]],
+    device half*        out    [[buffer(2)]],
+    constant EmbedParams& p    [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]) {
+  const uint total = p.hidden * p.tokens;
+  if (gid >= total) return;
+  const uint t = gid / p.hidden;
+  const uint i = gid % p.hidden;
+  const int tok = tokens[t];
+  out[gid] = table[(ulong)tok * (ulong)p.hidden + i];
+}
+
+// ---------------------------------------------------------------------------
+// KV store: append this token's K and V to the layer's cache at `position`.
+// Cache layout [max_context][kv_heads * head_dim], matching the CUDA side.
+// ---------------------------------------------------------------------------
+
+kernel void cpi_kv_store(
+    device const half*  k         [[buffer(0)]],
+    device const half*  v         [[buffer(1)]],
+    device half*        k_cache   [[buffer(2)]],
+    device half*        v_cache   [[buffer(3)]],
+    device const int*   positions [[buffer(4)]],
+    constant KvParams&  p         [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]) {
+  const uint kv_dim = p.kv_heads * p.head_dim;
+  const uint total = kv_dim * p.tokens;
+  if (gid >= total) return;
+
+  const uint t = gid / kv_dim;   // which token in the batch
+  const uint i = gid % kv_dim;   // which element of its K/V
+
+  uint base = p.position;
+  if (p.use_position_buffer != 0u) base = uint(positions[0]);
+  const uint pos = base + t;
+  if (pos >= p.max_context) return;
+
+  const ulong dst = (ulong)pos * (ulong)kv_dim + i;
+  k_cache[dst] = k[(ulong)t * (ulong)kv_dim + i];
+  v_cache[dst] = v[(ulong)t * (ulong)kv_dim + i];
+}
+
+// ---------------------------------------------------------------------------
+// Single-query attention over the cache. One threadgroup per query head.
+// GQA: query head h reads kv head h / (heads / kv_heads).
+//
+// Online (streaming) softmax so the scores never need a second pass over the
+// cache: track the running max and the running sum, rescaling the accumulator
+// when a new max appears. Same algorithm as the CUDA decode kernel.
+// ---------------------------------------------------------------------------
+// Prefill attention: one threadgroup per (QUERY BLOCK, head).
+//
+// The decode kernel below takes one threadgroup per (query token, head), and each of those
+// walks the whole KV cache itself. Across a prompt that is O(T^2) of DEVICE traffic, and on
+// the 8B it measured ~80 GB at ~73 GB/s -- genuinely bandwidth-bound, and 23% of prefill.
+//
+// A query block fixes it: the block of keys a threadgroup pulls in now serves Q_BLOCK
+// queries instead of one, so the same answer costs Q_BLOCK times less traffic. The keys and
+// values are re-read once per query WITHIN the block, but that is an L1 hit -- a key block
+// is a few KB and the reuse is immediate.
+//
+// Each query keeps its OWN online-softmax state (running max, running sum), because each
+// attends to a different prefix: causality masks key > that query's position.
+// ---------------------------------------------------------------------------

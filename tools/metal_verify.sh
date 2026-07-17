@@ -41,7 +41,7 @@ done
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 # The engine compiles the shaders at runtime when there is no offline metallib, which is the
 # normal case (the `metal` compiler ships with Xcode, not the Command Line Tools).
-export CPI_METAL_SOURCE="${CPI_METAL_SOURCE:-$REPO/src/kernels/metal/cpi_kernels.metal}"
+export CPI_METAL_SOURCE="${CPI_METAL_SOURCE:-$REPO/src/kernels/metal}"
 
 ran=0; failed=0; skipped=0; gpu_missing=0
 ok()   { echo "  PASS  $*"; ran=$((ran + 1)); }
