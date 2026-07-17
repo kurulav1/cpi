@@ -1628,6 +1628,19 @@ kernel void cpi_attention_decode(
 // cannot drift and one golden covers both.
 // ---------------------------------------------------------------------------
 
+// Keys per pass of the decode scoring loop, and the threadgroup width that serves it. They are
+// the same number ON PURPOSE: the loop gives each THREAD one whole key, so the 64-element dot
+// product stays in one thread and there is no cross-lane reduction at all.
+//
+// The kernel this replaced split each key's dot product across a simdgroup -- 32 lanes doing 2
+// MACs each, then a 5-step shuffle reduction, PER KEY. That is two MACs of work per reduction and
+// it ran the per-key term at ~23 GFLOP/s, 0.5% of peak. One key per lane needs as many keys in
+// flight as threads, which is why this threadgroup is 64 wide and not the 256 the rest of the file
+// uses: a decode chunk is only ~56 keys once the chunks are sized to fill the GPU, so 256 threads
+// would leave 200 of them idle and trade one bottleneck for another.
+#define DEC_KEY_BLOCK 64
+#define DEC_TG 64
+
 struct AttnSplitParams {
   uint heads;
   uint kv_heads;
@@ -1688,11 +1701,12 @@ kernel void cpi_attention_decode_split(
   const uint n_simd  = nthr / 32u;
 
   threadgroup float q_sh[256];
-  threadgroup float sc_sh[KEY_BLOCK];
-  threadgroup float w_sh[KEY_BLOCK];
+  threadgroup float sc_sh[DEC_KEY_BLOCK];
+  threadgroup float w_sh[DEC_KEY_BLOCK];
   threadgroup float tg_acc[256];
   threadgroup float tg_max;
   threadgroup float tg_sum;
+  threadgroup float red[DEC_TG / 32];  // one slot per simdgroup, for the block reductions
 
   for (uint i = lid; i < p.head_dim; i += nthr) {
     q_sh[i] = float(qh[i]);
@@ -1704,20 +1718,27 @@ kernel void cpi_attention_decode_split(
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  for (uint kb = c0; kb < c1; kb += KEY_BLOCK) {
-    const uint nk = min((uint)KEY_BLOCK, c1 - kb);
+  for (uint kb = c0; kb < c1; kb += DEC_KEY_BLOCK) {
+    const uint nk = min((uint)DEC_KEY_BLOCK, c1 - kb);
 
-    for (uint j = simd_id; j < nk; j += n_simd) {
+    // Score: ONE KEY PER THREAD. The whole dot product lives in one thread, so no shuffles.
+    for (uint j = lid; j < nk; j += nthr) {
       device const half* kt = k_cache + (ulong)(kb + j) * (ulong)kv_dim + kv_head * p.head_dim;
       float d = 0.0f;
-      for (uint i = lane; i < p.head_dim; i += 32u) d += q_sh[i] * float(kt[i]);
-      d = simd_sum(d);
-      if (lane == 0u) sc_sh[j] = d * p.scale;
+      for (uint i = 0u; i < p.head_dim; ++i) d += q_sh[i] * float(kt[i]);
+      sc_sh[j] = d * p.scale;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    // Block max, as a tree. Every thread used to scan all nk keys to find it, which is nk*nthr
+    // reads of threadgroup memory to compute one number.
+    float lmax = -INFINITY;
+    for (uint j = lid; j < nk; j += nthr) lmax = max(lmax, sc_sh[j]);
+    lmax = simd_max(lmax);
+    if (lane == 0u) red[simd_id] = lmax;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     float bmax = -INFINITY;
-    for (uint j = 0u; j < nk; ++j) bmax = max(bmax, sc_sh[j]);
+    for (uint s = 0u; s < n_simd; ++s) bmax = max(bmax, red[s]);
 
     const float old_max = tg_max;
     const float new_max = max(old_max, bmax);
@@ -1726,8 +1747,14 @@ kernel void cpi_attention_decode_split(
     for (uint j = lid; j < nk; j += nthr) w_sh[j] = exp(sc_sh[j] - new_max);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    // Block sum, same shape. The barrier above also fences `red` between its two uses.
+    float lsum = 0.0f;
+    for (uint j = lid; j < nk; j += nthr) lsum += w_sh[j];
+    lsum = simd_sum(lsum);
+    if (lane == 0u) red[simd_id] = lsum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     float bsum = 0.0f;
-    for (uint j = 0u; j < nk; ++j) bsum += w_sh[j];
+    for (uint s = 0u; s < n_simd; ++s) bsum += red[s];
 
     for (uint i = lid; i < p.head_dim; i += nthr) {
       float a = tg_acc[i] * rescale;

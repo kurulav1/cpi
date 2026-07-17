@@ -158,6 +158,11 @@ constexpr int kKeyBlock = 32;   // MUST match KEY_BLOCK in cpi_kernels.metal
 // second pass to merge them, which is why it is not worth it on a short context: below this
 // many keys the single-threadgroup kernel already wins.
 constexpr int kAttnSplitMinKeys = 256;
+// MUST match DEC_KEY_BLOCK / DEC_TG in cpi_kernels.metal. The decode split kernel runs a NARROW
+// threadgroup -- one thread per key, so the width has to match the keys in flight, not the 256
+// the rest of the file uses.
+constexpr int kDecKeyBlock = 64;
+constexpr int kDecTG = 64;
 // Enough (head, chunk) threadgroups to fill the GPU, with a ceiling so the partial buffers stay
 // small and the merge's per-thread loop over chunks stays short. 512 is measured, not reasoned:
 // decode at 2048 keys reads 61.7 / 64.4 / 66.5 / 65.9 / 66.0 tok/s at a target of 128 / 256 /
@@ -1083,7 +1088,12 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
           const int seq = position + 1;
           const int start = (window > 0 && seq > window) ? seq - window : 0;
           const int chunks = attn_split_chunks(op, position);
-          const int chunk_size = ((seq - start) + chunks - 1) / chunks;
+          // Whole key blocks per chunk: the kernel's scoring loop is one thread per key, so a
+          // chunk that is not a multiple of the block runs a short final pass with idle threads.
+          // Rounding UP can leave the last chunks empty, which they handle (-INF max, zero sum,
+          // and the merge skips them).
+          int chunk_size = ((seq - start) + chunks - 1) / chunks;
+          chunk_size = ((chunk_size + kDecKeyBlock - 1) / kDecKeyBlock) * kDecKeyBlock;
 
           AttnSplitParams sp{static_cast<std::uint32_t>(op.heads),
                              static_cast<std::uint32_t>(op.kv_heads),
@@ -1102,12 +1112,12 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
                                  attn_part_o_.handle(),
                                  pos_buf_.handle()};
           ctx_.dispatch("cpi_attention_decode_split", G::Groups,
-                        static_cast<std::size_t>(op.heads) * static_cast<std::size_t>(chunks), kTG,
-                        sbufs, nullptr, 7, &sp, sizeof(sp));
+                        static_cast<std::size_t>(op.heads) * static_cast<std::size_t>(chunks),
+                        kDecTG, sbufs, nullptr, 7, &sp, sizeof(sp));
           const void* mbufs[] = {attn_part_m_.handle(), attn_part_l_.handle(),
                                  attn_part_o_.handle(), slot(op.out)};
           ctx_.dispatch("cpi_attention_decode_merge", G::Groups,
-                        static_cast<std::size_t>(op.heads), kTG, mbufs, nullptr, 4, &sp,
+                        static_cast<std::size_t>(op.heads), kDecTG, mbufs, nullptr, 4, &sp,
                         sizeof(sp));
         } else {
           ctx_.dispatch("cpi_attention_decode", G::Groups,
@@ -1421,8 +1431,10 @@ int PlanMetalEngine::attn_split_chunks(const opplan::Op& op, int position) const
   const int nkeys = seq - start;
   if (nkeys < min_keys) return 1;  // the merge pass would cost more than it saves
   int chunks = (kAttnSplitTargetGroups + op.heads - 1) / op.heads;
-  // Never cut finer than a key block (the chunk would not fill its threadgroup either).
-  chunks = std::min(chunks, (nkeys + kKeyBlock - 1) / kKeyBlock);
+  // Never cut finer than a key block: a chunk with fewer keys than the threadgroup has threads
+  // leaves threads idle, which is the bottleneck the one-key-per-thread scoring loop exists to
+  // avoid.
+  chunks = std::min(chunks, (nkeys + kDecKeyBlock - 1) / kDecKeyBlock);
   chunks = std::min(chunks, kAttnSplitMaxChunks);
   return std::max(1, chunks);
 }

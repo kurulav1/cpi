@@ -386,9 +386,10 @@ against CPI's `metal_infer` with an N-token prompt / `--max-new N`.
 | int4 prefill, 541 tok | 3883 | 2800 | 72% |
 | int4 prefill, 640 tok | 3959 | 3055 | 77% |
 | int4 prefill, 1024 tok | 3921 | 2985 | 76% |
-| fp16 decode @ depth 16 | 96.0 | 89.2 | 93% |
-| fp16 decode @ depth 512 | 95.5 | 80.8 | 85% |
-| fp16 decode @ depth 2048 | 89.3 | 67.3 | 75% |
+| fp16 decode @ depth 256 | 96.1 | 87.1 | 91% |
+| fp16 decode @ depth 512 | 95.5 | 86.2 | 90% |
+| fp16 decode @ depth 1024 | 94.6 | 84.9 | 90% |
+| fp16 decode @ depth 2048 | 89.3 | 79.4 | 89% |
 
 > **The int4 decode row used to read 198 / 176 / 89%, and the 89% was not real.** Both numbers were
 > honestly measured and the comparison between them still wasn't: CPI's 176 came from a 64-token
@@ -597,19 +598,29 @@ to the 8B:
   a token. The per-key 1.838 us is the other 88% at depth 2048, and it is the whole gap:
   llama.cpp's entire attention there is ~800 us against our 4250.
 
-  **Each key-head is a 64-element dot product running at ~23 GFLOP/s -- 0.5% of this chip's peak**,
-  because the scoring loop is reduction-bound rather than compute-bound:
+  Each key-head is a 64-element dot product, and it was running at **~23 GFLOP/s, 0.5% of this
+  chip's peak**, because the scoring loop was reduction-bound rather than compute-bound:
 
   ```metal
   for (uint i = lane; i < p.head_dim; i += 32u) d += q_sh[i] * float(kt[i]);
   d = simd_sum(d);   // 2 MACs per lane, then a 5-step shuffle reduction -- PER KEY
   ```
 
-  Two MACs of work per lane, then a full cross-lane reduction, for every key. The fix is the
-  standard decode layout: give each LANE its own key so the dot product stays in one lane and no
-  reduction happens at all. It needs a wider key block for the decode kernel (32 keys cannot fill
-  256 threads one-per-lane) and a softmax reduction restructured to match -- KEY_BLOCK is shared
-  with the prefill kernels, so it wants its own constant, the same lesson as QMM_BLOCK above.
+  Two MACs of work per lane and then a full cross-lane reduction, for every key. **Giving each
+  THREAD its own key removes the reduction entirely**, and the fit says exactly what that was
+  worth: the per-key term went **1.838 -> 0.595 us/key, 3.1x**, while the 496 us fixed term did not
+  move (503 us) -- as it should not, since it is dispatch overhead and the dispatch count is
+  unchanged. A model that predicts which half of a number a change will move, and is right, is
+  worth more than the change.
+
+  One key per thread needs as many keys in flight as the threadgroup is wide, which is why the
+  decode kernel runs a **64-thread** threadgroup against the 256 the rest of the file uses: chunks
+  sized to fill the GPU are only ~56 keys, so 256 threads would idle 200 of them and swap one
+  bottleneck for another. `DEC_KEY_BLOCK`/`DEC_TG` are its own constants -- `KEY_BLOCK` is shared
+  with the prefill kernels, the same lesson as `QMM_BLOCK` above.
+
+  Decode is now **87.1 / 86.2 / 84.9 / 79.4 tok/s at depths 257 / 512 / 1022 / 2042** -- 89-91% of
+  llama.cpp at every depth, and nearly flat, against 38% at depth 2048 before any of this.
 
   The same redundancy is the whole decode gap: ablating `Attention` at depth 2048 gives 66.9 →
   **92.5 tok/s**, so attention is 4.16 ms of a 14.9 ms token where llama.cpp spends ~0.8 ms, and
