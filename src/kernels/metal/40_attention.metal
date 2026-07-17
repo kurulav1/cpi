@@ -80,7 +80,6 @@ kernel void cpi_attention_prefill_mm(device const half* q [[buffer(0)]],
   threadgroup half pw_sh[QMM_BLOCK * KEY_BLOCK];  // softmax weights [query][key], half for the matmul
   threadgroup float m_sh[QMM_BLOCK];              // running max per query
   threadgroup float l_sh[QMM_BLOCK];              // running sum per query
-  threadgroup float r_sh[QMM_BLOCK];              // this block's rescale per query
 
   // Zero the FULL QMM_BLOCK rows, not just nq: the matrix ops load 8-row fragments, so the
   // padding rows must be defined (0) rather than garbage that could turn into NaN.
@@ -162,16 +161,18 @@ kernel void cpi_attention_prefill_mm(device const half* q [[buffer(0)]],
           (lane < nk && sc != -INFINITY && new_max != -INFINITY) ? exp(sc - new_max) : 0.0f;
       pw_sh[qi * KEY_BLOCK + lane] = half(w);  // all 32 lanes: 0 past nk, so P.V masks itself
       const float bsum = simd_sum(w);
+      // Rescale this query's running accumulator right here, by the same simdgroup that owns the
+      // query -- rescale is uniform across the 32 lanes (it derives from the simd_max), so the
+      // lanes split the head_dim between them. This used to be a separate all-threads pass over
+      // acc with a barrier on each side; folding it in drops that pass and one of its barriers, and
+      // r_sh (the per-query factor it needed to communicate) disappears with it. head_dim <= 256
+      // here, so KEY_BLOCK(32) lanes cover it in <= 8 steps.
+      for (uint i = lane; i < hd; i += 32u) acc[qi * hd + i] = acc[qi * hd + i] * rescale;
       if (lane == 0u) {
         l_sh[qi] = l_sh[qi] * rescale + bsum;
         m_sh[qi] = new_max;
-        r_sh[qi] = rescale;
       }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Rescale the running fp32 accumulator by this block's per-query factor.
-    for (uint c = lid; c < nq * hd; c += nthr) acc[c] = acc[c] * r_sh[c / hd];
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // --- P.V: O[8q x 8d] += P[8q x 8k] @ V[8k x 8d], accumulated into the fp32 acc. ---
