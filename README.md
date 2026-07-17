@@ -583,8 +583,33 @@ to the 8B:
   shared bump would have broken it invisibly). The fragment loop stays: it costs nothing at 8, one
   iteration, and it disarms the landmine — the only reason to keep code from a failed experiment.
 
-  So attention's ~25 ms is **not** redundant KV traffic, and its mechanism is unidentified. The
-  decode half of the theory is untested and now doubtful for the same reason.
+  So attention's ~25 ms is **not** redundant KV traffic. What it is, on the decode side, is now
+  measured rather than guessed.
+
+- **Decode attention costs 496 us fixed + 1.838 us per key, per token.** Ablating `Attention`
+  across depth gives a decode time of **345 / 346 / 346 / 346 ms at depths 257 / 512 / 1022 /
+  2042** -- flat to a millisecond over an 8x range, which is the control every earlier attempt
+  lacked: it proves attention is the ONLY depth-dependent cost, and that the ablation is really
+  removing it. Attention itself reads 968 / 1375 / 2375 / 4250 us, and the linear fit predicts the
+  held-out points to within 0.1% (depth 1022: 2374 predicted, 2375 measured).
+
+  The fixed 496 us is 48 dispatches per token (split + merge, 24 layers) of launch overhead, ~4% of
+  a token. The per-key 1.838 us is the other 88% at depth 2048, and it is the whole gap:
+  llama.cpp's entire attention there is ~800 us against our 4250.
+
+  **Each key-head is a 64-element dot product running at ~23 GFLOP/s -- 0.5% of this chip's peak**,
+  because the scoring loop is reduction-bound rather than compute-bound:
+
+  ```metal
+  for (uint i = lane; i < p.head_dim; i += 32u) d += q_sh[i] * float(kt[i]);
+  d = simd_sum(d);   // 2 MACs per lane, then a 5-step shuffle reduction -- PER KEY
+  ```
+
+  Two MACs of work per lane, then a full cross-lane reduction, for every key. The fix is the
+  standard decode layout: give each LANE its own key so the dot product stays in one lane and no
+  reduction happens at all. It needs a wider key block for the decode kernel (32 keys cannot fill
+  256 threads one-per-lane) and a softmax reduction restructured to match -- KEY_BLOCK is shared
+  with the prefill kernels, so it wants its own constant, the same lesson as QMM_BLOCK above.
 
   The same redundancy is the whole decode gap: ablating `Attention` at depth 2048 gives 66.9 →
   **92.5 tok/s**, so attention is 4.16 ms of a 14.9 ms token where llama.cpp spends ~0.8 ms, and
