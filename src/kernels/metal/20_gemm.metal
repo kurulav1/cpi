@@ -40,19 +40,19 @@
 
 // The fp16 GEMM's ACCUMULATOR type. 0 = fp32 (simdgroup_float8x8), 1 = fp16.
 //
-// This is the last open perf question. Xcode's counters say the kernel is F32-limited at
-// 90.86% while the **F16 pipe sits at 0.00% utilization** -- every MAC issues on F32 purely
-// because the accumulator is float. Apple's F16 pipe is typically ~2x the F32 rate, so if
-// half accumulators issue there natively, this kernel roughly doubles.
+// This WAS the last open perf question, now closed by re-measurement. Xcode's counters show the
+// kernel F32-limited while the F16 pipe sits at 0.00% -- every MAC issues on F32 because the
+// accumulator is float -- and Apple's F16 ALU pipe is ~2x the F32 rate, so the hope was that half
+// accumulators route there and roughly double the kernel.
 //
-// An older note says half accumulators measured 3x SLOWER, which is why this is 0. Treat that
-// as unverified: it dates from the same period as a "+37%" that was a kernel skipping half its
-// writes, a "34% non-GEMM" that was a profiler artifact, and a "53% of peak" that used the
-// wrong denominator -- every measurement from then that has been re-checked was wrong. Flip
-// this and metal_gemm_bench will report a number only if the result is still correct.
-//
-// Accuracy is the other half of the trade: fp16 accumulation over an 896-deep dot product
-// loses precision, so a win here is only a win if the goldens still pass.
+// They do not. Flipped to 1 and benched honestly (spot-checked, warm, current harness): gate/up
+// 3.20 -> 0.81 TFLOP/s, aggregate 2.98 -> 0.74 -- a 4x REGRESSION, which confirms the old note
+// that had been distrusted for dating from the bad-measurement era. The 0% F16 utilization is not
+// headroom: the matrix unit (simdgroup_multiply_accumulate) accumulates in fp32 NATIVELY, and
+// asking for a half accumulator does not move the MAC onto the F16 pipe -- it emulates fp16
+// accumulation on the F32 unit, which is strictly more work. The F16 pipe is reachable by scalar
+// half math, not by the matrix unit, and a GEMM has to live on the matrix unit. (Precision was
+// fine -- the golden still passed -- so this is a pure throughput loss, not an accuracy one.)
 #define GEMM_ACC_HALF 0
 
 #if GEMM_ACC_HALF
