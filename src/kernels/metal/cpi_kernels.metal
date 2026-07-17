@@ -1180,24 +1180,28 @@ kernel void cpi_kv_store(
 // raising a shared constant would silently break a path whose golden is skipped on any host
 // without a Gemma checkpoint.
 //
-// It sets how often attention re-reads K/V: a block of QMM_BLOCK queries pulls each key block in
-// ONCE and serves all of them from it, so doubling this halves the passes over the cache.
+// The block is QMM_BLOCK/8 query row fragments, and 16 (two fragments) is what fills the scoring
+// loop: it runs qfs*n_kg work items, and with n_kg = KEY_BLOCK/8 = 4 key groups, one query
+// fragment leaves 4 of the 8 simdgroups idle where two fill them all. Measured on a 2041-token
+// prefill -- where attention is 39% of the pass, not the 15% it is at 541 -- attention goes
+// 330 -> 301 ms (-9%) from 8 to 16, and back to 330 at 32 (four fragments loop twice for no more
+// parallelism and cost more threadgroup memory). At 541 tokens the change is real but invisible:
+// 9% of a 15% share is under the run-to-run noise, which is why it first read as a dead end when
+// measured only there. Measure a small term where it is small and you conclude it is zero.
 //
-// THAT DOES NOT MAKE IT FASTER, which is worth writing down because it is the obvious thing to
-// try. Measured on a 541-token prefill: 8 -> 188/190 ms, 16 -> 187/187, 32 -> 194/194, while the
-// same runs with attention ablated read 166 / 158 / 161 -- a 5% spread on a figure that cannot
-// depend on this constant at all, so the noise floor is as big as the effect. The re-reads are
-// cache-served (a layer's K+V is ~277 KB at T=541, which the LLC holds without trying), so
-// removing passes over them buys nothing. Left at 8: no measured gain, half the threadgroup
-// memory.
+// It does NOT help by cutting K/V re-reads, the theory it was first tried under: those are
+// cache-served (a layer's K+V is ~277 KB at T=541, held in the LLC without trying), and 32 would
+// cut them further while running slower. It is only about keeping all 8 simdgroups busy in the
+// score matmul.
 //
 // Raising it USED to compute garbage -- the fragment plan scored exactly one simdgroup_float8x8
 // from row 0, so a block of 16 wrote its first 8 queries and left the rest as whatever shared
-// memory held. That is the fp16 GEMM's bug exactly (a tile widened past the threads that serve
-// it), and it read as a 9% speedup because it was doing half the work. The matrix ops below now
-// loop over QMM_BLOCK/8 fragments, so the constant is a real knob and the landmine is gone --
-// which is the only reason to keep the loop after a negative result.
-#define QMM_BLOCK 8
+// memory held (the fp16 GEMM's bug exactly, a tile widened past the threads that serve it). The
+// matrix ops below now loop over QMM_BLOCK/8 fragments, so it is a real knob.
+//
+// Threadgroup memory is the ceiling: q_sh + acc + sc_sh + pw_sh is QMM_BLOCK * (2*128 + 4*128 +
+// 4*32 + 2*32) bytes, so 16 costs ~15 KB of the 32 KB budget and 32 ~30 KB.
+#define QMM_BLOCK 16
 
 // ---------------------------------------------------------------------------
 // Prefill attention on the MATRIX UNITS (head_dim <= 128). The scalar kernel below scores

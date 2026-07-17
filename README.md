@@ -573,18 +573,23 @@ to the 8B:
   that serve it, and **the 9% "win" was just doing half the work.** Third time in one day that a
   speedup turned out to be a correctness bug.
 
-  Making the matrix ops loop over `QMM_BLOCK/8` fragments fixes it, and **the speedup does not
-  survive.** Correct, at 541 tokens: 8 → 188/190 ms, 16 → 187/187, 32 → 194/194. The same runs
-  with attention ablated read 166 / 158 / 161 ms — a 5% spread on a figure that cannot depend on
-  this constant at all, so the noise floor is the size of the effect. **The re-reads are
-  cache-served**: a layer's K+V is ~277 KB at T=541, which the LLC holds without trying, so
-  removing passes over them buys nothing and the "3 GB of redundant traffic" that motivated this
-  was DRAM-naive arithmetic. `QMM_BLOCK` stays 8 (separate from the scalar kernel's `Q_BLOCK`,
-  which is stuck at 8 by Gemma's head_dim 256 — whose golden *skips* without a checkpoint, so a
-  shared bump would have broken it invisibly). The fragment loop stays: it costs nothing at 8, one
-  iteration, and it disarms the landmine — the only reason to keep code from a failed experiment.
+  Making the matrix ops loop over `QMM_BLOCK/8` fragments fixes the correctness, and then the win
+  is real but not for the reason it was tried. It is **not** cutting K/V re-reads — those are
+  cache-served (a layer's K+V is ~277 KB at T=541, held in the LLC without trying), and the "3 GB
+  of redundant traffic" that motivated it was DRAM-naive arithmetic. What 16 does is fill the
+  scoring matmul: it runs `qfs·n_kg` simdgroup work items, and with 4 key groups one query fragment
+  leaves 4 of 8 simdgroups idle where two fill them all. At 2041 tokens, where attention is 39% of
+  the pass, **attention goes 330 → 301 ms (−9%)** from 8 to 16 and back to 330 at 32.
 
-  So attention's ~25 ms is **not** redundant KV traffic. What it is, on the decode side, is now
+  This first read as a dead end because it was measured at 541 tokens, where attention is 15% of
+  prefill and 9% of that is under the run-to-run noise. Both measurements were right; the
+  conclusion was drawn at the length where the effect is smallest. **Measure a small term where it
+  is small and you will call it zero** — the same mistake, in the same session, as testing the
+  decode split before a prompt was deep enough to need it. `QMM_BLOCK` is 16 (its own constant: the
+  scalar kernel's `Q_BLOCK` is stuck at 8 by Gemma's head_dim 256, whose golden *skips* without a
+  checkpoint, so a shared bump would have broken it invisibly).
+
+  So attention's cost is **not** redundant KV traffic. What it is, on the decode side, is now
   measured rather than guessed.
 
 - **Decode attention costs 496 us fixed + 1.838 us per key, per token.** Ablating `Attention`

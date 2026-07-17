@@ -149,7 +149,7 @@ constexpr int kGemmQTG = 32 * (64 / 32) * (kGemmQBN / 32);
 constexpr int kGemmMinTokens = 16;
 constexpr int kGemmQBK = 32;  // MUST match GEMM_QBK in the shader (quantized)
 constexpr int kQBlock = 8;      // MUST match Q_BLOCK in cpi_kernels.metal (scalar prefill)
-constexpr int kQMMBlock = 8;    // MUST match QMM_BLOCK in cpi_kernels.metal (matrix-unit prefill)
+constexpr int kQMMBlock = 16;   // MUST match QMM_BLOCK in cpi_kernels.metal (matrix-unit prefill)
 constexpr int kKeyBlock = 32;   // MUST match KEY_BLOCK in cpi_kernels.metal
 
 // Split-KV decode attention. A decode's attention grid is one threadgroup per head -- 14 of
