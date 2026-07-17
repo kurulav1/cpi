@@ -93,7 +93,7 @@ run_golden() {  # golden tokens quant candidate...
     skip "$golden${quant:+ (int$quant)} -- no checkpoint among: $*"
     return
   fi
-  label="$golden${quant:+ (int$quant)}"
+  label="$golden${quant:+ (int$quant)}${LABEL_EXTRA:-}"
   if [ -n "$quant" ]; then
     out=$(CPI_METAL_QUANT="$quant" "$BUILD/metal_decode_test" "$path" "$toks" \
           "$REPO/src/tests/golden/$golden" 2>&1)
@@ -132,6 +132,18 @@ else
   # the token level. The quantized GEMM is gated properly instead, by metal_smoke, against a
   # CPU reference over T = 1..200 -- which is a stronger check than this would have been.
   run_golden qwen2.5-0.5b-longprompt-86x64.txt 64 ""  qwen.ll2c Qwen2.5-0.5B-Instruct.ll2c
+
+  # Split-KV decode attention, forced on. It normally waits for 256 keys, which NO golden here
+  # ever reaches -- the longest tops out around 150 -- so without this the split kernels ship
+  # with the gate green and nothing having run them. CPI_METAL_ATTN_SPLIT_MIN=1 splits at any
+  # depth, so these re-runs point the same CUDA-referenced streams at pass 1 and the merge. The
+  # split is exact (log-sum-exp merges), so the expected answer is unchanged: same golden.
+  LABEL_EXTRA=" [split-kv]"
+  export CPI_METAL_ATTN_SPLIT_MIN=1
+  run_golden qwen2.5-0.5b-sky-128.txt 128 ""  qwen.ll2c Qwen2.5-0.5B-Instruct.ll2c
+  run_golden qwen2.5-0.5b-longprompt-86x64.txt 64 ""  qwen.ll2c Qwen2.5-0.5B-Instruct.ll2c
+  unset CPI_METAL_ATTN_SPLIT_MIN
+  LABEL_EXTRA=""
   # Qwen3: QK-norm, head_dim 128 (the 8B's attention path).
   run_golden qwen3-0.6b-sky-64.txt 64 "" Qwen3-0.6B.ll2c
   # Gemma: GeGLU, sliding window, head_dim 256 -- the scalar attention path.
