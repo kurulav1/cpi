@@ -513,23 +513,35 @@ to the 8B:
   unrelated kernels (Apple's matrix unit accumulates in fp32 natively, so half-accumulate appears
   to be emulated). So further tuning of the *tile* here is a dead end with a receipt.
 
-  > **The "dead end" and the 37% occupancy were both the BENCH, and a clean capture of the real
-  > pass says something different.** Every reading above came from `metal_gemm_bench` -- one shape
-  > run hot, back to back. A genuinely GEMM-only capture of a real prefill (every other op ablated,
+  > **The "dead end" and the 37% occupancy were both the BENCH, and clean captures of the real
+  > pass say something different.** Every reading above came from `metal_gemm_bench` -- one shape
+  > run hot, back to back. Genuinely GEMM-only captures of a real prefill (every other op ablated,
   > which only became possible once `CPI_METAL_ABLATE` stopped silently ignoring misspelled names
-  > this session) reads: **occupancy 94%, F32 limiter 79%, F32 utilization 70%, and an
-  > instruction-throughput limiter of 69% with ~30% combined integer/conditional load.** So the
-  > real GEMM runs at high occupancy, not 37%, and it is *not* at the F32 ceiling -- it leaves ~20%
-  > of the F32 pipe idle while the inner loop's address math, bounds checks and loop control eat
-  > the issue slots. That is exactly the "issues F32 denser than we do" the thread-scaling test
-  > inferred about llama.cpp. Lifting F32 utilization from 70% toward 90% is ~+28% on a GEMM that
-  > is 80% of prefill -- prefill 76% -> ~93% of llama.cpp, close to the whole gap.
+  > this session) read, at two lengths:
   >
-  > The next step is therefore NOT another tile size. It is cutting the inner loop's non-F32
-  > instruction count (unroll the K loop, hoist the address arithmetic, drop redundant bounds
-  > checks), with a falsifiable prediction: **F32 utilization rises and the instruction-throughput
-  > limiter falls.** If F32 util does not move, the hypothesis is wrong -- the same before/after
-  > discipline that separated this session's real wins from its three fake ones.
+  > | | T=257 | T=511 | bench, one shape |
+  > | --- | --- | --- | --- |
+  > | occupancy | 94% | (n/a) | 37% |
+  > | F32 limiter | 79% | 85% | 91% |
+  > | F32 utilization | 70% | 76% | 81% |
+  > | instruction-throughput limiter | 69% | 75% | -- |
+  >
+  > So the real GEMM runs at high occupancy, not 37%, and F32 utilization **climbs with prompt
+  > length** -- 70 -> 76 -> 81% -- because the big MLP GEMMs (gate/up/down, 87% of prefill FLOPs)
+  > tile better as T grows. The T=257 capture overstated the headroom for that reason. At a real
+  > length it is ~15%, not 20%, and the co-limiter is the tell: **instruction throughput at 75%,
+  > nearly level with F32's 85%.** The matmul phase is already F32-dense; what idles the F32 pipe
+  > is the FILL phase between barriers -- staging each K-block's operands into threadgroup memory
+  > (integer address math, uint4 loads) while the matrix units wait.
+  >
+  > So the lever is not a tile size and not the MAC loop -- it is **overlapping fill with compute**:
+  > double-buffer the K-block staging so block n+1 loads while block n multiplies, and the F32 pipe
+  > stops waiting. Predicted: F32 utilization rises toward the bench's 81%+ and the
+  > instruction-throughput limiter falls. It is a ~150-line change with real barrier subtlety and
+  > doubled threadgroup memory, deferred rather than rushed -- a half-correct GEMM behind a gate
+  > that (see three times this session) does not always catch a fast-but-wrong kernel is the worst
+  > outcome, not the best. The headroom is ~+7% on F32 util at real length, so prefill 76% -> low
+  > 80s% of llama.cpp: real, bounded, and smaller than the T=257 capture first suggested.
 
   What that gap IS was narrowed by ruling out the structural explanation. llama.cpp's backend
   prints `MTL,BLAS` and its binary links Accelerate (whose BLAS runs on Apple's AMX coprocessor),
