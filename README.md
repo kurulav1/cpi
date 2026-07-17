@@ -561,9 +561,38 @@ to the 8B:
   >
   > So the ~15% F32 headroom is occupancy-hidden (double-buffering made it worse), the shape mix is
   > grid-saturated (fusion barely moves it), and the machine is ~fully busy. The remaining gap to
-  > llama.cpp is a genuine GEMM-formulation difference -- their `mul_mm` sustains more per FLOP on the
-  > same F32 pipe -- which is a research-grade kernel rewrite, not a lever. **Prefill stands at ~76%,
-  > and it is now understood why, not merely unattempted.**
+  > llama.cpp is a genuine GEMM-formulation difference -- their kernel sustains more per FLOP on the
+  > same F32 pipe. **Prefill stands at ~76%, and it is now understood why, not merely unattempted.**
+
+- **Is that formulation gap reachable? Yes -- llama.cpp's M4 GEMM is the SAME primitive as ours,
+  tuned differently.** Read from its Metal source (to understand the technique, not copy it): the
+  fast tensor-coprocessor path (`matmul2d`) is compiled out on this chip -- the device reports no
+  tensor units -- so what actually runs is a classic kernel built on `simdgroup_float8x8` and
+  `simdgroup_multiply_accumulate`, the exact instructions ours uses. Their ~4160 tok/s is not a
+  hardware or vendor-library advantage; it is a better-structured version of what we already do.
+  Four differences stand out, none needing anything we lack:
+
+  1. **Output tile 64x32, not 64x64.** They accumulate 8 fragments per simdgroup where we hold 16,
+     so a threadgroup uses roughly half the registers -- which lets more threadgroups stay resident
+     and hide latency. This is the likely big one, and it is the opposite of the intuition that a
+     bigger tile is better: the bigger tile's register pressure costs more occupancy than its
+     arithmetic-intensity saves.
+  2. **Non-transposed matrix loads.** They swizzle each 8x8 fragment to be contiguous when they
+     stage the tile, so the `simdgroup_load` is a plain aligned load. Ours transposes the weight
+     fragment on every K-step -- which fits the 75% instruction-throughput co-limiter the capture
+     saw next to the 85% F32. (Our quantized path already stages transposed for exactly this reason;
+     the fp16 path never did.)
+  3. **Direct store to device.** They `simdgroup_store` the result straight to device memory. Ours
+     stages each of 16 accumulator fragments through threadgroup memory with two barriers apiece --
+     ~32 barriers in the store-out, once per threadgroup.
+  4. **`simdgroup_barrier(mem_none)` between fragment-load groups**, letting the loads and MACs
+     pipeline within a simdgroup rather than issuing in a dependent chain.
+
+  So the honest answer to "can we match it" is that there is no wall -- the gap is a tile-shape and
+  data-layout rewrite of `cpi_gemm_f16`, not a missing capability. It is a real rewrite (the
+  accumulator count, the fill swizzle and the store path all change together, so it cannot be done
+  incrementally and each intermediate is wrong), which is why it is scoped as its own effort rather
+  than folded into a session about other things -- but it is engineering, not hope.
 
   What that gap IS was narrowed by ruling out the structural explanation. llama.cpp's backend
   prints `MTL,BLAS` and its binary links Accelerate (whose BLAS runs on Apple's AMX coprocessor),
