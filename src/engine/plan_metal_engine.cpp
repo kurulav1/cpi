@@ -151,7 +151,7 @@ constexpr int kGemmQBK = 32;  // MUST match GEMM_QBK in the shader (quantized)
 constexpr int kQBlock = 8;      // MUST match Q_BLOCK in cpi_kernels.metal (scalar prefill)
 constexpr int kQMMBlock = 16;   // MUST match QMM_BLOCK in cpi_kernels.metal (matrix-unit prefill)
 constexpr int kKeyBlock = 32;   // MUST match KEY_BLOCK in cpi_kernels.metal (scalar / decode)
-constexpr int kMMKeyBlock = 64; // MUST match MM_KEY_BLOCK (matrix-unit prefill attention)
+constexpr int kMMKeyBlock = 128; // MUST match MM_KEY_BLOCK (matrix-unit prefill attention)
 
 // Split-KV decode attention. A decode's attention grid is one threadgroup per head -- 14 of
 // them for Qwen2.5-0.5B, on a GPU sized for hundreds -- so past a few hundred keys the cache

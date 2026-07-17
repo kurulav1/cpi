@@ -32,7 +32,7 @@ using namespace metal;
 // the iteration count. The softmax then covers 64 keys with 32 lanes (two keys per lane). Separate
 // from KEY_BLOCK because the scalar kernel keeps one-key-per-lane and the paged block alignment is
 // still stated in KEY_BLOCK units.
-#define MM_KEY_BLOCK 64
+#define MM_KEY_BLOCK 128
 
 // ---------------------------------------------------------------------------
 // Parameter blocks. One per op family, bound at buffer(N) as a `constant` ref.

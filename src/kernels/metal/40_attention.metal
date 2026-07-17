@@ -148,19 +148,26 @@ kernel void cpi_attention_prefill_mm(device const half* q [[buffer(0)]],
       const uint pos_i = base + t0 + qi;
       uint start_i = 0u;
       if (p.window != 0u && pos_i + 1u > p.window) start_i = pos_i + 1u - p.window;
-      const uint k0 = kb + lane, k1 = kb + lane + 32u;
-      const bool keep0 = (lane < nk) && (k0 <= pos_i) && (k0 >= start_i);
-      const bool keep1 = (lane + 32u < nk) && (k1 <= pos_i) && (k1 >= start_i);
-      const float sc0 = keep0 ? sc_sh[qi * MM_KEY_BLOCK + lane] * p.scale : -INFINITY;
-      const float sc1 = keep1 ? sc_sh[qi * MM_KEY_BLOCK + lane + 32u] * p.scale : -INFINITY;
+      // MM_KEY_BLOCK/32 keys per lane. Fold their max and sum across the group before the simd
+      // reduction; each is written back to its own pw_sh column.
+      float lmax = -INFINITY;
+      float sc[MM_KEY_BLOCK / 32u];
+      for (uint g = 0u; g < MM_KEY_BLOCK / 32u; ++g) {
+        const uint key = kb + lane + g * 32u;
+        const bool keep = (lane + g * 32u < nk) && (key <= pos_i) && (key >= start_i);
+        sc[g] = keep ? sc_sh[qi * MM_KEY_BLOCK + lane + g * 32u] * p.scale : -INFINITY;
+        lmax = max(lmax, sc[g]);
+      }
       const float old_max = m_sh[qi];
-      const float new_max = max(old_max, simd_max(max(sc0, sc1)));
+      const float new_max = max(old_max, simd_max(lmax));
       const float rescale = (old_max == -INFINITY) ? 0.0f : exp(old_max - new_max);
-      const float w0 = (sc0 != -INFINITY && new_max != -INFINITY) ? exp(sc0 - new_max) : 0.0f;
-      const float w1 = (sc1 != -INFINITY && new_max != -INFINITY) ? exp(sc1 - new_max) : 0.0f;
-      pw_sh[qi * MM_KEY_BLOCK + lane] = half(w0);        // 0 past nk, so P.V masks itself
-      pw_sh[qi * MM_KEY_BLOCK + lane + 32u] = half(w1);
-      const float bsum = simd_sum(w0 + w1);
+      float lsum = 0.0f;
+      for (uint g = 0u; g < MM_KEY_BLOCK / 32u; ++g) {
+        const float w = (sc[g] != -INFINITY && new_max != -INFINITY) ? exp(sc[g] - new_max) : 0.0f;
+        pw_sh[qi * MM_KEY_BLOCK + lane + g * 32u] = half(w);  // 0 past nk, so P.V masks itself
+        lsum += w;
+      }
+      const float bsum = simd_sum(lsum);
       // Rescale this query's running accumulator right here, by the simdgroup that owns the query
       // (rescale is uniform across the lanes, from the simd_max), lanes splitting head_dim.
       for (uint i = lane; i < hd; i += 32u) acc[qi * hd + i] = acc[qi * hd + i] * rescale;
