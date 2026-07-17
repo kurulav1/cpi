@@ -650,6 +650,14 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
 
   if (profile) profile_last_ = std::chrono::steady_clock::now();
 
+  // Tracks the previously dispatched op, for the concurrent-overlap check below. Local to this
+  // execute_ops call: a new call (the next layer) starts with no predecessor, so its first op
+  // barriers after everything the previous call queued.
+  bool prev_dispatch_valid = false;
+  opplan::OpKind prev_dispatch_kind = opplan::OpKind::RmsNorm;
+  opplan::Slot prev_dispatch_in = opplan::Slot::X;
+  opplan::Slot prev_dispatch_out = opplan::Slot::X;
+
   for (std::size_t oi = 0; oi < ops.size(); ++oi) {
     const opplan::Op& op = ops[oi];
 
@@ -660,6 +668,25 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
     // are asking about (it reported 551 ms of GPU work for a pass that really takes ~190).
     // Never set this outside an experiment.
     if (!ablate_.empty() && ablate_.count(op_kind_name(static_cast<int>(op.kind))) != 0) continue;
+
+    // CONCURRENT-DISPATCH OVERLAP. The compute encoder is concurrent and every dispatch barriers
+    // first by default (serial-equivalent). A Gemv that reads the SAME input slot as the
+    // immediately preceding Gemv and writes a DIFFERENT output is independent of it: the three
+    // Q/K/V projections all read the post-norm slot and write distinct slots, as do gate/up. They
+    // are consecutive, so nothing writes the shared input between them -- no RAW, WAR or WAW -- and
+    // the second/third may skip the barrier and overlap on the GPU. That is where the win is: the
+    // 128-row k/v projections are grid-starved (18 threadgroups on 10 cores) and never fill the
+    // machine alone. Everything else keeps the barrier, so multi-dispatch ops and the real
+    // dependency chain stay correctly ordered. prev is reset each execute_ops call, so the first op
+    // of a layer (its rmsnorm) always barriers after the previous layer.
+    if (op.kind == OpKind::Gemv && prev_dispatch_valid && prev_dispatch_kind == OpKind::Gemv &&
+        op.in == prev_dispatch_in && op.out != prev_dispatch_out && op.out != prev_dispatch_in) {
+      ctx_.set_next_barrier(false);
+    }
+    prev_dispatch_valid = true;
+    prev_dispatch_kind = op.kind;
+    prev_dispatch_in = op.in;
+    prev_dispatch_out = op.out;
 
     // PEEPHOLE FUSION: `X += delta` (AddInplace) immediately followed by `XNorm = rmsnorm(X)`
     // is one fused pass -- the residual is read and written once instead of twice. The two ops

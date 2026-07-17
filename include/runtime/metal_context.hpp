@@ -95,6 +95,15 @@ public:
                 const void* const* buffers, const std::size_t* offsets, int n_buffers,
                 const void* params, std::size_t params_bytes);
 
+  // The compute encoder is concurrent. By default each dispatch is preceded by a memory barrier
+  // (serial-equivalent, always safe). Call this with false immediately before a dispatch that is
+  // provably independent of everything since the last barrier, to let it overlap on the GPU. The
+  // flag is consumed by the next dispatch and resets to true, so it never affects more than the
+  // one dispatch it precedes.
+  void set_next_barrier(bool on) {
+    next_barrier_ = on;
+  }
+
   // Submits everything encoded so far and blocks until the GPU is done.
   void commit_and_wait();
 
@@ -147,6 +156,7 @@ private:
   void* encoder_ = nullptr;    // id<MTLComputeCommandEncoder>, reused across dispatches
   void* pipelines_ = nullptr;  // NSMutableDictionary name -> MTLComputePipelineState
   bool capturing_ = false;     // a .gputrace is open; end_gputrace() must close it
+  bool next_barrier_ = true;   // barrier before the next dispatch; see set_next_barrier
   std::string last_error_;
 
   double gpu_busy_ms_ = 0.0;

@@ -283,13 +283,30 @@ void MetalContext::dispatch(const std::string& name, Grid grid, std::size_t tota
   // dispatches is kept by an explicit memory barrier (below), which is far cheaper than an
   // encoder boundary.
   if (encoder_ == nullptr) {
-    encoder_ = (void*)[[cb computeCommandEncoder] retain];
+    // CONCURRENT dispatch, not the default serial. The slot/weight buffers are Shared and
+    // hazard-TRACKED (no Untracked flag on alloc), so Metal inserts a dependency barrier
+    // automatically wherever a dispatch reads what an earlier one wrote -- and ONLY there. Under a
+    // serial encoder that automatic tracking is moot: serial orders every dispatch regardless, so
+    // the independent ops in a layer (the three Q/K/V projections, gate/up) are force-serialised
+    // and each pays a pipeline drain. Concurrent lets those overlap -- the small grid-starved k/v
+    // projections in particular, which never fill the GPU alone -- while the tracker still
+    // serialises the real dependency chain (norm -> qkv -> rope -> attention -> o -> ...). This is
+    // the correct-by-construction version of an earlier attempt that tracked hazards by hand and
+    // reset the state per layer, missing cross-layer dependencies; Metal's tracking spans the whole
+    // command buffer and has no such seam.
+    encoder_ =
+        (void*)[[cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent] retain];
   }
-  // No explicit barrier: the slot/weight buffers are Shared and hazard-TRACKED, so Metal
-  // inserts a dependency barrier automatically wherever a dispatch reads what an earlier one
-  // wrote -- and only there. Independent ops in a layer (the Q/K/V projections, say) are then
-  // free to overlap on the GPU instead of being force-serialised as a per-op encoder did.
   id<MTLComputeCommandEncoder> enc = (id<MTLComputeCommandEncoder>)encoder_;
+  // The encoder is concurrent, so a dispatch runs as soon as its inputs are ready UNLESS a barrier
+  // orders it. By default every dispatch barriers first -- correctness-equivalent to a serial
+  // encoder. The caller drops the barrier (set_next_barrier(false)) only for a dispatch it has
+  // proven independent of everything since the last barrier, which lets the small grid-starved
+  // projections (q/k/v, gate/up) overlap. The flag is one-shot: it resets to true here so an
+  // un-marked dispatch is always safe, which is what keeps every multi-dispatch op's internal
+  // ordering correct without the caller having to think about it.
+  if (next_barrier_) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+  next_barrier_ = true;
   [enc setComputePipelineState:pso];
   ++dispatch_count_;
 
