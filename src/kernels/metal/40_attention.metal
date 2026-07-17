@@ -76,8 +76,8 @@ kernel void cpi_attention_prefill_mm(device const half* q [[buffer(0)]],
 
   threadgroup half q_sh[QMM_BLOCK * 128];         // [query][d]
   threadgroup float acc[QMM_BLOCK * 128];         // [query][d] fp32 output accumulator
-  threadgroup float sc_sh[QMM_BLOCK * KEY_BLOCK]; // scores [query][key]
-  threadgroup half pw_sh[QMM_BLOCK * KEY_BLOCK];  // softmax weights [query][key], half for the matmul
+  threadgroup float sc_sh[QMM_BLOCK * MM_KEY_BLOCK]; // scores [query][key]
+  threadgroup half pw_sh[QMM_BLOCK * MM_KEY_BLOCK];  // softmax weights [query][key], half for the matmul
   threadgroup float m_sh[QMM_BLOCK];              // running max per query
   threadgroup float l_sh[QMM_BLOCK];              // running sum per query
 
@@ -102,13 +102,13 @@ kernel void cpi_attention_prefill_mm(device const half* q [[buffer(0)]],
   const uint dfs = hd / 8u;              // head_dim fragments
   const uint qfs = (nq + 7u) / 8u;       // query fragments actually occupied (<= QMM_BLOCK/8)
 
-  for (uint kb = start; kb <= last_pos; kb += KEY_BLOCK) {
-    const uint nk = min((uint)KEY_BLOCK, last_pos - kb + 1u);
+  for (uint kb = start; kb <= last_pos; kb += MM_KEY_BLOCK) {
+    const uint nk = min((uint)MM_KEY_BLOCK, last_pos - kb + 1u);
     const uint n_kg = (nk + 7u) / 8u;  // 8-key groups this block
 
     // Where this key block physically lives. ONE lookup per block, not per key: the caller
-    // guarantees block_size % KEY_BLOCK == 0 and no sliding window (so start == 0 and every kb
-    // is KEY_BLOCK-aligned), which together mean the whole run [kb, kb+KEY_BLOCK) sits inside a
+    // guarantees block_size % MM_KEY_BLOCK == 0 and no sliding window (so start == 0 and every kb
+    // is MM_KEY_BLOCK-aligned), which together mean the whole run [kb, kb+MM_KEY_BLOCK) sits inside a
     // single physical block and stays contiguous -- so the simdgroup_loads below keep working
     // unchanged, just from a different base. Break either guarantee and a key block could
     // straddle two blocks, which this addressing cannot express; the dispatch enforces both.
@@ -131,42 +131,38 @@ kernel void cpi_attention_prefill_mm(device const half* q [[buffer(0)]],
         simdgroup_multiply_accumulate(S, Qf, Kf, S);
       }
       // Store straight into sc_sh[query][key] at this fragment's row and key group's column.
-      simdgroup_store(S, sc_sh + qf * 8u * KEY_BLOCK + kg * 8u, KEY_BLOCK);
+      simdgroup_store(S, sc_sh + qf * 8u * MM_KEY_BLOCK + kg * 8u, MM_KEY_BLOCK);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Online softmax, a simdgroup per query; lane j owns key j (KEY_BLOCK == 32 == simd width).
-    // LOOPS over queries rather than taking qi = simd_id: a block wider than n_simd would
-    // otherwise leave its tail queries with no simdgroup, and they would silently keep the
-    // -INFINITY max and zero sum they were initialised with.
+    // Online softmax, a simdgroup per query. MM_KEY_BLOCK is 64 and the simd is 32 wide, so each
+    // lane owns TWO keys -- lane and lane+32 -- and the block-max/block-sum reduce over both before
+    // the simd reduction. A 64-key block halves the number of iterations (and their three barriers
+    // and this reduction) versus a 32-key one, which is the point: attention's per-block overhead,
+    // not its matmuls, is what makes this kernel ~3x llama.cpp's.
     //
-    // The scale and the causal/window mask are FOLDED IN here rather than run as a separate pass
-    // over sc_sh. That pass needed its own full sweep of the block and its own barrier; here the
-    // softmax already holds the query (qi) and the key (lane), so the same masked-and-scaled score
-    // feeds the reduction directly -- one fewer barrier and one fewer scalar sweep per key block,
-    // which matters because attention's key blocks are small (32) and the non-matrix phases
-    // between the two matmuls are what this kernel spends its time on.
+    // Scale and the causal/window mask are folded in here rather than a separate sc_sh sweep: the
+    // softmax already holds the query (qi) and the keys (lane, lane+32), so the masked, scaled score
+    // feeds the reduction directly -- one fewer barrier and one fewer pass per block.
     for (uint qi = simd_id; qi < nq; qi += n_simd) {
-      const uint key = kb + lane;
       const uint pos_i = base + t0 + qi;
       uint start_i = 0u;
       if (p.window != 0u && pos_i + 1u > p.window) start_i = pos_i + 1u - p.window;
-      const bool keep = (lane < nk) && (key <= pos_i) && (key >= start_i);
-      const float sc = keep ? sc_sh[qi * KEY_BLOCK + lane] * p.scale : -INFINITY;
-      const float bmax = simd_max(sc);
+      const uint k0 = kb + lane, k1 = kb + lane + 32u;
+      const bool keep0 = (lane < nk) && (k0 <= pos_i) && (k0 >= start_i);
+      const bool keep1 = (lane + 32u < nk) && (k1 <= pos_i) && (k1 >= start_i);
+      const float sc0 = keep0 ? sc_sh[qi * MM_KEY_BLOCK + lane] * p.scale : -INFINITY;
+      const float sc1 = keep1 ? sc_sh[qi * MM_KEY_BLOCK + lane + 32u] * p.scale : -INFINITY;
       const float old_max = m_sh[qi];
-      const float new_max = max(old_max, bmax);
+      const float new_max = max(old_max, simd_max(max(sc0, sc1)));
       const float rescale = (old_max == -INFINITY) ? 0.0f : exp(old_max - new_max);
-      const float w =
-          (lane < nk && sc != -INFINITY && new_max != -INFINITY) ? exp(sc - new_max) : 0.0f;
-      pw_sh[qi * KEY_BLOCK + lane] = half(w);  // all 32 lanes: 0 past nk, so P.V masks itself
-      const float bsum = simd_sum(w);
-      // Rescale this query's running accumulator right here, by the same simdgroup that owns the
-      // query -- rescale is uniform across the 32 lanes (it derives from the simd_max), so the
-      // lanes split the head_dim between them. This used to be a separate all-threads pass over
-      // acc with a barrier on each side; folding it in drops that pass and one of its barriers, and
-      // r_sh (the per-query factor it needed to communicate) disappears with it. head_dim <= 256
-      // here, so KEY_BLOCK(32) lanes cover it in <= 8 steps.
+      const float w0 = (sc0 != -INFINITY && new_max != -INFINITY) ? exp(sc0 - new_max) : 0.0f;
+      const float w1 = (sc1 != -INFINITY && new_max != -INFINITY) ? exp(sc1 - new_max) : 0.0f;
+      pw_sh[qi * MM_KEY_BLOCK + lane] = half(w0);        // 0 past nk, so P.V masks itself
+      pw_sh[qi * MM_KEY_BLOCK + lane + 32u] = half(w1);
+      const float bsum = simd_sum(w0 + w1);
+      // Rescale this query's running accumulator right here, by the simdgroup that owns the query
+      // (rescale is uniform across the lanes, from the simd_max), lanes splitting head_dim.
       for (uint i = lane; i < hd; i += 32u) acc[qi * hd + i] = acc[qi * hd + i] * rescale;
       if (lane == 0u) {
         l_sh[qi] = l_sh[qi] * rescale + bsum;
@@ -183,7 +179,7 @@ kernel void cpi_attention_prefill_mm(device const half* q [[buffer(0)]],
       simdgroup_load(O, acc + qf * 8u * hd + dg * 8u, hd);  // current (rescaled) accumulator
       for (uint kg = 0u; kg < n_kg; ++kg) {
         simdgroup_half8x8 Pf, Vf;
-        simdgroup_load(Pf, pw_sh + qf * 8u * KEY_BLOCK + kg * 8u, KEY_BLOCK);  // [8q x 8k]
+        simdgroup_load(Pf, pw_sh + qf * 8u * MM_KEY_BLOCK + kg * 8u, MM_KEY_BLOCK);  // [8q x 8k]
         simdgroup_load(Vf, v_cache + (ulong)(kphys + kg * 8u) * (ulong)kv_dim + kv_head * hd + dg * 8u,
                        kv_dim);  // [8k x 8d]
         simdgroup_multiply_accumulate(O, Pf, Vf, O);

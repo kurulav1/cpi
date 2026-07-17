@@ -26,6 +26,14 @@ using namespace metal;
 // a time, so this is the barrier-amortisation factor.
 #define KEY_BLOCK 32
 
+// The matrix-unit prefill attention kernel uses a WIDER key block than the scalar/decode paths:
+// its per-block cost (three barriers + the softmax reductions) is amortised over the keys in the
+// block, and attention is the prefill bottleneck (measured ~3x llama.cpp), so a 64-key block halves
+// the iteration count. The softmax then covers 64 keys with 32 lanes (two keys per lane). Separate
+// from KEY_BLOCK because the scalar kernel keeps one-key-per-lane and the paged block alignment is
+// still stated in KEY_BLOCK units.
+#define MM_KEY_BLOCK 64
+
 // ---------------------------------------------------------------------------
 // Parameter blocks. One per op family, bound at buffer(N) as a `constant` ref.
 // Kept flat and POD so the C++ side can memcpy them without a shared header.

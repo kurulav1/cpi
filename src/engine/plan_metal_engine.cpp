@@ -150,7 +150,8 @@ constexpr int kGemmMinTokens = 16;
 constexpr int kGemmQBK = 32;  // MUST match GEMM_QBK in the shader (quantized)
 constexpr int kQBlock = 8;      // MUST match Q_BLOCK in cpi_kernels.metal (scalar prefill)
 constexpr int kQMMBlock = 16;   // MUST match QMM_BLOCK in cpi_kernels.metal (matrix-unit prefill)
-constexpr int kKeyBlock = 32;   // MUST match KEY_BLOCK in cpi_kernels.metal
+constexpr int kKeyBlock = 32;   // MUST match KEY_BLOCK in cpi_kernels.metal (scalar / decode)
+constexpr int kMMKeyBlock = 64; // MUST match MM_KEY_BLOCK (matrix-unit prefill attention)
 
 // Split-KV decode attention. A decode's attention grid is one threadgroup per head -- 14 of
 // them for Qwen2.5-0.5B, on a GPU sized for hundreds -- so past a few hundred keys the cache
@@ -1027,7 +1028,8 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
         // an odd block size, Gemma's head_dim 256, a chunk below one query block -- falls
         // through to the decode kernel, which handles any geometry at O(T^2).
         if (batch_ != nullptr && batch_->logits_last_only && T >= kQBlock && op.head_dim <= 128 &&
-            (op.full_attention || op.sliding_window == 0) && batch_->block_size % kKeyBlock == 0) {
+            (op.full_attention || op.sliding_window == 0) &&
+            batch_->block_size % kMMKeyBlock == 0) {
           AttnParams p{static_cast<std::uint32_t>(op.heads),
                        static_cast<std::uint32_t>(op.kv_heads),
                        static_cast<std::uint32_t>(op.head_dim),
