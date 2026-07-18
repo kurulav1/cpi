@@ -116,22 +116,52 @@ kernel void cpi_attention_prefill_mm(device const half* q [[buffer(0)]],
                            ? uint(block_tables[kb / p.block_size]) * p.block_size + (kb % p.block_size)
                            : kb;
 
-    // --- Scoring: a simdgroup per (query fragment, key group) computes S[8q x 8k]. ---
-    // One work item per fragment PAIR, not per key group: with 4 key groups this used to leave
-    // half of an 8-simdgroup threadgroup idle, and it is also what pins the query block to 8.
-    for (uint w = simd_id; w < qfs * n_kg; w += n_simd) {
-      const uint qf = w / n_kg, kg = w % n_kg;
-      simdgroup_float8x8 S = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    // --- Scoring: each simdgroup computes a QT x KT TILE of S[8q x 8k] fragments. ---
+    // REGISTER TILING, the same trick that makes the GEMM fast. One output fragment per work item
+    // means loading a Qf and a Kf for every single matrix op -- two loads per MAC, an arithmetic
+    // intensity of 0.5, against the GEMM's 2.0. That is why attention runs at a few percent of the
+    // GEMM's FLOP rate: it is starved on fragment loads, not short of matrix throughput. Holding a
+    // 2x2 tile reuses each loaded Qf across KT key groups and each Kf across QT query fragments:
+    // 4 loads feed 4 MACs (intensity 1.0), and with qfs=2 and n_kg up to 16 the tile count still
+    // fills all 8 simdgroups.
+    //
+    // Query fragments past qfs are safe to compute: q_sh is zeroed over the FULL QMM_BLOCK rows, so
+    // they contribute zeros that the softmax's nq bound ignores. Key groups past n_kg are NOT safe
+    // to read (they can run off the end of the KV cache), so their load is clamped and their store
+    // suppressed.
+    constexpr uint QT = 2u, KT = 2u;
+    const uint qt_n = (qfs + QT - 1u) / QT;
+    const uint kt_n = (n_kg + KT - 1u) / KT;
+    for (uint w = simd_id; w < qt_n * kt_n; w += n_simd) {
+      const uint qt = w / kt_n, kt = w % kt_n;
+      simdgroup_float8x8 S[QT][KT];
+      for (uint a = 0u; a < QT; ++a)
+        for (uint b = 0u; b < KT; ++b) S[a][b] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
       for (uint df = 0u; df < dfs; ++df) {
-        simdgroup_half8x8 Qf, Kf;
-        simdgroup_load(Qf, q_sh + qf * 8u * hd + df * 8u, hd);  // [8q x 8d] of THIS fragment
-        // K is [key][d]; load the [8k x 8d] tile TRANSPOSED to get [8d x 8k].
-        simdgroup_load(Kf, k_cache + (ulong)(kphys + kg * 8u) * (ulong)kv_dim + kv_head * hd + df * 8u,
-                       kv_dim, ulong2(0, 0), true);
-        simdgroup_multiply_accumulate(S, Qf, Kf, S);
+        simdgroup_half8x8 Qf[QT], Kf[KT];
+        for (uint a = 0u; a < QT; ++a)
+          simdgroup_load(Qf[a], q_sh + (qt * QT + a) * 8u * hd + df * 8u, hd);  // [8q x 8d]
+        for (uint b = 0u; b < KT; ++b) {
+          const uint kg = min(kt * KT + b, n_kg - 1u);  // clamped: out-of-range reads are discarded
+          // K is [key][d]; load the [8k x 8d] tile TRANSPOSED to get [8d x 8k].
+          simdgroup_load(Kf[b],
+                         k_cache + (ulong)(kphys + kg * 8u) * (ulong)kv_dim + kv_head * hd + df * 8u,
+                         kv_dim, ulong2(0, 0), true);
+        }
+        for (uint a = 0u; a < QT; ++a)
+          for (uint b = 0u; b < KT; ++b)
+            simdgroup_multiply_accumulate(S[a][b], Qf[a], Kf[b], S[a][b]);
       }
-      // Store straight into sc_sh[query][key] at this fragment's row and key group's column.
-      simdgroup_store(S, sc_sh + qf * 8u * MM_KEY_BLOCK + kg * 8u, MM_KEY_BLOCK);
+
+      for (uint a = 0u; a < QT; ++a) {
+        for (uint b = 0u; b < KT; ++b) {
+          const uint kg = kt * KT + b;
+          if (kg >= n_kg) continue;  // suppressed: this fragment's keys are past the block
+          simdgroup_store(S[a][b], sc_sh + (qt * QT + a) * 8u * MM_KEY_BLOCK + kg * 8u,
+                          MM_KEY_BLOCK);
+        }
+      }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
