@@ -318,7 +318,20 @@ kernel void cpi_attention_prefill_mm(device const half* q [[buffer(0)]],
 #define QP_NSG  4                     // simdgroups per threadgroup
 #define QP_QPS  8                     // queries per simdgroup == one 8x8 row fragment
 #define QP_QBLK (QP_QPS * QP_NSG)     // 32 queries per threadgroup
-#define QP_KB   32                    // keys per block (== simd width, so lane == key)
+// Keys per block, == the simd width, so lane == key and there is nothing to fold before the
+// reduction. That looked like this kernel's whole problem: the cap is the threadgroup budget
+// (per-simdgroup scratch times QP_NSG, and with q_sh and acc sized for head_dim 128 the four
+// simdgroups already spend ~30 KB of 32 KB here), and a narrow block leaves the softmax as almost
+// pure reduction latency.
+//
+// It was tried. Sizing q_sh and acc at dispatch from the real head_dim lifts the cap, and wider is
+// monotonically WORSE: 32 keys 743 ms, 64 764, 96 852, against 610 for the phase-partitioned
+// kernel. Threadgroup memory buys occupancy, not block width -- it decides how many threadgroups
+// stay resident per core, and at 96 keys only one fits. Latency hiding is worth more here than any
+// fold. The dynamic-allocation plumbing was reverted with the hypothesis (it also let a caller that
+// forgot to size the arrays get zero-length ones silently, which is how it broke the window golden).
+// Query-partitioning is not being held back by this constant.
+#define QP_KB   32
 kernel void cpi_attention_prefill_qp(device const half* q [[buffer(0)]],
                                      device const half* k_cache [[buffer(1)]],
                                      device const half* v_cache [[buffer(2)]],

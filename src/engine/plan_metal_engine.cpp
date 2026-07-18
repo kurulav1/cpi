@@ -1049,7 +1049,11 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
           const void* mmbufs[] = {slot(op.in), k_cache_[static_cast<std::size_t>(layer)].handle(),
                                   v_cache_[static_cast<std::size_t>(layer)].handle(), slot(op.out),
                                   pos_buf_.handle(), batch_bt_buf_.handle()};
-          const std::size_t blocks = static_cast<std::size_t>((T + kQBlock - 1) / kQBlock);
+          // Blocked by the kernel's OWN query block. This used to use kQBlock, which is half
+          // kQMMBlock, so every query was covered twice and half the threadgroups launched only to
+          // find t0 >= tokens and return. Harmless, and invisible in the output, which is why it
+          // survived: the kernel bounds-checks correctly, it was just dispatched twice over.
+          const std::size_t blocks = static_cast<std::size_t>((T + kQMMBlock - 1) / kQMMBlock);
           ctx_.dispatch("cpi_attention_prefill_mm", G::Groups,
                         static_cast<std::size_t>(op.heads) * blocks, kTG, mmbufs, nullptr, 6, &p,
                         sizeof(p));
