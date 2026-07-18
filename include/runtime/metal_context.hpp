@@ -104,6 +104,24 @@ public:
     next_barrier_ = on;
   }
 
+  // Specializes the NEXT dispatch's kernel on compile-time values, one per [[function_constant(i)]]
+  // the kernel declares. One-shot, like set_next_barrier: consumed by the next dispatch and
+  // cleared, so it cannot leak into an unrelated kernel.
+  //
+  // Why it is worth a pipeline per shape: a kernel that reads head_dim (and the strides derived
+  // from it) out of its params block cannot unroll a loop bounded by it, size an array to it, or
+  // fold it into an address. Specialising the prefill attention kernel on head_dim and the q/kv
+  // strides measured 612 -> 593 ms on a 2041-token prefill, for identical output.
+  //
+  // Values are uint32 because that is what the shapes are. The pipeline cache is keyed by the
+  // kernel name AND these values, so each distinct shape compiles once and is then reused; a model
+  // has one shape, so this is a handful of pipelines for the process lifetime.
+  //
+  // Unlike a silently-defaulted binding, getting this wrong is LOUD: a kernel that declares a
+  // function constant no caller supplies fails pipeline creation, with the driver's message.
+  static constexpr int kMaxSpecConstants = 8;
+  void set_next_specialization(const std::uint32_t* values, int count);
+
   // Submits everything encoded so far and blocks until the GPU is done.
   void commit_and_wait();
 
@@ -157,6 +175,8 @@ private:
   void* pipelines_ = nullptr;  // NSMutableDictionary name -> MTLComputePipelineState
   bool capturing_ = false;     // a .gputrace is open; end_gputrace() must close it
   bool next_barrier_ = true;   // barrier before the next dispatch; see set_next_barrier
+  std::uint32_t next_spec_[kMaxSpecConstants] = {};  // see set_next_specialization
+  int next_spec_n_ = 0;
   std::string last_error_;
 
   double gpu_busy_ms_ = 0.0;

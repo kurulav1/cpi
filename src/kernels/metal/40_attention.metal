@@ -39,6 +39,16 @@
 // phases overlap across concurrent threadgroups, so their measured costs are superadditive.
 #define ATTN_RCA 0
 
+// Shape constants for the matrix-unit prefill attention kernel, supplied at pipeline creation
+// rather than read out of the params block. head_dim bounds the kernel's inner loops and sizes its
+// threadgroup arrays, and the two strides land in every address it computes; as runtime values the
+// compiler can neither unroll against them nor fold them. Specialising measured 612 -> 593 ms on a
+// 2041-token prefill for byte-identical output. See MetalContext::set_next_specialization -- a
+// caller that fails to supply these gets a loud pipeline-creation failure, not a wrong answer.
+constant uint FC_head_dim [[function_constant(0)]];
+constant uint FC_kv_dim [[function_constant(1)]];
+constant uint FC_q_dim [[function_constant(2)]];
+
 // ---------------------------------------------------------------------------
 // Prefill attention on the MATRIX UNITS (head_dim <= 128). The scalar kernel below scores
 // QK^T and does P.V with per-thread dot products -- the matrix units sit idle through the
@@ -78,14 +88,17 @@ kernel void cpi_attention_prefill_mm(device const half* q [[buffer(0)]],
 
   const uint group = p.heads / p.kv_heads;
   const uint kv_head = head / group;
-  const uint kv_dim = p.kv_heads * p.head_dim;
-  const uint q_dim = p.heads * p.head_dim;
-  const uint hd = p.head_dim;  // <= 128
+  const uint kv_dim = FC_kv_dim;
+  const uint q_dim = FC_q_dim;
+  const uint hd = FC_head_dim;  // <= 128, compile-time
 
   const uint simd_id = lid / 32u;
   const uint lane = lid % 32u;
   const uint n_simd = nthr / 32u;
 
+  // Sized for the largest head_dim the kernel supports: a function constant is not a
+  // constant expression to MSL, so it cannot bound an array. Only the loops and the
+  // addressing get specialized.
   threadgroup half q_sh[QMM_BLOCK * 128];         // [query][d]
   threadgroup float acc[QMM_BLOCK * 128];         // [query][d] fp32 output accumulator
   threadgroup float sc_sh[QMM_BLOCK * MM_KEY_BLOCK]; // scores [query][key]

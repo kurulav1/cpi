@@ -232,6 +232,15 @@ MetalBuffer MetalContext::alloc_from(const void* src, std::size_t bytes) {
   return b;
 }
 
+void MetalContext::set_next_specialization(const std::uint32_t* values, int count) {
+  if (count < 0) count = 0;
+  if (count > kMaxSpecConstants) {
+    throw std::runtime_error("MetalContext: too many specialization constants");
+  }
+  for (int i = 0; i < count; ++i) next_spec_[i] = values[i];
+  next_spec_n_ = count;
+}
+
 void MetalContext::dispatch(const std::string& name, Grid grid, std::size_t total,
                             std::size_t tg_size, const void* const* buffers,
                             const std::size_t* offsets, int n_buffers, const void* params,
@@ -240,17 +249,45 @@ void MetalContext::dispatch(const std::string& name, Grid grid, std::size_t tota
 
   id<MTLDevice> dev = (id<MTLDevice>)device_;
   NSMutableDictionary* cache = (NSMutableDictionary*)pipelines_;
-  NSString* key = [NSString stringWithUTF8String:name.c_str()];
+  NSString* fname = [NSString stringWithUTF8String:name.c_str()];
+
+  // The cache key carries the specialization, so each shape gets its own pipeline and an
+  // unspecialized dispatch of the same kernel never picks up a specialized one.
+  const int spec_n = next_spec_n_;
+  std::uint32_t spec[kMaxSpecConstants];
+  for (int i = 0; i < spec_n; ++i) spec[i] = next_spec_[i];
+  next_spec_n_ = 0;
+
+  NSString* key = fname;
+  if (spec_n > 0) {
+    NSMutableString* k = [NSMutableString stringWithString:fname];
+    for (int i = 0; i < spec_n; ++i) [k appendFormat:@"/%u", (unsigned)spec[i]];
+    key = k;
+  }
 
   id<MTLComputePipelineState> pso = [cache objectForKey:key];
   if (pso == nil) {
     id<MTLLibrary> lib = (id<MTLLibrary>)library_;
-    id<MTLFunction> fn = [lib newFunctionWithName:key];
+    NSError* err = nil;
+    id<MTLFunction> fn = nil;
+    if (spec_n > 0) {
+      MTLFunctionConstantValues* fcv = [[MTLFunctionConstantValues alloc] init];
+      for (int i = 0; i < spec_n; ++i) {
+        [fcv setConstantValue:&spec[i] type:MTLDataTypeUInt atIndex:(NSUInteger)i];
+      }
+      fn = [lib newFunctionWithName:fname constantValues:fcv error:&err];
+      [fcv release];
+    } else {
+      fn = [lib newFunctionWithName:fname];
+    }
     if (fn == nil) {
       last_error_ = "no such kernel in metallib: " + name;
+      if (err != nil) {
+        last_error_ += ": ";
+        last_error_ += [[err localizedDescription] UTF8String];
+      }
       return;
     }
-    NSError* err = nil;
     pso = [dev newComputePipelineStateWithFunction:fn error:&err];
     [fn release];
     if (pso == nil) {

@@ -155,6 +155,15 @@ constexpr int kMMKeyBlock = 128; // MUST match MM_KEY_BLOCK (matrix-unit prefill
 // MUST match QP_QBLK / (QP_NSG*32) in the query-partitioned attention kernel.
 constexpr int kQPBlock = 32;
 constexpr int kQPThreads = 128;
+
+// Shape specialization for cpi_attention_prefill_mm. MUST stay in the order the kernel declares
+// its [[function_constant(i)]] slots: head_dim, kv_dim, q_dim.
+inline void specialize_mm_attn(runtime::MetalContext& ctx, const opplan::Op& op) {
+  const std::uint32_t vals[3] = {static_cast<std::uint32_t>(op.head_dim),
+                                 static_cast<std::uint32_t>(op.kv_heads * op.head_dim),
+                                 static_cast<std::uint32_t>(op.heads * op.head_dim)};
+  ctx.set_next_specialization(vals, 3);
+}
 // MUST match FA_QBLK (8 * FA_QT * FA_NSG) in the register-resident attention kernel.
 constexpr int kFABlock = 32;
 constexpr int kFAThreads = 128;
@@ -1086,6 +1095,7 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
           // find t0 >= tokens and return. Harmless, and invisible in the output, which is why it
           // survived: the kernel bounds-checks correctly, it was just dispatched twice over.
           const std::size_t blocks = static_cast<std::size_t>((T + kQMMBlock - 1) / kQMMBlock);
+          specialize_mm_attn(ctx_, op);
           ctx_.dispatch("cpi_attention_prefill_mm", G::Groups,
                         static_cast<std::size_t>(op.heads) * blocks, kTG, mmbufs, nullptr, 6, &p,
                         sizeof(p));
@@ -1167,6 +1177,7 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
                             6, &p, sizeof(p));
             } else {
               const std::size_t blocks = static_cast<std::size_t>((T + kQMMBlock - 1) / kQMMBlock);
+              specialize_mm_attn(ctx_, op);
               ctx_.dispatch("cpi_attention_prefill_mm", G::Groups,
                             static_cast<std::size_t>(op.heads) * blocks, kTG, mmbufs, nullptr, 6, &p,
                             sizeof(p));

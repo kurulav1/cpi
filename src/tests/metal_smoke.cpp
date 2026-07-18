@@ -503,6 +503,11 @@ int main() {
         const std::size_t blocks = (T + kQBlockSmoke - 1) / kQBlockSmoke;
         const void* mmbufs[] = {bq.handle(), bk.handle(), bv.handle(),
                                 bo.handle(), bp.handle(), bk.handle()};
+        // This kernel is specialized on its shape, so the constants have to be supplied here too,
+        // in the order it declares them. Omitting them fails pipeline creation outright -- which
+        // is how the gate caught this caller when the kernel gained them.
+        const std::uint32_t spec[3] = {hd, kv_dim, q_dim};
+        ctx.set_next_specialization(spec, 3);
         ctx.dispatch("cpi_attention_prefill_mm", runtime::MetalContext::Grid::Groups,
                      c.heads * blocks, 256, mmbufs, nullptr, 6, &p, sizeof(p));
       } else if (T >= kQBlockSmoke) {
