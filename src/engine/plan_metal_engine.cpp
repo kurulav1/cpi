@@ -155,6 +155,38 @@ constexpr int kMMKeyBlock = 128; // MUST match MM_KEY_BLOCK (matrix-unit prefill
 // MUST match QP_QBLK / (QP_NSG*32) in the query-partitioned attention kernel.
 constexpr int kQPBlock = 32;
 constexpr int kQPThreads = 128;
+// MUST match FA_QBLK (8 * FA_QT * FA_NSG) in the register-resident attention kernel.
+constexpr int kFABlock = 32;
+constexpr int kFAThreads = 128;
+
+// Does this device lay out an 8x8 simdgroup fragment the way cpi_attention_prefill_fa assumes?
+//
+// That kernel keeps the score matrix in registers and reduces across the lanes of a row, which
+// means it depends on WHICH lane holds which element -- a mapping MSL does not document and does
+// not promise to keep. So it is not assumed: the probe kernel writes the mapping out, and this
+// checks every one of the 64 elements against the same expression the kernel uses. A device that
+// disagrees (a future GPU, a different simd width) simply does not get the kernel; the
+// phase-partitioned one stays correct everywhere and is the fallback.
+//
+// Run once and cached -- it costs a dispatch, and the answer cannot change under us.
+inline bool simdgroup_layout_matches(runtime::MetalContext& ctx) {
+  runtime::MetalBuffer probe = ctx.alloc(64 * sizeof(float));
+  if (!probe.valid()) return false;
+  float* got = static_cast<float*>(probe.contents());
+  for (int i = 0; i < 64; ++i) got[i] = -1.0f;
+  const void* bufs[] = {probe.handle()};
+  ctx.dispatch("cpi_simdgroup_layout_probe", runtime::MetalContext::Grid::Groups, 1, 32, bufs,
+               nullptr, 1, nullptr, 0);
+  ctx.commit_and_wait();
+  for (unsigned lane = 0; lane < 32u; ++lane) {
+    const unsigned row = ((lane & 16u) >> 2) | ((lane & 6u) >> 1);
+    const unsigned col = ((lane & 8u) >> 1) | ((lane & 1u) << 1);
+    for (unsigned j = 0; j < 2u; ++j) {
+      if (got[row * 8u + col + j] != static_cast<float>(lane * 2u + j)) return false;
+    }
+  }
+  return true;
+}
 
 // Split-KV decode attention. A decode's attention grid is one threadgroup per head -- 14 of
 // them for Qwen2.5-0.5B, on a GPU sized for hundreds -- so past a few hundred keys the cache
@@ -1114,7 +1146,21 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
               const char* e = std::getenv("CPI_METAL_ATTN_QP");
               return e != nullptr && e[0] == '1';
             }();
-            if (qp) {
+            // CPI_METAL_ATTN_FA=1 selects the register-resident research kernel (see the header
+            // above it). Opt-in, because it measured slower -- the proven kernel stays the default.
+            // The layout check still gates it: the kernel is only correct on a device whose
+            // fragment layout matches what it assumes, and that is verified, never assumed.
+            static const bool fa = [&] {
+              const char* e = std::getenv("CPI_METAL_ATTN_FA");
+              if (e == nullptr || e[0] != '1') return false;
+              return simdgroup_layout_matches(ctx_);
+            }();
+            if (fa && op.head_dim <= 128 && op.head_dim % 8 == 0) {
+              const std::size_t blocks = static_cast<std::size_t>((T + kFABlock - 1) / kFABlock);
+              ctx_.dispatch("cpi_attention_prefill_fa", G::Groups,
+                            static_cast<std::size_t>(op.heads) * blocks, kFAThreads, mmbufs,
+                            nullptr, 6, &p, sizeof(p));
+            } else if (qp) {
               const std::size_t blocks = static_cast<std::size_t>((T + kQPBlock - 1) / kQPBlock);
               ctx_.dispatch("cpi_attention_prefill_qp", G::Groups,
                             static_cast<std::size_t>(op.heads) * blocks, kQPThreads, mmbufs, nullptr,

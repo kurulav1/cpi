@@ -279,6 +279,244 @@ kernel void cpi_attention_prefill_mm(device const half* q [[buffer(0)]],
 }
 
 // ---------------------------------------------------------------------------
+// Register-resident prefill attention (head_dim <= 128).
+//
+// The phase-partitioned kernel above spills the score matrix to threadgroup memory between
+// scoring, softmax and P.V. The in-kernel decomposition (ATTN_RCA) priced that round trip, not the
+// arithmetic, as what the softmax phase actually costs: a fast exp, skipping the accumulator
+// rescale and overlapping the reduction chains all measured neutral, because none of them touch
+// the traffic. This kernel never spills it. S is computed into simdgroup_float8x8 REGISTERS, the
+// softmax rewrites those registers in place, and P.V consumes them -- no threadgroup memory at
+// all, and no barrier anywhere in the key loop.
+//
+// That needs to know which lane of a simdgroup holds which element of an 8x8 fragment, which MSL
+// does not document. It is not guessed: cpi_simdgroup_layout_probe below writes the mapping out,
+// the engine runs it once at start-up, and this kernel is selected only if the device agrees with
+// what is assumed here. Anything else falls back to the phase-partitioned kernel.
+//
+// The measured mapping -- 8x8 fragment, 32-wide simd, exactly 2 elements per lane, and identical
+// for the half and float fragments (which is what lets P be written back for the matmul):
+//     row         = ((lane & 16) >> 2) | ((lane & 6) >> 1)
+//     col of e[0] = ((lane & 8) >> 1) | ((lane & 1) << 1),   e[1] at col + 1
+//
+// Two consequences carry the kernel. A row lives in exactly FOUR lanes, differing only in bits 0
+// and 3, so a row-wise reduction is two shuffles instead of the five a 32-lane simd_max costs. And
+// a lane sits in the same row of every fragment, so each lane simply tracks one query's running
+// max and sum in registers -- the online softmax needs no shared state, and the accumulator
+// rescale becomes two multiplies on the lane's own elements rather than a pass over shared memory.
+//
+// Q is gathered per lane rather than staged through threadgroup memory, and the output scattered
+// per lane, so this kernel's threadgroup footprint is ZERO and occupancy is bounded only by
+// registers. Both happen once per threadgroup, not per key block.
+//
+// STATUS: CORRECT (goldens pass) and RESEARCH-ONLY -- it LOSES, decisively. Attention costs ~262 ms
+// against the phase-partitioned kernel's ~121 ms at T=2041, so opting in (CPI_METAL_ATTN_FA=1)
+// makes prefill 753 ms instead of 612. Every variant was tried and every one is worse:
+//
+//   FA_QT 1, FA_KB 32   753 ms      <- best
+//   FA_QT 1, FA_KB 64   789
+//   FA_QT 2, FA_KB 32   820         <- register pressure; the doubled fragment set spills
+//   FA_QT 2, FA_KB 64  1006
+//   K/V staged in threadgroup memory, +2 barriers/block: 765, and no faster than not staging
+//   head_dim as a compile-time constant (in case the fragment arrays were spilling): neutral
+//
+// The reason is arithmetic intensity, and registers are what bound it. One query fragment per
+// simdgroup means every K and V fragment load feeds exactly ONE matmul (intensity 1.0), where the
+// phase-partitioned kernel tiles two query fragments against two key fragments and reaches 2.0.
+// Raising FA_QT to match is what registers will not pay for -- Qf, O, S and P all scale with it,
+// and the kernel gets slower, not faster. So the register file is to this design what the 32 KB
+// threadgroup budget is to the other one, and it is the smaller pool for holding the same working
+// set. Eliminating the score round-trip is real, and it does not come close to paying for that.
+//
+// Also falsified here: that the simdgroups re-reading each other's K/V (all four walk the same keys
+// with different queries, so each fragment is fetched FA_NSG times) mattered. Staging removes the
+// redundancy and buys nothing -- a layer's K+V is ~1 MB and the cache was already absorbing it,
+// which independently matches the -4.5% that K/V bandwidth was worth on the phase kernel.
+// ---------------------------------------------------------------------------
+#define FA_NSG 4                       // simdgroups per threadgroup; one query row fragment each
+#define FA_QBLK (8u * FA_NSG)          // queries per threadgroup
+#define FA_KB  32                      // keys per block -> FA_KB/8 score fragments held at once
+#define FA_KG  (FA_KB / 8u)
+
+#define FA_ROW(l) (((((uint)(l)) & 16u) >> 2) | ((((uint)(l)) & 6u) >> 1))
+#define FA_COL(l) (((((uint)(l)) & 8u) >> 1) | ((((uint)(l)) & 1u) << 1))
+
+// Reduce across the four lanes holding one fragment row. They differ only in bits 0 and 3, so two
+// butterfly steps suffice and every participating lane ends with the full result.
+inline float fa_row_max(float v) {
+  v = max(v, simd_shuffle_xor(v, 1u));
+  v = max(v, simd_shuffle_xor(v, 8u));
+  return v;
+}
+inline float fa_row_sum(float v) {
+  v += simd_shuffle_xor(v, 1u);
+  v += simd_shuffle_xor(v, 8u);
+  return v;
+}
+
+// Writes the fragment layout to a 64-element row-major buffer: element (r,c) receives the index of
+// the lane that owns it times two, plus which of that lane's two elements it is. The host checks
+// this against FA_ROW/FA_COL before cpi_attention_prefill_fa is allowed to run.
+kernel void cpi_simdgroup_layout_probe(device float* out [[buffer(0)]],
+                                       uint lane [[thread_index_in_simdgroup]]) {
+  simdgroup_float8x8 S = make_filled_simdgroup_matrix<float, 8, 8>(-1.0f);
+  thread auto& e = S.thread_elements();
+  e[0] = float(lane * 2u);
+  e[1] = float(lane * 2u + 1u);
+  simdgroup_store(S, out, 8);
+}
+
+kernel void cpi_attention_prefill_fa(device const half* q [[buffer(0)]],
+                                     device const half* k_cache [[buffer(1)]],
+                                     device const half* v_cache [[buffer(2)]],
+                                     device half* out [[buffer(3)]],
+                                     device const int* positions [[buffer(4)]],
+                                     device const int* block_tables [[buffer(5)]],
+                                     constant AttnParams& p [[buffer(6)]],
+                                     uint gid [[threadgroup_position_in_grid]],
+                                     uint lid [[thread_position_in_threadgroup]]) {
+  const uint sg = lid / 32u;
+  const uint lane = lid % 32u;
+
+  const uint head = gid % p.heads;
+  const uint t0 = (gid / p.heads) * FA_QBLK;
+  if (t0 >= p.tokens) return;
+
+  uint base = p.position;
+  if (p.use_position_buffer != 0u) base = uint(positions[0]);
+
+  const uint group = p.heads / p.kv_heads;
+  const uint kv_head = head / group;
+  const uint kv_dim = p.kv_heads * p.head_dim;
+  const uint q_dim = p.heads * p.head_dim;
+  const uint hd = p.head_dim;
+  const uint dfs = hd / 8u;
+
+  // This simdgroup's own 8 queries. Nothing below is shared with any other simdgroup, so there is
+  // no barrier and an early return here cannot strand anyone.
+  const uint q0 = t0 + sg * 8u;
+  if (q0 >= p.tokens) return;
+  const uint nq = min(8u, p.tokens - q0);
+
+  // This lane's fixed position in every fragment: one query row, two adjacent columns.
+  const uint row = FA_ROW(lane);
+  const uint col = FA_COL(lane);
+  const bool row_live = (row < nq);
+  const uint qtok = q0 + row;
+
+  // Q straight into registers -- each lane gathers exactly the two elements it owns of each
+  // fragment. Padding rows read nothing and hold 0, so they cannot turn into NaN downstream.
+  simdgroup_half8x8 Qf[16];
+  for (uint df = 0u; df < dfs; ++df) {
+    thread auto& e = Qf[df].thread_elements();
+    const ulong qb = (ulong)qtok * (ulong)q_dim + (ulong)(head * hd + df * 8u + col);
+    e[0] = row_live ? q[qb] : half(0);
+    e[1] = row_live ? q[qb + 1u] : half(0);
+  }
+
+  simdgroup_float8x8 O[16];
+  for (uint df = 0u; df < dfs; ++df) O[df] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+  // The running max and sum of THIS lane's query, in registers, replicated across the four lanes
+  // of the row by the butterfly reductions.
+  float m_run = -INFINITY;
+  float l_run = 0.0f;
+
+  const uint pos_i = base + qtok;
+  uint start_i = 0u;
+  if (p.window != 0u && pos_i + 1u > p.window) start_i = pos_i + 1u - p.window;
+
+  const uint last_pos = base + q0 + nq - 1u;
+  const uint first_pos = base + q0;
+  uint start = 0u;
+  if (p.window != 0u && first_pos + 1u > p.window) start = first_pos + 1u - p.window;
+
+  for (uint kb = start; kb <= last_pos; kb += FA_KB) {
+    const uint nk = min((uint)FA_KB, last_pos - kb + 1u);
+    const uint n_kg = (nk + 7u) / 8u;
+    const uint kphys =
+        (p.paged != 0u)
+            ? uint(block_tables[kb / p.block_size]) * p.block_size + (kb % p.block_size)
+            : kb;
+
+    // --- scoring: S[g] = Q @ K^T, [8 queries x 8 keys], held in registers ---
+    simdgroup_float8x8 S[FA_KG];
+    for (uint g = 0u; g < FA_KG; ++g) S[g] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    for (uint df = 0u; df < dfs; ++df) {
+      for (uint g = 0u; g < n_kg; ++g) {
+        simdgroup_half8x8 Kf;
+        simdgroup_load(Kf,
+                       k_cache + (ulong)(kphys + g * 8u) * (ulong)kv_dim + kv_head * hd + df * 8u,
+                       kv_dim, ulong2(0, 0), true);
+        simdgroup_multiply_accumulate(S[g], Qf[df], Kf, S[g]);
+      }
+    }
+
+    // --- online softmax, entirely in registers ---
+    // This lane owns keys (g*8 + col) and (g*8 + col + 1) of every group, all in its own row, so
+    // scale and the causal/window mask fold in as it reads its own elements.
+    float sv[FA_KG][2];
+    float lmax = -INFINITY;
+    for (uint g = 0u; g < n_kg; ++g) {
+      thread auto& se = S[g].thread_elements();
+      for (uint j = 0u; j < 2u; ++j) {
+        const uint koff = g * 8u + col + j;
+        const uint key = kb + koff;
+        const bool keep = row_live && (koff < nk) && (key <= pos_i) && (key >= start_i);
+        sv[g][j] = keep ? se[j] * p.scale : -INFINITY;
+        lmax = max(lmax, sv[g][j]);
+      }
+    }
+    const float new_max = max(m_run, fa_row_max(lmax));
+    const float rescale = (m_run == -INFINITY) ? 0.0f : exp(m_run - new_max);
+
+    // P written back into half fragments -- same layout as the float ones, which is what lets the
+    // matmul consume the softmax output without it ever reaching memory.
+    simdgroup_half8x8 P[FA_KG];
+    float lsum = 0.0f;
+    for (uint g = 0u; g < n_kg; ++g) {
+      thread auto& pe = P[g].thread_elements();
+      for (uint j = 0u; j < 2u; ++j) {
+        const float w =
+            (sv[g][j] != -INFINITY && new_max != -INFINITY) ? exp(sv[g][j] - new_max) : 0.0f;
+        pe[j] = half(w);  // 0 where masked, so P.V masks itself
+        lsum += w;
+      }
+    }
+    l_run = l_run * rescale + fa_row_sum(lsum);
+    m_run = new_max;
+
+    // The accumulator rescale is two multiplies on this lane's own elements.
+    for (uint df = 0u; df < dfs; ++df) {
+      thread auto& oe = O[df].thread_elements();
+      oe[0] *= rescale;
+      oe[1] *= rescale;
+    }
+
+    // --- P.V straight into the register accumulator ---
+    for (uint df = 0u; df < dfs; ++df) {
+      for (uint g = 0u; g < n_kg; ++g) {
+        simdgroup_half8x8 Vf;
+        simdgroup_load(Vf,
+                       v_cache + (ulong)(kphys + g * 8u) * (ulong)kv_dim + kv_head * hd + df * 8u,
+                       kv_dim);
+        simdgroup_multiply_accumulate(O[df], P[g], Vf, O[df]);
+      }
+    }
+  }
+
+  // Scatter out, per lane, bounds-checked -- no staging buffer and no barrier.
+  if (!row_live) return;
+  const float inv = (l_run > 0.0f) ? 1.0f / l_run : 0.0f;
+  for (uint df = 0u; df < dfs; ++df) {
+    thread auto& oe = O[df].thread_elements();
+    const ulong ob = (ulong)qtok * (ulong)q_dim + (ulong)(head * hd + df * 8u + col);
+    out[ob] = half(oe[0] * inv);
+    out[ob + 1u] = half(oe[1] * inv);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // QUERY-PARTITIONED prefill attention -- the research rewrite.
 //
 // The kernel above is PHASE-partitioned: all 8 simdgroups cooperate on all QMM_BLOCK queries and
