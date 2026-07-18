@@ -152,6 +152,9 @@ constexpr int kQBlock = 8;      // MUST match Q_BLOCK in cpi_kernels.metal (scal
 constexpr int kQMMBlock = 16;   // MUST match QMM_BLOCK in cpi_kernels.metal (matrix-unit prefill)
 constexpr int kKeyBlock = 32;   // MUST match KEY_BLOCK in cpi_kernels.metal (scalar / decode)
 constexpr int kMMKeyBlock = 128; // MUST match MM_KEY_BLOCK (matrix-unit prefill attention)
+// MUST match QP_QBLK / (QP_NSG*32) in the query-partitioned attention kernel.
+constexpr int kQPBlock = 32;
+constexpr int kQPThreads = 128;
 
 // Split-KV decode attention. A decode's attention grid is one threadgroup per head -- 14 of
 // them for Qwen2.5-0.5B, on a GPU sized for hundreds -- so past a few hundred keys the cache
@@ -1095,16 +1098,29 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
           // `blocks` here would hand a kernel the other's tiling and quietly drop or double-run
           // queries.
           if (op.head_dim <= 128) {
-            const std::size_t blocks = static_cast<std::size_t>((T + kQMMBlock - 1) / kQMMBlock);
             // p.paged stays 0, so block_tables is never read -- but the binding must exist,
             // because dispatch() puts the params block at index n_buffers.
             const void* mmbufs[] = {slot(op.in), k_cache_[static_cast<std::size_t>(layer)].handle(),
                                     v_cache_[static_cast<std::size_t>(layer)].handle(),
                                     slot(op.out), pos_buf_.handle(),
                                     k_cache_[static_cast<std::size_t>(layer)].handle()};
-            ctx_.dispatch("cpi_attention_prefill_mm", G::Groups,
-                          static_cast<std::size_t>(op.heads) * blocks, kTG, mmbufs, nullptr, 6, &p,
-                          sizeof(p));
+            // CPI_METAL_ATTN_QP=1 selects the query-partitioned research kernel (see the header
+            // above it): 4 simdgroups x 8 queries, per-simdgroup scratch, simdgroup_barrier only.
+            static const bool qp = [] {
+              const char* e = std::getenv("CPI_METAL_ATTN_QP");
+              return e != nullptr && e[0] == '1';
+            }();
+            if (qp) {
+              const std::size_t blocks = static_cast<std::size_t>((T + kQPBlock - 1) / kQPBlock);
+              ctx_.dispatch("cpi_attention_prefill_qp", G::Groups,
+                            static_cast<std::size_t>(op.heads) * blocks, kQPThreads, mmbufs, nullptr,
+                            6, &p, sizeof(p));
+            } else {
+              const std::size_t blocks = static_cast<std::size_t>((T + kQMMBlock - 1) / kQMMBlock);
+              ctx_.dispatch("cpi_attention_prefill_mm", G::Groups,
+                            static_cast<std::size_t>(op.heads) * blocks, kTG, mmbufs, nullptr, 6, &p,
+                            sizeof(p));
+            }
           } else {
             const std::size_t blocks = static_cast<std::size_t>((T + kQBlock - 1) / kQBlock);
             ctx_.dispatch("cpi_attention_prefill", G::Groups,

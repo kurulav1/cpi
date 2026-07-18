@@ -241,6 +241,178 @@ kernel void cpi_attention_prefill_mm(device const half* q [[buffer(0)]],
   }
 }
 
+// ---------------------------------------------------------------------------
+// QUERY-PARTITIONED prefill attention -- the research rewrite.
+//
+// The kernel above is PHASE-partitioned: all 8 simdgroups cooperate on all QMM_BLOCK queries and
+// re-partition between scoring / softmax / P.V, so every phase boundary pushes the intermediate
+// state through threadgroup memory behind a threadgroup_barrier. Measured, that structure costs
+// exactly what llama.cpp's flash-attention-OFF path costs (116 vs 117 ms at T=2048) -- it is the
+// unfused algorithm in a fused kernel's clothing, and no amount of tiling, block-size or occupancy
+// tuning moved it (all measured neutral).
+//
+// This one is QUERY-partitioned, which is what actually makes flash attention fast: each simdgroup
+// owns QP_QPS queries OUTRIGHT and carries them through scoring, softmax and accumulation itself.
+// Nothing it writes is read by any other simdgroup, so every scratch array is a per-simdgroup slice
+// and every barrier drops from threadgroup_barrier to simdgroup_barrier -- ordering within one
+// simdgroup, which is nearly free. There is no cross-simdgroup synchronisation in the key loop at
+// all, and a simdgroup with no queries can return early without deadlocking the others.
+//
+// 4 simdgroups x 8 queries = 32 queries per threadgroup. Scratch is 7.5 KB per simdgroup (q, sc,
+// pw, acc sized for head_dim <= 128), 30 KB total, just inside the 32 KB budget -- which is why
+// this uses 4 simdgroups and a 32-key block rather than the 8 and 128 the phase-partitioned kernel
+// settled on. Selected by CPI_METAL_ATTN_QP=1; the proven kernel above stays the default.
+//
+// STATUS: CORRECT (goldens pass) but currently 3.9x SLOWER -- 449 ms of attention at T=2042 against
+// the phase-partitioned kernel's 116 ms. The decomposition is not what is wrong; the BLOCK SIZE is.
+// Giving every simdgroup private scratch multiplies the scratch by NSG, which forces QP_KB down to
+// 32 where the phase kernel runs 128. The online softmax (its two simd reductions plus the
+// accumulator rescale) runs once per (query, key block), so a 32-key block does 4x the softmax work
+// of a 128-key one -- and that same effect is what made 32 -> 128 the single largest win on the
+// phase kernel. Hoisting the query fragments out of the key-group loop (intensity 0.5 -> 0.8) was
+// measured neutral, confirming the cost is the softmax count, not fragment loads.
+//
+// So making this competitive is a MEMORY problem, not a restructuring one: it needs the per-
+// simdgroup scratch to fit a 128-key block, which means sizing the arrays to the actual head_dim
+// instead of the 128 maximum (dynamic threadgroup memory via setThreadgroupMemoryLength) and
+// re-tuning NSG against QP_KB. At head_dim 64 that alone would roughly halve the scratch. Left here
+// behind the flag because it is correct and the remaining work is parameter tuning rather than a
+// rewrite -- which is a much better starting point than the blank page this began as.
+#define QP_NSG  4                     // simdgroups per threadgroup
+#define QP_QPS  8                     // queries per simdgroup == one 8x8 row fragment
+#define QP_QBLK (QP_QPS * QP_NSG)     // 32 queries per threadgroup
+#define QP_KB   32                    // keys per block (== simd width, so lane == key)
+kernel void cpi_attention_prefill_qp(device const half* q [[buffer(0)]],
+                                     device const half* k_cache [[buffer(1)]],
+                                     device const half* v_cache [[buffer(2)]],
+                                     device half* out [[buffer(3)]],
+                                     device const int* positions [[buffer(4)]],
+                                     device const int* block_tables [[buffer(5)]],
+                                     constant AttnParams& p [[buffer(6)]],
+                                     uint gid [[threadgroup_position_in_grid]],
+                                     uint lid [[thread_position_in_threadgroup]],
+                                     uint nthr [[threads_per_threadgroup]]) {
+  const uint sg = lid / 32u;
+  const uint lane = lid % 32u;
+
+  const uint head = gid % p.heads;
+  const uint t0 = (gid / p.heads) * QP_QBLK;
+  if (t0 >= p.tokens) return;
+
+  uint base = p.position;
+  if (p.use_position_buffer != 0u) base = uint(positions[0]);
+
+  const uint group = p.heads / p.kv_heads;
+  const uint kv_head = head / group;
+  const uint kv_dim = p.kv_heads * p.head_dim;
+  const uint q_dim = p.heads * p.head_dim;
+  const uint hd = p.head_dim;
+  const uint dfs = hd / 8u;
+
+  // This simdgroup's OWN queries. Nothing below is shared with another simdgroup.
+  const uint q0 = t0 + sg * QP_QPS;
+  const uint nq = (q0 < p.tokens) ? min((uint)QP_QPS, p.tokens - q0) : 0u;
+
+  threadgroup half q_sh[QP_NSG][QP_QPS * 128];
+  threadgroup float acc[QP_NSG][QP_QPS * 128];
+  threadgroup float sc[QP_NSG][QP_QPS * QP_KB];
+  threadgroup half pw[QP_NSG][QP_QPS * QP_KB];
+  threadgroup float m_sh[QP_NSG][QP_QPS];
+  threadgroup float l_sh[QP_NSG][QP_QPS];
+
+  // Zero the FULL QP_QPS rows: the matrix ops load 8-row fragments, so padding rows must be
+  // defined rather than garbage that could become NaN.
+  for (uint c = lane; c < QP_QPS * hd; c += 32u) {
+    const uint qi = c / hd, i = c % hd;
+    q_sh[sg][qi * hd + i] =
+        (qi < nq) ? q[(ulong)(q0 + qi) * (ulong)q_dim + head * hd + i] : half(0);
+    acc[sg][qi * hd + i] = 0.0f;
+  }
+  for (uint qi = lane; qi < QP_QPS; qi += 32u) {
+    m_sh[sg][qi] = -INFINITY;
+    l_sh[sg][qi] = 0.0f;
+  }
+  simdgroup_barrier(mem_flags::mem_threadgroup);
+
+  if (nq == 0u) return;  // safe: no threadgroup_barrier below, so this cannot deadlock the others
+
+  const uint last_pos = base + q0 + nq - 1u;
+  const uint first_pos = base + q0;
+  uint start = 0u;
+  if (p.window != 0u && first_pos + 1u > p.window) start = first_pos + 1u - p.window;
+
+  for (uint kb = start; kb <= last_pos; kb += QP_KB) {
+    const uint nk = min((uint)QP_KB, last_pos - kb + 1u);
+    const uint n_kg = (nk + 7u) / 8u;
+    const uint kphys =
+        (p.paged != 0u)
+            ? uint(block_tables[kb / p.block_size]) * p.block_size + (kb % p.block_size)
+            : kb;
+
+    // Scoring: this simdgroup's 8 queries against each key group. The query fragments are the SAME
+    // for every key group, so they are loaded ONCE into registers and reused across all of them --
+    // dfs + n_kg*dfs loads for n_kg*dfs MACs, rather than reloading Qf per key group (which would
+    // be two loads per MAC, the 0.5 intensity that starved the phase-partitioned kernel).
+    simdgroup_half8x8 Qf[16];  // dfs <= 128/8
+    for (uint df = 0u; df < dfs; ++df) simdgroup_load(Qf[df], q_sh[sg] + df * 8u, hd);
+    for (uint kg = 0u; kg < n_kg; ++kg) {
+      simdgroup_float8x8 S = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+      for (uint df = 0u; df < dfs; ++df) {
+        simdgroup_half8x8 Kf;
+        simdgroup_load(Kf, k_cache + (ulong)(kphys + kg * 8u) * (ulong)kv_dim + kv_head * hd + df * 8u,
+                       kv_dim, ulong2(0, 0), true);
+        simdgroup_multiply_accumulate(S, Qf[df], Kf, S);
+      }
+      simdgroup_store(S, sc[sg] + kg * 8u, QP_KB);
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Online softmax over this simdgroup's own queries; lane owns key `lane` (QP_KB == 32).
+    // Scale, causal/window mask and the accumulator rescale are all folded in.
+    for (uint qi = 0u; qi < nq; ++qi) {
+      const uint key = kb + lane;
+      const uint pos_i = base + q0 + qi;
+      uint start_i = 0u;
+      if (p.window != 0u && pos_i + 1u > p.window) start_i = pos_i + 1u - p.window;
+      const bool keep = (lane < nk) && (key <= pos_i) && (key >= start_i);
+      const float s = keep ? sc[sg][qi * QP_KB + lane] * p.scale : -INFINITY;
+      const float old_max = m_sh[sg][qi];
+      const float new_max = max(old_max, simd_max(s));
+      const float rescale = (old_max == -INFINITY) ? 0.0f : exp(old_max - new_max);
+      const float w = (s != -INFINITY && new_max != -INFINITY) ? exp(s - new_max) : 0.0f;
+      pw[sg][qi * QP_KB + lane] = half(w);
+      const float bsum = simd_sum(w);
+      for (uint i = lane; i < hd; i += 32u) acc[sg][qi * hd + i] = acc[sg][qi * hd + i] * rescale;
+      if (lane == 0u) {
+        l_sh[sg][qi] = l_sh[sg][qi] * rescale + bsum;
+        m_sh[sg][qi] = new_max;
+      }
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    // P.V into this simdgroup's own accumulator.
+    for (uint dg = 0u; dg < dfs; ++dg) {
+      simdgroup_float8x8 O;
+      simdgroup_load(O, acc[sg] + dg * 8u, hd);
+      for (uint kg = 0u; kg < n_kg; ++kg) {
+        simdgroup_half8x8 Pf, Vf;
+        simdgroup_load(Pf, pw[sg] + kg * 8u, QP_KB);
+        simdgroup_load(Vf, v_cache + (ulong)(kphys + kg * 8u) * (ulong)kv_dim + kv_head * hd + dg * 8u,
+                       kv_dim);
+        simdgroup_multiply_accumulate(O, Pf, Vf, O);
+      }
+      simdgroup_store(O, acc[sg] + dg * 8u, hd);
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  for (uint c = lane; c < nq * hd; c += 32u) {
+    const uint qi = c / hd, i = c % hd;
+    const float inv = (l_sh[sg][qi] > 0.0f) ? 1.0f / l_sh[sg][qi] : 0.0f;
+    out[(ulong)(q0 + qi) * (ulong)q_dim + head * hd + i] = half(acc[sg][qi * hd + i] * inv);
+  }
+}
+
 kernel void cpi_attention_prefill(device const half* q [[buffer(0)]],
                                   device const half* k_cache [[buffer(1)]],
                                   device const half* v_cache [[buffer(2)]],
