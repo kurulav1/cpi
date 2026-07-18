@@ -309,34 +309,62 @@ kernel void cpi_attention_prefill_mm(device const half* q [[buffer(0)]],
 // per lane, so this kernel's threadgroup footprint is ZERO and occupancy is bounded only by
 // registers. Both happen once per threadgroup, not per key block.
 //
-// STATUS: CORRECT (goldens pass) and RESEARCH-ONLY -- it LOSES, decisively. Attention costs ~262 ms
-// against the phase-partitioned kernel's ~121 ms at T=2041, so opting in (CPI_METAL_ATTN_FA=1)
-// makes prefill 753 ms instead of 612. Every variant was tried and every one is worse:
+// STATUS: CORRECT (goldens pass) and RESEARCH-ONLY -- it LOSES, decisively, and it loses for a
+// reason that retires the idea rather than this implementation of it. Attention costs ~283 ms
+// against the phase-partitioned kernel's ~117 ms at T=2041, so opting in (CPI_METAL_ATTN_FA=1)
+// makes prefill ~774 ms instead of 612. Decomposed against the other kernel (FA_RCA above):
+//
+//                  scoring   softmax    P.V     total
+//   phase           48 ms     60 ms    50 ms    117 ms
+//   register-res.  130 ms     63 ms   107 ms    283 ms
+//
+// The softmax is the point of this kernel and it costs THE SAME, 63 against 60. Keeping the score
+// matrix in registers, never spilling it, reducing over four lanes instead of thirty-two -- none of
+// it moves the number. So the phase kernel's 60 ms was never the threadgroup round trip it was
+// blamed on; it is intrinsic per-element work (exp, masking, the reductions) over ~700M score
+// elements, and it costs that wherever S lives. Which is also why every attack on it through memory
+// layout came back neutral: a fast exp, skipping the rescale, interleaving the reductions, staging
+// K/V, pre-transposing K, query tiling, block width. All aimed at a cost that is not memory-shaped.
+//
+// Every variant was tried and every one is worse:
 //
 //   FA_QT 1, FA_KB 32   753 ms      <- best
 //   FA_QT 1, FA_KB 64   789
 //   FA_QT 2, FA_KB 32   820         <- register pressure; the doubled fragment set spills
 //   FA_QT 2, FA_KB 64  1006
-//   K/V staged in threadgroup memory, +2 barriers/block: 765, and no faster than not staging
+//   K/V staged in threadgroup memory (once the staged key loop was made threadgroup-uniform, which
+//     it has to be because the copy barriers): 775 staged vs 771 not, i.e. nothing -- so the
+//     FA_NSG-fold re-reading of each block across simdgroups was never the cost either
+//   K pre-transposed during that copy, so the fragment load needs no transpose: 769, also nothing
 //   head_dim as a compile-time constant (in case the fragment arrays were spilling): neutral
+//   maxTotalThreadsPerThreadgroup is 1024 here and this kernel uses ZERO threadgroup memory, so it
+//     is not register- or occupancy-limited in any way the driver will admit to
 //
-// The reason is arithmetic intensity, and registers are what bound it. One query fragment per
-// simdgroup means every K and V fragment load feeds exactly ONE matmul (intensity 1.0), where the
-// phase-partitioned kernel tiles two query fragments against two key fragments and reaches 2.0.
-// Raising FA_QT to match is what registers will not pay for -- Qf, O, S and P all scale with it,
-// and the kernel gets slower, not faster. So the register file is to this design what the 32 KB
-// threadgroup budget is to the other one, and it is the smaller pool for holding the same working
-// set. Eliminating the score round-trip is real, and it does not come close to paying for that.
+// The matmuls are 2.2-2.7x slower and nothing tested explains it: not registers, not occupancy, not
+// the transposing load, not the cross-simdgroup redundancy, not intensity, not block width. What
+// IS established is that the softmax gains nothing from being register-resident, which removes the
+// reason to keep pulling on this thread.
 //
-// Also falsified here: that the simdgroups re-reading each other's K/V (all four walk the same keys
-// with different queries, so each fragment is fetched FA_NSG times) mattered. Staging removes the
-// redundancy and buys nothing -- a layer's K+V is ~1 MB and the cache was already absorbing it,
-// which independently matches the -4.5% that K/V bandwidth was worth on the phase kernel.
+// Where the remaining gap actually is: the phase kernel's three phases sum to 158 ms serial but
+// cost 117, so only ~35% overlaps, and that overlap comes entirely from concurrent threadgroups --
+// its three barriers per key block serialise scoring, softmax and P.V within one. Overlapped, that
+// is max(48, 60, 50) rather than their sum, which is llama.cpp's ~66 ms arrived at from our own
+// measured phase costs. The lever is pipelining the key loop, not making any phase cheaper.
 // ---------------------------------------------------------------------------
 #define FA_NSG 4                       // simdgroups per threadgroup; one query row fragment each
 #define FA_QBLK (8u * FA_NSG)          // queries per threadgroup
 #define FA_KB  32                      // keys per block -> FA_KB/8 score fragments held at once
 #define FA_KG  (FA_KB / 8u)
+
+// Phase decomposition, same contract as ATTN_RCA on the phase-partitioned kernel: each bit removes
+// one phase while leaving what the next phase reads intact, so nothing downstream is dead-code
+// eliminated and the wall-clock delta is that phase.
+//   1 = scoring matmul skipped (S keeps its zero fill, so the softmax still consumes it)
+//   4 = P.V matmul skipped (O keeps its zero fill, so the output loop still consumes it)
+// A stub whose result goes UNREAD lets the compiler delete the phase outright and then prices
+// nothing. That is not hypothetical: a first attempt here filled P directly and left S written but
+// unused, the scoring matmul vanished, and the softmax looked like it cost 28 ms when it costs 63.
+#define FA_RCA 0
 
 #define FA_ROW(l) (((((uint)(l)) & 16u) >> 2) | ((((uint)(l)) & 6u) >> 1))
 #define FA_COL(l) (((((uint)(l)) & 8u) >> 1) | ((((uint)(l)) & 1u) << 1))
@@ -442,6 +470,7 @@ kernel void cpi_attention_prefill_fa(device const half* q [[buffer(0)]],
     // --- scoring: S[g] = Q @ K^T, [8 queries x 8 keys], held in registers ---
     simdgroup_float8x8 S[FA_KG];
     for (uint g = 0u; g < FA_KG; ++g) S[g] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+#if !(FA_RCA & 1)
     for (uint df = 0u; df < dfs; ++df) {
       for (uint g = 0u; g < n_kg; ++g) {
         simdgroup_half8x8 Kf;
@@ -451,6 +480,7 @@ kernel void cpi_attention_prefill_fa(device const half* q [[buffer(0)]],
         simdgroup_multiply_accumulate(S[g], Qf[df], Kf, S[g]);
       }
     }
+#endif
 
     // --- online softmax, entirely in registers ---
     // This lane owns keys (g*8 + col) and (g*8 + col + 1) of every group, all in its own row, so
@@ -494,6 +524,7 @@ kernel void cpi_attention_prefill_fa(device const half* q [[buffer(0)]],
     }
 
     // --- P.V straight into the register accumulator ---
+#if !(FA_RCA & 4)
     for (uint df = 0u; df < dfs; ++df) {
       for (uint g = 0u; g < n_kg; ++g) {
         simdgroup_half8x8 Vf;
@@ -503,6 +534,7 @@ kernel void cpi_attention_prefill_fa(device const half* q [[buffer(0)]],
         simdgroup_multiply_accumulate(O[df], P[g], Vf, O[df]);
       }
     }
+#endif
   }
 
   // Scatter out, per lane, bounds-checked -- no staging buffer and no barrier.
