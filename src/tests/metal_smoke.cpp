@@ -156,7 +156,7 @@ int main() {
   // ---- GEMM (fp16), the multi-token prefill path -------------------------
   // MUST match GEMM_FBM / GEMM_BN in cpi_kernels.metal (and kGemmFBM / kGemmBN in the engine).
   constexpr std::uint32_t kSmokeGemmFBM = 64;   // rows per threadgroup
-  constexpr std::uint32_t kSmokeGemmBN = 64;    // tokens per tile
+  constexpr std::uint32_t kSmokeGemmBN = 32;    // tokens per tile
   // This kernel had NO check of its own: it was benchmarked heavily and gated only
   // indirectly, through end-to-end goldens. A prefill chunk and a token-at-a-time run
   // disagreed on Metal, and the split fell exactly on the GEMV/GEMM boundary, so the

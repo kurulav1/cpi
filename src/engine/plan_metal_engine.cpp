@@ -124,7 +124,7 @@ constexpr int kSimdsPerTG = kTG / 32;  // = rows per threadgroup in the GEMV
 constexpr int kPrefillMaxTokens = 2048;
 constexpr std::size_t kPrefillSlotBudget = 256u * 1024u * 1024u;
 
-constexpr int kGemmBN = 64;    // MUST match GEMM_BN in the shader (fp16 tokens per tile)
+constexpr int kGemmBN = 32;    // MUST match GEMM_BN in the shader (fp16 tokens per tile)
 constexpr int kGemmFBM = 64;  // MUST match GEMM_FBM in the shader (fp16 rows per tile)
 // One simdgroup per 32x32 sub-tile of the FBM x BN output tile: at 64x64 that is 2 x 2 = 4
 // simdgroups, 128 threads. DERIVED from the tile, never restated -- this line used to read

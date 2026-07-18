@@ -2,14 +2,21 @@
 // Tokens per threadgroup. Like the K-depth, the two GEMMs want DIFFERENT widths, measured on
 // the 0.5B fp16 prefill and the int4:
 //
-//   fp16  (GEMM_BN 64): narrow is better. This kernel STAGES the activation tile in
-//     threadgroup memory, so a wider tile costs more threadgroup memory and drops occupancy.
-//     128 measured 2017 -> 1663 tok/s.
+//   fp16  (GEMM_BN 32): narrow is better, and further than first measured. This kernel STAGES
+//     the activation tile in threadgroup memory, so a wider tile costs more threadgroup memory
+//     and drops occupancy; 128 measured 2017 -> 1663 tok/s. 32 is better again, because the tile
+//     width also sets how many threadgroups the grid has: out_dim/GEMM_FBM * ceil(T/GEMM_BN), and
+//     at short and middling prompts that product is small enough to leave the GPU idle. Halving
+//     the tile doubles it. Interleaved A/B, three rounds each:
+//       T=137  77 -> 66 ms     T=513  168 -> 157 ms     T=1027  300 -> 293 ms
+//       T=273 106 -> 100 ms    T=2041 593 -> 593 ms (neutral -- by then the grid is full anyway)
+//     Measured with the smoke test's mirror of this constant corrected: at 64 it disagreed with
+//     the shader and every gemm_f16 check failed, which made a correct kernel look broken.
 //   quant (GEMM_QBN 128): wide is better. The quant kernel reads activation fragments straight
 //     from device (no As tile), so widening only adds simdgroups and weight reuse -- the staged
 //     weight block now serves 128 tokens -- at the SAME threadgroup memory. 64 -> 128 measured
 //     1527 -> 1649 tok/s.
-#define GEMM_BN 64
+#define GEMM_BN 32
 #define GEMM_QBN 128
 // Simdgroups tile the 64-row output as a grid, each owning a 32x32 sub-tile (4x4 fragments).
 // Fragments of 8x8 each simdgroup owns: GEMM_RF rows x GEMM_CF cols. This sets arithmetic
