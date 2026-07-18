@@ -27,6 +27,18 @@
 // 4*32 + 2*32) bytes, so 16 costs ~15 KB of the 32 KB budget and 32 ~30 KB.
 #define QMM_BLOCK 16
 
+// RCA instrumentation for the prefill attention kernel. 0 = normal. Each bit replaces one phase
+// with a dependency-preserving stub -- the answer becomes wrong, but every other phase still runs
+// and nothing downstream gets dead-code-eliminated, so the wall-clock delta is that phase's cost.
+// This is the only way to see inside a kernel whose total is all we can otherwise measure.
+//   1 = scoring matmul stubbed (sc_sh still written, so the softmax is still fed)
+//   2 = softmax stubbed (pw_sh still written, so P.V is still fed)
+//   4 = P.V matmul stubbed (acc untouched; the output loop still reads it)
+// Bits combine: 7 stubs all three at once, which prices the residue no phase accounts for -- the
+// K/V loads, the barriers, and the output loop. Read the singles against that, not against 0: the
+// phases overlap across concurrent threadgroups, so their measured costs are superadditive.
+#define ATTN_RCA 0
+
 // ---------------------------------------------------------------------------
 // Prefill attention on the MATRIX UNITS (head_dim <= 128). The scalar kernel below scores
 // QK^T and does P.V with per-thread dot products -- the matrix units sit idle through the
@@ -132,6 +144,7 @@ kernel void cpi_attention_prefill_mm(device const half* q [[buffer(0)]],
     constexpr uint QT = 2u, KT = 2u;
     const uint qt_n = (qfs + QT - 1u) / QT;
     const uint kt_n = (n_kg + KT - 1u) / KT;
+#if !(ATTN_RCA & 1)
     for (uint w = simd_id; w < qt_n * kt_n; w += n_simd) {
       const uint qt = w / kt_n, kt = w % kt_n;
       simdgroup_float8x8 S[QT][KT];
@@ -163,17 +176,31 @@ kernel void cpi_attention_prefill_mm(device const half* q [[buffer(0)]],
         }
       }
     }
+#else
+    // RCA bit 0: scoring matmul stubbed. sc_sh still written so the softmax is still fed.
+    (void)qt_n; (void)kt_n; (void)QT; (void)KT;
+    for (uint c = lid; c < QMM_BLOCK * MM_KEY_BLOCK; c += nthr) sc_sh[c] = 0.0f;
+#endif
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Online softmax, a simdgroup per query. MM_KEY_BLOCK is 64 and the simd is 32 wide, so each
-    // lane owns TWO keys -- lane and lane+32 -- and the block-max/block-sum reduce over both before
-    // the simd reduction. A 64-key block halves the number of iterations (and their three barriers
-    // and this reduction) versus a 32-key one, which is the point: attention's per-block overhead,
-    // not its matmuls, is what makes this kernel ~3x llama.cpp's.
+    // Online softmax, a simdgroup per query. The simd is 32 wide and MM_KEY_BLOCK is wider, so each
+    // lane owns MM_KEY_BLOCK/32 keys and
+    // folds their max and sum before the simd reduction. A wide key block halves the number of
+    // iterations (and their barriers and reductions) versus a narrow one, which is the point:
+    // attention's per-block overhead, not its matmuls, is what makes this kernel slower than the
+    // flash-attention path it is measured against.
     //
     // Scale and the causal/window mask are folded in here rather than a separate sc_sh sweep: the
-    // softmax already holds the query (qi) and the keys (lane, lane+32), so the masked, scaled score
-    // feeds the reduction directly -- one fewer barrier and one fewer pass per block.
+    // softmax already holds the query and its keys, so the masked, scaled score feeds the reduction
+    // directly -- one fewer barrier and one fewer pass per block.
+    //
+    // Three things this loop does NOT cost, each measured and each reverted: a fast exp, skipping
+    // the accumulator rescale when the running max did not move, and interleaving two queries so
+    // their reduction chains overlap. All neutral. Taken with the phase decomposition (ATTN_RCA
+    // above), which prices this loop above either matmul despite its doing a sixty-fourth of their
+    // arithmetic, the cost is not in the body at all -- it is the score round-trip through
+    // threadgroup memory that phase-partitioning forces, which no edit inside the phase can remove.
+#if !(ATTN_RCA & 2)
     for (uint qi = simd_id; qi < nq; qi += n_simd) {
       const uint pos_i = base + t0 + qi;
       uint start_i = 0u;
@@ -206,6 +233,14 @@ kernel void cpi_attention_prefill_mm(device const half* q [[buffer(0)]],
         m_sh[qi] = new_max;
       }
     }
+#else
+    // RCA bit 1: softmax stubbed. pw_sh still written so P.V is still fed and not eliminated.
+    for (uint qi = simd_id; qi < nq; qi += n_simd) {
+      for (uint g = 0u; g < MM_KEY_BLOCK / 32u; ++g)
+        pw_sh[qi * MM_KEY_BLOCK + lane + g * 32u] = half(1.0f);
+      if (lane == 0u) l_sh[qi] = 1.0f;
+    }
+#endif
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // --- P.V: O[8q x 8d] += P[8q x 8k] @ V[8k x 8d], accumulated into the fp32 acc. ---
@@ -214,6 +249,7 @@ kernel void cpi_attention_prefill_mm(device const half* q [[buffer(0)]],
     // reuses each Vf across the query fragments -- 3 loads feed 2 MACs (0.67) -- while dt_n = dfs
     // keeps all 8 simdgroups busy. The accumulator load/store is hoisted out of the key loop, so it
     // amortises over all n_kg groups.
+#if !(ATTN_RCA & 4)
     for (uint w = simd_id; w < qt_n * dfs; w += n_simd) {
       const uint qt = w / dfs, dg = w % dfs;
       simdgroup_float8x8 O[QT];
@@ -231,6 +267,7 @@ kernel void cpi_attention_prefill_mm(device const half* q [[buffer(0)]],
       for (uint a = 0u; a < QT; ++a)
         simdgroup_store(O[a], acc + (qt * QT + a) * 8u * hd + dg * 8u, hd);
     }
+#endif
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
 
