@@ -777,6 +777,49 @@ to the 8B:
   So attention's cost is **not** redundant KV traffic. What it is, on the decode side, is now
   measured rather than guessed.
 
+- **Why prefill attention is 116 ms and llama.cpp's is 68 ms: we are running their
+  flash-attention-OFF algorithm.** llama.cpp has a `-fa on|off` switch, which isolates its attention
+  implementation exactly. Fitting `a*T + b*T^2` to its prefill curve at 512/1024/2048 both ways, and
+  taking the quadratic term at T=2048:
+
+  | | attention @ 2048 |
+  | --- | --- |
+  | llama.cpp, flash-attn ON | **68 ms** |
+  | llama.cpp, flash-attn OFF | **117 ms** |
+  | CPI | **116 ms** |
+
+  We land on their FA-*off* number to within a millisecond. So the entire 1.76x is the
+  flash-attention speedup, and our kernel captures none of it -- even though it is fused into one
+  kernel, uses an online softmax, and tiles over key blocks, which is what "flash attention" is
+  usually taken to mean.
+
+  Reading their kernel, the difference is not tiling, intensity or block size. It is the WORK
+  DECOMPOSITION:
+
+  - **llama.cpp is query-partitioned.** `const short j = jj*NSG + sgitg` gives each simdgroup its
+    own private queries; `float M[NQ], S[NQ]` keeps their running max and sum in REGISTERS; and the
+    K/V staging is per-simdgroup (`sk = shmem + sgitg*...`). A simdgroup scores, softmaxes and
+    accumulates its own queries end to end, so nothing it touches needs to be visible to any other
+    simdgroup: **6 barriers in the whole key loop.**
+  - **CPI is phase-partitioned.** All 8 simdgroups cooperate on all 16 queries, but re-partition
+    between phases -- scoring by (query-fragment, key-group), softmax by query, P.V by
+    (query-fragment, dim-fragment). Each re-partition forces the intermediate state (`sc_sh`,
+    `pw_sh`, `m_sh`, `l_sh`, `acc`) out through threadgroup memory behind a barrier.
+
+  **That is the actual content of flash attention, and it is what we are missing.** The win is not
+  fusing the ops into one kernel -- we did that -- it is keeping the softmax state and the
+  accumulator LOCAL and PRIVATE across the whole key loop. Materialising the scores and
+  round-tripping m/l/acc through shared memory every block is the unfused algorithm in a fused
+  kernel's clothing, and it prices accordingly.
+
+  This retro-explains every null result in the tuning above: raising arithmetic intensity past 1.0,
+  removing a barrier, shrinking the threadgroup allocation, and halving the K/V re-reads were all
+  neutral because **they optimise within the wrong decomposition.** The 60% that this session did
+  win (289 -> 116 ms) was making the phase-partitioned structure as good as it can be; it cannot
+  reach 68 ms, because the barriers and the shared-memory traffic are inherent to that structure
+  rather than incidental to it. Closing the rest means re-partitioning by query -- a rewrite of the
+  kernel's skeleton, now with a measured target and a known-good reference design.
+
 - **Decode attention costs 496 us fixed + 1.838 us per key, per token.** Ablating `Attention`
   across depth gives a decode time of **345 / 346 / 346 / 346 ms at depths 257 / 512 / 1022 /
   2042** -- flat to a millisecond over an 8x range, which is the control every earlier attempt
