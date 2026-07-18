@@ -209,19 +209,27 @@ kernel void cpi_attention_prefill_mm(device const half* q [[buffer(0)]],
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // --- P.V: O[8q x 8d] += P[8q x 8k] @ V[8k x 8d], accumulated into the fp32 acc. ---
-    // Again one work item per (query fragment, head-dim fragment).
-    for (uint w = simd_id; w < qfs * dfs; w += n_simd) {
-      const uint qf = w / dfs, dg = w % dfs;
-      simdgroup_float8x8 O;
-      simdgroup_load(O, acc + qf * 8u * hd + dg * 8u, hd);  // current (rescaled) accumulator
+    // Tiled over QT query fragments for the same reason as the scoring above: one output fragment
+    // per work item meant loading a Pf AND a Vf for every MAC (intensity 0.5). Holding QT of them
+    // reuses each Vf across the query fragments -- 3 loads feed 2 MACs (0.67) -- while dt_n = dfs
+    // keeps all 8 simdgroups busy. The accumulator load/store is hoisted out of the key loop, so it
+    // amortises over all n_kg groups.
+    for (uint w = simd_id; w < qt_n * dfs; w += n_simd) {
+      const uint qt = w / dfs, dg = w % dfs;
+      simdgroup_float8x8 O[QT];
+      for (uint a = 0u; a < QT; ++a)
+        simdgroup_load(O[a], acc + (qt * QT + a) * 8u * hd + dg * 8u, hd);  // rescaled accumulator
       for (uint kg = 0u; kg < n_kg; ++kg) {
-        simdgroup_half8x8 Pf, Vf;
-        simdgroup_load(Pf, pw_sh + qf * 8u * MM_KEY_BLOCK + kg * 8u, MM_KEY_BLOCK);  // [8q x 8k]
+        simdgroup_half8x8 Pf[QT], Vf;
+        for (uint a = 0u; a < QT; ++a)
+          simdgroup_load(Pf[a], pw_sh + (qt * QT + a) * 8u * MM_KEY_BLOCK + kg * 8u,
+                         MM_KEY_BLOCK);  // [8q x 8k]
         simdgroup_load(Vf, v_cache + (ulong)(kphys + kg * 8u) * (ulong)kv_dim + kv_head * hd + dg * 8u,
-                       kv_dim);  // [8k x 8d]
-        simdgroup_multiply_accumulate(O, Pf, Vf, O);
+                       kv_dim);  // [8k x 8d], shared by every query fragment in the tile
+        for (uint a = 0u; a < QT; ++a) simdgroup_multiply_accumulate(O[a], Pf[a], Vf, O[a]);
       }
-      simdgroup_store(O, acc + qf * 8u * hd + dg * 8u, hd);
+      for (uint a = 0u; a < QT; ++a)
+        simdgroup_store(O[a], acc + (qt * QT + a) * 8u * hd + dg * 8u, hd);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
