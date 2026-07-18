@@ -796,9 +796,10 @@ to the 8B:
   Reading their kernel, the difference is not tiling, intensity or block size. It is the WORK
   DECOMPOSITION:
 
-  - **llama.cpp is query-partitioned.** `const short j = jj*NSG + sgitg` gives each simdgroup its
-    own private queries; `float M[NQ], S[NQ]` keeps their running max and sum in REGISTERS; and the
-    K/V staging is per-simdgroup (`sk = shmem + sgitg*...`). A simdgroup scores, softmaxes and
+  - **llama.cpp is query-partitioned.** Its queries are dealt out to simdgroups round-robin, so each
+    simdgroup owns a private subset; the running max and sum for those queries are held in ordinary
+    per-thread float arrays -- REGISTERS, not shared memory -- and each simdgroup stages K/V into its
+    own slice of the scratch buffer. A simdgroup scores, softmaxes and
     accumulates its own queries end to end, so nothing it touches needs to be visible to any other
     simdgroup: **6 barriers in the whole key loop.**
   - **CPI is phase-partitioned.** All 8 simdgroups cooperate on all 16 queries, but re-partition
