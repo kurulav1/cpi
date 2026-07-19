@@ -567,7 +567,13 @@ void Qwen35CpuEngine::allocate_runtime_buffers() {
 void Qwen35CpuEngine::load_weight_pointers() {
   tok_embeddings_ = require_bf16_tensor(weights_, "model.language_model.embed_tokens.weight");
   norm_out_ = require_bf16_tensor(weights_, "model.language_model.norm.weight");
-  lm_head_ = require_bf16_tensor(weights_, "lm_head.weight");
+  // Tied embeddings: the released Qwen3.5 checkpoints set tie_word_embeddings and ship NO
+  // lm_head.weight, so the output projection IS the embedding table -- same [vocab, hidden]
+  // shape, so it aliases directly. Requiring the tensor unconditionally made every such
+  // checkpoint fail to load with "missing tensor: lm_head.weight".
+  lm_head_ = weights_.has_tensor("lm_head.weight")
+                 ? require_bf16_tensor(weights_, "lm_head.weight")
+                 : tok_embeddings_;
 
   layers_.resize(static_cast<std::size_t>(cfg_.num_layers));
   for (int layer = 0; layer < cfg_.num_layers; ++layer) {
