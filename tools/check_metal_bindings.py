@@ -36,11 +36,16 @@ SRC = Path("src/kernels/metal/cpi_kernels.metal")
 SHADER_DIR = Path("src/kernels/metal")
 
 # shader #define -> every C++ constant that must equal it, as (file, name).
+#
+# Add a file here the moment it restates a tile constant. metal_gemm_bench was missed on the
+# first pass of this table and drifted to a wrong tile within the hour -- it caught itself only
+# because it verifies against a reference, which the next such file might not.
 ENGINE = "src/engine/plan_metal_engine.cpp"
 SMOKE = "src/tests/metal_smoke.cpp"
+GEMM_BENCH = "src/tests/metal_gemm_bench.cpp"
 MIRRORS = {
-    "GEMM_BN": [(ENGINE, "kGemmBN"), (SMOKE, "kSmokeGemmBN")],
-    "GEMM_FBM": [(ENGINE, "kGemmFBM"), (SMOKE, "kSmokeGemmFBM")],
+    "GEMM_BN": [(ENGINE, "kGemmBN"), (SMOKE, "kSmokeGemmBN"), (GEMM_BENCH, "kBN")],
+    "GEMM_FBM": [(ENGINE, "kGemmFBM"), (SMOKE, "kSmokeGemmFBM"), (GEMM_BENCH, "kFBM")],
     "GEMM_QBN": [(ENGINE, "kGemmQBN")],
     "GEMM_QBK": [(ENGINE, "kGemmQBK")],
     "GEMM_RF": [(ENGINE, "kGemmRF")],

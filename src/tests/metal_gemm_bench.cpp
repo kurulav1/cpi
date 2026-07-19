@@ -68,7 +68,7 @@ float f16_to_f32(std::uint16_t h) {
 // it, which is the design working, but the lesson is the same one that started all this: a
 // restated formula is a bug with a delay.
 constexpr std::uint32_t kFBM = 64;  // GEMM_FBM: rows per threadgroup
-constexpr std::uint32_t kBN = 64;   // GEMM_BN:  tokens per tile
+constexpr std::uint32_t kBN = 32;   // GEMM_BN:  tokens per tile
 constexpr std::uint32_t kRF = 4;    // GEMM_RF:  8x8 row fragments per simdgroup
 constexpr std::uint32_t kCF = 4;    // GEMM_CF:  8x8 col fragments per simdgroup
 
