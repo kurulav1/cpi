@@ -117,12 +117,30 @@ struct HeaderV5 {
   std::int64_t attention_type_offset;
 };
 
+// HeaderV6 appends the delta-net dimensions to V5. It is a STRICT APPEND: every field before
+// them keeps its offset, so a v5 reader parses a v6 file correctly (it simply stops early) and a
+// v6 reader parses a v5 file by leaving the new fields at 0. That is the only reason this can be
+// a format bump rather than a migration.
+struct HeaderV6 {
+  HeaderV5 v5;
+  std::int32_t linear_key_head_dim;
+  std::int32_t linear_value_head_dim;
+  std::int32_t linear_conv_kernel_dim;
+};
+
 struct TensorEntry {
   char name[64];
   std::int64_t offset;
   std::int64_t bytes;
 };
 #pragma pack(pop)
+
+// The packer (tools/pack_ll2c.py) states these layouts a second time, as a struct format string,
+// and nothing but arithmetic keeps the two in step. Pin the sizes: a field added on one side and
+// not the other shifts every field after it, which does not fail to build or to load -- it reads
+// plausible garbage out of the wrong offsets. pack_ll2c.py asserts the same two numbers.
+static_assert(sizeof(HeaderV5) == 112, "HeaderV5 layout drifted from pack_ll2c.py's HEADER_FMT");
+static_assert(sizeof(HeaderV6) == 124, "HeaderV6 layout drifted from pack_ll2c.py's HEADER_FMT");
 
 constexpr const char kMagic[] = "LL2CUDA";
 
@@ -173,6 +191,9 @@ void WeightLoader::parse_manifest() {
   config_.partial_rotary_factor = 1.0f;
   config_.linear_num_key_heads = 0;
   config_.linear_num_value_heads = 0;
+  config_.linear_key_head_dim = 0;
+  config_.linear_value_head_dim = 0;
+  config_.linear_conv_kernel_dim = 0;
 
   if (version >= 5) {
     if (mmap_.size() < sizeof(HeaderV5)) {
@@ -206,6 +227,15 @@ void WeightLoader::parse_manifest() {
         hdr->partial_rotary_factor > 0.0f ? hdr->partial_rotary_factor : 1.0f;
     config_.linear_num_key_heads = hdr->linear_num_key_heads;
     config_.linear_num_value_heads = hdr->linear_num_value_heads;
+
+    // v6 appended the delta-net dimensions. Guard on BOTH the version and the mapped size: a
+    // truncated file that claims v6 would otherwise read past the mapping.
+    if (version >= 6 && mmap_.size() >= sizeof(HeaderV6)) {
+      const auto* h6 = reinterpret_cast<const HeaderV6*>(mmap_.data());
+      config_.linear_key_head_dim = h6->linear_key_head_dim;
+      config_.linear_value_head_dim = h6->linear_value_head_dim;
+      config_.linear_conv_kernel_dim = h6->linear_conv_kernel_dim;
+    }
 
     if (hdr->attention_type_count > 0) {
       const std::size_t bytes =

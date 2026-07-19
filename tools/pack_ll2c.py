@@ -19,7 +19,7 @@ except Exception:  # pragma: no cover
     np = None
 
 MAGIC = b"LL2CUDA\x00"
-VERSION = 5
+VERSION = 6
 
 # HeaderV5 layout (matches HeaderV5 struct in weight_loader.cpp):
 #   magic[8], version, vocab, hidden, inter, layers, heads, kv_heads,
@@ -29,9 +29,20 @@ VERSION = 5
 #   partial_rotary_factor (f), linear_num_key_heads (i), linear_num_value_heads (i),
 #   attention_type_count (i), attention_type_offset (Q)
 #
+# v6 APPENDS, and only appends:
+#   linear_key_head_dim (i), linear_value_head_dim (i), linear_conv_kernel_dim (i)
+# Every earlier field keeps its offset, so a v5 reader parses a v6 file correctly and a v6 reader
+# parses a v5 file with the new fields left at 0. The delta-net state buffers are sized from these
+# three; v5 carried the head COUNTS but not their widths, which is why they had to be added.
+#
 # flags bit layout: bit 0 = tie_word_embeddings, bit 1 = has_qkv_bias,
 # bit 2 = use_layernorm, bit 3 = has_qk_norm, bit 4 = mlp_gelu, bit 5 = scale_embeddings
-HEADER_FMT = "<8siiiiiiiiiiQffiiiiiifiiiQ"
+HEADER_FMT = "<8siiiiiiiiiiQffiiiiiifiiiQiii"
+# weight_loader.cpp states this layout a second time, as a packed struct, and only arithmetic
+# keeps the two in step. A field added on one side alone shifts everything after it and reads
+# plausible garbage rather than failing -- so both sides pin the sizes.
+assert struct.calcsize(HEADER_FMT) == 124, "HEADER_FMT drifted from HeaderV6 in weight_loader.cpp"
+assert struct.calcsize("<8siiiiiiiiiiQffiiiiiifiiiQ") == 112, "v5 prefix must stay byte-identical"
 ENTRY_FMT = "<64sqq"
 
 ATTENTION_KIND_ID = {
@@ -83,6 +94,11 @@ def load_config(src: Path, args) -> dict:
     result["partial_rotary_factor"] = float(cfg.get("partial_rotary_factor", 1.0) or 1.0)
     result["linear_num_key_heads"] = int(cfg.get("linear_num_key_heads", 0) or 0)
     result["linear_num_value_heads"] = int(cfg.get("linear_num_value_heads", 0) or 0)
+    # v6: the widths behind those head counts. 0 means "not a linear-attention model", which is
+    # every model that predates this field, so the default has to round-trip as absent.
+    result["linear_key_head_dim"] = int(cfg.get("linear_key_head_dim", 0) or 0)
+    result["linear_value_head_dim"] = int(cfg.get("linear_value_head_dim", 0) or 0)
+    result["linear_conv_kernel_dim"] = int(cfg.get("linear_conv_kernel_dim", 0) or 0)
     result["layer_attention_types"] = [
         str(value).lower() for value in cfg.get("layer_attention_types", []) or []
     ]
@@ -297,6 +313,9 @@ def main() -> None:
             cfg["linear_num_value_heads"],  # int32
             len(attention_type_ids),        # int32
             attention_type_offset,          # uint64
+            cfg["linear_key_head_dim"],     # int32  (v6)
+            cfg["linear_value_head_dim"],   # int32  (v6)
+            cfg["linear_conv_kernel_dim"],  # int32  (v6)
         ))
         if attention_type_blob:
             f.write(attention_type_blob)

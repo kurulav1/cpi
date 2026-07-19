@@ -98,8 +98,15 @@ struct LlamaConfig {
       0;  // Router top-k experts selected per token (Mixtral uses 2).
   std::int32_t expert_intermediate_size = 0;  // Expert FFN hidden size (0 = use intermediate_size).
   float partial_rotary_factor = 1.0f;     // Phi/Qwen-style partial RoPE factor (1.0 = full rotary).
-  std::int32_t linear_num_key_heads = 0;  // Linear-attention KV-head metadata for future runtimes.
+  std::int32_t linear_num_key_heads = 0;  // Linear-attention (delta-net) geometry.
   std::int32_t linear_num_value_heads = 0;
+  // The three dimensions the delta-net state buffers are sized from. The head COUNTS above have
+  // been in the container since v5, but without these a backend can only know how many heads
+  // there are, not how wide -- which is why the Metal engine could not allocate the conv window
+  // or the recurrent matrix. Container v6 carries them; a v5 file leaves them 0.
+  std::int32_t linear_key_head_dim = 0;
+  std::int32_t linear_value_head_dim = 0;
+  std::int32_t linear_conv_kernel_dim = 0;
   std::vector<AttentionKind>
       layer_attention_kinds;  // Optional per-layer attention dispatch metadata.
 
