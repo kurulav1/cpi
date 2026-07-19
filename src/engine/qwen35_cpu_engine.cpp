@@ -607,6 +607,40 @@ void Qwen35CpuEngine::load_weight_pointers() {
   }
 }
 
+// CPI_Q35_DUMP=<dir> writes this engine's hidden state after every layer, as
+// layer_NN_pos_MM.f32 (hidden_size floats, native endianness), plus the embedding as layer_-1.
+//
+// This exists so the Metal port can be diffed LAYER BY LAYER rather than by its final token. A
+// port that disagrees only in its output tells you nothing about where; the delta-net block, the
+// gated attention block and the MLP are three independent suspects per layer, times 24 layers.
+// Off unless the variable is set, so it costs a getenv per forward.
+namespace {
+const char* q35_dump_dir() {
+  static const char* d = std::getenv("CPI_Q35_DUMP");
+  return d;
+}
+// Dumps a named intermediate rather than the layer's hidden state. "layer 1 is wrong" narrows the
+// search to a block; this narrows it to a buffer inside that block.
+void q35_dump_named(const char* dir, const char* name, int layer, int position, const float* v,
+                    std::size_t n) {
+  char path[512];
+  std::snprintf(path, sizeof(path), "%s/%s_L%02d_pos_%02d.f32", dir, name, layer, position);
+  if (std::FILE* f = std::fopen(path, "wb")) {
+    std::fwrite(v, sizeof(float), n, f);
+    std::fclose(f);
+  }
+}
+
+void q35_dump(const char* dir, int layer, int position, const std::vector<float>& v) {
+  char path[512];
+  std::snprintf(path, sizeof(path), "%s/layer_%02d_pos_%02d.f32", dir, layer + 1, position);
+  if (std::FILE* f = std::fopen(path, "wb")) {
+    std::fwrite(v.data(), sizeof(float), v.size(), f);
+    std::fclose(f);
+  }
+}
+}  // namespace
+
 void Qwen35CpuEngine::apply_rope_partial(float* q, float* k, int position) {
   const int rotary_half = rotary_dim_ / 2;
   const float* cos_row =
@@ -737,10 +771,14 @@ void Qwen35CpuEngine::run_full_attention_layer(int layer, int position) {
   }
 }
 
-void Qwen35CpuEngine::run_linear_attention_layer(int layer) {
+void Qwen35CpuEngine::run_linear_attention_layer(int layer, int position) {
   const LayerWeights& lw = layers_[static_cast<std::size_t>(layer)];
   rmsnorm_offset(x_.data(), lw.norm_att, x_norm_.data(), cfg_.hidden_size, cfg_.rms_norm_eps);
 
+  if (const char* d = q35_dump_dir()) {
+    q35_dump_named(d, "lin_xnorm", layer, position, x_norm_.data(),
+                   static_cast<std::size_t>(cfg_.hidden_size));
+  }
   gemv_bf16(lw.linear_qkv, x_norm_.data(), linear_qkv_mix_.data(), linear_conv_dim_,
             cfg_.hidden_size);
   gemv_bf16(lw.linear_z, x_norm_.data(), linear_z_.data(), linear_v_dim_, cfg_.hidden_size);
@@ -868,6 +906,12 @@ void Qwen35CpuEngine::run_linear_attention_layer(int layer) {
                                  cfg_.rms_norm_eps);
   }
 
+  if (const char* d = q35_dump_dir()) {
+    q35_dump_named(d, "lin_mix", layer, position, linear_qkv_mix_.data(),
+                   static_cast<std::size_t>(linear_conv_dim_));
+    q35_dump_named(d, "lin_att", layer, position, linear_att_.data(),
+                   static_cast<std::size_t>(linear_v_dim_));
+  }
   gemv_bf16(lw.linear_out, linear_att_.data(), x_norm_.data(), cfg_.hidden_size, linear_v_dim_);
   for (int i = 0; i < cfg_.hidden_size; ++i) {
     x_[static_cast<std::size_t>(i)] += x_norm_[static_cast<std::size_t>(i)];
@@ -892,27 +936,6 @@ void Qwen35CpuEngine::run_mlp_layer(int layer) {
   }
 }
 
-// CPI_Q35_DUMP=<dir> writes this engine's hidden state after every layer, as
-// layer_NN_pos_MM.f32 (hidden_size floats, native endianness), plus the embedding as layer_-1.
-//
-// This exists so the Metal port can be diffed LAYER BY LAYER rather than by its final token. A
-// port that disagrees only in its output tells you nothing about where; the delta-net block, the
-// gated attention block and the MLP are three independent suspects per layer, times 24 layers.
-// Off unless the variable is set, so it costs a getenv per forward.
-namespace {
-const char* q35_dump_dir() {
-  static const char* d = std::getenv("CPI_Q35_DUMP");
-  return d;
-}
-void q35_dump(const char* dir, int layer, int position, const std::vector<float>& v) {
-  char path[512];
-  std::snprintf(path, sizeof(path), "%s/layer_%02d_pos_%02d.f32", dir, layer + 1, position);
-  if (std::FILE* f = std::fopen(path, "wb")) {
-    std::fwrite(v.data(), sizeof(float), v.size(), f);
-    std::fclose(f);
-  }
-}
-}  // namespace
 
 void Qwen35CpuEngine::forward_token(int token, int position) {
   const std::uint16_t* emb_row = tok_embeddings_ + static_cast<std::size_t>(token) *
@@ -928,7 +951,7 @@ void Qwen35CpuEngine::forward_token(int token, int position) {
     if (layers_[static_cast<std::size_t>(layer)].kind == LayerKind::FullAttention) {
       run_full_attention_layer(layer, position);
     } else {
-      run_linear_attention_layer(layer);
+      run_linear_attention_layer(layer, position);
     }
     run_mlp_layer(layer);
     if (dump != nullptr) q35_dump(dump, layer, position, x_);

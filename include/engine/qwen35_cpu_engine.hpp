@@ -100,7 +100,7 @@ private:
 
   void apply_rope_partial(float* q, float* k, int position);
   void run_full_attention_layer(int layer, int position);
-  void run_linear_attention_layer(int layer);
+  void run_linear_attention_layer(int layer, int position);
   void run_mlp_layer(int layer);
   void forward_token(int token, int position);
 
