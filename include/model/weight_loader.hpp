@@ -25,6 +25,14 @@ struct TensorSlice {
   std::size_t bytes = 0;   // Size of the tensor data in bytes.
 };
 
+// Reads ONLY the model family from a .ll2c container, without mapping its weights.
+//
+// Engine selection has to know the family before it commits to an engine, and opening a
+// multi-gigabyte container to ask one question is not an option. Returns ModelFamily::Llama for
+// anything it cannot read -- a missing or unreadable file is not this function's error to report,
+// and the caller's normal open() path will produce a better message.
+[[nodiscard]] ModelFamily peek_container_family(const std::string& path);
+
 // Memory-mapped weight loader for a compact custom binary format.
 // Format:
 //   [Header][TensorTable entries][raw tensor bytes]

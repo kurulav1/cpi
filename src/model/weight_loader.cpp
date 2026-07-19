@@ -1,6 +1,7 @@
 #include "model/weight_loader.hpp"
 
 #include <cstring>
+#include <fstream>
 
 #include "common.hpp"
 
@@ -145,6 +146,20 @@ static_assert(sizeof(HeaderV6) == 124, "HeaderV6 layout drifted from pack_ll2c.p
 constexpr const char kMagic[] = "LL2CUDA";
 
 }  // namespace
+
+// Deliberately reads through HeaderV5 rather than hand-computing model_family_id's byte offset:
+// the offset lives in one place, the struct, and stays correct if the format grows again.
+// model_family_id has been at a fixed offset since v4, so a v4 file reads correctly too.
+ModelFamily peek_container_family(const std::string& path) {
+  std::ifstream f(path, std::ios::binary);
+  if (!f) return ModelFamily::Unknown;
+  HeaderV5 h{};
+  f.read(reinterpret_cast<char*>(&h), sizeof(h));
+  if (!f || std::memcmp(h.magic, kMagic, sizeof(kMagic) - 1) != 0 || h.version < 4) {
+    return ModelFamily::Unknown;
+  }
+  return static_cast<ModelFamily>(h.model_family_id);
+}
 
 void WeightLoader::open(const std::string& path) {
   mmap_.open(path);

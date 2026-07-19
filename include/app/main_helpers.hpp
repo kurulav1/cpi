@@ -82,6 +82,7 @@ enum class EngineChoice {
   LlamaCpu,    // CpuLlamaEngine (force_cpu / no CUDA device / no-CUDA build)
   PlanCuda,    // generic per-layer op-plan executor (Gemma 4 .cpi today) — CUDA only
   Qwen35Cuda,
+  Qwen35Metal,  // PlanMetalEngine running the shared Qwen3.5 op plan (Apple Silicon, no CUDA)
   Qwen35Cpu,
   Llama4Cuda,
   Llama4Cpu,

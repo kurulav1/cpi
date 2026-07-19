@@ -23,7 +23,7 @@ enum class ModelFamily : std::int32_t {
   Phi3 = 4,     // Microsoft Phi-3 (partial rotary, rope_theta=10000)
   Qwen2 = 5,    // Alibaba Qwen2 (rope_theta=1000000, QKV biases)
   Mixtral = 6,  // Mixtral sparse-MoE (top-k routed experts, rope_theta=10000).
-  Qwen3_5 = 7,  // Qwen3.5 mixed-attention family (metadata only until linear kernels land).
+  Qwen3_5 = 7,  // Qwen3.5 mixed-attention family (gated delta-net + gated full attention).
   Qwen3 = 8,    // Qwen3 dense (rope_theta=1000000, per-head QK-norm, no QKV bias).
   Gemma = 9,    // Gemma 1 (GeGLU MLP, embedding scale, (1+w) RMSNorm, tied embeddings).
 };

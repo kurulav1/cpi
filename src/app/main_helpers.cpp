@@ -10,6 +10,8 @@
 #include <sstream>
 #include <stdexcept>
 
+#include "model/weight_loader.hpp"
+
 #ifdef _WIN32
 #include <Windows.h>
 #else
@@ -850,6 +852,12 @@ ModelProbe probe_model(const std::string& model_path) {
     p.kind = ModelFamilyKind::Gemma4;
   } else if (p.safetensors_family == "qwen3_5") {
     p.kind = ModelFamilyKind::Qwen35;
+  } else if (!p.is_safetensors_dir &&
+             model::peek_container_family(model_path) == model::ModelFamily::Qwen3_5) {
+    // A .ll2c container records its family in the header; ask it. Without this a Qwen3.5
+    // container fell through to ModelFamilyKind::Llama and reached PlanMetalEngine by accident
+    // rather than by recognition -- which happened to be the right engine, so nothing complained.
+    p.kind = ModelFamilyKind::Qwen35;
   } else if (p.is_safetensors_dir) {
     p.kind = ModelFamilyKind::Llama4;
   } else {
@@ -872,7 +880,23 @@ EngineChoice resolve_engine(const ModelProbe& probe, bool cuda_available, bool m
       }
       return EngineChoice::PlanCuda;
     case ModelFamilyKind::Qwen35:
-      return use_gpu ? EngineChoice::Qwen35Cuda : EngineChoice::Qwen35Cpu;
+      // Metal runs Qwen3.5 as a shared op plan, verified token-identical to the CPU reference.
+      // This branch has to exist for the probe fix above to be safe: teaching the probe to
+      // recognise a Qwen3.5 CONTAINER without it would route Macs to Qwen35Cpu, which reads a
+      // HuggingFace directory and cannot open a .ll2c at all. The two changes are one change.
+      if (use_gpu) return EngineChoice::Qwen35Cuda;
+      if (use_metal) return EngineChoice::Qwen35Metal;
+      // The Qwen3.5 CPU reference reads a HuggingFace DIRECTORY (config.json + safetensors), not
+      // a .ll2c container. Routing a container here would fail deep inside its loader complaining
+      // that <container>/config.json does not exist, which describes the symptom and not the
+      // cause. Say what is actually wrong instead.
+      if (!probe.is_safetensors_dir) {
+        throw std::runtime_error(
+            "Qwen3.5 on CPU needs the HuggingFace model directory, not a .ll2c container -- "
+            "the CPU reference engine reads config.json and safetensors directly. Point it at "
+            "the model directory, or drop --cpu to use the GPU engine, which does read .ll2c.");
+      }
+      return EngineChoice::Qwen35Cpu;
     case ModelFamilyKind::Llama4:
       return use_gpu ? EngineChoice::Llama4Cuda : EngineChoice::Llama4Cpu;
     case ModelFamilyKind::Llama:

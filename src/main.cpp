@@ -295,10 +295,10 @@ int main(int argc, char** argv) {
           break;
         case EngineChoice::Qwen35Cuda:
           std::cout
-              << "[info] Detected a Qwen3.5 safetensors model. Using the Qwen3.5 CUDA engine.\n";
+              << "[info] Detected a Qwen3.5 model. Using the Qwen3.5 CUDA engine.\n";
           break;
         case EngineChoice::Qwen35Cpu:
-          std::cout << "[info] Detected a Qwen3.5 safetensors model. Using the Qwen3.5 CPU engine.\n";
+          std::cout << "[info] Detected a Qwen3.5 model. Using the Qwen3.5 CPU engine.\n";
           break;
         case EngineChoice::Llama4Cuda:
           std::cout << "[info] Detected a safetensors model. Using the Llama4 CUDA engine.\n";
@@ -320,6 +320,7 @@ int main(int argc, char** argv) {
 #endif
           break;
         case EngineChoice::LlamaMetal:
+        case EngineChoice::Qwen35Metal:
           std::cout << "[info] No CUDA device found. Using the Metal GPU engine (Apple Silicon).\n";
           break;
         case EngineChoice::LlamaCuda:
@@ -431,6 +432,10 @@ int main(int argc, char** argv) {
         break;
       }
 #if LLAMA_ENGINE_ENABLE_METAL
+      // Both reach the same executor: Qwen3.5 is an op plan like any other, and the engine picks
+      // its builder from the container's family. The separate enum member exists so the choice is
+      // recorded rather than inferred.
+      case EngineChoice::Qwen35Metal:
       case EngineChoice::LlamaMetal: {
         // Apple Silicon GPU path for the main binary -- the same PlanMetalEngine the metal_infer
         // tool uses, wired into the standard serving modes so the REST/web bridge runs on a Mac.
