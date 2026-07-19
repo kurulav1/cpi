@@ -256,6 +256,31 @@ const char* op_kind_name(int k) {
   }
 }
 
+// Must match the layouts in 70_linear_attn.metal exactly.
+struct LinSplitParams {
+  std::uint32_t heads, head_dim;
+};
+struct LinGateParams {
+  std::uint32_t n;
+};
+struct LinMulVecParams {
+  std::uint32_t n;
+  float scale;
+};
+struct LinRepeatParams {
+  std::uint32_t num_key_heads, head_repeat, key_head_dim, value_head_dim;
+};
+
+// The delta-net family is recurrent and has no token dimension. A batched chunk would read past
+// a slot sized for one token and produce plausible numbers, so it is refused here by name.
+inline void require_single_token(opplan::OpKind kind, int tokens) {
+  if (tokens != 1) {
+    throw std::runtime_error(std::string("Metal: ") + op_kind_name(static_cast<int>(kind)) +
+                             " is a per-token recurrent op and cannot run on a chunk of " +
+                             std::to_string(tokens) + " tokens");
+  }
+}
+
 // Every name CPI_METAL_ABLATE accepts. MUST stay in step with op_kind_name above -- a name that
 // drifts out of this list stops being ablatable, and one that never matched an op is the bug the
 // validation below exists to catch.
@@ -567,8 +592,38 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
 
   // Slots, sized for a whole prefill chunk: [tokens][dim] contiguous, which is the
   // layout every batched kernel assumes.
+  // Delta-net / gated-attention geometry. Zero for every model that is not Qwen3.5, which makes
+  // the slots below zero-sized there rather than wrong-sized -- the default branch would hand
+  // them `hidden`, and a slot that is silently too small is read out of bounds by the first
+  // kernel that uses it.
+  const int lin_k_dim = cfg_.linear_num_key_heads * cfg_.linear_key_head_dim;
+  const int lin_v_dim = cfg_.linear_num_value_heads * cfg_.linear_value_head_dim;
+  const int lin_conv_dim = lin_k_dim * 2 + lin_v_dim;  // in_proj_qkv emits q|k|v back to back
+  const int lin_qk_dim = cfg_.linear_num_value_heads * cfg_.linear_key_head_dim;
+
   auto slot_elems = [&](opplan::Slot s) -> std::size_t {
     switch (s) {
+      // Qwen3.5 full-attention layers project [q|gate] per head, so QPair is twice q_dim; the
+      // split writes Q and QGate, each q_dim wide.
+      case opplan::Slot::QPair:
+        return static_cast<std::size_t>(q_dim) * 2u;
+      case opplan::Slot::QGate:
+        return static_cast<std::size_t>(q_dim);
+      // Delta-net. LinQ/LinK are per VALUE head (RepeatLinearHeads fans the shared key heads
+      // out), so they are num_value_heads * key_head_dim, NOT num_key_heads * key_head_dim.
+      case opplan::Slot::LinMix:
+        return static_cast<std::size_t>(lin_conv_dim);
+      case opplan::Slot::LinZ:
+        return static_cast<std::size_t>(lin_v_dim);
+      case opplan::Slot::LinA:
+      case opplan::Slot::LinB:
+        return static_cast<std::size_t>(std::max(1, cfg_.linear_num_value_heads));
+      case opplan::Slot::LinQ:
+      case opplan::Slot::LinK:
+        return static_cast<std::size_t>(lin_qk_dim);
+      case opplan::Slot::LinV:
+      case opplan::Slot::LinAtt:
+        return static_cast<std::size_t>(lin_v_dim);
       case opplan::Slot::Q:
       case opplan::Slot::Att:
         return static_cast<std::size_t>(q_dim);
@@ -1358,6 +1413,75 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
                       kTG, bufs, nullptr, 3, &p, sizeof(p));
         break;
       }
+      // ---- linear attention (delta-net) and gated attention -----------------
+      //
+      // These run ONE TOKEN AT A TIME. The delta-net kernels carry state across steps and have no
+      // token dimension -- CUDA and the CPU reference both drive this family through
+      // forward_one(token, position) for the same reason. Metal's batched prefill chunk does not
+      // apply here, so every case below refuses T > 1 rather than quietly walking off the end of a
+      // slot sized for one token.
+      case OpKind::SplitHeadHalves: {
+        require_single_token(op.kind, T);
+        LinSplitParams p{static_cast<std::uint32_t>(op.heads),
+                         static_cast<std::uint32_t>(op.head_dim)};
+        const std::size_t n = static_cast<std::size_t>(op.heads) * op.head_dim;
+        const void* bufs[] = {slot(op.in), slot(op.out), slot(op.out2)};
+        ctx_.dispatch("cpi_split_head_halves", G::Threads, n, kTG, bufs, nullptr, 3, &p, sizeof(p));
+        break;
+      }
+      case OpKind::SigmoidGate: {
+        require_single_token(op.kind, T);
+        LinGateParams p{static_cast<std::uint32_t>(op.cols)};
+        const void* bufs[] = {slot(op.out), slot(op.in2)};
+        ctx_.dispatch("cpi_sigmoid_gate_inplace", G::Threads, static_cast<std::size_t>(op.cols),
+                      kTG, bufs, nullptr, 2, &p, sizeof(p));
+        break;
+      }
+      case OpKind::MulVec: {
+        require_single_token(op.kind, T);
+        LinMulVecParams p{static_cast<std::uint32_t>(op.cols), op.scale};
+        const void* bufs[] = {slot(op.in), op.weight, slot(op.out)};
+        ctx_.dispatch("cpi_mul_vec", G::Threads, static_cast<std::size_t>(op.cols), kTG, bufs,
+                      nullptr, 3, &p, sizeof(p));
+        break;
+      }
+      case OpKind::RepeatLinearHeads: {
+        require_single_token(op.kind, T);
+        const int repeat = op.num_k_heads > 0 ? op.num_v_heads / op.num_k_heads : 1;
+        LinRepeatParams p{static_cast<std::uint32_t>(op.num_k_heads),
+                          static_cast<std::uint32_t>(repeat),
+                          static_cast<std::uint32_t>(op.key_head_dim),
+                          static_cast<std::uint32_t>(op.value_head_dim)};
+        const std::size_t width =
+            static_cast<std::size_t>(std::max(op.key_head_dim, op.value_head_dim));
+        const void* bufs[] = {slot(op.in), slot(opplan::Slot::LinQ), slot(opplan::Slot::LinK),
+                              slot(opplan::Slot::LinV)};
+        ctx_.dispatch("cpi_repeat_linear_heads", G::Threads,
+                      width * static_cast<std::size_t>(op.num_k_heads), 64, bufs, nullptr, 4, &p,
+                      sizeof(p));
+        break;
+      }
+
+      // The two stateful ones need per-layer buffers this engine does not allocate yet (the conv
+      // window and the recurrent matrix), and the attention step additionally needs its two fp32
+      // weights, which WeightSource cannot express. Both are the next step; until then this
+      // refuses by name rather than dispatching a kernel with nothing behind its state pointer.
+      case OpKind::LinearConv1d:
+      case OpKind::LinearAttentionStep:
+        throw std::runtime_error(
+            std::string("Metal: ") + op_kind_name(static_cast<int>(op.kind)) +
+            " needs the per-layer delta-net state buffers, which are not allocated yet");
+
+      // Kernels exist (80_vision.metal) but nothing here supplies pixels, patch positions or the
+      // 2-D RoPE tables, and those four ops implement GEMMA 4's tower -- Qwen3.5's is a different
+      // architecture (3-D conv patch embed, learned absolute positions, LayerNorm, spatial merge).
+      case OpKind::PatchEmbed:
+      case OpKind::Rope2D:
+      case OpKind::AvgPoolPatches:
+      case OpKind::Standardize:
+        throw std::runtime_error(std::string("Metal: ") + op_kind_name(static_cast<int>(op.kind)) +
+                                 " belongs to a vision tower that is not wired on this backend");
+
       case OpKind::AddInplace: {
         const std::size_t n =
             static_cast<std::size_t>(cfg_.hidden_size) * static_cast<std::size_t>(T);
