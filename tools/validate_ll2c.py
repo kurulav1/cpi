@@ -181,9 +181,22 @@ def main() -> None:
             return entries[q4name] // packed_cols
         raise ValueError(f"missing tensor: {name} (or packed int8/int4 alternative)")
 
-    q_hidden = infer_rows("layers.0.attention.wq", hidden)
-    wk_rows = infer_rows("layers.0.attention.wk", hidden)
-    wv_rows = infer_rows("layers.0.attention.wv", hidden)
+    # Layer 0 is not necessarily a full-attention layer. Mixed-attention families (Qwen3.5) put
+    # delta-net blocks in most layers and only a few full-attention ones, so probing a fixed index
+    # reports "missing tensor: layers.0.attention.wq" for a container that is perfectly well
+    # formed. Find the first layer that actually HAS the projections and infer the geometry there.
+    attn_layer = None
+    for i in range(layers):
+        if any(k in entries for k in (f"layers.{i}.attention.wq",
+                                      f"layers.{i}.attention.wq.int8",
+                                      f"layers.{i}.attention.wq.int4")):
+            attn_layer = i
+            break
+    if attn_layer is None:
+        raise ValueError("no layer has attention.wq -- cannot infer the attention geometry")
+    q_hidden = infer_rows(f"layers.{attn_layer}.attention.wq", hidden)
+    wk_rows = infer_rows(f"layers.{attn_layer}.attention.wk", hidden)
+    wv_rows = infer_rows(f"layers.{attn_layer}.attention.wv", hidden)
     if q_hidden <= 0 or (q_hidden % heads) != 0:
         raise ValueError("invalid q_proj shape: rows must be positive and divisible by heads")
     head_dim = q_hidden // heads

@@ -91,7 +91,10 @@ def detect_family(cfg: dict) -> str:
 
     if model_type == "qwen2":
         return FAMILY_QWEN2
-    if model_type == "qwen3_5":
+    # The text half of a Qwen3.5 checkpoint reports "qwen3_5_text"; the multimodal wrapper
+    # reports "qwen3_5". Match both, and match them BEFORE the generic "qwen" fallback below,
+    # which would otherwise classify this family as qwen2 and map the wrong tensor names.
+    if model_type.startswith("qwen3_5"):
         return FAMILY_QWEN3_5
     # Qwen3 dense (model_type "qwen3"): standard decoder + per-head QK-norm, no
     # QKV bias. Distinct from the mixed linear/full-attention "qwen3_5".
@@ -128,14 +131,31 @@ def unsupported_reason(cfg: dict) -> str:
     )
 
     if "qwen3_5" in model_type:
-        if has_linear_attention:
-            return ("Qwen3.5 is not supported by the native CPI engine yet: "
-                    "the model mixes linear-attention and full-attention layers.")
-        return "Qwen3.5 is not supported by the native CPI engine yet."
+        # Mixed linear/full attention is now expressible: the container records a per-layer
+        # attention kind (v5) and the delta-net geometry (v6), and every op the block needs has a
+        # kernel. What this conversion does NOT carry is the vision tower and the MTP head -- both
+        # are present in these checkpoints and both are skipped, so the result is the TEXT model.
+        if not has_linear_attention:
+            return "Qwen3.5 is not supported by the native CPI engine yet."
+        # The delta-net layers are expressible now. The FULL-attention layers are not, and the
+        # reason is easy to miss: attn_output_gate makes q_proj emit gate||q, so its rows are
+        # 2 * heads * head_dim (4096 for the 0.8B, against the 2048 the shape implies). Mapping
+        # that onto the standard wq would convert cleanly and then compute nonsense -- the
+        # container validator catches it as a k/v shape mismatch, which is the symptom, not the
+        # cause. Refuse until the gated form has a kernel path.
+        if bool(text_cfg.get("attn_output_gate", False)):
+            return ("Qwen3.5 with attn_output_gate is not supported yet: its full-attention "
+                    "layers project gate||q, which the standard attention path would "
+                    "misinterpret. The delta-net layers and the container format are ready; "
+                    "the gated attention block is not.")
+        return ""
 
+    # Linear attention is supported for qwen3_5 (handled above, which returns "" for it). Any
+    # OTHER family arriving here with linear-attention layers has a block shape this converter has
+    # not been taught, so it is still refused rather than mapped by guesswork.
     if has_linear_attention:
         return ("This model uses linear-attention layers, which the native CPI "
-                "engine does not support yet.")
+                "engine does not support yet for this family.")
 
     if model_type in ("gemma2", "gemma3") or "gemma2" in model_type or "gemma3" in model_type:
         return ("Gemma 2/3 is not supported yet: it needs attention- and "
@@ -159,13 +179,29 @@ def load_index(hf_dir: Path) -> dict:
 
     single_path = hf_dir / "model.safetensors"
     if not single_path.exists():
-        raise FileNotFoundError(f"Missing {index_path} and {single_path}")
+        # Some repos ship a single shard under the sharded NAME (Qwen3.5-0.8B is
+        # "model.safetensors-00001-of-00001.safetensors") and then omit the index, since there is
+        # nothing to index. Accept exactly one such file; refuse several, because picking one of
+        # a real multi-shard set would silently convert a fraction of the model.
+        shards = sorted(hf_dir.glob("*.safetensors")) + sorted(
+            hf_dir.glob("*.safetensors-*-of-*.safetensors"))
+        shards = sorted({p for p in shards})
+        if len(shards) == 1:
+            single_path = shards[0]
+        elif len(shards) > 1:
+            raise FileNotFoundError(
+                f"{index_path} is missing but {len(shards)} shards are present; an index is "
+                f"required to know which tensor lives where")
+        else:
+            raise FileNotFoundError(f"Missing {index_path} and {single_path}")
 
     with single_path.open("rb") as f:
         header_len = struct.unpack("<Q", f.read(8))[0]
         header = json.loads(f.read(header_len).decode("utf-8"))
 
-    weight_map = {k: "model.safetensors" for k in header if k != "__metadata__"}
+    # Point at the file actually opened, not the canonical name -- they differ whenever a repo
+    # ships one shard under a sharded filename.
+    weight_map = {k: single_path.name for k in header if k != "__metadata__"}
     return {"weight_map": weight_map}
 
 
@@ -214,10 +250,15 @@ def read_safetensor_blob(safetensor_path: Path, tensor_name: str):
 # Config extraction
 # ---------------------------------------------------------------------------
 
+# NOTE on the lookups below: Python evaluates a .get() default EAGERLY, so
+# `text_cfg.get(k, hf_cfg[k])` raises KeyError whenever k is absent from the TOP level -- even
+# when text_config supplies it. That is every nested-config model (Qwen3.5 keeps everything under
+# text_config), and it read as "this model has no attention heads" rather than as a lookup bug.
+# hf_cfg.get() keeps the fallback lazy.
 def extract_model_config(hf_cfg: dict, family: str) -> dict:
     """Build the model_config.json that pack_ll2c.py consumes."""
     text_cfg = hf_cfg.get("text_config", hf_cfg)
-    num_heads = int(text_cfg.get("num_attention_heads", hf_cfg["num_attention_heads"]))
+    num_heads = int(text_cfg.get("num_attention_heads", hf_cfg.get("num_attention_heads")))
     num_kv_heads = int(text_cfg.get("num_key_value_heads", hf_cfg.get("num_key_value_heads", num_heads)))
 
     rope_theta = float(text_cfg.get("rope_theta", hf_cfg.get("rope_theta", DEFAULT_ROPE_THETA.get(family, 10000.0))))
@@ -298,10 +339,10 @@ def extract_model_config(hf_cfg: dict, family: str) -> dict:
     return {
         "model_family":        family,
         "model_family_id":     FAMILY_ID.get(family, 0),
-        "vocab_size":          int(text_cfg.get("vocab_size", hf_cfg["vocab_size"])),
-        "hidden_size":         int(text_cfg.get("hidden_size", hf_cfg["hidden_size"])),
-        "intermediate_size":   int(text_cfg.get("intermediate_size", hf_cfg["intermediate_size"])),
-        "num_layers":          int(text_cfg.get("num_hidden_layers", hf_cfg["num_hidden_layers"])),
+        "vocab_size":          int(text_cfg.get("vocab_size", hf_cfg.get("vocab_size"))),
+        "hidden_size":         int(text_cfg.get("hidden_size", hf_cfg.get("hidden_size"))),
+        "intermediate_size":   int(text_cfg.get("intermediate_size", hf_cfg.get("intermediate_size"))),
+        "num_layers":          int(text_cfg.get("num_hidden_layers", hf_cfg.get("num_hidden_layers"))),
         "num_heads":           num_heads,
         "num_kv_heads":        num_kv_heads,
         "max_seq_len":         int(text_cfg.get("max_position_embeddings", hf_cfg.get("max_position_embeddings", 4096))),
@@ -331,14 +372,82 @@ def extract_model_config(hf_cfg: dict, family: str) -> dict:
 # Tensor name mapping
 # ---------------------------------------------------------------------------
 
+def build_qwen35_mapping(num_layers: int, layer_types: list, has_qk_norm: bool):
+    """Qwen3.5: tensors sit under model.language_model, and each layer is EITHER delta-net or
+    full attention -- `layer_types` says which, and the two carry disjoint tensor sets.
+
+    The vision tower (model.visual.*) and the multi-token-prediction head (mtp.*) are deliberately
+    not mapped: this produces the text model. They are ~168 of the checkpoint's 488 tensors, so
+    the caller reports them as skipped rather than letting them look absent.
+    """
+    P = "model.language_model."
+    items = [
+        (P + "embed_tokens.weight", "tok_embeddings.weight", True),
+        (P + "norm.weight", "norm.weight", True),
+        ("lm_head.weight", "output.weight", False),  # tied in the released checkpoints
+    ]
+    for i in range(num_layers):
+        kind = layer_types[i] if i < len(layer_types) else "full_attention"
+        items.append((f"{P}layers.{i}.post_attention_layernorm.weight",
+                      f"layers.{i}.ffn_norm.weight", True))
+        items.extend([
+            (f"{P}layers.{i}.mlp.gate_proj.weight", f"layers.{i}.feed_forward.w1", True),
+            (f"{P}layers.{i}.mlp.down_proj.weight", f"layers.{i}.feed_forward.w2", True),
+            (f"{P}layers.{i}.mlp.up_proj.weight", f"layers.{i}.feed_forward.w3", True),
+        ])
+        if "linear" in kind:
+            # Delta-net. There is no input_layernorm on these layers -- linear_attn.norm is the
+            # OUTPUT norm inside the block (value_head_dim wide), not a pre-norm.
+            items.extend([
+                (f"{P}layers.{i}.linear_attn.in_proj_qkv.weight",
+                 f"layers.{i}.linear_attn.in_proj_qkv", True),
+                (f"{P}layers.{i}.linear_attn.in_proj_z.weight",
+                 f"layers.{i}.linear_attn.in_proj_z", True),
+                (f"{P}layers.{i}.linear_attn.in_proj_a.weight",
+                 f"layers.{i}.linear_attn.in_proj_a", True),
+                (f"{P}layers.{i}.linear_attn.in_proj_b.weight",
+                 f"layers.{i}.linear_attn.in_proj_b", True),
+                (f"{P}layers.{i}.linear_attn.out_proj.weight",
+                 f"layers.{i}.linear_attn.out_proj", True),
+                (f"{P}layers.{i}.linear_attn.conv1d.weight",
+                 f"layers.{i}.linear_attn.conv1d", True),
+                (f"{P}layers.{i}.linear_attn.dt_bias",
+                 f"layers.{i}.linear_attn.dt_bias", True),
+                (f"{P}layers.{i}.linear_attn.A_log",
+                 f"layers.{i}.linear_attn.a_log", True),
+                (f"{P}layers.{i}.linear_attn.norm.weight",
+                 f"layers.{i}.linear_attn.norm", True),
+            ])
+        else:
+            items.append((f"{P}layers.{i}.input_layernorm.weight",
+                          f"layers.{i}.attention_norm.weight", True))
+            items.extend([
+                (f"{P}layers.{i}.self_attn.q_proj.weight", f"layers.{i}.attention.wq", True),
+                (f"{P}layers.{i}.self_attn.k_proj.weight", f"layers.{i}.attention.wk", True),
+                (f"{P}layers.{i}.self_attn.v_proj.weight", f"layers.{i}.attention.wv", True),
+                (f"{P}layers.{i}.self_attn.o_proj.weight", f"layers.{i}.attention.wo", True),
+            ])
+            if has_qk_norm:
+                items.extend([
+                    (f"{P}layers.{i}.self_attn.q_norm.weight",
+                     f"layers.{i}.attention.q_norm", True),
+                    (f"{P}layers.{i}.self_attn.k_norm.weight",
+                     f"layers.{i}.attention.k_norm", True),
+                ])
+    return items
+
+
 def build_mapping(family: str, num_layers: int, has_qkv_bias: bool, num_local_experts: int,
-                  has_qk_norm: bool = False):
+                  has_qk_norm: bool = False, layer_types: list = None):
     """
     Map HuggingFace tensor names to canonical internal names used by LL2CUDA.
 
     Dense families share the standard decoder naming.
     MoE checkpoints use block_sparse_moe router + per-expert FFN weights.
     """
+    if family == FAMILY_QWEN3_5:
+        return build_qwen35_mapping(num_layers, layer_types or [], has_qk_norm)
+
     items = [
         ("model.embed_tokens.weight", "tok_embeddings.weight", True),
         ("model.norm.weight",         "norm.weight",           True),
@@ -456,8 +565,23 @@ def main() -> None:
     index      = load_index(hf_dir)
     weight_map = index.get("weight_map", {})
     mapping    = build_mapping(family, num_layers, has_qkv_bias, num_local_experts,
-                               bool(model_cfg.get("has_qk_norm", False)))
+                               bool(model_cfg.get("has_qk_norm", False)),
+                               model_cfg.get("layer_attention_types", []))
     mapped_sources = {src for src, _dst, _required in mapping}
+
+    if family == FAMILY_QWEN3_5:
+        # Say plainly what is being left behind. These are not missing tensors; they are parts of
+        # the model this conversion does not represent, and silently dropping 168 of 488 tensors
+        # is the kind of thing that reads later as a corrupt checkpoint.
+        n_vis = sum(1 for k in weight_map if k.startswith("model.visual"))
+        n_mtp = sum(1 for k in weight_map if k.startswith("mtp."))
+        kinds = model_cfg.get("layer_attention_types", [])
+        n_lin = sum(1 for k in kinds if "linear" in str(k))
+        print(f"[info] qwen3.5: {n_lin} linear-attention + {len(kinds) - n_lin} full-attention "
+              f"layers")
+        if n_vis or n_mtp:
+            print(f"[warn] skipping {n_vis} vision-tower and {n_mtp} MTP tensors -- this "
+                  f"conversion produces the TEXT model only")
 
     # Surface known-but-currently-ignored tensors to make conversion behavior explicit.
     unsupported_biases = []
