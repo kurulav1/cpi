@@ -248,8 +248,14 @@ sampling, metrics), and `--weight-quant int4/int8` serves a quantized model, so 
 on a small Mac. On an M4, Qwen2.5-0.5B streams at ~54 tok/s (fp16) / ~87 tok/s (int4), versus
 ~2 tok/s on the CPU fallback.
 
-**Still not on Metal**, and rejected loudly rather than half-done: MoE, the vision tower, and
-linear attention (Qwen3.5). Those need work above the kernels.
+**Still not on Metal**: the vision tower, and linear attention (Qwen3.5) end to end. MoE now runs
+here -- the router, the fused gate/up GeGLU and the expert accumulate all have Metal kernels and a
+golden. Linear attention has its six kernels, each gated against a CPU reference (including two
+consecutive steps, so the conv window and the recurrent matrix are checked as they carry), but not
+the model plumbing: the .ll2c container records `linear_num_key_heads`/`num_value_heads` and drops
+the three dimensions the state buffers need, and the shared plan builder does not emit the block at
+all. Kernels done, wiring not -- which is the honest split, rather than a half-integration nothing
+can execute.
 
 Continuous batching now runs on Metal — `--interactive-batch`, the same flag and the same
 multi-user worker the CUDA server uses. Verified on an M4 with two concurrent requests: the
@@ -263,7 +269,7 @@ CUDA's serving policy because it never states one. That scheduler used to live i
 `LlamaEngine`, which is the only reason batching was ever CUDA-only — of its ~200 lines, two
 touched a GPU.
 
-**Verifying it.** Every kernel family has a CPU-reference check (`metal_smoke`, 37 checks),
+**Verifying it.** Every kernel family has a CPU-reference check (`metal_smoke`, 48 checks),
 plus golden token streams that must reproduce the CUDA backend exactly. `tools/metal_verify.sh`
 runs the lot in one command on any Mac. This is not ceremony: GitHub's macOS runners have no
 GPU, so CI can only compile Metal, never execute it — and a kernel that no gate executed was
@@ -275,8 +281,8 @@ To make that check automatic you need an Apple Silicon runner —
 
 | Model | | GPU weights | decode @64 | decode @256 | prefill |
 | --- | --- | --- | --- | --- | --- |
-| Qwen2.5-0.5B | fp16 | 1.17 GB | 88.2 tok/s | 82.4 tok/s | 2999 tok/s |
-| Qwen2.5-0.5B | int4 | 0.51 GB | 178.3 tok/s | 156.0 tok/s | 2800 tok/s |
+| Qwen2.5-0.5B | fp16 | 1.17 GB | 90.7 tok/s | 83.7 tok/s | 3343 tok/s |
+| Qwen2.5-0.5B | int4 | 0.51 GB | 176.2 tok/s | 154.6 tok/s | 3002 tok/s |
 | **Llama-3.1-8B** | **int4** | **4.91 GB** | **20.5 tok/s** | — | **161 tok/s** |
 
 Prefill is a ~540-token prompt; decode is `--max-new N` from a short one. Decode is quoted at two

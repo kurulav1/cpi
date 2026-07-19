@@ -27,6 +27,18 @@
 // 4*32 + 2*32) bytes, so 16 costs ~15 KB of the 32 KB budget and 32 ~30 KB.
 #define QMM_BLOCK 16
 
+// The scoring and P.V loops hold a QMM_QT x QMM_KT register tile, so they walk query fragments in
+// groups of QMM_QT and round the count UP. A block that is not a whole number of those groups
+// therefore reads query fragments past its own rows -- q_sh and acc are sized QMM_BLOCK rows, so
+// that is off the end of the array, not merely zero padding, and the kernel silently computes
+// wrong attention. QMM_BLOCK 8 did exactly that (the golden failed while every benchmark looked
+// fine), and 24 would too: being a multiple of 8 is not enough, it must be a multiple of 8*QMM_QT.
+#define QMM_QT 2
+#define QMM_KT 2
+#if (QMM_BLOCK % (8 * QMM_QT)) != 0
+#error "QMM_BLOCK must be a multiple of 8*QMM_QT -- otherwise the register tile reads past q_sh"
+#endif
+
 // RCA instrumentation for the prefill attention kernel. 0 = normal. Each bit replaces one phase
 // with a dependency-preserving stub -- the answer becomes wrong, but every other phase still runs
 // and nothing downstream gets dead-code-eliminated, so the wall-clock delta is that phase's cost.
@@ -150,11 +162,12 @@ kernel void cpi_attention_prefill_mm(device const half* q [[buffer(0)]],
     // 4 loads feed 4 MACs (intensity 1.0), and with qfs=2 and n_kg up to 16 the tile count still
     // fills all 8 simdgroups.
     //
-    // Query fragments past qfs are safe to compute: q_sh is zeroed over the FULL QMM_BLOCK rows, so
-    // they contribute zeros that the softmax's nq bound ignores. Key groups past n_kg are NOT safe
+    // Query fragments past qfs are safe to compute BECAUSE QMM_BLOCK is a whole number of QT-sized
+    // groups (enforced at the top of the file): q_sh is zeroed over the FULL QMM_BLOCK rows, so they
+    // contribute zeros that the softmax's nq bound ignores. Key groups past n_kg are NOT safe
     // to read (they can run off the end of the KV cache), so their load is clamped and their store
     // suppressed.
-    constexpr uint QT = 2u, KT = 2u;
+    constexpr uint QT = QMM_QT, KT = QMM_KT;
     const uint qt_n = (qfs + QT - 1u) / QT;
     const uint kt_n = (n_kg + KT - 1u) / KT;
 #if !(ATTN_RCA & 1)
