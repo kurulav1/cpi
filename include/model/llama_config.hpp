@@ -90,6 +90,11 @@ struct LlamaConfig {
   bool has_qk_norm = false;         // Per-head RMSNorm on Q and K after projection (Qwen3).
   bool mlp_gelu = false;            // MLP gate uses GeGLU (tanh GELU) instead of SwiGLU (Gemma).
   bool scale_embeddings = false;    // Scale token embeddings by sqrt(hidden_size) (Gemma).
+  // Qwen3.5 full-attention layers: the q projection emits [q | gate] PER HEAD -- so it is
+  // twice as wide as heads*head_dim implies -- and the attention output is multiplied by
+  // sigmoid(gate) before the output projection. Without this flag the doubled q_proj reads
+  // as a head_dim twice the real one, which converts cleanly and computes nonsense.
+  bool attn_output_gate = false;
   bool use_layernorm = false;       // Use true LayerNorm (mean+variance) instead of RMSNorm.
   bool tie_word_embeddings =
       false;  // lm_head shares weights with tok_embeddings (some Phi variants).

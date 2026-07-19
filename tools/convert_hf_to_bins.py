@@ -137,17 +137,6 @@ def unsupported_reason(cfg: dict) -> str:
         # are present in these checkpoints and both are skipped, so the result is the TEXT model.
         if not has_linear_attention:
             return "Qwen3.5 is not supported by the native CPI engine yet."
-        # The delta-net layers are expressible now. The FULL-attention layers are not, and the
-        # reason is easy to miss: attn_output_gate makes q_proj emit gate||q, so its rows are
-        # 2 * heads * head_dim (4096 for the 0.8B, against the 2048 the shape implies). Mapping
-        # that onto the standard wq would convert cleanly and then compute nonsense -- the
-        # container validator catches it as a k/v shape mismatch, which is the symptom, not the
-        # cause. Refuse until the gated form has a kernel path.
-        if bool(text_cfg.get("attn_output_gate", False)):
-            return ("Qwen3.5 with attn_output_gate is not supported yet: its full-attention "
-                    "layers project gate||q, which the standard attention path would "
-                    "misinterpret. The delta-net layers and the container format are ready; "
-                    "the gated attention block is not.")
         return ""
 
     # Linear attention is supported for qwen3_5 (handled above, which returns "" for it). Any
@@ -358,6 +347,10 @@ def extract_model_config(hf_cfg: dict, family: str) -> dict:
         "partial_rotary_factor": partial_rotary_factor,
         "linear_num_key_heads": linear_num_key_heads,
         "linear_num_value_heads": linear_num_value_heads,
+        # q_proj emits [q|gate] per head when this is set, so it is twice as wide as
+        # heads*head_dim. The container records it as a flag; without it the doubled projection
+        # reads as a head_dim twice the real one.
+        "attn_output_gate": bool(text_cfg.get("attn_output_gate", False)),
         "linear_key_head_dim": int(text_cfg.get("linear_key_head_dim", 0) or 0),
         "linear_value_head_dim": int(text_cfg.get("linear_value_head_dim", 0) or 0),
         "linear_conv_kernel_dim": int(text_cfg.get("linear_conv_kernel_dim", 0) or 0),

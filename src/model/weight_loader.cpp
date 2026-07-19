@@ -219,6 +219,7 @@ void WeightLoader::parse_manifest() {
     config_.has_qk_norm = (hdr->flags & 8) != 0;
     config_.mlp_gelu = (hdr->flags & 16) != 0;
     config_.scale_embeddings = (hdr->flags & 32) != 0;
+    config_.attn_output_gate = (hdr->flags & 64) != 0;
     config_.model_family = static_cast<ModelFamily>(hdr->model_family_id);
     config_.num_local_experts = hdr->num_local_experts;
     config_.num_experts_per_tok = hdr->num_experts_per_tok;

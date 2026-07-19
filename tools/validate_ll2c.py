@@ -13,6 +13,7 @@ HDR_V1 = struct.Struct("<8siiiiiiiiiQ")
 HDR_V2 = struct.Struct("<8siiiiiiiiiiQ")
 HDR_V3 = struct.Struct("<8siiiiiiiiiiQffiii")
 HDR_V4 = struct.Struct("<8siiiiiiiiiiQffiiiiii")
+HDR_V6_SIZE = 124  # v5 header + the three delta-net dimensions
 HDR_V5 = struct.Struct("<8siiiiiiiiiiQffiiiiiifiiiQ")
 ENTRY = struct.Struct("<64sqq")
 
@@ -37,6 +38,7 @@ def main() -> None:
     expert_inter = 0
     attention_type_count = 0
     attention_type_offset = 0
+    layer_kinds: list = []   # per-layer attention kind: 0 full, 1 sliding_window, 2 linear
     if version >= 5:
         if len(data) < HDR_V5.size:
             raise ValueError("file too small for v5 header")
@@ -56,7 +58,7 @@ def main() -> None:
             _rope_theta,
             _norm_eps,
             _sliding_window,
-            _flags,
+            flags,
             _model_family_id,
             num_local_experts,
             num_experts_per_tok,
@@ -86,7 +88,7 @@ def main() -> None:
             _rope_theta,
             _norm_eps,
             _sliding_window,
-            _flags,
+            flags,
             _model_family_id,
             num_local_experts,
             num_experts_per_tok,
@@ -111,7 +113,7 @@ def main() -> None:
             _rope_theta,
             _norm_eps,
             _sliding_window,
-            _flags,
+            flags,
             _model_family_id,
         ) = HDR_V3.unpack_from(data, 0)
     elif version >= 2:
@@ -144,6 +146,15 @@ def main() -> None:
             kind = struct.unpack_from("<i", data, attention_type_offset + i * 4)[0]
             if kind not in (0, 1, 2):
                 raise ValueError(f"invalid attention kind id at layer {i}: {kind}")
+            layer_kinds.append(kind)
+
+    # v6 carries the delta-net geometry; without it a linear layer's tensors cannot be sized.
+    lin_k_dim = lin_v_dim = lin_conv_dim = 0
+    if version >= 6 and len(data) >= HDR_V6_SIZE:
+        lkhd, lvhd, lck = struct.unpack_from("<iii", data, HDR_V5.size)
+        lin_k_dim = _linear_num_key_heads * lkhd
+        lin_v_dim = _linear_num_value_heads * lvhd
+        lin_conv_dim = lin_k_dim * 2 + lin_v_dim
 
     entries = {}
     offsets = {}
@@ -194,7 +205,14 @@ def main() -> None:
             break
     if attn_layer is None:
         raise ValueError("no layer has attention.wq -- cannot infer the attention geometry")
+    # bit 6: q_proj emits [q|gate] per head, so its rows are 2*heads*head_dim. Halve before
+    # inferring head_dim, or the k/v check fails on a perfectly well-formed container.
+    attn_output_gate = bool(locals().get("flags", 0) & 64)
     q_hidden = infer_rows(f"layers.{attn_layer}.attention.wq", hidden)
+    if attn_output_gate:
+        if q_hidden % 2 != 0:
+            raise ValueError("attn_output_gate is set but wq rows are odd")
+        q_hidden //= 2
     wk_rows = infer_rows(f"layers.{attn_layer}.attention.wk", hidden)
     wv_rows = infer_rows(f"layers.{attn_layer}.attention.wv", hidden)
     if q_hidden <= 0 or (q_hidden % heads) != 0:
@@ -245,25 +263,49 @@ def main() -> None:
 
     for layer in range(layers):
         p = f"layers.{layer}"
-        req_fp16_or_packed_lowbit(f"{p}.attention_norm.weight", hidden * hsz, hidden, (hidden + 1) // 2)
-        if f"{p}.attention_norm.bias" in entries:
-            expect(f"{p}.attention_norm.bias", entries[f"{p}.attention_norm.bias"], hidden * hsz)
-        req_fp16_or_packed_lowbit(
-            f"{p}.attention.wq", q_hidden * hidden * hsz, q_hidden * hidden, q_hidden * ((hidden + 1) // 2)
-        )
-        req_fp16_or_packed_lowbit(
-            f"{p}.attention.wk", kv_hidden * hidden * hsz, kv_hidden * hidden, kv_hidden * ((hidden + 1) // 2)
-        )
-        req_fp16_or_packed_lowbit(
-            f"{p}.attention.wv", kv_hidden * hidden * hsz, kv_hidden * hidden, kv_hidden * ((hidden + 1) // 2)
-        )
-        req_fp16_or_packed_lowbit(
-            f"{p}.attention.wo", hidden * q_hidden * hsz, hidden * q_hidden, hidden * ((q_hidden + 1) // 2)
-        )
-        if f"{p}.attention.bqkv" in entries:
-            expect(f"{p}.attention.bqkv", entries[f"{p}.attention.bqkv"], (q_hidden + 2 * kv_hidden) * hsz)
-        if f"{p}.attention.bo" in entries:
-            expect(f"{p}.attention.bo", entries[f"{p}.attention.bo"], hidden * hsz)
+
+        # A linear-attention (delta-net) layer carries a disjoint tensor set: no attention_norm,
+        # no wq/wk/wv/wo, and instead the projections and state weights of the recurrence. Checking
+        # every layer for attention tensors is what made a well-formed mixed-attention container
+        # look corrupt.
+        if layer < len(layer_kinds) and layer_kinds[layer] == 2:
+            req(f"{p}.linear_attn.in_proj_qkv", lin_conv_dim * hidden * hsz)
+            req(f"{p}.linear_attn.in_proj_z", lin_v_dim * hidden * hsz)
+            req(f"{p}.linear_attn.out_proj", hidden * lin_v_dim * hsz)
+            for t in ("in_proj_a", "in_proj_b", "conv1d", "dt_bias", "a_log", "norm"):
+                if f"{p}.linear_attn.{t}" not in entries:
+                    raise ValueError(f"missing tensor: {p}.linear_attn.{t}")
+            is_linear_layer = True
+        else:
+            is_linear_layer = False
+
+        if not is_linear_layer:
+            req_fp16_or_packed_lowbit(f"{p}.attention_norm.weight", hidden * hsz, hidden,
+                                      (hidden + 1) // 2)
+            if f"{p}.attention_norm.bias" in entries:
+                expect(f"{p}.attention_norm.bias", entries[f"{p}.attention_norm.bias"], hidden * hsz)
+            wq_rows = q_hidden * 2 if attn_output_gate else q_hidden
+            req_fp16_or_packed_lowbit(
+                f"{p}.attention.wq", wq_rows * hidden * hsz, wq_rows * hidden,
+                wq_rows * ((hidden + 1) // 2)
+            )
+            req_fp16_or_packed_lowbit(
+                f"{p}.attention.wk", kv_hidden * hidden * hsz, kv_hidden * hidden,
+                kv_hidden * ((hidden + 1) // 2)
+            )
+            req_fp16_or_packed_lowbit(
+                f"{p}.attention.wv", kv_hidden * hidden * hsz, kv_hidden * hidden,
+                kv_hidden * ((hidden + 1) // 2)
+            )
+            req_fp16_or_packed_lowbit(
+                f"{p}.attention.wo", hidden * q_hidden * hsz, hidden * q_hidden,
+                hidden * ((q_hidden + 1) // 2)
+            )
+            if f"{p}.attention.bqkv" in entries:
+                expect(f"{p}.attention.bqkv", entries[f"{p}.attention.bqkv"],
+                       (q_hidden + 2 * kv_hidden) * hsz)
+            if f"{p}.attention.bo" in entries:
+                expect(f"{p}.attention.bo", entries[f"{p}.attention.bo"], hidden * hsz)
         req_fp16_or_packed_lowbit(f"{p}.ffn_norm.weight", hidden * hsz, hidden, (hidden + 1) // 2)
         if f"{p}.ffn_norm.bias" in entries:
             expect(f"{p}.ffn_norm.bias", entries[f"{p}.ffn_norm.bias"], hidden * hsz)
