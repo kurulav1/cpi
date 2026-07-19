@@ -130,5 +130,44 @@ struct LlamaGeometry {
 // those eleven can run this plan.
 ModelPlan build_llama_plan(const LlamaGeometry& g, const WeightSource& w);
 
+// Geometry of a Qwen3.5-style MIXED-attention decoder: most layers are gated delta-net (a linear
+// recurrence), a few are full attention whose q projection emits [q | gate] per head. Which is
+// which comes from `layer_is_linear`, per layer, because it is not derivable from anything else.
+//
+// This is a separate builder rather than a flag on LlamaGeometry because the two layer kinds have
+// disjoint tensor sets and disjoint op sequences -- a "uniform geometry" struct cannot describe a
+// model whose geometry is not uniform. It is still the SHARED core: every op below already exists
+// and every backend executes them with the same kernels.
+//
+// Names are the canonical .ll2c ones the converter emits, reached through WeightSource. CUDA's own
+// Qwen3.5 path predates this and reads HF names straight from safetensors, so adopting this there
+// needs a name-mapping WeightSource -- see the note at PlanCudaEngine::build_qwen35_plan.
+struct Qwen35Geometry {
+  int num_layers = 0;
+  int hidden = 0;
+  int inter = 0;
+  int vocab = 0;
+  float rms_eps = 1e-6f;
+  float rope_theta = 10000000.0f;
+
+  // Full-attention layers.
+  int heads = 0;
+  int kv_heads = 0;
+  int head_dim = 0;
+  int rotary_dim = 0;  // partial RoPE: rotate only the first rotary_dim of each head
+
+  // Delta-net layers.
+  int lin_key_heads = 0;
+  int lin_value_heads = 0;
+  int lin_key_head_dim = 0;
+  int lin_value_head_dim = 0;
+  int lin_conv_kernel = 0;
+
+  // Per layer: true = gated delta-net, false = full attention. MUST be num_layers long.
+  std::vector<bool> layer_is_linear;
+};
+
+ModelPlan build_qwen35_plan(const Qwen35Geometry& g, const WeightSource& w);
+
 }  // namespace opplan
 }  // namespace engine

@@ -293,5 +293,233 @@ ModelPlan build_llama_plan(const LlamaGeometry& g, const WeightSource& w) {
   return plan;
 }
 
+// ---------------------------------------------------------------------------
+// Qwen3.5: mixed gated-delta-net / gated-full-attention decoder.
+// ---------------------------------------------------------------------------
+ModelPlan build_qwen35_plan(const Qwen35Geometry& g, const WeightSource& w) {
+  if (static_cast<int>(g.layer_is_linear.size()) != g.num_layers) {
+    throw std::runtime_error("build_qwen35_plan: layer_is_linear must have num_layers entries");
+  }
+  ModelPlan plan;
+  const int H = g.hidden;
+  const int q_dim = g.heads * g.head_dim;
+  const int kv_dim = g.kv_heads * g.head_dim;
+  const int lin_k_dim = g.lin_key_heads * g.lin_key_head_dim;
+  const int lin_v_dim = g.lin_value_heads * g.lin_value_head_dim;
+  const int lin_conv_dim = lin_k_dim * 2 + lin_v_dim;  // in_proj_qkv emits q|k|v back to back
+
+  {
+    Op e;
+    e.kind = OpKind::EmbeddingLookup;
+    e.out = Slot::X;
+    e.cols = H;
+    e.weight = w.fp16("tok_embeddings.weight");
+    plan.prologue.push_back(e);
+  }
+
+  plan.layers.assign(g.num_layers, LayerPlan{});
+  for (int L = 0; L < g.num_layers; ++L) {
+    const std::string p = "layers." + std::to_string(L) + ".";
+    LayerPlan& lp = plan.layers[L];
+    lp.layer_index = L;
+    auto& ops = lp.ops;
+
+    // Qwen3.5 scales by (1 + w), and unlike Gemma the converter does NOT fold the +1 into the
+    // stored weights -- that fold is gated on the Gemma family. So the offset is applied here,
+    // matching the CUDA and CPU implementations. Getting it wrong scales every norm by ~2 and
+    // compounds; it would surface as a divergence at the very first layer.
+    auto rms = [&](Slot in, Slot out, const std::string& t, int rows, int cols) {
+      Op o;
+      o.kind = OpKind::RmsNorm;
+      o.in = in;
+      o.out = out;
+      o.weight = w.fp16(p + t);
+      o.rows = rows;
+      o.cols = cols;
+      o.norm_offset = true;
+      ops.push_back(o);
+    };
+    auto gemv = [&](Slot in, Slot out, const std::string& t, int out_dim, int in_dim) {
+      Op o;
+      o.kind = OpKind::Gemv;
+      o.in = in;
+      o.out = out;
+      o.cols = out_dim;
+      o.in_dim = in_dim;
+      const QuantWeight q = w.quant(p + t, out_dim, in_dim);
+      if (q.packed != nullptr) {
+        o.qweight = q.packed;
+        o.qscales = q.scales;
+        o.qbits = q.bits;
+        o.qgroup = q.group;
+      } else {
+        o.weight = w.fp16(p + t);
+      }
+      ops.push_back(o);
+    };
+    auto add_x = [&](Slot src) {
+      Op o;
+      o.kind = OpKind::AddInplace;
+      o.out = Slot::X;
+      o.in = src;
+      o.cols = H;
+      ops.push_back(o);
+    };
+
+    if (!g.layer_is_linear[static_cast<std::size_t>(L)]) {
+      // ---- gated full attention ----
+      // wq is TWICE q_dim: it projects [q | gate] per head, and the gate multiplies the attention
+      // output before o_proj. Treating it as an ordinary q projection reads a head_dim twice the
+      // real one and converts cleanly into nonsense.
+      rms(Slot::X, Slot::XNorm, "attention_norm.weight", 1, H);
+      gemv(Slot::XNorm, Slot::QPair, "attention.wq", q_dim * 2, H);
+      gemv(Slot::XNorm, Slot::K, "attention.wk", kv_dim, H);
+      gemv(Slot::XNorm, Slot::V, "attention.wv", kv_dim, H);
+      {
+        Op o;
+        o.kind = OpKind::SplitHeadHalves;
+        o.in = Slot::QPair;
+        o.out = Slot::Q;
+        o.out2 = Slot::QGate;
+        o.heads = g.heads;
+        o.head_dim = g.head_dim;
+        ops.push_back(o);
+      }
+      rms(Slot::Q, Slot::Q, "attention.q_norm", g.heads, g.head_dim);
+      rms(Slot::K, Slot::K, "attention.k_norm", g.kv_heads, g.head_dim);
+      {
+        Op o;
+        o.kind = OpKind::Rope;
+        o.in = Slot::Q;
+        o.in2 = Slot::K;
+        o.heads = g.heads;
+        o.kv_heads = g.kv_heads;
+        o.head_dim = g.head_dim;
+        o.rotary_dim = g.rotary_dim;  // partial: 0.25 of head_dim on this family
+        o.rope_table = RopeTable::Full;
+        o.scale = g.rope_theta;
+        ops.push_back(o);
+      }
+      {
+        Op o;
+        o.kind = OpKind::KvStore;
+        o.in = Slot::K;
+        o.in2 = Slot::V;
+        o.kv_heads = g.kv_heads;
+        o.head_dim = g.head_dim;
+        o.cols = kv_dim;
+        ops.push_back(o);
+      }
+      {
+        Op o;
+        o.kind = OpKind::Attention;
+        o.in = Slot::Q;
+        o.out = Slot::Att;
+        o.heads = g.heads;
+        o.kv_heads = g.kv_heads;
+        o.head_dim = g.head_dim;
+        o.full_attention = true;
+        o.sliding_window = 0;
+        o.scale = 1.0f / std::sqrt(static_cast<float>(g.head_dim));
+        ops.push_back(o);
+      }
+      {
+        Op o;
+        o.kind = OpKind::SigmoidGate;
+        o.out = Slot::Att;
+        o.in2 = Slot::QGate;
+        o.cols = q_dim;
+        ops.push_back(o);
+      }
+      gemv(Slot::Att, Slot::Tmp, "attention.wo", H, q_dim);
+    } else {
+      // ---- gated delta-net ----
+      // These layers ARE pre-normed, exactly like the attention ones -- the four projections read
+      // the normalised state, not the raw residual. linear_attn.norm is a SECOND norm inside the
+      // block (value_head_dim wide, gated by z) and does not stand in for this one. Feeding the
+      // projections raw X leaves the whole block orthogonal to the reference at layer 1.
+      rms(Slot::X, Slot::XNorm, "attention_norm.weight", 1, H);
+      gemv(Slot::XNorm, Slot::LinMix, "linear_attn.in_proj_qkv", lin_conv_dim, H);
+      gemv(Slot::XNorm, Slot::LinZ, "linear_attn.in_proj_z", lin_v_dim, H);
+      gemv(Slot::XNorm, Slot::LinA, "linear_attn.in_proj_a", g.lin_value_heads, H);
+      gemv(Slot::XNorm, Slot::LinB, "linear_attn.in_proj_b", g.lin_value_heads, H);
+      {
+        Op o;
+        o.kind = OpKind::LinearConv1d;
+        o.in = Slot::LinMix;
+        o.weight = w.fp16(p + "linear_attn.conv1d");
+        o.cols = lin_conv_dim;
+        o.conv_kernel = g.lin_conv_kernel;
+        ops.push_back(o);
+      }
+      {
+        Op o;
+        o.kind = OpKind::RepeatLinearHeads;
+        o.in = Slot::LinMix;
+        o.num_k_heads = g.lin_key_heads;
+        o.num_v_heads = g.lin_value_heads;
+        o.key_head_dim = g.lin_key_head_dim;
+        o.value_head_dim = g.lin_value_head_dim;
+        ops.push_back(o);
+      }
+      {
+        Op o;
+        o.kind = OpKind::LinearAttentionStep;
+        // auxf_a/auxf_b are declared const float* by the shared plan because CUDA reads them as
+        // f32 from safetensors. On the .ll2c path every weight is fp16 (the converter casts all
+        // of them), so these carry fp16 handles and the kernel reads them as half.
+        o.auxf_a = static_cast<const float*>(w.fp16(p + "linear_attn.norm"));
+        o.auxf_b = static_cast<const float*>(w.fp16(p + "linear_attn.a_log"));
+        o.aux_ptr = w.fp16(p + "linear_attn.dt_bias");
+        o.num_v_heads = g.lin_value_heads;
+        o.key_head_dim = g.lin_key_head_dim;
+        o.value_head_dim = g.lin_value_head_dim;
+        o.eps = g.rms_eps;
+        ops.push_back(o);
+      }
+      gemv(Slot::LinAtt, Slot::Tmp, "linear_attn.out_proj", H, lin_v_dim);
+    }
+    add_x(Slot::Tmp);
+
+    // ---- MLP: SwiGLU, shared by both layer kinds ----
+    rms(Slot::X, Slot::XNorm, "ffn_norm.weight", 1, H);
+    gemv(Slot::XNorm, Slot::Gate, "feed_forward.w1", g.inter, H);
+    gemv(Slot::XNorm, Slot::Up, "feed_forward.w3", g.inter, H);
+    {
+      Op o;
+      o.kind = OpKind::SiluMul;
+      o.in = Slot::Gate;
+      o.in2 = Slot::Up;
+      o.out = Slot::Inter;
+      o.cols = g.inter;
+      ops.push_back(o);
+    }
+    gemv(Slot::Inter, Slot::Tmp, "feed_forward.w2", H, g.inter);
+    add_x(Slot::Tmp);
+  }
+
+  {
+    Op o;
+    o.kind = OpKind::RmsNorm;
+    o.in = Slot::X;
+    o.out = Slot::XNorm;
+    o.weight = w.fp16("norm.weight");
+    o.rows = 1;
+    o.cols = H;
+    o.norm_offset = true;
+    plan.epilogue.push_back(o);
+  }
+  {
+    Op o;
+    o.kind = OpKind::LmHead;
+    o.in = Slot::XNorm;
+    o.cols = g.vocab;
+    o.in_dim = H;
+    o.weight = w.fp16(w.has("output.weight") ? "output.weight" : "tok_embeddings.weight");
+    plan.epilogue.push_back(o);
+  }
+  return plan;
+}
+
 }  // namespace opplan
 }  // namespace engine
