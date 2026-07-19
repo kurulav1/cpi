@@ -33,6 +33,12 @@ HDR_V2 = struct.Struct("<8siiiiiiiiiiQ")
 HDR_V3 = struct.Struct("<8siiiiiiiiiiQffiii")
 HDR_V4 = struct.Struct("<8siiiiiiiiiiQffiiiiii")
 HDR_V5 = struct.Struct("<8siiiiiiiiiiQffiiiiiifiiiQ")
+# v6 appends the three delta-net dimensions. This tool REWRITES the header, so it must use the
+# struct that matches the file it read: parsing a v6 file as v5 and writing 112 bytes back would
+# emit a file whose version field says 6 while the appended fields are missing, and the next
+# reader would take the bytes after them -- the attention blob -- as those dimensions.
+HDR_V6 = struct.Struct("<8siiiiiiiiiiQffiiiiiifiiiQiii")
+MAX_KNOWN_VERSION = 6
 ENTRY = struct.Struct("<64sqq")
 
 
@@ -61,8 +67,13 @@ def parse_header(buf: bytes) -> dict:
     if len(buf) < HDR_V1.size:
         raise ValueError("file too small for LL2C header")
     version = struct.unpack_from("<i", buf, 8)[0]
+    if version > MAX_KNOWN_VERSION:
+        raise ValueError(
+            f"LL2C container version {version} is newer than this tool understands "
+            f"(max {MAX_KNOWN_VERSION}); rewriting it would silently drop fields")
     if version >= 5:
-        fields = HDR_V5.unpack_from(buf, 0)
+        hdr = HDR_V6 if version >= 6 else HDR_V5
+        fields = hdr.unpack_from(buf, 0)
         attention_count = int(fields[23])
         attention_offset = int(fields[24])
         attention_blob = b""
@@ -71,9 +82,9 @@ def parse_header(buf: bytes) -> dict:
             attention_blob = bytes(buf[attention_offset:attention_offset + byte_count])
         return {
             "version": version,
-            "struct": HDR_V5,
+            "struct": hdr,
             "fields": list(fields),
-            "header_size": HDR_V5.size,
+            "header_size": hdr.size,
             "hidden": int(fields[3]),
             "inter": int(fields[4]),
             "layers": int(fields[5]),

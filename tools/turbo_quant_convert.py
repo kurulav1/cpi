@@ -41,6 +41,8 @@ MAGIC = b"LL2CUDA\x00"
 HEADER_V3_FMT = "<8siiiiiiiiiiQffiii"  # HeaderV3
 HEADER_V4_FMT = "<8siiiiiiiiiiQffiiiiii"  # HeaderV4
 HEADER_V5_FMT = "<8siiiiiiiiiiQffiiiiiifiiiQ"  # HeaderV5
+HEADER_V6_FMT = "<8siiiiiiiiiiQffiiiiiifiiiQiii"  # HeaderV6: v5 + the delta-net dimensions
+MAX_KNOWN_VERSION = 6
 HEADER_V2_FMT = "<8siiiiiiiiiiQ"  # HeaderV2
 HEADER_V1_FMT = "<8siiiiiiiiiQ"  # HeaderV1
 ENTRY_FMT = "<64sqq"  # TensorEntry: name[64], offset int64, bytes int64
@@ -266,11 +268,19 @@ def read_ll2c_mmap(path: Path):
 
     version = struct.unpack_from("<i", mm, 8)[0]
 
+    if version > MAX_KNOWN_VERSION:
+        sys.exit(f"[error] {path}: LL2C version {version} is newer than this tool understands "
+                 f"(max {MAX_KNOWN_VERSION}); it rewrites the header, so continuing would drop "
+                 f"fields it cannot see")
+
     if version >= 5:
-        hdr = struct.unpack_from(HEADER_V5_FMT, mm, 0)
+        # Parse with the struct the FILE uses, and preserve its version -- this tool writes the
+        # header back out, so hardcoding 5 here would relabel a v6 file as v5 and strand the
+        # delta-net dimensions it carries.
+        hdr = struct.unpack_from(HEADER_V6_FMT if version >= 6 else HEADER_V5_FMT, mm, 0)
         fields = {
             "magic": hdr[0],
-            "version": 5,
+            "version": version,
             "vocab_size": hdr[2],
             "hidden_size": hdr[3],
             "intermediate_size": hdr[4],
