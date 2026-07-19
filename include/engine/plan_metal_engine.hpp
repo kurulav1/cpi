@@ -280,6 +280,22 @@ private:
   runtime::MetalBuffer lin_recurrent_state_;  // [layers][num_v_heads * key_hd * value_hd]
   std::size_t lin_conv_stride_ = 0;
   std::size_t lin_recurrent_stride_ = 0;
+  // True when the built plan contains a recurrent op, which forces prefill to advance one token
+  // at a time. Derived from the plan in open(), not from the config.
+  bool has_recurrent_ops_ = false;
+
+  // Which buffer the current forward's token ids were staged into. Set by whichever entry point
+  // staged them, because the token COUNT does not answer this -- a one-token prefill chunk still
+  // arrives in the sequence buffer.
+  bool tokens_in_seq_buf_ = false;
+
+  // Writes slot X after one layer, in the CPU engine's dump format. No-op unless CPI_Q35_DUMP is
+  // set. See the definition for why both prefill and decode call it.
+  void dump_layer_state(int layer_index, int position);
+
+  // Writes one named intermediate slot, in the same format and under the same name the CPU engine
+  // uses, so a divergence can be bisected to a buffer. No-op unless CPI_Q35_DUMP is set.
+  void dump_named_slot(const char* name, int layer, int position, opplan::Slot sl, int n);
 
   runtime::MetalBuffer moe_idx_buf_;  // int32[top_k]  -- selected expert ids
   runtime::MetalBuffer moe_w_buf_;    // float[top_k]  -- their renormalised routing weights

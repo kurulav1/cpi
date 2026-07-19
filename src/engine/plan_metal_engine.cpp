@@ -252,6 +252,14 @@ const char* op_kind_name(int k) {
     case opplan::OpKind::AddInplace: return "AddInplace";
     case opplan::OpKind::EmbeddingLookup: return "Embedding";
     case opplan::OpKind::LmHead: return "LmHead";
+    // Not in kAblatableKinds: ablating a recurrent op does not skip work, it corrupts the state
+    // every later token reads. These are here so errors and the profile name them.
+    case opplan::OpKind::SplitHeadHalves: return "SplitHeadHalves";
+    case opplan::OpKind::SigmoidGate: return "SigmoidGate";
+    case opplan::OpKind::MulVec: return "MulVec";
+    case opplan::OpKind::RepeatLinearHeads: return "RepeatLinearHeads";
+    case opplan::OpKind::LinearConv1d: return "LinearConv1d";
+    case opplan::OpKind::LinearAttentionStep: return "LinearAttentionStep";
     default: return "other";
   }
 }
@@ -545,9 +553,26 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
   // head_dim is NOT hidden/heads in general. Qwen3-0.6B has hidden=1024, heads=16,
   // head_dim=128 -- so q_dim (2048) is twice the hidden size. Derive it from the Q
   // projection's actual shape; assuming hidden/heads builds a wrong model silently.
-  const std::size_t wq_bytes = weights_.tensor_bytes("layers.0.attention.wq");
-  const int q_dim =
-      static_cast<int>(wq_bytes / (static_cast<std::size_t>(H) * sizeof(std::uint16_t)));
+  //
+  // Two Qwen3.5 wrinkles, both of which convert cleanly into a wrong model rather than an error:
+  //   - layer 0 is usually a DELTA-NET layer and has no attention.wq at all, so the probe has to
+  //     find the first full-attention layer instead of assuming layer 0 is one;
+  //   - on that family wq projects [q | gate] per head, so its row count is 2*q_dim. Halving it
+  //     is what attn_output_gate is recorded in the container for.
+  int probe_layer = 0;
+  while (probe_layer < cfg_.num_layers &&
+         cfg_.attention_kind_for_layer(probe_layer) == model::AttentionKind::Linear) {
+    ++probe_layer;
+  }
+  if (probe_layer >= cfg_.num_layers) {
+    throw std::runtime_error("model has no full-attention layer to derive head_dim from");
+  }
+  const std::size_t wq_bytes =
+      weights_.tensor_bytes("layers." + std::to_string(probe_layer) + ".attention.wq");
+  int q_dim = static_cast<int>(wq_bytes / (static_cast<std::size_t>(H) * sizeof(std::uint16_t)));
+  if (cfg_.attn_output_gate) {
+    q_dim /= 2;
+  }
   const int head_dim = q_dim / cfg_.num_heads;
   const int kv_dim = cfg_.num_kv_heads * head_dim;
   if (head_dim <= 0 || q_dim != cfg_.num_heads * head_dim) {
@@ -595,7 +620,51 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
     wsrc_->set_quant(quant_bits, quant_group > 0 ? quant_group : 64);
     quant_bits_ = quant_bits;
   }
-  plan_ = opplan::build_llama_plan(g, *wsrc_);
+  if (cfg_.model_family == model::ModelFamily::Qwen3_5) {
+    // Mixed geometry: a "uniform" LlamaGeometry cannot describe a model whose layers are not all
+    // the same kind, so this family gets its own builder over the SAME op vocabulary -- every op
+    // it emits already exists and every backend runs it with the shared kernels.
+    opplan::Qwen35Geometry q;
+    q.num_layers = cfg_.num_layers;
+    q.hidden = H;
+    q.inter = cfg_.intermediate_size;
+    q.vocab = cfg_.vocab_size;
+    q.rms_eps = cfg_.norm_eps;
+    q.rope_theta = cfg_.effective_rope_theta();
+    q.heads = cfg_.num_heads;
+    q.kv_heads = cfg_.num_kv_heads;
+    q.head_dim = head_dim;
+    // Partial RoPE: rotate only the leading fraction of each head, and only an even number of
+    // lanes -- an odd rotary_dim would leave a half-pair the kernel cannot rotate.
+    q.rotary_dim = static_cast<int>(static_cast<float>(head_dim) * cfg_.partial_rotary_factor);
+    q.rotary_dim -= q.rotary_dim % 2;
+    if (q.rotary_dim <= 0) {
+      q.rotary_dim = head_dim - (head_dim % 2);
+    }
+    q.lin_key_heads = cfg_.linear_num_key_heads;
+    q.lin_value_heads = cfg_.linear_num_value_heads;
+    q.lin_key_head_dim = cfg_.linear_key_head_dim;
+    q.lin_value_head_dim = cfg_.linear_value_head_dim;
+    q.lin_conv_kernel = cfg_.linear_conv_kernel_dim;
+    q.layer_is_linear.assign(static_cast<std::size_t>(cfg_.num_layers), false);
+    for (int L = 0; L < cfg_.num_layers; ++L) {
+      q.layer_is_linear[static_cast<std::size_t>(L)] =
+          cfg_.attention_kind_for_layer(L) == model::AttentionKind::Linear;
+    }
+    plan_ = opplan::build_qwen35_plan(q, *wsrc_);
+  } else {
+    plan_ = opplan::build_llama_plan(g, *wsrc_);
+  }
+  // Read off the PLAN rather than the config: the plan is what the encoder walks, so a model that
+  // gained or lost a recurrent op cannot disagree with this flag.
+  for (const auto& lp : plan_.layers) {
+    for (const auto& op : lp.ops) {
+      if (op.kind == opplan::OpKind::LinearConv1d ||
+          op.kind == opplan::OpKind::LinearAttentionStep) {
+        has_recurrent_ops_ = true;
+      }
+    }
+  }
 
   // Delta-net state. Sized from the container's v6 geometry, so it is zero-sized for every model
   // that is not a linear-attention one. The conv window holds kernel-1 previous inputs per
@@ -911,10 +980,12 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
     switch (op.kind) {
       case OpKind::EmbeddingLookup: {
         EmbedParams p{static_cast<std::uint32_t>(op.cols), static_cast<std::uint32_t>(T)};
-        // A prefill chunk reads the whole prompt from the sequence buffer; decode reads
-        // the single-token one. Batched decode always uses the sequence buffer -- a batch
-        // of ONE is still T == 1, but its token is staged there, not in tok_buf_.
-        const void* tb = (T > 1 || batch_ != nullptr) ? seq_tok_buf_.handle() : tok_buf_.handle();
+        // WHICH BUFFER THE CALLER STAGED INTO, not how many tokens there are. These are not the
+        // same question: a recurrent model prefills in chunks of exactly one token, which still
+        // arrive in the sequence buffer. Keying this off `T > 1` made such a chunk read tok_buf_,
+        // a buffer prefill never writes -- so every prefill position re-embedded whatever decode
+        // had left there, identically, and the model saw one repeated token instead of the prompt.
+        const void* tb = tokens_in_seq_buf_ ? seq_tok_buf_.handle() : tok_buf_.handle();
         const void* bufs[] = {op.weight, tb, slot(op.out)};
         ctx_.dispatch("cpi_embedding_lookup", G::Threads,
                       static_cast<std::size_t>(op.cols) * static_cast<std::size_t>(T), kTG, bufs,
@@ -936,6 +1007,12 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
         break;
       }
       case OpKind::Gemv: {
+        // The in_proj_qkv gemv is the first consumer of the delta-net block's normalised input,
+        // so dumping its INPUT here pins whether a wrong lin_mix came from the norm or the
+        // projection. Identified by its output slot -- no other gemv writes LinMix.
+        if (op.out == opplan::Slot::LinMix) {
+          dump_named_slot("lin_xnorm", layer, position, op.in, cfg_.hidden_size);
+        }
         if (op.qbits != 0) {
           const int gsz = (op.qgroup > 0) ? op.qgroup : op.in_dim;
           QuantParams p{static_cast<std::uint32_t>(op.cols),
@@ -1503,6 +1580,7 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
         const std::size_t offs[] = {0, off, 0};
         ctx_.dispatch("cpi_linear_conv1d_silu", G::Threads, static_cast<std::size_t>(op.cols), kTG,
                       bufs, offs, 3, &p, sizeof(p));
+        dump_named_slot("lin_mix", layer, position, opplan::Slot::LinMix, op.cols);
         break;
       }
       case OpKind::LinearAttentionStep: {
@@ -1532,6 +1610,8 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
         ctx_.dispatch("cpi_linear_attention_step", G::Groups,
                       static_cast<std::size_t>(op.num_v_heads), 256, bufs, offs, 11, &p,
                       sizeof(p));
+        dump_named_slot("lin_att", layer, position, opplan::Slot::LinAtt,
+                        op.num_v_heads * op.value_head_dim);
         break;
       }
 
@@ -1657,6 +1737,7 @@ void PlanMetalEngine::encode_forward(int token, int position) {
   }();
 
   // Unified memory: writing the token and the position IS the H2D transfer.
+  tokens_in_seq_buf_ = false;
   *static_cast<std::int32_t*>(tok_buf_.contents()) = static_cast<std::int32_t>(token);
   *static_cast<std::int32_t*>(pos_buf_.contents()) = static_cast<std::int32_t>(position);
 
@@ -1711,6 +1792,10 @@ void PlanMetalEngine::encode_forward(int token, int position) {
   };
 
   execute_ops(plan_.prologue, -1, position, 1);
+  // The embedding, before any layer. Dumped on the decode path too, not just prefill -- a diff
+  // tool cannot tell "these differ" from "one side never wrote this", and a missing file here
+  // reads as a token mismatch that did not happen.
+  dump_layer_state(0, position);
   peek("prologue");
   int done = 0;
   for (const opplan::LayerPlan& lp : plan_.layers) {
@@ -1741,6 +1826,9 @@ void PlanMetalEngine::encode_forward(int token, int position) {
       std::snprintf(b, sizeof(b), "layer %d", lp.layer_index);
       peek(b);
     }
+    // layer_00 is the embedding, before any layer ran -- so a layer's output is filed under N+1,
+    // matching the CPU engine.
+    dump_layer_state(lp.layer_index + 1, position);
     ++done;
   }
   execute_ops(plan_.epilogue, -1, position, 1);
@@ -1807,7 +1895,63 @@ int PlanMetalEngine::attn_split_chunks(const opplan::Op& op, int position) const
   return std::max(1, chunks);
 }
 
+// CPI_Q35_DUMP=<dir>: same files, same layout, same names as the CPU engine's dump, so
+// tools/layer_diff.py can point at one of each and name the first layer that disagrees. Writing
+// fp32 of an fp16 state is deliberate -- the format has to match the reference, and the widening
+// is lossless.
+//
+// Called from BOTH the prefill and decode paths. Dumping only decode would leave every position
+// but the last missing, and a divergence at the last position cannot be told apart from one
+// inherited from a prefill step that was never looked at.
+//
+// Costs a commit_and_wait per layer; only ever set this while debugging.
+void PlanMetalEngine::dump_layer_state(int layer_index, int position) {
+  static const char* dir = std::getenv("CPI_Q35_DUMP");
+  if (dir == nullptr) return;
+  ctx_.commit_and_wait();
+  const auto* x = static_cast<const std::uint16_t*>(slots_[0].contents());
+  char path[512];
+  std::snprintf(path, sizeof(path), "%s/layer_%02d_pos_%02d.f32", dir, layer_index, position);
+  std::FILE* f = std::fopen(path, "wb");
+  if (f == nullptr) return;
+  for (int i = 0; i < cfg_.hidden_size; ++i) {
+    const float v = fp16_to_f32(x[i]);
+    std::fwrite(&v, sizeof(float), 1, f);
+  }
+  std::fclose(f);
+}
+
+// Dumps a named intermediate slot, in the CPU engine's format and under the same names, so the
+// two can be diffed buffer by buffer. Widening fp16 to fp32 keeps the format identical -- the
+// difference in precision between the engines is real, but it is not what this is looking for.
+void PlanMetalEngine::dump_named_slot(const char* name, int layer, int position,
+                                      opplan::Slot sl, int n) {
+  static const char* dir = std::getenv("CPI_Q35_DUMP");
+  if (dir == nullptr) return;
+  ctx_.commit_and_wait();
+  const auto* x = static_cast<const std::uint16_t*>(slots_[static_cast<int>(sl)].contents());
+  char path[512];
+  std::snprintf(path, sizeof(path), "%s/%s_L%02d_pos_%02d.f32", dir, name, layer, position);
+  std::FILE* f = std::fopen(path, "wb");
+  if (f == nullptr) return;
+  for (int i = 0; i < n; ++i) {
+    const float v = fp16_to_f32(x[i]);
+    std::fwrite(&v, sizeof(float), 1, f);
+  }
+  std::fclose(f);
+}
+
 std::vector<int> PlanMetalEngine::prefill_chunks(int n) const {
+  // A recurrent model has no token dimension to batch over: its state must advance one token at a
+  // time, in order, so "prefill" here is just decode without sampling. CUDA and the CPU reference
+  // drive this family the same way, through forward_one(token, position).
+  //
+  // This costs the whole batched-prefill speedup on those models, which is a real loss and not a
+  // temporary one -- it is what the architecture allows. Chunked delta-net prefill exists in the
+  // literature and would be a separate kernel, not a tuning of this path.
+  if (has_recurrent_ops_) {
+    return std::vector<int>(static_cast<std::size_t>(n), 1);
+  }
   // The quantized GEMM tiles 128 tokens where the fp16 one tiles 64.
   return chunk_sizes(n, max_prefill_, quant_bits_ != 0 ? kGemmQBN : kGemmBN);
 }
@@ -1819,6 +1963,7 @@ void PlanMetalEngine::encode_prefill(const std::vector<int>& tokens, int start_p
     throw std::runtime_error("prefill chunk larger than the slots were sized for");
   }
 
+  tokens_in_seq_buf_ = true;
   auto* ids = static_cast<std::int32_t*>(seq_tok_buf_.contents());
   for (int i = 0; i < T; ++i) {
     ids[i] = static_cast<std::int32_t>(tokens[static_cast<std::size_t>(i)]);
@@ -1826,8 +1971,14 @@ void PlanMetalEngine::encode_prefill(const std::vector<int>& tokens, int start_p
   *static_cast<std::int32_t*>(pos_buf_.contents()) = static_cast<std::int32_t>(start_position);
 
   execute_ops(plan_.prologue, -1, start_position, T);
+  // layer_00 is the embedding, before any layer -- the same file the CPU engine writes. Lets a
+  // prefill divergence be split into "the token never got in" and "a layer computed it wrong".
+  if (T == 1) dump_layer_state(0, start_position);
   for (const opplan::LayerPlan& lp : plan_.layers) {
     execute_ops(lp.ops, lp.layer_index, start_position, T);
+    // Only when the chunk IS one token: with T > 1 slot X holds T states and "the state at
+    // start_position" is not what the first hidden_size values are.
+    if (T == 1) dump_layer_state(lp.layer_index + 1, start_position);
   }
   execute_ops(plan_.epilogue, -1, start_position, T);
 }
@@ -1915,6 +2066,7 @@ void PlanMetalEngine::prefill_paged(const std::vector<int>& tokens, int start_po
     batch_bt_elems_ = bt_elems;
   }
 
+  tokens_in_seq_buf_ = true;
   auto* ids = static_cast<std::int32_t*>(seq_tok_buf_.contents());
   auto* ps = static_cast<std::int32_t*>(batch_pos_buf_.contents());
   auto* sl = static_cast<std::int32_t*>(batch_seqlen_buf_.contents());
@@ -1993,6 +2145,7 @@ void PlanMetalEngine::decode_step_batched_logits(const std::vector<int>& tokens,
   }
 
   // Unified memory: writing these IS the upload.
+  tokens_in_seq_buf_ = true;
   auto* ids = static_cast<std::int32_t*>(seq_tok_buf_.contents());
   auto* ps = static_cast<std::int32_t*>(batch_pos_buf_.contents());
   auto* sl = static_cast<std::int32_t*>(batch_seqlen_buf_.contents());
