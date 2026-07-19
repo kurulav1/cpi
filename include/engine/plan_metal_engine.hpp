@@ -272,6 +272,15 @@ private:
   // Allocated lazily, and only ever for the narrow-output projections that take that path.
   runtime::MetalBuffer gemm_partial_buf_;
 
+  // Delta-net state, one contiguous buffer each, indexed by layer. Both are fp32 and both are
+  // read-modify-write within a single token's forward, so a layer's slice must not be shared and
+  // the ops that touch them must run exactly once per token. Zeroed at open(): the recurrence
+  // starts empty, and starting it from stale memory produces fluent nonsense rather than a crash.
+  runtime::MetalBuffer lin_conv_state_;       // [layers][conv_dim * (kernel-1)]
+  runtime::MetalBuffer lin_recurrent_state_;  // [layers][num_v_heads * key_hd * value_hd]
+  std::size_t lin_conv_stride_ = 0;
+  std::size_t lin_recurrent_stride_ = 0;
+
   runtime::MetalBuffer moe_idx_buf_;  // int32[top_k]  -- selected expert ids
   runtime::MetalBuffer moe_w_buf_;    // float[top_k]  -- their renormalised routing weights
 

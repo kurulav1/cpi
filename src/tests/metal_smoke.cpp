@@ -796,20 +796,21 @@ int main() {
     const float eps = 1e-6f;
     std::vector<std::uint16_t> q(H * kdim), k(H * kdim), v(H * vdim), z(H * vdim), av(H), bv2(H),
         dtb(H);
-    std::vector<float> nw(vdim), alog(H), st(H * ss);
+    std::vector<std::uint16_t> nw(vdim), alog(H);  // fp16: the container holds them that way
+    std::vector<float> st(H * ss);
     auto fill = [&](std::vector<std::uint16_t>& x, float s) {
       for (auto& e : x) e = f32_to_f16(dist(rng) * s);
     };
     fill(q, 1.0f); fill(k, 1.0f); fill(v, 1.0f); fill(z, 1.0f);
     fill(av, 1.0f); fill(bv2, 1.0f); fill(dtb, 0.5f);
-    for (auto& e : nw) e = dist(rng);
-    for (auto& e : alog) e = dist(rng) * 0.5f;
+    for (auto& e : nw) e = f32_to_f16(dist(rng));
+    for (auto& e : alog) e = f32_to_f16(dist(rng) * 0.5f);
     for (auto& e : st) e = dist(rng) * 0.1f;
 
     auto bq2 = ctx.alloc_from(q.data(), q.size()*2), bk2 = ctx.alloc_from(k.data(), k.size()*2);
     auto bv3 = ctx.alloc_from(v.data(), v.size()*2), bz = ctx.alloc_from(z.data(), z.size()*2);
     auto ba = ctx.alloc_from(av.data(), av.size()*2), bb = ctx.alloc_from(bv2.data(), bv2.size()*2);
-    auto bnw = ctx.alloc_from(nw.data(), nw.size()*4), bal = ctx.alloc_from(alog.data(), alog.size()*4);
+    auto bnw = ctx.alloc_from(nw.data(), nw.size()*2), bal = ctx.alloc_from(alog.data(), alog.size()*2);
     auto bdt = ctx.alloc_from(dtb.data(), dtb.size()*2), bst2 = ctx.alloc_from(st.data(), st.size()*4);
     auto bo2 = ctx.alloc(H * vdim * 2);
     LinAttnParams p{kdim, vdim, eps};
@@ -827,7 +828,7 @@ int main() {
         const float qn = 1.0f/std::sqrt(qss+1e-6f)/std::sqrt((float)kdim);
         const float kn = 1.0f/std::sqrt(kss+1e-6f);
         const float beta = sigmoidf(f16_to_f32(bv2[h]));
-        const float decay = std::exp(-std::exp(alog[h]) *
+        const float decay = std::exp(-std::exp(f16_to_f32(alog[h])) *
                                      softplusf(f16_to_f32(av[h]) + f16_to_f32(dtb[h])));
         std::vector<float> qs(kdim), ks(kdim);
         for (std::uint32_t i = 0; i < kdim; ++i) {
@@ -853,7 +854,7 @@ int main() {
         }
         const float inv = 1.0f/std::sqrt(oss/(float)vdim + eps);
         for (std::uint32_t d = 0; d < vdim; ++d)
-          out[h*vdim+d] = o[d]*inv*nw[d]*siluf(f16_to_f32(z[h*vdim+d]));
+          out[h*vdim+d] = o[d]*inv*f16_to_f32(nw[d])*siluf(f16_to_f32(z[h*vdim+d]));
       }
       return out;
     };

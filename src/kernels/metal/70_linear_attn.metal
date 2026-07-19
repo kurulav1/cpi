@@ -170,8 +170,14 @@ kernel void cpi_linear_attention_step(device const half* q [[buffer(0)]],
                                       device const half* z [[buffer(3)]],
                                       device const half* a [[buffer(4)]],
                                       device const half* b [[buffer(5)]],
-                                      device const float* norm_weight [[buffer(6)]],
-                                      device const float* a_log [[buffer(7)]],
+                                      // half, not float: the .ll2c container casts every weight
+                                      // to fp16, so there is no f32 source to read these from.
+                                      // CUDA reads them as f32 straight from safetensors, so the
+                                      // two backends differ here by fp16 rounding on a_log -- it
+                                      // feeds exp(-exp(a_log)*softplus(..)), so watch this first
+                                      // if a layer diverges by a small constant factor.
+                                      device const half* norm_weight [[buffer(6)]],
+                                      device const half* a_log [[buffer(7)]],
                                       device const half* dt_bias [[buffer(8)]],
                                       device float* recurrent_state [[buffer(9)]],
                                       device half* out [[buffer(10)]],
@@ -217,7 +223,7 @@ kernel void cpi_linear_attention_step(device const half* q [[buffer(0)]],
         shared_scalar[1] = rsqrt(tot + 1.0e-6f);
         shared_scalar[2] = lin_sigmoid(float(b[head]));
         shared_scalar[3] =
-            exp(-exp(a_log[head]) * lin_softplus(float(a[head]) + float(dt_bias[head])));
+            exp(-exp(float(a_log[head])) * lin_softplus(float(a[head]) + float(dt_bias[head])));
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -273,7 +279,7 @@ kernel void cpi_linear_attention_step(device const half* q [[buffer(0)]],
   const float out_inv = shared_scalar[4];
 
   for (uint dv = lid; dv < vd_n; dv += nthr) {
-    out[v_base + dv] =
-        half(scratch[dv] * out_inv * norm_weight[dv] * lin_silu(float(z[v_base + dv])));
+    out[v_base + dv] = half(scratch[dv] * out_inv * float(norm_weight[dv]) *
+                            lin_silu(float(z[v_base + dv])));
   }
 }

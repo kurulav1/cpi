@@ -270,6 +270,13 @@ struct LinMulVecParams {
 struct LinRepeatParams {
   std::uint32_t num_key_heads, head_repeat, key_head_dim, value_head_dim;
 };
+struct LinConvParams {
+  std::uint32_t channels, kernel_size;
+};
+struct LinAttnParams {
+  std::uint32_t key_head_dim, value_head_dim;
+  float rms_eps;
+};
 
 // The delta-net family is recurrent and has no token dimension. A batched chunk would read past
 // a slot sized for one token and produce plausible numbers, so it is refused here by name.
@@ -589,6 +596,27 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
     quant_bits_ = quant_bits;
   }
   plan_ = opplan::build_llama_plan(g, *wsrc_);
+
+  // Delta-net state. Sized from the container's v6 geometry, so it is zero-sized for every model
+  // that is not a linear-attention one. The conv window holds kernel-1 previous inputs per
+  // channel; the recurrent matrix is [key_head_dim x value_head_dim] per value head.
+  if (cfg_.linear_num_value_heads > 0 && cfg_.linear_conv_kernel_dim > 0) {
+    const std::size_t lin_k = static_cast<std::size_t>(cfg_.linear_num_key_heads) *
+                              static_cast<std::size_t>(cfg_.linear_key_head_dim);
+    const std::size_t lin_v = static_cast<std::size_t>(cfg_.linear_num_value_heads) *
+                              static_cast<std::size_t>(cfg_.linear_value_head_dim);
+    const std::size_t conv_dim = lin_k * 2u + lin_v;
+    lin_conv_stride_ = conv_dim * static_cast<std::size_t>(cfg_.linear_conv_kernel_dim - 1);
+    lin_recurrent_stride_ = static_cast<std::size_t>(cfg_.linear_num_value_heads) *
+                            static_cast<std::size_t>(cfg_.linear_key_head_dim) *
+                            static_cast<std::size_t>(cfg_.linear_value_head_dim);
+    const std::size_t layers = static_cast<std::size_t>(cfg_.num_layers);
+    lin_conv_state_ = ctx_.alloc(std::max<std::size_t>(1, layers * lin_conv_stride_) * sizeof(float));
+    lin_recurrent_state_ =
+        ctx_.alloc(std::max<std::size_t>(1, layers * lin_recurrent_stride_) * sizeof(float));
+    std::memset(lin_conv_state_.contents(), 0, lin_conv_state_.size());
+    std::memset(lin_recurrent_state_.contents(), 0, lin_recurrent_state_.size());
+  }
 
   // Slots, sized for a whole prefill chunk: [tokens][dim] contiguous, which is the
   // layout every batched kernel assumes.
@@ -1462,15 +1490,50 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
         break;
       }
 
-      // The two stateful ones need per-layer buffers this engine does not allocate yet (the conv
-      // window and the recurrent matrix), and the attention step additionally needs its two fp32
-      // weights, which WeightSource cannot express. Both are the next step; until then this
-      // refuses by name rather than dispatching a kernel with nothing behind its state pointer.
-      case OpKind::LinearConv1d:
-      case OpKind::LinearAttentionStep:
-        throw std::runtime_error(
-            std::string("Metal: ") + op_kind_name(static_cast<int>(op.kind)) +
-            " needs the per-layer delta-net state buffers, which are not allocated yet");
+      case OpKind::LinearConv1d: {
+        require_single_token(op.kind, T);
+        if (!lin_conv_state_.valid()) {
+          throw std::runtime_error("Metal: LinearConv1d without delta-net state (bad geometry?)");
+        }
+        LinConvParams p{static_cast<std::uint32_t>(op.cols),
+                        static_cast<std::uint32_t>(op.conv_kernel)};
+        const std::size_t off =
+            static_cast<std::size_t>(layer) * lin_conv_stride_ * sizeof(float);
+        const void* bufs[] = {op.weight, lin_conv_state_.handle(), slot(op.in)};
+        const std::size_t offs[] = {0, off, 0};
+        ctx_.dispatch("cpi_linear_conv1d_silu", G::Threads, static_cast<std::size_t>(op.cols), kTG,
+                      bufs, offs, 3, &p, sizeof(p));
+        break;
+      }
+      case OpKind::LinearAttentionStep: {
+        require_single_token(op.kind, T);
+        if (!lin_recurrent_state_.valid()) {
+          throw std::runtime_error("Metal: LinearAttentionStep without delta-net state");
+        }
+        LinAttnParams p{static_cast<std::uint32_t>(op.key_head_dim),
+                        static_cast<std::uint32_t>(op.value_head_dim), op.eps};
+        const std::size_t off =
+            static_cast<std::size_t>(layer) * lin_recurrent_stride_ * sizeof(float);
+        // auxf_a/auxf_b are typed const float* by the shared plan, but on this backend every
+        // weight handle is an opaque device buffer -- the same pun op.weight already relies on.
+        // They are fp16 here (the container casts every weight), see 70_linear_attn.metal.
+        const void* bufs[] = {slot(opplan::Slot::LinQ),
+                              slot(opplan::Slot::LinK),
+                              slot(opplan::Slot::LinV),
+                              slot(opplan::Slot::LinZ),
+                              slot(opplan::Slot::LinA),
+                              slot(opplan::Slot::LinB),
+                              static_cast<const void*>(op.auxf_a),
+                              static_cast<const void*>(op.auxf_b),
+                              op.aux_ptr,
+                              lin_recurrent_state_.handle(),
+                              slot(opplan::Slot::LinAtt)};
+        const std::size_t offs[] = {0, 0, 0, 0, 0, 0, 0, 0, 0, off, 0};
+        ctx_.dispatch("cpi_linear_attention_step", G::Groups,
+                      static_cast<std::size_t>(op.num_v_heads), 256, bufs, offs, 11, &p,
+                      sizeof(p));
+        break;
+      }
 
       // Kernels exist (80_vision.metal) but nothing here supplies pixels, patch positions or the
       // 2-D RoPE tables, and those four ops implement GEMMA 4's tower -- Qwen3.5's is a different
