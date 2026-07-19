@@ -250,7 +250,19 @@ def extract_model_config(hf_cfg: dict, family: str) -> dict:
     num_heads = int(text_cfg.get("num_attention_heads", hf_cfg.get("num_attention_heads")))
     num_kv_heads = int(text_cfg.get("num_key_value_heads", hf_cfg.get("num_key_value_heads", num_heads)))
 
-    rope_theta = float(text_cfg.get("rope_theta", hf_cfg.get("rope_theta", DEFAULT_ROPE_THETA.get(family, 10000.0))))
+    # Newer HF configs (Qwen3.5 and later) nest every rope knob under "rope_parameters" instead of
+    # leaving them at the top level. Reading only the flat key silently yields the FAMILY DEFAULT
+    # theta and a full-rotary factor -- a model that loads, runs, and is wrong.
+    def rope_param(key, default):
+        for scope in (text_cfg, hf_cfg):
+            nested = scope.get("rope_parameters") or scope.get("rope_scaling") or {}
+            if key in scope:
+                return scope[key]
+            if key in nested:
+                return nested[key]
+        return default
+
+    rope_theta = float(rope_param("rope_theta", DEFAULT_ROPE_THETA.get(family, 10000.0)))
 
     # Sliding-window attention (set when provided by checkpoint config).
     # Honor use_sliding_window: models like Qwen2.5 advertise a large window but
@@ -283,7 +295,10 @@ def extract_model_config(hf_cfg: dict, family: str) -> dict:
     has_qkv_bias = (family == FAMILY_QWEN2) or bool(text_cfg.get("attention_bias", hf_cfg.get("attention_bias", False)))
 
     # Per-head QK-norm (RMSNorm on Q and K after projection): Qwen3 dense.
-    has_qk_norm = (family == FAMILY_QWEN3)
+    # Qwen3.5's full-attention layers carry q_norm/k_norm too. Missing it here does not fail the
+    # conversion -- it drops both tensors from the mapping, so the container is quietly short two
+    # weights per attention layer and the engine skips a normalisation it needs.
+    has_qk_norm = family in (FAMILY_QWEN3, FAMILY_QWEN3_5)
 
     # Gemma: GeGLU MLP (tanh GELU) + token-embedding scale by sqrt(hidden). Its
     # (1+w) RMSNorm is folded into the norm weights at extraction (below), so no
@@ -306,10 +321,10 @@ def extract_model_config(hf_cfg: dict, family: str) -> dict:
     norm_eps = float(text_cfg.get("rms_norm_eps", text_cfg.get("layer_norm_eps", hf_cfg.get("rms_norm_eps", hf_cfg.get("layer_norm_eps", 1e-5)))))
 
     # Partial rotary factor (Phi-3; stored in config but not yet kernel-enforced)
-    partial_rotary_factor = float(text_cfg.get("partial_rotary_factor", hf_cfg.get("partial_rotary_factor", 1.0)))
+    partial_rotary_factor = float(rope_param("partial_rotary_factor", 1.0))
     if partial_rotary_factor != 1.0:
-        print(f"[info] partial_rotary_factor={partial_rotary_factor} detected (Phi-3). "
-              "Full rotary will be used in the engine until partial RoPE is kernel-supported.")
+        print(f"[info] partial_rotary_factor={partial_rotary_factor}: only the leading "
+              f"{partial_rotary_factor:.0%} of each head is rotated.")
 
     layer_types_raw = text_cfg.get("layer_types", [])
     layer_attention_types = []
@@ -383,14 +398,21 @@ def build_qwen35_mapping(num_layers: int, layer_types: list, has_qk_norm: bool):
         kind = layer_types[i] if i < len(layer_types) else "full_attention"
         items.append((f"{P}layers.{i}.post_attention_layernorm.weight",
                       f"layers.{i}.ffn_norm.weight", True))
+        # Both layer kinds have input_layernorm -- the delta-net block normalises its input the
+        # same way the attention block does. linear_attn.norm is a SECOND, narrower norm inside
+        # the block (value_head_dim wide, gated by z), not a replacement for this one. Emitting
+        # this only for attention layers leaves the delta-net block reading raw residual: the
+        # container loads, the model runs, and the block is orthogonal to the reference.
+        items.append((f"{P}layers.{i}.input_layernorm.weight",
+                      f"layers.{i}.attention_norm.weight", True))
         items.extend([
             (f"{P}layers.{i}.mlp.gate_proj.weight", f"layers.{i}.feed_forward.w1", True),
             (f"{P}layers.{i}.mlp.down_proj.weight", f"layers.{i}.feed_forward.w2", True),
             (f"{P}layers.{i}.mlp.up_proj.weight", f"layers.{i}.feed_forward.w3", True),
         ])
         if "linear" in kind:
-            # Delta-net. There is no input_layernorm on these layers -- linear_attn.norm is the
-            # OUTPUT norm inside the block (value_head_dim wide), not a pre-norm.
+            # Delta-net. linear_attn.norm is the OUTPUT norm inside the block (value_head_dim
+            # wide, gated by z) -- it is in ADDITION to the input_layernorm emitted above.
             items.extend([
                 (f"{P}layers.{i}.linear_attn.in_proj_qkv.weight",
                  f"layers.{i}.linear_attn.in_proj_qkv", True),
@@ -412,8 +434,6 @@ def build_qwen35_mapping(num_layers: int, layer_types: list, has_qk_norm: bool):
                  f"layers.{i}.linear_attn.norm", True),
             ])
         else:
-            items.append((f"{P}layers.{i}.input_layernorm.weight",
-                          f"layers.{i}.attention_norm.weight", True))
             items.extend([
                 (f"{P}layers.{i}.self_attn.q_proj.weight", f"layers.{i}.attention.wq", True),
                 (f"{P}layers.{i}.self_attn.k_proj.weight", f"layers.{i}.attention.wk", True),
