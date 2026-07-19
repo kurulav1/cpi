@@ -151,5 +151,6 @@ int main(int argc, char** argv) {
                static_cast<unsigned long long>(eng.dispatch_count()),
                static_cast<unsigned long long>(eng.cmdbuf_count()));
   eng.dump_profile();  // no-op unless CPI_METAL_PROFILE is set
+  eng.dump_gpu_profile();  // no-op unless CPI_METAL_GPUPROFILE is set
   return 0;
 }

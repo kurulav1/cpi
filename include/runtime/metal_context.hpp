@@ -15,6 +15,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace runtime {
 
@@ -122,6 +124,26 @@ public:
   static constexpr int kMaxSpecConstants = 8;
   void set_next_specialization(const std::uint32_t* values, int count);
 
+  // ---- per-dispatch GPU timing ------------------------------------------
+  //
+  // True GPU nanoseconds per kernel, from the device's timestamp counter set. This is what the
+  // host-timed CPI_METAL_PROFILE could never be: that one wraps every op in commit-and-wait and
+  // measures WALL time, so each op carries a command-buffer round trip it does not pay in a real
+  // pass -- roughly 3x, concentrated in the cheap ops, which are exactly the ones being weighed.
+  //
+  // The M4 exposes ONE counter set ("timestamp", one counter) and supports sampling only at
+  // stage boundaries -- there is no dispatch-boundary sampling and no ALU/limiter counter
+  // reachable from the Metal API at all. Those live only in Xcode's GPU debugger. Timing is what
+  // a CLI can have, so timing is what this gives.
+  //
+  // It puts each dispatch in its OWN encoder to bracket it, which serialises work that normally
+  // overlaps. Kernel times are therefore honest individually and their sum exceeds a real pass.
+  void enable_gpu_profile(bool on);
+  bool gpu_profile_enabled() const { return gpu_profile_; }
+  // kernel name -> (total GPU nanoseconds, dispatch count). Valid after commit_and_wait().
+  const std::vector<std::pair<std::string, std::pair<std::uint64_t, std::uint64_t>>>&
+  gpu_profile_results();
+
   // Submits everything encoded so far and blocks until the GPU is done.
   void commit_and_wait();
 
@@ -177,6 +199,14 @@ private:
   bool next_barrier_ = true;   // barrier before the next dispatch; see set_next_barrier
   std::uint32_t next_spec_[kMaxSpecConstants] = {};  // see set_next_specialization
   int next_spec_n_ = 0;
+
+  bool gpu_profile_ = false;
+  void* sample_buf_ = nullptr;  // id<MTLCounterSampleBuffer>
+  int sample_slots_ = 0;        // capacity in SAMPLES (two per dispatch)
+  int sample_next_ = 0;
+  std::vector<std::string> sample_names_;
+  std::vector<std::pair<std::string, std::pair<std::uint64_t, std::uint64_t>>> gpu_profile_out_;
+  void resolve_gpu_profile();
   std::string last_error_;
 
   double gpu_busy_ms_ = 0.0;

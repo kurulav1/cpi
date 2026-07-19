@@ -548,6 +548,12 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
   // The (1+w) form is still needed for Gemma 4, which comes from the .cpi container.
   g.norm_offset = false;
 
+  if (std::getenv("CPI_METAL_GPUPROFILE") != nullptr) {
+    ctx_.enable_gpu_profile(true);
+    if (!ctx_.gpu_profile_enabled()) {
+      std::fprintf(stderr, "[metal gpu-profile] unavailable: %s\n", ctx_.last_error().c_str());
+    }
+  }
   wsrc_ = std::make_unique<MetalWeights>(ctx_, weights_, wbuf_);
   if (quant_bits == 4 || quant_bits == 8) {
     // A group size that is a multiple of 8 keeps each 8-weight chunk the int4 kernel
@@ -1391,6 +1397,34 @@ void PlanMetalEngine::profile_tick(const char* name) {
   const auto now = std::chrono::steady_clock::now();
   profile_ms_[name] += std::chrono::duration<double, std::milli>(now - profile_last_).count();
   profile_last_ = now;
+}
+
+void PlanMetalEngine::dump_gpu_profile() {
+  if (!ctx_.gpu_profile_enabled()) return;
+  const auto& rows = ctx_.gpu_profile_results();
+  if (rows.empty()) {
+    std::fprintf(stderr, "[metal gpu-profile] no samples\n");
+    return;
+  }
+  std::uint64_t total = 0;
+  for (const auto& r : rows) total += r.second.first;
+  // Say what these numbers are and are not, in the output rather than only in a header: the
+  // serialisation is why the sum overshoots a real pass, and the missing limiters are a hardware
+  // fact (this device exposes one counter set, timestamp), not an omission.
+  std::fprintf(stderr,
+               "[metal gpu-profile] true GPU ns per kernel, from the device timestamp counters.\n"
+               "  Each dispatch gets its own encoder to bracket it, which SERIALISES work a real\n"
+               "  pass overlaps -- rows are honest individually, the sum exceeds a real pass.\n"
+               "  Limiters/occupancy are NOT reachable from the Metal API here; those need Xcode.\n");
+  std::fprintf(stderr, "  %-34s %12s %10s %9s\n", "kernel", "gpu_ms", "calls", "share");
+  for (const auto& r : rows) {
+    const double ms = static_cast<double>(r.second.first) / 1.0e6;
+    std::fprintf(stderr, "  %-34s %12.3f %10llu %8.1f%%\n", r.first.c_str(), ms,
+                 static_cast<unsigned long long>(r.second.second),
+                 100.0 * static_cast<double>(r.second.first) / static_cast<double>(total));
+  }
+  std::fprintf(stderr, "  %-34s %12.3f\n", "(sum, serialised)",
+               static_cast<double>(total) / 1.0e6);
 }
 
 void PlanMetalEngine::dump_profile() const {

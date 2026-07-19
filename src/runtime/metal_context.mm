@@ -19,6 +19,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <algorithm>
+#include <unordered_map>
 #include <vector>
 
 namespace runtime {
@@ -82,6 +84,7 @@ MetalContext::MetalContext() {
 MetalContext::~MetalContext() {
   if (encoder_ != nullptr) [(id<MTLComputeCommandEncoder>)encoder_ release];
   if (cmdbuf_ != nullptr) [(id<MTLCommandBuffer>)cmdbuf_ release];
+  if (sample_buf_ != nullptr) [(id<MTLCounterSampleBuffer>)sample_buf_ release];
   if (pipelines_ != nullptr) [(NSMutableDictionary*)pipelines_ release];
   if (library_ != nullptr) [(id<MTLLibrary>)library_ release];
   if (queue_ != nullptr) [(id<MTLCommandQueue>)queue_ release];
@@ -232,6 +235,75 @@ MetalBuffer MetalContext::alloc_from(const void* src, std::size_t bytes) {
   return b;
 }
 
+void MetalContext::enable_gpu_profile(bool on) {
+  gpu_profile_ = on;
+  if (!on || device_ == nullptr || sample_buf_ != nullptr) return;
+
+  id<MTLDevice> dev = (id<MTLDevice>)device_;
+  id<MTLCounterSet> ts = nil;
+  for (id<MTLCounterSet> cs in [dev counterSets]) {
+    if ([[cs name] isEqualToString:@"timestamp"]) ts = cs;
+  }
+  if (ts == nil) {
+    last_error_ = "this device exposes no timestamp counter set";
+    gpu_profile_ = false;
+    return;
+  }
+
+  // Two samples per dispatch. The driver caps a sample buffer at 32768 B = 4096 timestamps, so
+  // 2048 dispatches is the ceiling -- a 24-layer prefill issues ~750, comfortably inside it.
+  // Recording stops past the cap rather than reallocating mid-pass.
+  sample_slots_ = 4096;
+  MTLCounterSampleBufferDescriptor* d = [[MTLCounterSampleBufferDescriptor alloc] init];
+  d.counterSet = ts;
+  d.storageMode = MTLStorageModeShared;
+  d.sampleCount = (NSUInteger)sample_slots_;
+  NSError* err = nil;
+  id<MTLCounterSampleBuffer> sb = [dev newCounterSampleBufferWithDescriptor:d error:&err];
+  [d release];
+  if (sb == nil) {
+    last_error_ = "counter sample buffer creation failed";
+    if (err != nil) {
+      last_error_ += ": ";
+      last_error_ += [[err localizedDescription] UTF8String];
+    }
+    gpu_profile_ = false;
+    return;
+  }
+  sample_buf_ = (void*)sb;  // +1
+  sample_next_ = 0;
+  sample_names_.clear();
+}
+
+void MetalContext::resolve_gpu_profile() {
+  gpu_profile_out_.clear();
+  if (sample_buf_ == nullptr || sample_names_.empty()) return;
+  id<MTLCounterSampleBuffer> sb = (id<MTLCounterSampleBuffer>)sample_buf_;
+  NSData* data = [sb resolveCounterRange:NSMakeRange(0, (NSUInteger)sample_next_)];
+  if (data == nil) return;
+  const MTLCounterResultTimestamp* r = (const MTLCounterResultTimestamp*)[data bytes];
+  const std::size_t pairs = std::min(sample_names_.size(), (std::size_t)(sample_next_ / 2));
+
+  std::unordered_map<std::string, std::pair<std::uint64_t, std::uint64_t>> acc;
+  for (std::size_t i = 0; i < pairs; ++i) {
+    const std::uint64_t t0 = r[i * 2].timestamp, t1 = r[i * 2 + 1].timestamp;
+    // A sample pair can come back zeroed when the encoder was empty or the counter was not
+    // written; counting those as 0 ns would quietly deflate a kernel's total.
+    if (t1 <= t0) continue;
+    auto& e = acc[sample_names_[i]];
+    e.first += t1 - t0;
+    e.second += 1;
+  }
+  gpu_profile_out_.assign(acc.begin(), acc.end());
+  std::sort(gpu_profile_out_.begin(), gpu_profile_out_.end(),
+            [](const auto& a, const auto& b) { return a.second.first > b.second.first; });
+}
+
+const std::vector<std::pair<std::string, std::pair<std::uint64_t, std::uint64_t>>>&
+MetalContext::gpu_profile_results() {
+  return gpu_profile_out_;
+}
+
 void MetalContext::set_next_specialization(const std::uint32_t* values, int count) {
   if (count < 0) count = 0;
   if (count > kMaxSpecConstants) {
@@ -334,6 +406,25 @@ void MetalContext::dispatch(const std::string& name, Grid grid, std::size_t tota
     encoder_ =
         (void*)[[cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent] retain];
   }
+  // Profiling brackets each dispatch with its own encoder, because the timestamp counter samples
+  // at ENCODER boundaries -- the device does not support dispatch-boundary sampling. That
+  // serialises work the concurrent encoder would overlap, which is the price of per-kernel numbers.
+  if (gpu_profile_ && sample_buf_ != nullptr && sample_next_ + 2 <= sample_slots_) {
+    if (encoder_ != nullptr) {
+      [(id<MTLComputeCommandEncoder>)encoder_ endEncoding];
+      [(id<MTLComputeCommandEncoder>)encoder_ release];
+      encoder_ = nullptr;
+    }
+    MTLComputePassDescriptor* pd = [MTLComputePassDescriptor computePassDescriptor];
+    pd.sampleBufferAttachments[0].sampleBuffer = (id<MTLCounterSampleBuffer>)sample_buf_;
+    pd.sampleBufferAttachments[0].startOfEncoderSampleIndex = (NSUInteger)sample_next_;
+    pd.sampleBufferAttachments[0].endOfEncoderSampleIndex = (NSUInteger)(sample_next_ + 1);
+    id<MTLCommandBuffer> pcb = (id<MTLCommandBuffer>)cmdbuf_;
+    encoder_ = (void*)[[pcb computeCommandEncoderWithDescriptor:pd] retain];
+    sample_names_.push_back(name);
+    sample_next_ += 2;
+  }
+
   id<MTLComputeCommandEncoder> enc = (id<MTLComputeCommandEncoder>)encoder_;
   // The encoder is concurrent, so a dispatch runs as soon as its inputs are ready UNLESS a barrier
   // orders it. By default every dispatch barriers first -- correctness-equivalent to a serial
@@ -438,6 +529,7 @@ void MetalContext::commit_and_wait() {
   }
   [cb release];
   cmdbuf_ = nullptr;
+  if (gpu_profile_) resolve_gpu_profile();
 }
 
 }  // namespace runtime

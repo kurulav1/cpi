@@ -206,6 +206,12 @@ private:
   // CPI_METAL_PROFILE=1 accumulates GPU time by op kind; dump_profile() prints the split.
   void dump_profile() const;
 
+  // CPI_METAL_GPUPROFILE=1: true per-kernel GPU nanoseconds, from the device timestamp counters,
+  // rather than the host times dump_profile() reports. See MetalContext::enable_gpu_profile --
+  // it serialises dispatches to bracket them, so the individual numbers are honest and their
+  // sum is larger than a real pass.
+  void dump_gpu_profile();
+
  private:
   void profile_tick(const char* name);
   std::map<std::string, double> profile_ms_;
