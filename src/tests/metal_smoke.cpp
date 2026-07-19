@@ -114,6 +114,20 @@ struct LinAttnParams {
   std::uint32_t key_head_dim, value_head_dim;
   float rms_eps;
 };
+// Must match the layouts in 80_vision.metal exactly.
+struct VisPatchParams {
+  std::uint32_t hidden, patch_dim, pos_table_size, tokens;
+};
+struct VisRope2DParams {
+  std::uint32_t num_heads, head_dim, pairs_per_half, tokens;
+};
+struct VisPoolParams {
+  std::uint32_t tokens, hidden, k, cells_x, out_tokens;
+  float gain;
+};
+struct VisStdParams {
+  std::uint32_t n, hidden;
+};
 
 float sigmoidf(float x) {
   return 1.0f / (1.0f + std::exp(-x));
@@ -854,6 +868,139 @@ int main() {
       for (std::uint32_t i = 0; i < H*vdim; ++i) got[i] = f16_to_f32(o[i]);
       check(step == 0 ? "lin_attn_step" : "lin_attn_step.t2", compare(got, want), 0.02);
     }
+  }
+
+  // ---- vision tower ------------------------------------------------------
+  //
+  // No Gemma 4 checkpoint is converted here either, so the CPU reference is the gate. Every one
+  // of these includes PADDING PATCHES (a negative position), because that is the case that fails
+  // silently: padding mixed into a real cell is a plausible-looking number, not a crash.
+  {
+    const std::uint32_t tok = 7, hid = 24, pdim = 12, pts = 8;
+    std::vector<std::uint16_t> proj(hid * pdim), ptab(2 * pts * hid);
+    std::vector<float> pix(tok * pdim);
+    std::vector<std::int32_t> px(tok), py(tok);
+    for (auto& v : proj) v = f32_to_f16(dist(rng) * 0.3f);
+    for (auto& v : ptab) v = f32_to_f16(dist(rng) * 0.3f);
+    for (auto& v : pix) v = 0.5f + dist(rng) * 0.5f;
+    for (std::uint32_t t = 0; t < tok; ++t) { px[t] = t % 4; py[t] = t / 4; }
+    px[5] = -1; py[6] = -1;  // two padding patches, one per coordinate
+
+    auto bp = ctx.alloc_from(proj.data(), proj.size()*2);
+    auto bpix = ctx.alloc_from(pix.data(), pix.size()*4);
+    auto bt = ctx.alloc_from(ptab.data(), ptab.size()*2);
+    auto bx = ctx.alloc_from(px.data(), px.size()*4), by = ctx.alloc_from(py.data(), py.size()*4);
+    auto bo = ctx.alloc(tok * hid * 2);
+    VisPatchParams p{hid, pdim, pts, tok};
+    const void* bufs[] = {bp.handle(), bpix.handle(), bt.handle(), bx.handle(), by.handle(),
+                          bo.handle()};
+    ctx.dispatch("cpi_patch_embed", runtime::MetalContext::Grid::Threads, tok * hid, 256, bufs,
+                 nullptr, 6, &p, sizeof(p));
+    ctx.commit_and_wait();
+    std::vector<float> want(tok * hid), got(tok * hid);
+    for (std::uint32_t t = 0; t < tok; ++t)
+      for (std::uint32_t h = 0; h < hid; ++h) {
+        if (px[t] < 0 || py[t] < 0) { want[t*hid+h] = 0.0f; continue; }
+        float acc = 0.0f;
+        for (std::uint32_t k = 0; k < pdim; ++k)
+          acc += f16_to_f32(proj[h*pdim+k]) * (2.0f * (pix[t*pdim+k] - 0.5f));
+        acc += f16_to_f32(ptab[(std::size_t)px[t]*hid + h]);
+        acc += f16_to_f32(ptab[(std::size_t)pts*hid + (std::size_t)py[t]*hid + h]);
+        want[t*hid+h] = acc;
+      }
+    const auto* o = static_cast<const std::uint16_t*>(bo.contents());
+    for (std::uint32_t i = 0; i < tok*hid; ++i) got[i] = f16_to_f32(o[i]);
+    check("patch_embed", compare(got, want), 0.02);
+  }
+  {
+    const std::uint32_t tok = 5, heads = 3, hd = 16, hp = hd / 4;
+    std::vector<std::uint16_t> x(tok * heads * hd);
+    std::vector<float> ct(64 * hp), st(64 * hp);
+    std::vector<std::int32_t> px(tok), py(tok);
+    for (auto& v : x) v = f32_to_f16(dist(rng));
+    for (std::size_t i = 0; i < ct.size(); ++i) { ct[i] = std::cos(0.1f*i); st[i] = std::sin(0.1f*i); }
+    for (std::uint32_t t = 0; t < tok; ++t) { px[t] = t; py[t] = (t*2) % 5; }
+    const std::vector<std::uint16_t> x0 = x;
+
+    auto bx = ctx.alloc_from(x.data(), x.size()*2);
+    auto bpx = ctx.alloc_from(px.data(), px.size()*4), bpy = ctx.alloc_from(py.data(), py.size()*4);
+    auto bc = ctx.alloc_from(ct.data(), ct.size()*4), bs = ctx.alloc_from(st.data(), st.size()*4);
+    VisRope2DParams p{heads, hd, hp, tok};
+    const void* bufs[] = {bx.handle(), bpx.handle(), bpy.handle(), bc.handle(), bs.handle()};
+    ctx.dispatch("cpi_rope_2d_inplace", runtime::MetalContext::Grid::Threads,
+                 tok * heads * 2 * hp, 256, bufs, nullptr, 5, &p, sizeof(p));
+    ctx.commit_and_wait();
+    std::vector<float> want(x.size()), got(x.size());
+    for (std::size_t i = 0; i < x0.size(); ++i) want[i] = f16_to_f32(x0[i]);
+    for (std::uint32_t t = 0; t < tok; ++t)
+      for (std::uint32_t hh = 0; hh < heads; ++hh)
+        for (std::uint32_t a = 0; a < 2; ++a)
+          for (std::uint32_t j = 0; j < hp; ++j) {
+            const std::size_t row = ((std::size_t)t*heads + hh)*hd;
+            const std::uint32_t base = a * (hd/2);
+            const std::int32_t pos = a == 0 ? px[t] : py[t];
+            const float c = ct[(std::size_t)pos*hp + j], sn = st[(std::size_t)pos*hp + j];
+            const float v0 = f16_to_f32(x0[row + base + j]);
+            const float v1 = f16_to_f32(x0[row + base + j + hp]);
+            want[row + base + j] = v0*c - v1*sn;
+            want[row + base + j + hp] = v1*c + v0*sn;
+          }
+    const auto* o = static_cast<const std::uint16_t*>(bx.contents());
+    for (std::size_t i = 0; i < got.size(); ++i) got[i] = f16_to_f32(o[i]);
+    check("rope_2d", compare(got, want), 0.005);
+  }
+  {
+    const std::uint32_t tok = 12, hid = 16, k = 2, cx = 2, outt = 4;
+    const float gain = 1.5f;
+    std::vector<std::uint16_t> in(tok * hid);
+    std::vector<std::int32_t> px(tok), py(tok);
+    for (auto& v : in) v = f32_to_f16(dist(rng));
+    for (std::uint32_t t = 0; t < tok; ++t) { px[t] = t % 4; py[t] = (t / 4) % 4; }
+    px[3] = -1; py[9] = -1;  // padding must be skipped but must NOT shrink the divisor
+
+    auto bi = ctx.alloc_from(in.data(), in.size()*2);
+    auto bpx = ctx.alloc_from(px.data(), px.size()*4), bpy = ctx.alloc_from(py.data(), py.size()*4);
+    auto bo = ctx.alloc(outt * hid * 2);
+    VisPoolParams p{tok, hid, k, cx, outt, gain};
+    const void* bufs[] = {bi.handle(), bpx.handle(), bpy.handle(), bo.handle()};
+    ctx.dispatch("cpi_avg_pool_patches", runtime::MetalContext::Grid::Threads, outt * hid, 256,
+                 bufs, nullptr, 4, &p, sizeof(p));
+    ctx.commit_and_wait();
+    std::vector<float> want(outt*hid), got(outt*hid);
+    for (std::uint32_t cell = 0; cell < outt; ++cell)
+      for (std::uint32_t h = 0; h < hid; ++h) {
+        float acc = 0.0f;
+        for (std::uint32_t t = 0; t < tok; ++t) {
+          if (px[t] < 0 || py[t] < 0) continue;
+          const std::uint32_t c = ((std::uint32_t)px[t]/k) + cx*((std::uint32_t)py[t]/k);
+          if (c == cell) acc += f16_to_f32(in[(std::size_t)t*hid + h]);
+        }
+        want[cell*hid+h] = acc / float(k*k) * gain;
+      }
+    const auto* o = static_cast<const std::uint16_t*>(bo.contents());
+    for (std::uint32_t i = 0; i < outt*hid; ++i) got[i] = f16_to_f32(o[i]);
+    check("avg_pool", compare(got, want), 0.01);
+  }
+  {
+    const std::uint32_t tok = 9, hid = 32, n = tok * hid;
+    std::vector<std::uint16_t> x(n), bias(hid), scl(hid);
+    for (auto& v : x) v = f32_to_f16(dist(rng));
+    for (auto& v : bias) v = f32_to_f16(dist(rng) * 0.5f);
+    for (auto& v : scl) v = f32_to_f16(0.5f + dist(rng) * 0.25f);
+    const std::vector<std::uint16_t> x0 = x;
+    auto bx = ctx.alloc_from(x.data(), n*2);
+    auto bb = ctx.alloc_from(bias.data(), hid*2), bsc = ctx.alloc_from(scl.data(), hid*2);
+    VisStdParams p{n, hid};
+    const void* bufs[] = {bx.handle(), bb.handle(), bsc.handle()};
+    ctx.dispatch("cpi_standardize", runtime::MetalContext::Grid::Threads, n, 256, bufs, nullptr, 3,
+                 &p, sizeof(p));
+    ctx.commit_and_wait();
+    std::vector<float> want(n), got(n);
+    for (std::uint32_t i = 0; i < n; ++i)
+      want[i] = (f16_to_f32(x0[i]) - f16_to_f32(bias[i % hid])) * f16_to_f32(scl[i % hid]);
+    const auto* o = static_cast<const std::uint16_t*>(bx.contents());
+    for (std::uint32_t i = 0; i < n; ++i) got[i] = f16_to_f32(o[i]);
+    check("standardize", compare(got, want), 0.005);
   }
 
   std::printf("[metal_smoke] %s\n", failures == 0 ? "ALL PASS" : "FAILURES");
