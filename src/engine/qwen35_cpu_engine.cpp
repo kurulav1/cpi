@@ -892,12 +892,37 @@ void Qwen35CpuEngine::run_mlp_layer(int layer) {
   }
 }
 
+// CPI_Q35_DUMP=<dir> writes this engine's hidden state after every layer, as
+// layer_NN_pos_MM.f32 (hidden_size floats, native endianness), plus the embedding as layer_-1.
+//
+// This exists so the Metal port can be diffed LAYER BY LAYER rather than by its final token. A
+// port that disagrees only in its output tells you nothing about where; the delta-net block, the
+// gated attention block and the MLP are three independent suspects per layer, times 24 layers.
+// Off unless the variable is set, so it costs a getenv per forward.
+namespace {
+const char* q35_dump_dir() {
+  static const char* d = std::getenv("CPI_Q35_DUMP");
+  return d;
+}
+void q35_dump(const char* dir, int layer, int position, const std::vector<float>& v) {
+  char path[512];
+  std::snprintf(path, sizeof(path), "%s/layer_%02d_pos_%02d.f32", dir, layer + 1, position);
+  if (std::FILE* f = std::fopen(path, "wb")) {
+    std::fwrite(v.data(), sizeof(float), v.size(), f);
+    std::fclose(f);
+  }
+}
+}  // namespace
+
 void Qwen35CpuEngine::forward_token(int token, int position) {
   const std::uint16_t* emb_row = tok_embeddings_ + static_cast<std::size_t>(token) *
                                                        static_cast<std::size_t>(cfg_.hidden_size);
   for (int i = 0; i < cfg_.hidden_size; ++i) {
     x_[static_cast<std::size_t>(i)] = bf16_to_f32(emb_row[i]);
   }
+
+  const char* dump = q35_dump_dir();
+  if (dump != nullptr) q35_dump(dump, -1, position, x_);  // the embedding, before any layer
 
   for (int layer = 0; layer < cfg_.num_layers; ++layer) {
     if (layers_[static_cast<std::size_t>(layer)].kind == LayerKind::FullAttention) {
@@ -906,6 +931,7 @@ void Qwen35CpuEngine::forward_token(int token, int position) {
       run_linear_attention_layer(layer);
     }
     run_mlp_layer(layer);
+    if (dump != nullptr) q35_dump(dump, layer, position, x_);
   }
 
   rmsnorm_offset(x_.data(), norm_out_, x_norm_.data(), cfg_.hidden_size, cfg_.rms_norm_eps);
