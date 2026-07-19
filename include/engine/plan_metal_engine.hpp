@@ -262,6 +262,10 @@ private:
 
   // MoE: the router's selection, carried between ops on the device so a token never
   // round-trips to the host mid-layer. Only allocated for MoE models.
+  // float[GEMM_SPLITK * tokens * out_dim] -- per-split partial sums for the split-K GEMM.
+  // Allocated lazily, and only ever for the narrow-output projections that take that path.
+  runtime::MetalBuffer gemm_partial_buf_;
+
   runtime::MetalBuffer moe_idx_buf_;  // int32[top_k]  -- selected expert ids
   runtime::MetalBuffer moe_w_buf_;    // float[top_k]  -- their renormalised routing weights
 

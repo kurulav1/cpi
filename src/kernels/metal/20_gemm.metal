@@ -107,6 +107,8 @@ typedef float gemm_acc_e;
 #define GEMM_QBK 32
 #define GEMM_FBM 64
 #define GEMM_FBK 32
+// Reduction splits for the split-K prototype below. Not used by the engine.
+#define GEMM_SPLITK 4
 
 // ---------------------------------------------------------------------------
 // Blocked fp16 GEMM (prefill). A K-block of both operands is staged in threadgroup memory,
@@ -197,6 +199,128 @@ kernel void cpi_gemm_f16(device const half* w [[buffer(0)]], device const half* 
       }
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// SPLIT-K prototype of the fp16 GEMM.
+//
+// At a short prompt the grid is out_dim/GEMM_FBM * ceil(T/GEMM_BN) threadgroups, which for this
+// model's 896-row projections is 28 at T=64 -- on a 10-core GPU. down_proj is the worst of them:
+// same FLOPs and same bytes as gate_proj, but a 14x76 grid instead of 76x14, and it measures 2.2x
+// slower. Shrinking the row tile to make more threadgroups was tried and LOST (GEMM_FBM 32: 0.49
+// -> 0.55 ms), because it also halves how many output rows each staged weight tile serves and so
+// doubles the weight traffic.
+//
+// Splitting the REDUCTION does not have that problem: every threadgroup reads a different slice of
+// K, so the total weight bytes are unchanged and only the activation tile is re-read. Each
+// threadgroup writes a float partial, and a second pass sums them.
+//
+// Cost is the partial buffer: GEMM_SPLITK * tokens * out_dim floats, plus one extra read+write of
+// it. At T=64 and out_dim 896 with 4 splits that is ~917 KB, a fraction of a millisecond.
+// ---------------------------------------------------------------------------
+kernel void cpi_gemm_f16_splitk(device const half* w [[buffer(0)]],
+                                device const half* in [[buffer(1)]],
+                                device float* partial [[buffer(2)]],
+                                constant GemvParams& p [[buffer(3)]],
+                                uint tgid [[threadgroup_position_in_grid]],
+                                uint lid [[thread_position_in_threadgroup]],
+                                uint nthr [[threads_per_threadgroup]]) {
+  const uint sgid = lid / 32u;
+  const uint lane = lid % 32u;
+  const uint sg_row = sgid / GEMM_SG_COLS;
+  const uint sg_col = sgid % GEMM_SG_COLS;
+
+  const uint row_blocks = p.out_dim / GEMM_FBM;
+  const uint tok_tiles = (p.tokens + GEMM_BN - 1u) / GEMM_BN;
+  const uint per_split = row_blocks * tok_tiles;
+
+  const uint split = tgid / per_split;          // which slice of K this threadgroup reduces
+  const uint within = tgid % per_split;
+  const uint row0 = (within % row_blocks) * GEMM_FBM;
+  const uint tok0 = (within / row_blocks) * GEMM_BN;
+  if (tok0 >= p.tokens) return;
+
+  // K range for this split, snapped to whole GEMM_FBK blocks so the staging loop is unchanged.
+  const uint kblocks = (p.in_dim + GEMM_FBK - 1u) / GEMM_FBK;
+  const uint kb_per = (kblocks + GEMM_SPLITK - 1u) / GEMM_SPLITK;
+  const uint k_begin = split * kb_per * GEMM_FBK;
+  const uint k_end = min(p.in_dim, (split + 1u) * kb_per * GEMM_FBK);
+
+  threadgroup half Ws[GEMM_FBM * GEMM_FBK];
+  threadgroup half As[GEMM_BN * GEMM_FBK];
+
+  gemm_acc_t acc[GEMM_RF][GEMM_CF];
+  for (uint i = 0u; i < GEMM_RF; ++i)
+    for (uint j = 0u; j < GEMM_CF; ++j)
+      acc[i][j] = make_filled_simdgroup_matrix<gemm_acc_e, 8, 8>(gemm_acc_e(0));
+
+  const uint chunks = GEMM_FBK / 8u;
+
+  for (uint k0 = k_begin; k0 < k_end; k0 += GEMM_FBK) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint c = lid; c < GEMM_FBM * chunks; c += nthr) {
+      const uint r = c / chunks, sub = c % chunks;
+      *(threadgroup uint4*)(Ws + r * GEMM_FBK + sub * 8u) =
+          *(device const uint4*)(w + (ulong)(row0 + r) * (ulong)p.in_dim + k0 + sub * 8u);
+    }
+    for (uint c = lid; c < GEMM_BN * chunks; c += nthr) {
+      const uint t = c / chunks, sub = c % chunks;
+      threadgroup uint4* dst = (threadgroup uint4*)(As + t * GEMM_FBK + sub * 8u);
+      if (tok0 + t < p.tokens) {
+        *dst = *(device const uint4*)(in + (ulong)(tok0 + t) * (ulong)p.in_dim + k0 + sub * 8u);
+      } else {
+        *dst = uint4(0u);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint kk = 0u; kk < GEMM_FBK; kk += 8u) {
+      simdgroup_half8x8 wf[GEMM_RF], af[GEMM_CF];
+      for (uint i = 0u; i < GEMM_RF; ++i)
+        simdgroup_load(wf[i], Ws + (sg_row * GEMM_SG_ROWS + i * 8u) * GEMM_FBK + kk, GEMM_FBK,
+                       ulong2(0, 0), true);
+      for (uint j = 0u; j < GEMM_CF; ++j)
+        simdgroup_load(af[j], As + (sg_col * GEMM_SG_TOKS + j * 8u) * GEMM_FBK + kk, GEMM_FBK);
+      for (uint i = 0u; i < GEMM_RF; ++i)
+        for (uint j = 0u; j < GEMM_CF; ++j)
+          simdgroup_multiply_accumulate(acc[i][j], af[j], wf[i], acc[i][j]);
+    }
+  }
+
+  // Partials are [split][token][row], so the reduce reads consecutive splits with a fixed stride
+  // and writes the output layout unchanged.
+  const ulong plane = (ulong)p.tokens * (ulong)p.out_dim;
+  threadgroup gemm_acc_e* mine = (threadgroup gemm_acc_e*)Ws + sgid * 64u;
+  for (uint i = 0u; i < GEMM_RF; ++i) {
+    for (uint j = 0u; j < GEMM_CF; ++j) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      simdgroup_store(acc[i][j], mine, 8);
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+      for (uint e = lane; e < 64u; e += 32u) {
+        const uint t = e / 8u;
+        const uint r = e % 8u;
+        const uint tok = tok0 + sg_col * GEMM_SG_TOKS + j * 8u + t;
+        if (tok >= p.tokens) continue;
+        const uint row = row0 + sg_row * GEMM_SG_ROWS + i * 8u + r;
+        partial[(ulong)split * plane + (ulong)tok * (ulong)p.out_dim + row] = float(mine[t * 8u + r]);
+      }
+    }
+  }
+}
+
+// Sums the GEMM_SPLITK partials into the fp16 output, applying the bias once.
+kernel void cpi_gemm_splitk_reduce(device const float* partial [[buffer(0)]],
+                                   device half* out [[buffer(1)]],
+                                   device const half* bias [[buffer(2)]],
+                                   constant GemvParams& p [[buffer(3)]],
+                                   uint gid [[thread_position_in_grid]]) {
+  const uint n = p.tokens * p.out_dim;
+  if (gid >= n) return;
+  const ulong plane = (ulong)p.tokens * (ulong)p.out_dim;
+  float v = 0.0f;
+  for (uint s = 0u; s < GEMM_SPLITK; ++s) v += partial[(ulong)s * plane + gid];
+  if (p.has_bias != 0u) v += float(bias[gid % p.out_dim]);
+  out[gid] = half(v);
 }
 
 // Fills one K-block of the weight tile, dequantizing on the way in.

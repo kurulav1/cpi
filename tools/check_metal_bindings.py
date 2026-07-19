@@ -46,6 +46,7 @@ GEMM_BENCH = "src/tests/metal_gemm_bench.cpp"
 MIRRORS = {
     "GEMM_BN": [(ENGINE, "kGemmBN"), (SMOKE, "kSmokeGemmBN"), (GEMM_BENCH, "kBN")],
     "GEMM_FBM": [(ENGINE, "kGemmFBM"), (SMOKE, "kSmokeGemmFBM"), (GEMM_BENCH, "kFBM")],
+    "GEMM_SPLITK": [(ENGINE, "kGemmSplitK")],
     "GEMM_QBN": [(ENGINE, "kGemmQBN")],
     "GEMM_QBK": [(ENGINE, "kGemmQBK")],
     "GEMM_RF": [(ENGINE, "kGemmRF")],

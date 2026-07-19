@@ -126,6 +126,25 @@ constexpr std::size_t kPrefillSlotBudget = 256u * 1024u * 1024u;
 
 constexpr int kGemmBN = 32;    // MUST match GEMM_BN in the shader (fp16 tokens per tile)
 constexpr int kGemmFBM = 64;  // MUST match GEMM_FBM in the shader (fp16 rows per tile)
+constexpr int kGemmSplitK = 4;  // MUST match GEMM_SPLITK in the shader
+// Below this many threadgroups the fp16 GEMM does not fill the GPU, and splitting its
+// reduction across kGemmSplitK threadgroups each -- which costs a float partial buffer and a
+// summing pass -- wins. Above it, the grid is already wide and the extra pass is pure loss.
+//
+// Measured per shape at the tile this kernel uses (T=64, one dispatch each, best of 30):
+//   down_proj 896x4864   28 groups   0.867 -> 0.417 ms   (2.1x)
+//   q_proj     896x896   28 groups   0.141 -> 0.076 ms
+//   o_proj     896x896   28 groups   0.097 -> 0.051 ms
+//   gate_proj 4864x896  152 groups   0.415 -> 0.452 ms   (LOSS -- already wide)
+// By T=256 every one of these shapes is past the threshold and the split is off again, which
+// is what the measurements say should happen: at T=256 splitting q/o/gate all lose.
+constexpr std::size_t kGemmSplitKMaxGroups = 64;
+// ...and only while the token count is small. A narrow-output projection (k/v are 128 rows, so
+// two row blocks) keeps a small group count at EVERY prompt length, so a grid test alone splits
+// them inside the 512-token chunks of a long prefill, where splitting loses: measured 580 -> 590 ms
+// at T=2041 with the grid test alone. Both conditions together confine it to the regime the
+// per-shape measurements actually cover.
+constexpr int kGemmSplitKMaxTokens = 128;
 // One simdgroup per 32x32 sub-tile of the FBM x BN output tile: at 64x64 that is 2 x 2 = 4
 // simdgroups, 128 threads. DERIVED from the tile, never restated -- this line used to read
 // `32 * (64 / 32) * (kGemmBN / 32)`, and when the row tile went 64 -> 128 the literal 64 stayed.
@@ -924,7 +943,29 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
           // returned immediately, so it was pure waste rather than a wrong answer -- but it
           // hid the row-tile mismatch above by looking like it covered the rows.
           const std::size_t groups = (static_cast<std::size_t>(op.cols) / kGemmFBM) * tiles;
-          ctx_.dispatch("cpi_gemm_f16", G::Groups, groups, kGemmTG, bufs, offs, 4, &gp, sizeof(gp));
+
+          // Split the reduction when the grid is too small to fill the GPU. Shrinking the row
+          // tile to make more threadgroups was tried and lost, because it also halves how many
+          // output rows a staged weight tile serves and so doubles the weight traffic; splitting
+          // K does not, since every threadgroup reads a different slice of the weights.
+          const std::size_t out_elems =
+              static_cast<std::size_t>(gemm_tokens) * static_cast<std::size_t>(op.cols);
+          if (groups < kGemmSplitKMaxGroups && gemm_tokens <= kGemmSplitKMaxTokens) {
+            const std::size_t need = out_elems * kGemmSplitK * sizeof(float);
+            if (gemm_partial_buf_.size() < need) gemm_partial_buf_ = ctx_.alloc(need);
+            const void* sbufs[] = {bufs[0], bufs[1], gemm_partial_buf_.handle()};
+            const std::size_t soffs[] = {offs[0], offs[1], 0};
+            ctx_.dispatch("cpi_gemm_f16_splitk", G::Groups, groups * kGemmSplitK, kGemmTG, sbufs,
+                          soffs, 3, &gp, sizeof(gp));
+            const void* rbufs[] = {gemm_partial_buf_.handle(), bufs[2],
+                                   op.bias != nullptr ? bufs[3] : bufs[2]};
+            const std::size_t roffs2[] = {0, offs[2], op.bias != nullptr ? offs[3] : offs[2]};
+            ctx_.dispatch("cpi_gemm_splitk_reduce", G::Threads, out_elems, 256, rbufs, roffs2, 3,
+                          &gp, sizeof(gp));
+          } else {
+            ctx_.dispatch("cpi_gemm_f16", G::Groups, groups, kGemmTG, bufs, offs, 4, &gp,
+                          sizeof(gp));
+          }
         }
 
         const int rest = T - gemm_tokens;
