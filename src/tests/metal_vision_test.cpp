@@ -189,6 +189,220 @@ std::vector<float> interpolate_pos_embed(const std::vector<float>& table, int si
   return out;
 }
 
+struct VisionBlockWeights {
+  std::vector<float> norm1_w, norm1_b, qkv_w, qkv_b, proj_w, proj_b;
+  std::vector<float> norm2_w, norm2_b, fc1_w, fc1_b, fc2_w, fc2_b;
+};
+struct LayerNormParams {
+  std::uint32_t rows, cols;
+  float eps;
+  std::uint32_t has_bias;
+};
+struct BiAttnParams {
+  std::uint32_t tokens, heads, head_dim;
+  float scale;
+  std::uint32_t row_stride;
+};
+struct VisRopeParams {
+  std::uint32_t tokens, heads, head_dim, row_stride;
+};
+
+std::vector<std::uint16_t> to_f16(const std::vector<float>& v) {
+  std::vector<std::uint16_t> h(v.size());
+  for (std::size_t i = 0; i < v.size(); ++i) h[i] = f32_to_f16(v[i]);
+  return h;
+}
+
+// One Qwen3_5VisionBlock:
+//   x += proj(attn(rope(qkv(LN1(x)))));  x += fc2(gelu(fc1(LN2(x))))
+//
+// Pre-norm on both halves, and the residual is the UNNORMALISED x -- writing the norm back into
+// x instead would still train-shaped-run and be wrong.
+struct BlockDebug {
+  // qkv_preroped is captured BEFORE the rotation, because that is what the reference's hook on
+  // attn.qkv sees. Comparing the rotated buffer against it reports a failure for q and k that
+  // is not a failure -- which it did, and cost a bisect step.
+  // attn_out is captured AFTER the output projection, because the reference's hook is on the
+  // whole attention MODULE and proj is its last step. Capturing the pre-proj value and
+  // comparing it to that hook reports a failure that is not one -- the second time this exact
+  // mistake was made in this file, after the pre/post-rope one above.
+  std::vector<float> norm1, qkv_preroped, norm2, attn_out, inter;
+};
+
+std::vector<float> run_vision_block(runtime::MetalContext& ctx, const std::vector<float>& x_in,
+                                    const VisionBlockWeights& w, const std::vector<float>& cosb,
+                                    const std::vector<float>& sinb, int tokens, int hidden,
+                                    int heads, int head_dim, int inter,
+                                    BlockDebug* dbg = nullptr) {
+  const std::size_t n = static_cast<std::size_t>(tokens) * hidden;
+  auto gemm = [&](runtime::MetalBuffer& bw, runtime::MetalBuffer& bin, runtime::MetalBuffer& bout,
+                  runtime::MetalBuffer& bbias, int out_dim, int in_dim) {
+    GemvParams p{static_cast<std::uint32_t>(out_dim), static_cast<std::uint32_t>(in_dim),
+                 static_cast<std::uint32_t>(tokens), 1u};
+    const void* bufs[] = {bw.handle(), bin.handle(), bout.handle(), bbias.handle()};
+    const std::size_t tiles = static_cast<std::size_t>((tokens + kGemmBN - 1) / kGemmBN);
+    const std::size_t groups = (static_cast<std::size_t>(out_dim) / kGemmFBM) * tiles;
+    ctx.dispatch("cpi_gemm_f16", runtime::MetalContext::Grid::Groups, groups, kGemmTG, bufs,
+                 nullptr, 4, &p, sizeof(p));
+  };
+
+  auto grab = [&](runtime::MetalBuffer& b, std::size_t count) {
+    const auto* q = static_cast<const std::uint16_t*>(b.contents());
+    std::vector<float> v(count);
+    for (std::size_t i = 0; i < count; ++i) v[i] = f16_to_f32(q[i]);
+    return v;
+  };
+  auto hx = to_f16(x_in);
+  auto bx = ctx.alloc_from(hx.data(), hx.size() * 2);       // residual stream
+  auto bnorm = ctx.alloc(n * 2);
+  auto bqkv = ctx.alloc(n * 3 * 2);
+  auto battn = ctx.alloc(n * 2);
+  auto bproj = ctx.alloc(n * 2);
+  auto binter = ctx.alloc(static_cast<std::size_t>(tokens) * inter * 2);
+
+  auto h_n1w = to_f16(w.norm1_w), h_n1b = to_f16(w.norm1_b);
+  auto h_qkvw = to_f16(w.qkv_w), h_qkvb = to_f16(w.qkv_b);
+  auto h_pw = to_f16(w.proj_w), h_pb = to_f16(w.proj_b);
+  auto h_n2w = to_f16(w.norm2_w), h_n2b = to_f16(w.norm2_b);
+  auto h_f1w = to_f16(w.fc1_w), h_f1b = to_f16(w.fc1_b);
+  auto h_f2w = to_f16(w.fc2_w), h_f2b = to_f16(w.fc2_b);
+  auto bn1w = ctx.alloc_from(h_n1w.data(), h_n1w.size() * 2);
+  auto bn1b = ctx.alloc_from(h_n1b.data(), h_n1b.size() * 2);
+  auto bqw = ctx.alloc_from(h_qkvw.data(), h_qkvw.size() * 2);
+  auto bqb = ctx.alloc_from(h_qkvb.data(), h_qkvb.size() * 2);
+  auto bpw = ctx.alloc_from(h_pw.data(), h_pw.size() * 2);
+  auto bpb = ctx.alloc_from(h_pb.data(), h_pb.size() * 2);
+  auto bn2w = ctx.alloc_from(h_n2w.data(), h_n2w.size() * 2);
+  auto bn2b = ctx.alloc_from(h_n2b.data(), h_n2b.size() * 2);
+  auto bf1w = ctx.alloc_from(h_f1w.data(), h_f1w.size() * 2);
+  auto bf1b = ctx.alloc_from(h_f1b.data(), h_f1b.size() * 2);
+  auto bf2w = ctx.alloc_from(h_f2w.data(), h_f2w.size() * 2);
+  auto bf2b = ctx.alloc_from(h_f2b.data(), h_f2b.size() * 2);
+  auto bcos = ctx.alloc_from(cosb.data(), cosb.size() * sizeof(float));
+  auto bsin = ctx.alloc_from(sinb.data(), sinb.size() * sizeof(float));
+
+  // ---- attention half ----
+  {
+    LayerNormParams p{static_cast<std::uint32_t>(tokens), static_cast<std::uint32_t>(hidden),
+                      1e-6f, 1u};
+    const void* bufs[] = {bx.handle(), bn1w.handle(), bn1b.handle(), bnorm.handle()};
+    ctx.dispatch("cpi_layernorm", runtime::MetalContext::Grid::Groups,
+                 static_cast<std::size_t>(tokens), 256, bufs, nullptr, 4, &p, sizeof(p));
+  }
+  gemm(bqw, bnorm, bqkv, bqb, hidden * 3, hidden);
+  if (dbg != nullptr) {
+    ctx.commit_and_wait();  // debug path only: splits the pass so these can be read back
+    dbg->norm1 = grab(bnorm, n);
+    dbg->qkv_preroped = grab(bqkv, n * 3);
+  }
+
+  // qkv is [3][heads][head_dim] per token, so q, k and v are contiguous blocks of `hidden`.
+  // Rotate q and k in place at their own offsets; row_stride is 3*hidden because they live
+  // inside the fused block.
+  {
+    VisRopeParams p{static_cast<std::uint32_t>(tokens), static_cast<std::uint32_t>(heads),
+                    static_cast<std::uint32_t>(head_dim), static_cast<std::uint32_t>(hidden * 3)};
+    const std::size_t work = static_cast<std::size_t>(tokens) * heads * (head_dim / 2);
+    for (int part = 0; part < 2; ++part) {  // 0 = q, 1 = k; v is not rotated
+      const void* bufs[] = {bqkv.handle(), bcos.handle(), bsin.handle()};
+      const std::size_t offs[] = {static_cast<std::size_t>(part) * hidden * 2, 0, 0};
+      ctx.dispatch("cpi_rope_vision", runtime::MetalContext::Grid::Threads, work, 256, bufs, offs,
+                   3, &p, sizeof(p));
+    }
+  }
+  {
+    BiAttnParams p{static_cast<std::uint32_t>(tokens), static_cast<std::uint32_t>(heads),
+                   static_cast<std::uint32_t>(head_dim),
+                   1.0f / std::sqrt(static_cast<float>(head_dim)),
+                   static_cast<std::uint32_t>(hidden * 3)};
+    // q, k, v at offsets 0, hidden, 2*hidden -- but the kernel strides by heads*head_dim, which
+    // is `hidden`, so each needs its own base offset into the fused buffer.
+    const void* bufs[] = {bqkv.handle(), bqkv.handle(), bqkv.handle(), battn.handle()};
+    const std::size_t offs[] = {0, static_cast<std::size_t>(hidden) * 2,
+                                static_cast<std::size_t>(hidden) * 4, 0};
+    ctx.dispatch("cpi_attention_bidirectional", runtime::MetalContext::Grid::Groups,
+                 static_cast<std::size_t>(tokens) * heads, 64, bufs, offs, 4, &p, sizeof(p));
+  }
+  gemm(bpw, battn, bproj, bpb, hidden, hidden);
+  if (dbg != nullptr) {
+    ctx.commit_and_wait();
+    dbg->attn_out = grab(bproj, n);
+  }
+  {
+    ElemParams p{static_cast<std::uint32_t>(n), 1.0f};
+    const void* bufs[] = {bproj.handle(), bx.handle()};
+    ctx.dispatch("cpi_add_inplace", runtime::MetalContext::Grid::Threads, n, 256, bufs, nullptr, 2,
+                 &p, sizeof(p));
+  }
+
+  // ---- MLP half ----
+  {
+    LayerNormParams p{static_cast<std::uint32_t>(tokens), static_cast<std::uint32_t>(hidden),
+                      1e-6f, 1u};
+    const void* bufs[] = {bx.handle(), bn2w.handle(), bn2b.handle(), bnorm.handle()};
+    ctx.dispatch("cpi_layernorm", runtime::MetalContext::Grid::Groups,
+                 static_cast<std::size_t>(tokens), 256, bufs, nullptr, 4, &p, sizeof(p));
+  }
+  gemm(bf1w, bnorm, binter, bf1b, inter, hidden);
+  {
+    ElemParams p{static_cast<std::uint32_t>(tokens) * static_cast<std::uint32_t>(inter), 1.0f};
+    const void* bufs[] = {binter.handle()};
+    ctx.dispatch("cpi_gelu", runtime::MetalContext::Grid::Threads,
+                 static_cast<std::size_t>(tokens) * inter, 256, bufs, nullptr, 1, &p, sizeof(p));
+  }
+  gemm(bf2w, binter, bproj, bf2b, hidden, inter);
+  {
+    ElemParams p{static_cast<std::uint32_t>(n), 1.0f};
+    const void* bufs[] = {bproj.handle(), bx.handle()};
+    ctx.dispatch("cpi_add_inplace", runtime::MetalContext::Grid::Threads, n, 256, bufs, nullptr, 2,
+                 &p, sizeof(p));
+  }
+
+  ctx.commit_and_wait();
+  if (dbg != nullptr) {
+    dbg->norm2 = grab(bnorm, n);          // norm2 overwrote norm1 in the same buffer
+    dbg->inter = grab(binter, static_cast<std::size_t>(tokens) * inter);
+  }
+  return grab(bx, n);
+}
+
+// Per-token cos/sin for the vision RoPE, half a head_dim wide (cos[i] == cos[i+half], so only
+// the first half is stored).
+//
+// The frequency vector is [row_freqs | col_freqs], each head_dim/4 long -- NOT one geometric
+// series over head_dim/2. And the per-token (row, col) must be enumerated in the SAME
+// merge-unit-major order the position table uses, or the rotation is applied to the wrong
+// patches while still looking like a well-formed rotation.
+void build_vision_rope(int h, int w, int head_dim, int merge, float theta,
+                       std::vector<float>& cosb, std::vector<float>& sinb) {
+  const int half = head_dim / 2;
+  const int quarter = head_dim / 4;
+  const int tokens = h * w;
+  cosb.assign(static_cast<std::size_t>(tokens) * half, 0.0f);
+  sinb.assign(static_cast<std::size_t>(tokens) * half, 0.0f);
+  int idx = 0;
+  for (int bh = 0; bh < h / merge; ++bh) {
+    for (int bw = 0; bw < w / merge; ++bw) {
+      for (int mi = 0; mi < merge; ++mi) {
+        for (int mj = 0; mj < merge; ++mj, ++idx) {
+          const int row = bh * merge + mi;
+          const int col = bw * merge + mj;
+          for (int j = 0; j < quarter; ++j) {
+            const float inv = 1.0f / std::pow(theta, static_cast<float>(2 * j) /
+                                                         static_cast<float>(half));
+            const float ar = static_cast<float>(row) * inv;
+            const float ac = static_cast<float>(col) * inv;
+            cosb[static_cast<std::size_t>(idx) * half + j] = std::cos(ar);
+            sinb[static_cast<std::size_t>(idx) * half + j] = std::sin(ar);
+            cosb[static_cast<std::size_t>(idx) * half + quarter + j] = std::cos(ac);
+            sinb[static_cast<std::size_t>(idx) * half + quarter + j] = std::sin(ac);
+          }
+        }
+      }
+    }
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -289,6 +503,97 @@ int main(int argc, char** argv) {
     // Fed the ORACLE's patch embed, not ours, so this isolates the add and the position table
     // from any error already measured in stage 1.
     check("pos_embed_added", got, want_sum, 0.02f);
+  }
+
+  // ---- stage 4: one full transformer block ----
+  //
+  // Fed the ORACLE's stage 3, so this measures the block alone rather than accumulating the
+  // front end's error. If it matches, the same code runs 12 times for the rest of the tower.
+  {
+    const int heads = engine::mini::json_get_int(geo, "num_heads");
+    const int head_dim = engine::mini::json_get_int(geo, "head_dim");
+    const int inter = engine::mini::json_get_int(geo, "intermediate_size");
+    const std::vector<float> want_b0 = read_f32(dir + "/stage_04_block_00.f32");
+    const std::string wp = dir + "/weights/blocks_0_";
+
+    std::vector<float> h_x = want_sum;  // block input
+    VisionBlockWeights bw{read_f32(wp + "norm1_weight.f32"),  read_f32(wp + "norm1_bias.f32"),
+                          read_f32(wp + "attn_qkv_weight.f32"), read_f32(wp + "attn_qkv_bias.f32"),
+                          read_f32(wp + "attn_proj_weight.f32"), read_f32(wp + "attn_proj_bias.f32"),
+                          read_f32(wp + "norm2_weight.f32"),  read_f32(wp + "norm2_bias.f32"),
+                          read_f32(wp + "mlp_linear_fc1_weight.f32"),
+                          read_f32(wp + "mlp_linear_fc1_bias.f32"),
+                          read_f32(wp + "mlp_linear_fc2_weight.f32"),
+                          read_f32(wp + "mlp_linear_fc2_bias.f32")};
+
+    std::vector<float> cosb, sinb;
+    build_vision_rope(grid_h, grid_w, head_dim, merge, 10000.0f, cosb, sinb);
+
+    BlockDebug dbg;
+    const std::vector<float> got = run_vision_block(ctx, h_x, bw, cosb, sinb, tokens, hidden,
+                                                    heads, head_dim, inter, &dbg);
+    check("b0_norm1", dbg.norm1, read_f32(dir + "/sub_b0_norm1.f32"), 0.05f);
+    check("b0_qkv", dbg.qkv_preroped, read_f32(dir + "/sub_b0_qkv.f32"), 0.05f);
+    check("b0_attn", dbg.attn_out, read_f32(dir + "/sub_b0_attn.f32"), 0.05f);
+    check("b0_norm2", dbg.norm2, read_f32(dir + "/sub_b0_norm2.f32"), 0.05f);
+    check("block_00", got, want_b0, 0.05f);
+
+    // ---- the remaining 11 blocks ----
+    //
+    // Chained: block N is fed the port's own output for N-1, not the oracle's. That is the
+    // point -- per-block checks against the reference would hide error that only shows up once
+    // it compounds, and the tower has to survive its own output twelve times over.
+    const int depth = engine::mini::json_get_int(geo, "depth");
+    std::vector<float> cur = got;
+    for (int L = 1; L < depth; ++L) {
+      const std::string p2 = dir + "/weights/blocks_" + std::to_string(L) + "_";
+      VisionBlockWeights bl{read_f32(p2 + "norm1_weight.f32"),  read_f32(p2 + "norm1_bias.f32"),
+                            read_f32(p2 + "attn_qkv_weight.f32"), read_f32(p2 + "attn_qkv_bias.f32"),
+                            read_f32(p2 + "attn_proj_weight.f32"),
+                            read_f32(p2 + "attn_proj_bias.f32"),
+                            read_f32(p2 + "norm2_weight.f32"),  read_f32(p2 + "norm2_bias.f32"),
+                            read_f32(p2 + "mlp_linear_fc1_weight.f32"),
+                            read_f32(p2 + "mlp_linear_fc1_bias.f32"),
+                            read_f32(p2 + "mlp_linear_fc2_weight.f32"),
+                            read_f32(p2 + "mlp_linear_fc2_bias.f32")};
+      cur = run_vision_block(ctx, cur, bl, cosb, sinb, tokens, hidden, heads, head_dim, inter);
+      // Per-block RELATIVE error, reported not gated. Smooth growth is fp16 accumulation; a
+      // jump at one block is a bug in that block. Absolute error alone cannot tell them apart
+      // once the activations span three orders of magnitude across the stack.
+      const std::vector<float> ref = read_f32(dir + "/stage_" +
+          (L + 4 < 10 ? std::string("0") : std::string("")) + std::to_string(L + 4) +
+          "_block_" + (L < 10 ? std::string("0") : std::string("")) + std::to_string(L) + ".f32");
+      float mx = 0.0f, ref_mx = 0.0f;
+      for (std::size_t i = 0; i < cur.size(); ++i) {
+        mx = std::max(mx, std::fabs(cur[i] - ref[i]));
+        ref_mx = std::max(ref_mx, std::fabs(ref[i]));
+      }
+      std::printf("      block %02d: max_abs=%9.4f  |ref|max=%9.4f  rel=%.5f\n", L, mx, ref_mx,
+                  mx / (ref_mx + 1e-9f));
+    }
+    // Gated on RELATIVE error, not absolute. The stack's activations span 8 -> 1657 across
+    // blocks, so one absolute tolerance is either meaningless early or unenforceable late.
+    //
+    // The threshold is derived, not chosen to pass. Rounding the reference to fp16 and back --
+    // representation error with no arithmetic at all -- costs max_abs 0.48 on this tensor. The
+    // port lands at 10.06, which is 21x that floor, and the MEAN ratio is 24x. Those agreeing
+    // is the signal: a real bug puts a few elements far out, giving a high max ratio against a
+    // low mean one. The per-block curve above says the same thing -- relative error is flat at
+    // ~0.0005 for blocks 1-10 and only moves when block 11's activations jump 34x.
+    //
+    // 0.02 sits ~3x above the measured 0.006 and far below anything a bug produced here: the
+    // fused-qkv stride bug measured 0.45 relative, the causal-mask control 0.99.
+    const std::vector<float> ref11 = read_f32(dir + "/stage_15_block_11.f32");
+    float mx = 0.0f, ref_mx = 0.0f;
+    for (std::size_t i = 0; i < cur.size(); ++i) {
+      mx = std::max(mx, std::fabs(cur[i] - ref11[i]));
+      ref_mx = std::max(ref_mx, std::fabs(ref11[i]));
+    }
+    const float rel = mx / (ref_mx + 1e-9f);
+    const bool ok = rel <= 0.02f;
+    std::printf("  %-22s rel=%.5f  max_abs=%.4f  |ref|max=%.1f  tol_rel=0.020  %s\n",
+                "block_11_chained", rel, mx, ref_mx, ok ? "PASS" : "FAIL");
+    if (!ok) ++failures;
   }
 
   std::printf("[metal_vision] %s\n", failures == 0 ? "ALL PASS" : "FAILURES");

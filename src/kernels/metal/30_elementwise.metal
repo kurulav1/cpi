@@ -177,3 +177,59 @@ kernel void cpi_kv_store(
 // Each query keeps its OWN online-softmax state (running max, running sum), because each
 // attends to a different prefix: causality masks key > that query's position.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Plain (ungated) GELU, tanh approximation -- gelu_pytorch_tanh.
+//
+// The vision MLP is fc1 -> gelu -> fc2, not a gated GeGLU, so cpi_gelu_mul does not fit.
+// Same sigmoid formulation as that kernel and for the same reason: writing this as
+// 0.5*x*(1 + tanh(inner)) gives NaN on Metal for |inner| beyond ~44, where CUDA's tanhf
+// saturates. See the note above cpi_gelu_mul.
+// ---------------------------------------------------------------------------
+kernel void cpi_gelu(
+    device half*        x   [[buffer(0)]],
+    constant ElemParams& p  [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid >= p.n) return;
+  const float v = float(x[gid]);
+  const float k = 0.7978845608028654f;  // sqrt(2/pi)
+  const float inner = k * (v + 0.044715f * v * v * v);
+  x[gid] = half(v / (1.0f + exp(-2.0f * inner)));
+}
+
+// ---------------------------------------------------------------------------
+// RoPE for a vision tower, from PRECOMPUTED per-token cos/sin tables.
+//
+// The rotation itself is the same rotate_half pairing cpi_rope uses -- (i, i+head_dim/2) --
+// but the ANGLES are not derivable from a scalar position: each patch has a (row, column),
+// and the frequency vector is [row_freqs | col_freqs] rather than one geometric series. So the
+// table is built on the host (tokens * head_dim/2 floats, once per image) and read here.
+//
+// Not cpi_rope_2d_inplace from the Gemma 4 tower, which looks applicable and is not: it pairs
+// lanes WITHIN each axis's half (j, j+pairs_per_half), where this pairs ACROSS the midpoint.
+// Same idea, different lanes, silently wrong output.
+// ---------------------------------------------------------------------------
+kernel void cpi_rope_vision(
+    device half*        x    [[buffer(0)]],
+    device const float* cosb [[buffer(1)]],
+    device const float* sinb [[buffer(2)]],
+    constant VisRopeParams& p [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]) {
+  const uint half_dim = p.head_dim / 2u;
+  const uint total = p.tokens * p.heads * half_dim;
+  if (gid >= total) return;
+
+  const uint i     = gid % half_dim;
+  const uint head  = (gid / half_dim) % p.heads;
+  const uint token = gid / (half_dim * p.heads);
+
+  const float c = cosb[token * half_dim + i];
+  const float s = sinb[token * half_dim + i];
+
+  // row_stride lets this address q and k inside a fused qkv block without copying them out.
+  const ulong base = (ulong)token * (ulong)p.row_stride + (ulong)head * (ulong)p.head_dim + i;
+  const float a = float(x[base]);
+  const float b = float(x[base + half_dim]);
+  x[base]            = half(a * c - b * s);
+  x[base + half_dim] = half(a * s + b * c);
+}

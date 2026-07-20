@@ -65,6 +65,15 @@ struct LayerNormParams {
 #error "BIATTN_CHUNK must be a multiple of 32"
 #endif
 
+// Vision RoPE driven by host-built cos/sin tables. row_stride is the distance between tokens
+// in the buffer being rotated, so q and k can be rotated in place inside a fused qkv block.
+struct VisRopeParams {
+  uint tokens;
+  uint heads;
+  uint head_dim;
+  uint row_stride;
+};
+
 // Bidirectional attention over a patch grid. No window, no KV cache, no position: every
 // query sees every key, which is the whole difference from the causal params above.
 struct BiAttnParams {
@@ -72,6 +81,7 @@ struct BiAttnParams {
   uint heads;
   uint head_dim;
   float scale;
+  uint row_stride;  // 0 => packed (heads * head_dim); else the fused-qkv stride
 };
 
 struct GemvParams {

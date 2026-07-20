@@ -132,6 +132,7 @@ struct VisStdParams {
 struct BiAttnParams {
   std::uint32_t tokens, heads, head_dim;
   float scale;
+  std::uint32_t row_stride;
 };
 // Mirrors LayerNormParams in 00_common.metal.
 struct LayerNormParams {
@@ -1088,7 +1089,7 @@ int main() {
     auto bq = ctx.alloc_from(q.data(), n * 2), bk = ctx.alloc_from(k.data(), n * 2);
     auto bv = ctx.alloc_from(v.data(), n * 2), bo = ctx.alloc(n * 2);
     const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
-    BiAttnParams p{tokens, heads, hd, scale};
+    BiAttnParams p{tokens, heads, hd, scale, 0u};
     const void* bufs[] = {bq.handle(), bk.handle(), bv.handle(), bo.handle()};
     ctx.dispatch("cpi_attention_bidirectional", runtime::MetalContext::Grid::Groups,
                  tokens * heads, 64, bufs, nullptr, 4, &p, sizeof(p));

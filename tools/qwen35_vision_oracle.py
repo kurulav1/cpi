@@ -117,6 +117,25 @@ def main() -> int:
         handles.append(block.register_forward_hook(record("block_%02d" % i)))
     handles.append(model.merger.register_forward_hook(record("merger")))
 
+    # Block 0's internals, dumped separately. A block is seven things in a trench coat
+    # (two norms, a fused qkv, a rotation, the attention, two projections, an activation),
+    # and "block_00 is wrong" does not say which. These land in their own name space rather
+    # than the stage sequence, so the stage indices stay stable when this is switched off.
+    sub: list[tuple[str, torch.Tensor]] = []
+
+    def record_sub(name):
+        def hook(_mod, _inp, output):
+            t = output[0] if isinstance(output, tuple) else output
+            sub.append((name, t.detach().to(torch.float32).contiguous()))
+        return hook
+
+    b0 = model.blocks[0]
+    for name, mod in [("norm1", b0.norm1), ("qkv", b0.attn.qkv), ("attn", b0.attn),
+                      ("proj", b0.attn.proj), ("norm2", b0.norm2),
+                      ("fc1", b0.mlp.linear_fc1), ("fc2", b0.mlp.linear_fc2),
+                      ("mlp", b0.mlp)]:
+        handles.append(mod.register_forward_hook(record_sub("b0_" + name)))
+
     out = model(pixels, grid_thw)
     for h in handles:
         h.remove()
@@ -186,6 +205,18 @@ def main() -> int:
         manifest["weights"].append({"name": name, "shape": list(tensor.shape),
                                     "file": "weights/" + fname})
     print("[oracle] wrote %d weight tensors" % len(manifest["weights"]))
+
+    # The rotary table itself, so a port can check the ANGLES separately from their
+    # application. A wrong table and a wrong rotation look identical downstream.
+    rpe = model.rot_pos_emb(grid_thw).detach().to(torch.float32).contiguous()
+    sub.append(("rot_pos_emb", rpe))
+
+    manifest["sub_stages"] = []
+    for name, t in sub:
+        fname = "sub_%s.f32" % name
+        (out_dir / fname).write_bytes(t.numpy().astype("<f4").tobytes())
+        manifest["sub_stages"].append({"name": name, "shape": list(t.shape), "file": fname})
+        print("  %-18s %-18s %s" % (name, tuple(t.shape), fname))
 
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=1), encoding="utf-8")
     print("[oracle] wrote %d stages to %s" % (len(manifest["stages"]), out_dir))

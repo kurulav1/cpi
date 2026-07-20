@@ -1431,7 +1431,15 @@ kernel void cpi_attention_bidirectional(
   if (gid >= total) return;
   const uint t    = gid / p.heads;
   const uint head = gid % p.heads;
-  const uint dim  = p.heads * p.head_dim;
+  // The row stride is NOT heads*head_dim in general: a fused qkv projection leaves q, k and v
+  // interleaved in one buffer with a stride of 3*hidden, and each is addressed by its own base
+  // offset. Assuming the packed stride reads q's row t from wherever k's row t/3 happens to be
+  // -- plausible numbers, wrong attention.
+  const uint dim  = (p.row_stride != 0u) ? p.row_stride : (p.heads * p.head_dim);
+  // The OUTPUT is its own packed [tokens][heads*head_dim] buffer, so it never carries the
+  // fused stride. Using `dim` for both -- which is the natural way to write this -- scatters
+  // each token's result three rows apart and leaves two thirds of the buffer untouched.
+  const uint out_dim = p.heads * p.head_dim;
   const uint hoff = head * p.head_dim;
 
   device const half* qh = q + (ulong)t * dim + hoff;
@@ -1515,6 +1523,6 @@ kernel void cpi_attention_bidirectional(
 
   const float inv = 1.0f / (stats[1] + 1e-20f);
   for (uint d = lid; d < p.head_dim; d += nthr) {
-    out[(ulong)t * dim + hoff + d] = half(acc[d] * inv);
+    out[(ulong)t * out_dim + hoff + d] = half(acc[d] * inv);
   }
 }
