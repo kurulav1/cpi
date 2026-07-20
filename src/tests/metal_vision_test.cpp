@@ -982,13 +982,103 @@ int main(int argc, char** argv) {
     }
 
     const std::vector<std::int32_t> mpos = engine::build_mrope_positions(toks, IMG, mh, mw);
-    eng.prefill_multimodal(toks, embeds, mpos);
 
-    int pos = engine::mrope_next_position(toks, IMG, mh, mw);
+    // Prefill everything EXCEPT the last token, then push that one through forward_token.
+    //
+    // prefill_multimodal consumes every token it is handed -- prefill_chunks(n) covers all n --
+    // and there is no accessor for the logits it leaves behind. So prefilling all of `toks` and
+    // then calling forward_token(toks.back()) feeds the final token TWICE, at n-1 and again at
+    // n, which corrupts the KV cache and shifts every position after it.
+    //
+    // This loop did exactly that, and it is what MULTIMODAL_stream was really measuring. The
+    // same mistake in qwen35_text_test produced the last prompt token eight times in a row,
+    // which is what made it visible: here it merely looked like a plausible near-tie at step 5.
+    const int n_tok = static_cast<int>(toks.size());
+    const std::vector<int> head(toks.begin(), toks.end() - 1);
+    const std::vector<std::vector<float>> head_embeds(embeds.begin(), embeds.end() - 1);
+    // mpos is [3][n_tok]; the prefill needs [3][n_tok-1] with the same axis-major layout.
+    std::vector<std::int32_t> head_mpos(static_cast<std::size_t>(3) * (n_tok - 1));
+    for (int axis = 0; axis < 3; ++axis) {
+      for (int t = 0; t < n_tok - 1; ++t) {
+        head_mpos[static_cast<std::size_t>(axis) * (n_tok - 1) + t] =
+            mpos[static_cast<std::size_t>(axis) * n_tok + t];
+      }
+    }
+    eng.prefill_multimodal(head, head_embeds, head_mpos);
+
+    // The last prompt token is text, so its three M-RoPE axes agree and forward_token's scalar
+    // position is exact. mrope_next_position reports where the NEXT token goes, so the last
+    // prompt token sits one before it.
+    const int last_pos = engine::mrope_next_position(toks, IMG, mh, mw) - 1;
+    int pos = last_pos;
     std::vector<int> got;
     int next = toks.back();
     for (int i = 0; i < 8; ++i) {
       const std::vector<float>& lg = eng.forward_token(next, pos + i);
+
+      // ---- step 0 against the oracle's DENSE logits ----
+      //
+      // MULTIMODAL_stream compares eight argmax decisions. That is 8 bits of evidence about a
+      // 248320-wide vector, and it cannot tell "our logits are slightly off" from "our logits
+      // are badly off but the ordering survived". qwen35_multimodal_oracle.py has been dumping
+      // first_step_logits.f32 since it was written and NOTHING has ever compared against it --
+      // the same written-but-unrun pattern as the fp16 fixture.
+      //
+      // Step 0 specifically, because it is the last position where the two runs are guaranteed
+      // to be looking at identical input: from step 1 on, any divergence feeds itself.
+      if (i == 0) {
+        const std::string mmdir = dir + "/../q35_mm/first_step_logits.f32";
+        std::FILE* probe = std::fopen(mmdir.c_str(), "rb");
+        if (probe == nullptr) {
+          std::printf("      %-20s no q35_mm dump next to the oracle dir; skipped\n",
+                      "FIRST_STEP_LOGITS");
+        } else {
+          std::fclose(probe);
+          const std::vector<float> ref = read_f32(mmdir);
+          if (ref.size() != lg.size()) {
+            std::printf("  %-22s size %zu vs oracle %zu  FAIL\n", "FIRST_STEP_LOGITS", lg.size(),
+                        ref.size());
+            ++failures;
+          } else {
+            // Compare the SHAPE of the distribution, not raw magnitudes: a constant offset
+            // across every logit is invisible to softmax and to argmax, so it is not an error.
+            // Centre both on their own mean before differencing.
+            double mg = 0.0, mr = 0.0;
+            for (std::size_t j = 0; j < lg.size(); ++j) { mg += lg[j]; mr += ref[j]; }
+            mg /= static_cast<double>(lg.size());
+            mr /= static_cast<double>(ref.size());
+            float mx = 0.0f;
+            double sum = 0.0;
+            int arg_g = 0, arg_r = 0;
+            for (std::size_t j = 0; j < lg.size(); ++j) {
+              const float d = std::fabs((lg[j] - static_cast<float>(mg)) -
+                                        (ref[j] - static_cast<float>(mr)));
+              mx = std::max(mx, d);
+              sum += d;
+              if (lg[j] > lg[static_cast<std::size_t>(arg_g)]) arg_g = static_cast<int>(j);
+              if (ref[j] > ref[static_cast<std::size_t>(arg_r)]) arg_r = static_cast<int>(j);
+            }
+            // Also price the pair that actually decides step 5, at step 0: if OUR gap between
+            // them is already drifting here, the divergence is not born at step 5.
+            const float g35 = lg[3160] - lg[3878];
+            const float r35 = ref[3160] - ref[3878];
+            std::printf("      argmax ours=%d oracle=%d | logit(3160)-logit(3878): ours=%+.4f "
+                        "oracle=%+.4f  drift=%+.4f\n", arg_g, arg_r, g35, r35, g35 - r35);
+            // Tolerance 0.20 on the MEAN, set from the text-only control rather than from
+            // whatever this happens to score. qwen35_text_test runs this exact measurement with
+            // no image, no splice and 1-D rope, and gets mean_abs 0.12 -- so 0.12 is what the
+            // shared text stack costs, and anything much above it is multimodal-specific.
+            //
+            // Currently 0.484, so this FAILS deliberately. Four times the text path's drift is a
+            // defect in the splice, the soft-token scaling or M-RoPE, and the tower is not a
+            // candidate: it is gated at rel 0.0032 upstream. Do not widen this to make it green.
+            const double mean_abs = sum / static_cast<double>(lg.size());
+            std::printf("  %-22s max_abs=%.4f  mean_abs=%.4f  tol_mean=0.20 (text ctrl 0.12)  %s\n",
+                        "FIRST_STEP_LOGITS", mx, mean_abs, mean_abs <= 0.20 ? "PASS" : "FAIL");
+            if (mean_abs > 0.20) ++failures;
+          }
+        }
+      }
       int best = 0;
       for (std::size_t j = 1; j < lg.size(); ++j) {
         if (lg[j] > lg[static_cast<std::size_t>(best)]) best = static_cast<int>(j);

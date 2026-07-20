@@ -393,6 +393,13 @@ if(LLAMA_ENGINE_ENABLE_METAL)
   # No add_test: it needs an oracle directory produced by a torch/transformers run, which the
   # Mac cannot generate. Run it by hand with the dumps copied over.
 
+  # Qwen3.5's text stack vs a HuggingFace logits oracle. No add_test: it needs both a container
+  # and an oracle dump from a torch run, neither of which the Mac can produce. It is also the
+  # control for metal_vision_test's FIRST_STEP_LOGITS -- see the file header.
+  add_executable(qwen35_text_test src/tests/qwen35_text_test.cpp)
+  target_link_libraries(qwen35_text_test PRIVATE llama_engine)
+  target_include_directories(qwen35_text_test PRIVATE include)
+
   add_executable(metal_smoke src/tests/metal_smoke.cpp)
   target_link_libraries(metal_smoke PRIVATE llama_engine)
   target_include_directories(metal_smoke PRIVATE include)
