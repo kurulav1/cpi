@@ -1,6 +1,7 @@
 // Metal executor for the op-plan IR. See plan_metal_engine.hpp.
 
 #include "engine/plan_metal_engine.hpp"
+#include "runtime/fp16.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -94,33 +95,12 @@ struct EmbedParams {
 // NOT in a namespace called `detail`: engine::detail is the shared sampler's namespace,
 // and clang rightly calls the lookup ambiguous (MSVC silently picked one).
 // The engine only ever read fp16 before this; the image splice has to WRITE it.
-inline std::uint16_t f32_to_fp16(float f) {
-  std::uint32_t x;
-  std::memcpy(&x, &f, 4);
-  const std::uint32_t sign = (x >> 16) & 0x8000u;
-  const std::int32_t exp = static_cast<std::int32_t>((x >> 23) & 0xFFu) - 127 + 15;
-  const std::uint32_t man = x & 0x7FFFFFu;
-  if (exp <= 0) return static_cast<std::uint16_t>(sign);
-  if (exp >= 31) return static_cast<std::uint16_t>(sign | 0x7C00u);
-  return static_cast<std::uint16_t>(sign | (static_cast<std::uint32_t>(exp) << 10) | (man >> 13));
-}
-
-inline float fp16_to_f32(std::uint16_t h) {
-  const std::uint32_t sign = static_cast<std::uint32_t>(h >> 15) << 31;
-  const std::uint32_t exp = (h >> 10) & 0x1F;
-  const std::uint32_t mant = h & 0x3FF;
-  std::uint32_t bits;
-  if (exp == 0) {
-    bits = sign;  // denormals flush to zero; they are far below any quantization level
-  } else if (exp == 31) {
-    bits = sign | 0x7F800000u | (mant << 13);
-  } else {
-    bits = sign | ((exp + 112) << 23) | (mant << 13);
-  }
-  float f;
-  std::memcpy(&f, &bits, 4);
-  return f;
-}
+// These were local copies that truncated the mantissa and flushed subnormals to zero. The old
+// comment here read "denormals flush to zero; they are far below any quantization level" -- true
+// of their magnitude, but they are not below the level at which a systematic, one-directional
+// bias accumulates. See include/runtime/fp16.hpp; gated by metal_fp16_test.
+inline std::uint16_t f32_to_fp16(float f) { return cpi::f32_to_f16(f); }
+inline float fp16_to_f32(std::uint16_t h) { return cpi::f16_to_f32(h); }
 
 struct QuantParams {
   std::uint32_t out_dim, in_dim, tokens, bits, group, groups, has_bias;

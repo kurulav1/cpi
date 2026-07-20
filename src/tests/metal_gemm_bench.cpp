@@ -26,37 +26,15 @@
 #include <string>
 #include <vector>
 
+#include "runtime/fp16.hpp"
 #include "runtime/metal_context.hpp"
 
 namespace {
 
-std::uint16_t f32_to_f16(float f) {
-  std::uint32_t x;
-  std::memcpy(&x, &f, 4);
-  const std::uint32_t sign = (x >> 16) & 0x8000u;
-  std::int32_t exp = static_cast<std::int32_t>((x >> 23) & 0xFF) - 127 + 15;
-  std::uint32_t man = x & 0x7FFFFFu;
-  if (exp <= 0) return static_cast<std::uint16_t>(sign);
-  if (exp >= 31) return static_cast<std::uint16_t>(sign | 0x7C00u);
-  return static_cast<std::uint16_t>(sign | (static_cast<std::uint32_t>(exp) << 10) | (man >> 13));
-}
-
-float f16_to_f32(std::uint16_t h) {
-  const std::uint32_t sign = (h & 0x8000u) << 16;
-  const std::uint32_t exp = (h >> 10) & 0x1Fu;
-  const std::uint32_t man = h & 0x3FFu;
-  std::uint32_t out;
-  if (exp == 0) {
-    out = sign;
-  } else if (exp == 31) {
-    out = sign | 0x7F800000u | (man << 13);
-  } else {
-    out = sign | ((exp - 15 + 127) << 23) | (man << 13);
-  }
-  float f;
-  std::memcpy(&f, &out, 4);
-  return f;
-}
+// Shared with the engine. This one is a BENCH, so its accuracy column was never load-bearing --
+// which is exactly why a private, differently-rounding copy could sit here unnoticed.
+inline std::uint16_t f32_to_f16(float f) { return cpi::f32_to_f16(f); }
+inline float f16_to_f32(std::uint16_t h) { return cpi::f16_to_f32(h); }
 
 // MUST match the shader / engine. The whole bug was a copy of these drifting, so they are
 // stated once and everything below derives from them.

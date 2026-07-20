@@ -22,38 +22,16 @@
 #include <vector>
 
 #include "engine/plan_metal_engine.hpp"
+#include "runtime/fp16.hpp"
 
 namespace engine {
 
 namespace {
 
-std::uint16_t f32_to_f16_bits(float f) {
-  std::uint32_t x;
-  std::memcpy(&x, &f, 4);
-  const std::uint32_t sign = (x >> 16) & 0x8000u;
-  const std::int32_t exp = static_cast<std::int32_t>((x >> 23) & 0xFFu) - 127 + 15;
-  const std::uint32_t man = x & 0x7FFFFFu;
-  if (exp <= 0) return static_cast<std::uint16_t>(sign);
-  if (exp >= 31) return static_cast<std::uint16_t>(sign | 0x7C00u);
-  return static_cast<std::uint16_t>(sign | (static_cast<std::uint32_t>(exp) << 10) | (man >> 13));
-}
-
-float f16_bits_to_f32(std::uint16_t h) {
-  const std::uint32_t sign = (h & 0x8000u) << 16;
-  const std::uint32_t exp = (h >> 10) & 0x1Fu;
-  const std::uint32_t man = h & 0x3FFu;
-  std::uint32_t out;
-  if (exp == 0) {
-    out = sign;
-  } else if (exp == 31) {
-    out = sign | 0x7F800000u | (man << 13);
-  } else {
-    out = sign | ((exp - 15 + 127) << 23) | (man << 13);
-  }
-  float f;
-  std::memcpy(&f, &out, 4);
-  return f;
-}
+// Was a local copy that truncated and flushed subnormals; see include/runtime/fp16.hpp for what
+// that cost and metal_fp16_test for the gate.
+inline std::uint16_t f32_to_f16_bits(float f) { return cpi::f32_to_f16(f); }
+inline float f16_bits_to_f32(std::uint16_t h) { return cpi::f16_to_f32(h); }
 
 struct GemvParams {
   std::uint32_t out_dim, in_dim, tokens, has_bias;
@@ -357,9 +335,9 @@ std::vector<float> PlanMetalEngine::encode_image(const std::vector<float>& patch
     // Host-side rather than a kernel: one pass over tokens*hidden, against twelve blocks of
     // GEMMs. It does not register, and the buffer is already host-addressable.
     //
-    // NOTE: the rounding here is f32_to_f16_bits, which TRUNCATES and flushes fp16 subnormals to
-    // zero -- it is not IEEE. That is a separate, still-open defect shared by five copies of this
-    // converter; see docs/qwen35-vision-handoff.md.
+    // The single rounding here is IEEE round-to-nearest (include/runtime/fp16.hpp). It used to
+    // be a local truncating converter, which put a second, one-directional error on top of the
+    // one this fix removes.
     auto* dst = static_cast<std::uint16_t*>(bx.contents());
     for (std::size_t i = 0; i < n; ++i) {
       dst[i] = f32_to_f16_bits(f16_bits_to_f32(dst[i]) + pos[i]);

@@ -21,38 +21,17 @@
 #include <string>
 #include <vector>
 
+#include "runtime/fp16.hpp"
 #include "runtime/metal_context.hpp"
 
 namespace {
 
-// Minimal fp16 <-> fp32, so this test depends on nothing but the context.
-std::uint16_t f32_to_f16(float f) {
-  std::uint32_t x;
-  std::memcpy(&x, &f, 4);
-  const std::uint32_t sign = (x >> 16) & 0x8000u;
-  std::int32_t exp = static_cast<std::int32_t>((x >> 23) & 0xFF) - 127 + 15;
-  std::uint32_t mant = x & 0x7FFFFFu;
-  if (exp <= 0) return static_cast<std::uint16_t>(sign);
-  if (exp >= 31) return static_cast<std::uint16_t>(sign | 0x7C00u);
-  return static_cast<std::uint16_t>(sign | (static_cast<std::uint32_t>(exp) << 10) | (mant >> 13));
-}
-
-float f16_to_f32(std::uint16_t h) {
-  const std::uint32_t sign = static_cast<std::uint32_t>(h >> 15) << 31;
-  const std::uint32_t exp = (h >> 10) & 0x1F;
-  const std::uint32_t mant = h & 0x3FF;
-  std::uint32_t bits;
-  if (exp == 0) {
-    bits = sign;  // treat denormals as zero; irrelevant at these magnitudes
-  } else if (exp == 31) {
-    bits = sign | 0x7F800000u | (mant << 13);
-  } else {
-    bits = sign | ((exp + 112) << 23) | (mant << 13);
-  }
-  float f;
-  std::memcpy(&f, &bits, 4);
-  return f;
-}
+// Shared with the engine on purpose. A "minimal fp16 <-> fp32, so this test depends on nothing"
+// local copy is how this test came to round differently from the code it gates -- the kernels
+// convert with Metal's half(), which is IEEE, so a truncating harness charges the shader for its
+// own error. include/runtime/fp16.hpp, gated by metal_fp16_test.
+inline std::uint16_t f32_to_f16(float f) { return cpi::f32_to_f16(f); }
+inline float f16_to_f32(std::uint16_t h) { return cpi::f16_to_f32(h); }
 
 struct Result {
   double max_abs = 0.0;
