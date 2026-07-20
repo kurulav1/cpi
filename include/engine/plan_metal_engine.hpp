@@ -102,7 +102,15 @@ public:
 
   // Runs one decode step and returns the logits (a view into the shared buffer,
   // valid until the next step).
-  const std::vector<float>& forward_token(int token, int position);
+  // `position` is the ROTARY position; `cache_position` is where this token's K/V go and how
+  // much history attention covers. They are the same number for plain text and -1 means "same",
+  // which is every caller that is not multimodal.
+  //
+  // They diverge under M-RoPE: an image span advances the rotary counter by its MERGED extent,
+  // so a 16-token image advances it by 4 and every later token sits 12 behind its sequence
+  // index. Passing one value for both wrote K/V on top of an image token and truncated
+  // attention to the rotary position -- 11 of 21 prompt tokens silently dropped.
+  const std::vector<float>& forward_token(int token, int position, int cache_position = -1);
 
   // Capture a .gputrace of whatever runs between these, for Xcode's Metal Debugger.
   //
@@ -247,7 +255,7 @@ private:
   void profile_tick(const char* name);
   std::map<std::string, double> profile_ms_;
   std::chrono::steady_clock::time_point profile_last_{};
-  void encode_forward(int token, int position);
+  void encode_forward(int token, int position, int cache_position);
   // Encodes a whole prefill chunk: T tokens through the tower in one pass.
   void encode_prefill(const std::vector<int>& tokens, int start_position);
 

@@ -1740,7 +1740,8 @@ void PlanMetalEngine::dump_profile() const {
 
 // Encodes a whole forward WITHOUT committing, so the caller can append more work
 // (the argmax) to the same command buffer and sync once instead of twice.
-void PlanMetalEngine::encode_forward(int token, int position) {
+void PlanMetalEngine::encode_forward(int token, int position, int cache_position) {
+  if (cache_position < 0) cache_position = position;
   // CPI_METAL_LAYERS=N runs only the first N layers. A NaN has to start SOMEWHERE, and
   // bisecting on the layer count finds where far faster than reasoning about which op
   // could overflow.
@@ -1750,9 +1751,30 @@ void PlanMetalEngine::encode_forward(int token, int position) {
   }();
 
   // Unified memory: writing the token and the position IS the H2D transfer.
+  //
+  // pos_buf_ holds the CACHE position -- where K/V land and how far attention reaches (KvParams
+  // and AttnParams both read it). The ROTARY position is `position`, which differs from the
+  // cache position only under M-RoPE and is fed to the rope kernel separately, below.
   tokens_in_seq_buf_ = false;
   *static_cast<std::int32_t*>(tok_buf_.contents()) = static_cast<std::int32_t>(token);
-  *static_cast<std::int32_t*>(pos_buf_.contents()) = static_cast<std::int32_t>(position);
+  *static_cast<std::int32_t*>(pos_buf_.contents()) = static_cast<std::int32_t>(cache_position);
+
+  // When the two diverge, the rope kernel must NOT read pos_buf_ (now the cache position). Arm a
+  // one-token M-RoPE buffer with the rotary position on all three axes: t == h == w is exactly
+  // 1-D rope, and the lane mapping collapses to a single value -- gated bit-for-bit by
+  // metal_smoke::mrope_reduces_to_1d. This is why generated tokens, which are text, are correct
+  // with a scalar rotary position even though the prompt used a 3-D one.
+  if (cache_position != position) {
+    const std::size_t need = static_cast<std::size_t>(3) * sizeof(std::int32_t);
+    if (mrope_pos_buf_.size() < need) mrope_pos_buf_ = ctx_.alloc(need);
+    auto* dst = static_cast<std::int32_t*>(mrope_pos_buf_.contents());
+    dst[0] = dst[1] = dst[2] = static_cast<std::int32_t>(position);
+    mrope_active_ = true;
+  } else {
+    // A pure-text decode has no reason to route through the M-RoPE path; leave it off so the
+    // scalar pos_buf_ drives rope as it always has.
+    mrope_active_ = false;
+  }
 
   // CPI_METAL_DEBUG prints max|X| after every layer. Unified memory makes this almost
   // free to do: the residual stream is host-addressable, so an explosion can simply be
@@ -2283,8 +2305,9 @@ void PlanMetalEngine::decode_step_batched_logits(const std::vector<int>& tokens,
   }
 }
 
-const std::vector<float>& PlanMetalEngine::forward_token(int token, int position) {
-  encode_forward(token, position);
+const std::vector<float>& PlanMetalEngine::forward_token(int token, int position,
+                                                         int cache_position) {
+  encode_forward(token, position, cache_position);
   ctx_.commit_and_wait();
 
   if (!ctx_.last_error().empty()) {
@@ -2476,7 +2499,7 @@ std::vector<int> PlanMetalEngine::generate_greedy(const std::vector<int>& prompt
   for (int i = 0; i < max_new; ++i, ++pos) {
     // Forward + argmax in ONE command buffer: the logits never leave the GPU, so
     // there is no reason to sync between them. Two syncs per token was pure latency.
-    encode_forward(next, pos);
+    encode_forward(next, pos, pos);  // text decode: rotary and cache positions coincide
 
     // Argmax on the GPU: the vocab never crosses to the host.
     ElemParams p1{static_cast<std::uint32_t>(cfg_.vocab_size), 0.0f};
