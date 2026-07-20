@@ -18,9 +18,35 @@ kernel void cpi_rope(
 
   uint pos;
   if (p.mrope_t != 0u || p.mrope_h != 0u || p.mrope_w != 0u) {
-    // M-RoPE: pick this lane's axis from the section boundaries, then read that axis's
-    // position for this token. The buffer is [3][tokens] -- t, then h, then w.
-    const uint axis = (i < p.mrope_t) ? 0u : ((i < p.mrope_t + p.mrope_h) ? 1u : 2u);
+    // M-RoPE: pick this lane's axis, then read that axis's position for this token. The buffer
+    // is [3][tokens] -- t, then h, then w.
+    //
+    // The layout is INTERLEAVED, not chunked: [T,H,W,T,H,W,...], not [TTT...HHH...WWW]. Qwen3.5
+    // sets mrope_interleaved=true and transformers' apply_interleaved_mrope builds it as "start
+    // from T everywhere, then overwrite stride-3 slots" --
+    //
+    //     freqs_t = freqs[0]
+    //     for dim, offset in ((1,1), (2,2)):
+    //         freqs_t[..., offset : mrope_section[dim]*3 : 3] = freqs[dim, ..., ...]
+    //
+    // so H takes lanes 1,4,7,... below section[1]*3 and W takes 2,5,8,... below section[2]*3,
+    // and every lane neither claims stays T. For [11,11,10] that is 11 T, 11 H, 10 W -- the same
+    // COUNTS the chunked reading gives, which is why the section values look interchangeable and
+    // are not.
+    //
+    // This was chunked, and nothing caught it. Both M-RoPE gates are blind to the lane mapping:
+    // mrope_reduces_to_1d feeds t == h == w, where every mapping produces identical output
+    // bit-for-bit, and mrope_splits_axes only asserts the result DIFFERS from 1-D rope -- which a
+    // wrong mapping does just as well as a right one. Same shape as the position-0 rotary trap.
+    //
+    // A model with mrope_interleaved=false would need the chunked rule back, behind a flag.
+    uint axis = 0u;  // T unless another axis claims this lane
+    const uint slot = i % 3u;
+    if (slot == 1u && i < p.mrope_h * 3u) {
+      axis = 1u;  // H
+    } else if (slot == 2u && i < p.mrope_w * 3u) {
+      axis = 2u;  // W
+    }
     pos = uint(positions[axis * p.tokens + token]);
   } else if (p.per_row_positions != 0u) {
     pos = uint(positions[token]);  // batched decode: row t is its own sequence

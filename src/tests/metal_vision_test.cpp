@@ -967,12 +967,24 @@ int main(int argc, char** argv) {
     const int n_soft = static_cast<int>(soft.size()) / out_hidden;
     const int mh = grid_h / merge, mw = grid_w / merge;
 
+    const std::vector<float> want_soft = read_f32(dir + "/stage_16_merger.f32");
+    // CPI_MM_ORACLE_SOFT=1 splices the ORACLE's soft tokens instead of our tower's. That splits
+    // the multimodal drift in two: whatever remains with the oracle's inputs belongs to the
+    // splice, M-RoPE and the text stack, and whatever the swap removes was the tower's own fp16
+    // error propagating. Without this the two are indistinguishable, and 16 of the 22 positions
+    // carry tower output -- enough that "the logits drift" says nothing about where.
+    const std::vector<float>& soft_src =
+        (std::getenv("CPI_MM_ORACLE_SOFT") != nullptr) ? want_soft : soft;
+    if (std::getenv("CPI_MM_ORACLE_SOFT") != nullptr) {
+      std::printf("      [CPI_MM_ORACLE_SOFT: splicing the oracle's soft tokens, not ours]\n");
+    }
+
     std::vector<int> toks = {248053};
     std::vector<std::vector<float>> embeds(1);
     for (int i = 0; i < n_soft; ++i) {
       toks.push_back(IMG);
-      embeds.emplace_back(soft.begin() + static_cast<std::size_t>(i) * out_hidden,
-                          soft.begin() + static_cast<std::size_t>(i + 1) * out_hidden);
+      embeds.emplace_back(soft_src.begin() + static_cast<std::size_t>(i) * out_hidden,
+                          soft_src.begin() + static_cast<std::size_t>(i + 1) * out_hidden);
     }
     toks.push_back(248054);
     embeds.emplace_back();

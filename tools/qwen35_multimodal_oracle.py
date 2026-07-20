@@ -108,10 +108,38 @@ def main() -> int:
 
     # First-step logits too: a token stream that matches proves agreement at the argmax, but the
     # logits show HOW close, which is what tells drift apart from a genuine disagreement.
+    #
+    # And the POST-SPLICE hidden state, which is what localises a disagreement. The logits are
+    # downstream of four subsystems at once (tower, splice, M-RoPE, text stack); the input to
+    # layer 0 is downstream of only two -- the embedding lookup and the image scatter. If ours
+    # matches this, the splice is right and the defect is M-RoPE or the text stack; if it does
+    # not, no amount of looking at the text stack will help.
+    #
+    # Captured with a pre-hook on the first decoder layer rather than by recomputing the scatter
+    # here: a reimplementation of the thing under test proves only that two reimplementations
+    # agree.
+    captured = {}
+
+    def grab_layer0_input(_mod, args, kwargs):
+        h = kwargs.get("hidden_states")
+        if h is None and args:
+            h = args[0]
+        if h is not None and "h" not in captured:
+            captured["h"] = h.detach()[0].to(torch.float32).contiguous()
+
+    layers = model.model.language_model.layers
+    handle = layers[0].register_forward_pre_hook(grab_layer0_input, with_kwargs=True)
     step = model(input_ids=input_ids, pixel_values=pixels, image_grid_thw=grid_thw,
                  mm_token_type_ids=mm_token_type_ids)
+    handle.remove()
+
     logits = step.logits[0, -1].to(torch.float32).contiguous()
     (out_dir / "first_step_logits.f32").write_bytes(logits.numpy().astype("<f4").tobytes())
+    if "h" in captured:
+        (out_dir / "layer0_input.f32").write_bytes(captured["h"].numpy().astype("<f4").tobytes())
+        print("[mm-oracle] layer0 input: %s" % (tuple(captured["h"].shape),))
+    else:
+        print("[mm-oracle] WARNING: layer-0 pre-hook captured nothing; no layer0_input.f32")
 
     manifest = {
         "input_ids": ids,
@@ -122,6 +150,8 @@ def main() -> int:
         "vision_start_token_id": cfg.vision_start_token_id,
         "vision_end_token_id": cfg.vision_end_token_id,
         "logits_file": "first_step_logits.f32",
+        "layer0_input_file": "layer0_input.f32" if "h" in captured else "",
+        "layer0_input_shape": list(captured["h"].shape) if "h" in captured else [],
         "vocab": int(logits.numel()),
         "mm_token_type_ids": mm_token_type_ids[0].tolist(),
         "mrope_section": list(getattr(cfg.text_config.rope_parameters, "get", lambda *_: None)(
