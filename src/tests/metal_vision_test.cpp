@@ -1012,6 +1012,18 @@ int main(int argc, char** argv) {
       for (std::size_t j = 1; j < lg.size(); ++j) {
         if (lg[j] > lg[static_cast<std::size_t>(best)]) best = static_cast<int>(j);
       }
+      // Top-2 margin at every step. A divergence at a step where the top two logits are
+      // within fp16 noise is a tipped near-tie; one where the winner leads comfortably is a
+      // real disagreement. Printing it is the difference between knowing and guessing.
+      int second = (best == 0) ? 1 : 0;
+      for (std::size_t j = 0; j < lg.size(); ++j) {
+        if (static_cast<int>(j) == best) continue;
+        if (lg[j] > lg[static_cast<std::size_t>(second)]) second = static_cast<int>(j);
+      }
+      std::printf("      step %d: top1=%d (%.4f)  top2=%d (%.4f)  margin=%.4f\n", i, best,
+                  lg[static_cast<std::size_t>(best)], second,
+                  lg[static_cast<std::size_t>(second)],
+                  lg[static_cast<std::size_t>(best)] - lg[static_cast<std::size_t>(second)]);
       got.push_back(best);
       next = best;
     }
