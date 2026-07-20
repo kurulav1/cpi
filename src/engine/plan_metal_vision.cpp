@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <stdexcept>
 #include <unordered_map>
@@ -170,6 +171,59 @@ void build_rope_tables(int h, int w, int head_dim, int merge, float theta,
 }
 
 }  // namespace
+
+// Builds the 3-D (t, h, w) position ids M-RoPE needs, as one [3][tokens] array.
+//
+// The rule, read off the reference's own output rather than from its source:
+//
+//   - a text token takes t = h = w = next, and advances next by 1;
+//   - an image span takes base = next and assigns t = base, h = base + row, w = base + col over
+//     its MERGED grid, then advances next by max(merged_h, merged_w).
+//
+// That last step is the one that matters and the one a reimplementation gets wrong. An image of
+// 16 tokens advances the counter by 4, not 16, so every text token AFTER an image sits four
+// positions past the image's start -- 5..9 for the reference prompt, where a 1-D counter puts
+// them at 17..21. Getting the image span right and the tail wrong still corrupts the answer.
+//
+// Verified against the transformers dump for <vision_start> + 16 image + <vision_end> + 4 text;
+// see metal_vision_test's mrope_positions case.
+std::vector<std::int32_t> build_mrope_positions(const std::vector<int>& tokens, int image_token_id,
+                                                int merged_h, int merged_w) {
+  const int n = static_cast<int>(tokens.size());
+  std::vector<std::int32_t> pos(static_cast<std::size_t>(3) * n, 0);
+  auto set = [&](int idx, int t, int h, int w) {
+    pos[static_cast<std::size_t>(idx)] = t;
+    pos[static_cast<std::size_t>(n + idx)] = h;
+    pos[static_cast<std::size_t>(2 * n + idx)] = w;
+  };
+  int next = 0;
+  int i = 0;
+  while (i < n) {
+    if (tokens[static_cast<std::size_t>(i)] != image_token_id) {
+      set(i, next, next, next);
+      ++next;
+      ++i;
+      continue;
+    }
+    // A run of image tokens. Its length must be exactly merged_h * merged_w -- one placeholder
+    // per soft token -- or the grid this walks does not describe the run.
+    int run = 0;
+    while (i + run < n && tokens[static_cast<std::size_t>(i + run)] == image_token_id) ++run;
+    const int expect = merged_h * merged_w;
+    if (run != expect) {
+      throw std::runtime_error("image span is " + std::to_string(run) + " tokens but the " +
+                               std::to_string(merged_h) + "x" + std::to_string(merged_w) +
+                               " merged grid needs " + std::to_string(expect));
+    }
+    const int base = next;
+    for (int k = 0; k < run; ++k) {
+      set(i + k, base, base + k / merged_w, base + k % merged_w);
+    }
+    next = base + std::max(merged_h, merged_w);
+    i += run;
+  }
+  return pos;
+}
 
 std::vector<float> PlanMetalEngine::encode_image(const std::vector<float>& patches, int grid_h,
                                                  int grid_w) {

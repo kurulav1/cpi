@@ -932,6 +932,43 @@ int main(int argc, char** argv) {
     }
   }
 
+  // ---- M-RoPE positions, against the transformers dump ----
+  //
+  // These numbers came out of the reference for <vision_start> + 16 image + <vision_end> + 4
+  // text with a 4x4 merged grid. Hardcoded rather than recomputed here: a check that derives
+  // the expectation the same way the code does only proves the code is self-consistent.
+  {
+    const int IMG = 248056;
+    std::vector<int> toks = {248053};
+    for (int i = 0; i < 16; ++i) toks.push_back(IMG);
+    toks.push_back(248054);
+    for (int i = 0; i < 4; ++i) toks.push_back(3838 + i);
+    const std::vector<std::int32_t> want_t = {0, 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, 5,6,7,8,9};
+    const std::vector<std::int32_t> want_h = {0, 1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4, 5,6,7,8,9};
+    const std::vector<std::int32_t> want_w = {0, 1,2,3,4,1,2,3,4,1,2,3,4,1,2,3,4, 5,6,7,8,9};
+
+    const std::vector<std::int32_t> got = engine::build_mrope_positions(toks, IMG, 4, 4);
+    const int n = static_cast<int>(toks.size());
+    int wrong = 0;
+    for (int i = 0; i < n; ++i) {
+      if (got[i] != want_t[i]) ++wrong;
+      if (got[n + i] != want_h[i]) ++wrong;
+      if (got[2 * n + i] != want_w[i]) ++wrong;
+    }
+    std::printf("  %-22s %d/%d position components wrong  %s\n", "mrope_positions", wrong, 3 * n,
+                wrong == 0 ? "PASS" : "FAIL");
+    if (wrong != 0) {
+      std::printf("      got t: ");
+      for (int i = 0; i < n; ++i) std::printf("%d ", got[i]);
+      std::printf("\n      got h: ");
+      for (int i = 0; i < n; ++i) std::printf("%d ", got[n + i]);
+      std::printf("\n      got w: ");
+      for (int i = 0; i < n; ++i) std::printf("%d ", got[2 * n + i]);
+      std::printf("\n");
+      ++failures;
+    }
+  }
+
   std::printf("[metal_vision] %s\n", failures == 0 ? "ALL PASS" : "FAILURES");
   return failures == 0 ? 0 : 1;
 }

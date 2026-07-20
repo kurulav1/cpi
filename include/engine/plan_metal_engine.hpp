@@ -36,6 +36,12 @@
 
 namespace engine {
 
+// M-RoPE position ids for a prompt containing image spans, as one [3][tokens] array (t, h, w).
+// Free function rather than a member: it depends only on the token layout and the merged grid,
+// so it is testable without an engine, a device or a checkpoint.
+std::vector<std::int32_t> build_mrope_positions(const std::vector<int>& tokens, int image_token_id,
+                                                int merged_h, int merged_w);
+
 struct GenerationConstraints;  // fwd (generation_constraints.hpp) — grammar-constrained decode
 
 class PlanMetalEngine {
