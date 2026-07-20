@@ -65,6 +65,11 @@ public:
   // layout the tower's own patch embed expects. Throws if the model has no tower or the grid
   // is not a whole number of merge units.
   std::vector<float> encode_image(const std::vector<float>& patches, int grid_h, int grid_w);
+
+  // Prefills a prompt containing image tokens. `embeds` is indexed by absolute position; an
+  // empty row leaves that token's own embedding in place. Rows are spliced AS-IS.
+  void prefill_multimodal(const std::vector<int>& tokens,
+                          const std::vector<std::vector<float>>& embeds);
   int quant_bits() const {
     return quant_bits_;
   }
@@ -303,6 +308,10 @@ private:
   // staged them, because the token COUNT does not answer this -- a one-token prefill chunk still
   // arrives in the sequence buffer.
   bool tokens_in_seq_buf_ = false;
+
+  // Borrowed for the duration of prefill_multimodal only, never owned. Cleared on the way out
+  // (including on a throw) so a later plain prefill cannot read a dangling pointer.
+  const std::vector<std::vector<float>>* embeds_ = nullptr;
 
   // Writes slot X after one layer, in the CPU engine's dump format. No-op unless CPI_Q35_DUMP is
   // set. See the definition for why both prefill and decode call it.

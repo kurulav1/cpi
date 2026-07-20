@@ -89,6 +89,18 @@ struct EmbedParams {
 //
 // NOT in a namespace called `detail`: engine::detail is the shared sampler's namespace,
 // and clang rightly calls the lookup ambiguous (MSVC silently picked one).
+// The engine only ever read fp16 before this; the image splice has to WRITE it.
+inline std::uint16_t f32_to_fp16(float f) {
+  std::uint32_t x;
+  std::memcpy(&x, &f, 4);
+  const std::uint32_t sign = (x >> 16) & 0x8000u;
+  const std::int32_t exp = static_cast<std::int32_t>((x >> 23) & 0xFFu) - 127 + 15;
+  const std::uint32_t man = x & 0x7FFFFFu;
+  if (exp <= 0) return static_cast<std::uint16_t>(sign);
+  if (exp >= 31) return static_cast<std::uint16_t>(sign | 0x7C00u);
+  return static_cast<std::uint16_t>(sign | (static_cast<std::uint32_t>(exp) << 10) | (man >> 13));
+}
+
 inline float fp16_to_f32(std::uint16_t h) {
   const std::uint32_t sign = static_cast<std::uint32_t>(h >> 15) << 31;
   const std::uint32_t exp = (h >> 10) & 0x1F;
@@ -1948,6 +1960,29 @@ opplan::WeightSource& PlanMetalEngine::weight_source() {
   return *wsrc_;
 }
 
+// Prefills a prompt in which some positions are IMAGE tokens: `embeds` is indexed by absolute
+// position, and an empty row means "use the token's own embedding".
+//
+// Chunking is left to prefill_chunks, so this works unchanged on a recurrent model (which
+// prefills one token at a time) -- the splice is keyed on absolute position, not chunk offset.
+void PlanMetalEngine::prefill_multimodal(const std::vector<int>& tokens,
+                                         const std::vector<std::vector<float>>& embeds) {
+  embeds_ = &embeds;
+  int pos = 0;
+  try {
+    for (const int chunk : prefill_chunks(static_cast<int>(tokens.size()))) {
+      const std::vector<int> ids(tokens.begin() + pos, tokens.begin() + pos + chunk);
+      encode_prefill(ids, pos);
+      ctx_.commit_and_wait();
+      pos += chunk;
+    }
+  } catch (...) {
+    embeds_ = nullptr;  // a throw must not leave a dangling pointer for the next prefill
+    throw;
+  }
+  embeds_ = nullptr;
+}
+
 std::vector<int> PlanMetalEngine::prefill_chunks(int n) const {
   // A recurrent model has no token dimension to batch over: its state must advance one token at a
   // time, in order, so "prefill" here is just decode without sampling. CUDA and the CPU reference
@@ -1978,6 +2013,36 @@ void PlanMetalEngine::encode_prefill(const std::vector<int>& tokens, int start_p
   *static_cast<std::int32_t*>(pos_buf_.contents()) = static_cast<std::int32_t>(start_position);
 
   execute_ops(plan_.prologue, -1, start_position, T);
+
+  // Image soft tokens go in HERE: after the embedding lookup, before any layer reads X. Used
+  // AS-IS -- unlike text embeddings they get no sqrt(hidden) scale -- matching the CUDA path
+  // and what the reference projects from.
+  if (embeds_ != nullptr) {
+    bool any = false;
+    for (int t = 0; t < T; ++t) {
+      const std::size_t idx = static_cast<std::size_t>(start_position + t);
+      if (idx < embeds_->size() && !(*embeds_)[idx].empty()) any = true;
+    }
+    if (any) {
+      ctx_.commit_and_wait();  // the lookup must have landed before it is overwritten
+      auto* xw = static_cast<std::uint16_t*>(slots_[0].contents());
+      const int H2 = cfg_.hidden_size;
+      for (int t = 0; t < T; ++t) {
+        const std::size_t idx = static_cast<std::size_t>(start_position + t);
+        if (idx >= embeds_->size() || (*embeds_)[idx].empty()) continue;
+        const std::vector<float>& row = (*embeds_)[idx];
+        if (static_cast<int>(row.size()) != H2) {
+          throw std::runtime_error("image embedding at position " + std::to_string(idx) +
+                                   " is " + std::to_string(row.size()) + " wide, expected " +
+                                   std::to_string(H2));
+        }
+        for (int j = 0; j < H2; ++j) {
+          xw[static_cast<std::size_t>(t) * H2 + j] = f32_to_fp16(row[static_cast<std::size_t>(j)]);
+        }
+      }
+    }
+  }
+
   // layer_00 is the embedding, before any layer -- the same file the CPU engine writes. Lets a
   // prefill divergence be split into "the token never got in" and "a layer computed it wrong".
   if (T == 1) dump_layer_state(0, start_position);

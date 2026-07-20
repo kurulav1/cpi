@@ -854,6 +854,84 @@ int main(int argc, char** argv) {
     std::printf("      (no container given -- pass one as argv[2] to gate the conversion)\n");
   }
 
+  // ---- the splice: soft tokens standing in for placeholder tokens ----
+  //
+  // There is no oracle past this point -- the reference dump stops at soft tokens -- so this
+  // gates the two things that CAN be checked without one: that the spliced rows are the ones
+  // that reach the residual stream, and that a prompt containing them generates without
+  // diverging into NaN. It does NOT check that the model's ANSWER is right; that needs a full
+  // multimodal comparison against HuggingFace, which is a heavier harness than this.
+  if (argc >= 3) {
+    engine::PlanMetalEngine eng;
+    eng.open(argv[2], 512);
+    const std::vector<float> soft = eng.encode_image(pixels, grid_h, grid_w);
+    const int out_hidden = engine::mini::json_get_int(geo, "out_hidden_size");
+    const int n_soft = static_cast<int>(soft.size()) / out_hidden;
+
+    // A prompt of arbitrary text tokens with n_soft placeholders in the middle. The ids do not
+    // matter for the placeholders -- their embeddings are overwritten -- but they must be in
+    // range, and using a REAL id rather than 0 is deliberate: 0 often maps to a padding
+    // embedding that is all zeros, which would make a failed splice look like a working one.
+    std::vector<int> toks = {760, 6511};
+    std::vector<std::vector<float>> embeds(toks.size());
+    for (int i = 0; i < n_soft; ++i) {
+      toks.push_back(9338);
+      embeds.emplace_back(soft.begin() + static_cast<std::size_t>(i) * out_hidden,
+                          soft.begin() + static_cast<std::size_t>(i + 1) * out_hidden);
+    }
+    for (int i = 0; i < 2; ++i) {
+      toks.push_back(314);
+      embeds.emplace_back();
+    }
+    eng.prefill_multimodal(toks, embeds);
+    std::printf("      spliced %d soft tokens into a %zu-token prompt\n", n_soft, toks.size());
+
+    // Generation must survive the spliced prompt. NaN or a hang here is the failure mode that
+    // matters -- a wrong-but-finite answer cannot be judged without a multimodal oracle.
+    bool finite = true;
+    int next = toks.back();
+    for (int i = 0; i < 4; ++i) {
+      const std::vector<float>& lg = eng.forward_token(next, static_cast<int>(toks.size()) + i);
+      int best = 0;
+      for (std::size_t j = 0; j < lg.size(); ++j) {
+        if (!std::isfinite(lg[j])) { finite = false; break; }
+        if (lg[j] > lg[static_cast<std::size_t>(best)]) best = static_cast<int>(j);
+      }
+      if (!finite) break;
+      next = best;
+    }
+    std::printf("  %-22s %s\n", "SPLICE_generation",
+                finite ? "logits finite over 4 steps  PASS" : "NON-FINITE logits  FAIL");
+    if (!finite) ++failures;
+
+    // CONTROL: the same prompt with NO splice must produce different logits. "Finite" alone
+    // says nothing -- a splice that silently did nothing also produces finite logits, and that
+    // is precisely the failure this whole file keeps running into. Comparing against the
+    // unspliced run is the only thing that shows the soft tokens reached the residual stream.
+    {
+      engine::PlanMetalEngine eng2;
+      eng2.open(argv[2], 512);
+      const std::vector<std::vector<float>> none(toks.size());
+      eng2.prefill_multimodal(toks, none);
+      const std::vector<float>& plain = eng2.forward_token(toks.back(),
+                                                           static_cast<int>(toks.size()));
+      engine::PlanMetalEngine eng3;
+      eng3.open(argv[2], 512);
+      eng3.prefill_multimodal(toks, embeds);
+      const std::vector<float>& with = eng3.forward_token(toks.back(),
+                                                          static_cast<int>(toks.size()));
+      double diff = 0.0;
+      const std::size_t m = std::min(plain.size(), with.size());
+      for (std::size_t i = 0; i < m; ++i) {
+        diff = std::max(diff, static_cast<double>(std::fabs(plain[i] - with[i])));
+      }
+      const bool changed = diff > 1e-3;
+      std::printf("  %-22s max logit delta vs unspliced = %.4f  %s\n", "SPLICE_is_load_bearing",
+                  diff, changed ? "PASS" : "FAIL (splice did nothing)");
+      if (!changed) ++failures;
+    }
+  }
+
   std::printf("[metal_vision] %s\n", failures == 0 ? "ALL PASS" : "FAILURES");
   return failures == 0 ? 0 : 1;
 }
