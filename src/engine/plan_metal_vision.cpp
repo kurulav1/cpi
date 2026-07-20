@@ -13,6 +13,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <unordered_map>
@@ -343,12 +345,25 @@ std::vector<float> PlanMetalEngine::encode_image(const std::vector<float>& patch
     for (std::size_t i = 0; i < tab32.size(); ++i) tab32[i] = f16_bits_to_f32(tab[i]);
     const std::vector<float> pos =
         interpolate_pos_embed(tab32.data(), side, grid_h, grid_w, hidden, merge);
-    auto hpos = to_f16(pos);
-    auto bpos = ctx_.alloc_from(hpos.data(), hpos.size() * 2);
-    ElemParams p{static_cast<std::uint32_t>(n), 1.0f};
-    const void* bufs[] = {bpos.handle(), bx.handle()};
-    ctx_.dispatch("cpi_add_inplace", runtime::MetalContext::Grid::Threads, n, 256, bufs, nullptr, 2,
-                  &p, sizeof(p));
+    // Add the position table in fp32 and round ONCE, rather than rounding the table to fp16
+    // first and adding in the kernel.
+    //
+    // The interpolated table is not the stored one: bilinear blending of four bf16 rows with
+    // fractional weights produces values with full f32 mantissa content, so rounding it before
+    // the add throws away bits the add would otherwise keep. Measured on the M4, this halves the
+    // tower's error -- ENGINE_encode_image rel 0.01010 -> 0.00508 -- and it is what the
+    // reference (and metal_vision_test's END_TO_END path) does.
+    //
+    // Host-side rather than a kernel: one pass over tokens*hidden, against twelve blocks of
+    // GEMMs. It does not register, and the buffer is already host-addressable.
+    //
+    // NOTE: the rounding here is f32_to_f16_bits, which TRUNCATES and flushes fp16 subnormals to
+    // zero -- it is not IEEE. That is a separate, still-open defect shared by five copies of this
+    // converter; see docs/qwen35-vision-handoff.md.
+    auto* dst = static_cast<std::uint16_t*>(bx.contents());
+    for (std::size_t i = 0; i < n; ++i) {
+      dst[i] = f32_to_f16_bits(f16_bits_to_f32(dst[i]) + pos[i]);
+    }
   }
 
   std::vector<float> cosb, sinb;
@@ -428,6 +443,27 @@ std::vector<float> PlanMetalEngine::encode_image(const std::vector<float>& patch
       const void* bufs[] = {btmp.handle(), bx.handle()};
       ctx_.dispatch("cpi_add_inplace", runtime::MetalContext::Grid::Threads, n, 256, bufs, nullptr,
                     2, &p, sizeof(p));
+    }
+    // Diagnostic (CPI_VISION_DUMP_BLOCKS=<dir>): write this block's residual stream, so the
+    // engine's per-block error curve can be laid next to the one metal_vision_test prints for
+    // the harness. Comparing the two curves is what localises a divergence to a block instead of
+    // leaving "the output is wrong" across twelve of them; it is how the fp32 position add above
+    // was tracked down, and it showed the remainder is diffuse rather than any single block.
+    //
+    // Splitting the command buffer here is numerically neutral -- MetalContext barriers before
+    // every dispatch by default (metal_context.mm:430) -- so this observes without perturbing.
+    // Verified: with the dump on, ENGINE_encode_image is bit-identical at rel=0.01009724.
+    if (const char* dd = std::getenv("CPI_VISION_DUMP_BLOCKS")) {
+      ctx_.commit_and_wait();
+      const auto* q = static_cast<const std::uint16_t*>(bx.contents());
+      std::vector<float> v(n);
+      for (std::size_t i = 0; i < n; ++i) v[i] = f16_bits_to_f32(q[i]);
+      char path[512];
+      std::snprintf(path, sizeof path, "%s/engine_block_%02d.f32", dd, L);
+      if (std::FILE* f = std::fopen(path, "wb")) {
+        std::fwrite(v.data(), sizeof(float), v.size(), f);
+        std::fclose(f);
+      }
     }
   }
 
