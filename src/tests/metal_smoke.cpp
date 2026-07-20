@@ -128,6 +128,12 @@ struct VisPoolParams {
 struct VisStdParams {
   std::uint32_t n, hidden;
 };
+// Mirrors LayerNormParams in 00_common.metal.
+struct LayerNormParams {
+  std::uint32_t rows, cols;
+  float eps;
+  std::uint32_t has_bias;
+};
 
 float sigmoidf(float x) {
   return 1.0f / (1.0f + std::exp(-x));
@@ -1002,6 +1008,63 @@ int main() {
     const auto* o = static_cast<const std::uint16_t*>(bx.contents());
     for (std::uint32_t i = 0; i < n; ++i) got[i] = f16_to_f32(o[i]);
     check("standardize", compare(got, want), 0.005);
+  }
+
+  {
+    // LayerNorm, gated against an fp64 reference rather than a rearrangement of the kernel's
+    // own algebra -- a reference sharing the kernel's formulation confirms only that it was
+    // transcribed twice.
+    //
+    // TWO row scales, deliberately. Row 1 carries values around 1600, which is what the
+    // Qwen3.5 vision tower's last block actually produces. Squared that is ~2.6e6, past
+    // fp16's 65504, so this row is what makes the case discriminating: patching the kernel's
+    // variance accumulator to half moves it from max_abs 0.0005 to 1.21. A case built only
+    // from unit-scale noise passes either way, which is how a tower that runs and is wrong
+    // gets shipped.
+    //
+    // It does NOT discriminate the one-pass E[x^2] - E[x]^2 form: this data is zero-mean, so
+    // nothing cancels, and that variant was measured to pass here unchanged. Catching it
+    // would need a large-mean/small-variance row -- not added, because the tower's real
+    // activations are near zero-mean (max |mean|/stddev 0.5) and a test should gate risks
+    // this model actually has.
+    const std::uint32_t rows = 4, cols = 768, n = rows * cols;
+    std::vector<std::uint16_t> x(n), w(cols), bs(cols);
+    for (std::uint32_t r = 0; r < rows; ++r) {
+      const float scale = (r == 1) ? 1600.0f : 1.0f;
+      for (std::uint32_t c = 0; c < cols; ++c) x[r * cols + c] = f32_to_f16(dist(rng) * scale);
+    }
+    for (auto& v : w) v = f32_to_f16(0.5f + dist(rng) * 0.25f);
+    for (auto& v : bs) v = f32_to_f16(dist(rng) * 0.5f);
+    auto bx = ctx.alloc_from(x.data(), n * 2);
+    auto bw = ctx.alloc_from(w.data(), cols * 2);
+    auto bbias = ctx.alloc_from(bs.data(), cols * 2);
+    auto bo = ctx.alloc(n * 2);
+    LayerNormParams p{rows, cols, 1e-6f, 1u};
+    const void* bufs[] = {bx.handle(), bw.handle(), bbias.handle(), bo.handle()};
+    ctx.dispatch("cpi_layernorm", runtime::MetalContext::Grid::Groups, rows, 256, bufs, nullptr,
+                 4, &p, sizeof(p));
+    ctx.commit_and_wait();
+    std::vector<float> want(n), got(n);
+    for (std::uint32_t r = 0; r < rows; ++r) {
+      double mean = 0.0;
+      for (std::uint32_t c = 0; c < cols; ++c) mean += f16_to_f32(x[r * cols + c]);
+      mean /= double(cols);
+      double var = 0.0;
+      for (std::uint32_t c = 0; c < cols; ++c) {
+        const double d = static_cast<double>(f16_to_f32(x[r * cols + c])) - mean;
+        var += d * d;
+      }
+      var /= double(cols);
+      const double inv = 1.0 / std::sqrt(var + 1e-6);
+      for (std::uint32_t c = 0; c < cols; ++c) {
+        want[r * cols + c] =
+            static_cast<float>((static_cast<double>(f16_to_f32(x[r * cols + c])) - mean) * inv *
+                                   f16_to_f32(w[c]) + f16_to_f32(bs[c]));
+      }
+    }
+    const auto* o = static_cast<const std::uint16_t*>(bo.contents());
+    for (std::uint32_t i = 0; i < n; ++i) got[i] = f16_to_f32(o[i]);
+    check("layernorm", compare(got, want), 0.01);
   }
 
   std::printf("[metal_smoke] %s\n", failures == 0 ? "ALL PASS" : "FAILURES");

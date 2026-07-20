@@ -230,3 +230,76 @@ kernel void cpi_lm_head(
   if (lane == 0u) out[row] = acc;
 }
 
+
+// ---------------------------------------------------------------------------
+// True LayerNorm: (x - mean) / sqrt(var + eps) * weight + bias.
+//
+// The fp32 accumulators are LOAD-BEARING and measured to be so. The Qwen3.5 vision tower's
+// last block holds outliers around 1657 (its rows are otherwise ~unit scale), and 1657^2 is
+// 2.7e6 -- past fp16's 65504. Swapping the variance accumulator to half makes metal_smoke's
+// layernorm case go from max_abs 0.0005 to 1.21, so that test genuinely pins this.
+//
+// The two passes are DEFENSIVE, not required by this model. The one-pass identity
+// var = E[x^2] - E[x]^2 cancels catastrophically only when |mean| >> stddev, and these
+// activations are near zero-mean (max |mean|/stddev across the tower is 0.5), so both forms
+// agree here -- verified by patching the kernel to the one-pass form and seeing the test
+// pass unchanged. Kept anyway: the second pass re-reads a row that is already in cache, and
+// nothing guarantees the next checkpoint's activations stay centred.
+// ---------------------------------------------------------------------------
+kernel void cpi_layernorm(
+    device const half*  x       [[buffer(0)]],
+    device const half*  weight  [[buffer(1)]],
+    device const half*  bias    [[buffer(2)]],
+    device half*        out     [[buffer(3)]],
+    constant LayerNormParams& p [[buffer(4)]],
+    uint  gid  [[threadgroup_position_in_grid]],
+    uint  lid  [[thread_position_in_threadgroup]],
+    uint  nthr [[threads_per_threadgroup]]) {
+  if (gid >= p.rows) return;
+
+  const uint base = gid * p.cols;
+  threadgroup float partial[32];
+  const uint simd_id   = lid / 32u;
+  const uint simd_lane = lid % 32u;
+  const uint n_simd    = (nthr + 31u) / 32u;
+
+  // ---- pass 1: mean ----
+  float sum = 0.0f;
+  for (uint i = lid; i < p.cols; i += nthr) sum += float(x[base + i]);
+  sum = simd_sum(sum);
+  if (simd_lane == 0u) partial[simd_id] = sum;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_id == 0u) {
+    float v = (simd_lane < n_simd) ? partial[simd_lane] : 0.0f;
+    v = simd_sum(v);
+    if (simd_lane == 0u) partial[0] = v;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float mean = partial[0] / float(p.cols);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  // ---- pass 2: variance about that mean ----
+  float ss = 0.0f;
+  for (uint i = lid; i < p.cols; i += nthr) {
+    const float d = float(x[base + i]) - mean;
+    ss += d * d;
+  }
+  ss = simd_sum(ss);
+  if (simd_lane == 0u) partial[simd_id] = ss;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  // Reduces into a slot it also reads from, which is safe only because simd_sum completes
+  // for the whole simdgroup before any lane writes. `mean` is already in registers by this
+  // point, so reusing partial[] costs nothing and keeps one shared array.
+  if (simd_id == 0u) {
+    float v = (simd_lane < n_simd) ? partial[simd_lane] : 0.0f;
+    v = simd_sum(v);
+    if (simd_lane == 0u) partial[0] = v;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float inv = rsqrt(partial[0] / float(p.cols) + p.eps);
+
+  for (uint i = lid; i < p.cols; i += nthr) {
+    const float n = (float(x[base + i]) - mean) * inv * float(weight[i]);
+    out[base + i] = half(p.has_bias != 0u ? n + float(bias[i]) : n);
+  }
+}

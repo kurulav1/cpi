@@ -47,6 +47,15 @@ struct NormParams {
   uint has_weight;     // 0 => weightless (ones)
 };
 
+// True LayerNorm: subtracts the mean and scales by weight, then adds bias. RMSNorm does
+// neither, so this cannot be folded into NormParams -- a bias pointer has nowhere to go there.
+struct LayerNormParams {
+  uint rows;
+  uint cols;
+  float eps;
+  uint has_bias;  // 0 => weight-only (the bias buffer is still bound but never read)
+};
+
 struct GemvParams {
   uint out_dim;
   uint in_dim;
