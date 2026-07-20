@@ -439,7 +439,36 @@ int main(int argc, char** argv) {
       case EngineChoice::LlamaMetal: {
         // Apple Silicon GPU path for the main binary -- the same PlanMetalEngine the metal_infer
         // tool uses, wired into the standard serving modes so the REST/web bridge runs on a Mac.
-        // fp16 for now; grammar-constrained decode and a Metal vision tower are not yet wired.
+        // What actually works here, verified on an M4 rather than assumed -- the comment this
+        // replaces claimed "fp16 for now; grammar-constrained decode and a Metal vision tower are
+        // not yet wired", and two thirds of that was stale:
+        //
+        //   int4/int8 weight-quant  yes (--weight-quant, below)
+        //   continuous batching     yes (--interactive-batch, two concurrent streams interleaved)
+        //   grammar / JSON-schema   yes -- proven by forcing a field name the model would never
+        //                           emit unprompted; without the schema it produces "name"/"id"
+        //   vision tower            NO. encode_image/prefill_multimodal exist on the engine but
+        //                           nothing calls them; see the --image guard below.
+        //   speculative decoding    NO, CUDA-only (the --draft-model guard below).
+        //
+        // The two unsupported ones REFUSE rather than proceed. Both were accepted and silently
+        // dropped: --image returned a confident text-only answer to a question about a picture,
+        // and --draft-model quietly turned speculative decoding off -- which the web server
+        // passes unconditionally when it is configured, so a Mac deployment saw a silent
+        // slowdown rather than an error. A wrong answer nobody can attribute is worse than a
+        // refusal, and neither of these is something the caller can be expected to notice.
+        if (!cli.image_path.empty()) {
+          throw std::runtime_error(
+              "--image is not supported on the Metal backend yet. The vision tower itself works "
+              "(PlanMetalEngine::encode_image is gated against the HuggingFace oracle), but "
+              "app::image_prompt::expand is still hard-typed to PlanCudaEngine, so nothing wires "
+              "the two together. Refusing rather than silently answering without the image.");
+        }
+        if (!cli.draft_model_path.empty()) {
+          throw std::runtime_error(
+              "--draft-model / speculative decoding is CUDA-only; the Metal branch would ignore "
+              "it and decode normally. Refusing rather than silently dropping to a slower path.");
+        }
         engine::PlanMetalEngine meng;
         // --weight-quant int4/int8 (a.k.a. --int4-streaming) maps to on-load host quantization;
         // otherwise fp16. This is what lets a large model (e.g. an 8B) serve on a 16 GB Mac.
@@ -485,6 +514,13 @@ int main(int argc, char** argv) {
           s.temperature = temperature;
           s.top_k = cli.opts.top_k;
           s.top_p = cli.opts.top_p;
+          // --repeat-penalty and --no-repeat-ngram were parsed, stored, and then dropped here.
+          // The batch path below already forwards them (bo.repetition_penalty), so the flags
+          // worked under --interactive-batch and silently did nothing everywhere else -- which
+          // is the shape of bug that reads as "the model is repetitive on Mac" rather than as a
+          // missing feature. Sampling has carried both fields all along.
+          s.repetition_penalty = cli.opts.repetition_penalty;
+          s.no_repeat_ngram_size = cli.opts.no_repeat_ngram_size;
           s.eos_id = cli.opts.eos_token_id;
           return s;
         };
