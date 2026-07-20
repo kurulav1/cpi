@@ -32,6 +32,7 @@
 #if LLAMA_ENGINE_ENABLE_METAL
 #include "engine/plan_metal_engine.hpp"
 #include "engine/speculative_decoder.hpp"  // header-only template; harmless if CUDA already pulled it
+#include "model/image_preprocess.hpp"
 #include "runtime/metal_context.hpp"
 #endif
 #include "model/tokenizer.hpp"
@@ -103,6 +104,110 @@ template <typename E>
 app::main_modes::GenerateMultimodalFn make_multimodal_fn(E&) {
   return nullptr;
 }
+
+#if LLAMA_ENGINE_ENABLE_METAL
+// One image + a text question through the Metal Qwen3.5 tower, end to end. This is the CLI face
+// of the pipeline metal_vision_test gates: the tower, the splice, M-RoPE and the two-position
+// decode are all verified there against HuggingFace (MULTIMODAL_stream 8/8). What this adds is
+// only the two ends the test stubs -- real image preprocessing (qwen2vl_preprocess, byte-exact vs
+// the HF processor) and detokenised output.
+//
+// The special-token ids are Qwen3.5's and are NOT in the .ll2c container, so they are stated here
+// with provenance. A different vision model would need its own ids and template.
+void run_with_image_metal(engine::PlanMetalEngine& meng, const app::main_cli::ParsedArgs& cli,
+                          model::Tokenizer& tokenizer, std::ostream& info_out) {
+  constexpr int kImageToken = 248056;   // <|image_pad|>
+  constexpr int kVisionStart = 248053;  // <|vision_start|>
+  constexpr int kVisionEnd = 248054;    // <|vision_end|>
+  // Qwen2VLImageProcessor's pixel-area budget (config size.shortest/longest_edge). Held here
+  // because the container does not carry it; qwen2vl_preproc_test pins these same values.
+  constexpr long kMinPixels = 65536;
+  constexpr long kMaxPixels = 16777216;
+
+  const model::LlamaConfig& c = meng.config();
+  if (!c.has_vision_tower()) {
+    throw std::runtime_error("--image: this model has no vision tower (text-only container)");
+  }
+  const int merge = c.vision_spatial_merge_size;
+
+  // 1. Preprocess the image exactly as HuggingFace does (gated: qwen2vl_preproc_test).
+  const model::image::Image img = model::image::load_png(cli.image_path);
+  const float mean[3] = {0.5f, 0.5f, 0.5f};
+  const float stdv[3] = {0.5f, 0.5f, 0.5f};
+  const model::image::Qwen2VLPatches pp = model::image::qwen2vl_preprocess(
+      img, c.vision_patch_size, c.vision_temporal_patch_size, merge, mean, stdv, kMinPixels,
+      kMaxPixels);
+
+  // 2. Tower -> soft tokens.
+  const std::vector<float> soft = meng.encode_image(pp.pixels, pp.grid_h, pp.grid_w);
+  const int out_hidden = c.vision_out_hidden_size;
+  const int n_soft = static_cast<int>(soft.size()) / out_hidden;
+  const int mh = pp.grid_h / merge, mw = pp.grid_w / merge;
+
+  // 3. Build the prompt: <vision_start> + n_soft image placeholders + <vision_end> + the
+  //    question. embeds[i] holds a soft token for each placeholder position, empty elsewhere; the
+  //    engine splices the soft tokens over the placeholders' embeddings.
+  std::vector<int> toks;
+  std::vector<std::vector<float>> embeds;
+  toks.push_back(kVisionStart);
+  embeds.emplace_back();
+  for (int i = 0; i < n_soft; ++i) {
+    toks.push_back(kImageToken);
+    embeds.emplace_back(soft.begin() + static_cast<std::size_t>(i) * out_hidden,
+                        soft.begin() + static_cast<std::size_t>(i + 1) * out_hidden);
+  }
+  toks.push_back(kVisionEnd);
+  embeds.emplace_back();
+  const std::vector<int> q = tokenizer.encode(cli.prompt_text, /*add_bos=*/false);
+  for (int t : q) {
+    toks.push_back(t);
+    embeds.emplace_back();
+  }
+
+  info_out << "[image] " << cli.image_path << "  " << pp.grid_w << "x" << pp.grid_h
+           << " patches -> " << n_soft << " soft tokens; prompt = " << toks.size() << " tokens\n\n";
+
+  // 4. M-RoPE positions, prefill all but the last token, then decode with the rotary and cache
+  //    positions kept apart (an image span advances the rotary counter by its MERGED extent).
+  const std::vector<std::int32_t> mpos =
+      engine::build_mrope_positions(toks, kImageToken, mh, mw);
+  const int n_tok = static_cast<int>(toks.size());
+  const std::vector<int> head(toks.begin(), toks.end() - 1);
+  const std::vector<std::vector<float>> head_embeds(embeds.begin(), embeds.end() - 1);
+  std::vector<std::int32_t> head_mpos(static_cast<std::size_t>(3) * (n_tok - 1));
+  for (int axis = 0; axis < 3; ++axis) {
+    for (int t = 0; t < n_tok - 1; ++t) {
+      head_mpos[static_cast<std::size_t>(axis) * (n_tok - 1) + t] =
+          mpos[static_cast<std::size_t>(axis) * n_tok + t];
+    }
+  }
+  meng.prefill_multimodal(head, head_embeds, head_mpos);
+
+  const int rope_pos0 = engine::mrope_next_position(toks, kImageToken, mh, mw) - 1;
+  const int cache_pos0 = static_cast<int>(head.size());
+  const int eos = cli.opts.eos_token_id;
+
+  const auto t0 = std::chrono::steady_clock::now();
+  std::vector<int> gen;
+  int next = toks.back();
+  for (int i = 0; i < cli.max_new; ++i) {
+    const std::vector<float>& lg = meng.forward_token(next, rope_pos0 + i, cache_pos0 + i);
+    int best = 0;
+    for (std::size_t j = 1; j < lg.size(); ++j) {
+      if (lg[j] > lg[static_cast<std::size_t>(best)]) best = static_cast<int>(j);
+    }
+    if (best == eos) break;
+    gen.push_back(best);
+    next = best;
+  }
+  const auto t1 = std::chrono::steady_clock::now();
+  const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+  std::cout << tokenizer.decode(gen) << "\n";
+  std::cout << "\n[perf] generated_tokens=" << gen.size() << " elapsed_ms=" << ms
+            << " tok_per_s=" << (gen.empty() ? 0.0 : gen.size() / (ms / 1000.0)) << "\n";
+}
+#endif
 
 }  // namespace
 
@@ -459,11 +564,11 @@ int main(int argc, char** argv) {
         // slowdown rather than an error. A wrong answer nobody can attribute is worse than a
         // refusal, and neither of these is something the caller can be expected to notice.
         if (!cli.image_path.empty()) {
-          throw std::runtime_error(
-              "--image is not supported on the Metal backend yet. The vision tower itself works "
-              "(PlanMetalEngine::encode_image is gated against the HuggingFace oracle), but "
-              "app::image_prompt::expand is still hard-typed to PlanCudaEngine, so nothing wires "
-              "the two together. Refusing rather than silently answering without the image.");
+          if (!use_tokenizer) throw std::runtime_error("--image requires --tokenizer");
+          engine::PlanMetalEngine img_eng;
+          img_eng.open(cli.opts.model_path, cli.opts.max_context, 0, 0);
+          run_with_image_metal(img_eng, cli, tokenizer, std::cerr);
+          break;
         }
         // Speculative decoding: a small DRAFT proposes K tokens, this model (the TARGET) checks
         // them in one parallel verify pass, and only its own argmax is ever emitted -- so the

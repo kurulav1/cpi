@@ -380,6 +380,14 @@ add_executable(metal_fp16_test src/tests/metal_fp16_test.cpp)
 target_include_directories(metal_fp16_test PRIVATE include)
 add_test(NAME metal_fp16_test COMMAND metal_fp16_test)
 
+# Qwen2-VL / Qwen3.5 image preprocessing vs the HuggingFace processor. Pure CPU (no Metal, no
+# CUDA), so it lives OUTSIDE the backend guards and builds anywhere -- unlike image_preprocess_test,
+# which is stranded under the CUDA guard and so never built on a Mac. No add_test: it needs an
+# oracle dump from a torch/torchvision run that CI does not have.
+add_executable(qwen2vl_preproc_test src/tests/qwen2vl_preproc_test.cpp)
+target_include_directories(qwen2vl_preproc_test PRIVATE include)
+target_link_libraries(qwen2vl_preproc_test PRIVATE llama_engine)
+
 # Metal kernel smoke test: runs each shader against a CPU reference. On a machine
 # with no Metal GPU (any VM, including GitHub's macOS runners) it reports SKIP and
 # passes -- so a green run here proves it COMPILES AND LINKS, never that the

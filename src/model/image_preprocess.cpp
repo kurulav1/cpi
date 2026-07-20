@@ -173,5 +173,92 @@ PatchGrid to_patches(const Image& img, int patch_size, int pooling_kernel, int m
   return g;
 }
 
+namespace {
+
+// Qwen2-VL smart_resize: round both sides to a multiple of `factor`, keeping the pixel area in
+// [min_pixels, max_pixels] and the aspect ratio. Verified against the processor: 140x200,
+// factor 32 -> 224x320.
+void smart_resize(int h, int w, int factor, long min_pixels, long max_pixels, int& out_h,
+                  int& out_w) {
+  auto round_mult = [factor](double v) {
+    return static_cast<int>(std::lround(v / factor)) * factor;
+  };
+  int hb = std::max(factor, round_mult(h));
+  int wb = std::max(factor, round_mult(w));
+  const double area = static_cast<double>(h) * w;
+  if (static_cast<long>(hb) * wb > max_pixels) {
+    const double beta = std::sqrt(area / static_cast<double>(max_pixels));
+    hb = static_cast<int>(std::floor(h / beta / factor)) * factor;
+    wb = static_cast<int>(std::floor(w / beta / factor)) * factor;
+  } else if (static_cast<long>(hb) * wb < min_pixels) {
+    const double beta = std::sqrt(static_cast<double>(min_pixels) / area);
+    hb = static_cast<int>(std::ceil(h * beta / factor)) * factor;
+    wb = static_cast<int>(std::ceil(w * beta / factor)) * factor;
+  }
+  out_h = std::max(factor, hb);
+  out_w = std::max(factor, wb);
+}
+
+}  // namespace
+
+Qwen2VLPatches qwen2vl_preprocess(const Image& img, int patch_size, int temporal_patch_size,
+                                  int merge_size, const float mean[3], const float std[3],
+                                  long min_pixels, long max_pixels) {
+  if (patch_size <= 0 || temporal_patch_size <= 0 || merge_size <= 0) {
+    throw std::runtime_error("qwen2vl: bad patch parameters");
+  }
+  const int factor = patch_size * merge_size;
+  int rh = 0, rw = 0;
+  smart_resize(img.height, img.width, factor, min_pixels, max_pixels, rh, rw);
+
+  const Image r = resize_bicubic(img, rw, rh);
+
+  Qwen2VLPatches out;
+  out.grid_h = rh / patch_size;
+  out.grid_w = rw / patch_size;
+  const int gh = out.grid_h, gw = out.grid_w;
+  const int C = 3;
+  const int patch_dim = C * temporal_patch_size * patch_size * patch_size;
+  out.pixels.assign(static_cast<std::size_t>(gh) * gw * patch_dim, 0.0f);
+
+  // Rows in MERGE-UNIT-MAJOR order: (block_h, block_w, merge_h, merge_w), matching the tower.
+  // Row content: (channel, temporal, patch_h, patch_w). The single frame is repeated across the
+  // temporal axis, so every temporal slice is identical -- but it must still be written, or the
+  // patch_dim stride is wrong and the tower reads channels out of a neighbouring patch.
+  const int bh = gh / merge_size, bw = gw / merge_size;
+  std::size_t row = 0;
+  for (int ph_b = 0; ph_b < bh; ++ph_b) {
+    for (int pw_b = 0; pw_b < bw; ++pw_b) {
+      for (int mi = 0; mi < merge_size; ++mi) {
+        for (int mj = 0; mj < merge_size; ++mj) {
+          const int patch_row = ph_b * merge_size + mi;  // which patch down
+          const int patch_col = pw_b * merge_size + mj;  // which patch across
+          float* dst = out.pixels.data() + row * patch_dim;
+          for (int c = 0; c < C; ++c) {
+            for (int tp = 0; tp < temporal_patch_size; ++tp) {
+              for (int y = 0; y < patch_size; ++y) {
+                for (int x = 0; x < patch_size; ++x) {
+                  const int sy = patch_row * patch_size + y;
+                  const int sx = patch_col * patch_size + x;
+                  const std::uint8_t v =
+                      r.rgb[(static_cast<std::size_t>(sy) * rw + sx) * 3 + c];
+                  const float norm = (static_cast<float>(v) / 255.0f - mean[c]) / std[c];
+                  const std::size_t idx =
+                      ((static_cast<std::size_t>(c) * temporal_patch_size + tp) * patch_size + y) *
+                          patch_size +
+                      x;
+                  dst[idx] = norm;
+                }
+              }
+            }
+          }
+          ++row;
+        }
+      }
+    }
+  }
+  return out;
+}
+
 }  // namespace image
 }  // namespace model
