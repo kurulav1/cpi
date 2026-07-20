@@ -45,6 +45,7 @@ struct RopeParams {
   // Lanes rotated per head; 0 means the whole head. MUST match RopeParams in 00_common.metal --
   // this mirror going stale is how the kernel would read a field the host never wrote.
   std::uint32_t rotary_dim = 0;
+  std::uint32_t mrope_t = 0, mrope_h = 0, mrope_w = 0;
 };
 struct ElemParams {
   std::uint32_t n;

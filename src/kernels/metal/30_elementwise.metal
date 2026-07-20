@@ -17,7 +17,12 @@ kernel void cpi_rope(
   const uint i     = rem % half_dim;
 
   uint pos;
-  if (p.per_row_positions != 0u) {
+  if (p.mrope_t != 0u || p.mrope_h != 0u || p.mrope_w != 0u) {
+    // M-RoPE: pick this lane's axis from the section boundaries, then read that axis's
+    // position for this token. The buffer is [3][tokens] -- t, then h, then w.
+    const uint axis = (i < p.mrope_t) ? 0u : ((i < p.mrope_t + p.mrope_h) ? 1u : 2u);
+    pos = uint(positions[axis * p.tokens + token]);
+  } else if (p.per_row_positions != 0u) {
     pos = uint(positions[token]);  // batched decode: row t is its own sequence
   } else {
     pos = (p.use_position_buffer != 0u) ? uint(positions[0]) : p.position;

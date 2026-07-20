@@ -108,6 +108,15 @@ struct RopeParams {
   // before. Qwen3.5 rotates 25% of a 256-wide head; rotating all of it is wrong in a way that
   // is INVISIBLE at position 0, because the angle is zero there.
   uint rotary_dim;
+  // M-RoPE: the rotary lanes are split between three position axes (t, h, w), with
+  // mrope_section giving how many lanes each takes -- [11, 11, 10] on Qwen3.5, summing to
+  // rotary_dim/2. Zero means plain 1-D rope, where every lane reads the same scalar position.
+  //
+  // For pure TEXT tokens t == h == w, so M-RoPE reduces exactly to 1-D rope. That is what makes
+  // this safe to switch on for a whole sequence rather than per token.
+  uint mrope_t;
+  uint mrope_h;
+  uint mrope_w;
 };
 
 struct ElemParams {

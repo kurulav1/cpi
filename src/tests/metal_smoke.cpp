@@ -128,6 +128,15 @@ struct VisPoolParams {
 struct VisStdParams {
   std::uint32_t n, hidden;
 };
+// Mirrors RopeParams in 00_common.metal.
+struct RopeParams {
+  std::uint32_t heads, head_dim, position, tokens;
+  float theta;
+  std::uint32_t use_position_buffer, row_stride, per_row_positions;
+  std::uint32_t rotary_dim;
+  std::uint32_t mrope_t, mrope_h, mrope_w;
+};
+
 // Mirrors BiAttnParams in 00_common.metal.
 struct BiAttnParams {
   std::uint32_t tokens, heads, head_dim;
@@ -1122,6 +1131,72 @@ int main() {
     const auto* o = static_cast<const std::uint16_t*>(bo.contents());
     for (std::uint32_t i = 0; i < n; ++i) got[i] = f16_to_f32(o[i]);
     check("bidir_attn", compare(got, want), 0.01);
+  }
+
+  {
+    // M-RoPE, gated two ways.
+    //
+    // (1) STRICT GENERALISATION: with t == h == w == position, M-RoPE must reproduce plain 1-D
+    //     rope BIT FOR BIT. That is the property that makes it safe to enable for a whole
+    //     sequence rather than switching per token, and it is checked against the kernel's own
+    //     1-D path rather than a reimplementation of it.
+    // (2) It actually splits axes: with three DIFFERENT axis positions the result must differ
+    //     from the 1-D answer, or the section boundaries are being ignored.
+    const std::uint32_t heads = 2, head_dim = 256, rot = 64, tokens = 5;
+    const std::uint32_t n = tokens * heads * head_dim;
+    std::vector<std::uint16_t> x0(n);
+    for (auto& v : x0) v = f32_to_f16(dist(rng));
+
+    auto run = [&](bool mrope, const std::vector<std::int32_t>& pos) {
+      std::vector<std::uint16_t> x = x0;
+      auto bx = ctx.alloc_from(x.data(), n * 2);
+      auto bp = ctx.alloc_from(pos.data(), pos.size() * sizeof(std::int32_t));
+      RopeParams p{heads, head_dim, 0u, tokens, 1000000.0f, 1u, 0u, 0u, rot, 0u, 0u, 0u};
+      if (mrope) { p.mrope_t = 11; p.mrope_h = 11; p.mrope_w = 10; }
+      const void* bufs[] = {bx.handle(), bp.handle()};
+      ctx.dispatch("cpi_rope", runtime::MetalContext::Grid::Threads,
+                   static_cast<std::size_t>(heads) * (rot / 2) * tokens, 256, bufs, nullptr, 2,
+                   &p, sizeof(p));
+      ctx.commit_and_wait();
+      const auto* o2 = static_cast<const std::uint16_t*>(bx.contents());
+      return std::vector<std::uint16_t>(o2, o2 + n);
+    };
+
+    // 1-D reference: position buffer holds the base, kernel adds the token index.
+    const std::vector<std::int32_t> base = {0};
+    const std::vector<std::uint16_t> oned = run(false, base);
+
+    // Same positions expressed as three identical axes.
+    std::vector<std::int32_t> same(3 * tokens);
+    for (std::uint32_t t = 0; t < tokens; ++t) {
+      same[t] = static_cast<std::int32_t>(t);
+      same[tokens + t] = static_cast<std::int32_t>(t);
+      same[2 * tokens + t] = static_cast<std::int32_t>(t);
+    }
+    const std::vector<std::uint16_t> flat = run(true, same);
+    std::size_t bad = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+      if (flat[i] != oned[i]) ++bad;
+    }
+    std::printf("  %-22s %zu/%zu differ from 1-D rope  %s\n", "mrope_reduces_to_1d", bad, n,
+                bad == 0 ? "PASS" : "FAIL");
+    if (bad != 0) ++failures;
+
+    // Genuinely 3-axis: an image-like layout where h and w differ from t.
+    std::vector<std::int32_t> split(3 * tokens);
+    for (std::uint32_t t = 0; t < tokens; ++t) {
+      split[t] = 1;                                       // t: constant across an image span
+      split[tokens + t] = static_cast<std::int32_t>(1 + t / 2);
+      split[2 * tokens + t] = static_cast<std::int32_t>(1 + t % 2);
+    }
+    const std::vector<std::uint16_t> three = run(true, split);
+    std::size_t moved = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+      if (three[i] != oned[i]) ++moved;
+    }
+    std::printf("  %-22s %zu/%zu differ from 1-D rope  %s\n", "mrope_splits_axes", moved, n,
+                moved > 0 ? "PASS" : "FAIL (sections ignored)");
+    if (moved == 0) ++failures;
   }
 
   std::printf("[metal_smoke] %s\n", failures == 0 ? "ALL PASS" : "FAILURES");
