@@ -225,6 +225,24 @@ std::vector<std::int32_t> build_mrope_positions(const std::vector<int>& tokens, 
   return pos;
 }
 
+// Where the M-RoPE counter ended -- the position the FIRST generated token takes. Not the token
+// count: an image span advances the counter by its merged extent, so after 16 image tokens the
+// two differ by 12 and using the token count rotates every generated token wrongly.
+int mrope_next_position(const std::vector<int>& tokens, int image_token_id, int merged_h,
+                        int merged_w) {
+  const std::vector<std::int32_t> pos =
+      build_mrope_positions(tokens, image_token_id, merged_h, merged_w);
+  const int n = static_cast<int>(tokens.size());
+  if (n == 0) return 0;
+  // The last token's t axis, plus one. For a trailing text token all three axes agree; for a
+  // trailing IMAGE token the counter has already advanced past the span, so take the max.
+  int last = 0;
+  for (int axis = 0; axis < 3; ++axis) {
+    last = std::max(last, static_cast<int>(pos[static_cast<std::size_t>(axis) * n + (n - 1)]));
+  }
+  return last + 1;
+}
+
 std::vector<float> PlanMetalEngine::encode_image(const std::vector<float>& patches, int grid_h,
                                                  int grid_w) {
   const model::LlamaConfig& c = cfg_;

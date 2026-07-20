@@ -42,6 +42,12 @@ namespace engine {
 std::vector<std::int32_t> build_mrope_positions(const std::vector<int>& tokens, int image_token_id,
                                                 int merged_h, int merged_w);
 
+// The position the first GENERATED token takes. Differs from tokens.size() whenever the prompt
+// contains an image, because an image span advances the counter by its merged extent rather
+// than by its token count.
+int mrope_next_position(const std::vector<int>& tokens, int image_token_id, int merged_h,
+                        int merged_w);
+
 struct GenerationConstraints;  // fwd (generation_constraints.hpp) — grammar-constrained decode
 
 class PlanMetalEngine {
@@ -74,8 +80,13 @@ public:
 
   // Prefills a prompt containing image tokens. `embeds` is indexed by absolute position; an
   // empty row leaves that token's own embedding in place. Rows are spliced AS-IS.
+  // `mrope_positions` is the [3][tokens] array from build_mrope_positions(); empty keeps the
+  // plain 1-D rope path. After this returns, generation continues on 1-D positions -- generated
+  // tokens are text, so their axes are equal -- but the caller must pass the M-ROPE counter,
+  // not the token index, which build_mrope_positions reports via mrope_next_position().
   void prefill_multimodal(const std::vector<int>& tokens,
-                          const std::vector<std::vector<float>>& embeds);
+                          const std::vector<std::vector<float>>& embeds,
+                          const std::vector<std::int32_t>& mrope_positions = {});
   int quant_bits() const {
     return quant_bits_;
   }
@@ -318,6 +329,12 @@ private:
   // Borrowed for the duration of prefill_multimodal only, never owned. Cleared on the way out
   // (including on a throw) so a later plain prefill cannot read a dangling pointer.
   const std::vector<std::vector<float>>* embeds_ = nullptr;
+
+  // Armed only for the duration of a multimodal prefill. The rope kernel reads the axis
+  // positions for the CURRENT chunk from here; decode goes back to the scalar path.
+  bool mrope_active_ = false;
+  runtime::MetalBuffer mrope_pos_buf_;
+  int mrope_section_[3] = {11, 11, 10};
 
   // Writes slot X after one layer, in the CPU engine's dump format. No-op unless CPI_Q35_DUMP is
   // set. See the definition for why both prefill and decode call it.

@@ -1245,8 +1245,20 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
         // Batched decode: the rows are N different sequences, so each takes its own
         // position rather than base+t.
         if (batch_ != nullptr) p.per_row_positions = 1;
+        // M-RoPE: bind the [3][T] axis positions for THIS chunk and tell the kernel how the
+        // rotary lanes divide between them. Off unless a multimodal prefill armed it, and for
+        // pure text the three axes are equal, so the kernel's own 1-D result is reproduced
+        // bit for bit (metal_smoke::mrope_reduces_to_1d).
+        const bool use_mrope = mrope_active_ && mrope_pos_buf_.valid();
+        if (use_mrope) {
+          p.mrope_t = static_cast<std::uint32_t>(mrope_section_[0]);
+          p.mrope_h = static_cast<std::uint32_t>(mrope_section_[1]);
+          p.mrope_w = static_cast<std::uint32_t>(mrope_section_[2]);
+        }
         const void* bufs[] = {slot(op.in),
-                              batch_ != nullptr ? batch_pos_buf_.handle() : pos_buf_.handle()};
+                              use_mrope ? mrope_pos_buf_.handle()
+                                        : (batch_ != nullptr ? batch_pos_buf_.handle()
+                                                             : pos_buf_.handle())};
         // Threads cover the ROTATED lanes only. Launching head_dim/2 per head was not just
         // wasteful, it was wrong: those extra threads rotated lanes that must pass through.
         const int rot = op.rotary_dim > 0 ? op.rotary_dim : op.head_dim;
@@ -1975,21 +1987,48 @@ opplan::WeightSource& PlanMetalEngine::weight_source() {
 // Chunking is left to prefill_chunks, so this works unchanged on a recurrent model (which
 // prefills one token at a time) -- the splice is keyed on absolute position, not chunk offset.
 void PlanMetalEngine::prefill_multimodal(const std::vector<int>& tokens,
-                                         const std::vector<std::vector<float>>& embeds) {
+                                         const std::vector<std::vector<float>>& embeds,
+                                         const std::vector<std::int32_t>& mrope_positions) {
   embeds_ = &embeds;
+  const int n = static_cast<int>(tokens.size());
+  const bool want_mrope = !mrope_positions.empty();
+  if (want_mrope && static_cast<int>(mrope_positions.size()) != 3 * n) {
+    embeds_ = nullptr;
+    throw std::runtime_error("mrope positions must be 3 x tokens, got " +
+                             std::to_string(mrope_positions.size()) + " for " +
+                             std::to_string(n) + " tokens");
+  }
+  mrope_active_ = want_mrope;
   int pos = 0;
   try {
-    for (const int chunk : prefill_chunks(static_cast<int>(tokens.size()))) {
+    for (const int chunk : prefill_chunks(n)) {
       const std::vector<int> ids(tokens.begin() + pos, tokens.begin() + pos + chunk);
+      if (want_mrope) {
+        // The kernel indexes positions[axis * p.tokens + token] with p.tokens == this chunk's
+        // width, so each chunk needs its own [3][chunk] slice rather than the whole array.
+        const std::size_t need = static_cast<std::size_t>(3) * chunk * sizeof(std::int32_t);
+        if (mrope_pos_buf_.size() < need) mrope_pos_buf_ = ctx_.alloc(need);
+        auto* dst = static_cast<std::int32_t*>(mrope_pos_buf_.contents());
+        for (int axis = 0; axis < 3; ++axis) {
+          for (int t = 0; t < chunk; ++t) {
+            dst[axis * chunk + t] = mrope_positions[static_cast<std::size_t>(axis) * n + pos + t];
+          }
+        }
+      }
       encode_prefill(ids, pos);
       ctx_.commit_and_wait();
       pos += chunk;
     }
   } catch (...) {
     embeds_ = nullptr;  // a throw must not leave a dangling pointer for the next prefill
+    mrope_active_ = false;
     throw;
   }
   embeds_ = nullptr;
+  // Decode continues on the plain 1-D path: generated tokens are text, so their three axes are
+  // equal and the caller passes the M-RoPE counter as a scalar position. Leaving this armed
+  // would make forward_token read a buffer sized for the last prefill chunk.
+  mrope_active_ = false;
 }
 
 std::vector<int> PlanMetalEngine::prefill_chunks(int n) const {

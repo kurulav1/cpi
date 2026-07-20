@@ -969,6 +969,66 @@ int main(int argc, char** argv) {
     }
   }
 
+  // ---- THE END: Metal's token stream vs the reference's ----
+  //
+  // Everything else in this file compares activations. This compares ANSWERS, which is the only
+  // check that covers the tower, the splice, M-RoPE and the text stack at once -- and the only
+  // one that can tell a wrong-but-finite result from a right one.
+  //
+  // Reference stream from tools/qwen35_multimodal_oracle.py on the same synthetic image and
+  // prompt. Hardcoded: regenerating it here would just be running the oracle twice.
+  if (argc >= 3) {
+    const int IMG = 248056;
+    engine::PlanMetalEngine eng;
+    eng.open(argv[2], 512);
+    const std::vector<float> soft = eng.encode_image(pixels, grid_h, grid_w);
+    const int out_hidden = engine::mini::json_get_int(geo, "out_hidden_size");
+    const int n_soft = static_cast<int>(soft.size()) / out_hidden;
+    const int mh = grid_h / merge, mw = grid_w / merge;
+
+    std::vector<int> toks = {248053};
+    std::vector<std::vector<float>> embeds(1);
+    for (int i = 0; i < n_soft; ++i) {
+      toks.push_back(IMG);
+      embeds.emplace_back(soft.begin() + static_cast<std::size_t>(i) * out_hidden,
+                          soft.begin() + static_cast<std::size_t>(i + 1) * out_hidden);
+    }
+    toks.push_back(248054);
+    embeds.emplace_back();
+    for (int t : {3838, 374, 419, 30}) {
+      toks.push_back(t);
+      embeds.emplace_back();
+    }
+
+    const std::vector<std::int32_t> mpos = engine::build_mrope_positions(toks, IMG, mh, mw);
+    eng.prefill_multimodal(toks, embeds, mpos);
+
+    int pos = engine::mrope_next_position(toks, IMG, mh, mw);
+    std::vector<int> got;
+    int next = toks.back();
+    for (int i = 0; i < 8; ++i) {
+      const std::vector<float>& lg = eng.forward_token(next, pos + i);
+      int best = 0;
+      for (std::size_t j = 1; j < lg.size(); ++j) {
+        if (lg[j] > lg[static_cast<std::size_t>(best)]) best = static_cast<int>(j);
+      }
+      got.push_back(best);
+      next = best;
+    }
+    const std::vector<int> want = {198, 760, 2099, 4774, 264, 3160, 5072, 314};
+    int match = 0;
+    for (std::size_t i = 0; i < want.size() && i < got.size(); ++i) {
+      if (got[i] == want[i]) ++match; else break;
+    }
+    std::printf("      metal : ");
+    for (int v : got) std::printf("%d ", v);
+    std::printf("\n      oracle: ");
+    for (int v : want) std::printf("%d ", v);
+    std::printf("\n  %-22s %d/8 leading tokens match  %s\n", "MULTIMODAL_stream", match,
+                match == 8 ? "PASS" : "FAIL");
+    if (match != 8) ++failures;
+  }
+
   std::printf("[metal_vision] %s\n", failures == 0 ? "ALL PASS" : "FAILURES");
   return failures == 0 ? 0 : 1;
 }
