@@ -7,7 +7,7 @@ import { spawn, execFileSync } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { randomUUID } from "node:crypto";
 
-import { getRuntimeConfig, publicRuntimeSummary, setPreferredModelDir, profileBatchable, NON_BATCH_FAMILIES } from "./config.mjs";
+import { getRuntimeConfig, publicRuntimeSummary, setPreferredModelDir, profileBatchable, isMetalBackend } from "./config.mjs";
 import { createBatchWorker, toBatchArgs } from "./batch_worker.mjs";
 import {
   buildInternalBodyFromChatRequest,
@@ -1523,14 +1523,19 @@ function batchWorkerEnabled() {
   return process.env.CPI_BATCH_WORKER !== "0";
 }
 
-// The batched decode path only supports plain fp16 fully-resident, full-attention
-// models. Anything else (runtime int8/int4, pre-packed streaming weights, MoE)
-// must fall back to the single-flight worker, which can run them. Deciding this
-// on the Node side lets a request route to the right worker instead of failing.
-// Families that run on their own engine (NOT LlamaEngine) can't be batched: the
-// --interactive-batch loop is LlamaEngine-only (see main.cpp), so the worker
-// would load the model but never speak the batch protocol and hang the request.
-const NON_LLAMA_ENGINE_FAMILIES = NON_BATCH_FAMILIES;
+// Which requests the shared batch worker can serve; everything else falls back to single-flight,
+// which can run anything. Deciding it here lets a request route to the right worker rather than
+// fail at it.
+//
+// This used to say the batched path "only supports plain fp16 fully-resident full-attention
+// models" and that "--interactive-batch is LlamaEngine-only". Both were stale. main.cpp wires
+// --interactive-batch for PlanMetalEngine too (engine::BatchScheduler is backend-free), and on
+// an M4 two concurrent streams interleave correctly at fp16, int8 AND int4.
+//
+// The surviving rule is per-FAMILY, not per-engine: a recurrent/delta-net model (qwen3_5) carries
+// per-sequence state the batched scheduler does not multiplex, and MoE/streamed-weight profiles
+// have their own reasons. That lives in NON_BATCH_FAMILIES/profileBatchable in config.mjs, which
+// is what actually enforces it -- a NON_LLAMA_ENGINE_FAMILIES alias sat here unused.
 
 function isBatchCompatible(cliConfig) {
   const p = cliConfig.profile || {};
@@ -1540,7 +1545,14 @@ function isBatchCompatible(cliConfig) {
   if (!profileBatchable({ ...p, template: p.template ?? cliConfig.meta?.template })) return false;
   if (cliConfig.imagePath) return false;                                   // images: single-flight only
   if (cliConfig.meta?.thinking) return false;                              // reasoning split needs the single-flight splitter
-  if (cliConfig.quantMode && cliConfig.quantMode !== "none") return false; // runtime quantization
+  // Runtime quantization forces single-flight on CUDA. It does NOT on Metal: PlanMetalEngine
+  // runs --interactive-batch with --weight-quant int8 AND int4, measured on an M4 (two
+  // concurrent streams, correctly interleaved, coherent output at both widths).
+  //
+  // This mattered more than it looks. Quantization is precisely how a large model fits in a
+  // 16 GB unified-memory Mac, so vetoing batching whenever the model is quantized pushed Mac
+  // deployments to single-flight in exactly the case where concurrency is worth most.
+  if (!isMetalBackend() && cliConfig.quantMode && cliConfig.quantMode !== "none") return false;
   return true;
 }
 

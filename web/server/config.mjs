@@ -1367,6 +1367,17 @@ export const NON_BATCH_FAMILIES = new Set(["qwen3_5", "llama4", "cpt_gpt", "gemm
 
 // Can this MODEL ever use continuous batching? Request-level reasons to fall back to
 // single-flight (thinking, images, runtime quant) are checked separately.
+// Which GPU backend llama_infer will pick. The server had NO notion of this -- the only
+// platform test in it was `process.platform === "win32"` -- so every backend-specific rule was
+// written for CUDA and silently applied to Apple Silicon as well.
+//
+// Apple Silicon implies Metal: there is no CUDA on darwin/arm64, and main.cpp's resolve_engine
+// picks the Metal engine whenever Metal is available and CUDA is not. That makes the platform
+// test sufficient here; it does not need to interrogate the binary.
+export function isMetalBackend() {
+  return process.platform === "darwin" && process.arch === "arm64";
+}
+
 export function profileBatchable(profile) {
   const family = String(profile?.family || profile?.template || "").toLowerCase();
   if (NON_BATCH_FAMILIES.has(family)) return false;
