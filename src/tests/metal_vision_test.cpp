@@ -366,6 +366,60 @@ std::vector<float> run_vision_block(runtime::MetalContext& ctx, const std::vecto
   return grab(bx, n);
 }
 
+// The patch merger: LayerNorm per patch, fold each 2x2 unit into one row, fc1 -> exact GELU ->
+// fc2. The fold needs no data movement -- patches are already in merge-unit-major order, so
+// four consecutive rows ARE one unit and [tokens][hidden] reinterprets as [tokens/4][4*hidden].
+std::vector<float> run_merger(runtime::MetalContext& ctx, const std::vector<float>& in,
+                              const std::string& dir, int tokens, int hidden, int merge,
+                              int inter_m, int out_hidden, int soft) {
+  const std::string mp = dir + "/weights/merger_";
+  auto hx = to_f16(in);
+  auto bx = ctx.alloc_from(hx.data(), hx.size() * 2);
+  auto bn = ctx.alloc(hx.size() * 2);
+  auto bi = ctx.alloc(static_cast<std::size_t>(soft) * inter_m * 2);
+  auto bo = ctx.alloc(static_cast<std::size_t>(soft) * out_hidden * 2);
+  auto up = [&](const std::vector<float>& v) {
+    auto h = to_f16(v);
+    return ctx.alloc_from(h.data(), h.size() * 2);
+  };
+  auto bnw = up(read_f32(mp + "norm_weight.f32")), bnb = up(read_f32(mp + "norm_bias.f32"));
+  auto b1w = up(read_f32(mp + "linear_fc1_weight.f32"));
+  auto b1b = up(read_f32(mp + "linear_fc1_bias.f32"));
+  auto b2w = up(read_f32(mp + "linear_fc2_weight.f32"));
+  auto b2b = up(read_f32(mp + "linear_fc2_bias.f32"));
+  {
+    LayerNormParams p{static_cast<std::uint32_t>(tokens), static_cast<std::uint32_t>(hidden),
+                      1e-6f, 1u};
+    const void* bufs[] = {bx.handle(), bnw.handle(), bnb.handle(), bn.handle()};
+    ctx.dispatch("cpi_layernorm", runtime::MetalContext::Grid::Groups,
+                 static_cast<std::size_t>(tokens), 256, bufs, nullptr, 4, &p, sizeof(p));
+  }
+  auto mgemm = [&](runtime::MetalBuffer& w2, runtime::MetalBuffer& in2, runtime::MetalBuffer& out2,
+                   runtime::MetalBuffer& b2, int od, int idim) {
+    GemvParams p{static_cast<std::uint32_t>(od), static_cast<std::uint32_t>(idim),
+                 static_cast<std::uint32_t>(soft), 1u};
+    const void* bufs[] = {w2.handle(), in2.handle(), out2.handle(), b2.handle()};
+    const std::size_t tiles = static_cast<std::size_t>((soft + kGemmBN - 1) / kGemmBN);
+    const std::size_t groups = (static_cast<std::size_t>(od) / kGemmFBM) * tiles;
+    ctx.dispatch("cpi_gemm_f16", runtime::MetalContext::Grid::Groups, groups, kGemmTG, bufs,
+                 nullptr, 4, &p, sizeof(p));
+  };
+  mgemm(b1w, bn, bi, b1b, inter_m, inter_m);
+  {
+    ElemParams p{static_cast<std::uint32_t>(soft) * static_cast<std::uint32_t>(inter_m), 1.0f};
+    const void* bufs[] = {bi.handle()};
+    // erf, not tanh -- the merger's nn.GELU() defaults to approximate='none'.
+    ctx.dispatch("cpi_gelu_erf", runtime::MetalContext::Grid::Threads,
+                 static_cast<std::size_t>(soft) * inter_m, 256, bufs, nullptr, 1, &p, sizeof(p));
+  }
+  mgemm(b2w, bi, bo, b2b, out_hidden, inter_m);
+  ctx.commit_and_wait();
+  const auto* o = static_cast<const std::uint16_t*>(bo.contents());
+  std::vector<float> out(static_cast<std::size_t>(soft) * out_hidden);
+  for (std::size_t i = 0; i < out.size(); ++i) out[i] = f16_to_f32(o[i]);
+  return out;
+}
+
 // Per-token cos/sin for the vision RoPE, half a head_dim wide (cos[i] == cos[i+half], so only
 // the first half is stored).
 //
@@ -448,6 +502,9 @@ int main(int argc, char** argv) {
   const std::vector<float> b_proj = read_f32(dir + "/weights/patch_embed_proj_bias.f32");
   const std::vector<float> pos_tab = read_f32(dir + "/weights/pos_embed_weight.f32");
 
+  std::vector<float> our_patch_embed;   // filled by stage 1, consumed by the end-to-end run
+  std::vector<float> our_sum;
+
   // ---- stage 1: patch embed ----
   // Conv3d with stride == kernel_size over an input reshaped so each sample IS one patch, so
   // it reduces to Linear(patch_dim -> hidden). The [768,3,2,16,16] weight is already contiguous
@@ -477,6 +534,7 @@ int main(int argc, char** argv) {
     std::printf("    got[0..3] = %.4f %.4f %.4f %.4f\n", got[0], got[1], got[2], got[3]);
     std::printf("    want[0..3]= %.4f %.4f %.4f %.4f\n", want_pe[0], want_pe[1],
                 want_pe[2], want_pe[3]);
+    our_patch_embed = got;
     check("patch_embed", got, want_pe, 0.05f);
   }
 
@@ -503,6 +561,10 @@ int main(int argc, char** argv) {
     // Fed the ORACLE's patch embed, not ours, so this isolates the add and the position table
     // from any error already measured in stage 1.
     check("pos_embed_added", got, want_sum, 0.02f);
+    // Our own sum, from our own patch embed -- the stage check above deliberately used the
+    // oracle's, to isolate the add. This is what the end-to-end run starts from.
+    our_sum.resize(our_patch_embed.size());
+    for (std::size_t i = 0; i < our_sum.size(); ++i) our_sum[i] = our_patch_embed[i] + pos[i];
   }
 
   // ---- stage 4: one full transformer block ----
@@ -516,7 +578,7 @@ int main(int argc, char** argv) {
     const std::vector<float> want_b0 = read_f32(dir + "/stage_04_block_00.f32");
     const std::string wp = dir + "/weights/blocks_0_";
 
-    std::vector<float> h_x = want_sum;  // block input
+    std::vector<float> h_x = want_sum;  // block input (oracle's, to isolate block 0)
     VisionBlockWeights bw{read_f32(wp + "norm1_weight.f32"),  read_f32(wp + "norm1_bias.f32"),
                           read_f32(wp + "attn_qkv_weight.f32"), read_f32(wp + "attn_qkv_bias.f32"),
                           read_f32(wp + "attn_proj_weight.f32"), read_f32(wp + "attn_proj_bias.f32"),
@@ -593,6 +655,70 @@ int main(int argc, char** argv) {
     const bool ok = rel <= 0.02f;
     std::printf("  %-22s rel=%.5f  max_abs=%.4f  |ref|max=%.1f  tol_rel=0.020  %s\n",
                 "block_11_chained", rel, mx, ref_mx, ok ? "PASS" : "FAIL");
+    if (!ok) ++failures;
+  }
+
+  // ---- the merger: 2x2 patches -> one soft token ----
+  //
+  // Fed the ORACLE's block_11 so this measures the merger alone rather than inheriting the
+  // stack's accumulated error.
+  //
+  // The 2x2 fold needs NO data movement. The norm is applied per patch over hidden, and the
+  // patches are already in merge-unit-major order, so four consecutive rows ARE one unit --
+  // regrouping [tokens][768] as [tokens/4][3072] is a reinterpretation of the same buffer.
+  {
+    const int inter_m = hidden * merge * merge;               // 3072
+    const int out_hidden = engine::mini::json_get_int(geo, "out_hidden_size");
+    const int soft = tokens / (merge * merge);
+    const std::vector<float> want = read_f32(dir + "/stage_16_merger.f32");
+    const std::vector<float> got = run_merger(ctx, read_f32(dir + "/stage_15_block_11.f32"), dir,
+                                              tokens, hidden, merge, inter_m, out_hidden, soft);
+    std::printf("      %d patches -> %d soft tokens of %d\n", tokens, soft, out_hidden);
+    check("merger", got, want, 0.05f);
+  }
+
+  // ---- END TO END: pixels -> soft tokens, entirely on our own outputs ----
+  //
+  // Every check above feeds a stage the ORACLE's input, which isolates that stage but says
+  // nothing about whether the errors compound. This runs the whole tower on its own output and
+  // is the only number that describes what the port actually produces.
+  {
+    const int heads = engine::mini::json_get_int(geo, "num_heads");
+    const int head_dim = engine::mini::json_get_int(geo, "head_dim");
+    const int inter = engine::mini::json_get_int(geo, "intermediate_size");
+    const int depth = engine::mini::json_get_int(geo, "depth");
+    const int inter_m = hidden * merge * merge;
+    const int out_hidden = engine::mini::json_get_int(geo, "out_hidden_size");
+    const int soft = tokens / (merge * merge);
+
+    std::vector<float> cosb, sinb;
+    build_vision_rope(grid_h, grid_w, head_dim, merge, 10000.0f, cosb, sinb);
+    std::vector<float> cur = our_sum;
+    for (int L = 0; L < depth; ++L) {
+      const std::string bp = dir + "/weights/blocks_" + std::to_string(L) + "_";
+      VisionBlockWeights bl{read_f32(bp + "norm1_weight.f32"),  read_f32(bp + "norm1_bias.f32"),
+                            read_f32(bp + "attn_qkv_weight.f32"), read_f32(bp + "attn_qkv_bias.f32"),
+                            read_f32(bp + "attn_proj_weight.f32"),
+                            read_f32(bp + "attn_proj_bias.f32"),
+                            read_f32(bp + "norm2_weight.f32"),  read_f32(bp + "norm2_bias.f32"),
+                            read_f32(bp + "mlp_linear_fc1_weight.f32"),
+                            read_f32(bp + "mlp_linear_fc1_bias.f32"),
+                            read_f32(bp + "mlp_linear_fc2_weight.f32"),
+                            read_f32(bp + "mlp_linear_fc2_bias.f32")};
+      cur = run_vision_block(ctx, cur, bl, cosb, sinb, tokens, hidden, heads, head_dim, inter);
+    }
+    const std::vector<float> got = run_merger(ctx, cur, dir, tokens, hidden, merge, inter_m,
+                                              out_hidden, soft);
+    const std::vector<float> want = read_f32(dir + "/stage_16_merger.f32");
+    float mx = 0.0f, ref_mx = 0.0f;
+    for (std::size_t i = 0; i < got.size(); ++i) {
+      mx = std::max(mx, std::fabs(got[i] - want[i]));
+      ref_mx = std::max(ref_mx, std::fabs(want[i]));
+    }
+    const float rel = mx / (ref_mx + 1e-9f);
+    const bool ok = rel <= 0.02f;
+    std::printf("  %-22s rel=%.5f  max_abs=%.4f  |ref|max=%.2f  tol_rel=0.020  %s\n",
+                "END_TO_END", rel, mx, ref_mx, ok ? "PASS" : "FAIL");
     if (!ok) ++failures;
   }
 

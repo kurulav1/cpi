@@ -233,3 +233,34 @@ kernel void cpi_rope_vision(
   x[base]            = half(a * c - b * s);
   x[base + half_dim] = half(a * s + b * c);
 }
+
+// ---------------------------------------------------------------------------
+// Exact (erf) GELU: 0.5 * x * (1 + erf(x / sqrt(2))).
+//
+// NOT interchangeable with cpi_gelu above. The vision tower uses both: its blocks specify
+// hidden_act = "gelu_pytorch_tanh", but the patch merger constructs a bare nn.GELU(), whose
+// default is approximate='none'. The two differ by up to ~4e-4 -- small, systematic, and
+// exactly the kind of thing that gets absorbed into a loosened tolerance instead of fixed.
+// ---------------------------------------------------------------------------
+// metal_stdlib has no erf (nor erfc), so this is Abramowitz & Stegun 7.1.26 -- max absolute
+// error 1.5e-7, which is four orders below fp16's resolution and two below the 4e-4 gap
+// between exact and tanh GELU that this exists to close.
+inline float cpi_erf(float x) {
+  const float sign = (x < 0.0f) ? -1.0f : 1.0f;
+  const float a = fabs(x);
+  const float t = 1.0f / (1.0f + 0.3275911f * a);
+  const float poly = t * (0.254829592f +
+                     t * (-0.284496736f +
+                     t * (1.421413741f +
+                     t * (-1.453152027f + t * 1.061405429f))));
+  return sign * (1.0f - poly * exp(-a * a));
+}
+
+kernel void cpi_gelu_erf(
+    device half*        x   [[buffer(0)]],
+    constant ElemParams& p  [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]) {
+  if (gid >= p.n) return;
+  const float v = float(x[gid]);
+  x[gid] = half(0.5f * v * (1.0f + cpi_erf(v * 0.70710678118654752f)));  // 1/sqrt(2)
+}
