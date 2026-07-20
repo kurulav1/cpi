@@ -14,6 +14,24 @@ here), and it isolates the model from the resize/normalise step, which has its o
 
     python tools/qwen35_multimodal_oracle.py --model ~/models/qwen35-0.8b-hf \
                                              --out artifacts/q35_mm --max-new 8
+
+WHAT THIS FOUND, first run, before any comparison: the text stack uses M-RoPE for multimodal
+input and the Metal port does not. For <vision_start> + 16 image tokens + <vision_end> + 4 text
+tokens the model assigns
+
+    t: 0  1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1  5 6 7 8 9
+    h: 0  1 1 1 1 2 2 2 2 3 3 3 3 4 4 4 4  5 6 7 8 9
+    w: 0  1 2 3 4 1 2 3 4 1 2 3 4 1 2 3 4  5 6 7 8 9
+
+against a naive 0..21. Two consequences, and the second is the one that bites:
+
+  - image tokens carry a 4x4 (h, w) grid rather than a running index, with mrope_section
+    [11, 11, 10] splitting each head's rotary lanes across the t, h and w axes;
+  - the image block advances the counter by only 4 -- the MERGED grid width -- so every text
+    token after the image sits at 5..9 where a 1-D counter puts it at 17..21.
+
+So the splice can be perfectly correct and the whole remainder of the prompt still be rotated to
+the wrong positions. Soft tokens alone are not enough.
 """
 
 from __future__ import annotations
