@@ -1184,6 +1184,45 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
           }
           break;
         }
+        // Speculative verify: every position's logits, into batch_logits_buf_. This is the same
+        // per-row loop the batched-decode path uses, but over consecutive tokens of ONE sequence
+        // rather than N sequences -- verify_tokens sizes the buffer and reads K argmaxes back.
+        // The extra T-1 vocab GEMVs are the cost of checking K drafts in one pass, which is still
+        // far cheaper than K separate target decodes.
+        if (prefill_all_logits_) {
+          for (int t = 0; t < T; ++t) {
+            const std::size_t in_off =
+                static_cast<std::size_t>(t) * static_cast<std::size_t>(op.in_dim) * 2;
+            const std::size_t out_off =
+                static_cast<std::size_t>(t) * static_cast<std::size_t>(cfg_.vocab_size) *
+                sizeof(float);
+            if (op.qbits != 0) {
+              const int gsz = (op.qgroup > 0) ? op.qgroup : op.in_dim;
+              QuantParams p{static_cast<std::uint32_t>(op.cols),
+                            static_cast<std::uint32_t>(op.in_dim),
+                            1,
+                            static_cast<std::uint32_t>(op.qbits),
+                            static_cast<std::uint32_t>(op.qgroup),
+                            static_cast<std::uint32_t>((op.in_dim + gsz - 1) / gsz),
+                            0};
+              const void* bufs[] = {op.qweight, slot(op.in), batch_logits_buf_.handle(),
+                                    op.qscales};
+              const std::size_t offs[] = {0, in_off, out_off, 0};
+              ctx_.dispatch("cpi_lm_head_quant", G::Groups,
+                            groups_for_rows(static_cast<std::size_t>(op.cols)), kTG, bufs, offs, 4,
+                            &p, sizeof(p));
+            } else {
+              GemvParams p{static_cast<std::uint32_t>(op.cols),
+                           static_cast<std::uint32_t>(op.in_dim), 1, 0};
+              const void* bufs[] = {op.weight, slot(op.in), batch_logits_buf_.handle()};
+              const std::size_t offs[] = {0, in_off, out_off};
+              ctx_.dispatch("cpi_lm_head", G::Groups,
+                            groups_for_rows(static_cast<std::size_t>(op.cols)), kTG, bufs, offs, 3,
+                            &p, sizeof(p));
+            }
+          }
+          break;
+        }
         if (op.qbits != 0) {
           const int gsz = (op.qgroup > 0) ? op.qgroup : op.in_dim;
           QuantParams p{static_cast<std::uint32_t>(op.cols),
@@ -2317,6 +2356,100 @@ const std::vector<float>& PlanMetalEngine::forward_token(int token, int position
   const float* src = static_cast<const float*>(logits_buf_.contents());
   std::memcpy(logits_.data(), src, logits_.size() * sizeof(float));
   return logits_;
+}
+
+// ---- Speculative decoding ----
+
+void PlanMetalEngine::reset_kv_cache() {
+  // Nothing to zero: the KV cache is addressed by absolute position and overwritten in place. The
+  // only per-sequence state is the prefix-reuse record, which a fresh sequence must not inherit.
+  prev_seq_.clear();
+}
+
+void PlanMetalEngine::prefill_prompt(const std::vector<int>& prompt_tokens, int start_pos) {
+  // Process every token EXCEPT the last, so the last is consumed by the first decode/verify step
+  // at position P-1 -- matching LlamaEngine and generate_stream. Chunked at max_prefill_.
+  const int P = static_cast<int>(prompt_tokens.size());
+  if (P <= 1) return;
+  prev_seq_.clear();  // this rewrites the cache directly; drop any shared-prefix state
+  int pos = start_pos;
+  int i = 0;
+  const int last_idx = P - 1;
+  while (i < last_idx) {
+    const int chunk = std::min(max_prefill_, last_idx - i);
+    const std::vector<int> ids(prompt_tokens.begin() + i, prompt_tokens.begin() + i + chunk);
+    encode_prefill(ids, pos);
+    ctx_.commit_and_wait();
+    pos += chunk;
+    i += chunk;
+  }
+  if (!ctx_.last_error().empty()) last_error_ = ctx_.last_error();
+}
+
+int PlanMetalEngine::decode_next_token(int token, int position, float /*temperature*/,
+                                       const std::vector<int>& /*history*/) {
+  const std::vector<float>& lg = forward_token(token, position);
+  int best = 0;
+  for (std::size_t j = 1; j < lg.size(); ++j) {
+    if (lg[j] > lg[static_cast<std::size_t>(best)]) best = static_cast<int>(j);
+  }
+  return best;
+}
+
+int PlanMetalEngine::decode_next_token2(int token, int position, int* second) {
+  const std::vector<float>& lg = forward_token(token, position);
+  int best = 0;
+  for (std::size_t j = 1; j < lg.size(); ++j) {
+    if (lg[j] > lg[static_cast<std::size_t>(best)]) best = static_cast<int>(j);
+  }
+  if (second != nullptr) {
+    int s = (best == 0) ? 1 : 0;
+    for (std::size_t j = 0; j < lg.size(); ++j) {
+      if (static_cast<int>(j) == best) continue;
+      if (lg[j] > lg[static_cast<std::size_t>(s)]) s = static_cast<int>(j);
+    }
+    *second = s;
+  }
+  return best;
+}
+
+void PlanMetalEngine::verify_tokens(const std::vector<int>& tokens, int start_pos,
+                                    std::vector<int>& out_argmax) {
+  const int K = static_cast<int>(tokens.size());
+  out_argmax.assign(static_cast<std::size_t>(K), 0);
+  if (K == 0) return;
+  if (K > max_prefill_) {
+    throw std::runtime_error("verify_tokens: K=" + std::to_string(K) + " exceeds max_prefill_=" +
+                             std::to_string(max_prefill_));
+  }
+  if (has_recurrent_ops_) {
+    throw std::runtime_error(
+        "verify_tokens: speculative decoding needs a parallel verify pass, which a recurrent "
+        "(delta-net) model has no token dimension for");
+  }
+
+  // batch_logits_buf_ is the batched-decode scratch; verify borrows it for K rows. Grow if a
+  // previous batched call sized it smaller.
+  const std::size_t need =
+      static_cast<std::size_t>(K) * static_cast<std::size_t>(cfg_.vocab_size) * sizeof(float);
+  if (batch_logits_buf_.size() < need) batch_logits_buf_ = ctx_.alloc(need);
+
+  // One causal chunk at [start_pos, start_pos+K-1], with logits for every position.
+  prefill_all_logits_ = true;
+  encode_prefill(tokens, start_pos);
+  ctx_.commit_and_wait();
+  prefill_all_logits_ = false;
+  if (!ctx_.last_error().empty()) last_error_ = ctx_.last_error();
+
+  const float* src = static_cast<const float*>(batch_logits_buf_.contents());
+  for (int t = 0; t < K; ++t) {
+    const float* row = src + static_cast<std::size_t>(t) * static_cast<std::size_t>(cfg_.vocab_size);
+    int best = 0;
+    for (int j = 1; j < cfg_.vocab_size; ++j) {
+      if (row[j] > row[best]) best = j;
+    }
+    out_argmax[static_cast<std::size_t>(t)] = best;
+  }
 }
 
 std::vector<int> PlanMetalEngine::generate(const std::vector<int>& prompt, int max_new,

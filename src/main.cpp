@@ -31,6 +31,7 @@
 #endif
 #if LLAMA_ENGINE_ENABLE_METAL
 #include "engine/plan_metal_engine.hpp"
+#include "engine/speculative_decoder.hpp"  // header-only template; harmless if CUDA already pulled it
 #include "runtime/metal_context.hpp"
 #endif
 #include "model/tokenizer.hpp"
@@ -464,10 +465,74 @@ int main(int argc, char** argv) {
               "app::image_prompt::expand is still hard-typed to PlanCudaEngine, so nothing wires "
               "the two together. Refusing rather than silently answering without the image.");
         }
+        // Speculative decoding: a small DRAFT proposes K tokens, this model (the TARGET) checks
+        // them in one parallel verify pass, and only its own argmax is ever emitted -- so the
+        // output is identical to plain greedy decoding of the target, just faster when the draft
+        // guesses well. Two PlanMetalEngine instances; unified memory means each just holds its
+        // own weights. Not compatible with --interactive-batch (that path is its own server).
         if (!cli.draft_model_path.empty()) {
-          throw std::runtime_error(
-              "--draft-model / speculative decoding is CUDA-only; the Metal branch would ignore "
-              "it and decode normally. Refusing rather than silently dropping to a slower path.");
+          if (cli.interactive_batch) {
+            throw std::runtime_error("--draft-model and --interactive-batch are mutually exclusive");
+          }
+          engine::PlanMetalEngine target_eng;
+          const int tgt_quant = cli.opts.int8_streaming ? cli.opts.streaming_quant_bits : 0;
+          target_eng.open(cli.opts.model_path, cli.opts.max_context, tgt_quant, 0);
+
+          // Quantize the draft to int8 at load. A small model loses almost nothing to int8, and
+          // a draft that does not fit fully resident is far too slow to be worth speculating
+          // with. This mirrors the CUDA path's draft handling.
+          engine::PlanMetalEngine draft_eng;
+          draft_eng.open(cli.draft_model_path, cli.opts.max_context, 8, 0);
+
+          engine::SpeculativeDecoder<engine::PlanMetalEngine> spec(draft_eng, target_eng,
+                                                                   cli.spec_tokens);
+          const int eos = cli.opts.eos_token_id;
+          app::main_modes::execute_engine_modes(
+              run_opts, prompt_tokens, stop_token_ids, cli.stop_texts,
+              use_tokenizer ? &tokenizer : nullptr,
+              [&](const std::vector<int>& p, int max_new, float /*temperature*/) {
+                // spec.generate returns prompt+generated; PlanMetalEngine::generate returns
+                // generated-only, so strip the prompt to keep the two Metal paths' output
+                // identical rather than have speculation echo the prompt.
+                std::vector<int> full = spec.generate(p, max_new, eos, nullptr);
+                return std::vector<int>(full.begin() + std::min(p.size(), full.size()), full.end());
+              },
+              [&](const std::vector<int>& p, int max_new, float temperature,
+                  const std::function<bool(int)>& on_token,
+                  const engine::GenerationConstraints* constraints) {
+                // Grammar can't ride the speculative verify path (it argmaxes drafts on-device,
+                // which a logit mask can't reach), so a constrained request falls back to the
+                // target's own single-token decode -- same choice the CUDA path makes.
+                if (constraints != nullptr && constraints->grammar != nullptr) {
+                  engine::PlanMetalEngine::Sampling s;
+                  s.temperature = temperature;
+                  s.top_k = cli.opts.top_k;
+                  s.top_p = cli.opts.top_p;
+                  s.repetition_penalty = cli.opts.repetition_penalty;
+                  s.no_repeat_ngram_size = cli.opts.no_repeat_ngram_size;
+                  s.eos_id = eos;
+                  return target_eng.generate_stream(p, max_new, s, on_token, constraints);
+                }
+                // Strip the prompt, as generate_stream does: on_token already streamed the
+                // generated tokens live, and the return value feeds the same display path.
+                std::vector<int> full = spec.generate(p, max_new, eos, on_token);
+                return std::vector<int>(full.begin() + std::min(p.size(), full.size()), full.end());
+              },
+              [&](const std::vector<int>& p, int top_k) {
+                return target_eng.inspect_next_logits(p, top_k);
+              },
+              [&]() -> const engine::BenchmarkStats& { return target_eng.last_benchmark_stats(); },
+              nullptr);
+
+          if (!quiet_output) {
+            const auto& s = spec.stats();
+            std::cerr << "[spec] rounds=" << s.rounds << " drafted=" << s.drafted
+                      << " accepted=" << s.accepted << " emitted=" << s.emitted
+                      << " accept_rate=" << s.accept_rate()
+                      << " tokens_per_round=" << s.tokens_per_round()
+                      << " spec_tokens=" << cli.spec_tokens << "\n";
+          }
+          break;
         }
         engine::PlanMetalEngine meng;
         // --weight-quant int4/int8 (a.k.a. --int4-streaming) maps to on-load host quantization;

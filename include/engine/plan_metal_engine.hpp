@@ -112,6 +112,40 @@ public:
   // attention to the rotary position -- 11 of 21 prompt tokens silently dropped.
   const std::vector<float>& forward_token(int token, int position, int cache_position = -1);
 
+  // ---- Speculative decoding surface ----
+  //
+  // These mirror LlamaEngine's method names and signatures exactly, so SpeculativeDecoder is a
+  // template over the engine type rather than two copies of one algorithm. A draft and a target
+  // are two separate PlanMetalEngine instances; unified memory means each just holds its own
+  // weights.
+
+  // Drops single-sequence prefix-reuse state so the next prefill starts from position 0. The KV
+  // cache itself needs no clearing -- it is addressed by absolute position and overwritten.
+  void reset_kv_cache();
+
+  // Fills the cache with the prompt EXCEPT its last token, at positions [0, P-2]. The last token
+  // is consumed by the first decode/verify step at position P-1, matching generate_stream and the
+  // CUDA path. Chunked at max_prefill_.
+  void prefill_prompt(const std::vector<int>& prompt_tokens, int start_pos = 0);
+
+  // One greedy decode step returning the argmax. `temperature`/`history` are accepted for
+  // signature-compatibility with LlamaEngine's n-gram-constrained decode; the speculative path
+  // only ever calls this pure-greedy (temperature 0, empty history), which is what keeps
+  // speculation lossless w.r.t. the target's own argmax.
+  int decode_next_token(int token, int position, float temperature,
+                        const std::vector<int>& history);
+
+  // Greedy decode returning the top-1 argmax and, via `second`, the top-2 token. Only the
+  // tree-opportunity probe (LLAMA_INFER_SPEC_TREE_PROBE) uses `second`.
+  int decode_next_token2(int token, int position, int* second);
+
+  // Runs `tokens` as ONE causal chunk at [start_pos, start_pos+K-1] and returns, per position i,
+  // the target's argmax AFTER consuming tokens[i] -- i.e. its prediction for position start_pos+i+1.
+  // This is the one operation that makes speculation faster than plain decode: the target checks K
+  // drafts in a single forward pass. K must be <= max_prefill_. Uniform-geometry (Llama/Qwen2)
+  // models only -- a recurrent model has no parallel token dimension to verify over.
+  void verify_tokens(const std::vector<int>& tokens, int start_pos, std::vector<int>& out_argmax);
+
   // Capture a .gputrace of whatever runs between these, for Xcode's Metal Debugger.
   //
   // metal_gemm_bench can already capture ITS dispatches -- but a bench is not a prefill, and
@@ -303,6 +337,11 @@ private:
     bool logits_last_only;
   };
   const BatchCtx* batch_ = nullptr;
+
+  // Set only during verify_tokens: makes the single-sequence LmHead op emit logits for EVERY
+  // position of the chunk (into batch_logits_buf_) instead of the last one alone. A normal
+  // prefill leaves it false and pays one vocab GEMV, not T.
+  bool prefill_all_logits_ = false;
 
   // name -> device buffer. Owns every weight for the model's lifetime.
   std::unordered_map<std::string, runtime::MetalBuffer> wbuf_;
