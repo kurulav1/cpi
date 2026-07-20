@@ -377,6 +377,12 @@ if(LLAMA_ENGINE_ENABLE_METAL)
   target_link_libraries(metal_infer PRIVATE llama_engine)
   target_include_directories(metal_infer PRIVATE include)
 
+  add_executable(metal_vision_test src/tests/metal_vision_test.cpp)
+  target_link_libraries(metal_vision_test PRIVATE llama_engine)
+  target_include_directories(metal_vision_test PRIVATE include)
+  # No add_test: it needs an oracle directory produced by a torch/transformers run, which the
+  # Mac cannot generate. Run it by hand with the dumps copied over.
+
   add_executable(metal_smoke src/tests/metal_smoke.cpp)
   target_link_libraries(metal_smoke PRIVATE llama_engine)
   target_include_directories(metal_smoke PRIVATE include)

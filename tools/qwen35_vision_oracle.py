@@ -132,6 +132,10 @@ def main() -> int:
         "source": str(model_dir),
         "grid_thw": grid_thw.tolist(),
         "geometry": {
+            "grid_t": int(grid_thw[0][0]),
+            "grid_h": int(grid_thw[0][1]),
+            "grid_w": int(grid_thw[0][2]),
+            "num_grid_per_side": int(cfg.num_position_embeddings ** 0.5),
             "depth": cfg.depth,
             "hidden_size": cfg.hidden_size,
             "num_heads": cfg.num_heads,
@@ -168,6 +172,20 @@ def main() -> int:
     write("last_hidden_state_premerge", out_t.detach().to(torch.float32).contiguous(),
           len(stages) + 1)
     manifest["soft_tokens_stage"] = "merger"
+
+    # The vision weights, in the same fp32 layout, so a port can be gated before the container
+    # format carries them. The converter does not emit model.visual.* yet, and waiting for it
+    # would mean the arithmetic is only checkable once the plumbing is done -- which is the
+    # wrong order. These stay useful afterwards as the test's fixture.
+    wdir = out_dir / "weights"
+    wdir.mkdir(exist_ok=True)
+    manifest["weights"] = []
+    for name, tensor in sorted(visual.items()):
+        fname = name.replace(".", "_") + ".f32"
+        (wdir / fname).write_bytes(tensor.contiguous().numpy().astype("<f4").tobytes())
+        manifest["weights"].append({"name": name, "shape": list(tensor.shape),
+                                    "file": "weights/" + fname})
+    print("[oracle] wrote %d weight tensors" % len(manifest["weights"]))
 
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=1), encoding="utf-8")
     print("[oracle] wrote %d stages to %s" % (len(manifest["stages"]), out_dir))

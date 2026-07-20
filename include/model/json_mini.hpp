@@ -6,7 +6,16 @@
 // safetensors-style config.json and convert the same bf16 weights without
 // duplicating ~200 lines. Hand-rolled (no third-party JSON dep), per CPI policy.
 
-#include <cuda_fp16.h>
+// A JSON reader has no business requiring CUDA. It did: one helper below converts to fp16 via
+// __float2half, and the unconditional include made this header unusable from the Metal and
+// CPU-only builds -- which is where the vision work needs it. Guarded so a CUDA build keeps
+// the intrinsic (bit-for-bit unchanged) and everything else gets the portable path.
+#if defined(__has_include)
+#  if __has_include(<cuda_fp16.h>)
+#    include <cuda_fp16.h>
+#    define CPI_JSON_MINI_HAS_CUDA_FP16 1
+#  endif
+#endif
 
 #include <cctype>
 #include <cstdint>
@@ -31,10 +40,57 @@ inline float bf16_to_float(std::uint16_t bits) {
 }
 
 inline std::uint16_t float_to_half_bits(float value) {
+#if defined(CPI_JSON_MINI_HAS_CUDA_FP16)
   const __half h = __float2half(value);
   std::uint16_t bits = 0;
   std::memcpy(&bits, &h, sizeof(bits));
   return bits;
+#else
+  // Round-to-nearest-even, matching __float2half. The obvious fallback -- shift the mantissa
+  // down and drop the low bits -- truncates instead, which biases every converted weight
+  // toward zero. Small per weight, systematic across a whole tensor, and invisible unless
+  // something compares the two backends' weights directly.
+  std::uint32_t x = 0;
+  std::memcpy(&x, &value, sizeof(x));
+  const std::uint32_t sign = (x >> 16) & 0x8000u;
+  const std::int32_t exp = static_cast<std::int32_t>((x >> 23) & 0xFFu) - 127;
+  const std::uint32_t man = x & 0x7FFFFFu;
+
+  if (exp == 128) {  // Inf / NaN: keep NaN non-zero so it stays NaN
+    return static_cast<std::uint16_t>(sign | 0x7C00u | (man != 0u ? 0x200u : 0u));
+  }
+  if (exp > 15) return static_cast<std::uint16_t>(sign | 0x7C00u);  // overflow -> Inf
+  // Below 2^-25 -- HALF the smallest subnormal -- everything rounds to zero. The tempting
+  // bound is 2^-24, the smallest subnormal itself, but values between the two round UP to it
+  // and returning zero for them loses the only bit they had. Also keeps `shift` <= 24, so the
+  // shifts below stay defined.
+  if (exp < -25) return static_cast<std::uint16_t>(sign);
+
+  std::uint32_t mantissa;
+  std::int32_t shift;
+  if (exp < -14) {          // subnormal half: shift in the implicit leading 1
+    mantissa = man | 0x800000u;
+    shift = -exp - 14 + 13;
+  } else {
+    mantissa = man;
+    shift = 13;
+  }
+  const std::uint32_t lsb = 1u << shift;
+  const std::uint32_t round_bias = (lsb >> 1) - 1u + ((mantissa >> shift) & 1u);
+  std::uint32_t rounded = (mantissa + round_bias) >> shift;
+  std::uint32_t biased_exp = (exp < -14) ? 0u : static_cast<std::uint32_t>(exp + 15);
+  if (exp >= -14) {
+    // Rounding can carry into the exponent; that is correct, and can push it to Inf.
+    biased_exp += (rounded >> 10);
+    rounded &= 0x3FFu;
+    if (biased_exp >= 31u) return static_cast<std::uint16_t>(sign | 0x7C00u);
+  } else if ((rounded & 0x400u) != 0u) {
+    // A subnormal that rounded up into the smallest normal.
+    biased_exp = 1u;
+    rounded &= 0x3FFu;
+  }
+  return static_cast<std::uint16_t>(sign | (biased_exp << 10) | rounded);
+#endif
 }
 
 inline std::string read_text_file(const std::filesystem::path& path) {
