@@ -38,7 +38,12 @@ HDR_V5 = struct.Struct("<8siiiiiiiiiiQffiiiiiifiiiQ")
 # emit a file whose version field says 6 while the appended fields are missing, and the next
 # reader would take the bytes after them -- the attention blob -- as those dimensions.
 HDR_V6 = struct.Struct("<8siiiiiiiiiiQffiiiiiifiiiQiii")
-MAX_KNOWN_VERSION = 6
+# v7 appends the vision tower's geometry. Quantization never touches those weights (they are
+# not in the per-layer MLP/attention set it rewrites), but the header must round-trip intact --
+# writing a v6 header over a v7 file would drop the tower's geometry and leave the tensors
+# behind it unreachable.
+HDR_V7 = struct.Struct("<8siiiiiiiiiiQffiiiiiifiiiQiii" + "i" * 10)
+MAX_KNOWN_VERSION = 7
 ENTRY = struct.Struct("<64sqq")
 
 
@@ -72,7 +77,7 @@ def parse_header(buf: bytes) -> dict:
             f"LL2C container version {version} is newer than this tool understands "
             f"(max {MAX_KNOWN_VERSION}); rewriting it would silently drop fields")
     if version >= 5:
-        hdr = HDR_V6 if version >= 6 else HDR_V5
+        hdr = HDR_V7 if version >= 7 else (HDR_V6 if version >= 6 else HDR_V5)
         fields = hdr.unpack_from(buf, 0)
         attention_count = int(fields[23])
         attention_offset = int(fields[24])

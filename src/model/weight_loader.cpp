@@ -129,6 +129,24 @@ struct HeaderV6 {
   std::int32_t linear_conv_kernel_dim;
 };
 
+// HeaderV7 appends the vision tower's geometry to V6, by the same strict-append rule: every
+// earlier field keeps its offset, so a v6 reader parses a v7 file and a v7 reader parses a v6
+// file with the vision fields left at 0. depth == 0 IS the "no tower" signal -- there is no
+// separate flag that could disagree with the geometry.
+struct HeaderV7 {
+  HeaderV6 v6;
+  std::int32_t vision_depth;
+  std::int32_t vision_hidden_size;
+  std::int32_t vision_num_heads;
+  std::int32_t vision_intermediate_size;
+  std::int32_t vision_patch_size;
+  std::int32_t vision_temporal_patch_size;
+  std::int32_t vision_in_channels;
+  std::int32_t vision_spatial_merge_size;
+  std::int32_t vision_num_position_embeddings;
+  std::int32_t vision_out_hidden_size;
+};
+
 struct TensorEntry {
   char name[64];
   std::int64_t offset;
@@ -142,6 +160,7 @@ struct TensorEntry {
 // plausible garbage out of the wrong offsets. pack_ll2c.py asserts the same two numbers.
 static_assert(sizeof(HeaderV5) == 112, "HeaderV5 layout drifted from pack_ll2c.py's HEADER_FMT");
 static_assert(sizeof(HeaderV6) == 124, "HeaderV6 layout drifted from pack_ll2c.py's HEADER_FMT");
+static_assert(sizeof(HeaderV7) == 164, "HeaderV7 layout drifted from pack_ll2c.py's HEADER_FMT");
 
 constexpr const char kMagic[] = "LL2CUDA";
 
@@ -251,6 +270,21 @@ void WeightLoader::parse_manifest() {
       config_.linear_key_head_dim = h6->linear_key_head_dim;
       config_.linear_value_head_dim = h6->linear_value_head_dim;
       config_.linear_conv_kernel_dim = h6->linear_conv_kernel_dim;
+    }
+
+    // v7 appended the vision tower's geometry. Same guard on version AND mapped size.
+    if (version >= 7 && mmap_.size() >= sizeof(HeaderV7)) {
+      const auto* h7 = reinterpret_cast<const HeaderV7*>(mmap_.data());
+      config_.vision_depth = h7->vision_depth;
+      config_.vision_hidden_size = h7->vision_hidden_size;
+      config_.vision_num_heads = h7->vision_num_heads;
+      config_.vision_intermediate_size = h7->vision_intermediate_size;
+      config_.vision_patch_size = h7->vision_patch_size;
+      config_.vision_temporal_patch_size = h7->vision_temporal_patch_size;
+      config_.vision_in_channels = h7->vision_in_channels;
+      config_.vision_spatial_merge_size = h7->vision_spatial_merge_size;
+      config_.vision_num_position_embeddings = h7->vision_num_position_embeddings;
+      config_.vision_out_hidden_size = h7->vision_out_hidden_size;
     }
 
     if (hdr->attention_type_count > 0) {

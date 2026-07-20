@@ -264,6 +264,25 @@ def extract_model_config(hf_cfg: dict, family: str) -> dict:
 
     rope_theta = float(rope_param("rope_theta", DEFAULT_ROPE_THETA.get(family, 10000.0)))
 
+    # Vision geometry, when the checkpoint is multimodal. Empty for text-only models, which
+    # leaves every field zero in the container -- the engine reads depth == 0 as "no tower"
+    # rather than needing a separate flag.
+    vc = hf_cfg.get("vision_config") or {}
+    vision_cfg = {}
+    if vc:
+        vision_cfg = {
+            "vision_depth": int(vc.get("depth", 0) or 0),
+            "vision_hidden_size": int(vc.get("hidden_size", 0) or 0),
+            "vision_num_heads": int(vc.get("num_heads", 0) or 0),
+            "vision_intermediate_size": int(vc.get("intermediate_size", 0) or 0),
+            "vision_patch_size": int(vc.get("patch_size", 0) or 0),
+            "vision_temporal_patch_size": int(vc.get("temporal_patch_size", 0) or 0),
+            "vision_in_channels": int(vc.get("in_channels", 0) or 0),
+            "vision_spatial_merge_size": int(vc.get("spatial_merge_size", 0) or 0),
+            "vision_num_position_embeddings": int(vc.get("num_position_embeddings", 0) or 0),
+            "vision_out_hidden_size": int(vc.get("out_hidden_size", 0) or 0),
+        }
+
     # Sliding-window attention (set when provided by checkpoint config).
     # Honor use_sliding_window: models like Qwen2.5 advertise a large window but
     # keep it disabled, in which case attention is full and storing a window
@@ -360,6 +379,7 @@ def extract_model_config(hf_cfg: dict, family: str) -> dict:
         "scale_embeddings":    scale_embeddings,
         "use_layernorm":       use_layernorm,
         "partial_rotary_factor": partial_rotary_factor,
+        **vision_cfg,
         "linear_num_key_heads": linear_num_key_heads,
         "linear_num_value_heads": linear_num_value_heads,
         # q_proj emits [q|gate] per head when this is set, so it is twice as wide as
@@ -380,13 +400,50 @@ def extract_model_config(hf_cfg: dict, family: str) -> dict:
 # Tensor name mapping
 # ---------------------------------------------------------------------------
 
-def build_qwen35_mapping(num_layers: int, layer_types: list, has_qk_norm: bool):
+def build_qwen35_vision_mapping(depth: int):
+    """The vision tower's tensors, under model.visual.*.
+
+    Names are flattened to vision.* so the container's flat namespace stays readable and the
+    engine can find them without knowing HuggingFace's nesting. patch_embed.proj is a Conv3d
+    whose stride equals its kernel, which makes it a plain Linear -- its [768,3,2,16,16] weight
+    is already contiguous as [768,1536], so it is stored as-is and reinterpreted, not reshaped.
+    """
+    V = "model.visual."
+    items = [
+        (V + "patch_embed.proj.weight", "vision.patch_embed.weight", True),
+        (V + "patch_embed.proj.bias", "vision.patch_embed.bias", True),
+        (V + "pos_embed.weight", "vision.pos_embed.weight", True),
+        (V + "merger.norm.weight", "vision.merger.norm.weight", True),
+        (V + "merger.norm.bias", "vision.merger.norm.bias", True),
+        (V + "merger.linear_fc1.weight", "vision.merger.fc1.weight", True),
+        (V + "merger.linear_fc1.bias", "vision.merger.fc1.bias", True),
+        (V + "merger.linear_fc2.weight", "vision.merger.fc2.weight", True),
+        (V + "merger.linear_fc2.bias", "vision.merger.fc2.bias", True),
+    ]
+    for i in range(depth):
+        B = f"{V}blocks.{i}."
+        C = f"vision.blocks.{i}."
+        for hf, own in [("norm1.weight", "norm1.weight"), ("norm1.bias", "norm1.bias"),
+                        ("norm2.weight", "norm2.weight"), ("norm2.bias", "norm2.bias"),
+                        ("attn.qkv.weight", "attn.qkv.weight"), ("attn.qkv.bias", "attn.qkv.bias"),
+                        ("attn.proj.weight", "attn.proj.weight"),
+                        ("attn.proj.bias", "attn.proj.bias"),
+                        ("mlp.linear_fc1.weight", "mlp.fc1.weight"),
+                        ("mlp.linear_fc1.bias", "mlp.fc1.bias"),
+                        ("mlp.linear_fc2.weight", "mlp.fc2.weight"),
+                        ("mlp.linear_fc2.bias", "mlp.fc2.bias")]:
+            items.append((B + hf, C + own, True))
+    return items
+
+
+def build_qwen35_mapping(num_layers: int, layer_types: list, has_qk_norm: bool,
+                         vision_depth: int = 0):
     """Qwen3.5: tensors sit under model.language_model, and each layer is EITHER delta-net or
     full attention -- `layer_types` says which, and the two carry disjoint tensor sets.
 
-    The vision tower (model.visual.*) and the multi-token-prediction head (mtp.*) are deliberately
-    not mapped: this produces the text model. They are ~168 of the checkpoint's 488 tensors, so
-    the caller reports them as skipped rather than letting them look absent.
+    The vision tower is included when vision_depth > 0 (see build_qwen35_vision_mapping). The
+    multi-token-prediction head (mtp.*) is still deliberately skipped, and the caller reports it
+    as skipped rather than letting it look absent.
     """
     P = "model.language_model."
     items = [
@@ -447,11 +504,14 @@ def build_qwen35_mapping(num_layers: int, layer_types: list, has_qk_norm: bool):
                     (f"{P}layers.{i}.self_attn.k_norm.weight",
                      f"layers.{i}.attention.k_norm", True),
                 ])
+    if vision_depth > 0:
+        items.extend(build_qwen35_vision_mapping(vision_depth))
     return items
 
 
 def build_mapping(family: str, num_layers: int, has_qkv_bias: bool, num_local_experts: int,
-                  has_qk_norm: bool = False, layer_types: list = None):
+                  has_qk_norm: bool = False, layer_types: list = None,
+                  vision_depth: int = 0):
     """
     Map HuggingFace tensor names to canonical internal names used by LL2CUDA.
 
@@ -459,7 +519,7 @@ def build_mapping(family: str, num_layers: int, has_qkv_bias: bool, num_local_ex
     MoE checkpoints use block_sparse_moe router + per-expert FFN weights.
     """
     if family == FAMILY_QWEN3_5:
-        return build_qwen35_mapping(num_layers, layer_types or [], has_qk_norm)
+        return build_qwen35_mapping(num_layers, layer_types or [], has_qk_norm, vision_depth)
 
     items = [
         ("model.embed_tokens.weight", "tok_embeddings.weight", True),
@@ -579,7 +639,8 @@ def main() -> None:
     weight_map = index.get("weight_map", {})
     mapping    = build_mapping(family, num_layers, has_qkv_bias, num_local_experts,
                                bool(model_cfg.get("has_qk_norm", False)),
-                               model_cfg.get("layer_attention_types", []))
+                               model_cfg.get("layer_attention_types", []),
+                               int(model_cfg.get("vision_depth", 0) or 0))
     mapped_sources = {src for src, _dst, _required in mapping}
 
     if family == FAMILY_QWEN3_5:

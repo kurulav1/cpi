@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "model/json_mini.hpp"
+#include "model/weight_loader.hpp"
 #include "runtime/metal_context.hpp"
 
 namespace {
@@ -720,6 +721,78 @@ int main(int argc, char** argv) {
     std::printf("  %-22s rel=%.5f  max_abs=%.4f  |ref|max=%.2f  tol_rel=0.020  %s\n",
                 "END_TO_END", rel, mx, ref_mx, ok ? "PASS" : "FAIL");
     if (!ok) ++failures;
+  }
+
+  // ---- the same tower, weights from a .ll2c CONTAINER ----
+  //
+  // Everything above reads the oracle's own fp32 weight dumps, so it gates the arithmetic while
+  // assuming the plumbing. This re-runs it against the container the converter produces, which
+  // is what the engine will actually load. A name that does not survive conversion, a tensor
+  // stored transposed, a geometry field dropped by the packer's whitelist -- none of those can
+  // be seen upstream of here.
+  if (argc >= 3) {
+    model::WeightLoader wl;
+    wl.open(argv[2]);
+    const model::LlamaConfig& c = wl.config();
+    std::printf("      container: v-geometry depth=%d hidden=%d heads=%d merge=%d out=%d\n",
+                c.vision_depth, c.vision_hidden_size, c.vision_num_heads,
+                c.vision_spatial_merge_size, c.vision_out_hidden_size);
+    if (!c.has_vision_tower()) {
+      std::printf("  %-22s container carries no vision geometry  FAIL\n", "container_tower");
+      ++failures;
+    } else if (c.vision_depth != engine::mini::json_get_int(geo, "depth") ||
+               c.vision_hidden_size != hidden ||
+               c.vision_out_hidden_size != engine::mini::json_get_int(geo, "out_hidden_size")) {
+      std::printf("  %-22s container geometry disagrees with the oracle  FAIL\n", "container_tower");
+      ++failures;
+    } else {
+      // The container stores fp16; the oracle dumps fp32. Compare the WEIGHTS directly rather
+      // than only the outputs -- a transposed or truncated tensor can still produce plausible
+      // activations, and this says which tensor rather than which stage.
+      int checked = 0, bad = 0;
+      const std::vector<std::pair<std::string, std::string>> pairs = {
+          {"vision.patch_embed.weight", "patch_embed_proj_weight"},
+          {"vision.patch_embed.bias", "patch_embed_proj_bias"},
+          {"vision.pos_embed.weight", "pos_embed_weight"},
+          {"vision.merger.fc1.weight", "merger_linear_fc1_weight"},
+          {"vision.merger.fc2.weight", "merger_linear_fc2_weight"},
+          {"vision.merger.norm.weight", "merger_norm_weight"},
+          {"vision.blocks.0.attn.qkv.weight", "blocks_0_attn_qkv_weight"},
+          {"vision.blocks.11.mlp.fc2.weight", "blocks_11_mlp_linear_fc2_weight"},
+      };
+      for (const auto& pr : pairs) {
+        if (!wl.has_tensor(pr.first)) {
+          std::printf("      MISSING from container: %s\n", pr.first.c_str());
+          ++bad;
+          continue;
+        }
+        const std::vector<float> ref = read_f32(dir + "/weights/" + pr.second + ".f32");
+        const auto* got = reinterpret_cast<const std::uint16_t*>(wl.tensor_data(pr.first));
+        const std::size_t n2 = wl.tensor_bytes(pr.first) / 2;
+        if (n2 != ref.size()) {
+          std::printf("      SIZE %s: container %zu vs oracle %zu\n", pr.first.c_str(), n2,
+                      ref.size());
+          ++bad;
+          continue;
+        }
+        float mx = 0.0f;
+        for (std::size_t i = 0; i < n2; ++i) {
+          mx = std::max(mx, std::fabs(f16_to_f32(got[i]) - ref[i]));
+        }
+        // bf16 -> fp16 is the only conversion between them, so anything past a few thousandths
+        // means a different tensor, not a rounding difference.
+        if (mx > 0.01f) {
+          std::printf("      DIFFERS %s: max_abs=%.5f\n", pr.first.c_str(), mx);
+          ++bad;
+        }
+        ++checked;
+      }
+      std::printf("  %-22s %d tensors checked, %d wrong  %s\n", "container_weights", checked, bad,
+                  bad == 0 ? "PASS" : "FAIL");
+      if (bad != 0) ++failures;
+    }
+  } else {
+    std::printf("      (no container given -- pass one as argv[2] to gate the conversion)\n");
   }
 
   std::printf("[metal_vision] %s\n", failures == 0 ? "ALL PASS" : "FAILURES");

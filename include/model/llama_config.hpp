@@ -112,6 +112,23 @@ struct LlamaConfig {
   std::int32_t linear_key_head_dim = 0;
   std::int32_t linear_value_head_dim = 0;
   std::int32_t linear_conv_kernel_dim = 0;
+  // Vision tower geometry (container v7). All zero for a text-only model; vision_depth == 0
+  // is the "no tower" signal, so presence and geometry cannot disagree.
+  std::int32_t vision_depth = 0;
+  std::int32_t vision_hidden_size = 0;
+  std::int32_t vision_num_heads = 0;
+  std::int32_t vision_intermediate_size = 0;
+  std::int32_t vision_patch_size = 0;
+  std::int32_t vision_temporal_patch_size = 0;
+  std::int32_t vision_in_channels = 0;
+  std::int32_t vision_spatial_merge_size = 0;
+  std::int32_t vision_num_position_embeddings = 0;
+  std::int32_t vision_out_hidden_size = 0;
+
+  [[nodiscard]] bool has_vision_tower() const {
+    return vision_depth > 0;
+  }
+
   std::vector<AttentionKind>
       layer_attention_kinds;  // Optional per-layer attention dispatch metadata.
 

@@ -42,7 +42,8 @@ HEADER_V3_FMT = "<8siiiiiiiiiiQffiii"  # HeaderV3
 HEADER_V4_FMT = "<8siiiiiiiiiiQffiiiiii"  # HeaderV4
 HEADER_V5_FMT = "<8siiiiiiiiiiQffiiiiiifiiiQ"  # HeaderV5
 HEADER_V6_FMT = "<8siiiiiiiiiiQffiiiiiifiiiQiii"  # HeaderV6: v5 + the delta-net dimensions
-MAX_KNOWN_VERSION = 6
+HEADER_V7_FMT = HEADER_V6_FMT + "i" * 10          # HeaderV7: v6 + the vision tower's geometry
+MAX_KNOWN_VERSION = 7
 HEADER_V2_FMT = "<8siiiiiiiiiiQ"  # HeaderV2
 HEADER_V1_FMT = "<8siiiiiiiiiQ"  # HeaderV1
 ENTRY_FMT = "<64sqq"  # TensorEntry: name[64], offset int64, bytes int64
@@ -277,7 +278,13 @@ def read_ll2c_mmap(path: Path):
         # Parse with the struct the FILE uses, and preserve its version -- this tool writes the
         # header back out, so hardcoding 5 here would relabel a v6 file as v5 and strand the
         # delta-net dimensions it carries.
-        hdr = struct.unpack_from(HEADER_V6_FMT if version >= 6 else HEADER_V5_FMT, mm, 0)
+        if version >= 7:
+            hdr_fmt = HEADER_V7_FMT
+        elif version >= 6:
+            hdr_fmt = HEADER_V6_FMT
+        else:
+            hdr_fmt = HEADER_V5_FMT
+        hdr = struct.unpack_from(hdr_fmt, mm, 0)
         fields = {
             "magic": hdr[0],
             "version": version,

@@ -19,7 +19,7 @@ except Exception:  # pragma: no cover
     np = None
 
 MAGIC = b"LL2CUDA\x00"
-VERSION = 6
+VERSION = 7
 
 # HeaderV5 layout (matches HeaderV5 struct in weight_loader.cpp):
 #   magic[8], version, vocab, hidden, inter, layers, heads, kv_heads,
@@ -38,11 +38,18 @@ VERSION = 6
 # flags bit layout: bit 0 = tie_word_embeddings, bit 1 = has_qkv_bias,
 # bit 2 = use_layernorm, bit 3 = has_qk_norm, bit 4 = mlp_gelu, bit 5 = scale_embeddings,
 # bit 6 = attn_output_gate (q_proj emits [q|gate] per head; attention output is gated)
-HEADER_FMT = "<8siiiiiiiiiiQffiiiiiifiiiQiii"
+# v7 APPENDS the vision tower's geometry, same rule again: ten int32 after v6's three. A
+# text-only model writes zeros, and depth == 0 is what the engine reads as "no tower" -- no
+# separate flag, so the geometry and its presence cannot disagree.
+#   vision_depth, vision_hidden_size, vision_num_heads, vision_intermediate_size,
+#   vision_patch_size, vision_temporal_patch_size, vision_in_channels,
+#   vision_spatial_merge_size, vision_num_position_embeddings, vision_out_hidden_size
+HEADER_FMT = "<8siiiiiiiiiiQffiiiiiifiiiQiii" + "i" * 10
 # weight_loader.cpp states this layout a second time, as a packed struct, and only arithmetic
 # keeps the two in step. A field added on one side alone shifts everything after it and reads
 # plausible garbage rather than failing -- so both sides pin the sizes.
-assert struct.calcsize(HEADER_FMT) == 124, "HEADER_FMT drifted from HeaderV6 in weight_loader.cpp"
+assert struct.calcsize(HEADER_FMT) == 164, "HEADER_FMT drifted from HeaderV7 in weight_loader.cpp"
+assert struct.calcsize("<8siiiiiiiiiiQffiiiiiifiiiQiii") == 124, "v6 prefix must stay byte-identical"
 assert struct.calcsize("<8siiiiiiiiiiQffiiiiiifiiiQ") == 112, "v5 prefix must stay byte-identical"
 ENTRY_FMT = "<64sqq"
 
@@ -90,6 +97,15 @@ def load_config(src: Path, args) -> dict:
     result["scale_embeddings"]    = bool(cfg.get("scale_embeddings", False))
     result["attn_output_gate"]    = bool(cfg.get("attn_output_gate", False))
     result["model_family_id"]     = int(cfg.get("model_family_id", 0))
+    # V7 vision geometry. load_config is an explicit WHITELIST, not a passthrough -- a field
+    # present in model_config.json but absent here is silently dropped, and the header then
+    # writes zeros that read as "no vision tower" on a checkpoint that has one.
+    for _k in ("vision_depth", "vision_hidden_size", "vision_num_heads",
+               "vision_intermediate_size", "vision_patch_size", "vision_temporal_patch_size",
+               "vision_in_channels", "vision_spatial_merge_size",
+               "vision_num_position_embeddings", "vision_out_hidden_size"):
+        result[_k] = int(cfg.get(_k, 0) or 0)
+
     result["num_local_experts"] = int(cfg.get("num_local_experts", 0) or 0)
     result["num_experts_per_tok"] = int(cfg.get("num_experts_per_tok", 0) or 0)
     result["expert_intermediate_size"] = int(cfg.get("expert_intermediate_size", 0) or 0)
@@ -320,6 +336,16 @@ def main() -> None:
             cfg["linear_key_head_dim"],     # int32  (v6)
             cfg["linear_value_head_dim"],   # int32  (v6)
             cfg["linear_conv_kernel_dim"],  # int32  (v6)
+            cfg.get("vision_depth", 0),                     # int32  (v7)
+            cfg.get("vision_hidden_size", 0),
+            cfg.get("vision_num_heads", 0),
+            cfg.get("vision_intermediate_size", 0),
+            cfg.get("vision_patch_size", 0),
+            cfg.get("vision_temporal_patch_size", 0),
+            cfg.get("vision_in_channels", 0),
+            cfg.get("vision_spatial_merge_size", 0),
+            cfg.get("vision_num_position_embeddings", 0),
+            cfg.get("vision_out_hidden_size", 0),
         ))
         if attention_type_blob:
             f.write(attention_type_blob)
