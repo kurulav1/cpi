@@ -16,8 +16,22 @@
 #include <vector>
 
 #include "app/main_helpers.hpp"
-#include "engine/bert_embedder.hpp"
 #include "model/wordpiece_tokenizer.hpp"
+
+// One embedder, chosen at compile time. The two implementations deliberately expose the same
+// initialize/embed/dim/max_tokens/config surface, so everything below this point -- the protocol,
+// the tokenizer, the batching -- is backend-agnostic and this is the only place that knows.
+//
+// CUDA wins when both are available, matching resolve_engine's preference for the discrete GPU.
+#if LLAMA_ENGINE_HAS_CUDA
+#include "engine/bert_embedder.hpp"
+using CpiEmbedder = engine::BertEmbedder;
+#elif defined(LLAMA_ENGINE_ENABLE_METAL)
+#include "engine/metal_bert_embedder.hpp"
+using CpiEmbedder = engine::MetalBertEmbedder;
+#else
+#error "cpi_embed needs a GPU backend: enable CUDA or Metal"
+#endif
 
 int main(int argc, char** argv) {
   using app::main_helpers::json_escape;
@@ -32,7 +46,7 @@ int main(int argc, char** argv) {
   }
   const std::string model_dir = argv[1];
 
-  engine::BertEmbedder embedder;
+  CpiEmbedder embedder;
   model::WordPieceTokenizer tokenizer;
   try {
     embedder.initialize(model_dir);

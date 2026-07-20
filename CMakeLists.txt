@@ -181,6 +181,7 @@ if(LLAMA_ENGINE_ENABLE_METAL)
     src/runtime/metal_context.mm
     src/engine/plan_metal_engine.cpp
     src/engine/plan_metal_vision.cpp
+    src/engine/metal_bert_embedder.cpp
   )
 endif()
 
@@ -333,8 +334,13 @@ add_executable(llama_infer
 )
 target_link_libraries(llama_infer PRIVATE llama_engine)
 
-# cpi_embed: embedding worker (CUDA BERT-family encoder). Needs CUDA.
-if(LLAMA_ENGINE_ENABLE_CUDA)
+# cpi_embed: embedding worker (BERT-family encoder). Needs a GPU backend -- CUDA or Metal.
+#
+# Was CUDA-only, which is what left embeddings, RAG and folder-search dead on Apple Silicon: the
+# target simply did not exist, so the Node server resolved cpi_embed from a CUDA build dir, found
+# nothing, and 503'd every embedding route. src/cpi_embed.cpp now selects the implementation at
+# compile time; the encoder itself is engine::MetalBertEmbedder on Apple.
+if(LLAMA_ENGINE_ENABLE_CUDA OR LLAMA_ENGINE_ENABLE_METAL)
   add_executable(cpi_embed
     src/cpi_embed.cpp
     src/app/main_helpers.cpp
@@ -399,6 +405,12 @@ if(LLAMA_ENGINE_ENABLE_METAL)
   add_executable(qwen35_text_test src/tests/qwen35_text_test.cpp)
   target_link_libraries(qwen35_text_test PRIVATE llama_engine)
   target_include_directories(qwen35_text_test PRIVATE include)
+
+  # The Metal BERT embedder vs a HuggingFace reference. No add_test: it needs both a model dir
+  # and an oracle dump from a torch run, neither of which the Mac can produce.
+  add_executable(metal_embed_test src/tests/metal_embed_test.cpp)
+  target_link_libraries(metal_embed_test PRIVATE llama_engine)
+  target_include_directories(metal_embed_test PRIVATE include)
 
   add_executable(metal_smoke src/tests/metal_smoke.cpp)
   target_link_libraries(metal_smoke PRIVATE llama_engine)
