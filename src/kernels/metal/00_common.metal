@@ -103,6 +103,11 @@ struct RopeParams {
   // than base+t. The default (0) keeps the prefill meaning, where the rows are consecutive
   // tokens of one sequence.
   uint per_row_positions;
+  // Lanes actually rotated, from the head's start. 0 means "all of head_dim", which is what
+  // every model without a partial_rotary_factor wants and what this kernel did unconditionally
+  // before. Qwen3.5 rotates 25% of a 256-wide head; rotating all of it is wrong in a way that
+  // is INVISIBLE at position 0, because the angle is zero there.
+  uint rotary_dim;
 };
 
 struct ElemParams {

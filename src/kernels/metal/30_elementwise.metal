@@ -3,7 +3,10 @@ kernel void cpi_rope(
     device const int*   positions [[buffer(1)]],
     constant RopeParams& p        [[buffer(2)]],
     uint gid [[thread_position_in_grid]]) {
-  const uint half_dim = p.head_dim / 2u;
+  // Only the leading rotary_dim lanes of each head rotate; the rest pass through untouched.
+  // rot_dim == 0 means "the whole head", which is every model without a partial factor.
+  const uint rot_dim = (p.rotary_dim != 0u) ? p.rotary_dim : p.head_dim;
+  const uint half_dim = rot_dim / 2u;
   const uint per_token = p.heads * half_dim;
   const uint total = per_token * p.tokens;
   if (gid >= total) return;
@@ -21,12 +24,17 @@ kernel void cpi_rope(
     pos += token;  // sequence prefill: token t sits at position base + t
   }
 
-  const float freq  = pow(p.theta, -float(2u * i) / float(p.head_dim));
+  // The frequency denominator is the ROTARY width, not the head width. Using head_dim here
+  // stretches every angle by head_dim/rotary_dim and still looks perfectly correct at
+  // position 0, where the angle is zero regardless.
+  const float freq  = pow(p.theta, -float(2u * i) / float(rot_dim));
   const float angle = float(pos) * freq;
   const float c = cos(angle);
   const float s = sin(angle);
 
   const uint stride = (p.row_stride != 0u) ? p.row_stride : (p.heads * p.head_dim);
+  // Indexed by the HEAD stride, not the rotary stride: lane i of head h still lives at
+  // h * head_dim + i, and only the pairing distance shrinks to half of rotary_dim.
   const uint base = token * stride + head * p.head_dim + i;
 
   const float a = float(x[base]);

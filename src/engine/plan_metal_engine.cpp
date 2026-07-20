@@ -42,6 +42,9 @@ struct RopeParams {
   // 0 (the default every existing call gets) keeps the prefill meaning: row t is token
   // base+t of one sequence. Batched decode sets it, and then row t takes positions[t].
   std::uint32_t per_row_positions = 0;
+  // Lanes rotated per head; 0 means the whole head. MUST match RopeParams in 00_common.metal --
+  // this mirror going stale is how the kernel would read a field the host never wrote.
+  std::uint32_t rotary_dim = 0;
 };
 struct ElemParams {
   std::uint32_t n;
@@ -1235,14 +1238,19 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
                      static_cast<std::uint32_t>(T),
                      op.scale,  // the builder folds rope_theta into scale
                      1,
-                     0};
+                     0,
+                     0,
+                     static_cast<std::uint32_t>(op.rotary_dim)};
         // Batched decode: the rows are N different sequences, so each takes its own
         // position rather than base+t.
         if (batch_ != nullptr) p.per_row_positions = 1;
         const void* bufs[] = {slot(op.in),
                               batch_ != nullptr ? batch_pos_buf_.handle() : pos_buf_.handle()};
+        // Threads cover the ROTATED lanes only. Launching head_dim/2 per head was not just
+        // wasteful, it was wrong: those extra threads rotated lanes that must pass through.
+        const int rot = op.rotary_dim > 0 ? op.rotary_dim : op.head_dim;
         const std::size_t total = static_cast<std::size_t>(op.heads) *
-                                  static_cast<std::size_t>(op.head_dim / 2) *
+                                  static_cast<std::size_t>(rot / 2) *
                                   static_cast<std::size_t>(T);
         ctx_.dispatch("cpi_rope", G::Threads, total, kTG, bufs, nullptr, 2, &p, sizeof(p));
         break;
