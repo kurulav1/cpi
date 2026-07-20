@@ -1400,3 +1400,121 @@ kernel void cpi_attention_decode_batched_paged(
 // improvement.
 // ---------------------------------------------------------------------------
 
+
+// ---------------------------------------------------------------------------
+// Bidirectional (non-causal) attention, for a vision tower.
+//
+// A SEPARATE kernel rather than a mask mode on the causal ones above. Those four are tuned
+// against a measured roofline and are on the path of every text model; threading a
+// "bidirectional" branch through them would put a vision feature's regressions into the text
+// engine. The shapes differ too: no KV cache, no paging, no sliding window, no GQA, and a
+// sequence that is a patch grid rather than a growing context.
+//
+// One threadgroup per (query token, head). Keys are consumed in chunks of nthr with an online
+// softmax, so nothing scales with sequence length in threadgroup memory and there is no cap on
+// the patch count.
+//
+// Deliberately NOT tuned. It is correct and readable first; the tower has to match the oracle
+// before any of its cost is worth measuring, and the causal kernels' history says the wins are
+// not where they look.
+// ---------------------------------------------------------------------------
+kernel void cpi_attention_bidirectional(
+    device const half* q   [[buffer(0)]],
+    device const half* k   [[buffer(1)]],
+    device const half* v   [[buffer(2)]],
+    device half*       out [[buffer(3)]],
+    constant BiAttnParams& p [[buffer(4)]],
+    uint gid  [[threadgroup_position_in_grid]],
+    uint lid  [[thread_position_in_threadgroup]],
+    uint nthr [[threads_per_threadgroup]]) {
+  const uint total = p.tokens * p.heads;
+  if (gid >= total) return;
+  const uint t    = gid / p.heads;
+  const uint head = gid % p.heads;
+  const uint dim  = p.heads * p.head_dim;
+  const uint hoff = head * p.head_dim;
+
+  device const half* qh = q + (ulong)t * dim + hoff;
+
+  threadgroup float sc[BIATTN_CHUNK];
+  threadgroup float red[BIATTN_CHUNK / 32];
+  threadgroup float acc[BIATTN_MAXDIM];   // running unnormalised output
+  // [2] holds the max from BEFORE this chunk. The rescale factor is exp(prev_max - run_max),
+  // and reading stats[0] after it has been updated makes that exp(0) == 1 -- a no-op rescale
+  // that silently drops the correction whenever the max grows, which for a softmax whose
+  // first chunk happens to hold the largest score is most of the time.
+  threadgroup float stats[3];             // [0] running max, [1] running sum, [2] previous max
+
+  for (uint d = lid; d < p.head_dim; d += nthr) acc[d] = 0.0f;
+  if (lid == 0u) { stats[0] = -INFINITY; stats[1] = 0.0f; stats[2] = -INFINITY; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  for (uint chunk = 0u; chunk < p.tokens; chunk += nthr) {
+    const uint n = min(nthr, p.tokens - chunk);
+
+    // ---- scores for this chunk: one key per thread, full dot over head_dim ----
+    if (lid < n) {
+      device const half* kh = k + (ulong)(chunk + lid) * dim + hoff;
+      float dot = 0.0f;
+      for (uint d = 0u; d < p.head_dim; ++d) dot += float(qh[d]) * float(kh[d]);
+      sc[lid] = dot * p.scale;   // no mask: every query sees every key, both directions
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- chunk max ----
+    float m = (lid < n) ? sc[lid] : -INFINITY;
+    m = simd_max(m);
+    if ((lid % 32u) == 0u) red[lid / 32u] = m;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0u) {
+      float cm = -INFINITY;
+      for (uint s = 0u; s < (n + 31u) / 32u; ++s) cm = max(cm, red[s]);
+      stats[2] = stats[0];            // keep the old max: the rescale below needs it
+      stats[0] = max(stats[0], cm);   // running max across chunks, not just this one
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float run_max = stats[0];
+    // On the first chunk prev_max is -INFINITY, so this is exp(-inf) == 0 -- which is the
+    // right factor, since acc and the running sum are both still zero.
+    const float rescale = exp(stats[2] - run_max);
+
+    // ---- exponentiate against the running max ----
+    if (lid < n) sc[lid] = exp(sc[lid] - run_max);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float s = (lid < n) ? sc[lid] : 0.0f;
+    s = simd_sum(s);
+    if ((lid % 32u) == 0u) red[lid / 32u] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // The running max can only grow, so everything accumulated so far was exponentiated
+    // against a smaller max and is scaled too high by exp(prev_max - run_max). Rescale the
+    // accumulator and the running sum by that factor before folding this chunk in.
+    if (lid == 0u) {
+      float cs = 0.0f;
+      for (uint sg = 0u; sg < (n + 31u) / 32u; ++sg) cs += red[sg];
+      red[0] = cs;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float chunk_sum = red[0];
+
+    if (lid == 0u) stats[1] = stats[1] * rescale + chunk_sum;
+    for (uint d = lid; d < p.head_dim; d += nthr) acc[d] *= rescale;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- fold this chunk's values in ----
+    for (uint d = lid; d < p.head_dim; d += nthr) {
+      float a = 0.0f;
+      for (uint j = 0u; j < n; ++j) {
+        a += sc[j] * float(v[(ulong)(chunk + j) * dim + hoff + d]);
+      }
+      acc[d] += a;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  const float inv = 1.0f / (stats[1] + 1e-20f);
+  for (uint d = lid; d < p.head_dim; d += nthr) {
+    out[(ulong)t * dim + hoff + d] = half(acc[d] * inv);
+  }
+}

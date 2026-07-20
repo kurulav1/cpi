@@ -128,6 +128,11 @@ struct VisPoolParams {
 struct VisStdParams {
   std::uint32_t n, hidden;
 };
+// Mirrors BiAttnParams in 00_common.metal.
+struct BiAttnParams {
+  std::uint32_t tokens, heads, head_dim;
+  float scale;
+};
 // Mirrors LayerNormParams in 00_common.metal.
 struct LayerNormParams {
   std::uint32_t rows, cols;
@@ -1065,6 +1070,57 @@ int main() {
     const auto* o = static_cast<const std::uint16_t*>(bo.contents());
     for (std::uint32_t i = 0; i < n; ++i) got[i] = f16_to_f32(o[i]);
     check("layernorm", compare(got, want), 0.01);
+  }
+
+  {
+    // Bidirectional attention, against a plain fp64 softmax over ALL keys.
+    //
+    // tokens deliberately exceeds BIATTN_CHUNK so the online-softmax path runs more than one
+    // chunk. With a single chunk the running-max rescale is never exercised and a kernel that
+    // drops it entirely still passes -- which was the state of this kernel before the control
+    // below caught it.
+    const std::uint32_t tokens = 100, heads = 3, hd = 64, dim = heads * hd;
+    const std::uint32_t n = tokens * dim;
+    std::vector<std::uint16_t> q(n), k(n), v(n);
+    for (auto& x : q) x = f32_to_f16(dist(rng));
+    for (auto& x : k) x = f32_to_f16(dist(rng));
+    for (auto& x : v) x = f32_to_f16(dist(rng));
+    auto bq = ctx.alloc_from(q.data(), n * 2), bk = ctx.alloc_from(k.data(), n * 2);
+    auto bv = ctx.alloc_from(v.data(), n * 2), bo = ctx.alloc(n * 2);
+    const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+    BiAttnParams p{tokens, heads, hd, scale};
+    const void* bufs[] = {bq.handle(), bk.handle(), bv.handle(), bo.handle()};
+    ctx.dispatch("cpi_attention_bidirectional", runtime::MetalContext::Grid::Groups,
+                 tokens * heads, 64, bufs, nullptr, 4, &p, sizeof(p));
+    ctx.commit_and_wait();
+
+    std::vector<float> want(n), got(n);
+    for (std::uint32_t t = 0; t < tokens; ++t) {
+      for (std::uint32_t h = 0; h < heads; ++h) {
+        const std::uint32_t off = h * hd;
+        std::vector<double> sc(tokens);
+        double mx = -1e300;
+        for (std::uint32_t j = 0; j < tokens; ++j) {  // every key, both directions
+          double d = 0.0;
+          for (std::uint32_t e = 0; e < hd; ++e)
+            d += static_cast<double>(f16_to_f32(q[t * dim + off + e])) *
+                 f16_to_f32(k[j * dim + off + e]);
+          sc[j] = d * scale;
+          mx = std::max(mx, sc[j]);
+        }
+        double sum = 0.0;
+        for (std::uint32_t j = 0; j < tokens; ++j) { sc[j] = std::exp(sc[j] - mx); sum += sc[j]; }
+        for (std::uint32_t e = 0; e < hd; ++e) {
+          double a = 0.0;
+          for (std::uint32_t j = 0; j < tokens; ++j)
+            a += sc[j] * f16_to_f32(v[j * dim + off + e]);
+          want[t * dim + off + e] = static_cast<float>(a / sum);
+        }
+      }
+    }
+    const auto* o = static_cast<const std::uint16_t*>(bo.contents());
+    for (std::uint32_t i = 0; i < n; ++i) got[i] = f16_to_f32(o[i]);
+    check("bidir_attn", compare(got, want), 0.01);
   }
 
   std::printf("[metal_smoke] %s\n", failures == 0 ? "ALL PASS" : "FAILURES");

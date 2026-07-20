@@ -56,6 +56,24 @@ struct LayerNormParams {
   uint has_bias;  // 0 => weight-only (the bias buffer is still bound but never read)
 };
 
+// Key chunk per iteration of the bidirectional kernel, and the widest head it supports.
+// CHUNK must be a multiple of 32 (the reduction indexes red[] by simdgroup) and must equal the
+// threadgroup size the engine dispatches with, since one thread scores one key.
+#define BIATTN_CHUNK 64
+#define BIATTN_MAXDIM 128
+#if (BIATTN_CHUNK % 32) != 0
+#error "BIATTN_CHUNK must be a multiple of 32"
+#endif
+
+// Bidirectional attention over a patch grid. No window, no KV cache, no position: every
+// query sees every key, which is the whole difference from the causal params above.
+struct BiAttnParams {
+  uint tokens;
+  uint heads;
+  uint head_dim;
+  float scale;
+};
+
 struct GemvParams {
   uint out_dim;
   uint in_dim;
