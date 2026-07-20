@@ -1941,6 +1941,13 @@ void PlanMetalEngine::dump_named_slot(const char* name, int layer, int position,
   std::fclose(f);
 }
 
+opplan::WeightSource& PlanMetalEngine::weight_source() {
+  if (wsrc_ == nullptr) {
+    throw std::runtime_error("weight source requested before open()");
+  }
+  return *wsrc_;
+}
+
 std::vector<int> PlanMetalEngine::prefill_chunks(int n) const {
   // A recurrent model has no token dimension to batch over: its state must advance one token at a
   // time, in order, so "prefill" here is just decode without sampling. CUDA and the CPU reference

@@ -180,6 +180,7 @@ if(LLAMA_ENGINE_ENABLE_METAL)
   list(APPEND LLAMA_ENGINE_SOURCES
     src/runtime/metal_context.mm
     src/engine/plan_metal_engine.cpp
+    src/engine/plan_metal_vision.cpp
   )
 endif()
 

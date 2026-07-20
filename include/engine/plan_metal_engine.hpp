@@ -56,6 +56,15 @@ public:
   // and the (untied) LM head. quant_group 0 defaults to 64.
   void open(const std::string& weights_path, int max_context = 2048, int quant_bits = 0,
             int quant_group = 0);
+
+  // Runs the vision tower over ONE pre-patchified image and returns its soft tokens:
+  // (grid_h*grid_w)/(merge^2) rows of vision_out_hidden_size, which equals the text model's
+  // hidden size so they can be spliced straight into the token stream.
+  //
+  // `patches` is (grid_h*grid_w) x (in_channels * temporal_patch_size * patch_size^2), the
+  // layout the tower's own patch embed expects. Throws if the model has no tower or the grid
+  // is not a whole number of merge units.
+  std::vector<float> encode_image(const std::vector<float>& patches, int grid_h, int grid_w);
   int quant_bits() const {
     return quant_bits_;
   }
@@ -219,6 +228,12 @@ private:
   void encode_forward(int token, int position);
   // Encodes a whole prefill chunk: T tokens through the tower in one pass.
   void encode_prefill(const std::vector<int>& tokens, int start_position);
+
+  // MetalWeights is defined inside plan_metal_engine.cpp, so it is an incomplete type in every
+  // other translation unit -- including the vision tower's. This upcast is defined there, where
+  // it is complete, rather than moving the class into the header just to satisfy one caller.
+  opplan::WeightSource& weight_source();
+
   // How to cut a prefill of `n` tokens into chunks no larger than a slot. Splitting evenly
   // beats filling greedily -- see the definition.
   std::vector<int> prefill_chunks(int n) const;

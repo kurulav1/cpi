@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "model/json_mini.hpp"
+#include "engine/plan_metal_engine.hpp"
 #include "model/weight_loader.hpp"
 #include "runtime/metal_context.hpp"
 
@@ -94,6 +95,18 @@ void check(const char* name, const std::vector<float>& got, const std::vector<fl
            float tol) {
   if (got.size() != want.size()) {
     std::printf("  %-22s SIZE MISMATCH got=%zu want=%zu  FAIL\n", name, got.size(), want.size());
+    ++failures;
+    return;
+  }
+  // NaN must be caught EXPLICITLY. std::max(x, NaN) returns x -- every comparison with NaN is
+  // false -- so an all-NaN result accumulates a max of 0 and passes every tolerance in this
+  // file. That is not hypothetical: the engine path returned NaN and this reported PASS.
+  std::size_t nans = 0;
+  for (std::size_t i = 0; i < got.size(); ++i) {
+    if (!std::isfinite(got[i])) ++nans;
+  }
+  if (nans != 0) {
+    std::printf("  %-22s %zu/%zu non-finite values  FAIL\n", name, nans, got.size());
     ++failures;
     return;
   }
@@ -465,6 +478,11 @@ int main(int argc, char** argv) {
     std::printf("usage: metal_vision_test <oracle_dir>\n");
     return 2;
   }
+  // Unbuffered: this test can crash the process (it drives a GPU and mmaps a multi-GB
+  // container), and a buffered stdout loses every line printed before the fault -- which reads
+  // as "it produced no output" rather than "it died at stage N".
+  std::setvbuf(stdout, nullptr, _IONBF, 0);
+
   const std::string dir = argv[1];
   const std::string manifest = read_text(dir + "/manifest.json");
   const std::string geo = engine::mini::json_extract_object(manifest, "geometry");
@@ -652,7 +670,11 @@ int main(int argc, char** argv) {
       mx = std::max(mx, std::fabs(cur[i] - ref11[i]));
       ref_mx = std::max(ref_mx, std::fabs(ref11[i]));
     }
-    const float rel = mx / (ref_mx + 1e-9f);
+    std::size_t nan_c = 0;
+    for (float v : cur) {
+      if (!std::isfinite(v)) ++nan_c;
+    }
+    const float rel = (nan_c != 0) ? 1e9f : mx / (ref_mx + 1e-9f);
     const bool ok = rel <= 0.02f;
     std::printf("  %-22s rel=%.5f  max_abs=%.4f  |ref|max=%.1f  tol_rel=0.020  %s\n",
                 "block_11_chained", rel, mx, ref_mx, ok ? "PASS" : "FAIL");
@@ -716,7 +738,11 @@ int main(int argc, char** argv) {
       mx = std::max(mx, std::fabs(got[i] - want[i]));
       ref_mx = std::max(ref_mx, std::fabs(want[i]));
     }
-    const float rel = mx / (ref_mx + 1e-9f);
+    std::size_t nan_e = 0;
+    for (float v : got) {
+      if (!std::isfinite(v)) ++nan_e;
+    }
+    const float rel = (nan_e != 0) ? 1e9f : mx / (ref_mx + 1e-9f);
     const bool ok = rel <= 0.02f;
     std::printf("  %-22s rel=%.5f  max_abs=%.4f  |ref|max=%.2f  tol_rel=0.020  %s\n",
                 "END_TO_END", rel, mx, ref_mx, ok ? "PASS" : "FAIL");
@@ -790,6 +816,39 @@ int main(int argc, char** argv) {
       std::printf("  %-22s %d tensors checked, %d wrong  %s\n", "container_weights", checked, bad,
                   bad == 0 ? "PASS" : "FAIL");
       if (bad != 0) ++failures;
+
+      // And the ENGINE's own path, end to end: open the container, hand it the same pixels,
+      // compare its soft tokens to the oracle's. Everything above this exercises the test's
+      // reimplementation of the tower; this exercises the code that will actually ship, through
+      // the real weight loader. Without it the two can drift and every check above stays green.
+      {
+        engine::PlanMetalEngine eng;
+        eng.open(argv[2], 512);
+        const std::vector<float> soft = eng.encode_image(pixels, grid_h, grid_w);
+        const std::vector<float> want16 = read_f32(dir + "/stage_16_merger.f32");
+        float mx = 0.0f, ref_mx = 0.0f;
+        for (std::size_t i = 0; i < soft.size() && i < want16.size(); ++i) {
+          mx = std::max(mx, std::fabs(soft[i] - want16[i]));
+          ref_mx = std::max(ref_mx, std::fabs(want16[i]));
+        }
+        std::size_t nan_s = 0;
+        for (float v : soft) {
+          if (!std::isfinite(v)) ++nan_s;
+        }
+        if (nan_s != 0) {
+          std::printf("      engine produced %zu/%zu NON-FINITE values\n", nan_s, soft.size());
+        }
+        const bool sized = soft.size() == want16.size() && nan_s == 0;
+        const float rel = (nan_s != 0) ? 1e9f : mx / (ref_mx + 1e-9f);
+        const bool ok2 = sized && rel <= 0.02f;
+        std::printf("      engine soft: %zu floats (want %zu); first= %.4f %.4f %.4f | "
+                    "oracle= %.4f %.4f %.4f\n",
+                    soft.size(), want16.size(), soft[0], soft[1], soft[2], want16[0], want16[1],
+                    want16[2]);
+        std::printf("  %-22s rel=%.8f  max_abs=%.6f  %s\n", "ENGINE_encode_image", rel, mx,
+                    ok2 ? "PASS" : "FAIL");
+        if (!ok2) ++failures;
+      }
     }
   } else {
     std::printf("      (no container given -- pass one as argv[2] to gate the conversion)\n");
