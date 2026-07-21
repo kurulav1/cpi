@@ -90,6 +90,37 @@ public:
   void prefill_multimodal(const std::vector<int>& tokens,
                           const std::vector<std::vector<float>>& embeds,
                           const std::vector<std::int32_t>& mrope_positions = {});
+
+  // ---- Gemma 4 vision (the app::image_prompt::expand surface, mirroring PlanCudaEngine) ----
+
+  // True when the opened checkpoint carries a Gemma 4 vision tower and it was initialised.
+  bool has_vision() const {
+    return gvis_.present;
+  }
+  const opplan::Gemma4VisionGeometry& vision_config() const {
+    return gvis_;
+  }
+  // Images need a sequence prefill (the span is bidirectional, so its tokens must be computed
+  // together). True whenever the plan allows chunked prefill -- i.e. not a recurrent model and
+  // not forced token-by-token via CPI_METAL_SEQ_AUX.
+  bool can_sequence_prefill() const {
+    return !has_recurrent_ops_;
+  }
+
+  // Gemma 4's tower: pre-patchified pixels + per-patch grid coordinates -> `out_tokens` soft
+  // tokens of the TEXT hidden size. The overload above is Qwen3.5's tower; the two differ in
+  // architecture (RMSNorm/2-D RoPE/avg-pool vs LayerNorm/M-RoPE/spatial-merge), not just shape.
+  std::vector<float> encode_image(const std::vector<float>& pixels, const std::vector<int>& pos_x,
+                                  const std::vector<int>& pos_y, int out_tokens);
+
+  // Generation over a prompt whose image span is already expanded (app::image_prompt::expand):
+  // `embeds` overrides token embeddings position-by-position, `limits` is the per-token key
+  // limit that makes the image span bidirectional (empty = plain causal). Greedy at temp 0.
+  // Mirrors PlanCudaEngine::generate_multimodal.
+  std::vector<int> generate_multimodal(const std::vector<int>& tokens,
+                                       const std::vector<std::vector<float>>& embeds,
+                                       const std::vector<int>& limits, int max_new, float temp,
+                                       const std::function<bool(int)>& on_token);
   int quant_bits() const {
     return quant_bits_;
   }
@@ -295,6 +326,8 @@ private:
   void encode_forward(int token, int position, int cache_position);
   // Encodes a whole prefill chunk: T tokens through the tower in one pass.
   void encode_prefill(const std::vector<int>& tokens, int start_position);
+  // Overwrites slot X rows with embeds_ entries for [start_position, start_position+T).
+  void splice_embeds(int start_position, int T);
 
   // MetalWeights is defined inside plan_metal_engine.cpp, so it is an incomplete type in every
   // other translation unit -- including the vision tower's. This upcast is defined there, where
@@ -413,6 +446,33 @@ private:
   // Borrowed for the duration of prefill_multimodal only, never owned. Cleared on the way out
   // (including on a throw) so a later plain prefill cannot read a dangling pointer.
   const std::vector<std::vector<float>>* embeds_ = nullptr;
+
+  // ---- Gemma 4 vision state --------------------------------------------------
+  // The tower's plan + geometry, built at open() when the checkpoint has a vision_config and the
+  // tower's tensors. All zero/absent for every other model.
+  opplan::Gemma4VisionGeometry gvis_{};
+  opplan::ModelPlan gvis_plan_;
+  // Vision-pass slot set. execute_ops resolves slots through slot(), which reads vslots_ instead
+  // of slots_ while vision_pass_ is true -- the same executor, re-pointed, exactly as CUDA's
+  // ExecCtx carries a different slot array for the tower.
+  std::vector<runtime::MetalBuffer> vslots_;
+  bool vision_pass_ = false;
+  int gvis_max_patches_ = 0;  // what vslots_ / the pixel buffers are sized for
+  runtime::MetalBuffer gvis_pix_buf_;    // float[P][patch_dim]
+  runtime::MetalBuffer gvis_posx_buf_;   // int32[P]
+  runtime::MetalBuffer gvis_posy_buf_;   // int32[P]
+  runtime::MetalBuffer gvis_rope_cos_;   // float[4096][head_dim/4]
+  runtime::MetalBuffer gvis_rope_sin_;
+  runtime::MetalBuffer gvis_clamp_buf_;  // clip_in staging, so the input slot is never mutated
+  runtime::MetalBuffer gvis_ones_buf_;   // fp16 ones for the projector's weightless rms
+  void init_gemma_vision(const std::string& model_dir);
+
+  // Per-token key limits for multimodal prefill (the bidirectional image span). Armed only for
+  // the duration of generate_multimodal's prefill; attention reads it when limits_active_.
+  runtime::MetalBuffer seq_limits_buf_;  // int32[max_prefill] -- this CHUNK's limits
+  bool limits_active_ = false;
+  // From the Gemma config.json at open(); LlamaConfig deliberately has no eos field.
+  int eos_token_id_ = -1;
 
   // Armed only for the duration of a multimodal prefill. The rope kernel reads the axis
   // positions for the CURRENT chunk from here; decode goes back to the scalar path.

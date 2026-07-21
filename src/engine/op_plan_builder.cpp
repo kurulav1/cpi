@@ -316,6 +316,11 @@ ModelPlan build_qwen35_plan(const Qwen35Geometry& g, const WeightSource& w) {
     e.weight = w.fp16("tok_embeddings.weight");
     plan.prologue.push_back(e);
   }
+  // Embeddings are final here (no scale, no PLE); multimodal prefill splices at this index.
+  // This was UNSET (0) until the Metal executor started honouring embed_ready, at which point
+  // "0" meant "splice before the lookup" and the lookup overwrote every soft token -- caught by
+  // SPLICE_is_load_bearing, which exists for exactly this class of silent no-op.
+  plan.embed_ready = plan.prologue.size();
 
   plan.layers.assign(g.num_layers, LayerPlan{});
   for (int L = 0; L < g.num_layers; ++L) {
@@ -760,6 +765,157 @@ ModelPlan build_gemma4_plan(const Gemma4Geometry& g, const WeightSource& w) {
     h.cols = g.vocab;
     h.in_dim = H;
     epi.push_back(h);
+  }
+  return plan;
+}
+
+// Field-for-field the plan PlanCudaEngine::build_vision_plan constructs, with weights resolved
+// through WeightSource instead of a device-pointer map. Keep the two in lockstep until CUDA
+// delegates here; the cross-backend soft-token gate is what catches drift meanwhile.
+//
+// Same RMSNorm note as the text plan: PLAIN rmsnorm, no (1 + w) offset. The vision Attention op
+// carries NO scale of its own -- a ScaleCopy pre-multiplies Q by sqrt(head_dim) so the kernel's
+// 1/sqrt(head_dim) cancels to the tower's scaling of 1.0. Executors apply 1/sqrt(head_dim),
+// not Op::scale, exactly as they do for text.
+ModelPlan build_gemma4_vision_plan(const Gemma4VisionGeometry& g, const WeightSource& w) {
+  ModelPlan plan;
+  const int H = g.hidden;
+  const int patch_dim = 3 * g.patch_size * g.patch_size;
+  const std::string v = "model.vision_tower.";
+
+  {  // prologue: pixels -> patch embeddings (+ the two-axis learned position table)
+    Op o;
+    o.kind = OpKind::PatchEmbed;
+    o.out = Slot::X;
+    o.cols = H;
+    o.in_dim = patch_dim;
+    o.rows = g.pos_table_size;
+    o.weight = w.fp16(v + "patch_embedder.input_proj.weight");
+    o.aux_ptr = w.fp16(v + "patch_embedder.position_embedding_table");
+    plan.prologue.push_back(o);
+  }
+  plan.embed_ready = plan.prologue.size();
+
+  plan.layers.assign(static_cast<std::size_t>(g.layers), LayerPlan{});
+  for (int L = 0; L < g.layers; ++L) {
+    const std::string p = v + "encoder.layers." + std::to_string(L) + ".";
+    auto& ops = plan.layers[static_cast<std::size_t>(L)].ops;
+    plan.layers[static_cast<std::size_t>(L)].layer_index = L;
+    const int nq = g.heads, nkv = g.kv_heads, hd = g.head_dim;
+    const int qdim = nq * hd, kvdim = nkv * hd;
+
+    auto rms = [&](Slot in, Slot out, const void* wgt, int rows, int cols) {
+      Op o;
+      o.kind = OpKind::RmsNorm;
+      o.in = in;
+      o.out = out;
+      o.weight = wgt;
+      o.rows = rows;
+      o.cols = cols;
+      o.eps = g.rms_eps;
+      ops.push_back(o);
+    };
+    auto gemv = [&](Slot in, Slot out, const char* t, int out_dim, int in_dim) {
+      Op o;
+      o.kind = OpKind::Gemv;
+      o.in = in;
+      o.out = out;
+      o.cols = out_dim;
+      o.in_dim = in_dim;
+      o.weight = w.fp16(p + t);
+      if (g.clipped_linears) {
+        // "<proj>.linear.weight" -> "<proj>." -- the bounds live beside the projection.
+        const std::string tn(t);
+        const std::string base = p + tn.substr(0, tn.find("linear.weight"));
+        o.clip_in_min = w.scalar(base + "input_min");
+        o.clip_in_max = w.scalar(base + "input_max");
+        o.clip_out_min = w.scalar(base + "output_min");
+        o.clip_out_max = w.scalar(base + "output_max");
+      }
+      ops.push_back(o);
+    };
+    auto rope2d = [&](Slot s, int heads) {
+      Op o;
+      o.kind = OpKind::Rope2D;
+      o.in = s;
+      o.out = s;
+      o.heads = heads;
+      o.head_dim = hd;
+      ops.push_back(o);
+    };
+    auto add_x = [&](Slot src) {
+      Op o;
+      o.kind = OpKind::AddInplace;
+      o.out = Slot::X;
+      o.in = src;
+      o.cols = H;
+      ops.push_back(o);
+    };
+
+    // The same sandwich-norm shape as a Gemma TEXT layer. The differences are that
+    // attention is bidirectional and the positions are 2-D.
+    rms(Slot::X, Slot::XNorm, w.fp16(p + "input_layernorm.weight"), 1, H);
+    gemv(Slot::XNorm, Slot::Q, "self_attn.q_proj.linear.weight", qdim, H);
+    gemv(Slot::XNorm, Slot::K, "self_attn.k_proj.linear.weight", kvdim, H);
+    gemv(Slot::XNorm, Slot::V, "self_attn.v_proj.linear.weight", kvdim, H);
+    rms(Slot::Q, Slot::Q, w.fp16(p + "self_attn.q_norm.weight"), nq, hd);
+    rms(Slot::K, Slot::K, w.fp16(p + "self_attn.k_norm.weight"), nkv, hd);
+    rms(Slot::V, Slot::V, nullptr, nkv, hd);  // weightless v-norm, as in the text tower
+    rope2d(Slot::Q, nq);
+    rope2d(Slot::K, nkv);
+    {  // scaling = 1.0: pre-scale q by sqrt(hd) to cancel the kernel's 1/sqrt(hd)
+      Op o;
+      o.kind = OpKind::ScaleCopy;
+      o.in = Slot::Q;
+      o.out = Slot::Q;
+      o.cols = qdim;
+      o.scale = std::sqrt(static_cast<float>(hd));
+      ops.push_back(o);
+    }
+    {
+      Op o;
+      o.kind = OpKind::Attention;
+      o.in = Slot::Q;
+      o.out = Slot::Att;
+      o.heads = nq;
+      o.kv_heads = nkv;
+      o.head_dim = hd;
+      o.full_attention = true;
+      ops.push_back(o);
+    }
+    gemv(Slot::Att, Slot::Tmp, "self_attn.o_proj.linear.weight", H, qdim);
+    rms(Slot::Tmp, Slot::Tmp, w.fp16(p + "post_attention_layernorm.weight"), 1, H);
+    add_x(Slot::Tmp);
+
+    rms(Slot::X, Slot::XNorm, w.fp16(p + "pre_feedforward_layernorm.weight"), 1, H);
+    gemv(Slot::XNorm, Slot::Gate, "mlp.gate_proj.linear.weight", g.intermediate, H);
+    gemv(Slot::XNorm, Slot::Up, "mlp.up_proj.linear.weight", g.intermediate, H);
+    {
+      Op o;
+      o.kind = OpKind::GeluMul;
+      o.in = Slot::Gate;
+      o.in2 = Slot::Up;
+      o.out = Slot::Inter;
+      o.cols = g.intermediate;
+      ops.push_back(o);
+    }
+    gemv(Slot::Inter, Slot::Tmp, "mlp.down_proj.linear.weight", H, g.intermediate);
+    rms(Slot::Tmp, Slot::Tmp, w.fp16(p + "post_feedforward_layernorm.weight"), 1, H);
+    add_x(Slot::Tmp);
+  }
+
+  // Epilogue: standardize, when the checkpoint has it (E2B does not). Pooling and projection
+  // are NOT ops -- pooling changes the token count, so the executor has to be re-entered with
+  // the new count; see encode_image.
+  if (g.standardize) {
+    Op o;
+    o.kind = OpKind::Standardize;
+    o.in = Slot::X;
+    o.out = Slot::X;
+    o.cols = H;
+    o.weight = w.fp16(v + "std_bias");
+    o.aux_ptr = w.fp16(v + "std_scale");
+    plan.epilogue.push_back(o);
   }
   return plan;
 }

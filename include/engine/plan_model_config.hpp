@@ -21,6 +21,7 @@
 #include <string>
 #include <vector>
 
+#include "engine/op_plan_builder.hpp"
 #include "model/llama_config.hpp"
 
 namespace engine {
@@ -94,5 +95,9 @@ model::LlamaConfig gemma4_to_llama_config(const PlanModelConfig& g);
 // text_config, falling back to the root -- the same place PlanCudaEngine::open looks, and the same
 // place probe_model's directory sniff looks.
 bool config_json_is_gemma4(const std::string& config_json);
+
+// Gemma 4's `vision_config`, parsed into the shared vision-plan geometry. Returns
+// present == false when the checkpoint has no vision_config block (text-only export).
+opplan::Gemma4VisionGeometry parse_gemma4_vision_config(const std::string& config_json);
 
 }  // namespace engine

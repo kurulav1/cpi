@@ -136,4 +136,32 @@ model::LlamaConfig gemma4_to_llama_config(const PlanModelConfig& g) {
   return c;
 }
 
+// Mirrors PlanCudaEngine::parse_vision_config key for key. Shared and CUDA-free for the same
+// reason parse_gemma4_text_config is: the vision tower now runs on two backends, and a config
+// field parsed on one and defaulted on the other is the "one description, two readers" bug class
+// in config form.
+opplan::Gemma4VisionGeometry parse_gemma4_vision_config(const std::string& config_json) {
+  opplan::Gemma4VisionGeometry v;
+  const std::string vc = mini::json_extract_object(config_json, "vision_config");
+  if (vc.empty()) return v;
+
+  v.hidden = mini::json_get_int(vc, "hidden_size", 0);
+  v.layers = mini::json_get_int(vc, "num_hidden_layers", 0);
+  v.heads = mini::json_get_int(vc, "num_attention_heads", 0);
+  v.kv_heads = mini::json_get_int(vc, "num_key_value_heads", v.heads);
+  v.head_dim = mini::json_get_int(vc, "head_dim", 0);
+  v.intermediate = mini::json_get_int(vc, "intermediate_size", 0);
+  v.patch_size = mini::json_get_int(vc, "patch_size", 0);
+  v.pos_table_size = mini::json_get_int(vc, "position_embedding_size", 0);
+  v.pooling_kernel = mini::json_get_int(vc, "pooling_kernel_size", 1);
+  v.rms_eps = mini::json_get_float(vc, "rms_norm_eps", 1e-6f);
+  v.standardize = mini::json_get_bool(vc, "standardize", false);
+  v.clipped_linears = mini::json_get_bool(vc, "use_clipped_linears", false);
+  const std::string rp = mini::json_extract_object(vc, "rope_parameters");
+  v.rope_theta = mini::json_get_float(rp.empty() ? vc : rp, "rope_theta", 100.0f);
+
+  v.present = v.hidden > 0 && v.layers > 0 && v.patch_size > 0;
+  return v;
+}
+
 }  // namespace engine

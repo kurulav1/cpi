@@ -154,6 +154,10 @@ struct AttnParams {
   // contiguous run and a key's row IS its position.
   uint paged;
   uint block_size;  // tokens per KV block; only meaningful when paged != 0
+  // Multimodal prefill: chunk-local per-token EXCLUSIVE key bounds replace the causal pos+1
+  // (a bidirectional image span gives every token in the span the span's end). A sliding
+  // window is measured back from the bound. 0 = causal; the limits binding is a dummy then.
+  uint use_limits;
 };
 
 struct QuantParams {

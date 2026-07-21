@@ -491,6 +491,7 @@ int main() {
       float scale;
       std::uint32_t use_position_buffer, tokens;
       std::uint32_t paged, block_size;  // contiguous here: paged = 0
+      std::uint32_t use_limits;         // 0 here: the limits binding is a dummy
     };
     struct Case {
       const char* name;
@@ -537,8 +538,12 @@ int main() {
       const std::int32_t base = static_cast<std::int32_t>(c.base);
       auto bp = ctx.alloc_from(&base, sizeof(base));
 
-      AP p{c.heads, c.kv_heads, hd, 0, max_ctx, c.window, scale, 1, T, 0, 0};
-      const void* bufs[] = {bq.handle(), bk.handle(), bv.handle(), bo.handle(), bp.handle()};
+      AP p{c.heads, c.kv_heads, hd, 0, max_ctx, c.window, scale, 1, T, 0, 0, 0};
+      // The scalar prefill and decode kernels take per-token limits at buffer(5) (multimodal
+      // image spans); use_limits is 0 so the binding is a never-read dummy -- but it must
+      // exist, or dispatch() writes the params block over it. Same shape as the mm case below.
+      const void* bufs[] = {bq.handle(), bk.handle(), bv.handle(),
+                            bo.handle(), bp.handle(), bp.handle()};
       // The engine's own choice, reproduced -- testing a kernel production does not pick
       // would prove nothing about production.
       if (T >= kQBlockSmoke && hd <= 128) {
@@ -560,10 +565,10 @@ int main() {
       } else if (T >= kQBlockSmoke) {
         const std::size_t blocks = (T + kQBlockSmoke - 1) / kQBlockSmoke;
         ctx.dispatch("cpi_attention_prefill", runtime::MetalContext::Grid::Groups,
-                     c.heads * blocks, 256, bufs, nullptr, 5, &p, sizeof(p));
+                     c.heads * blocks, 256, bufs, nullptr, 6, &p, sizeof(p));
       } else {
         ctx.dispatch("cpi_attention_decode", runtime::MetalContext::Grid::Groups, c.heads * T, 256,
-                     bufs, nullptr, 5, &p, sizeof(p));
+                     bufs, nullptr, 6, &p, sizeof(p));
       }
       ctx.commit_and_wait();
 

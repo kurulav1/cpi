@@ -68,6 +68,12 @@ struct AttnParams {
   // Paged prefill; read only by cpi_attention_prefill_mm. Defaulted so every existing
   // construction keeps the contiguous meaning.
   std::uint32_t paged = 0, block_size = 0;
+  // Per-token key limits (multimodal prefill's bidirectional image span). When set, the
+  // prefill-capable kernels read chunk-local limits[t] as token t's EXCLUSIVE key bound instead
+  // of the causal pos+1, and a sliding window is measured back from that bound -- the same
+  // semantics as CUDA's attention_prefill limits argument. Defaulted 0 = causal, every
+  // existing construction unchanged.
+  std::uint32_t use_limits = 0;
 };
 // MUST match AttnSplitParams in cpi_kernels.metal, field for field.
 struct AttnSplitParams {
@@ -509,6 +515,16 @@ public:
     bits_ = bits;
     group_ = group;
   }
+
+  // Host value of a one-element tensor -- the vision builder's clip bounds. Through fp16_data
+  // so a BF16 checkpoint converts here exactly as it does everywhere else.
+  float scalar(const std::string& name) const override {
+    if (!wl_.has_tensor(name)) {
+      throw std::runtime_error("scalar tensor not in the model file: " + name);
+    }
+    std::vector<std::uint16_t> conv;
+    return fp16_to_f32(fp16_data(name, conv)[0]);
+  }
   std::size_t bytes() const override {
     std::size_t n = 0;
     for (const auto& kv : qbufs_) {
@@ -567,7 +583,10 @@ std::size_t PlanMetalEngine::weight_bytes() const {
 }
 
 void* PlanMetalEngine::slot(opplan::Slot s) const {
-  return slots_[static_cast<int>(s)].handle();
+  // A vision pass runs the SAME executor over its own slot set: the tower's per-token widths
+  // (vision hidden, its q/kv dims, its intermediate) share nothing with the text geometry the
+  // engine's slots_ are sized for.
+  return (vision_pass_ ? vslots_ : slots_)[static_cast<int>(s)].handle();
 }
 
 void PlanMetalEngine::open(const std::string& weights_path, int max_context, int quant_bits,
@@ -612,7 +631,11 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
       }
     }
     if (!gemma_cfg.empty()) {
-      cfg_ = engine::gemma4_to_llama_config(engine::parse_gemma4_text_config(gemma_cfg));
+      const engine::PlanModelConfig pmc = engine::parse_gemma4_text_config(gemma_cfg);
+      cfg_ = engine::gemma4_to_llama_config(pmc);
+      // LlamaConfig deliberately carries no bos/eos; generate_multimodal needs eos to stop on,
+      // exactly as PlanCudaEngine reads it off its own config.
+      eos_token_id_ = pmc.eos_token_id;
     } else if (st_.has_metadata()) {
       cfg_ = model::config_from_json(st_.metadata_json());
     } else {
@@ -806,6 +829,11 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
       gg.layer_scalar[static_cast<std::size_t>(L)] = engine::mini::bf16_to_float(raw[0]);
     }
     plan_ = opplan::build_gemma4_plan(gg, *wsrc_);
+    // The vision tower, when this checkpoint has one (E2B does; a text-only export does not).
+    // After the text plan: it reads the same WeightSource and the same config.json, and a tower
+    // that fails to initialise must not take the text path down with it -- init throws only on a
+    // malformed tower, and simply returns on an absent one.
+    init_gemma_vision(weights_path);
   } else {
     plan_ = opplan::build_llama_plan(g, *wsrc_);
   }
@@ -1296,8 +1324,27 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
           }
           break;
         }
+        // Clipped projections (Gemma 4 E2B's vision tower): clamp the INPUT into a staging
+        // buffer rather than in place -- XNorm feeds q/k/v projections whose bounds differ, so
+        // mutating the slot would leak one projection's clamp into the next. The output clamp
+        // IS in place; nothing else reads the slot between the GEMM and the clamp.
+        const void* in_h = slot(op.in);
+        const bool clip_in = std::isfinite(op.clip_in_min) || std::isfinite(op.clip_in_max);
+        const bool clip_out = std::isfinite(op.clip_out_min) || std::isfinite(op.clip_out_max);
+        if (clip_in) {
+          struct ClampParams {
+            std::uint32_t n;
+            float lo, hi;
+          } cp{static_cast<std::uint32_t>(op.in_dim) * static_cast<std::uint32_t>(T),
+               op.clip_in_min, op.clip_in_max};
+          const void* cbufs[] = {in_h, gvis_clamp_buf_.handle()};
+          ctx_.dispatch("cpi_clamp", G::Threads,
+                        static_cast<std::size_t>(op.in_dim) * static_cast<std::size_t>(T), kTG,
+                        cbufs, nullptr, 2, &cp, sizeof(cp));
+          in_h = gvis_clamp_buf_.handle();
+        }
         const void* bb = op.bias != nullptr ? op.bias : op.weight;  // bound, unread when absent
-        const void* bufs[] = {op.weight, slot(op.in), slot(op.out), bb};
+        const void* bufs[] = {op.weight, in_h, slot(op.out), bb};
         // Q/K/V share one fused bqkv tensor; bias_offset selects this op's slice.
         const std::size_t offs[] = {
             0, 0, 0, static_cast<std::size_t>(op.bias_offset) * sizeof(std::uint16_t)};
@@ -1365,6 +1412,17 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
           ctx_.dispatch("cpi_gemv_f16", G::Groups,
                         groups_for_rows(static_cast<std::size_t>(op.cols)) * tiles, kTG, bufs,
                         roffs, 4, &p, sizeof(p));
+        }
+        if (clip_out) {
+          struct ClampParams {
+            std::uint32_t n;
+            float lo, hi;
+          } cp{static_cast<std::uint32_t>(op.cols) * static_cast<std::uint32_t>(T),
+               op.clip_out_min, op.clip_out_max};
+          const void* cbufs[] = {slot(op.out), slot(op.out)};
+          ctx_.dispatch("cpi_clamp", G::Threads,
+                        static_cast<std::size_t>(op.cols) * static_cast<std::size_t>(T), kTG,
+                        cbufs, nullptr, 2, &cp, sizeof(cp));
         }
         break;
       }
@@ -1541,6 +1599,29 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
         break;
       }
       case OpKind::Attention: {
+        // Vision pass: bidirectional and CACHELESS -- the K/V slots ARE the keys, there is no
+        // KvStore and no position. Mirrors CUDA's `ctx.causal == false` branch. The kernel takes
+        // ONE row stride for q/k/v; Gemma 4's tower has kv_heads == heads so they agree, and a
+        // future GQA tower must extend the kernel rather than silently mis-stride.
+        if (vision_pass_) {
+          if (op.kv_heads != op.heads) {
+            throw std::runtime_error("Metal vision attention needs kv_heads == heads");
+          }
+          struct BiAttnParams {
+            std::uint32_t tokens, heads, head_dim;
+            float scale;
+            std::uint32_t row_stride;
+          } p{static_cast<std::uint32_t>(T), static_cast<std::uint32_t>(op.heads),
+              static_cast<std::uint32_t>(op.head_dim),
+              1.0f / std::sqrt(static_cast<float>(op.head_dim)),
+              static_cast<std::uint32_t>(op.heads * op.head_dim)};
+          const void* bufs[] = {slot(op.in), slot(opplan::Slot::K), slot(opplan::Slot::V),
+                                slot(op.out)};
+          ctx_.dispatch("cpi_attention_bidirectional", G::Groups,
+                        static_cast<std::size_t>(T) * static_cast<std::size_t>(op.heads), 64,
+                        bufs, nullptr, 4, &p, sizeof(p));
+          break;
+        }
         // A paged PREFILL is one sequence's consecutive tokens sharing one block table, so it
         // can use the query-block matrix kernel instead of the decode kernel -- which matters:
         // the decode kernel makes every query re-walk the whole history, measured at 2.81x the
@@ -1611,9 +1692,19 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
                      op.scale,
                      1,
                      static_cast<std::uint32_t>(T)};
+        p.use_limits = limits_active_ ? 1u : 0u;
+        if (limits_active_ && layer == 0 && std::getenv("CPI_METAL_DEBUG") != nullptr) {
+          const auto* lb = static_cast<const std::int32_t*>(seq_limits_buf_.contents());
+          std::fprintf(stderr, "  [dbg] attn L%d T=%d use_limits=1 hd=%d limits[0..9]=", layer, T,
+                       op.head_dim);
+          for (int z = 0; z < std::min(T, 10); ++z) std::fprintf(stderr, "%d ", lb[z]);
+          std::fprintf(stderr, "\n");
+        }
+        // The limits binding must exist even when unused; pos_buf_ stands in then.
+        const void* limits_h = limits_active_ ? seq_limits_buf_.handle() : pos_buf_.handle();
         const void* bufs[] = {slot(op.in), kbuf(layer).handle(),
                               vbuf(layer).handle(), slot(op.out),
-                              pos_buf_.handle()};
+                              pos_buf_.handle(),    limits_h};
         // A prefill's threadgroups each walk the whole KV cache, so per-token attention is
         // O(T^2) in DEVICE traffic and was 23% of the 8B's prefill. The prefill kernel gives
         // one threadgroup a BLOCK of queries, so a key block it pulls in serves kQBlock of
@@ -1666,7 +1757,7 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
           } else if (op.head_dim <= 256) {
             const std::size_t blocks = static_cast<std::size_t>((T + kQBlock - 1) / kQBlock);
             ctx_.dispatch("cpi_attention_prefill", G::Groups,
-                          static_cast<std::size_t>(op.heads) * blocks, kTG, bufs, nullptr, 5, &p,
+                          static_cast<std::size_t>(op.heads) * blocks, kTG, bufs, nullptr, 6, &p,
                           sizeof(p));
           } else {
             // Gemma 4's FULL layers are head_dim 512: the scalar kernel's q_sh/acc hold 256
@@ -1676,10 +1767,12 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
             const std::size_t blocks =
                 static_cast<std::size_t>((T + kQBlockWide - 1) / kQBlockWide);
             ctx_.dispatch("cpi_attention_prefill_wide", G::Groups,
-                          static_cast<std::size_t>(op.heads) * blocks, kTG, bufs, nullptr, 5, &p,
+                          static_cast<std::size_t>(op.heads) * blocks, kTG, bufs, nullptr, 6, &p,
                           sizeof(p));
           }
-        } else if (T == 1 && attn_split_chunks(op, position) > 1) {
+        } else if (T == 1 && !limits_active_ && attn_split_chunks(op, position) > 1) {
+          // limits_active_ skips the split path: the split kernel has no limits argument, and a
+          // one-token chunk under limits is causal anyway -- the decode kernel below handles it.
           // Split-KV: one threadgroup per (head, chunk), then a merge. See the kernels.
           const int window = op.full_attention ? 0 : op.sliding_window;
           const int seq = position + 1;
@@ -1719,7 +1812,7 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
         } else {
           ctx_.dispatch("cpi_attention_decode", G::Groups,
                         static_cast<std::size_t>(op.heads) * static_cast<std::size_t>(T), kTG,
-                        bufs, nullptr, 5, &p, sizeof(p));
+                        bufs, nullptr, 6, &p, sizeof(p));
         }
         break;
       }
@@ -1916,15 +2009,53 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
         break;
       }
 
-      // Kernels exist (80_vision.metal) but nothing here supplies pixels, patch positions or the
-      // 2-D RoPE tables, and those four ops implement GEMMA 4's tower -- Qwen3.5's is a different
-      // architecture (3-D conv patch embed, learned absolute positions, LayerNorm, spatial merge).
-      case OpKind::PatchEmbed:
-      case OpKind::Rope2D:
+      // GEMMA 4's tower (80_vision.metal) -- Qwen3.5's is a different architecture (3-D conv
+      // patch embed, learned absolute positions, LayerNorm, spatial merge) and stays in
+      // plan_metal_vision.cpp. Pixels, patch positions and the 2-D RoPE tables are engine
+      // buffers, staged by encode_image before the pass; these ops only run under vision_pass_.
+      case OpKind::PatchEmbed: {
+        struct VisPatchParams {
+          std::uint32_t hidden, patch_dim, pos_table_size, tokens;
+        } p{static_cast<std::uint32_t>(op.cols), static_cast<std::uint32_t>(op.in_dim),
+            static_cast<std::uint32_t>(op.rows), static_cast<std::uint32_t>(T)};
+        const void* bufs[] = {op.weight,               gvis_pix_buf_.handle(), op.aux_ptr,
+                              gvis_posx_buf_.handle(), gvis_posy_buf_.handle(), slot(op.out)};
+        ctx_.dispatch("cpi_patch_embed", G::Threads,
+                      static_cast<std::size_t>(op.cols) * static_cast<std::size_t>(T), kTG, bufs,
+                      nullptr, 6, &p, sizeof(p));
+        break;
+      }
+      case OpKind::Rope2D: {
+        struct VisRope2DParams {
+          std::uint32_t num_heads, head_dim, pairs_per_half, tokens;
+        } p{static_cast<std::uint32_t>(op.heads), static_cast<std::uint32_t>(op.head_dim),
+            static_cast<std::uint32_t>(op.head_dim / 4), static_cast<std::uint32_t>(T)};
+        const void* bufs[] = {slot(op.in), gvis_posx_buf_.handle(), gvis_posy_buf_.handle(),
+                              gvis_rope_cos_.handle(), gvis_rope_sin_.handle()};
+        const std::size_t work = static_cast<std::size_t>(T) *
+                                 static_cast<std::size_t>(op.heads) *
+                                 static_cast<std::size_t>(op.head_dim / 2);
+        ctx_.dispatch("cpi_rope_2d_inplace", G::Threads, work, kTG, bufs, nullptr, 5, &p,
+                      sizeof(p));
+        break;
+      }
+      case OpKind::Standardize: {
+        struct VisStdParams {
+          std::uint32_t n, hidden;
+        } p{static_cast<std::uint32_t>(op.cols) * static_cast<std::uint32_t>(T),
+            static_cast<std::uint32_t>(op.cols)};
+        const void* bufs[] = {slot(op.in), op.weight, op.aux_ptr};
+        ctx_.dispatch("cpi_standardize", G::Threads,
+                      static_cast<std::size_t>(op.cols) * static_cast<std::size_t>(T), kTG, bufs,
+                      nullptr, 3, &p, sizeof(p));
+        break;
+      }
+      // AvgPoolPatches changes the token count, so it is not part of the walked plan -- Gemma's
+      // encode_image dispatches the kernel directly between the plan and the projector, exactly
+      // as PlanCudaEngine::encode_image does.
       case OpKind::AvgPoolPatches:
-      case OpKind::Standardize:
-        throw std::runtime_error(std::string("Metal: ") + op_kind_name(static_cast<int>(op.kind)) +
-                                 " belongs to a vision tower that is not wired on this backend");
+        throw std::runtime_error(
+            "Metal: AvgPoolPatches is dispatched by encode_image, not from a plan");
 
       case OpKind::AddInplace: {
         // WIDTH COMES FROM THE OP. It used to be hardcoded to hidden_size, which is right for
@@ -2343,6 +2474,33 @@ std::vector<int> PlanMetalEngine::prefill_chunks(int n) const {
   return chunk_sizes(n, max_prefill_, quant_bits_ != 0 ? kGemmQBN : kGemmBN);
 }
 
+// Overwrite slot X's rows with the caller's per-position embeddings (image soft tokens).
+// Runs between the embedding lookup and whatever reads the embeddings next; see encode_prefill.
+void PlanMetalEngine::splice_embeds(int start_position, int T) {
+  bool any = false;
+  for (int t = 0; t < T; ++t) {
+    const std::size_t idx = static_cast<std::size_t>(start_position + t);
+    if (idx < embeds_->size() && !(*embeds_)[idx].empty()) any = true;
+  }
+  if (!any) return;
+  ctx_.commit_and_wait();  // the lookup must have landed before it is overwritten
+  auto* xw = static_cast<std::uint16_t*>(slots_[0].contents());
+  const int H2 = cfg_.hidden_size;
+  for (int t = 0; t < T; ++t) {
+    const std::size_t idx = static_cast<std::size_t>(start_position + t);
+    if (idx >= embeds_->size() || (*embeds_)[idx].empty()) continue;
+    const std::vector<float>& row = (*embeds_)[idx];
+    if (static_cast<int>(row.size()) != H2) {
+      throw std::runtime_error("image embedding at position " + std::to_string(idx) + " is " +
+                               std::to_string(row.size()) + " wide, expected " +
+                               std::to_string(H2));
+    }
+    for (int j = 0; j < H2; ++j) {
+      xw[static_cast<std::size_t>(t) * H2 + j] = f32_to_fp16(row[static_cast<std::size_t>(j)]);
+    }
+  }
+}
+
 void PlanMetalEngine::encode_prefill(const std::vector<int>& tokens, int start_position) {
   const int T = static_cast<int>(tokens.size());
   if (T <= 0) return;
@@ -2357,35 +2515,29 @@ void PlanMetalEngine::encode_prefill(const std::vector<int>& tokens, int start_p
   }
   *static_cast<std::int32_t*>(pos_buf_.contents()) = static_cast<std::int32_t>(start_position);
 
-  execute_ops(plan_.prologue, -1, start_position, T);
-
-  // Image soft tokens go in HERE: after the embedding lookup, before any layer reads X. Used
-  // AS-IS -- unlike text embeddings they get no sqrt(hidden) scale -- matching the CUDA path
-  // and what the reference projects from.
-  if (embeds_ != nullptr) {
-    bool any = false;
-    for (int t = 0; t < T; ++t) {
-      const std::size_t idx = static_cast<std::size_t>(start_position + t);
-      if (idx < embeds_->size() && !(*embeds_)[idx].empty()) any = true;
-    }
-    if (any) {
-      ctx_.commit_and_wait();  // the lookup must have landed before it is overwritten
-      auto* xw = static_cast<std::uint16_t*>(slots_[0].contents());
-      const int H2 = cfg_.hidden_size;
-      for (int t = 0; t < T; ++t) {
-        const std::size_t idx = static_cast<std::size_t>(start_position + t);
-        if (idx >= embeds_->size() || (*embeds_)[idx].empty()) continue;
-        const std::vector<float>& row = (*embeds_)[idx];
-        if (static_cast<int>(row.size()) != H2) {
-          throw std::runtime_error("image embedding at position " + std::to_string(idx) +
-                                   " is " + std::to_string(row.size()) + " wide, expected " +
-                                   std::to_string(H2));
-        }
-        for (int j = 0; j < H2; ++j) {
-          xw[static_cast<std::size_t>(t) * H2 + j] = f32_to_fp16(row[static_cast<std::size_t>(j)]);
-        }
-      }
-    }
+  // Image soft tokens go in at plan_.embed_ready: after the embedding lookup and its scale,
+  // BEFORE anything that reads the embeddings. Splicing after the whole prologue was correct
+  // for Qwen3.5 (its prologue ends there) and WRONG for Gemma 4, whose prologue projects the
+  // per-layer inputs FROM the embeddings -- a post-prologue splice computes them from the
+  // placeholder token instead of the image, exactly the drift op_plan.hpp's embed_ready
+  // comment warns about. Used AS-IS -- no sqrt(hidden) scale -- matching the CUDA path.
+  // embed_ready == 0 means the builder never set it; treat that as "after the whole prologue"
+  // (the pre-embed_ready behaviour) rather than "before the lookup", which would let the lookup
+  // overwrite every spliced row -- a silent no-op splice, not an error.
+  const std::size_t er = plan_.embed_ready == 0
+                             ? plan_.prologue.size()
+                             : std::min(plan_.embed_ready, plan_.prologue.size());
+  if (embeds_ != nullptr && er < plan_.prologue.size()) {
+    const std::vector<opplan::Op> pre(plan_.prologue.begin(),
+                                      plan_.prologue.begin() + static_cast<std::ptrdiff_t>(er));
+    const std::vector<opplan::Op> post(plan_.prologue.begin() + static_cast<std::ptrdiff_t>(er),
+                                       plan_.prologue.end());
+    execute_ops(pre, -1, start_position, T);
+    splice_embeds(start_position, T);
+    execute_ops(post, -1, start_position, T);
+  } else {
+    execute_ops(plan_.prologue, -1, start_position, T);
+    if (embeds_ != nullptr) splice_embeds(start_position, T);
   }
 
   // layer_00 is the embedding, before any layer -- the same file the CPU engine writes. Lets a

@@ -142,9 +142,6 @@ set(LLAMA_ENGINE_SOURCES
 
 if(LLAMA_ENGINE_ENABLE_CUDA)
   list(APPEND LLAMA_ENGINE_SOURCES
-    # Splices an encoded image into the prompt -- calls PlanCudaEngine directly,
-    # so it belongs to the CUDA path, not the portable one.
-    src/app/image_prompt.cpp
     src/runtime/system_info.cpp
     src/runtime/cuda_utils.cu
     src/runtime/kv_cache.cpp

@@ -22,8 +22,10 @@
 #include "engine/cpu_engine.hpp"
 #include "engine/llama4_cpu_engine.hpp"
 #include "engine/qwen35_cpu_engine.hpp"
-#if LLAMA_ENGINE_HAS_CUDA
+// The image splicer is a template over the engine now (CUDA and Metal both use it), and its
+// header pulls in no backend types -- so it sits outside both guards.
 #include "app/image_prompt.hpp"
+#if LLAMA_ENGINE_HAS_CUDA
 #include "engine/plan_cuda_engine.hpp"
 #include "engine/llama4_cuda_engine.hpp"
 #include "engine/llama_engine.hpp"
@@ -123,6 +125,23 @@ std::vector<int> generate_multimodal_metal(engine::PlanMetalEngine& meng,
                                            const std::string& image_path, int max_new, int eos,
                                            const std::function<bool(int)>& on_token,
                                            std::ostream* info_out) {
+  // GEMMA 4's tower first: the SAME expand + generate_multimodal pair the CUDA path runs --
+  // the splice layout lives in one templated header, and the engines carry the same surface.
+  // (meng.has_vision() is the Gemma tower; config().has_vision_tower() is Qwen3.5's, carried
+  // by container v7. A model has one or the other, never both.)
+  if (meng.has_vision()) {
+    const auto ip = app::image_prompt::expand(meng, base_tokens, image_path,
+                                              std::getenv("CPI_IMAGE_CAUSAL") != nullptr);
+    if (info_out) {
+      *info_out << "[image] " << image_path << "  " << ip.grid_w << "x" << ip.grid_h
+                << " patches -> " << ip.image_tokens << " image tokens; prompt = "
+                << ip.tokens.size() << " tokens\n\n";
+    }
+    (void)eos;  // the engine stops on its own config's eos, exactly as PlanCudaEngine does
+    return meng.generate_multimodal(ip.tokens, ip.embeds, ip.limits, max_new, /*temp=*/0.0f,
+                                    on_token);
+  }
+
   constexpr int kImageToken = 248056;   // <|image_pad|>
   constexpr int kVisionStart = 248053;  // <|vision_start|>
   constexpr int kVisionEnd = 248054;    // <|vision_end|>
@@ -233,7 +252,13 @@ std::vector<int> generate_multimodal_metal(engine::PlanMetalEngine& meng,
 // One image + a text question on the command line. A thin wrapper over the shared core above.
 void run_with_image_metal(engine::PlanMetalEngine& meng, const app::main_cli::ParsedArgs& cli,
                           model::Tokenizer& tokenizer, std::ostream& info_out) {
-  const std::vector<int> base = tokenizer.encode(cli.prompt_text, /*add_bos=*/false);
+  // Gemma's chat text carries the placeholder inside the user turn -- the same string CUDA's
+  // run_with_image builds, so the two CLIs ask the model the same question the same way.
+  const std::string text =
+      meng.has_vision()
+          ? "<|turn>user\n<|image|>\n" + cli.prompt_text + "<turn|>\n<|turn>model\n"
+          : cli.prompt_text;
+  const std::vector<int> base = tokenizer.encode(text, /*add_bos=*/meng.has_vision());
   const auto t0 = std::chrono::steady_clock::now();
   const std::vector<int> gen =
       generate_multimodal_metal(meng, base, cli.image_path, cli.max_new, cli.opts.eos_token_id,
@@ -604,16 +629,11 @@ int main(int argc, char** argv) {
         //   continuous batching     yes (--interactive-batch, two concurrent streams interleaved)
         //   grammar / JSON-schema   yes -- proven by forcing a field name the model would never
         //                           emit unprompted; without the schema it produces "name"/"id"
-        //   vision tower            NO. encode_image/prefill_multimodal exist on the engine but
-        //                           nothing calls them; see the --image guard below.
-        //   speculative decoding    NO, CUDA-only (the --draft-model guard below).
-        //
-        // The two unsupported ones REFUSE rather than proceed. Both were accepted and silently
-        // dropped: --image returned a confident text-only answer to a question about a picture,
-        // and --draft-model quietly turned speculative decoding off -- which the web server
-        // passes unconditionally when it is configured, so a Mac deployment saw a silent
-        // slowdown rather than an error. A wrong answer nobody can attribute is worse than a
-        // refusal, and neither of these is something the caller can be expected to notice.
+        //   vision tower            yes, both of them: Qwen3.5 (gated 8/8 vs HF) and Gemma 4
+        //                           (expand + generate_multimodal, gated vs the CUDA tower's
+        //                           soft tokens) -- run_with_image_metal routes by which tower
+        //                           the model carries.
+        //   speculative decoding    yes (--draft-model, the block just below).
         if (!cli.image_path.empty() && !use_tokenizer) {
           throw std::runtime_error("--image requires --tokenizer");
         }
@@ -767,7 +787,8 @@ int main(int argc, char** argv) {
             // text-only model still fails the request cleanly ("this model cannot take images")
             // instead of pretending. This used to be an unconditional nullptr, which meant the
             // REST/web image route was dead on Metal even after the CLI path worked.
-            meng.config().has_vision_tower()
+            // has_vision_tower() is Qwen3.5's tower (container v7); has_vision() is Gemma 4's.
+            (meng.config().has_vision_tower() || meng.has_vision())
                 ? app::main_modes::GenerateMultimodalFn(
                       [&](const std::vector<int>& base, const std::string& image_path, int max_new,
                           float /*temperature*/, const std::function<bool(int)>& on_token) {

@@ -778,7 +778,8 @@ kernel void cpi_attention_prefill(device const half* q [[buffer(0)]],
                                   device const half* v_cache [[buffer(2)]],
                                   device half* out [[buffer(3)]],
                                   device const int* positions [[buffer(4)]],
-                                  constant AttnParams& p [[buffer(5)]],
+                                  device const int* limits [[buffer(5)]],
+                                  constant AttnParams& p [[buffer(6)]],
                                   uint gid [[threadgroup_position_in_grid]],
                                   uint lid [[thread_position_in_threadgroup]],
                                   uint nthr [[threads_per_threadgroup]]) {
@@ -823,14 +824,22 @@ kernel void cpi_attention_prefill(device const half* q [[buffer(0)]],
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
   // The block's queries span positions [base+t0, base+t0+nq-1]; the last one reaches
-  // furthest, and the first one's window (if any) starts earliest.
+  // furthest, and the first one's window (if any) starts earliest. Per-token limits widen
+  // that: a bidirectional span token's bound can sit PAST its causal position (its span's
+  // keys are all written -- KvStore appends the whole chunk before attention runs).
   const uint last_pos = base + t0 + nq - 1u;
   const uint first_pos = base + t0;
   uint start = 0u;
   if (p.window != 0u && first_pos + 1u > p.window) start = first_pos + 1u - p.window;
+  uint end_total = last_pos + 1u;
+  if (p.use_limits != 0u) {
+    start = 0u;  // per-pair windows handle the start; the block loop must not clip them
+    end_total = 0u;
+    for (uint qi = 0u; qi < nq; ++qi) end_total = max(end_total, uint(limits[t0 + qi]));
+  }
 
-  for (uint kb = start; kb <= last_pos; kb += KEY_BLOCK) {
-    const uint nk = min((uint)KEY_BLOCK, last_pos - kb + 1u);
+  for (uint kb = start; kb < end_total; kb += KEY_BLOCK) {
+    const uint nk = min((uint)KEY_BLOCK, end_total - kb);
 
     // Score every (query, key) pair: ONE THREAD per pair, a full dot product with no
     // cross-lane reduction. The previous version gave each pair a whole simdgroup and summed
@@ -841,11 +850,12 @@ kernel void cpi_attention_prefill(device const half* q [[buffer(0)]],
       const uint key = kb + j;
       const uint pos_i = base + t0 + qi;
 
+      const uint end_i = (p.use_limits != 0u) ? uint(limits[t0 + qi]) : pos_i + 1u;
       uint start_i = 0u;
-      if (p.window != 0u && pos_i + 1u > p.window) start_i = pos_i + 1u - p.window;
+      if (p.window != 0u && end_i > p.window) start_i = end_i - p.window;
 
       float d = -INFINITY;
-      if (key <= pos_i && key >= start_i) {  // causal mask, plus the sliding window
+      if (key < end_i && key >= start_i) {  // causal / span mask, plus the sliding window
         device const half* kt = k_cache + (ulong)key * (ulong)kv_dim + kv_head * hd;
         float acc_d = 0.0f;
         for (uint i = 0u; i < hd; ++i) acc_d += q_sh[qi * hd + i] * float(kt[i]);
@@ -911,7 +921,8 @@ kernel void cpi_attention_prefill_wide(device const half* q [[buffer(0)]],
                                        device const half* v_cache [[buffer(2)]],
                                        device half* out [[buffer(3)]],
                                        device const int* positions [[buffer(4)]],
-                                       constant AttnParams& p [[buffer(5)]],
+                                       device const int* limits [[buffer(5)]],
+                                       constant AttnParams& p [[buffer(6)]],
                                        uint gid [[threadgroup_position_in_grid]],
                                        uint lid [[thread_position_in_threadgroup]],
                                        uint nthr [[threads_per_threadgroup]]) {
@@ -955,20 +966,27 @@ kernel void cpi_attention_prefill_wide(device const half* q [[buffer(0)]],
   const uint first_pos = base + t0;
   uint start = 0u;
   if (p.window != 0u && first_pos + 1u > p.window) start = first_pos + 1u - p.window;
+  uint end_total = last_pos + 1u;
+  if (p.use_limits != 0u) {
+    start = 0u;
+    end_total = 0u;
+    for (uint qi = 0u; qi < nq; ++qi) end_total = max(end_total, uint(limits[t0 + qi]));
+  }
 
-  for (uint kb = start; kb <= last_pos; kb += KEY_BLOCK) {
-    const uint nk = min((uint)KEY_BLOCK, last_pos - kb + 1u);
+  for (uint kb = start; kb < end_total; kb += KEY_BLOCK) {
+    const uint nk = min((uint)KEY_BLOCK, end_total - kb);
 
     for (uint pidx = lid; pidx < nq * nk; pidx += nthr) {
       const uint qi = pidx / nk, j = pidx % nk;
       const uint key = kb + j;
       const uint pos_i = base + t0 + qi;
 
+      const uint end_i = (p.use_limits != 0u) ? uint(limits[t0 + qi]) : pos_i + 1u;
       uint start_i = 0u;
-      if (p.window != 0u && pos_i + 1u > p.window) start_i = pos_i + 1u - p.window;
+      if (p.window != 0u && end_i > p.window) start_i = end_i - p.window;
 
       float d = -INFINITY;
-      if (key <= pos_i && key >= start_i) {  // causal mask, plus the sliding window
+      if (key < end_i && key >= start_i) {  // causal / span mask, plus the sliding window
         device const half* kt = k_cache + (ulong)key * (ulong)kv_dim + kv_head * hd;
         float acc_d = 0.0f;
         for (uint i = 0u; i < hd; ++i) acc_d += q_sh[qi * hd + i] * float(kt[i]);
@@ -1028,7 +1046,8 @@ kernel void cpi_attention_decode(
     device const half*  v_cache   [[buffer(2)]],
     device half*        out       [[buffer(3)]],
     device const int*   positions [[buffer(4)]],
-    constant AttnParams& p        [[buffer(5)]],
+    device const int*   limits    [[buffer(5)]],
+    constant AttnParams& p        [[buffer(6)]],
     uint gid  [[threadgroup_position_in_grid]],
     uint lid  [[thread_position_in_threadgroup]],
     uint nthr [[threads_per_threadgroup]]) {
@@ -1054,8 +1073,11 @@ kernel void cpi_attention_decode(
   const uint kv_dim  = p.kv_heads * p.head_dim;
   const uint q_dim   = p.heads * p.head_dim;
 
+  // Exclusive key bound: causal pos+1, or this token's limit (bidirectional image span).
+  uint kend = pos + 1u;
+  if (p.use_limits != 0u) kend = uint(limits[t]);
   uint start = 0u;
-  if (p.window != 0u && pos + 1u > p.window) start = pos + 1u - p.window;
+  if (p.window != 0u && kend > p.window) start = kend - p.window;
 
   device const half* qh = q + (ulong)t * (ulong)q_dim + head * p.head_dim;
 
@@ -1080,8 +1102,8 @@ kernel void cpi_attention_decode(
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  for (uint kb = start; kb <= pos; kb += KEY_BLOCK) {
-    const uint nk = min((uint)KEY_BLOCK, pos - kb + 1u);
+  for (uint kb = start; kb < kend; kb += KEY_BLOCK) {
+    const uint nk = min((uint)KEY_BLOCK, kend - kb);
 
     // Score the whole block: each simdgroup takes a key and reduces its dot product.
     for (uint j = simd_id; j < nk; j += n_simd) {

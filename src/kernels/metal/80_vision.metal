@@ -154,3 +154,19 @@ kernel void cpi_standardize(device half* x [[buffer(0)]], device const half* bia
   const uint h = gid % p.hidden;
   x[gid] = half((float(x[gid]) - float(bias[h])) * float(scale[h]));
 }
+
+struct ClampParams {
+  uint n;
+  float lo, hi;
+};
+
+// out = clamp(in, lo, hi). Gemma 4 E2B's clipped linears (Gemma4ClippableLinear): HF clamps both
+// the input and the output of every vision projection with per-projection bounds. in == out is
+// allowed (the output clamp runs in place); the INPUT clamp must go through a staging buffer
+// instead, because one normalised activation feeds several projections with different bounds.
+kernel void cpi_clamp(device const half* in [[buffer(0)]], device half* out [[buffer(1)]],
+                      constant ClampParams& p [[buffer(2)]],
+                      uint gid [[thread_position_in_grid]]) {
+  if (gid >= p.n) return;
+  out[gid] = half(clamp(float(in[gid]), p.lo, p.hi));
+}

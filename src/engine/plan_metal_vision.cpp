@@ -16,12 +16,15 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <stdexcept>
 #include <unordered_map>
 #include <string>
 #include <vector>
 
 #include "engine/plan_metal_engine.hpp"
+#include "engine/plan_model_config.hpp"
+#include "model/json_mini.hpp"
 #include "runtime/fp16.hpp"
 
 namespace engine {
@@ -474,6 +477,284 @@ std::vector<float> PlanMetalEngine::encode_image(const std::vector<float>& patch
   std::vector<float> result(static_cast<std::size_t>(soft) * out_hidden);
   for (std::size_t i = 0; i < result.size(); ++i) result[i] = f16_bits_to_f32(o[i]);
   return result;
+}
+
+// ---------------------------------------------------------------------------
+// Gemma 4's vision tower. Unlike Qwen3.5's hand-rolled sequence above, this one is a PLAN
+// (build_gemma4_vision_plan, the same description PlanCudaEngine constructs) walked by the
+// engine's own execute_ops with the slot resolver pointed at vision-sized buffers -- one
+// description, two executors, and now one executor for two towers of the text engine's ops.
+
+void PlanMetalEngine::init_gemma_vision(const std::string& model_dir) {
+  namespace fs = std::filesystem;
+  const fs::path cj = fs::path(model_dir) / "config.json";
+  std::error_code ec;
+  if (!fs::exists(cj, ec)) return;
+  const opplan::Gemma4VisionGeometry v =
+      engine::parse_gemma4_vision_config(engine::mini::read_text_file(cj));
+  if (!v.present) return;  // a text-only export; the text path is unaffected
+  if (!raw_has("model.vision_tower.patch_embedder.input_proj.weight")) return;
+  if (v.kv_heads != v.heads) {
+    // cpi_attention_bidirectional takes one row stride for q/k/v; see the executor's check.
+    throw std::runtime_error("Gemma 4 vision tower with kv_heads != heads is not supported");
+  }
+
+  // cos/sin over the SPATIAL half-dim, exactly PlanCudaEngine::build_vision_rope_tables:
+  // inv_freq = theta^(-2j/spatial_dim) with spatial_dim = head_dim/2, head_dim/4 entries per
+  // position, both axes sharing the table.
+  {
+    const int pairs = v.head_dim / 4;
+    const int spatial_dim = v.head_dim / 2;
+    const int max_pos = 4096;  // patch-grid coordinates; far above any real image
+    std::vector<float> cs(static_cast<std::size_t>(max_pos) * pairs), ss(cs.size());
+    for (int p = 0; p < max_pos; ++p) {
+      for (int j = 0; j < pairs; ++j) {
+        const float inv = std::pow(v.rope_theta,
+                                   -static_cast<float>(2 * j) / static_cast<float>(spatial_dim));
+        const float ang = static_cast<float>(p) * inv;
+        cs[static_cast<std::size_t>(p) * pairs + j] = std::cos(ang);
+        ss[static_cast<std::size_t>(p) * pairs + j] = std::sin(ang);
+      }
+    }
+    gvis_rope_cos_ = ctx_.alloc_from(cs.data(), cs.size() * sizeof(float));
+    gvis_rope_sin_ = ctx_.alloc_from(ss.data(), ss.size() * sizeof(float));
+  }
+
+  // Sized for the soft-token budget times the pool window -- 280 * 3 * 3 = 2520 patches on E2B
+  // -- rounded up. The image preprocessor never emits more (it downscales to the budget).
+  gvis_max_patches_ = 2560;
+  const int P = gvis_max_patches_;
+  const int H = v.hidden;
+  const int qdim = v.heads * v.head_dim;
+  const int kvdim = v.kv_heads * v.head_dim;
+  const int patch_dim = 3 * v.patch_size * v.patch_size;
+
+  vslots_.clear();
+  vslots_.resize(static_cast<std::size_t>(opplan::Slot::Count));
+  auto al = [&](opplan::Slot s, std::size_t per_token) {
+    vslots_[static_cast<std::size_t>(s)] =
+        ctx_.alloc(static_cast<std::size_t>(P) * per_token * sizeof(std::uint16_t));
+  };
+  using opplan::Slot;
+  al(Slot::X, static_cast<std::size_t>(H));
+  al(Slot::XNorm, static_cast<std::size_t>(H));
+  // Tmp doubles as the projector's output, which is TEXT-hidden wide.
+  al(Slot::Tmp, static_cast<std::size_t>(std::max(H, cfg_.hidden_size)));
+  al(Slot::Q, static_cast<std::size_t>(qdim));
+  al(Slot::K, static_cast<std::size_t>(kvdim));
+  al(Slot::V, static_cast<std::size_t>(kvdim));
+  al(Slot::Att, static_cast<std::size_t>(qdim));
+  al(Slot::Gate, static_cast<std::size_t>(v.intermediate));
+  al(Slot::Up, static_cast<std::size_t>(v.intermediate));
+  al(Slot::Inter, static_cast<std::size_t>(v.intermediate));
+
+  gvis_pix_buf_ = ctx_.alloc(static_cast<std::size_t>(P) * patch_dim * sizeof(float));
+  gvis_posx_buf_ = ctx_.alloc(static_cast<std::size_t>(P) * sizeof(std::int32_t));
+  gvis_posy_buf_ = ctx_.alloc(static_cast<std::size_t>(P) * sizeof(std::int32_t));
+  // clip_in staging: the widest gemv input is the MLP down-projection's (intermediate).
+  gvis_clamp_buf_ = ctx_.alloc(static_cast<std::size_t>(P) *
+                               static_cast<std::size_t>(std::max(H, v.intermediate)) *
+                               sizeof(std::uint16_t));
+  {
+    std::vector<std::uint16_t> ones(static_cast<std::size_t>(H), cpi::f32_to_f16(1.0f));
+    gvis_ones_buf_ = ctx_.alloc_from(ones.data(), ones.size() * sizeof(std::uint16_t));
+  }
+
+  // Last, so a throw above leaves gvis_.present false and the text path standing.
+  gvis_plan_ = opplan::build_gemma4_vision_plan(v, *wsrc_);
+  gvis_ = v;
+}
+
+std::vector<float> PlanMetalEngine::encode_image(const std::vector<float>& pixels,
+                                                 const std::vector<int>& pos_x,
+                                                 const std::vector<int>& pos_y, int out_tokens) {
+  if (!gvis_.present) throw std::runtime_error("this model has no vision tower");
+  const int P = static_cast<int>(pos_x.size());
+  if (P <= 0 || static_cast<int>(pos_y.size()) != P) {
+    throw std::runtime_error("pos_x / pos_y must be one entry per patch");
+  }
+  if (P > gvis_max_patches_) throw std::runtime_error("too many patches for the vision buffers");
+  const int H = gvis_.hidden;
+  const int patch_dim = 3 * gvis_.patch_size * gvis_.patch_size;
+  if (static_cast<int>(pixels.size()) != P * patch_dim) {
+    throw std::runtime_error("pixel buffer is " + std::to_string(pixels.size()) +
+                             " floats, expected " + std::to_string(P * patch_dim));
+  }
+
+  std::memcpy(gvis_pix_buf_.contents(), pixels.data(), pixels.size() * sizeof(float));
+  auto* px = static_cast<std::int32_t*>(gvis_posx_buf_.contents());
+  auto* py = static_cast<std::int32_t*>(gvis_posy_buf_.contents());
+  for (int i = 0; i < P; ++i) {
+    px[i] = pos_x[static_cast<std::size_t>(i)];
+    py[i] = pos_y[static_cast<std::size_t>(i)];
+  }
+
+  vision_pass_ = true;
+  try {
+    // The tower is bidirectional and cacheless: ONE pass over all P patches.
+    execute_ops(gvis_plan_.prologue, -1, 0, P);
+    for (const opplan::LayerPlan& lp : gvis_plan_.layers) {
+      execute_ops(lp.ops, lp.layer_index, 0, P);
+    }
+    execute_ops(gvis_plan_.epilogue, -1, 0, P);
+
+    // Pool the patches down to out_tokens soft tokens, then project into text space -- direct
+    // dispatches, not plan ops, because pooling changes the token count (see the builder note).
+    const int k = gvis_.pooling_kernel;
+    int max_x = 0;
+    for (int i = 0; i < P; ++i) max_x = std::max(max_x, pos_x[static_cast<std::size_t>(i)]);
+    const int cells_x = (max_x / k) + 1;
+    {
+      struct VisPoolParams {
+        std::uint32_t tokens, hidden, k, cells_x, out_tokens;
+        float gain;
+      } p{static_cast<std::uint32_t>(P),       static_cast<std::uint32_t>(H),
+          static_cast<std::uint32_t>(k),       static_cast<std::uint32_t>(cells_x),
+          static_cast<std::uint32_t>(out_tokens),
+          std::sqrt(static_cast<float>(H))};
+      const void* bufs[] = {slot(opplan::Slot::X), gvis_posx_buf_.handle(),
+                            gvis_posy_buf_.handle(), slot(opplan::Slot::XNorm)};
+      ctx_.dispatch("cpi_avg_pool_patches", runtime::MetalContext::Grid::Threads,
+                    static_cast<std::size_t>(out_tokens) * static_cast<std::size_t>(H), 256, bufs,
+                    nullptr, 4, &p, sizeof(p));
+    }
+    // Projector: weightless RMS norm (ONES weight, mirroring CUDA's launch_rmsnorm with
+    // d_ones_) -> linear into the text hidden size.
+    {
+      struct NormParams {
+        std::uint32_t rows, cols;
+        float eps;
+        std::uint32_t weight_offset, has_weight;
+      } p{static_cast<std::uint32_t>(out_tokens), static_cast<std::uint32_t>(H), gvis_.rms_eps, 0u,
+          1u};
+      const void* bufs[] = {slot(opplan::Slot::XNorm), gvis_ones_buf_.handle(),
+                            slot(opplan::Slot::XNorm)};
+      ctx_.dispatch("cpi_rmsnorm", runtime::MetalContext::Grid::Groups,
+                    static_cast<std::size_t>(out_tokens), 256, bufs, nullptr, 3, &p, sizeof(p));
+    }
+    {
+      const void* w = wsrc_->fp16("model.embed_vision.embedding_projection.weight");
+      GemvParams p{static_cast<std::uint32_t>(cfg_.hidden_size), static_cast<std::uint32_t>(H),
+                   static_cast<std::uint32_t>(out_tokens), 0u};
+      const void* bufs[] = {w, slot(opplan::Slot::XNorm), slot(opplan::Slot::Tmp), w};
+      // text hidden is a multiple of kGemmFBM on every Gemma 4 (E2B: 1536) and the vision hidden
+      // a multiple of 32, so the blocked GEMM's geometry holds; its store masks the token tail.
+      const std::size_t tiles =
+          static_cast<std::size_t>((out_tokens + kGemmBN - 1) / kGemmBN);
+      const std::size_t groups =
+          (static_cast<std::size_t>(cfg_.hidden_size) / kGemmFBM) * tiles;
+      ctx_.dispatch("cpi_gemm_f16", runtime::MetalContext::Grid::Groups, groups, kGemmTG, bufs,
+                    nullptr, 4, &p, sizeof(p));
+    }
+    ctx_.commit_and_wait();
+  } catch (...) {
+    vision_pass_ = false;
+    throw;
+  }
+  vision_pass_ = false;
+
+  const auto* o = static_cast<const std::uint16_t*>(
+      vslots_[static_cast<std::size_t>(opplan::Slot::Tmp)].contents());
+  std::vector<float> out(static_cast<std::size_t>(out_tokens) *
+                         static_cast<std::size_t>(cfg_.hidden_size));
+  for (std::size_t i = 0; i < out.size(); ++i) out[i] = f16_bits_to_f32(o[i]);
+  return out;
+}
+
+std::vector<int> PlanMetalEngine::generate_multimodal(const std::vector<int>& tokens,
+                                                      const std::vector<std::vector<float>>& embeds,
+                                                      const std::vector<int>& limits, int max_new,
+                                                      float temp,
+                                                      const std::function<bool(int)>& on_token) {
+  const int n = static_cast<int>(tokens.size());
+  if (n == 0) return {};
+  if (!limits.empty() && static_cast<int>(limits.size()) != n) {
+    throw std::runtime_error("limits must have one entry per token");
+  }
+  // A fresh sequence: prefix reuse would splice yesterday's KV under today's image.
+  reset_kv_cache();
+
+  embeds_ = &embeds;
+  limits_active_ = !limits.empty();
+  int pos = 0;
+  try {
+    for (const int chunk : prefill_chunks(n)) {
+      if (limits_active_) {
+        const std::size_t need = static_cast<std::size_t>(chunk) * sizeof(std::int32_t);
+        if (seq_limits_buf_.size() < need) seq_limits_buf_ = ctx_.alloc(need);
+        auto* dst = static_cast<std::int32_t*>(seq_limits_buf_.contents());
+        for (int t = 0; t < chunk; ++t) {
+          const int lim = limits[static_cast<std::size_t>(pos + t)];
+          // A span token's keys must all be WRITTEN when its chunk's attention runs; a span
+          // straddling a chunk boundary would attend over unwritten cache. Prompts are far
+          // below one chunk today; splitting chunks at span edges is the fix if that changes.
+          if (lim > pos + chunk) {
+            throw std::runtime_error("bidirectional image span straddles a prefill chunk "
+                                     "boundary (limit " +
+                                     std::to_string(lim) + " > chunk end " +
+                                     std::to_string(pos + chunk) + ")");
+          }
+          dst[t] = lim;
+        }
+        // CPI_LIMITS_TEST=1: clamp every token to key 0 only. A falsification probe -- if the
+        // output does not change under this, the kernels are not reading the limits at all.
+        if (std::getenv("CPI_LIMITS_TEST") != nullptr) {
+          for (int t = 0; t < chunk; ++t) dst[t] = 1;
+        }
+      }
+      const std::vector<int> ids(tokens.begin() + pos, tokens.begin() + pos + chunk);
+      encode_prefill(ids, pos);
+      ctx_.commit_and_wait();
+      pos += chunk;
+    }
+  } catch (...) {
+    embeds_ = nullptr;
+    limits_active_ = false;
+    throw;
+  }
+  embeds_ = nullptr;
+  limits_active_ = false;
+
+  // The prefill's epilogue left the last token's logits in logits_buf_ (float). Sample from
+  // there, then continue on the ordinary decode path.
+  std::vector<int> out;
+  std::uint32_t rng = 0x9E3779B9u;  // deterministic; --image has no seed flag
+  auto sample_from = [&](const float* lg) -> int {
+    const int V = cfg_.vocab_size;
+    if (temp <= 0.0f) {
+      int best = 0;
+      for (int i = 1; i < V; ++i) {
+        if (lg[i] > lg[best]) best = i;
+      }
+      return best;
+    }
+    float m = lg[0];
+    for (int i = 1; i < V; ++i) m = std::max(m, lg[i]);
+    double sum = 0.0;
+    std::vector<double> p(static_cast<std::size_t>(V));
+    for (int i = 0; i < V; ++i) {
+      p[static_cast<std::size_t>(i)] = std::exp((lg[i] - m) / temp);
+      sum += p[static_cast<std::size_t>(i)];
+    }
+    rng = rng * 1664525u + 1013904223u;
+    double r = (rng / 4294967296.0) * sum;
+    for (int i = 0; i < V; ++i) {
+      r -= p[static_cast<std::size_t>(i)];
+      if (r <= 0.0) return i;
+    }
+    return V - 1;
+  };
+
+  int next = sample_from(static_cast<const float*>(logits_buf_.contents()));
+  for (int i = 0; i < max_new; ++i) {
+    if (next == eos_token_id_) break;
+    out.push_back(next);
+    if (on_token && !on_token(next)) break;
+    if (i + 1 >= max_new) break;
+    const std::vector<float>& lg = forward_token(next, n + i);
+    next = sample_from(lg.data());
+  }
+  return out;
 }
 
 }  // namespace engine

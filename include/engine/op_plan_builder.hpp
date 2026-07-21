@@ -13,6 +13,7 @@
 //
 // This file must compile with no CUDA and no Metal toolkit present.
 
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -53,6 +54,14 @@ public:
     (void)out_dim;
     (void)in_dim;
     return {};
+  }
+
+  // HOST value of a one-element tensor. The vision builder needs the clip BOUNDS as numbers
+  // (they go into Op::clip_*, not into a buffer binding), and only the backend knows how to
+  // read bytes out of its container. Default throws: a builder that needs scalars on a backend
+  // that cannot supply them is a wiring error, not a silent 0.
+  virtual float scalar(const std::string& name) const {
+    throw std::runtime_error("WeightSource::scalar not implemented for " + name);
   }
 };
 
@@ -241,6 +250,36 @@ struct Gemma4Geometry {
 // Applying the offset form here scales by ~2 at every norm, which compounds and overflows fp16 by
 // about layer 2. So no op below sets norm_offset.
 ModelPlan build_gemma4_plan(const Gemma4Geometry& g, const WeightSource& w);
+
+// Geometry of Gemma 4's VISION tower (`vision_config` in the checkpoint). The tower is a
+// text-shaped sandwich-norm encoder with three differences, each already an op: positions are
+// 2-D (Rope2D), the input is pixels (PatchEmbed), and attention is bidirectional (the executor's
+// cacheless mode). Pooling and projection into text space are NOT in the plan -- pooling changes
+// the token count, so the executor is re-entered with the new count; see the engines'
+// encode_image.
+struct Gemma4VisionGeometry {
+  bool present = false;
+  int hidden = 0;
+  int layers = 0;
+  int heads = 0;
+  int kv_heads = 0;
+  int head_dim = 0;
+  int intermediate = 0;
+  int patch_size = 0;
+  int pos_table_size = 0;
+  int pooling_kernel = 1;
+  float rms_eps = 1e-6f;
+  float rope_theta = 100.0f;
+  bool standardize = false;
+  // E2B ships per-projection activation bounds and HF CLAMPS with them; the 26B sets this false
+  // and ships none. Skipping them does not crash -- it silently changes the numbers.
+  bool clipped_linears = false;
+};
+
+// The vision plan, previously built privately inside PlanCudaEngine::build_vision_plan. One
+// description, two executors -- the same argument that moved the text builders here. Clip bounds
+// are read through WeightSource::scalar (only when g.clipped_linears).
+ModelPlan build_gemma4_vision_plan(const Gemma4VisionGeometry& g, const WeightSource& w);
 
 }  // namespace opplan
 }  // namespace engine
