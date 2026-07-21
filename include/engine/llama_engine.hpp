@@ -72,6 +72,12 @@ struct LtMatmulPlan {
 class LlamaEngine {
   // Speculative decoding drives a draft + target engine pair through their
   // internal decode/prefill/verify methods.
+  // SpeculativeDecoder is a TEMPLATE now (one algorithm over both engines), so the friend
+  // declaration has to be too. `friend class SpeculativeDecoder;` also implicitly DECLARED it as
+  // a non-template here, which then collided with the real definition -- MSVC: "class template
+  // has already been declared as a non-class template". Metal never saw this because it does not
+  // include llama_engine.hpp.
+  template <typename EngineT>
   friend class SpeculativeDecoder;
 
 public:
