@@ -66,7 +66,21 @@ namespace model {
   X(vision_in_channels, "vision_in_channels", I)                              \
   X(vision_spatial_merge_size, "vision_spatial_merge_size", I)                \
   X(vision_num_position_embeddings, "vision_num_position_embeddings", I)      \
-  X(vision_out_hidden_size, "vision_out_hidden_size", I)
+  X(vision_out_hidden_size, "vision_out_hidden_size", I)                       \
+  X(hidden_size_per_layer_input, "hidden_size_per_layer_input", I)             \
+  X(vocab_size_per_layer_input, "vocab_size_per_layer_input", I)               \
+  X(num_kv_shared_layers, "num_kv_shared_layers", I)                           \
+  X(first_shared_layer, "first_shared_layer", I)                               \
+  X(head_dim_sliding, "head_dim_sliding", I)                                   \
+  X(head_dim_full, "head_dim_full", I)                                         \
+  X(num_kv_heads_sliding, "num_kv_heads_sliding", I)                           \
+  X(num_kv_heads_full, "num_kv_heads_full", I)                                 \
+  X(rope_theta_sliding, "rope_theta_sliding", F)                               \
+  X(rope_theta_full, "rope_theta_full", F)                                     \
+  X(partial_rotary_full, "partial_rotary_full", F)                             \
+  X(use_double_wide_mlp, "use_double_wide_mlp", B)                             \
+  X(attention_k_eq_v, "attention_k_eq_v", B)                                   \
+  X(final_logit_softcapping, "final_logit_softcapping", F)
 
 // Serializes to a flat JSON object. Values are strings, because safetensors' `__metadata__` is
 // specified as a string->string map and readers in the wild (including HF's) reject anything else
@@ -107,6 +121,15 @@ inline std::string config_to_json(const LlamaConfig& c) {
     kinds += static_cast<char>('0' + static_cast<int>(k));
   }
   put("layer_attention_kinds", kinds);
+  // Gemma 4's KV sharing: which layer's K/V each layer reads. COMMA-SEPARATED, not one digit each
+  // like the kinds above -- these are layer INDICES and a 35-layer model already exceeds 9, so the
+  // compact form would silently truncate layer 10 to '1'. Empty for every other family.
+  std::string kvsrc;
+  for (std::size_t i = 0; i < c.kv_source.size(); ++i) {
+    if (i) kvsrc += ',';
+    kvsrc += std::to_string(c.kv_source[i]);
+  }
+  put("kv_source", kvsrc);
   s += "}";
   return s;
 }
@@ -148,6 +171,15 @@ inline LlamaConfig config_from_json(const std::string& j) {
   c.layer_attention_kinds.reserve(kinds.size());
   for (char ch : kinds) {
     c.layer_attention_kinds.push_back(static_cast<AttentionKind>(ch - '0'));
+  }
+  // Gemma 4 KV sharing, comma-separated layer indices (see the writer).
+  const std::string kvsrc = get_str("kv_source");
+  c.kv_source.clear();
+  for (std::size_t i = 0; i < kvsrc.size();) {
+    std::size_t j = kvsrc.find(',', i);
+    if (j == std::string::npos) j = kvsrc.size();
+    if (j > i) c.kv_source.push_back(std::stoi(kvsrc.substr(i, j - i)));
+    i = j + 1;
   }
   return c;
 }

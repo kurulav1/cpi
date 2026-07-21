@@ -51,6 +51,10 @@ int main() {
   in.model_family = model::ModelFamily::Qwen3_5;
   in.layer_attention_kinds = {model::AttentionKind::Linear, model::AttentionKind::Full,
                               model::AttentionKind::SlidingWindow, model::AttentionKind::Linear};
+  // Gemma 4 KV sharing. Deliberately includes indices ABOVE 9: layer_attention_kinds encodes one
+  // digit per entry, and reusing that scheme here would silently turn 13 into 1 and 3. A 35-layer
+  // E2B shares 20 layers onto sources in the teens, so this is the real case, not a corner one.
+  in.kv_source = {0, 7, 13, 13, 14, 27};
 
   const std::string json = model::config_to_json(in);
   const model::LlamaConfig out = model::config_from_json(json);
@@ -84,7 +88,14 @@ int main() {
     kinds_ok = out.layer_attention_kinds[i] == in.layer_attention_kinds[i];
   }
   check("layer_attention_kinds", kinds_ok);
-  checked += 3;
+  bool kv_ok = out.kv_source.size() == in.kv_source.size();
+  for (std::size_t i = 0; kv_ok && i < in.kv_source.size(); ++i) {
+    kv_ok = out.kv_source[i] == in.kv_source[i];
+  }
+  check("kv_source", kv_ok,
+        "size " + std::to_string(out.kv_source.size()) + " want " +
+            std::to_string(in.kv_source.size()));
+  checked += 4;
 
   // THE RESIDUAL HOLE, and why this count is pinned.
   //
@@ -97,8 +108,8 @@ int main() {
   // immediately. For ADDING one, LlamaConfig's declaration carries a pointer back here -- a
   // sizeof() static_assert would be stronger but is not portable, because std::string/std::vector
   // differ in size between MSVC and libc++ and the number would be wrong on one of them.
-  check("field count (update when CPI_CONFIG_FIELDS changes)", checked == 40,
-        "got " + std::to_string(checked) + " want 40");
+  check("field count (update when CPI_CONFIG_FIELDS changes)", checked == 55,
+        "got " + std::to_string(checked) + " want 55");
   std::printf("  %d fields round-tripped\n", checked);
   std::printf("[config_json] %s\n", failures == 0 ? "ALL PASS" : "FAILURES");
   return failures == 0 ? 0 : 1;
