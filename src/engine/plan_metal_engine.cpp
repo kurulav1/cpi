@@ -535,9 +535,9 @@ public:
 
 private:
   // Every CPU-side read of a tensor's values goes through here, so the BF16 conversion cannot
-  // be present on one path and absent on another. It was: fp16() converted and quant() read the
-  // raw bytes, so `--weight-quant` on a BF16 HF checkpoint (Gemma 4 is one; .ll2c/.cpi are fp16
-  // by construction) quantized plausibly-scaled garbage into 100% special-token output.
+  // be present on one path and absent on another. A path that reads BF16 bytes as fp16 gets
+  // plausibly-scaled garbage, not an error (.ll2c/.cpi are fp16 by construction; HF checkpoints
+  // are BF16).
   const std::uint16_t* fp16_data(const std::string& name,
                                  std::vector<std::uint16_t>& conv) const {
     const auto* src = reinterpret_cast<const std::uint16_t*>(wl_.tensor_data(name));
@@ -846,17 +846,12 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
         has_recurrent_ops_ = true;
       }
       // Ops that read a WINDOW of another slot (Gemma 4's per-layer-input injection: layer L
-      // multiplies by per_layer_inputs[L], at aux_offset = L*ple) used to force token-by-token
-      // prefill here, because a flat in2 displacement is only correct for one token. Two fixes
-      // lifted that: the PLE gate became stride-aware (ElemParams.row_len / in2_stride /
-      // in2_offset), and the "something else not batch-safe" that kept the restriction after
-      // that turned out to be the scalar prefill attention kernel -- its threadgroup arrays
-      // hold 256 floats per query, and Gemma's FULL layers (head_dim 512) wrote past them
-      // (cpi_attention_prefill_wide is the fix). Batched prefill now reproduces the sequential
-      // token stream, so aux_offset plans batch like everything else.
-      // CPI_METAL_SEQ_AUX=1 forces the old token-by-token prefill back, kept as the bisection
-      // lever: if a future Gemma-path bug needs isolating, sequential-vs-batched is the first
-      // split worth making.
+      // multiplies by per_layer_inputs[L], at aux_offset = L*ple) batch like everything else:
+      // the PLE gate is stride-aware (ElemParams.row_len / in2_stride / in2_offset) and the
+      // prefill attention kernels cover every head_dim (cpi_attention_prefill_wide). Batched
+      // prefill reproduces the sequential token stream.
+      // CPI_METAL_SEQ_AUX=1 forces token-by-token prefill for these plans -- the bisection
+      // lever: on a new Gemma-path bug, sequential-vs-batched is the first split to make.
       static const bool force_seq_aux = std::getenv("CPI_METAL_SEQ_AUX") != nullptr;
       if (op.aux_offset != 0 && force_seq_aux) {
         has_recurrent_ops_ = true;
@@ -1760,10 +1755,10 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
                           static_cast<std::size_t>(op.heads) * blocks, kTG, bufs, nullptr, 6, &p,
                           sizeof(p));
           } else {
-            // Gemma 4's FULL layers are head_dim 512: the scalar kernel's q_sh/acc hold 256
-            // floats per query, so a 512-wide head writes past them and corrupts the whole
-            // threadgroup -- every prefill token from the first full layer on came out NaN.
-            // The wide variant sizes them ATTN_MAX_HEAD_DIM and halves the query block to fit.
+            // head_dim > 256 (Gemma 4's full layers are 512): the scalar kernel's q_sh/acc hold
+            // 256 floats per query, so a wider head writes past them and corrupts the whole
+            // threadgroup. The wide variant sizes them ATTN_MAX_HEAD_DIM with a smaller query
+            // block to fit.
             const std::size_t blocks =
                 static_cast<std::size_t>((T + kQBlockWide - 1) / kQBlockWide);
             ctx_.dispatch("cpi_attention_prefill_wide", G::Groups,
@@ -2516,14 +2511,13 @@ void PlanMetalEngine::encode_prefill(const std::vector<int>& tokens, int start_p
   *static_cast<std::int32_t*>(pos_buf_.contents()) = static_cast<std::int32_t>(start_position);
 
   // Image soft tokens go in at plan_.embed_ready: after the embedding lookup and its scale,
-  // BEFORE anything that reads the embeddings. Splicing after the whole prologue was correct
-  // for Qwen3.5 (its prologue ends there) and WRONG for Gemma 4, whose prologue projects the
-  // per-layer inputs FROM the embeddings -- a post-prologue splice computes them from the
-  // placeholder token instead of the image, exactly the drift op_plan.hpp's embed_ready
-  // comment warns about. Used AS-IS -- no sqrt(hidden) scale -- matching the CUDA path.
+  // BEFORE anything that reads the embeddings. Gemma 4's prologue projects the per-layer
+  // inputs FROM the embeddings, so splicing after the whole prologue would compute them from
+  // the placeholder token instead of the image. Rows are used AS-IS (no sqrt(hidden) scale),
+  // matching the CUDA path.
   // embed_ready == 0 means the builder never set it; treat that as "after the whole prologue"
-  // (the pre-embed_ready behaviour) rather than "before the lookup", which would let the lookup
-  // overwrite every spliced row -- a silent no-op splice, not an error.
+  // rather than "before the lookup", where the lookup would overwrite every spliced row -- a
+  // silent no-op splice, not an error.
   const std::size_t er = plan_.embed_ready == 0
                              ? plan_.prologue.size()
                              : std::min(plan_.embed_ready, plan_.prologue.size());

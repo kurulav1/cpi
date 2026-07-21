@@ -317,9 +317,8 @@ ModelPlan build_qwen35_plan(const Qwen35Geometry& g, const WeightSource& w) {
     plan.prologue.push_back(e);
   }
   // Embeddings are final here (no scale, no PLE); multimodal prefill splices at this index.
-  // This was UNSET (0) until the Metal executor started honouring embed_ready, at which point
-  // "0" meant "splice before the lookup" and the lookup overwrote every soft token -- caught by
-  // SPLICE_is_load_bearing, which exists for exactly this class of silent no-op.
+  // Every builder must set this: an unset (0) embed_ready puts the splice before the lookup,
+  // and the lookup then overwrites every soft token. SPLICE_is_load_bearing gates it.
   plan.embed_ready = plan.prologue.size();
 
   plan.layers.assign(g.num_layers, LayerPlan{});

@@ -8,10 +8,10 @@
 // inside the 32 KB budget, but it is OCCUPANCY that pays -- so this is measured, not assumed.
 #define ATTN_MAX_HEAD_DIM 512
 // Query-block size of cpi_attention_prefill_wide, the head_dim > 256 variant of the scalar
-// prefill kernel. The main kernel's q_sh/acc are Q_BLOCK * 256 floats and CANNOT be raised to
-// ATTN_MAX_HEAD_DIM at Q_BLOCK 8 -- that is 2 * 16 KB and the whole threadgroup budget is 32 KB.
-// Halving the query block instead keeps the pair at 16 KB total. Only Gemma 4's FULL layers
-// (head_dim 512, 7 of 35 layers) take this kernel; the tuned 256 path is untouched.
+// prefill kernel. The main kernel's q_sh/acc are Q_BLOCK * 256 floats and cannot be raised to
+// ATTN_MAX_HEAD_DIM at Q_BLOCK 8: that is 2 * 16 KB against a 32 KB threadgroup budget.
+// Halving the query block keeps the pair at 16 KB. Only head_dim > 256 layers (Gemma 4's full
+// layers) take the wide kernel; the tuned 256 path is untouched.
 #define Q_BLOCK_WIDE 4
 // The matrix-unit prefill kernel's query-block size. Separate from Q_BLOCK because the scalar
 // kernel sizes its shared arrays for head_dim 256 (Gemma) and cannot afford a wider block --
@@ -803,7 +803,7 @@ kernel void cpi_attention_prefill(device const half* q [[buffer(0)]],
   // 256 is a hard head_dim ceiling, NOT ATTN_MAX_HEAD_DIM: at Q_BLOCK 8 the 512-wide pair alone
   // is the whole 32 KB threadgroup budget. The executor routes head_dim > 256 to
   // cpi_attention_prefill_wide below; dispatching THIS kernel wider silently smashes acc and the
-  // softmax scratch (it did -- that was Gemma 4's batched-prefill bug).
+  // softmax scratch.
   threadgroup float q_sh[Q_BLOCK * 256];
   threadgroup float acc[Q_BLOCK * 256];
   threadgroup float sc_sh[Q_BLOCK * KEY_BLOCK];
@@ -913,8 +913,8 @@ kernel void cpi_attention_prefill(device const half* q [[buffer(0)]],
 
 // The head_dim > 256 copy of cpi_attention_prefill: same online softmax over KEY_BLOCK key
 // blocks, arrays sized ATTN_MAX_HEAD_DIM with the query block halved to fit them (see
-// Q_BLOCK_WIDE above). A separate kernel, NOT a widening of the one above -- q_sh/acc strides
-// are threadgroup-array sizes, so one kernel would pay the 512 footprint (and its occupancy)
+// Q_BLOCK_WIDE above). A separate kernel rather than a widening of the one above: threadgroup
+// array sizes are compile-time, so one kernel would pay the 512 footprint (and its occupancy)
 // on every model, and the 256 path is measured and tuned.
 kernel void cpi_attention_prefill_wide(device const half* q [[buffer(0)]],
                                        device const half* k_cache [[buffer(1)]],

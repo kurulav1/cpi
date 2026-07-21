@@ -482,8 +482,7 @@ std::vector<float> PlanMetalEngine::encode_image(const std::vector<float>& patch
 // ---------------------------------------------------------------------------
 // Gemma 4's vision tower. Unlike Qwen3.5's hand-rolled sequence above, this one is a PLAN
 // (build_gemma4_vision_plan, the same description PlanCudaEngine constructs) walked by the
-// engine's own execute_ops with the slot resolver pointed at vision-sized buffers -- one
-// description, two executors, and now one executor for two towers of the text engine's ops.
+// engine's own execute_ops with the slot resolver pointed at vision-sized buffers.
 
 void PlanMetalEngine::init_gemma_vision(const std::string& model_dir) {
   namespace fs = std::filesystem;
@@ -671,7 +670,7 @@ std::vector<int> PlanMetalEngine::generate_multimodal(const std::vector<int>& to
   if (!limits.empty() && static_cast<int>(limits.size()) != n) {
     throw std::runtime_error("limits must have one entry per token");
   }
-  // A fresh sequence: prefix reuse would splice yesterday's KV under today's image.
+  // A fresh sequence: prefix reuse would pair a previous run's KV with this image's splice.
   reset_kv_cache();
 
   embeds_ = &embeds;
@@ -696,8 +695,8 @@ std::vector<int> PlanMetalEngine::generate_multimodal(const std::vector<int>& to
           }
           dst[t] = lim;
         }
-        // CPI_LIMITS_TEST=1: clamp every token to key 0 only. A falsification probe -- if the
-        // output does not change under this, the kernels are not reading the limits at all.
+        // CPI_LIMITS_TEST=1: clamp every token to key 0 only. If the output does not change
+        // under this, the kernels are not reading the limits at all.
         if (std::getenv("CPI_LIMITS_TEST") != nullptr) {
           for (int t = 0; t < chunk; ++t) dst[t] = 1;
         }

@@ -906,14 +906,9 @@ EngineChoice resolve_engine(const ModelProbe& probe, bool cuda_available, bool m
   const bool use_metal = metal_available && !cuda_available && !force_cpu;
   switch (probe.kind) {
     case ModelFamilyKind::Gemma4:
-      // Gemma 4 on Metal is ON BY DEFAULT, same shape as Qwen3.5 below. It was opt-in via
-      // CPI_METAL_GEMMA4=1 while the batched-prefill smash was open (the scalar prefill kernel's
-      // threadgroup arrays held 256 floats per query; Gemma's FULL layers are head_dim 512 and
-      // wrote past them, so every prefill token from the first full layer on came out NaN --
-      // see cpi_attention_prefill_wide). With that fixed, batched and token-by-token prefill
-      // produce the same token stream, so the honest-refusal argument no longer applies: there
-      // is nothing left to refuse over. Text generation is verified on an M4; the vision tower
-      // is still untested on Metal.
+      // Gemma 4 on Metal is on by default, same shape as Qwen3.5 below. Batched and
+      // token-by-token prefill produce the same token stream (CPI_METAL_SEQ_AUX bisects), and
+      // text, quant and the vision tower are all verified on an M4 against the CUDA backend.
       if (use_gpu) return EngineChoice::PlanCuda;
       if (use_metal) return EngineChoice::Gemma4Metal;
       throw std::runtime_error(

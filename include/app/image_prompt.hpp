@@ -67,9 +67,8 @@ ImagePrompt expand(Engine& eng, const std::vector<int>& base_tokens, const std::
 
   const std::vector<float> soft =
       eng.encode_image(grid.pixels, grid.pos_x, grid.pos_y, grid.soft_tokens);
-  // CPI_VISION_SOFT_DUMP=<file>: raw f32 soft tokens, for the cross-backend gate. This is the
-  // ONE engine-agnostic point both backends' towers flow through, which is exactly what makes
-  // a CUDA-vs-Metal diff of the files a tower gate rather than an end-to-end shrug.
+  // CPI_VISION_SOFT_DUMP=<file>: raw f32 soft tokens. Both backends' towers flow through this
+  // one engine-agnostic point, so diffing two dumps of the same image gates the tower itself.
   if (const char* dump = std::getenv("CPI_VISION_SOFT_DUMP")) {
     if (std::FILE* f = std::fopen(dump, "wb")) {
       std::fwrite(soft.data(), sizeof(float), soft.size(), f);
