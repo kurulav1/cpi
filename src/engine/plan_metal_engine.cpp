@@ -527,7 +527,7 @@ void* PlanMetalEngine::slot(opplan::Slot s) const {
 }
 
 void PlanMetalEngine::open(const std::string& weights_path, int max_context, int quant_bits,
-                           int quant_group) {
+                           int quant_group, float rope_theta_override) {
   if (!ctx_.available()) {
     throw std::runtime_error("no Metal GPU: " + ctx_.last_error());
   }
@@ -537,6 +537,16 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
 
   weights_.open(weights_path);
   cfg_ = weights_.config();
+
+  // --rope-theta, applied BEFORE the plan is built so the builder folds the override into every
+  // Rope op's scale. This used to be dropped on the floor: the flag parsed, the run succeeded, and
+  // the model silently used the container's theta. That is the one ignored flag that produces a
+  // WRONG answer rather than a slow one -- a long-context checkpoint needing a different base
+  // decodes garbage past the original window, with nothing to indicate the override was skipped.
+  // Same precedence as the CUDA path: CLI override wins, otherwise the model file.
+  if (rope_theta_override > 0.0f) {
+    cfg_.rope_theta = rope_theta_override;
+  }
   max_context_ = max_context;
   // max_prefill_ is set once the slot widths are known -- see below, it is priced off them.
 

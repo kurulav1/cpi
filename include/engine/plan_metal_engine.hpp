@@ -66,8 +66,10 @@ public:
   // Loads a .ll2c model, uploads its weights, and builds the plan.
   // quant_bits: 0 = fp16, or 4 / 8 for weight-only quantization of every projection
   // and the (untied) LM head. quant_group 0 defaults to 64.
+  // `rope_theta_override` > 0 replaces the container's RoPE base (the --rope-theta flag). Applied
+  // before the plan is built, so it reaches every Rope op. 0 keeps the model file's value.
   void open(const std::string& weights_path, int max_context = 2048, int quant_bits = 0,
-            int quant_group = 0);
+            int quant_group = 0, float rope_theta_override = 0.0f);
 
   // Runs the vision tower over ONE pre-patchified image and returns its soft tokens:
   // (grid_h*grid_w)/(merge^2) rows of vision_out_hidden_size, which equals the text model's

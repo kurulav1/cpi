@@ -876,7 +876,18 @@ EngineChoice resolve_engine(const ModelProbe& probe, bool cuda_available, bool m
   switch (probe.kind) {
     case ModelFamilyKind::Gemma4:
       if (!use_gpu) {
-        throw std::runtime_error("Gemma 4 currently requires a CUDA device");
+        // Name the actual blocker. Gemma 4 is not missing kernels on Metal -- every OpKind the
+        // plan uses has one, and its vision tower's kernels are in 80_vision.metal -- it is
+        // missing a CONTAINER: PlanCudaEngine::open reads a .cpi (or a safetensors dir), while
+        // PlanMetalEngine::open goes through model::WeightLoader, which reads .ll2c only. So the
+        // work is container support (or a .cpi -> .ll2c conversion), not a kernel port.
+        throw std::runtime_error(
+            metal_available
+                ? "Gemma 4 does not run on Metal yet: the Metal engine loads .ll2c containers "
+                  "(model::WeightLoader) and Gemma 4 ships as .cpi / safetensors, which only the "
+                  "CUDA plan engine reads. This is a container gap, not a missing kernel. Use a "
+                  "CUDA device, or convert the model to .ll2c."
+                : "Gemma 4 currently requires a CUDA device");
       }
       return EngineChoice::PlanCuda;
     case ModelFamilyKind::Qwen35:

@@ -114,8 +114,15 @@ app::main_modes::GenerateMultimodalFn make_multimodal_fn(E&) {
 //
 // The special-token ids are Qwen3.5's and are NOT in the .ll2c container, so they are stated here
 // with provenance. A different vision model would need its own ids and template.
-void run_with_image_metal(engine::PlanMetalEngine& meng, const app::main_cli::ParsedArgs& cli,
-                          model::Tokenizer& tokenizer, std::ostream& info_out) {
+// The reusable core: base prompt tokens + an image path -> generated tokens, streaming each one
+// through on_token. Both the one-shot CLI (--image) and the REST/web bridge's multimodal route go
+// through THIS, so there is one path and it is the one metal_vision_test gates -- rather than a
+// second, unverified copy behind the server.
+std::vector<int> generate_multimodal_metal(engine::PlanMetalEngine& meng,
+                                           const std::vector<int>& base_tokens,
+                                           const std::string& image_path, int max_new, int eos,
+                                           const std::function<bool(int)>& on_token,
+                                           std::ostream* info_out) {
   constexpr int kImageToken = 248056;   // <|image_pad|>
   constexpr int kVisionStart = 248053;  // <|vision_start|>
   constexpr int kVisionEnd = 248054;    // <|vision_end|>
@@ -131,7 +138,7 @@ void run_with_image_metal(engine::PlanMetalEngine& meng, const app::main_cli::Pa
   const int merge = c.vision_spatial_merge_size;
 
   // 1. Preprocess the image exactly as HuggingFace does (gated: qwen2vl_preproc_test).
-  const model::image::Image img = model::image::load_png(cli.image_path);
+  const model::image::Image img = model::image::load_png(image_path);
   const float mean[3] = {0.5f, 0.5f, 0.5f};
   const float stdv[3] = {0.5f, 0.5f, 0.5f};
   const model::image::Qwen2VLPatches pp = model::image::qwen2vl_preprocess(
@@ -147,25 +154,46 @@ void run_with_image_metal(engine::PlanMetalEngine& meng, const app::main_cli::Pa
   // 3. Build the prompt: <vision_start> + n_soft image placeholders + <vision_end> + the
   //    question. embeds[i] holds a soft token for each placeholder position, empty elsewhere; the
   //    engine splices the soft tokens over the placeholders' embeddings.
+  // The image span goes at the FRONT, before the caller's tokens. If the prompt already carries a
+  // single <|image_pad|> placeholder the span replaces it in place instead, so a chat template
+  // that positions the image inside the user turn keeps that position.
   std::vector<int> toks;
   std::vector<std::vector<float>> embeds;
-  toks.push_back(kVisionStart);
-  embeds.emplace_back();
-  for (int i = 0; i < n_soft; ++i) {
-    toks.push_back(kImageToken);
-    embeds.emplace_back(soft.begin() + static_cast<std::size_t>(i) * out_hidden,
-                        soft.begin() + static_cast<std::size_t>(i + 1) * out_hidden);
-  }
-  toks.push_back(kVisionEnd);
-  embeds.emplace_back();
-  const std::vector<int> q = tokenizer.encode(cli.prompt_text, /*add_bos=*/false);
-  for (int t : q) {
-    toks.push_back(t);
+  auto push_image_span = [&]() {
+    toks.push_back(kVisionStart);
     embeds.emplace_back();
+    for (int i = 0; i < n_soft; ++i) {
+      toks.push_back(kImageToken);
+      embeds.emplace_back(soft.begin() + static_cast<std::size_t>(i) * out_hidden,
+                          soft.begin() + static_cast<std::size_t>(i + 1) * out_hidden);
+    }
+    toks.push_back(kVisionEnd);
+    embeds.emplace_back();
+  };
+  const auto ph = std::find(base_tokens.begin(), base_tokens.end(), kImageToken);
+  if (ph != base_tokens.end()) {
+    for (auto it = base_tokens.begin(); it != ph; ++it) {
+      toks.push_back(*it);
+      embeds.emplace_back();
+    }
+    push_image_span();
+    for (auto it = ph + 1; it != base_tokens.end(); ++it) {
+      toks.push_back(*it);
+      embeds.emplace_back();
+    }
+  } else {
+    push_image_span();
+    for (int t : base_tokens) {
+      toks.push_back(t);
+      embeds.emplace_back();
+    }
   }
 
-  info_out << "[image] " << cli.image_path << "  " << pp.grid_w << "x" << pp.grid_h
-           << " patches -> " << n_soft << " soft tokens; prompt = " << toks.size() << " tokens\n\n";
+  if (info_out != nullptr) {
+    *info_out << "[image] " << image_path << "  " << pp.grid_w << "x" << pp.grid_h
+              << " patches -> " << n_soft << " soft tokens; prompt = " << toks.size()
+              << " tokens\n\n";
+  }
 
   // 4. M-RoPE positions, prefill all but the last token, then decode with the rotary and cache
   //    positions kept apart (an image span advances the rotary counter by its MERGED extent).
@@ -185,21 +213,31 @@ void run_with_image_metal(engine::PlanMetalEngine& meng, const app::main_cli::Pa
 
   const int rope_pos0 = engine::mrope_next_position(toks, kImageToken, mh, mw) - 1;
   const int cache_pos0 = static_cast<int>(head.size());
-  const int eos = cli.opts.eos_token_id;
 
-  const auto t0 = std::chrono::steady_clock::now();
   std::vector<int> gen;
   int next = toks.back();
-  for (int i = 0; i < cli.max_new; ++i) {
+  for (int i = 0; i < max_new; ++i) {
     const std::vector<float>& lg = meng.forward_token(next, rope_pos0 + i, cache_pos0 + i);
     int best = 0;
     for (std::size_t j = 1; j < lg.size(); ++j) {
       if (lg[j] > lg[static_cast<std::size_t>(best)]) best = static_cast<int>(j);
     }
-    if (best == eos) break;
+    if (eos >= 0 && best == eos) break;
     gen.push_back(best);
     next = best;
+    if (on_token && !on_token(best)) break;  // caller asked to stop (client disconnect, stop text)
   }
+  return gen;
+}
+
+// One image + a text question on the command line. A thin wrapper over the shared core above.
+void run_with_image_metal(engine::PlanMetalEngine& meng, const app::main_cli::ParsedArgs& cli,
+                          model::Tokenizer& tokenizer, std::ostream& info_out) {
+  const std::vector<int> base = tokenizer.encode(cli.prompt_text, /*add_bos=*/false);
+  const auto t0 = std::chrono::steady_clock::now();
+  const std::vector<int> gen =
+      generate_multimodal_metal(meng, base, cli.image_path, cli.max_new, cli.opts.eos_token_id,
+                                nullptr, &info_out);
   const auto t1 = std::chrono::steady_clock::now();
   const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
@@ -411,6 +449,17 @@ int main(int argc, char** argv) {
           break;
         case EngineChoice::Llama4Cpu:
           std::cout << "[info] Detected a safetensors model. Using the Llama4 CPU engine.\n";
+          // SAY that the GPU is being skipped. On a Mac this path is reached with a perfectly
+          // good Metal device present -- Llama4 has its own engine (llama4_cuda_engine) with no
+          // Metal counterpart, so resolve_engine falls back to CPU. That fallback used to be
+          // silent, which reads as "CPI is slow on this model" rather than "CPI is not using
+          // your GPU". A degradation nobody can attribute is the same failure mode as --image
+          // and --draft-model silently doing nothing.
+          if (metal_available && !cli.force_cpu) {
+            std::cout << "[warn] A Metal GPU is present but Llama4 has no Metal engine yet, so "
+                         "this will run on the CPU and be far slower. Only the Llama/Qwen2/Qwen3 "
+                         "and Qwen3.5 families have a Metal path.\n";
+          }
           break;
         case EngineChoice::LlamaCpu:
 #if LLAMA_ENGINE_HAS_CUDA
@@ -563,12 +612,8 @@ int main(int argc, char** argv) {
         // passes unconditionally when it is configured, so a Mac deployment saw a silent
         // slowdown rather than an error. A wrong answer nobody can attribute is worse than a
         // refusal, and neither of these is something the caller can be expected to notice.
-        if (!cli.image_path.empty()) {
-          if (!use_tokenizer) throw std::runtime_error("--image requires --tokenizer");
-          engine::PlanMetalEngine img_eng;
-          img_eng.open(cli.opts.model_path, cli.opts.max_context, 0, 0);
-          run_with_image_metal(img_eng, cli, tokenizer, std::cerr);
-          break;
+        if (!cli.image_path.empty() && !use_tokenizer) {
+          throw std::runtime_error("--image requires --tokenizer");
         }
         // Speculative decoding: a small DRAFT proposes K tokens, this model (the TARGET) checks
         // them in one parallel verify pass, and only its own argmax is ever emitted -- so the
@@ -581,13 +626,14 @@ int main(int argc, char** argv) {
           }
           engine::PlanMetalEngine target_eng;
           const int tgt_quant = cli.opts.int8_streaming ? cli.opts.streaming_quant_bits : 0;
-          target_eng.open(cli.opts.model_path, cli.opts.max_context, tgt_quant, 0);
+          target_eng.open(cli.opts.model_path, cli.opts.max_context, tgt_quant, 0,
+                          cli.opts.rope_theta);
 
           // Quantize the draft to int8 at load. A small model loses almost nothing to int8, and
           // a draft that does not fit fully resident is far too slow to be worth speculating
           // with. This mirrors the CUDA path's draft handling.
           engine::PlanMetalEngine draft_eng;
-          draft_eng.open(cli.draft_model_path, cli.opts.max_context, 8, 0);
+          draft_eng.open(cli.draft_model_path, cli.opts.max_context, 8, 0, cli.opts.rope_theta);
 
           engine::SpeculativeDecoder<engine::PlanMetalEngine> spec(draft_eng, target_eng,
                                                                    cli.spec_tokens);
@@ -658,7 +704,15 @@ int main(int argc, char** argv) {
           const int pool_tokens = cli.opts.max_context * 4;
           meng.set_paged_kv((pool_tokens + bs - 1) / bs, bs);
         }
-        meng.open(cli.opts.model_path, cli.opts.max_context, metal_quant_bits, /*quant_group=*/0);
+        meng.open(cli.opts.model_path, cli.opts.max_context, metal_quant_bits, /*quant_group=*/0,
+                  cli.opts.rope_theta);
+
+        // One-shot `--image`. After open() so it shares the engine with the serving modes below
+        // rather than loading the weights a second time.
+        if (!cli.image_path.empty() && !cli.web_mode && !cli.interactive_batch) {
+          run_with_image_metal(meng, cli, tokenizer, std::cerr);
+          break;
+        }
 
         if (cli.interactive_batch) {
           if (!use_tokenizer) {
@@ -706,7 +760,19 @@ int main(int argc, char** argv) {
               return meng.generate_stream(p, max_new, make_samp(temperature), on_token, constraints);
             },
             [&](const std::vector<int>& p, int top_k) { return meng.inspect_next_logits(p, top_k); },
-            [&]() -> const engine::BenchmarkStats& { return meng.last_benchmark_stats(); }, nullptr);
+            [&]() -> const engine::BenchmarkStats& { return meng.last_benchmark_stats(); },
+            // Multimodal over the bridge. Null when the container has no vision tower, so a
+            // text-only model still fails the request cleanly ("this model cannot take images")
+            // instead of pretending. This used to be an unconditional nullptr, which meant the
+            // REST/web image route was dead on Metal even after the CLI path worked.
+            meng.config().has_vision_tower()
+                ? app::main_modes::GenerateMultimodalFn(
+                      [&](const std::vector<int>& base, const std::string& image_path, int max_new,
+                          float /*temperature*/, const std::function<bool(int)>& on_token) {
+                        return generate_multimodal_metal(meng, base, image_path, max_new,
+                                                         cli.opts.eos_token_id, on_token, nullptr);
+                      })
+                : nullptr);
         break;
       }
 #endif
