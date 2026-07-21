@@ -219,10 +219,12 @@ struct JsonParser {
     throw std::runtime_error(std::string("safetensors JSON: unexpected char '") + *s + "'");
   }
 
-  bool parse_tensor_object(std::int64_t& offset_start, std::int64_t& offset_end) {
+  bool parse_tensor_object(std::int64_t& offset_start, std::int64_t& offset_end,
+                           std::string& dtype) {
     expect('{');
     offset_start = -1;
     offset_end = -1;
+    dtype.clear();
     skip_ws();
     if (s < end && *s == '}') {
       ++s;
@@ -232,7 +234,13 @@ struct JsonParser {
     while (true) {
       const std::string key = parse_string();
       expect(':');
-      if (key == "data_offsets") {
+      if (key == "dtype") {
+        // Captured because the value decides whether a consumer must CONVERT. Everything CPI
+        // packs itself is F16, but a HuggingFace checkpoint is usually BF16 -- same width,
+        // different exponent split, so reading one as the other is silent garbage rather than
+        // an error.
+        dtype = parse_string();
+      } else if (key == "data_offsets") {
         expect('[');
         offset_start = parse_integer();
         expect(',');
@@ -285,8 +293,9 @@ struct JsonParser {
       } else {
         std::int64_t start = -1;
         std::int64_t end_offset = -1;
-        if (parse_tensor_object(start, end_offset)) {
-          cb(name, static_cast<std::size_t>(start), static_cast<std::size_t>(end_offset));
+        std::string dtype;
+        if (parse_tensor_object(start, end_offset, dtype)) {
+          cb(name, static_cast<std::size_t>(start), static_cast<std::size_t>(end_offset), dtype);
         }
       }
       skip_ws();
@@ -384,7 +393,8 @@ void SafetensorsLoader::open(const std::string& model_dir) {
     const char* json = reinterpret_cast<const char*>(base + 8);
     JsonParser parser(json, static_cast<std::size_t>(header_size));
     const int shard_index = static_cast<int>(shard_idx);
-    parser.parse_header([&](const std::string& name, std::size_t start, std::size_t end_offset) {
+    parser.parse_header([&](const std::string& name, std::size_t start, std::size_t end_offset,
+                            const std::string& dtype) {
       if (end_offset < start || end_offset > payload_size) {
         throw std::runtime_error("safetensors: invalid data_offsets for tensor " + name + " in " +
                                  path.string());
@@ -392,7 +402,7 @@ void SafetensorsLoader::open(const std::string& model_dir) {
       if (tensors_.find(name) != tensors_.end()) {
         return;
       }
-      tensors_.emplace(name, TensorMeta{shard_index, start, end_offset});
+      tensors_.emplace(name, TensorMeta{shard_index, start, end_offset, dtype});
     });
     // A `.cpi` carries its config here. Sharded HF models normally do not, so an empty block is
     // not an error -- only the .cpi path requires one, and it says so itself.
@@ -420,6 +430,11 @@ std::size_t SafetensorsLoader::tensor_bytes(const std::string& name) const {
   }
   const TensorMeta& meta = it->second;
   return meta.data_end - meta.data_start;
+}
+
+std::string SafetensorsLoader::tensor_dtype(const std::string& name) const {
+  const auto it = tensors_.find(name);
+  return it == tensors_.end() ? std::string() : it->second.dtype;
 }
 
 bool SafetensorsLoader::has_tensor(const std::string& name) const {

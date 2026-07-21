@@ -55,6 +55,14 @@ public:
   // Returns true if a tensor with the given name exists in the weight file.
   [[nodiscard]] bool has_tensor(const std::string& name) const;
 
+  // Part of the loader surface SafetensorsLoader also presents, so a consumer can be templated on
+  // the loader rather than written twice. A .ll2c is fp16 by construction -- pack_ll2c.py converts
+  // at packing time -- so this is a constant here, and the answer is what lets an uploader convert
+  // BF16 from a HuggingFace checkpoint without special-casing which container it came from.
+  [[nodiscard]] std::string tensor_dtype(const std::string& name) const {
+    return has_tensor(name) ? std::string("F16") : std::string();
+  }
+
   // Every tensor name in the container, sorted. Needed to REPACK a .ll2c into another container
   // without a hardcoded name list -- the list would be a second place the model's tensor set is
   // written down, and those drift (see the v7 vision-geometry whitelist).

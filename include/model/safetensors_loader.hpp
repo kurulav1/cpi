@@ -40,6 +40,14 @@ public:
   // Returns true if `name` is present in the index.
   [[nodiscard]] bool has_tensor(const std::string& name) const;
 
+  // The tensor's dtype exactly as the container declares it ("F16", "BF16", "F32"). Empty if the
+  // tensor is absent. Consumers that memcpy the bytes to a device MUST check this: CPI's own
+  // containers are F16, but a HuggingFace checkpoint is typically BF16, and the two are the same
+  // WIDTH with a different exponent split -- so reinterpreting one as the other produces
+  // plausibly-scaled garbage instead of an error. model::WeightLoader answers "F16" to the same
+  // question, which is what lets a consumer be templated on the loader.
+  [[nodiscard]] std::string tensor_dtype(const std::string& name) const;
+
   // The container's `__metadata__` block, verbatim JSON. A `.cpi` stores its whole LlamaConfig
   // here -- the self-describing replacement for the .ll2c binary header. Empty for a plain HF
   // checkpoint, which keeps its config in a separate config.json.
@@ -51,6 +59,7 @@ private:
     int shard_idx;
     std::size_t data_start;  // byte offset within shard binary payload
     std::size_t data_end;    // exclusive end (data_end - data_start = size)
+    std::string dtype;       // as written in the header: "F16", "BF16", "F32", ...
   };
 
   std::vector<platform::MMapFile> shards_;
