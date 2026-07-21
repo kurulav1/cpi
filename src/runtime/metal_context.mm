@@ -78,14 +78,26 @@ MetalContext::MetalContext() {
   }
   queue_ = (void*)q;  // already +1
 
-  pipelines_ = (void*)[[NSMutableDictionary alloc] init];
+  // The pipeline cache lives behind the existing void* so the HEADER LAYOUT IS UNCHANGED.
+  // MetalContext is embedded BY VALUE in PlanMetalEngine, so growing it breaks any translation
+  // unit still compiled against the old layout -- which a first attempt at this did: the engine
+  // read its config through a shifted `this` and reported layers=7, vocab=397.
+  pipelines_ = (void*)new std::unordered_map<std::string, void*>();
 }
 
 MetalContext::~MetalContext() {
   if (encoder_ != nullptr) [(id<MTLComputeCommandEncoder>)encoder_ release];
   if (cmdbuf_ != nullptr) [(id<MTLCommandBuffer>)cmdbuf_ release];
   if (sample_buf_ != nullptr) [(id<MTLCounterSampleBuffer>)sample_buf_ release];
-  if (pipelines_ != nullptr) [(NSMutableDictionary*)pipelines_ release];
+  // The map holds a +1 on each pipeline state.
+  if (pipelines_ != nullptr) {
+    auto* pmap = (std::unordered_map<std::string, void*>*)pipelines_;
+    for (auto& kv : *pmap) {
+      if (kv.second != nullptr) [(id<MTLComputePipelineState>)kv.second release];
+    }
+    delete pmap;
+    pipelines_ = nullptr;
+  }
   if (library_ != nullptr) [(id<MTLLibrary>)library_ release];
   if (queue_ != nullptr) [(id<MTLCommandQueue>)queue_ release];
   if (device_ != nullptr) [(id<MTLDevice>)device_ release];
@@ -320,8 +332,6 @@ void MetalContext::dispatch(const std::string& name, Grid grid, std::size_t tota
   if (device_ == nullptr || library_ == nullptr || total == 0) return;
 
   id<MTLDevice> dev = (id<MTLDevice>)device_;
-  NSMutableDictionary* cache = (NSMutableDictionary*)pipelines_;
-  NSString* fname = [NSString stringWithUTF8String:name.c_str()];
 
   // The cache key carries the specialization, so each shape gets its own pipeline and an
   // unspecialized dispatch of the same kernel never picks up a specialized one.
@@ -330,15 +340,28 @@ void MetalContext::dispatch(const std::string& name, Grid grid, std::size_t tota
   for (int i = 0; i < spec_n; ++i) spec[i] = next_spec_[i];
   next_spec_n_ = 0;
 
-  NSString* key = fname;
+  // Key built as a std::string. The unspecialized case -- which is every dispatch in a decode
+  // step -- does no allocation at all: the lookup hashes `name` in place. Only the rare
+  // specialized dispatch builds a string, and only the first time does any of this touch ObjC.
+  const std::string* keyp = &name;
+  std::string spec_key;
   if (spec_n > 0) {
-    NSMutableString* k = [NSMutableString stringWithString:fname];
-    for (int i = 0; i < spec_n; ++i) [k appendFormat:@"/%u", (unsigned)spec[i]];
-    key = k;
+    spec_key = name;
+    for (int i = 0; i < spec_n; ++i) {
+      spec_key += '/';
+      spec_key += std::to_string(spec[i]);
+    }
+    keyp = &spec_key;
   }
 
-  id<MTLComputePipelineState> pso = [cache objectForKey:key];
+  id<MTLComputePipelineState> pso = nil;
+  auto& pmap = *(std::unordered_map<std::string, void*>*)pipelines_;
+  auto it = pmap.find(*keyp);
+  if (it != pmap.end()) {
+    pso = (id<MTLComputePipelineState>)it->second;
+  }
   if (pso == nil) {
+    NSString* fname = [NSString stringWithUTF8String:name.c_str()];
     id<MTLLibrary> lib = (id<MTLLibrary>)library_;
     NSError* err = nil;
     id<MTLFunction> fn = nil;
@@ -370,9 +393,8 @@ void MetalContext::dispatch(const std::string& name, Grid grid, std::size_t tota
       }
       return;
     }
-    [cache setObject:pso forKey:key];
-    [pso release];  // the dictionary owns it now
-    pso = [cache objectForKey:key];
+    // The map takes the +1 from newComputePipelineState; ~MetalContext releases it.
+    pmap.emplace(*keyp, (void*)pso);
   }
 
   // One command buffer accumulates every dispatch until commit_and_wait(). This
