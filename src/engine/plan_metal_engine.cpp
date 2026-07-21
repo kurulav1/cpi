@@ -385,19 +385,8 @@ public:
     // conversion had always already happened upstream. CUDA does exactly this, at
     // plan_cuda_engine.cu's "safetensors : bf16 ... we convert bf16 -> fp16".
     const std::size_t bytes = wl_.tensor_bytes(name);
-    const std::string dt = wl_.tensor_dtype(name);
-    runtime::MetalBuffer b;
-    if (dt == "BF16") {
-      const auto* src = reinterpret_cast<const std::uint16_t*>(wl_.tensor_data(name));
-      const std::size_t n = bytes / sizeof(std::uint16_t);
-      std::vector<std::uint16_t> conv(n);
-      for (std::size_t i = 0; i < n; ++i) {
-        conv[i] = cpi::f32_to_f16(engine::mini::bf16_to_float(src[i]));
-      }
-      b = ctx_.alloc_from(conv.data(), bytes);
-    } else {
-      b = ctx_.alloc_from(wl_.tensor_data(name), bytes);
-    }
+    std::vector<std::uint16_t> conv;
+    runtime::MetalBuffer b = ctx_.alloc_from(fp16_data(name, conv), bytes);
     if (!b.valid()) throw std::runtime_error("failed to allocate a device buffer for " + name);
     const void* h = b.handle();
     bufs_.emplace(name, std::move(b));
@@ -426,9 +415,10 @@ public:
         break;  // ran out of experts
       }
       auto append = [&](const std::string& t) {
-        const std::size_t bytes = wl_.tensor_bytes(t);
-        const auto* src = reinterpret_cast<const std::uint16_t*>(wl_.tensor_data(t));
-        fused.insert(fused.end(), src, src + bytes / sizeof(std::uint16_t));
+        const std::size_t n = wl_.tensor_bytes(t) / sizeof(std::uint16_t);
+        std::vector<std::uint16_t> conv;
+        const std::uint16_t* src = fp16_data(t, conv);
+        fused.insert(fused.end(), src, src + n);
       };
       append(a);
       if (gate_up) append(pe + "w3");  // up rows follow this expert's gate rows
@@ -453,7 +443,8 @@ public:
 
     auto it = qbufs_.find(name);
     if (it == qbufs_.end()) {
-      const auto* src = reinterpret_cast<const std::uint16_t*>(wl_.tensor_data(name));
+      std::vector<std::uint16_t> conv;
+      const std::uint16_t* src = fp16_data(name, conv);
       const int gsz = (group_ > 0) ? group_ : in_dim;
       const int groups = (in_dim + gsz - 1) / gsz;
       const float max_q = (bits_ == 4) ? 7.0f : 127.0f;
@@ -527,6 +518,22 @@ public:
   }
 
 private:
+  // Every CPU-side read of a tensor's values goes through here, so the BF16 conversion cannot
+  // be present on one path and absent on another. It was: fp16() converted and quant() read the
+  // raw bytes, so `--weight-quant` on a BF16 HF checkpoint (Gemma 4 is one; .ll2c/.cpi are fp16
+  // by construction) quantized plausibly-scaled garbage into 100% special-token output.
+  const std::uint16_t* fp16_data(const std::string& name,
+                                 std::vector<std::uint16_t>& conv) const {
+    const auto* src = reinterpret_cast<const std::uint16_t*>(wl_.tensor_data(name));
+    if (wl_.tensor_dtype(name) != "BF16") return src;
+    const std::size_t n = wl_.tensor_bytes(name) / sizeof(std::uint16_t);
+    conv.resize(n);
+    for (std::size_t i = 0; i < n; ++i) {
+      conv[i] = cpi::f32_to_f16(engine::mini::bf16_to_float(src[i]));
+    }
+    return conv.data();
+  }
+
   struct QBuf {
     runtime::MetalBuffer packed;
     runtime::MetalBuffer scales;

@@ -799,6 +799,10 @@ kernel void cpi_attention_prefill(device const half* q [[buffer(0)]],
   const uint simd_id = lid / 32u;
   const uint lane = lid % 32u;
 
+  // 256 is a hard head_dim ceiling, NOT ATTN_MAX_HEAD_DIM: at Q_BLOCK 8 the 512-wide pair alone
+  // is the whole 32 KB threadgroup budget. The executor routes head_dim > 256 to
+  // cpi_attention_prefill_wide below; dispatching THIS kernel wider silently smashes acc and the
+  // softmax scratch (it did -- that was Gemma 4's batched-prefill bug).
   threadgroup float q_sh[Q_BLOCK * 256];
   threadgroup float acc[Q_BLOCK * 256];
   threadgroup float sc_sh[Q_BLOCK * KEY_BLOCK];
