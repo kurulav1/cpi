@@ -370,6 +370,22 @@ private:
   std::vector<runtime::MetalBuffer> slots_;  // indexed by opplan::Slot
   std::vector<runtime::MetalBuffer> k_cache_;
   std::vector<runtime::MetalBuffer> v_cache_;
+  // Which layer OWNS the cache each layer reads. Identity for every family except Gemma 4, whose
+  // trailing layers reuse an earlier layer's K/V instead of projecting their own (E2B shares 20 of
+  // 35). Those layers allocate nothing and index through here.
+  //
+  // An index map rather than aliased buffers because runtime::MetalBuffer is move-only and owns
+  // its allocation -- copying one to alias it would double-free. Always read the caches through
+  // kbuf()/vbuf(); indexing k_cache_ by layer directly is correct only when nothing is shared,
+  // which is exactly the kind of "works until it doesn't" this is here to prevent.
+  std::vector<int> kv_owner_;
+
+  [[nodiscard]] const runtime::MetalBuffer& kbuf(int layer) const {
+    return k_cache_[static_cast<std::size_t>(kv_owner_[static_cast<std::size_t>(layer)])];
+  }
+  [[nodiscard]] const runtime::MetalBuffer& vbuf(int layer) const {
+    return v_cache_[static_cast<std::size_t>(kv_owner_[static_cast<std::size_t>(layer)])];
+  }
 
   // MoE: the router's selection, carried between ops on the device so a token never
   // round-trips to the host mid-layer. Only allocated for MoE models.

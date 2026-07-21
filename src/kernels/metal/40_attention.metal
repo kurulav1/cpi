@@ -1,4 +1,12 @@
 #define Q_BLOCK 8
+// The largest head_dim the SCALAR attention kernels can hold in threadgroup memory. Was a bare
+// 256 repeated in six places, which is exactly the head_dim of Qwen3.5 and Gemma 4's SLIDING
+// layers -- so it fit every model anyone had run. Gemma 4 E2B's FULL layers are head_dim 512 and
+// wrote straight past these arrays, which is where its NaN logits came from.
+//
+// Cost is 2 arrays * ATTN_MAX_HEAD_DIM floats per threadgroup: 4 KB at 512, up from 2 KB. Well
+// inside the 32 KB budget, but it is OCCUPANCY that pays -- so this is measured, not assumed.
+#define ATTN_MAX_HEAD_DIM 512
 // The matrix-unit prefill kernel's query-block size. Separate from Q_BLOCK because the scalar
 // kernel sizes its shared arrays for head_dim 256 (Gemma) and cannot afford a wider block --
 // raising a shared constant would silently break a path whose golden is skipped on any host
@@ -926,10 +934,10 @@ kernel void cpi_attention_decode(
   const uint lane    = lid % 32u;
   const uint n_simd  = nthr / 32u;
 
-  threadgroup float q_sh[256];    // the query, read once instead of per key
+  threadgroup float q_sh[ATTN_MAX_HEAD_DIM];    // the query, read once instead of per key
   threadgroup float sc_sh[KEY_BLOCK];
   threadgroup float w_sh[KEY_BLOCK];
-  threadgroup float tg_acc[256];
+  threadgroup float tg_acc[ATTN_MAX_HEAD_DIM];
   threadgroup float tg_max;
   threadgroup float tg_sum;
 
@@ -1088,10 +1096,10 @@ kernel void cpi_attention_decode_split(
   const uint lane    = lid % 32u;
   const uint n_simd  = nthr / 32u;
 
-  threadgroup float q_sh[256];
+  threadgroup float q_sh[ATTN_MAX_HEAD_DIM];
   threadgroup float sc_sh[DEC_KEY_BLOCK];
   threadgroup float w_sh[DEC_KEY_BLOCK];
-  threadgroup float tg_acc[256];
+  threadgroup float tg_acc[ATTN_MAX_HEAD_DIM];
   threadgroup float tg_max;
   threadgroup float tg_sum;
   threadgroup float red[DEC_TG / 32];  // one slot per simdgroup, for the block reductions
@@ -1316,10 +1324,10 @@ kernel void cpi_attention_decode_batched_paged(
   const uint lane    = lid % 32u;
   const uint n_simd  = nthr / 32u;
 
-  threadgroup float q_sh[256];
+  threadgroup float q_sh[ATTN_MAX_HEAD_DIM];
   threadgroup float sc_sh[KEY_BLOCK];
   threadgroup float w_sh[KEY_BLOCK];
-  threadgroup float tg_acc[256];
+  threadgroup float tg_acc[ATTN_MAX_HEAD_DIM];
   threadgroup float tg_max;
   threadgroup float tg_sum;
 

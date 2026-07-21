@@ -922,10 +922,46 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
       paged_blocks_ > 0
           ? static_cast<std::size_t>(paged_blocks_) * static_cast<std::size_t>(paged_block_size_)
           : static_cast<std::size_t>(max_context_);
-  const std::size_t cache_bytes = cache_tokens * static_cast<std::size_t>(kv_dim) * 2;
   k_cache_.resize(static_cast<std::size_t>(cfg_.num_layers));
   v_cache_.resize(static_cast<std::size_t>(cfg_.num_layers));
+  // Who owns whose cache. Identity everywhere except Gemma 4's shared tail, which reads the cache
+  // of the last non-shared layer OF THE SAME TYPE (kv_source, derived once in
+  // parse_gemma4_text_config). A shared layer allocates NOTHING -- it emits no KvStore either, so
+  // an own cache would be read-but-never-written, which is precisely the uninitialised memory that
+  // made the first Gemma-4-on-Metal run return NaN.
+  kv_owner_.resize(static_cast<std::size_t>(cfg_.num_layers));
   for (int L = 0; L < cfg_.num_layers; ++L) {
+    const bool shared = is_gemma4 && cfg_.first_shared_layer > 0 && L >= cfg_.first_shared_layer &&
+                        L < static_cast<int>(cfg_.kv_source.size());
+    kv_owner_[static_cast<std::size_t>(L)] = shared ? cfg_.kv_source[static_cast<std::size_t>(L)] : L;
+  }
+  if (is_gemma4 && std::getenv("CPI_GEMMA4_TRACE") != nullptr) {
+    std::fprintf(stderr,
+                 "[g4] layers=%d hidden=%d inter=%d vocab=%d heads=%d ple=%d first_shared=%d\n"
+                 "[g4] hd_slide=%d hd_full=%d kvh_slide=%d kvh_full=%d eps=%g swin=%d dwmlp=%d\n"
+                 "[g4] kv_owner[0..7]=%d %d %d %d %d %d %d %d  kv_owner[last]=%d\n",
+                 cfg_.num_layers, cfg_.hidden_size, cfg_.intermediate_size, cfg_.vocab_size,
+                 cfg_.num_heads, cfg_.hidden_size_per_layer_input, cfg_.first_shared_layer,
+                 cfg_.head_dim_sliding, cfg_.head_dim_full, cfg_.num_kv_heads_sliding,
+                 cfg_.num_kv_heads_full, cfg_.norm_eps, cfg_.sliding_window,
+                 static_cast<int>(cfg_.use_double_wide_mlp), kv_owner_[0], kv_owner_[1],
+                 kv_owner_[2], kv_owner_[3], kv_owner_[4], kv_owner_[5], kv_owner_[6],
+                 kv_owner_[7], kv_owner_.back());
+    std::fflush(stderr);
+  }
+  for (int L = 0; L < cfg_.num_layers; ++L) {
+    if (kv_owner_[static_cast<std::size_t>(L)] != L) continue;  // reads someone else's
+    // Sized PER LAYER TYPE. Gemma 4's sliding and full layers differ in both head_dim and kv-head
+    // count (E2B: 256x2 vs 512x1), so one kv_dim for the whole tower is wrong for one of them --
+    // too small is an out-of-bounds read, too large silently wastes hundreds of MB.
+    std::size_t layer_kv_dim = static_cast<std::size_t>(kv_dim);
+    if (is_gemma4) {
+      const bool full = cfg_.attention_kind_for_layer(L) == model::AttentionKind::Full;
+      layer_kv_dim = static_cast<std::size_t>(full ? cfg_.num_kv_heads_full * cfg_.head_dim_full
+                                                   : cfg_.num_kv_heads_sliding *
+                                                         cfg_.head_dim_sliding);
+    }
+    const std::size_t cache_bytes = cache_tokens * layer_kv_dim * 2;
     k_cache_[static_cast<std::size_t>(L)] = ctx_.alloc(cache_bytes);
     v_cache_[static_cast<std::size_t>(L)] = ctx_.alloc(cache_bytes);
   }
@@ -1426,8 +1462,8 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
                           static_cast<std::uint32_t>(batch_->block_size),
                           static_cast<std::uint32_t>(batch_->batch)};
           const void* bufs[] = {
-              slot(op.in), slot(op.in2), k_cache_[static_cast<std::size_t>(layer)].handle(),
-              v_cache_[static_cast<std::size_t>(layer)].handle(), batch_bt_buf_.handle(),
+              slot(op.in), slot(op.in2), kbuf(layer).handle(),
+              vbuf(layer).handle(), batch_bt_buf_.handle(),
               batch_pos_buf_.handle()};
           ctx_.dispatch("cpi_kv_store_batched_paged", G::Groups,
                         static_cast<std::size_t>(batch_->batch), kTG, bufs, nullptr, 6, &p,
@@ -1441,8 +1477,8 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
                    1,
                    static_cast<std::uint32_t>(T)};
         const void* bufs[] = {
-            slot(op.in), slot(op.in2), k_cache_[static_cast<std::size_t>(layer)].handle(),
-            v_cache_[static_cast<std::size_t>(layer)].handle(), pos_buf_.handle()};
+            slot(op.in), slot(op.in2), kbuf(layer).handle(),
+            vbuf(layer).handle(), pos_buf_.handle()};
         const std::size_t total = static_cast<std::size_t>(op.kv_heads) *
                                   static_cast<std::size_t>(op.head_dim) *
                                   static_cast<std::size_t>(T);
@@ -1477,8 +1513,8 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
                        static_cast<std::uint32_t>(batch_->block_size)};
           // batch_bt_buf_ holds the sequence's table replicated per row; the mm kernel wants
           // just the table, and row 0 sits at offset 0, so it reads the right thing.
-          const void* mmbufs[] = {slot(op.in), k_cache_[static_cast<std::size_t>(layer)].handle(),
-                                  v_cache_[static_cast<std::size_t>(layer)].handle(), slot(op.out),
+          const void* mmbufs[] = {slot(op.in), kbuf(layer).handle(),
+                                  vbuf(layer).handle(), slot(op.out),
                                   pos_buf_.handle(), batch_bt_buf_.handle()};
           // Blocked by the kernel's OWN query block. This used to use kQBlock, which is half
           // kQMMBlock, so every query was covered twice and half the threadgroups launched only to
@@ -1502,8 +1538,8 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
                             static_cast<std::uint32_t>(op.full_attention ? 0 : op.sliding_window),
                             op.scale,
                             static_cast<std::uint32_t>(batch_->batch)};
-          const void* bufs[] = {slot(op.in), k_cache_[static_cast<std::size_t>(layer)].handle(),
-                                v_cache_[static_cast<std::size_t>(layer)].handle(), slot(op.out),
+          const void* bufs[] = {slot(op.in), kbuf(layer).handle(),
+                                vbuf(layer).handle(), slot(op.out),
                                 batch_bt_buf_.handle(), batch_seqlen_buf_.handle()};
           ctx_.dispatch("cpi_attention_decode_batched_paged", G::Groups,
                         static_cast<std::size_t>(batch_->batch) *
@@ -1520,8 +1556,8 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
                      op.scale,
                      1,
                      static_cast<std::uint32_t>(T)};
-        const void* bufs[] = {slot(op.in), k_cache_[static_cast<std::size_t>(layer)].handle(),
-                              v_cache_[static_cast<std::size_t>(layer)].handle(), slot(op.out),
+        const void* bufs[] = {slot(op.in), kbuf(layer).handle(),
+                              vbuf(layer).handle(), slot(op.out),
                               pos_buf_.handle()};
         // A prefill's threadgroups each walk the whole KV cache, so per-token attention is
         // O(T^2) in DEVICE traffic and was 23% of the 8B's prefill. The prefill kernel gives
@@ -1536,10 +1572,10 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
           if (op.head_dim <= 128) {
             // p.paged stays 0, so block_tables is never read -- but the binding must exist,
             // because dispatch() puts the params block at index n_buffers.
-            const void* mmbufs[] = {slot(op.in), k_cache_[static_cast<std::size_t>(layer)].handle(),
-                                    v_cache_[static_cast<std::size_t>(layer)].handle(),
+            const void* mmbufs[] = {slot(op.in), kbuf(layer).handle(),
+                                    vbuf(layer).handle(),
                                     slot(op.out), pos_buf_.handle(),
-                                    k_cache_[static_cast<std::size_t>(layer)].handle()};
+                                    kbuf(layer).handle()};
             // CPI_METAL_ATTN_QP=1 selects the query-partitioned research kernel (see the header
             // above it): 4 simdgroups x 8 queries, per-simdgroup scratch, simdgroup_barrier only.
             static const bool qp = [] {
@@ -1601,8 +1637,8 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
                              static_cast<std::uint32_t>(chunk_size),
                              static_cast<std::uint32_t>(chunks)};
           const void* sbufs[] = {slot(op.in),
-                                 k_cache_[static_cast<std::size_t>(layer)].handle(),
-                                 v_cache_[static_cast<std::size_t>(layer)].handle(),
+                                 kbuf(layer).handle(),
+                                 vbuf(layer).handle(),
                                  attn_part_m_.handle(),
                                  attn_part_l_.handle(),
                                  attn_part_o_.handle(),
