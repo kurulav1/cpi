@@ -293,6 +293,9 @@ int main() {
     gg.use_double_wide_mlp = true;
     gg.ple = 8;
     gg.layer_scalar = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+    gg.rope_theta_sliding = 10000.0f;
+    gg.rope_theta_full = 1000000.0f;
+    gg.partial_rotary_full = 0.25f;
 
     FakeWeights wg;
     const ModelPlan pg = build_gemma4_plan(gg, wg);
@@ -346,6 +349,26 @@ int main() {
     // Gemma 4 stores raw gains, not (w - 1). Applying the offset form doubles every norm, which
     // compounds and overflows fp16 around layer 2.
     expect(offset_norms == 0, "gemma4: no RmsNorm uses the (1+w) offset form");
+
+    // RoPE carries its configuration as VALUES, not just as the rope_table enum. A backend that
+    // computes angles in-shader (Metal) never reads rope_table, and Op::scale defaults to 1.0f --
+    // a theta of 1.0 rotates every lane at the same frequency and is a wrong model, not an error.
+    auto rope_of = [&](int L) {
+      const Op* r = nullptr;
+      for (const Op& o : pg.layers[L].ops)
+        if (o.kind == OpKind::Rope && r == nullptr) r = &o;
+      return r;
+    };
+    const Op* r0 = rope_of(0);  // sliding
+    const Op* r2 = rope_of(2);  // full
+    expect(r0 && r0->scale == 10000.0f, "gemma4: sliding layer rope theta 1e4");
+    expect(r2 && r2->scale == 1000000.0f, "gemma4: full layer rope theta 1e6");
+    expect(r0 && r0->rope_table == RopeTable::Sliding, "gemma4: sliding layer names its table");
+    expect(r2 && r2->rope_table == RopeTable::Full, "gemma4: full layer names its table");
+    // Partial rotary on the FULL layers only, and even: 32 * 0.25 = 8.
+    expect(r0 && r0->rotary_dim == 0, "gemma4: sliding layer rotates all of head_dim");
+    expect(r2 && r2->rotary_dim == 8 && r2->rotary_dim % 2 == 0,
+           "gemma4: full layer rotary_dim is 0.25*head_dim and even");
 
     // PLE injection reads layer L's window of the packed per-layer table.
     for (int L = 0; L < gg.num_layers; ++L) {

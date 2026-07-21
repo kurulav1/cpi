@@ -192,6 +192,14 @@ struct Gemma4Geometry {
   int head_dim_sliding = 0, head_dim_full = 0;
   int kv_heads_sliding = 0, kv_heads_full = 0;
 
+  // ...and a different RoPE base per layer type, with PARTIAL rotary on the full layers only.
+  // These must be set: Op::scale carries theta on backends that compute RoPE in-shader rather
+  // than from a table, and it defaults to 1.0f -- a theta of 1.0 makes every lane rotate at the
+  // same frequency, which is a wrong model rather than an error.
+  float rope_theta_sliding = 10000.0f;
+  float rope_theta_full = 1000000.0f;
+  float partial_rotary_full = 1.0f;  // fraction of head_dim that rotates on FULL layers
+
   // Per layer: 1 = full attention, 0 = sliding. MUST be num_layers long.
   std::vector<int> layer_full;
 

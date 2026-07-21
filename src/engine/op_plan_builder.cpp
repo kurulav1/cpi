@@ -615,6 +615,21 @@ ModelPlan build_gemma4_plan(const Gemma4Geometry& g, const WeightSource& w) {
     LayerPlan& lp = plan.layers[L];
     lp.layer_index = L;
     std::vector<Op>& ops = lp.ops;
+    // Gemma 4's two RoPE configurations. rope_table names WHICH for backends that precompute
+    // tables (CUDA); scale and rotary_dim carry the same choice as VALUES, for backends that
+    // compute the angles in-shader (Metal, which does not look at rope_table at all). Both are set
+    // because the plan is one description shared by both executors -- setting only the enum leaves
+    // Metal on Op::scale's default theta of 1.0, i.e. every lane at the same frequency.
+    const float theta = full ? g.rope_theta_full : g.rope_theta_sliding;
+    // Partial rotary applies to the FULL layers only, and must be even -- an odd count leaves a
+    // half-pair no rotation kernel can turn. 0 means "all of head_dim", which is what the sliding
+    // layers want.
+    int rot = 0;
+    if (full && g.partial_rotary_full > 0.0f && g.partial_rotary_full < 1.0f) {
+      rot = static_cast<int>(static_cast<float>(hd) * g.partial_rotary_full);
+      rot -= rot % 2;
+      if (rot <= 0) rot = hd - (hd % 2);
+    }
     auto rope = [&](Slot s, int heads) {
       Op o;
       o.kind = OpKind::Rope;
@@ -623,6 +638,8 @@ ModelPlan build_gemma4_plan(const Gemma4Geometry& g, const WeightSource& w) {
       o.heads = heads;
       o.head_dim = hd;
       o.rope_table = full ? RopeTable::Full : RopeTable::Sliding;
+      o.scale = theta;
+      o.rotary_dim = rot;
       return o;
     };
 

@@ -745,6 +745,9 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
     gg.head_dim_full = cfg_.head_dim_full;
     gg.kv_heads_sliding = cfg_.num_kv_heads_sliding;
     gg.kv_heads_full = cfg_.num_kv_heads_full;
+    gg.rope_theta_sliding = cfg_.rope_theta_sliding;
+    gg.rope_theta_full = cfg_.rope_theta_full;
+    gg.partial_rotary_full = cfg_.partial_rotary_full;
     gg.first_shared_layer = cfg_.first_shared_layer;
     gg.attention_k_eq_v = cfg_.attention_k_eq_v;
     gg.use_double_wide_mlp = cfg_.use_double_wide_mlp;
