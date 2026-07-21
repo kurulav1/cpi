@@ -856,11 +856,20 @@ ModelProbe probe_model(const std::string& model_path) {
     try {
       model::SafetensorsLoader probe;
       probe.open(model_path);
-      if (probe.has_metadata()) {
+      // A `__metadata__` block is NOT proof the block is OURS. Gemma 4's converter writes one too,
+      // in its own schema (`family`, `hidden`, `vocab`), and none of those keys are the ones
+      // config_from_json reads -- so it hands back a fully DEFAULTED LlamaConfig. Identify the
+      // schema by a key `config_to_json` always emits, and never by a parsed VALUE: the old test
+      // here was `c.hidden_size > 0`, and hidden_size defaults to 4096, so it was true for every
+      // container that had any metadata at all. That silently routed Gemma 4 `.cpi` files to
+      // LlamaEngine, which reads `.ll2c` only -- a shipped, working path broken by a probe that
+      // looked like it was checking something.
+      if (probe.has_metadata() &&
+          !engine::mini::json_get_string(probe.metadata_json(), "model_family").empty()) {
         const model::LlamaConfig c = model::config_from_json(probe.metadata_json());
         if (c.model_family == model::ModelFamily::Qwen3_5) {
           p.kind = ModelFamilyKind::Qwen35;
-        } else if (c.hidden_size > 0) {
+        } else {
           p.kind = ModelFamilyKind::Llama;  // the uniform-geometry families the plan engines share
         }
       }

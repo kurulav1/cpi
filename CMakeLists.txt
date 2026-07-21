@@ -394,6 +394,13 @@ add_executable(config_json_test src/tests/config_json_test.cpp)
 target_include_directories(config_json_test PRIVATE include)
 add_test(NAME config_json_test COMMAND config_json_test)
 
+# Which engine a .cpi resolves to. Compiles main_helpers.cpp directly because that file lives in
+# the executables, not in llama_engine. CPU-only, so it runs on CI, Windows and the Mac alike.
+add_executable(probe_model_test src/tests/probe_model_test.cpp src/app/main_helpers.cpp)
+target_include_directories(probe_model_test PRIVATE include)
+target_link_libraries(probe_model_test PRIVATE llama_engine)
+add_test(NAME probe_model_test COMMAND probe_model_test)
+
 add_executable(qwen2vl_preproc_test src/tests/qwen2vl_preproc_test.cpp)
 target_include_directories(qwen2vl_preproc_test PRIVATE include)
 target_link_libraries(qwen2vl_preproc_test PRIVATE llama_engine)
