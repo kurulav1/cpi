@@ -942,13 +942,15 @@ EngineChoice resolve_engine(const ModelProbe& probe, bool cuda_available, bool m
         // here. An extraction, not a port.
         throw std::runtime_error(
             metal_available
-                ? "Gemma 4 does not run correctly on Metal yet. It loads, builds its plan and "
-                  "executes -- the container, the shared plan builder, the per-layer-type KV cache "
-                  "and its shared-layer aliasing are all in place -- but LAYER 0 emits NaN and the "
-                  "cause is not yet isolated. The prologue is finite (max_abs 57.7); layer 0's "
-                  "output is entirely NaN, so it is structural rather than fp16 overflow. Set "
-                  "CPI_METAL_GEMMA4=1 plus CPI_Q35_DUMP=<dir> to reproduce and bisect it. Use a "
-                  "CUDA device for a correct answer."
+                ? "Gemma 4 does not run correctly on Metal yet, and what is missing is now known: "
+                  "DUAL ROPE TABLES. Gemma 4 uses a different RoPE base per layer type -- full "
+                  "layers theta 1e6 with partial rotary 0.25, sliding layers theta 1e4 -- which "
+                  "the plan carries as Op::rope_table. PlanCudaEngine builds both; the Metal "
+                  "executor does not reference rope_table at all, so every layer gets one table "
+                  "and layer 0 comes out NaN. The container, the shared plan builder, the "
+                  "per-layer-type KV cache and its shared-layer aliasing are all in place -- this "
+                  "is the last piece. CPI_METAL_GEMMA4=1 runs it anyway; the output is not "
+                  "trustworthy. Use a CUDA device for a correct answer."
                 : "Gemma 4 currently requires a CUDA device");
       }
       return EngineChoice::PlanCuda;
