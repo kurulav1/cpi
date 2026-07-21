@@ -69,6 +69,10 @@ inline const char* attention_kind_name(AttentionKind kind) {
 // Architectural hyper-parameters for a LLaMA-family transformer model.
 // All fields correspond directly to the matching entries in the model's
 // config.json.  Default values match the LLaMA-7B configuration.
+// ADDING A FIELD HERE? Add it to CPI_CONFIG_FIELDS in model/config_json.hpp and bump the count in
+// config_json_test.cpp. That list is what serialises this struct into a `.cpi` container's
+// __metadata__; a field missing from it is written as its default and read back as its default,
+// silently -- which is precisely how container v7 shipped with all-zero vision geometry.
 struct LlamaConfig {
   std::int32_t vocab_size = 32000;         // Number of token embeddings.
   std::int32_t hidden_size = 4096;         // Dimension of the residual stream (d_model).

@@ -384,6 +384,11 @@ add_test(NAME metal_fp16_test COMMAND metal_fp16_test)
 # CUDA), so it lives OUTSIDE the backend guards and builds anywhere -- unlike image_preprocess_test,
 # which is stranded under the CUDA guard and so never built on a Mac. No add_test: it needs an
 # oracle dump from a torch/torchvision run that CI does not have.
+# LlamaConfig <-> .cpi __metadata__ round trip. Header-only and CPU-only, so it runs everywhere.
+add_executable(config_json_test src/tests/config_json_test.cpp)
+target_include_directories(config_json_test PRIVATE include)
+add_test(NAME config_json_test COMMAND config_json_test)
+
 add_executable(qwen2vl_preproc_test src/tests/qwen2vl_preproc_test.cpp)
 target_include_directories(qwen2vl_preproc_test PRIVATE include)
 target_link_libraries(qwen2vl_preproc_test PRIVATE llama_engine)
