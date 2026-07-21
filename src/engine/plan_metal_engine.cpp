@@ -170,6 +170,7 @@ constexpr int kGemmQTG = 32 * (64 / 32) * (kGemmQBN / 32);
 constexpr int kGemmMinTokens = 16;
 constexpr int kGemmQBK = 32;  // MUST match GEMM_QBK in the shader (quantized)
 constexpr int kQBlock = 8;      // MUST match Q_BLOCK in cpi_kernels.metal (scalar prefill)
+constexpr int kQBlockWide = 4;  // MUST match Q_BLOCK_WIDE (scalar prefill, head_dim > 256)
 constexpr int kQMMBlock = 16;   // MUST match QMM_BLOCK in cpi_kernels.metal (matrix-unit prefill)
 constexpr int kKeyBlock = 32;   // MUST match KEY_BLOCK in cpi_kernels.metal (scalar / decode)
 constexpr int kMMKeyBlock = 128; // MUST match MM_KEY_BLOCK (matrix-unit prefill attention)
@@ -809,24 +810,20 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
           op.kind == opplan::OpKind::LinearAttentionStep) {
         has_recurrent_ops_ = true;
       }
-      // An op that reads a WINDOW of another slot (Gemma 4's per-layer-input injection: layer L
-      // multiplies by per_layer_inputs[L], at aux_offset = L*ple) has the same restriction as a
-      // recurrent one, for a different reason. The offset is a flat displacement into in2, but
-      // slots are [token][dim] and in2's row stride (num_layers*ple) differs from the op's own
-      // (ple) -- so one displacement is only correct for a single token. Batched chunks would
-      // silently pair the wrong rows. Force token-by-token, like the delta-net family, until the
-      // kernel takes a per-operand stride.
-      // Still forces token-by-token, and the GeluMul stride alone is NOT enough to lift it.
-      // Making the PLE gate stride-aware was necessary but not sufficient: with batched chunks
-      // enabled the model produced pure special tokens, so something else on the Gemma path is
-      // not batch-safe (the per-layer-type KV geometry and the PLE prologue are the candidates,
-      // neither yet checked). Kept as the conservative choice -- ~16 tok/s prefill is slow, a
-      // wrong answer is worse. Lifting this is the open perf item.
-      // CPI_METAL_BATCH_AUX=1 opts INTO batched prefill for this plan, so the remaining
-      // batch-safety bug can be bisected without editing and rebuilding. Default stays
-      // token-by-token, which is slow but correct.
-      static const bool allow_batched_aux = std::getenv("CPI_METAL_BATCH_AUX") != nullptr;
-      if (op.aux_offset != 0 && !allow_batched_aux) {
+      // Ops that read a WINDOW of another slot (Gemma 4's per-layer-input injection: layer L
+      // multiplies by per_layer_inputs[L], at aux_offset = L*ple) used to force token-by-token
+      // prefill here, because a flat in2 displacement is only correct for one token. Two fixes
+      // lifted that: the PLE gate became stride-aware (ElemParams.row_len / in2_stride /
+      // in2_offset), and the "something else not batch-safe" that kept the restriction after
+      // that turned out to be the scalar prefill attention kernel -- its threadgroup arrays
+      // hold 256 floats per query, and Gemma's FULL layers (head_dim 512) wrote past them
+      // (cpi_attention_prefill_wide is the fix). Batched prefill now reproduces the sequential
+      // token stream, so aux_offset plans batch like everything else.
+      // CPI_METAL_SEQ_AUX=1 forces the old token-by-token prefill back, kept as the bisection
+      // lever: if a future Gemma-path bug needs isolating, sequential-vs-batched is the first
+      // split worth making.
+      static const bool force_seq_aux = std::getenv("CPI_METAL_SEQ_AUX") != nullptr;
+      if (op.aux_offset != 0 && force_seq_aux) {
         has_recurrent_ops_ = true;
       }
     }
@@ -1659,9 +1656,19 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
                             static_cast<std::size_t>(op.heads) * blocks, kTG, mmbufs, nullptr, 6, &p,
                             sizeof(p));
             }
-          } else {
+          } else if (op.head_dim <= 256) {
             const std::size_t blocks = static_cast<std::size_t>((T + kQBlock - 1) / kQBlock);
             ctx_.dispatch("cpi_attention_prefill", G::Groups,
+                          static_cast<std::size_t>(op.heads) * blocks, kTG, bufs, nullptr, 5, &p,
+                          sizeof(p));
+          } else {
+            // Gemma 4's FULL layers are head_dim 512: the scalar kernel's q_sh/acc hold 256
+            // floats per query, so a 512-wide head writes past them and corrupts the whole
+            // threadgroup -- every prefill token from the first full layer on came out NaN.
+            // The wide variant sizes them ATTN_MAX_HEAD_DIM and halves the query block to fit.
+            const std::size_t blocks =
+                static_cast<std::size_t>((T + kQBlockWide - 1) / kQBlockWide);
+            ctx_.dispatch("cpi_attention_prefill_wide", G::Groups,
                           static_cast<std::size_t>(op.heads) * blocks, kTG, bufs, nullptr, 5, &p,
                           sizeof(p));
           }

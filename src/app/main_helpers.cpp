@@ -906,54 +906,18 @@ EngineChoice resolve_engine(const ModelProbe& probe, bool cuda_available, bool m
   const bool use_metal = metal_available && !cuda_available && !force_cpu;
   switch (probe.kind) {
     case ModelFamilyKind::Gemma4:
-      // Gemma 4 on Metal is BUILT BUT NOT CORRECT YET, so it is opt-in via CPI_METAL_GEMMA4=1.
-      //
-      // What works: the config parse, the geometry, the shared plan (build_gemma4_plan), the PLE
-      // slots and the routing -- the model loads and runs end to end on an M4 with no crash.
-      // What does NOT: the logits come back NaN, and the cause is known. Gemma 4's KV cache is
-      // PER-LAYER-TYPE sized (E2B: 256x2 sliding, 512x1 full) and its last 20 layers ALIAS an
-      // earlier layer's cache instead of owning one -- see PlanCudaEngine's allocation, which
-      // mallocs only the non-shared layers and points the rest at their kv_source. PlanMetalEngine
-      // allocates one uniformly-sized cache per layer and aliases nothing, so every shared layer
-      // attends over memory nobody wrote.
-      //
-      // Shipping it enabled would trade an honest refusal for confident NaN, and this file argues
-      // elsewhere that a wrong answer nobody can attribute is worse than a refusal. So the default
-      // still refuses, and says why.
-      if (use_metal && std::getenv("CPI_METAL_GEMMA4") != nullptr) return EngineChoice::Gemma4Metal;
-      if (!use_gpu) {
-        // Name the actual blocker -- and it is NO LONGER the container. This message used to say
-        // "the Metal engine loads .ll2c only, so convert the model", which was true when written
-        // and became wrong in `6bac273`: PlanMetalEngine::open now routes a `.cpi` file AND a
-        // HuggingFace safetensors directory (plan_metal_engine.cpp, templated on the loader).
-        // Following that advice today means converting a container the engine already reads.
-        //
-        // What is actually missing, measured rather than assumed:
-        //   * NOT kernels. All 26 OpKinds are implemented on Metal, including the MoE ops and the
-        //     vision tower (PatchEmbed / Rope2D / AvgPoolPatches / Standardize). The one that
-        //     looks absent, AddRmsNorm, is emitted by no backend at all (see op_plan.hpp).
-        //   * The PLAN. `build_llama_plan` and `build_qwen35_plan` live in the shared, CUDA-free
-        //     op_plan_builder.cpp and Metal calls both. Gemma 4 has no sibling there -- its plan
-        //     is built inside PlanCudaEngine::build_plan, and its config parser
-        //     (parse_gemma4_st_config) reads into a Config nested in plan_cuda_engine.hpp, a
-        //     header that includes <cuda_runtime.h>. Both are CUDA-free logic in a CUDA TU.
-        // So the work is: lift that config into a shared header, add build_gemma4_plan beside its
-        // two siblings, allocate the per-layer-embedding buffers Metal has never needed, and route
-        // here. An extraction, not a port.
-        throw std::runtime_error(
-            metal_available
-                ? "Gemma 4 does not run correctly on Metal yet, and what is missing is now known: "
-                  "DUAL ROPE TABLES. Gemma 4 uses a different RoPE base per layer type -- full "
-                  "layers theta 1e6 with partial rotary 0.25, sliding layers theta 1e4 -- which "
-                  "the plan carries as Op::rope_table. PlanCudaEngine builds both; the Metal "
-                  "executor does not reference rope_table at all, so every layer gets one table "
-                  "and layer 0 comes out NaN. The container, the shared plan builder, the "
-                  "per-layer-type KV cache and its shared-layer aliasing are all in place -- this "
-                  "is the last piece. CPI_METAL_GEMMA4=1 runs it anyway; the output is not "
-                  "trustworthy. Use a CUDA device for a correct answer."
-                : "Gemma 4 currently requires a CUDA device");
-      }
-      return EngineChoice::PlanCuda;
+      // Gemma 4 on Metal is ON BY DEFAULT, same shape as Qwen3.5 below. It was opt-in via
+      // CPI_METAL_GEMMA4=1 while the batched-prefill smash was open (the scalar prefill kernel's
+      // threadgroup arrays held 256 floats per query; Gemma's FULL layers are head_dim 512 and
+      // wrote past them, so every prefill token from the first full layer on came out NaN --
+      // see cpi_attention_prefill_wide). With that fixed, batched and token-by-token prefill
+      // produce the same token stream, so the honest-refusal argument no longer applies: there
+      // is nothing left to refuse over. Text generation is verified on an M4; the vision tower
+      // is still untested on Metal.
+      if (use_gpu) return EngineChoice::PlanCuda;
+      if (use_metal) return EngineChoice::Gemma4Metal;
+      throw std::runtime_error(
+          "Gemma 4 currently requires a GPU (a CUDA device or Apple Silicon)");
     case ModelFamilyKind::Qwen35:
       // Metal runs Qwen3.5 as a shared op plan, verified token-identical to the CPU reference.
       // This branch has to exist for the probe fix above to be safe: teaching the probe to

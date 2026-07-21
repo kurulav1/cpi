@@ -7,6 +7,12 @@
 // Cost is 2 arrays * ATTN_MAX_HEAD_DIM floats per threadgroup: 4 KB at 512, up from 2 KB. Well
 // inside the 32 KB budget, but it is OCCUPANCY that pays -- so this is measured, not assumed.
 #define ATTN_MAX_HEAD_DIM 512
+// Query-block size of cpi_attention_prefill_wide, the head_dim > 256 variant of the scalar
+// prefill kernel. The main kernel's q_sh/acc are Q_BLOCK * 256 floats and CANNOT be raised to
+// ATTN_MAX_HEAD_DIM at Q_BLOCK 8 -- that is 2 * 16 KB and the whole threadgroup budget is 32 KB.
+// Halving the query block instead keeps the pair at 16 KB total. Only Gemma 4's FULL layers
+// (head_dim 512, 7 of 35 layers) take this kernel; the tuned 256 path is untouched.
+#define Q_BLOCK_WIDE 4
 // The matrix-unit prefill kernel's query-block size. Separate from Q_BLOCK because the scalar
 // kernel sizes its shared arrays for head_dim 256 (Gemma) and cannot afford a wider block --
 // raising a shared constant would silently break a path whose golden is skipped on any host
@@ -849,6 +855,125 @@ kernel void cpi_attention_prefill(device const half* q [[buffer(0)]],
     // 256 threads work -- the old thread-per-query version left 8 threads busy and 248 idle at
     // the barrier below. KEY_BLOCK == 32 == simd width, so lane j owns key j and the max/sum are
     // lane-parallel reductions.
+    const uint qi = simd_id;
+    if (qi < nq) {
+      // A fully masked block leaves new_max at -INFINITY; guard so exp(-inf - -inf) is not NaN.
+      const float sc = (lane < nk) ? sc_sh[qi * KEY_BLOCK + lane] : -INFINITY;
+      const float bmax = simd_max(sc);
+
+      const float old_max = m_sh[qi];
+      const float new_max = max(old_max, bmax);
+      const float rescale = (old_max == -INFINITY) ? 0.0f : exp(old_max - new_max);
+
+      const float w =
+          (lane < nk && sc != -INFINITY && new_max != -INFINITY) ? exp(sc - new_max) : 0.0f;
+      if (lane < nk) w_sh[qi * KEY_BLOCK + lane] = w;
+      const float bsum = simd_sum(w);
+
+      if (lane == 0u) {
+        l_sh[qi] = l_sh[qi] * rescale + bsum;
+        m_sh[qi] = new_max;
+        r_sh[qi] = rescale;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint c = lid; c < nq * hd; c += nthr) {
+      const uint qi = c / hd, i = c % hd;
+      float a = acc[qi * hd + i] * r_sh[qi];
+      for (uint j = 0u; j < nk; ++j) {
+        device const half* vt = v_cache + (ulong)(kb + j) * (ulong)kv_dim + kv_head * hd;
+        a += w_sh[qi * KEY_BLOCK + j] * float(vt[i]);
+      }
+      acc[qi * hd + i] = a;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  for (uint c = lid; c < nq * hd; c += nthr) {
+    const uint qi = c / hd, i = c % hd;
+    const float inv = (l_sh[qi] > 0.0f) ? 1.0f / l_sh[qi] : 0.0f;
+    out[(ulong)(t0 + qi) * (ulong)q_dim + head * hd + i] = half(acc[qi * hd + i] * inv);
+  }
+}
+
+// The head_dim > 256 copy of cpi_attention_prefill: same online softmax over KEY_BLOCK key
+// blocks, arrays sized ATTN_MAX_HEAD_DIM with the query block halved to fit them (see
+// Q_BLOCK_WIDE above). A separate kernel, NOT a widening of the one above -- q_sh/acc strides
+// are threadgroup-array sizes, so one kernel would pay the 512 footprint (and its occupancy)
+// on every model, and the 256 path is measured and tuned.
+kernel void cpi_attention_prefill_wide(device const half* q [[buffer(0)]],
+                                       device const half* k_cache [[buffer(1)]],
+                                       device const half* v_cache [[buffer(2)]],
+                                       device half* out [[buffer(3)]],
+                                       device const int* positions [[buffer(4)]],
+                                       constant AttnParams& p [[buffer(5)]],
+                                       uint gid [[threadgroup_position_in_grid]],
+                                       uint lid [[thread_position_in_threadgroup]],
+                                       uint nthr [[threads_per_threadgroup]]) {
+  const uint head = gid % p.heads;
+  const uint t0 = (gid / p.heads) * Q_BLOCK_WIDE;
+  if (t0 >= p.tokens) return;
+  const uint nq = min((uint)Q_BLOCK_WIDE, p.tokens - t0);
+
+  uint base = p.position;
+  if (p.use_position_buffer != 0u) base = uint(positions[0]);
+
+  const uint group = p.heads / p.kv_heads;
+  const uint kv_head = head / group;
+  const uint kv_dim = p.kv_heads * p.head_dim;
+  const uint q_dim = p.heads * p.head_dim;
+  const uint hd = p.head_dim;
+
+  const uint simd_id = lid / 32u;
+  const uint lane = lid % 32u;
+
+  threadgroup float q_sh[Q_BLOCK_WIDE * ATTN_MAX_HEAD_DIM];
+  threadgroup float acc[Q_BLOCK_WIDE * ATTN_MAX_HEAD_DIM];
+  threadgroup float sc_sh[Q_BLOCK_WIDE * KEY_BLOCK];
+  threadgroup float w_sh[Q_BLOCK_WIDE * KEY_BLOCK];
+  threadgroup float m_sh[Q_BLOCK_WIDE];  // running max, per query
+  threadgroup float l_sh[Q_BLOCK_WIDE];  // running sum, per query
+  threadgroup float r_sh[Q_BLOCK_WIDE];  // this block's rescale, per query
+
+  for (uint c = lid; c < nq * hd; c += nthr) {
+    const uint qi = c / hd, i = c % hd;
+    q_sh[qi * hd + i] = float(q[(ulong)(t0 + qi) * (ulong)q_dim + head * hd + i]);
+    acc[qi * hd + i] = 0.0f;
+  }
+  for (uint qi = lid; qi < nq; qi += nthr) {
+    m_sh[qi] = -INFINITY;
+    l_sh[qi] = 0.0f;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const uint last_pos = base + t0 + nq - 1u;
+  const uint first_pos = base + t0;
+  uint start = 0u;
+  if (p.window != 0u && first_pos + 1u > p.window) start = first_pos + 1u - p.window;
+
+  for (uint kb = start; kb <= last_pos; kb += KEY_BLOCK) {
+    const uint nk = min((uint)KEY_BLOCK, last_pos - kb + 1u);
+
+    for (uint pidx = lid; pidx < nq * nk; pidx += nthr) {
+      const uint qi = pidx / nk, j = pidx % nk;
+      const uint key = kb + j;
+      const uint pos_i = base + t0 + qi;
+
+      uint start_i = 0u;
+      if (p.window != 0u && pos_i + 1u > p.window) start_i = pos_i + 1u - p.window;
+
+      float d = -INFINITY;
+      if (key <= pos_i && key >= start_i) {  // causal mask, plus the sliding window
+        device const half* kt = k_cache + (ulong)key * (ulong)kv_dim + kv_head * hd;
+        float acc_d = 0.0f;
+        for (uint i = 0u; i < hd; ++i) acc_d += q_sh[qi * hd + i] * float(kt[i]);
+        d = acc_d * p.scale;
+      }
+      sc_sh[qi * KEY_BLOCK + j] = d;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
     const uint qi = simd_id;
     if (qi < nq) {
       // A fully masked block leaves new_max at -INFINITY; guard so exp(-inf - -inf) is not NaN.
