@@ -708,6 +708,12 @@ ModelPlan build_gemma4_plan(const Gemma4Geometry& g, const WeightSource& w) {
     ops.push_back(norm(Slot::X, Slot::XNorm, w.fp16(p + "pre_feedforward_layernorm.weight"), 1, H));
     ops.push_back(gemv(Slot::XNorm, Slot::Gate, w, p + "mlp.gate_proj.weight", inter, H));
     ops.push_back(gemv(Slot::XNorm, Slot::Up, w, p + "mlp.up_proj.weight", inter, H));
+    // NOTE: no fp16 headroom scaling here, deliberately. The GeGLU product DID overflow fp16
+    // while attention was returning zero -- an unattenuated residual made the pre-FFN norm huge --
+    // but that was a consequence of the under-specified KvStore, not a property of the model.
+    // With attention working, this product peaks around 45 against a 65504 ceiling. A scale op per
+    // layer to fix a problem that no longer exists is just cost. The shader keeps a clamp as a
+    // backstop, which is a no-op for anything in range.
     {
       Op m;
       m.kind = OpKind::GeluMul;

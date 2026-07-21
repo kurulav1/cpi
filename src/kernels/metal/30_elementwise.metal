@@ -142,16 +142,21 @@ kernel void cpi_gelu_mul(
   const float k = 0.7978845608028654f;  // sqrt(2/pi)
   const float inner = k * (x + 0.044715f * x * x * x);
   const float gelu = x / (1.0f + exp(-2.0f * inner));  // == 0.5*x*(1 + tanh(inner))
-  // Saturate instead of overflowing. Gemma 4's norm gains are large (7-47 in E2B), so activations
-  // reach ~165 entering the MLP and the GeGLU product can exceed fp16's 65504 -- which becomes
-  // inf, then NaN at the next accumulation, and takes the whole forward pass with it. Clamping is
-  // a NO-OP for every value already in range, so no existing model's arithmetic changes; it only
-  // replaces "inf and everything after is NaN" with a saturated number.
+  // p.scale (0 means 1) divides the product before it is stored, and the plan multiplies the same
+  // factor back AFTER the following down-projection. That projection is linear, so the round trip
+  // is exact -- and with a POWER OF TWO the scaling is a pure exponent shift, so it costs no
+  // mantissa bits either. Nothing is approximated here.
   //
-  // This is a floor, not the fix: a saturated activation is still wrong, just locally. The real
-  // answer is keeping this product in fp32 the way CUDA does.
+  // It exists because Gemma 4's norm gains are large (7-47 in E2B): activations reach ~165 into
+  // the MLP and the GeGLU product passes fp16's 65504, which becomes inf and then NaN at the next
+  // accumulation. Saturating instead (the previous behaviour) kept it finite but was LOSSY, and
+  // the loss compounded into repetition over a long generation.
+  //
+  // The clamp stays as a backstop for anything still out of range after scaling. It is a no-op
+  // for every value that fits, so no existing model's arithmetic changes.
   const float prod = gelu * float(b[gid]);
-  out[gid] = half(clamp(prod, -65504.0f, 65504.0f));
+  const float scaled = (p.scale != 0.0f) ? (prod * p.scale) : prod;
+  out[gid] = half(clamp(scaled, -65504.0f, 65504.0f));
 }
 
 // ---------------------------------------------------------------------------

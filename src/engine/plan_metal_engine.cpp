@@ -1769,7 +1769,10 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
       case OpKind::SiluMul:
       case OpKind::GeluMul: {
         const std::size_t n = static_cast<std::size_t>(op.cols) * static_cast<std::size_t>(T);
-        ElemParams p{static_cast<std::uint32_t>(n), 0.0f};
+        // op.scale rides along: GeluMul uses it to divide the product down into fp16 range, and
+        // the plan multiplies the same power-of-two back after the down-projection. 0 = no scaling,
+        // which is every model that is not Gemma 4.
+        ElemParams p{static_cast<std::uint32_t>(n), op.scale};
         const void* bufs[] = {slot(op.in), slot(op.in2), slot(op.out)};
         // aux_offset selects a WINDOW of in2 rather than its start -- Gemma 4's per-layer-input
         // injection multiplies by per_layer_inputs[L], layer L's slice of one packed
