@@ -907,17 +907,32 @@ EngineChoice resolve_engine(const ModelProbe& probe, bool cuda_available, bool m
   switch (probe.kind) {
     case ModelFamilyKind::Gemma4:
       if (!use_gpu) {
-        // Name the actual blocker. Gemma 4 is not missing kernels on Metal -- every OpKind the
-        // plan uses has one, and its vision tower's kernels are in 80_vision.metal -- it is
-        // missing a CONTAINER: PlanCudaEngine::open reads a .cpi (or a safetensors dir), while
-        // PlanMetalEngine::open goes through model::WeightLoader, which reads .ll2c only. So the
-        // work is container support (or a .cpi -> .ll2c conversion), not a kernel port.
+        // Name the actual blocker -- and it is NO LONGER the container. This message used to say
+        // "the Metal engine loads .ll2c only, so convert the model", which was true when written
+        // and became wrong in `6bac273`: PlanMetalEngine::open now routes a `.cpi` file AND a
+        // HuggingFace safetensors directory (plan_metal_engine.cpp, templated on the loader).
+        // Following that advice today means converting a container the engine already reads.
+        //
+        // What is actually missing, measured rather than assumed:
+        //   * NOT kernels. All 26 OpKinds are implemented on Metal, including the MoE ops and the
+        //     vision tower (PatchEmbed / Rope2D / AvgPoolPatches / Standardize). The one that
+        //     looks absent, AddRmsNorm, is emitted by no backend at all (see op_plan.hpp).
+        //   * The PLAN. `build_llama_plan` and `build_qwen35_plan` live in the shared, CUDA-free
+        //     op_plan_builder.cpp and Metal calls both. Gemma 4 has no sibling there -- its plan
+        //     is built inside PlanCudaEngine::build_plan, and its config parser
+        //     (parse_gemma4_st_config) reads into a Config nested in plan_cuda_engine.hpp, a
+        //     header that includes <cuda_runtime.h>. Both are CUDA-free logic in a CUDA TU.
+        // So the work is: lift that config into a shared header, add build_gemma4_plan beside its
+        // two siblings, allocate the per-layer-embedding buffers Metal has never needed, and route
+        // here. An extraction, not a port.
         throw std::runtime_error(
             metal_available
-                ? "Gemma 4 does not run on Metal yet: the Metal engine loads .ll2c containers "
-                  "(model::WeightLoader) and Gemma 4 ships as .cpi / safetensors, which only the "
-                  "CUDA plan engine reads. This is a container gap, not a missing kernel. Use a "
-                  "CUDA device, or convert the model to .ll2c."
+                ? "Gemma 4 does not run on Metal yet. The container gap is CLOSED -- the Metal "
+                  "engine reads .cpi and safetensors directories -- so converting the model will "
+                  "NOT help. What is missing is the plan builder: Gemma 4's op plan and config "
+                  "parser still live inside the CUDA engine, while Llama and Qwen3.5 build theirs "
+                  "from the shared op_plan_builder that Metal already calls. Every kernel it "
+                  "needs exists on Metal. Use a CUDA device for now."
                 : "Gemma 4 currently requires a CUDA device");
       }
       return EngineChoice::PlanCuda;
