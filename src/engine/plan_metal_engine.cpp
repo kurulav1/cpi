@@ -781,6 +781,16 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
           op.kind == opplan::OpKind::LinearAttentionStep) {
         has_recurrent_ops_ = true;
       }
+      // An op that reads a WINDOW of another slot (Gemma 4's per-layer-input injection: layer L
+      // multiplies by per_layer_inputs[L], at aux_offset = L*ple) has the same restriction as a
+      // recurrent one, for a different reason. The offset is a flat displacement into in2, but
+      // slots are [token][dim] and in2's row stride (num_layers*ple) differs from the op's own
+      // (ple) -- so one displacement is only correct for a single token. Batched chunks would
+      // silently pair the wrong rows. Force token-by-token, like the delta-net family, until the
+      // kernel takes a per-operand stride.
+      if (op.aux_offset != 0) {
+        has_recurrent_ops_ = true;
+      }
     }
   }
 
@@ -1736,8 +1746,18 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
         const std::size_t n = static_cast<std::size_t>(op.cols) * static_cast<std::size_t>(T);
         ElemParams p{static_cast<std::uint32_t>(n), 0.0f};
         const void* bufs[] = {slot(op.in), slot(op.in2), slot(op.out)};
+        // aux_offset selects a WINDOW of in2 rather than its start -- Gemma 4's per-layer-input
+        // injection multiplies by per_layer_inputs[L], layer L's slice of one packed
+        // [num_layers][ple] table. Dropping it (which this dispatch did) makes every layer
+        // multiply by LAYER 0's window: correct at layer 0 by accident, wrong everywhere after.
+        // CUDA does the same thing as pointer arithmetic (S(op.in2) + op.aux_offset); here it is a
+        // buffer offset in BYTES, which is what the LmHead case below already does for its input.
+        // Safe as a flat displacement only because an aux_offset plan runs token-by-token -- see
+        // has_recurrent_ops_ above, which this op now sets.
+        const std::size_t aux_bytes = static_cast<std::size_t>(op.aux_offset) * sizeof(std::uint16_t);
+        const std::size_t offs[] = {0, aux_bytes, 0};
         ctx_.dispatch(op.kind == OpKind::SiluMul ? "cpi_silu_mul" : "cpi_gelu_mul", G::Threads, n,
-                      kTG, bufs, nullptr, 3, &p, sizeof(p));
+                      kTG, bufs, op.aux_offset != 0 ? offs : nullptr, 3, &p, sizeof(p));
         break;
       }
       // ---- linear attention (delta-net) and gated attention -----------------
