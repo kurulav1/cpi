@@ -521,5 +521,209 @@ ModelPlan build_qwen35_plan(const Qwen35Geometry& g, const WeightSource& w) {
   return plan;
 }
 
+ModelPlan build_gemma4_plan(const Gemma4Geometry& g, const WeightSource& w) {
+  if (g.num_layers <= 0 || g.hidden <= 0 || g.heads <= 0)
+    throw std::runtime_error("build_gemma4_plan: degenerate geometry");
+  if (static_cast<int>(g.layer_full.size()) != g.num_layers)
+    throw std::runtime_error("build_gemma4_plan: layer_full must be num_layers long");
+  if (!g.layer_scalar.empty() && static_cast<int>(g.layer_scalar.size()) != g.num_layers)
+    throw std::runtime_error("build_gemma4_plan: layer_scalar must be empty or num_layers long");
+
+  ModelPlan plan;
+  const int H = g.hidden;
+  const std::string& WP = g.weight_prefix;
+
+  // Every RmsNorm below carries `eps` explicitly. The CUDA executor reads a global cfg_.rms_eps
+  // and would not notice it missing; the Metal executor reads op.eps, so a plan built without it
+  // normalises by 1/sqrt(mean) with no epsilon at all. Same plan, two executors, and only one of
+  // them would have told you.
+  auto norm = [&](Slot in, Slot out, const void* weight, int rows, int cols) {
+    Op o;
+    o.kind = OpKind::RmsNorm;
+    o.in = in;
+    o.out = out;
+    o.weight = weight;  // null => weightless (ones), used for Gemma's v-norm
+    o.rows = rows;
+    o.cols = cols;
+    o.eps = g.rms_eps;
+    return o;  // NOTE: norm_offset stays false -- Gemma 4 stores raw gains, not (w - 1).
+  };
+  auto scale = [&](Slot s, int len, float sc) {
+    Op o;
+    o.kind = OpKind::ScaleCopy;
+    o.in = s;
+    o.out = s;
+    o.cols = len;
+    o.scale = sc;
+    return o;
+  };
+  auto add_into = [&](Slot dst, Slot src, int cols) {
+    Op o;
+    o.kind = OpKind::AddInplace;
+    o.out = dst;
+    o.in = src;
+    o.cols = cols;
+    return o;
+  };
+  auto embed = [&](const std::string& name, Slot out, int dim) {
+    Op o;
+    o.kind = OpKind::EmbeddingLookup;
+    o.out = out;
+    o.cols = dim;
+    o.weight = w.fp16(name);
+    return o;
+  };
+
+  // ── prologue: token -> embeddings (+ scale, and the PLE build when present) ──
+  {
+    std::vector<Op>& pro = plan.prologue;
+    pro.push_back(embed(WP + "embed_tokens.weight", Slot::X, H));
+    pro.push_back(scale(Slot::X, H, std::sqrt(static_cast<float>(H))));
+    // Image embeddings splice in HERE, before anything reads X -- and the per-layer-input
+    // projection below DOES read X, which is why this marker is before it and not after the
+    // prologue (HF projects the per-layer inputs from the post-scatter embeddings).
+    plan.embed_ready = pro.size();
+    if (g.has_ple()) {
+      const int ple = g.ple;
+      const int tot = g.num_layers * ple;
+      // ple_raw = embed_tokens_per_layer[token] * sqrt(ple)
+      pro.push_back(embed(WP + "embed_tokens_per_layer.weight", Slot::PleRaw, tot));
+      pro.push_back(scale(Slot::PleRaw, tot, std::sqrt(static_cast<float>(ple))));
+      // ple = rmsnorm( (W_proj . x) * hidden^-0.5 )   [x = the scaled embeddings in Slot::X]
+      pro.push_back(
+          gemv(Slot::X, Slot::PleAll, w, WP + "per_layer_model_projection.weight", tot, H));
+      pro.push_back(scale(Slot::PleAll, tot, std::pow(static_cast<float>(H), -0.5f)));
+      pro.push_back(norm(Slot::PleAll, Slot::PleAll, w.fp16(WP + "per_layer_projection_norm.weight"),
+                         g.num_layers, ple));
+      // per_layer_inputs = (ple + ple_raw) * 2^-0.5
+      pro.push_back(add_into(Slot::PleAll, Slot::PleRaw, tot));
+      pro.push_back(scale(Slot::PleAll, tot, std::pow(2.0f, -0.5f)));
+    }
+  }
+
+  // ── the tower ──
+  plan.layers.assign(g.num_layers, LayerPlan{});
+  for (int L = 0; L < g.num_layers; ++L) {
+    const std::string p = WP + "layers." + std::to_string(L) + ".";
+    const int hd = g.head_dim_of(L);
+    const int nq = g.heads, nkv = g.kv_heads_of(L);
+    const int qdim = nq * hd, kvdim = nkv * hd;
+    const bool full = g.layer_full[L] != 0;
+    const bool shared = g.is_shared(L);
+    const int inter = g.inter * ((g.use_double_wide_mlp && shared) ? 2 : 1);
+
+    LayerPlan& lp = plan.layers[L];
+    lp.layer_index = L;
+    std::vector<Op>& ops = lp.ops;
+    auto rope = [&](Slot s, int heads) {
+      Op o;
+      o.kind = OpKind::Rope;
+      o.in = s;
+      o.out = s;
+      o.heads = heads;
+      o.head_dim = hd;
+      o.rope_table = full ? RopeTable::Full : RopeTable::Sliding;
+      return o;
+    };
+
+    // --- attention ---
+    ops.push_back(norm(Slot::X, Slot::XNorm, w.fp16(p + "input_layernorm.weight"), 1, H));
+    ops.push_back(gemv(Slot::XNorm, Slot::Q, w, p + "self_attn.q_proj.weight", qdim, H));
+    ops.push_back(norm(Slot::Q, Slot::Q, w.fp16(p + "self_attn.q_norm.weight"), nq, hd));
+    ops.push_back(rope(Slot::Q, nq));
+    // A KV-SHARED layer projects no K/V at all: it reads the cache another layer filled. Emitting
+    // the projections anyway would not just waste work, it would overwrite that cache.
+    if (!shared) {
+      ops.push_back(gemv(Slot::XNorm, Slot::K, w, p + "self_attn.k_proj.weight", kvdim, H));
+      if (g.k_eq_v(L)) {
+        Op c;  // V shares the RAW k_proj output -- copied before k_norm and rope touch K.
+        c.kind = OpKind::CopySlot;
+        c.in = Slot::K;
+        c.out = Slot::V;
+        c.cols = kvdim;
+        ops.push_back(c);
+      } else {
+        ops.push_back(gemv(Slot::XNorm, Slot::V, w, p + "self_attn.v_proj.weight", kvdim, H));
+      }
+      ops.push_back(norm(Slot::K, Slot::K, w.fp16(p + "self_attn.k_norm.weight"), nkv, hd));
+      ops.push_back(rope(Slot::K, nkv));
+      ops.push_back(norm(Slot::V, Slot::V, nullptr, nkv, hd));  // weightless v-norm (ones)
+      Op st;
+      st.kind = OpKind::KvStore;
+      st.cols = kvdim;
+      ops.push_back(st);
+    }
+    // Net attention scale is 1.0: pre-scale Q by sqrt(hd) to cancel the kernel's 1/sqrt(hd).
+    ops.push_back(scale(Slot::Q, qdim, std::sqrt(static_cast<float>(hd))));
+    {
+      Op a;
+      a.kind = OpKind::Attention;
+      a.in = Slot::Q;
+      a.out = Slot::Att;
+      a.heads = nq;
+      a.kv_heads = nkv;
+      a.head_dim = hd;
+      a.full_attention = full;
+      a.sliding_window = g.sliding_window;
+      ops.push_back(a);
+    }
+    ops.push_back(gemv(Slot::Att, Slot::Tmp, w, p + "self_attn.o_proj.weight", H, qdim));
+    ops.push_back(norm(Slot::Tmp, Slot::Tmp, w.fp16(p + "post_attention_layernorm.weight"), 1, H));
+    ops.push_back(add_into(Slot::X, Slot::Tmp, H));
+
+    // --- MLP (GeGLU, double-wide on the shared layers) ---
+    ops.push_back(norm(Slot::X, Slot::XNorm, w.fp16(p + "pre_feedforward_layernorm.weight"), 1, H));
+    ops.push_back(gemv(Slot::XNorm, Slot::Gate, w, p + "mlp.gate_proj.weight", inter, H));
+    ops.push_back(gemv(Slot::XNorm, Slot::Up, w, p + "mlp.up_proj.weight", inter, H));
+    {
+      Op m;
+      m.kind = OpKind::GeluMul;
+      m.in = Slot::Gate;
+      m.in2 = Slot::Up;
+      m.out = Slot::Inter;
+      m.cols = inter;
+      ops.push_back(m);
+    }
+    ops.push_back(gemv(Slot::Inter, Slot::Tmp, w, p + "mlp.down_proj.weight", H, inter));
+    ops.push_back(norm(Slot::Tmp, Slot::Tmp, w.fp16(p + "post_feedforward_layernorm.weight"), 1, H));
+    ops.push_back(add_into(Slot::X, Slot::Tmp, H));
+
+    // --- Per-Layer Input injection ---
+    if (g.has_ple()) {
+      const int ple = g.ple;
+      ops.push_back(gemv(Slot::X, Slot::PleGate, w, p + "per_layer_input_gate.weight", ple, H));
+      Op gt;
+      gt.kind = OpKind::GeluMul;
+      gt.in = Slot::PleGate;
+      gt.out = Slot::PleGate;
+      gt.cols = ple;
+      gt.in2 = Slot::PleAll;     // gelu(gate) * per_layer_input[L]...
+      gt.aux_offset = L * ple;   // ...which is layer L's window of the packed table
+      ops.push_back(gt);
+      ops.push_back(gemv(Slot::PleGate, Slot::Tmp, w, p + "per_layer_projection.weight", H, ple));
+      ops.push_back(
+          norm(Slot::Tmp, Slot::Tmp, w.fp16(p + "post_per_layer_input_norm.weight"), 1, H));
+      ops.push_back(add_into(Slot::X, Slot::Tmp, H));
+    }
+
+    // --- per-layer output gain ---
+    ops.push_back(scale(Slot::X, H, g.layer_scalar.empty() ? 1.0f : g.layer_scalar[L]));
+  }
+
+  // ── epilogue: final norm -> LM head. The logit softcap stays host-side. ──
+  {
+    std::vector<Op>& epi = plan.epilogue;
+    epi.push_back(norm(Slot::X, Slot::XNorm, w.fp16(WP + "norm.weight"), 1, H));
+    Op h;
+    h.kind = OpKind::LmHead;
+    h.in = Slot::XNorm;
+    h.weight = w.fp16(WP + "embed_tokens.weight");  // tied
+    h.cols = g.vocab;
+    h.in_dim = H;
+    epi.push_back(h);
+  }
+  return plan;
+}
+
 }  // namespace opplan
 }  // namespace engine

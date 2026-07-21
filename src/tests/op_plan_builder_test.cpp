@@ -266,6 +266,127 @@ int main() {
     expect(p3.prologue[1].scale > 29.9f && p3.prologue[1].scale < 30.0f, "scale = sqrt(hidden)");
   }
 
+  // ---- Gemma 4 -------------------------------------------------------------
+  //
+  // E2B's shape, scaled down so the op lists stay readable: alternating sliding/full layers with
+  // a DIFFERENT head_dim each, the tail of them sharing KV, per-layer embeddings, and a
+  // double-wide MLP on the shared layers. Each check below is a rule that fails silently -- the
+  // model still runs and still produces fluent-looking text when any of them is wrong.
+  {
+    Gemma4Geometry gg;
+    gg.num_layers = 6;
+    gg.hidden = 64;
+    gg.inter = 128;
+    gg.vocab = 999;
+    gg.heads = 4;
+    // Deliberately NOT 1e-6f: that is Op::eps's own default, so a builder that never assigns eps
+    // would still satisfy the "carries eps" check below. The control caught this test passing
+    // while measuring nothing -- the value has to be one the default cannot accidentally match.
+    gg.rms_eps = 7.5e-5f;
+    gg.sliding_window = 512;
+    gg.head_dim_sliding = 16;
+    gg.head_dim_full = 32;
+    gg.kv_heads_sliding = 2;
+    gg.kv_heads_full = 1;
+    gg.layer_full = {0, 0, 1, 0, 0, 1};
+    gg.first_shared_layer = 4;  // layers 4,5 reuse someone else's K/V
+    gg.use_double_wide_mlp = true;
+    gg.ple = 8;
+    gg.layer_scalar = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+
+    FakeWeights wg;
+    const ModelPlan pg = build_gemma4_plan(gg, wg);
+
+    expect(static_cast<int>(pg.layers.size()) == 6, "gemma4: one LayerPlan per layer");
+    // The image splice point must sit after the embedding scale but BEFORE the PLE build, because
+    // the per-layer inputs are projected FROM the embeddings. Splicing after the whole prologue
+    // would compute them from the placeholder token instead of the image.
+    expect(pg.embed_ready == 2, "gemma4: embed_ready precedes the PLE build");
+    expect(pg.prologue.size() > 2, "gemma4: PLE build emitted into the prologue");
+
+    // KV sharing: a shared layer must project NO K/V and store nothing -- emitting the projections
+    // would not merely waste work, it would overwrite the cache it is supposed to be reading.
+    auto has_kind = [](const std::vector<Op>& ops, OpKind k) {
+      for (const Op& o : ops)
+        if (o.kind == k) return true;
+      return false;
+    };
+    expect(has_kind(pg.layers[0].ops, OpKind::KvStore), "gemma4: layer 0 stores KV");
+    expect(!has_kind(pg.layers[4].ops, OpKind::KvStore), "gemma4: shared layer 4 stores no KV");
+    expect(!has_kind(pg.layers[5].ops, OpKind::KvStore), "gemma4: shared layer 5 stores no KV");
+
+    // Per-layer-type head_dim / kv-heads. One head_dim cannot describe this model.
+    const Op* att0 = nullptr;
+    const Op* att2 = nullptr;
+    for (const Op& o : pg.layers[0].ops)
+      if (o.kind == OpKind::Attention) att0 = &o;
+    for (const Op& o : pg.layers[2].ops)
+      if (o.kind == OpKind::Attention) att2 = &o;
+    expect(att0 && att0->head_dim == 16 && att0->kv_heads == 2, "gemma4: sliding layer 16/2");
+    expect(att2 && att2->head_dim == 32 && att2->kv_heads == 1, "gemma4: full layer 32/1");
+    expect(att0 && !att0->full_attention, "gemma4: layer 0 is sliding");
+    expect(att2 && att2->full_attention, "gemma4: layer 2 is full");
+
+    // THE TRAP THAT PROMPTED THIS TEST: the CUDA executor reads a global rms_eps and would run
+    // fine with op.eps unset; the Metal executor reads op.eps. A plan missing it normalises with
+    // no epsilon on one backend only.
+    int norms = 0, norms_with_eps = 0, offset_norms = 0;
+    auto scan = [&](const std::vector<Op>& ops) {
+      for (const Op& o : ops) {
+        if (o.kind != OpKind::RmsNorm) continue;
+        ++norms;
+        if (o.eps == gg.rms_eps) ++norms_with_eps;
+        if (o.norm_offset) ++offset_norms;
+      }
+    };
+    scan(pg.prologue);
+    for (const LayerPlan& lp : pg.layers) scan(lp.ops);
+    scan(pg.epilogue);
+    expect(norms > 0 && norms == norms_with_eps, "gemma4: EVERY RmsNorm carries eps");
+    // Gemma 4 stores raw gains, not (w - 1). Applying the offset form doubles every norm, which
+    // compounds and overflows fp16 around layer 2.
+    expect(offset_norms == 0, "gemma4: no RmsNorm uses the (1+w) offset form");
+
+    // PLE injection reads layer L's window of the packed per-layer table.
+    for (int L = 0; L < gg.num_layers; ++L) {
+      bool ok = false;
+      for (const Op& o : pg.layers[L].ops)
+        if (o.kind == OpKind::GeluMul && o.in2 == Slot::PleAll && o.aux_offset == L * gg.ple)
+          ok = true;
+      expect(ok, "gemma4: layer " + std::to_string(L) + " gates its own PLE window");
+    }
+
+    // Double-wide MLP on the shared layers only.
+    auto mlp_width = [&](int L) {
+      for (const Op& o : pg.layers[L].ops)
+        if (o.kind == OpKind::GeluMul && o.out == Slot::Inter) return o.cols;
+      return -1;
+    };
+    expect(mlp_width(0) == 128, "gemma4: normal layer MLP is inter");
+    expect(mlp_width(4) == 256, "gemma4: shared layer MLP is double-wide");
+
+    // Per-layer output gain, in order.
+    expect(pg.layers[3].ops.back().kind == OpKind::ScaleCopy &&
+               pg.layers[3].ops.back().scale == 4.0f,
+           "gemma4: layer ends with its own scalar gain");
+
+    // ---- the 12B / MoE shape: no PLE at all ----
+    Gemma4Geometry g12 = gg;
+    g12.ple = 0;
+    g12.first_shared_layer = 0;  // no sharing either
+    FakeWeights w12;
+    const ModelPlan p12 = build_gemma4_plan(g12, w12);
+    expect(p12.prologue.size() == 2, "gemma4: no PLE => prologue is just embed+scale");
+    bool any_ple = false;
+    for (const LayerPlan& lp : p12.layers)
+      for (const Op& o : lp.ops)
+        if (o.in2 == Slot::PleAll || o.out == Slot::PleGate) any_ple = true;
+    expect(!any_ple, "gemma4: no PLE => no per-layer injection");
+    for (int L = 0; L < g12.num_layers; ++L)
+      expect(has_kind(p12.layers[L].ops, OpKind::KvStore),
+             "gemma4: no sharing => every layer stores KV");
+  }
+
   std::printf("op_plan_builder_test: %s\n", failures == 0 ? "PASS" : "FAIL");
   return failures == 0 ? 0 : 1;
 }

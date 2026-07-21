@@ -169,5 +169,70 @@ struct Qwen35Geometry {
 
 ModelPlan build_qwen35_plan(const Qwen35Geometry& g, const WeightSource& w);
 
+// Geometry of a Gemma 4 decoder. A third sibling rather than a flag on LlamaGeometry, for the
+// reason given at num_experts above: this family's per-layer geometry is not uniform, and its MoE
+// is not Mixtral's. Layers alternate SLIDING and FULL attention with a DIFFERENT head_dim, kv-head
+// count and RoPE base each (E2B: 256/512), the last `num_kv_shared_layers` reuse an earlier
+// layer's K/V instead of projecting their own, and E2B additionally carries Per-Layer Embeddings
+// that the prologue folds in.
+//
+// Every op this needs already exists and every backend executes them with the same kernels -- this
+// is the shared core, not a fork. Confirmed by counting: all 26 OpKinds are implemented on both
+// the CUDA and Metal executors.
+struct Gemma4Geometry {
+  int num_layers = 0;
+  int hidden = 0;
+  int inter = 0;  // MLP intermediate, DOUBLED on shared layers when use_double_wide_mlp
+  int vocab = 0;
+  int heads = 0;
+  float rms_eps = 1e-6f;
+  int sliding_window = 0;
+
+  // Per layer TYPE, because one head_dim cannot describe this model.
+  int head_dim_sliding = 0, head_dim_full = 0;
+  int kv_heads_sliding = 0, kv_heads_full = 0;
+
+  // Per layer: 1 = full attention, 0 = sliding. MUST be num_layers long.
+  std::vector<int> layer_full;
+
+  // Layers at or after this index reuse another layer's K/V and project none of their own.
+  // 0 means no sharing at all (the 12B and the MoE).
+  int first_shared_layer = 0;
+  bool attention_k_eq_v = false;   // full layers: V reuses the raw k_proj output, there is no v_proj
+  bool use_double_wide_mlp = false;
+
+  // Per-Layer Embeddings width. 0 = this checkpoint has none (12B, MoE), and the whole PLE
+  // prologue and per-layer injection drop out.
+  int ple = 0;
+
+  // Per-layer output gain. HOST floats, not weight handles: the value is multiplied into a
+  // ScaleCopy op, so the builder needs the NUMBER, and only a backend knows how to read bytes out
+  // of its container. Empty means "all 1.0", which is what a checkpoint without layer_scalar means.
+  std::vector<float> layer_scalar;
+
+  // Gemma 4 ships HuggingFace tensor names, so both prefixes are explicit rather than assumed.
+  std::string weight_prefix = "model.language_model.";
+
+  [[nodiscard]] bool has_ple() const { return ple > 0; }
+  [[nodiscard]] int head_dim_of(int layer) const {
+    return layer_full[layer] ? head_dim_full : head_dim_sliding;
+  }
+  [[nodiscard]] int kv_heads_of(int layer) const {
+    return layer_full[layer] ? kv_heads_full : kv_heads_sliding;
+  }
+  // Only the FULL layers of a k_eq_v checkpoint share V with K.
+  [[nodiscard]] bool k_eq_v(int layer) const { return attention_k_eq_v && layer_full[layer] != 0; }
+  [[nodiscard]] bool is_shared(int layer) const {
+    return first_shared_layer > 0 && layer >= first_shared_layer;
+  }
+};
+
+// NOTE on RMSNorm: Gemma 4 uses PLAIN rmsnorm, NOT the (1 + w) form. Gemma 1/2 store their norm
+// weights as (w - 1); Gemma 4 does not -- measured on the E2B checkpoint, whose input_layernorm
+// values are 9.375 / 7.97 / 10.69, i.e. raw multiplicative gains rather than offsets around zero.
+// Applying the offset form here scales by ~2 at every norm, which compounds and overflows fp16 by
+// about layer 2. So no op below sets norm_offset.
+ModelPlan build_gemma4_plan(const Gemma4Geometry& g, const WeightSource& w);
+
 }  // namespace opplan
 }  // namespace engine
