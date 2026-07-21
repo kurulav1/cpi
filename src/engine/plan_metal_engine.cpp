@@ -1,6 +1,7 @@
 // Metal executor for the op-plan IR. See plan_metal_engine.hpp.
 
 #include "engine/plan_metal_engine.hpp"
+#include "engine/plan_model_config.hpp"
 #include "model/config_json.hpp"
 #include <filesystem>
 #include "runtime/fp16.hpp"
@@ -555,16 +556,41 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
   }
   if (from_safetensors_) {
     st_.open(weights_path);
-    if (!st_.has_metadata()) {
+    // Gemma 4 ships as a HuggingFace DIRECTORY: config.json beside the weights, and no
+    // __metadata__ block at all. Its config therefore has to come from config.json, parsed by the
+    // one Gemma 4 parser (engine::parse_gemma4_text_config) rather than a second copy here.
+    //
+    // Checking config.json BEFORE __metadata__ is deliberate: a `.cpi` written by
+    // convert_gemma4.py does carry a metadata block, but in GEMMA's own schema (family / hidden /
+    // vocab), which model::config_from_json does not read -- it would hand back a fully defaulted
+    // config and the model would load at the wrong shape. That is the same trap probe_model fell
+    // into, and a defaulted parse is indistinguishable from a successful one.
+    std::string gemma_cfg;
+    {
+      namespace fs = std::filesystem;
+      const fs::path cj = fs::path(weights_path) / "config.json";
+      std::error_code ec;
+      if (fs::is_directory(weights_path, ec) && fs::exists(cj, ec)) {
+        const std::string raw = engine::mini::read_text_file(cj);
+        if (engine::config_json_is_gemma4(raw)) gemma_cfg = raw;
+      }
+    }
+    if (!gemma_cfg.empty()) {
+      cfg_ = engine::gemma4_to_llama_config(engine::parse_gemma4_text_config(gemma_cfg));
+    } else if (st_.has_metadata()) {
+      cfg_ = model::config_from_json(st_.metadata_json());
+    } else {
       throw std::runtime_error(
           "safetensors container has no __metadata__ config block: " + weights_path +
           " -- repack it with ll2c_to_cpi, which writes one.");
     }
-    cfg_ = model::config_from_json(st_.metadata_json());
   } else {
     weights_.open(weights_path);
     cfg_ = weights_.config();
   }
+  // Gemma 4 is the one family here whose tensors carry HuggingFace names and whose geometry is
+  // per-layer rather than uniform, so the paths below branch on it rather than on the container.
+  const bool is_gemma4 = cfg_.model_family == model::ModelFamily::Gemma4;
 
   // --rope-theta, applied BEFORE the plan is built so the builder folds the override into every
   // Rope op's scale. This used to be dropped on the floor: the flag parsed, the run succeeded, and
@@ -593,24 +619,40 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
   //     find the first full-attention layer instead of assuming layer 0 is one;
   //   - on that family wq projects [q | gate] per head, so its row count is 2*q_dim. Halving it
   //     is what attn_output_gate is recorded in the container for.
-  int probe_layer = 0;
-  while (probe_layer < cfg_.num_layers &&
-         cfg_.attention_kind_for_layer(probe_layer) == model::AttentionKind::Linear) {
-    ++probe_layer;
-  }
-  if (probe_layer >= cfg_.num_layers) {
-    throw std::runtime_error("model has no full-attention layer to derive head_dim from");
-  }
-  const std::size_t wq_bytes =
-      raw_bytes("layers." + std::to_string(probe_layer) + ".attention.wq");
-  int q_dim = static_cast<int>(wq_bytes / (static_cast<std::size_t>(H) * sizeof(std::uint16_t)));
-  if (cfg_.attn_output_gate) {
-    q_dim /= 2;
-  }
-  const int head_dim = q_dim / cfg_.num_heads;
-  const int kv_dim = cfg_.num_kv_heads * head_dim;
-  if (head_dim <= 0 || q_dim != cfg_.num_heads * head_dim) {
-    throw std::runtime_error("could not derive head_dim from the Q projection's shape");
+  int q_dim = 0;
+  int head_dim = 0;
+  int kv_dim = 0;
+  if (is_gemma4) {
+    // Gemma 4 states head_dim in its config, per LAYER TYPE, and its tensors use HuggingFace
+    // names -- so there is no "layers.N.attention.wq" to measure and nothing to derive. The slots
+    // below are sized for the WIDER of the two types, because one buffer serves both.
+    head_dim = std::max(cfg_.head_dim_sliding, cfg_.head_dim_full);
+    q_dim = cfg_.num_heads * head_dim;
+    kv_dim = std::max(cfg_.num_kv_heads_sliding * cfg_.head_dim_sliding,
+                      cfg_.num_kv_heads_full * cfg_.head_dim_full);
+    if (head_dim <= 0 || kv_dim <= 0) {
+      throw std::runtime_error("Gemma 4 config carries no per-layer-type head_dim / kv heads");
+    }
+  } else {
+    int probe_layer = 0;
+    while (probe_layer < cfg_.num_layers &&
+           cfg_.attention_kind_for_layer(probe_layer) == model::AttentionKind::Linear) {
+      ++probe_layer;
+    }
+    if (probe_layer >= cfg_.num_layers) {
+      throw std::runtime_error("model has no full-attention layer to derive head_dim from");
+    }
+    const std::size_t wq_bytes =
+        raw_bytes("layers." + std::to_string(probe_layer) + ".attention.wq");
+    q_dim = static_cast<int>(wq_bytes / (static_cast<std::size_t>(H) * sizeof(std::uint16_t)));
+    if (cfg_.attn_output_gate) {
+      q_dim /= 2;
+    }
+    head_dim = q_dim / cfg_.num_heads;
+    kv_dim = cfg_.num_kv_heads * head_dim;
+    if (head_dim <= 0 || q_dim != cfg_.num_heads * head_dim) {
+      throw std::runtime_error("could not derive head_dim from the Q projection's shape");
+    }
   }
 
   opplan::LlamaGeometry g;
@@ -690,6 +732,41 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
           cfg_.attention_kind_for_layer(L) == model::AttentionKind::Linear;
     }
     plan_ = opplan::build_qwen35_plan(q, *wsrc_);
+  } else if (is_gemma4) {
+    opplan::Gemma4Geometry gg;
+    gg.num_layers = cfg_.num_layers;
+    gg.hidden = H;
+    gg.inter = cfg_.intermediate_size;
+    gg.vocab = cfg_.vocab_size;
+    gg.heads = cfg_.num_heads;
+    gg.rms_eps = cfg_.norm_eps;
+    gg.sliding_window = cfg_.sliding_window;
+    gg.head_dim_sliding = cfg_.head_dim_sliding;
+    gg.head_dim_full = cfg_.head_dim_full;
+    gg.kv_heads_sliding = cfg_.num_kv_heads_sliding;
+    gg.kv_heads_full = cfg_.num_kv_heads_full;
+    gg.first_shared_layer = cfg_.first_shared_layer;
+    gg.attention_k_eq_v = cfg_.attention_k_eq_v;
+    gg.use_double_wide_mlp = cfg_.use_double_wide_mlp;
+    gg.ple = cfg_.hidden_size_per_layer_input;
+    gg.layer_full.assign(static_cast<std::size_t>(cfg_.num_layers), 0);
+    for (int L = 0; L < cfg_.num_layers; ++L) {
+      gg.layer_full[static_cast<std::size_t>(L)] =
+          cfg_.attention_kind_for_layer(L) == model::AttentionKind::Full ? 1 : 0;
+    }
+    // The per-layer output gain is a NUMBER the plan multiplies in, not a weight the GPU reads, so
+    // it has to be pulled host-side. wsrc_->fp16() would hand back an opaque Metal buffer here --
+    // dereferencing one is a SIGBUS, then silent NaN. It is bf16 in the checkpoint, and a model
+    // without the tensor means a no-op gain of 1.0.
+    gg.layer_scalar.assign(static_cast<std::size_t>(cfg_.num_layers), 1.0f);
+    for (int L = 0; L < cfg_.num_layers; ++L) {
+      const std::string n =
+          "model.language_model.layers." + std::to_string(L) + ".layer_scalar";
+      if (!st_.has_tensor(n)) continue;
+      const auto* raw = reinterpret_cast<const std::uint16_t*>(st_.tensor_data(n));
+      gg.layer_scalar[static_cast<std::size_t>(L)] = engine::mini::bf16_to_float(raw[0]);
+    }
+    plan_ = opplan::build_gemma4_plan(gg, *wsrc_);
   } else {
     plan_ = opplan::build_llama_plan(g, *wsrc_);
   }
@@ -771,6 +848,18 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
         return static_cast<std::size_t>(cfg_.intermediate_size);
       case opplan::Slot::MoeLogits:
         return static_cast<std::size_t>(std::max(1, cfg_.num_local_experts));
+      // Gemma 4 Per-Layer Embeddings. PleRaw and PleAll hold the WHOLE packed table --
+      // [num_layers][ple] -- because the prologue builds every layer's window in one pass and each
+      // layer then gates its own slice out of it (GeluMul with aux_offset = L*ple). Falling
+      // through to `default` would hand them `hidden`: 1536 instead of 8960 on E2B, which the
+      // comment above this switch describes exactly -- silently too small, read out of bounds by
+      // the first kernel that touches it. PleGate is one layer's window only.
+      case opplan::Slot::PleRaw:
+      case opplan::Slot::PleAll:
+        return static_cast<std::size_t>(cfg_.num_layers) *
+               static_cast<std::size_t>(std::max(0, cfg_.hidden_size_per_layer_input));
+      case opplan::Slot::PleGate:
+        return static_cast<std::size_t>(std::max(0, cfg_.hidden_size_per_layer_input));
       case opplan::Slot::MoeInter: {
         // [top_k, expert_inter]: every selected expert's act(gate)*up lives here at once, so
         // MoeDownAccum walks them in one pass.

@@ -84,6 +84,7 @@ enum class EngineChoice {
   Qwen35Cuda,
   Qwen35Metal,  // PlanMetalEngine running the shared Qwen3.5 op plan (Apple Silicon, no CUDA)
   Qwen35Cpu,
+  Gemma4Metal,  // PlanMetalEngine running the shared Gemma 4 op plan (Apple Silicon, no CUDA)
   Llama4Cuda,
   Llama4Cpu,
 };

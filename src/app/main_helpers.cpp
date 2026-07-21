@@ -906,6 +906,21 @@ EngineChoice resolve_engine(const ModelProbe& probe, bool cuda_available, bool m
   const bool use_metal = metal_available && !cuda_available && !force_cpu;
   switch (probe.kind) {
     case ModelFamilyKind::Gemma4:
+      // Gemma 4 on Metal is BUILT BUT NOT CORRECT YET, so it is opt-in via CPI_METAL_GEMMA4=1.
+      //
+      // What works: the config parse, the geometry, the shared plan (build_gemma4_plan), the PLE
+      // slots and the routing -- the model loads and runs end to end on an M4 with no crash.
+      // What does NOT: the logits come back NaN, and the cause is known. Gemma 4's KV cache is
+      // PER-LAYER-TYPE sized (E2B: 256x2 sliding, 512x1 full) and its last 20 layers ALIAS an
+      // earlier layer's cache instead of owning one -- see PlanCudaEngine's allocation, which
+      // mallocs only the non-shared layers and points the rest at their kv_source. PlanMetalEngine
+      // allocates one uniformly-sized cache per layer and aliases nothing, so every shared layer
+      // attends over memory nobody wrote.
+      //
+      // Shipping it enabled would trade an honest refusal for confident NaN, and this file argues
+      // elsewhere that a wrong answer nobody can attribute is worse than a refusal. So the default
+      // still refuses, and says why.
+      if (use_metal && std::getenv("CPI_METAL_GEMMA4") != nullptr) return EngineChoice::Gemma4Metal;
       if (!use_gpu) {
         // Name the actual blocker -- and it is NO LONGER the container. This message used to say
         // "the Metal engine loads .ll2c only, so convert the model", which was true when written
@@ -927,12 +942,14 @@ EngineChoice resolve_engine(const ModelProbe& probe, bool cuda_available, bool m
         // here. An extraction, not a port.
         throw std::runtime_error(
             metal_available
-                ? "Gemma 4 does not run on Metal yet. The container gap is CLOSED -- the Metal "
-                  "engine reads .cpi and safetensors directories -- so converting the model will "
-                  "NOT help. What is missing is the plan builder: Gemma 4's op plan and config "
-                  "parser still live inside the CUDA engine, while Llama and Qwen3.5 build theirs "
-                  "from the shared op_plan_builder that Metal already calls. Every kernel it "
-                  "needs exists on Metal. Use a CUDA device for now."
+                ? "Gemma 4 does not run correctly on Metal yet. Two earlier blockers are gone: the "
+                  "engine reads .cpi and safetensors directories, and the shared plan builder now "
+                  "has build_gemma4_plan -- so converting the model will NOT help. What remains is "
+                  "the KV CACHE: Gemma 4 sizes it per layer TYPE and its shared layers alias an "
+                  "earlier layer's cache, which PlanMetalEngine does not do yet, so those layers "
+                  "attend over uninitialised memory and the logits come back NaN. Set "
+                  "CPI_METAL_GEMMA4=1 to run it anyway (it loads and executes; the output is not "
+                  "trustworthy). Use a CUDA device for a correct answer."
                 : "Gemma 4 currently requires a CUDA device");
       }
       return EngineChoice::PlanCuda;

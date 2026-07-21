@@ -75,4 +75,65 @@ PlanModelConfig parse_gemma4_text_config(const std::string& config_json) {
   return c;
 }
 
+bool config_json_is_gemma4(const std::string& config_json) {
+  const std::string tc = mini::json_extract_object(config_json, "text_config");
+  const std::string mt = mini::json_get_string(tc.empty() ? config_json : tc, "model_type", "");
+  return mt.rfind("gemma4", 0) == 0;
+}
+
+model::LlamaConfig gemma4_to_llama_config(const PlanModelConfig& g) {
+  model::LlamaConfig c;
+  c.model_family = model::ModelFamily::Gemma4;
+  c.num_layers = g.num_layers;
+  c.hidden_size = g.hidden;
+  c.intermediate_size = g.intermediate;
+  c.vocab_size = g.vocab;
+  c.num_heads = g.num_heads;
+  c.num_kv_heads = g.num_kv_heads;
+  c.norm_eps = g.rms_eps;
+  c.sliding_window = g.sliding_window;
+  c.tie_word_embeddings = g.tie_word_embeddings;
+  // NOTE: bos/eos token ids are deliberately not carried here. LlamaConfig has no such fields --
+  // they belong to the tokenizer, not the model geometry -- and inventing them would put a second
+  // source of truth beside tokenizer_config.json.
+  // Gemma's MLP is GeGLU and its embeddings are scaled by sqrt(hidden). Both are capabilities the
+  // shared geometry already has; neither is a fork.
+  c.mlp_gelu = true;
+  c.scale_embeddings = true;
+
+  // LlamaConfig has no single head_dim -- every other family derives it from the Q projection's
+  // shape. Gemma 4 cannot be described that way (its head_dim differs per layer type), which is
+  // exactly why the pair below exists and why PlanMetalEngine::open skips the shape probe for it.
+  c.head_dim_sliding = g.head_dim_sliding;
+  c.head_dim_full = g.head_dim_full;
+  c.num_kv_heads_sliding = g.num_kv_heads_sliding;
+  c.num_kv_heads_full = g.num_kv_heads_full;
+  c.rope_theta_sliding = g.rope_theta_sliding;
+  c.rope_theta_full = g.rope_theta_full;
+  c.partial_rotary_full = g.partial_rotary_full;
+  c.rope_theta = g.rope_theta_full;  // the single-value fallback
+
+  c.hidden_size_per_layer_input = g.hidden_size_per_layer_input;
+  c.vocab_size_per_layer_input = g.vocab_size_per_layer_input;
+  c.num_kv_shared_layers = g.num_kv_shared_layers;
+  c.first_shared_layer = g.first_shared_layer;
+  c.kv_source.assign(g.kv_source.begin(), g.kv_source.end());
+  c.use_double_wide_mlp = g.use_double_wide_mlp;
+  c.attention_k_eq_v = g.attention_k_eq_v;
+  c.final_logit_softcapping = g.final_logit_softcapping;
+
+  c.num_local_experts = g.num_experts;
+  c.num_experts_per_tok = g.top_k_experts;
+  c.expert_intermediate_size = g.moe_intermediate_size;
+
+  // Per-layer attention kinds, so anything reading the generic field sees the right shape rather
+  // than assuming uniform full attention.
+  c.layer_attention_kinds.reserve(g.layer_full.size());
+  for (int full : g.layer_full) {
+    c.layer_attention_kinds.push_back(full ? model::AttentionKind::Full
+                                           : model::AttentionKind::SlidingWindow);
+  }
+  return c;
+}
+
 }  // namespace engine

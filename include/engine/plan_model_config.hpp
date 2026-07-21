@@ -21,6 +21,8 @@
 #include <string>
 #include <vector>
 
+#include "model/llama_config.hpp"
+
 namespace engine {
 
 // Which model recipe builds the plan. The EXECUTOR, sampler, quantizer, decode graph and KV/state
@@ -79,5 +81,18 @@ struct PlanModelConfig {
 // non-shared layer OF THE SAME TYPE -- sliding and full are tracked separately, and getting it
 // wrong still runs and still produces fluent-looking garbage).
 PlanModelConfig parse_gemma4_text_config(const std::string& config_json);
+
+// Same geometry, expressed as a model::LlamaConfig.
+//
+// The Metal engine builds its slots, geometry and plan from LlamaConfig, so this is how Gemma 4
+// reaches it. It is a pure FIELD MAPPING and deliberately does no parsing: every JSON key name
+// lives in parse_gemma4_text_config and nowhere else, so the two cannot drift. Reading the config
+// on Metal is therefore parse -> map, not a second parser.
+model::LlamaConfig gemma4_to_llama_config(const PlanModelConfig& g);
+
+// True when a HuggingFace config.json describes a Gemma 4 model. Checks `model_type` in
+// text_config, falling back to the root -- the same place PlanCudaEngine::open looks, and the same
+// place probe_model's directory sniff looks.
+bool config_json_is_gemma4(const std::string& config_json);
 
 }  // namespace engine
