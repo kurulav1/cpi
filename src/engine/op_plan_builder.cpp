@@ -665,8 +665,19 @@ ModelPlan build_gemma4_plan(const Gemma4Geometry& g, const WeightSource& w) {
       ops.push_back(norm(Slot::K, Slot::K, w.fp16(p + "self_attn.k_norm.weight"), nkv, hd));
       ops.push_back(rope(Slot::K, nkv));
       ops.push_back(norm(Slot::V, Slot::V, nullptr, nkv, hd));  // weightless v-norm (ones)
+      // Every field matters here, and CUDA's own Gemma builder sets only `cols` -- its executor
+      // reads the K and V slots by hardcoded name, so the rest is implied. The Metal executor
+      // takes them FROM THE OP (slot(op.in), slot(op.in2), op.kv_heads, op.head_dim), so an
+      // under-specified KvStore writes nothing, the cache stays zero, and attention then
+      // correctly returns zero over an empty cache. That is the same mistake as leaving
+      // Op::scale unset on the Rope ops: a plan is one description read by two executors, so it
+      // has to be complete, not merely sufficient for the one that infers the most.
       Op st;
       st.kind = OpKind::KvStore;
+      st.in = Slot::K;
+      st.in2 = Slot::V;
+      st.kv_heads = nkv;
+      st.head_dim = hd;
       st.cols = kvdim;
       ops.push_back(st);
     }
@@ -682,6 +693,11 @@ ModelPlan build_gemma4_plan(const Gemma4Geometry& g, const WeightSource& w) {
       a.head_dim = hd;
       a.full_attention = full;
       a.sliding_window = g.sliding_window;
+      // Softmax scale, for the same reason as above: build_llama_plan sets it and the Metal
+      // executor reads it, while CUDA's Gemma path relies on its kernel applying 1/sqrt(head_dim)
+      // internally. The ScaleCopy just above pre-multiplies Q by sqrt(head_dim) so that the two
+      // cancel and the NET attention scale is 1.0, which is what Gemma 4 specifies.
+      a.scale = 1.0f / std::sqrt(static_cast<float>(hd));
       ops.push_back(a);
     }
     ops.push_back(gemv(Slot::Att, Slot::Tmp, w, p + "self_attn.o_proj.weight", H, qdim));
