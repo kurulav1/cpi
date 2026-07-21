@@ -27,11 +27,24 @@ public:
   // Valid for the lifetime of this object. Throws if name is not present.
   [[nodiscard]] const std::byte* tensor_ptr(const std::string& name) const;
 
+  // Alias for tensor_ptr, so this loader and model::WeightLoader present the SAME three-method
+  // surface (has_tensor / tensor_bytes / tensor_data). That lets a consumer be templated on the
+  // loader instead of duplicated per container format -- which is the point of the .cpi work.
+  [[nodiscard]] const std::byte* tensor_data(const std::string& name) const {
+    return tensor_ptr(name);
+  }
+
   // Returns the byte size of tensor `name`. Throws if not present.
   [[nodiscard]] std::size_t tensor_bytes(const std::string& name) const;
 
   // Returns true if `name` is present in the index.
   [[nodiscard]] bool has_tensor(const std::string& name) const;
+
+  // The container's `__metadata__` block, verbatim JSON. A `.cpi` stores its whole LlamaConfig
+  // here -- the self-describing replacement for the .ll2c binary header. Empty for a plain HF
+  // checkpoint, which keeps its config in a separate config.json.
+  [[nodiscard]] bool has_metadata() const { return !metadata_json_.empty(); }
+  [[nodiscard]] const std::string& metadata_json() const { return metadata_json_; }
 
 private:
   struct TensorMeta {
@@ -43,6 +56,7 @@ private:
   std::vector<platform::MMapFile> shards_;
   std::vector<std::size_t> shard_data_offsets_;  // 8 + header_size per shard
   std::unordered_map<std::string, TensorMeta> tensors_;
+  std::string metadata_json_;
 };
 
 }  // namespace model

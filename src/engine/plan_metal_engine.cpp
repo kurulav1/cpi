@@ -1,6 +1,8 @@
 // Metal executor for the op-plan IR. See plan_metal_engine.hpp.
 
 #include "engine/plan_metal_engine.hpp"
+#include "model/config_json.hpp"
+#include <filesystem>
 #include "runtime/fp16.hpp"
 
 #include <algorithm>
@@ -337,10 +339,15 @@ std::vector<int> chunk_sizes(int n, int max_chunk, int tile) {
 // Resolves a tensor name to its MTLBuffer handle. The plan carries these as opaque
 // void*, and execute_ops passes them straight back to Metal as buffer bindings --
 // they are never dereferenced as pointers.
-class PlanMetalEngine::MetalWeights : public opplan::WeightSource {
+// Templated on the LOADER, not written twice. model::WeightLoader (.ll2c) and
+// model::SafetensorsLoader (.cpi / HF dir) expose the same has_tensor / tensor_bytes /
+// tensor_data surface, so the upload logic -- including the MoE expert fusion below -- is
+// identical for both container formats and cannot drift between them.
+template <typename Loader>
+class PlanMetalEngine::MetalWeightsT : public PlanMetalEngine::MetalWeightsBase {
 public:
-  MetalWeights(runtime::MetalContext& ctx, model::WeightLoader& wl,
-               std::unordered_map<std::string, runtime::MetalBuffer>& bufs)
+  MetalWeightsT(runtime::MetalContext& ctx, Loader& wl,
+                std::unordered_map<std::string, runtime::MetalBuffer>& bufs)
       : ctx_(ctx), wl_(wl), bufs_(bufs) {}
 
   const void* fp16(const std::string& name) const override {
@@ -477,11 +484,11 @@ public:
     return q;
   }
 
-  void set_quant(int bits, int group) {
+  void set_quant(int bits, int group) override {
     bits_ = bits;
     group_ = group;
   }
-  std::size_t bytes() const {
+  std::size_t bytes() const override {
     std::size_t n = 0;
     for (const auto& kv : qbufs_) {
       n += kv.second.packed.size() + kv.second.scales.size();
@@ -497,7 +504,7 @@ private:
   };
 
   runtime::MetalContext& ctx_;
-  model::WeightLoader& wl_;
+  Loader& wl_;
   std::unordered_map<std::string, runtime::MetalBuffer>& bufs_;
   mutable std::unordered_map<std::string, QBuf> qbufs_;
   int bits_ = 0;
@@ -535,8 +542,29 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
     throw std::runtime_error("could not load the shader library: " + ctx_.last_error());
   }
 
-  weights_.open(weights_path);
-  cfg_ = weights_.config();
+  // Route by container. A `.cpi` file (or a HuggingFace safetensors DIRECTORY) is safetensors
+  // layout with its config in the JSON __metadata__; anything else is a .ll2c with a typed binary
+  // header. Same tensor names either way -- a .cpi repacked by ll2c_to_cpi preserves them -- so
+  // the plan and every kernel are untouched by this choice.
+  {
+    namespace fs = std::filesystem;
+    const fs::path p(weights_path);
+    const bool is_dir = fs::exists(p) && fs::is_directory(p);
+    const bool is_cpi = p.extension() == ".cpi";
+    from_safetensors_ = is_dir || is_cpi;
+  }
+  if (from_safetensors_) {
+    st_.open(weights_path);
+    if (!st_.has_metadata()) {
+      throw std::runtime_error(
+          "safetensors container has no __metadata__ config block: " + weights_path +
+          " -- repack it with ll2c_to_cpi, which writes one.");
+    }
+    cfg_ = model::config_from_json(st_.metadata_json());
+  } else {
+    weights_.open(weights_path);
+    cfg_ = weights_.config();
+  }
 
   // --rope-theta, applied BEFORE the plan is built so the builder folds the override into every
   // Rope op's scale. This used to be dropped on the floor: the flag parsed, the run succeeded, and
@@ -574,7 +602,7 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
     throw std::runtime_error("model has no full-attention layer to derive head_dim from");
   }
   const std::size_t wq_bytes =
-      weights_.tensor_bytes("layers." + std::to_string(probe_layer) + ".attention.wq");
+      raw_bytes("layers." + std::to_string(probe_layer) + ".attention.wq");
   int q_dim = static_cast<int>(wq_bytes / (static_cast<std::size_t>(H) * sizeof(std::uint16_t)));
   if (cfg_.attn_output_gate) {
     q_dim /= 2;
@@ -617,7 +645,11 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
       std::fprintf(stderr, "[metal gpu-profile] unavailable: %s\n", ctx_.last_error().c_str());
     }
   }
-  wsrc_ = std::make_unique<MetalWeights>(ctx_, weights_, wbuf_);
+  if (from_safetensors_) {
+    wsrc_ = std::make_unique<MetalWeightsT<model::SafetensorsLoader>>(ctx_, st_, wbuf_);
+  } else {
+    wsrc_ = std::make_unique<MetalWeightsT<model::WeightLoader>>(ctx_, weights_, wbuf_);
+  }
   if (quant_bits == 4 || quant_bits == 8) {
     // A group size that is a multiple of 8 keeps each 8-weight chunk the int4 kernel
     // loads inside a single scale group.

@@ -318,7 +318,7 @@ std::vector<float> PlanMetalEngine::encode_image(const std::vector<float>& patch
     // The position table is the one vision tensor the CPU has to read, because the resample is
     // done host-side; everything else stays on the GPU as a handle.
     const auto* tab = reinterpret_cast<const std::uint16_t*>(
-        weights_.tensor_data("vision.pos_embed.weight"));
+        raw_data("vision.pos_embed.weight"));
     std::vector<float> tab32(static_cast<std::size_t>(c.vision_num_position_embeddings) * hidden);
     for (std::size_t i = 0; i < tab32.size(); ++i) tab32[i] = f16_bits_to_f32(tab[i]);
     const std::vector<float> pos =

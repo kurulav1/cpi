@@ -1,4 +1,6 @@
 #include "app/main_helpers.hpp"
+#include "model/config_json.hpp"
+#include "model/safetensors_loader.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -845,7 +847,27 @@ ModelProbe probe_model(const std::string& model_path) {
   p.is_safetensors_dir = !p.is_cpi && is_safetensors_model_dir(model_path);
   p.safetensors_family = p.is_cpi ? "" : infer_safetensors_model_family(model_path);
   if (p.is_cpi) {
+    // A `.cpi` is a CONTAINER FORMAT, not a model family. It meant "Gemma 4" only because Gemma 4
+    // was the first thing to ship in it; ll2c_to_cpi now repacks any model this way. So look
+    // INSIDE: our containers carry the whole LlamaConfig in the safetensors __metadata__ block,
+    // and its model_family says what this actually is. Only a .cpi with no metadata (i.e. the
+    // Gemma 4 converter's output, which predates config_to_json) still defaults to Gemma 4.
     p.kind = ModelFamilyKind::Gemma4;
+    try {
+      model::SafetensorsLoader probe;
+      probe.open(model_path);
+      if (probe.has_metadata()) {
+        const model::LlamaConfig c = model::config_from_json(probe.metadata_json());
+        if (c.model_family == model::ModelFamily::Qwen3_5) {
+          p.kind = ModelFamilyKind::Qwen35;
+        } else if (c.hidden_size > 0) {
+          p.kind = ModelFamilyKind::Llama;  // the uniform-geometry families the plan engines share
+        }
+      }
+    } catch (const std::exception&) {
+      // Unreadable as safetensors -> leave it as Gemma 4 and let that engine report the real
+      // problem, which will be more specific than anything guessable here.
+    }
   } else if (p.safetensors_family == "gemma4") {
     // Gemma 4 also ships as a HuggingFace directory (the MoE checkpoint does); the
     // plan executor reads either container.

@@ -11,6 +11,7 @@
 
 #include <cstddef>
 #include <string>
+#include <vector>
 #include <unordered_map>
 
 #include "model/llama_config.hpp"
@@ -53,6 +54,11 @@ public:
 
   // Returns true if a tensor with the given name exists in the weight file.
   [[nodiscard]] bool has_tensor(const std::string& name) const;
+
+  // Every tensor name in the container, sorted. Needed to REPACK a .ll2c into another container
+  // without a hardcoded name list -- the list would be a second place the model's tensor set is
+  // written down, and those drift (see the v7 vision-geometry whitelist).
+  [[nodiscard]] std::vector<std::string> tensor_names() const;
 
   // Returns the LlamaConfig that was embedded in the weight file header.
   [[nodiscard]] const LlamaConfig& config() const {

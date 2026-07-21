@@ -1,5 +1,6 @@
 #include "model/weight_loader.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <fstream>
 
@@ -206,6 +207,16 @@ std::size_t WeightLoader::tensor_bytes(const std::string& name) const {
 
 bool WeightLoader::has_tensor(const std::string& name) const {
   return tensors_.find(name) != tensors_.end();
+}
+
+std::vector<std::string> WeightLoader::tensor_names() const {
+  std::vector<std::string> names;
+  names.reserve(tensors_.size());
+  for (const auto& kv : tensors_) names.push_back(kv.first);
+  // Sorted so a repack is deterministic: the same .ll2c must produce a byte-identical container
+  // every time, or "the output changed" stops being evidence of anything.
+  std::sort(names.begin(), names.end());
+  return names;
 }
 
 void WeightLoader::parse_manifest() {

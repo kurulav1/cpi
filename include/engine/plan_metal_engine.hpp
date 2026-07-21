@@ -31,6 +31,7 @@
 #include "engine/op_plan.hpp"
 #include "engine/op_plan_builder.hpp"
 #include "model/llama_config.hpp"
+#include "model/safetensors_loader.hpp"
 #include "model/weight_loader.hpp"
 #include "runtime/metal_context.hpp"
 
@@ -309,7 +310,25 @@ private:
   void* slot(opplan::Slot s) const;
 
   runtime::MetalContext ctx_;
+  // TWO container formats, one engine. `.ll2c` (typed binary header) goes through WeightLoader;
+  // `.cpi` and HuggingFace safetensors directories go through SafetensorsLoader, with the config
+  // coming from the container's JSON __metadata__ instead of a struct. Only one is populated --
+  // from_safetensors_ says which.
   model::WeightLoader weights_;
+  model::SafetensorsLoader st_;
+  bool from_safetensors_ = false;
+
+  // Raw tensor bytes from whichever loader is live. Used by the few places that read weight bytes
+  // on the HOST (the vision position table, the head-dim probe) rather than uploading them.
+  [[nodiscard]] bool raw_has(const std::string& name) const {
+    return from_safetensors_ ? st_.has_tensor(name) : weights_.has_tensor(name);
+  }
+  [[nodiscard]] std::size_t raw_bytes(const std::string& name) const {
+    return from_safetensors_ ? st_.tensor_bytes(name) : weights_.tensor_bytes(name);
+  }
+  [[nodiscard]] const std::byte* raw_data(const std::string& name) const {
+    return from_safetensors_ ? st_.tensor_data(name) : weights_.tensor_data(name);
+  }
   model::LlamaConfig cfg_{};
   opplan::ModelPlan plan_;
   int max_context_ = 0;
@@ -416,8 +435,17 @@ private:
   std::vector<int> prev_seq_;  // last (prompt + generated) sequence, for shared-prefix KV reuse
   std::string last_error_;
 
-  class MetalWeights;
-  std::unique_ptr<MetalWeights> wsrc_;
+  // The concrete weight source is templated on the loader (.ll2c vs safetensors), so the engine
+  // holds it through this small interface: WeightSource plus the two things only the Metal
+  // backend needs -- its quantization policy and its GPU byte count.
+  class MetalWeightsBase : public opplan::WeightSource {
+  public:
+    virtual void set_quant(int bits, int group) = 0;
+    virtual std::size_t bytes() const = 0;
+  };
+  template <typename Loader>
+  class MetalWeightsT;
+  std::unique_ptr<MetalWeightsBase> wsrc_;
 
   // Continuous batching. The allocator hands out block ids from the paged pool sized by
   // set_paged_kv(); the adapter is this engine's half of BatchBackend. Held as the base
