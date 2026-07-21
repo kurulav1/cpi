@@ -154,7 +154,16 @@ kernel void cpi_gelu_mul(
   //
   // The clamp stays as a backstop for anything still out of range after scaling. It is a no-op
   // for every value that fits, so no existing model's arithmetic changes.
-  const float prod = gelu * float(b[gid]);
+  // in2 may be a window of a WIDER row than out's. Flat indexing is only correct when the two
+  // strides match, which is why an aux_offset plan used to be forced to one token at a time --
+  // this makes it correct for a whole prefill chunk instead.
+  uint bidx = gid;
+  if (p.row_len != 0u) {
+    const uint t = gid / p.row_len;
+    const uint j = gid % p.row_len;
+    bidx = t * p.in2_stride + p.in2_offset + j;
+  }
+  const float prod = gelu * float(b[bidx]);
   const float scaled = (p.scale != 0.0f) ? (prod * p.scale) : prod;
   out[gid] = half(clamp(scaled, -65504.0f, 65504.0f));
 }

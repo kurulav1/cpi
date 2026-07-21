@@ -122,6 +122,13 @@ struct RopeParams {
 struct ElemParams {
   uint n;       // total elements
   float scale;
+  // Strided second operand, for an op whose in2 is a WINDOW of a wider per-token row than its own
+  // (Gemma 4's per-layer-input gate: out/in are [token][ple], in2 is [token][num_layers*ple] and
+  // this layer wants its own slice). row_len == 0 means "in2 is laid out exactly like in", which
+  // is every other op and every other model.
+  uint row_len;      // elements per token in in/out
+  uint in2_stride;   // elements per token in in2
+  uint in2_offset;   // this op's window start within a row of in2
 };
 
 struct KvParams {

@@ -54,6 +54,9 @@ struct RopeParams {
 struct ElemParams {
   std::uint32_t n;
   float scale;
+  std::uint32_t row_len = 0;     // 0 = in2 is laid out exactly like in (every op but Gemma's PLE gate)
+  std::uint32_t in2_stride = 0;
+  std::uint32_t in2_offset = 0;
 };
 struct KvParams {
   std::uint32_t kv_heads, head_dim, position, max_context, use_position_buffer, tokens;
@@ -813,6 +816,12 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
       // (ple) -- so one displacement is only correct for a single token. Batched chunks would
       // silently pair the wrong rows. Force token-by-token, like the delta-net family, until the
       // kernel takes a per-operand stride.
+      // Still forces token-by-token, and the GeluMul stride alone is NOT enough to lift it.
+      // Making the PLE gate stride-aware was necessary but not sufficient: with batched chunks
+      // enabled the model produced pure special tokens, so something else on the Gemma path is
+      // not batch-safe (the per-layer-type KV geometry and the PLE prologue are the candidates,
+      // neither yet checked). Kept as the conservative choice -- ~16 tok/s prefill is slow, a
+      // wrong answer is worse. Lifting this is the open perf item.
       if (op.aux_offset != 0) {
         has_recurrent_ops_ = true;
       }
@@ -1773,19 +1782,23 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
         // the plan multiplies the same power-of-two back after the down-projection. 0 = no scaling,
         // which is every model that is not Gemma 4.
         ElemParams p{static_cast<std::uint32_t>(n), op.scale};
-        const void* bufs[] = {slot(op.in), slot(op.in2), slot(op.out)};
         // aux_offset selects a WINDOW of in2 rather than its start -- Gemma 4's per-layer-input
         // injection multiplies by per_layer_inputs[L], layer L's slice of one packed
-        // [num_layers][ple] table. Dropping it (which this dispatch did) makes every layer
-        // multiply by LAYER 0's window: correct at layer 0 by accident, wrong everywhere after.
-        // CUDA does the same thing as pointer arithmetic (S(op.in2) + op.aux_offset); here it is a
-        // buffer offset in BYTES, which is what the LmHead case below already does for its input.
-        // Safe as a flat displacement only because an aux_offset plan runs token-by-token -- see
-        // has_recurrent_ops_ above, which this op now sets.
-        const std::size_t aux_bytes = static_cast<std::size_t>(op.aux_offset) * sizeof(std::uint16_t);
-        const std::size_t offs[] = {0, aux_bytes, 0};
+        // [num_layers][ple] table. Described as a STRIDE here rather than a flat buffer offset,
+        // because in2's row is num_layers*ple wide while this op's is ple: a single displacement
+        // is only right for one token, which is what used to force these plans to prefill one
+        // token at a time. With the stride the kernel indexes correctly for a whole chunk.
+        if (op.aux_offset != 0 || op.in2 == opplan::Slot::PleAll) {
+          p.row_len = static_cast<std::uint32_t>(op.cols);
+          // PleAll's row is the whole packed table: [num_layers][ple]. Taken from the config
+          // rather than a slot-size helper so it cannot drift from how the slot was allocated.
+          p.in2_stride = static_cast<std::uint32_t>(cfg_.num_layers) *
+                         static_cast<std::uint32_t>(cfg_.hidden_size_per_layer_input);
+          p.in2_offset = static_cast<std::uint32_t>(op.aux_offset);
+        }
+        const void* bufs[] = {slot(op.in), slot(op.in2), slot(op.out)};
         ctx_.dispatch(op.kind == OpKind::SiluMul ? "cpi_silu_mul" : "cpi_gelu_mul", G::Threads, n,
-                      kTG, bufs, op.aux_offset != 0 ? offs : nullptr, 3, &p, sizeof(p));
+                      kTG, bufs, nullptr, 3, &p, sizeof(p));
         break;
       }
       // ---- linear attention (delta-net) and gated attention -----------------
