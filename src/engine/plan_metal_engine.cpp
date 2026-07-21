@@ -1896,8 +1896,15 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
                                  " belongs to a vision tower that is not wired on this backend");
 
       case OpKind::AddInplace: {
-        const std::size_t n =
-            static_cast<std::size_t>(cfg_.hidden_size) * static_cast<std::size_t>(T);
+        // WIDTH COMES FROM THE OP. It used to be hardcoded to hidden_size, which is right for
+        // every residual add -- and every AddInplace in the Llama and Qwen3.5 plans is one, so
+        // nothing ever noticed. Gemma 4's prologue adds the two halves of its per-layer-embedding
+        // table, which is [num_layers][ple] = 8960 wide on E2B, not 1536: the hardcoded width
+        // summed the first 17% of it and left the rest of the table holding one unsummed operand,
+        // so every layer past the sixth read a wrong per-layer input.
+        // 0 keeps the old meaning (a hidden-wide residual add) so existing plans are untouched.
+        const int width = op.cols > 0 ? op.cols : cfg_.hidden_size;
+        const std::size_t n = static_cast<std::size_t>(width) * static_cast<std::size_t>(T);
         ElemParams p{static_cast<std::uint32_t>(n), 0.0f};
         const void* bufs[] = {slot(op.in), slot(op.out)};
         ctx_.dispatch("cpi_add_inplace", G::Threads, n, kTG, bufs, nullptr, 2, &p, sizeof(p));

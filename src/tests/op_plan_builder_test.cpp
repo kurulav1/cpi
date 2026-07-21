@@ -410,6 +410,113 @@ int main() {
              "gemma4: no sharing => every layer stores KV");
   }
 
+  // ---- OP COMPLETENESS, across every builder ------------------------------
+  //
+  // The bug class this session kept producing, four times: an op that CUDA's executor can run
+  // because it INFERS the missing fields (it reads K and V from hardcoded slots, applies
+  // 1/sqrt(head_dim) in-kernel, selects a rope table by enum), and that Metal's executor cannot,
+  // because it reads those same things OFF THE OP. Symptoms ranged from a wrong rope frequency to
+  // KvStore writing nothing at all -- and none of them failed at build time, on any machine.
+  //
+  // A plan is ONE description read by TWO executors, so "complete" is the requirement, not
+  // "sufficient for whichever executor infers the most". This walks every op of every builder and
+  // asserts the fields its kind actually needs. CPU-only, no GPU, no weights.
+  {
+    auto check_ops = [&](const std::vector<Op>& ops, const char* where) {
+      for (std::size_t i = 0; i < ops.size(); ++i) {
+        const Op& o = ops[i];
+        const std::string at =
+            std::string(where) + " op[" + std::to_string(i) + "] " + kind_name(o.kind);
+        auto need = [&](bool ok, const char* field) { expect(ok, at + ": needs " + field); };
+        switch (o.kind) {
+          case OpKind::Gemv:
+            need(o.cols > 0, "cols");
+            need(o.in_dim > 0, "in_dim");
+            need(o.weight != nullptr || o.qweight != nullptr, "weight or qweight");
+            break;
+          case OpKind::RmsNorm:
+            need(o.rows > 0, "rows");
+            need(o.cols > 0, "cols");
+            need(o.eps > 0.0f, "eps (Metal reads op.eps; CUDA uses a global)");
+            break;
+          case OpKind::Rope:
+            need(o.heads > 0, "heads");
+            need(o.head_dim > 0, "head_dim");
+            need(o.scale > 0.0f, "scale = rope theta (Metal computes angles in-shader)");
+            break;
+          case OpKind::KvStore:
+            need(o.in != o.in2, "distinct in/in2 (K and V)");
+            need(o.kv_heads > 0, "kv_heads");
+            need(o.head_dim > 0, "head_dim");
+            break;
+          case OpKind::Attention:
+            need(o.heads > 0, "heads");
+            need(o.kv_heads > 0, "kv_heads");
+            need(o.head_dim > 0, "head_dim");
+            need(o.scale > 0.0f, "scale = softmax 1/sqrt(head_dim)");
+            break;
+          case OpKind::EmbeddingLookup:
+            need(o.cols > 0, "cols");
+            need(o.weight != nullptr, "weight");
+            break;
+          case OpKind::LmHead:
+            need(o.cols > 0, "cols");
+            need(o.in_dim > 0, "in_dim");
+            need(o.weight != nullptr, "weight");
+            break;
+          case OpKind::ScaleCopy:
+            need(o.cols > 0, "cols");
+            break;
+          case OpKind::AddInplace:
+            // cols == 0 legitimately means "a hidden-wide residual add", which is what every
+            // AddInplace in the Llama and Qwen3.5 plans is. Only a NON-residual add (Gemma 4's
+            // per-layer-embedding table, 8960 wide) has to say so -- and the executors now honour
+            // it either way, which is the actual fix. Nothing to require here.
+            break;
+          case OpKind::CopySlot:
+            need(o.cols > 0, "cols");
+            break;
+          case OpKind::GeluMul:
+          case OpKind::SiluMul:
+            need(o.cols > 0, "cols");
+            need(o.in != o.in2, "distinct in/in2");
+            break;
+          default:
+            break;  // MoE and delta-net ops have their own field sets; not covered here yet.
+        }
+      }
+    };
+    auto check_plan = [&](const ModelPlan& pl, const char* who) {
+      check_ops(pl.prologue, (std::string(who) + " prologue").c_str());
+      for (const LayerPlan& lp : pl.layers) {
+        check_ops(lp.ops, (std::string(who) + " layer").c_str());
+      }
+      check_ops(pl.epilogue, (std::string(who) + " epilogue").c_str());
+    };
+
+    FakeWeights wa;
+    check_plan(build_llama_plan(g, wa), "llama");
+
+    Gemma4Geometry g4;
+    g4.num_layers = 4;
+    g4.hidden = 64;
+    g4.inter = 128;
+    g4.vocab = 999;
+    g4.heads = 4;
+    g4.rms_eps = 1e-6f;
+    g4.head_dim_sliding = 16;
+    g4.head_dim_full = 32;
+    g4.kv_heads_sliding = 2;
+    g4.kv_heads_full = 1;
+    g4.layer_full = {0, 1, 0, 1};
+    g4.ple = 8;
+    g4.rope_theta_sliding = 10000.0f;
+    g4.rope_theta_full = 1000000.0f;
+    g4.partial_rotary_full = 0.25f;
+    FakeWeights wb;
+    check_plan(build_gemma4_plan(g4, wb), "gemma4");
+  }
+
   std::printf("op_plan_builder_test: %s\n", failures == 0 ? "PASS" : "FAIL");
   return failures == 0 ? 0 : 1;
 }
