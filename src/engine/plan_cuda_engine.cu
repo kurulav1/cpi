@@ -583,66 +583,11 @@ void PlanCudaEngine::allocate_buffers() {
 // plan builder run unchanged -- the MoE checkpoint is not a second Gemma port.
 void PlanCudaEngine::parse_gemma4_st_config(const std::string& model_dir) {
   const std::string raw = mini::read_text_file(std::filesystem::path(model_dir) / "config.json");
-  const std::string tc = mini::json_extract_object(raw, "text_config");
-  if (tc.empty()) throw std::runtime_error("Gemma 4 config is missing text_config");
 
-  cfg_.family = Family::Gemma4;
-  cfg_.vocab = mini::json_get_int(tc, "vocab_size", 0);
-  cfg_.hidden = mini::json_get_int(tc, "hidden_size", 0);
-  cfg_.intermediate = mini::json_get_int(tc, "intermediate_size", 0);
-  cfg_.num_layers = mini::json_get_int(tc, "num_hidden_layers", 0);
-  cfg_.num_heads = mini::json_get_int(tc, "num_attention_heads", 0);
-  cfg_.head_dim = mini::json_get_int(tc, "head_dim", 256);
-  cfg_.head_dim_sliding = cfg_.head_dim;
-  cfg_.head_dim_full = mini::json_get_int(tc, "global_head_dim", cfg_.head_dim);
-  cfg_.num_kv_heads_sliding = mini::json_get_int(tc, "num_key_value_heads", 1);
-  cfg_.num_kv_heads_full =
-      mini::json_get_int(tc, "num_global_key_value_heads", cfg_.num_kv_heads_sliding);
-  cfg_.num_kv_heads = cfg_.num_kv_heads_sliding;
-  cfg_.hidden_size_per_layer_input = mini::json_get_int(tc, "hidden_size_per_layer_input", 0);
-  cfg_.num_kv_shared_layers = mini::json_get_int(tc, "num_kv_shared_layers", 0);
-  cfg_.sliding_window = mini::json_get_int(tc, "sliding_window", 0);
-  cfg_.rms_eps = mini::json_get_float(tc, "rms_norm_eps", 1e-6f);
-  cfg_.final_logit_softcapping = mini::json_get_float(tc, "final_logit_softcapping", 0.0f);
-  cfg_.attention_k_eq_v = mini::json_get_bool(tc, "attention_k_eq_v", false);
-  cfg_.use_double_wide_mlp = mini::json_get_bool(tc, "use_double_wide_mlp", false);
-  cfg_.tie_word_embeddings = mini::json_get_bool(tc, "tie_word_embeddings", true);
-  cfg_.eos_token_id = mini::json_get_int(tc, "eos_token_id", 1);
-  cfg_.bos_token_id = mini::json_get_int(tc, "bos_token_id", 2);
-
-  cfg_.enable_moe_block = mini::json_get_bool(tc, "enable_moe_block", false);
-  cfg_.num_experts = mini::json_get_int(tc, "num_experts", 0);
-  cfg_.top_k_experts = mini::json_get_int(tc, "top_k_experts", 0);
-  cfg_.moe_intermediate_size = mini::json_get_int(tc, "moe_intermediate_size", 0);
-  if (cfg_.enable_moe_block &&
-      (cfg_.num_experts <= 0 || cfg_.top_k_experts <= 0 || cfg_.moe_intermediate_size <= 0))
-    throw std::runtime_error("Gemma 4 MoE config is missing num_experts/top_k/moe_intermediate");
-
-  // layer_types: "full_attention" vs "sliding_attention", per layer.
-  const auto types = mini::json_get_string_array(tc, "layer_types");
-  cfg_.layer_full.assign(cfg_.num_layers, 0);
-  for (int L = 0; L < cfg_.num_layers && L < static_cast<int>(types.size()); ++L)
-    cfg_.layer_full[L] = (types[L] == "full_attention") ? 1 : 0;
-  // KV sharing: the last num_kv_shared_layers layers do NOT project their own K/V --
-  // they reuse the cache of the LAST NON-SHARED LAYER OF THE SAME TYPE (sliding vs
-  // full). E2B shares 20 of its 35 layers; the MoE and 12B share none. Getting this
-  // wrong still runs, and still produces fluent-looking garbage.
-  cfg_.first_shared_layer =
-      cfg_.num_kv_shared_layers > 0 ? cfg_.num_layers - cfg_.num_kv_shared_layers : 0;
-  cfg_.kv_source.assign(cfg_.num_layers, 0);
-  for (int L = 0; L < cfg_.num_layers; ++L) {
-    if (cfg_.first_shared_layer > 0 && L >= cfg_.first_shared_layer) {
-      int src = L;
-      for (int i = 0; i < cfg_.first_shared_layer; ++i)
-        if (cfg_.layer_full[i] == cfg_.layer_full[L]) src = i;  // last match wins
-      cfg_.kv_source[L] = src;
-    } else {
-      cfg_.kv_source[L] = L;
-    }
-  }
-
-  if (cfg_.vocab <= 0 || cfg_.hidden <= 0 || cfg_.num_layers <= 0)
-    throw std::runtime_error("Gemma 4 config.json is missing required text_config fields");
+  // The PARSE lives in engine/plan_model_config.cpp, with no CUDA in it, so PlanMetalEngine can
+  // reach the same geometry. What stays here is the SHAPE REGISTRY below, which is specific to how
+  // this engine resolves tensors. Splitting it that way is what unblocks Gemma 4 on Metal.
+  cfg_ = engine::parse_gemma4_text_config(raw);
 
   // --- shape registry (see shape_of) ---
   const int H = cfg_.hidden;
@@ -654,7 +599,8 @@ void PlanCudaEngine::parse_gemma4_st_config(const std::string& model_dir) {
   // Per-Layer Embeddings (E2B has them; 12B and the MoE do not).
   const int ple = cfg_.hidden_size_per_layer_input;
   if (ple > 0) {
-    const int ple_vocab = mini::json_get_int(tc, "vocab_size_per_layer_input", cfg_.vocab);
+    const int ple_vocab =
+        cfg_.vocab_size_per_layer_input > 0 ? cfg_.vocab_size_per_layer_input : cfg_.vocab;
     put("embed_tokens_per_layer.weight", ple_vocab, cfg_.num_layers * ple);
     put("per_layer_model_projection.weight", cfg_.num_layers * ple, H);
     put("per_layer_projection_norm.weight", 1, ple);

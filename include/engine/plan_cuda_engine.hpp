@@ -27,6 +27,7 @@
 #include "engine/decode_driver.hpp"
 #include "engine/engine_types.hpp"
 #include "engine/op_plan.hpp"
+#include "engine/plan_model_config.hpp"
 #include "model/safetensors_loader.hpp"
 
 namespace engine {
@@ -91,40 +92,17 @@ class PlanCudaEngine : public runtime::SequenceModel {
   int sample(const runtime::DecodeParams& params, const std::vector<int>& history) override;
 
  private:
-  // Which model recipe builds the plan. The EXECUTOR, sampler, quantizer, decode
-  // graph and KV/state machinery are shared; only the config parse, weight load and
-  // plan recipe differ — so a "new model" is a recipe, not an engine.
-  enum class Family { Gemma4, Qwen35 };
-
-  struct Config {
-    Family family = Family::Gemma4;
-    int num_layers = 0, hidden = 0, num_heads = 0, num_kv_heads = 1;
-    int head_dim = 256, global_head_dim = 512, intermediate = 0, vocab = 0;
-    // Actual per-layer-type head_dim from the weights (E2B: 256/512; 12B: 256/512).
-    int head_dim_sliding = 256, head_dim_full = 512;
-    // num_kv_heads can differ per layer type (12B: sliding GQA-8, full MQA-1).
-    int num_kv_heads_sliding = 1, num_kv_heads_full = 1;
-    bool attention_k_eq_v = false;  // 12B full layers: V shares k_proj (no v_proj)
-    int hidden_size_per_layer_input = 256, num_kv_shared_layers = 0, first_shared_layer = 0;
-    int sliding_window = 0, bos_token_id = 2, eos_token_id = 1;
-    float rms_eps = 1e-6f, final_logit_softcapping = 0.0f;
-    float rope_theta_full = 1e6f, rope_theta_sliding = 1e4f, partial_rotary_full = 0.25f;
-    bool use_double_wide_mlp = false, tie_word_embeddings = true;
-    bool enable_moe_block = false;  // 26B-A4B: dense-MLP + top-k experts (not yet run)
-    int num_experts = 0, top_k_experts = 0, moe_intermediate_size = 0;
-    std::vector<int> layer_full;    // 1 if full_attention, 0 if sliding/linear
-    std::vector<int> kv_source;     // which layer's K/V each layer uses
-
-    // ── Qwen3.5 (hybrid full-attention + gated delta-net) ──
-    // layer_full doubles as the layer-kind mask here: 1 = full_attention,
-    // 0 = linear_attention (delta-net), exactly as for Gemma's sliding layers.
-    int linear_num_key_heads = 0, linear_num_value_heads = 0;
-    int linear_key_head_dim = 0, linear_value_head_dim = 0;
-    int linear_conv_kernel_dim = 0;
-    int max_position_embeddings = 0;
-    float rope_theta = 1e7f;
-    float partial_rotary_factor = 1.0f;
-  };
+  // Which model recipe builds the plan, and the geometry it builds from. BOTH now live in
+  // engine/plan_model_config.hpp, a header with no CUDA in it, because PlanMetalEngine needs the
+  // same answers -- "what shape is this model" is not a backend question. These aliases keep every
+  // existing `cfg_.<field>` and `Family::Gemma4` in this engine compiling unchanged; the field
+  // names in the shared struct are deliberately identical for that reason.
+  //
+  // The EXECUTOR, sampler, quantizer, decode graph and KV/state machinery are shared; only the
+  // config parse, weight load and plan recipe differ -- so a "new model" is a recipe, not an
+  // engine, and a new BACKEND for an existing model should be a routing change, not a fork.
+  using Family = engine::PlanFamily;
+  using Config = engine::PlanModelConfig;
 
   struct TensorMeta {
     std::string dtype;

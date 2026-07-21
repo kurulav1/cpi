@@ -117,6 +117,10 @@ set(LLAMA_ENGINE_SOURCES
   # Backend-neutral: a plan is just data, so the builder belongs outside any
   # GPU backend and is shared by the CUDA and Metal executors alike.
   src/engine/op_plan_builder.cpp
+  # Same reasoning for the config the builder reads: "what shape is this model" is
+  # not a backend question. Gemma 4 was CUDA-only because this parse sat in a header
+  # that included <cuda_runtime.h>, not because of any missing kernel.
+  src/engine/plan_model_config.cpp
   # The shared sampler (temperature / top-k / top-p / repetition penalty / n-gram).
   # It has no CUDA in it and never did; it was only ever in the CUDA block because it
   # lived next to LlamaEngine. Metal needs it, so it moves to the portable list.
