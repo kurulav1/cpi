@@ -822,7 +822,11 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
       // not batch-safe (the per-layer-type KV geometry and the PLE prologue are the candidates,
       // neither yet checked). Kept as the conservative choice -- ~16 tok/s prefill is slow, a
       // wrong answer is worse. Lifting this is the open perf item.
-      if (op.aux_offset != 0) {
+      // CPI_METAL_BATCH_AUX=1 opts INTO batched prefill for this plan, so the remaining
+      // batch-safety bug can be bisected without editing and rebuilding. Default stays
+      // token-by-token, which is slow but correct.
+      static const bool allow_batched_aux = std::getenv("CPI_METAL_BATCH_AUX") != nullptr;
+      if (op.aux_offset != 0 && !allow_batched_aux) {
         has_recurrent_ops_ = true;
       }
     }
