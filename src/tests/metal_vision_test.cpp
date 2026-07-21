@@ -23,6 +23,9 @@
 #include "model/json_mini.hpp"
 #include "engine/plan_metal_engine.hpp"
 #include "runtime/fp16.hpp"
+#include <filesystem>
+#include "model/config_json.hpp"
+#include "model/safetensors_loader.hpp"
 #include "model/weight_loader.hpp"
 #include "runtime/metal_context.hpp"
 
@@ -738,9 +741,32 @@ int main(int argc, char** argv) {
   // stored transposed, a geometry field dropped by the packer's whitelist -- none of those can
   // be seen upstream of here.
   if (argc >= 3) {
+    // Loader-agnostic. This block byte-checks tensors straight out of the container, so it has
+    // to know the format -- and the engine now accepts BOTH .ll2c and .cpi/safetensors. Opening
+    // WeightLoader unconditionally is what made a repacked .cpi throw "expected LL2CUDA manifest"
+    // here while the engine loaded it fine.
+    const std::string cpath = argv[2];
+    const bool use_st = (cpath.size() > 4 && cpath.compare(cpath.size() - 4, 4, ".cpi") == 0) ||
+                        std::filesystem::is_directory(cpath);
     model::WeightLoader wl;
-    wl.open(argv[2]);
-    const model::LlamaConfig& c = wl.config();
+    model::SafetensorsLoader st;
+    model::LlamaConfig c;
+    if (use_st) {
+      st.open(cpath);
+      c = model::config_from_json(st.metadata_json());
+    } else {
+      wl.open(cpath);
+      c = wl.config();
+    }
+    const auto ct_has = [&](const std::string& n) {
+      return use_st ? st.has_tensor(n) : wl.has_tensor(n);
+    };
+    const auto ct_data = [&](const std::string& n) {
+      return use_st ? st.tensor_data(n) : wl.tensor_data(n);
+    };
+    const auto ct_bytes = [&](const std::string& n) {
+      return use_st ? st.tensor_bytes(n) : wl.tensor_bytes(n);
+    };
     std::printf("      container: v-geometry depth=%d hidden=%d heads=%d merge=%d out=%d\n",
                 c.vision_depth, c.vision_hidden_size, c.vision_num_heads,
                 c.vision_spatial_merge_size, c.vision_out_hidden_size);
@@ -768,14 +794,14 @@ int main(int argc, char** argv) {
           {"vision.blocks.11.mlp.fc2.weight", "blocks_11_mlp_linear_fc2_weight"},
       };
       for (const auto& pr : pairs) {
-        if (!wl.has_tensor(pr.first)) {
+        if (!ct_has(pr.first)) {
           std::printf("      MISSING from container: %s\n", pr.first.c_str());
           ++bad;
           continue;
         }
         const std::vector<float> ref = read_f32(dir + "/weights/" + pr.second + ".f32");
-        const auto* got = reinterpret_cast<const std::uint16_t*>(wl.tensor_data(pr.first));
-        const std::size_t n2 = wl.tensor_bytes(pr.first) / 2;
+        const auto* got = reinterpret_cast<const std::uint16_t*>(ct_data(pr.first));
+        const std::size_t n2 = ct_bytes(pr.first) / 2;
         if (n2 != ref.size()) {
           std::printf("      SIZE %s: container %zu vs oracle %zu\n", pr.first.c_str(), n2,
                       ref.size());
