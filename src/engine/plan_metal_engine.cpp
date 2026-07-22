@@ -1263,7 +1263,8 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
       // GLU fusion (ported from the CUDA campaign): [gate][up][GeluMul] in ONE dispatch,
       // writing the activated product straight to the GeluMul's output -- no Gate/Up
       // round-trip and one dispatch fewer than the cat+gelu pair.
-      const bool glu = gu && oi + 2 < ops.size() && ops[oi + 2].kind == OpKind::GeluMul &&
+      static const bool no_glu = std::getenv("CPI_METAL_NO_GLU") != nullptr;
+      const bool glu = !no_glu && gu && oi + 2 < ops.size() && ops[oi + 2].kind == OpKind::GeluMul &&
                        ops[oi + 2].in == op.out && ops[oi + 2].in2 == ops[oi + 1].out &&
                        ops[oi + 2].aux_ptr == nullptr && ops[oi + 2].aux_offset == 0 &&
                        ops[oi + 2].cols == op.cols && op.bias == nullptr &&
