@@ -858,6 +858,14 @@ void PlanCudaEngine::load_all(const std::string& cpi_path) {
       load_weight(p + t, t);
     // k_eq_v full layers have no v_proj (V reuses the raw k_proj output).
     if (!k_eq_v(L)) load_weight(p + "self_attn.v_proj.weight", "self_attn.v_proj.weight");
+    {
+      // Fold the sqrt(head_dim) attention pre-scale into the q_norm weight (scaling
+      // commutes with rotation): the per-layer ScaleCopy op it replaces cost a
+      // kernel-latency floor every token.
+      const int hd_l = head_dim_of(L);
+      __half* wq = const_cast<__half*>(dev_at(p + "self_attn.q_norm.weight"));
+      kernels::launch_scale_copy(wq, wq, hd_l, std::sqrt(static_cast<float>(hd_l)), stream_);
+    }
     if (has_ple()) {
       for (const char* t : {"per_layer_input_gate.weight", "per_layer_projection.weight"})
         load_weight(p + t, t);
@@ -1732,8 +1740,9 @@ void PlanCudaEngine::build_plan() {
       st.cols = kvdim;
       ops.push_back(st);
     }
-    // net attention scale = 1.0: pre-scale q by sqrt(hd) to cancel the kernel's 1/sqrt(hd).
-    scale(Slot::Q, qdim, std::sqrt((float)hd));
+    // net attention scale = 1.0: sqrt(hd) is FOLDED INTO the q_norm weight at load (it
+    // commutes with the rotation), cancelling the kernel's internal 1/sqrt(hd) without a
+    // per-layer ScaleCopy op.
     {
       Op o;
       o.kind = OpKind::Attention;
@@ -1792,8 +1801,9 @@ void PlanCudaEngine::build_plan() {
       add_x(Slot::Tmp);
     }
 
-    // --- per-layer scalar ---
-    scale(Slot::X, H, layer_scalar_host_[L]);
+    // --- per-layer scalar (a checkpoint without one means 1.0 -- emitting a no-op
+    // ScaleCopy per layer costs a real ~1 us kernel-latency floor each) ---
+    if (layer_scalar_host_[L] != 1.0f) scale(Slot::X, H, layer_scalar_host_[L]);
   }
 
   // --- epilogue: final norm -> LM head (float logits). Softcap stays host-side. ---
