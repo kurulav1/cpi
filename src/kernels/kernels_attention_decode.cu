@@ -356,7 +356,8 @@ __device__ __forceinline__ void attention_step_chunk_stats_core(
 
   // Score every key in the chunk. Key (chunk_start + i) belongs to warp (i % WarpsPerBlock)
   // exactly as the old tile loop assigned it, so each dot is the same fp sequence.
-  for (int t = chunk_start + warp_id; t < chunk_end; t += WarpsPerBlock) {
+  const int score_warps = blockDim.x / warpSize;  // launchers may raise threads: more
+  for (int t = chunk_start + warp_id; t < chunk_end; t += score_warps) {  // parallel dots
     const int base = cache_index(t, kv_head, 0, num_kv_heads, head_dim);
     const half2* q2 = reinterpret_cast<const half2*>(q_shared);
     const half2* k2 = reinterpret_cast<const half2*>(k_cache + base);
@@ -549,7 +550,10 @@ __global__ void attention_step_chunk_stats_any_device_pos_kernel(
 __device__ __forceinline__ void attention_step_chunk_reduce_any_core(
     const float* chunk_m, const float* chunk_l, const float* chunk_o, half* out, int seq_len,
     int num_heads, int head_dim, int chunk_size, int scratch_chunks, int k_start) {
-  __shared__ float scale_shared[3];
+  // Every thread runs the m/l scan redundantly in registers -- identical inputs in
+  // identical order give identical values, so the old per-chunk single-thread section and
+  // its TWO barriers (x26 chunks) vanish without moving a rounding. The m/l loads are
+  // same-address broadcasts.
   const int head = blockIdx.x;
   const int tid = threadIdx.x;
   const int first_chunk = k_start / chunk_size;
@@ -561,23 +565,15 @@ __device__ __forceinline__ void attention_step_chunk_reduce_any_core(
   float running_l = 0.0f;
 
   for (int chunk = first_chunk; chunk < chunk_count; ++chunk) {
-    if (tid == 0) {
-      const int idx = head * scratch_chunks + chunk;
-      const float chunk_m_value = chunk_m[idx];
-      const float chunk_l_value = chunk_l[idx];
-      const float new_m = fmaxf(running_m, chunk_m_value);
-      const float alpha = (running_l == 0.0f) ? 0.0f : expf(running_m - new_m);
-      const float beta = (chunk_l_value == 0.0f) ? 0.0f : expf(chunk_m_value - new_m);
-      running_l = running_l * alpha + chunk_l_value * beta;
-      running_m = new_m;
-      scale_shared[0] = alpha;
-      scale_shared[1] = beta;
-      scale_shared[2] = running_l;
-    }
-    __syncthreads();
+    const int idx = head * scratch_chunks + chunk;
+    const float chunk_m_value = chunk_m[idx];
+    const float chunk_l_value = chunk_l[idx];
+    const float new_m = fmaxf(running_m, chunk_m_value);
+    const float alpha = (running_l == 0.0f) ? 0.0f : expf(running_m - new_m);
+    const float beta = (chunk_l_value == 0.0f) ? 0.0f : expf(chunk_m_value - new_m);
+    running_l = running_l * alpha + chunk_l_value * beta;
+    running_m = new_m;
 
-    const float alpha = scale_shared[0];
-    const float beta = scale_shared[1];
     const std::size_t base =
         (static_cast<std::size_t>(head) * static_cast<std::size_t>(scratch_chunks) +
          static_cast<std::size_t>(chunk)) *
@@ -586,10 +582,9 @@ __device__ __forceinline__ void attention_step_chunk_reduce_any_core(
     for (int d = tid; d < head_dim; d += blockDim.x, ++j) {
       acc[j] = acc[j] * alpha + chunk_o[base + static_cast<std::size_t>(d)] * beta;
     }
-    __syncthreads();
   }
 
-  const float inv_l = 1.0f / fmaxf(scale_shared[2], 1e-8f);
+  const float inv_l = 1.0f / fmaxf(running_l, 1e-8f);
   int j = 0;
   for (int d = tid; d < head_dim; d += blockDim.x, ++j) {
     out[head * head_dim + d] = __float2half(acc[j] * inv_l);
@@ -1909,8 +1904,8 @@ void launch_attention_split_any(const half* q, const half* k_cache, const half* 
                                 int num_kv_heads, int head_dim, float* scratch_m,
                                 float* scratch_l, float* scratch_o, int chunk_size,
                                 int scratch_chunks, cudaStream_t stream) {
-  constexpr int warps = 4;
-  constexpr int threads = warps * 32;
+  constexpr int warps = 4;       // merge-tile template arg (arithmetic order pinned)
+  constexpr int threads = 256;   // score/merge thread count -- runtime-derived in-kernel
   const int k_start = (window > 0 && seq_len > window) ? seq_len - window : 0;
   const std::size_t smem = static_cast<std::size_t>(head_dim) * sizeof(half) +
                            static_cast<std::size_t>(2 * warps + 4) * sizeof(float) +
@@ -1930,8 +1925,8 @@ void launch_attention_split_any_device_pos(const half* q, const half* k_cache,
                                            int head_dim, float* scratch_m, float* scratch_l,
                                            float* scratch_o, int chunk_size, int scratch_chunks,
                                            cudaStream_t stream) {
-  constexpr int warps = 4;
-  constexpr int threads = warps * 32;
+  constexpr int warps = 4;       // merge-tile template arg (arithmetic order pinned)
+  constexpr int threads = 256;   // score/merge thread count -- runtime-derived in-kernel
   const std::size_t smem = static_cast<std::size_t>(head_dim) * sizeof(half) +
                            static_cast<std::size_t>(2 * warps + 4) * sizeof(float) +
                            static_cast<std::size_t>(warps * head_dim) * sizeof(half);
