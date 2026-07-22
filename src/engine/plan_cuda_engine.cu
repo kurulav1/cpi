@@ -1909,7 +1909,22 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
     // run as one launch. Unlike the opt-in fusions below this survives its measurement:
     // the 256-row k/v grids are pure exposed latency behind q's launch, and the cat kernel
     // is per-row bit-identical to the split wide gemv, so the token stream cannot move.
+    // fp16 GLU fusion, checked before the cat peephole so [gate][up][gelu] outranks
+    // a plain gate|up cat.
     static const bool no_cat = std::getenv("CPI_CUDA_NO_CAT") != nullptr;
+    if (!seq && !no_cat && op.kind == OpKind::Gemv && op.qbits == 0 && op.bias == nullptr &&
+        (op.in_dim % 8) == 0 && idx + 2 < n && ops[idx + 1].kind == OpKind::Gemv &&
+        ops[idx + 1].qbits == 0 && ops[idx + 1].bias == nullptr && ops[idx + 1].in == op.in &&
+        ops[idx + 1].in_dim == op.in_dim && ops[idx + 1].cols == op.cols &&
+        ops[idx + 2].kind == OpKind::GeluMul && ops[idx + 2].aux_ptr == nullptr &&
+        ops[idx + 2].aux_offset == 0 && ops[idx + 2].in == op.out &&
+        ops[idx + 2].in2 == ops[idx + 1].out && ops[idx + 2].cols == op.cols &&
+        ops[idx + 2].out != op.in) {
+      kernels::launch_half_gemv_glu(HW(op.weight), HW(ops[idx + 1].weight), S(op.in),
+                                    S(ops[idx + 2].out), op.cols, op.in_dim, stream_);
+      idx += 2;
+      goto op_done;
+    }
     if (!seq && !no_cat && op.kind == OpKind::Gemv && op.qbits == 0 && op.bias == nullptr &&
         (op.in_dim % 8) == 0 && op.out != op.in && idx + 1 < n) {
       const Op& b = ops[idx + 1];

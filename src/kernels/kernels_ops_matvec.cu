@@ -1453,6 +1453,80 @@ __global__ void quantize_fp16_to_int8_perm8_g32_kernel(const half* __restrict__ 
   }
 }
 
+// fp16 GeGLU fused matvec: paired-warp shape (gate warps 0..R-1, up warps R..2R-1, one
+// row per warp), inner loop = gemv_wide's 128-bit half loads, gelu on the fp16-rounded
+// dots exactly as the unfused [gemv; gemv; gelu_mul] sequence rounds them.
+template <int RowsPerBlock>
+__global__ void half_gemv_glu_kernel(const half* __restrict__ wg, const half* __restrict__ wu,
+                                     const half* __restrict__ x, half* __restrict__ y,
+                                     int out_features, int in_features) {
+  __shared__ float pair_acc[2 * RowsPerBlock];
+  const int warp_id = static_cast<int>(threadIdx.x) / warpSize;
+  const int lane = static_cast<int>(threadIdx.x) & (warpSize - 1);
+  const bool is_up = warp_id >= RowsPerBlock;
+  const int local_row = is_up ? (warp_id - RowsPerBlock) : warp_id;
+  const int row = blockIdx.x * RowsPerBlock + local_row;
+  float acc = 0.0f;
+  if (row < out_features) {
+    const half* w = is_up ? wu : wg;
+    const int vecs = in_features / 8;
+    const int4* wrow = reinterpret_cast<const int4*>(
+        w + static_cast<std::size_t>(row) * static_cast<std::size_t>(in_features));
+    const int4* xv4 = reinterpret_cast<const int4*>(x);
+    constexpr int kUnroll = 4;
+    int4 wbuf[kUnroll];
+    int4 xbuf[kUnroll];
+    for (int base = lane; base < vecs; base += warpSize * kUnroll) {
+#pragma unroll
+      for (int u = 0; u < kUnroll; ++u) {
+        const int i = base + u * warpSize;
+        if (i < vecs) {
+          wbuf[u] = wrow[i];
+          xbuf[u] = xv4[i];
+        }
+      }
+#pragma unroll
+      for (int u = 0; u < kUnroll; ++u) {
+        const int i = base + u * warpSize;
+        if (i < vecs) {
+          const half2* wh = reinterpret_cast<const half2*>(&wbuf[u]);
+          const half2* xh = reinterpret_cast<const half2*>(&xbuf[u]);
+#pragma unroll
+          for (int j = 0; j < 4; ++j) {
+            const float2 a = __half22float2(wh[j]);
+            const float2 b = __half22float2(xh[j]);
+            acc += a.x * b.x + a.y * b.y;
+          }
+        }
+      }
+    }
+    acc = warp_sum(acc);
+  }
+  if (lane == 0) {
+    pair_acc[warp_id] = acc;
+  }
+  __syncthreads();
+  if (warp_id == 0 && lane < RowsPerBlock) {
+    const int out_row = blockIdx.x * RowsPerBlock + lane;
+    if (out_row < out_features) {
+      const float gate_h = __half2float(__float2half(pair_acc[lane]));
+      const float up_h = __half2float(__float2half(pair_acc[RowsPerBlock + lane]));
+      y[out_row] = __float2half(gelu_tanh_f32(gate_h) * up_h);
+    }
+  }
+}
+
+void launch_half_gemv_glu(const half* wg, const half* wu, const half* x, half* y,
+                          int out_features, int in_features, cudaStream_t stream) {
+  if ((in_features % 8) != 0) {
+    return;  // caller gates
+  }
+  constexpr int kRows = 4;
+  const int blocks = (out_features + kRows - 1) / kRows;
+  half_gemv_glu_kernel<kRows><<<blocks, kRows * 64, 0, stream>>>(wg, wu, x, y, out_features,
+                                                                 in_features);
+}
+
 void launch_quantize_fp16_to_int8_perm8_g32(const half* src, std::int8_t* dst, float* scales,
                                             int cols, cudaStream_t stream) {
   constexpr int threads = 256;

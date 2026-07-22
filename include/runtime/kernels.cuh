@@ -1112,6 +1112,13 @@ void launch_weight_only_int8_matvec_glu(const std::int8_t* wg, const float* sg,
                                         half* y, int out_features, int in_features,
                                         cudaStream_t stream);
 
+// launch_half_gemv_glu
+//
+// Fused fp16 GeGLU: out[r] = gelu_tanh(gate_r) * up_r, paired-warp shape, gelu on the
+// fp16-rounded dots. in_features % 8 == 0.
+void launch_half_gemv_glu(const half* wg, const half* wu, const half* x, half* y,
+                          int out_features, int in_features, cudaStream_t stream);
+
 // launch_rowmajor_half_gemv_cat
 //
 // Up to three batch-1 fp16 GEMVs sharing one input vector, run as ONE launch (q|k|v,
