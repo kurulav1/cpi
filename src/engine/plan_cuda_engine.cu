@@ -5,6 +5,8 @@
 // decode attention, gelu-mul, gemv).
 #include <algorithm>
 #include <chrono>
+#include <map>
+#include <string>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -1743,8 +1745,84 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
   const bool seq = T > 1;
   auto rows_x = [&](int rows) { return rows * T; };
   auto len_x = [&](int len) { return len * T; };
+  // CPI_CUDA_PROFILE=1: per-op-kind GPU time via event pairs, printed at exit. Decode-only
+  // ranking tool; it serialises nothing but each op pays two event records, so its ABSOLUTE
+  // numbers are honest and its use is with LLAMA_INFER_PLAN_NO_GRAPH=1 (a captured graph
+  // bypasses this function entirely).
+  static const bool prof = std::getenv("CPI_CUDA_PROFILE") != nullptr;
+  struct ProfBin {
+    double ms = 0.0;
+    std::uint64_t count = 0;
+  };
+  static std::map<std::string, ProfBin> prof_bins;
+  static struct ProfDump {
+    ~ProfDump() {
+      if (prof_bins.empty()) return;
+      std::fprintf(stderr, "[cuda-prof] per-op-kind GPU ms (sum / count / us-per):\n");
+      double total = 0.0;
+      for (const auto& kv : prof_bins) total += kv.second.ms;
+      for (const auto& kv : prof_bins) {
+        std::fprintf(stderr, "  %-18s %9.2f ms  %8llu  %6.2f us  %5.1f%%\n", kv.first.c_str(),
+                     kv.second.ms, static_cast<unsigned long long>(kv.second.count),
+                     1000.0 * kv.second.ms / static_cast<double>(kv.second.count),
+                     100.0 * kv.second.ms / total);
+      }
+      std::fprintf(stderr, "  %-18s %9.2f ms\n", "TOTAL", total);
+    }
+  } prof_dump;
+  cudaEvent_t ev0 = nullptr, ev1 = nullptr;
   for (std::size_t idx = 0; idx < n; ++idx) {
     const Op& op = ops[idx];
+    if (prof) {
+      cudaEventCreate(&ev0);
+      cudaEventCreate(&ev1);
+      cudaEventRecord(ev0, stream_);
+    }
+
+    // DECODE FUSION PEEPHOLES -- OPT-IN (LLAMA_INFER_PLAN_FUSE=1), because the premise was
+    // measured and did not survive. The eager profiler prices every tiny op at ~11-14 us,
+    // which made these two patterns (~200 of Gemma 4's ~870 per-token kernels) look like a
+    // fifth of the token; fused-vs-unfused interleaved A/B under GRAPH replay measured
+    // 100.2/103.2 vs 101.1/105.5 tok/s -- neutral to slightly negative. The ~12 us was
+    // LAUNCH cost that graph replay already amortises, not execution the fusion could
+    // remove: a limiter read off the eager path cannot be quoted as the graph's. Kept as an
+    // experiment lever, not a default: fusion also changes reduction order, so opt-in runs
+    // may shift near-tie tokens.
+    static const bool fuse = std::getenv("LLAMA_INFER_PLAN_FUSE") != nullptr;
+    if (!seq && fuse) {
+      // [RmsNorm(1 x cols, in==out)] [AddInplace(dst += that)] [optional ScaleCopy(dst *= a)]
+      if (op.kind == OpKind::RmsNorm && !op.norm_offset && op.rows == 1 && op.in == op.out &&
+          op.weight != nullptr && idx + 1 < n && ops[idx + 1].kind == OpKind::AddInplace &&
+          ops[idx + 1].in == op.out && ops[idx + 1].out != op.out) {
+        const Op& add = ops[idx + 1];
+        float alpha = 1.0f;
+        std::size_t consumed = 1;
+        if (idx + 2 < n && ops[idx + 2].kind == OpKind::ScaleCopy && ops[idx + 2].in == add.out &&
+            ops[idx + 2].out == add.out) {
+          alpha = ops[idx + 2].scale;
+          consumed = 2;
+        }
+        kernels::launch_rmsnorm_add_scale(S(add.out), S(op.in), HW(op.weight), op.cols,
+                                          cfg_.rms_eps, alpha, stream_);
+        idx += consumed;
+        goto op_done;
+      }
+      // [RmsNorm(rows=heads, in==out, weighted)] [Rope(same slot, whole-head table rope)]
+      if (op.kind == OpKind::RmsNorm && !op.norm_offset && op.rows > 1 && op.in == op.out &&
+          op.weight != nullptr && idx + 1 < n && ops[idx + 1].kind == OpKind::Rope &&
+          ops[idx + 1].in == op.in && ops[idx + 1].rotary_dim == 0 &&
+          ops[idx + 1].heads == op.rows && ops[idx + 1].head_dim == op.cols) {
+        const Op& rp = ops[idx + 1];
+        const float* cosT = rp.rope_table == RopeTable::Full ? d_cos_full_ : d_cos_sliding_;
+        const float* sinT = rp.rope_table == RopeTable::Full ? d_sin_full_ : d_sin_sliding_;
+        kernels::launch_rmsnorm_rope(S(op.in), HW(op.weight), op.rows, op.cols, position,
+                                     device_pos_mode_ ? d_position_ : nullptr, cosT, sinT,
+                                     cfg_.rms_eps, stream_);
+        idx += 1;
+        goto op_done;
+      }
+    }
+
     switch (op.kind) {
       case OpKind::EmbeddingLookup:
         kernels::launch_embedding_lookup(HW(op.weight), seq ? d_seq_tokens_ : d_tok_, S(op.out), T,
@@ -1976,6 +2054,31 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
             S(Slot::LinB), op.auxf_a, op.auxf_b, HW(op.aux_ptr), lin_recurrent_state(layer),
             S(Slot::LinAtt), op.num_v_heads, op.key_head_dim, op.value_head_dim, op.eps, stream_);
         break;
+    }
+  op_done:
+    if (prof) {
+      cudaEventRecord(ev1, stream_);
+      cudaEventSynchronize(ev1);
+      float ms = 0.0f;
+      cudaEventElapsedTime(&ms, ev0, ev1);
+      static const char* kProfNames[] = {"RmsNorm", "Gemv", "Rope", "ScaleCopy", "CopySlot",
+                                         "KvStore", "Attention", "GeluMul", "AddInplace",
+                                         "AddRmsNorm", "Embedding", "LmHead", "SiluMul",
+                                         "SplitHeads", "SigmoidGate", "LinConv1d", "RepeatHeads",
+                                         "LinAttnStep", "MulVec", "MoeRouter", "MoeGateUp",
+                                         "MoeDown", "PatchEmbed", "Rope2D", "AvgPool", "Standardize"};
+      const int ki = static_cast<int>(op.kind);
+      std::string key = (ki >= 0 && ki < 26) ? kProfNames[ki] : "Unknown";
+      // Split the two op kinds that hide very different shapes under one name.
+      if (op.kind == OpKind::Gemv) {
+        key += "_" + std::to_string(op.cols) + "x" + std::to_string(op.in_dim);
+      } else if (op.kind == OpKind::RmsNorm) {
+        key += "_" + std::to_string(op.rows) + "x" + std::to_string(op.cols);
+      }
+      prof_bins[key].ms += ms;
+      prof_bins[key].count += 1;
+      cudaEventDestroy(ev0);
+      cudaEventDestroy(ev1);
     }
   }
 }

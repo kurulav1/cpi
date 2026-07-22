@@ -141,6 +141,22 @@ void launch_rope_inplace_partial_table(half* q, half* k, int num_heads_q, int nu
                                        const float* cos_table, const float* sin_table,
                                        cudaStream_t stream);
 
+// launch_rmsnorm_add_scale
+//
+// Decode fusion: x = (x + rmsnorm_w(tmp)) * alpha over one row. Replaces the
+// [RmsNorm -> AddInplace -> optional ScaleCopy] sandwich-norm tail (three ~12 us kernel
+// entries) with one.
+void launch_rmsnorm_add_scale(half* x, const half* tmp, const half* w, int cols, float eps,
+                              float alpha, cudaStream_t stream);
+
+// launch_rmsnorm_rope
+//
+// Decode fusion: per-head rmsnorm then table RoPE, in place. pos_ptr (device) wins over
+// position (host) when non-null, so the kernel is graph-capturable.
+void launch_rmsnorm_rope(half* s, const half* w, int heads, int head_dim, int position,
+                         const int* pos_ptr, const float* cos_table, const float* sin_table,
+                         float eps, cudaStream_t stream);
+
 // launch_rope_inplace_partial_table_device_pos
 //
 // The partial-RoPE variant with the position read from a device pointer -- the piece that

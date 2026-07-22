@@ -347,6 +347,95 @@ __global__ void rope_inplace_partial_table_kernel(half* q, half* k, int num_head
 // arithmetic: only the position source differs. Keep the two in lockstep -- the graph gate
 // (graphs-on vs LLAMA_INFER_PLAN_NO_GRAPH streams must be token-identical) is what catches
 // drift between them.
+// ---------------------------------------------------------------------------
+// Decode fusions (the kernel-count tax). At T=1 on this GPU every kernel costs ~11-14 us
+// REGARDLESS of size -- a 3 KB residual add prices the same as a 1 MB GEMV -- so Gemma 4's
+// ~870-op token spent more time entering kernels than running them. These fuse the two
+// highest-count patterns; the executor's peepholes decide when they apply.
+
+// x = (x + rmsnorm_w(tmp)) * alpha, one row. Fuses the sandwich-norm tail
+// [RmsNorm(Tmp) -> AddInplace(X += Tmp) -> optional ScaleCopy(X *= layer_scalar)]
+// into one kernel. Rounding mirrors the eager sequence: the normalised value is rounded to
+// half before the add, the sum is rounded before the scale, so drift against the unfused
+// path is one reduction-order difference in the sum of squares, not a formula change.
+__global__ void rmsnorm_add_scale_kernel(half* x, const half* tmp, const half* w, int cols,
+                                         float eps, float alpha) {
+  const int tid = threadIdx.x;
+  __shared__ float sum_sq[256];
+  __shared__ float inv_shared;
+
+  float local = 0.0f;
+  for (int col = tid; col < cols; col += blockDim.x) {
+    const float v = __half2float(tmp[col]);
+    local += v * v;
+  }
+  sum_sq[tid] = local;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) sum_sq[tid] += sum_sq[tid + stride];
+    __syncthreads();
+  }
+  if (tid == 0) inv_shared = rsqrtf(sum_sq[0] / static_cast<float>(cols) + eps);
+  __syncthreads();
+
+  const float inv = inv_shared;
+  for (int col = tid; col < cols; col += blockDim.x) {
+    const float nv = __half2float(tmp[col]) * inv * __half2float(w[col]);
+    const half nh = __float2half(nv);  // the fp16 the unfused RmsNorm would have written
+    float acc = __half2float(x[col]) + __half2float(nh);
+    if (alpha != 1.0f) {
+      acc = __half2float(__float2half(acc)) * alpha;  // ScaleCopy read a rounded sum
+    }
+    x[col] = __float2half(acc);
+  }
+}
+
+// Per-head rmsnorm followed by table RoPE, in place: fuses the [RmsNorm(rows=heads) -> Rope]
+// pair on Q and K. The table encodes any partial rotary (identity rotations past the rotary
+// span), exactly as the unfused rope kernel reads it. `pos_ptr` wins over `position` when
+// non-null, so the same kernel serves eager decode and graph capture.
+__global__ void rmsnorm_rope_kernel(half* s, const half* w, int head_dim, int position,
+                                    const int* pos_ptr, const float* cos_table,
+                                    const float* sin_table, float eps) {
+  const int head = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int half_dim = head_dim / 2;
+  half* row = s + static_cast<std::size_t>(head) * head_dim;
+  __shared__ float sum_sq[256];
+  __shared__ float inv_shared;
+
+  float local = 0.0f;
+  for (int col = tid; col < head_dim; col += blockDim.x) {
+    const float v = __half2float(row[col]);
+    local += v * v;
+  }
+  sum_sq[tid] = local;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) sum_sq[tid] += sum_sq[tid + stride];
+    __syncthreads();
+  }
+  if (tid == 0) inv_shared = rsqrtf(sum_sq[0] / static_cast<float>(head_dim) + eps);
+  __syncthreads();
+
+  const float inv = inv_shared;
+  const int pos = (pos_ptr != nullptr) ? pos_ptr[0] : position;
+  for (int pair = tid; pair < half_dim; pair += blockDim.x) {
+    const int i0 = pair;
+    const int i1 = pair + half_dim;
+    // Normalise both lanes of the pair, rounded to half exactly as the unfused norm wrote them.
+    const float n0 =
+        __half2float(__float2half(__half2float(row[i0]) * inv * __half2float(w[i0])));
+    const float n1 =
+        __half2float(__float2half(__half2float(row[i1]) * inv * __half2float(w[i1])));
+    const int table_idx = pos * half_dim + pair;
+    const float c = cos_table[table_idx];
+    const float sn = sin_table[table_idx];
+    row[i0] = __float2half(n0 * c - n1 * sn);
+    row[i1] = __float2half(n1 * c + n0 * sn);
+  }
+}
+
 __global__ void rope_inplace_partial_table_device_pos_kernel(half* q, half* k, int num_heads_q,
                                                              int num_heads_k, int head_dim,
                                                              int rotary_dim,
@@ -1136,6 +1225,18 @@ void launch_rope_inplace_partial_table_device_pos(half* q, half* k, int num_head
   const int blocks = (num_heads_q > num_heads_k) ? num_heads_q : num_heads_k;
   rope_inplace_partial_table_device_pos_kernel<<<blocks, threads, 0, stream>>>(
       q, k, num_heads_q, num_heads_k, head_dim, rotary_dim, position, cos_table, sin_table);
+}
+
+void launch_rmsnorm_add_scale(half* x, const half* tmp, const half* w, int cols, float eps,
+                              float alpha, cudaStream_t stream) {
+  rmsnorm_add_scale_kernel<<<1, 256, 0, stream>>>(x, tmp, w, cols, eps, alpha);
+}
+
+void launch_rmsnorm_rope(half* s, const half* w, int heads, int head_dim, int position,
+                         const int* pos_ptr, const float* cos_table, const float* sin_table,
+                         float eps, cudaStream_t stream) {
+  rmsnorm_rope_kernel<<<heads, 256, 0, stream>>>(s, w, head_dim, position, pos_ptr, cos_table,
+                                                 sin_table, eps);
 }
 
 void launch_rope_inplace_device_pos(half* q, half* k, int num_heads_q, int num_heads_k,
