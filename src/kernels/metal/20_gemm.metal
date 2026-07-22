@@ -769,13 +769,64 @@ kernel void cpi_gemv_quant_cat(
   const uint lane = lid % 32u;
 
   const uint total = p.n0 + p.n1 + p.n2;
+  const uint gsz = (p.group == 0u) ? p.in_dim : p.group;
+
+  // NR0=4 decode path (see cpi_gemv_quant): four rows per simdgroup, activations loaded
+  // once for all four. Executor shrinks the grid under the SAME predicate.
+  if (p.tokens == 1u && p.bits == 4u && (p.in_dim & 31u) == 0u && (gsz & 31u) == 0u &&
+      p.has_bias == 0u) {
+    const uint r0 = (gid * simds_per_tg + simd_id) * 4u;
+    if (r0 >= total) return;
+    const uint nrows = min(4u, total - r0);
+    float acc4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const uint n32 = p.in_dim >> 5;
+    for (uint k = lane; k < n32; k += 32u) {
+      const uint j0 = k << 5;
+      device const half4* x4 = (device const half4*)(in + j0);
+      float4 xev[4], xod[4];
+      for (uint w = 0u; w < 4u; ++w) {
+        const half4 xa = x4[2u * w];
+        const half4 xb = x4[2u * w + 1u];
+        xev[w] = float4(float(xa.x), float(xa.z), float(xb.x), float(xb.z));
+        xod[w] = float4(float(xa.y), float(xa.w), float(xb.y), float(xb.w));
+      }
+      for (uint r = 0u; r < nrows; ++r) {
+        const uint g = r0 + r;
+        device const uchar* qw = (g < p.n0) ? qw0 : (g < p.n0 + p.n1) ? qw1 : qw2;
+        device const float* sc = (g < p.n0) ? sc0 : (g < p.n0 + p.n1) ? sc1 : sc2;
+        const uint lr = (g < p.n0) ? g : (g < p.n0 + p.n1) ? (g - p.n0) : (g - p.n0 - p.n1);
+        device const uint4* w128 = (device const uint4*)(qw + (ulong)lr * (ulong)(p.in_dim >> 1));
+        const uint4 packed = w128[k];
+        const float scl = (sc + (ulong)lr * (ulong)p.groups)[j0 / gsz];
+        float sub = 0.0f;
+        for (uint w = 0u; w < 4u; ++w) {
+          const uint word =
+              (w == 0u) ? packed.x : (w == 1u) ? packed.y : (w == 2u) ? packed.z : packed.w;
+          const char4 lo = as_type<char4>((word & 0x0F0F0F0Fu) ^ 0x08080808u) - char4(8);
+          const char4 hi = as_type<char4>(((word >> 4u) & 0x0F0F0F0Fu) ^ 0x08080808u) - char4(8);
+          sub += dot(float4(lo), xev[w]) + dot(float4(hi), xod[w]);
+        }
+        acc4[r] += sub * scl;
+      }
+    }
+    for (uint r = 0u; r < nrows; ++r) {
+      const float s = simd_sum(acc4[r]);
+      if (lane == 0u) {
+        const uint g = r0 + r;
+        device half* o = (g < p.n0) ? out0 : (g < p.n0 + p.n1) ? out1 : out2;
+        const uint lr = (g < p.n0) ? g : (g < p.n0 + p.n1) ? (g - p.n0) : (g - p.n0 - p.n1);
+        o[lr] = half(s);
+      }
+    }
+    return;
+  }
+
   const uint row_blocks = (total + simds_per_tg - 1u) / simds_per_tg;
   const uint tile = gid / row_blocks;
   const uint t0 = tile * GEMV_TILE;
   const uint grow = (gid % row_blocks) * simds_per_tg + simd_id;  // global row
   if (t0 >= p.tokens || grow >= total) return;
 
-  const uint gsz = (p.group == 0u) ? p.in_dim : p.group;
   if (grow < p.n0) {
     qcat_row(qw0, sc0, in, out0, bias, grow, grow, p.n0, p.has_bias, p.in_dim, p.bits, gsz,
              p.groups, t0, p.tokens, lane);

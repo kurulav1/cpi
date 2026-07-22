@@ -1334,7 +1334,12 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
             0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
             static_cast<std::size_t>(a.bias_offset) * sizeof(std::uint16_t)};
         const std::size_t total = static_cast<std::size_t>(n0 + n1 + n2);
-        const std::size_t rb = (total + kSimdsPerTG - 1) / kSimdsPerTG;
+        // NR0=4 decode shape (see cpi_gemv_quant_cat): same predicate as the shader.
+        const bool nr4 = T == 1 && a.qbits == 4 && (a.in_dim % 32) == 0 && (gsz % 32) == 0 &&
+                         a.bias == nullptr;
+        const std::size_t rows_per_tg =
+            nr4 ? static_cast<std::size_t>(kSimdsPerTG) * 4 : kSimdsPerTG;
+        const std::size_t rb = (total + rows_per_tg - 1) / rows_per_tg;
         const std::size_t tiles = static_cast<std::size_t>((T + kGemvTile - 1) / kGemvTile);
         ctx_.dispatch("cpi_gemv_quant_cat", G::Groups, rb * tiles, kTG, bufs, offs, 11, &gp,
                       sizeof(gp));
