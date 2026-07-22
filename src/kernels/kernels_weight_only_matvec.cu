@@ -525,6 +525,68 @@ __global__ void weight_only_int4_matvec_grouped_wide_kernel(const int8_t* __rest
   }
 }
 
+// Grouped int4 x int8-activation dp4a matvec. The activation vector must be quantized with
+// launch_quantize_fp16_to_int8_perm8 (even/odd bytes deinterleaved per 8-column window):
+// `word & 0x0F0F0F0F` extracts a byte-word's four EVEN columns and `(word >> 4) & ...` the
+// four ODD columns, each pairing with one aligned 32-bit load of the permuted x. Nibbles
+// are re-signed with a single __vsubss4. Per 32-weight chunk the dot is EXACT int32, then
+// scaled by the chunk's group scale; the activation scale applies once at the end.
+template <int Warps>
+__global__ void weight_only_int4_matvec_grouped_dp4a_wide_kernel(
+    const int8_t* __restrict__ w_packed, const float* __restrict__ scales,
+    const int8_t* __restrict__ xq, const float* __restrict__ x_scale, half* __restrict__ y,
+    int out_features, int in_features, int group_shift, int n_groups) {
+  const int row = blockIdx.x * Warps + (threadIdx.x / warpSize);
+  if (row >= out_features) {
+    return;
+  }
+  const int lane = threadIdx.x & (warpSize - 1);
+  const int packed_cols = in_features / 2;
+  const uint4* wrow = reinterpret_cast<const uint4*>(
+      w_packed + static_cast<std::size_t>(row) * static_cast<std::size_t>(packed_cols));
+  const float* row_s = scales + static_cast<std::size_t>(row) * static_cast<std::size_t>(n_groups);
+  const int* xw = reinterpret_cast<const int*>(xq);
+
+  const int chunks = packed_cols / 16;  // 32 weights per 16-byte chunk
+  constexpr int kUnroll = 4;
+  float acc = 0.0f;
+  uint4 wbuf[kUnroll];
+  for (int base = lane; base < chunks; base += warpSize * kUnroll) {
+#pragma unroll
+    for (int u = 0; u < kUnroll; ++u) {
+      const int c = base + u * warpSize;
+      if (c < chunks) {
+        wbuf[u] = wrow[c];
+      }
+    }
+#pragma unroll
+    for (int u = 0; u < kUnroll; ++u) {
+      const int c = base + u * warpSize;
+      if (c < chunks) {
+        const unsigned* wu = reinterpret_cast<const unsigned*>(&wbuf[u]);
+        int gacc = 0;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          const unsigned word = wu[i];  // window 4c+i: 4 bytes = 8 weights
+          // Nibbles are TWO'S COMPLEMENT (pack stores q & 0xF), so the decode is
+          // (n ^ 8) - 8 (sign extension), NOT n - 8 -- xor first, then subtract.
+          const int wlo =
+              __vsubss4(static_cast<int>((word & 0x0F0F0F0Fu) ^ 0x08080808u), 0x08080808);
+          const int whi =
+              __vsubss4(static_cast<int>(((word >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u), 0x08080808);
+          gacc = __dp4a(wlo, xw[8 * c + 2 * i], gacc);
+          gacc = __dp4a(whi, xw[8 * c + 2 * i + 1], gacc);
+        }
+        acc += static_cast<float>(gacc) * row_s[(c * 32) >> group_shift];
+      }
+    }
+  }
+  acc = warp_sum(acc);
+  if (lane == 0) {
+    y[row] = __float2half(acc * x_scale[0]);
+  }
+}
+
 template <int Warps>
 __global__ void weight_only_int8_matvec_wide_kernel(const int8_t* __restrict__ w,
                                                     const float* __restrict__ scales,
@@ -969,6 +1031,21 @@ void launch_weight_only_int4_matvec_grouped(const int8_t* w_packed, const float*
   weight_only_int4_matvec_grouped_kernel<<<
       out_features, threads, static_cast<std::size_t>(threads) * sizeof(float), stream>>>(
       w_packed, scales, x, y, out_features, in_features, shift, n_groups);
+}
+
+void launch_weight_only_int4_matvec_grouped_dp4a(const int8_t* w_packed, const float* scales,
+                                                 const std::int8_t* xq, const float* x_scale,
+                                                 half* y, int out_features, int in_features,
+                                                 int group, cudaStream_t stream) {
+  const int shift = group_shift_of(group);
+  if (shift < 0 || (group % 32) != 0 || (in_features % 32) != 0) {
+    return;  // caller must gate: permuted-x dp4a needs 32-col chunks inside one group
+  }
+  const int n_groups = quant_group_count(in_features, group);
+  constexpr int kWarps = 4;
+  const int blocks = (out_features + kWarps - 1) / kWarps;
+  weight_only_int4_matvec_grouped_dp4a_wide_kernel<kWarps><<<blocks, kWarps * 32, 0, stream>>>(
+      w_packed, scales, xq, x_scale, y, out_features, in_features, shift, n_groups);
 }
 
 void launch_weight_only_int8_matvec_grouped(const int8_t* w, const float* scales, const half* x,

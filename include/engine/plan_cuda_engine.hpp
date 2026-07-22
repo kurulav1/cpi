@@ -422,6 +422,12 @@ private:
   std::int8_t* d_head_q_ = nullptr;
   float* d_head_qs_ = nullptr;
 
+  // Decode activation-quant scratch for the dp4a matvec paths (one vector + one scale).
+  // int8 runs hold the plain rowwise layout, int4 runs the perm8 layout -- a run is one
+  // or the other, so the buffer is shared. nullptr = dp4a routing off.
+  std::int8_t* d_act_i8_ = nullptr;
+  float* d_act_qs_ = nullptr;
+
   // Split-K decode-attention scratch for the wide-head (any-head_dim) path. Sized
   // num_heads x split_any_chunks_ (x maxhd for the partial outputs) in allocate_buffers.
   static constexpr int kSplitAnyChunk = 32;

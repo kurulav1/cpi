@@ -1042,6 +1042,24 @@ void launch_rowmajor_half_gemv_f16(const half* w, const half* x, half* y, int ou
                                    int tile_pairs = 0, int rows_per_warp = 1,
                                    half* residual = nullptr);
 
+// launch_quantize_fp16_to_int8_perm8
+//
+// Batch-1 rowwise int8 activation quantization (same max/scale/rounding as
+// launch_quantize_rowwise_fp16_to_int8) with even/odd bytes deinterleaved per 8-column
+// window -- the layout launch_weight_only_int4_matvec_grouped_dp4a consumes. cols % 8 == 0.
+void launch_quantize_fp16_to_int8_perm8(const half* src, std::int8_t* dst, float* scales, int cols,
+                                        cudaStream_t stream);
+
+// launch_weight_only_int4_matvec_grouped_dp4a
+//
+// Batch-1 grouped int4(weight) x int8(activation) GEMV via dp4a. `xq` MUST hold the
+// perm8-quantized activation and `x_scale` its scale. Requires in_features % 32 == 0 and
+// group % 32 == 0 (silently returns otherwise -- caller gates).
+void launch_weight_only_int4_matvec_grouped_dp4a(const std::int8_t* w_packed,
+                                                 const float* scales, const std::int8_t* xq,
+                                                 const float* x_scale, half* y, int out_features,
+                                                 int in_features, int group, cudaStream_t stream);
+
 // launch_rowmajor_half_gemv_cat
 //
 // Up to three batch-1 fp16 GEMVs sharing one input vector, run as ONE launch (q|k|v,

@@ -1340,6 +1340,76 @@ void launch_rowmajor_half_gemv_f16(const half* w, const half* x, half* y, int ou
                             rows_per_warp, residual);
 }
 
+// Rowwise int8 activation quantization with a PERMUTED byte layout for the grouped-dp4a
+// int4 matvec: within each 8-column window the even columns land in bytes 0-3 and the odd
+// columns in bytes 4-7. The int4 packing stores column pairs (2j, 2j+1) as a byte's
+// (lo, hi) nibbles, so `word & 0x0F0F0F0F` yields four EVEN columns -- this layout lets
+// that mask line up with one 32-bit load of x instead of a gather. Same max/scale/rounding
+// semantics as quantize_rowwise_fp16_to_int8_kernel. Requires cols % 8 == 0; batch 1.
+__global__ void quantize_fp16_to_int8_perm8_kernel(const half* __restrict__ src,
+                                                   int8_t* __restrict__ dst,
+                                                   float* __restrict__ scales, int cols,
+                                                   int max_q) {
+  extern __shared__ float smax[];
+  const int tid = threadIdx.x;
+  const int lane = tid & (warpSize - 1);
+  const int warp = tid / warpSize;
+  const int warp_count = (blockDim.x + warpSize - 1) / warpSize;
+
+  float local_max = 0.0f;
+  const half2* src2 = reinterpret_cast<const half2*>(src);
+  const int cols2 = cols / 2;
+  for (int col2 = tid; col2 < cols2; col2 += blockDim.x) {
+    const half2 v2 = src2[col2];
+    local_max = fmaxf(local_max, fabsf(__half2float(__low2half(v2))));
+    local_max = fmaxf(local_max, fabsf(__half2float(__high2half(v2))));
+  }
+  local_max = warp_max(local_max);
+  if (lane == 0) {
+    smax[warp] = local_max;
+  }
+  __syncthreads();
+  if (warp == 0) {
+    float block_max = (lane < warp_count) ? smax[lane] : 0.0f;
+    block_max = warp_max(block_max);
+    if (lane == 0) {
+      float scale = block_max / static_cast<float>(max_q);
+      if (scale < 1.0e-8f) {
+        scale = 1.0e-8f;
+      }
+      scales[0] = scale;
+      smax[0] = 1.0f / scale;
+    }
+  }
+  __syncthreads();
+
+  const float inv_scale = smax[0];
+  const int windows = cols / 8;
+  char4* dst4 = reinterpret_cast<char4*>(dst);
+  for (int w8 = tid; w8 < windows; w8 += blockDim.x) {
+    int q[8];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const half2 v2 = src2[w8 * 4 + j];
+      int a = __float2int_rn(__half2float(__low2half(v2)) * inv_scale);
+      int b = __float2int_rn(__half2float(__high2half(v2)) * inv_scale);
+      q[2 * j] = max(-max_q, min(max_q, a));
+      q[2 * j + 1] = max(-max_q, min(max_q, b));
+    }
+    dst4[w8 * 2] = make_char4(static_cast<signed char>(q[0]), static_cast<signed char>(q[2]),
+                              static_cast<signed char>(q[4]), static_cast<signed char>(q[6]));
+    dst4[w8 * 2 + 1] = make_char4(static_cast<signed char>(q[1]), static_cast<signed char>(q[3]),
+                                  static_cast<signed char>(q[5]), static_cast<signed char>(q[7]));
+  }
+}
+
+void launch_quantize_fp16_to_int8_perm8(const half* src, std::int8_t* dst, float* scales, int cols,
+                                        cudaStream_t stream) {
+  constexpr int threads = 256;
+  quantize_fp16_to_int8_perm8_kernel<<<1, threads, (threads / 32) * sizeof(float), stream>>>(
+      src, dst, scales, cols, 127);
+}
+
 void launch_rowmajor_half_gemv_cat(const half* w0, half* y0, int n0, const half* w1, half* y1,
                                    int n1, const half* w2, half* y2, int n2, const half* x,
                                    int in_features, cudaStream_t stream) {

@@ -848,6 +848,14 @@ void PlanCudaEngine::load_all(const std::string& cpi_path) {
 void PlanCudaEngine::open(const std::string& cpi_path, int max_context) {
   max_ctx_ = max_context;
   if (std::getenv("LLAMA_INFER_PLAN_NO_GRAPH")) decode_graph_enabled_ = false;
+  // dp4a decode routing needs a quantized copy of the current activation vector.
+  // 64 KB covers any in_dim in the model zoo; CPI_CUDA_NO_DP4A keeps the fp16-activation
+  // quant kernels (the pre-parity behaviour) for A/B and bisection.
+  if ((weight_quant_bits_ == 4 || weight_quant_bits_ == 8) && d_act_i8_ == nullptr &&
+      std::getenv("CPI_CUDA_NO_DP4A") == nullptr) {
+    G4_CHECK(cudaMalloc(&d_act_i8_, 65536));
+    G4_CHECK(cudaMalloc(&d_act_qs_, sizeof(float)));
+  }
   if (std::getenv("LLAMA_INFER_PLAN_NO_DEVICE_TOPK")) device_topk_enabled_ = false;
 
   // A directory ⇒ HuggingFace safetensors; a file ⇒ .cpi. Within a directory the
@@ -1813,6 +1821,12 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
     }
   } prof_dump;
   cudaEvent_t ev0 = nullptr, ev1 = nullptr;
+  // dp4a activation-quant cache: adjacent quant Gemvs reading the same vector (q/k/v,
+  // gate/up) share one quantize launch. Slots are reused within a layer (XNorm is written
+  // twice with the same pointer and length), so identity alone would hit stale -- ANY
+  // non-Gemv op invalidates, which keeps exactly the adjacent-run reuse and nothing else.
+  const void* actq_src = nullptr;
+  int actq_len = 0;
   for (std::size_t idx = 0; idx < n; ++idx) {
     const Op& op = ops[idx];
     if (prof) {
@@ -1922,6 +1936,26 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
       case OpKind::Gemv:
         // Weight encoding AND scale granularity were chosen at load; the op just
         // carries them.
+        // int4 decode Gemvs route through dp4a with int8 activations (the llama.cpp
+        // design): quantize the input vector once per adjacent run, then integer dots.
+        // int8 stays on the wide fp16-activation kernel -- it is bandwidth-bound already
+        // and the dp4a tiled kernel measured SLOWER (175 vs 198.5 tok/s end to end).
+        // CPI_CUDA_NO_DP4A=1 keeps the fp16-activation kernels for int4 too.
+        if (!seq && d_act_i8_ != nullptr && op.bias == nullptr && op.qbits == 4 &&
+            op.qgroup > 0 && (op.qgroup % 32) == 0 && (op.in_dim % 32) == 0) {
+          if (actq_src != S(op.in) || actq_len != op.in_dim) {
+            kernels::launch_quantize_fp16_to_int8_perm8(S(op.in), d_act_i8_, d_act_qs_,
+                                                        op.in_dim, stream_);
+            actq_src = S(op.in);
+            actq_len = op.in_dim;
+          }
+          kernels::launch_weight_only_int4_matvec_grouped_dp4a(QW(op.qweight), QS(op.qscales),
+                                                               d_act_i8_, d_act_qs_, S(op.out),
+                                                               op.cols, op.in_dim, op.qgroup,
+                                                               stream_);
+          if (S(op.out) == actq_src) actq_src = nullptr;
+          break;
+        }
         if (op.qbits == 4 && op.qgroup > 0) {
           kernels::launch_weight_only_int4_matvec_grouped(QW(op.qweight), QS(op.qscales), S(op.in),
                                                           S(op.out), op.cols, op.in_dim, op.qgroup,
@@ -2156,6 +2190,7 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
         break;
     }
   op_done:
+    if (op.kind != OpKind::Gemv) actq_src = nullptr;
     if (prof) {
       cudaEventRecord(ev1, stream_);
       cudaEventSynchronize(ev1);
