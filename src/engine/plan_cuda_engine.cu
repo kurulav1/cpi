@@ -782,7 +782,14 @@ void PlanCudaEngine::load_all(const std::string& cpi_path) {
   upload(W + "norm.weight");
   if (has_ple()) {  // E2B has Per-Layer Embeddings; 12B does not
     upload(W + "embed_tokens_per_layer.weight");
-    upload(W + "per_layer_model_projection.weight");
+    // The PLE projections are ordinary 2-D matmuls and ride the same quantiser (and the
+    // dp4a decode path) as attn/mlp -- they were the last fp16 gemvs in the quant token
+    // (~180 us/token): model_projection is [layers*ple x H], each layer adds a gate and a
+    // down-projection below. Norms stay fp16 as everywhere else.
+    if (weight_quant_bits_ == 4 || weight_quant_bits_ == 8)
+      upload_int4(W + "per_layer_model_projection.weight");
+    else
+      upload(W + "per_layer_model_projection.weight");
     upload(W + "per_layer_projection_norm.weight");
   }
   layer_scalar_host_.assign(cfg_.num_layers, 1.0f);
@@ -807,9 +814,10 @@ void PlanCudaEngine::load_all(const std::string& cpi_path) {
     const bool is_attn =
         std::strncmp(t, "self_attn.", 10) == 0 && std::strstr(t, "_proj.") != nullptr;
     const bool is_mlp = std::strncmp(t, "mlp.", 4) == 0 && std::strstr(t, "_proj.") != nullptr;
+    const bool is_ple = std::strncmp(t, "per_layer_", 10) == 0;  // gate + projection, not norms
     if (group == "attn") return is_attn;
     if (group == "mlp") return is_mlp;
-    return is_attn || is_mlp;
+    return is_attn || is_mlp || is_ple;
   };
   const auto load_weight = [&](const std::string& full, const char* t) {
     if (quantize && quantizable(t))
@@ -828,10 +836,11 @@ void PlanCudaEngine::load_all(const std::string& cpi_path) {
       load_weight(p + t, t);
     // k_eq_v full layers have no v_proj (V reuses the raw k_proj output).
     if (!k_eq_v(L)) load_weight(p + "self_attn.v_proj.weight", "self_attn.v_proj.weight");
-    if (has_ple())
-      for (const char* t : {"per_layer_input_gate.weight", "per_layer_projection.weight",
-                            "post_per_layer_input_norm.weight"})
-        upload(p + t);
+    if (has_ple()) {
+      for (const char* t : {"per_layer_input_gate.weight", "per_layer_projection.weight"})
+        load_weight(p + t, t);
+      upload(p + "post_per_layer_input_norm.weight");
+    }
     if (cfg_.enable_moe_block) {
       // Norms and the tiny router stay fp16; the EXPERTS are ~90% of the model, so
       // they go through the same quantiser as any other projection (they are plain
@@ -1563,7 +1572,17 @@ void PlanCudaEngine::build_plan() {
       g.kind = OpKind::Gemv;
       g.in = Slot::X;
       g.out = Slot::PleAll;
-      g.weight = dev_at(wprefix_ + "per_layer_model_projection.weight");
+      {  // binds the int4 form when the load quantized it (same rule as the layer gemvs)
+        const auto q = qdev_.find(wprefix_ + "per_layer_model_projection.weight");
+        if (q != qdev_.end()) {
+          g.qweight = q->second.packed;
+          g.qscales = q->second.scales;
+          g.qbits = weight_quant_bits_;
+          g.qgroup = q->second.group;
+        } else {
+          g.weight = dev_at(wprefix_ + "per_layer_model_projection.weight");
+        }
+      }
       g.cols = tot;
       g.in_dim = cfg_.hidden;
       pro.push_back(g);
