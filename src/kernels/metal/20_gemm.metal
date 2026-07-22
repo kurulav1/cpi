@@ -510,17 +510,22 @@ kernel void cpi_gemv_quant(
       const uint j0 = k << 5;
       const float sc = srow[j0 / gsz];
 
+      char4 lo[4], hi[4];
+      for (uint w = 0u; w < 4u; ++w) {
+        const uint word = (w == 0u) ? packed.x : (w == 1u) ? packed.y
+                        : (w == 2u) ? packed.z : packed.w;
+        lo[w] = as_type<char4>((word & 0x0F0F0F0Fu) ^ 0x08080808u) - char4(8);
+        hi[w] = as_type<char4>(((word >> 4u) & 0x0F0F0F0Fu) ^ 0x08080808u) - char4(8);
+      }
       for (uint t = 0u; t < nt; ++t) {
-        device const half* x = in + (ulong)(t0 + t) * (ulong)p.in_dim + j0;
+        device const half4* x4 = (device const half4*)(in + (ulong)(t0 + t) * (ulong)p.in_dim + j0);
         float sub = 0.0f;
         for (uint w = 0u; w < 4u; ++w) {
-          const uint word = (w == 0u) ? packed.x : (w == 1u) ? packed.y
-                          : (w == 2u) ? packed.z : packed.w;
-          for (uint e = 0u; e < 8u; ++e) {
-            const int nib = int((word >> (4u * e)) & 0xFu);
-            const int q = (nib ^ 0x8) - 0x8;
-            sub += float(q) * float(x[w * 8u + e]);
-          }
+          const half4 xa = x4[2u * w];
+          const half4 xb = x4[2u * w + 1u];
+          const float4 ev = float4(float(xa.x), float(xa.z), float(xb.x), float(xb.z));
+          const float4 od = float4(float(xa.y), float(xa.w), float(xb.y), float(xb.w));
+          sub += dot(float4(lo[w]), ev) + dot(float4(hi[w]), od);
         }
         acc[t] += sub * sc;
       }
@@ -622,16 +627,26 @@ static inline void qcat_row(device const uchar* qw, device const float* scales,
       const uint4 packed = w128[k];
       const uint j0 = k << 5;
       const float sc = srow[j0 / gsz];
+      // Vectorized decode: a uint's low nibbles are elements {0,2,4,6}, high nibbles
+      // {1,3,5,7} (LSB-first packing). Two's-complement in one char4 op: (n ^ 8) - 8.
+      // The scalar version spent 32 shifts + 32 scalar half loads per uint4; this does
+      // 8 char4 decodes + 8 half4 loads + 8 dot4s.
+      char4 lo[4], hi[4];
+      for (uint w = 0u; w < 4u; ++w) {
+        const uint word =
+            (w == 0u) ? packed.x : (w == 1u) ? packed.y : (w == 2u) ? packed.z : packed.w;
+        lo[w] = as_type<char4>((word & 0x0F0F0F0Fu) ^ 0x08080808u) - char4(8);
+        hi[w] = as_type<char4>(((word >> 4u) & 0x0F0F0F0Fu) ^ 0x08080808u) - char4(8);
+      }
       for (uint t = 0u; t < nt; ++t) {
-        device const half* x = in + (ulong)(t0 + t) * (ulong)in_dim + j0;
+        device const half4* x4 = (device const half4*)(in + (ulong)(t0 + t) * (ulong)in_dim + j0);
         float sub = 0.0f;
         for (uint w = 0u; w < 4u; ++w) {
-          const uint word =
-              (w == 0u) ? packed.x : (w == 1u) ? packed.y : (w == 2u) ? packed.z : packed.w;
-          for (uint e = 0u; e < 8u; ++e) {
-            const int nib = int((word >> (4u * e)) & 0xFu);
-            sub += float((nib ^ 0x8) - 0x8) * float(x[w * 8u + e]);
-          }
+          const half4 xa = x4[2u * w];
+          const half4 xb = x4[2u * w + 1u];
+          const float4 ev = float4(float(xa.x), float(xa.z), float(xb.x), float(xb.z));
+          const float4 od = float4(float(xa.y), float(xa.w), float(xb.y), float(xb.w));
+          sub += dot(float4(lo[w]), ev) + dot(float4(hi[w]), od);
         }
         acc[t] += sub * sc;
       }
