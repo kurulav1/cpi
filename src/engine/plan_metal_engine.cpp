@@ -3035,7 +3035,7 @@ std::vector<int> PlanMetalEngine::generate(const std::vector<int>& prompt, int m
     std::vector<float> lg = forward_token(next, pos);  // a copy: the sampler edits in place
     next = detail::dispatch_sample_from_logits(
         lg, s.temperature, s.top_k, s.top_p, s.repetition_penalty, s.no_repeat_ngram_size, history);
-    if (s.eos_id >= 0 && next == s.eos_id) break;
+    if (s.eos_id >= 0 && next == s.eos_id && std::getenv("CPI_METAL_IGNORE_EOS") == nullptr) break;
     out.push_back(next);
     history.push_back(next);
     if (detail::dispatch_has_degenerate_tail(out, prompt.size())) break;  // loop guard (parity)
@@ -3107,7 +3107,7 @@ std::vector<int> PlanMetalEngine::generate_stream(const std::vector<int>& prompt
     const float temp = (grammar != nullptr) ? 0.0f : s.temperature;
     next = detail::dispatch_sample_from_logits(lg, temp, s.top_k, s.top_p, s.repetition_penalty,
                                                s.no_repeat_ngram_size, history);
-    if (s.eos_id >= 0 && next == s.eos_id) break;
+    if (s.eos_id >= 0 && next == s.eos_id && std::getenv("CPI_METAL_IGNORE_EOS") == nullptr) break;
     if (grammar != nullptr) grammar->accept(next);  // advance grammar state by the chosen token
     out.push_back(next);
     history.push_back(next);
