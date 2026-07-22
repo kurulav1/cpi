@@ -1260,6 +1260,41 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
       const bool qkv = op.out == opplan::Slot::Q && is_qgemv(oi + 1, opplan::Slot::K) &&
                        is_qgemv(oi + 2, opplan::Slot::V);
       const bool gu = op.out == opplan::Slot::Gate && is_qgemv(oi + 1, opplan::Slot::Up);
+      // GLU fusion (ported from the CUDA campaign): [gate][up][GeluMul] in ONE dispatch,
+      // writing the activated product straight to the GeluMul's output -- no Gate/Up
+      // round-trip and one dispatch fewer than the cat+gelu pair.
+      const bool glu = gu && oi + 2 < ops.size() && ops[oi + 2].kind == OpKind::GeluMul &&
+                       ops[oi + 2].in == op.out && ops[oi + 2].in2 == ops[oi + 1].out &&
+                       ops[oi + 2].aux_ptr == nullptr && ops[oi + 2].aux_offset == 0 &&
+                       ops[oi + 2].cols == op.cols && op.bias == nullptr &&
+                       ops[oi + 1].bias == nullptr;
+      if (glu) {
+        ctx_.set_next_barrier(true);
+        grp_read = 0;
+        grp_written = ~0ull;
+        const opplan::Op& a = op;
+        const opplan::Op& b = ops[oi + 1];
+        const int gsz = (a.qgroup > 0) ? a.qgroup : a.in_dim;
+        QCatParams gp{static_cast<std::uint32_t>(a.cols),
+                      0u,
+                      0u,
+                      static_cast<std::uint32_t>(a.in_dim),
+                      static_cast<std::uint32_t>(T),
+                      static_cast<std::uint32_t>(a.qbits),
+                      static_cast<std::uint32_t>(a.qgroup),
+                      static_cast<std::uint32_t>((a.in_dim + gsz - 1) / gsz),
+                      0u};
+        const void* bufs[] = {slot(a.in),  a.qweight, a.qscales,
+                              b.qweight,   b.qscales, slot(ops[oi + 2].out)};
+        const std::size_t pairs_per_tg = kSimdsPerTG / 2;
+        const std::size_t rb = (static_cast<std::size_t>(a.cols) + pairs_per_tg - 1) / pairs_per_tg;
+        const std::size_t tiles = static_cast<std::size_t>((T + kGemvTile - 1) / kGemvTile);
+        ctx_.dispatch("cpi_gemv_quant_glu", G::Groups, rb * tiles, kTG, bufs, nullptr, 6, &gp,
+                      sizeof(gp));
+        oi += 2;
+        if (profile) profile_tick("Gemv(glu fused)");
+        continue;
+      }
       if (qkv || gu) {
         // Same as the fused add+rmsnorm above: this dispatch writes more slots than the
         // tracker modelled for `op` alone, so keep its barrier and poison the group.

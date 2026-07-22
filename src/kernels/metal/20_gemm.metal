@@ -728,6 +728,105 @@ kernel void cpi_gemv_quant_cat(
   }
 }
 
+// Fused GeGLU GEMV (the gated-activation fusion, ported from the CUDA campaign):
+// out[t, r] = gelu_tanh(gate_r . x_t) * (up_r . x_t) in ONE dispatch -- no Gate/Up slot
+// round-trip, no separate cpi_gelu_mul. Simd shape follows the CUDA lesson (one ROW per
+// simdgroup, never two): the first half of the threadgroup's simds compute gate rows, the
+// second half their up partners, paired through threadgroup memory. Both dots round to
+// half before the gelu, exactly as the unfused sequence rounds them.
+kernel void cpi_gemv_quant_glu(
+    device const half*   in   [[buffer(0)]],
+    device const uchar*  qwg  [[buffer(1)]], device const float* scg [[buffer(2)]],
+    device const uchar*  qwu  [[buffer(3)]], device const float* scu [[buffer(4)]],
+    device half*         out  [[buffer(5)]],
+    constant QCatParams& p    [[buffer(6)]],
+    uint gid  [[threadgroup_position_in_grid]],
+    uint lid  [[thread_position_in_threadgroup]],
+    uint nthr [[threads_per_threadgroup]]) {
+  const uint simds_per_tg = nthr / 32u;
+  const uint pairs_per_tg = simds_per_tg / 2u;
+  const uint simd_id = lid / 32u;
+  const uint lane = lid % 32u;
+  const bool is_up = simd_id >= pairs_per_tg;
+  const uint local_pair = is_up ? (simd_id - pairs_per_tg) : simd_id;
+
+  const uint row_blocks = (p.n0 + pairs_per_tg - 1u) / pairs_per_tg;
+  const uint tile = gid / row_blocks;
+  const uint t0 = tile * GEMV_TILE;
+  const uint row = (gid % row_blocks) * pairs_per_tg + local_pair;
+
+  threadgroup float pair_acc[GEMV_TILE * 8u];  // [token][simd], simds_per_tg <= 8
+
+  float acc[GEMV_TILE];
+  for (uint t = 0u; t < GEMV_TILE; ++t) acc[t] = 0.0f;
+  const uint nt = min((uint)GEMV_TILE, p.tokens - min(t0, p.tokens));
+
+  if (t0 < p.tokens && row < p.n0) {
+    device const uchar* qw = is_up ? qwu : qwg;
+    device const float* sc = is_up ? scu : scg;
+    const uint gsz = (p.group == 0u) ? p.in_dim : p.group;
+    device const float* srow = sc + (ulong)row * (ulong)p.groups;
+    if (p.bits == 4u) {
+      device const uint* w32 = (device const uint*)(qw + (ulong)row * (ulong)(p.in_dim >> 1));
+      const uint n8 = p.in_dim >> 3;
+      for (uint k = lane; k < n8; k += 32u) {
+        const uint packed = w32[k];
+        const uint j0 = k << 3;
+        const float scl = srow[j0 / gsz];
+        for (uint t = 0u; t < nt; ++t) {
+          device const half* x = in + (ulong)(t0 + t) * (ulong)p.in_dim + j0;
+          float sub = 0.0f;
+          for (uint e = 0u; e < 8u; ++e) {
+            const int nib = int((packed >> (4u * e)) & 0xFu);
+            sub += float((nib ^ 0x8) - 0x8) * float(x[e]);
+          }
+          acc[t] += sub * scl;
+        }
+      }
+    } else {
+      device const uint4* w16 = (device const uint4*)(qw + (ulong)row * (ulong)p.in_dim);
+      const uint n16 = p.in_dim >> 4;
+      for (uint k = lane; k < n16; k += 32u) {
+        const uint4 packed = w16[k];
+        const uint j0 = k << 4;
+        const float scl = srow[j0 / gsz];
+        for (uint t = 0u; t < nt; ++t) {
+          device const half* x = in + (ulong)(t0 + t) * (ulong)p.in_dim + j0;
+          float sub = 0.0f;
+          for (uint w = 0u; w < 4u; ++w) {
+            const uint word =
+                (w == 0u) ? packed.x : (w == 1u) ? packed.y : (w == 2u) ? packed.z : packed.w;
+            for (uint e = 0u; e < 4u; ++e) {
+              const int q = int(char((word >> (8u * e)) & 0xFFu));
+              sub += float(q) * float(x[w * 4u + e]);
+            }
+          }
+          acc[t] += sub * scl;
+        }
+      }
+    }
+  }
+
+  for (uint t = 0u; t < GEMV_TILE; ++t) {
+    const float s = simd_sum(acc[t]);
+    if (lane == 0u) pair_acc[t * 8u + simd_id] = s;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  if (simd_id == 0u && lane < pairs_per_tg) {
+    const uint orow = (gid % row_blocks) * pairs_per_tg + lane;
+    if (t0 < p.tokens && orow < p.n0) {
+      const float kg = 0.7978845608028654f;  // sqrt(2/pi), matches cpi_gelu_mul
+      for (uint t = 0u; t < nt; ++t) {
+        const float g = float(half(pair_acc[t * 8u + lane]));
+        const float u = float(half(pair_acc[t * 8u + pairs_per_tg + lane]));
+        const float act = 0.5f * g * (1.0f + tanh(kg * (g + 0.044715f * g * g * g)));
+        out[(ulong)(t0 + t) * (ulong)p.n0 + orow] = half(act * u);
+      }
+    }
+  }
+}
+
 // Same, but fp32 output: the LM head feeds the sampler.
 kernel void cpi_lm_head_quant(
     device const uchar*  qw     [[buffer(0)]],
