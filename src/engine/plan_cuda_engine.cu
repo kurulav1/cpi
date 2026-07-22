@@ -91,6 +91,8 @@ PlanCudaEngine::~PlanCudaEngine() {
   cudaFree(d_tok_);
   cudaFree(d_position_);
   cudaFree(d_argmax_);
+  cudaFree(d_argmax_pv_);
+  cudaFree(d_argmax_pi_);
   cudaFree(d_topk_part_val_);
   cudaFree(d_topk_part_idx_);
   cudaFree(d_topk_val_);
@@ -475,6 +477,9 @@ void PlanCudaEngine::allocate_buffers() {
     G4_CHECK(cudaMalloc(&d_tok_, sizeof(int)));
     G4_CHECK(cudaMalloc(&d_position_, sizeof(int)));
     G4_CHECK(cudaMalloc(&d_argmax_, sizeof(int)));
+  argmax_parts_ = kernels::argmax_partition_count(cfg_.vocab);
+  G4_CHECK(cudaMalloc(&d_argmax_pv_, static_cast<std::size_t>(argmax_parts_) * sizeof(float)));
+  G4_CHECK(cudaMalloc(&d_argmax_pi_, static_cast<std::size_t>(argmax_parts_) * sizeof(int)));
     const int topk_parts = kernels::topk_partition_count(cfg_.vocab);
     const std::size_t part_n = static_cast<std::size_t>(topk_parts) * kMaxDeviceTopK;
     G4_CHECK(cudaMalloc(&d_topk_part_val_, part_n * sizeof(float)));
@@ -539,6 +544,9 @@ void PlanCudaEngine::allocate_buffers() {
   G4_CHECK(cudaMalloc(&d_tok_, sizeof(int)));
   G4_CHECK(cudaMalloc(&d_position_, sizeof(int)));
   G4_CHECK(cudaMalloc(&d_argmax_, sizeof(int)));
+  argmax_parts_ = kernels::argmax_partition_count(cfg_.vocab);
+  G4_CHECK(cudaMalloc(&d_argmax_pv_, static_cast<std::size_t>(argmax_parts_) * sizeof(float)));
+  G4_CHECK(cudaMalloc(&d_argmax_pi_, static_cast<std::size_t>(argmax_parts_) * sizeof(int)));
   // Device top-k sampling scratch (sized for the largest k we accept).
   const int topk_parts = kernels::topk_partition_count(cfg_.vocab);
   const std::size_t part_n = static_cast<std::size_t>(topk_parts) * kMaxDeviceTopK;
@@ -2723,8 +2731,11 @@ int PlanCudaEngine::sample(const runtime::DecodeParams& params, const std::vecto
   const bool greedy_fast_path = params.temperature <= 0.0f && params.repetition_penalty <= 1.0f &&
                                 params.no_repeat_ngram_size <= 1 && !params.grammar_mask;
   if (greedy_fast_path) {
+    // Two-phase argmax: the single-block fallback walked 262K logits on ONE SM and
+    // cost 296 us/token -- 7% of the int4 token -- found by the first nsys per-kernel
+    // trace. The partitioned kernel exists for exactly this; it just needs scratch.
     kernels::launch_argmax_float(static_cast<const float*>(d_logits_), cfg_.vocab, d_argmax_,
-                                 stream_);
+                                 stream_, d_argmax_pv_, d_argmax_pi_, argmax_parts_);
     G4_CHECK(cudaStreamSynchronize(stream_));
     int next = 0;
     G4_CHECK(cudaMemcpy(&next, d_argmax_, sizeof(int), cudaMemcpyDeviceToHost));

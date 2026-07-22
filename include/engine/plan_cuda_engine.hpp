@@ -401,6 +401,9 @@ private:
   int* d_tok_ = nullptr;         // current token id (device); EmbeddingLookup reads it
   int* d_position_ = nullptr;    // current decode position (device); device-pos ops read it
   int* d_argmax_ = nullptr;      // device-argmax result (greedy fast path)
+  float* d_argmax_pv_ = nullptr;  // two-phase argmax partition scratch
+  int* d_argmax_pi_ = nullptr;
+  int argmax_parts_ = 1;
 
   // Device top-k sampling (temperature>0 — the real chat path, since greedy only
   // covers temp<=0). Selects the candidate set on the GPU so the host never sees
