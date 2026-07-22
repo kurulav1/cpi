@@ -558,7 +558,7 @@ __global__ void weight_only_int4_matvec_grouped_dp4a_wide_kernel(
       const int c = base + u * warpSize;
       if (c < chunks) {
         wbuf[u] = wrow[c];
-        sbuf[u] = row_s[(c * 32) >> group_shift];
+        sbuf[u] = row_s[(c * 32) >> group_shift] * x_scale[c];  // w-scale x g32 x-scale
       }
     }
 #pragma unroll
@@ -593,7 +593,7 @@ __global__ void weight_only_int4_matvec_grouped_dp4a_wide_kernel(
   }
   acc = warp_sum(acc);
   if (lane == 0) {
-    y[row] = __float2half(acc * x_scale[0]);
+    y[row] = __float2half(acc);
   }
 }
 
@@ -647,7 +647,7 @@ __global__ void weight_only_int4_matvec_grouped_dp4a_cat_kernel(
       const int c = base + u * warpSize;
       if (c < chunks) {
         wbuf[u] = wrow[c];
-        sbuf[u] = row_s[(c * 32) >> group_shift];
+        sbuf[u] = row_s[(c * 32) >> group_shift] * x_scale[c];  // w-scale x g32 x-scale
       }
     }
 #pragma unroll
@@ -680,7 +680,7 @@ __global__ void weight_only_int4_matvec_grouped_dp4a_cat_kernel(
   }
   acc = warp_sum(acc);
   if (lane == 0) {
-    y[r] = __float2half(acc * x_scale[0]);
+    y[r] = __float2half(acc);
   }
 }
 
@@ -727,7 +727,7 @@ __global__ void weight_only_int4_matvec_grouped_dp4a_glu_kernel(
         const int c = base + u * warpSize;
         if (c < chunks) {
           wbuf[u] = wrow[c];
-          sbuf[u] = row_s[(c * 32) >> group_shift];
+          sbuf[u] = row_s[(c * 32) >> group_shift] * x_scale[c];  // w-scale x g32 x-scale
         }
       }
 #pragma unroll
@@ -766,9 +766,8 @@ __global__ void weight_only_int4_matvec_grouped_dp4a_glu_kernel(
   if (warp_id == 0 && lane < RowsPerBlock) {
     const int out_row = blockIdx.x * RowsPerBlock + lane;
     if (out_row < out_features) {
-      const float xs = x_scale[0];
-      const float gate_h = __half2float(__float2half(pair_acc[lane] * xs));
-      const float up_h = __half2float(__float2half(pair_acc[RowsPerBlock + lane] * xs));
+      const float gate_h = __half2float(__float2half(pair_acc[lane]));
+      const float up_h = __half2float(__float2half(pair_acc[RowsPerBlock + lane]));
       y[out_row] = __float2half(glu_gelu_tanh_f32(gate_h) * up_h);
     }
   }

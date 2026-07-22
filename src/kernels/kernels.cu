@@ -1103,31 +1103,19 @@ __global__ void rmsnorm_quant_perm8_kernel(const half* __restrict__ x, const hal
     }
     reinterpret_cast<int4*>(y)[tid] = obuf;
   }
-#pragma unroll
-  for (int off = warpSize / 2; off > 0; off >>= 1) {
-    local_max = fmaxf(local_max, __shfl_down_sync(0xffffffffu, local_max, off));
+  // Group-32 scales (q8_1 style): each thread owns one 8-column window; a 4-lane
+  // butterfly maxes the 32-column group. No block-wide reduction, no barrier.
+  local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffffu, local_max, 1));
+  local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffffu, local_max, 2));
+  float g_scale = local_max / static_cast<float>(max_q);
+  if (g_scale < 1.0e-8f) {
+    g_scale = 1.0e-8f;
   }
-  if (lane == 0) {
-    partial[warp] = local_max;
-  }
-  __syncthreads();
-  if (tid == 0) {
-    float m = 0.0f;
-#pragma unroll
-    for (int i = 0; i < Threads / 32; ++i) {
-      m = fmaxf(m, partial[i]);
-    }
-    float scale = m / static_cast<float>(max_q);
-    if (scale < 1.0e-8f) {
-      scale = 1.0e-8f;
-    }
-    xscale[0] = scale;
-    shared_vals[1] = 1.0f / scale;
-  }
-  __syncthreads();
-
   if (active) {
-    const float inv_scale = shared_vals[1];
+    if ((tid & 3) == 0) {
+      xscale[tid / 4] = g_scale;
+    }
+    const float inv_scale = 1.0f / g_scale;
     const half2* oh = reinterpret_cast<const half2*>(&obuf);
     int q[8];
 #pragma unroll

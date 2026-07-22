@@ -1403,6 +1403,65 @@ __global__ void quantize_fp16_to_int8_perm8_kernel(const half* __restrict__ src,
   }
 }
 
+// Group-32 variant (the llama.cpp q8_1 pattern): one scale per 32 columns instead of one
+// per vector. A group is exactly one dp4a chunk (32 weights), so the matvec's per-chunk
+// int32 dot picks up s_w[chunk] * s_x[chunk] -- and quantization needs NO global max:
+// each thread owns one 8-column window, a 4-lane butterfly maxes the group, and the
+// kernel is embarrassingly multi-block (the rowwise version ran ONE block even at 12288
+// columns). Finer scales also quantize x strictly more precisely. cols % 32 == 0.
+__global__ void quantize_fp16_to_int8_perm8_g32_kernel(const half* __restrict__ src,
+                                                       int8_t* __restrict__ dst,
+                                                       float* __restrict__ scales, int cols,
+                                                       int max_q) {
+  const int w8 = blockIdx.x * blockDim.x + threadIdx.x;  // one 8-column window per thread
+  const int windows = cols / 8;
+  const half2* src2 = reinterpret_cast<const half2*>(src);
+  float v[8];
+  float m = 0.0f;
+  if (w8 < windows) {
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const half2 h2 = src2[w8 * 4 + j];
+      v[2 * j] = __half2float(__low2half(h2));
+      v[2 * j + 1] = __half2float(__high2half(h2));
+      m = fmaxf(m, fmaxf(fabsf(v[2 * j]), fabsf(v[2 * j + 1])));
+    }
+  }
+  // group = 4 consecutive windows = 4 consecutive lanes (cols % 32 == 0 keeps groups
+  // whole and lane-aligned).
+  m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 1));
+  m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 2));
+  float scale = m / static_cast<float>(max_q);
+  if (scale < 1.0e-8f) {
+    scale = 1.0e-8f;
+  }
+  if (w8 < windows) {
+    if ((threadIdx.x & 3) == 0) {
+      scales[w8 / 4] = scale;
+    }
+    const float inv = 1.0f / scale;
+    int q[8];
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+      q[k] = max(-max_q, min(max_q, __float2int_rn(v[k] * inv)));
+    }
+    char4* dst4 = reinterpret_cast<char4*>(dst);
+    dst4[w8 * 2] = make_char4(static_cast<signed char>(q[0]), static_cast<signed char>(q[2]),
+                              static_cast<signed char>(q[4]), static_cast<signed char>(q[6]));
+    dst4[w8 * 2 + 1] = make_char4(static_cast<signed char>(q[1]), static_cast<signed char>(q[3]),
+                                  static_cast<signed char>(q[5]), static_cast<signed char>(q[7]));
+  }
+}
+
+void launch_quantize_fp16_to_int8_perm8_g32(const half* src, std::int8_t* dst, float* scales,
+                                            int cols, cudaStream_t stream) {
+  constexpr int threads = 256;
+  const int windows = cols / 8;
+  const int blocks = (windows + threads - 1) / threads;
+  quantize_fp16_to_int8_perm8_g32_kernel<<<blocks, threads, 0, stream>>>(src, dst, scales, cols,
+                                                                         127);
+}
+
 void launch_quantize_fp16_to_int8_perm8(const half* src, std::int8_t* dst, float* scales, int cols,
                                         cudaStream_t stream) {
   constexpr int threads = 256;

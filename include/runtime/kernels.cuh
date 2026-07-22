@@ -1050,6 +1050,11 @@ void launch_rowmajor_half_gemv_f16(const half* w, const half* x, half* y, int ou
 void launch_quantize_fp16_to_int8_perm8(const half* src, std::int8_t* dst, float* scales, int cols,
                                         cudaStream_t stream);
 
+// Group-32 variant (q8_1 style): scales[cols/32], no global max, multi-block. The dp4a
+// grouped kernels consume these per-chunk. cols % 32 == 0.
+void launch_quantize_fp16_to_int8_perm8_g32(const half* src, std::int8_t* dst, float* scales,
+                                            int cols, cudaStream_t stream);
+
 // launch_weight_only_int4_matvec_grouped_dp4a
 //
 // Batch-1 grouped int4(weight) x int8(activation) GEMV via dp4a. `xq` MUST hold the

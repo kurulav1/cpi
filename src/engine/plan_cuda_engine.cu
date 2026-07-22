@@ -871,7 +871,7 @@ void PlanCudaEngine::open(const std::string& cpi_path, int max_context) {
   if ((weight_quant_bits_ == 4 || weight_quant_bits_ == 8) && d_act_i8_ == nullptr &&
       std::getenv("CPI_CUDA_NO_DP4A") == nullptr) {
     G4_CHECK(cudaMalloc(&d_act_i8_, 65536));
-    G4_CHECK(cudaMalloc(&d_act_qs_, sizeof(float)));
+    G4_CHECK(cudaMalloc(&d_act_qs_, (65536 / 32) * sizeof(float)));  // group-32 x scales
   }
   if (std::getenv("LLAMA_INFER_PLAN_NO_DEVICE_TOPK")) device_topk_enabled_ = false;
 
@@ -1972,7 +1972,7 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
         // fp16-ROUNDED values); the Gemv branch then hits the actq cache and skips its
         // quantize launch entirely.
         if (!seq && d_act_i8_ != nullptr && !op.norm_offset && op.rows == 1 &&
-            op.weight != nullptr && (op.cols % 8) == 0 && op.cols <= 2048 && idx + 1 < n &&
+            op.weight != nullptr && (op.cols % 32) == 0 && op.cols <= 2048 && idx + 1 < n &&
             ops[idx + 1].kind == OpKind::Gemv && ops[idx + 1].qbits == 4 &&
             ops[idx + 1].qgroup > 0 && (ops[idx + 1].qgroup % 32) == 0 &&
             ops[idx + 1].in == op.out && ops[idx + 1].in_dim == op.cols &&
@@ -2004,8 +2004,8 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
         if (!seq && d_act_i8_ != nullptr && op.bias == nullptr && op.qbits == 4 &&
             op.qgroup > 0 && (op.qgroup % 32) == 0 && (op.in_dim % 32) == 0) {
           if (actq_src != S(op.in) || actq_len != op.in_dim) {
-            kernels::launch_quantize_fp16_to_int8_perm8(S(op.in), d_act_i8_, d_act_qs_,
-                                                        op.in_dim, stream_);
+            kernels::launch_quantize_fp16_to_int8_perm8_g32(S(op.in), d_act_i8_, d_act_qs_,
+                                                            op.in_dim, stream_);
             actq_src = S(op.in);
             actq_len = op.in_dim;
           }
