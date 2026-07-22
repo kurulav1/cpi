@@ -3239,7 +3239,8 @@ std::vector<int> PlanMetalEngine::generate_greedy(const std::vector<int>& prompt
     const auto* ring = static_cast<const std::int32_t*>(chain_ring_.contents());
     for (int k = 0; k < block; ++k) {
       out.push_back(static_cast<int>(ring[k]));
-      if (detail::dispatch_has_degenerate_tail(out, prompt.size())) {  // loop guard (parity)
+      static const bool no_stop = std::getenv("CPI_METAL_IGNORE_EOS") != nullptr;
+      if (!no_stop && detail::dispatch_has_degenerate_tail(out, prompt.size())) {  // loop guard
         stop = true;
         break;
       }
