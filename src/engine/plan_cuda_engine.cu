@@ -2102,6 +2102,23 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
           if (S(op.out) == actq_src) actq_src = nullptr;
           break;
         }
+        // int8 GLU fusion: [gate Gemv][up Gemv][GeluMul] -> one paired-warp launch.
+        if (!seq && op.qbits == 8 && op.qgroup == 0 && op.bias == nullptr &&
+            (op.in_dim % 16) == 0 && idx + 2 < n && ops[idx + 1].kind == OpKind::Gemv &&
+            ops[idx + 1].qbits == 8 && ops[idx + 1].qgroup == 0 &&
+            ops[idx + 1].bias == nullptr && ops[idx + 1].in == op.in &&
+            ops[idx + 1].in_dim == op.in_dim && ops[idx + 1].cols == op.cols &&
+            ops[idx + 2].kind == OpKind::GeluMul && ops[idx + 2].aux_ptr == nullptr &&
+            ops[idx + 2].aux_offset == 0 && ops[idx + 2].in == op.out &&
+            ops[idx + 2].in2 == ops[idx + 1].out && ops[idx + 2].cols == op.cols &&
+            ops[idx + 2].out != op.in) {
+          kernels::launch_weight_only_int8_matvec_glu(
+              QW(op.qweight), QS(op.qscales), QW(ops[idx + 1].qweight),
+              QS(ops[idx + 1].qscales), S(op.in), S(ops[idx + 2].out), op.cols, op.in_dim,
+              stream_);
+          idx += 2;
+          break;
+        }
         if (op.qbits == 4 && op.qgroup > 0) {
           kernels::launch_weight_only_int4_matvec_grouped(QW(op.qweight), QS(op.qscales), S(op.in),
                                                           S(op.out), op.cols, op.in_dim, op.qgroup,

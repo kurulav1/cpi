@@ -1103,6 +1103,15 @@ void launch_weight_only_int4_matvec_grouped_dp4a_f32(const std::int8_t* w_packed
                                                      int out_features, int in_features, int group,
                                                      cudaStream_t stream);
 
+// launch_weight_only_int8_matvec_glu
+//
+// Fused GeGLU for rowwise-int8 weights with fp16 activations: out[r] = gelu(gate_r)*up_r,
+// one row per warp, gelu on the fp16-rounded dots. in_features % 16 == 0.
+void launch_weight_only_int8_matvec_glu(const std::int8_t* wg, const float* sg,
+                                        const std::int8_t* wu, const float* su, const half* x,
+                                        half* y, int out_features, int in_features,
+                                        cudaStream_t stream);
+
 // launch_rowmajor_half_gemv_cat
 //
 // Up to three batch-1 fp16 GEMVs sharing one input vector, run as ONE launch (q|k|v,

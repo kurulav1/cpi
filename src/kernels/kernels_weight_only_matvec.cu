@@ -836,6 +836,71 @@ __global__ void weight_only_int4_matvec_grouped_dp4a_f32_kernel(
   }
 }
 
+// int8 twin of the fused GeGLU matvec: warps 0..RowsPerBlock-1 compute gate rows,
+// warps RowsPerBlock.. their up partners (one row per warp -- the law), rowwise scales,
+// fp16 activations, gelu on the fp16-rounded dots exactly as the unfused path.
+template <int RowsPerBlock>
+__global__ void weight_only_int8_matvec_glu_kernel(const int8_t* __restrict__ wg,
+                                                   const float* __restrict__ sg,
+                                                   const int8_t* __restrict__ wu,
+                                                   const float* __restrict__ su,
+                                                   const half* __restrict__ x,
+                                                   half* __restrict__ y, int out_features,
+                                                   int in_features) {
+  __shared__ float pair_acc[2 * RowsPerBlock];
+  const int warp_id = threadIdx.x / warpSize;
+  const int lane = threadIdx.x & (warpSize - 1);
+  const bool is_up = warp_id >= RowsPerBlock;
+  const int local_row = is_up ? (warp_id - RowsPerBlock) : warp_id;
+  const int row = blockIdx.x * RowsPerBlock + local_row;
+  float acc = 0.0f;
+  if (row < out_features) {
+    const int8_t* w = is_up ? wu : wg;
+    const float* sc = is_up ? su : sg;
+    const int4* wrow = reinterpret_cast<const int4*>(
+        w + static_cast<std::size_t>(row) * static_cast<std::size_t>(in_features));
+    const half2* x2 = reinterpret_cast<const half2*>(x);
+    const int chunks = in_features / 16;
+    constexpr int kUnroll = 4;
+    int4 wbuf[kUnroll];
+    for (int base = lane; base < chunks; base += warpSize * kUnroll) {
+#pragma unroll
+      for (int u = 0; u < kUnroll; ++u) {
+        const int c = base + u * warpSize;
+        if (c < chunks) {
+          wbuf[u] = wrow[c];
+        }
+      }
+#pragma unroll
+      for (int u = 0; u < kUnroll; ++u) {
+        const int c = base + u * warpSize;
+        if (c < chunks) {
+          const int8_t* wb = reinterpret_cast<const int8_t*>(&wbuf[u]);
+#pragma unroll
+          for (int i = 0; i < 8; ++i) {
+            const float2 xv = __half22float2(x2[c * 8 + i]);
+            acc += static_cast<float>(wb[2 * i]) * xv.x +
+                   static_cast<float>(wb[2 * i + 1]) * xv.y;
+          }
+        }
+      }
+    }
+    acc = warp_sum(acc) * sc[row];
+  }
+  if (lane == 0) {
+    pair_acc[warp_id] = acc;
+  }
+  __syncthreads();
+  if (warp_id == 0 && lane < RowsPerBlock) {
+    const int out_row = blockIdx.x * RowsPerBlock + lane;
+    if (out_row < out_features) {
+      const float gate_h = __half2float(__float2half(pair_acc[lane]));
+      const float up_h = __half2float(__float2half(pair_acc[RowsPerBlock + lane]));
+      y[out_row] = __float2half(glu_gelu_tanh_f32(gate_h) * up_h);
+    }
+  }
+}
+
 template <int Warps>
 __global__ void weight_only_int8_matvec_wide_kernel(const int8_t* __restrict__ w,
                                                     const float* __restrict__ scales,
@@ -1342,6 +1407,19 @@ void launch_weight_only_int4_matvec_grouped_dp4a_f32(const std::int8_t* w_packed
   const int blocks = (out_features + kWarps - 1) / kWarps;
   weight_only_int4_matvec_grouped_dp4a_f32_kernel<kWarps><<<blocks, kWarps * 32, 0, stream>>>(
       w_packed, scales, xq, x_scale, y, out_features, in_features, shift, n_groups);
+}
+
+void launch_weight_only_int8_matvec_glu(const std::int8_t* wg, const float* sg,
+                                        const std::int8_t* wu, const float* su, const half* x,
+                                        half* y, int out_features, int in_features,
+                                        cudaStream_t stream) {
+  if ((in_features % 16) != 0) {
+    return;  // caller gates
+  }
+  constexpr int kRows = 4;
+  const int blocks = (out_features + kRows - 1) / kRows;
+  weight_only_int8_matvec_glu_kernel<kRows><<<blocks, kRows * 64, 0, stream>>>(
+      wg, sg, wu, su, x, y, out_features, in_features);
 }
 
 void launch_weight_only_int8_matvec_grouped(const int8_t* w, const float* scales, const half* x,
