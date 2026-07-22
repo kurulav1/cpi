@@ -1276,15 +1276,19 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
         const opplan::Op& a = op;
         const opplan::Op& b = ops[oi + 1];
         const int gsz = (a.qgroup > 0) ? a.qgroup : a.in_dim;
-        QCatParams gp{static_cast<std::uint32_t>(a.cols),
-                      0u,
-                      0u,
-                      static_cast<std::uint32_t>(a.in_dim),
-                      static_cast<std::uint32_t>(T),
-                      static_cast<std::uint32_t>(a.qbits),
-                      static_cast<std::uint32_t>(a.qgroup),
-                      static_cast<std::uint32_t>((a.in_dim + gsz - 1) / gsz),
-                      0u};
+        struct QGluParams {
+          std::uint32_t n0, n1, n2, in_dim, tokens, bits, group, groups, has_bias;
+          float glu_scale;  // cpi_gelu_mul's headroom scale (0 = 1), multiplied back later
+        } gp{static_cast<std::uint32_t>(a.cols),
+             0u,
+             0u,
+             static_cast<std::uint32_t>(a.in_dim),
+             static_cast<std::uint32_t>(T),
+             static_cast<std::uint32_t>(a.qbits),
+             static_cast<std::uint32_t>(a.qgroup),
+             static_cast<std::uint32_t>((a.in_dim + gsz - 1) / gsz),
+             0u,
+             ops[oi + 2].scale};
         const void* bufs[] = {slot(a.in),  a.qweight, a.qscales,
                               b.qweight,   b.qscales, slot(ops[oi + 2].out)};
         const std::size_t pairs_per_tg = kSimdsPerTG / 2;

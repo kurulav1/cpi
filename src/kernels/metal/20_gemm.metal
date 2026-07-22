@@ -734,12 +734,17 @@ kernel void cpi_gemv_quant_cat(
 // simdgroup, never two): the first half of the threadgroup's simds compute gate rows, the
 // second half their up partners, paired through threadgroup memory. Both dots round to
 // half before the gelu, exactly as the unfused sequence rounds them.
+struct QGluParams {
+  uint n0, n1, n2, in_dim, tokens, bits, group, groups, has_bias;
+  float glu_scale;  // cpi_gelu_mul's p.scale: 0 means 1; multiplied into the stored product
+};
+
 kernel void cpi_gemv_quant_glu(
     device const half*   in   [[buffer(0)]],
     device const uchar*  qwg  [[buffer(1)]], device const float* scg [[buffer(2)]],
     device const uchar*  qwu  [[buffer(3)]], device const float* scu [[buffer(4)]],
     device half*         out  [[buffer(5)]],
-    constant QCatParams& p    [[buffer(6)]],
+    constant QGluParams& p    [[buffer(6)]],
     uint gid  [[threadgroup_position_in_grid]],
     uint lid  [[thread_position_in_threadgroup]],
     uint nthr [[threads_per_threadgroup]]) {
@@ -816,12 +821,19 @@ kernel void cpi_gemv_quant_glu(
   if (simd_id == 0u && lane < pairs_per_tg) {
     const uint orow = (gid % row_blocks) * pairs_per_tg + lane;
     if (t0 < p.tokens && orow < p.n0) {
-      const float kg = 0.7978845608028654f;  // sqrt(2/pi), matches cpi_gelu_mul
+      // EXACTLY cpi_gelu_mul's semantics or the fusion is a numerics change in disguise:
+      // sigmoid-form gelu (tanh overflows via exp(+large)), the fp16-headroom scale that
+      // the plan multiplies back after the down-projection (first version omitted it --
+      // activations landed 2^k too large and generation died), and the clamp backstop.
       for (uint t = 0u; t < nt; ++t) {
         const float g = float(half(pair_acc[t * 8u + lane]));
         const float u = float(half(pair_acc[t * 8u + pairs_per_tg + lane]));
-        const float act = 0.5f * g * (1.0f + tanh(kg * (g + 0.044715f * g * g * g)));
-        out[(ulong)(t0 + t) * (ulong)p.n0 + orow] = half(act * u);
+        const float kg = 0.7978845608028654f;  // sqrt(2/pi)
+        const float inner = kg * (g + 0.044715f * g * g * g);
+        const float gelu = g / (1.0f + exp(-2.0f * inner));
+        const float prod = gelu * u;
+        const float scaled = (p.glu_scale != 0.0f) ? (prod * p.glu_scale) : prod;
+        out[(ulong)(t0 + t) * (ulong)p.n0 + orow] = half(clamp(scaled, -65504.0f, 65504.0f));
       }
     }
   }
