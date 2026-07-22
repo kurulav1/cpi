@@ -20,12 +20,14 @@ int main(int argc, char** argv) {
   int gen = 0;
   int graph_bench = 0;  // >0: run the CUDA-graph decode A/B benchmark for N iters
   int graph_pos = 0;    // decode position for --graph-bench (pads prefill; exercises the window)
+  int weight_quant = 0;  // 0 fp16, 4 or 8: on-load weight-only quant (llama-bench-comparable)
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     if (a == "--model" && i + 1 < argc) cpi = argv[++i];
     else if (a == "--expect" && i + 1 < argc) expect = std::stoi(argv[++i]);
     else if (a == "--gen" && i + 1 < argc) gen = std::stoi(argv[++i]);
     else if (a == "--graph-bench" && i + 1 < argc) graph_bench = std::stoi(argv[++i]);
+    else if (a == "--weight-quant" && i + 1 < argc) weight_quant = std::stoi(argv[++i]);
     else if (a == "--graph-pos" && i + 1 < argc) graph_pos = std::stoi(argv[++i]);
     else if (a == "--tokens" && i + 1 < argc) {
       tokens.clear();
@@ -38,7 +40,16 @@ int main(int argc, char** argv) {
   try {
     engine::PlanCudaEngine eng;
     std::printf("loading %s ...\n", cpi.c_str());
-    eng.open(cpi);
+    if (weight_quant == 4 || weight_quant == 8) {
+      engine::EngineOptions opt;
+      opt.model_path = cpi;
+      opt.max_context = 4096;
+      opt.int8_streaming = true;
+      opt.streaming_quant_bits = weight_quant;
+      eng.initialize(opt);
+    } else {
+      eng.open(cpi);
+    }
     std::printf("loaded. vocab=%d\n", eng.vocab());
 
     if (graph_bench > 0) {
