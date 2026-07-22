@@ -481,6 +481,51 @@ kernel void cpi_gemv_quant(
   const uint simd_id      = lid / 32u;
   const uint lane         = lid % 32u;
 
+  const uint gsz0 = (p.group == 0u) ? p.in_dim : p.group;
+  // NR0=4 decode path (llama.cpp's M-series mul_mv shape: N_R0_Q4_0 = 4): one simdgroup
+  // owns FOUR consecutive rows and the activation chunk is loaded ONCE for all of them.
+  // On the bandwidth-tight M4 the x-reuse beats the one-row shape that won on CUDA.
+  // The executor shrinks the grid 4x under the SAME predicate -- keep them in lockstep.
+  if (p.tokens == 1u && p.bits == 4u && (p.in_dim & 31u) == 0u && (gsz0 & 31u) == 0u &&
+      p.has_bias == 0u) {
+    const uint r0 = (gid * simds_per_tg + simd_id) * 4u;
+    if (r0 >= p.out_dim) return;
+    const uint nrows = min(4u, p.out_dim - r0);
+    float acc4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const uint n32 = p.in_dim >> 5;
+    for (uint k = lane; k < n32; k += 32u) {
+      const uint j0 = k << 5;
+      device const half4* x4 = (device const half4*)(in + j0);
+      float4 xev[4], xod[4];
+      for (uint w = 0u; w < 4u; ++w) {
+        const half4 xa = x4[2u * w];
+        const half4 xb = x4[2u * w + 1u];
+        xev[w] = float4(float(xa.x), float(xa.z), float(xb.x), float(xb.z));
+        xod[w] = float4(float(xa.y), float(xa.w), float(xb.y), float(xb.w));
+      }
+      for (uint r = 0u; r < nrows; ++r) {
+        const uint rr = r0 + r;
+        device const uint4* w128 = (device const uint4*)(qw + (ulong)rr * (ulong)(p.in_dim >> 1));
+        const uint4 packed = w128[k];
+        const float sc = (scales + (ulong)rr * (ulong)p.groups)[j0 / gsz0];
+        float sub = 0.0f;
+        for (uint w = 0u; w < 4u; ++w) {
+          const uint word =
+              (w == 0u) ? packed.x : (w == 1u) ? packed.y : (w == 2u) ? packed.z : packed.w;
+          const char4 lo = as_type<char4>((word & 0x0F0F0F0Fu) ^ 0x08080808u) - char4(8);
+          const char4 hi = as_type<char4>(((word >> 4u) & 0x0F0F0F0Fu) ^ 0x08080808u) - char4(8);
+          sub += dot(float4(lo), xev[w]) + dot(float4(hi), xod[w]);
+        }
+        acc4[r] += sub * sc;
+      }
+    }
+    for (uint r = 0u; r < nrows; ++r) {
+      const float s = simd_sum(acc4[r]);
+      if (lane == 0u) out[r0 + r] = half(s);
+    }
+    return;
+  }
+
   const uint row_blocks = (p.out_dim + simds_per_tg - 1u) / simds_per_tg;
   const uint tile = gid / row_blocks;
   const uint blk  = gid % row_blocks;

@@ -1438,9 +1438,17 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
                 static_cast<std::size_t>(qgemm_tokens) * static_cast<std::size_t>(op.cols) * 2, 0,
                 static_cast<std::size_t>(op.bias_offset) * sizeof(std::uint16_t)};
             const std::size_t tiles = static_cast<std::size_t>((qrest + kGemvTile - 1) / kGemvTile);
-            ctx_.dispatch("cpi_gemv_quant", G::Groups,
-                          groups_for_rows(static_cast<std::size_t>(op.cols)) * tiles, kTG, bufs,
-                          roffs, 5, &rp, sizeof(rp));
+            // NR0=4 decode shape (see cpi_gemv_quant): same predicate as the shader, 4x
+            // fewer threadgroups, activations loaded once per four rows.
+            const int gsz0 = (op.qgroup == 0) ? op.in_dim : op.qgroup;
+            const bool nr4 = qrest == 1 && op.qbits == 4 && (op.in_dim % 32) == 0 &&
+                             (gsz0 % 32) == 0 && op.bias == nullptr;
+            const std::size_t rows_per_tg =
+                nr4 ? static_cast<std::size_t>(kSimdsPerTG) * 4 : kSimdsPerTG;
+            const std::size_t rbq =
+                (static_cast<std::size_t>(op.cols) + rows_per_tg - 1) / rows_per_tg;
+            ctx_.dispatch("cpi_gemv_quant", G::Groups, rbq * tiles, kTG, bufs, roffs, 5, &rp,
+                          sizeof(rp));
             if (profile) profile_tick("Gemv(quant remainder)");
           }
           break;
