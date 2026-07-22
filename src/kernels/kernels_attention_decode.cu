@@ -554,6 +554,12 @@ __device__ __forceinline__ void attention_step_chunk_reduce_any_core(
   // identical order give identical values, so the old per-chunk single-thread section and
   // its TWO barriers (x26 chunks) vanish without moving a rounding. The m/l loads are
   // same-address broadcasts.
+  // TWO-PASS combine: the running-rescale recurrence (acc = acc*alpha + o*beta) is a
+  // serial dependency across chunks -- at depth 3500 a full-attention layer has ~219 of
+  // them and the chain measured as a 15% end-to-end sag vs llama.cpp's flat curve. Pass 1
+  // finds the global max (scalar, broadcast loads); pass 2 accumulates INDEPENDENT
+  // o_c * exp(m_c - M) products, which pipeline freely. One exp scale per chunk instead
+  // of a running rescale is also numerically tighter.
   const int head = blockIdx.x;
   const int tid = threadIdx.x;
   const int first_chunk = k_start / chunk_size;
@@ -561,30 +567,28 @@ __device__ __forceinline__ void attention_step_chunk_reduce_any_core(
   float acc[kAccPerThread];
 #pragma unroll
   for (int j = 0; j < kAccPerThread; ++j) acc[j] = 0.0f;
-  float running_m = neg_inf<float>();
-  float running_l = 0.0f;
 
+  float global_m = neg_inf<float>();
+  for (int chunk = first_chunk; chunk < chunk_count; ++chunk) {
+    global_m = fmaxf(global_m, chunk_m[head * scratch_chunks + chunk]);
+  }
+  float total_l = 0.0f;
   for (int chunk = first_chunk; chunk < chunk_count; ++chunk) {
     const int idx = head * scratch_chunks + chunk;
-    const float chunk_m_value = chunk_m[idx];
     const float chunk_l_value = chunk_l[idx];
-    const float new_m = fmaxf(running_m, chunk_m_value);
-    const float alpha = (running_l == 0.0f) ? 0.0f : expf(running_m - new_m);
-    const float beta = (chunk_l_value == 0.0f) ? 0.0f : expf(chunk_m_value - new_m);
-    running_l = running_l * alpha + chunk_l_value * beta;
-    running_m = new_m;
-
+    const float w = (chunk_l_value == 0.0f) ? 0.0f : expf(chunk_m[idx] - global_m);
+    total_l += chunk_l_value * w;
     const std::size_t base =
         (static_cast<std::size_t>(head) * static_cast<std::size_t>(scratch_chunks) +
          static_cast<std::size_t>(chunk)) *
         static_cast<std::size_t>(head_dim);
     int j = 0;
     for (int d = tid; d < head_dim; d += blockDim.x, ++j) {
-      acc[j] = acc[j] * alpha + chunk_o[base + static_cast<std::size_t>(d)] * beta;
+      acc[j] += chunk_o[base + static_cast<std::size_t>(d)] * w;
     }
   }
 
-  const float inv_l = 1.0f / fmaxf(running_l, 1e-8f);
+  const float inv_l = 1.0f / fmaxf(total_l, 1e-8f);
   int j = 0;
   for (int d = tid; d < head_dim; d += blockDim.x, ++j) {
     out[head * head_dim + d] = __float2half(acc[j] * inv_l);

@@ -2251,20 +2251,31 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
             // Grid sizing: the depth bucket (set by forward_one; falls back to max) --
             // and a sliding layer never needs more chunks than its window can span.
             int chunks = attn_chunk_budget_ > 0 ? attn_chunk_budget_ : split_any_chunks_;
+            // Depth-adaptive chunk size: fine chunks maximize parallelism shallow, but the
+            // fp32 (m,l,o) scratch written+re-read per chunk scales with chunk COUNT --
+            // at depth 3500 chunk-16 moved ~25 MB/token of scratch and measured a 15%
+            // sag vs llama.cpp's flat curve. Deep buckets coarsen to 64-token chunks
+            // (scratch/4, reduce scan/4); the merge math per key is unchanged.
+            int cs = kSplitAnyChunk;
+            {
+              const int live_tokens = chunks * kSplitAnyChunk;
+              if (live_tokens >= 2048) {
+                cs = 64;
+                chunks = (live_tokens + cs - 1) / cs;
+              }
+            }
             if (window > 0) {
-              const int wc = window / kSplitAnyChunk + 2;  // window can straddle chunk edges
+              const int wc = window / cs + 2;  // window can straddle chunk edges
               if (wc < chunks) chunks = wc;
             }
             if (device_pos_mode_) {
               kernels::launch_attention_split_any_device_pos(
                   S(op.in), kc, vc, S(op.out), d_position_, window, op.heads, op.kv_heads,
-                  op.head_dim, d_split_m_, d_split_l_, d_split_o_, kSplitAnyChunk, chunks,
-                  stream_);
+                  op.head_dim, d_split_m_, d_split_l_, d_split_o_, cs, chunks, stream_);
             } else {
               kernels::launch_attention_split_any(
                   S(op.in), kc, vc, S(op.out), position + 1, window, op.heads, op.kv_heads,
-                  op.head_dim, d_split_m_, d_split_l_, d_split_o_, kSplitAnyChunk, chunks,
-                  stream_);
+                  op.head_dim, d_split_m_, d_split_l_, d_split_o_, cs, chunks, stream_);
             }
             break;
           }
