@@ -1060,6 +1060,14 @@ void launch_weight_only_int4_matvec_grouped_dp4a(const std::int8_t* w_packed,
                                                  const float* x_scale, half* y, int out_features,
                                                  int in_features, int group, cudaStream_t stream);
 
+// launch_rmsnorm_quant_perm8
+//
+// rows=1 rmsnorm fused with perm8 int8 activation quantization (XNorm sites feeding dp4a
+// projections). Bit-identical to [launch_rmsnorm; launch_quantize_fp16_to_int8_perm8]:
+// the quantizer reads the fp16-ROUNDED normed values. cols % 8 == 0 and cols <= 2048.
+void launch_rmsnorm_quant_perm8(const half* x, const half* w, half* y, std::int8_t* xq,
+                                float* xscale, int cols, float eps, cudaStream_t stream);
+
 // launch_weight_only_int4_matvec_grouped_dp4a_cat
 //
 // Up to three grouped int4 dp4a GEMVs sharing one perm8-quantized activation, run as ONE

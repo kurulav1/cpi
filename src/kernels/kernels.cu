@@ -1037,6 +1037,115 @@ __global__ void rmsnorm_fast_kernel(const half* __restrict__ x, const half* __re
   }
 }
 
+// rmsnorm_fast + perm8 int8 activation quantization in ONE kernel, for the rows=1 norms
+// whose output feeds dp4a int4 projections (XNorm sites). The normed row never leaves
+// registers: fp16 y is written as usual, then the fp16-ROUNDED values are quantized --
+// exactly what the separate quantize kernel would read back -- so the fused path is
+// bit-identical to [rmsnorm_fast; quantize_fp16_to_int8_perm8]. cols <= Threads * 8.
+template <int Threads>
+__global__ void rmsnorm_quant_perm8_kernel(const half* __restrict__ x, const half* __restrict__ w,
+                                           half* __restrict__ y, int8_t* __restrict__ xq,
+                                           float* __restrict__ xscale, int cols, float eps,
+                                           int max_q) {
+  const int tid = threadIdx.x;
+  const int vecs = cols / 8;
+  const int4* x4 = reinterpret_cast<const int4*>(x);
+
+  int4 xbuf;
+  int4 obuf;
+  float acc = 0.0f;
+  const bool active = tid < vecs;
+  if (active) {
+    xbuf = x4[tid];
+    const half2* h = reinterpret_cast<const half2*>(&xbuf);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const float2 v = __half22float2(h[j]);
+      acc += v.x * v.x + v.y * v.y;
+    }
+  }
+#pragma unroll
+  for (int off = warpSize / 2; off > 0; off >>= 1) {
+    acc += __shfl_down_sync(0xffffffffu, acc, off);
+  }
+  __shared__ float partial[Threads / 32];
+  __shared__ float shared_vals[2];  // [inv_rms, inv_scale]
+  const int warp = tid / warpSize;
+  const int lane = tid & (warpSize - 1);
+  if (lane == 0) {
+    partial[warp] = acc;
+  }
+  __syncthreads();
+  if (tid == 0) {
+    float total = 0.0f;
+#pragma unroll
+    for (int i = 0; i < Threads / 32; ++i) {
+      total += partial[i];
+    }
+    shared_vals[0] = rsqrtf(total / static_cast<float>(cols) + eps);
+  }
+  __syncthreads();
+
+  const float inv = shared_vals[0];
+  float local_max = 0.0f;
+  if (active) {
+    const int4 wpack = reinterpret_cast<const int4*>(w)[tid];
+    const half2* xh = reinterpret_cast<const half2*>(&xbuf);
+    const half2* wh = reinterpret_cast<const half2*>(&wpack);
+    half2* oh = reinterpret_cast<half2*>(&obuf);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const float2 xv = __half22float2(xh[j]);
+      const float2 wv = __half22float2(wh[j]);
+      oh[j] = __floats2half2_rn(xv.x * inv * wv.x, xv.y * inv * wv.y);
+      const float2 ov = __half22float2(oh[j]);
+      local_max = fmaxf(local_max, fmaxf(fabsf(ov.x), fabsf(ov.y)));
+    }
+    reinterpret_cast<int4*>(y)[tid] = obuf;
+  }
+#pragma unroll
+  for (int off = warpSize / 2; off > 0; off >>= 1) {
+    local_max = fmaxf(local_max, __shfl_down_sync(0xffffffffu, local_max, off));
+  }
+  if (lane == 0) {
+    partial[warp] = local_max;
+  }
+  __syncthreads();
+  if (tid == 0) {
+    float m = 0.0f;
+#pragma unroll
+    for (int i = 0; i < Threads / 32; ++i) {
+      m = fmaxf(m, partial[i]);
+    }
+    float scale = m / static_cast<float>(max_q);
+    if (scale < 1.0e-8f) {
+      scale = 1.0e-8f;
+    }
+    xscale[0] = scale;
+    shared_vals[1] = 1.0f / scale;
+  }
+  __syncthreads();
+
+  if (active) {
+    const float inv_scale = shared_vals[1];
+    const half2* oh = reinterpret_cast<const half2*>(&obuf);
+    int q[8];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const float2 v = __half22float2(oh[j]);
+      int a = __float2int_rn(v.x * inv_scale);
+      int b = __float2int_rn(v.y * inv_scale);
+      q[2 * j] = max(-max_q, min(max_q, a));
+      q[2 * j + 1] = max(-max_q, min(max_q, b));
+    }
+    char4* dst4 = reinterpret_cast<char4*>(xq);
+    dst4[tid * 2] = make_char4(static_cast<signed char>(q[0]), static_cast<signed char>(q[2]),
+                               static_cast<signed char>(q[4]), static_cast<signed char>(q[6]));
+    dst4[tid * 2 + 1] = make_char4(static_cast<signed char>(q[1]), static_cast<signed char>(q[3]),
+                                   static_cast<signed char>(q[5]), static_cast<signed char>(q[7]));
+  }
+}
+
 // Causal row-softmax over an attention score matrix, in place.
 //
 // Used by the tensor-core prefill attention: Q.K^T comes out of a cuBLAS batched GEMM as a
@@ -1147,6 +1256,13 @@ __global__ void build_attention_ptrs_kernel(const half* k_layer, const half* v_l
 
 // Host launch wrappers keep kernel-selection policy out of the runtime call
 // sites.
+void launch_rmsnorm_quant_perm8(const half* x, const half* w, half* y, std::int8_t* xq,
+                                float* xscale, int cols, float eps, cudaStream_t stream) {
+  constexpr int kThreads = 256;
+  rmsnorm_quant_perm8_kernel<kThreads>
+      <<<1, kThreads, 0, stream>>>(x, w, y, xq, xscale, cols, eps, 127);
+}
+
 void launch_rmsnorm(const half* x, const half* weight, half* y, int rows, int cols, float eps,
                     cudaStream_t stream) {
   // Fast path needs 128-bit alignment (cols % 8) and the row to fit in registers.

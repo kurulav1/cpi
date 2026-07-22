@@ -1827,6 +1827,7 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
   // non-Gemv op invalidates, which keeps exactly the adjacent-run reuse and nothing else.
   const void* actq_src = nullptr;
   int actq_len = 0;
+  bool actq_set_now = false;
   for (std::size_t idx = 0; idx < n; ++idx) {
     const Op& op = ops[idx];
     if (prof) {
@@ -1939,6 +1940,23 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
             d_logits_, op.cols, op.in_dim, stream_);
         break;
       case OpKind::RmsNorm:
+        // An XNorm-site norm whose output feeds a dp4a int4 projection fuses the perm8
+        // activation quantize into the norm (bit-identical: the fused kernel quantizes the
+        // fp16-ROUNDED values); the Gemv branch then hits the actq cache and skips its
+        // quantize launch entirely.
+        if (!seq && d_act_i8_ != nullptr && !op.norm_offset && op.rows == 1 &&
+            op.weight != nullptr && (op.cols % 8) == 0 && op.cols <= 2048 && idx + 1 < n &&
+            ops[idx + 1].kind == OpKind::Gemv && ops[idx + 1].qbits == 4 &&
+            ops[idx + 1].qgroup > 0 && (ops[idx + 1].qgroup % 32) == 0 &&
+            ops[idx + 1].in == op.out && ops[idx + 1].in_dim == op.cols &&
+            ops[idx + 1].bias == nullptr) {
+          kernels::launch_rmsnorm_quant_perm8(S(op.in), HW(op.weight), S(op.out), d_act_i8_,
+                                              d_act_qs_, op.cols, cfg_.rms_eps, stream_);
+          actq_src = S(op.out);
+          actq_len = op.cols;
+          actq_set_now = true;
+          break;
+        }
         // norm_offset ⇒ the weight is applied as (1 + w) (Qwen3.5-style).
         if (op.norm_offset) {
           kernels::launch_rmsnorm_offset(S(op.in), HW(op.weight), S(op.out), rows_x(op.rows),
@@ -2237,7 +2255,8 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
         break;
     }
   op_done:
-    if (op.kind != OpKind::Gemv) actq_src = nullptr;
+    if (!actq_set_now && op.kind != OpKind::Gemv) actq_src = nullptr;
+    actq_set_now = false;
     if (prof) {
       cudaEventRecord(ev1, stream_);
       cudaEventSynchronize(ev1);
