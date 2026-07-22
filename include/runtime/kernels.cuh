@@ -458,7 +458,7 @@ void launch_gated_glu_interleaved(const half* ff13, half* out, int inter, int to
 // This is the middle of the tensor-core prefill attention: cuBLAS batched GEMM produces the
 // scores, this normalises them, and a second GEMM consumes them as P.
 void launch_softmax_causal_rows(half* scores, int heads, int chunk_stride, int rows, int keys,
-                                int q_start, cudaStream_t stream);
+                                int q_start, cudaStream_t stream, int window = 0);
 
 void launch_attention_prefill(const half* q, const half* k_cache, const half* v_cache, half* out,
                               int num_tokens, int start_position, int num_heads, int num_kv_heads,

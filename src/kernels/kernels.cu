@@ -1143,7 +1143,8 @@ __global__ void rmsnorm_quant_perm8_kernel(const half* __restrict__ x, const hal
 // Row (h, i) is query token (q_start + i), so it may attend to keys j <= q_start + i. Masked
 // entries are written as ZERO, not -inf: they are consumed by a GEMM, not another softmax, so
 // a zero weight is what drops them from the P.V product.
-__global__ void softmax_causal_rows_kernel(half* s, int chunk_stride, int keys, int q_start) {
+__global__ void softmax_causal_rows_kernel(half* s, int chunk_stride, int keys, int q_start,
+                                           int window) {
   const int i = blockIdx.x;   // query within the chunk
   const int h = blockIdx.y;   // head
   // chunk_stride is the ALLOCATED rows per head (kChunk), not the rows in flight: the GEMM
@@ -1152,13 +1153,16 @@ __global__ void softmax_causal_rows_kernel(half* s, int chunk_stride, int keys, 
   half* row = s + (static_cast<std::size_t>(h) * chunk_stride + i) * keys;
 
   const int valid = min(keys, q_start + i + 1);  // causal bound
+  // Sliding window: keys below (q_abs - window + 1) are masked out entirely -- excluded
+  // from max and sum, written as zero (they feed a GEMM, so zero drops them from P.V).
+  const int lo = (window > 0) ? max(0, q_start + i + 1 - window) : 0;
   const int tid = threadIdx.x;
 
   __shared__ float sh_max;
   __shared__ float sh_sum;
 
   float m = -3.402823466e+38F;
-  for (int j = tid; j < valid; j += blockDim.x) {
+  for (int j = lo + tid; j < valid; j += blockDim.x) {
     m = fmaxf(m, __half2float(row[j]));
   }
   m = warp_max_f(m);
@@ -1182,7 +1186,7 @@ __global__ void softmax_causal_rows_kernel(half* s, int chunk_stride, int keys, 
   // throughout, so that doubled the precision loss for no reason. One rounding is unavoidable
   // (the second GEMM consumes P as fp16); two is just sloppy.
   float sum = 0.0f;
-  for (int j = tid; j < valid; j += blockDim.x) {
+  for (int j = lo + tid; j < valid; j += blockDim.x) {
     sum += __expf(__half2float(row[j]) - mx);
   }
   sum = warp_sum(sum);
@@ -1197,10 +1201,13 @@ __global__ void softmax_causal_rows_kernel(half* s, int chunk_stride, int keys, 
   __syncthreads();
   const float inv = 1.0f / sh_sum;
 
-  for (int j = tid; j < valid; j += blockDim.x) {
+  for (int j = lo + tid; j < valid; j += blockDim.x) {
     row[j] = __float2half(__expf(__half2float(row[j]) - mx) * inv);
   }
-  // Zero the future: these keys must not contribute to P.V.
+  // Zero the past-the-window and the future: neither may contribute to P.V.
+  for (int j = tid; j < lo; j += blockDim.x) {
+    row[j] = __float2half(0.0f);
+  }
   for (int j = valid + tid; j < keys; j += blockDim.x) {
     row[j] = __float2half(0.0f);
   }
@@ -1397,9 +1404,10 @@ void launch_build_attention_ptrs(const half* k_layer, const half* v_layer, const
 }
 
 void launch_softmax_causal_rows(half* scores, int heads, int chunk_stride, int rows, int keys,
-                                int q_start, cudaStream_t stream) {
+                                int q_start, cudaStream_t stream, int window) {
   const dim3 grid(static_cast<unsigned>(rows), static_cast<unsigned>(heads));
-  softmax_causal_rows_kernel<<<grid, 256, 0, stream>>>(scores, chunk_stride, keys, q_start);
+  softmax_causal_rows_kernel<<<grid, 256, 0, stream>>>(scores, chunk_stride, keys, q_start,
+                                                       window);
 }
 
 void launch_attention_prefill(const half* q, const half* k_cache, const half* v_cache, half* out,

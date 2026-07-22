@@ -1879,7 +1879,7 @@ bool PlanCudaEngine::seq_gemm_cublas(const __half* w, const __half* x, __half* y
 // layers keep the masked tiled kernel (the window mask lives only there).
 bool PlanCudaEngine::prefill_attention_tc(const __half* q, const __half* k, const __half* v,
                                           __half* out, int rows, int base_pos, int heads,
-                                          int kv_heads, int hd) {
+                                          int kv_heads, int hd, int window) {
   static const bool disabled = std::getenv("CPI_CUDA_NO_TC_PREFILL") != nullptr;
   if (disabled || cublas_ == nullptr) return false;
   if (heads <= 0 || kv_heads <= 0 || (heads % kv_heads) != 0) return false;
@@ -1916,7 +1916,7 @@ bool PlanCudaEngine::prefill_attention_tc(const __half* q, const __half* k, cons
                             CUBLAS_GEMM_DEFAULT_TENSOR_OP) != CUBLAS_STATUS_SUCCESS)
       return false;
     kernels::launch_softmax_causal_rows(d_pf_scores_, heads, kChunk, chunk, keys, base_pos + c0,
-                                        stream_);
+                                        stream_, window);
     if (cublasGemmBatchedEx(h, CUBLAS_OP_N, CUBLAS_OP_N, hd, chunk, keys, &one, A2, CUDA_R_16F,
                             kv_stride, B2, CUDA_R_16F, keys, &zero, C2, CUDA_R_16F, out_stride,
                             heads, CUBLAS_COMPUTE_32F,
@@ -2382,9 +2382,9 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
           // window to the masked tiled kernel, and ctx.limits (when set) makes an image
           // span bidirectional.
           const int window = op.full_attention ? 0 : op.sliding_window;
-          if (op.full_attention && ctx.limits == nullptr &&
+          if (ctx.limits == nullptr &&
               prefill_attention_tc(S(op.in), caches_k_[layer], caches_v_[layer], S(op.out), T,
-                                   position, op.heads, op.kv_heads, op.head_dim)) {
+                                   position, op.heads, op.kv_heads, op.head_dim, window)) {
             break;
           }
           kernels::launch_attention_prefill(S(op.in), caches_k_[layer], caches_v_[layer], S(op.out),
