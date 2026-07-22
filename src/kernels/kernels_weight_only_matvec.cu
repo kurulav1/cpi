@@ -1422,6 +1422,57 @@ void launch_weight_only_int8_matvec_glu(const std::int8_t* wg, const float* sg,
       wg, sg, wu, su, x, y, out_features, in_features);
 }
 
+// Dequantize a whole packed matrix back to fp16. Prefill-only: sequence mode runs the
+// real fp16 GEMM over a dequantized scratch copy (one matrix at a time) instead of a
+// batched quant matvec -- the GEMM amortizes the dequant at any real prompt length, and
+// decode keeps its dp4a kernels. Grouped int4 variant; group % 2 == 0.
+__global__ void dequant_int4_grouped_kernel(const int8_t* __restrict__ w_packed,
+                                            const float* __restrict__ scales,
+                                            half* __restrict__ out, int rows, int cols,
+                                            int group_shift, int n_groups) {
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const int packed_cols = cols / 2;
+  const int8_t* rp = w_packed + static_cast<std::size_t>(row) * packed_cols;
+  const float* rs = scales + static_cast<std::size_t>(row) * n_groups;
+  half* ro = out + static_cast<std::size_t>(row) * cols;
+  for (int b = threadIdx.x; b < packed_cols; b += blockDim.x) {
+    const unsigned byte = static_cast<unsigned char>(rp[b]);
+    const float s = rs[(2 * b) >> group_shift];
+    const int lo = (static_cast<int>(byte & 0x0Fu) ^ 0x8) - 0x8;
+    const int hi = (static_cast<int>(byte >> 4) ^ 0x8) - 0x8;
+    ro[2 * b] = __float2half(static_cast<float>(lo) * s);
+    ro[2 * b + 1] = __float2half(static_cast<float>(hi) * s);
+  }
+}
+
+__global__ void dequant_int8_rowwise_kernel(const int8_t* __restrict__ w,
+                                            const float* __restrict__ scales,
+                                            half* __restrict__ out, int rows, int cols) {
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const float s = scales[row];
+  const int8_t* rp = w + static_cast<std::size_t>(row) * cols;
+  half* ro = out + static_cast<std::size_t>(row) * cols;
+  for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+    ro[c] = __float2half(static_cast<float>(rp[c]) * s);
+  }
+}
+
+void launch_dequant_int4_grouped(const std::int8_t* w_packed, const float* scales, half* out,
+                                 int rows, int cols, int group, cudaStream_t stream) {
+  const int shift = group_shift_of(group);
+  if (shift < 0 || (cols % 2) != 0) return;
+  const int n_groups = quant_group_count(cols, group);
+  dequant_int4_grouped_kernel<<<rows, 256, 0, stream>>>(w_packed, scales, out, rows, cols, shift,
+                                                        n_groups);
+}
+
+void launch_dequant_int8_rowwise(const std::int8_t* w, const float* scales, half* out, int rows,
+                                 int cols, cudaStream_t stream) {
+  dequant_int8_rowwise_kernel<<<rows, 256, 0, stream>>>(w, scales, out, rows, cols);
+}
+
 void launch_weight_only_int8_matvec_grouped(const int8_t* w, const float* scales, const half* x,
                                             half* y, int out_features, int in_features, int group,
                                             cudaStream_t stream) {

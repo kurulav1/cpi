@@ -101,6 +101,7 @@ PlanCudaEngine::~PlanCudaEngine() {
   cudaFree(d_cand_val_);
   cudaFree(d_cand_count_);
   cudaFree(d_persist_ops_);
+  cudaFree(d_seq_dequant_);
   cudaFree(d_head_q_);
   cudaFree(d_head_qs_);
   cudaFree(d_split_m_);
@@ -902,6 +903,9 @@ void PlanCudaEngine::open(const std::string& cpi_path, int max_context) {
       std::getenv("CPI_CUDA_NO_DP4A") == nullptr) {
     G4_CHECK(cudaMalloc(&d_act_i8_, 65536));
     G4_CHECK(cudaMalloc(&d_act_qs_, (65536 / 32) * sizeof(float)));  // group-32 x scales
+    // Largest projection on the supported models is <= 16384 x 4096 halfs (128 MB is the
+    // ceiling; E2B's largest is 12288 x 1536 = 38 MB). Sized generously once.
+    G4_CHECK(cudaMalloc(&d_seq_dequant_, std::size_t(16384) * 4096 * sizeof(__half)));
   }
   if (std::getenv("LLAMA_INFER_PLAN_NO_DEVICE_TOPK")) device_topk_enabled_ = false;
 
@@ -985,6 +989,11 @@ void PlanCudaEngine::open(const std::string& cpi_path, int max_context) {
   build_plan();  // resolve the per-layer forward into a data op-plan (once)
   persist_enabled_ =
       std::getenv("CPI_CUDA_PERSISTENT") != nullptr && compile_persistent_plan();
+  // Sequence prefill: this route NEVER set the capability flag, so every .cpi model
+  // prefilled token-by-token -- ~140 tok/s while llama.cpp ingests 22K. Found by the
+  // first-ever prefill benchmark of this backend.
+  seq_prefill_ok_ = plan_can_sequence_prefill();
+  if (seq_prefill_ok_) allocate_sequence_buffers(std::min(max_ctx_, 4096));
   G4_CHECK(cudaStreamSynchronize(stream_));
 }
 
@@ -2117,6 +2126,25 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
           if (S(op.out) == actq_src) actq_src = nullptr;
           break;
         }
+        // SEQUENCE mode with quantized weights: dequantize into scratch and run the real
+        // fp16 GEMM. The quant matvec kernels are batch-1; calling them with T tokens
+        // computed only token 0 and filled the KV cache with garbage -- the reason the
+        // .cpi route historically never enabled sequence prefill.
+        if (seq && op.qbits != 0 && d_seq_dequant_ != nullptr) {
+          if (op.qbits == 4 && op.qgroup > 0) {
+            kernels::launch_dequant_int4_grouped(QW(op.qweight), QS(op.qscales), d_seq_dequant_,
+                                                 op.cols, op.in_dim, op.qgroup, stream_);
+          } else if (op.qbits == 8 && op.qgroup == 0) {
+            kernels::launch_dequant_int8_rowwise(QW(op.qweight), QS(op.qscales), d_seq_dequant_,
+                                                 op.cols, op.in_dim, stream_);
+          } else {
+            throw std::runtime_error("sequence prefill: unsupported quant layout");
+          }
+          kernels::launch_rowmajor_half_gemm_f16(d_seq_dequant_, S(op.in), S(op.out), op.cols,
+                                                 op.in_dim, T, stream_, op.clip_in_min,
+                                                 op.clip_in_max, op.clip_out_min, op.clip_out_max);
+          break;
+        }
         // int8 GLU fusion: [gate Gemv][up Gemv][GeluMul] -> one paired-warp launch.
         if (!seq && op.qbits == 8 && op.qgroup == 0 && op.bias == nullptr &&
             (op.in_dim % 16) == 0 && idx + 2 < n && ops[idx + 1].kind == OpKind::Gemv &&
@@ -2245,6 +2273,10 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
           // Sequence prefill appends T rows at once: the K/V slots are [T][kvdim] and the
           // cache rows are contiguous, so it is the same copy, T times as long.
           const std::size_t rows = static_cast<std::size_t>(T);
+          if (std::getenv("CPI_KV_DEBUG"))
+            std::fprintf(stderr, "[kvdbg] layer=%d T=%d pos=%d kvdim=%zu kc=%p vc=%p K=%p V=%p\n",
+                         layer, T, position, kvdim, (void*)kc, (void*)vc, (void*)S(Slot::K),
+                         (void*)S(Slot::V));
           G4_CHECK(cudaMemcpyAsync(kc + static_cast<std::size_t>(position) * kvdim, S(Slot::K),
                                    rows * kvdim * sizeof(__half), cudaMemcpyDeviceToDevice,
                                    stream_));

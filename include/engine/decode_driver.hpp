@@ -60,6 +60,13 @@ class SequenceModel {
   // sampler (+ optional grammar mask). Engines with a device-argmax greedy fast
   // path override this to keep it.
   virtual int sample(const DecodeParams& params, const std::vector<int>& history);
+  // Ingest the whole prompt (only the last token needs logits). Default: the per-token
+  // step loop. Engines with a BATCHED prefill override this -- the plan engine's
+  // sequence prefill is ~100x the per-token rate on long prompts.
+  virtual void prefill(const std::vector<int>& prompt) {
+    const int P = static_cast<int>(prompt.size());
+    for (int i = 0; i < P; ++i) step(prompt[i], i, i == P - 1);
+  }
 };
 
 // Prefill `prompt` (only the last token computes logits), then decode up to

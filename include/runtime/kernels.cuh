@@ -1119,6 +1119,15 @@ void launch_weight_only_int8_matvec_glu(const std::int8_t* wg, const float* sg,
 void launch_half_gemv_glu(const half* wg, const half* wu, const half* x, half* y,
                           int out_features, int in_features, cudaStream_t stream);
 
+// launch_dequant_int4_grouped / launch_dequant_int8_rowwise
+//
+// Whole-matrix dequant to fp16 (prefill scratch: sequence mode runs the real GEMM over a
+// dequantized copy; decode keeps the quant kernels).
+void launch_dequant_int4_grouped(const std::int8_t* w_packed, const float* scales, half* out,
+                                 int rows, int cols, int group, cudaStream_t stream);
+void launch_dequant_int8_rowwise(const std::int8_t* w, const float* scales, half* out, int rows,
+                                 int cols, cudaStream_t stream);
+
 // launch_rowmajor_half_gemv_cat
 //
 // Up to three batch-1 fp16 GEMVs sharing one input vector, run as ONE launch (q|k|v,

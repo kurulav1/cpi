@@ -29,6 +29,12 @@ std::vector<int> run_decode(SequenceModel& model, const std::vector<int>& prompt
   std::vector<int> out;
   const int P = static_cast<int>(prompt.size());
   if (P == 0) return out;
+  // A prompt at or past the context limit used to overrun the KV cache and surface as a
+  // cryptic CUDA invalid-argument (found via a 2049-token prompt against the 2048
+  // default). Fail with the actual reason instead.
+  if (P >= model.max_context())
+    throw std::runtime_error("prompt (" + std::to_string(P) + " tokens) does not fit the context (" +
+                             std::to_string(model.max_context()) + "); raise --max-context");
   model.reset_state();
   if (stats) {
     *stats = BenchmarkStats{};
@@ -36,9 +42,9 @@ std::vector<int> run_decode(SequenceModel& model, const std::vector<int>& prompt
   }
   if (params.seed >= 0) detail::dispatch_seed_sampler_rng(static_cast<unsigned>(params.seed));
 
-  // Prefill: run every prompt token; only the last computes logits.
+  // Prefill: batched when the engine supports it (see SequenceModel::prefill).
   const auto prefill_start = clock::now();
-  for (int i = 0; i < P; ++i) model.step(prompt[i], i, i == P - 1);
+  model.prefill(prompt);
   model.synchronize();
   if (stats) stats->prefill_ms = ms(prefill_start, clock::now());
 

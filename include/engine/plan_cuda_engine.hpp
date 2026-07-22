@@ -19,6 +19,8 @@
 
 #include <array>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <string>
 #include <unordered_map>
@@ -90,6 +92,36 @@ class PlanCudaEngine : public runtime::SequenceModel {
   // and copy back one int — skipping the 262K-vocab D2H + host softcap that
   // otherwise dominate E2B decode. Non-greedy falls back to the host sampler.
   int sample(const runtime::DecodeParams& params, const std::vector<int>& history) override;
+  // Batched prompt ingestion via the sequence-prefill path (the multimodal machinery,
+  // minus images). Falls back to per-token stepping for plans that cannot sequence.
+  void prefill(const std::vector<int>& prompt) override {
+    const int T = static_cast<int>(prompt.size());
+    if (std::getenv("CPI_KV_DEBUG"))
+      std::fprintf(stderr, "[prefill] T=%d seq_ok=%d\n", T, seq_prefill_ok_ ? 1 : 0);
+    if (T > 1 && seq_prefill_ok_) {
+      // CHUNKED: one giant sequence pass broke past ~2K tokens (a T-scaled launch
+      // dimension exceeded a limit; the sticky error surfaced at the next memcpy) and
+      // buffers cap at seq_max_tokens_ anyway. KV appends make chunks exact.
+      constexpr int kChunk = 2048;
+      int pos = 0;
+      while (pos < T) {
+        int n = std::min(kChunk, T - pos);
+        // Never emit a single-token chunk: prefill_sequence with T == 1 degenerates to
+        // decode-mode kernels that read the (stale) device position. Shrink so the tail
+        // has at least two tokens, and step a genuinely single-token remainder normally.
+        if (n > 1 && T - pos - n == 1) n -= 1;
+        if (n == 1) {
+          step(prompt[pos], pos, pos == T - 1);
+        } else {
+          prefill_sequence(std::vector<int>(prompt.begin() + pos, prompt.begin() + pos + n), pos,
+                           {}, {});
+        }
+        pos += n;
+      }
+      return;
+    }
+    runtime::SequenceModel::prefill(prompt);
+  }
 
  private:
   // Which model recipe builds the plan, and the geometry it builds from. BOTH now live in
@@ -432,6 +464,9 @@ private:
   // or the other, so the buffer is shared. nullptr = dp4a routing off.
   std::int8_t* d_act_i8_ = nullptr;
   float* d_act_qs_ = nullptr;
+  // Prefill dequant scratch: sequence mode runs fp16 GEMMs over a dequantized copy of
+  // each quantized matrix (sized for the largest projection). nullptr on fp16 runs.
+  __half* d_seq_dequant_ = nullptr;
 
   // Split-K decode-attention scratch for the wide-head (any-head_dim) path. Sized
   // num_heads x split_any_chunks_ (x maxhd for the partial outputs) in allocate_buffers.
