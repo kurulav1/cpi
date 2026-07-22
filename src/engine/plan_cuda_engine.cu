@@ -1903,6 +1903,21 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
       }
     }
 
+    // Op-CLASS ablation levers, graph-safe (they change what gets captured). Output is
+    // GARBAGE by design -- like CPI_CUDA_ABLATE_ATTENTION they price an op class under
+    // graph replay, which no profiler can do. Never set outside an experiment.
+    {
+      static const bool ab_elem = std::getenv("CPI_CUDA_ABLATE_ELEMENTWISE") != nullptr;
+      static const bool ab_norm = std::getenv("CPI_CUDA_ABLATE_NORMS") != nullptr;
+      if (!seq &&
+          ((ab_elem && (op.kind == OpKind::AddInplace || op.kind == OpKind::GeluMul ||
+                        op.kind == OpKind::ScaleCopy || op.kind == OpKind::CopySlot)) ||
+           (ab_norm && (op.kind == OpKind::RmsNorm || op.kind == OpKind::Rope ||
+                        op.kind == OpKind::KvStore)))) {
+        goto op_done;
+      }
+    }
+
     switch (op.kind) {
       case OpKind::EmbeddingLookup:
         kernels::launch_embedding_lookup(HW(op.weight), seq ? d_seq_tokens_ : d_tok_, S(op.out), T,
@@ -1948,6 +1963,31 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
                                                         op.in_dim, stream_);
             actq_src = S(op.in);
             actq_len = op.in_dim;
+          }
+          // Adjacent same-input int4 Gemvs (q/k/v, gate/up) run as ONE cat launch,
+          // mirroring the fp16 cat peephole -- ~2 fewer medium-gemv launches per site.
+          {
+            auto same = [&](const Op& o2) {
+              return o2.kind == OpKind::Gemv && o2.qbits == 4 && o2.qgroup == op.qgroup &&
+                     o2.bias == nullptr && o2.in == op.in && o2.in_dim == op.in_dim &&
+                     o2.out != o2.in;
+            };
+            const Op* b = (idx + 1 < n && same(ops[idx + 1]) && ops[idx + 1].out != op.out)
+                              ? &ops[idx + 1]
+                              : nullptr;
+            const Op* c = (b != nullptr && idx + 2 < n && same(ops[idx + 2]) &&
+                           ops[idx + 2].out != op.out && ops[idx + 2].out != b->out)
+                              ? &ops[idx + 2]
+                              : nullptr;
+            if (b != nullptr) {
+              kernels::launch_weight_only_int4_matvec_grouped_dp4a_cat(
+                  QW(op.qweight), QS(op.qscales), S(op.out), op.cols, QW(b->qweight),
+                  QS(b->qscales), S(b->out), b->cols, c ? QW(c->qweight) : nullptr,
+                  c ? QS(c->qscales) : nullptr, c ? S(c->out) : nullptr, c ? c->cols : 0,
+                  d_act_i8_, d_act_qs_, op.in_dim, op.qgroup, stream_);
+              idx += c ? 2 : 1;
+              break;
+            }
           }
           kernels::launch_weight_only_int4_matvec_grouped_dp4a(QW(op.qweight), QS(op.qscales),
                                                                d_act_i8_, d_act_qs_, S(op.out),

@@ -1060,6 +1060,16 @@ void launch_weight_only_int4_matvec_grouped_dp4a(const std::int8_t* w_packed,
                                                  const float* x_scale, half* y, int out_features,
                                                  int in_features, int group, cudaStream_t stream);
 
+// launch_weight_only_int4_matvec_grouped_dp4a_cat
+//
+// Up to three grouped int4 dp4a GEMVs sharing one perm8-quantized activation, run as ONE
+// launch (q|k|v, gate|up). Same per-row math as the non-cat variant; pass n2 = 0 for two
+// segments. Same gating: in_features % 32 == 0, group % 32 == 0.
+void launch_weight_only_int4_matvec_grouped_dp4a_cat(
+    const std::int8_t* w0, const float* s0, half* y0, int n0, const std::int8_t* w1,
+    const float* s1, half* y1, int n1, const std::int8_t* w2, const float* s2, half* y2, int n2,
+    const std::int8_t* xq, const float* x_scale, int in_features, int group, cudaStream_t stream);
+
 // launch_rowmajor_half_gemv_cat
 //
 // Up to three batch-1 fp16 GEMVs sharing one input vector, run as ONE launch (q|k|v,
