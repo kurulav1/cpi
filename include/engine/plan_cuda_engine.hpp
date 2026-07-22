@@ -424,6 +424,8 @@ private:
   // quant runs (EmbeddingLookup keeps reading the fp16 table). nullptr = fp16 head.
   std::int8_t* d_head_q_ = nullptr;
   float* d_head_qs_ = nullptr;
+  int head_qbits_ = 0;   // 8 = rowwise int8 head, 4 = grouped int4 head (dp4a f32 path)
+  int head_qgroup_ = 0;
 
   // Decode activation-quant scratch for the dp4a matvec paths (one vector + one scale).
   // int8 runs hold the plain rowwise layout, int4 runs the perm8 layout -- a run is one

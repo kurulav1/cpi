@@ -773,6 +773,69 @@ __global__ void weight_only_int4_matvec_grouped_dp4a_glu_kernel(
   }
 }
 
+// Float-output twin of the grouped dp4a wide kernel, for the quantized LM head: logits
+// must stay fp32 for argmax/softcap. Same math, same g32 activation scales.
+template <int Warps>
+__global__ void weight_only_int4_matvec_grouped_dp4a_f32_kernel(
+    const int8_t* __restrict__ w_packed, const float* __restrict__ scales,
+    const int8_t* __restrict__ xq, const float* __restrict__ x_scale, float* __restrict__ y,
+    int out_features, int in_features, int group_shift, int n_groups) {
+  const int row = blockIdx.x * Warps + (threadIdx.x / warpSize);
+  if (row >= out_features) {
+    return;
+  }
+  const int lane = threadIdx.x & (warpSize - 1);
+  const int packed_cols = in_features / 2;
+  const uint4* wrow = reinterpret_cast<const uint4*>(
+      w_packed + static_cast<std::size_t>(row) * static_cast<std::size_t>(packed_cols));
+  const float* row_s = scales + static_cast<std::size_t>(row) * static_cast<std::size_t>(n_groups);
+
+  const int chunks = packed_cols / 16;
+  constexpr int kUnroll = 4;
+  float acc = 0.0f;
+  uint4 wbuf[kUnroll];
+  float sbuf[kUnroll];
+  for (int base = lane; base < chunks; base += warpSize * kUnroll) {
+#pragma unroll
+    for (int u = 0; u < kUnroll; ++u) {
+      const int c = base + u * warpSize;
+      if (c < chunks) {
+        wbuf[u] = wrow[c];
+        sbuf[u] = row_s[(c * 32) >> group_shift] * x_scale[c];
+      }
+    }
+#pragma unroll
+    for (int u = 0; u < kUnroll; ++u) {
+      const int c = base + u * warpSize;
+      if (c < chunks) {
+        const uint4 xa = reinterpret_cast<const uint4*>(xq)[2 * c];
+        const uint4 xb = reinterpret_cast<const uint4*>(xq)[2 * c + 1];
+        const int xv[8] = {static_cast<int>(xa.x), static_cast<int>(xa.y),
+                           static_cast<int>(xa.z), static_cast<int>(xa.w),
+                           static_cast<int>(xb.x), static_cast<int>(xb.y),
+                           static_cast<int>(xb.z), static_cast<int>(xb.w)};
+        const unsigned* wu = reinterpret_cast<const unsigned*>(&wbuf[u]);
+        int gacc = 0;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          const unsigned word = wu[i];
+          const int wlo =
+              __vsubss4(static_cast<int>((word & 0x0F0F0F0Fu) ^ 0x08080808u), 0x08080808);
+          const int whi =
+              __vsubss4(static_cast<int>(((word >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u), 0x08080808);
+          gacc = __dp4a(wlo, xv[2 * i], gacc);
+          gacc = __dp4a(whi, xv[2 * i + 1], gacc);
+        }
+        acc += static_cast<float>(gacc) * sbuf[u];
+      }
+    }
+  }
+  acc = warp_sum(acc);
+  if (lane == 0) {
+    y[row] = acc;
+  }
+}
+
 template <int Warps>
 __global__ void weight_only_int8_matvec_wide_kernel(const int8_t* __restrict__ w,
                                                     const float* __restrict__ scales,
@@ -1263,6 +1326,22 @@ void launch_weight_only_int4_matvec_grouped_dp4a_glu(
   const int blocks = (out_features + kRows - 1) / kRows;
   weight_only_int4_matvec_grouped_dp4a_glu_kernel<kRows><<<blocks, kRows * 64, 0, stream>>>(
       wg, sg, wu, su, xq, x_scale, y, out_features, in_features, shift, n_groups);
+}
+
+void launch_weight_only_int4_matvec_grouped_dp4a_f32(const std::int8_t* w_packed,
+                                                     const float* scales, const std::int8_t* xq,
+                                                     const float* x_scale, float* y,
+                                                     int out_features, int in_features, int group,
+                                                     cudaStream_t stream) {
+  const int shift = group_shift_of(group);
+  if (shift < 0 || (group % 32) != 0 || (in_features % 32) != 0) {
+    return;  // caller gates
+  }
+  const int n_groups = quant_group_count(in_features, group);
+  constexpr int kWarps = 4;
+  const int blocks = (out_features + kWarps - 1) / kWarps;
+  weight_only_int4_matvec_grouped_dp4a_f32_kernel<kWarps><<<blocks, kWarps * 32, 0, stream>>>(
+      w_packed, scales, xq, x_scale, y, out_features, in_features, shift, n_groups);
 }
 
 void launch_weight_only_int8_matvec_grouped(const int8_t* w, const float* scales, const half* x,

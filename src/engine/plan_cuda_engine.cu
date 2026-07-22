@@ -801,10 +801,32 @@ void PlanCudaEngine::load_all(const std::string& cpi_path) {
   if (quantize && d_head_q_ == nullptr) {
     const __half* emb = static_cast<const __half*>(dev_at(W + "embed_tokens.weight"));
     const std::size_t n = static_cast<std::size_t>(cfg_.vocab) * static_cast<std::size_t>(cfg_.hidden);
-    G4_CHECK(cudaMalloc(&d_head_q_, n));
-    G4_CHECK(cudaMalloc(&d_head_qs_, static_cast<std::size_t>(cfg_.vocab) * sizeof(float)));
-    kernels::launch_quantize_rowwise_fp16_to_int8(emb, d_head_q_, d_head_qs_, cfg_.vocab,
-                                                  cfg_.hidden, stream_);
+    if (weight_quant_bits_ == 4 && (cfg_.hidden % 32) == 0) {
+      // int4 runs: grouped-int4 head (~5 bpw with scales) on the dp4a f32 path -- half
+      // the bytes of the int8 head, which was already at roofline. Packed via the same
+      // int8-then-pack pipeline as every projection.
+      const int group = weight_quant_group_ > 0 ? weight_quant_group_ : 128;
+      const int n_groups = kernels::quant_group_count(cfg_.hidden, group);
+      std::int8_t* tmp_i8 = nullptr;
+      G4_CHECK(cudaMalloc(&tmp_i8, n));
+      G4_CHECK(cudaMalloc(&d_head_q_, n / 2));
+      G4_CHECK(cudaMalloc(&d_head_qs_, static_cast<std::size_t>(cfg_.vocab) * n_groups *
+                                           sizeof(float)));
+      kernels::launch_quantize_groupwise_fp16_to_int8(emb, tmp_i8, d_head_qs_, cfg_.vocab,
+                                                      cfg_.hidden, group, stream_, 7);
+      kernels::launch_pack_rowwise_int8_to_int4(tmp_i8, d_head_q_, cfg_.vocab, cfg_.hidden,
+                                                stream_);
+      G4_CHECK(cudaStreamSynchronize(stream_));
+      cudaFree(tmp_i8);
+      head_qbits_ = 4;
+      head_qgroup_ = group;
+    } else {
+      G4_CHECK(cudaMalloc(&d_head_q_, n));
+      G4_CHECK(cudaMalloc(&d_head_qs_, static_cast<std::size_t>(cfg_.vocab) * sizeof(float)));
+      kernels::launch_quantize_rowwise_fp16_to_int8(emb, d_head_q_, d_head_qs_, cfg_.vocab,
+                                                    cfg_.hidden, stream_);
+      head_qbits_ = 8;
+    }
   }
   // LLAMA_INFER_PLAN_INT4_GROUP=attn|mlp restricts quantization to one group
   // (bisection aid when a model degrades under int4).
@@ -1791,8 +1813,8 @@ void PlanCudaEngine::build_plan() {
     if (d_head_q_ != nullptr) {
       h.qweight = d_head_q_;
       h.qscales = d_head_qs_;
-      h.qbits = 8;
-      h.qgroup = 0;
+      h.qbits = head_qbits_;
+      h.qgroup = head_qgroup_;
     } else {
       h.weight = dev_at(wprefix_ + "embed_tokens.weight");
     }
@@ -1954,6 +1976,18 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
       case OpKind::LmHead:
         // In sequence mode only the LAST token's logits are wanted -- running the head
         // over the whole prompt would cost a 262K-wide GEMM per token for nothing.
+        if (op.qbits == 4 && d_act_i8_ != nullptr) {
+          const __half* head_in =
+              S(op.in) + static_cast<std::size_t>(T - 1) * static_cast<std::size_t>(op.in_dim);
+          if (actq_src != head_in || actq_len != op.in_dim) {
+            kernels::launch_quantize_fp16_to_int8_perm8_g32(head_in, d_act_i8_, d_act_qs_,
+                                                            op.in_dim, stream_);
+          }
+          kernels::launch_weight_only_int4_matvec_grouped_dp4a_f32(
+              QW(op.qweight), QS(op.qscales), d_act_i8_, d_act_qs_, d_logits_, op.cols,
+              op.in_dim, op.qgroup, stream_);
+          break;
+        }
         if (op.qbits == 8) {
           kernels::launch_weight_only_int8_gemv_f32(
               QW(op.qweight), QS(op.qscales),

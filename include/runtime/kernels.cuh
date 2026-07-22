@@ -1093,6 +1093,16 @@ void launch_weight_only_int4_matvec_grouped_dp4a_glu(
     const std::int8_t* xq, const float* x_scale, half* y, int out_features, int in_features,
     int group, cudaStream_t stream);
 
+// launch_weight_only_int4_matvec_grouped_dp4a_f32
+//
+// Float-output grouped dp4a GEMV for the quantized LM head (logits stay fp32).
+// Consumes the perm8-g32 activation like the other dp4a launchers.
+void launch_weight_only_int4_matvec_grouped_dp4a_f32(const std::int8_t* w_packed,
+                                                     const float* scales, const std::int8_t* xq,
+                                                     const float* x_scale, float* y,
+                                                     int out_features, int in_features, int group,
+                                                     cudaStream_t stream);
+
 // launch_rowmajor_half_gemv_cat
 //
 // Up to three batch-1 fp16 GEMVs sharing one input vector, run as ONE launch (q|k|v,
