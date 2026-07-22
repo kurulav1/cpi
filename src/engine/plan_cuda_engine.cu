@@ -2006,6 +2006,11 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
         __half* vc = caches_v_[layer];
         const std::size_t kvdim = static_cast<std::size_t>(op.kv_heads) * op.head_dim;
         {
+          // CPI_CUDA_ABLATE_ATTENTION=1 skips every decode attention dispatch. The output is
+          // GARBAGE -- that is the point: it prices attention under the graph by removing it,
+          // which no profiler distortion can confuse. Never set outside an experiment.
+          static const bool ablate_attn = std::getenv("CPI_CUDA_ABLATE_ATTENTION") != nullptr;
+          if (ablate_attn && !seq) break;
           const int window = op.full_attention ? 0 : op.sliding_window;
           // Wide heads (Gemma's 256/512) take the any-head_dim SPLIT-K path when its scratch
           // exists: the tiled single-block-per-head kernel leaves a 170-SM GPU running 8
