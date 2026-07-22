@@ -321,7 +321,11 @@ __device__ __forceinline__ void attention_step_chunk_stats_core(
   half* v_tile = reinterpret_cast<half*>(stats_shared + 4);
 
   const int head = blockIdx.x;
-  const int chunk = blockIdx.y;
+  // blockIdx.y maps to the first LIVE chunk, so a windowed layer's grid only needs to span
+  // the window: launchers may size grid.y to the live chunk count instead of the whole
+  // scratch range. Scratch stays absolutely indexed; with k_start == 0 this is the old
+  // mapping, and any grid larger than the live range still exits on the guards below.
+  const int chunk = blockIdx.y + k_start / chunk_size;
   // A sliding window clips the chunk range from below. Dead chunks (fully outside
   // [k_start, seq_len)) exit without writing; the window-aware reduce skips them by
   // recomputing the same k_start, so their stale scratch is never read.

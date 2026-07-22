@@ -2112,16 +2112,23 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
           // (heads x chunks) with per-chunk seq/window guards -- graph-safe -- and eager and
           // graph share the same kernels so the two stay bit-identical.
           if (d_split_o_ != nullptr && op.head_dim > 128) {
+            // Grid sizing: the depth bucket (set by forward_one; falls back to max) --
+            // and a sliding layer never needs more chunks than its window can span.
+            int chunks = attn_chunk_budget_ > 0 ? attn_chunk_budget_ : split_any_chunks_;
+            if (window > 0) {
+              const int wc = window / kSplitAnyChunk + 2;  // window can straddle chunk edges
+              if (wc < chunks) chunks = wc;
+            }
             if (device_pos_mode_) {
               kernels::launch_attention_split_any_device_pos(
                   S(op.in), kc, vc, S(op.out), d_position_, window, op.heads, op.kv_heads,
-                  op.head_dim, d_split_m_, d_split_l_, d_split_o_, kSplitAnyChunk,
-                  split_any_chunks_, stream_);
+                  op.head_dim, d_split_m_, d_split_l_, d_split_o_, kSplitAnyChunk, chunks,
+                  stream_);
             } else {
               kernels::launch_attention_split_any(
                   S(op.in), kc, vc, S(op.out), position + 1, window, op.heads, op.kv_heads,
-                  op.head_dim, d_split_m_, d_split_l_, d_split_o_, kSplitAnyChunk,
-                  split_any_chunks_, stream_);
+                  op.head_dim, d_split_m_, d_split_l_, d_split_o_, kSplitAnyChunk, chunks,
+                  stream_);
             }
             break;
           }
@@ -2577,7 +2584,25 @@ void PlanCudaEngine::forward_one(int token, int position, bool compute_logits,
   }
 
   if (compute_logits && per_layer_rms == nullptr && decode_graph_enabled_) {
-    if (!decode_graph_ready_) capture_decode_graph();
+    // The split-attention grid is frozen at capture, so a graph captured for max_ctx
+    // launches (heads x max_chunks) blocks per layer FOREVER -- at depth 400 with a 4096
+    // context that is ~90% dead blocks, and it measured as most of attention's 1.3 ms.
+    // Capture instead for a power-of-two DEPTH BUCKET (>= 512 tokens) and re-capture when
+    // generation crosses into the next bucket: a handful of ~ms captures per generation
+    // buys grids at most 2x the live depth. Math is unchanged -- dead chunks never
+    // contribute -- so graph and eager stay bit-identical.
+    if (split_any_chunks_ > 0) {
+      int need_chunks = (position + 1 + kSplitAnyChunk - 1) / kSplitAnyChunk;
+      int bucket = 512 / kSplitAnyChunk;
+      while (bucket < need_chunks) bucket *= 2;
+      if (bucket > split_any_chunks_) bucket = split_any_chunks_;
+      if (decode_graph_ready_ && bucket != graph_bucket_chunks_) decode_graph_ready_ = false;
+      attn_chunk_budget_ = bucket;
+    }
+    if (!decode_graph_ready_) {
+      capture_decode_graph();
+      graph_bucket_chunks_ = attn_chunk_budget_;
+    }
     G4_CHECK(cudaMemcpyAsync(d_tok_, &token, sizeof(int), cudaMemcpyHostToDevice, stream_));
     G4_CHECK(cudaMemcpyAsync(d_position_, &position, sizeof(int), cudaMemcpyHostToDevice, stream_));
     G4_CHECK(cudaGraphLaunch(decode_graph_exec_, stream_));
@@ -2588,6 +2613,8 @@ void PlanCudaEngine::forward_one(int token, int position, bool compute_logits,
   }
 
   // Publish the token; the prologue's EmbeddingLookup ops read d_tok_ on-device.
+  // Eager decode sizes attention grids exactly (no bucket needed without a capture).
+  attn_chunk_budget_ = (position + 1 + kSplitAnyChunk - 1) / kSplitAnyChunk;
   G4_CHECK(cudaMemcpyAsync(d_tok_, &token, sizeof(int), cudaMemcpyHostToDevice, stream_));
   execute_ops(plan_.prologue.data(), plan_.prologue.size(), -1, position);
   for (int L = 0; L < cfg_.num_layers; ++L) {
@@ -2877,6 +2904,15 @@ void PlanCudaEngine::capture_decode_graph() {
   // d_logits_) are stable for the engine's lifetime, so one capture serves all
   // positions and all generate() calls. Sync first so no prefill work is pending.
   G4_CHECK(cudaStreamSynchronize(stream_));
+  // Depth-bucket re-capture: drop the previous instantiation before capturing anew.
+  if (decode_graph_exec_ != nullptr) {
+    cudaGraphExecDestroy(decode_graph_exec_);
+    decode_graph_exec_ = nullptr;
+  }
+  if (decode_graph_ != nullptr) {
+    cudaGraphDestroy(decode_graph_);
+    decode_graph_ = nullptr;
+  }
   device_pos_mode_ = true;
   G4_CHECK(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal));
   execute_ops(plan_.prologue.data(), plan_.prologue.size(), -1, 0);

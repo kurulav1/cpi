@@ -431,6 +431,11 @@ private:
   // Split-K decode-attention scratch for the wide-head (any-head_dim) path. Sized
   // num_heads x split_any_chunks_ (x maxhd for the partial outputs) in allocate_buffers.
   static constexpr int kSplitAnyChunk = 32;
+  // Depth-bucketed attention grids: forward_one sets attn_chunk_budget_ (a power-of-two
+  // chunk count covering the current position, min 512 tokens) and the decode graph is
+  // re-captured whenever the bucket grows. 0 = fall back to the full scratch range.
+  int attn_chunk_budget_ = 0;
+  int graph_bucket_chunks_ = 0;
   float* d_split_m_ = nullptr;
   float* d_split_l_ = nullptr;
   float* d_split_o_ = nullptr;
