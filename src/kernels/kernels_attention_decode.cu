@@ -361,6 +361,7 @@ __device__ __forceinline__ void attention_step_chunk_stats_core(
     const half2* q2 = reinterpret_cast<const half2*>(q_shared);
     const half2* k2 = reinterpret_cast<const half2*>(k_cache + base);
     float partial = 0.0f;
+#pragma unroll 4
     for (int pair = lane; pair < head_pairs; pair += warpSize) {
       const float2 qv = __half22float2(q2[pair]);
       const float2 kv = __half22float2(k2[pair]);
@@ -384,15 +385,25 @@ __device__ __forceinline__ void attention_step_chunk_stats_core(
 
   for (int tile_base = chunk_start; tile_base < chunk_end; tile_base += WarpsPerBlock) {
     const int tile_tokens = min(WarpsPerBlock, chunk_end - tile_base);
+    // Compile-time trip counts with predication: the runtime-bound versions of these
+    // loops could not unroll, so every V load waited on the previous FMA -- a serial
+    // load-use chain that block-level overlap hides at depth and NOTHING hides shallow
+    // (measured 15 us at 0.4% SM with one live chunk). Unrolled, the loads batch.
     float tile_m = neg_inf<float>();
-    for (int i = 0; i < tile_tokens; ++i) {
-      tile_m = fmaxf(tile_m, score_shared[tile_base - chunk_start + i]);
+#pragma unroll
+    for (int i = 0; i < WarpsPerBlock; ++i) {
+      if (i < tile_tokens) {
+        tile_m = fmaxf(tile_m, score_shared[tile_base - chunk_start + i]);
+      }
     }
     float beta[WarpsPerBlock];
     float tile_l = 0.0f;
-    for (int i = 0; i < tile_tokens; ++i) {
-      beta[i] = expf(score_shared[tile_base - chunk_start + i] - tile_m);
-      tile_l += beta[i];
+#pragma unroll
+    for (int i = 0; i < WarpsPerBlock; ++i) {
+      if (i < tile_tokens) {
+        beta[i] = expf(score_shared[tile_base - chunk_start + i] - tile_m);
+        tile_l += beta[i];
+      }
     }
     const float new_m = fmaxf(running_m, tile_m);
     const float c_prev = (running_l == 0.0f) ? 0.0f : expf(running_m - new_m);
@@ -400,10 +411,20 @@ __device__ __forceinline__ void attention_step_chunk_stats_core(
 
     int j = 0;
     for (int d = tid; d < head_dim; d += blockDim.x, ++j) {
+      float vbuf[WarpsPerBlock];
+#pragma unroll
+      for (int i = 0; i < WarpsPerBlock; ++i) {
+        if (i < tile_tokens) {
+          const int base = cache_index(tile_base + i, kv_head, 0, num_kv_heads, head_dim);
+          vbuf[i] = __half2float(v_cache[base + d]);
+        }
+      }
       float tile_o = 0.0f;
-      for (int i = 0; i < tile_tokens; ++i) {
-        const int base = cache_index(tile_base + i, kv_head, 0, num_kv_heads, head_dim);
-        tile_o += beta[i] * __half2float(v_cache[base + d]);
+#pragma unroll
+      for (int i = 0; i < WarpsPerBlock; ++i) {
+        if (i < tile_tokens) {
+          tile_o += beta[i] * vbuf[i];
+        }
       }
       acc[j] = acc[j] * c_prev + tile_o * c_tile;
     }
