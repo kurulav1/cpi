@@ -551,12 +551,14 @@ __global__ void weight_only_int4_matvec_grouped_dp4a_wide_kernel(
   constexpr int kUnroll = 4;
   float acc = 0.0f;
   uint4 wbuf[kUnroll];
+  float sbuf[kUnroll];
   for (int base = lane; base < chunks; base += warpSize * kUnroll) {
 #pragma unroll
     for (int u = 0; u < kUnroll; ++u) {
       const int c = base + u * warpSize;
       if (c < chunks) {
         wbuf[u] = wrow[c];
+        sbuf[u] = row_s[(c * 32) >> group_shift];
       }
     }
 #pragma unroll
@@ -577,7 +579,7 @@ __global__ void weight_only_int4_matvec_grouped_dp4a_wide_kernel(
           gacc = __dp4a(wlo, xw[8 * c + 2 * i], gacc);
           gacc = __dp4a(whi, xw[8 * c + 2 * i + 1], gacc);
         }
-        acc += static_cast<float>(gacc) * row_s[(c * 32) >> group_shift];
+        acc += static_cast<float>(gacc) * sbuf[u];
       }
     }
   }
@@ -630,12 +632,14 @@ __global__ void weight_only_int4_matvec_grouped_dp4a_cat_kernel(
   constexpr int kUnroll = 4;
   float acc = 0.0f;
   uint4 wbuf[kUnroll];
+  float sbuf[kUnroll];
   for (int base = lane; base < chunks; base += warpSize * kUnroll) {
 #pragma unroll
     for (int u = 0; u < kUnroll; ++u) {
       const int c = base + u * warpSize;
       if (c < chunks) {
         wbuf[u] = wrow[c];
+        sbuf[u] = row_s[(c * 32) >> group_shift];
       }
     }
 #pragma unroll
@@ -654,7 +658,7 @@ __global__ void weight_only_int4_matvec_grouped_dp4a_cat_kernel(
           gacc = __dp4a(wlo, xw[8 * c + 2 * i], gacc);
           gacc = __dp4a(whi, xw[8 * c + 2 * i + 1], gacc);
         }
-        acc += static_cast<float>(gacc) * row_s[(c * 32) >> group_shift];
+        acc += static_cast<float>(gacc) * sbuf[u];
       }
     }
   }
