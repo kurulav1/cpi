@@ -313,12 +313,19 @@ __device__ __forceinline__ void attention_step_chunk_stats_core(
     const half* q, const half* k_cache, const half* v_cache, float* chunk_m, float* chunk_l,
     float* chunk_o, int seq_len, int num_heads, int num_kv_heads, int head_dim, int chunk_size,
     int scratch_chunks, int k_start = 0) {
+  // Restructured 2026-07-22, BIT-IDENTICAL to the tile-loop original: same score per key
+  // (same warp mapping, same lane stride, same warp_sum), same tile merge arithmetic in the
+  // same order, same V-read order per dim. What changed is WHO computes it: all keys are
+  // scored up front (one barrier), then every thread redundantly runs the tile-merge
+  // recurrence in registers instead of round-tripping running stats through shared memory
+  // with a single-thread serial section per tile. The original spent ~12 barriers and four
+  // 127-threads-idle sections per 16-key chunk -- measured 16-17 us/instance under graph
+  // replay; the arithmetic itself is microseconds. V is read straight from L2 (the old
+  // v_tile staging bought nothing: reads were already coalesced and cache-hot).
+  // smem layout: half q_shared[head_dim]; float score_shared[chunk_size].
   extern __shared__ unsigned char smem_bytes[];
   half* q_shared = reinterpret_cast<half*>(smem_bytes);
   float* score_shared = reinterpret_cast<float*>(q_shared + head_dim);
-  float* beta_shared = score_shared + WarpsPerBlock;
-  float* stats_shared = beta_shared + WarpsPerBlock;  // [running_m, running_l, tile_m, tile_l]
-  half* v_tile = reinterpret_cast<half*>(stats_shared + 4);
 
   const int head = blockIdx.x;
   // blockIdx.y maps to the first LIVE chunk, so a windowed layer's grid only needs to span
@@ -326,9 +333,6 @@ __device__ __forceinline__ void attention_step_chunk_stats_core(
   // scratch range. Scratch stays absolutely indexed; with k_start == 0 this is the old
   // mapping, and any grid larger than the live range still exits on the guards below.
   const int chunk = blockIdx.y + k_start / chunk_size;
-  // A sliding window clips the chunk range from below. Dead chunks (fully outside
-  // [k_start, seq_len)) exit without writing; the window-aware reduce skips them by
-  // recomputing the same k_start, so their stale scratch is never read.
   const int chunk_start = max(chunk * chunk_size, k_start);
   if (chunk_start >= seq_len || (chunk + 1) * chunk_size <= k_start) {
     return;
@@ -348,92 +352,68 @@ __device__ __forceinline__ void attention_step_chunk_stats_core(
   for (int d = tid; d < head_dim; d += blockDim.x) {
     q_shared[d] = q[head * head_dim + d];
   }
-  if (tid == 0) {
-    stats_shared[0] = neg_inf<float>();
-    stats_shared[1] = 0.0f;
+  __syncthreads();
+
+  // Score every key in the chunk. Key (chunk_start + i) belongs to warp (i % WarpsPerBlock)
+  // exactly as the old tile loop assigned it, so each dot is the same fp sequence.
+  for (int t = chunk_start + warp_id; t < chunk_end; t += WarpsPerBlock) {
+    const int base = cache_index(t, kv_head, 0, num_kv_heads, head_dim);
+    const half2* q2 = reinterpret_cast<const half2*>(q_shared);
+    const half2* k2 = reinterpret_cast<const half2*>(k_cache + base);
+    float partial = 0.0f;
+    for (int pair = lane; pair < head_pairs; pair += warpSize) {
+      const float2 qv = __half22float2(q2[pair]);
+      const float2 kv = __half22float2(k2[pair]);
+      partial += qv.x * kv.x + qv.y * kv.y;
+    }
+    const float score = warp_sum(partial) * scale;
+    if (lane == 0) {
+      score_shared[t - chunk_start] = score;
+    }
   }
   __syncthreads();
 
+  // Every thread runs the tile-merge recurrence redundantly in registers: identical inputs
+  // in identical order produce identical values on every thread, so the shared-memory
+  // stats round-trips and their barriers vanish without moving a single rounding.
+  float running_m = neg_inf<float>();
+  float running_l = 0.0f;
   float acc[kAccPerThread];
 #pragma unroll
   for (int jj = 0; jj < kAccPerThread; ++jj) acc[jj] = 0.0f;
+
   for (int tile_base = chunk_start; tile_base < chunk_end; tile_base += WarpsPerBlock) {
     const int tile_tokens = min(WarpsPerBlock, chunk_end - tile_base);
-
-    {
-      const int t = tile_base + warp_id;
-      float score = neg_inf<float>();
-      if (warp_id < tile_tokens) {
-        const int base = cache_index(t, kv_head, 0, num_kv_heads, head_dim);
-        const half2* q2 = reinterpret_cast<const half2*>(q_shared);
-        const half2* k2 = reinterpret_cast<const half2*>(k_cache + base);
-        float partial = 0.0f;
-        for (int pair = lane; pair < head_pairs; pair += warpSize) {
-          const float2 qv = __half22float2(q2[pair]);
-          const float2 kv = __half22float2(k2[pair]);
-          partial += qv.x * kv.x + qv.y * kv.y;
-        }
-        score = warp_sum(partial) * scale;
-      }
-      if (lane == 0 && warp_id < tile_tokens) {
-        score_shared[warp_id] = score;
-      }
+    float tile_m = neg_inf<float>();
+    for (int i = 0; i < tile_tokens; ++i) {
+      tile_m = fmaxf(tile_m, score_shared[tile_base - chunk_start + i]);
     }
+    float beta[WarpsPerBlock];
+    float tile_l = 0.0f;
+    for (int i = 0; i < tile_tokens; ++i) {
+      beta[i] = expf(score_shared[tile_base - chunk_start + i] - tile_m);
+      tile_l += beta[i];
+    }
+    const float new_m = fmaxf(running_m, tile_m);
+    const float c_prev = (running_l == 0.0f) ? 0.0f : expf(running_m - new_m);
+    const float c_tile = expf(tile_m - new_m);
 
-    {
+    int j = 0;
+    for (int d = tid; d < head_dim; d += blockDim.x, ++j) {
+      float tile_o = 0.0f;
       for (int i = 0; i < tile_tokens; ++i) {
         const int base = cache_index(tile_base + i, kv_head, 0, num_kv_heads, head_dim);
-        for (int d = tid; d < head_dim; d += blockDim.x) {
-          v_tile[i * head_dim + d] = v_cache[base + d];
-        }
+        tile_o += beta[i] * __half2float(v_cache[base + d]);
       }
+      acc[j] = acc[j] * c_prev + tile_o * c_tile;
     }
-    __syncthreads();
-
-    if (tid == 0) {
-      float tile_m = neg_inf<float>();
-      for (int i = 0; i < tile_tokens; ++i) {
-        tile_m = fmaxf(tile_m, score_shared[i]);
-      }
-      float tile_l = 0.0f;
-      for (int i = 0; i < tile_tokens; ++i) {
-        const float b = expf(score_shared[i] - tile_m);
-        beta_shared[i] = b;
-        tile_l += b;
-      }
-      stats_shared[2] = tile_m;
-      stats_shared[3] = tile_l;
-    }
-    __syncthreads();
-
-    {
-      const float tile_m = stats_shared[2];
-      const float tile_l = stats_shared[3];
-      const float running_m = stats_shared[0];
-      const float running_l = stats_shared[1];
-      const float new_m = fmaxf(running_m, tile_m);
-      const float c_prev = (running_l == 0.0f) ? 0.0f : expf(running_m - new_m);
-      const float c_tile = expf(tile_m - new_m);
-
-      int j = 0;
-      for (int d = tid; d < head_dim; d += blockDim.x, ++j) {
-        float tile_o = 0.0f;
-        for (int i = 0; i < tile_tokens; ++i) {
-          tile_o += beta_shared[i] * __half2float(v_tile[i * head_dim + d]);
-        }
-        acc[j] = acc[j] * c_prev + tile_o * c_tile;
-      }
-      if (tid == 0) {
-        stats_shared[0] = new_m;
-        stats_shared[1] = running_l * c_prev + tile_l * c_tile;
-      }
-    }
-    __syncthreads();
+    running_m = new_m;
+    running_l = running_l * c_prev + tile_l * c_tile;
   }
 
   if (tid == 0) {
-    chunk_m[chunk_index] = stats_shared[0];
-    chunk_l[chunk_index] = stats_shared[1];
+    chunk_m[chunk_index] = running_m;
+    chunk_l[chunk_index] = running_l;
   }
   int jo = 0;
   for (int d = tid; d < head_dim; d += blockDim.x, ++jo) {
