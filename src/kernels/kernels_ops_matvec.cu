@@ -1543,6 +1543,31 @@ void launch_quantize_fp16_to_int8_perm8(const half* src, std::int8_t* dst, float
       src, dst, scales, cols, 127);
 }
 
+// int8-GEMM epilogue for the sequence prefill: the cuBLAS 8-bit GEMM leaves int32 dots in
+// column-major [out, chunk]; this folds the rowwise weight scale and per-token activation
+// scale and writes fp16 row-major [T, out] at token offset t0.
+__global__ void i32_scale_to_fp16_kernel(const int* __restrict__ acc,
+                                         const float* __restrict__ sw,
+                                         const float* __restrict__ sx, half* __restrict__ y,
+                                         int out, int chunk, int t0) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = out * chunk;
+  if (idx >= total) return;
+  const int r = idx % out;
+  const int lt = idx / out;
+  y[static_cast<std::size_t>(t0 + lt) * out + r] =
+      __float2half(static_cast<float>(acc[static_cast<std::size_t>(lt) * out + r]) * sw[r] *
+                   sx[t0 + lt]);
+}
+
+void launch_i32_scale_to_fp16(const int* acc, const float* sw, const float* sx, half* y, int out,
+                              int chunk, int t0, cudaStream_t stream) {
+  const int total = out * chunk;
+  const int threads = 256;
+  i32_scale_to_fp16_kernel<<<(total + threads - 1) / threads, threads, 0, stream>>>(
+      acc, sw, sx, y, out, chunk, t0);
+}
+
 void launch_rowmajor_half_gemv_cat(const half* w0, half* y0, int n0, const half* w1, half* y1,
                                    int n1, const half* w2, half* y2, int n2, const half* x,
                                    int in_features, cudaStream_t stream) {

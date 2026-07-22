@@ -106,6 +106,9 @@ PlanCudaEngine::~PlanCudaEngine() {
   cudaFree(d_pf_scores_);
   cudaFree(d_pf_ptrs_);
   cudaFree(d_seq_dequant_);
+  cudaFree(d_seq_x8_);
+  cudaFree(d_seq_xs_);
+  cudaFree(d_seq_i32_);
   cudaFree(d_head_q_);
   cudaFree(d_head_qs_);
   cudaFree(d_split_m_);
@@ -372,6 +375,17 @@ void PlanCudaEngine::upload_int4(const std::string& name, int rows, int cols) {
                                                   bits == 4 ? 7 : 127);
   }
 
+  // Rowwise-int8 prefill copy (see QuantWeight): int8-rowwise configs alias their main
+  // weights below; everything else pays one int8 copy so sequence GEMMs can run 8-bit.
+  std::int8_t* d_pf = nullptr;
+  float* d_pf_s = nullptr;
+  static const bool int8_prefill = std::getenv("CPI_CUDA_INT8_PREFILL") != nullptr;
+  if (int8_prefill && !(bits == 8 && group == 0)) {
+    G4_CHECK(cudaMalloc(&d_pf, n));
+    G4_CHECK(cudaMalloc(&d_pf_s, static_cast<std::size_t>(rows) * sizeof(float)));
+    kernels::launch_quantize_rowwise_fp16_to_int8(d_fp16, d_pf, d_pf_s, rows, cols, stream_, 127);
+  }
+
   std::int8_t* d_w = d_i8;
   if (bits == 4) {
     std::int8_t* d_packed = nullptr;
@@ -385,7 +399,13 @@ void PlanCudaEngine::upload_int4(const std::string& name, int rows, int cols) {
   }
 
   cudaFree(d_fp16);  // the whole point: the fp16 never coexists with the next tensor
-  qdev_[name] = {d_w, d_scales, group};
+  QuantWeight qw;
+  qw.packed = d_w;
+  qw.scales = d_scales;
+  qw.group = group;
+  qw.pf_i8 = (bits == 8 && group == 0) ? d_w : d_pf;      // alias when already rowwise int8
+  qw.pf_scales = (bits == 8 && group == 0) ? d_scales : d_pf_s;
+  qdev_[name] = qw;
 }
 
 float PlanCudaEngine::scalar_value(const std::string& name) {
@@ -910,6 +930,11 @@ void PlanCudaEngine::open(const std::string& cpi_path, int max_context) {
     // Largest projection on the supported models is <= 16384 x 4096 halfs (128 MB is the
     // ceiling; E2B's largest is 12288 x 1536 = 38 MB). Sized generously once.
     G4_CHECK(cudaMalloc(&d_seq_dequant_, std::size_t(16384) * 4096 * sizeof(__half)));
+    // int8-direct prefill scratch: activations [4096 x 16384] int8 + per-token scales +
+    // one 512-token int32 GEMM tile [16384 x 512].
+    G4_CHECK(cudaMalloc(&d_seq_x8_, std::size_t(4096) * 16384));
+    G4_CHECK(cudaMalloc(&d_seq_xs_, 4096 * sizeof(float)));
+    G4_CHECK(cudaMalloc(&d_seq_i32_, std::size_t(16384) * 512 * sizeof(int)));
   }
   if (std::getenv("LLAMA_INFER_PLAN_NO_DEVICE_TOPK")) device_topk_enabled_ = false;
 
@@ -1094,6 +1119,8 @@ void PlanCudaEngine::append_moe_ffn_ops(std::vector<opplan::Op>& ops, const std:
       o.qscales = q->second.scales;
       o.qbits = weight_quant_bits_;
       o.qgroup = q->second.group;
+      o.pf_qweight = q->second.pf_i8;
+      o.pf_qscales = q->second.pf_scales;
     } else {
       o.weight = dev_at(p + t);
     }
@@ -1622,6 +1649,8 @@ void PlanCudaEngine::build_plan() {
           g.qscales = q->second.scales;
           g.qbits = weight_quant_bits_;
           g.qgroup = q->second.group;
+          g.pf_qweight = q->second.pf_i8;
+          g.pf_qscales = q->second.pf_scales;
         } else {
           g.weight = dev_at(wprefix_ + "per_layer_model_projection.weight");
         }
@@ -1691,6 +1720,8 @@ void PlanCudaEngine::build_plan() {
         o.qscales = q->second.scales;
         o.qbits = weight_quant_bits_;
         o.qgroup = q->second.group;
+        o.pf_qweight = q->second.pf_i8;
+        o.pf_qscales = q->second.pf_scales;
       } else {
         o.weight = dev_at(full);
       }
@@ -2209,6 +2240,43 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
         // fp16 GEMM. The quant matvec kernels are batch-1; calling them with T tokens
         // computed only token 0 and filled the KV cache with garbage -- the reason the
         // .cpi route historically never enabled sequence prefill.
+        // int8-DIRECT sequence GEMM: 8-bit x 8-bit -> int32 via cuBLAS, per-token rowwise
+        // activation scales folded in the epilogue. Reads a quarter of the dequant
+        // round-trip's bytes. Falls through to dequant+fp16 GEMM when the op has no
+        // prefill copy or cuBLAS declines the shape.
+        // MEASURED AND LOST as a default (162-172 ms vs the dequant path's 146-150 on
+        // p1200): plain cublasGemmEx int8 does not hit IMMA on this stack; doing this
+        // right needs cublasLt ordered layouts. Kept as an OPT-IN experiment.
+        static const bool int8_prefill = std::getenv("CPI_CUDA_INT8_PREFILL") != nullptr;
+        if (seq && int8_prefill && op.qbits != 0 && op.pf_qweight != nullptr &&
+            d_seq_x8_ != nullptr && (op.in_dim % 4) == 0 && cublas_ != nullptr) {
+          if (actq_src != S(op.in) || actq_len != -op.in_dim) {  // negative key: seq form
+            kernels::launch_quantize_rowwise_fp16_to_int8(S(op.in), d_seq_x8_, d_seq_xs_, T,
+                                                          op.in_dim, stream_);
+            actq_src = S(op.in);
+            actq_len = -op.in_dim;
+          }
+          cublasHandle_t ch = static_cast<cublasHandle_t>(cublas_);
+          cublasSetStream(ch, stream_);
+          const int ialpha = 1, ibeta = 0;
+          bool ok = true;
+          for (int t0 = 0; t0 < T && ok; t0 += 512) {
+            const int chunk = std::min(512, T - t0);
+            ok = cublasGemmEx(ch, CUBLAS_OP_T, CUBLAS_OP_N, op.cols, chunk, op.in_dim, &ialpha,
+                              op.pf_qweight, CUDA_R_8I, op.in_dim,
+                              d_seq_x8_ + static_cast<std::size_t>(t0) * op.in_dim, CUDA_R_8I,
+                              op.in_dim, &ibeta, d_seq_i32_, CUDA_R_32I, op.cols,
+                              CUBLAS_COMPUTE_32I,
+                              CUBLAS_GEMM_DEFAULT_TENSOR_OP) == CUBLAS_STATUS_SUCCESS;
+            if (ok) {
+              kernels::launch_i32_scale_to_fp16(
+                  d_seq_i32_, static_cast<const float*>(op.pf_qscales), d_seq_xs_, S(op.out),
+                  op.cols, chunk, t0, stream_);
+            }
+          }
+          if (ok) break;
+          actq_src = nullptr;  // fall through to the dequant path below
+        }
         if (seq && op.qbits != 0 && d_seq_dequant_ != nullptr) {
           if (op.qbits == 4 && op.qgroup > 0) {
             kernels::launch_dequant_int4_grouped(QW(op.qweight), QS(op.qscales), d_seq_dequant_,
@@ -2599,6 +2667,8 @@ void PlanCudaEngine::build_qwen35_plan() {
         o.qscales = q->second.scales;
         o.qbits = weight_quant_bits_;
         o.qgroup = q->second.group;
+        o.pf_qweight = q->second.pf_i8;
+        o.pf_qscales = q->second.pf_scales;
       } else {
         o.weight = W(t);
       }

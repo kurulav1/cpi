@@ -148,6 +148,10 @@ struct Op {
   // [bq | bk | bv], so all three ops point at the same handle and are distinguished
   // by bias_offset (in elements, not bytes).
   const void* bias = nullptr;
+  // Optional rowwise-int8 PREFILL form of a quantized weight (CUDA sequence GEMMs);
+  // executors that don't sequence-prefill simply ignore these.
+  const void* pf_qweight = nullptr;
+  const void* pf_qscales = nullptr;
   int bias_offset = 0;
   // Quantized Gemv: when qweight is set the op runs a weight-only matvec instead
   // of the fp16 one. qbits picks the encoding: 8 = int8, 4 = int4 (packed

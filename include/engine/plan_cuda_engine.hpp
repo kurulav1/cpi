@@ -363,6 +363,12 @@ private:
     std::int8_t* packed = nullptr;  // int4: two values per byte, row-major
     float* scales = nullptr;        // dequant scales, [rows, groups] row-major
     int group = 0;                  // 0 = one scale per row; >0 = group-wise
+    // Rowwise-int8 PREFILL copy: sequence GEMMs run 8-bit x 8-bit -> int32 through
+    // cuBLAS with per-token activation scales (exact fold: y = idot * s_w[r] * s_x[t]).
+    // For int8 configs these alias `packed`/`scales` (no extra VRAM); int4 configs pay
+    // one extra int8 copy. nullptr = use the dequant-to-fp16 fallback.
+    std::int8_t* pf_i8 = nullptr;
+    float* pf_scales = nullptr;
   };
   std::unordered_map<std::string, QuantWeight> qdev_;  // name -> quantized weight
   int weight_quant_bits_ = 0;                          // 0 = fp16, 4 = int4, 8 = int8
@@ -468,6 +474,10 @@ private:
   // Prefill dequant scratch: sequence mode runs fp16 GEMMs over a dequantized copy of
   // each quantized matrix (sized for the largest projection). nullptr on fp16 runs.
   __half* d_seq_dequant_ = nullptr;
+  // int8-direct prefill scratch: per-token quantized activations + int32 GEMM output.
+  std::int8_t* d_seq_x8_ = nullptr;
+  float* d_seq_xs_ = nullptr;
+  int* d_seq_i32_ = nullptr;
   // cuBLAS, for the SEQUENCE-mode GEMMs only (precedent: llama4 engine + bert embedder).
   // The hand-rolled GEMM measured ~3% of tensor-core rate; prefill was 30x off llama.cpp
   // because of it. Decode never touches this. CPI_CUDA_NO_CUBLAS=1 restores the fallback.

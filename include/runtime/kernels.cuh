@@ -1128,6 +1128,12 @@ void launch_dequant_int4_grouped(const std::int8_t* w_packed, const float* scale
 void launch_dequant_int8_rowwise(const std::int8_t* w, const float* scales, half* out, int rows,
                                  int cols, cudaStream_t stream);
 
+// launch_i32_scale_to_fp16
+//
+// Epilogue for the int8-direct sequence GEMM: fp16 y[t0+lt, r] = i32[lt, r] * sw[r] * sx[t].
+void launch_i32_scale_to_fp16(const int* acc, const float* sw, const float* sx, half* y, int out,
+                              int chunk, int t0, cudaStream_t stream);
+
 // launch_rowmajor_half_gemv_cat
 //
 // Up to three batch-1 fp16 GEMVs sharing one input vector, run as ONE launch (q|k|v,
