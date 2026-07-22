@@ -141,6 +141,24 @@ void launch_rope_inplace_partial_table(half* q, half* k, int num_heads_q, int nu
                                        const float* cos_table, const float* sin_table,
                                        cudaStream_t stream);
 
+// launch_attention_split_any / _device_pos
+//
+// Split-K decode attention for ANY even head_dim <= kTiledMaxHeadDim, sliding-window aware.
+// Grid is (num_heads, scratch_chunks) with per-chunk seq/window guards, so it is graph-safe
+// and fills the GPU where the single-block-per-head tiled path cannot (Gemma 4: 8 heads on a
+// 170-SM card). The reduce merges chunk softmax stats exactly (log-sum-exp).
+void launch_attention_split_any(const half* q, const half* k_cache, const half* v_cache,
+                                half* out, int seq_len, int window, int num_heads,
+                                int num_kv_heads, int head_dim, float* scratch_m,
+                                float* scratch_l, float* scratch_o, int chunk_size,
+                                int scratch_chunks, cudaStream_t stream);
+void launch_attention_split_any_device_pos(const half* q, const half* k_cache,
+                                           const half* v_cache, half* out, const int* position,
+                                           int window, int num_heads, int num_kv_heads,
+                                           int head_dim, float* scratch_m, float* scratch_l,
+                                           float* scratch_o, int chunk_size, int scratch_chunks,
+                                           cudaStream_t stream);
+
 // launch_rmsnorm_add_scale
 //
 // Decode fusion: x = (x + rmsnorm_w(tmp)) * alpha over one row. Replaces the

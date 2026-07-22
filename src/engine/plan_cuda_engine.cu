@@ -98,6 +98,9 @@ PlanCudaEngine::~PlanCudaEngine() {
   cudaFree(d_cand_idx_);
   cudaFree(d_cand_val_);
   cudaFree(d_cand_count_);
+  cudaFree(d_split_m_);
+  cudaFree(d_split_l_);
+  cudaFree(d_split_o_);
   if (decode_graph_exec_) cudaGraphExecDestroy(decode_graph_exec_);
   if (decode_graph_) cudaGraphDestroy(decode_graph_);
   if (stream_) cudaStreamDestroy(stream_);
@@ -551,6 +554,16 @@ void PlanCudaEngine::allocate_buffers() {
   std::vector<__half> ones(std::max(maxhd, cfg_.hidden), __float2half(1.0f));
   G4_CHECK(cudaMalloc(&d_ones_, ones.size() * sizeof(__half)));
   G4_CHECK(cudaMemcpy(d_ones_, ones.data(), ones.size() * sizeof(__half), cudaMemcpyHostToDevice));
+
+  // Split-K decode-attention scratch for the wide-head path (head_dim > 128, window or not).
+  // Without it every decode attention runs ONE block per head -- 8 blocks on this GPU -- and
+  // the whole windowed KV walk serialises inside them. ~2 MB at Gemma E2B geometry.
+  split_any_chunks_ = (max_ctx_ + kSplitAnyChunk - 1) / kSplitAnyChunk;
+  const std::size_t split_cells =
+      static_cast<std::size_t>(cfg_.num_heads) * static_cast<std::size_t>(split_any_chunks_);
+  G4_CHECK(cudaMalloc(&d_split_m_, split_cells * sizeof(float)));
+  G4_CHECK(cudaMalloc(&d_split_l_, split_cells * sizeof(float)));
+  G4_CHECK(cudaMalloc(&d_split_o_, split_cells * static_cast<std::size_t>(maxhd) * sizeof(float)));
 
   // per-layer K/V caches: own for L < first_shared, alias for shared.
   // Own K/V cache for each non-shared layer; shared layers (>= first_shared)
@@ -1992,22 +2005,44 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
         __half* kc = caches_k_[layer];
         __half* vc = caches_v_[layer];
         const std::size_t kvdim = static_cast<std::size_t>(op.kv_heads) * op.head_dim;
-        if (device_pos_mode_) {
-          // Device-position kernel: seq derived from d_position_ on-device (graph-
-          // safe). Sliding layers pass their window so k_start is computed on device.
+        {
           const int window = op.full_attention ? 0 : op.sliding_window;
-          kernels::launch_attention_step_device_pos(S(op.in), kc, vc, S(op.out), d_position_,
-                                                    op.heads, op.kv_heads, op.head_dim, stream_,
-                                                    nullptr, nullptr, nullptr, 0, true, window);
-        } else {
-          const int seq = position + 1;
-          int k_start = 0;
-          if (!op.full_attention && op.sliding_window > 0 && seq > op.sliding_window)
-            k_start = seq - op.sliding_window;
-          const int att_seq = seq - k_start;
-          kernels::launch_attention_step(S(op.in), kc + static_cast<std::size_t>(k_start) * kvdim,
-                                         vc + static_cast<std::size_t>(k_start) * kvdim, S(op.out),
-                                         att_seq, op.heads, op.kv_heads, op.head_dim, stream_);
+          // Wide heads (Gemma's 256/512) take the any-head_dim SPLIT-K path when its scratch
+          // exists: the tiled single-block-per-head kernel leaves a 170-SM GPU running 8
+          // blocks, and the whole windowed KV walk serialises inside them. The split's grid is
+          // (heads x chunks) with per-chunk seq/window guards -- graph-safe -- and eager and
+          // graph share the same kernels so the two stay bit-identical.
+          if (d_split_o_ != nullptr && op.head_dim > 128) {
+            if (device_pos_mode_) {
+              kernels::launch_attention_split_any_device_pos(
+                  S(op.in), kc, vc, S(op.out), d_position_, window, op.heads, op.kv_heads,
+                  op.head_dim, d_split_m_, d_split_l_, d_split_o_, kSplitAnyChunk,
+                  split_any_chunks_, stream_);
+            } else {
+              kernels::launch_attention_split_any(
+                  S(op.in), kc, vc, S(op.out), position + 1, window, op.heads, op.kv_heads,
+                  op.head_dim, d_split_m_, d_split_l_, d_split_o_, kSplitAnyChunk,
+                  split_any_chunks_, stream_);
+            }
+            break;
+          }
+          if (device_pos_mode_) {
+            // Device-position kernel: seq derived from d_position_ on-device (graph-
+            // safe). Sliding layers pass their window so k_start is computed on device.
+            kernels::launch_attention_step_device_pos(S(op.in), kc, vc, S(op.out), d_position_,
+                                                      op.heads, op.kv_heads, op.head_dim, stream_,
+                                                      nullptr, nullptr, nullptr, 0, true, window);
+          } else {
+            const int seq = position + 1;
+            int k_start = 0;
+            if (!op.full_attention && op.sliding_window > 0 && seq > op.sliding_window)
+              k_start = seq - op.sliding_window;
+            const int att_seq = seq - k_start;
+            kernels::launch_attention_step(S(op.in), kc + static_cast<std::size_t>(k_start) * kvdim,
+                                           vc + static_cast<std::size_t>(k_start) * kvdim,
+                                           S(op.out), att_seq, op.heads, op.kv_heads, op.head_dim,
+                                           stream_);
+          }
         }
         break;
       }

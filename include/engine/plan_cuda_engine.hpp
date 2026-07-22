@@ -407,6 +407,14 @@ private:
   // the full vocab-sized logit vector; only the ~k candidates come back.
   static constexpr int kMaxDeviceTopK = 256;
   static constexpr int kCandCapacity = kMaxDeviceTopK + 64;  // slack for ties at the k-th logit
+  // Split-K decode-attention scratch for the wide-head (any-head_dim) path. Sized
+  // num_heads x split_any_chunks_ (x maxhd for the partial outputs) in allocate_buffers.
+  static constexpr int kSplitAnyChunk = 32;
+  float* d_split_m_ = nullptr;
+  float* d_split_l_ = nullptr;
+  float* d_split_o_ = nullptr;
+  int split_any_chunks_ = 0;
+
   float* d_topk_part_val_ = nullptr;  // per-partition scratch
   int* d_topk_part_idx_ = nullptr;
   float* d_topk_val_ = nullptr;       // [k] descending; [k-1] is the threshold
