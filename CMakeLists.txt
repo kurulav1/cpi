@@ -580,6 +580,21 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
   )
 
+  # Sequence-prefill vs per-token parity, all quant configs, short + chunk-crossing
+  # prompts. Skips gracefully when the model artifact is absent. Exists because four
+  # stacked prefill defects lived behind a green suite.
+  add_executable(prefill_parity_test
+    src/tests/prefill_parity_test.cu
+  )
+  target_include_directories(prefill_parity_test PRIVATE include)
+  target_link_libraries(prefill_parity_test PRIVATE llama_engine)
+  set_target_properties(prefill_parity_test PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+  )
+  add_test(NAME prefill_parity_test COMMAND prefill_parity_test
+           WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
   # Gemma 4 forward parity driver (checks the fork engine against the HF oracle).
   add_executable(gemma4_forward_test
     src/tests/gemma4_forward_test.cu

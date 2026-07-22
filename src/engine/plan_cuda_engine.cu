@@ -3,6 +3,7 @@
 // Gemma 4 is currently its sole tenant; see memory:cpi-gemma4-arch for that
 // model's spec. Reuses the shared kernels (rmsnorm scale=w, rope table, tiled
 // decode attention, gelu-mul, gemv).
+#include <cublas_v2.h>
 #include <algorithm>
 #include <chrono>
 #include <map>
@@ -101,6 +102,7 @@ PlanCudaEngine::~PlanCudaEngine() {
   cudaFree(d_cand_val_);
   cudaFree(d_cand_count_);
   cudaFree(d_persist_ops_);
+  if (cublas_ != nullptr) cublasDestroy(static_cast<cublasHandle_t>(cublas_));
   cudaFree(d_seq_dequant_);
   cudaFree(d_head_q_);
   cudaFree(d_head_qs_);
@@ -1847,6 +1849,27 @@ void PlanCudaEngine::build_plan() {
 // runtime-varying inputs are `position` (RoPE / KV store / attention window) and
 // the executor's device token buffer (EmbeddingLookup). `layer` selects the
 // cache for KvStore/Attention; the prologue/epilogue pass -1 (no such ops).
+// Sequence-mode GEMM: y[T,out] = x[T,in] * W[out,in]^T via cublasGemmEx (fp16 in, fp32
+// accumulate) -- the classic row-major-as-column-major call. Falls back to the hand-rolled
+// GEMM when cuBLAS is disabled or the op carries activation clips (vision projections).
+bool PlanCudaEngine::seq_gemm_cublas(const __half* w, const __half* x, __half* y, int out,
+                                     int in, int T) {
+  static const bool disabled = std::getenv("CPI_CUDA_NO_CUBLAS") != nullptr;
+  if (disabled) return false;
+  if (cublas_ == nullptr) {
+    cublasHandle_t h = nullptr;
+    if (cublasCreate(&h) != CUBLAS_STATUS_SUCCESS) return false;
+    cublas_ = h;
+  }
+  cublasHandle_t h = static_cast<cublasHandle_t>(cublas_);
+  cublasSetStream(h, stream_);
+  const float alpha = 1.0f, beta = 0.0f;
+  const cublasStatus_t st = cublasGemmEx(
+      h, CUBLAS_OP_T, CUBLAS_OP_N, out, T, in, &alpha, w, CUDA_R_16F, in, x, CUDA_R_16F, in,
+      &beta, y, CUDA_R_16F, out, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+  return st == CUBLAS_STATUS_SUCCESS;
+}
+
 void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer, int position,
                                  const ExecCtx& ctx) {
   using namespace opplan;
@@ -2140,9 +2163,12 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
           } else {
             throw std::runtime_error("sequence prefill: unsupported quant layout");
           }
-          kernels::launch_rowmajor_half_gemm_f16(d_seq_dequant_, S(op.in), S(op.out), op.cols,
-                                                 op.in_dim, T, stream_, op.clip_in_min,
-                                                 op.clip_in_max, op.clip_out_min, op.clip_out_max);
+          if (!seq_gemm_cublas(d_seq_dequant_, S(op.in), S(op.out), op.cols, op.in_dim, T)) {
+            kernels::launch_rowmajor_half_gemm_f16(d_seq_dequant_, S(op.in), S(op.out), op.cols,
+                                                   op.in_dim, T, stream_, op.clip_in_min,
+                                                   op.clip_in_max, op.clip_out_min,
+                                                   op.clip_out_max);
+          }
           break;
         }
         // int8 GLU fusion: [gate Gemv][up Gemv][GeluMul] -> one paired-warp launch.
@@ -2177,9 +2203,15 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
           kernels::launch_weight_only_int8_matvec(QW(op.qweight), QS(op.qscales), S(op.in),
                                                   S(op.out), op.cols, op.in_dim, stream_);
         } else if (seq) {
-          kernels::launch_rowmajor_half_gemm_f16(HW(op.weight), S(op.in), S(op.out), op.cols,
-                                                 op.in_dim, T, stream_, op.clip_in_min,
-                                                 op.clip_in_max, op.clip_out_min, op.clip_out_max);
+          const bool clipped = std::isfinite(op.clip_in_min) || std::isfinite(op.clip_in_max) ||
+                               std::isfinite(op.clip_out_min) || std::isfinite(op.clip_out_max);
+          if (clipped ||
+              !seq_gemm_cublas(HW(op.weight), S(op.in), S(op.out), op.cols, op.in_dim, T)) {
+            kernels::launch_rowmajor_half_gemm_f16(HW(op.weight), S(op.in), S(op.out), op.cols,
+                                                   op.in_dim, T, stream_, op.clip_in_min,
+                                                   op.clip_in_max, op.clip_out_min,
+                                                   op.clip_out_max);
+          }
         } else {
           kernels::launch_rowmajor_half_gemv_f16(HW(op.weight), S(op.in), S(op.out), op.cols,
                                                  op.in_dim, stream_);

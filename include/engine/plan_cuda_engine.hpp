@@ -143,6 +143,7 @@ class PlanCudaEngine : public runtime::SequenceModel {
   };
 
   void parse_manifest(const std::string& manifest_path);
+  bool seq_gemm_cublas(const __half* w, const __half* x, __half* y, int out, int in, int T);
   void load_all(const std::string& cpi_path);
   // ── Qwen3.5 recipe (config parse + weight load + plan build). The executor,
   //    sampler, quantizer, graph and state machinery below are all SHARED. ──
@@ -467,6 +468,10 @@ private:
   // Prefill dequant scratch: sequence mode runs fp16 GEMMs over a dequantized copy of
   // each quantized matrix (sized for the largest projection). nullptr on fp16 runs.
   __half* d_seq_dequant_ = nullptr;
+  // cuBLAS, for the SEQUENCE-mode GEMMs only (precedent: llama4 engine + bert embedder).
+  // The hand-rolled GEMM measured ~3% of tensor-core rate; prefill was 30x off llama.cpp
+  // because of it. Decode never touches this. CPI_CUDA_NO_CUBLAS=1 restores the fallback.
+  void* cublas_ = nullptr;  // cublasHandle_t, kept as void* to keep cublas out of the header
 
   // Split-K decode-attention scratch for the wide-head (any-head_dim) path. Sized
   // num_heads x split_any_chunks_ (x maxhd for the partial outputs) in allocate_buffers.
