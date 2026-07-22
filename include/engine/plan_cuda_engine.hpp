@@ -472,6 +472,12 @@ private:
   // The hand-rolled GEMM measured ~3% of tensor-core rate; prefill was 30x off llama.cpp
   // because of it. Decode never touches this. CPI_CUDA_NO_CUBLAS=1 restores the fallback.
   void* cublas_ = nullptr;  // cublasHandle_t, kept as void* to keep cublas out of the header
+  // Tensor-core attention prefill (full-attention layers): scores scratch + device
+  // pointer arrays, the LlamaEngine machinery adapted. Lazy-allocated on first use.
+  __half* d_pf_scores_ = nullptr;
+  void** d_pf_ptrs_ = nullptr;
+  bool prefill_attention_tc(const __half* q, const __half* k, const __half* v, __half* out,
+                            int rows, int base_pos, int heads, int kv_heads, int hd);
 
   // Split-K decode-attention scratch for the wide-head (any-head_dim) path. Sized
   // num_heads x split_any_chunks_ (x maxhd for the partial outputs) in allocate_buffers.

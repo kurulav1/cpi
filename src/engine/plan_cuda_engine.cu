@@ -103,6 +103,8 @@ PlanCudaEngine::~PlanCudaEngine() {
   cudaFree(d_cand_count_);
   cudaFree(d_persist_ops_);
   if (cublas_ != nullptr) cublasDestroy(static_cast<cublasHandle_t>(cublas_));
+  cudaFree(d_pf_scores_);
+  cudaFree(d_pf_ptrs_);
   cudaFree(d_seq_dequant_);
   cudaFree(d_head_q_);
   cudaFree(d_head_qs_);
@@ -1870,6 +1872,60 @@ bool PlanCudaEngine::seq_gemm_cublas(const __half* w, const __half* x, __half* y
   return st == CUBLAS_STATUS_SUCCESS;
 }
 
+// Tensor-core attention prefill for FULL-attention layers: batched QK^T -> causal
+// softmax -> PV via cuBLAS, the LlamaEngine machinery (device-built pointer arrays keep
+// GQA groups straight). The scalar fallback measured 5 ms PER LAYER at 1216 tokens --
+// 32% of the whole prefill; this does the same work in tensor-core GEMMs. Sliding
+// layers keep the masked tiled kernel (the window mask lives only there).
+bool PlanCudaEngine::prefill_attention_tc(const __half* q, const __half* k, const __half* v,
+                                          __half* out, int rows, int base_pos, int heads,
+                                          int kv_heads, int hd) {
+  static const bool disabled = std::getenv("CPI_CUDA_NO_TC_PREFILL") != nullptr;
+  if (disabled || cublas_ == nullptr) return false;
+  if (heads <= 0 || kv_heads <= 0 || (heads % kv_heads) != 0) return false;
+  constexpr int kChunk = 256;
+  if (d_pf_scores_ == nullptr) {
+    // heads x kChunk x max_ctx fp16 scores + 6*heads device pointers.
+    if (cudaMalloc(&d_pf_scores_, static_cast<std::size_t>(heads) * kChunk * max_ctx_ *
+                                      sizeof(__half)) != cudaSuccess)
+      return false;
+    if (cudaMalloc(&d_pf_ptrs_, sizeof(void*) * 6 * heads) != cudaSuccess) return false;
+  }
+  cublasHandle_t h = static_cast<cublasHandle_t>(cublas_);
+  cublasSetStream(h, stream_);
+  const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+  const float zero = 0.0f, one = 1.0f;
+  const int keys = base_pos + rows;
+  const int group = heads / kv_heads;
+  const int kv_stride = kv_heads * hd;
+  const int q_stride = heads * hd;
+  const int out_stride = heads * hd;
+  for (int c0 = 0; c0 < rows; c0 += kChunk) {
+    const int chunk = std::min(kChunk, rows - c0);
+    kernels::launch_build_attention_ptrs(k, v, q, d_pf_scores_, out, d_pf_ptrs_, heads, group,
+                                         hd, kChunk, keys, q_stride, out_stride, c0, stream_);
+    const void* const* A1 = const_cast<const void* const*>(d_pf_ptrs_);
+    const void* const* B1 = const_cast<const void* const*>(d_pf_ptrs_ + heads);
+    void* const* C1 = d_pf_ptrs_ + 2 * heads;
+    const void* const* A2 = const_cast<const void* const*>(d_pf_ptrs_ + 3 * heads);
+    const void* const* B2 = const_cast<const void* const*>(d_pf_ptrs_ + 4 * heads);
+    void* const* C2 = d_pf_ptrs_ + 5 * heads;
+    if (cublasGemmBatchedEx(h, CUBLAS_OP_T, CUBLAS_OP_N, keys, chunk, hd, &scale, A1,
+                            CUDA_R_16F, kv_stride, B1, CUDA_R_16F, q_stride, &zero, C1,
+                            CUDA_R_16F, keys, heads, CUBLAS_COMPUTE_32F,
+                            CUBLAS_GEMM_DEFAULT_TENSOR_OP) != CUBLAS_STATUS_SUCCESS)
+      return false;
+    kernels::launch_softmax_causal_rows(d_pf_scores_, heads, kChunk, chunk, keys, base_pos + c0,
+                                        stream_);
+    if (cublasGemmBatchedEx(h, CUBLAS_OP_N, CUBLAS_OP_N, hd, chunk, keys, &one, A2, CUDA_R_16F,
+                            kv_stride, B2, CUDA_R_16F, keys, &zero, C2, CUDA_R_16F, out_stride,
+                            heads, CUBLAS_COMPUTE_32F,
+                            CUBLAS_GEMM_DEFAULT_TENSOR_OP) != CUBLAS_STATUS_SUCCESS)
+      return false;
+  }
+  return true;
+}
+
 void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer, int position,
                                  const ExecCtx& ctx) {
   using namespace opplan;
@@ -2321,9 +2377,16 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
       case OpKind::Attention: {
         if (seq && ctx.cached) {
           // TEXT prefill: K/V were appended to this layer's cache by KvStore, so attend
-          // over the CACHE (it also holds any earlier context). Sliding layers pass their
-          // window, and ctx.limits (when set) makes an image span bidirectional.
+          // over the CACHE (it also holds any earlier context). Full-attention layers with
+          // no image limits take the tensor-core cuBLAS path; sliding layers pass their
+          // window to the masked tiled kernel, and ctx.limits (when set) makes an image
+          // span bidirectional.
           const int window = op.full_attention ? 0 : op.sliding_window;
+          if (op.full_attention && ctx.limits == nullptr &&
+              prefill_attention_tc(S(op.in), caches_k_[layer], caches_v_[layer], S(op.out), T,
+                                   position, op.heads, op.kv_heads, op.head_dim)) {
+            break;
+          }
           kernels::launch_attention_prefill(S(op.in), caches_k_[layer], caches_v_[layer], S(op.out),
                                             T, position, op.heads, op.kv_heads, op.head_dim,
                                             stream_,
