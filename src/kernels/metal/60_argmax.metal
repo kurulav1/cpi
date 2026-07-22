@@ -65,3 +65,32 @@ kernel void cpi_argmax_reduce(
 
   if (lid == 0u) out[0] = ti[0];
 }
+
+// ---------------------------------------------------------------------------
+// Chained greedy decode. K token-steps are encoded into command buffers the host never waits
+// on individually: each step's argmax feeds the NEXT step's input token entirely on the GPU,
+// so the per-token host round-trip (commit, wait, read, write) disappears. The host reads the
+// whole block's tokens back once, from `ring`.
+
+struct ChainParams {
+  uint idx;
+  int value;
+};
+
+// dst[0] = value. The chained step's position: the host knows it at encode time but must not
+// write pos_buf_ directly while earlier steps still execute.
+kernel void cpi_set_i32(device int* dst [[buffer(0)]], constant ChainParams& p [[buffer(1)]],
+                        uint gid [[thread_position_in_grid]]) {
+  if (gid == 0u) dst[0] = p.value;
+}
+
+// Feed the argmax result forward as the next step's input token, and record it for the host.
+kernel void cpi_chain_token(device const int* argmax_out [[buffer(0)]],
+                            device int* tok [[buffer(1)]], device int* ring [[buffer(2)]],
+                            constant ChainParams& p [[buffer(3)]],
+                            uint gid [[thread_position_in_grid]]) {
+  if (gid == 0u) {
+    tok[0] = argmax_out[0];
+    ring[p.idx] = argmax_out[0];
+  }
+}

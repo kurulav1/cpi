@@ -345,6 +345,60 @@ std::vector<int> chunk_sizes(int n, int max_chunk, int tile) {
   return out;
 }
 
+// Slot-level read/write footprint of a decode (T=1) op, as bitmasks for the concurrent-
+// dispatch overlap in execute_ops. Bits below Slot::Count are slots; the rest are the
+// pseudo-resources a decode also touches: the layer's KV cache, the logits buffer, and the
+// staged token/position words. Returns false for kinds whose dependencies are not modelled
+// (MoE, delta-net, vision) -- the caller serialises around those.
+constexpr int kDepCache = 40;
+constexpr int kDepLogits = 41;
+constexpr int kDepTok = 42;
+constexpr int kDepPos = 43;
+inline bool dep_sets(const engine::opplan::Op& op, std::uint64_t& rd, std::uint64_t& wr) {
+  using engine::opplan::OpKind;
+  const auto b = [](engine::opplan::Slot s) { return 1ull << static_cast<int>(s); };
+  switch (op.kind) {
+    case OpKind::RmsNorm:
+    case OpKind::Gemv:
+    case OpKind::ScaleCopy:
+    case OpKind::CopySlot:
+      rd = b(op.in);
+      wr = b(op.out);
+      return true;
+    case OpKind::Rope:  // in place, at the staged position
+      rd = b(op.in) | (1ull << kDepPos);
+      wr = b(op.in);
+      return true;
+    case OpKind::GeluMul:
+    case OpKind::SiluMul:
+      rd = b(op.in) | b(op.in2);
+      wr = b(op.out);
+      return true;
+    case OpKind::AddInplace:
+      rd = b(op.in) | b(op.out);
+      wr = b(op.out);
+      return true;
+    case OpKind::KvStore:
+      rd = b(op.in) | b(op.in2) | (1ull << kDepPos);
+      wr = 1ull << kDepCache;
+      return true;
+    case OpKind::Attention:
+      rd = b(op.in) | (1ull << kDepCache) | (1ull << kDepPos);
+      wr = b(op.out);
+      return true;
+    case OpKind::EmbeddingLookup:
+      rd = 1ull << kDepTok;
+      wr = b(op.out);
+      return true;
+    case OpKind::LmHead:
+      rd = b(op.in);
+      wr = 1ull << kDepLogits;
+      return true;
+    default:
+      return false;
+  }
+}
+
 }  // namespace
 
 // Resolves a tensor name to its MTLBuffer handle. The plan carries these as opaque
@@ -1116,10 +1170,10 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
   // Tracks the previously dispatched op, for the concurrent-overlap check below. Local to this
   // execute_ops call: a new call (the next layer) starts with no predecessor, so its first op
   // barriers after everything the previous call queued.
-  bool prev_dispatch_valid = false;
-  opplan::OpKind prev_dispatch_kind = opplan::OpKind::RmsNorm;
-  opplan::Slot prev_dispatch_in = opplan::Slot::X;
-  opplan::Slot prev_dispatch_out = opplan::Slot::X;
+  // Concurrent-dispatch group state (see the overlap comment in the loop). grp_written starts
+  // as "everything" so the first dispatch of every call barriers against the previous call.
+  std::uint64_t grp_read = 0;
+  std::uint64_t grp_written = ~0ull;
 
   for (std::size_t oi = 0; oi < ops.size(); ++oi) {
     const opplan::Op& op = ops[oi];
@@ -1132,24 +1186,42 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
     // Never set this outside an experiment.
     if (!ablate_.empty() && ablate_.count(op_kind_name(static_cast<int>(op.kind))) != 0) continue;
 
-    // CONCURRENT-DISPATCH OVERLAP. The compute encoder is concurrent and every dispatch barriers
-    // first by default (serial-equivalent). A Gemv that reads the SAME input slot as the
-    // immediately preceding Gemv and writes a DIFFERENT output is independent of it: the three
-    // Q/K/V projections all read the post-norm slot and write distinct slots, as do gate/up. They
-    // are consecutive, so nothing writes the shared input between them -- no RAW, WAR or WAW -- and
-    // the second/third may skip the barrier and overlap on the GPU. That is where the win is: the
-    // 128-row k/v projections are grid-starved (18 threadgroups on 10 cores) and never fill the
-    // machine alone. Everything else keeps the barrier, so multi-dispatch ops and the real
-    // dependency chain stay correctly ordered. prev is reset each execute_ops call, so the first op
-    // of a layer (its rmsnorm) always barriers after the previous layer.
-    if (op.kind == OpKind::Gemv && prev_dispatch_valid && prev_dispatch_kind == OpKind::Gemv &&
-        op.in == prev_dispatch_in && op.out != prev_dispatch_out && op.out != prev_dispatch_in) {
-      ctx_.set_next_barrier(false);
+    // CONCURRENT-DISPATCH OVERLAP, generalised from the old same-input-Gemv-pair rule. The
+    // compute encoder is concurrent and every dispatch barriers first by default
+    // (serial-equivalent). For a T=1 decode, each op's slot reads/writes are statically known,
+    // so the barrier is dropped whenever the op conflicts with NOTHING dispatched since the
+    // last barrier (no RAW, WAR or WAW on slots, the KV cache, the token/position buffers or
+    // the logits). Two things pay for this: grid-starved neighbours overlap (the 128-row k/v
+    // projections never fill the machine alone), and -- the reason it was generalised -- every
+    // avoided barrier avoids a pipeline DRAIN, which measured ~9 us per dispatch on Gemma 4's
+    // ~700-op token and was a third of its decode.
+    //
+    // Ops whose dependencies are not modelled (MoE, delta-net, vision, the fused paths below)
+    // poison the group, so the next op barriers. Group state resets at every execute_ops call
+    // with "everything written": the first dispatch of a call ALWAYS barriers against the
+    // previous call's work. The token-identity goldens gate this: a missed dependency is a
+    // wrong stream, not a slowdown.
+    if (T == 1 && batch_ != nullptr) {
+      // Batched decode uses per-row paged variants whose dependencies are not modelled here.
+      grp_written = ~0ull;
+    } else if (T == 1) {
+      std::uint64_t rd = 0, wr = 0;
+      if (dep_sets(op, rd, wr)) {
+        const bool conflict =
+            (rd & grp_written) != 0 || (wr & grp_written) != 0 || (wr & grp_read) != 0;
+        if (!conflict) {
+          ctx_.set_next_barrier(false);
+          grp_read |= rd;
+          grp_written |= wr;
+        } else {
+          grp_read = rd;
+          grp_written = wr;
+        }
+      } else {
+        grp_read = 0;
+        grp_written = ~0ull;
+      }
     }
-    prev_dispatch_valid = true;
-    prev_dispatch_kind = op.kind;
-    prev_dispatch_in = op.in;
-    prev_dispatch_out = op.out;
 
     // PEEPHOLE FUSION: `X += delta` (AddInplace) immediately followed by `XNorm = rmsnorm(X)`
     // is one fused pass -- the residual is read and written once instead of twice. The two ops
@@ -1157,6 +1229,11 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
     // here rather than in the shared plan builder so the CUDA path is untouched.
     if (op.kind == OpKind::AddInplace && oi + 1 < ops.size() &&
         ops[oi + 1].kind == OpKind::RmsNorm && ops[oi + 1].in == op.out) {
+      // The fused dispatch's writes exceed what the tracker modelled for `op` alone: keep its
+      // own barrier and poison the group so the next op barriers too.
+      ctx_.set_next_barrier(true);
+      grp_read = 0;
+      grp_written = ~0ull;
       const opplan::Op& nrm = ops[oi + 1];
       const int rows = nrm.rows * T;
       NormParams p{static_cast<std::uint32_t>(rows), static_cast<std::uint32_t>(nrm.cols), nrm.eps,
@@ -1184,6 +1261,11 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
                        is_qgemv(oi + 2, opplan::Slot::V);
       const bool gu = op.out == opplan::Slot::Gate && is_qgemv(oi + 1, opplan::Slot::Up);
       if (qkv || gu) {
+        // Same as the fused add+rmsnorm above: this dispatch writes more slots than the
+        // tracker modelled for `op` alone, so keep its barrier and poison the group.
+        ctx_.set_next_barrier(true);
+        grp_read = 0;
+        grp_written = ~0ull;
         const opplan::Op& a = op;
         const opplan::Op& b = ops[oi + 1];
         const opplan::Op& c = qkv ? ops[oi + 2] : op;  // c unused when n2 == 0
@@ -2163,13 +2245,6 @@ void PlanMetalEngine::dump_profile() const {
 // (the argmax) to the same command buffer and sync once instead of twice.
 void PlanMetalEngine::encode_forward(int token, int position, int cache_position) {
   if (cache_position < 0) cache_position = position;
-  // CPI_METAL_LAYERS=N runs only the first N layers. A NaN has to start SOMEWHERE, and
-  // bisecting on the layer count finds where far faster than reasoning about which op
-  // could overflow.
-  static const int layer_limit = [] {
-    const char* e = std::getenv("CPI_METAL_LAYERS");
-    return e != nullptr ? std::atoi(e) : -1;
-  }();
 
   // Unified memory: writing the token and the position IS the H2D transfer.
   //
@@ -2196,6 +2271,35 @@ void PlanMetalEngine::encode_forward(int token, int position, int cache_position
     // scalar pos_buf_ drives rope as it always has.
     mrope_active_ = false;
   }
+
+  encode_forward_body(position);
+}
+
+// The chained-decode variant: the step's token was written into tok_buf_ by the PREVIOUS
+// step's cpi_chain_token dispatch and its position is set by a cpi_set_i32 dispatch here --
+// the host must not touch tok_buf_/pos_buf_ while earlier steps are still executing on the
+// GPU, which is the whole point of the chain (see generate_greedy).
+void PlanMetalEngine::encode_forward_chained(int position) {
+  tokens_in_seq_buf_ = false;
+  mrope_active_ = false;  // text decode only; multimodal decode stays on the per-token path
+  struct ChainParams {
+    std::uint32_t idx;
+    std::int32_t value;
+  } cp{0u, static_cast<std::int32_t>(position)};
+  const void* pb[] = {pos_buf_.handle()};
+  ctx_.dispatch("cpi_set_i32", runtime::MetalContext::Grid::Threads, 1, 32, pb, nullptr, 1, &cp,
+                sizeof(cp));
+  encode_forward_body(position);
+}
+
+void PlanMetalEngine::encode_forward_body(int position) {
+  // CPI_METAL_LAYERS=N runs only the first N layers. A NaN has to start SOMEWHERE, and
+  // bisecting on the layer count finds where far faster than reasoning about which op
+  // could overflow.
+  static const int layer_limit = [] {
+    const char* e = std::getenv("CPI_METAL_LAYERS");
+    return e != nullptr ? std::atoi(e) : -1;
+  }();
 
   // CPI_METAL_DEBUG prints max|X| after every layer. Unified memory makes this almost
   // free to do: the residual stream is host-addressable, so an explosion can simply be
@@ -3030,28 +3134,74 @@ std::vector<int> PlanMetalEngine::generate_greedy(const std::vector<int>& prompt
   prefill_ms_ = std::chrono::duration<double, std::milli>(pre1 - pre0).count();
   prefill_tokens_ = n_pre;
 
-  int next = prompt.back();
-  for (int i = 0; i < max_new; ++i, ++pos) {
-    // Forward + argmax in ONE command buffer: the logits never leave the GPU, so
-    // there is no reason to sync between them. Two syncs per token was pure latency.
-    encode_forward(next, pos, pos);  // text decode: rotary and cache positions coincide
+  // CHAINED decode: the step's argmax feeds the next step's token buffer ON the GPU
+  // (cpi_chain_token), so the host never waits per token -- it encodes step k+1 while the GPU
+  // executes step k (commit_async), and reads a whole block of tokens back at once. This is
+  // what turned 62% GPU-busy into ~full: the per-token commit/wait/read/write round-trip was
+  // a third of every decode token on Gemma 4's 700-dispatch plan.
+  //
+  // The loop guard and the context bound are checked per BLOCK, so up to kChainBlock-1 tokens
+  // past a degenerate tail are generated and discarded -- wasted work, not wrong output.
+  constexpr int kChainBlock = 8;
+  if (chain_ring_.size() < kChainBlock * sizeof(std::int32_t)) {
+    chain_ring_ = ctx_.alloc(kChainBlock * sizeof(std::int32_t));
+  }
 
-    // Argmax on the GPU: the vocab never crosses to the host.
-    ElemParams p1{static_cast<std::uint32_t>(cfg_.vocab_size), 0.0f};
-    const void* b1[] = {logits_buf_.handle(), argmax_val_.handle(), argmax_idx_.handle()};
-    ctx_.dispatch("cpi_argmax_partial", runtime::MetalContext::Grid::Groups, kArgmaxParts, kTG, b1,
-                  nullptr, 3, &p1, sizeof(p1));
+  // Step 0's token is host-staged (nothing is in flight yet; the prefill was waited on).
+  *static_cast<std::int32_t*>(tok_buf_.contents()) = static_cast<std::int32_t>(prompt.back());
 
-    ElemParams p2{static_cast<std::uint32_t>(kArgmaxParts), 0.0f};
-    const void* b2[] = {argmax_val_.handle(), argmax_idx_.handle(), argmax_out_.handle()};
-    ctx_.dispatch("cpi_argmax_reduce", runtime::MetalContext::Grid::Groups, 1, kTG, b2, nullptr, 3,
-                  &p2, sizeof(p2));
-    ctx_.commit_and_wait();
+  static const bool chain_dbg = std::getenv("CPI_METAL_CHAIN_DBG") != nullptr;
+  bool stop = false;
+  while (!stop && static_cast<int>(out.size()) < max_new) {
+    const int block = std::min(kChainBlock, std::min(max_new - static_cast<int>(out.size()),
+                                                     max_context_ - 1 - pos));
+    if (block <= 0) break;
+    const auto tb0 = std::chrono::steady_clock::now();
+    for (int k = 0; k < block; ++k) {
+      encode_forward_chained(pos + k);
 
-    next = static_cast<int>(*static_cast<const std::int32_t*>(argmax_out_.contents()));
-    out.push_back(next);
-    if (detail::dispatch_has_degenerate_tail(out, prompt.size())) break;  // loop guard (parity)
-    if (pos + 1 >= max_context_) break;
+      // Argmax on the GPU: the vocab never crosses to the host.
+      ElemParams p1{static_cast<std::uint32_t>(cfg_.vocab_size), 0.0f};
+      const void* b1[] = {logits_buf_.handle(), argmax_val_.handle(), argmax_idx_.handle()};
+      ctx_.dispatch("cpi_argmax_partial", runtime::MetalContext::Grid::Groups, kArgmaxParts, kTG,
+                    b1, nullptr, 3, &p1, sizeof(p1));
+      ElemParams p2{static_cast<std::uint32_t>(kArgmaxParts), 0.0f};
+      const void* b2[] = {argmax_val_.handle(), argmax_idx_.handle(), argmax_out_.handle()};
+      ctx_.dispatch("cpi_argmax_reduce", runtime::MetalContext::Grid::Groups, 1, kTG, b2, nullptr,
+                    3, &p2, sizeof(p2));
+
+      struct ChainParams {
+        std::uint32_t idx;
+        std::int32_t value;
+      } cp{static_cast<std::uint32_t>(k), 0};
+      const void* b3[] = {argmax_out_.handle(), tok_buf_.handle(), chain_ring_.handle()};
+      ctx_.dispatch("cpi_chain_token", runtime::MetalContext::Grid::Threads, 1, 32, b3, nullptr, 3,
+                    &cp, sizeof(cp));
+
+    }
+    // ONE command buffer for the whole block. Committing per step measured ~6 ms of GPU idle
+    // per token in scheduling gaps between buffers -- the encode itself is ~0.3 ms/token and
+    // hides completely, so block-granular submission is what matters, not encode overlap.
+    ctx_.commit_async();
+    const auto tb1 = std::chrono::steady_clock::now();
+    ctx_.wait_pending();
+    const auto tb2 = std::chrono::steady_clock::now();
+    if (chain_dbg) {
+      std::fprintf(stderr, "[chain] block=%d encode=%.1fms wait=%.1fms\n", block,
+                   std::chrono::duration<double, std::milli>(tb1 - tb0).count(),
+                   std::chrono::duration<double, std::milli>(tb2 - tb1).count());
+    }
+
+    const auto* ring = static_cast<const std::int32_t*>(chain_ring_.contents());
+    for (int k = 0; k < block; ++k) {
+      out.push_back(static_cast<int>(ring[k]));
+      if (detail::dispatch_has_degenerate_tail(out, prompt.size())) {  // loop guard (parity)
+        stop = true;
+        break;
+      }
+    }
+    pos += block;
+    if (pos + 1 >= max_context_) stop = true;
   }
   return out;
 }

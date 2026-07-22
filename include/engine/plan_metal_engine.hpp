@@ -324,6 +324,12 @@ private:
   std::map<std::string, double> profile_ms_;
   std::chrono::steady_clock::time_point profile_last_{};
   void encode_forward(int token, int position, int cache_position);
+  // The shared T=1 op walk (prologue/layers/epilogue), after host state is staged.
+  void encode_forward_body(int position);
+  // Chained decode step: token comes from the previous step's on-GPU argmax, position from a
+  // cpi_set_i32 dispatch. No host writes to tok_buf_/pos_buf_ -- earlier steps may still be
+  // executing.
+  void encode_forward_chained(int position);
   // Encodes a whole prefill chunk: T tokens through the tower in one pass.
   void encode_prefill(const std::vector<int>& tokens, int start_position);
   // Overwrites slot X rows with embeds_ entries for [start_position, start_position+T).
@@ -503,6 +509,7 @@ private:
   runtime::MetalBuffer argmax_val_;   // float[parts]
   runtime::MetalBuffer argmax_idx_;   // int32[parts]
   runtime::MetalBuffer argmax_out_;   // int32[1]
+  runtime::MetalBuffer chain_ring_;   // int32[kChainBlock] -- chained decode's per-block tokens
 
   std::vector<float> logits_;
   double prefill_ms_ = 0.0;

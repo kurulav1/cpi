@@ -275,10 +275,13 @@ ModelPlan build_llama_plan(const LlamaGeometry& g, const WeightSource& w) {
     o.in_dim = g.hidden;
 
     // The LM head is the single biggest read of a decode step (vocab x hidden), so it
-    // is the most valuable thing to quantize. But only when it is UNTIED: a tied head
-    // shares storage with the embedding table, which is looked up as fp16, and
-    // quantizing it would corrupt the lookup.
-    const QuantWeight q = untied ? w.quant(head, g.vocab, g.hidden) : QuantWeight{};
+    // is the most valuable thing to quantize -- tied or not. A tied head shares WEIGHTS
+    // with the embedding table, not storage: WeightSource::quant packs a separate copy,
+    // and the EmbeddingLookup op keeps its own fp16 handle, so the lookup is untouched.
+    // (This used to skip tied heads, which left Qwen2.5 and Gemma paying a full fp16
+    // vocab x hidden read per token in every quant mode -- the single largest slice of
+    // their decode traffic.)
+    const QuantWeight q = w.quant(head, g.vocab, g.hidden);
     if (q.bits != 0) {
       o.qweight = q.packed;
       o.qscales = q.scales;
@@ -519,7 +522,18 @@ ModelPlan build_qwen35_plan(const Qwen35Geometry& g, const WeightSource& w) {
     o.in = Slot::XNorm;
     o.cols = g.vocab;
     o.in_dim = H;
-    o.weight = w.fp16(w.has("output.weight") ? "output.weight" : "tok_embeddings.weight");
+    // Same tied-head quantization as the other builders: a separate packed copy for the
+    // GEMV, the fp16 table untouched for the lookup.
+    const std::string head = w.has("output.weight") ? "output.weight" : "tok_embeddings.weight";
+    const QuantWeight q = w.quant(head, g.vocab, H);
+    if (q.bits != 0) {
+      o.qweight = q.packed;
+      o.qscales = q.scales;
+      o.qbits = q.bits;
+      o.qgroup = q.group;
+    } else {
+      o.weight = w.fp16(head);
+    }
     plan.epilogue.push_back(o);
   }
   return plan;
@@ -685,8 +699,6 @@ ModelPlan build_gemma4_plan(const Gemma4Geometry& g, const WeightSource& w) {
       st.cols = kvdim;
       ops.push_back(st);
     }
-    // Net attention scale is 1.0: pre-scale Q by sqrt(hd) to cancel the kernel's 1/sqrt(hd).
-    ops.push_back(scale(Slot::Q, qdim, std::sqrt(static_cast<float>(hd))));
     {
       Op a;
       a.kind = OpKind::Attention;
@@ -697,11 +709,13 @@ ModelPlan build_gemma4_plan(const Gemma4Geometry& g, const WeightSource& w) {
       a.head_dim = hd;
       a.full_attention = full;
       a.sliding_window = g.sliding_window;
-      // Softmax scale, for the same reason as above: build_llama_plan sets it and the Metal
-      // executor reads it, while CUDA's Gemma path relies on its kernel applying 1/sqrt(head_dim)
-      // internally. The ScaleCopy just above pre-multiplies Q by sqrt(head_dim) so that the two
-      // cancel and the NET attention scale is 1.0, which is what Gemma 4 specifies.
-      a.scale = 1.0f / std::sqrt(static_cast<float>(hd));
+      // Gemma 4 specifies a NET attention scale of 1.0, and the Metal executor applies
+      // op.scale directly -- so state 1.0 here rather than pre-scaling Q by sqrt(head_dim)
+      // with a ScaleCopy and cancelling it against 1/sqrt(head_dim). The old pair cost a
+      // dispatch per layer and an extra fp16 rounding of Q. (CUDA's own Gemma builder keeps
+      // the pre-scale because its kernel applies 1/sqrt(head_dim) internally; if it ever
+      // delegates here, its executor must honour op.scale first.)
+      a.scale = 1.0f;
       ops.push_back(a);
     }
     ops.push_back(gemv(Slot::Att, Slot::Tmp, w, p + "self_attn.o_proj.weight", H, qdim));
@@ -749,8 +763,10 @@ ModelPlan build_gemma4_plan(const Gemma4Geometry& g, const WeightSource& w) {
       ops.push_back(add_into(Slot::X, Slot::Tmp, H));
     }
 
-    // --- per-layer output gain ---
-    ops.push_back(scale(Slot::X, H, g.layer_scalar.empty() ? 1.0f : g.layer_scalar[L]));
+    // --- per-layer output gain (skipped when it is exactly 1.0: a multiply-by-one is a
+    // dispatch per layer per token that changes nothing) ---
+    const float ls = g.layer_scalar.empty() ? 1.0f : g.layer_scalar[L];
+    if (ls != 1.0f) ops.push_back(scale(Slot::X, H, ls));
   }
 
   // ── epilogue: final norm -> LM head. The logit softcap stays host-side. ──
@@ -760,9 +776,20 @@ ModelPlan build_gemma4_plan(const Gemma4Geometry& g, const WeightSource& w) {
     Op h;
     h.kind = OpKind::LmHead;
     h.in = Slot::XNorm;
-    h.weight = w.fp16(WP + "embed_tokens.weight");  // tied
     h.cols = g.vocab;
     h.in_dim = H;
+    // Tied head, quantized when the backend quantizes: the vocab x hidden read is the
+    // single largest slice of a decode token (0.77 GB fp16 on E2B). WeightSource::quant
+    // packs a separate copy; the prologue's EmbeddingLookup keeps its own fp16 handle.
+    const QuantWeight q = w.quant(WP + "embed_tokens.weight", g.vocab, H);
+    if (q.bits != 0) {
+      h.qweight = q.packed;
+      h.qscales = q.scales;
+      h.qbits = q.bits;
+      h.qgroup = q.group;
+    } else {
+      h.weight = w.fp16(WP + "embed_tokens.weight");  // tied
+    }
     epi.push_back(h);
   }
   return plan;

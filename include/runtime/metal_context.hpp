@@ -147,6 +147,16 @@ public:
   // Submits everything encoded so far and blocks until the GPU is done.
   void commit_and_wait();
 
+  // Submits everything encoded so far WITHOUT waiting, so the GPU starts on it while the host
+  // encodes the next batch of work. Command buffers on this (serial) queue begin execution in
+  // submission order and every buffer here uses tracked resources, so cross-buffer hazards
+  // (step N+1 reading what step N wrote) are ordered by the driver. Pair with wait_pending().
+  void commit_async();
+
+  // Blocks until every commit_async()'d buffer has completed, and folds their GPU-busy time
+  // into gpu_busy_ms(). A no-op when nothing is in flight.
+  void wait_pending();
+
   const std::string& last_error() const {
     return last_error_;
   }
@@ -194,6 +204,8 @@ private:
   void* library_ = nullptr;    // id<MTLLibrary>
   void* cmdbuf_ = nullptr;     // id<MTLCommandBuffer>, lazily opened
   void* encoder_ = nullptr;    // id<MTLComputeCommandEncoder>, reused across dispatches
+  // commit_async()'d buffers not yet waited on (each retained id<MTLCommandBuffer>).
+  std::vector<void*> in_flight_;
   void* pipelines_ = nullptr;  // NSMutableDictionary name -> MTLComputePipelineState
   bool capturing_ = false;     // a .gputrace is open; end_gputrace() must close it
   bool next_barrier_ = true;   // barrier before the next dispatch; see set_next_barrier

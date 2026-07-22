@@ -526,7 +526,46 @@ void MetalContext::end_gputrace() {
   capturing_ = false;
 }
 
+void MetalContext::commit_async() {
+  if (cmdbuf_ == nullptr) return;
+  id<MTLCommandBuffer> cb = (id<MTLCommandBuffer>)cmdbuf_;
+  if (encoder_ != nullptr) {
+    [(id<MTLComputeCommandEncoder>)encoder_ endEncoding];
+    [(id<MTLComputeCommandEncoder>)encoder_ release];
+    encoder_ = nullptr;
+  }
+  [cb commit];  // retained reference moves to in_flight_; wait_pending() releases it
+  in_flight_.push_back(cmdbuf_);
+  ++cmdbuf_count_;
+  cmdbuf_ = nullptr;
+}
+
+void MetalContext::wait_pending() {
+  if (in_flight_.empty()) return;
+  // The queue is serial, so completion of the LAST buffer implies all earlier ones -- but each
+  // is waited (cheap once complete) so its GPU-busy time and error status are collected.
+  for (void* p : in_flight_) {
+    id<MTLCommandBuffer> cb = (id<MTLCommandBuffer>)p;
+    [cb waitUntilCompleted];
+    const double busy = ([cb GPUEndTime] - [cb GPUStartTime]) * 1000.0;
+    if (busy > 0.0) gpu_busy_ms_ += busy;
+    if ([cb status] == MTLCommandBufferStatusError) {
+      NSError* err = [cb error];
+      last_error_ = "command buffer failed";
+      if (err != nil) {
+        last_error_ += ": ";
+        last_error_ += [[err localizedDescription] UTF8String];
+      }
+    }
+    [cb release];
+  }
+  in_flight_.clear();
+}
+
 void MetalContext::commit_and_wait() {
+  // Anything committed asynchronously belongs to the same stream of work; a caller asking for
+  // a full sync means ALL of it.
+  wait_pending();
   if (cmdbuf_ == nullptr) return;
   id<MTLCommandBuffer> cb = (id<MTLCommandBuffer>)cmdbuf_;
   if (encoder_ != nullptr) {
