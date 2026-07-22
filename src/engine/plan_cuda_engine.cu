@@ -99,6 +99,8 @@ PlanCudaEngine::~PlanCudaEngine() {
   cudaFree(d_cand_val_);
   cudaFree(d_cand_count_);
   cudaFree(d_persist_ops_);
+  cudaFree(d_head_q_);
+  cudaFree(d_head_qs_);
   cudaFree(d_split_m_);
   cudaFree(d_split_l_);
   cudaFree(d_split_o_);
@@ -778,6 +780,17 @@ void PlanCudaEngine::load_all(const std::string& cpi_path) {
   layer_scalar_host_.assign(cfg_.num_layers, 1.0f);
   // The dense projections carry ~all the weight; norms/embeddings stay fp16.
   const bool quantize = weight_quant_bits_ == 4 || weight_quant_bits_ == 8;
+  // The tied LM head re-reads the whole fp16 embedding table every token (~0.5 ms on E2B's
+  // 262K x 1536). Quant runs give the HEAD a rowwise-int8 packed copy -- int8 even under
+  // int4, since per-row int8 needs no groups -- while EmbeddingLookup keeps the fp16 table.
+  if (quantize && d_head_q_ == nullptr) {
+    const __half* emb = static_cast<const __half*>(dev_at(W + "embed_tokens.weight"));
+    const std::size_t n = static_cast<std::size_t>(cfg_.vocab) * static_cast<std::size_t>(cfg_.hidden);
+    G4_CHECK(cudaMalloc(&d_head_q_, n));
+    G4_CHECK(cudaMalloc(&d_head_qs_, static_cast<std::size_t>(cfg_.vocab) * sizeof(float)));
+    kernels::launch_quantize_rowwise_fp16_to_int8(emb, d_head_q_, d_head_qs_, cfg_.vocab,
+                                                  cfg_.hidden, stream_);
+  }
   // LLAMA_INFER_PLAN_INT4_GROUP=attn|mlp restricts quantization to one group
   // (bisection aid when a model degrades under int4).
   const char* group_env = std::getenv("LLAMA_INFER_PLAN_INT4_GROUP");
@@ -1740,7 +1753,14 @@ void PlanCudaEngine::build_plan() {
     Op h;
     h.kind = OpKind::LmHead;
     h.in = Slot::XNorm;
-    h.weight = dev_at(wprefix_ + "embed_tokens.weight");
+    if (d_head_q_ != nullptr) {
+      h.qweight = d_head_q_;
+      h.qscales = d_head_qs_;
+      h.qbits = 8;
+      h.qgroup = 0;
+    } else {
+      h.weight = dev_at(wprefix_ + "embed_tokens.weight");
+    }
     h.cols = cfg_.vocab;
     h.in_dim = H;
     epi.push_back(h);
@@ -1877,6 +1897,13 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
       case OpKind::LmHead:
         // In sequence mode only the LAST token's logits are wanted -- running the head
         // over the whole prompt would cost a 262K-wide GEMM per token for nothing.
+        if (op.qbits == 8) {
+          kernels::launch_weight_only_int8_gemv_f32(
+              QW(op.qweight), QS(op.qscales),
+              S(op.in) + static_cast<std::size_t>(T - 1) * static_cast<std::size_t>(op.in_dim),
+              d_logits_, op.cols, op.in_dim, stream_);
+          break;
+        }
         kernels::launch_rowmajor_half_gemv_f32(
             HW(op.weight),
             S(op.in) + static_cast<std::size_t>(T - 1) * static_cast<std::size_t>(op.in_dim),

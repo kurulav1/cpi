@@ -417,6 +417,11 @@ private:
   int persist_blocks_ = 0;
   bool persist_enabled_ = false;
 
+  // Rowwise-int8 packed copy of the tied embedding table, used by the LM head ONLY on
+  // quant runs (EmbeddingLookup keeps reading the fp16 table). nullptr = fp16 head.
+  std::int8_t* d_head_q_ = nullptr;
+  float* d_head_qs_ = nullptr;
+
   // Split-K decode-attention scratch for the wide-head (any-head_dim) path. Sized
   // num_heads x split_any_chunks_ (x maxhd for the partial outputs) in allocate_buffers.
   static constexpr int kSplitAnyChunk = 32;

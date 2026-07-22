@@ -460,6 +460,117 @@ __global__ void weight_only_int4_matvec_kernel(const int8_t* w_packed, const flo
   }
 }
 
+// Wide warp-per-row decode kernels. The block-per-row kernels above read the packed row a
+// BYTE at a time -- 196 GB/s effective on the 5090, which handed the whole bandwidth win of
+// int4 back. These mirror gemv_wide_kernel's shape (Warps warps per block, one row per warp,
+// 16-byte vector loads, kUnroll prefetch) on the packed data. A 16-byte chunk holds 32 int4
+// or 16 int8 weights; group scales hoist per chunk when group % 32 == 0 (the default 128).
+// The launchers route here when the shape allows and fall back to the naive kernels else.
+template <int Warps>
+__global__ void weight_only_int4_matvec_grouped_wide_kernel(const int8_t* __restrict__ w_packed,
+                                                            const float* __restrict__ scales,
+                                                            const half* __restrict__ x,
+                                                            half* __restrict__ y, int out_features,
+                                                            int in_features, int group_shift,
+                                                            int n_groups) {
+  const int row = blockIdx.x * Warps + (threadIdx.x / warpSize);
+  if (row >= out_features) {
+    return;
+  }
+  const int lane = threadIdx.x & (warpSize - 1);
+  const int packed_cols = in_features / 2;
+  const int4* wrow = reinterpret_cast<const int4*>(
+      w_packed + static_cast<std::size_t>(row) * static_cast<std::size_t>(packed_cols));
+  const float* row_s = scales + static_cast<std::size_t>(row) * static_cast<std::size_t>(n_groups);
+  const half2* x2 = reinterpret_cast<const half2*>(x);
+
+  const int chunks = packed_cols / 16;  // 32 weights per 16-byte chunk
+  constexpr int kUnroll = 4;
+  float acc = 0.0f;
+  int4 wbuf[kUnroll];
+  for (int base = lane; base < chunks; base += warpSize * kUnroll) {
+#pragma unroll
+    for (int u = 0; u < kUnroll; ++u) {
+      const int c = base + u * warpSize;
+      if (c < chunks) {
+        wbuf[u] = wrow[c];
+      }
+    }
+#pragma unroll
+    for (int u = 0; u < kUnroll; ++u) {
+      const int c = base + u * warpSize;
+      if (c < chunks) {
+        const float s = row_s[(c * 32) >> group_shift];
+        float chunk = 0.0f;
+        const unsigned* wu = reinterpret_cast<const unsigned*>(&wbuf[u]);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          const unsigned word = wu[i];  // 4 bytes = 8 consecutive weights
+#pragma unroll
+          for (int b = 0; b < 4; ++b) {
+            const unsigned byte = (word >> (8 * b)) & 0xFFu;
+            const int lo = static_cast<int>((byte & 0x0Fu) ^ 0x8u) - 0x8;
+            const int hi = static_cast<int>((byte >> 4) ^ 0x8u) - 0x8;
+            const float2 xv = __half22float2(x2[c * 16 + i * 4 + b]);
+            chunk += static_cast<float>(lo) * xv.x + static_cast<float>(hi) * xv.y;
+          }
+        }
+        acc += s * chunk;
+      }
+    }
+  }
+  acc = warp_sum(acc);
+  if (lane == 0) {
+    y[row] = __float2half(acc);
+  }
+}
+
+template <int Warps>
+__global__ void weight_only_int8_matvec_wide_kernel(const int8_t* __restrict__ w,
+                                                    const float* __restrict__ scales,
+                                                    const half* __restrict__ x,
+                                                    half* __restrict__ y, int out_features,
+                                                    int in_features) {
+  const int row = blockIdx.x * Warps + (threadIdx.x / warpSize);
+  if (row >= out_features) {
+    return;
+  }
+  const int lane = threadIdx.x & (warpSize - 1);
+  const int4* wrow = reinterpret_cast<const int4*>(
+      w + static_cast<std::size_t>(row) * static_cast<std::size_t>(in_features));
+  const half2* x2 = reinterpret_cast<const half2*>(x);
+
+  const int chunks = in_features / 16;  // 16 weights per 16-byte chunk
+  constexpr int kUnroll = 4;
+  float acc = 0.0f;
+  int4 wbuf[kUnroll];
+  for (int base = lane; base < chunks; base += warpSize * kUnroll) {
+#pragma unroll
+    for (int u = 0; u < kUnroll; ++u) {
+      const int c = base + u * warpSize;
+      if (c < chunks) {
+        wbuf[u] = wrow[c];
+      }
+    }
+#pragma unroll
+    for (int u = 0; u < kUnroll; ++u) {
+      const int c = base + u * warpSize;
+      if (c < chunks) {
+        const int8_t* wb = reinterpret_cast<const int8_t*>(&wbuf[u]);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+          const float2 xv = __half22float2(x2[c * 8 + i]);
+          acc += static_cast<float>(wb[2 * i]) * xv.x + static_cast<float>(wb[2 * i + 1]) * xv.y;
+        }
+      }
+    }
+  }
+  acc = warp_sum(acc);
+  if (lane == 0) {
+    y[row] = __float2half(acc * scales[row]);
+  }
+}
+
 // Group-wise scales: the scale varies along the row, so it cannot be hoisted out
 // of the dot product the way the per-row kernels do. Each weight is dequantised
 // with its own group's scale before it is accumulated. `group_shift` is
@@ -809,6 +920,13 @@ void launch_weight_only_int8_gemv_f32(const int8_t* w, const float* scales, cons
 
 void launch_weight_only_int8_matvec(const int8_t* w, const float* scales, const half* x, half* y,
                                     int out_features, int in_features, cudaStream_t stream) {
+  if ((in_features % 16) == 0) {
+    constexpr int kWarps = 4;
+    const int blocks = (out_features + kWarps - 1) / kWarps;
+    weight_only_int8_matvec_wide_kernel<kWarps>
+        <<<blocks, kWarps * 32, 0, stream>>>(w, scales, x, y, out_features, in_features);
+    return;
+  }
   const int threads = choose_reduction_threads(in_features);
   weight_only_int8_matvec_kernel<<<out_features, threads,
                                    static_cast<std::size_t>(threads) * sizeof(float), stream>>>(
@@ -840,6 +958,13 @@ void launch_weight_only_int4_matvec_grouped(const int8_t* w_packed, const float*
     return;  // caller bug: group must be a positive power of two
   }
   const int n_groups = quant_group_count(in_features, group);
+  if ((in_features % 32) == 0 && (group % 32) == 0) {
+    constexpr int kWarps = 4;
+    const int blocks = (out_features + kWarps - 1) / kWarps;
+    weight_only_int4_matvec_grouped_wide_kernel<kWarps><<<blocks, kWarps * 32, 0, stream>>>(
+        w_packed, scales, x, y, out_features, in_features, shift, n_groups);
+    return;
+  }
   const int threads = choose_reduction_threads(in_features);
   weight_only_int4_matvec_grouped_kernel<<<
       out_features, threads, static_cast<std::size_t>(threads) * sizeof(float), stream>>>(
