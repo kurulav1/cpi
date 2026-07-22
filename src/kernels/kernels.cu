@@ -343,6 +343,46 @@ __global__ void rope_inplace_partial_table_kernel(half* q, half* k, int num_head
   }
 }
 
+// The device-position twin of rope_inplace_partial_table_kernel, byte-for-byte the same
+// arithmetic: only the position source differs. Keep the two in lockstep -- the graph gate
+// (graphs-on vs LLAMA_INFER_PLAN_NO_GRAPH streams must be token-identical) is what catches
+// drift between them.
+__global__ void rope_inplace_partial_table_device_pos_kernel(half* q, half* k, int num_heads_q,
+                                                             int num_heads_k, int head_dim,
+                                                             int rotary_dim,
+                                                             const int* position_ptr,
+                                                             const float* cos_table,
+                                                             const float* sin_table) {
+  const int position = position_ptr[0];
+  const int head = blockIdx.x;
+  const int pair = threadIdx.x;
+  const int half_dim = rotary_dim / 2;
+  if (pair >= half_dim) {
+    return;
+  }
+
+  const int table_idx = position * half_dim + pair;
+  const float c = cos_table[table_idx];
+  const float s = sin_table[table_idx];
+
+  if (head < num_heads_q) {
+    const int i0 = head * head_dim + pair;
+    const int i1 = head * head_dim + pair + half_dim;
+    const float q0 = __half2float(q[i0]);
+    const float q1 = __half2float(q[i1]);
+    q[i0] = __float2half(q0 * c - q1 * s);
+    q[i1] = __float2half(q1 * c + q0 * s);
+  }
+  if (head < num_heads_k) {
+    const int i0 = head * head_dim + pair;
+    const int i1 = head * head_dim + pair + half_dim;
+    const float k0 = __half2float(k[i0]);
+    const float k1 = __half2float(k[i1]);
+    k[i0] = __float2half(k0 * c - k1 * s);
+    k[i1] = __float2half(k1 * c + k0 * s);
+  }
+}
+
 __global__ void rope_inplace_device_pos_kernel(half* q, half* k, int num_heads_q, int num_heads_k,
                                                int head_dim, const int* position_ptr,
                                                const float* cos_table, const float* sin_table) {
@@ -1082,6 +1122,19 @@ void launch_rope_inplace_partial_table(half* q, half* k, int num_heads_q, int nu
   const int threads = rotary_dim / 2;
   const int blocks = (num_heads_q > num_heads_k) ? num_heads_q : num_heads_k;
   rope_inplace_partial_table_kernel<<<blocks, threads, 0, stream>>>(
+      q, k, num_heads_q, num_heads_k, head_dim, rotary_dim, position, cos_table, sin_table);
+}
+
+void launch_rope_inplace_partial_table_device_pos(half* q, half* k, int num_heads_q,
+                                                  int num_heads_k, int head_dim, int rotary_dim,
+                                                  const int* position, const float* cos_table,
+                                                  const float* sin_table, cudaStream_t stream) {
+  if (rotary_dim <= 0 || (rotary_dim & 1) != 0) {
+    return;
+  }
+  const int threads = rotary_dim / 2;
+  const int blocks = (num_heads_q > num_heads_k) ? num_heads_q : num_heads_k;
+  rope_inplace_partial_table_device_pos_kernel<<<blocks, threads, 0, stream>>>(
       q, k, num_heads_q, num_heads_k, head_dim, rotary_dim, position, cos_table, sin_table);
 }
 

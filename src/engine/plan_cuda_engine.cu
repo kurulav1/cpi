@@ -836,8 +836,10 @@ void PlanCudaEngine::open(const std::string& cpi_path, int max_context) {
       wprefix_ = "model.language_model.";
       parse_gemma4_st_config(cpi_path);
       if (max_ctx_ <= 0) max_ctx_ = 4096;
-      // Gemma's dual/partial RoPE has no device-position kernel, same as Qwen's.
-      decode_graph_enabled_ = false;
+      // Decode-graph capture stays ON: every op in this plan has a device-position variant
+      // (partial RoPE gained its twin -- launch_rope_inplace_partial_table_device_pos; the
+      // sliding/full attention and KV store already had theirs). Gate: graphs-on and
+      // LLAMA_INFER_PLAN_NO_GRAPH=1 must produce token-identical streams.
       G4_CHECK(cudaStreamCreate(&stream_));
       load_all(cpi_path);
       build_rope_tables();
@@ -867,9 +869,10 @@ void PlanCudaEngine::open(const std::string& cpi_path, int max_context) {
     if (max_ctx_ <= 0 ||
         (cfg_.max_position_embeddings > 0 && max_ctx_ > cfg_.max_position_embeddings))
       max_ctx_ = std::min(max_ctx_ > 0 ? max_ctx_ : 2048, cfg_.max_position_embeddings);
-    // Partial RoPE has no device-position kernel, so this plan cannot be graphed.
-    // A capability decision made on the PLAN, not on a model name.
-    decode_graph_enabled_ = false;
+    // Partial RoPE gained its device-position twin (launch_rope_inplace_partial_table_device_pos),
+    // so this plan is graph-capturable now: the delta-net state ops read/write fixed device
+    // buffers and every position-dependent op has a device-position variant. Gate: graphs-on and
+    // LLAMA_INFER_PLAN_NO_GRAPH=1 must produce token-identical streams.
     G4_CHECK(cudaStreamCreate(&stream_));
     load_qwen35_weights();
     build_rope_tables();
@@ -1833,12 +1836,18 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
         const float* cosT = op.rope_table == RopeTable::Full ? d_cos_full_ : d_cos_sliding_;
         const float* sinT = op.rope_table == RopeTable::Full ? d_sin_full_ : d_sin_sliding_;
         if (op.rotary_dim > 0) {
-          // Partial RoPE over Q (in) and K (in2) together. No device-position
-          // variant exists, so a plan using it runs without the decode graph
-          // (capability tiering: the plan decides, not the model name).
-          kernels::launch_rope_inplace_partial_table(S(op.in), S(op.in2), op.heads, op.kv_heads,
-                                                     op.head_dim, op.rotary_dim, position, cosT,
-                                                     sinT, stream_);
+          // Partial RoPE over Q (in) and K (in2) together. The device-position twin is what
+          // makes partial-RoPE plans graph-capturable -- it was the ONE missing kernel that
+          // kept Gemma 4 decode launching ~700 kernels per token from the host.
+          if (device_pos_mode_) {
+            kernels::launch_rope_inplace_partial_table_device_pos(
+                S(op.in), S(op.in2), op.heads, op.kv_heads, op.head_dim, op.rotary_dim,
+                d_position_, cosT, sinT, stream_);
+          } else {
+            kernels::launch_rope_inplace_partial_table(S(op.in), S(op.in2), op.heads, op.kv_heads,
+                                                       op.head_dim, op.rotary_dim, position, cosT,
+                                                       sinT, stream_);
+          }
         } else if (seq) {
           // Sequence prefill: token t sits at position (chunk start + t).
           kernels::launch_rope_seq_table(S(op.in), op.heads, op.head_dim, position, T, cosT, sinT,

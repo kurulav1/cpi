@@ -141,6 +141,16 @@ void launch_rope_inplace_partial_table(half* q, half* k, int num_heads_q, int nu
                                        const float* cos_table, const float* sin_table,
                                        cudaStream_t stream);
 
+// launch_rope_inplace_partial_table_device_pos
+//
+// The partial-RoPE variant with the position read from a device pointer -- the piece that
+// makes plans carrying partial RoPE (Gemma 4's full layers, Qwen3.5's attention layers)
+// graph-capturable. Same table layout as launch_rope_inplace_partial_table.
+void launch_rope_inplace_partial_table_device_pos(half* q, half* k, int num_heads_q,
+                                                  int num_heads_k, int head_dim, int rotary_dim,
+                                                  const int* position, const float* cos_table,
+                                                  const float* sin_table, cudaStream_t stream);
+
 // launch_rope_inplace_device_pos
 //
 // In-place RoPE using a precomputed cos/sin table where the position is read
