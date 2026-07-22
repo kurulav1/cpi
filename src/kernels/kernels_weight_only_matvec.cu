@@ -689,88 +689,88 @@ __device__ __forceinline__ float glu_gelu_tanh_f32(float x) {
   return 0.5f * x * (1.0f + tanhf(k * (x + 0.044715f * x * x * x)));
 }
 
-// Fused GeGLU dp4a matvec (the llama.cpp gated-activation fusion): one warp computes row r
-// of BOTH the gate and up projections against the shared perm8 activation and writes
-// out[r] = gelu(gate_r) * up_r directly -- no Gate/Up round-trip, no separate GeluMul
-// launch. Numerics match the unfused path: both dots are rounded to fp16 first (that is
-// what the standalone GeluMul read back), then gelu in fp32.
-template <int Warps>
+// Fused GeGLU dp4a matvec (the llama.cpp gated-activation fusion): out[r] =
+// gelu(gate_r) * up_r with no Gate/Up round-trip and no elementwise launch. Warp shape
+// matters: a first version gave each warp BOTH rows and measured 36% DRAM (the
+// rows-per-warp-2 penalty, third occurrence) -- so each warp owns ONE row of ONE matrix
+// (the proven wide-kernel shape): warps 0..3 take four gate rows, warps 4..7 their up
+// partners, and a tiny shared-memory epilogue pairs them. Numerics match the unfused
+// path: both dots round to fp16 before the gelu.
+template <int RowsPerBlock>
 __global__ void weight_only_int4_matvec_grouped_dp4a_glu_kernel(
     const int8_t* __restrict__ wg, const float* __restrict__ sg, const int8_t* __restrict__ wu,
     const float* __restrict__ su, const int8_t* __restrict__ xq,
     const float* __restrict__ x_scale, half* __restrict__ y, int out_features, int in_features,
     int group_shift, int n_groups) {
-  const int row = blockIdx.x * Warps + (threadIdx.x / warpSize);
-  if (row >= out_features) {
-    return;
-  }
+  __shared__ float pair_acc[2 * RowsPerBlock];
+  const int warp_id = threadIdx.x / warpSize;
   const int lane = threadIdx.x & (warpSize - 1);
+  const bool is_up = warp_id >= RowsPerBlock;
+  const int local_row = is_up ? (warp_id - RowsPerBlock) : warp_id;
+  const int row = blockIdx.x * RowsPerBlock + local_row;
   const int packed_cols = in_features / 2;
-  const uint4* wrow_g = reinterpret_cast<const uint4*>(
-      wg + static_cast<std::size_t>(row) * static_cast<std::size_t>(packed_cols));
-  const uint4* wrow_u = reinterpret_cast<const uint4*>(
-      wu + static_cast<std::size_t>(row) * static_cast<std::size_t>(packed_cols));
-  const float* row_sg = sg + static_cast<std::size_t>(row) * static_cast<std::size_t>(n_groups);
-  const float* row_su = su + static_cast<std::size_t>(row) * static_cast<std::size_t>(n_groups);
-
   const int chunks = packed_cols / 16;
-  constexpr int kUnroll = 2;
-  float acc_g = 0.0f, acc_u = 0.0f;
-  uint4 gbuf[kUnroll], ubuf[kUnroll];
-  float sgbuf[kUnroll], subuf[kUnroll];
-  for (int base = lane; base < chunks; base += warpSize * kUnroll) {
+  float acc = 0.0f;
+  if (row < out_features) {
+    const int8_t* w = is_up ? wu : wg;
+    const float* sc = is_up ? su : sg;
+    const uint4* wrow = reinterpret_cast<const uint4*>(
+        w + static_cast<std::size_t>(row) * static_cast<std::size_t>(packed_cols));
+    const float* row_s = sc + static_cast<std::size_t>(row) * static_cast<std::size_t>(n_groups);
+
+    constexpr int kUnroll = 4;
+    uint4 wbuf[kUnroll];
+    float sbuf[kUnroll];
+    for (int base = lane; base < chunks; base += warpSize * kUnroll) {
 #pragma unroll
-    for (int u = 0; u < kUnroll; ++u) {
-      const int c = base + u * warpSize;
-      if (c < chunks) {
-        gbuf[u] = wrow_g[c];
-        ubuf[u] = wrow_u[c];
-        sgbuf[u] = row_sg[(c * 32) >> group_shift];
-        subuf[u] = row_su[(c * 32) >> group_shift];
-      }
-    }
-#pragma unroll
-    for (int u = 0; u < kUnroll; ++u) {
-      const int c = base + u * warpSize;
-      if (c < chunks) {
-        const uint4 xa = reinterpret_cast<const uint4*>(xq)[2 * c];
-        const uint4 xb = reinterpret_cast<const uint4*>(xq)[2 * c + 1];
-        const int xv[8] = {static_cast<int>(xa.x), static_cast<int>(xa.y),
-                           static_cast<int>(xa.z), static_cast<int>(xa.w),
-                           static_cast<int>(xb.x), static_cast<int>(xb.y),
-                           static_cast<int>(xb.z), static_cast<int>(xb.w)};
-        const unsigned* gu = reinterpret_cast<const unsigned*>(&gbuf[u]);
-        const unsigned* uu = reinterpret_cast<const unsigned*>(&ubuf[u]);
-        int gg = 0, gu_acc = 0;
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-          const unsigned wgw = gu[i];
-          const int g_lo =
-              __vsubss4(static_cast<int>((wgw & 0x0F0F0F0Fu) ^ 0x08080808u), 0x08080808);
-          const int g_hi =
-              __vsubss4(static_cast<int>(((wgw >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u), 0x08080808);
-          gg = __dp4a(g_lo, xv[2 * i], gg);
-          gg = __dp4a(g_hi, xv[2 * i + 1], gg);
-          const unsigned wuw = uu[i];
-          const int u_lo =
-              __vsubss4(static_cast<int>((wuw & 0x0F0F0F0Fu) ^ 0x08080808u), 0x08080808);
-          const int u_hi =
-              __vsubss4(static_cast<int>(((wuw >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u), 0x08080808);
-          gu_acc = __dp4a(u_lo, xv[2 * i], gu_acc);
-          gu_acc = __dp4a(u_hi, xv[2 * i + 1], gu_acc);
+      for (int u = 0; u < kUnroll; ++u) {
+        const int c = base + u * warpSize;
+        if (c < chunks) {
+          wbuf[u] = wrow[c];
+          sbuf[u] = row_s[(c * 32) >> group_shift];
         }
-        acc_g += static_cast<float>(gg) * sgbuf[u];
-        acc_u += static_cast<float>(gu_acc) * subuf[u];
+      }
+#pragma unroll
+      for (int u = 0; u < kUnroll; ++u) {
+        const int c = base + u * warpSize;
+        if (c < chunks) {
+          const uint4 xa = reinterpret_cast<const uint4*>(xq)[2 * c];
+          const uint4 xb = reinterpret_cast<const uint4*>(xq)[2 * c + 1];
+          const int xv[8] = {static_cast<int>(xa.x), static_cast<int>(xa.y),
+                             static_cast<int>(xa.z), static_cast<int>(xa.w),
+                             static_cast<int>(xb.x), static_cast<int>(xb.y),
+                             static_cast<int>(xb.z), static_cast<int>(xb.w)};
+          const unsigned* wu4 = reinterpret_cast<const unsigned*>(&wbuf[u]);
+          int gacc = 0;
+#pragma unroll
+          for (int i = 0; i < 4; ++i) {
+            const unsigned word = wu4[i];
+            const int wlo =
+                __vsubss4(static_cast<int>((word & 0x0F0F0F0Fu) ^ 0x08080808u), 0x08080808);
+            const int whi =
+                __vsubss4(static_cast<int>(((word >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u),
+                          0x08080808);
+            gacc = __dp4a(wlo, xv[2 * i], gacc);
+            gacc = __dp4a(whi, xv[2 * i + 1], gacc);
+          }
+          acc += static_cast<float>(gacc) * sbuf[u];
+        }
       }
     }
+    acc = warp_sum(acc);
   }
-  acc_g = warp_sum(acc_g);
-  acc_u = warp_sum(acc_u);
   if (lane == 0) {
-    const float xs = x_scale[0];
-    const float gate_h = __half2float(__float2half(acc_g * xs));
-    const float up_h = __half2float(__float2half(acc_u * xs));
-    y[row] = __float2half(glu_gelu_tanh_f32(gate_h) * up_h);
+    pair_acc[warp_id] = acc;
+  }
+  __syncthreads();
+  if (warp_id == 0 && lane < RowsPerBlock) {
+    const int out_row = blockIdx.x * RowsPerBlock + lane;
+    if (out_row < out_features) {
+      const float xs = x_scale[0];
+      const float gate_h = __half2float(__float2half(pair_acc[lane] * xs));
+      const float up_h = __half2float(__float2half(pair_acc[RowsPerBlock + lane] * xs));
+      y[out_row] = __float2half(glu_gelu_tanh_f32(gate_h) * up_h);
+    }
   }
 }
 
@@ -1260,9 +1260,9 @@ void launch_weight_only_int4_matvec_grouped_dp4a_glu(
     return;  // caller gates
   }
   const int n_groups = quant_group_count(in_features, group);
-  constexpr int kWarps = 4;
-  const int blocks = (out_features + kWarps - 1) / kWarps;
-  weight_only_int4_matvec_grouped_dp4a_glu_kernel<kWarps><<<blocks, kWarps * 32, 0, stream>>>(
+  constexpr int kRows = 4;  // 8 warps: 4 gate rows + their 4 up partners
+  const int blocks = (out_features + kRows - 1) / kRows;
+  weight_only_int4_matvec_grouped_dp4a_glu_kernel<kRows><<<blocks, kRows * 64, 0, stream>>>(
       wg, sg, wu, su, xq, x_scale, y, out_features, in_features, shift, n_groups);
 }
 
