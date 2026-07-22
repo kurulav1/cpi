@@ -566,6 +566,14 @@ __global__ void weight_only_int4_matvec_grouped_dp4a_wide_kernel(
       const int c = base + u * warpSize;
       if (c < chunks) {
         const unsigned* wu = reinterpret_cast<const unsigned*>(&wbuf[u]);
+        // x for the chunk as two 128-bit loads (8 words) instead of eight 32-bit loads:
+        // the kernel was 78% long-scoreboard stalled, largely on x-read L1TEX slots.
+        const uint4 xa = reinterpret_cast<const uint4*>(xq)[2 * c];
+        const uint4 xb = reinterpret_cast<const uint4*>(xq)[2 * c + 1];
+        const int xv[8] = {static_cast<int>(xa.x), static_cast<int>(xa.y),
+                           static_cast<int>(xa.z), static_cast<int>(xa.w),
+                           static_cast<int>(xb.x), static_cast<int>(xb.y),
+                           static_cast<int>(xb.z), static_cast<int>(xb.w)};
         int gacc = 0;
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
@@ -576,8 +584,8 @@ __global__ void weight_only_int4_matvec_grouped_dp4a_wide_kernel(
               __vsubss4(static_cast<int>((word & 0x0F0F0F0Fu) ^ 0x08080808u), 0x08080808);
           const int whi =
               __vsubss4(static_cast<int>(((word >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u), 0x08080808);
-          gacc = __dp4a(wlo, xw[8 * c + 2 * i], gacc);
-          gacc = __dp4a(whi, xw[8 * c + 2 * i + 1], gacc);
+          gacc = __dp4a(wlo, xv[2 * i], gacc);
+          gacc = __dp4a(whi, xv[2 * i + 1], gacc);
         }
         acc += static_cast<float>(gacc) * sbuf[u];
       }
@@ -647,6 +655,14 @@ __global__ void weight_only_int4_matvec_grouped_dp4a_cat_kernel(
       const int c = base + u * warpSize;
       if (c < chunks) {
         const unsigned* wu = reinterpret_cast<const unsigned*>(&wbuf[u]);
+        // x for the chunk as two 128-bit loads (8 words) instead of eight 32-bit loads:
+        // the kernel was 78% long-scoreboard stalled, largely on x-read L1TEX slots.
+        const uint4 xa = reinterpret_cast<const uint4*>(xq)[2 * c];
+        const uint4 xb = reinterpret_cast<const uint4*>(xq)[2 * c + 1];
+        const int xv[8] = {static_cast<int>(xa.x), static_cast<int>(xa.y),
+                           static_cast<int>(xa.z), static_cast<int>(xa.w),
+                           static_cast<int>(xb.x), static_cast<int>(xb.y),
+                           static_cast<int>(xb.z), static_cast<int>(xb.w)};
         int gacc = 0;
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
@@ -655,8 +671,8 @@ __global__ void weight_only_int4_matvec_grouped_dp4a_cat_kernel(
               __vsubss4(static_cast<int>((word & 0x0F0F0F0Fu) ^ 0x08080808u), 0x08080808);
           const int whi =
               __vsubss4(static_cast<int>(((word >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u), 0x08080808);
-          gacc = __dp4a(wlo, xw[8 * c + 2 * i], gacc);
-          gacc = __dp4a(whi, xw[8 * c + 2 * i + 1], gacc);
+          gacc = __dp4a(wlo, xv[2 * i], gacc);
+          gacc = __dp4a(whi, xv[2 * i + 1], gacc);
         }
         acc += static_cast<float>(gacc) * sbuf[u];
       }
