@@ -388,6 +388,82 @@ int main() {
     check(bits == 4 ? "gemv_int4" : "gemv_int8", compare(got, want), 0.05);
   }
 
+  // ---- Fused GeGLU quant GEMV (gate|up|gelu in one dispatch) --------------
+  // Added the day the fusion shipped broken and generation died silently: nothing else
+  // exercises this kernel against a reference.
+  for (int bits : {4, 8}) {
+    const std::uint32_t out_dim = 96, in_dim = 256, group = 64;
+    const std::uint32_t groups_n = in_dim / group;
+    const float max_q = (bits == 4) ? 7.0f : 127.0f;
+    std::vector<float> Wg(out_dim * in_dim), Wu(out_dim * in_dim);
+    std::vector<std::uint16_t> xin(in_dim);
+    for (auto& v : Wg) v = dist(rng) * 0.2f;
+    for (auto& v : Wu) v = dist(rng) * 0.2f;
+    for (auto& v : xin) v = f32_to_f16(dist(rng));
+    const std::uint32_t packed_row = (bits == 4) ? in_dim / 2 : in_dim;
+    std::vector<std::uint8_t> pg(out_dim * packed_row, 0), pu(out_dim * packed_row, 0);
+    std::vector<float> sg(out_dim * groups_n), su(out_dim * groups_n);
+    std::vector<float> dg(out_dim * in_dim), du(out_dim * in_dim);
+    auto quant = [&](const std::vector<float>& W, std::vector<std::uint8_t>& packed,
+                     std::vector<float>& scales, std::vector<float>& deq) {
+      for (std::uint32_t r = 0; r < out_dim; ++r) {
+        for (std::uint32_t g = 0; g < groups_n; ++g) {
+          float amax = 0.0f;
+          for (std::uint32_t j = g * group; j < (g + 1) * group; ++j)
+            amax = std::max(amax, std::fabs(W[r * in_dim + j]));
+          const float sc = std::max(amax / max_q, 1e-8f);
+          scales[r * groups_n + g] = sc;
+          for (std::uint32_t j = g * group; j < (g + 1) * group; ++j) {
+            int q = static_cast<int>(std::lround(W[r * in_dim + j] / sc));
+            q = (bits == 4) ? std::max(-8, std::min(7, q)) : std::max(-127, std::min(127, q));
+            deq[r * in_dim + j] = static_cast<float>(q) * sc;
+            if (bits == 4) {
+              const std::uint8_t nib = static_cast<std::uint8_t>(q < 0 ? q + 16 : q);
+              std::uint8_t& b = packed[r * packed_row + j / 2];
+              b = (j & 1) == 0 ? static_cast<std::uint8_t>((b & 0xF0u) | nib)
+                               : static_cast<std::uint8_t>((b & 0x0Fu) | (nib << 4));
+            } else {
+              packed[r * packed_row + j] = static_cast<std::uint8_t>(static_cast<std::int8_t>(q));
+            }
+          }
+        }
+      }
+    };
+    quant(Wg, pg, sg, dg);
+    quant(Wu, pu, su, du);
+    auto bg = ctx.alloc_from(pg.data(), pg.size());
+    auto bsg = ctx.alloc_from(sg.data(), sg.size() * sizeof(float));
+    auto bu = ctx.alloc_from(pu.data(), pu.size());
+    auto bsu = ctx.alloc_from(su.data(), su.size() * sizeof(float));
+    auto bx = ctx.alloc_from(xin.data(), xin.size() * 2);
+    auto bo = ctx.alloc(out_dim * 2);
+    struct QCP {
+      std::uint32_t n0, n1, n2, in_dim, tokens, bits, group, groups, has_bias;
+    } p{out_dim, 0, 0, in_dim, 1, static_cast<std::uint32_t>(bits), group, groups_n, 0};
+    const void* bufs[] = {bx.handle(), bg.handle(), bsg.handle(),
+                          bu.handle(), bsu.handle(), bo.handle()};
+    const std::size_t pairs_per_tg = 4;  // 256 threads = 8 simds, half gate half up
+    ctx.dispatch("cpi_gemv_quant_glu", runtime::MetalContext::Grid::Groups,
+                 (out_dim + pairs_per_tg - 1) / pairs_per_tg, 256, bufs, nullptr, 6, &p,
+                 sizeof(p));
+    ctx.commit_and_wait();
+    std::vector<float> want(out_dim), got(out_dim);
+    for (std::uint32_t r = 0; r < out_dim; ++r) {
+      float ag = 0.0f, au = 0.0f;
+      for (std::uint32_t j = 0; j < in_dim; ++j) {
+        ag += dg[r * in_dim + j] * f16_to_f32(xin[j]);
+        au += du[r * in_dim + j] * f16_to_f32(xin[j]);
+      }
+      const float g = f16_to_f32(f32_to_f16(ag));
+      const float u = f16_to_f32(f32_to_f16(au));
+      const float kg = 0.7978845608028654f;
+      want[r] = 0.5f * g * (1.0f + std::tanh(kg * (g + 0.044715f * g * g * g))) * u;
+    }
+    const auto* o = static_cast<const std::uint16_t*>(bo.contents());
+    for (std::size_t i = 0; i < got.size(); ++i) got[i] = f16_to_f32(o[i]);
+    check(bits == 4 ? "gemv_glu_int4" : "gemv_glu_int8", compare(got, want), 0.05);
+  }
+
   // ---- Quantized GEMM (int4/int8), the multi-token prefill path ----------
   // Same story as the fp16 GEMM above: this kernel had no check of its own, and it only runs
   // at T >= kGemmMinTokens, which no golden prompt reaches. It carries the 8B's entire
