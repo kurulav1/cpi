@@ -2260,7 +2260,7 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
             {
               const int live_tokens = chunks * kSplitAnyChunk;
               if (live_tokens >= 2048) {
-                cs = 64;
+                cs = 32;
                 chunks = (live_tokens + cs - 1) / cs;
               }
             }
