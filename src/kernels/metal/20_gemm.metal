@@ -558,16 +558,17 @@ kernel void cpi_gemv_quant(
       const uint j0 = k << 4;
       const float sc = srow[j0 / gsz];  // gsz is a multiple of 16 here
 
+      char4 qb[4];
+      for (uint w = 0u; w < 4u; ++w) {
+        const uint word = (w == 0u) ? packed.x : (w == 1u) ? packed.y
+                        : (w == 2u) ? packed.z : packed.w;
+        qb[w] = as_type<char4>(word);  // int8 needs no decode; bytes ARE the weights
+      }
       for (uint t = 0u; t < nt; ++t) {
-        device const half* x = in + (ulong)(t0 + t) * (ulong)p.in_dim + j0;
+        device const half4* x4 = (device const half4*)(in + (ulong)(t0 + t) * (ulong)p.in_dim + j0);
         float sub = 0.0f;
         for (uint w = 0u; w < 4u; ++w) {
-          const uint word = (w == 0u) ? packed.x : (w == 1u) ? packed.y
-                          : (w == 2u) ? packed.z : packed.w;
-          for (uint e = 0u; e < 4u; ++e) {
-            const int q = int(char((word >> (8u * e)) & 0xFFu));
-            sub += float(q) * float(x[w * 4u + e]);
-          }
+          sub += dot(float4(qb[w]), float4(x4[w]));
         }
         acc[t] += sub * sc;
       }
@@ -673,16 +674,17 @@ static inline void qcat_row(device const uchar* qw, device const float* scales,
       const uint4 packed = w16[k];
       const uint j0 = k << 4;
       const float sc = srow[j0 / gsz];
+      char4 qb[4];
+      for (uint w = 0u; w < 4u; ++w) {
+        const uint word =
+            (w == 0u) ? packed.x : (w == 1u) ? packed.y : (w == 2u) ? packed.z : packed.w;
+        qb[w] = as_type<char4>(word);  // int8 needs no decode; bytes ARE the weights
+      }
       for (uint t = 0u; t < nt; ++t) {
-        device const half* x = in + (ulong)(t0 + t) * (ulong)in_dim + j0;
+        device const half4* x4 = (device const half4*)(in + (ulong)(t0 + t) * (ulong)in_dim + j0);
         float sub = 0.0f;
         for (uint w = 0u; w < 4u; ++w) {
-          const uint word =
-              (w == 0u) ? packed.x : (w == 1u) ? packed.y : (w == 2u) ? packed.z : packed.w;
-          for (uint e = 0u; e < 4u; ++e) {
-            const int q = int(char((word >> (8u * e)) & 0xFFu));
-            sub += float(q) * float(x[w * 4u + e]);
-          }
+          sub += dot(float4(qb[w]), float4(x4[w]));
         }
         acc[t] += sub * sc;
       }
