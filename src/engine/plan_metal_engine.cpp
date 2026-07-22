@@ -1263,8 +1263,12 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
       // GLU fusion (ported from the CUDA campaign): [gate][up][GeluMul] in ONE dispatch,
       // writing the activated product straight to the GeluMul's output -- no Gate/Up
       // round-trip and one dispatch fewer than the cat+gelu pair.
-      static const bool no_glu = std::getenv("CPI_METAL_NO_GLU") != nullptr;
-      const bool glu = !no_glu && gu && oi + 2 < ops.size() && ops[oi + 2].kind == OpKind::GeluMul &&
+      // MEASURED AND LOST as a default on the M4 (41.3 vs 46.5 tok/s interleaved): the
+      // paired-simd shape halves output rows per threadgroup, and a chained-cmdbuf
+      // dispatch after dep-elision is too cheap to be worth buying back. The CUDA win
+      // did not port. Opt-in for future hardware.
+      static const bool want_glu = std::getenv("CPI_METAL_GLU") != nullptr;
+      const bool glu = want_glu && gu && oi + 2 < ops.size() && ops[oi + 2].kind == OpKind::GeluMul &&
                        ops[oi + 2].in == op.out && ops[oi + 2].in2 == ops[oi + 1].out &&
                        ops[oi + 2].aux_ptr == nullptr && ops[oi + 2].aux_offset == 0 &&
                        ops[oi + 2].cols == op.cols && op.bias == nullptr &&
