@@ -407,6 +407,16 @@ private:
   // the full vocab-sized logit vector; only the ~k candidates come back.
   static constexpr int kMaxDeviceTopK = 256;
   static constexpr int kCandCapacity = kMaxDeviceTopK + 64;  // slack for ties at the k-th logit
+  // Persistent decode: the plan compiled to device-side op descriptors, executed as ONE
+  // cooperative launch per token (kernels_persistent_decode.cu). Compiled after build_plan;
+  // a plan with kinds the interpreter lacks compiles to "unsupported" and decode keeps the
+  // graph path. persist_enabled_ also drops to false if the cooperative launch is rejected.
+  bool compile_persistent_plan();
+  void* d_persist_ops_ = nullptr;  // kernels::PersistOp[], device
+  int persist_n_ops_ = 0;
+  int persist_blocks_ = 0;
+  bool persist_enabled_ = false;
+
   // Split-K decode-attention scratch for the wide-head (any-head_dim) path. Sized
   // num_heads x split_any_chunks_ (x maxhd for the partial outputs) in allocate_buffers.
   static constexpr int kSplitAnyChunk = 32;

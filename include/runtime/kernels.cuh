@@ -141,6 +141,56 @@ void launch_rope_inplace_partial_table(half* q, half* k, int num_heads_q, int nu
                                        const float* cos_table, const float* sin_table,
                                        cudaStream_t stream);
 
+// Persistent-decode interpreter (kernels_persistent_decode.cu): the whole single-token
+// forward as one cooperative launch over a device array of resolved op descriptors.
+// The engine compiles its (already-data) plan into these; kinds it cannot express reject
+// the plan at compile time and the decode falls back to the graph path.
+struct PersistOp {
+  enum Kind {
+    kEmbed = 0,
+    kScale,
+    kCopy,
+    kAdd,
+    kGeluMul,
+    kRmsNorm,
+    kRope,
+    kGemv,
+    kLmHead,
+    kKvStore,
+    kAttnStats,
+    kAttnReduce,
+  };
+  int kind = 0;
+  int rows = 0, cols = 0, in_dim = 0;
+  int heads = 0, kv_heads = 0, head_dim = 0, window = 0;
+  int aux_offset = 0, chunk_size = 0, chunks = 0;
+  float scale = 1.0f, eps = 1e-6f;
+  const half* weight = nullptr;
+  const half* in = nullptr;
+  const half* in2 = nullptr;
+  half* out = nullptr;
+  float* fout = nullptr;  // LmHead logits
+  const float* cosT = nullptr;
+  const float* sinT = nullptr;
+  float* sm = nullptr;  // attention scratch
+  float* sl = nullptr;
+  float* so = nullptr;
+  half* kcache = nullptr;
+  half* vcache = nullptr;
+  // Set by the compiler when the NEXT op reads only same-grid-stride elements of this op's
+  // output (a pure elementwise chain): the grid.sync after this op is skipped, because block
+  // b's writes are exactly what block b reads next.
+  int no_sync = 0;
+};
+
+// Grid size the cooperative launch can co-schedule (SMs x occupancy for the kernel).
+int persistent_decode_max_blocks();
+
+// One cooperative launch executing `n_ops` descriptors. Returns false if the launch is
+// rejected (co-residency), letting the caller fall back to the graph path.
+bool launch_persistent_decode(const PersistOp* ops, int n_ops, const int* tok, const int* pos,
+                              int blocks, cudaStream_t stream);
+
 // launch_attention_split_any / _device_pos
 //
 // Split-K decode attention for ANY even head_dim <= kTiledMaxHeadDim, sliding-window aware.

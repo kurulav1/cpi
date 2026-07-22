@@ -147,6 +147,7 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
     src/runtime/kv_cache.cpp
     src/kernels/kernels.cu
     src/kernels/kernels_attention_decode.cu
+    src/kernels/kernels_persistent_decode.cu
     src/kernels/kernels_attention_decode_int4.cu
     src/kernels/kernels_ops_matvec.cu
     src/kernels/kernels_moe_experts.cu

@@ -98,6 +98,7 @@ PlanCudaEngine::~PlanCudaEngine() {
   cudaFree(d_cand_idx_);
   cudaFree(d_cand_val_);
   cudaFree(d_cand_count_);
+  cudaFree(d_persist_ops_);
   cudaFree(d_split_m_);
   cudaFree(d_split_l_);
   cudaFree(d_split_o_);
@@ -860,6 +861,8 @@ void PlanCudaEngine::open(const std::string& cpi_path, int max_context) {
       build_rope_tables();
       allocate_buffers();
       build_plan();
+      persist_enabled_ =
+          std::getenv("CPI_CUDA_PERSISTENT") != nullptr && compile_persistent_plan();
       // The vision tower, when the checkpoint ships one. Opt out with
       // LLAMA_INFER_NO_VISION=1 (it costs VRAM even on text-only prompts).
       // Sequence prefill is a capability of the PLAN: partial RoPE and delta-net have no
@@ -912,6 +915,8 @@ void PlanCudaEngine::open(const std::string& cpi_path, int max_context) {
   build_rope_tables();
   allocate_buffers();
   build_plan();  // resolve the per-layer forward into a data op-plan (once)
+  persist_enabled_ =
+      std::getenv("CPI_CUDA_PERSISTENT") != nullptr && compile_persistent_plan();
   G4_CHECK(cudaStreamSynchronize(stream_));
 }
 
@@ -2467,6 +2472,20 @@ void PlanCudaEngine::forward_one(int token, int position, bool compute_logits,
   // Skipped for the per-layer-rms parity dump (it syncs mid-forward). The graph
   // writes the KV cache at d_position_, so it interleaves correctly with the eager
   // prefill (which fills earlier rows via host position).
+  // Persistent decode: the whole token as ONE cooperative launch over the compiled plan.
+  // Falls back to the graph path if the launch is ever rejected (co-residency).
+  if (compute_logits && per_layer_rms == nullptr && persist_enabled_) {
+    G4_CHECK(cudaMemcpyAsync(d_tok_, &token, sizeof(int), cudaMemcpyHostToDevice, stream_));
+    G4_CHECK(cudaMemcpyAsync(d_position_, &position, sizeof(int), cudaMemcpyHostToDevice, stream_));
+    if (kernels::launch_persistent_decode(
+            static_cast<const kernels::PersistOp*>(d_persist_ops_), persist_n_ops_, d_tok_,
+            d_position_, persist_blocks_, stream_)) {
+      if (!defer_host_logits_) publish_host_logits();
+      return;
+    }
+    persist_enabled_ = false;
+  }
+
   if (compute_logits && per_layer_rms == nullptr && decode_graph_enabled_) {
     if (!decode_graph_ready_) capture_decode_graph();
     G4_CHECK(cudaMemcpyAsync(d_tok_, &token, sizeof(int), cudaMemcpyHostToDevice, stream_));
@@ -2594,6 +2613,172 @@ std::vector<float> PlanCudaEngine::forward_logits(const std::vector<int>& tokens
     forward_one(tokens[pos], pos, last, last ? per_layer_rms : nullptr);
   }
   return last_logits_;
+}
+
+// Compile the (already-data) decode plan into the persistent interpreter's device
+// descriptors. Returns false -- leaving the graph path in charge -- when the plan uses any
+// kind the interpreter does not implement (MoE, delta-net, quantized projections, biases,
+// rotary_dim ropes). Every pointer is resolved HERE, once, exactly as build_plan resolved
+// them for the eager executor.
+bool PlanCudaEngine::compile_persistent_plan() {
+  using namespace opplan;
+  std::vector<kernels::PersistOp> pl;
+  auto S = [&](Slot s) -> __half* { return const_cast<__half*>(slot_ptr_[static_cast<int>(s)]); };
+  auto HW = [](const void* w) { return static_cast<const __half*>(w); };
+
+  auto add_ops = [&](const std::vector<Op>& ops, int layer) -> bool {
+    for (const Op& op : ops) {
+      kernels::PersistOp d;
+      switch (op.kind) {
+        case OpKind::EmbeddingLookup:
+          d.kind = kernels::PersistOp::kEmbed;
+          d.weight = HW(op.weight);
+          d.out = S(op.out);
+          d.cols = op.cols;
+          break;
+        case OpKind::ScaleCopy:
+          d.kind = kernels::PersistOp::kScale;
+          d.in = S(op.in);
+          d.out = S(op.out);
+          d.cols = op.cols;
+          d.scale = op.scale;
+          break;
+        case OpKind::CopySlot:
+          d.kind = kernels::PersistOp::kCopy;
+          d.in = S(op.in);
+          d.out = S(op.out);
+          d.cols = op.cols;
+          break;
+        case OpKind::AddInplace:
+          d.kind = kernels::PersistOp::kAdd;
+          d.in = S(op.in);
+          d.out = S(op.out);
+          d.cols = op.cols;
+          break;
+        case OpKind::GeluMul:
+          d.kind = kernels::PersistOp::kGeluMul;
+          d.in = S(op.in);
+          d.in2 = op.aux_ptr != nullptr ? HW(op.aux_ptr) : S(op.in2);
+          d.aux_offset = op.aux_ptr != nullptr ? 0 : op.aux_offset;
+          d.out = S(op.out);
+          d.cols = op.cols;
+          break;
+        case OpKind::RmsNorm:
+          if (op.norm_offset) return false;
+          d.kind = kernels::PersistOp::kRmsNorm;
+          d.in = S(op.in);
+          d.out = S(op.out);
+          d.weight = HW(op.weight);
+          d.rows = op.rows;
+          d.cols = op.cols;
+          d.eps = cfg_.rms_eps;
+          break;
+        case OpKind::Rope:
+          if (op.rotary_dim > 0) return false;
+          d.kind = kernels::PersistOp::kRope;
+          d.out = S(op.in);  // in place
+          d.heads = op.heads;
+          d.head_dim = op.head_dim;
+          d.cosT = op.rope_table == RopeTable::Full ? d_cos_full_ : d_cos_sliding_;
+          d.sinT = op.rope_table == RopeTable::Full ? d_sin_full_ : d_sin_sliding_;
+          break;
+        case OpKind::Gemv:
+          if (op.qbits != 0 || op.bias != nullptr || (op.in_dim % 8) != 0) return false;
+          d.kind = kernels::PersistOp::kGemv;
+          d.weight = HW(op.weight);
+          d.in = S(op.in);
+          d.out = S(op.out);
+          d.rows = op.cols;
+          d.in_dim = op.in_dim;
+          break;
+        case OpKind::LmHead:
+          if (op.qbits != 0 || (op.in_dim % 8) != 0) return false;
+          d.kind = kernels::PersistOp::kLmHead;
+          d.weight = HW(op.weight);
+          d.in = S(op.in);
+          d.fout = d_logits_;
+          d.rows = op.cols;
+          d.in_dim = op.in_dim;
+          break;
+        case OpKind::KvStore:
+          d.kind = kernels::PersistOp::kKvStore;
+          d.in = S(Slot::K);
+          d.in2 = S(Slot::V);
+          d.cols = op.cols;
+          d.kcache = caches_k_[layer];
+          d.vcache = caches_v_[layer];
+          break;
+        case OpKind::Attention: {
+          if (d_split_o_ == nullptr || op.head_dim > 512 || (op.head_dim % 2) != 0) return false;
+          const int window = op.full_attention ? 0 : op.sliding_window;
+          kernels::PersistOp st;
+          st.kind = kernels::PersistOp::kAttnStats;
+          st.in = S(op.in);
+          st.heads = op.heads;
+          st.kv_heads = op.kv_heads;
+          st.head_dim = op.head_dim;
+          st.window = window;
+          st.chunk_size = kSplitAnyChunk;
+          st.chunks = split_any_chunks_;
+          st.sm = d_split_m_;
+          st.sl = d_split_l_;
+          st.so = d_split_o_;
+          st.kcache = caches_k_[layer];
+          st.vcache = caches_v_[layer];
+          pl.push_back(st);
+          d.kind = kernels::PersistOp::kAttnReduce;
+          d.out = S(op.out);
+          d.heads = op.heads;
+          d.head_dim = op.head_dim;
+          d.window = window;
+          d.chunk_size = kSplitAnyChunk;
+          d.chunks = split_any_chunks_;
+          d.sm = d_split_m_;
+          d.sl = d_split_l_;
+          d.so = d_split_o_;
+          break;
+        }
+        default:
+          return false;
+      }
+      pl.push_back(d);
+    }
+    return true;
+  };
+
+  if (!add_ops(plan_.prologue, -1)) return false;
+  for (int L = 0; L < cfg_.num_layers; ++L) {
+    if (!add_ops(plan_.layers[L].ops, L)) return false;
+  }
+  if (!add_ops(plan_.epilogue, -1)) return false;
+
+  // Elide the grid.sync between adjacent PURE-ELEMENTWISE ops of equal length: block b's
+  // writes are exactly the elements block b reads next (same grid stride), so no cross-block
+  // data moves. A windowed GeluMul reading the previous op's output is the one same-length
+  // case where indices shift; keep its sync.
+  auto elementwise = [](int k) {
+    return k == kernels::PersistOp::kEmbed || k == kernels::PersistOp::kScale ||
+           k == kernels::PersistOp::kCopy || k == kernels::PersistOp::kAdd ||
+           k == kernels::PersistOp::kGeluMul;
+  };
+  for (std::size_t i = 0; i + 1 < pl.size(); ++i) {
+    kernels::PersistOp& a = pl[i];
+    const kernels::PersistOp& b = pl[i + 1];
+    if (!elementwise(a.kind) || !elementwise(b.kind) || a.cols != b.cols) continue;
+    if (b.kind == kernels::PersistOp::kGeluMul && b.aux_offset != 0 &&
+        b.in2 == static_cast<const half*>(a.out)) {
+      continue;
+    }
+    a.no_sync = 1;
+  }
+
+  persist_blocks_ = kernels::persistent_decode_max_blocks();
+  if (persist_blocks_ <= 0) return false;
+  persist_n_ops_ = static_cast<int>(pl.size());
+  G4_CHECK(cudaMalloc(&d_persist_ops_, pl.size() * sizeof(kernels::PersistOp)));
+  G4_CHECK(cudaMemcpy(d_persist_ops_, pl.data(), pl.size() * sizeof(kernels::PersistOp),
+                      cudaMemcpyHostToDevice));
+  return true;
 }
 
 void PlanCudaEngine::capture_decode_graph() {
