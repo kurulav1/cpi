@@ -1078,6 +1078,16 @@ void launch_weight_only_int4_matvec_grouped_dp4a_cat(
     const float* s1, half* y1, int n1, const std::int8_t* w2, const float* s2, half* y2, int n2,
     const std::int8_t* xq, const float* x_scale, int in_features, int group, cudaStream_t stream);
 
+// launch_weight_only_int4_matvec_grouped_dp4a_glu
+//
+// Fused GeGLU: out[r] = gelu_tanh(gate_r) * up_r with both grouped-int4 dp4a dots computed
+// in one warp against the shared perm8 activation. Numerics match [gate gemv; up gemv;
+// gelu_mul]: dots round to fp16 before the gelu. Same gating as the other dp4a launchers.
+void launch_weight_only_int4_matvec_grouped_dp4a_glu(
+    const std::int8_t* wg, const float* sg, const std::int8_t* wu, const float* su,
+    const std::int8_t* xq, const float* x_scale, half* y, int out_features, int in_features,
+    int group, cudaStream_t stream);
+
 // launch_rowmajor_half_gemv_cat
 //
 // Up to three batch-1 fp16 GEMVs sharing one input vector, run as ONE launch (q|k|v,

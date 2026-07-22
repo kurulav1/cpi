@@ -2009,6 +2009,23 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
             actq_src = S(op.in);
             actq_len = op.in_dim;
           }
+          // GLU fusion (the llama.cpp gated-activation pattern): [gate Gemv][up Gemv]
+          // [GeluMul] collapses into ONE kernel writing the activated product -- no
+          // Gate/Up round-trip, no elementwise launch.
+          if (idx + 2 < n && ops[idx + 1].kind == OpKind::Gemv && ops[idx + 1].qbits == 4 &&
+              ops[idx + 1].qgroup == op.qgroup && ops[idx + 1].bias == nullptr &&
+              ops[idx + 1].in == op.in && ops[idx + 1].in_dim == op.in_dim &&
+              ops[idx + 2].kind == OpKind::GeluMul && ops[idx + 2].aux_ptr == nullptr &&
+              ops[idx + 2].aux_offset == 0 && ops[idx + 2].in == op.out &&
+              ops[idx + 2].in2 == ops[idx + 1].out && ops[idx + 2].cols == op.cols &&
+              ops[idx + 1].cols == op.cols && ops[idx + 2].out != op.in) {
+            kernels::launch_weight_only_int4_matvec_grouped_dp4a_glu(
+                QW(op.qweight), QS(op.qscales), QW(ops[idx + 1].qweight),
+                QS(ops[idx + 1].qscales), d_act_i8_, d_act_qs_, S(ops[idx + 2].out), op.cols,
+                op.in_dim, op.qgroup, stream_);
+            idx += 2;
+            break;
+          }
           // Adjacent same-input int4 Gemvs (q/k/v, gate/up) run as ONE cat launch,
           // mirroring the fp16 cat peephole -- ~2 fewer medium-gemv launches per site.
           {
