@@ -1133,6 +1133,76 @@ __global__ void gemv_wide_kernel(const half* __restrict__ w, const half* __restr
   }
 }
 
+// Segment-routed gemv_wide_kernel: up to three projections sharing one input vector run as
+// ONE launch (q|k|v, gate|up). A warp resolves its global row to (matrix, output, local row)
+// and then runs gemv_wide_kernel's exact inner loop -- same lane stride, same unroll, same
+// warp_sum, same fp16 rounding -- so a cat'd launch is bit-identical to the split launches;
+// only the grid packing differs. Warp-per-row with no shared memory, so partial trailing
+// blocks need no cross-warp care.
+template <int Warps>
+__global__ void gemv_wide_cat_kernel(const half* __restrict__ w0, half* __restrict__ y0, int n0,
+                                     const half* __restrict__ w1, half* __restrict__ y1, int n1,
+                                     const half* __restrict__ w2, half* __restrict__ y2, int n2,
+                                     const half* __restrict__ x, int in_features) {
+  const int row = blockIdx.x * Warps + (threadIdx.x / warpSize);
+  const half* w = nullptr;
+  half* y = nullptr;
+  int r = row;
+  if (row < n0) {
+    w = w0;
+    y = y0;
+  } else if (row < n0 + n1) {
+    r = row - n0;
+    w = w1;
+    y = y1;
+  } else if (row < n0 + n1 + n2) {
+    r = row - n0 - n1;
+    w = w2;
+    y = y2;
+  } else {
+    return;
+  }
+  const int lane = threadIdx.x & (warpSize - 1);
+  const int vecs = in_features / 8;
+  const int4* wrow =
+      reinterpret_cast<const int4*>(w + static_cast<std::size_t>(r) * static_cast<std::size_t>(in_features));
+  const int4* xv = reinterpret_cast<const int4*>(x);
+
+  constexpr int kUnroll = 4;
+  float acc = 0.0f;
+  int4 wbuf[kUnroll];
+  int4 xbuf[kUnroll];
+  for (int base = lane; base < vecs; base += warpSize * kUnroll) {
+#pragma unroll
+    for (int u = 0; u < kUnroll; ++u) {
+      const int i = base + u * warpSize;
+      if (i < vecs) {
+        wbuf[u] = wrow[i];
+        xbuf[u] = xv[i];
+      }
+    }
+#pragma unroll
+    for (int u = 0; u < kUnroll; ++u) {
+      const int i = base + u * warpSize;
+      if (i < vecs) {
+        const half2* wh = reinterpret_cast<const half2*>(&wbuf[u]);
+        const half2* xh = reinterpret_cast<const half2*>(&xbuf[u]);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          const float2 a = __half22float2(wh[j]);
+          const float2 b = __half22float2(xh[j]);
+          acc += a.x * b.x + a.y * b.y;
+        }
+      }
+    }
+  }
+
+  acc = warp_sum(acc);
+  if (lane == 0) {
+    y[r] = __float2half(acc);
+  }
+}
+
 // Opt-out, not opt-in: the wide kernel is the default because the profile says the tiled one
 // is 4x off. LLAMA_INFER_TILED_GEMV=1 restores the old kernel for A/B and bisection.
 static bool use_wide_gemv() {
@@ -1268,6 +1338,16 @@ void launch_rowmajor_half_gemv_f16(const half* w, const half* x, half* y, int ou
                                    int tile_pairs, int rows_per_warp, half* residual) {
   launch_rowmajor_half_gemv(w, x, y, out_features, in_features, stream, warps_per_block, tile_pairs,
                             rows_per_warp, residual);
+}
+
+void launch_rowmajor_half_gemv_cat(const half* w0, half* y0, int n0, const half* w1, half* y1,
+                                   int n1, const half* w2, half* y2, int n2, const half* x,
+                                   int in_features, cudaStream_t stream) {
+  constexpr int kWarps = 4;
+  const int total = n0 + n1 + n2;
+  const int blocks = (total + kWarps - 1) / kWarps;
+  gemv_wide_cat_kernel<kWarps>
+      <<<blocks, kWarps * 32, 0, stream>>>(w0, y0, n0, w1, y1, n1, w2, y2, n2, x, in_features);
 }
 
 void launch_rowmajor_half_gemv_f32(const half* w, const half* x, float* y, int out_features,

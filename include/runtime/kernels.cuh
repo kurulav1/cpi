@@ -1042,6 +1042,16 @@ void launch_rowmajor_half_gemv_f16(const half* w, const half* x, half* y, int ou
                                    int tile_pairs = 0, int rows_per_warp = 1,
                                    half* residual = nullptr);
 
+// launch_rowmajor_half_gemv_cat
+//
+// Up to three batch-1 fp16 GEMVs sharing one input vector, run as ONE launch (q|k|v,
+// gate|up). Per-row arithmetic mirrors the wide gemv exactly, so results are bit-identical
+// to three separate launches. Requires in_features % 8 == 0. Pass n2 = 0 (w2/y2 null) for
+// a two-segment cat.
+void launch_rowmajor_half_gemv_cat(const half* w0, half* y0, int n0, const half* w1, half* y1,
+                                   int n1, const half* w2, half* y2, int n2, const half* x,
+                                   int in_features, cudaStream_t stream);
+
 // launch_rowmajor_half_gemv_f32
 //
 // Batch-1 row-major fp16 GEMV with fp32 output, used for the LM head where

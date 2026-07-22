@@ -1635,11 +1635,17 @@ void PlanCudaEngine::build_plan() {
 
     // --- attention block ---
     rms(Slot::X, Slot::XNorm, W("input_layernorm.weight"), 1, H);
+    // q/k/v all read XNorm, so they are emitted ADJACENT: the executor's cat peephole
+    // runs adjacent same-input projections as one launch. The norms/ropes that consume
+    // them follow after; on keqv layers the raw-K copy still happens before k_norm.
     gemv(Slot::XNorm, Slot::Q, "self_attn.q_proj.weight", qdim, H);
+    if (!shared) {
+      gemv(Slot::XNorm, Slot::K, "self_attn.k_proj.weight", kvdim, H);
+      if (!keqv) gemv(Slot::XNorm, Slot::V, "self_attn.v_proj.weight", kvdim, H);
+    }
     rms(Slot::Q, Slot::Q, W("self_attn.q_norm.weight"), nq, hd);
     rope(Slot::Q, nq);
     if (!shared) {
-      gemv(Slot::XNorm, Slot::K, "self_attn.k_proj.weight", kvdim, H);
       if (keqv) {  // V shares the raw k_proj output (before k_norm/rope)
         Op o;
         o.kind = OpKind::CopySlot;
@@ -1647,8 +1653,6 @@ void PlanCudaEngine::build_plan() {
         o.out = Slot::V;
         o.cols = kvdim;
         ops.push_back(o);
-      } else {
-        gemv(Slot::XNorm, Slot::V, "self_attn.v_proj.weight", kvdim, H);
       }
       rms(Slot::K, Slot::K, W("self_attn.k_norm.weight"), nkv, hd);
       rope(Slot::K, nkv);
@@ -1806,6 +1810,30 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
     // remove: a limiter read off the eager path cannot be quoted as the graph's. Kept as an
     // experiment lever, not a default: fusion also changes reduction order, so opt-in runs
     // may shift near-tie tokens.
+    // ADJACENT-PROJECTION CAT -- default ON (CPI_CUDA_NO_CAT=1 restores split launches).
+    // Two or three fp16 decode projections reading the SAME input vector (q|k|v, gate|up)
+    // run as one launch. Unlike the opt-in fusions below this survives its measurement:
+    // the 256-row k/v grids are pure exposed latency behind q's launch, and the cat kernel
+    // is per-row bit-identical to the split wide gemv, so the token stream cannot move.
+    static const bool no_cat = std::getenv("CPI_CUDA_NO_CAT") != nullptr;
+    if (!seq && !no_cat && op.kind == OpKind::Gemv && op.qbits == 0 && op.bias == nullptr &&
+        (op.in_dim % 8) == 0 && op.out != op.in && idx + 1 < n) {
+      const Op& b = ops[idx + 1];
+      if (b.kind == OpKind::Gemv && b.qbits == 0 && b.bias == nullptr && b.in == op.in &&
+          b.in_dim == op.in_dim && b.out != b.in && b.out != op.out) {
+        const Op* c = (idx + 2 < n) ? &ops[idx + 2] : nullptr;
+        const bool three = c != nullptr && c->kind == OpKind::Gemv && c->qbits == 0 &&
+                           c->bias == nullptr && c->in == op.in && c->in_dim == op.in_dim &&
+                           c->out != c->in && c->out != op.out && c->out != b.out;
+        kernels::launch_rowmajor_half_gemv_cat(
+            HW(op.weight), S(op.out), op.cols, HW(b.weight), S(b.out), b.cols,
+            three ? HW(c->weight) : nullptr, three ? S(c->out) : nullptr, three ? c->cols : 0,
+            S(op.in), op.in_dim, stream_);
+        idx += three ? 2 : 1;
+        goto op_done;
+      }
+    }
+
     static const bool fuse = std::getenv("LLAMA_INFER_PLAN_FUSE") != nullptr;
     if (!seq && fuse) {
       // [RmsNorm(1 x cols, in==out)] [AddInplace(dst += that)] [optional ScaleCopy(dst *= a)]
