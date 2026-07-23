@@ -1109,7 +1109,13 @@ kernel void cpi_attention_decode(
     for (uint j = simd_id; j < nk; j += n_simd) {
       device const half* kt = k_cache + (ulong)(kb + j) * (ulong)kv_dim + kv_head * p.head_dim;
       float d = 0.0f;
-      for (uint i = lane; i < p.head_dim; i += 32u) d += q_sh[i] * float(kt[i]);
+      {
+        // half4 K loads + float4 dots (gemv lesson); head_dim % 4 == 0 on every model here.
+        threadgroup const float4* q4 = (threadgroup const float4*)q_sh;
+        device const half4* kt4 = (device const half4*)kt;
+        const uint hd4 = p.head_dim >> 2u;
+        for (uint i = lane; i < hd4; i += 32u) d += dot(q4[i], float4(kt4[i]));
+      }
       d = simd_sum(d);
       if (lane == 0u) sc_sh[j] = d * p.scale;
     }
@@ -1520,7 +1526,13 @@ kernel void cpi_attention_decode_batched_paged(
       const uint phys = uint(bt[kpos / p.block_size]) * p.block_size + (kpos % p.block_size);
       device const half* kt = k_pool + (ulong)phys * (ulong)kv_dim + kv_head * p.head_dim;
       float d = 0.0f;
-      for (uint i = lane; i < p.head_dim; i += 32u) d += q_sh[i] * float(kt[i]);
+      {
+        // half4 K loads + float4 dots (gemv lesson); head_dim % 4 == 0 on every model here.
+        threadgroup const float4* q4 = (threadgroup const float4*)q_sh;
+        device const half4* kt4 = (device const half4*)kt;
+        const uint hd4 = p.head_dim >> 2u;
+        for (uint i = lane; i < hd4; i += 32u) d += dot(q4[i], float4(kt4[i]));
+      }
       d = simd_sum(d);
       if (lane == 0u) sc_sh[j] = d * p.scale;
     }
@@ -1539,15 +1551,21 @@ kernel void cpi_attention_decode_batched_paged(
     float bsum = 0.0f;
     for (uint j = 0u; j < nk; ++j) bsum += w_sh[j];
 
-    for (uint i = lid; i < p.head_dim; i += nthr) {
-      float a = tg_acc[i] * rescale;
-      for (uint j = 0u; j < nk; ++j) {
-        const uint kpos = kb + j;
-        const uint phys = uint(bt[kpos / p.block_size]) * p.block_size + (kpos % p.block_size);
-        device const half* vt = v_pool + (ulong)phys * (ulong)kv_dim + kv_head * p.head_dim;
-        a += w_sh[j] * float(vt[i]);
+    {
+      // V accumulate, float4 over dims, physical row resolved once per key (gemv lesson).
+      threadgroup float4* acc4 = (threadgroup float4*)tg_acc;
+      const uint hd4v = p.head_dim >> 2u;
+      for (uint i4 = lid; i4 < hd4v; i4 += nthr) {
+        float4 a = acc4[i4] * rescale;
+        for (uint j = 0u; j < nk; ++j) {
+          const uint kpos = kb + j;
+          const uint phys = uint(bt[kpos / p.block_size]) * p.block_size + (kpos % p.block_size);
+          device const half4* vt4 = (device const half4*)(v_pool + (ulong)phys * (ulong)kv_dim +
+                                                          kv_head * p.head_dim);
+          a += w_sh[j] * float4(vt4[i4]);
+        }
+        acc4[i4] = a;
       }
-      tg_acc[i] = a;
     }
 
     // Every thread read tg_max above; thread 0 is about to overwrite it.
