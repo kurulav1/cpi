@@ -1390,8 +1390,7 @@ kernel void cpi_attention_decode_split_gqa(
 
   const uint simd_id = lid / 32u;
   const uint lane    = lid % 32u;
-  const uint n_simd  = nthr / 32u;
-  const uint head    = simd_id;  // one simdgroup per q-head (heads <= n_simd, checked host-side)
+  const uint head    = simd_id;  // one simdgroup per q-head (heads == simds, checked host-side)
   const uint kv_dim  = p.kv_heads * p.head_dim;
 
   // All heads share kv_head 0 (executor gates on kv_heads == 1).
