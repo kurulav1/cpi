@@ -99,7 +99,17 @@ jobs:
           -DCPI_ENABLE_SENTENCEPIECE=OFF
           -DCMAKE_BUILD_TYPE=Release
       - name: Build
-        run: cmake --build build --config Release -j
+        run: |
+          set -o pipefail
+          cmake --build build --config Release -j 2>&1 | tee /tmp/build.log
+      # Job logs need admin auth to read; surface the first compiler errors as annotations
+      # (readable via the check-runs API) so a failure is diagnosable off the runner.
+      - name: Surface build errors
+        if: failure()
+        run: |
+          echo "::error::toolchain: $(clang --version | head -1)"
+          grep -E 'error:' /tmp/build.log | head -25 | while IFS= read -r l; do echo "::error::$l"; done
+          exit 0
       - name: Test (metal_smoke SKIPs -- no GPU in the runner)
         run: ctest --test-dir build -C Release --output-on-failure
       # Runs the real gate's script here too, where every check SKIPs. That proves only
