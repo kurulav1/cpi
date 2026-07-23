@@ -206,8 +206,8 @@ void LlamaEngine::tune_resident_projection_backends() {
   const int head_dim = attn_head_dim_ > 0 ? attn_head_dim_ : (cfg.hidden_size / cfg.num_heads);
   const int kv_hidden = attn_kv_hidden_ > 0 ? attn_kv_hidden_ : (cfg.num_kv_heads * head_dim);
   const auto& lw = layer_cache_.front();
-  const int warmup = std::max(0, env_int_or_default("LLAMA_INFER_TUNE_WARMUP", 3));
-  const int iters = std::max(1, env_int_or_default("LLAMA_INFER_TUNE_ITERS", 20));
+  const int warmup = std::max(0, env_int_or_default("CPI_TUNE_WARMUP", 3));
+  const int iters = std::max(1, env_int_or_default("CPI_TUNE_ITERS", 20));
   struct ProjectionConfig {
     int warps = 4;
     int tile = 128;

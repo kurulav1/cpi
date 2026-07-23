@@ -179,7 +179,7 @@ void Llama4CudaEngine::copy_bf16_tensor_to_fp16_device(const std::uint16_t* src,
     return;
   }
   if (d_bf16_stage_ == nullptr || bf16_stage_elems_ == 0) {
-    LLAMA_ENGINE_THROW("BF16 staging buffer is not initialized");
+    CPI_THROW("BF16 staging buffer is not initialized");
   }
 
   std::size_t offset = 0;
@@ -199,7 +199,7 @@ void Llama4CudaEngine::load_resident_weights() {
                          std::size_t expected_elems = 0) -> const std::uint16_t* {
     const std::size_t bytes = weights_.tensor_bytes(name);
     if (expected_elems > 0 && bytes != expected_elems * sizeof(std::uint16_t)) {
-      LLAMA_ENGINE_THROW("unexpected tensor size for " + name);
+      CPI_THROW("unexpected tensor size for " + name);
     }
     return reinterpret_cast<const std::uint16_t*>(weights_.tensor_ptr(name));
   };
@@ -396,7 +396,7 @@ void Llama4CudaEngine::reset_kv_cache() {
 
 void Llama4CudaEngine::load_token_embedding_to_device(int token) {
   if (!h_tok_embeddings_bf16_) {
-    LLAMA_ENGINE_THROW("token embeddings are not initialized");
+    CPI_THROW("token embeddings are not initialized");
   }
   token = std::clamp(token, 0, vocab_size_ - 1);
   const std::uint16_t* row =
@@ -441,7 +441,7 @@ int Llama4CudaEngine::select_expert_cpu(int layer) {
 
 void Llama4CudaEngine::load_layer_moe_weights_to_device(int layer, int expert_idx) {
   if (expert_idx < 0 || expert_idx >= n_experts_) {
-    LLAMA_ENGINE_THROW("expert index out of range");
+    CPI_THROW("expert index out of range");
   }
 
   const auto& host = layer_host_moe_[static_cast<std::size_t>(layer)];

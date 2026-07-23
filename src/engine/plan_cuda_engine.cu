@@ -863,9 +863,9 @@ void PlanCudaEngine::load_all(const std::string& cpi_path) {
       head_qbits_ = 8;
     }
   }
-  // LLAMA_INFER_PLAN_INT4_GROUP=attn|mlp restricts quantization to one group
+  // CPI_PLAN_INT4_GROUP=attn|mlp restricts quantization to one group
   // (bisection aid when a model degrades under int4).
-  const char* group_env = std::getenv("LLAMA_INFER_PLAN_INT4_GROUP");
+  const char* group_env = std::getenv("CPI_PLAN_INT4_GROUP");
   const std::string group = group_env ? group_env : "";
   const auto quantizable = [&group](const char* t) {
     const bool is_attn =
@@ -929,7 +929,7 @@ void PlanCudaEngine::load_all(const std::string& cpi_path) {
 
 void PlanCudaEngine::open(const std::string& cpi_path, int max_context) {
   max_ctx_ = max_context;
-  if (std::getenv("LLAMA_INFER_PLAN_NO_GRAPH")) decode_graph_enabled_ = false;
+  if (std::getenv("CPI_PLAN_NO_GRAPH")) decode_graph_enabled_ = false;
   // dp4a decode routing needs a quantized copy of the current activation vector.
   // 64 KB covers any in_dim in the model zoo; CPI_CUDA_NO_DP4A keeps the fp16-activation
   // quant kernels (the pre-parity behaviour) for A/B and bisection.
@@ -946,7 +946,7 @@ void PlanCudaEngine::open(const std::string& cpi_path, int max_context) {
     G4_CHECK(cudaMalloc(&d_seq_xs_, 4096 * sizeof(float)));
     G4_CHECK(cudaMalloc(&d_seq_i32_, std::size_t(16384) * 512 * sizeof(int)));
   }
-  if (std::getenv("LLAMA_INFER_PLAN_NO_DEVICE_TOPK")) device_topk_enabled_ = false;
+  if (std::getenv("CPI_PLAN_NO_DEVICE_TOPK")) device_topk_enabled_ = false;
 
   // A directory ⇒ HuggingFace safetensors; a file ⇒ .cpi. Within a directory the
   // architecture comes from config.json's model_type -- the engine reads whichever
@@ -966,7 +966,7 @@ void PlanCudaEngine::open(const std::string& cpi_path, int max_context) {
       // Decode-graph capture stays ON: every op in this plan has a device-position variant
       // (partial RoPE gained its twin -- launch_rope_inplace_partial_table_device_pos; the
       // sliding/full attention and KV store already had theirs). Gate: graphs-on and
-      // LLAMA_INFER_PLAN_NO_GRAPH=1 must produce token-identical streams.
+      // CPI_PLAN_NO_GRAPH=1 must produce token-identical streams.
       G4_CHECK(cudaStreamCreate(&stream_));
       load_all(cpi_path);
       build_rope_tables();
@@ -975,14 +975,14 @@ void PlanCudaEngine::open(const std::string& cpi_path, int max_context) {
       persist_enabled_ =
           std::getenv("CPI_CUDA_PERSISTENT") != nullptr && compile_persistent_plan();
       // The vision tower, when the checkpoint ships one. Opt out with
-      // LLAMA_INFER_NO_VISION=1 (it costs VRAM even on text-only prompts).
+      // CPI_NO_VISION=1 (it costs VRAM even on text-only prompts).
       // Sequence prefill is a capability of the PLAN: partial RoPE and delta-net have no
       // sequence kernels yet, so those plans keep the token-by-token prefill.
       seq_prefill_ok_ = plan_can_sequence_prefill();
       if (seq_prefill_ok_) allocate_sequence_buffers(std::min(max_ctx_, 4096));
 
       parse_vision_config(cpi_path);
-      if (vcfg_.present && !std::getenv("LLAMA_INFER_NO_VISION")) {
+      if (vcfg_.present && !std::getenv("CPI_NO_VISION")) {
         vis_max_patches_ = 4096;
         load_vision_weights();
         build_vision_rope_tables();
@@ -1001,7 +1001,7 @@ void PlanCudaEngine::open(const std::string& cpi_path, int max_context) {
     // Partial RoPE gained its device-position twin (launch_rope_inplace_partial_table_device_pos),
     // so this plan is graph-capturable now: the delta-net state ops read/write fixed device
     // buffers and every position-dependent op has a device-position variant. Gate: graphs-on and
-    // LLAMA_INFER_PLAN_NO_GRAPH=1 must produce token-identical streams.
+    // CPI_PLAN_NO_GRAPH=1 must produce token-identical streams.
     G4_CHECK(cudaStreamCreate(&stream_));
     load_qwen35_weights();
     build_rope_tables();
@@ -1829,10 +1829,10 @@ void PlanCudaEngine::build_plan() {
     // MoE models run a second, ROUTED feed-forward in parallel with the dense one and
     // sum them. Slot::Tmp holds the dense output (pre-norm) on entry, and the summed
     // result on exit, so the shared tail below is identical either way.
-    // LLAMA_INFER_PLAN_NO_MOE=1 drops the routed branch, leaving the dense MLP only.
+    // CPI_PLAN_NO_MOE=1 drops the routed branch, leaving the dense MLP only.
     // Bisection aid: it separates "the shared Gemma path is wrong" from "the MoE ops
     // are wrong" (the model is degraded but must stay finite and coherent-ish).
-    if (cfg_.enable_moe_block && !std::getenv("LLAMA_INFER_PLAN_NO_MOE"))
+    if (cfg_.enable_moe_block && !std::getenv("CPI_PLAN_NO_MOE"))
       append_moe_ffn_ops(ops, p, L);
     rms(Slot::Tmp, Slot::Tmp, W("post_feedforward_layernorm.weight"), 1, H);
     add_x(Slot::Tmp);
@@ -1984,7 +1984,7 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
   auto len_x = [&](int len) { return len * T; };
   // CPI_CUDA_PROFILE=1: per-op-kind GPU time via event pairs, printed at exit. Decode-only
   // ranking tool; it serialises nothing but each op pays two event records, so its ABSOLUTE
-  // numbers are honest and its use is with LLAMA_INFER_PLAN_NO_GRAPH=1 (a captured graph
+  // numbers are honest and its use is with CPI_PLAN_NO_GRAPH=1 (a captured graph
   // bypasses this function entirely).
   static const bool prof = std::getenv("CPI_CUDA_PROFILE") != nullptr;
   struct ProfBin {
@@ -2025,7 +2025,7 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
       cudaEventRecord(ev0, stream_);
     }
 
-    // DECODE FUSION PEEPHOLES -- OPT-IN (LLAMA_INFER_PLAN_FUSE=1), because the premise was
+    // DECODE FUSION PEEPHOLES -- OPT-IN (CPI_PLAN_FUSE=1), because the premise was
     // measured and did not survive. The eager profiler prices every tiny op at ~11-14 us,
     // which made these two patterns (~200 of Gemma 4's ~870 per-token kernels) look like a
     // fifth of the token; fused-vs-unfused interleaved A/B under GRAPH replay measured
@@ -2073,7 +2073,7 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
       }
     }
 
-    static const bool fuse = std::getenv("LLAMA_INFER_PLAN_FUSE") != nullptr;
+    static const bool fuse = std::getenv("CPI_PLAN_FUSE") != nullptr;
     if (!seq && fuse) {
       // [RmsNorm(1 x cols, in==out)] [AddInplace(dst += that)] [optional ScaleCopy(dst *= a)]
       if (op.kind == OpKind::RmsNorm && !op.norm_offset && op.rows == 1 && op.in == op.out &&
@@ -3608,11 +3608,11 @@ void PlanCudaEngine::initialize(const EngineOptions& options) {
   // compounds into garbage (Gemma 12B produced "t/t/t/t/..."). Group-wise costs
   // 32 bits per group -- 4.25 bits/weight instead of 4. int8's 255 levels do not
   // need it, so it stays per-row and byte-identical to before.
-  // Override with LLAMA_INFER_PLAN_QUANT_GROUP (0 = per-row, else a power of two).
+  // Override with CPI_PLAN_QUANT_GROUP (0 = per-row, else a power of two).
   if (weight_quant_bits_ == 4) {
     weight_quant_group_ = 128;
   }
-  if (const char* g = std::getenv("LLAMA_INFER_PLAN_QUANT_GROUP")) {
+  if (const char* g = std::getenv("CPI_PLAN_QUANT_GROUP")) {
     weight_quant_group_ = std::atoi(g);
   }
   open(options.model_path, options.max_context > 0 ? options.max_context : 4096);

@@ -130,7 +130,7 @@ That is the exact blind spot that hid the original bug, reproduced on demand.
 The same gate, no CI required — this is what to run on any Mac before trusting a change:
 
 ```sh
-cmake -S . -B build -DLLAMA_ENGINE_ENABLE_CUDA=OFF -DLLAMA_ENGINE_ENABLE_METAL=ON
+cmake -S . -B build -DCPI_ENABLE_CUDA=OFF -DCPI_ENABLE_METAL=ON
 cmake --build build --config Release -j
 ./tools/metal_verify.sh --build build --models ~/models --require-gpu
 ```

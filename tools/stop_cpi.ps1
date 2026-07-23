@@ -4,10 +4,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-Write-Host "[stop-llama] Searching for llama_infer processes..."
-$llama = Get-Process -Name "llama_infer" -ErrorAction SilentlyContinue
+Write-Host "[stop-llama] Searching for cpi processes..."
+$llama = Get-Process -Name "cpi" -ErrorAction SilentlyContinue
 if (-not $llama) {
-  Write-Host "[stop-llama] No llama_infer process found."
+  Write-Host "[stop-llama] No cpi process found."
 } else {
   $llama | ForEach-Object {
     Write-Host ("[stop-llama] Stopping PID={0}" -f $_.Id)
@@ -32,7 +32,7 @@ if ($AlsoWeb) {
 Start-Sleep -Milliseconds 150
 $maxChecks = 10
 for ($i = 0; $i -lt $maxChecks; $i++) {
-  $left = Get-Process -Name "llama_infer" -ErrorAction SilentlyContinue
+  $left = Get-Process -Name "cpi" -ErrorAction SilentlyContinue
   if (-not $left) {
     Write-Host "[stop-llama] Done."
     exit 0
@@ -40,6 +40,6 @@ for ($i = 0; $i -lt $maxChecks; $i++) {
   Start-Sleep -Milliseconds 120
 }
 
-Write-Host "[stop-llama] Warning: llama_infer still running." -ForegroundColor Yellow
+Write-Host "[stop-llama] Warning: cpi still running." -ForegroundColor Yellow
 $left | Select-Object Id, ProcessName | Format-Table -AutoSize
 exit 1

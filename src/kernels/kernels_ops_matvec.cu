@@ -1204,10 +1204,10 @@ __global__ void gemv_wide_cat_kernel(const half* __restrict__ w0, half* __restri
 }
 
 // Opt-out, not opt-in: the wide kernel is the default because the profile says the tiled one
-// is 4x off. LLAMA_INFER_TILED_GEMV=1 restores the old kernel for A/B and bisection.
+// is 4x off. CPI_TILED_GEMV=1 restores the old kernel for A/B and bisection.
 static bool use_wide_gemv() {
   static const bool v = [] {
-    const char* e = std::getenv("LLAMA_INFER_TILED_GEMV");
+    const char* e = std::getenv("CPI_TILED_GEMV");
     return !(e && *e == '1');
   }();
   return v;

@@ -11,7 +11,7 @@
 // Requires a tokenizer + --paged-blocks. Takes the scheduler, NOT an engine: the worker only
 // ever needed admit/step/cancel/active, and engine::BatchScheduler is backend-free, so this
 // whole file no longer knows or cares which GPU is underneath it. That is what took the
-// #if LLAMA_ENGINE_HAS_CUDA off it.
+// #if CPI_HAS_CUDA off it.
 #include "app/main_modes.hpp"
 
 

@@ -326,7 +326,7 @@ void SafetensorsLoader::open(const std::string& model_dir) {
 
   fs::path root(model_dir);
   if (!fs::exists(root)) {
-    LLAMA_ENGINE_THROW("safetensors path not found: " + model_dir);
+    CPI_THROW("safetensors path not found: " + model_dir);
   }
 
   std::vector<fs::path> shard_paths;
@@ -347,7 +347,7 @@ void SafetensorsLoader::open(const std::string& model_dir) {
 
   if (!single_file) {
     if (!fs::is_directory(root)) {
-      LLAMA_ENGINE_THROW("safetensors path is not a directory: " + model_dir);
+      CPI_THROW("safetensors path is not a directory: " + model_dir);
     }
     for (const auto& entry : fs::directory_iterator(root)) {
       if (entry.is_regular_file() && entry.path().extension() == ".safetensors") {

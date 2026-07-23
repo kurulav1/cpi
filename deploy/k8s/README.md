@@ -8,7 +8,7 @@ comprehensive setup: **CPT trains, CPI serves, and they meet on a shared model s
    TRAINING PLANE (CPT repo)         MODEL STORE (the seam)        SERVING PLANE (this repo)
  ┌──────────────────────┐        ┌──────────────────────┐      ┌──────────────────────────┐
  │ Indexed Job          │ write  │ RWX PVC / object store│ read │ Deployment (N replicas)  │
- │  gang of ranks       │ ─────► │   /models/<name>/     │ ───► │  web :3001 → llama_infer │
+ │  gang of ranks       │ ─────► │   /models/<name>/     │ ───► │  web :3001 → cpi │
  │  gradient sync       │  ckpt  │     model.ll2c        │      │  Service + Ingress + HPA │
  └──────────────────────┘        │     tokenizer.json    │      └──────────────────────────┘
           │ on success                     ▲
@@ -138,7 +138,7 @@ requests (`inference-deployment.yaml`); the WSL dance is a Docker-Desktop-only w
 ## The real integration gap
 
 The orchestration here is plumbing. The substance is the **artifact round-trip** — a CPT-trained
-checkpoint actually loading in `llama_infer`:
+checkpoint actually loading in `cpi`:
 
 - ✅ Export path exists: CPT `export_cpt_to_hf.py` → CPI `convert_hf_to_bins.py` (HF → `.ll2c`).
 - ⚠️ **Round-trip not yet verified** end-to-end. That is the one piece that is engineering, not YAML.

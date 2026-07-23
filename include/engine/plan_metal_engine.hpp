@@ -170,7 +170,7 @@ public:
                         const std::vector<int>& history);
 
   // Greedy decode returning the top-1 argmax and, via `second`, the top-2 token. Only the
-  // tree-opportunity probe (LLAMA_INFER_SPEC_TREE_PROBE) uses `second`.
+  // tree-opportunity probe (CPI_SPEC_TREE_PROBE) uses `second`.
   int decode_next_token2(int token, int position, int* second);
 
   // Runs `tokens` as ONE causal chunk at [start_pos, start_pos+K-1] and returns, per position i,

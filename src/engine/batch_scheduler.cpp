@@ -33,7 +33,7 @@ void BatchScheduler::grow_table(StreamSeq& s, int upto_pos) {
     // (callers then reject the admit / preempt in decode).
     if (!prefix_cache_.empty()) {
       prefix_cache_.clear();
-      if (opts_.verbose || std::getenv("LLAMA_INFER_PREFIX_LOG")) {
+      if (opts_.verbose || std::getenv("CPI_PREFIX_LOG")) {
         std::fprintf(stderr, "[stream] prefix_cache evicted under KV pressure\n");
       }
     }
@@ -131,7 +131,7 @@ void BatchScheduler::admit(const std::string& id, const std::vector<int>& prompt
     }
   }
 
-  if ((opts_.verbose || std::getenv("LLAMA_INFER_PREFIX_LOG")) && shared_tokens > 0) {
+  if ((opts_.verbose || std::getenv("CPI_PREFIX_LOG")) && shared_tokens > 0) {
     std::fprintf(stderr, "[stream] prefix_reuse tokens=%d/%zu\n", shared_tokens,
                  prompt_tokens.size());
   }

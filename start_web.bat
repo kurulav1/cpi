@@ -6,7 +6,7 @@ if /I "%~1"=="/?" goto :help
 
 for %%I in ("%~dp0.") do set "REPO_DIR=%%~fI"
 set "WEB_DIR=%REPO_DIR%\web"
-set "INFER_BIN=%REPO_DIR%\build\Release\llama_infer.exe"
+set "INFER_BIN=%REPO_DIR%\build\Release\cpi.exe"
 
 if not exist "%WEB_DIR%\package.json" (
   echo [start_web] Could not find web\package.json.
@@ -35,7 +35,7 @@ if not exist "%WEB_DIR%\config.json" (
 
 if not exist "%INFER_BIN%" (
   echo [start_web] Warning: %INFER_BIN% not found.
-  echo [start_web] API will start, but inference requests will fail until llama_infer is built.
+  echo [start_web] API will start, but inference requests will fail until cpi is built.
 )
 
 pushd "%WEB_DIR%"

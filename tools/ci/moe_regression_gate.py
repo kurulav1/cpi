@@ -44,7 +44,7 @@ def get_decode_tok_s(summary: dict[str, Any], mode: str) -> float | None:
 def main() -> int:
     repo_root = Path(__file__).resolve().parents[2]
     ap = argparse.ArgumentParser(description="Run MoE CUDA benchmark/parity gates for CI.")
-    ap.add_argument("--llama-infer", type=Path, default=repo_root / "build" / "Release" / "llama_infer.exe")
+    ap.add_argument("--llama-infer", type=Path, default=repo_root / "build" / "Release" / "cpi.exe")
     ap.add_argument("--tokenizer", type=Path, required=True)
     ap.add_argument("--fp16-model", type=Path, required=True)
     ap.add_argument("--int8-model", type=Path, required=True)
@@ -75,7 +75,7 @@ def main() -> int:
         sys.executable,
         str(bench_script),
         "--llama-infer",
-        str(args.llama_infer.resolve()),
+        str(args.cpi.resolve()),
         "--tokenizer",
         str(args.tokenizer.resolve()),
         "--fp16-model",

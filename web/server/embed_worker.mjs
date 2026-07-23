@@ -1,6 +1,6 @@
 // Drives the cpi_embed worker (CUDA BERT-family embedding model) over its
 // line-delimited JSON protocol. One persistent process, requests serialized
-// through a queue. Independent of the chat llama_infer worker (separate process,
+// through a queue. Independent of the chat cpi worker (separate process,
 // shares the GPU; bge-small is tiny).
 
 import { spawn } from "node:child_process";
@@ -22,7 +22,7 @@ let lastError = null;
 // cpi_embed is a CUDA-only target, so it lands in whichever CUDA build dir the
 // user configured (build-run, build-cuda, …), never the plain CPU build/. We
 // can't assume a single location, so try, in order: an explicit override, the
-// dir holding the resolved llama_infer (they're built together), then every
+// dir holding the resolved cpi (they're built together), then every
 // known build dir — returning the first that exists. Returns a path that may
 // not exist (the best guess) only when nothing is found, so the caller's
 // existence check produces a clear "set EMBED_BIN" error.

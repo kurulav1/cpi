@@ -101,7 +101,7 @@ void rope_cpu(std::vector<float>* q, std::vector<float>* k, int num_heads_q, int
 
 bool LlamaEngine::run_parity_check(const std::vector<int>& prompt_tokens) {
   if (prompt_tokens.empty()) {
-    LLAMA_ENGINE_THROW("parity check requires non-empty prompt");
+    CPI_THROW("parity check requires non-empty prompt");
   }
 
   const auto& cfg = weights_.config();
@@ -112,7 +112,7 @@ bool LlamaEngine::run_parity_check(const std::vector<int>& prompt_tokens) {
   const int kv_hidden = attn_kv_hidden_ > 0 ? attn_kv_hidden_ : (cfg.num_kv_heads * head_dim);
   const int seq_len = static_cast<int>(prompt_tokens.size());
   if (seq_len > options_.max_context) {
-    LLAMA_ENGINE_THROW("parity prompt exceeds max_context");
+    CPI_THROW("parity prompt exceeds max_context");
   }
 
   reset_kv_cache();

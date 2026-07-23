@@ -65,7 +65,7 @@ def parse_stdout_metrics(stdout: str) -> dict[str, float | int | str]:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", type=Path, default=Path("."))
-    ap.add_argument("--infer-bin", type=Path, default=Path("build/Release/llama_infer.exe"))
+    ap.add_argument("--infer-bin", type=Path, default=Path("build/Release/cpi.exe"))
     ap.add_argument("--model", type=Path, default=Path(r"d:\models\llama2_tq3_fixed.ll2c"))
     ap.add_argument("--tokenizer", type=Path, default=Path(r"d:\models\Llama-2-7b-chat-hf\tokenizer.model"))
     ap.add_argument("--prompt", type=str, default="Write one short sentence about quantization.")

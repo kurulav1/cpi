@@ -468,7 +468,7 @@ void CpuLlamaEngine::rope(float* q, float* k, int pos, int n_heads, int n_kv_hea
 // Stores the new K and V into k_cache_ / v_cache_ at position pos.
 void CpuLlamaEngine::attention(int pos, int layer) {
   if (cfg_.attention_kind_for_layer(layer) == model::AttentionKind::Linear) {
-    LLAMA_ENGINE_THROW("native CPU runtime does not support linear-attention layers yet");
+    CPI_THROW("native CPU runtime does not support linear-attention layers yet");
   }
   const int H = cfg_.num_heads;
   const int H_kv = cfg_.num_kv_heads;
@@ -842,7 +842,7 @@ void CpuLlamaEngine::initialize(const EngineOptions& options) {
   weights_.open(options.model_path);
   cfg_ = weights_.config();
   if (cfg_.has_linear_attention()) {
-    LLAMA_ENGINE_THROW("native CPU runtime does not support linear-attention layers yet");
+    CPI_THROW("native CPU runtime does not support linear-attention layers yet");
   }
 
   const int H = cfg_.hidden_size;
@@ -857,22 +857,22 @@ void CpuLlamaEngine::initialize(const EngineOptions& options) {
   const std::string wq_name = "layers.0.attention.wq";
   const std::string wk_name = "layers.0.attention.wk";
   if (!weights_.has_tensor(wq_name) || !weights_.has_tensor(wk_name)) {
-    LLAMA_ENGINE_THROW("missing attention projection tensors for CPU init");
+    CPI_THROW("missing attention projection tensors for CPU init");
   }
   const std::size_t row_bytes = static_cast<std::size_t>(H) * sizeof(uint16_t);
   const std::size_t wq_bytes = weights_.tensor_bytes(wq_name);
   const std::size_t wk_bytes = weights_.tensor_bytes(wk_name);
   if (row_bytes == 0 || (wq_bytes % row_bytes) != 0 || (wk_bytes % row_bytes) != 0) {
-    LLAMA_ENGINE_THROW("invalid attention projection tensor shape for CPU init");
+    CPI_THROW("invalid attention projection tensor shape for CPU init");
   }
   q_dim_ = static_cast<int>(wq_bytes / row_bytes);
   if (q_dim_ <= 0 || (q_dim_ % NH) != 0) {
-    LLAMA_ENGINE_THROW("invalid q_proj shape for CPU init");
+    CPI_THROW("invalid q_proj shape for CPU init");
   }
   head_dim_ = q_dim_ / NH;
   kv_dim_ = NKV * head_dim_;
   if (static_cast<int>(wk_bytes / row_bytes) != kv_dim_) {
-    LLAMA_ENGINE_THROW("invalid k_proj shape for CPU init");
+    CPI_THROW("invalid k_proj shape for CPU init");
   }
 
   if (options_.verbose) {
@@ -958,7 +958,7 @@ void CpuLlamaEngine::initialize(const EngineOptions& options) {
     const std::string scname = name + ".scale";
     if (!weights_.has_tensor(scname) ||
         (!weights_.has_tensor(i8name) && !weights_.has_tensor(i4name))) {
-      LLAMA_ENGINE_THROW("tensor not found: " + name + " (and no INT8/INT4 alternative)");
+      CPI_THROW("tensor not found: " + name + " (and no INT8/INT4 alternative)");
     }
     const auto* scales = reinterpret_cast<const float*>(weights_.tensor_data(scname));
     const std::size_t scale_count = weights_.tensor_bytes(scname) / sizeof(float);

@@ -87,7 +87,7 @@ Notes:
 - **VRAM-sized KV pool**: the paged block pool auto-sizes to free VRAM rather than a single context
   window, so how many sequences run concurrently scales with the card. Under genuine over-subscription
   the newest sequences are preempted (and the client told) as a safety net, rather than the server
-  crashing. Override the pool size with `LLAMA_INFER_KV_POOL_TOKENS`.
+  crashing. Override the pool size with `CPI_KV_POOL_TOKENS`.
 - **Default on the web server** for supported models (opt out with `CPI_BATCH_WORKER=0`); requires
   fp16-resident weights (`--gpu-cache-all`) + paged KV (`--paged-blocks`) and full-attention models.
   Quantized / MoE / streaming models (e.g. the 32B int4) fall back to single-request serving.
@@ -111,7 +111,7 @@ splits the KV sequence across the SMs FlashDecoding-style: at long context each 
 several KV blocks under a running online softmax, so the memory system stays saturated instead of
 running thousands of tiny latency-bound blocks. That coarsened split roughly doubles long-context
 decode (Llama-3.1-8B at 32K: ~30 → ~49 tok/s, ~34% → ~52% of the weight+KV bandwidth roofline; same
-before/after binary, `LLAMA_INFER_ATTN_BPC=1` vs default). Llama-3.1-8B still falls off fastest: it
+before/after binary, `CPI_ATTN_BPC=1` vs default). Llama-3.1-8B still falls off fastest: it
 has 8 KV heads to Qwen2.5-7B's 4, so ~2× the KV to scan per token and a smaller (4× vs 7×) query group
 to amortize it over. (Contexts past ~4K need
 `--tokens-file`, since a token list that long exceeds the OS command-line limit.)
@@ -160,15 +160,15 @@ python tools/bench_report.py --patch-benchmarks
 
 ### Download a prebuilt binary
 
-Tagged releases attach prebuilt `llama_infer` binaries (see the repository's Releases page):
+Tagged releases attach prebuilt `cpi` binaries (see the repository's Releases page):
 
 | Asset | Platform | Backend |
 | ----- | -------- | ------- |
-| `llama_infer-linux-x64-cpu` | Linux x64 | CPU |
-| `llama_infer-windows-x64-cpu` | Windows x64 | CPU |
-| `llama_infer-macos-arm64-metal` | macOS (Apple Silicon) | Metal GPU + CPU |
+| `cpi-linux-x64-cpu` | Linux x64 | CPU |
+| `cpi-windows-x64-cpu` | Windows x64 | CPU |
+| `cpi-macos-arm64-metal` | macOS (Apple Silicon) | Metal GPU + CPU |
 
-Unpack and check the build with `llama_infer --version`. The macOS archive bundles the Metal
+Unpack and check the build with `cpi --version`. The macOS archive bundles the Metal
 shader sources next to the binary; launch it with the included `./run.sh` (which sets
 `CPI_METAL_SOURCE` for you) or set that variable by hand. CUDA is not shipped as a binary (it is
 GPU-architecture and driver specific) — build it from source per [Build Modes](#build-modes).
@@ -207,7 +207,7 @@ These scripts:
 - install web dependencies with `npm ci`
 - create `web/.env` from `web/.env.example` if needed
 - create `web/config.json` from `web/config.example.json` if needed
-- build `llama_infer` if it is missing
+- build `cpi` if it is missing
 
 ### Run the packaged local app
 
@@ -295,11 +295,11 @@ retractions) is in [docs/metal-optimization-log.md](docs/metal-optimization-log.
 ### Build and run
 
 ```bash
-cmake -S . -B build -DLLAMA_ENGINE_ENABLE_CUDA=OFF -DLLAMA_ENGINE_ENABLE_METAL=ON -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build -DCPI_ENABLE_CUDA=OFF -DCPI_ENABLE_METAL=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 
 export CPI_METAL_SOURCE=$PWD/src/kernels/metal
-./build/llama_infer model.ll2c --tokenizer tokenizer.json \
+./build/cpi model.ll2c --tokenizer tokenizer.json \
     --prompt "Explain in two sentences why the sky is blue." --max-new 80 --temp 0
 ```
 
@@ -345,7 +345,7 @@ cmake --build --preset cpu-release
 Equivalent manual configure:
 
 ```bash
-cmake -S . -B build/cpu-release -DLLAMA_ENGINE_ENABLE_CUDA=OFF -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build/cpu-release -DCPI_ENABLE_CUDA=OFF -DCMAKE_BUILD_TYPE=Release
 cmake --build build/cpu-release
 ```
 
@@ -390,21 +390,21 @@ Set at least:
 
 Useful environment variables:
 
-- `LLAMA_INFER_BIN`
-- `LLAMA_MODEL_DIRS`
-- `LLAMA_MODEL_PATH`
-- `LLAMA_TOKENIZER_PATH`
-- `LLAMA_CHAT_TEMPLATE`
+- `CPI_BIN`
+- `CPI_MODEL_DIRS`
+- `CPI_MODEL_PATH`
+- `CPI_TOKENIZER_PATH`
+- `CPI_CHAT_TEMPLATE`
 
 `web/.env.example` now uses cross-platform defaults:
 
-- `LLAMA_INFER_BIN` is blank by default so the server auto-detects the right binary path
-- `LLAMA_MODEL_DIRS` defaults to `../artifacts`
+- `CPI_BIN` is blank by default so the server auto-detects the right binary path
+- `CPI_MODEL_DIRS` defaults to `../artifacts`
 - model-specific paths are blank until you choose a model
 
 ## Scripts
 
-- `install.bat` / `install.sh`: install dependencies, create default web config, build `llama_infer` if missing
+- `install.bat` / `install.sh`: install dependencies, create default web config, build `cpi` if missing
 - `start_local.bat` / `start_local.sh`: packaged local app flow
 - `start_web.bat` / `start_web.sh`: API + Vite dev flow
 - `start_docker.bat` / `start_docker.sh`: Docker-based flow
@@ -497,7 +497,7 @@ TinyLlama note:
 CLI run:
 
 ```bash
-./build/llama_infer /path/to/model.ll2c \
+./build/cpi /path/to/model.ll2c \
   --prompt "Hello" \
   --tokenizer /path/to/tokenizer.json \
   --max-new 64
@@ -506,7 +506,7 @@ CLI run:
 Windows Release binary:
 
 ```powershell
-.\build\Release\llama_infer.exe C:\path\to\model.ll2c --prompt "Hello" --tokenizer C:\path\to\tokenizer.json --max-new 64
+.\build\Release\cpi.exe C:\path\to\model.ll2c --prompt "Hello" --tokenizer C:\path\to\tokenizer.json --max-new 64
 ```
 
 ## Notes

@@ -1,12 +1,24 @@
 #include "app/main_cli.hpp"
 
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <ostream>
 #include <sstream>
 #include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include "app/main_helpers.hpp"
+
+// Access to the process environment block for the legacy-env shim. macOS forbids `environ` in a
+// normal executable and exposes it via _NSGetEnviron(); other POSIX declares the global directly.
+#if defined(__APPLE__)
+#include <crt_externs.h>
+#elif !defined(_WIN32)
+extern "C" char** environ;
+#endif
 
 namespace app::main_cli {
 namespace {
@@ -64,55 +76,55 @@ T parse_env_or_default(const char* name, const T& default_value, ParseFn&& parse
 }
 
 void init_options_from_env(engine::EngineOptions* opts) {
-  opts->max_context = parse_env_or_default("LLAMA_INFER_MAX_CONTEXT", opts->max_context,
+  opts->max_context = parse_env_or_default("CPI_MAX_CONTEXT", opts->max_context,
                                            [](const char* v) { return std::stoi(v); });
-  opts->top_k = parse_env_or_default("LLAMA_INFER_TOP_K", opts->top_k,
+  opts->top_k = parse_env_or_default("CPI_TOP_K", opts->top_k,
                                      [](const char* v) { return std::stoi(v); });
-  opts->top_p = parse_env_or_default("LLAMA_INFER_TOP_P", opts->top_p,
+  opts->top_p = parse_env_or_default("CPI_TOP_P", opts->top_p,
                                      [](const char* v) { return std::stof(v); });
   opts->repetition_penalty =
-      parse_env_or_default("LLAMA_INFER_REPEAT_PENALTY", opts->repetition_penalty,
+      parse_env_or_default("CPI_REPEAT_PENALTY", opts->repetition_penalty,
                            [](const char* v) { return std::stof(v); });
   opts->no_repeat_ngram_size =
-      parse_env_or_default("LLAMA_INFER_NO_REPEAT_NGRAM", opts->no_repeat_ngram_size,
+      parse_env_or_default("CPI_NO_REPEAT_NGRAM", opts->no_repeat_ngram_size,
                            [](const char* v) { return std::stoi(v); });
-  opts->eos_token_id = parse_env_or_default("LLAMA_INFER_EOS_TOKEN_ID", opts->eos_token_id,
+  opts->eos_token_id = parse_env_or_default("CPI_EOS_TOKEN_ID", opts->eos_token_id,
                                             [](const char* v) { return std::stoi(v); });
   opts->gpu_cache_layers =
-      parse_env_or_default("LLAMA_INFER_GPU_CACHE_LAYERS", opts->gpu_cache_layers,
+      parse_env_or_default("CPI_GPU_CACHE_LAYERS", opts->gpu_cache_layers,
                            [](const char* v) { return std::stoi(v); });
   opts->gpu_cache_limit_mb = static_cast<std::size_t>(parse_env_or_default(
-      "LLAMA_INFER_GPU_CACHE_LIMIT_MB", static_cast<unsigned long long>(opts->gpu_cache_limit_mb),
+      "CPI_GPU_CACHE_LIMIT_MB", static_cast<unsigned long long>(opts->gpu_cache_limit_mb),
       [](const char* v) { return std::stoull(v); }));
   opts->vram_safety_margin_mb = static_cast<std::size_t>(parse_env_or_default(
-      "LLAMA_INFER_VRAM_MARGIN_MB", static_cast<unsigned long long>(opts->vram_safety_margin_mb),
+      "CPI_VRAM_MARGIN_MB", static_cast<unsigned long long>(opts->vram_safety_margin_mb),
       [](const char* v) { return std::stoull(v); }));
-  opts->max_cpu_percent = parse_env_or_default("LLAMA_INFER_MAX_CPU_PERCENT", opts->max_cpu_percent,
+  opts->max_cpu_percent = parse_env_or_default("CPI_MAX_CPU_PERCENT", opts->max_cpu_percent,
                                                [](const char* v) { return std::stod(v); });
   opts->max_memory_percent =
-      parse_env_or_default("LLAMA_INFER_MAX_MEMORY_PERCENT", opts->max_memory_percent,
+      parse_env_or_default("CPI_MAX_MEMORY_PERCENT", opts->max_memory_percent,
                            [](const char* v) { return std::stod(v); });
   opts->resource_sample_interval_ms =
-      parse_env_or_default("LLAMA_INFER_RESOURCE_SAMPLE_MS", opts->resource_sample_interval_ms,
+      parse_env_or_default("CPI_RESOURCE_SAMPLE_MS", opts->resource_sample_interval_ms,
                            [](const char* v) { return std::stoi(v); });
   opts->resource_sustain_ms =
-      parse_env_or_default("LLAMA_INFER_RESOURCE_SUSTAIN_MS", opts->resource_sustain_ms,
+      parse_env_or_default("CPI_RESOURCE_SUSTAIN_MS", opts->resource_sustain_ms,
                            [](const char* v) { return std::stoi(v); });
   opts->resource_throttle_sleep_ms =
-      parse_env_or_default("LLAMA_INFER_RESOURCE_THROTTLE_MS", opts->resource_throttle_sleep_ms,
+      parse_env_or_default("CPI_RESOURCE_THROTTLE_MS", opts->resource_throttle_sleep_ms,
                            [](const char* v) { return std::stoi(v); });
   opts->tq_cached_init_timeout_ms =
-      parse_env_or_default("LLAMA_INFER_TQ_CACHED_INIT_TIMEOUT_MS", opts->tq_cached_init_timeout_ms,
+      parse_env_or_default("CPI_TQ_CACHED_INIT_TIMEOUT_MS", opts->tq_cached_init_timeout_ms,
                            [](const char* v) { return std::stoi(v); });
   opts->tq_first_token_timeout_ms =
-      parse_env_or_default("LLAMA_INFER_TQ_FIRST_TOKEN_TIMEOUT_MS", opts->tq_first_token_timeout_ms,
+      parse_env_or_default("CPI_TQ_FIRST_TOKEN_TIMEOUT_MS", opts->tq_first_token_timeout_ms,
                            [](const char* v) { return std::stoi(v); });
 }
 
 }  // namespace
 
 void print_usage(std::ostream& os) {
-  os << "Usage: llama_infer <model.ll2c|model_dir> [--prompt text --tokenizer tokenizer.model] "
+  os << "Usage: cpi <model.ll2c|model_dir> [--prompt text --tokenizer tokenizer.model] "
         "[--tokens csv] [--max-new n] [--temp t] [--max-context n] "
         "[--gpu-cache-all] [--gpu-cache-layers n] [--gpu-cache-limit-mb n] "
         "[--vram-safety-margin-mb n] "
@@ -139,10 +151,10 @@ void apply_simple_mode_defaults(ParsedArgs* args) {
     return;
   }
   const int simple_default_max_new =
-      parse_env_or_default("LLAMA_INFER_SIMPLE_MAX_NEW", kSimpleModeDefaultMaxNewTokens,
+      parse_env_or_default("CPI_SIMPLE_MAX_NEW", kSimpleModeDefaultMaxNewTokens,
                            [](const char* v) { return std::stoi(v); });
   const float simple_default_temp =
-      parse_env_or_default("LLAMA_INFER_SIMPLE_TEMP", kSimpleModeDefaultTemperature,
+      parse_env_or_default("CPI_SIMPLE_TEMP", kSimpleModeDefaultTemperature,
                            [](const char* v) { return std::stof(v); });
 
   if (!args->max_new_set) {
@@ -224,9 +236,9 @@ ParsedArgs parse_args(int argc, char** argv) {
   ParsedArgs args;
   args.opts.model_path = argv[1];
   init_options_from_env(&args.opts);
-  args.max_new = parse_env_or_default("LLAMA_INFER_DEFAULT_MAX_NEW", kDefaultMaxNewTokens,
+  args.max_new = parse_env_or_default("CPI_DEFAULT_MAX_NEW", kDefaultMaxNewTokens,
                                       [](const char* v) { return std::stoi(v); });
-  args.temp = parse_env_or_default("LLAMA_INFER_DEFAULT_TEMP", kDefaultTemperature,
+  args.temp = parse_env_or_default("CPI_DEFAULT_TEMP", kDefaultTemperature,
                                    [](const char* v) { return std::stof(v); });
 
   for (int i = 2; i < argc; ++i) {
@@ -421,6 +433,45 @@ ParsedArgs parse_args(int argc, char** argv) {
   apply_simple_mode_defaults(&args);
   validate_args(args);
   return args;
+}
+
+void apply_legacy_env_aliases() {
+#if defined(_WIN32)
+  char** env = _environ;
+#elif defined(__APPLE__)
+  char** env = *_NSGetEnviron();
+#else
+  char** env = environ;
+#endif
+  if (env == nullptr) return;
+  const std::string prefix = "LLAMA_INFER_";
+  std::vector<std::pair<std::string, std::string>> migrations;  // (new name, value)
+  std::vector<std::string> old_names;
+  for (char** e = env; *e != nullptr; ++e) {
+    const std::string entry = *e;
+    const std::size_t eq = entry.find('=');
+    if (eq == std::string::npos) continue;
+    const std::string name = entry.substr(0, eq);
+    if (name.rfind(prefix, 0) != 0) continue;
+    const std::string new_name = "CPI_" + name.substr(prefix.size());
+    if (std::getenv(new_name.c_str()) != nullptr) continue;  // new name wins if already set
+    migrations.emplace_back(new_name, entry.substr(eq + 1));
+    old_names.push_back(name);
+  }
+  if (migrations.empty()) return;
+  for (const auto& m : migrations) {
+#if defined(_WIN32)
+    _putenv_s(m.first.c_str(), m.second.c_str());
+#else
+    setenv(m.first.c_str(), m.second.c_str(), 0);
+#endif
+  }
+  std::fprintf(stderr, "[cpi] note: %zu deprecated LLAMA_INFER_* env var(s) mapped to CPI_* (",
+               migrations.size());
+  for (std::size_t i = 0; i < old_names.size(); ++i) {
+    std::fprintf(stderr, "%s%s", i ? ", " : "", old_names[i].c_str());
+  }
+  std::fprintf(stderr, "); rename them to CPI_* to silence this.\n");
 }
 
 }  // namespace app::main_cli

@@ -7,7 +7,7 @@ if /I "%~1"=="/?" goto :help
 for %%I in ("%~dp0.") do set "REPO_DIR=%%~fI"
 set "WEB_DIR=%REPO_DIR%\web"
 set "BUILD_DIR=%REPO_DIR%\build"
-set "INFER_BIN=%BUILD_DIR%\Release\llama_infer.exe"
+set "INFER_BIN=%BUILD_DIR%\Release\cpi.exe"
 
 if not exist "%WEB_DIR%\package.json" (
   echo [install] Could not find web\package.json.
@@ -33,10 +33,10 @@ if not exist "%WEB_DIR%\config.json" (
 )
 
 if not exist "%INFER_BIN%" (
-  echo [install] Building llama_infer.exe...
+  echo [install] Building cpi.exe...
   cmake --fresh -S "%REPO_DIR%" -B "%BUILD_DIR%" -A x64
   if errorlevel 1 exit /b 1
-  cmake --build "%BUILD_DIR%" --config Release --target llama_infer
+  cmake --build "%BUILD_DIR%" --config Release --target cpi
   if errorlevel 1 exit /b 1
 )
 
@@ -55,5 +55,5 @@ echo   1. Installs Python dependencies from requirements.txt
 echo   2. Installs web dependencies
 echo   3. Creates web\.env if missing
 echo   4. Creates web\config.json if missing
-echo   5. Builds build\Release\llama_infer.exe if missing
+echo   5. Builds build\Release\cpi.exe if missing
 exit /b 0

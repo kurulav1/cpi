@@ -46,7 +46,7 @@ All outputs land in `docs/results/`. The report command updates the
 | `prefill_ms` | ms | Time to process the prompt tokens (forward pass over the full prompt). |
 | `decode_ms` | ms | Total time for all decode steps (excludes prefill). |
 
-Phase breakdowns (reported when `--benchmark-phases` is passed to `llama_infer`):
+Phase breakdowns (reported when `--benchmark-phases` is passed to `cpi`):
 
 | Phase metric | Definition |
 |---|---|
@@ -94,7 +94,7 @@ variants:
 
 | Metric | Unit | How measured |
 |---|---|---|
-| `peak_rss_mb` | MB | Peak RSS (Resident Set Size) of the `llama_infer` process tree, sampled every 150 ms by `bench_sweep.py` via `psutil`. Represents host RAM. |
+| `peak_rss_mb` | MB | Peak RSS (Resident Set Size) of the `cpi` process tree, sampled every 150 ms by `bench_sweep.py` via `psutil`. Represents host RAM. |
 | `peak_vram_mb` | MB | Peak VRAM delta above the pre-run baseline, sampled every 150 ms via `nvidia-smi --query-gpu=memory.used`. Represents GPU memory. |
 
 ---
@@ -105,7 +105,7 @@ variants:
 
 1. **Warm-up:** Each configuration runs `--benchmark-warmup 1` warm-up passes
    (not counted) before `--benchmark-reps 3` timed passes. The reported
-   throughput is the average of the timed passes, as computed by `llama_infer`.
+   throughput is the average of the timed passes, as computed by `cpi`.
 2. **Temperature:** 0 (greedy decoding) with `--top-k 1`. This eliminates
    sampling variance from timing measurements.
 3. **Context filling:** The prompt is fixed. Context length is set via

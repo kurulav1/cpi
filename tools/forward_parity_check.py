@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Forward-parity gate: GPU decode forward vs an independent CPU reference.
 
-Runs llama_infer --parity-check, which computes the full decode forward on the
+Runs cpi --parity-check, which computes the full decode forward on the
 GPU and again on the CPU (embedding -> N x [RMSNorm, QKV(+bias), RoPE, attention,
 o-proj, residual, RMSNorm, SwiGLU, residual] -> final norm -> lm-head), then
 compares: the argmax must agree and the max logit diff must be within tolerance.
@@ -14,7 +14,7 @@ missing QKV bias, for instance, took Qwen2.5's max_abs from 0.07 to 21).
 
 Usage:
   python tools/forward_parity_check.py \
-    --bin build/Release/llama_infer.exe \
+    --bin build/Release/cpi.exe \
     --model artifacts/hub/Qwen__Qwen2.5-0.5B-Instruct/Qwen2.5-0.5B-Instruct.ll2c \
     --tokenizer artifacts/hub/Qwen__Qwen2.5-0.5B-Instruct/hf/tokenizer.json
 
@@ -32,13 +32,13 @@ import sys
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--bin", default="build/Release/llama_infer.exe")
+    ap.add_argument("--bin", default="build/Release/cpi.exe")
     ap.add_argument("--model", required=True)
     ap.add_argument("--tokenizer", required=True)
     ap.add_argument("--prompt", default="The capital of France is")
     a = ap.parse_args()
 
-    env = dict(os.environ, LLAMA_INFER_INSTANCE_MUTEX=f"Local\\cpi_parity_{os.getpid()}")
+    env = dict(os.environ, CPI_INSTANCE_MUTEX=f"Local\\cpi_parity_{os.getpid()}")
     cmd = [os.path.abspath(a.bin), a.model, "--tokenizer", a.tokenizer, "--prompt", a.prompt,
            "--parity-check", "--gpu-cache-all", "--no-resource-limits"]
     p = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=400)

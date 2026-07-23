@@ -160,7 +160,7 @@ def write_reports(results: list[dict], json_out: Path | None, csv_out: Path | No
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", type=Path, default=Path("."))
-    ap.add_argument("--infer-bin", type=Path, default=Path("build/Release/llama_infer.exe"))
+    ap.add_argument("--infer-bin", type=Path, default=Path("build/Release/cpi.exe"))
     ap.add_argument("--input-model", type=Path, required=True)
     ap.add_argument("--tokenizer", type=Path, required=True)
     ap.add_argument("--mode", choices=["smoke", "perf-sweep"], default="smoke")

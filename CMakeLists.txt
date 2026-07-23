@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.24)
-project(cpi VERSION 0.1.0 LANGUAGES CXX)
+project(cpi VERSION 0.2.0 LANGUAGES CXX)
 
 # Stamp the build with the project version (and the short git SHA when available) so
-# `llama_infer --version` reports exactly what was built. CPI_GIT_SHA is best-effort:
+# `cpi --version` reports exactly what was built. CPI_GIT_SHA is best-effort:
 # a source archive with no .git resolves to "unknown", which is fine.
 set(CPI_GIT_SHA "unknown")
 find_package(Git QUIET)
@@ -24,21 +24,21 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 include(CTest)
 enable_testing()
 
-option(LLAMA_ENGINE_ENABLE_CUDA "Enable CUDA GPU inference and tools" ON)
+option(CPI_ENABLE_CUDA "Enable CUDA GPU inference and tools" ON)
 # Metal is the Apple Silicon backend. Defaults ON only on Apple, and is the exact
-# analogue of LLAMA_ENGINE_ENABLE_CUDA: the two are independent, and a machine
+# analogue of CPI_ENABLE_CUDA: the two are independent, and a machine
 # with neither still gets the portable CPU engines.
 if(APPLE)
-  option(LLAMA_ENGINE_ENABLE_METAL "Enable the Metal GPU backend (Apple Silicon)" ON)
+  option(CPI_ENABLE_METAL "Enable the Metal GPU backend (Apple Silicon)" ON)
 else()
-  option(LLAMA_ENGINE_ENABLE_METAL "Enable the Metal GPU backend (Apple Silicon)" OFF)
+  option(CPI_ENABLE_METAL "Enable the Metal GPU backend (Apple Silicon)" OFF)
 endif()
-option(LLAMA_ENGINE_ENABLE_LTO "Enable LTO" ON)
-option(LLAMA_ENGINE_WARNINGS_AS_ERRORS "Treat warnings as errors" OFF)
-option(LLAMA_ENGINE_ENABLE_CLANG_TIDY "Enable clang-tidy during build" OFF)
-option(LLAMA_ENGINE_ENABLE_SENTENCEPIECE "Enable sentencepiece tokenizer support" ON)
+option(CPI_ENABLE_LTO "Enable LTO" ON)
+option(CPI_WARNINGS_AS_ERRORS "Treat warnings as errors" OFF)
+option(CPI_ENABLE_CLANG_TIDY "Enable clang-tidy during build" OFF)
+option(CPI_ENABLE_SENTENCEPIECE "Enable sentencepiece tokenizer support" ON)
 
-if(LLAMA_ENGINE_ENABLE_CUDA)
+if(CPI_ENABLE_CUDA)
   include(CheckLanguage)
   check_language(CUDA)
   if(CMAKE_CUDA_COMPILER)
@@ -66,16 +66,16 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
 
     find_package(CUDAToolkit QUIET)
     if(NOT CUDAToolkit_FOUND)
-      message(WARNING "CUDAToolkit was not found; falling back to a CPU-only build. Set LLAMA_ENGINE_ENABLE_CUDA=OFF to silence this warning.")
-      set(LLAMA_ENGINE_ENABLE_CUDA OFF)
+      message(WARNING "CUDAToolkit was not found; falling back to a CPU-only build. Set CPI_ENABLE_CUDA=OFF to silence this warning.")
+      set(CPI_ENABLE_CUDA OFF)
     endif()
   else()
-    message(WARNING "A CUDA compiler was not found; falling back to a CPU-only build. Set LLAMA_ENGINE_ENABLE_CUDA=OFF to silence this warning.")
-    set(LLAMA_ENGINE_ENABLE_CUDA OFF)
+    message(WARNING "A CUDA compiler was not found; falling back to a CPU-only build. Set CPI_ENABLE_CUDA=OFF to silence this warning.")
+    set(CPI_ENABLE_CUDA OFF)
   endif()
 endif()
 
-if(LLAMA_ENGINE_ENABLE_CUDA)
+if(CPI_ENABLE_CUDA)
   message(STATUS "CUDA support enabled")
   message(STATUS "Building CUDA kernels for architecture(s): ${CMAKE_CUDA_ARCHITECTURES}")
 else()
@@ -84,14 +84,14 @@ endif()
 
 if(MSVC)
   add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/W4>)
-  if(LLAMA_ENGINE_WARNINGS_AS_ERRORS)
+  if(CPI_WARNINGS_AS_ERRORS)
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/WX>)
   endif()
 else()
   # Quote the genexp so its internal ';' list stays inside it; unquoted, CMake would
   # split at parse time and leave a stray "-Wpedantic>" token on gcc/clang.
   add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Wpedantic>")
-  if(LLAMA_ENGINE_WARNINGS_AS_ERRORS)
+  if(CPI_WARNINGS_AS_ERRORS)
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Werror>)
   endif()
 endif()
@@ -100,7 +100,7 @@ find_package(OpenMP)
 find_program(CLANG_FORMAT_EXE NAMES clang-format)
 find_program(CLANG_TIDY_EXE NAMES clang-tidy)
 
-if(LLAMA_ENGINE_ENABLE_SENTENCEPIECE)
+if(CPI_ENABLE_SENTENCEPIECE)
   find_package(sentencepiece CONFIG QUIET)
   if(NOT sentencepiece_FOUND)
     find_path(SENTENCEPIECE_INCLUDE_DIR
@@ -122,7 +122,7 @@ if(LLAMA_ENGINE_ENABLE_SENTENCEPIECE)
   endif()
 endif()
 
-set(LLAMA_ENGINE_SOURCES
+set(CPI_ENGINE_SOURCES
   src/platform/mmap_file.cpp
   src/model/weight_loader.cpp
   src/model/safetensors_loader.cpp
@@ -158,8 +158,8 @@ set(LLAMA_ENGINE_SOURCES
   src/engine/qwen35_cpu_engine.cpp
 )
 
-if(LLAMA_ENGINE_ENABLE_CUDA)
-  list(APPEND LLAMA_ENGINE_SOURCES
+if(CPI_ENABLE_CUDA)
+  list(APPEND CPI_ENGINE_SOURCES
     src/runtime/system_info.cpp
     src/runtime/cuda_utils.cu
     src/runtime/kv_cache.cpp
@@ -195,8 +195,8 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
   )
 endif()
 
-if(LLAMA_ENGINE_ENABLE_METAL)
-  list(APPEND LLAMA_ENGINE_SOURCES
+if(CPI_ENABLE_METAL)
+  list(APPEND CPI_ENGINE_SOURCES
     src/runtime/metal_context.mm
     src/engine/plan_metal_engine.cpp
     src/engine/plan_metal_vision.cpp
@@ -204,11 +204,11 @@ if(LLAMA_ENGINE_ENABLE_METAL)
   )
 endif()
 
-add_library(llama_engine ${LLAMA_ENGINE_SOURCES})
-target_include_directories(llama_engine PUBLIC include)
+add_library(cpi_engine ${CPI_ENGINE_SOURCES})
+target_include_directories(cpi_engine PUBLIC include)
 
-if(LLAMA_ENGINE_ENABLE_CUDA)
-  target_link_libraries(llama_engine
+if(CPI_ENABLE_CUDA)
+  target_link_libraries(cpi_engine
     PUBLIC
       CUDA::cudart
       CUDA::cublas
@@ -216,27 +216,27 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
   )
 endif()
 
-target_compile_definitions(llama_engine PUBLIC LLAMA_ENGINE_HAS_CUDA=$<BOOL:${LLAMA_ENGINE_ENABLE_CUDA}>)
-target_compile_definitions(llama_engine PUBLIC LLAMA_ENGINE_HAS_METAL=$<BOOL:${LLAMA_ENGINE_ENABLE_METAL}>)
+target_compile_definitions(cpi_engine PUBLIC CPI_HAS_CUDA=$<BOOL:${CPI_ENABLE_CUDA}>)
+target_compile_definitions(cpi_engine PUBLIC CPI_HAS_METAL=$<BOOL:${CPI_ENABLE_METAL}>)
 
 # ---------------------------------------------------------------------------
 # Metal backend (Apple Silicon)
 # ---------------------------------------------------------------------------
-if(LLAMA_ENGINE_ENABLE_METAL)
+if(CPI_ENABLE_METAL)
   # metal_context.mm is Objective-C++ and is deliberately built WITHOUT ARC, so a
   # Metal object can live behind a plain void* in a header that knows nothing
   # about Objective-C.
   set_source_files_properties(src/runtime/metal_context.mm PROPERTIES
     COMPILE_FLAGS "-fno-objc-arc")
 
-  target_link_libraries(llama_engine PUBLIC
+  target_link_libraries(cpi_engine PUBLIC
     "-framework Metal"
     "-framework Foundation"
   )
 
-  # Exposed as a compile macro (PUBLIC, so llama_infer sees it) so the main binary can
-  # conditionally wire the Metal engine into its dispatch -- mirrors LLAMA_ENGINE_HAS_CUDA.
-  target_compile_definitions(llama_engine PUBLIC LLAMA_ENGINE_ENABLE_METAL=1)
+  # Exposed as a compile macro (PUBLIC, so cpi sees it) so the main binary can
+  # conditionally wire the Metal engine into its dispatch -- mirrors CPI_HAS_CUDA.
+  target_compile_definitions(cpi_engine PUBLIC CPI_ENABLE_METAL=1)
 
   # The shaders are split into family files (00_common.metal, 10_dense.metal, ...) under this
   # directory. CPI_METAL_SOURCE is the DIRECTORY: the runtime loader concatenates its *.metal in
@@ -279,7 +279,7 @@ if(LLAMA_ENGINE_ENABLE_METAL)
       VERBATIM
     )
     add_custom_target(cpi_metallib ALL DEPENDS ${CPI_METALLIB})
-    add_dependencies(llama_engine cpi_metallib)
+    add_dependencies(cpi_engine cpi_metallib)
     message(STATUS "Metal: offline toolchain found; precompiling cpi_kernels.metallib")
   else()
     set(CPI_METALLIB "")
@@ -289,13 +289,13 @@ if(LLAMA_ENGINE_ENABLE_METAL)
 endif()
 
 if(sentencepiece_FOUND)
-  target_link_libraries(llama_engine PUBLIC sentencepiece::sentencepiece)
-  target_compile_definitions(llama_engine PUBLIC LLAMA_ENGINE_HAS_SENTENCEPIECE=1)
+  target_link_libraries(cpi_engine PUBLIC sentencepiece::sentencepiece)
+  target_compile_definitions(cpi_engine PUBLIC CPI_HAS_SENTENCEPIECE=1)
 endif()
 
 # OpenMP for the CPU engine (parallel GEMV rows).
 if(OpenMP_CXX_FOUND)
-  target_link_libraries(llama_engine PUBLIC OpenMP::OpenMP_CXX)
+  target_link_libraries(cpi_engine PUBLIC OpenMP::OpenMP_CXX)
 endif()
 
 # AVX2 + F16C for the CPU engine GEMV (8-wide FP32 SIMD, on-the-fly FP16
@@ -326,33 +326,50 @@ else()
   message(STATUS "CPU engines: non-x86 target (${CMAKE_SYSTEM_PROCESSOR}); using scalar fallbacks")
 endif()
 
-set_target_properties(llama_engine PROPERTIES POSITION_INDEPENDENT_CODE ON)
+set_target_properties(cpi_engine PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-if(LLAMA_ENGINE_ENABLE_CUDA)
-  set_target_properties(llama_engine PROPERTIES
+if(CPI_ENABLE_CUDA)
+  set_target_properties(cpi_engine PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
   )
 endif()
 
-if(LLAMA_ENGINE_ENABLE_LTO)
+if(CPI_ENABLE_LTO)
   include(CheckIPOSupported)
   check_ipo_supported(RESULT LTO_SUPPORTED OUTPUT LTO_ERROR)
   if(LTO_SUPPORTED)
-    set_property(TARGET llama_engine PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+    set_property(TARGET cpi_engine PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
   else()
     message(WARNING "LTO not supported: ${LTO_ERROR}")
   endif()
 endif()
 
-add_executable(llama_infer
+add_executable(cpi
   src/main.cpp
   src/app/main_helpers.cpp
   src/app/main_cli.cpp
   src/app/main_modes.cpp
   src/app/main_interactive_batch.cpp
 )
-target_link_libraries(llama_infer PRIVATE llama_engine)
+target_link_libraries(cpi PRIVATE cpi_engine)
+
+# Backward-compat alias: the binary was renamed llama_infer -> cpi. Drop a `llama_infer` next to it
+# (symlink on Unix, copy on Windows) so existing local scripts keep working for one release. This
+# is source-build only; the release archives ship `cpi`.
+if(NOT DEFINED CPI_NO_LEGACY_ALIAS)
+  if(WIN32)
+    add_custom_command(TARGET cpi POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              "$<TARGET_FILE:cpi>" "$<TARGET_FILE_DIR:cpi>/llama_infer.exe"
+      VERBATIM)
+  else()
+    add_custom_command(TARGET cpi POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E create_symlink
+              "$<TARGET_FILE_NAME:cpi>" "$<TARGET_FILE_DIR:cpi>/llama_infer"
+      VERBATIM)
+  endif()
+endif()
 
 # cpi_embed: embedding worker (BERT-family encoder). Needs a GPU backend -- CUDA or Metal.
 #
@@ -360,12 +377,12 @@ target_link_libraries(llama_infer PRIVATE llama_engine)
 # target simply did not exist, so the Node server resolved cpi_embed from a CUDA build dir, found
 # nothing, and 503'd every embedding route. src/cpi_embed.cpp now selects the implementation at
 # compile time; the encoder itself is engine::MetalBertEmbedder on Apple.
-if(LLAMA_ENGINE_ENABLE_CUDA OR LLAMA_ENGINE_ENABLE_METAL)
+if(CPI_ENABLE_CUDA OR CPI_ENABLE_METAL)
   add_executable(cpi_embed
     src/cpi_embed.cpp
     src/app/main_helpers.cpp
   )
-  target_link_libraries(cpi_embed PRIVATE llama_engine)
+  target_link_libraries(cpi_embed PRIVATE cpi_engine)
 endif()
 
 # Grammar unit tests. CUDA-free: built from the grammar sources directly so the
@@ -408,7 +425,7 @@ add_test(NAME metal_fp16_test COMMAND metal_fp16_test)
 # Repack a .ll2c into a .cpi (safetensors + JSON __metadata__). CPU-only, no backend needed.
 add_executable(ll2c_to_cpi src/tools/ll2c_to_cpi.cpp)
 target_include_directories(ll2c_to_cpi PRIVATE include)
-target_link_libraries(ll2c_to_cpi PRIVATE llama_engine)
+target_link_libraries(ll2c_to_cpi PRIVATE cpi_engine)
 
 # LlamaConfig <-> .cpi __metadata__ round trip. Header-only and CPU-only, so it runs everywhere.
 add_executable(config_json_test src/tests/config_json_test.cpp)
@@ -419,27 +436,27 @@ add_test(NAME config_json_test COMMAND config_json_test)
 # the executables, not in llama_engine. CPU-only, so it runs on CI, Windows and the Mac alike.
 add_executable(probe_model_test src/tests/probe_model_test.cpp src/app/main_helpers.cpp)
 target_include_directories(probe_model_test PRIVATE include)
-target_link_libraries(probe_model_test PRIVATE llama_engine)
+target_link_libraries(probe_model_test PRIVATE cpi_engine)
 add_test(NAME probe_model_test COMMAND probe_model_test)
 
 add_executable(qwen2vl_preproc_test src/tests/qwen2vl_preproc_test.cpp)
 target_include_directories(qwen2vl_preproc_test PRIVATE include)
-target_link_libraries(qwen2vl_preproc_test PRIVATE llama_engine)
+target_link_libraries(qwen2vl_preproc_test PRIVATE cpi_engine)
 
 # Metal kernel smoke test: runs each shader against a CPU reference. On a machine
 # with no Metal GPU (any VM, including GitHub's macOS runners) it reports SKIP and
 # passes -- so a green run here proves it COMPILES AND LINKS, never that the
 # kernels are correct. Only real Apple Silicon can prove that.
-if(LLAMA_ENGINE_ENABLE_METAL)
-  # Text generation on Apple Silicon. Separate from llama_infer, whose engine dispatch
+if(CPI_ENABLE_METAL)
+  # Text generation on Apple Silicon. Separate from cpi, whose engine dispatch
   # is templated over the CUDA engines -- keeping this standalone means the Metal path
   # has no CUDA anywhere in its dependency graph.
   add_executable(metal_infer src/app/metal_infer.cpp)
-  target_link_libraries(metal_infer PRIVATE llama_engine)
+  target_link_libraries(metal_infer PRIVATE cpi_engine)
   target_include_directories(metal_infer PRIVATE include)
 
   add_executable(metal_vision_test src/tests/metal_vision_test.cpp)
-  target_link_libraries(metal_vision_test PRIVATE llama_engine)
+  target_link_libraries(metal_vision_test PRIVATE cpi_engine)
   target_include_directories(metal_vision_test PRIVATE include)
   # No add_test: it needs an oracle directory produced by a torch/transformers run, which the
   # Mac cannot generate. Run it by hand with the dumps copied over.
@@ -448,17 +465,17 @@ if(LLAMA_ENGINE_ENABLE_METAL)
   # and an oracle dump from a torch run, neither of which the Mac can produce. It is also the
   # control for metal_vision_test's FIRST_STEP_LOGITS -- see the file header.
   add_executable(qwen35_text_test src/tests/qwen35_text_test.cpp)
-  target_link_libraries(qwen35_text_test PRIVATE llama_engine)
+  target_link_libraries(qwen35_text_test PRIVATE cpi_engine)
   target_include_directories(qwen35_text_test PRIVATE include)
 
   # The Metal BERT embedder vs a HuggingFace reference. No add_test: it needs both a model dir
   # and an oracle dump from a torch run, neither of which the Mac can produce.
   add_executable(metal_embed_test src/tests/metal_embed_test.cpp)
-  target_link_libraries(metal_embed_test PRIVATE llama_engine)
+  target_link_libraries(metal_embed_test PRIVATE cpi_engine)
   target_include_directories(metal_embed_test PRIVATE include)
 
   add_executable(metal_smoke src/tests/metal_smoke.cpp)
-  target_link_libraries(metal_smoke PRIVATE llama_engine)
+  target_link_libraries(metal_smoke PRIVATE cpi_engine)
   target_include_directories(metal_smoke PRIVATE include)
   add_test(NAME metal_smoke COMMAND metal_smoke)
   # Both are set: the metallib if we have one, and the source path as the fallback
@@ -469,7 +486,7 @@ if(LLAMA_ENGINE_ENABLE_METAL)
   # Metal decode vs the CPU engine on the same weights. Needs a model, so it SKIPs
   # (exit 0) with no argument and ctest stays green without one.
   add_executable(metal_decode_test src/tests/metal_decode_test.cpp)
-  target_link_libraries(metal_decode_test PRIVATE llama_engine)
+  target_link_libraries(metal_decode_test PRIVATE cpi_engine)
   target_include_directories(metal_decode_test PRIVATE include)
   add_test(NAME metal_decode_test COMMAND metal_decode_test)
   set_tests_properties(metal_decode_test PROPERTIES
@@ -477,12 +494,12 @@ if(LLAMA_ENGINE_ENABLE_METAL)
 
   # Isolated fp16 GEMM benchmark that verifies what it times. No model needed.
   add_executable(metal_gemm_bench src/tests/metal_gemm_bench.cpp)
-  target_link_libraries(metal_gemm_bench PRIVATE llama_engine)
+  target_link_libraries(metal_gemm_bench PRIVATE cpi_engine)
   target_include_directories(metal_gemm_bench PRIVATE include)
 
   # Batched paged decode vs the single-sequence path. Needs a model, so it SKIPs without one.
   add_executable(metal_batched_test src/tests/metal_batched_test.cpp)
-  target_link_libraries(metal_batched_test PRIVATE llama_engine)
+  target_link_libraries(metal_batched_test PRIVATE cpi_engine)
   target_include_directories(metal_batched_test PRIVATE include)
   add_test(NAME metal_batched_test COMMAND metal_batched_test)
   set_tests_properties(metal_batched_test PROPERTIES
@@ -518,7 +535,7 @@ add_test(NAME wordpiece_test
 # (not FAILED) when the model is absent, e.g. on CI / clean checkouts.
 set_tests_properties(wordpiece_test PROPERTIES SKIP_RETURN_CODE 77)
 
-if(LLAMA_ENGINE_ENABLE_CUDA)
+if(CPI_ENABLE_CUDA)
   add_executable(cuda_bandwidth_bench
     src/tools/cuda_bandwidth_bench.cu
     src/runtime/cuda_utils.cu
@@ -534,7 +551,7 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
     src/tests/moe_kernel_parity_test.cu
   )
   target_include_directories(moe_kernel_parity_test PRIVATE include)
-  target_link_libraries(moe_kernel_parity_test PRIVATE llama_engine)
+  target_link_libraries(moe_kernel_parity_test PRIVATE cpi_engine)
   set_target_properties(moe_kernel_parity_test PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
@@ -546,21 +563,21 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
     src/tests/image_preprocess_test.cpp
   )
   target_include_directories(image_preprocess_test PRIVATE include)
-  target_link_libraries(image_preprocess_test PRIVATE llama_engine)
+  target_link_libraries(image_preprocess_test PRIVATE cpi_engine)
 
   # Hand-rolled PNG decoder: byte-exact vs fixtures made with a real DEFLATE encoder.
   add_executable(png_test
     src/tests/png_test.cpp
   )
   target_include_directories(png_test PRIVATE include)
-  target_link_libraries(png_test PRIVATE llama_engine)
+  target_link_libraries(png_test PRIVATE cpi_engine)
 
   # Sequence prefill == token-by-token prefill (incl. beyond the sliding window).
   add_executable(seq_prefill_test
     src/tests/seq_prefill_test.cu
   )
   target_include_directories(seq_prefill_test PRIVATE include)
-  target_link_libraries(seq_prefill_test PRIVATE llama_engine)
+  target_link_libraries(seq_prefill_test PRIVATE cpi_engine)
   set_target_properties(seq_prefill_test PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
@@ -571,7 +588,7 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
     src/tests/vision_forward_test.cu
   )
   target_include_directories(vision_forward_test PRIVATE include)
-  target_link_libraries(vision_forward_test PRIVATE llama_engine)
+  target_link_libraries(vision_forward_test PRIVATE cpi_engine)
   set_target_properties(vision_forward_test PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
@@ -582,7 +599,7 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
     src/tests/lm_head_bench.cu
   )
   target_include_directories(lm_head_bench PRIVATE include)
-  target_link_libraries(lm_head_bench PRIVATE llama_engine)
+  target_link_libraries(lm_head_bench PRIVATE cpi_engine)
   set_target_properties(lm_head_bench PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
@@ -593,7 +610,7 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
     src/tests/gemm_parity_test.cu
   )
   target_include_directories(gemm_parity_test PRIVATE include)
-  target_link_libraries(gemm_parity_test PRIVATE llama_engine)
+  target_link_libraries(gemm_parity_test PRIVATE cpi_engine)
   set_target_properties(gemm_parity_test PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
@@ -606,7 +623,7 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
     src/tests/prefill_parity_test.cu
   )
   target_include_directories(prefill_parity_test PRIVATE include)
-  target_link_libraries(prefill_parity_test PRIVATE llama_engine)
+  target_link_libraries(prefill_parity_test PRIVATE cpi_engine)
   set_target_properties(prefill_parity_test PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
@@ -619,7 +636,7 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
     src/tests/gemma4_forward_test.cu
   )
   target_include_directories(gemma4_forward_test PRIVATE include)
-  target_link_libraries(gemma4_forward_test PRIVATE llama_engine)
+  target_link_libraries(gemma4_forward_test PRIVATE cpi_engine)
   set_target_properties(gemma4_forward_test PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
@@ -633,7 +650,7 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
     src/tests/attention_reference_parity_test.cu
   )
   target_include_directories(attention_reference_parity_test PRIVATE include)
-  target_link_libraries(attention_reference_parity_test PRIVATE llama_engine)
+  target_link_libraries(attention_reference_parity_test PRIVATE cpi_engine)
   set_target_properties(attention_reference_parity_test PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
@@ -648,7 +665,7 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
     src/tests/batched_paged_attention_reference_parity_test.cu
   )
   target_include_directories(batched_paged_attention_reference_parity_test PRIVATE include)
-  target_link_libraries(batched_paged_attention_reference_parity_test PRIVATE llama_engine)
+  target_link_libraries(batched_paged_attention_reference_parity_test PRIVATE cpi_engine)
   set_target_properties(batched_paged_attention_reference_parity_test PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
@@ -663,7 +680,7 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
     src/tests/int4_attention_reference_parity_test.cu
   )
   target_include_directories(int4_attention_reference_parity_test PRIVATE include)
-  target_link_libraries(int4_attention_reference_parity_test PRIVATE llama_engine)
+  target_link_libraries(int4_attention_reference_parity_test PRIVATE cpi_engine)
   set_target_properties(int4_attention_reference_parity_test PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
@@ -676,7 +693,7 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
     src/tests/paged_attention_parity_test.cu
   )
   target_include_directories(paged_attention_parity_test PRIVATE include)
-  target_link_libraries(paged_attention_parity_test PRIVATE llama_engine)
+  target_link_libraries(paged_attention_parity_test PRIVATE cpi_engine)
   set_target_properties(paged_attention_parity_test PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
@@ -688,7 +705,7 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
     src/tests/paged_batched_attention_parity_test.cu
   )
   target_include_directories(paged_batched_attention_parity_test PRIVATE include)
-  target_link_libraries(paged_batched_attention_parity_test PRIVATE llama_engine)
+  target_link_libraries(paged_batched_attention_parity_test PRIVATE cpi_engine)
   set_target_properties(paged_batched_attention_parity_test PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
@@ -700,7 +717,7 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
     src/tests/paged_batched_primitives_test.cu
   )
   target_include_directories(paged_batched_primitives_test PRIVATE include)
-  target_link_libraries(paged_batched_primitives_test PRIVATE llama_engine)
+  target_link_libraries(paged_batched_primitives_test PRIVATE cpi_engine)
   set_target_properties(paged_batched_primitives_test PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
@@ -711,7 +728,7 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
     src/tests/int4_gemv_bench.cu
   )
   target_include_directories(int4_gemv_bench PRIVATE include)
-  target_link_libraries(int4_gemv_bench PRIVATE llama_engine)
+  target_link_libraries(int4_gemv_bench PRIVATE cpi_engine)
   set_target_properties(int4_gemv_bench PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
@@ -723,22 +740,22 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
     src/tests/attention_decode_bench.cu
   )
   target_include_directories(attention_decode_bench PRIVATE include)
-  target_link_libraries(attention_decode_bench PRIVATE llama_engine)
+  target_link_libraries(attention_decode_bench PRIVATE cpi_engine)
   set_target_properties(attention_decode_bench PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
   )
 endif()
 
-if(LLAMA_ENGINE_ENABLE_CLANG_TIDY AND CLANG_TIDY_EXE)
-  set_target_properties(llama_engine PROPERTIES CXX_CLANG_TIDY "${CLANG_TIDY_EXE}")
-  set_target_properties(llama_infer PROPERTIES CXX_CLANG_TIDY "${CLANG_TIDY_EXE}")
+if(CPI_ENABLE_CLANG_TIDY AND CLANG_TIDY_EXE)
+  set_target_properties(cpi_engine PROPERTIES CXX_CLANG_TIDY "${CLANG_TIDY_EXE}")
+  set_target_properties(cpi PROPERTIES CXX_CLANG_TIDY "${CLANG_TIDY_EXE}")
   if(TARGET cuda_bandwidth_bench)
     set_target_properties(cuda_bandwidth_bench PROPERTIES CXX_CLANG_TIDY "${CLANG_TIDY_EXE}")
   endif()
 endif()
 
-file(GLOB_RECURSE LLAMA_ENGINE_SOURCES
+file(GLOB_RECURSE CPI_ENGINE_SOURCES
   CONFIGURE_DEPENDS
   include/*.hpp
   include/*.h
@@ -749,13 +766,13 @@ file(GLOB_RECURSE LLAMA_ENGINE_SOURCES
 
 if(CLANG_FORMAT_EXE)
   add_custom_target(format
-    COMMAND ${CLANG_FORMAT_EXE} -i ${LLAMA_ENGINE_SOURCES}
+    COMMAND ${CLANG_FORMAT_EXE} -i ${CPI_ENGINE_SOURCES}
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     COMMENT "Running clang-format on project sources"
   )
 
   add_custom_target(format-check
-    COMMAND ${CLANG_FORMAT_EXE} --dry-run --Werror ${LLAMA_ENGINE_SOURCES}
+    COMMAND ${CLANG_FORMAT_EXE} --dry-run --Werror ${CPI_ENGINE_SOURCES}
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     COMMENT "Checking source formatting with clang-format"
   )
@@ -763,7 +780,7 @@ endif()
 
 if(CLANG_TIDY_EXE)
   add_custom_target(tidy
-    COMMAND ${CLANG_TIDY_EXE} ${LLAMA_ENGINE_SOURCES} -- -I${CMAKE_SOURCE_DIR}/include
+    COMMAND ${CLANG_TIDY_EXE} ${CPI_ENGINE_SOURCES} -- -I${CMAKE_SOURCE_DIR}/include
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     COMMENT "Running clang-tidy (standalone mode)"
   )

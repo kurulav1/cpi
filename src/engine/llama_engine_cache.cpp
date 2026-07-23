@@ -418,11 +418,11 @@ void LlamaEngine::init_layer_cache() {
       std::ostringstream oss;
       oss << "TurboQuant cached mode requires full residency: requested_layers=" << requested_layers
           << " total_layers=" << cfg.num_layers << " policy=" << cache_policy;
-      LLAMA_ENGINE_THROW(oss.str());
+      CPI_THROW(oss.str());
     }
     std::string strict_reason;
     if (!tq_cached_preflight_layers(requested_layers, &strict_reason)) {
-      LLAMA_ENGINE_THROW("TurboQuant cached preflight failed: " + strict_reason);
+      CPI_THROW("TurboQuant cached preflight failed: " + strict_reason);
     }
     cache_policy = "tq_cached_strict";
   } else if (tq3_enabled_ && requested_layers > 0) {
@@ -608,13 +608,13 @@ void LlamaEngine::init_layer_cache() {
         return;
       }
       if (!has_any_packed_lowbit_tensor(weights_, name)) {
-        LLAMA_ENGINE_THROW("missing fp16/packed tensor for cached layer load: " + name);
+        CPI_THROW("missing fp16/packed tensor for cached layer load: " + name);
       }
       if (!lowbit_streaming_enabled(options_)) {
-        LLAMA_ENGINE_THROW("packed low-bit tensor requires --weight-quant int8|int4: " + name);
+        CPI_THROW("packed low-bit tensor requires --weight-quant int8|int4: " + name);
       }
       if (!tmp_i8 || !tmp_scales) {
-        LLAMA_ENGINE_THROW("missing temporary low-bit buffers for cached layer load: " + name);
+        CPI_THROW("missing temporary low-bit buffers for cached layer load: " + name);
       }
       // Packed low-bit: async H2D on transfer_stream_, sync to compute_stream_ via
       // event before dequant to fp16.
@@ -638,7 +638,7 @@ void LlamaEngine::init_layer_cache() {
             rows, cols, unpacked.data());
         CUDA_CHECK(cudaMemcpy(tmp_i8, unpacked.data(), unpacked.size(), cudaMemcpyHostToDevice));
       } else {
-        LLAMA_ENGINE_THROW("missing packed low-bit tensor data: " + name);
+        CPI_THROW("missing packed low-bit tensor data: " + name);
       }
       cudaEvent_t ev_i8 = nullptr;
       CUDA_CHECK(cudaEventCreateWithFlags(&ev_i8, cudaEventDisableTiming));
@@ -676,7 +676,7 @@ void LlamaEngine::init_layer_cache() {
         return;
       }
       if (!weights_.has_tensor(name)) {
-        LLAMA_ENGINE_THROW("missing tensor: " + name);
+        CPI_THROW("missing tensor: " + name);
       }
       CUDA_CHECK(cudaMemcpyAsync(dst, weights_.tensor_data(name), bytes, cudaMemcpyHostToDevice,
                                  transfer_stream_));
@@ -774,7 +774,7 @@ void LlamaEngine::init_layer_cache() {
       CUDA_CHECK(cudaStreamWaitEvent(compute_stream_, ev_wqkv, 0));
       if (use_proj_int4) {
         if (!tmp_i8 || !tmp_i8->w1 || !tmp_i8->w2 || !tmp_i8->s_w1 || !tmp_i8->s_w2) {
-          LLAMA_ENGINE_THROW("missing temporary buffers for int4 projection packing");
+          CPI_THROW("missing temporary buffers for int4 projection packing");
         }
         kernels::launch_quantize_rowwise_fp16_to_int8(
             static_cast<const __half*>(lw.wqkv), tmp_i8->w1, tmp_i8->s_w1, q_hidden + 2 * kv_hidden,
@@ -905,7 +905,7 @@ void LlamaEngine::init_layer_cache() {
           return;
         }
 
-        LLAMA_ENGINE_THROW("missing low-bit/fp16 tensor for cached MLP: " + name);
+        CPI_THROW("missing low-bit/fp16 tensor for cached MLP: " + name);
       };
       load_cached_lowbit(p + ".feed_forward.w1", inter, hidden, lw_i8.w1, lw_i8.s_w1);
       load_cached_lowbit(p + ".feed_forward.w2", hidden, inter, lw_i8.w2, lw_i8.s_w2);
@@ -1093,7 +1093,7 @@ void LlamaEngine::init_layer_cache() {
     for (int layer = 0; layer < cached_layer_count_; ++layer) {
       const auto& tq = layer_cache_tq3_[static_cast<std::size_t>(layer)];
       if (!tq.wqkv || !tq.wo || !tq.w13) {
-        LLAMA_ENGINE_THROW("TurboQuant model is missing packed weights for layer " +
+        CPI_THROW("TurboQuant model is missing packed weights for layer " +
                            std::to_string(layer) + " (wqkv=" + (tq.wqkv ? "ok" : "MISSING") +
                            " wo=" + (tq.wo ? "ok" : "MISSING") +
                            " w13=" + (tq.w13 ? "ok" : "MISSING") +

@@ -2,7 +2,7 @@
 """
 CPI throughput / latency / memory sweep.
 
-Runs llama_infer across a configurable matrix of:
+Runs cpi across a configurable matrix of:
   - context lengths  (e.g. 128, 512, 2048, 4096)
   - quantization modes  (fp16, int8, int4)
   - compute paths  (CUDA, CPU)
@@ -432,7 +432,7 @@ def main() -> int:
     ap.add_argument("--model", required=True, help=".ll2c model path")
     ap.add_argument("--tokenizer", required=True, help="Tokenizer path (tokenizer.json or .model)")
     ap.add_argument("--infer-bin", default=None,
-                    help="Path to llama_infer binary (auto-detected if omitted)")
+                    help="Path to cpi binary (auto-detected if omitted)")
     ap.add_argument("--context-lengths", nargs="+", type=int,
                     default=[128, 512, 2048, 4096],
                     help="Context lengths to sweep (default: 128 512 2048 4096)")
@@ -455,7 +455,7 @@ def main() -> int:
     ap.add_argument("--chat-template", default="",
                     help="Chat template name (llama2, llama4, mistral, qwen3_5, …)")
     ap.add_argument("--no-resource-limits", action="store_true",
-                    help="Pass --no-resource-limits to llama_infer (bypass CPU/RAM throttle guards)")
+                    help="Pass --no-resource-limits to cpi (bypass CPU/RAM throttle guards)")
     ap.add_argument("--timeout", type=int, default=600,
                     help="Per-run timeout in seconds (default: 600)")
     ap.add_argument("--model-name", default=None,
@@ -480,14 +480,14 @@ def main() -> int:
         infer_bin = Path(args.infer_bin).resolve()
     else:
         candidates = [
-            REPO_ROOT / "build" / "Release" / "llama_infer.exe",
-            REPO_ROOT / "build" / "llama_infer",
-            REPO_ROOT / "build" / "Release" / "llama_infer",
-            REPO_ROOT / "build" / "cpu-release" / "llama_infer",
+            REPO_ROOT / "build" / "Release" / "cpi.exe",
+            REPO_ROOT / "build" / "cpi",
+            REPO_ROOT / "build" / "Release" / "cpi",
+            REPO_ROOT / "build" / "cpu-release" / "cpi",
         ]
         infer_bin = next((c for c in candidates if c.exists()), None)
         if infer_bin is None:
-            print("[sweep] could not find llama_infer binary. "
+            print("[sweep] could not find cpi binary. "
                   "Build first or pass --infer-bin.", file=sys.stderr)
             return 2
 

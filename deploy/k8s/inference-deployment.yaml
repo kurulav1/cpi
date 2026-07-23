@@ -1,7 +1,7 @@
 # CPI inference plane — the SERVING half of the CPT(train) + CPI(serve) platform.
 #
 # Shape: a long-running Deployment (not a Job). N stateless replicas of the CPI
-# image (Node web server on :3001 that shells out to the llama_infer CUDA binary),
+# image (Node web server on :3001 that shells out to the cpi CUDA binary),
 # load-balanced by a Service, fronted by an Ingress, autoscaled by an HPA. Each
 # replica mounts the shared model store read-only at /models — this is the "seam"
 # the training plane writes to (CPT checkpoint -> export -> .ll2c -> /models).
@@ -69,8 +69,8 @@ spec:
           env:
             - name: PORT
               value: "3001"
-            - name: LLAMA_INFER_BIN
-              value: /app/bin/llama_infer
+            - name: CPI_BIN
+              value: /app/bin/cpi
             - name: LLAMA_MODEL_DIRS
               value: /models
             - name: LLAMA_MODEL_PATH
@@ -87,7 +87,7 @@ spec:
               value: "8192"
             # Batched prefill pass size. Built-in default (16) caps cold prefill
             # at ~250 tok/s on Blackwell; 256 is ~5.3x faster, byte-identical.
-            - name: LLAMA_INFER_PREFILL_CHUNK_SIZE
+            - name: CPI_PREFILL_CHUNK_SIZE
               value: "256"
           volumeMounts:
             - name: models

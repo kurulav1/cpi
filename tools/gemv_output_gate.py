@@ -5,15 +5,15 @@
 # order-dependent. The question that actually matters is whether that last-bit difference
 # ever changes a greedy argmax. Run every model both ways and diff the decoded text.
 #
-#   LLAMA_INFER_TILED_GEMV=1 -> old tiled kernel (half2 loads)
-#   LLAMA_INFER_TILED_GEMV=0 -> new wide kernel (int4 loads)
+#   CPI_TILED_GEMV=1 -> old tiled kernel (half2 loads)
+#   CPI_TILED_GEMV=0 -> new wide kernel (int4 loads)
 
 import os
 import subprocess
 import sys
 
 HUB = "artifacts/hub"
-EXE = os.path.abspath("build/Release/llama_infer.exe")
+EXE = os.path.abspath("build/Release/cpi.exe")
 PROMPT = "Explain in two sentences why the sky is blue."
 MAX_NEW = 96
 
@@ -37,9 +37,9 @@ MODELS = [
 # gate compares new-against-new and passes without testing anything. (It did exactly that
 # once: it toggled only the GEMV while the fast RMSNorm stayed on in both runs.)
 LEGACY_ENV = {
-    "LLAMA_INFER_TILED_GEMV": "1",     # tiled half2 GEMV (pre-128-bit-load)
-    "LLAMA_INFER_LEGACY_RMSNORM": "1", # shared-tree RMSNorm (pre-register-cached)
-    "LLAMA_INFER_HOST_SAMPLING": "1",  # full-vocab host sampler (pre-device-topk)
+    "CPI_TILED_GEMV": "1",     # tiled half2 GEMV (pre-128-bit-load)
+    "CPI_LEGACY_RMSNORM": "1", # shared-tree RMSNorm (pre-register-cached)
+    "CPI_HOST_SAMPLING": "1",  # full-vocab host sampler (pre-device-topk)
 }
 
 

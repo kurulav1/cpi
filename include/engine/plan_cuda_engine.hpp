@@ -540,7 +540,7 @@ private:
   int* d_cand_idx_ = nullptr;         // gathered candidates (>= threshold)
   float* d_cand_val_ = nullptr;
   int* d_cand_count_ = nullptr;
-  bool device_topk_enabled_ = true;   // env LLAMA_INFER_PLAN_NO_DEVICE_TOPK=1 disables (A/B)
+  bool device_topk_enabled_ = true;   // env CPI_PLAN_NO_DEVICE_TOPK=1 disables (A/B)
   // When true (the shared decode-loop path), forward_one leaves the logits on the
   // device (d_logits_) instead of copying 262K floats to host + softcapping every
   // step; sample() then does the device argmax (greedy) or a lazy host copy.
@@ -551,7 +551,7 @@ private:
 
   // Decode CUDA graph: the single-token forward captured once (device-position
   // ops), replayed for every logits step. decode_graph_enabled_ off falls back to
-  // the eager path (env LLAMA_INFER_PLAN_NO_GRAPH=1, for A/B / debugging).
+  // the eager path (env CPI_PLAN_NO_GRAPH=1, for A/B / debugging).
   cudaGraph_t decode_graph_ = nullptr;
   cudaGraphExec_t decode_graph_exec_ = nullptr;
   bool decode_graph_ready_ = false;

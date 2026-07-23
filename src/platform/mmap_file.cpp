@@ -52,7 +52,7 @@ void MMapFile::open(const std::string& path) {
   close();
 
   if (!std::filesystem::exists(path)) {
-    LLAMA_ENGINE_THROW("weights file not found: " + path);
+    CPI_THROW("weights file not found: " + path);
   }
 
 #ifdef _WIN32
@@ -63,13 +63,13 @@ void MMapFile::open(const std::string& path) {
                              FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
   if (file_handle_ == INVALID_HANDLE_VALUE) {
     file_handle_ = nullptr;
-    LLAMA_ENGINE_THROW("CreateFileA failed for: " + path);
+    CPI_THROW("CreateFileA failed for: " + path);
   }
 
   LARGE_INTEGER li;
   if (!GetFileSizeEx(static_cast<HANDLE>(file_handle_), &li)) {
     close();
-    LLAMA_ENGINE_THROW("GetFileSizeEx failed");
+    CPI_THROW("GetFileSizeEx failed");
   }
   size_ = static_cast<std::size_t>(li.QuadPart);
 
@@ -77,25 +77,25 @@ void MMapFile::open(const std::string& path) {
       CreateFileMappingA(static_cast<HANDLE>(file_handle_), nullptr, PAGE_READONLY, 0, 0, nullptr);
   if (!mapping_handle_) {
     close();
-    LLAMA_ENGINE_THROW("CreateFileMappingA failed");
+    CPI_THROW("CreateFileMappingA failed");
   }
 
   data_ = static_cast<const std::byte*>(
       MapViewOfFile(static_cast<HANDLE>(mapping_handle_), FILE_MAP_READ, 0, 0, 0));
   if (!data_) {
     close();
-    LLAMA_ENGINE_THROW("MapViewOfFile failed");
+    CPI_THROW("MapViewOfFile failed");
   }
 #else
   fd_ = ::open(path.c_str(), O_RDONLY);
   if (fd_ < 0) {
-    LLAMA_ENGINE_THROW("open failed for: " + path);
+    CPI_THROW("open failed for: " + path);
   }
 
   struct stat st;
   if (fstat(fd_, &st) != 0) {
     close();
-    LLAMA_ENGINE_THROW("fstat failed");
+    CPI_THROW("fstat failed");
   }
 
   size_ = static_cast<std::size_t>(st.st_size);
@@ -103,7 +103,7 @@ void MMapFile::open(const std::string& path) {
   if (data_ == MAP_FAILED) {
     data_ = nullptr;
     close();
-    LLAMA_ENGINE_THROW("mmap failed");
+    CPI_THROW("mmap failed");
   }
 #endif
 }

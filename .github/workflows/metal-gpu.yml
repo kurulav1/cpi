@@ -72,9 +72,9 @@ jobs:
       - name: Configure (Metal on, CUDA off)
         run: >
           cmake -S . -B build
-          -DLLAMA_ENGINE_ENABLE_CUDA=OFF
-          -DLLAMA_ENGINE_ENABLE_METAL=ON
-          -DLLAMA_ENGINE_ENABLE_SENTENCEPIECE=OFF
+          -DCPI_ENABLE_CUDA=OFF
+          -DCPI_ENABLE_METAL=ON
+          -DCPI_ENABLE_SENTENCEPIECE=OFF
           -DCMAKE_BUILD_TYPE=Release
 
       - name: Build

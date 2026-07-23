@@ -806,7 +806,7 @@ function systemStatus() {
   };
 }
 
-// Build the llama_infer argument list from a request body and server config.
+// Build the cpi argument list from a request body and server config.
 // Accepts both internal fields (maxNewTokens, profileId) and OpenAI fields
 // (max_tokens, model) so this function works for all endpoints.
 function buildCliArgs(config, body) {
@@ -815,7 +815,7 @@ function buildCliArgs(config, body) {
 
   if (!selectedProfile) {
     throw new Error(
-      "No model available. Set modelPath/modelDirs in config.json or LLAMA_MODEL_PATH."
+      "No model available. Set modelPath/modelDirs in config.json or CPI_MODEL_PATH."
     );
   }
   if (!selectedProfile.ready) {
@@ -1021,7 +1021,7 @@ function buildWorkerCliConfig(profile, options = {}) {
 
 // Core generation engine
 //
-// Keeps a warm interactive llama_infer worker per selected model profile.
+// Keeps a warm interactive cpi worker per selected model profile.
 // Each request is sent as one NDJSON line over stdin and streamed back as
 // NDJSON events on stdout.
 
@@ -1485,7 +1485,7 @@ function spawnInteractiveWorker(config, cliConfig) {
     if (worker.pending) {
       const pending = worker.pending;
       worker.pending = null;
-      pending.reject(`Failed to launch llama_infer: ${err.message}`);
+      pending.reject(`Failed to launch cpi: ${err.message}`);
     }
 
     if (interactiveWorker === worker) {
@@ -1512,7 +1512,7 @@ function ensureInteractiveWorker(config, cliConfig) {
   if (interactiveWorker) {
     killWorker(interactiveWorker, true);
     interactiveWorker = null;
-    // llama_infer enforces single instance; give OS a moment to release lock.
+    // cpi enforces single instance; give OS a moment to release lock.
     sleepMs(120);
   }
 
@@ -1547,7 +1547,7 @@ function batchWorkerEnabled() {
 // The surviving rule is per-FAMILY, not per-engine: a recurrent/delta-net model (qwen3_5) carries
 // per-sequence state the batched scheduler does not multiplex, and MoE/streamed-weight profiles
 // have their own reasons. That lives in NON_BATCH_FAMILIES/profileBatchable in config.mjs, which
-// is what actually enforces it -- a NON_LLAMA_ENGINE_FAMILIES alias sat here unused.
+// is what actually enforces it -- a NON_CPI_ENGINE_FAMILIES alias sat here unused.
 
 function isBatchCompatible(cliConfig) {
   const p = cliConfig.profile || {};
@@ -1644,7 +1644,7 @@ async function getBatchWorker(config, cliConfig) {
     args,
     cwd: config.repoRoot,
     // Unique per spawn so a still-dying predecessor can never collide on the lock.
-    env: { ...process.env, LLAMA_INFER_INSTANCE_MUTEX: `Local\\llama_infer_batch_${process.pid}_${Date.now()}` },
+    env: { ...process.env, CPI_INSTANCE_MUTEX: `Local\\cpi_batch_${process.pid}_${Date.now()}` },
     onReadyError: (err) => console.error("[batch] worker error:", err?.message || err)
   });
   batchWorkerKey = key;
@@ -2022,7 +2022,7 @@ async function runPreferredFamilyGenerationOnce(config, cliConfig, requestKind =
       if (prefersHfChatBackend(cliConfig)) {
         throw err;
       }
-      console.warn(`[${family}] HF backend failed, using llama_infer: ${err.message}`);
+      console.warn(`[${family}] HF backend failed, using cpi: ${err.message}`);
     }
   }
 
@@ -3854,12 +3854,12 @@ app.listen(runtimeConfig.port, () => {
   );
   if (!s.ready) {
     console.log(
-      "[cpi] Set modelPath and tokenizerPath in web/config.json (or LLAMA_MODEL_PATH / LLAMA_TOKENIZER_PATH)."
+      "[cpi] Set modelPath and tokenizerPath in web/config.json (or CPI_MODEL_PATH / CPI_TOKENIZER_PATH)."
     );
-  } else if (isTruthyFlag(process.env.LLAMA_WARM_ON_START ?? "1")) {
+  } else if (isTruthyFlag(process.env.CPI_WARM_ON_START ?? "1")) {
     // Pre-load the model into the worker at boot so the first real request isn't a
     // ~60s cold start. /healthz/ready stays 503 until this completes, so k8s holds
-    // traffic until the pod is genuinely warm. Disable with LLAMA_WARM_ON_START=0.
+    // traffic until the pod is genuinely warm. Disable with CPI_WARM_ON_START=0.
     const batchDefault = batchWorkerEnabled();
     console.log(`[cpi] warming model on startup… (${batchDefault ? "batch worker" : "single-flight"})`);
     const warmStart = batchDefault

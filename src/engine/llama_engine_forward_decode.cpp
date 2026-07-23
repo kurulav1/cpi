@@ -36,9 +36,9 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
         return std::pair<int, int>{start, seq_len};
       }
       case model::AttentionKind::Linear:
-        LLAMA_ENGINE_THROW("native CUDA runtime does not support linear-attention layers yet");
+        CPI_THROW("native CUDA runtime does not support linear-attention layers yet");
       default:
-        LLAMA_ENGINE_THROW("unknown attention kind in model metadata");
+        CPI_THROW("unknown attention kind in model metadata");
     }
   };
   const bool can_use_dp4a_decode = ((hidden & 3) == 0) && ((inter & 3) == 0);
@@ -71,7 +71,7 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
     acc += static_cast<double>(ms);
   };
   if (position >= options_.max_context) {
-    LLAMA_ENGINE_THROW("context length exceeded max_context");
+    CPI_THROW("context length exceeded max_context");
   }
   // Helper: compute INT4 layer-local pointers and dispatch KV store + attention.
   // Captures layer, position, kv_hidden, head_dim, cfg from the surrounding scope.
@@ -145,7 +145,7 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
 
     const auto copy_fp16 = [&](const std::string& name, void* dst, std::size_t bytes) {
       if (!weights_.has_tensor(name)) {
-        LLAMA_ENGINE_THROW("missing tensor: " + name);
+        CPI_THROW("missing tensor: " + name);
       }
       CUDA_CHECK(cudaMemcpyAsync(dst, weights_.tensor_data(name), bytes, cudaMemcpyHostToDevice,
                                  compute_stream_));
@@ -161,7 +161,7 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
 
     const auto copy_row_scales = [&](const std::string& scale_name, int rows, float* dst) {
       if (!weights_.has_tensor(scale_name)) {
-        LLAMA_ENGINE_THROW("missing quant scales: " + scale_name);
+        CPI_THROW("missing quant scales: " + scale_name);
       }
       const auto* src = reinterpret_cast<const float*>(weights_.tensor_data(scale_name));
       const std::size_t scale_count = weights_.tensor_bytes(scale_name) / sizeof(float);
@@ -177,7 +177,7 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
                                    cudaMemcpyHostToDevice, compute_stream_));
         return;
       }
-      LLAMA_ENGINE_THROW("invalid quant scale size for " + scale_name);
+      CPI_THROW("invalid quant scale size for " + scale_name);
     };
 
     const auto matvec_device_weight = [&](const std::string& base, int rows, int cols,
@@ -210,7 +210,7 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
 
       if (!use_i8 && !use_i4) {
         if (!has_fp16) {
-          LLAMA_ENGINE_THROW("missing MoE tensor: " + base);
+          CPI_THROW("missing MoE tensor: " + base);
         }
         copy_fp16(base, fp16_weight_dst, bytes_for_matrix(rows, cols));
         kernels::launch_rowmajor_half_gemv_f16(static_cast<const __half*>(fp16_weight_dst), x, y,
@@ -219,7 +219,7 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
       }
 
       if (!has_scales) {
-        LLAMA_ENGINE_THROW("missing MoE tensor: " + base);
+        CPI_THROW("missing MoE tensor: " + base);
       }
       copy_row_scales(sname, rows, scale_dst);
       if (use_i8) {
