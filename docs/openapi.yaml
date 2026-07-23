@@ -1,0 +1,967 @@
+openapi: 3.1.0
+info:
+  title: CPI HTTP API
+  version: 0.1.0
+  description: |
+    HTTP API for CPI (Cross-Platform Inference) — the Node server in `web/` that fronts the
+    `llama_infer` engine. Two namespaces:
+
+    - **`/api/*`** — CPI-native endpoints: inference, model management (Hugging Face download +
+      quantization), health. Error envelope: `{ "error": "<message>" }`.
+    - **`/v1/*`** — OpenAI-compatible endpoints (chat, completions, embeddings, responses, models),
+      usable with existing OpenAI clients by pointing the base URL here. Error envelope:
+      `{ "error": { "message", "type", "code", "param" } }`.
+
+    Bodies are JSON (`Content-Type: application/json`, 4 MB cap). No authentication and no CORS
+    middleware are applied — run it behind your own gateway if exposing it beyond localhost.
+
+    ### Streaming
+    Three different streaming shapes are used; OpenAPI cannot fully model event streams, so the
+    per-operation descriptions define the frame format:
+    - `POST /api/chat/stream` → **NDJSON** (`application/x-ndjson`), one JSON object per line.
+    - All `/v1/*` streaming (when `stream: true`) → **SSE** (`text/event-stream`), `data: {…}`
+      frames terminated by a final `data: [DONE]`.
+    - `GET /api/quant/status/{jobId}` and `GET /api/hub/status/{jobId}` → **SSE** event-log replay
+      (progress/status/log/done/error events), not `[DONE]`-terminated.
+  license:
+    name: Apache-2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+
+servers:
+  - url: http://localhost:3001
+    description: Default local server (port from web/config.json → runtime.port, default 3001)
+
+tags:
+  - name: Health
+    description: Liveness, readiness, metrics.
+  - name: Models
+    description: List and select models and their quantization mode.
+  - name: Inference
+    description: CPI-native text generation.
+  - name: OpenAI
+    description: OpenAI-compatible endpoints (drop-in for OpenAI clients).
+  - name: Hub
+    description: Search, download, and convert models from Hugging Face.
+  - name: Quantization
+    description: Convert a model to int8/int4 and track the job.
+  - name: System
+    description: Local filesystem helpers used by the UI.
+
+paths:
+  /metrics:
+    get:
+      tags: [Health]
+      summary: Prometheus metrics
+      description: Prometheus exposition text for requests under `/api` and `/v1`.
+      responses:
+        "200":
+          description: Metrics text.
+          content:
+            text/plain:
+              schema: { type: string }
+
+  /healthz/live:
+    get:
+      tags: [Health]
+      summary: Liveness probe
+      responses:
+        "200":
+          description: Always `ok` while the process is up.
+          content:
+            text/plain:
+              schema: { type: string, example: ok }
+
+  /healthz/ready:
+    get:
+      tags: [Health]
+      summary: Readiness probe
+      responses:
+        "200":
+          description: Worker is ready and the runtime is configured.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { ready: { type: boolean, const: true } }
+        "503":
+          description: Not ready.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { ready: { type: boolean, const: false } }
+
+  /api/health:
+    get:
+      tags: [Health]
+      summary: Full runtime + system status
+      description: "Rich status: readiness, the active worker, quant overrides, system (GPU/CPU/RAM), and engine queue stats."
+      responses:
+        "200":
+          description: Status snapshot.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/HealthResponse" }
+
+  /api/models:
+    get:
+      tags: [Models]
+      summary: List model profiles
+      responses:
+        "200":
+          description: Available profiles and any quant overrides.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  models:
+                    type: array
+                    items: { $ref: "#/components/schemas/ModelProfile" }
+                  quantOverrides:
+                    type: object
+                    additionalProperties: { type: string, enum: [none, int8, int4] }
+
+  /api/quant/select:
+    post:
+      tags: [Models]
+      summary: Set the quantization mode for a profile
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [profileId]
+              properties:
+                profileId: { type: string }
+                quantMode: { type: string, enum: [none, int8, int4, q8, q4] }
+      responses:
+        "200":
+          description: Override applied.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  profileId: { type: string }
+                  modelLabel: { type: string }
+                  quantMode: { type: string }
+                  override: { type: string }
+                  allowed: { type: array, items: { type: string } }
+        "400": { $ref: "#/components/responses/ApiError" }
+        "404": { $ref: "#/components/responses/ApiError" }
+
+  /api/quant/state:
+    get:
+      tags: [Models]
+      summary: Quantization state for a profile
+      parameters:
+        - { name: profileId, in: query, required: true, schema: { type: string } }
+        - { name: quantMode, in: query, required: false, schema: { type: string } }
+      responses:
+        "200":
+          description: Selected/configured/override modes and latest conversion jobs.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  profileId: { type: string }
+                  modelLabel: { type: string }
+                  quant: { type: object, additionalProperties: true }
+                  selectedQuantMode: { type: string }
+                  configuredQuantMode: { type: string }
+                  overrideQuantMode: { type: string }
+                  latestJobForSelectedQuant:
+                    oneOf: [{ $ref: "#/components/schemas/QuantJobSummary" }, { type: "null" }]
+                  latestJobAnyQuant:
+                    oneOf: [{ $ref: "#/components/schemas/QuantJobSummary" }, { type: "null" }]
+                  activeWorker:
+                    oneOf: [{ $ref: "#/components/schemas/ActiveWorker" }, { type: "null" }]
+        "404": { $ref: "#/components/responses/ApiError" }
+
+  /api/warmup:
+    post:
+      tags: [Inference]
+      summary: Warm a model into memory
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                profileId: { type: string }
+                performanceMode: { type: boolean }
+                quantMode: { type: string, enum: [none, int8, int4] }
+                maxContext: { type: integer }
+      responses:
+        "200":
+          description: Warmup started or already warm.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  warmed: { type: string }
+                  modelLabel: { type: string }
+                  pending: { type: boolean }
+                  ready: { type: boolean }
+                  busy: { type: boolean }
+        "400": { $ref: "#/components/responses/ApiError" }
+        "503": { $ref: "#/components/responses/ApiError" }
+
+  /api/generate:
+    post:
+      tags: [Inference]
+      summary: Generate text (blocking)
+      description: Single-shot, non-streaming generation. Returns the full text plus timing/metrics.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/GenerationRequest" }
+      responses:
+        "200":
+          description: Generated text plus run metadata.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GenerationResult" }
+        "400": { $ref: "#/components/responses/ApiError" }
+        "409": { $ref: "#/components/responses/ApiError" }
+        "500": { $ref: "#/components/responses/ApiError" }
+        "503": { $ref: "#/components/responses/ApiError" }
+
+  /api/chat/stream:
+    post:
+      tags: [Inference]
+      summary: Generate text (streaming, NDJSON)
+      description: |
+        Streams the response as **newline-delimited JSON** (`application/x-ndjson`): one JSON object
+        per line. Event `type`s: `start` (carries run metadata), `delta` (answer text), `reasoning`
+        (only in thinking mode), `metrics`, `done` (final timing/metrics + full `message`), `error`.
+        Build errors are returned as a plain `400 { error }` before streaming begins.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/GenerationRequest" }
+      responses:
+        "200":
+          description: NDJSON event stream.
+          content:
+            application/x-ndjson:
+              schema:
+                type: string
+                description: One JSON object per line (see operation description for event shapes).
+        "400": { $ref: "#/components/responses/ApiError" }
+        "409": { $ref: "#/components/responses/ApiError" }
+        "503": { $ref: "#/components/responses/ApiError" }
+
+  /v1/models:
+    get:
+      tags: [OpenAI]
+      summary: List models (OpenAI)
+      responses:
+        "200":
+          description: OpenAI model list, plus an `embeddings` availability hint.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  object: { type: string, const: list }
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/OpenAiModel" }
+                  embeddings:
+                    type: object
+                    properties:
+                      available: { type: boolean }
+                      model:
+                        oneOf: [{ type: string }, { type: "null" }]
+
+  /v1/models/{model}:
+    get:
+      tags: [OpenAI]
+      summary: Retrieve a model (OpenAI)
+      parameters:
+        - { name: model, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: The model.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OpenAiModel" }
+        "404": { $ref: "#/components/responses/OpenAiError" }
+
+  /v1/completions:
+    post:
+      tags: [OpenAI]
+      summary: Legacy text completions (OpenAI)
+      description: "OpenAI legacy completions. Set `stream: true` for an SSE stream terminated by `data: [DONE]`."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [prompt]
+              properties:
+                model: { type: string }
+                prompt:
+                  oneOf: [{ type: string }, { type: array, items: { type: string } }]
+                max_tokens: { type: integer }
+                temperature: { type: number }
+                stop:
+                  oneOf: [{ type: string }, { type: array, items: { type: string } }]
+                echo: { type: boolean }
+                suffix: { type: string }
+                stream: { type: boolean, default: false }
+                stream_options:
+                  type: object
+                  properties: { include_usage: { type: boolean } }
+      responses:
+        "200":
+          description: A completion object, or (when `stream:true`) an SSE stream.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OpenAiCompletion" }
+            text/event-stream:
+              schema: { type: string, description: "SSE text_completion chunks, ending with data: [DONE]." }
+        "400": { $ref: "#/components/responses/OpenAiError" }
+        "500": { $ref: "#/components/responses/OpenAiError" }
+        "503": { $ref: "#/components/responses/OpenAiError" }
+
+  /v1/chat/completions:
+    post:
+      tags: [OpenAI]
+      summary: Chat completions (OpenAI)
+      description: |
+        OpenAI chat completions — the drop-in endpoint for OpenAI SDKs. Set `stream: true` for an SSE
+        stream of `chat.completion.chunk` objects terminated by `data: [DONE]`. Supports `tools` /
+        `tool_choice` (tool calls are emitted in the final chunk) and `response_format`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [messages]
+              properties:
+                model: { type: string }
+                messages:
+                  type: array
+                  items: { $ref: "#/components/schemas/ChatMessage" }
+                max_tokens: { type: integer }
+                temperature: { type: number }
+                stop:
+                  oneOf: [{ type: string }, { type: array, items: { type: string } }]
+                tools: { type: array, items: { type: object, additionalProperties: true } }
+                tool_choice: {}
+                response_format: { type: object, additionalProperties: true }
+                stream: { type: boolean, default: false }
+                stream_options:
+                  type: object
+                  properties: { include_usage: { type: boolean } }
+      responses:
+        "200":
+          description: A chat completion object, or (when `stream:true`) an SSE stream.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OpenAiChatCompletion" }
+            text/event-stream:
+              schema: { type: string, description: "SSE chat.completion.chunk frames, ending with data: [DONE]." }
+        "400": { $ref: "#/components/responses/OpenAiError" }
+        "500": { $ref: "#/components/responses/OpenAiError" }
+        "503": { $ref: "#/components/responses/OpenAiError" }
+
+  /v1/embeddings:
+    post:
+      tags: [OpenAI]
+      summary: Embeddings (OpenAI)
+      description: L2-normalized embeddings via the built-in bge-small model. Requires the `cpi_embed` binary.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [input]
+              properties:
+                input:
+                  oneOf: [{ type: string }, { type: array, items: { type: string } }]
+                model: { type: string, default: bge-small-en-v1.5 }
+                encoding_format: { type: string, enum: [float], default: float }
+                input_type: { type: string, enum: [query, document], default: document, description: "Non-standard CPI extension." }
+      responses:
+        "200":
+          description: Embedding list.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  object: { type: string, const: list }
+                  model: { type: string }
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        object: { type: string, const: embedding }
+                        index: { type: integer }
+                        embedding: { type: array, items: { type: number } }
+                  usage:
+                    type: object
+                    properties:
+                      prompt_tokens: { type: integer }
+                      total_tokens: { type: integer }
+        "400": { $ref: "#/components/responses/OpenAiError" }
+        "500": { $ref: "#/components/responses/OpenAiError" }
+        "503":
+          description: Embeddings backend (`cpi_embed`) not available.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OpenAiErrorBody" }
+
+  /v1/responses:
+    post:
+      tags: [OpenAI]
+      summary: Responses API (OpenAI)
+      description: "OpenAI Responses API. Set `stream: true` for an SSE stream of `response.*` events ending with `data: [DONE]`."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                model: { type: string }
+                input:
+                  oneOf: [{ type: string }, { type: array, items: { type: object, additionalProperties: true } }]
+                instructions: { type: string }
+                max_output_tokens: { type: integer }
+                temperature: { type: number }
+                stream: { type: boolean, default: false }
+      responses:
+        "200":
+          description: A response object, or (when `stream:true`) an SSE stream.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OpenAiResponse" }
+            text/event-stream:
+              schema: { type: string, description: "SSE response.* events, ending with data: [DONE]." }
+        "400": { $ref: "#/components/responses/OpenAiError" }
+        "500": { $ref: "#/components/responses/OpenAiError" }
+        "503": { $ref: "#/components/responses/OpenAiError" }
+
+  /api/hub/search:
+    get:
+      tags: [Hub]
+      summary: Search Hugging Face models
+      parameters:
+        - { name: q, in: query, required: true, schema: { type: string } }
+        - { name: limit, in: query, required: false, schema: { type: integer, default: 10, minimum: 1, maximum: 50 } }
+        - { name: token, in: query, required: false, schema: { type: string }, description: "Hugging Face access token for gated/private models." }
+      responses:
+        "200":
+          description: Search results (passthrough of the downloader's results object).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  type: { type: string, const: results }
+                additionalProperties: true
+        "400": { $ref: "#/components/responses/ApiError" }
+        "500": { $ref: "#/components/responses/ApiError" }
+
+  /api/hub/download:
+    post:
+      tags: [Hub]
+      summary: Download and convert a model
+      description: |
+        Starts an async job that runs `tools/hf_download.py` to download a Hugging Face checkpoint and
+        convert it to CPI's `.ll2c` format. Returns a `jobId`; follow progress on
+        `GET /api/hub/status/{jobId}` (SSE).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [repoId]
+              properties:
+                repoId: { type: string, description: "Hugging Face repo id, e.g. Qwen/Qwen2.5-0.5B-Instruct." }
+                outputDir: { type: string, description: "Destination directory; also sets the preferred model dir." }
+                hfToken: { type: string, description: "HF access token for gated/private repos." }
+                family: { type: string, description: "Override architecture family detection." }
+      responses:
+        "200":
+          description: Job started.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { jobId: { type: string, format: uuid } }
+        "400": { $ref: "#/components/responses/ApiError" }
+
+  /api/hub/status/{jobId}:
+    get:
+      tags: [Hub]
+      summary: Download job progress (SSE)
+      description: |
+        `text/event-stream`. Replays the buffered log then streams live events; event `type`s:
+        `log` (`msg`), `status` (`status`), `done` (`path`), `error`. Ends when the job is terminal.
+      parameters:
+        - { name: jobId, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: SSE event-log stream.
+          content:
+            text/event-stream:
+              schema: { type: string }
+        "404": { $ref: "#/components/responses/ApiError" }
+
+  /api/hub/jobs:
+    get:
+      tags: [Hub]
+      summary: List download jobs
+      responses:
+        "200":
+          description: Minimal job list.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  jobs:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        jobId: { type: string }
+                        status: { $ref: "#/components/schemas/JobStatus" }
+                        path: { type: string }
+
+  /api/hub/jobs/{jobId}:
+    delete:
+      tags: [Hub]
+      summary: Cancel/remove a download job
+      parameters:
+        - { name: jobId, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Cancelled.
+          content:
+            application/json:
+              schema: { type: object, properties: { ok: { type: boolean } } }
+        "404": { $ref: "#/components/responses/ApiError" }
+
+  /api/quant/convert:
+    post:
+      tags: [Quantization]
+      summary: Convert a model to int8/int4
+      description: Starts an async quantization job. Follow progress on `GET /api/quant/status/{jobId}` (SSE).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [profileId, quantMode]
+              properties:
+                profileId: { type: string }
+                quantMode: { type: string, enum: [int8, int4] }
+                outputPath: { type: string }
+                overwrite: { type: boolean, default: false }
+      responses:
+        "200":
+          description: Job started.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  jobId: { type: string, format: uuid }
+                  profileId: { type: string }
+                  modelLabel: { type: string }
+                  quantMode: { type: string }
+                  outputPath: { type: string }
+        "400": { $ref: "#/components/responses/ApiError" }
+        "409":
+          description: Conflict — already packed, a conversion is running, or the output exists.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error: { type: string }
+                  jobId: { type: string }
+                  outputPath: { type: string }
+        "500": { $ref: "#/components/responses/ApiError" }
+
+  /api/quant/status/{jobId}:
+    get:
+      tags: [Quantization]
+      summary: Conversion job progress (SSE)
+      description: |
+        `text/event-stream`. Replays the buffered log then streams live events; event `type`s:
+        `progress` (`done`,`total`,`pct`,`tensor`), `status` (`status`), `log` (`msg`), `done`,
+        `error`. Ends when the job is terminal.
+      parameters:
+        - { name: jobId, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: SSE event-log stream.
+          content:
+            text/event-stream:
+              schema: { type: string }
+        "404": { $ref: "#/components/responses/ApiError" }
+
+  /api/quant/jobs:
+    get:
+      tags: [Quantization]
+      summary: List conversion jobs
+      responses:
+        "200":
+          description: Jobs, newest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  jobs:
+                    type: array
+                    items: { $ref: "#/components/schemas/QuantJobSummary" }
+
+  /api/quant/jobs/{jobId}:
+    delete:
+      tags: [Quantization]
+      summary: Cancel/remove a conversion job
+      parameters:
+        - { name: jobId, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Cancelled.
+          content:
+            application/json:
+              schema: { type: object, properties: { ok: { type: boolean } } }
+        "404": { $ref: "#/components/responses/ApiError" }
+
+  /api/system/pick-folder:
+    post:
+      tags: [System]
+      summary: Native folder picker (Windows only)
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: { initialDir: { type: string } }
+      responses:
+        "200":
+          description: Selected path, or cancelled.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  cancelled: { type: boolean }
+                  path: { type: string }
+        "500": { $ref: "#/components/responses/ApiError" }
+
+  /api/system/model-dir:
+    post:
+      tags: [System]
+      summary: Set the preferred model directory
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: { dir: { type: string, description: "Empty string clears the preference." } }
+      responses:
+        "200":
+          description: Updated preference and re-scanned profiles.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  preferredModelDir: { type: string }
+                  models:
+                    type: array
+                    items: { $ref: "#/components/schemas/ModelProfile" }
+        "500": { $ref: "#/components/responses/ApiError" }
+
+components:
+  responses:
+    ApiError:
+      description: CPI-native error.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties: { error: { type: string } }
+    OpenAiError:
+      description: OpenAI-format error.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/OpenAiErrorBody" }
+
+  schemas:
+    JobStatus:
+      type: string
+      enum: [pending, running, done, error, cancelled]
+
+    GenerationRequest:
+      type: object
+      description: |
+        Shared body for `/api/generate` and `/api/chat/stream`. At least one user message is required
+        (via `messages`). Numeric fields are clamped server-side (ranges noted).
+      required: [messages]
+      properties:
+        messages:
+          type: array
+          items: { $ref: "#/components/schemas/ChatMessage" }
+        profileId: { type: string, description: "Model profile to use (alias: `model`)." }
+        model: { type: string }
+        template: { type: string }
+        systemPrompt: { type: string }
+        maxContext: { type: integer, description: "Clamped 128 .. profile max." }
+        maxNewTokens: { type: integer, description: "Clamped 32 .. 4096 (alias: `max_tokens`)." }
+        max_tokens: { type: integer }
+        minNewTokens: { type: integer, description: "Clamped 0 .. maxNewTokens (aliases: min_tokens, min_new_tokens)." }
+        temperature: { type: number, description: "Clamped 0 .. 2." }
+        autoMaxTokens: { type: boolean, default: true }
+        longFormMode: { type: boolean }
+        performanceMode: { type: boolean }
+        forceCpu: { type: boolean }
+        thinking: { type: boolean, description: "Honored only when the profile's reasoning mode is optional." }
+        quantMode: { type: string, enum: [none, int8, int4, q8, q4] }
+        jsonSchema: { type: object, additionalProperties: true, description: "Grammar-constrained (JSON-schema) decoding." }
+        stop:
+          oneOf: [{ type: string }, { type: array, items: { type: string } }]
+        image: { type: string, description: "PNG data URL (data:image/png;base64,...), max 20 MB. 400 if the profile has no vision support." }
+
+    GenerationResult:
+      type: object
+      description: "`/api/generate` response: the generation result spread with run metadata."
+      properties:
+        text: { type: string }
+        elapsedMs: { type: number }
+        generatedTokens: { oneOf: [{ type: integer }, { type: "null" }] }
+        tokPerS: { oneOf: [{ type: number }, { type: "null" }] }
+        decodeMs: { oneOf: [{ type: number }, { type: "null" }] }
+        decodeTokPerS: { oneOf: [{ type: number }, { type: "null" }] }
+        metrics: { oneOf: [{ type: object, additionalProperties: true }, { type: "null" }] }
+        profileId: { type: string }
+        modelLabel: { type: string }
+        template: { type: string }
+        maxNewTokens: { type: integer }
+        maxContext: { type: integer }
+        temperature: { type: number }
+        quantMode: { type: string }
+      additionalProperties: true
+
+    ChatMessage:
+      type: object
+      required: [role, content]
+      properties:
+        role: { type: string, enum: [system, user, assistant, tool] }
+        content: { type: string }
+
+    ModelProfile:
+      type: object
+      description: A discovered/configured model profile (public fields).
+      properties:
+        id: { type: string }
+        source: { type: string }
+        label: { type: string }
+        family: { type: string }
+        modelPath: { type: string }
+        tokenizerPath: { type: string }
+        tokenizerFormat: { type: string }
+        template: { type: string }
+        reasoning: { type: object, additionalProperties: true }
+        vision: { type: object, additionalProperties: true }
+        maxPositionEmbeddings: { type: integer }
+        ropeTheta: { type: number }
+        unsupportedReason: { oneOf: [{ type: string }, { type: "null" }] }
+        quant: { type: object, additionalProperties: true }
+        moe: { oneOf: [{ type: object, additionalProperties: true }, { type: "null" }] }
+        capabilities: { type: object, additionalProperties: true }
+        ready: { type: boolean }
+        status: { type: string }
+      additionalProperties: true
+
+    ActiveWorker:
+      type: object
+      properties:
+        ready: { type: boolean }
+        alive: { type: boolean }
+        metrics: { oneOf: [{ type: object, additionalProperties: true }, { type: "null" }] }
+        profileId: { type: string }
+        maxContext: { type: integer }
+        performanceMode: { type: boolean }
+        quantMode: { type: string }
+        forceCpu: { type: boolean }
+
+    QuantJobSummary:
+      type: object
+      properties:
+        jobId: { type: string }
+        status: { $ref: "#/components/schemas/JobStatus" }
+        profileId: { type: string }
+        quantMode: { type: string }
+        modelLabel: { type: string }
+        path: { type: string }
+        createdAt: { type: number }
+        updatedAt: { type: number }
+        progress:
+          oneOf:
+            - type: object
+              properties:
+                done: { type: integer }
+                total: { type: integer }
+                pct: { oneOf: [{ type: number }, { type: "null" }] }
+                tensor: { type: string }
+                updatedAt: { type: number }
+            - type: "null"
+
+    HealthResponse:
+      type: object
+      properties:
+        ok: { type: boolean }
+        ready: { type: boolean }
+        busy: { type: boolean }
+        activeKind: { oneOf: [{ type: string }, { type: "null" }] }
+        config: { type: object, additionalProperties: true, description: "publicRuntimeSummary (runtime config + selected/available profiles)." }
+        quantOverrides: { type: object, additionalProperties: { type: string } }
+        activeWorker:
+          oneOf: [{ $ref: "#/components/schemas/ActiveWorker" }, { type: "null" }]
+        activeQuantJob:
+          oneOf: [{ $ref: "#/components/schemas/QuantJobSummary" }, { type: "null" }]
+        system:
+          type: object
+          properties:
+            device: { type: string, enum: [cuda, cpu] }
+            gpu:
+              oneOf:
+                - type: object
+                  properties:
+                    name: { type: string }
+                    memUsedMB: { type: number }
+                    memTotalMB: { type: number }
+                    utilPercent: { type: number }
+                - type: "null"
+            cpu:
+              type: object
+              properties:
+                model: { type: string }
+                cores: { type: integer }
+            ram:
+              type: object
+              properties:
+                totalMB: { type: number }
+                freeMB: { type: number }
+        engine:
+          type: object
+          properties:
+            queueDepth: { type: integer }
+            inFlight: { type: boolean }
+            maxQueue: { type: integer }
+            samples: { type: integer }
+            p50Ms: { oneOf: [{ type: number }, { type: "null" }] }
+            p95Ms: { oneOf: [{ type: number }, { type: "null" }] }
+            avgTokPerS: { oneOf: [{ type: number }, { type: "null" }] }
+
+    OpenAiModel:
+      type: object
+      properties:
+        id: { type: string }
+        object: { type: string, const: model }
+        created: { type: integer }
+        owned_by: { type: string, const: cpi }
+        permission: { type: array, items: {} }
+        root: { type: string }
+        parent: { oneOf: [{ type: string }, { type: "null" }] }
+
+    OpenAiCompletion:
+      type: object
+      properties:
+        id: { type: string }
+        object: { type: string, const: text_completion }
+        created: { type: integer }
+        model: { type: string }
+        system_fingerprint: { type: string }
+        choices:
+          type: array
+          items:
+            type: object
+            properties:
+              index: { type: integer }
+              text: { type: string }
+              logprobs: { type: "null" }
+              finish_reason: { type: string }
+        usage: { $ref: "#/components/schemas/OpenAiUsage" }
+
+    OpenAiChatCompletion:
+      type: object
+      properties:
+        id: { type: string }
+        object: { type: string, const: chat.completion }
+        created: { type: integer }
+        model: { type: string }
+        system_fingerprint: { type: string }
+        choices:
+          type: array
+          items:
+            type: object
+            properties:
+              index: { type: integer }
+              message:
+                type: object
+                properties:
+                  role: { type: string }
+                  content: { oneOf: [{ type: string }, { type: "null" }] }
+                  tool_calls: { type: array, items: { type: object, additionalProperties: true } }
+              finish_reason: { type: string }
+        usage: { $ref: "#/components/schemas/OpenAiUsage" }
+
+    OpenAiResponse:
+      type: object
+      properties:
+        id: { type: string }
+        object: { type: string, const: response }
+        created_at: { type: integer }
+        status: { type: string }
+        model: { type: string }
+        output: { type: array, items: { type: object, additionalProperties: true } }
+        usage: { $ref: "#/components/schemas/OpenAiUsage" }
+      additionalProperties: true
+
+    OpenAiUsage:
+      type: object
+      properties:
+        prompt_tokens: { type: integer }
+        completion_tokens: { type: integer }
+        total_tokens: { type: integer }
+
+    OpenAiErrorBody:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            message: { type: string }
+            type: { type: string }
+            code: { oneOf: [{ type: string }, { type: "null" }] }
+            param: { oneOf: [{ type: string }, { type: "null" }] }
