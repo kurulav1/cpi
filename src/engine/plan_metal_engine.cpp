@@ -3019,19 +3019,40 @@ void PlanMetalEngine::verify_tokens(const std::vector<int>& tokens, int start_po
   // One causal chunk at [start_pos, start_pos+K-1], with logits for every position.
   prefill_all_logits_ = true;
   encode_prefill(tokens, start_pos);
+
+  // Per-row argmax on the GPU, appended to the SAME command buffer as the prefill: a host loop
+  // over K x 152k logits cost ~2.6 ms/verify and made spec a net loss whenever acceptance was
+  // less than near-perfect. Each row gets its own [parts] scratch slice so the K reductions do
+  // not race inside one buffer; only K int32s cross to the host.
+  const std::size_t val_need = static_cast<std::size_t>(K) * kArgmaxParts * sizeof(float);
+  if (verify_amax_val_.size() < val_need) {
+    verify_amax_val_ = ctx_.alloc(val_need);
+    verify_amax_idx_ = ctx_.alloc(static_cast<std::size_t>(K) * kArgmaxParts * sizeof(std::int32_t));
+    verify_argmax_ = ctx_.alloc(static_cast<std::size_t>(K) * sizeof(std::int32_t));
+  }
+  for (int t = 0; t < K; ++t) {
+    const std::size_t vrow = static_cast<std::size_t>(t) * cfg_.vocab_size * sizeof(float);
+    const std::size_t prow = static_cast<std::size_t>(t) * kArgmaxParts;
+    ElemParams p1{static_cast<std::uint32_t>(cfg_.vocab_size), 0.0f};
+    const void* b1[] = {batch_logits_buf_.handle(), verify_amax_val_.handle(),
+                        verify_amax_idx_.handle()};
+    const std::size_t o1[] = {vrow, prow * sizeof(float), prow * sizeof(std::int32_t)};
+    ctx_.dispatch("cpi_argmax_partial", runtime::MetalContext::Grid::Groups, kArgmaxParts, kTG, b1,
+                  o1, 3, &p1, sizeof(p1));
+    ElemParams p2{static_cast<std::uint32_t>(kArgmaxParts), 0.0f};
+    const void* b2[] = {verify_amax_val_.handle(), verify_amax_idx_.handle(),
+                        verify_argmax_.handle()};
+    const std::size_t o2[] = {prow * sizeof(float), prow * sizeof(std::int32_t),
+                              static_cast<std::size_t>(t) * sizeof(std::int32_t)};
+    ctx_.dispatch("cpi_argmax_reduce", runtime::MetalContext::Grid::Groups, 1, kTG, b2, o2, 3, &p2,
+                  sizeof(p2));
+  }
   ctx_.commit_and_wait();
   prefill_all_logits_ = false;
   if (!ctx_.last_error().empty()) last_error_ = ctx_.last_error();
 
-  const float* src = static_cast<const float*>(batch_logits_buf_.contents());
-  for (int t = 0; t < K; ++t) {
-    const float* row = src + static_cast<std::size_t>(t) * static_cast<std::size_t>(cfg_.vocab_size);
-    int best = 0;
-    for (int j = 1; j < cfg_.vocab_size; ++j) {
-      if (row[j] > row[best]) best = j;
-    }
-    out_argmax[static_cast<std::size_t>(t)] = best;
-  }
+  const std::int32_t* am = static_cast<const std::int32_t*>(verify_argmax_.contents());
+  for (int t = 0; t < K; ++t) out_argmax[static_cast<std::size_t>(t)] = static_cast<int>(am[t]);
 }
 
 std::vector<int> PlanMetalEngine::generate(const std::vector<int>& prompt, int max_new,
