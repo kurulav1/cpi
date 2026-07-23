@@ -112,3 +112,8 @@ Thumbs.db
 # Local / internal (not for the public repo)
 # ------------------------------
 RELEASE_CHECKLIST.md
+
+# Profiling outputs (nsys/ncu wrappers write to the repo root)
+*.nsys-rep
+*.sqlite
+*.ncu-rep
