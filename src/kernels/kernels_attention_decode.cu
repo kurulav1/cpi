@@ -610,6 +610,40 @@ __global__ void attention_step_chunk_reduce_any_device_pos_kernel(
                                        head_dim, chunk_size, scratch_chunks, k_start);
 }
 
+// Multi-query twins for the graphed speculative verify: blockIdx.z / blockIdx.y select the
+// query token t, whose causal KV length is (base position + t + 1). Query/output rows use
+// the sequence-slot stride [token][heads*head_dim]; scratch adds a leading token axis. The
+// per-chunk seq guard makes the fixed max-context grid safe at any live depth, and per-token
+// lengths give exact causality inside the verify batch.
+template <int WarpsPerBlock>
+__global__ void attention_step_chunk_stats_any_mt_device_pos_kernel(
+    const half* q, const half* k_cache, const half* v_cache, float* chunk_m, float* chunk_l,
+    float* chunk_o, const int* position_ptr, int num_heads, int num_kv_heads, int head_dim,
+    int chunk_size, int scratch_chunks, int window) {
+  const int t = blockIdx.z;
+  const int seq_len = position_ptr[0] + t + 1;
+  const int k_start = (window > 0 && seq_len > window) ? seq_len - window : 0;
+  const std::size_t scr = static_cast<std::size_t>(t) * num_heads * scratch_chunks;
+  attention_step_chunk_stats_core<WarpsPerBlock>(
+      q + static_cast<std::size_t>(t) * num_heads * head_dim, k_cache, v_cache, chunk_m + scr,
+      chunk_l + scr, chunk_o + scr * head_dim, seq_len, num_heads, num_kv_heads, head_dim,
+      chunk_size, scratch_chunks, k_start);
+}
+
+__global__ void attention_step_chunk_reduce_any_mt_device_pos_kernel(
+    const float* chunk_m, const float* chunk_l, const float* chunk_o, half* out,
+    const int* position_ptr, int num_heads, int head_dim, int chunk_size, int scratch_chunks,
+    int window) {
+  const int t = blockIdx.y;
+  const int seq_len = position_ptr[0] + t + 1;
+  const int k_start = (window > 0 && seq_len > window) ? seq_len - window : 0;
+  const std::size_t scr = static_cast<std::size_t>(t) * num_heads * scratch_chunks;
+  attention_step_chunk_reduce_any_core(chunk_m + scr, chunk_l + scr, chunk_o + scr * head_dim,
+                                       out + static_cast<std::size_t>(t) * num_heads * head_dim,
+                                       seq_len, num_heads, head_dim, chunk_size, scratch_chunks,
+                                       k_start);
+}
+
 // Split-K decode pass-1, PAGED (P3 phase 2b): identical math to
 // attention_step_chunk_stats_kernel, but K/V for logical chunk `chunk` live in
 // physical block `block_table[chunk]` of a block pool (block_size == chunk_size).
@@ -829,6 +863,44 @@ __global__ void store_kv_device_pos_vec8_kernel(const int4* k, const int4* v, in
   const int offset = position * kv_hidden_vec8 + idx;
   k_cache[offset] = k[idx];
   v_cache[offset] = v[idx];
+}
+
+// Sequence form: appends `rows` K/V rows starting at the device-side base position
+// (blockIdx.y = row). Rows past max_context are dropped, matching the scalar kernel.
+__global__ void store_kv_seq_device_pos_vec8_kernel(const int4* k, const int4* v, int4* k_cache,
+                                                    int4* v_cache, const int* position_ptr,
+                                                    int kv_hidden_vec8, int max_context) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= kv_hidden_vec8) {
+    return;
+  }
+  const int row = blockIdx.y;
+  const int position = position_ptr[0] + row;
+  if (position < 0 || position >= max_context) {
+    return;
+  }
+  const std::size_t src = static_cast<std::size_t>(row) * kv_hidden_vec8 + idx;
+  const std::size_t dst = static_cast<std::size_t>(position) * kv_hidden_vec8 + idx;
+  k_cache[dst] = k[src];
+  v_cache[dst] = v[src];
+}
+
+__global__ void store_kv_seq_device_pos_kernel(const half* k, const half* v, half* k_cache,
+                                               half* v_cache, const int* position_ptr,
+                                               int kv_hidden, int max_context) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= kv_hidden) {
+    return;
+  }
+  const int row = blockIdx.y;
+  const int position = position_ptr[0] + row;
+  if (position < 0 || position >= max_context) {
+    return;
+  }
+  const std::size_t src = static_cast<std::size_t>(row) * kv_hidden + idx;
+  const std::size_t dst = static_cast<std::size_t>(position) * kv_hidden + idx;
+  k_cache[dst] = k[src];
+  v_cache[dst] = v[src];
 }
 
 __global__ void copy_int_kernel(const int* src, int* dst) {
@@ -1937,6 +2009,51 @@ void launch_attention_split_any_device_pos(const half* q, const half* k_cache,
   attention_step_chunk_reduce_any_device_pos_kernel<<<num_heads, threads, 0, stream>>>(
       scratch_m, scratch_l, scratch_o, out, position, num_heads, head_dim, chunk_size,
       scratch_chunks, window);
+}
+
+void launch_attention_split_any_mt_device_pos(const half* q, const half* k_cache,
+                                              const half* v_cache, half* out,
+                                              const int* position, int tokens, int window,
+                                              int num_heads, int num_kv_heads, int head_dim,
+                                              float* scratch_m, float* scratch_l,
+                                              float* scratch_o, int chunk_size,
+                                              int scratch_chunks, cudaStream_t stream) {
+  constexpr int warps = 4;       // merge-tile template arg (arithmetic order pinned)
+  constexpr int threads = 256;   // score/merge thread count -- runtime-derived in-kernel
+  const std::size_t smem = static_cast<std::size_t>(head_dim) * sizeof(half) +
+                           static_cast<std::size_t>(2 * warps + 4) * sizeof(float) +
+                           static_cast<std::size_t>(warps * head_dim) * sizeof(half);
+  const dim3 grid(num_heads, scratch_chunks, tokens);
+  attention_step_chunk_stats_any_mt_device_pos_kernel<warps><<<grid, threads, smem, stream>>>(
+      q, k_cache, v_cache, scratch_m, scratch_l, scratch_o, position, num_heads, num_kv_heads,
+      head_dim, chunk_size, scratch_chunks, window);
+  const dim3 rgrid(num_heads, tokens);
+  attention_step_chunk_reduce_any_mt_device_pos_kernel<<<rgrid, threads, 0, stream>>>(
+      scratch_m, scratch_l, scratch_o, out, position, num_heads, head_dim, chunk_size,
+      scratch_chunks, window);
+}
+
+void launch_store_kv_seq_device_pos(const half* k, const half* v, half* k_cache, half* v_cache,
+                                    const int* position, int kv_hidden, int rows, int max_context,
+                                    cudaStream_t stream) {
+  const bool aligned =
+      ((reinterpret_cast<std::uintptr_t>(k) | reinterpret_cast<std::uintptr_t>(v) |
+        reinterpret_cast<std::uintptr_t>(k_cache) | reinterpret_cast<std::uintptr_t>(v_cache)) &
+       (alignof(int4) - 1)) == 0;
+  if ((kv_hidden & 7) == 0 && aligned) {
+    const int kv_hidden_vec8 = kv_hidden / 8;
+    const int threads = choose_copy_threads(kv_hidden);
+    const dim3 blocks((kv_hidden_vec8 + threads - 1) / threads, rows);
+    store_kv_seq_device_pos_vec8_kernel<<<blocks, threads, 0, stream>>>(
+        reinterpret_cast<const int4*>(k), reinterpret_cast<const int4*>(v),
+        reinterpret_cast<int4*>(k_cache), reinterpret_cast<int4*>(v_cache), position,
+        kv_hidden_vec8, max_context);
+    return;
+  }
+  constexpr int threads = 256;
+  const dim3 blocks((kv_hidden + threads - 1) / threads, rows);
+  store_kv_seq_device_pos_kernel<<<blocks, threads, 0, stream>>>(k, v, k_cache, v_cache, position,
+                                                                 kv_hidden, max_context);
 }
 
 }  // namespace kernels

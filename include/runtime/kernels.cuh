@@ -208,6 +208,21 @@ void launch_attention_split_any_device_pos(const half* q, const half* k_cache,
                                            int head_dim, float* scratch_m, float* scratch_l,
                                            float* scratch_o, int chunk_size, int scratch_chunks,
                                            cudaStream_t stream);
+// Multi-query (T <= 16) device-position form for the graphed speculative verify: query
+// token t attends causally over cache[0 .. *position + t], q/out use the sequence-slot
+// stride, scratch gains a leading token axis (sized tokens * num_heads * scratch_chunks).
+void launch_attention_split_any_mt_device_pos(const half* q, const half* k_cache,
+                                              const half* v_cache, half* out,
+                                              const int* position, int tokens, int window,
+                                              int num_heads, int num_kv_heads, int head_dim,
+                                              float* scratch_m, float* scratch_l,
+                                              float* scratch_o, int chunk_size,
+                                              int scratch_chunks, cudaStream_t stream);
+// Sequence form of the device-position KV append: `rows` K/V rows land at device base
+// position + row. Graph-capturable replacement for the host-offset seq memcpys.
+void launch_store_kv_seq_device_pos(const half* k, const half* v, half* k_cache, half* v_cache,
+                                    const int* position, int kv_hidden, int rows, int max_context,
+                                    cudaStream_t stream);
 
 // launch_rmsnorm_add_scale
 //
@@ -1018,6 +1033,12 @@ void launch_swiglu_gemv_f16(const half* w_gate, const half* w_up, const half* x,
 void launch_rope_seq_table(half* x, int num_heads, int head_dim, int start_position, int tokens,
                            const float* cos_table, const float* sin_table, int rotary_dim,
                            cudaStream_t stream);
+// Device-position twin (base position read from device memory) so a captured graph can
+// replay sequence RoPE at any position. Identical rotation math.
+void launch_rope_seq_table_device_pos(half* x, int num_heads, int head_dim,
+                                      const int* position_ptr, int tokens, const float* cos_table,
+                                      const float* sin_table, int rotary_dim,
+                                      cudaStream_t stream);
 
 // launch_rowmajor_half_gemm_f16
 //

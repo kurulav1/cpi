@@ -441,7 +441,23 @@ private:
   float* d_argmax_pv_ = nullptr;  // two-phase argmax partition scratch
   int* d_argmax_pi_ = nullptr;
   int argmax_parts_ = 1;
-  float* d_mt_logits_ = nullptr;  // [8][vocab] verify-batch logits (lazy, spec decode only)
+  float* d_mt_logits_ = nullptr;  // [16][vocab] verify-batch logits (lazy, spec decode only)
+
+  // ── Graphed speculative verify: the T=16 verify forward captured once with
+  //    device-position seq kernels, replayed per verify with only d_position_ and
+  //    d_seq_tokens_ updated. All scratch is lazy (spec decode only). ──
+  bool spec_seq_device_pos_ = false;  // execute_ops: seq rope/kv-append/attention take
+                                      // their device-position twins (graph-capturable)
+  bool spec_graph_broken_ = false;    // init or capture failed once; stay on the eager path
+  cudaGraph_t spec_graph_ = nullptr;
+  cudaGraphExec_t spec_graph_exec_ = nullptr;
+  int spec_attn_chunks_ = 0;          // fixed split-K chunk grid, sized from max_ctx_
+  float* d_spec_split_m_ = nullptr;   // [16][heads][chunks] (o adds head_dim)
+  float* d_spec_split_l_ = nullptr;
+  float* d_spec_split_o_ = nullptr;
+  int* d_spec_argmax_ = nullptr;      // [16] per-position verify argmaxes
+  bool spec_graph_init();             // alloc scratch (+ capture unless CPI_CUDA_SPEC_GRAPH=0)
+  void spec_forward_t16();            // the captured body (also runs eagerly for A/B)
 
   // Device top-k sampling (temperature>0 — the real chat path, since greedy only
   // covers temp<=0). Selects the candidate set on the GPU so the host never sees

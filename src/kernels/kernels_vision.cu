@@ -214,4 +214,42 @@ void launch_rope_seq_table(half* x, int num_heads, int head_dim, int start_posit
                                                       cos_table, sin_table, rotary_dim);
 }
 
+// Device-position twin: the chunk's base position is read from device memory, so a
+// captured graph can replay the same sequence RoPE at any position. Rotation math and
+// table layout are identical to rope_seq_table_kernel.
+__global__ void rope_seq_table_device_pos_kernel(half* x, int num_heads, int head_dim,
+                                                 const int* position_ptr, const float* cos_table,
+                                                 const float* sin_table, int rotary_dim) {
+  const int head = blockIdx.x;
+  const int token = blockIdx.y;
+  const int pair = threadIdx.x;
+  const int rot = rotary_dim > 0 ? rotary_dim : head_dim;
+  const int half_rot = rot / 2;
+  if (pair >= half_rot) {
+    return;
+  }
+  const int position = position_ptr[0] + token;
+  const int half_dim = head_dim / 2;
+  const float c = cos_table[static_cast<std::size_t>(position) * half_dim + pair];
+  const float s = sin_table[static_cast<std::size_t>(position) * half_dim + pair];
+
+  const std::size_t row = (static_cast<std::size_t>(token) * num_heads + head) * head_dim;
+  const int i0 = pair;
+  const int i1 = pair + half_rot;
+  const float v0 = __half2float(x[row + i0]);
+  const float v1 = __half2float(x[row + i1]);
+  x[row + i0] = __float2half(v0 * c - v1 * s);
+  x[row + i1] = __float2half(v1 * c + v0 * s);
+}
+
+void launch_rope_seq_table_device_pos(half* x, int num_heads, int head_dim,
+                                      const int* position_ptr, int tokens, const float* cos_table,
+                                      const float* sin_table, int rotary_dim,
+                                      cudaStream_t stream) {
+  const int rot = rotary_dim > 0 ? rotary_dim : head_dim;
+  const dim3 grid(static_cast<unsigned>(num_heads), static_cast<unsigned>(tokens));
+  rope_seq_table_device_pos_kernel<<<grid, rot / 2, 0, stream>>>(
+      x, num_heads, head_dim, position_ptr, cos_table, sin_table, rotary_dim);
+}
+
 }  // namespace kernels

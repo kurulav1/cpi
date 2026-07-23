@@ -95,6 +95,12 @@ PlanCudaEngine::~PlanCudaEngine() {
   cudaFree(d_argmax_pv_);
   cudaFree(d_argmax_pi_);
   cudaFree(d_mt_logits_);
+  if (spec_graph_exec_) cudaGraphExecDestroy(spec_graph_exec_);
+  if (spec_graph_) cudaGraphDestroy(spec_graph_);
+  cudaFree(d_spec_split_m_);
+  cudaFree(d_spec_split_l_);
+  cudaFree(d_spec_split_o_);
+  cudaFree(d_spec_argmax_);
   cudaFree(d_topk_part_val_);
   cudaFree(d_topk_part_idx_);
   cudaFree(d_topk_val_);
@@ -2413,9 +2419,15 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
                                                        sinT, stream_);
           }
         } else if (seq) {
-          // Sequence prefill: token t sits at position (chunk start + t).
-          kernels::launch_rope_seq_table(S(op.in), op.heads, op.head_dim, position, T, cosT, sinT,
-                                         0, stream_);
+          // Sequence prefill: token t sits at position (chunk start + t). The spec-verify
+          // graph reads the base position from the device instead.
+          if (spec_seq_device_pos_) {
+            kernels::launch_rope_seq_table_device_pos(S(op.in), op.heads, op.head_dim,
+                                                      d_position_, T, cosT, sinT, 0, stream_);
+          } else {
+            kernels::launch_rope_seq_table(S(op.in), op.heads, op.head_dim, position, T, cosT,
+                                           sinT, 0, stream_);
+          }
         } else if (device_pos_mode_) {
           // Single-tensor RoPE via the device-position kernel (k-branch guarded off
           // by num_heads_k=0). Graph-capturable: position read from d_position_.
@@ -2442,6 +2454,11 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
         if (device_pos_mode_) {
           kernels::launch_store_kv_device_pos(S(Slot::K), S(Slot::V), kc, vc, d_position_,
                                               static_cast<int>(kvdim), max_ctx_, stream_);
+        } else if (spec_seq_device_pos_) {
+          // Graph-capturable seq append: T rows land at device base position + row (the
+          // host-offset memcpys below would bake one position into the graph).
+          kernels::launch_store_kv_seq_device_pos(S(Slot::K), S(Slot::V), kc, vc, d_position_,
+                                                  static_cast<int>(kvdim), T, max_ctx_, stream_);
         } else {
           // Sequence prefill appends T rows at once: the K/V slots are [T][kvdim] and the
           // cache rows are contiguous, so it is the same copy, T times as long.
@@ -2467,6 +2484,16 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
           // window to the masked tiled kernel, and ctx.limits (when set) makes an image
           // span bidirectional.
           const int window = op.full_attention ? 0 : op.sliding_window;
+          if (spec_seq_device_pos_) {
+            // Spec-verify graph: multi-query split-K with per-token causal length derived
+            // from the device position. Fixed max-context chunk grid; per-chunk guards
+            // skip dead chunks, so one capture serves every depth.
+            kernels::launch_attention_split_any_mt_device_pos(
+                S(op.in), caches_k_[layer], caches_v_[layer], S(op.out), d_position_, T, window,
+                op.heads, op.kv_heads, op.head_dim, d_spec_split_m_, d_spec_split_l_,
+                d_spec_split_o_, 32, spec_attn_chunks_, stream_);
+            break;
+          }
           if (ctx.limits == nullptr &&
               prefill_attention_tc(S(op.in), caches_k_[layer], caches_v_[layer], S(op.out), T,
                                    position, op.heads, op.kv_heads, op.head_dim, window)) {
@@ -3459,13 +3486,121 @@ void PlanCudaEngine::initialize(const EngineOptions& options) {
   open(options.model_path, options.max_context > 0 ? options.max_context : 4096);
 }
 
+// The verify-batch forward at FIXED T=16 with device-position seq kernels: reads tokens
+// from d_seq_tokens_ and the base position from d_position_, leaves the 16 per-position
+// argmaxes in d_spec_argmax_. This is exactly what the spec graph captures; it also runs
+// eagerly (CPI_CUDA_SPEC_GRAPH=0) so graph and eager replay the same kernel stream and
+// must agree bitwise. Host `position` args are dead in this mode.
+void PlanCudaEngine::spec_forward_t16() {
+  using namespace opplan;
+  constexpr int T = 16;
+  ExecCtx ctx{sslot_ptr_.data(), T, /*causal=*/true, /*cached=*/true, nullptr};
+  spec_seq_device_pos_ = true;
+  execute_ops(plan_.prologue.data(), plan_.prologue.size(), 0, 0, ctx);
+  for (int L = 0; L < cfg_.num_layers; ++L)
+    execute_ops(plan_.layers[L].ops.data(), plan_.layers[L].ops.size(), L, 0, ctx);
+  const Op& head = plan_.epilogue.back();
+  for (std::size_t i = 0; i + 1 < plan_.epilogue.size(); ++i) {
+    execute_ops(&plan_.epilogue[i], 1, 0, 0, ctx);
+  }
+  const __half* xn = sslot_ptr_[static_cast<int>(head.in)];
+  kernels::launch_quantize_fp16_to_int8_perm8_g32_mt(xn, d_act_i8_, d_act_qs_, head.in_dim, T,
+                                                     stream_);
+  kernels::launch_weight_only_int4_matvec_grouped_dp4a_mt_f32(
+      static_cast<const std::int8_t*>(head.qweight), static_cast<const float*>(head.qscales),
+      d_act_i8_, d_act_qs_, d_mt_logits_, head.cols, head.in_dim, head.qgroup, T, stream_);
+  for (int t = 0; t < T; ++t) {
+    kernels::launch_argmax_float(d_mt_logits_ + static_cast<std::size_t>(t) * head.cols,
+                                 head.cols, d_spec_argmax_ + t, stream_, d_argmax_pv_,
+                                 d_argmax_pi_, argmax_parts_);
+  }
+  spec_seq_device_pos_ = false;
+}
+
+// One-time scratch + capture for the graphed verify. Returns true when the spec kernel
+// path is usable (graphed or eager); a failure marks the path broken and the caller
+// stays on the cuBLAS eager verify forever.
+bool PlanCudaEngine::spec_graph_init() {
+  if (spec_graph_broken_) return false;
+  if (d_spec_argmax_ != nullptr) return true;  // already initialized
+  try {
+    const opplan::Op& head = plan_.epilogue.back();
+    if (d_mt_logits_ == nullptr) {
+      G4_CHECK(cudaMalloc(&d_mt_logits_,
+                          16ull * static_cast<std::size_t>(head.cols) * sizeof(float)));
+    }
+    G4_CHECK(cudaMalloc(&d_spec_argmax_, 16 * sizeof(int)));
+    int max_heads = 0, max_hd = 0;
+    for (const auto& lp : plan_.layers) {
+      for (const auto& o : lp.ops) {
+        if (o.kind == opplan::OpKind::Attention) {
+          max_heads = std::max(max_heads, o.heads);
+          max_hd = std::max(max_hd, o.head_dim);
+        }
+      }
+    }
+    if (max_heads <= 0 || max_hd <= 0) throw std::runtime_error("no attention ops");
+    spec_attn_chunks_ = (max_ctx_ + 31) / 32;
+    const std::size_t cells =
+        16ull * static_cast<std::size_t>(max_heads) * static_cast<std::size_t>(spec_attn_chunks_);
+    G4_CHECK(cudaMalloc(&d_spec_split_m_, cells * sizeof(float)));
+    G4_CHECK(cudaMalloc(&d_spec_split_l_, cells * sizeof(float)));
+    G4_CHECK(cudaMalloc(&d_spec_split_o_, cells * static_cast<std::size_t>(max_hd) * sizeof(float)));
+    static const bool graph_off = [] {
+      const char* e = std::getenv("CPI_CUDA_SPEC_GRAPH");
+      return e && *e == '0';
+    }();
+    if (!graph_off) {
+      G4_CHECK(cudaStreamSynchronize(stream_));
+      G4_CHECK(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal));
+      spec_forward_t16();
+      G4_CHECK(cudaStreamEndCapture(stream_, &spec_graph_));
+      G4_CHECK(cudaGraphInstantiate(&spec_graph_exec_, spec_graph_, nullptr, nullptr, 0));
+    }
+    return true;
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "[spec] graph init failed (%s); staying on the eager verify\n", e.what());
+    spec_seq_device_pos_ = false;
+    if (spec_graph_exec_) cudaGraphExecDestroy(spec_graph_exec_), spec_graph_exec_ = nullptr;
+    if (spec_graph_) cudaGraphDestroy(spec_graph_), spec_graph_ = nullptr;
+    spec_graph_broken_ = true;
+    return false;
+  }
+}
+
 // Greedy speculative verify: forward `k` tokens (the pending token plus k-1 drafts) at
 // positions pos.., then compute each position's greedy argmax. Returns the argmaxes; the
 // caller accepts the longest draft prefix they confirm. KV rows for rejected positions go
 // stale in place -- attention never reads past the current position, and later steps
 // overwrite them.
+//
+// Fast path: the fixed-T=16 forward captured by spec_graph_init replays as ONE graph
+// launch (drafts padded by repeating the last token -- padded rows write KV that later
+// steps overwrite before ever reading). Falls back to the eager seq forward when the
+// batch would cross max_context or the plan is not an int4 one.
 void PlanCudaEngine::verify_greedy(const int* tokens, int k, int pos, int* out_argmax) {
   using namespace opplan;
+  {
+    const Op& h = plan_.epilogue.back();
+    if (h.qbits == 4 && d_act_i8_ != nullptr && pos + 16 <= max_ctx_ && spec_graph_init()) {
+      int padded[16];
+      for (int i = 0; i < 16; ++i) padded[i] = tokens[i < k ? i : k - 1];
+      G4_CHECK(cudaMemcpyAsync(d_seq_tokens_, padded, 16 * sizeof(int), cudaMemcpyHostToDevice,
+                               stream_));
+      G4_CHECK(cudaMemcpyAsync(d_position_, &pos, sizeof(int), cudaMemcpyHostToDevice, stream_));
+      if (spec_graph_exec_) {
+        G4_CHECK(cudaGraphLaunch(spec_graph_exec_, stream_));
+      } else {
+        spec_forward_t16();  // CPI_CUDA_SPEC_GRAPH=0: same kernel stream, launched eagerly
+      }
+      int tmp[16];
+      G4_CHECK(cudaMemcpyAsync(tmp, d_spec_argmax_, 16 * sizeof(int), cudaMemcpyDeviceToHost,
+                               stream_));
+      G4_CHECK(cudaStreamSynchronize(stream_));
+      for (int i = 0; i < k; ++i) out_argmax[i] = tmp[i];
+      return;
+    }
+  }
   G4_CHECK(cudaMemcpyAsync(d_seq_tokens_, tokens, static_cast<std::size_t>(k) * sizeof(int),
                            cudaMemcpyHostToDevice, stream_));
   ExecCtx ctx{sslot_ptr_.data(), k, /*causal=*/true, /*cached=*/true, nullptr};
