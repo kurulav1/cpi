@@ -201,11 +201,19 @@ bool MetalContext::load_library_from_source(const std::string& metal_source_path
   // rsqrt in RMSNorm. Left on, logits drift ~0.5 against the fp32 CPU reference --
   // an order of magnitude worse than the CUDA backend's 0.06 -- which is enough for
   // a greedy stream to flip a token after a few steps. Correctness first.
+  // MTLCompileOptions.mathMode / MTLMathModeSafe are macOS 15 SDK symbols. Guard on the SDK
+  // version at COMPILE time (a runtime @available alone still needs the symbol to exist in the
+  // headers, so it fails to build against Xcode 15). Older SDKs use the deprecated-but-equivalent
+  // fastMathEnabled = NO -- both simply disable fast math.
+#if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
   if (@available(macOS 15.0, iOS 18.0, *)) {
     opts.mathMode = MTLMathModeSafe;
   } else {
     opts.fastMathEnabled = NO;
   }
+#else
+  opts.fastMathEnabled = NO;
+#endif
   id<MTLLibrary> lib = [dev newLibraryWithSource:src options:opts error:&err];
   [opts release];
 
