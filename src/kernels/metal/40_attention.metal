@@ -1110,7 +1110,7 @@ kernel void cpi_attention_decode(
       device const half* kt = k_cache + (ulong)(kb + j) * (ulong)kv_dim + kv_head * p.head_dim;
       float d = 0.0f;
       {
-        // half4 K loads + float4 dots (gemv lesson); head_dim % 4 == 0 on every model here.
+        // half4 K loads + float4 dots; head_dim % 4 == 0 on every model here.
         threadgroup const float4* q4 = (threadgroup const float4*)q_sh;
         device const half4* kt4 = (device const half4*)kt;
         const uint hd4 = p.head_dim >> 2u;
@@ -1136,7 +1136,7 @@ kernel void cpi_attention_decode(
     for (uint j = 0u; j < nk; ++j) bsum += w_sh[j];
 
     {
-      // V accumulate, float4 over dims: 4x fewer strided loads per thread (gemv lesson).
+      // V accumulate, float4 over dims: 4x fewer strided loads per thread.
       threadgroup float4* acc4 = (threadgroup float4*)tg_acc;
       device const half4* vbase = (device const half4*)(v_cache + kv_head * p.head_dim);
       const uint hd4v = p.head_dim >> 2u;
@@ -1280,9 +1280,8 @@ kernel void cpi_attention_decode_split(
   for (uint kb = c0; kb < c1; kb += DEC_KEY_BLOCK) {
     const uint nk = min((uint)DEC_KEY_BLOCK, c1 - kb);
 
-    // Score: ONE KEY PER THREAD, vectorized (the gemv lesson): half4 K loads + float4
-    // dots -- the scalar form was head_dim serial scalar loads per key. head_dim % 4 == 0
-    // on every model here.
+    // Score: ONE KEY PER THREAD, half4 K loads + float4 dots. head_dim % 4 == 0 on
+    // every model here.
     {
       threadgroup const float4* q4 = (threadgroup const float4*)q_sh;
       const uint hd4 = p.head_dim >> 2u;
@@ -1324,7 +1323,7 @@ kernel void cpi_attention_decode_split(
     for (uint s = 0u; s < n_simd; ++s) bsum += red[s];
 
     {
-      // V accumulate, float4 over dims: 4x fewer strided loads per thread (gemv lesson).
+      // V accumulate, float4 over dims: 4x fewer strided loads per thread.
       threadgroup float4* acc4 = (threadgroup float4*)tg_acc;
       device const half4* vbase = (device const half4*)(v_cache + kv_head * p.head_dim);
       const uint hd4v = p.head_dim >> 2u;
@@ -1357,14 +1356,12 @@ kernel void cpi_attention_decode_split(
   }
 }
 
-// GQA-shared split decode: one threadgroup per KEY CHUNK, all q-heads of the (single)
-// kv-head handled by one simdgroup each, with the K and V blocks staged in threadgroup
-// memory ONCE for all of them. With kv_heads=1 and 8 q-heads the per-(head,chunk) kernel
-// reads every K/V byte eight times; this reads it once -- on a bandwidth-bound M4 that is
-// the whole game. (The same shape LOST on the 5090: occupancy beat traffic there.
-// Hardware disagrees; the merge kernel is shared unchanged.)
-// Per-head softmax state lives entirely in simd registers: lane j owns key (kb + j), the
-// online max/sum use simd reductions, and the V pass broadcasts each weight from its lane.
+// GQA-shared split decode: one threadgroup per KEY CHUNK, one simdgroup per q-head, the
+// K and V blocks staged in threadgroup memory once for all heads (the per-(head,chunk)
+// kernel re-reads the shared kv_head per q-head). Opt-in: the staging barriers measured
+// costlier than the traffic they save. Per-head softmax state lives in simd registers:
+// lane j owns key (kb + j), online max/sum via simd reductions, the V pass broadcasts
+// each weight from its lane. The merge kernel is shared unchanged.
 kernel void cpi_attention_decode_split_gqa(
     device const half*  q         [[buffer(0)]],
     device const half*  k_cache   [[buffer(1)]],
@@ -1675,7 +1672,7 @@ kernel void cpi_attention_decode_batched_paged(
       device const half* kt = k_pool + (ulong)phys * (ulong)kv_dim + kv_head * p.head_dim;
       float d = 0.0f;
       {
-        // half4 K loads + float4 dots (gemv lesson); head_dim % 4 == 0 on every model here.
+        // half4 K loads + float4 dots; head_dim % 4 == 0 on every model here.
         threadgroup const float4* q4 = (threadgroup const float4*)q_sh;
         device const half4* kt4 = (device const half4*)kt;
         const uint hd4 = p.head_dim >> 2u;
@@ -1700,7 +1697,7 @@ kernel void cpi_attention_decode_batched_paged(
     for (uint j = 0u; j < nk; ++j) bsum += w_sh[j];
 
     {
-      // V accumulate, float4 over dims, physical row resolved once per key (gemv lesson).
+      // V accumulate, float4 over dims, physical row resolved once per key.
       threadgroup float4* acc4 = (threadgroup float4*)tg_acc;
       const uint hd4v = p.head_dim >> 2u;
       for (uint i4 = lid; i4 < hd4v; i4 += nthr) {

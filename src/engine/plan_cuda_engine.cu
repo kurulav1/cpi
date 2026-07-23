@@ -1018,9 +1018,8 @@ void PlanCudaEngine::open(const std::string& cpi_path, int max_context) {
   build_plan();  // resolve the per-layer forward into a data op-plan (once)
   persist_enabled_ =
       std::getenv("CPI_CUDA_PERSISTENT") != nullptr && compile_persistent_plan();
-  // Sequence prefill: this route NEVER set the capability flag, so every .cpi model
-  // prefilled token-by-token -- ~140 tok/s while llama.cpp ingests 22K. Found by the
-  // first-ever prefill benchmark of this backend.
+  // Sequence prefill: this route must set the capability flag too, or every .cpi model
+  // prefills token-by-token (orders of magnitude slower than the batched path).
   seq_prefill_ok_ = plan_can_sequence_prefill();
   if (seq_prefill_ok_) allocate_sequence_buffers(std::min(max_ctx_, 4096));
   G4_CHECK(cudaStreamSynchronize(stream_));
@@ -2174,11 +2173,11 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
       case OpKind::Gemv:
         // Weight encoding AND scale granularity were chosen at load; the op just
         // carries them.
-        // int4 decode Gemvs route through dp4a with int8 activations (the llama.cpp
-        // design): quantize the input vector once per adjacent run, then integer dots.
-        // int8 stays on the wide fp16-activation kernel -- it is bandwidth-bound already
-        // and the dp4a tiled kernel measured SLOWER (175 vs 198.5 tok/s end to end).
-        // CPI_CUDA_NO_DP4A=1 keeps the fp16-activation kernels for int4 too.
+        // int4 decode Gemvs route through dp4a with int8 activations: quantize the input
+        // vector once per adjacent run, then integer dots. int8 stays on the wide
+        // fp16-activation kernel -- it is bandwidth-bound already and its dp4a variant
+        // measured slower. CPI_CUDA_NO_DP4A=1 keeps the fp16-activation kernels for
+        // int4 too.
         if (!seq && d_act_i8_ != nullptr && op.bias == nullptr && op.qbits == 4 &&
             op.qgroup > 0 && (op.qgroup % 32) == 0 && (op.in_dim % 32) == 0) {
           if (actq_src != S(op.in) || actq_len != op.in_dim) {
@@ -2187,9 +2186,8 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
             actq_src = S(op.in);
             actq_len = op.in_dim;
           }
-          // GLU fusion (the llama.cpp gated-activation pattern): [gate Gemv][up Gemv]
-          // [GeluMul] collapses into ONE kernel writing the activated product -- no
-          // Gate/Up round-trip, no elementwise launch.
+          // GLU fusion: [gate Gemv][up Gemv][GeluMul] collapses into ONE kernel writing
+          // the activated product -- no Gate/Up round-trip, no elementwise launch.
           if (idx + 2 < n && ops[idx + 1].kind == OpKind::Gemv && ops[idx + 1].qbits == 4 &&
               ops[idx + 1].qgroup == op.qgroup && ops[idx + 1].bias == nullptr &&
               ops[idx + 1].in == op.in && ops[idx + 1].in_dim == op.in_dim &&
@@ -2488,11 +2486,10 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
             // Grid sizing: the depth bucket (set by forward_one; falls back to max) --
             // and a sliding layer never needs more chunks than its window can span.
             int chunks = attn_chunk_budget_ > 0 ? attn_chunk_budget_ : split_any_chunks_;
-            // Depth-adaptive chunk size: fine chunks maximize parallelism shallow, but the
-            // fp32 (m,l,o) scratch written+re-read per chunk scales with chunk COUNT --
-            // at depth 3500 chunk-16 moved ~25 MB/token of scratch and measured a 15%
-            // sag vs llama.cpp's flat curve. Deep buckets coarsen to 64-token chunks
-            // (scratch/4, reduce scan/4); the merge math per key is unchanged.
+            // Depth-adaptive chunk size: fine chunks maximize parallelism shallow, but
+            // the fp32 (m,l,o) scratch written+re-read per chunk scales with chunk
+            // count and dominates at depth. Deep buckets coarsen the chunks; the merge
+            // math per key is unchanged.
             int cs = kSplitAnyChunk;
             {
               const int live_tokens = chunks * kSplitAnyChunk;
@@ -3051,9 +3048,9 @@ int PlanCudaEngine::sample(const runtime::DecodeParams& params, const std::vecto
   const bool greedy_fast_path = params.temperature <= 0.0f && params.repetition_penalty <= 1.0f &&
                                 params.no_repeat_ngram_size <= 1 && !params.grammar_mask;
   if (greedy_fast_path) {
-    // Two-phase argmax: the single-block fallback walked 262K logits on ONE SM and
-    // cost 296 us/token -- 7% of the int4 token -- found by the first nsys per-kernel
-    // trace. The partitioned kernel exists for exactly this; it just needs scratch.
+    // Two-phase argmax: without partition scratch the single-block fallback walks the
+    // whole vocab on one SM every greedy token. The partitioned kernel exists for
+    // exactly this; it just needs the scratch passed.
     kernels::launch_argmax_float(static_cast<const float*>(d_logits_), cfg_.vocab, d_argmax_,
                                  stream_, d_argmax_pv_, d_argmax_pi_, argmax_parts_);
     G4_CHECK(cudaStreamSynchronize(stream_));

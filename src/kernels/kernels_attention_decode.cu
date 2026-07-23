@@ -313,16 +313,13 @@ __device__ __forceinline__ void attention_step_chunk_stats_core(
     const half* q, const half* k_cache, const half* v_cache, float* chunk_m, float* chunk_l,
     float* chunk_o, int seq_len, int num_heads, int num_kv_heads, int head_dim, int chunk_size,
     int scratch_chunks, int k_start = 0) {
-  // Restructured 2026-07-22, BIT-IDENTICAL to the tile-loop original: same score per key
-  // (same warp mapping, same lane stride, same warp_sum), same tile merge arithmetic in the
-  // same order, same V-read order per dim. What changed is WHO computes it: all keys are
-  // scored up front (one barrier), then every thread redundantly runs the tile-merge
-  // recurrence in registers instead of round-tripping running stats through shared memory
-  // with a single-thread serial section per tile. The original spent ~12 barriers and four
-  // 127-threads-idle sections per 16-key chunk -- measured 16-17 us/instance under graph
-  // replay; the arithmetic itself is microseconds. V is read straight from L2 (the old
-  // v_tile staging bought nothing: reads were already coalesced and cache-hot).
-  // smem layout: half q_shared[head_dim]; float score_shared[chunk_size].
+  // Same score per key as the tile-loop original (same warp mapping, lane stride and
+  // warp_sum) and the same tile-merge arithmetic in the same order; what changed is WHO
+  // computes it. All keys are scored up front (one barrier), then every thread runs the
+  // tile-merge recurrence redundantly in registers instead of round-tripping running
+  // stats through shared memory with a single-thread serial section per tile. V is read
+  // straight from cache (the old v_tile staging bought nothing: reads were already
+  // coalesced and hot). smem layout: half q_shared[head_dim]; float score_shared[chunk_size].
   extern __shared__ unsigned char smem_bytes[];
   half* q_shared = reinterpret_cast<half*>(smem_bytes);
   float* score_shared = reinterpret_cast<float*>(q_shared + head_dim);
@@ -356,8 +353,8 @@ __device__ __forceinline__ void attention_step_chunk_stats_core(
 
   // Score every key in the chunk. Key (chunk_start + i) belongs to warp (i % WarpsPerBlock)
   // exactly as the old tile loop assigned it, so each dot is the same fp sequence.
-  const int score_warps = blockDim.x / warpSize;  // launchers may raise threads: more
-  for (int t = chunk_start + warp_id; t < chunk_end; t += score_warps) {  // parallel dots
+  const int score_warps = blockDim.x / warpSize;  // launchers may raise threads for more parallel dots
+  for (int t = chunk_start + warp_id; t < chunk_end; t += score_warps) {
     const int base = cache_index(t, kv_head, 0, num_kv_heads, head_dim);
     const half2* q2 = reinterpret_cast<const half2*>(q_shared);
     const half2* k2 = reinterpret_cast<const half2*>(k_cache + base);
@@ -386,10 +383,10 @@ __device__ __forceinline__ void attention_step_chunk_stats_core(
 
   for (int tile_base = chunk_start; tile_base < chunk_end; tile_base += WarpsPerBlock) {
     const int tile_tokens = min(WarpsPerBlock, chunk_end - tile_base);
-    // Compile-time trip counts with predication: the runtime-bound versions of these
-    // loops could not unroll, so every V load waited on the previous FMA -- a serial
-    // load-use chain that block-level overlap hides at depth and NOTHING hides shallow
-    // (measured 15 us at 0.4% SM with one live chunk). Unrolled, the loads batch.
+    // Compile-time trip counts with predication: the runtime-bound versions could not
+    // unroll, so every V load waited on the previous FMA -- a serial load-use chain that
+    // block-level overlap hides at depth and nothing hides shallow. Unrolled, the loads
+    // batch.
     float tile_m = neg_inf<float>();
 #pragma unroll
     for (int i = 0; i < WarpsPerBlock; ++i) {
@@ -555,11 +552,10 @@ __device__ __forceinline__ void attention_step_chunk_reduce_any_core(
   // its TWO barriers (x26 chunks) vanish without moving a rounding. The m/l loads are
   // same-address broadcasts.
   // TWO-PASS combine: the running-rescale recurrence (acc = acc*alpha + o*beta) is a
-  // serial dependency across chunks -- at depth 3500 a full-attention layer has ~219 of
-  // them and the chain measured as a 15% end-to-end sag vs llama.cpp's flat curve. Pass 1
-  // finds the global max (scalar, broadcast loads); pass 2 accumulates INDEPENDENT
-  // o_c * exp(m_c - M) products, which pipeline freely. One exp scale per chunk instead
-  // of a running rescale is also numerically tighter.
+  // serial dependency across chunks, which dominates deep. Pass 1 finds the global max
+  // (scalar, broadcast loads); pass 2 accumulates independent o_c * exp(m_c - M)
+  // products, which pipeline freely. One exp scale per chunk instead of a running
+  // rescale is also numerically tighter.
   const int head = blockIdx.x;
   const int tid = threadIdx.x;
   const int first_chunk = k_start / chunk_size;

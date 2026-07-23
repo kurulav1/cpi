@@ -482,10 +482,9 @@ kernel void cpi_gemv_quant(
   const uint lane         = lid % 32u;
 
   const uint gsz0 = (p.group == 0u) ? p.in_dim : p.group;
-  // NR0=4 decode path (llama.cpp's M-series mul_mv shape: N_R0_Q4_0 = 4): one simdgroup
-  // owns FOUR consecutive rows and the activation chunk is loaded ONCE for all of them.
-  // On the bandwidth-tight M4 the x-reuse beats the one-row shape that won on CUDA.
-  // The executor shrinks the grid 4x under the SAME predicate -- keep them in lockstep.
+  // Four-rows-per-simdgroup decode path: one simdgroup owns four consecutive rows and
+  // the activation chunk is loaded once for all of them. The executor shrinks the grid
+  // under the SAME predicate -- keep them in lockstep or rows go missing.
   if (p.tokens == 1u && p.bits == 4u && (p.in_dim & 31u) == 0u && (gsz0 & 31u) == 0u &&
       p.has_bias == 0u) {
     const uint r0 = (gid * simds_per_tg + simd_id) * 4u;
@@ -673,10 +672,9 @@ static inline void qcat_row(device const uchar* qw, device const float* scales,
       const uint4 packed = w128[k];
       const uint j0 = k << 5;
       const float sc = srow[j0 / gsz];
-      // Vectorized decode: a uint's low nibbles are elements {0,2,4,6}, high nibbles
-      // {1,3,5,7} (LSB-first packing). Two's-complement in one char4 op: (n ^ 8) - 8.
-      // The scalar version spent 32 shifts + 32 scalar half loads per uint4; this does
-      // 8 char4 decodes + 8 half4 loads + 8 dot4s.
+      // A uint's low nibbles are elements {0,2,4,6}, high nibbles {1,3,5,7} (LSB-first
+      // packing); two's-complement decode is (n ^ 8) - 8, one char4 op per word. The
+      // half4 x loads use the matching even/odd swizzle.
       char4 lo[4], hi[4];
       for (uint w = 0u; w < 4u; ++w) {
         const uint word =
@@ -771,8 +769,8 @@ kernel void cpi_gemv_quant_cat(
   const uint total = p.n0 + p.n1 + p.n2;
   const uint gsz = (p.group == 0u) ? p.in_dim : p.group;
 
-  // NR0=4 decode path (see cpi_gemv_quant): four rows per simdgroup, activations loaded
-  // once for all four. Executor shrinks the grid under the SAME predicate.
+  // Four-rows-per-simdgroup decode path (see cpi_gemv_quant); executor shrinks the grid
+  // under the SAME predicate.
   if (p.tokens == 1u && p.bits == 4u && (p.in_dim & 31u) == 0u && (gsz & 31u) == 0u &&
       p.has_bias == 0u) {
     const uint r0 = (gid * simds_per_tg + simd_id) * 4u;
@@ -841,12 +839,11 @@ kernel void cpi_gemv_quant_cat(
   }
 }
 
-// Fused GeGLU GEMV (the gated-activation fusion, ported from the CUDA campaign):
-// out[t, r] = gelu_tanh(gate_r . x_t) * (up_r . x_t) in ONE dispatch -- no Gate/Up slot
-// round-trip, no separate cpi_gelu_mul. Simd shape follows the CUDA lesson (one ROW per
-// simdgroup, never two): the first half of the threadgroup's simds compute gate rows, the
-// second half their up partners, paired through threadgroup memory. Both dots round to
-// half before the gelu, exactly as the unfused sequence rounds them.
+// Fused GeGLU GEMV: out[t, r] = gelu_tanh(gate_r . x_t) * (up_r . x_t) in one dispatch --
+// no Gate/Up slot round-trip, no separate cpi_gelu_mul. One row per simdgroup: the first
+// half of the threadgroup's simds compute gate rows, the second half their up partners,
+// paired through threadgroup memory. Both dots round to half before the gelu, exactly as
+// the unfused sequence rounds them.
 struct QGluParams {
   uint n0, n1, n2, in_dim, tokens, bits, group, groups, has_bias;
   float glu_scale;  // cpi_gelu_mul's p.scale: 0 means 1; multiplied into the stored product

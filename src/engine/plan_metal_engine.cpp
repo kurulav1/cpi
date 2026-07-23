@@ -1260,13 +1260,10 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
       const bool qkv = op.out == opplan::Slot::Q && is_qgemv(oi + 1, opplan::Slot::K) &&
                        is_qgemv(oi + 2, opplan::Slot::V);
       const bool gu = op.out == opplan::Slot::Gate && is_qgemv(oi + 1, opplan::Slot::Up);
-      // GLU fusion (ported from the CUDA campaign): [gate][up][GeluMul] in ONE dispatch,
-      // writing the activated product straight to the GeluMul's output -- no Gate/Up
-      // round-trip and one dispatch fewer than the cat+gelu pair.
-      // MEASURED AND LOST as a default on the M4 (41.3 vs 46.5 tok/s interleaved): the
-      // paired-simd shape halves output rows per threadgroup, and a chained-cmdbuf
-      // dispatch after dep-elision is too cheap to be worth buying back. The CUDA win
-      // did not port. Opt-in for future hardware.
+      // GLU fusion: [gate][up][GeluMul] as one dispatch, writing the activated product
+      // straight to the GeluMul's output. Measured slower as a default: the paired-simd
+      // shape halves output rows per threadgroup, and the dispatch it saves is nearly
+      // free once dependency elision holds. Opt-in.
       static const bool want_glu = std::getenv("CPI_METAL_GLU") != nullptr;
       const bool glu = want_glu && gu && oi + 2 < ops.size() && ops[oi + 2].kind == OpKind::GeluMul &&
                        ops[oi + 2].in == op.out && ops[oi + 2].in2 == ops[oi + 1].out &&
@@ -1334,12 +1331,12 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
             0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
             static_cast<std::size_t>(a.bias_offset) * sizeof(std::uint16_t)};
         const std::size_t total = static_cast<std::size_t>(n0 + n1 + n2);
-        // NR0=4 decode shape (see cpi_gemv_quant_cat): same predicate as the shader.
+        // Four-rows-per-simdgroup decode shape (see cpi_gemv_quant_cat): the shader
+        // derives its row mapping from the same predicate -- keep them in lockstep.
         const bool nr4 = T == 1 && a.qbits == 4 && (a.in_dim % 32) == 0 && (gsz % 32) == 0 &&
                          a.bias == nullptr;
-        // llama.cpp's M-series mul_mv runs 64-thread threadgroups (N_SG=2); with NR0=4
-        // that is 8 rows per tg. The shader derives everything from nthr, so only the
-        // dispatch geometry changes -- keep rows_per_tg == (tg/32)*4 in lockstep.
+        // 64-thread threadgroups for the four-row shape: 8 rows per tg. The shader
+        // derives everything from nthr; keep rows_per_tg == (tg/32)*4 in lockstep.
         const std::size_t tg = nr4 ? 64 : kTG;
         const std::size_t rows_per_tg = nr4 ? (tg / 32) * 4 : kSimdsPerTG;
         const std::size_t rb = (total + rows_per_tg - 1) / rows_per_tg;
@@ -1446,12 +1443,13 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
                 static_cast<std::size_t>(qgemm_tokens) * static_cast<std::size_t>(op.cols) * 2, 0,
                 static_cast<std::size_t>(op.bias_offset) * sizeof(std::uint16_t)};
             const std::size_t tiles = static_cast<std::size_t>((qrest + kGemvTile - 1) / kGemvTile);
-            // NR0=4 decode shape (see cpi_gemv_quant): same predicate as the shader, 4x
-            // fewer threadgroups, activations loaded once per four rows.
+            // Four-rows-per-simdgroup decode shape (see cpi_gemv_quant): 4x fewer
+            // threadgroups, activations loaded once per four rows; predicate mirrored in
+            // the shader's row mapping.
             const int gsz0 = (op.qgroup == 0) ? op.in_dim : op.qgroup;
             const bool nr4 = qrest == 1 && op.qbits == 4 && (op.in_dim % 32) == 0 &&
                              (gsz0 % 32) == 0 && op.bias == nullptr;
-            const std::size_t tgq = nr4 ? 64 : kTG;  // llama.cpp's 64-thread mul_mv tgs
+            const std::size_t tgq = nr4 ? 64 : kTG;
             const std::size_t rows_per_tg = nr4 ? (tgq / 32) * 4 : kSimdsPerTG;
             const std::size_t rbq =
                 (static_cast<std::size_t>(op.cols) + rows_per_tg - 1) / rows_per_tg;
@@ -1938,13 +1936,10 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
                                  attn_part_l_.handle(),
                                  attn_part_o_.handle(),
                                  pos_buf_.handle()};
-          // GQA-shared variant: kv_heads == 1 and exactly 8 heads (one simdgroup each,
-          // uniform threadgroup barriers require heads == simds). K/V staged once per
-          // chunk for all heads -- 8x less KV traffic on the M4's tight bandwidth.
-          // MEASURED AND LOST at depth (48.5 vs 57.4 tok/s interleaved at 1500 tokens):
-          // the staging barriers and shuffle-heavy dots cost more than the 8x KV-traffic
-          // win. The shape has now lost on BOTH architectures for different reasons
-          // (5090: occupancy; M4: synchronization). Opt-in for whatever comes next.
+          // GQA-shared variant: kv_heads == 1 and exactly 8 heads (one simdgroup each;
+          // uniform threadgroup barriers require heads == simds). Stages K/V once per
+          // chunk for all heads. Measured slower as a default: the staging barriers and
+          // shuffle-heavy dots cost more than the KV-traffic saving. Opt-in.
           static const bool want_gqa = std::getenv("CPI_METAL_GQA") != nullptr;
           if (want_gqa && op.kv_heads == 1 && op.heads == 8) {
             ctx_.dispatch("cpi_attention_decode_split_gqa", G::Groups,

@@ -96,12 +96,9 @@ class PlanCudaEngine : public runtime::SequenceModel {
   // minus images). Falls back to per-token stepping for plans that cannot sequence.
   void prefill(const std::vector<int>& prompt) override {
     const int T = static_cast<int>(prompt.size());
-    if (std::getenv("CPI_KV_DEBUG"))
-      std::fprintf(stderr, "[prefill] T=%d seq_ok=%d\n", T, seq_prefill_ok_ ? 1 : 0);
     if (T > 1 && seq_prefill_ok_) {
-      // CHUNKED: one giant sequence pass broke past ~2K tokens (a T-scaled launch
-      // dimension exceeded a limit; the sticky error surfaced at the next memcpy) and
-      // buffers cap at seq_max_tokens_ anyway. KV appends make chunks exact.
+      // Chunked: the sequence buffers cap at seq_max_tokens_; KV appends keep the
+      // chunks exact.
       constexpr int kChunk = 2048;
       int pos = 0;
       while (pos < T) {
@@ -478,9 +475,9 @@ private:
   std::int8_t* d_seq_x8_ = nullptr;
   float* d_seq_xs_ = nullptr;
   int* d_seq_i32_ = nullptr;
-  // cuBLAS, for the SEQUENCE-mode GEMMs only (precedent: llama4 engine + bert embedder).
-  // The hand-rolled GEMM measured ~3% of tensor-core rate; prefill was 30x off llama.cpp
-  // because of it. Decode never touches this. CPI_CUDA_NO_CUBLAS=1 restores the fallback.
+  // cuBLAS, for the SEQUENCE-mode GEMMs only (precedent: llama4 engine + bert embedder);
+  // the hand-rolled GEMM cannot reach tensor-core rates. Decode never touches this.
+  // CPI_CUDA_NO_CUBLAS=1 restores the fallback.
   void* cublas_ = nullptr;  // cublasHandle_t, kept as void* to keep cublas out of the header
   // Tensor-core attention prefill (full-attention layers): scores scratch + device
   // pointer arrays, the LlamaEngine machinery adapted. Lazy-allocated on first use.

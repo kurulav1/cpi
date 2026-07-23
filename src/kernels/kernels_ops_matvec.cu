@@ -1403,7 +1403,7 @@ __global__ void quantize_fp16_to_int8_perm8_kernel(const half* __restrict__ src,
   }
 }
 
-// Group-32 variant (the llama.cpp q8_1 pattern): one scale per 32 columns instead of one
+// Group-32 variant: one scale per 32 columns instead of one
 // per vector. A group is exactly one dp4a chunk (32 weights), so the matvec's per-chunk
 // int32 dot picks up s_w[chunk] * s_x[chunk] -- and quantization needs NO global max:
 // each thread owns one 8-column window, a 4-lane butterfly maxes the group, and the

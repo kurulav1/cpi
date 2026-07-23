@@ -461,11 +461,11 @@ __global__ void weight_only_int4_matvec_kernel(const int8_t* w_packed, const flo
 }
 
 // Wide warp-per-row decode kernels. The block-per-row kernels above read the packed row a
-// BYTE at a time -- 196 GB/s effective on the 5090, which handed the whole bandwidth win of
-// int4 back. These mirror gemv_wide_kernel's shape (Warps warps per block, one row per warp,
-// 16-byte vector loads, kUnroll prefetch) on the packed data. A 16-byte chunk holds 32 int4
-// or 16 int8 weights; group scales hoist per chunk when group % 32 == 0 (the default 128).
-// The launchers route here when the shape allows and fall back to the naive kernels else.
+// byte at a time, which forfeits the bandwidth win of quantization. These mirror
+// gemv_wide_kernel's shape (Warps warps per block, one row per warp, 16-byte vector loads,
+// kUnroll prefetch) on the packed data. A 16-byte chunk holds 32 int4 or 16 int8 weights;
+// group scales hoist per chunk when group % 32 == 0 (the default 128). The launchers route
+// here when the shape allows and fall back to the naive kernels else.
 template <int Warps>
 __global__ void weight_only_int4_matvec_grouped_wide_kernel(const int8_t* __restrict__ w_packed,
                                                             const float* __restrict__ scales,
@@ -689,13 +689,11 @@ __device__ __forceinline__ float glu_gelu_tanh_f32(float x) {
   return 0.5f * x * (1.0f + tanhf(k * (x + 0.044715f * x * x * x)));
 }
 
-// Fused GeGLU dp4a matvec (the llama.cpp gated-activation fusion): out[r] =
-// gelu(gate_r) * up_r with no Gate/Up round-trip and no elementwise launch. Warp shape
-// matters: a first version gave each warp BOTH rows and measured 36% DRAM (the
-// rows-per-warp-2 penalty, third occurrence) -- so each warp owns ONE row of ONE matrix
-// (the proven wide-kernel shape): warps 0..3 take four gate rows, warps 4..7 their up
-// partners, and a tiny shared-memory epilogue pairs them. Numerics match the unfused
-// path: both dots round to fp16 before the gelu.
+// Fused GeGLU dp4a matvec: out[r] = gelu(gate_r) * up_r with no Gate/Up round-trip and
+// no elementwise launch. Each warp owns ONE row of ONE matrix (two-rows-per-warp variants
+// measured slower): warps 0..3 take four gate rows, warps 4..7 their up partners, and a
+// small shared-memory epilogue pairs them. Numerics match the unfused path: both dots
+// round to fp16 before the gelu.
 template <int RowsPerBlock>
 __global__ void weight_only_int4_matvec_grouped_dp4a_glu_kernel(
     const int8_t* __restrict__ wg, const float* __restrict__ sg, const int8_t* __restrict__ wu,
@@ -836,9 +834,9 @@ __global__ void weight_only_int4_matvec_grouped_dp4a_f32_kernel(
   }
 }
 
-// int8 twin of the fused GeGLU matvec: warps 0..RowsPerBlock-1 compute gate rows,
-// warps RowsPerBlock.. their up partners (one row per warp -- the law), rowwise scales,
-// fp16 activations, gelu on the fp16-rounded dots exactly as the unfused path.
+// int8 twin of the fused GeGLU matvec: warps 0..RowsPerBlock-1 compute gate rows, warps
+// RowsPerBlock.. their up partners (one row per warp), rowwise scales, fp16 activations,
+// gelu on the fp16-rounded dots exactly as the unfused path.
 template <int RowsPerBlock>
 __global__ void weight_only_int8_matvec_glu_kernel(const int8_t* __restrict__ wg,
                                                    const float* __restrict__ sg,
