@@ -331,7 +331,7 @@ kernel void cpi_gemm_splitk_reduce(device const float* partial [[buffer(0)]],
 // dequant loop writes scalars anyway, so it can just as easily scatter them into K-major
 // order once, and the fragment load becomes an ordinary one.
 static inline void load_qblock(threadgroup half* Ws, threadgroup float* sc_row,
-                               device const uchar* qw, device const float* scales, uint row0,
+                               device const uchar* qw, device const half* scales, uint row0,
                                uint k0, uint groups, uint gsz, uint bits, uint packed_row, uint lid,
                                uint nthr) {
   // Hoisted out of the dequant inner loop: one scale load per row, not one per weight.
@@ -376,7 +376,7 @@ static inline void load_qblock(threadgroup half* Ws, threadgroup float* sc_row,
 // ---------------------------------------------------------------------------
 kernel void cpi_gemm_quant(device const uchar* qw [[buffer(0)]],
                            device const half* in [[buffer(1)]], device half* out [[buffer(2)]],
-                           device const float* scales [[buffer(3)]],
+                           device const half* scales [[buffer(3)]],
                            device const half* bias [[buffer(4)]],
                            constant QuantParams& p [[buffer(5)]],
                            uint tgid [[threadgroup_position_in_grid]],
@@ -471,7 +471,7 @@ kernel void cpi_gemv_quant(
     device const uchar*  qw     [[buffer(0)]],
     device const half*   in     [[buffer(1)]],
     device half*         out    [[buffer(2)]],
-    device const float*  scales [[buffer(3)]],
+    device const half*  scales [[buffer(3)]],
     device const half*   bias   [[buffer(4)]],
     constant QuantParams& p     [[buffer(5)]],
     uint gid   [[threadgroup_position_in_grid]],
@@ -533,7 +533,7 @@ kernel void cpi_gemv_quant(
   if (t0 >= p.tokens || row >= p.out_dim) return;
   const uint nt = min((uint)GEMV_TILE, p.tokens - t0);
 
-  device const float* srow = scales + (ulong)row * (ulong)p.groups;
+  device const half* srow = scales + (ulong)row * (ulong)p.groups;
   const uint gsz = (p.group == 0u) ? p.in_dim : p.group;
 
   float acc[GEMV_TILE];
@@ -655,12 +655,12 @@ struct QCatParams {
 };
 
 // One output row's quantized dot product against the token tile, written to `out`.
-static inline void qcat_row(device const uchar* qw, device const float* scales,
+static inline void qcat_row(device const uchar* qw, device const half* scales,
                             device const half* in, device half* out, device const half* bias,
                             uint row, uint global_row, uint out_dim_m, uint has_bias, uint in_dim,
                             uint bits, uint gsz, uint groups, uint t0, uint tokens, uint lane) {
   const uint packed_row = (bits == 4u) ? ((in_dim + 1u) / 2u) : in_dim;
-  device const float* srow = scales + (ulong)row * (ulong)groups;
+  device const half* srow = scales + (ulong)row * (ulong)groups;
   const uint nt = min((uint)GEMV_TILE, tokens - t0);
   float acc[GEMV_TILE];
   for (uint t = 0u; t < GEMV_TILE; ++t) acc[t] = 0.0f;
@@ -751,11 +751,11 @@ static inline void qcat_row(device const uchar* qw, device const float* scales,
 
 kernel void cpi_gemv_quant_cat(
     device const half*   in   [[buffer(0)]],
-    device const uchar*  qw0  [[buffer(1)]], device const float* sc0 [[buffer(2)]],
+    device const uchar*  qw0  [[buffer(1)]], device const half* sc0 [[buffer(2)]],
     device half*         out0 [[buffer(3)]],
-    device const uchar*  qw1  [[buffer(4)]], device const float* sc1 [[buffer(5)]],
+    device const uchar*  qw1  [[buffer(4)]], device const half* sc1 [[buffer(5)]],
     device half*         out1 [[buffer(6)]],
-    device const uchar*  qw2  [[buffer(7)]], device const float* sc2 [[buffer(8)]],
+    device const uchar*  qw2  [[buffer(7)]], device const half* sc2 [[buffer(8)]],
     device half*         out2 [[buffer(9)]],
     device const half*   bias [[buffer(10)]],
     constant QCatParams& p    [[buffer(11)]],
@@ -791,7 +791,7 @@ kernel void cpi_gemv_quant_cat(
       for (uint r = 0u; r < nrows; ++r) {
         const uint g = r0 + r;
         device const uchar* qw = (g < p.n0) ? qw0 : (g < p.n0 + p.n1) ? qw1 : qw2;
-        device const float* sc = (g < p.n0) ? sc0 : (g < p.n0 + p.n1) ? sc1 : sc2;
+        device const half* sc = (g < p.n0) ? sc0 : (g < p.n0 + p.n1) ? sc1 : sc2;
         const uint lr = (g < p.n0) ? g : (g < p.n0 + p.n1) ? (g - p.n0) : (g - p.n0 - p.n1);
         device const uint4* w128 = (device const uint4*)(qw + (ulong)lr * (ulong)(p.in_dim >> 1));
         const uint4 packed = w128[k];
@@ -851,8 +851,8 @@ struct QGluParams {
 
 kernel void cpi_gemv_quant_glu(
     device const half*   in   [[buffer(0)]],
-    device const uchar*  qwg  [[buffer(1)]], device const float* scg [[buffer(2)]],
-    device const uchar*  qwu  [[buffer(3)]], device const float* scu [[buffer(4)]],
+    device const uchar*  qwg  [[buffer(1)]], device const half* scg [[buffer(2)]],
+    device const uchar*  qwu  [[buffer(3)]], device const half* scu [[buffer(4)]],
     device half*         out  [[buffer(5)]],
     constant QGluParams& p    [[buffer(6)]],
     uint gid  [[threadgroup_position_in_grid]],
@@ -878,9 +878,9 @@ kernel void cpi_gemv_quant_glu(
 
   if (t0 < p.tokens && row < p.n0) {
     device const uchar* qw = is_up ? qwu : qwg;
-    device const float* sc = is_up ? scu : scg;
+    device const half* sc = is_up ? scu : scg;
     const uint gsz = (p.group == 0u) ? p.in_dim : p.group;
-    device const float* srow = sc + (ulong)row * (ulong)p.groups;
+    device const half* srow = sc + (ulong)row * (ulong)p.groups;
     if (p.bits == 4u) {
       device const uint* w32 = (device const uint*)(qw + (ulong)row * (ulong)(p.in_dim >> 1));
       const uint n8 = p.in_dim >> 3;
@@ -954,7 +954,7 @@ kernel void cpi_lm_head_quant(
     device const uchar*  qw     [[buffer(0)]],
     device const half*   in     [[buffer(1)]],
     device float*        out    [[buffer(2)]],
-    device const float*  scales [[buffer(3)]],
+    device const half*  scales [[buffer(3)]],
     constant QuantParams& p     [[buffer(4)]],
     uint gid   [[threadgroup_position_in_grid]],
     uint lid   [[thread_position_in_threadgroup]],
@@ -965,7 +965,7 @@ kernel void cpi_lm_head_quant(
   const uint row = gid * simds_per_tg + simd_id;
   if (row >= p.out_dim) return;
 
-  device const float* srow = scales + (ulong)row * (ulong)p.groups;
+  device const half* srow = scales + (ulong)row * (ulong)p.groups;
   const uint gsz = (p.group == 0u) ? p.in_dim : p.group;
   float acc = 0.0f;
 
