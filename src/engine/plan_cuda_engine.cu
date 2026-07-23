@@ -94,6 +94,7 @@ PlanCudaEngine::~PlanCudaEngine() {
   cudaFree(d_argmax_);
   cudaFree(d_argmax_pv_);
   cudaFree(d_argmax_pi_);
+  cudaFree(d_mt_logits_);
   cudaFree(d_topk_part_val_);
   cudaFree(d_topk_part_idx_);
   cudaFree(d_topk_val_);
@@ -925,8 +926,8 @@ void PlanCudaEngine::open(const std::string& cpi_path, int max_context) {
   // quant kernels (the pre-parity behaviour) for A/B and bisection.
   if ((weight_quant_bits_ == 4 || weight_quant_bits_ == 8) && d_act_i8_ == nullptr &&
       std::getenv("CPI_CUDA_NO_DP4A") == nullptr) {
-    G4_CHECK(cudaMalloc(&d_act_i8_, std::size_t(8) * 65536));  // up to 8 tokens' activations
-    G4_CHECK(cudaMalloc(&d_act_qs_, std::size_t(8) * (65536 / 32) * sizeof(float)));  // g32 x scales, up to 8 tokens
+    G4_CHECK(cudaMalloc(&d_act_i8_, std::size_t(16) * 65536));  // up to 16 tokens' activations
+    G4_CHECK(cudaMalloc(&d_act_qs_, std::size_t(16) * (65536 / 32) * sizeof(float)));  // g32 x scales, up to 16 tokens
     // Largest projection on the supported models is <= 16384 x 4096 halfs (128 MB is the
     // ceiling; E2B's largest is 12288 x 1536 = 38 MB). Sized generously once.
     G4_CHECK(cudaMalloc(&d_seq_dequant_, std::size_t(16384) * 4096 * sizeof(__half)));
@@ -2239,7 +2240,7 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
         // Short quantized sequences (a speculative verify, a tail chunk) stream the
         // weights ONCE for all tokens through the multi-token dp4a kernel instead of
         // paying a whole-model dequant round.
-        if (seq && T <= 8 && op.qbits == 4 && op.qgroup > 0 && (op.qgroup % 32) == 0 &&
+        if (seq && T <= 16 && op.qbits == 4 && op.qgroup > 0 && (op.qgroup % 32) == 0 &&
             (op.in_dim % 32) == 0 && op.bias == nullptr && d_act_i8_ != nullptr) {
           if (mtq_src != S(op.in) || mtq_len != op.in_dim) {
             kernels::launch_quantize_fp16_to_int8_perm8_g32_mt(S(op.in), d_act_i8_, d_act_qs_,
@@ -3478,15 +3479,31 @@ void PlanCudaEngine::verify_greedy(const int* tokens, int k, int pos, int* out_a
     execute_ops(&plan_.epilogue[i], 1, 0, pos, ctx);
   }
   const __half* xn = sslot_ptr_[static_cast<int>(head.in)];
+  if (head.qbits == 4 && d_act_i8_ != nullptr) {
+    // Batched head: one weight pass produces all k positions' logits (the per-position
+    // gemv re-read the 262K-row head k times and dominated the verify's GPU time).
+    if (d_mt_logits_ == nullptr) {
+      G4_CHECK(cudaMalloc(&d_mt_logits_, 16ull * static_cast<std::size_t>(head.cols) *
+                                             sizeof(float)));
+    }
+    kernels::launch_quantize_fp16_to_int8_perm8_g32_mt(xn, d_act_i8_, d_act_qs_, head.in_dim, k,
+                                                       stream_);
+    kernels::launch_weight_only_int4_matvec_grouped_dp4a_mt_f32(
+        static_cast<const std::int8_t*>(head.qweight), static_cast<const float*>(head.qscales),
+        d_act_i8_, d_act_qs_, d_mt_logits_, head.cols, head.in_dim, head.qgroup, k, stream_);
+    for (int t = 0; t < k; ++t) {
+      kernels::launch_argmax_float(d_mt_logits_ + static_cast<std::size_t>(t) * head.cols,
+                                   head.cols, d_argmax_, stream_, d_argmax_pv_, d_argmax_pi_,
+                                   argmax_parts_);
+      G4_CHECK(cudaMemcpyAsync(out_argmax + t, d_argmax_, sizeof(int), cudaMemcpyDeviceToHost,
+                               stream_));
+    }
+    G4_CHECK(cudaStreamSynchronize(stream_));
+    return;
+  }
   for (int t = 0; t < k; ++t) {
     const __half* row = xn + static_cast<std::size_t>(t) * head.in_dim;
-    if (head.qbits == 4 && d_act_i8_ != nullptr) {
-      kernels::launch_quantize_fp16_to_int8_perm8_g32(row, d_act_i8_, d_act_qs_, head.in_dim,
-                                                      stream_);
-      kernels::launch_weight_only_int4_matvec_grouped_dp4a_f32(
-          static_cast<const std::int8_t*>(head.qweight), static_cast<const float*>(head.qscales),
-          d_act_i8_, d_act_qs_, d_logits_, head.cols, head.in_dim, head.qgroup, stream_);
-    } else if (head.qbits == 8) {
+    if (head.qbits == 8) {
       kernels::launch_weight_only_int8_gemv_f32(
           static_cast<const std::int8_t*>(head.qweight), static_cast<const float*>(head.qscales),
           row, d_logits_, head.cols, head.in_dim, stream_);
@@ -3552,11 +3569,11 @@ std::vector<int> PlanCudaEngine::generate_stream(const std::vector<int>& prompt,
   defer_host_logits_ = true;
 
   // Speculative greedy decode (CPI_CUDA_SPEC=<k>: up to k prompt-lookup drafts per
-  // batched verify, batch = drafts+1 <= 8). Greedy-only and sampler-neutral (no
+  // batched verify, batch = drafts+1 <= 16). Greedy-only and sampler-neutral (no
   // penalties, no grammar): every emitted token is a verified argmax, so the stream
   // must be identical to the plain greedy stream — that is the correctness gate.
   const char* spec_env = std::getenv("CPI_CUDA_SPEC");
-  const int spec_k = spec_env ? std::min(std::atoi(spec_env), 7) : 0;
+  const int spec_k = spec_env ? std::min(std::atoi(spec_env), 15) : 0;
   if (spec_k >= 1 && temperature <= 0.0f && seq_prefill_ok_ && !prompt.empty() &&
       p.repetition_penalty == 1.0f && p.no_repeat_ngram_size == 0) {
     using clock = std::chrono::steady_clock;
@@ -3592,7 +3609,7 @@ std::vector<int> PlanCudaEngine::generate_stream(const std::vector<int>& prompt,
     if (!stop && is_stop(cur)) stop = true;
     // Invariant at loop top: `cur` is emitted but not yet forwarded; `pos` is its slot.
     while (!stop && stats_.generated_tokens < p.max_new_tokens && pos < max_ctx) {
-      int drafts[8];
+      int drafts[16];
       const int room = max_ctx - pos - 1;  // verify writes KV rows pos..pos+nd
       const int nd = room >= 1 ? lookup_draft(history, 3, std::min(spec_k, room), drafts) : 0;
       if (nd <= 0) {
@@ -3600,7 +3617,7 @@ std::vector<int> PlanCudaEngine::generate_stream(const std::vector<int>& prompt,
         ++pos;
         cur = sample(p, history);
       } else {
-        int batch[9], verdict[9];
+        int batch[17], verdict[17];
         batch[0] = cur;
         for (int i = 0; i < nd; ++i) batch[1 + i] = drafts[i];
         verify_greedy(batch, nd + 1, pos, verdict);

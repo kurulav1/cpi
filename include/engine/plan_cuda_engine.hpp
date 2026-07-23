@@ -441,6 +441,7 @@ private:
   float* d_argmax_pv_ = nullptr;  // two-phase argmax partition scratch
   int* d_argmax_pi_ = nullptr;
   int argmax_parts_ = 1;
+  float* d_mt_logits_ = nullptr;  // [8][vocab] verify-batch logits (lazy, spec decode only)
 
   // Device top-k sampling (temperature>0 — the real chat path, since greedy only
   // covers temp<=0). Selects the candidate set on the GPU so the host never sees

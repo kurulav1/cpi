@@ -1148,6 +1148,14 @@ void launch_weight_only_int4_matvec_grouped_dp4a_mt(const std::int8_t* w_packed,
                                                     const float* x_scales, half* y,
                                                     int out_features, int in_features, int group,
                                                     int tokens, cudaStream_t stream);
+// f32-output form for the LM head: logits for all T positions in one weight pass
+// (y is [token][out_features] floats, ready for the argmax kernels).
+void launch_weight_only_int4_matvec_grouped_dp4a_mt_f32(const std::int8_t* w_packed,
+                                                        const float* scales, const std::int8_t* xq,
+                                                        const float* x_scales, float* y,
+                                                        int out_features, int in_features,
+                                                        int group, int tokens,
+                                                        cudaStream_t stream);
 
 // launch_rowmajor_half_gemv_cat
 //

@@ -904,10 +904,10 @@ __global__ void weight_only_int8_matvec_glu_kernel(const int8_t* __restrict__ wg
 // activation. This is what makes a speculative verify pass cost about one decode step's
 // weight traffic for k tokens, and it also serves short prefill remainders. Activations
 // are perm8/group-32 per token (x scales laid out [token][group]).
-template <int Warps, int MaxT>
+template <int Warps, int MaxT, typename OutT>
 __global__ void weight_only_int4_matvec_grouped_dp4a_mt_kernel(
     const int8_t* __restrict__ w_packed, const float* __restrict__ scales,
-    const int8_t* __restrict__ xq, const float* __restrict__ x_scales, half* __restrict__ y,
+    const int8_t* __restrict__ xq, const float* __restrict__ x_scales, OutT* __restrict__ y,
     int out_features, int in_features, int group_shift, int n_groups, int tokens) {
   const int row = blockIdx.x * Warps + (threadIdx.x / warpSize);
   if (row >= out_features) {
@@ -925,26 +925,50 @@ __global__ void weight_only_int4_matvec_grouped_dp4a_mt_kernel(
 #pragma unroll
   for (int t = 0; t < MaxT; ++t) acc[t] = 0.0f;
 
-  for (int c = lane; c < chunks; c += warpSize) {
-    const uint4 packed = wrow[c];
-    const float ws = row_s[(c * 32) >> group_shift];
-    const unsigned* wu = reinterpret_cast<const unsigned*>(&packed);
-    int wlo[4], whi[4];
+  constexpr int kUnroll = 2;
+  uint4 wbuf[kUnroll];
+  float sbuf[kUnroll];
+  for (int base = lane; base < chunks; base += warpSize * kUnroll) {
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      const unsigned word = wu[i];
-      wlo[i] = __vsubss4(static_cast<int>((word & 0x0F0F0F0Fu) ^ 0x08080808u), 0x08080808);
-      whi[i] = __vsubss4(static_cast<int>(((word >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u), 0x08080808);
-    }
-    for (int t = 0; t < tokens; ++t) {
-      const int* xw = reinterpret_cast<const int*>(xq + static_cast<std::size_t>(t) * in_features);
-      int gacc = 0;
-#pragma unroll
-      for (int i = 0; i < 4; ++i) {
-        gacc = __dp4a(wlo[i], xw[8 * c + 2 * i], gacc);
-        gacc = __dp4a(whi[i], xw[8 * c + 2 * i + 1], gacc);
+    for (int u = 0; u < kUnroll; ++u) {
+      const int c = base + u * warpSize;
+      if (c < chunks) {
+        wbuf[u] = wrow[c];
+        sbuf[u] = row_s[(c * 32) >> group_shift];
       }
-      acc[t] += static_cast<float>(gacc) * ws * x_scales[t * xg + c];
+    }
+#pragma unroll
+    for (int u = 0; u < kUnroll; ++u) {
+      const int c = base + u * warpSize;
+      if (c < chunks) {
+        const unsigned* wu = reinterpret_cast<const unsigned*>(&wbuf[u]);
+        int wlo[4], whi[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          const unsigned word = wu[i];
+          wlo[i] = __vsubss4(static_cast<int>((word & 0x0F0F0F0Fu) ^ 0x08080808u), 0x08080808);
+          whi[i] = __vsubss4(static_cast<int>(((word >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u),
+                             0x08080808);
+        }
+        for (int t = 0; t < tokens; ++t) {
+          // x for the chunk as two 128-bit loads per token, matching the wide kernel;
+          // eight scalar 32-bit loads here were the long-scoreboard stall source.
+          const uint4* x4 =
+              reinterpret_cast<const uint4*>(xq + static_cast<std::size_t>(t) * in_features);
+          const uint4 xa = x4[2 * c];
+          const uint4 xb = x4[2 * c + 1];
+          int gacc = 0;
+          gacc = __dp4a(wlo[0], static_cast<int>(xa.x), gacc);
+          gacc = __dp4a(whi[0], static_cast<int>(xa.y), gacc);
+          gacc = __dp4a(wlo[1], static_cast<int>(xa.z), gacc);
+          gacc = __dp4a(whi[1], static_cast<int>(xa.w), gacc);
+          gacc = __dp4a(wlo[2], static_cast<int>(xb.x), gacc);
+          gacc = __dp4a(whi[2], static_cast<int>(xb.y), gacc);
+          gacc = __dp4a(wlo[3], static_cast<int>(xb.z), gacc);
+          gacc = __dp4a(whi[3], static_cast<int>(xb.w), gacc);
+          acc[t] += static_cast<float>(gacc) * sbuf[u] * x_scales[t * xg + c];
+        }
+      }
     }
   }
 #pragma unroll
@@ -952,7 +976,11 @@ __global__ void weight_only_int4_matvec_grouped_dp4a_mt_kernel(
     if (t < tokens) {
       const float s = warp_sum(acc[t]);
       if (lane == 0) {
-        y[static_cast<std::size_t>(t) * out_features + row] = __float2half(s);
+        if constexpr (sizeof(OutT) == sizeof(half)) {
+          y[static_cast<std::size_t>(t) * out_features + row] = __float2half(s);
+        } else {
+          y[static_cast<std::size_t>(t) * out_features + row] = s;
+        }
       }
     }
   }
@@ -1536,14 +1564,45 @@ void launch_weight_only_int4_matvec_grouped_dp4a_mt(const std::int8_t* w_packed,
                                                     int out_features, int in_features, int group,
                                                     int tokens, cudaStream_t stream) {
   const int shift = group_shift_of(group);
-  if (shift < 0 || (group % 32) != 0 || (in_features % 32) != 0 || tokens < 1 || tokens > 8) {
+  if (shift < 0 || (group % 32) != 0 || (in_features % 32) != 0 || tokens < 1 || tokens > 16) {
     return;  // caller gates
   }
   const int n_groups = quant_group_count(in_features, group);
   constexpr int kWarps = 4;
   const int blocks = (out_features + kWarps - 1) / kWarps;
-  weight_only_int4_matvec_grouped_dp4a_mt_kernel<kWarps, 8><<<blocks, kWarps * 32, 0, stream>>>(
-      w_packed, scales, xq, x_scales, y, out_features, in_features, shift, n_groups, tokens);
+  if (tokens <= 8) {
+    weight_only_int4_matvec_grouped_dp4a_mt_kernel<kWarps, 8, half>
+        <<<blocks, kWarps * 32, 0, stream>>>(w_packed, scales, xq, x_scales, y, out_features,
+                                             in_features, shift, n_groups, tokens);
+  } else {
+    weight_only_int4_matvec_grouped_dp4a_mt_kernel<kWarps, 16, half>
+        <<<blocks, kWarps * 32, 0, stream>>>(w_packed, scales, xq, x_scales, y, out_features,
+                                             in_features, shift, n_groups, tokens);
+  }
+}
+
+void launch_weight_only_int4_matvec_grouped_dp4a_mt_f32(const std::int8_t* w_packed,
+                                                        const float* scales, const std::int8_t* xq,
+                                                        const float* x_scales, float* y,
+                                                        int out_features, int in_features,
+                                                        int group, int tokens,
+                                                        cudaStream_t stream) {
+  const int shift = group_shift_of(group);
+  if (shift < 0 || (group % 32) != 0 || (in_features % 32) != 0 || tokens < 1 || tokens > 16) {
+    return;  // caller gates
+  }
+  const int n_groups = quant_group_count(in_features, group);
+  constexpr int kWarps = 4;
+  const int blocks = (out_features + kWarps - 1) / kWarps;
+  if (tokens <= 8) {
+    weight_only_int4_matvec_grouped_dp4a_mt_kernel<kWarps, 8, float>
+        <<<blocks, kWarps * 32, 0, stream>>>(w_packed, scales, xq, x_scales, y, out_features,
+                                             in_features, shift, n_groups, tokens);
+  } else {
+    weight_only_int4_matvec_grouped_dp4a_mt_kernel<kWarps, 16, float>
+        <<<blocks, kWarps * 32, 0, stream>>>(w_packed, scales, xq, x_scales, y, out_features,
+                                             in_features, shift, n_groups, tokens);
+  }
 }
 
 void launch_weight_only_int8_matvec_grouped(const int8_t* w, const float* scales, const half* x,
