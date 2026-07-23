@@ -509,6 +509,11 @@ private:
   runtime::MetalBuffer argmax_val_;   // float[parts]
   runtime::MetalBuffer argmax_idx_;   // int32[parts]
   runtime::MetalBuffer argmax_out_;   // int32[1]
+  // Speculative verify does a per-row argmax on the GPU (vocab never crosses to the host): K
+  // rows, each with its own [parts] scratch slice so all rows argmax in one command buffer.
+  runtime::MetalBuffer verify_amax_val_;  // float[max_prefill * parts]
+  runtime::MetalBuffer verify_amax_idx_;  // int32[max_prefill * parts]
+  runtime::MetalBuffer verify_argmax_;    // int32[max_prefill]
   runtime::MetalBuffer chain_ring_;   // int32[kChainBlock] -- chained decode's per-block tokens
 
   std::vector<float> logits_;

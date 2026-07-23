@@ -3019,19 +3019,40 @@ void PlanMetalEngine::verify_tokens(const std::vector<int>& tokens, int start_po
   // One causal chunk at [start_pos, start_pos+K-1], with logits for every position.
   prefill_all_logits_ = true;
   encode_prefill(tokens, start_pos);
+
+  // Per-row argmax on the GPU, appended to the SAME command buffer as the prefill: a host loop
+  // over K x 152k logits cost ~2.6 ms/verify and made spec a net loss whenever acceptance was
+  // less than near-perfect. Each row gets its own [parts] scratch slice so the K reductions do
+  // not race inside one buffer; only K int32s cross to the host.
+  const std::size_t val_need = static_cast<std::size_t>(K) * kArgmaxParts * sizeof(float);
+  if (verify_amax_val_.size() < val_need) {
+    verify_amax_val_ = ctx_.alloc(val_need);
+    verify_amax_idx_ = ctx_.alloc(static_cast<std::size_t>(K) * kArgmaxParts * sizeof(std::int32_t));
+    verify_argmax_ = ctx_.alloc(static_cast<std::size_t>(K) * sizeof(std::int32_t));
+  }
+  for (int t = 0; t < K; ++t) {
+    const std::size_t vrow = static_cast<std::size_t>(t) * cfg_.vocab_size * sizeof(float);
+    const std::size_t prow = static_cast<std::size_t>(t) * kArgmaxParts;
+    ElemParams p1{static_cast<std::uint32_t>(cfg_.vocab_size), 0.0f};
+    const void* b1[] = {batch_logits_buf_.handle(), verify_amax_val_.handle(),
+                        verify_amax_idx_.handle()};
+    const std::size_t o1[] = {vrow, prow * sizeof(float), prow * sizeof(std::int32_t)};
+    ctx_.dispatch("cpi_argmax_partial", runtime::MetalContext::Grid::Groups, kArgmaxParts, kTG, b1,
+                  o1, 3, &p1, sizeof(p1));
+    ElemParams p2{static_cast<std::uint32_t>(kArgmaxParts), 0.0f};
+    const void* b2[] = {verify_amax_val_.handle(), verify_amax_idx_.handle(),
+                        verify_argmax_.handle()};
+    const std::size_t o2[] = {prow * sizeof(float), prow * sizeof(std::int32_t),
+                              static_cast<std::size_t>(t) * sizeof(std::int32_t)};
+    ctx_.dispatch("cpi_argmax_reduce", runtime::MetalContext::Grid::Groups, 1, kTG, b2, o2, 3, &p2,
+                  sizeof(p2));
+  }
   ctx_.commit_and_wait();
   prefill_all_logits_ = false;
   if (!ctx_.last_error().empty()) last_error_ = ctx_.last_error();
 
-  const float* src = static_cast<const float*>(batch_logits_buf_.contents());
-  for (int t = 0; t < K; ++t) {
-    const float* row = src + static_cast<std::size_t>(t) * static_cast<std::size_t>(cfg_.vocab_size);
-    int best = 0;
-    for (int j = 1; j < cfg_.vocab_size; ++j) {
-      if (row[j] > row[best]) best = j;
-    }
-    out_argmax[static_cast<std::size_t>(t)] = best;
-  }
+  const std::int32_t* am = static_cast<const std::int32_t*>(verify_argmax_.contents());
+  for (int t = 0; t < K; ++t) out_argmax[static_cast<std::size_t>(t)] = static_cast<int>(am[t]);
 }
 
 std::vector<int> PlanMetalEngine::generate(const std::vector<int>& prompt, int max_new,
@@ -3188,8 +3209,97 @@ std::vector<std::pair<int, float>> PlanMetalEngine::inspect_next_logits(
   return ranked;
 }
 
+// Prompt-lookup draft: the most recent earlier occurrence of the last `ng` tokens predicts the
+// tokens that followed it. No draft model -- the context IS the draft source, which is why this
+// wins on structured/repetitive output (code, JSON, quoting) and is neutral on free prose.
+static int metal_lookup_draft(const std::vector<int>& hist, int ng, int k, int* out) {
+  const int n = static_cast<int>(hist.size());
+  if (n < ng + 1 || k <= 0) return 0;
+  for (int start = n - ng - 1; start >= 0; --start) {
+    bool match = true;
+    for (int j = 0; j < ng; ++j) {
+      if (hist[start + j] != hist[n - ng + j]) { match = false; break; }
+    }
+    if (match) {
+      int c = 0;
+      for (int j = start + ng; j < n && c < k; ++j) out[c++] = hist[j];
+      return c;
+    }
+  }
+  return 0;
+}
+
 std::vector<int> PlanMetalEngine::generate_greedy(const std::vector<int>& prompt, int max_new) {
   if (prompt.empty()) throw std::runtime_error("empty prompt");
+
+  // Speculative greedy decode (CPI_METAL_SPEC=<k>): n-gram prompt-lookup drafts verified in ONE
+  // parallel pass (verify_tokens). Greedy, so every emitted token is a verified argmax and the
+  // stream matches plain greedy up to the prefill-vs-decode rounding class. Off by default; a
+  // recurrent (delta-net) model has no parallel verify and is refused.
+  const char* spec_env = std::getenv("CPI_METAL_SPEC");
+  const int spec_k = spec_env ? std::min(std::atoi(spec_env), 15) : 0;
+  if (spec_k >= 1 && !has_recurrent_ops_ && static_cast<int>(prompt.size()) >= 1) {
+    const int cap = std::min(spec_k, std::max(1, max_prefill_ - 1));
+    reset_kv_cache();
+    const int P = static_cast<int>(prompt.size());
+    const auto pre0 = std::chrono::steady_clock::now();
+    prefill_prompt(prompt, 0);  // positions 0..P-2; the last token is the first decode input
+    prefill_ms_ =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pre0).count();
+    prefill_tokens_ = P - 1;
+
+    std::vector<int> out;
+    std::vector<int> history = prompt;
+    static const bool no_stop = std::getenv("CPI_METAL_IGNORE_EOS") != nullptr;
+    int verifies = 0, drafted = 0, accepted = 0;
+
+    // First generated token: forward the last prompt token at position P-1.
+    int cur = decode_next_token(prompt.back(), P - 1, 0.0f, history);
+    out.push_back(cur);
+    history.push_back(cur);
+    int pos = P;  // where `cur` will be written when it is next forwarded
+    bool stop = !no_stop && detail::dispatch_has_degenerate_tail(out, prompt.size());
+    while (!stop && static_cast<int>(out.size()) < max_new && pos + 1 < max_context_) {
+      int drafts[16];
+      const int room = std::min(cap, max_context_ - pos - 1);
+      const int nd = metal_lookup_draft(history, 3, room, drafts);
+      if (nd <= 0) {
+        const int nx = decode_next_token(cur, pos, 0.0f, history);
+        ++pos;
+        out.push_back(nx);
+        history.push_back(nx);
+        cur = nx;
+      } else {
+        std::vector<int> batch;
+        batch.reserve(nd + 1);
+        batch.push_back(cur);
+        for (int i = 0; i < nd; ++i) batch.push_back(drafts[i]);
+        std::vector<int> verdict;
+        verify_tokens(batch, pos, verdict);  // writes KV pos..pos+nd, returns nd+1 argmaxes
+        ++verifies;
+        drafted += nd;
+        int a = 0;
+        while (a < nd && verdict[a] == drafts[a]) ++a;
+        accepted += a;
+        pos += a + 1;  // KV is correct through the a-th accepted draft; rejected rows go stale
+        for (int i = 0; i < a && static_cast<int>(out.size()) < max_new; ++i) {
+          out.push_back(drafts[i]);
+          history.push_back(drafts[i]);
+        }
+        cur = verdict[a];  // bonus token (verify's own next-token), not yet forwarded
+        out.push_back(cur);
+        history.push_back(cur);
+      }
+      if (!no_stop && detail::dispatch_has_degenerate_tail(out, prompt.size())) stop = true;
+    }
+    if (out.size() > static_cast<std::size_t>(max_new)) out.resize(max_new);
+    if (std::getenv("CPI_METAL_SPEC_STATS")) {
+      std::fprintf(stderr, "[spec] verifies=%d drafted=%d accepted=%d (%.1f%%) tokens=%zu\n",
+                   verifies, drafted, accepted, drafted ? 100.0 * accepted / drafted : 0.0,
+                   out.size());
+    }
+    return out;
+  }
 
   prev_seq_.clear();  // this path rewrites the KV cache untracked; drop any shared-prefix state
 
