@@ -117,3 +117,8 @@ RELEASE_CHECKLIST.md
 *.nsys-rep
 *.sqlite
 *.ncu-rep
+
+# Personal single-machine dev wrappers (hardcoded local paths, not portable)
+/build-cuda-ninja.bat
+/nsys*.bat
+/ncu*.bat

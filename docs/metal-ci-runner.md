@@ -60,8 +60,8 @@ GPU-less is:
 - **A Mac mini with the runner agent** — simplest, and fine. State persists between jobs, so
   a wedged build directory is yours to clean.
 
-A rented Mac (this backend was built on a $3.30/day rentamac.io M4) works for a session but is
-not a runner: the moment it lapses, Metal is unguarded again.
+A rented Apple Silicon Mac works for a session but is not a runner: the moment it lapses, Metal
+is unguarded again.
 
 ## Setup
 
