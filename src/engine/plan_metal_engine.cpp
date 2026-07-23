@@ -1938,9 +1938,18 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
                                  attn_part_l_.handle(),
                                  attn_part_o_.handle(),
                                  pos_buf_.handle()};
-          ctx_.dispatch("cpi_attention_decode_split", G::Groups,
-                        static_cast<std::size_t>(op.heads) * static_cast<std::size_t>(chunks),
-                        kDecTG, sbufs, nullptr, 7, &sp, sizeof(sp));
+          // GQA-shared variant: kv_heads == 1 and exactly 8 heads (one simdgroup each,
+          // uniform threadgroup barriers require heads == simds). K/V staged once per
+          // chunk for all heads -- 8x less KV traffic on the M4's tight bandwidth.
+          if (op.kv_heads == 1 && op.heads == 8) {
+            ctx_.dispatch("cpi_attention_decode_split_gqa", G::Groups,
+                          static_cast<std::size_t>(chunks), 256, sbufs, nullptr, 7, &sp,
+                          sizeof(sp));
+          } else {
+            ctx_.dispatch("cpi_attention_decode_split", G::Groups,
+                          static_cast<std::size_t>(op.heads) * static_cast<std::size_t>(chunks),
+                          kDecTG, sbufs, nullptr, 7, &sp, sizeof(sp));
+          }
           const void* mbufs[] = {attn_part_m_.handle(), attn_part_l_.handle(),
                                  attn_part_o_.handle(), slot(op.out)};
           ctx_.dispatch("cpi_attention_decode_merge", G::Groups,

@@ -1357,6 +1357,155 @@ kernel void cpi_attention_decode_split(
   }
 }
 
+// GQA-shared split decode: one threadgroup per KEY CHUNK, all q-heads of the (single)
+// kv-head handled by one simdgroup each, with the K and V blocks staged in threadgroup
+// memory ONCE for all of them. With kv_heads=1 and 8 q-heads the per-(head,chunk) kernel
+// reads every K/V byte eight times; this reads it once -- on a bandwidth-bound M4 that is
+// the whole game. (The same shape LOST on the 5090: occupancy beat traffic there.
+// Hardware disagrees; the merge kernel is shared unchanged.)
+// Per-head softmax state lives entirely in simd registers: lane j owns key (kb + j), the
+// online max/sum use simd reductions, and the V pass broadcasts each weight from its lane.
+kernel void cpi_attention_decode_split_gqa(
+    device const half*  q         [[buffer(0)]],
+    device const half*  k_cache   [[buffer(1)]],
+    device const half*  v_cache   [[buffer(2)]],
+    device float*       part_m    [[buffer(3)]],
+    device float*       part_l    [[buffer(4)]],
+    device float*       part_o    [[buffer(5)]],
+    device const int*   positions [[buffer(6)]],
+    constant AttnSplitParams& p   [[buffer(7)]],
+    uint gid  [[threadgroup_position_in_grid]],
+    uint lid  [[thread_position_in_threadgroup]],
+    uint nthr [[threads_per_threadgroup]]) {
+  const uint chunk = gid;
+  if (chunk >= p.chunks) return;
+
+  uint pos = p.position;
+  if (p.use_position_buffer != 0u) pos = uint(positions[0]);
+  uint start = 0u;
+  if (p.window != 0u && pos + 1u > p.window) start = pos + 1u - p.window;
+
+  const uint c0 = start + chunk * p.chunk_size;
+  const uint c1 = min(c0 + p.chunk_size, pos + 1u);
+
+  const uint simd_id = lid / 32u;
+  const uint lane    = lid % 32u;
+  const uint n_simd  = nthr / 32u;
+  const uint head    = simd_id;  // one simdgroup per q-head (heads <= n_simd, checked host-side)
+  const uint kv_dim  = p.kv_heads * p.head_dim;
+
+  // All heads share kv_head 0 (executor gates on kv_heads == 1).
+  if (c0 >= c1) {
+    if (head < p.heads && lane == 0u) {
+      part_m[head * p.chunks + chunk] = -INFINITY;
+      part_l[head * p.chunks + chunk] = 0.0f;
+    }
+    return;
+  }
+
+  // 16 KB staging block, reused for K then V each key-block. 32 keys at head_dim 256;
+  // halve the block for 512-wide heads.
+  const uint kblk = (p.head_dim <= 256u) ? 32u : 16u;
+  threadgroup half kv_sh[32u * 256u];
+
+  // Stage this head's query into registers, float4-wide: hd <= 512 -> <= 4 float4 per lane.
+  float4 qreg[4];
+  const uint hd4 = p.head_dim >> 2u;
+  const uint q4count = (hd4 + 31u) / 32u;
+  if (head < p.heads) {
+    device const half4* q4p = (device const half4*)(q + head * p.head_dim);
+    for (uint c = 0u; c < q4count; ++c) {
+      const uint i4 = lane + c * 32u;
+      qreg[c] = (i4 < hd4) ? float4(q4p[i4]) : float4(0.0f);
+    }
+  }
+
+  float run_m = -INFINITY;
+  float run_l = 0.0f;
+  float acc[16];  // head_dim/32 accumulators per lane, <= 16 at hd 512
+  const uint npl = p.head_dim / 32u;  // dims per lane (head_dim % 32 == 0 on every model)
+  for (uint i = 0u; i < npl; ++i) acc[i] = 0.0f;
+
+  for (uint kb = c0; kb < c1; kb += kblk) {
+    const uint nk = min(kblk, c1 - kb);
+
+    // Stage K block once for every head.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint idx = lid; idx < nk * p.head_dim; idx += nthr) {
+      const uint j = idx / p.head_dim;
+      const uint i = idx % p.head_dim;
+      kv_sh[idx] = k_cache[(ulong)(kb + j) * (ulong)kv_dim + i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Lane j scores key (kb + j) for this simd's head, from the staged block.
+    float score = -INFINITY;
+    if (head < p.heads && lane < nk) {
+      threadgroup const half* kt = kv_sh + lane * p.head_dim;
+      float d = 0.0f;
+      for (uint c = 0u; c < q4count; ++c) {
+        for (uint l4 = 0u; l4 < 32u && (l4 + c * 32u) < hd4; ++l4) {
+          // dot against qreg held lane-strided: broadcast each lane's q fragment.
+          const float4 qf = simd_shuffle(qreg[c], l4);
+          const uint i0 = (l4 + c * 32u) * 4u;
+          d += qf.x * float(kt[i0]) + qf.y * float(kt[i0 + 1u]) + qf.z * float(kt[i0 + 2u]) +
+               qf.w * float(kt[i0 + 3u]);
+        }
+      }
+      score = d * p.scale;
+    }
+
+    // Per-head online softmax in simd registers.
+    const float bmax = simd_max(score);
+    if (head < p.heads && bmax != -INFINITY) {
+      const float new_m = max(run_m, bmax);
+      const float rescale = (run_m == -INFINITY) ? 0.0f : exp(run_m - new_m);
+      const float w = (lane < nk) ? exp(score - new_m) : 0.0f;
+      const float bsum = simd_sum(w);
+
+      // Stage V over the same buffer -- everyone is past the K reads by the barrier below.
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (uint idx = lid; idx < nk * p.head_dim; idx += nthr) {
+        const uint j = idx / p.head_dim;
+        const uint i = idx % p.head_dim;
+        kv_sh[idx] = v_cache[(ulong)(kb + j) * (ulong)kv_dim + i];
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      for (uint i = 0u; i < npl; ++i) acc[i] *= rescale;
+      for (uint j = 0u; j < nk; ++j) {
+        const float wj = simd_shuffle(w, j);
+        threadgroup const half* vt = kv_sh + j * p.head_dim;
+        for (uint i = 0u; i < npl; ++i) {
+          acc[i] += wj * float(vt[lane + i * 32u]);
+        }
+      }
+      run_l = run_l * rescale + bsum;
+      run_m = new_m;
+    } else {
+      // Heads beyond p.heads (or empty scores) still participate in the V restage barriers.
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (uint idx = lid; idx < nk * p.head_dim; idx += nthr) {
+        const uint j = idx / p.head_dim;
+        const uint i = idx % p.head_dim;
+        kv_sh[idx] = v_cache[(ulong)(kb + j) * (ulong)kv_dim + i];
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+  }
+
+  if (head < p.heads) {
+    const uint slot = head * p.chunks + chunk;
+    if (lane == 0u) {
+      part_m[slot] = run_m;
+      part_l[slot] = run_l;
+    }
+    for (uint i = 0u; i < npl; ++i) {
+      part_o[(ulong)slot * (ulong)p.head_dim + lane + i * 32u] = acc[i];
+    }
+  }
+}
+
 kernel void cpi_attention_decode_merge(
     device const float* part_m  [[buffer(0)]],
     device const float* part_l  [[buffer(1)]],
