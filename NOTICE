@@ -1,0 +1,12 @@
+CPI - Cross-Platform Inference
+Copyright 2026 Väinö Kurula
+
+This product is licensed under the Apache License, Version 2.0 (the "License");
+you may not use this software except in compliance with the License. A copy of
+the License is in the LICENSE file at the root of this repository, or at
+https://www.apache.org/licenses/LICENSE-2.0.
+
+CPI is a from-scratch LLM inference engine: every kernel, tokenizer, and model
+container reader is original work in this repository, with no third-party
+runtime dependencies. It ships CPU, CUDA, and Metal backends that execute the
+same model plans.

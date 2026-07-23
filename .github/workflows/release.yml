@@ -45,7 +45,7 @@ jobs:
         run: |
           mkdir -p pkg/${{ matrix.asset }}
           cp "${{ matrix.bin }}" pkg/${{ matrix.asset }}/
-          cp README.md LICENSE* pkg/${{ matrix.asset }}/ 2>/dev/null || true
+          cp README.md LICENSE NOTICE pkg/${{ matrix.asset }}/ 2>/dev/null || true
       - name: Archive
         shell: bash
         run: |
@@ -60,9 +60,52 @@ jobs:
           name: ${{ matrix.asset }}
           path: pkg/${{ matrix.asset }}.*
 
+  build-macos-metal:
+    name: Build macOS Metal binary
+    runs-on: macos-14  # Apple Silicon (arm64) runner -- Metal backend on by default
+    env:
+      ASSET: llama_infer-macos-arm64-metal
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (Metal, CUDA off)
+        run: >
+          cmake -S . -B build
+          -DLLAMA_ENGINE_ENABLE_CUDA=OFF
+          -DLLAMA_ENGINE_ENABLE_METAL=ON
+          -DLLAMA_ENGINE_ENABLE_SENTENCEPIECE=OFF
+          -DCMAKE_BUILD_TYPE=Release
+      - name: Build llama_infer
+        run: cmake --build build --config Release --target llama_infer -j
+      - name: Stage package
+        shell: bash
+        run: |
+          # The Metal backend compiles its shaders at runtime, so the .metal sources ship
+          # alongside the binary and a launcher points CPI_METAL_SOURCE at them. Running the
+          # bare binary also works if CPI_METAL_SOURCE is set by hand.
+          mkdir -p "pkg/$ASSET/metal"
+          cp build/llama_infer "pkg/$ASSET/"
+          cp src/kernels/metal/*.metal "pkg/$ASSET/metal/"
+          cp README.md LICENSE NOTICE "pkg/$ASSET/" 2>/dev/null || true
+          cat > "pkg/$ASSET/run.sh" <<'EOF'
+          #!/bin/bash
+          # Launcher: resolve the bundle dir, point the Metal backend at the shipped shaders.
+          DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          export CPI_METAL_SOURCE="$DIR/metal"
+          exec "$DIR/llama_infer" "$@"
+          EOF
+          chmod +x "pkg/$ASSET/run.sh" "pkg/$ASSET/llama_infer"
+      - name: Archive
+        shell: bash
+        run: |
+          cd pkg && tar -czf "$ASSET.tar.gz" "$ASSET"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ASSET }}
+          path: pkg/*.tar.gz
+
   release:
     name: Publish release
-    needs: build-binaries
+    needs: [build-binaries, build-macos-metal]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -78,7 +121,26 @@ jobs:
           body: |
             ## CPI ${{ github.event.inputs.tag || github.ref_name }}
 
-            Attached are **portable CPU-only** builds of `llama_infer` for Linux and Windows (x64).
+            Prebuilt `llama_infer` binaries:
+
+            | Asset | Platform | Backend |
+            |---|---|---|
+            | `llama_infer-linux-x64-cpu` | Linux x64 | CPU |
+            | `llama_infer-windows-x64-cpu` | Windows x64 | CPU |
+            | `llama_infer-macos-arm64-metal` | macOS (Apple Silicon) | Metal GPU + CPU |
+
+            Verify a build with `llama_infer --version`.
+
+            ### macOS (Metal)
+            The Metal backend compiles its shaders at runtime, so the archive bundles the
+            `.metal` sources next to the binary. Use the included launcher:
+
+            ```
+            ./run.sh model.cpi --tokenizer tokenizer.json --prompt "..." --weight-quant int4
+            ```
+
+            (or run `llama_infer` directly with `CPI_METAL_SOURCE=./metal` set). First launch
+            may prompt Gatekeeper on an unsigned binary — allow it in System Settings › Privacy.
 
             ### GPU (CUDA) builds
             CUDA binaries are GPU-architecture and driver specific, so they are not
