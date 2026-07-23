@@ -1129,13 +1129,19 @@ kernel void cpi_attention_decode(
     float bsum = 0.0f;
     for (uint j = 0u; j < nk; ++j) bsum += w_sh[j];
 
-    for (uint i = lid; i < p.head_dim; i += nthr) {
-      float a = tg_acc[i] * rescale;
-      for (uint j = 0u; j < nk; ++j) {
-        device const half* vt = v_cache + (ulong)(kb + j) * (ulong)kv_dim + kv_head * p.head_dim;
-        a += w_sh[j] * float(vt[i]);
+    {
+      // V accumulate, float4 over dims: 4x fewer strided loads per thread (gemv lesson).
+      threadgroup float4* acc4 = (threadgroup float4*)tg_acc;
+      device const half4* vbase = (device const half4*)(v_cache + kv_head * p.head_dim);
+      const uint hd4v = p.head_dim >> 2u;
+      const uint kvd4 = kv_dim >> 2u;
+      for (uint i4 = lid; i4 < hd4v; i4 += nthr) {
+        float4 a = acc4[i4] * rescale;
+        for (uint j = 0u; j < nk; ++j) {
+          a += w_sh[j] * float4(vbase[(ulong)(kb + j) * (ulong)kvd4 + i4]);
+        }
+        acc4[i4] = a;
       }
-      tg_acc[i] = a;
     }
 
     // Every thread read tg_max above; thread 0 is about to overwrite it.
@@ -1268,12 +1274,20 @@ kernel void cpi_attention_decode_split(
   for (uint kb = c0; kb < c1; kb += DEC_KEY_BLOCK) {
     const uint nk = min((uint)DEC_KEY_BLOCK, c1 - kb);
 
-    // Score: ONE KEY PER THREAD. The whole dot product lives in one thread, so no shuffles.
-    for (uint j = lid; j < nk; j += nthr) {
-      device const half* kt = k_cache + (ulong)(kb + j) * (ulong)kv_dim + kv_head * p.head_dim;
-      float d = 0.0f;
-      for (uint i = 0u; i < p.head_dim; ++i) d += q_sh[i] * float(kt[i]);
-      sc_sh[j] = d * p.scale;
+    // Score: ONE KEY PER THREAD, vectorized (the gemv lesson): half4 K loads + float4
+    // dots -- the scalar form was head_dim serial scalar loads per key. head_dim % 4 == 0
+    // on every model here.
+    {
+      threadgroup const float4* q4 = (threadgroup const float4*)q_sh;
+      const uint hd4 = p.head_dim >> 2u;
+      for (uint j = lid; j < nk; j += nthr) {
+        device const half4* kt4 = (device const half4*)(k_cache +
+                                                        (ulong)(kb + j) * (ulong)kv_dim +
+                                                        kv_head * p.head_dim);
+        float d = 0.0f;
+        for (uint i = 0u; i < hd4; ++i) d += dot(q4[i], float4(kt4[i]));
+        sc_sh[j] = d * p.scale;
+      }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1303,13 +1317,19 @@ kernel void cpi_attention_decode_split(
     float bsum = 0.0f;
     for (uint s = 0u; s < n_simd; ++s) bsum += red[s];
 
-    for (uint i = lid; i < p.head_dim; i += nthr) {
-      float a = tg_acc[i] * rescale;
-      for (uint j = 0u; j < nk; ++j) {
-        device const half* vt = v_cache + (ulong)(kb + j) * (ulong)kv_dim + kv_head * p.head_dim;
-        a += w_sh[j] * float(vt[i]);
+    {
+      // V accumulate, float4 over dims: 4x fewer strided loads per thread (gemv lesson).
+      threadgroup float4* acc4 = (threadgroup float4*)tg_acc;
+      device const half4* vbase = (device const half4*)(v_cache + kv_head * p.head_dim);
+      const uint hd4v = p.head_dim >> 2u;
+      const uint kvd4 = kv_dim >> 2u;
+      for (uint i4 = lid; i4 < hd4v; i4 += nthr) {
+        float4 a = acc4[i4] * rescale;
+        for (uint j = 0u; j < nk; ++j) {
+          a += w_sh[j] * float4(vbase[(ulong)(kb + j) * (ulong)kvd4 + i4]);
+        }
+        acc4[i4] = a;
       }
-      tg_acc[i] = a;
     }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
