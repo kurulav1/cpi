@@ -158,6 +158,21 @@ python tools/bench_report.py --patch-benchmarks
 
 ## Quick Start
 
+### Download a prebuilt binary
+
+Tagged releases attach prebuilt `llama_infer` binaries (see the repository's Releases page):
+
+| Asset | Platform | Backend |
+| ----- | -------- | ------- |
+| `llama_infer-linux-x64-cpu` | Linux x64 | CPU |
+| `llama_infer-windows-x64-cpu` | Windows x64 | CPU |
+| `llama_infer-macos-arm64-metal` | macOS (Apple Silicon) | Metal GPU + CPU |
+
+Unpack and check the build with `llama_infer --version`. The macOS archive bundles the Metal
+shader sources next to the binary; launch it with the included `./run.sh` (which sets
+`CPI_METAL_SOURCE` for you) or set that variable by hand. CUDA is not shipped as a binary (it is
+GPU-architecture and driver specific) — build it from source per [Build Modes](#build-modes).
+
 ### Prerequisites
 
 | Tool | Version | Needed for |

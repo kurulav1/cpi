@@ -284,6 +284,36 @@ int main(int argc, char** argv) {
   SetConsoleCP(CP_UTF8);
 #endif
 
+  // --version / --help are answered before anything else (no model, no instance lock), so they
+  // work as plain informational commands.
+#ifndef CPI_VERSION
+#define CPI_VERSION "0.0.0"
+#endif
+#ifndef CPI_GIT_SHA
+#define CPI_GIT_SHA "unknown"
+#endif
+  for (int i = 1; i < argc; ++i) {
+    const std::string a = argv[i];
+    if (a == "--version" || a == "-V") {
+      const char* backends =
+#if defined(LLAMA_ENGINE_HAS_CUDA) && LLAMA_ENGINE_HAS_CUDA
+          "cpu, cuda"
+#elif defined(LLAMA_ENGINE_HAS_METAL) && LLAMA_ENGINE_HAS_METAL
+          "cpu, metal"
+#else
+          "cpu"
+#endif
+          ;
+      std::cout << "CPI (llama_infer) " CPI_VERSION " (" CPI_GIT_SHA ")\n"
+                << "backends: " << backends << "\n";
+      return 0;
+    }
+    if (a == "--help" || a == "-h") {
+      app::main_cli::print_usage(std::cout);
+      return 0;
+    }
+  }
+
   SingleInstanceGuard instance_guard;
   if (!instance_guard.acquire()) {
     std::cerr << "Another llama_infer instance is already running.\n";

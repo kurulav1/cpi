@@ -1,5 +1,23 @@
 cmake_minimum_required(VERSION 3.24)
-project(cpi LANGUAGES CXX)
+project(cpi VERSION 0.1.0 LANGUAGES CXX)
+
+# Stamp the build with the project version (and the short git SHA when available) so
+# `llama_infer --version` reports exactly what was built. CPI_GIT_SHA is best-effort:
+# a source archive with no .git resolves to "unknown", which is fine.
+set(CPI_GIT_SHA "unknown")
+find_package(Git QUIET)
+if(Git_FOUND)
+  execute_process(
+    COMMAND ${GIT_EXECUTABLE} rev-parse --short HEAD
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    OUTPUT_VARIABLE CPI_GIT_SHA_OUT
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+  if(CPI_GIT_SHA_OUT)
+    set(CPI_GIT_SHA "${CPI_GIT_SHA_OUT}")
+  endif()
+endif()
+add_compile_definitions(CPI_VERSION="${PROJECT_VERSION}" CPI_GIT_SHA="${CPI_GIT_SHA}")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -199,6 +217,7 @@ if(LLAMA_ENGINE_ENABLE_CUDA)
 endif()
 
 target_compile_definitions(llama_engine PUBLIC LLAMA_ENGINE_HAS_CUDA=$<BOOL:${LLAMA_ENGINE_ENABLE_CUDA}>)
+target_compile_definitions(llama_engine PUBLIC LLAMA_ENGINE_HAS_METAL=$<BOOL:${LLAMA_ENGINE_ENABLE_METAL}>)
 
 # ---------------------------------------------------------------------------
 # Metal backend (Apple Silicon)
