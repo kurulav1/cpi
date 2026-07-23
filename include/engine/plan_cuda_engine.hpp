@@ -459,6 +459,21 @@ private:
   bool spec_graph_init();             // alloc scratch (+ capture unless CPI_CUDA_SPEC_GRAPH=0)
   void spec_forward_t16();            // the captured body (also runs eagerly for A/B)
 
+  // ── Per-box tuning knobs. Defaults are the RTX 5090 hand-tuned values; CPI_AUTOTUNE=1
+  //    coordinate-descends over real decode-graph replay time and persists the winners per
+  //    (GPU, model geometry, quant) so every other box pays the search once. All gemv-warps
+  //    variants are bit-identical (row math is warp-local); chunk-size variants regroup the
+  //    exact split-K merge, the same tolerance class as the existing depth-adaptive switch. ──
+  int tune_gemv_warps_ = 4;        // int4 dp4a wide/cat/glu rows per block (2/4/8)
+  int tune_attn_cs_shallow_ = 16;  // split-K chunk size below the deep crossover
+  int tune_attn_cs_deep_ = 32;     // ...and at/after it
+  int tune_attn_deep_tokens_ = 2048;
+  void autotune();                            // search + report (call after open())
+  double time_decode_at(int pos, int iters);  // decode-graph replay ms/token at a depth
+  std::string tuning_path() const;            // per-(GPU, model, quant) cache file
+  bool load_tuning();
+  void save_tuning() const;
+
   // Device top-k sampling (temperature>0 — the real chat path, since greedy only
   // covers temp<=0). Selects the candidate set on the GPU so the host never sees
   // the full vocab-sized logit vector; only the ~k candidates come back.

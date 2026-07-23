@@ -13,7 +13,10 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <cctype>
+#include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
@@ -2207,7 +2210,7 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
             kernels::launch_weight_only_int4_matvec_grouped_dp4a_glu(
                 QW(op.qweight), QS(op.qscales), QW(ops[idx + 1].qweight),
                 QS(ops[idx + 1].qscales), d_act_i8_, d_act_qs_, S(ops[idx + 2].out), op.cols,
-                op.in_dim, op.qgroup, stream_);
+                op.in_dim, op.qgroup, stream_, tune_gemv_warps_);
             idx += 2;
             break;
           }
@@ -2231,7 +2234,7 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
                   QW(op.qweight), QS(op.qscales), S(op.out), op.cols, QW(b->qweight),
                   QS(b->qscales), S(b->out), b->cols, c ? QW(c->qweight) : nullptr,
                   c ? QS(c->qscales) : nullptr, c ? S(c->out) : nullptr, c ? c->cols : 0,
-                  d_act_i8_, d_act_qs_, op.in_dim, op.qgroup, stream_);
+                  d_act_i8_, d_act_qs_, op.in_dim, op.qgroup, stream_, tune_gemv_warps_);
               idx += c ? 2 : 1;
               break;
             }
@@ -2239,7 +2242,7 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
           kernels::launch_weight_only_int4_matvec_grouped_dp4a(QW(op.qweight), QS(op.qscales),
                                                                d_act_i8_, d_act_qs_, S(op.out),
                                                                op.cols, op.in_dim, op.qgroup,
-                                                               stream_);
+                                                               stream_, tune_gemv_warps_);
           if (S(op.out) == actq_src) actq_src = nullptr;
           break;
         }
@@ -2539,10 +2542,10 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
             int cs = kSplitAnyChunk;
             {
               const int live_tokens = chunks * kSplitAnyChunk;
-              if (live_tokens >= 2048) {
-                cs = 32;
-                chunks = (live_tokens + cs - 1) / cs;
-              }
+              // Shallow/deep chunk sizes and the crossover are per-box tuning knobs.
+              cs = live_tokens >= tune_attn_deep_tokens_ ? tune_attn_cs_deep_
+                                                         : tune_attn_cs_shallow_;
+              if (cs != kSplitAnyChunk) chunks = (live_tokens + cs - 1) / cs;
             }
             if (window > 0) {
               const int wc = window / cs + 2;  // window can straddle chunk edges
@@ -3360,6 +3363,135 @@ void PlanCudaEngine::capture_decode_graph() {
   decode_graph_ready_ = true;
 }
 
+// ── Per-box autotuning ──────────────────────────────────────────────────────────────
+// The objective is the real workload: ms per decode-graph replay at a representative
+// depth, not a kernel microbench (microbenches repeatedly ranked candidates wrong during
+// the parity campaign -- the graph replay is what generation actually runs).
+
+double PlanCudaEngine::time_decode_at(int pos, int iters) {
+  using clock = std::chrono::steady_clock;
+  attn_chunk_budget_ = (pos + 1 + kSplitAnyChunk - 1) / kSplitAnyChunk;
+  decode_graph_ready_ = false;  // knobs changed between calls; force a fresh capture
+  const int tok = cfg_.bos_token_id;
+  G4_CHECK(cudaMemcpyAsync(d_tok_, &tok, sizeof(int), cudaMemcpyHostToDevice, stream_));
+  G4_CHECK(cudaMemcpyAsync(d_position_, &pos, sizeof(int), cudaMemcpyHostToDevice, stream_));
+  capture_decode_graph();
+  for (int i = 0; i < 5; ++i) G4_CHECK(cudaGraphLaunch(decode_graph_exec_, stream_));
+  G4_CHECK(cudaStreamSynchronize(stream_));
+  const auto t0 = clock::now();
+  for (int i = 0; i < iters; ++i) G4_CHECK(cudaGraphLaunch(decode_graph_exec_, stream_));
+  G4_CHECK(cudaStreamSynchronize(stream_));
+  return std::chrono::duration<double, std::milli>(clock::now() - t0).count() / iters;
+}
+
+std::string PlanCudaEngine::tuning_path() const {
+  cudaDeviceProp prop{};
+  cudaGetDeviceProperties(&prop, 0);
+  std::string gpu = prop.name;
+  for (char& ch : gpu) {
+    if (!std::isalnum(static_cast<unsigned char>(ch))) ch = '_';
+  }
+  const char* base = std::getenv("LOCALAPPDATA");
+  if (base == nullptr) base = std::getenv("HOME");
+  if (base == nullptr) base = ".";
+  return std::string(base) + "/cpi/tuning/" + gpu + "-L" + std::to_string(cfg_.num_layers) + "h" +
+         std::to_string(cfg_.hidden) + "q" + std::to_string(weight_quant_bits_) + "g" +
+         std::to_string(weight_quant_group_) + ".json";
+}
+
+// The file is written by save_tuning below, so a full JSON parser is overkill: pull each
+// "key": <int> pair by name.
+static int tuning_field(const std::string& s, const char* key, int fallback) {
+  const std::string pat = std::string("\"") + key + "\":";
+  const std::size_t at = s.find(pat);
+  if (at == std::string::npos) return fallback;
+  return std::atoi(s.c_str() + at + pat.size());
+}
+
+bool PlanCudaEngine::load_tuning() {
+  std::ifstream in(tuning_path());
+  if (!in.good()) return false;
+  std::string s((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  const int gw = tuning_field(s, "gemv_warps", tune_gemv_warps_);
+  if (gw == 2 || gw == 4 || gw == 8) tune_gemv_warps_ = gw;
+  const int csw = tuning_field(s, "attn_cs_shallow", tune_attn_cs_shallow_);
+  if (csw == 16 || csw == 32) tune_attn_cs_shallow_ = csw;
+  const int csd = tuning_field(s, "attn_cs_deep", tune_attn_cs_deep_);
+  if (csd == 16 || csd == 32 || csd == 64) tune_attn_cs_deep_ = csd;
+  const int th = tuning_field(s, "attn_deep_tokens", tune_attn_deep_tokens_);
+  if (th >= 256 && th <= 65536) tune_attn_deep_tokens_ = th;
+  std::fprintf(stderr, "[tune] loaded %s: gemv_warps=%d attn_cs=%d/%d@%d\n",
+               tuning_path().c_str(), tune_gemv_warps_, tune_attn_cs_shallow_,
+               tune_attn_cs_deep_, tune_attn_deep_tokens_);
+  return true;
+}
+
+void PlanCudaEngine::save_tuning() const {
+  const std::string path = tuning_path();
+  std::error_code ec;
+  std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
+  std::ofstream out(path, std::ios::trunc);
+  if (!out.good()) {
+    std::fprintf(stderr, "[tune] could not write %s\n", path.c_str());
+    return;
+  }
+  out << "{\"gemv_warps\":" << tune_gemv_warps_
+      << ",\"attn_cs_shallow\":" << tune_attn_cs_shallow_
+      << ",\"attn_cs_deep\":" << tune_attn_cs_deep_
+      << ",\"attn_deep_tokens\":" << tune_attn_deep_tokens_ << "}\n";
+  std::fprintf(stderr, "[tune] saved %s\n", path.c_str());
+}
+
+void PlanCudaEngine::autotune() {
+  if (!decode_graph_enabled_ || d_tok_ == nullptr) return;
+  const int iters = 40;
+  const int shallow_pos = std::min(400, max_ctx_ - 2);
+  const int deep_pos = std::min(3072, max_ctx_ - 2);
+  struct Knob {
+    const char* name;
+    int* value;
+    std::vector<int> candidates;
+    int depth;
+  };
+  // Coordinate descent, one knob at a time, defaults kept unless a candidate wins by >1%
+  // (jitter hysteresis: thermal drift on a working box is 3-5%, so each comparison re-times
+  // the incumbent in the same pass instead of trusting an earlier number).
+  std::vector<Knob> knobs = {
+      {"gemv_warps", &tune_gemv_warps_, {2, 4, 8}, shallow_pos},
+      {"attn_cs_shallow", &tune_attn_cs_shallow_, {16, 32}, shallow_pos},
+      {"attn_cs_deep", &tune_attn_cs_deep_, {32, 64}, deep_pos},
+  };
+  std::fprintf(stderr, "[tune] autotuning (depths %d/%d, %d replays per candidate)\n",
+               shallow_pos, deep_pos, iters);
+  for (auto& k : knobs) {
+    // Deep knobs are pointless when the context cannot reach the crossover.
+    if (k.depth + 1 < tune_attn_deep_tokens_ && k.value == &tune_attn_cs_deep_) {
+      continue;
+    }
+    // Throwaway run first: the very first capture+replay at a depth lands on cold clocks
+    // and unramped power state, and a cold incumbent loses to any warm candidate. (This
+    // fired on the first bring-up: warps=4 "lost" 28% purely to clock ramp.)
+    time_decode_at(k.depth, 10);
+    int best = *k.value;
+    double best_ms = time_decode_at(k.depth, iters);
+    const double incumbent_ms = best_ms;
+    for (int cand : k.candidates) {
+      if (cand == best) continue;
+      *k.value = cand;
+      const double ms = time_decode_at(k.depth, iters);
+      if (ms < best_ms * 0.98) {  // 2% hysteresis toward the incumbent; drift is real
+        best = cand;
+        best_ms = ms;
+      }
+    }
+    *k.value = best;
+    std::fprintf(stderr, "[tune]   %s=%d (%.3f ms/tok; incumbent was %.3f)\n", k.name, best,
+                 best_ms, incumbent_ms);
+  }
+  decode_graph_ready_ = false;  // generation re-captures at its own depth bucket
+  attn_chunk_budget_ = 0;
+}
+
 void PlanCudaEngine::benchmark_graph_decode(const std::vector<int>& prompt, int iters,
                                             int pos_override) {
   using clock = std::chrono::steady_clock;
@@ -3484,6 +3616,14 @@ void PlanCudaEngine::initialize(const EngineOptions& options) {
     weight_quant_group_ = std::atoi(g);
   }
   open(options.model_path, options.max_context > 0 ? options.max_context : 4096);
+  // Per-box tuning: CPI_AUTOTUNE=1 searches on this GPU and persists the winners; every
+  // other run silently applies the saved file for this (GPU, model, quant) if one exists.
+  if (std::getenv("CPI_AUTOTUNE") != nullptr) {
+    autotune();
+    save_tuning();
+  } else {
+    load_tuning();
+  }
 }
 
 // The verify-batch forward at FIXED T=16 with device-position seq kernels: reads tokens

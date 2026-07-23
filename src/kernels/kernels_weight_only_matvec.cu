@@ -1435,47 +1435,88 @@ void launch_weight_only_int4_matvec_grouped(const int8_t* w_packed, const float*
 void launch_weight_only_int4_matvec_grouped_dp4a(const int8_t* w_packed, const float* scales,
                                                  const std::int8_t* xq, const float* x_scale,
                                                  half* y, int out_features, int in_features,
-                                                 int group, cudaStream_t stream) {
+                                                 int group, cudaStream_t stream, int warps) {
   const int shift = group_shift_of(group);
   if (shift < 0 || (group % 32) != 0 || (in_features % 32) != 0) {
     return;  // caller must gate: permuted-x dp4a needs 32-col chunks inside one group
   }
   const int n_groups = quant_group_count(in_features, group);
-  constexpr int kWarps = 4;
-  const int blocks = (out_features + kWarps - 1) / kWarps;
-  weight_only_int4_matvec_grouped_dp4a_wide_kernel<kWarps><<<blocks, kWarps * 32, 0, stream>>>(
-      w_packed, scales, xq, x_scale, y, out_features, in_features, shift, n_groups);
+  // Rows-per-block is a per-GPU tuning knob (the autotuner probes 2/4/8); each row's math
+  // is warp-local, so every variant is bit-identical to every other.
+  const int blocks = (out_features + warps - 1) / warps;
+  switch (warps) {
+    case 2:
+      weight_only_int4_matvec_grouped_dp4a_wide_kernel<2><<<blocks, 2 * 32, 0, stream>>>(
+          w_packed, scales, xq, x_scale, y, out_features, in_features, shift, n_groups);
+      return;
+    case 8:
+      weight_only_int4_matvec_grouped_dp4a_wide_kernel<8><<<blocks, 8 * 32, 0, stream>>>(
+          w_packed, scales, xq, x_scale, y, out_features, in_features, shift, n_groups);
+      return;
+    default:
+      weight_only_int4_matvec_grouped_dp4a_wide_kernel<4><<<(out_features + 3) / 4, 4 * 32, 0,
+                                                            stream>>>(
+          w_packed, scales, xq, x_scale, y, out_features, in_features, shift, n_groups);
+      return;
+  }
 }
 
 void launch_weight_only_int4_matvec_grouped_dp4a_cat(
     const int8_t* w0, const float* s0, half* y0, int n0, const int8_t* w1, const float* s1,
     half* y1, int n1, const int8_t* w2, const float* s2, half* y2, int n2, const std::int8_t* xq,
-    const float* x_scale, int in_features, int group, cudaStream_t stream) {
+    const float* x_scale, int in_features, int group, cudaStream_t stream, int warps) {
   const int shift = group_shift_of(group);
   if (shift < 0 || (group % 32) != 0 || (in_features % 32) != 0) {
     return;  // caller gates
   }
   const int n_groups = quant_group_count(in_features, group);
-  constexpr int kWarps = 4;
   const int total = n0 + n1 + n2;
-  const int blocks = (total + kWarps - 1) / kWarps;
-  weight_only_int4_matvec_grouped_dp4a_cat_kernel<kWarps><<<blocks, kWarps * 32, 0, stream>>>(
-      w0, s0, y0, n0, w1, s1, y1, n1, w2, s2, y2, n2, xq, x_scale, in_features, shift, n_groups);
+  const int blocks = (total + warps - 1) / warps;
+  switch (warps) {
+    case 2:
+      weight_only_int4_matvec_grouped_dp4a_cat_kernel<2><<<blocks, 2 * 32, 0, stream>>>(
+          w0, s0, y0, n0, w1, s1, y1, n1, w2, s2, y2, n2, xq, x_scale, in_features, shift,
+          n_groups);
+      return;
+    case 8:
+      weight_only_int4_matvec_grouped_dp4a_cat_kernel<8><<<blocks, 8 * 32, 0, stream>>>(
+          w0, s0, y0, n0, w1, s1, y1, n1, w2, s2, y2, n2, xq, x_scale, in_features, shift,
+          n_groups);
+      return;
+    default:
+      weight_only_int4_matvec_grouped_dp4a_cat_kernel<4><<<(total + 3) / 4, 4 * 32, 0, stream>>>(
+          w0, s0, y0, n0, w1, s1, y1, n1, w2, s2, y2, n2, xq, x_scale, in_features, shift,
+          n_groups);
+      return;
+  }
 }
 
 void launch_weight_only_int4_matvec_grouped_dp4a_glu(
     const std::int8_t* wg, const float* sg, const std::int8_t* wu, const float* su,
     const std::int8_t* xq, const float* x_scale, half* y, int out_features, int in_features,
-    int group, cudaStream_t stream) {
+    int group, cudaStream_t stream, int warps) {
   const int shift = group_shift_of(group);
   if (shift < 0 || (group % 32) != 0 || (in_features % 32) != 0) {
     return;  // caller gates
   }
   const int n_groups = quant_group_count(in_features, group);
-  constexpr int kRows = 4;  // 8 warps: 4 gate rows + their 4 up partners
-  const int blocks = (out_features + kRows - 1) / kRows;
-  weight_only_int4_matvec_grouped_dp4a_glu_kernel<kRows><<<blocks, kRows * 64, 0, stream>>>(
-      wg, sg, wu, su, xq, x_scale, y, out_features, in_features, shift, n_groups);
+  // `warps` = gate rows per block; the block also carries as many up-partner warps.
+  const int blocks = (out_features + warps - 1) / warps;
+  switch (warps) {
+    case 2:
+      weight_only_int4_matvec_grouped_dp4a_glu_kernel<2><<<blocks, 2 * 64, 0, stream>>>(
+          wg, sg, wu, su, xq, x_scale, y, out_features, in_features, shift, n_groups);
+      return;
+    case 8:
+      weight_only_int4_matvec_grouped_dp4a_glu_kernel<8><<<blocks, 8 * 64, 0, stream>>>(
+          wg, sg, wu, su, xq, x_scale, y, out_features, in_features, shift, n_groups);
+      return;
+    default:
+      weight_only_int4_matvec_grouped_dp4a_glu_kernel<4><<<(out_features + 3) / 4, 4 * 64, 0,
+                                                           stream>>>(
+          wg, sg, wu, su, xq, x_scale, y, out_features, in_features, shift, n_groups);
+      return;
+  }
 }
 
 void launch_weight_only_int4_matvec_grouped_dp4a_f32(const std::int8_t* w_packed,

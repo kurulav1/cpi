@@ -1084,11 +1084,14 @@ void launch_quantize_fp16_to_int8_perm8_g32_mt(const half* src, std::int8_t* dst
 //
 // Batch-1 grouped int4(weight) x int8(activation) GEMV via dp4a. `xq` MUST hold the
 // perm8-quantized activation and `x_scale` its scale. Requires in_features % 32 == 0 and
-// group % 32 == 0 (silently returns otherwise -- caller gates).
+// group % 32 == 0 (silently returns otherwise -- caller gates). `warps` (2/4/8) is the
+// rows-per-block shape knob probed by the per-box autotuner; all variants are
+// bit-identical (row math is warp-local).
 void launch_weight_only_int4_matvec_grouped_dp4a(const std::int8_t* w_packed,
                                                  const float* scales, const std::int8_t* xq,
                                                  const float* x_scale, half* y, int out_features,
-                                                 int in_features, int group, cudaStream_t stream);
+                                                 int in_features, int group, cudaStream_t stream,
+                                                 int warps = 4);
 
 // launch_rmsnorm_quant_perm8
 //
@@ -1106,7 +1109,8 @@ void launch_rmsnorm_quant_perm8(const half* x, const half* w, half* y, std::int8
 void launch_weight_only_int4_matvec_grouped_dp4a_cat(
     const std::int8_t* w0, const float* s0, half* y0, int n0, const std::int8_t* w1,
     const float* s1, half* y1, int n1, const std::int8_t* w2, const float* s2, half* y2, int n2,
-    const std::int8_t* xq, const float* x_scale, int in_features, int group, cudaStream_t stream);
+    const std::int8_t* xq, const float* x_scale, int in_features, int group, cudaStream_t stream,
+    int warps = 4);
 
 // launch_weight_only_int4_matvec_grouped_dp4a_glu
 //
@@ -1116,7 +1120,7 @@ void launch_weight_only_int4_matvec_grouped_dp4a_cat(
 void launch_weight_only_int4_matvec_grouped_dp4a_glu(
     const std::int8_t* wg, const float* sg, const std::int8_t* wu, const float* su,
     const std::int8_t* xq, const float* x_scale, half* y, int out_features, int in_features,
-    int group, cudaStream_t stream);
+    int group, cudaStream_t stream, int warps = 4);
 
 // launch_weight_only_int4_matvec_grouped_dp4a_f32
 //
