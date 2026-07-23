@@ -31,6 +31,14 @@ namespace {
 // convert with Metal's half(), which is IEEE, so a truncating harness charges the shader for its
 // own error. include/runtime/fp16.hpp, gated by metal_fp16_test.
 inline std::uint16_t f32_to_f16(float f) { return cpi::f32_to_f16(f); }
+// Quant scales are stored fp16 on the GPU (see plan_metal_engine's quantizer). The kernels
+// read half*, so the smoke harness must upload f16 scales and use the f16-rounded value in
+// its reference dequant, or every quant case reads f32 bytes as half and diverges.
+inline std::vector<std::uint16_t> scales_to_f16(const std::vector<float>& s) {
+  std::vector<std::uint16_t> out(s.size());
+  for (std::size_t i = 0; i < s.size(); ++i) out[i] = cpi::f32_to_f16(s[i]);
+  return out;
+}
 inline float f16_to_f32(std::uint16_t h) { return cpi::f16_to_f32(h); }
 
 struct Result {
@@ -345,7 +353,7 @@ int main() {
         for (std::uint32_t j = g * group; j < (g + 1) * group; ++j) {
           amax = std::max(amax, std::fabs(W[r * in_dim + j]));
         }
-        float sc = std::max(amax / max_q, 1e-8f);
+        float sc = cpi::f16_to_f32(cpi::f32_to_f16(std::max(amax / max_q, 1e-8f)));
         scales[r * groups + g] = sc;
         for (std::uint32_t j = g * group; j < (g + 1) * group; ++j) {
           int q = static_cast<int>(std::lround(W[r * in_dim + j] / sc));
@@ -366,7 +374,8 @@ int main() {
     auto bq = ctx.alloc_from(packed.data(), packed.size());
     auto bx = ctx.alloc_from(xin.data(), xin.size() * 2);
     auto bo = ctx.alloc(out_dim * 2);
-    auto bs = ctx.alloc_from(scales.data(), scales.size() * sizeof(float));
+    const auto sc16 = scales_to_f16(scales);
+    auto bs = ctx.alloc_from(sc16.data(), sc16.size() * sizeof(std::uint16_t));
 
     struct QP {
       std::uint32_t out_dim, in_dim, tokens, bits, group, groups, has_bias;
@@ -411,7 +420,7 @@ int main() {
           float amax = 0.0f;
           for (std::uint32_t j = g * group; j < (g + 1) * group; ++j)
             amax = std::max(amax, std::fabs(W[r * in_dim + j]));
-          const float sc = std::max(amax / max_q, 1e-8f);
+          const float sc = cpi::f16_to_f32(cpi::f32_to_f16(std::max(amax / max_q, 1e-8f)));
           scales[r * groups_n + g] = sc;
           for (std::uint32_t j = g * group; j < (g + 1) * group; ++j) {
             int q = static_cast<int>(std::lround(W[r * in_dim + j] / sc));
@@ -432,9 +441,11 @@ int main() {
     quant(Wg, pg, sg, dg);
     quant(Wu, pu, su, du);
     auto bg = ctx.alloc_from(pg.data(), pg.size());
-    auto bsg = ctx.alloc_from(sg.data(), sg.size() * sizeof(float));
+    const auto sg16 = scales_to_f16(sg);
+    auto bsg = ctx.alloc_from(sg16.data(), sg16.size() * sizeof(std::uint16_t));
     auto bu = ctx.alloc_from(pu.data(), pu.size());
-    auto bsu = ctx.alloc_from(su.data(), su.size() * sizeof(float));
+    const auto su16 = scales_to_f16(su);
+    auto bsu = ctx.alloc_from(su16.data(), su16.size() * sizeof(std::uint16_t));
     auto bx = ctx.alloc_from(xin.data(), xin.size() * 2);
     auto bo = ctx.alloc(out_dim * 2);
     struct QCP {
@@ -495,7 +506,7 @@ int main() {
           for (std::uint32_t j = g * group; j < (g + 1) * group; ++j) {
             amax = std::max(amax, std::fabs(W[r * in_dim + j]));
           }
-          const float sc = std::max(amax / max_q, 1e-8f);
+          const float sc = cpi::f16_to_f32(cpi::f32_to_f16(std::max(amax / max_q, 1e-8f)));
           scales[r * groups_n + g] = sc;
           for (std::uint32_t j = g * group; j < (g + 1) * group; ++j) {
             int q = static_cast<int>(std::lround(W[r * in_dim + j] / sc));
@@ -516,7 +527,8 @@ int main() {
       auto bq = ctx.alloc_from(packed.data(), packed.size());
       auto bx = ctx.alloc_from(A.data(), A.size() * 2);
       auto bo = ctx.alloc(static_cast<std::size_t>(T) * out_dim * 2);
-      auto bs = ctx.alloc_from(scales.data(), scales.size() * sizeof(float));
+      const auto sc16 = scales_to_f16(scales);
+    auto bs = ctx.alloc_from(sc16.data(), sc16.size() * sizeof(std::uint16_t));
 
       struct QP {
         std::uint32_t out_dim, in_dim, tokens, bits, group, groups, has_bias;
