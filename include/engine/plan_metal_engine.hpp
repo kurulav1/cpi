@@ -254,6 +254,12 @@ public:
 
   // Greedy decode. Argmax runs on the GPU so the vocab never crosses to the host.
   std::vector<int> generate_greedy(const std::vector<int>& prompt, int max_new);
+  // Prompt-lookup speculative greedy decode (CPI_METAL_SPEC=k). `emit` is called for every
+  // generated token as it is produced (bursts, on accept); returning false stops early (a
+  // streaming client hanging up). Shared by generate() and generate_stream(). Returns the full
+  // generated sequence. Caller gates on greedy + no grammar + non-recurrent.
+  std::vector<int> generate_spec_lookup(const std::vector<int>& prompt, int max_new, int spec_k,
+                                        const std::function<bool(int)>& emit);
 
   // Sampled decode, through CPI's shared sampler -- the same code path LlamaEngine
   // uses, not a second implementation. Greedy (temperature <= 0) still takes the

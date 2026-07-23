@@ -3117,6 +3117,17 @@ std::vector<int> PlanMetalEngine::generate_stream(const std::vector<int>& prompt
     detail::dispatch_seed_sampler_rng(static_cast<unsigned>(constraints->seed));
   }
 
+  // Speculative streaming: same prompt-lookup path as generate(), streaming each accepted token
+  // through on_token. Greedy only (temperature 0, no penalties), and never under a grammar or a
+  // min-new floor -- both need per-token logit surgery that the batched verify does not apply.
+  const char* spec_env = std::getenv("CPI_METAL_SPEC");
+  const int spec_k = spec_env ? std::min(std::atoi(spec_env), 15) : 0;
+  if (spec_k >= 1 && grammar == nullptr && min_new == 0 && !has_recurrent_ops_ &&
+      s.temperature <= 0.0f && s.repetition_penalty <= 1.0f && s.no_repeat_ngram_size <= 1 &&
+      !prompt.empty()) {
+    return generate_spec_lookup(prompt, max_new, spec_k, on_token);
+  }
+
   std::vector<int> out;
   std::vector<int> history = prompt;
 
@@ -3229,76 +3240,86 @@ static int metal_lookup_draft(const std::vector<int>& hist, int ng, int k, int* 
   return 0;
 }
 
+std::vector<int> PlanMetalEngine::generate_spec_lookup(const std::vector<int>& prompt, int max_new,
+                                                      int spec_k,
+                                                      const std::function<bool(int)>& emit) {
+  const int cap = std::min(spec_k, std::max(1, max_prefill_ - 1));
+  reset_kv_cache();
+  const int P = static_cast<int>(prompt.size());
+  const auto pre0 = std::chrono::steady_clock::now();
+  prefill_prompt(prompt, 0);  // positions 0..P-2; the last token is the first decode input
+  prefill_ms_ =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pre0).count();
+  prefill_tokens_ = P - 1;
+
+  std::vector<int> out;
+  std::vector<int> history = prompt;
+  static const bool no_stop = std::getenv("CPI_METAL_IGNORE_EOS") != nullptr;
+  int verifies = 0, drafted = 0, accepted = 0;
+  bool stop = false;
+
+  // Record a generated token: append, stream it, and test the stop conditions. Returns false when
+  // the loop should end (client hang-up, max_new reached, or a degenerate repeated tail).
+  auto record = [&](int tok) -> bool {
+    out.push_back(tok);
+    history.push_back(tok);
+    if (emit && !emit(tok)) return false;
+    if (static_cast<int>(out.size()) >= max_new) return false;
+    if (!no_stop && detail::dispatch_has_degenerate_tail(out, prompt.size())) return false;
+    return true;
+  };
+
+  int pos = P;  // where `cur` will be written when it is next forwarded
+  int cur = decode_next_token(prompt.back(), P - 1, 0.0f, history);  // first token
+  stop = !record(cur);
+  while (!stop && pos + 1 < max_context_) {
+    int drafts[16];
+    const int room = std::min(cap, max_context_ - pos - 1);
+    const int nd = metal_lookup_draft(history, 3, room, drafts);
+    if (nd <= 0) {
+      cur = decode_next_token(cur, pos, 0.0f, history);
+      ++pos;
+      if (!record(cur)) break;
+    } else {
+      std::vector<int> batch;
+      batch.reserve(nd + 1);
+      batch.push_back(cur);
+      for (int i = 0; i < nd; ++i) batch.push_back(drafts[i]);
+      std::vector<int> verdict;
+      verify_tokens(batch, pos, verdict);  // writes KV pos..pos+nd, returns nd+1 argmaxes
+      ++verifies;
+      drafted += nd;
+      int a = 0;
+      while (a < nd && verdict[a] == drafts[a]) ++a;
+      accepted += a;
+      pos += a + 1;  // KV correct through the a-th accepted draft; rejected rows go stale
+      bool cont = true;
+      for (int i = 0; i < a; ++i) {
+        if (!record(drafts[i])) { cont = false; break; }
+      }
+      if (!cont) break;
+      cur = verdict[a];  // bonus token (verify's own next-token), not yet forwarded
+      if (!record(cur)) break;
+    }
+  }
+  if (std::getenv("CPI_METAL_SPEC_STATS")) {
+    std::fprintf(stderr, "[spec] verifies=%d drafted=%d accepted=%d (%.1f%%) tokens=%zu\n",
+                 verifies, drafted, accepted, drafted ? 100.0 * accepted / drafted : 0.0,
+                 out.size());
+  }
+  return out;
+}
+
 std::vector<int> PlanMetalEngine::generate_greedy(const std::vector<int>& prompt, int max_new) {
   if (prompt.empty()) throw std::runtime_error("empty prompt");
 
-  // Speculative greedy decode (CPI_METAL_SPEC=<k>): n-gram prompt-lookup drafts verified in ONE
-  // parallel pass (verify_tokens). Greedy, so every emitted token is a verified argmax and the
-  // stream matches plain greedy up to the prefill-vs-decode rounding class. Off by default; a
-  // recurrent (delta-net) model has no parallel verify and is refused.
+  // Speculative greedy decode (CPI_METAL_SPEC=<k>): drafts verified in one parallel pass, so the
+  // emitted stream matches plain greedy up to the prefill-vs-decode rounding class. Off by
+  // default; recurrent models are refused inside the helper.
   const char* spec_env = std::getenv("CPI_METAL_SPEC");
   const int spec_k = spec_env ? std::min(std::atoi(spec_env), 15) : 0;
-  if (spec_k >= 1 && !has_recurrent_ops_ && static_cast<int>(prompt.size()) >= 1) {
-    const int cap = std::min(spec_k, std::max(1, max_prefill_ - 1));
-    reset_kv_cache();
-    const int P = static_cast<int>(prompt.size());
-    const auto pre0 = std::chrono::steady_clock::now();
-    prefill_prompt(prompt, 0);  // positions 0..P-2; the last token is the first decode input
-    prefill_ms_ =
-        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pre0).count();
-    prefill_tokens_ = P - 1;
-
-    std::vector<int> out;
-    std::vector<int> history = prompt;
-    static const bool no_stop = std::getenv("CPI_METAL_IGNORE_EOS") != nullptr;
-    int verifies = 0, drafted = 0, accepted = 0;
-
-    // First generated token: forward the last prompt token at position P-1.
-    int cur = decode_next_token(prompt.back(), P - 1, 0.0f, history);
-    out.push_back(cur);
-    history.push_back(cur);
-    int pos = P;  // where `cur` will be written when it is next forwarded
-    bool stop = !no_stop && detail::dispatch_has_degenerate_tail(out, prompt.size());
-    while (!stop && static_cast<int>(out.size()) < max_new && pos + 1 < max_context_) {
-      int drafts[16];
-      const int room = std::min(cap, max_context_ - pos - 1);
-      const int nd = metal_lookup_draft(history, 3, room, drafts);
-      if (nd <= 0) {
-        const int nx = decode_next_token(cur, pos, 0.0f, history);
-        ++pos;
-        out.push_back(nx);
-        history.push_back(nx);
-        cur = nx;
-      } else {
-        std::vector<int> batch;
-        batch.reserve(nd + 1);
-        batch.push_back(cur);
-        for (int i = 0; i < nd; ++i) batch.push_back(drafts[i]);
-        std::vector<int> verdict;
-        verify_tokens(batch, pos, verdict);  // writes KV pos..pos+nd, returns nd+1 argmaxes
-        ++verifies;
-        drafted += nd;
-        int a = 0;
-        while (a < nd && verdict[a] == drafts[a]) ++a;
-        accepted += a;
-        pos += a + 1;  // KV is correct through the a-th accepted draft; rejected rows go stale
-        for (int i = 0; i < a && static_cast<int>(out.size()) < max_new; ++i) {
-          out.push_back(drafts[i]);
-          history.push_back(drafts[i]);
-        }
-        cur = verdict[a];  // bonus token (verify's own next-token), not yet forwarded
-        out.push_back(cur);
-        history.push_back(cur);
-      }
-      if (!no_stop && detail::dispatch_has_degenerate_tail(out, prompt.size())) stop = true;
-    }
-    if (out.size() > static_cast<std::size_t>(max_new)) out.resize(max_new);
-    if (std::getenv("CPI_METAL_SPEC_STATS")) {
-      std::fprintf(stderr, "[spec] verifies=%d drafted=%d accepted=%d (%.1f%%) tokens=%zu\n",
-                   verifies, drafted, accepted, drafted ? 100.0 * accepted / drafted : 0.0,
-                   out.size());
-    }
-    return out;
+  if (spec_k >= 1 && !has_recurrent_ops_ && !prompt.empty()) {
+    return generate_spec_lookup(prompt, max_new, spec_k, {});
   }
 
   prev_seq_.clear();  // this path rewrites the KV cache untracked; drop any shared-prefix state
