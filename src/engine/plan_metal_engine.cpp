@@ -512,7 +512,12 @@ public:
       const std::size_t packed_row = (bits_ == 4) ? static_cast<std::size_t>((in_dim + 1) / 2)
                                                   : static_cast<std::size_t>(in_dim);
       std::vector<std::uint8_t> packed(static_cast<std::size_t>(out_dim) * packed_row, 0);
-      std::vector<float> scales(static_cast<std::size_t>(out_dim) * groups, 0.0f);
+      // Scales are stored fp16, not fp32: for group-32 int4 the scale is one value per 32
+      // weights (16 packed bytes), so an fp32 scale added 1 bit/weight of decode bandwidth
+      // -- 5.0 bits/weight vs llama.cpp Q4_0's 4.5. fp16 halves that overhead. The weight is
+      // quantized against the fp16-ROUNDED scale the kernel will actually read, so decode
+      // stays self-consistent (same discipline as the byte-identical fp16 rounding rule).
+      std::vector<std::uint16_t> scales(static_cast<std::size_t>(out_dim) * groups, 0);
 
       for (int r = 0; r < out_dim; ++r) {
         const std::uint16_t* row = src + static_cast<std::size_t>(r) * in_dim;
@@ -526,7 +531,9 @@ public:
           }
           float scale = amax / max_q;
           if (scale < 1.0e-8f) scale = 1.0e-8f;
-          scales[static_cast<std::size_t>(r) * groups + g] = scale;
+          const std::uint16_t scale_h = f32_to_fp16(scale);
+          scales[static_cast<std::size_t>(r) * groups + g] = scale_h;
+          scale = fp16_to_f32(scale_h);  // quantize against the value decode will read
 
           const float inv = 1.0f / scale;
           for (int j = j0; j < j1; ++j) {
@@ -552,7 +559,7 @@ public:
 
       QBuf qb;
       qb.packed = ctx_.alloc_from(packed.data(), packed.size());
-      qb.scales = ctx_.alloc_from(scales.data(), scales.size() * sizeof(float));
+      qb.scales = ctx_.alloc_from(scales.data(), scales.size() * sizeof(std::uint16_t));
       qb.groups = groups;
       it = qbufs_.emplace(name, std::move(qb)).first;
     }
