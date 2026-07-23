@@ -56,6 +56,18 @@ app.get("/metrics", (_req, res) => {
   res.send(obsMetrics.render());
 });
 
+// The OpenAPI 3.1 definition for this server. Served straight from docs/openapi.yaml (read per
+// request so edits show up without a restart); point any OpenAPI viewer or code generator at it.
+app.get("/openapi.yaml", (_req, res) => {
+  try {
+    const specPath = path.join(getRuntimeConfig().repoRoot, "docs", "openapi.yaml");
+    res.set("Content-Type", "text/yaml; charset=utf-8");
+    res.send(fs.readFileSync(specPath, "utf8"));
+  } catch {
+    res.status(404).json({ error: "openapi.yaml not found" });
+  }
+});
+
 // Kubernetes probes. Registered before the SPA catch-all so they aren't shadowed.
 // Liveness: the process is up and serving HTTP (do NOT gate on the model, so a slow
 // model load never triggers a liveness kill — the startupProbe covers that window).

@@ -413,23 +413,27 @@ All repo-managed Node install paths use `npm ci`.
 
 ## API
 
-The server runs on port `3001` by default.
+The server runs on port `3001` by default. The full contract is defined in an **OpenAPI 3.1**
+document at [`docs/openapi.yaml`](docs/openapi.yaml), also served live at
+`GET /openapi.yaml` — point any OpenAPI viewer or client generator at it.
 
-### `GET /api/health`
+There are two namespaces: **`/api/*`** (CPI-native, error envelope `{ "error": "..." }`) and
+**`/v1/*`** (OpenAI-compatible, so existing OpenAI clients work by changing the base URL). No auth
+or CORS is applied — put it behind your own gateway if you expose it beyond localhost.
 
-Returns server status, busy flag, and active runtime configuration.
+| Group | Endpoints |
+| ----- | --------- |
+| Health | `GET /api/health` · `GET /metrics` · `GET /healthz/live` · `GET /healthz/ready` |
+| Inference | `POST /api/generate` (blocking) · `POST /api/chat/stream` (NDJSON) · `POST /api/warmup` |
+| Models | `GET /api/models` · `POST /api/quant/select` · `GET /api/quant/state` |
+| Model hub | `GET /api/hub/search` · `POST /api/hub/download` · `GET /api/hub/status/{jobId}` (SSE) · `GET /api/hub/jobs` · `DELETE /api/hub/jobs/{jobId}` |
+| Quantize | `POST /api/quant/convert` · `GET /api/quant/status/{jobId}` (SSE) · `GET /api/quant/jobs` · `DELETE /api/quant/jobs/{jobId}` |
+| System | `POST /api/system/model-dir` · `POST /api/system/pick-folder` |
+| OpenAI | `POST /v1/chat/completions` · `POST /v1/completions` · `POST /v1/embeddings` · `POST /v1/responses` · `GET /v1/models` · `GET /v1/models/{model}` |
 
-### `GET /api/models`
+### Common examples
 
-Returns discovered model profiles.
-
-```bash
-curl http://localhost:3001/api/models
-```
-
-### `POST /api/generate`
-
-Blocking inference.
+Blocking inference:
 
 ```bash
 curl -X POST http://localhost:3001/api/generate \
@@ -437,24 +441,22 @@ curl -X POST http://localhost:3001/api/generate \
   -d '{"messages":[{"role":"user","content":"What is CUDA?"}]}'
 ```
 
-### `POST /api/chat/stream`
-
-Streaming inference with newline-delimited JSON events.
-
-```bash
-curl -X POST http://localhost:3001/api/chat/stream \
-  -H "Content-Type: application/json" \
-  -d '{"messages":[{"role":"user","content":"Explain RoPE embeddings."}]}'
-```
-
-### `POST /v1/chat/completions`
-
-OpenAI-compatible chat completions endpoint.
+OpenAI-compatible chat (drop-in for OpenAI SDKs — set the base URL to `http://localhost:3001/v1`):
 
 ```bash
 curl -X POST http://localhost:3001/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"messages":[{"role":"user","content":"Hello"}],"stream":false}'
+```
+
+Download and convert a model over the API (the same pipeline as `tools/hf_download.py`, async with
+a job id — poll progress on `GET /api/hub/status/{jobId}`):
+
+```bash
+curl -X POST http://localhost:3001/api/hub/download \
+  -H "Content-Type: application/json" \
+  -d '{"repoId":"Qwen/Qwen2.5-0.5B-Instruct"}'
+# → {"jobId":"..."}
 ```
 
 ## Preparing Models
