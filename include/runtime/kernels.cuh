@@ -1054,6 +1054,10 @@ void launch_quantize_fp16_to_int8_perm8(const half* src, std::int8_t* dst, float
 // grouped kernels consume these per-chunk. cols % 32 == 0.
 void launch_quantize_fp16_to_int8_perm8_g32(const half* src, std::int8_t* dst, float* scales,
                                             int cols, cudaStream_t stream);
+// Multi-row form: quantizes `rows` consecutive vectors in one launch (dst stride = cols,
+// scale stride = cols/32 per row).
+void launch_quantize_fp16_to_int8_perm8_g32_mt(const half* src, std::int8_t* dst, float* scales,
+                                               int cols, int rows, cudaStream_t stream);
 
 // launch_weight_only_int4_matvec_grouped_dp4a
 //
@@ -1133,6 +1137,17 @@ void launch_dequant_int8_rowwise(const std::int8_t* w, const float* scales, half
 // Epilogue for the int8-direct sequence GEMM: fp16 y[t0+lt, r] = i32[lt, r] * sw[r] * sx[t].
 void launch_i32_scale_to_fp16(const int* acc, const float* sw, const float* sx, half* y, int out,
                               int chunk, int t0, cudaStream_t stream);
+
+// launch_weight_only_int4_matvec_grouped_dp4a_mt
+//
+// Multi-token (T <= 8) grouped dp4a matvec: the weights stream once for all T tokens'
+// perm8/group-32 activations (x scales [token][group]). Serves speculative verify and
+// short sequence remainders. Same gating as the other grouped dp4a launchers.
+void launch_weight_only_int4_matvec_grouped_dp4a_mt(const std::int8_t* w_packed,
+                                                    const float* scales, const std::int8_t* xq,
+                                                    const float* x_scales, half* y,
+                                                    int out_features, int in_features, int group,
+                                                    int tokens, cudaStream_t stream);
 
 // launch_rowmajor_half_gemv_cat
 //

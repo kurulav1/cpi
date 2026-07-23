@@ -899,6 +899,65 @@ __global__ void weight_only_int8_matvec_glu_kernel(const int8_t* __restrict__ wg
   }
 }
 
+// Multi-token grouped dp4a matvec: T tokens (<= 8) share ONE pass over the weights --
+// each warp's weight chunk is decoded once and dotted against every token's perm8
+// activation. This is what makes a speculative verify pass cost about one decode step's
+// weight traffic for k tokens, and it also serves short prefill remainders. Activations
+// are perm8/group-32 per token (x scales laid out [token][group]).
+template <int Warps, int MaxT>
+__global__ void weight_only_int4_matvec_grouped_dp4a_mt_kernel(
+    const int8_t* __restrict__ w_packed, const float* __restrict__ scales,
+    const int8_t* __restrict__ xq, const float* __restrict__ x_scales, half* __restrict__ y,
+    int out_features, int in_features, int group_shift, int n_groups, int tokens) {
+  const int row = blockIdx.x * Warps + (threadIdx.x / warpSize);
+  if (row >= out_features) {
+    return;
+  }
+  const int lane = threadIdx.x & (warpSize - 1);
+  const int packed_cols = in_features / 2;
+  const uint4* wrow = reinterpret_cast<const uint4*>(
+      w_packed + static_cast<std::size_t>(row) * static_cast<std::size_t>(packed_cols));
+  const float* row_s = scales + static_cast<std::size_t>(row) * static_cast<std::size_t>(n_groups);
+
+  const int chunks = packed_cols / 16;
+  const int xg = in_features / 32;  // x scale groups per token
+  float acc[MaxT];
+#pragma unroll
+  for (int t = 0; t < MaxT; ++t) acc[t] = 0.0f;
+
+  for (int c = lane; c < chunks; c += warpSize) {
+    const uint4 packed = wrow[c];
+    const float ws = row_s[(c * 32) >> group_shift];
+    const unsigned* wu = reinterpret_cast<const unsigned*>(&packed);
+    int wlo[4], whi[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const unsigned word = wu[i];
+      wlo[i] = __vsubss4(static_cast<int>((word & 0x0F0F0F0Fu) ^ 0x08080808u), 0x08080808);
+      whi[i] = __vsubss4(static_cast<int>(((word >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u), 0x08080808);
+    }
+    for (int t = 0; t < tokens; ++t) {
+      const int* xw = reinterpret_cast<const int*>(xq + static_cast<std::size_t>(t) * in_features);
+      int gacc = 0;
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        gacc = __dp4a(wlo[i], xw[8 * c + 2 * i], gacc);
+        gacc = __dp4a(whi[i], xw[8 * c + 2 * i + 1], gacc);
+      }
+      acc[t] += static_cast<float>(gacc) * ws * x_scales[t * xg + c];
+    }
+  }
+#pragma unroll
+  for (int t = 0; t < MaxT; ++t) {
+    if (t < tokens) {
+      const float s = warp_sum(acc[t]);
+      if (lane == 0) {
+        y[static_cast<std::size_t>(t) * out_features + row] = __float2half(s);
+      }
+    }
+  }
+}
+
 template <int Warps>
 __global__ void weight_only_int8_matvec_wide_kernel(const int8_t* __restrict__ w,
                                                     const float* __restrict__ scales,
@@ -1469,6 +1528,22 @@ void launch_dequant_int4_grouped(const std::int8_t* w_packed, const float* scale
 void launch_dequant_int8_rowwise(const std::int8_t* w, const float* scales, half* out, int rows,
                                  int cols, cudaStream_t stream) {
   dequant_int8_rowwise_kernel<<<rows, 256, 0, stream>>>(w, scales, out, rows, cols);
+}
+
+void launch_weight_only_int4_matvec_grouped_dp4a_mt(const std::int8_t* w_packed,
+                                                    const float* scales, const std::int8_t* xq,
+                                                    const float* x_scales, half* y,
+                                                    int out_features, int in_features, int group,
+                                                    int tokens, cudaStream_t stream) {
+  const int shift = group_shift_of(group);
+  if (shift < 0 || (group % 32) != 0 || (in_features % 32) != 0 || tokens < 1 || tokens > 8) {
+    return;  // caller gates
+  }
+  const int n_groups = quant_group_count(in_features, group);
+  constexpr int kWarps = 4;
+  const int blocks = (out_features + kWarps - 1) / kWarps;
+  weight_only_int4_matvec_grouped_dp4a_mt_kernel<kWarps, 8><<<blocks, kWarps * 32, 0, stream>>>(
+      w_packed, scales, xq, x_scales, y, out_features, in_features, shift, n_groups, tokens);
 }
 
 void launch_weight_only_int8_matvec_grouped(const int8_t* w, const float* scales, const half* x,

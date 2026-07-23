@@ -1453,6 +1453,55 @@ __global__ void quantize_fp16_to_int8_perm8_g32_kernel(const half* __restrict__ 
   }
 }
 
+// Multi-row twin of the g32 quantizer: blockIdx.y selects the row, so T rows quantize in
+// ONE launch (a speculative verify otherwise pays T launches per Gemv site). Per row the
+// math is identical to the single-row kernel; scales pack [row][group].
+__global__ void quantize_fp16_to_int8_perm8_g32_mt_kernel(const half* __restrict__ src_all,
+                                                          int8_t* __restrict__ dst_all,
+                                                          float* __restrict__ scales_all, int cols,
+                                                          int max_q) {
+  const int t = blockIdx.y;
+  const half* src = src_all + static_cast<std::size_t>(t) * cols;
+  int8_t* dst = dst_all + static_cast<std::size_t>(t) * cols;
+  float* scales = scales_all + static_cast<std::size_t>(t) * (cols / 32);
+  const int w8 = blockIdx.x * blockDim.x + threadIdx.x;
+  const int windows = cols / 8;
+  const half2* src2 = reinterpret_cast<const half2*>(src);
+  float v[8];
+  float m = 0.0f;
+  if (w8 < windows) {
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const half2 h2 = src2[w8 * 4 + j];
+      v[2 * j] = __half2float(__low2half(h2));
+      v[2 * j + 1] = __half2float(__high2half(h2));
+      m = fmaxf(m, fmaxf(fabsf(v[2 * j]), fabsf(v[2 * j + 1])));
+    }
+  }
+  m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 1));
+  m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 2));
+  float scale = m / static_cast<float>(max_q);
+  if (scale < 1.0e-8f) {
+    scale = 1.0e-8f;
+  }
+  if (w8 < windows) {
+    if ((threadIdx.x & 3) == 0) {
+      scales[w8 / 4] = scale;
+    }
+    const float inv = 1.0f / scale;
+    int q[8];
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+      q[k] = max(-max_q, min(max_q, __float2int_rn(v[k] * inv)));
+    }
+    char4* dst4 = reinterpret_cast<char4*>(dst);
+    dst4[w8 * 2] = make_char4(static_cast<signed char>(q[0]), static_cast<signed char>(q[2]),
+                              static_cast<signed char>(q[4]), static_cast<signed char>(q[6]));
+    dst4[w8 * 2 + 1] = make_char4(static_cast<signed char>(q[1]), static_cast<signed char>(q[3]),
+                                  static_cast<signed char>(q[5]), static_cast<signed char>(q[7]));
+  }
+}
+
 // fp16 GeGLU fused matvec: paired-warp shape (gate warps 0..R-1, up warps R..2R-1, one
 // row per warp), inner loop = gemv_wide's 128-bit half loads, gelu on the fp16-rounded
 // dots exactly as the unfused [gemv; gemv; gelu_mul] sequence rounds them.
@@ -1534,6 +1583,15 @@ void launch_quantize_fp16_to_int8_perm8_g32(const half* src, std::int8_t* dst, f
   const int blocks = (windows + threads - 1) / threads;
   quantize_fp16_to_int8_perm8_g32_kernel<<<blocks, threads, 0, stream>>>(src, dst, scales, cols,
                                                                          127);
+}
+
+void launch_quantize_fp16_to_int8_perm8_g32_mt(const half* src, std::int8_t* dst, float* scales,
+                                               int cols, int rows, cudaStream_t stream) {
+  constexpr int threads = 256;
+  const int windows = cols / 8;
+  const dim3 blocks((windows + threads - 1) / threads, rows);
+  quantize_fp16_to_int8_perm8_g32_mt_kernel<<<blocks, threads, 0, stream>>>(src, dst, scales, cols,
+                                                                            127);
 }
 
 void launch_quantize_fp16_to_int8_perm8(const half* src, std::int8_t* dst, float* scales, int cols,

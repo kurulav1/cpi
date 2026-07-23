@@ -925,8 +925,8 @@ void PlanCudaEngine::open(const std::string& cpi_path, int max_context) {
   // quant kernels (the pre-parity behaviour) for A/B and bisection.
   if ((weight_quant_bits_ == 4 || weight_quant_bits_ == 8) && d_act_i8_ == nullptr &&
       std::getenv("CPI_CUDA_NO_DP4A") == nullptr) {
-    G4_CHECK(cudaMalloc(&d_act_i8_, 65536));
-    G4_CHECK(cudaMalloc(&d_act_qs_, (65536 / 32) * sizeof(float)));  // group-32 x scales
+    G4_CHECK(cudaMalloc(&d_act_i8_, std::size_t(8) * 65536));  // up to 8 tokens' activations
+    G4_CHECK(cudaMalloc(&d_act_qs_, std::size_t(8) * (65536 / 32) * sizeof(float)));  // g32 x scales, up to 8 tokens
     // Largest projection on the supported models is <= 16384 x 4096 halfs (128 MB is the
     // ceiling; E2B's largest is 12288 x 1536 = 38 MB). Sized generously once.
     G4_CHECK(cudaMalloc(&d_seq_dequant_, std::size_t(16384) * 4096 * sizeof(__half)));
@@ -2005,6 +2005,8 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
   const void* actq_src = nullptr;
   int actq_len = 0;
   bool actq_set_now = false;
+  const void* mtq_src = nullptr;  // multi-token act-quant cache (seq T <= 8)
+  int mtq_len = 0;
   for (std::size_t idx = 0; idx < n; ++idx) {
     const Op& op = ops[idx];
     if (prof) {
@@ -2232,6 +2234,22 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
                                                                op.cols, op.in_dim, op.qgroup,
                                                                stream_);
           if (S(op.out) == actq_src) actq_src = nullptr;
+          break;
+        }
+        // Short quantized sequences (a speculative verify, a tail chunk) stream the
+        // weights ONCE for all tokens through the multi-token dp4a kernel instead of
+        // paying a whole-model dequant round.
+        if (seq && T <= 8 && op.qbits == 4 && op.qgroup > 0 && (op.qgroup % 32) == 0 &&
+            (op.in_dim % 32) == 0 && op.bias == nullptr && d_act_i8_ != nullptr) {
+          if (mtq_src != S(op.in) || mtq_len != op.in_dim) {
+            kernels::launch_quantize_fp16_to_int8_perm8_g32_mt(S(op.in), d_act_i8_, d_act_qs_,
+                                                               op.in_dim, T, stream_);
+            mtq_src = S(op.in);
+            mtq_len = op.in_dim;
+          }
+          kernels::launch_weight_only_int4_matvec_grouped_dp4a_mt(
+              QW(op.qweight), QS(op.qscales), d_act_i8_, d_act_qs_, S(op.out), op.cols,
+              op.in_dim, op.qgroup, T, stream_);
           break;
         }
         // SEQUENCE mode with quantized weights: dequantize into scratch and run the real
@@ -2578,7 +2596,10 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
         break;
     }
   op_done:
-    if (!actq_set_now && op.kind != OpKind::Gemv) actq_src = nullptr;
+    if (!actq_set_now && op.kind != OpKind::Gemv) {
+      actq_src = nullptr;
+      mtq_src = nullptr;
+    }
     actq_set_now = false;
     if (prof) {
       cudaEventRecord(ev1, stream_);
@@ -3437,6 +3458,72 @@ void PlanCudaEngine::initialize(const EngineOptions& options) {
   open(options.model_path, options.max_context > 0 ? options.max_context : 4096);
 }
 
+// Greedy speculative verify: forward `k` tokens (the pending token plus k-1 drafts) at
+// positions pos.., then compute each position's greedy argmax. Returns the argmaxes; the
+// caller accepts the longest draft prefix they confirm. KV rows for rejected positions go
+// stale in place -- attention never reads past the current position, and later steps
+// overwrite them.
+void PlanCudaEngine::verify_greedy(const int* tokens, int k, int pos, int* out_argmax) {
+  using namespace opplan;
+  G4_CHECK(cudaMemcpyAsync(d_seq_tokens_, tokens, static_cast<std::size_t>(k) * sizeof(int),
+                           cudaMemcpyHostToDevice, stream_));
+  ExecCtx ctx{sslot_ptr_.data(), k, /*causal=*/true, /*cached=*/true, nullptr};
+  execute_ops(plan_.prologue.data(), plan_.prologue.size(), 0, pos, ctx);
+  for (int L = 0; L < cfg_.num_layers; ++L)
+    execute_ops(plan_.layers[L].ops.data(), plan_.layers[L].ops.size(), L, pos, ctx);
+  // Epilogue norm over all k rows; then the head + argmax per position (the seq LmHead
+  // case computes only the last row).
+  const Op& head = plan_.epilogue.back();
+  for (std::size_t i = 0; i + 1 < plan_.epilogue.size(); ++i) {
+    execute_ops(&plan_.epilogue[i], 1, 0, pos, ctx);
+  }
+  const __half* xn = sslot_ptr_[static_cast<int>(head.in)];
+  for (int t = 0; t < k; ++t) {
+    const __half* row = xn + static_cast<std::size_t>(t) * head.in_dim;
+    if (head.qbits == 4 && d_act_i8_ != nullptr) {
+      kernels::launch_quantize_fp16_to_int8_perm8_g32(row, d_act_i8_, d_act_qs_, head.in_dim,
+                                                      stream_);
+      kernels::launch_weight_only_int4_matvec_grouped_dp4a_f32(
+          static_cast<const std::int8_t*>(head.qweight), static_cast<const float*>(head.qscales),
+          d_act_i8_, d_act_qs_, d_logits_, head.cols, head.in_dim, head.qgroup, stream_);
+    } else if (head.qbits == 8) {
+      kernels::launch_weight_only_int8_gemv_f32(
+          static_cast<const std::int8_t*>(head.qweight), static_cast<const float*>(head.qscales),
+          row, d_logits_, head.cols, head.in_dim, stream_);
+    } else {
+      kernels::launch_rowmajor_half_gemv_f32(static_cast<const __half*>(head.weight), row,
+                                             d_logits_, head.cols, head.in_dim, stream_);
+    }
+    kernels::launch_argmax_float(d_logits_, head.cols, d_argmax_, stream_, d_argmax_pv_,
+                                 d_argmax_pi_, argmax_parts_);
+    G4_CHECK(cudaMemcpyAsync(out_argmax + t, d_argmax_, sizeof(int), cudaMemcpyDeviceToHost,
+                             stream_));
+  }
+  G4_CHECK(cudaStreamSynchronize(stream_));
+}
+
+// Prompt-lookup draft: find the most recent earlier occurrence of the last `ng` tokens
+// and propose the tokens that followed it.
+static int lookup_draft(const std::vector<int>& hist, int ng, int k, int* out) {
+  const int n = static_cast<int>(hist.size());
+  if (n < ng + 1) return 0;
+  for (int start = n - ng - 1; start >= 0; --start) {
+    bool match = true;
+    for (int j = 0; j < ng; ++j) {
+      if (hist[start + j] != hist[n - ng + j]) {
+        match = false;
+        break;
+      }
+    }
+    if (match) {
+      int c = 0;
+      for (int j = start + ng; j < n && c < k; ++j) out[c++] = hist[j];
+      return c;
+    }
+  }
+  return 0;
+}
+
 std::vector<int> PlanCudaEngine::generate_stream(const std::vector<int>& prompt, int max_new,
                                                  float temperature,
                                                  const std::function<bool(int)>& on_token,
@@ -3463,6 +3550,100 @@ std::vector<int> PlanCudaEngine::generate_stream(const std::vector<int>& prompt,
   // sample() pulls logits off the device lazily (greedy argmax / host copy), so
   // step() need not copy 262K floats to host every token.
   defer_host_logits_ = true;
+
+  // Speculative greedy decode (CPI_CUDA_SPEC=<k>: up to k prompt-lookup drafts per
+  // batched verify, batch = drafts+1 <= 8). Greedy-only and sampler-neutral (no
+  // penalties, no grammar): every emitted token is a verified argmax, so the stream
+  // must be identical to the plain greedy stream — that is the correctness gate.
+  const char* spec_env = std::getenv("CPI_CUDA_SPEC");
+  const int spec_k = spec_env ? std::min(std::atoi(spec_env), 7) : 0;
+  if (spec_k >= 1 && temperature <= 0.0f && seq_prefill_ok_ && !prompt.empty() &&
+      p.repetition_penalty == 1.0f && p.no_repeat_ngram_size == 0) {
+    using clock = std::chrono::steady_clock;
+    const auto msf = [](clock::time_point a, clock::time_point b) {
+      return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    const int P = static_cast<int>(prompt.size());
+    if (P >= max_context())
+      throw std::runtime_error("prompt (" + std::to_string(P) +
+                               " tokens) does not fit the context (" +
+                               std::to_string(max_context()) + "); raise --max-context");
+    reset_state();
+    stats_ = BenchmarkStats{};
+    stats_.prompt_tokens = P;
+    const auto t0 = clock::now();
+    prefill(prompt);
+    synchronize();
+    stats_.prefill_ms = msf(t0, clock::now());
+
+    std::vector<int> history = prompt;
+    std::vector<int> out;
+    const int max_ctx = max_context();
+    int verify_calls = 0, drafted = 0, accepted_total = 0;
+    const auto d0 = clock::now();
+    int pos = P;
+    bool stop = false;
+    // First token from the prefill logits, via the same device-argmax sample().
+    int cur = sample(p, history);
+    out.push_back(cur);
+    history.push_back(cur);
+    stats_.generated_tokens++;
+    if (on_token && !on_token(cur)) stop = true;
+    if (!stop && is_stop(cur)) stop = true;
+    // Invariant at loop top: `cur` is emitted but not yet forwarded; `pos` is its slot.
+    while (!stop && stats_.generated_tokens < p.max_new_tokens && pos < max_ctx) {
+      int drafts[8];
+      const int room = max_ctx - pos - 1;  // verify writes KV rows pos..pos+nd
+      const int nd = room >= 1 ? lookup_draft(history, 3, std::min(spec_k, room), drafts) : 0;
+      if (nd <= 0) {
+        step(cur, pos, /*want_logits=*/true);
+        ++pos;
+        cur = sample(p, history);
+      } else {
+        int batch[9], verdict[9];
+        batch[0] = cur;
+        for (int i = 0; i < nd; ++i) batch[1 + i] = drafts[i];
+        verify_greedy(batch, nd + 1, pos, verdict);
+        ++verify_calls;
+        drafted += nd;
+        int acc = 0;
+        while (acc < nd && verdict[acc] == drafts[acc]) ++acc;
+        accepted_total += acc;
+        // KV rows past pos+acc are stale in place; the next forward overwrites them.
+        pos += acc + 1;
+        for (int i = 0; i < acc && !stop && stats_.generated_tokens < p.max_new_tokens; ++i) {
+          out.push_back(drafts[i]);
+          history.push_back(drafts[i]);
+          stats_.generated_tokens++;
+          if (on_token && !on_token(drafts[i])) stop = true;
+          if (!stop && is_stop(drafts[i])) stop = true;
+        }
+        if (stop || stats_.generated_tokens >= p.max_new_tokens) break;
+        cur = verdict[acc];  // bonus token: computed by the verify, not yet forwarded
+      }
+      out.push_back(cur);
+      history.push_back(cur);
+      stats_.generated_tokens++;
+      if (on_token && !on_token(cur)) break;
+      if (is_stop(cur)) break;
+    }
+    synchronize();
+    stats_.decode_ms = msf(d0, clock::now());
+    if (std::getenv("CPI_CUDA_SPEC_STATS")) {
+      std::fprintf(stderr,
+                   "[spec] verifies=%d drafted=%d accepted=%d (%.1f%%) tokens=%d\n",
+                   verify_calls, drafted, accepted_total,
+                   drafted > 0 ? 100.0 * accepted_total / drafted : 0.0,
+                   static_cast<int>(stats_.generated_tokens));
+    }
+    if (p.include_prompt) {
+      std::vector<int> full = prompt;
+      full.insert(full.end(), out.begin(), out.end());
+      return full;
+    }
+    return out;
+  }
+
   return runtime::run_decode(*this, prompt, p, on_token, &stats_);
 }
 

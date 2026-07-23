@@ -141,6 +141,7 @@ class PlanCudaEngine : public runtime::SequenceModel {
 
   void parse_manifest(const std::string& manifest_path);
   bool seq_gemm_cublas(const __half* w, const __half* x, __half* y, int out, int in, int T);
+  void verify_greedy(const int* tokens, int k, int pos, int* out_argmax);
   void load_all(const std::string& cpi_path);
   // ── Qwen3.5 recipe (config parse + weight load + plan build). The executor,
   //    sampler, quantizer, graph and state machinery below are all SHARED. ──
