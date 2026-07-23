@@ -12,6 +12,14 @@
 
 #include "app/main_helpers.hpp"
 
+// Access to the process environment block for the legacy-env shim. macOS forbids `environ` in a
+// normal executable and exposes it via _NSGetEnviron(); other POSIX declares the global directly.
+#if defined(__APPLE__)
+#include <crt_externs.h>
+#elif !defined(_WIN32)
+extern "C" char** environ;
+#endif
+
 namespace app::main_cli {
 namespace {
 
@@ -430,8 +438,9 @@ ParsedArgs parse_args(int argc, char** argv) {
 void apply_legacy_env_aliases() {
 #if defined(_WIN32)
   char** env = _environ;
+#elif defined(__APPLE__)
+  char** env = *_NSGetEnviron();
 #else
-  extern char** environ;
   char** env = environ;
 #endif
   if (env == nullptr) return;
