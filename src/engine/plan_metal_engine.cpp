@@ -1337,11 +1337,14 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
         // NR0=4 decode shape (see cpi_gemv_quant_cat): same predicate as the shader.
         const bool nr4 = T == 1 && a.qbits == 4 && (a.in_dim % 32) == 0 && (gsz % 32) == 0 &&
                          a.bias == nullptr;
-        const std::size_t rows_per_tg =
-            nr4 ? static_cast<std::size_t>(kSimdsPerTG) * 4 : kSimdsPerTG;
+        // llama.cpp's M-series mul_mv runs 64-thread threadgroups (N_SG=2); with NR0=4
+        // that is 8 rows per tg. The shader derives everything from nthr, so only the
+        // dispatch geometry changes -- keep rows_per_tg == (tg/32)*4 in lockstep.
+        const std::size_t tg = nr4 ? 64 : kTG;
+        const std::size_t rows_per_tg = nr4 ? (tg / 32) * 4 : kSimdsPerTG;
         const std::size_t rb = (total + rows_per_tg - 1) / rows_per_tg;
         const std::size_t tiles = static_cast<std::size_t>((T + kGemvTile - 1) / kGemvTile);
-        ctx_.dispatch("cpi_gemv_quant_cat", G::Groups, rb * tiles, kTG, bufs, offs, 11, &gp,
+        ctx_.dispatch("cpi_gemv_quant_cat", G::Groups, rb * tiles, tg, bufs, offs, 11, &gp,
                       sizeof(gp));
         oi += qkv ? 2 : 1;
         if (profile) profile_tick(qkv ? "Gemv(qkv fused)" : "Gemv(gate/up fused)");
@@ -1448,11 +1451,11 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
             const int gsz0 = (op.qgroup == 0) ? op.in_dim : op.qgroup;
             const bool nr4 = qrest == 1 && op.qbits == 4 && (op.in_dim % 32) == 0 &&
                              (gsz0 % 32) == 0 && op.bias == nullptr;
-            const std::size_t rows_per_tg =
-                nr4 ? static_cast<std::size_t>(kSimdsPerTG) * 4 : kSimdsPerTG;
+            const std::size_t tgq = nr4 ? 64 : kTG;  // llama.cpp's 64-thread mul_mv tgs
+            const std::size_t rows_per_tg = nr4 ? (tgq / 32) * 4 : kSimdsPerTG;
             const std::size_t rbq =
                 (static_cast<std::size_t>(op.cols) + rows_per_tg - 1) / rows_per_tg;
-            ctx_.dispatch("cpi_gemv_quant", G::Groups, rbq * tiles, kTG, bufs, roffs, 5, &rp,
+            ctx_.dispatch("cpi_gemv_quant", G::Groups, rbq * tiles, tgq, bufs, roffs, 5, &rp,
                           sizeof(rp));
             if (profile) profile_tick("Gemv(quant remainder)");
           }
