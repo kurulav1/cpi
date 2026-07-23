@@ -1,6 +1,6 @@
 // Text generation on Apple Silicon: tokenizer -> Metal decode -> text.
 //
-// A separate entry point from llama_infer rather than a flag on it. llama_infer's
+// A separate entry point from cpi rather than a flag on it. cpi's
 // engine dispatch is templated over the CUDA engines and pulls in the whole CUDA
 // tree; on a Mac none of that exists. Keeping this small and standalone means the
 // Metal path has no CUDA in its dependency graph at all, which is the property that

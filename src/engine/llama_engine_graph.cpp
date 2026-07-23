@@ -454,7 +454,7 @@ void LlamaEngine::init_greedy_decode_graph() {
   // How many kernels does one decoded token actually cost? At batch 1 on a small model,
   // per-kernel scheduling overhead -- not bandwidth -- is what separates us from the
   // roofline, so the node count is the number to optimise against.
-  if (std::getenv("LLAMA_INFER_GRAPH_NODES")) {
+  if (std::getenv("CPI_GRAPH_NODES")) {
     std::size_t n = 0;
     cudaGraphGetNodes(greedy_decode_graph_, nullptr, &n);
     std::cerr << "[graph] greedy decode graph: " << n << " nodes ("
@@ -871,11 +871,11 @@ void LlamaEngine::ensure_device_topk_buffers() {
   device_topk_ready_ = true;
 }
 
-// Opt-out for A/B and bisection: LLAMA_INFER_HOST_SAMPLING=1 forces the old full-vocab
+// Opt-out for A/B and bisection: CPI_HOST_SAMPLING=1 forces the old full-vocab
 // host path. Used by tools/gemv_output_gate.py to prove the two agree token-for-token.
 static bool host_sampling_forced() {
   static const bool v = [] {
-    const char* e = std::getenv("LLAMA_INFER_HOST_SAMPLING");
+    const char* e = std::getenv("CPI_HOST_SAMPLING");
     return e && *e == '1';
   }();
   return v;

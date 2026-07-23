@@ -1243,10 +1243,10 @@ __global__ void attention_step_chunk_stats_gqa_split_device_pos_kernel(
 // many 32-token sub-chunks with a running online softmax. Pick the largest G (<=
 // kMaxBpc) that keeps the grid (lanes*coarse_chunks, lanes = num_kv_heads*batch)
 // above a floor for occupancy, so long context runs on fewer, larger, latency-
-// hiding blocks. Short context stays at G=1. LLAMA_INFER_ATTN_BPC overrides.
+// hiding blocks. Short context stays at G=1. CPI_ATTN_BPC overrides.
 static inline int pick_blocks_per_chunk(int total_blocks, long long lanes) {
   static const int env_bpc = [] {
-    const char* s = std::getenv("LLAMA_INFER_ATTN_BPC");
+    const char* s = std::getenv("CPI_ATTN_BPC");
     return s ? atoi(s) : 0;
   }();
   const int cap = max(1, total_blocks);
@@ -1266,7 +1266,7 @@ void launch_attention_step(const half* q, const half* k_cache, const half* v_cac
                            int seq_len, int num_heads, int num_kv_heads, int head_dim,
                            cudaStream_t stream, float* scratch_m, float* scratch_l,
                            float* scratch_o, int scratch_chunks, bool allow_split) {
-  const bool force_fallback = std::getenv("LLAMA_INFER_FORCE_FALLBACK_DECODE_ATTENTION") != nullptr;
+  const bool force_fallback = std::getenv("CPI_FORCE_FALLBACK_DECODE_ATTENTION") != nullptr;
   if (force_fallback) {
     constexpr int threads = 128;
     const std::size_t smem = static_cast<std::size_t>(head_dim) * sizeof(half) +
@@ -1810,7 +1810,7 @@ void launch_attention_step_device_pos(const half* q, const half* k_cache, const 
                                       int num_kv_heads, int head_dim, cudaStream_t stream,
                                       float* scratch_m, float* scratch_l, float* scratch_o,
                                       int scratch_chunks, bool allow_split, int window) {
-  const bool force_fallback = std::getenv("LLAMA_INFER_FORCE_FALLBACK_DECODE_ATTENTION") != nullptr;
+  const bool force_fallback = std::getenv("CPI_FORCE_FALLBACK_DECODE_ATTENTION") != nullptr;
   if (force_fallback) {
     constexpr int threads = 128;
     const std::size_t smem = static_cast<std::size_t>(head_dim) * sizeof(half) +

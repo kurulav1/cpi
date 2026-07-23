@@ -220,7 +220,7 @@ Llama4CudaEngine::~Llama4CudaEngine() {
 void Llama4CudaEngine::forward_token(int token, int position, bool compute_logits,
                                      std::vector<float>* out_logits, int* out_argmax) {
   if (position < 0 || position >= max_ctx_) {
-    LLAMA_ENGINE_THROW("decode position exceeds max context");
+    CPI_THROW("decode position exceeds max context");
   }
 
   auto time_or_launch = [&](double* slot, auto&& launch) {
@@ -449,10 +449,10 @@ std::vector<int> Llama4CudaEngine::generate_stream(const std::vector<int>& promp
                                                    const std::function<bool(int)>& on_token,
                                                    const GenerationConstraints* constraints) {
   if (max_new_tokens < 0) {
-    LLAMA_ENGINE_THROW("max_new_tokens must be >= 0");
+    CPI_THROW("max_new_tokens must be >= 0");
   }
   if (static_cast<int>(prompt_tokens.size()) > max_ctx_) {
-    LLAMA_ENGINE_THROW("prompt length exceeds max context");
+    CPI_THROW("prompt length exceeds max context");
   }
 
   active_grammar_ = constraints ? constraints->grammar : nullptr;
@@ -534,7 +534,7 @@ std::vector<std::pair<int, float>> Llama4CudaEngine::inspect_next_logits(
     return {};
   }
   if (static_cast<int>(prompt_tokens.size()) > max_ctx_) {
-    LLAMA_ENGINE_THROW("prompt length exceeds max context");
+    CPI_THROW("prompt length exceeds max context");
   }
 
   reset_kv_cache();

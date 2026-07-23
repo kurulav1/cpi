@@ -68,7 +68,7 @@ echo
 # ---------------------------------------------------------------------------
 echo "-- kernel smoke (vs CPU reference) --"
 if [ ! -x "$BUILD/metal_smoke" ]; then
-  bad "metal_smoke not built (is $BUILD configured with -DLLAMA_ENGINE_ENABLE_METAL=ON?)"
+  bad "metal_smoke not built (is $BUILD configured with -DCPI_ENABLE_METAL=ON?)"
 else
   out=$("$BUILD/metal_smoke" 2>&1)
   if echo "$out" | grep -q "ALL PASS"; then

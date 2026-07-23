@@ -16,7 +16,7 @@ fi
 
 REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 WEB_DIR="$REPO_DIR/web"
-INFER_BIN="$REPO_DIR/build/llama_infer"
+INFER_BIN="$REPO_DIR/build/cpi"
 
 if [[ ! -f "$WEB_DIR/package.json" ]]; then
   echo "[start_web] Could not find web/package.json." >&2
@@ -45,7 +45,7 @@ fi
 
 if [[ ! -x "$INFER_BIN" ]]; then
   echo "[start_web] Warning: $INFER_BIN not found."
-  echo "[start_web] API will start, but inference requests will fail until llama_infer is built."
+  echo "[start_web] API will start, but inference requests will fail until cpi is built."
 fi
 
 cd "$WEB_DIR"

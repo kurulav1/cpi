@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Interactive Gemma chat REPL.
 
-Runs `llama_infer --interactive` as a resident subprocess (the model loads once),
+Runs `cpi --interactive` as a resident subprocess (the model loads once),
 applies the Gemma 4 turn template (<|turn>user … <turn|> <|turn>model), and
 streams the reply token-by-token. Type a question, press enter; /quit to exit.
 
@@ -21,7 +21,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--tokenizer", required=True)
-    ap.add_argument("--infer-bin", default="build/Release/llama_infer.exe")
+    ap.add_argument("--infer-bin", default="build/Release/cpi.exe")
     ap.add_argument("--max-new", type=int, default=256)
     ap.add_argument("--temp", type=float, default=0.0)
     args = ap.parse_args()
@@ -30,7 +30,7 @@ def main():
     if not infer.is_absolute():
         infer = (Path.cwd() / infer).resolve()
     if not infer.exists():
-        sys.exit(f"[gemma_chat] llama_infer not found at {infer} — pass --infer-bin or run from the repo root")
+        sys.exit(f"[gemma_chat] cpi not found at {infer} — pass --infer-bin or run from the repo root")
 
     proc = subprocess.Popen(
         [str(infer), args.model, "--tokenizer", args.tokenizer, "--interactive",

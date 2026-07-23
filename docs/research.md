@@ -3,7 +3,7 @@
 ## Abstract
 
 CPI is a local LLM inference engine designed around two goals: portability and
-performance. It provides a single binary (`llama_infer`) that runs on any x86
+performance. It provides a single binary (`cpi`) that runs on any x86
 machine — falling back to a multithreaded CPU path when no CUDA device is
 present — and a CUDA path that leverages custom kernels and post-training
 quantization to push decode throughput on consumer and datacenter GPUs. A
@@ -106,7 +106,7 @@ cuBLAS + NCCL-free all-reduce. This is primarily used for large MoE models
 ### Serving Layer (Node.js)
 
 The API server (`web/server/index.mjs`) maintains a **warm interactive worker**
-— a persistent `llama_infer` subprocess that receives inference requests over
+— a persistent `cpi` subprocess that receives inference requests over
 stdin as NDJSON lines and streams token deltas back on stdout. This eliminates
 the model-load latency that would otherwise occur on every request. The server:
 

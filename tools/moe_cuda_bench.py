@@ -233,7 +233,7 @@ def print_bench(label: str, result: BenchResult) -> None:
 def main() -> int:
     repo_root = Path(__file__).resolve().parent.parent
     ap = argparse.ArgumentParser(description="Run MoE CUDA perf + parity checks for fp16/int8/int4 model variants.")
-    ap.add_argument("--llama-infer", type=Path, default=repo_root / "build" / "Release" / "llama_infer.exe")
+    ap.add_argument("--llama-infer", type=Path, default=repo_root / "build" / "Release" / "cpi.exe")
     ap.add_argument("--tokenizer", type=Path, required=True)
     ap.add_argument("--fp16-model", type=Path, required=True)
     ap.add_argument("--int8-model", type=Path)
@@ -253,9 +253,9 @@ def main() -> int:
     ap.add_argument("--json-out", type=Path, help="Write machine-readable benchmark/parity summary JSON.")
     args = ap.parse_args()
 
-    infer_bin = args.llama_infer.resolve()
+    infer_bin = args.cpi.resolve()
     if not infer_bin.exists():
-        raise FileNotFoundError(f"llama_infer not found: {infer_bin}")
+        raise FileNotFoundError(f"cpi not found: {infer_bin}")
 
     tokenizer = args.tokenizer.resolve()
     fp16_model = args.fp16_model.resolve()

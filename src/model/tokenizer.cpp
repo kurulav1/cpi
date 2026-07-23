@@ -10,7 +10,7 @@
 
 #include "model/hf_bpe_tokenizer.hpp"
 
-#ifdef LLAMA_ENGINE_HAS_SENTENCEPIECE
+#ifdef CPI_HAS_SENTENCEPIECE
 #include <sentencepiece_processor.h>
 #endif
 
@@ -18,7 +18,7 @@
 //   1. HfBpeTokenizer  — a built-in BPE implementation that reads HuggingFace
 //      tokenizer.json files directly, requiring no external tools at runtime.
 //   2. SentencePiece   — the reference libsentencepiece library (optional; gated
-//      by LLAMA_ENGINE_HAS_SENTENCEPIECE), or, when the library is absent, a
+//      by CPI_HAS_SENTENCEPIECE), or, when the library is absent, a
 //      subprocess-based fallback that first tries the bundled Python helper and
 //      then shells out to spm_encode/spm_decode command-line programs.
 //
@@ -148,7 +148,7 @@ void write_text_file(const std::filesystem::path& p, const std::string& text) {
 Tokenizer::~Tokenizer() {
   delete reinterpret_cast<HfBpeTokenizer*>(hf_bpe_);
   hf_bpe_ = nullptr;
-#ifdef LLAMA_ENGINE_HAS_SENTENCEPIECE
+#ifdef CPI_HAS_SENTENCEPIECE
   delete reinterpret_cast<sentencepiece::SentencePieceProcessor*>(sp_);
   sp_ = nullptr;
 #endif
@@ -213,7 +213,7 @@ void Tokenizer::load(const std::string& path) {
     spm_decode_exe_ = default_tool_path("spm_decode.exe");
   }
 
-#ifdef LLAMA_ENGINE_HAS_SENTENCEPIECE
+#ifdef CPI_HAS_SENTENCEPIECE
   if (!sp_) {
     sp_ = new sentencepiece::SentencePieceProcessor();
   }
@@ -305,7 +305,7 @@ std::vector<int> Tokenizer::encode(const std::string& text, bool add_bos) const 
     return tok->encode(text, add_bos);
   }
 
-#ifdef LLAMA_ENGINE_HAS_SENTENCEPIECE
+#ifdef CPI_HAS_SENTENCEPIECE
   if (sp_) {
     auto* proc = reinterpret_cast<const sentencepiece::SentencePieceProcessor*>(sp_);
     std::vector<int> ids;
@@ -391,7 +391,7 @@ std::string Tokenizer::decode(const std::vector<int>& ids,
     return tok->decode(filtered, keep_special);
   }
 
-#ifdef LLAMA_ENGINE_HAS_SENTENCEPIECE
+#ifdef CPI_HAS_SENTENCEPIECE
   if (sp_) {
     auto* proc = reinterpret_cast<const sentencepiece::SentencePieceProcessor*>(sp_);
     std::string out;

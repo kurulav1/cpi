@@ -454,7 +454,7 @@ std::vector<int> LlamaEngine::generate_stream(const std::vector<int>& prompt_tok
                                               const std::function<bool(int)>& on_token,
                                               const GenerationConstraints* constraints) {
   if (prompt_tokens.empty()) {
-    LLAMA_ENGINE_THROW("prompt token list is empty");
+    CPI_THROW("prompt token list is empty");
   }
   // Bounds guard: the KV cache and position tables are allocated for exactly
   // options_.max_context positions (see llama_engine_lifecycle.cpp). A prompt
@@ -463,7 +463,7 @@ std::vector<int> LlamaEngine::generate_stream(const std::vector<int>& prompt_tok
   // stack-buffer-overrun on others. Reject with a clear error before touching
   // any buffer, leaving at least one slot for a generated token.
   if (static_cast<int>(prompt_tokens.size()) >= options_.max_context) {
-    LLAMA_ENGINE_THROW("prompt length " + std::to_string(prompt_tokens.size()) +
+    CPI_THROW("prompt length " + std::to_string(prompt_tokens.size()) +
                        " exceeds the model context window " + std::to_string(options_.max_context) +
                        " (reduce the prompt or raise --max-context / LLAMA_MAX_CONTEXT)");
   }
@@ -539,7 +539,7 @@ std::vector<int> LlamaEngine::generate_stream(const std::vector<int>& prompt_tok
     const int total = std::min(
         options_.max_context, static_cast<int>(prompt_tokens.size()) + std::max(0, max_new_tokens));
     if (!seq_blocks_->ensure_position(total - 1)) {
-      LLAMA_ENGINE_THROW("paged KV pool exhausted for sequence length " + std::to_string(total));
+      CPI_THROW("paged KV pool exhausted for sequence length " + std::to_string(total));
     }
     const int bs = options_.paged_block_size > 0 ? options_.paged_block_size : 32;
     const int nblk = (total + bs - 1) / bs;
@@ -547,7 +547,7 @@ std::vector<int> LlamaEngine::generate_stream(const std::vector<int>& prompt_tok
     for (int c = 0; c < nblk; ++c) {
       const int blk = seq_blocks_->block_for(c * bs);
       if (blk == BlockAllocator::kInvalidBlock) {
-        LLAMA_ENGINE_THROW("paged block table has no block for chunk " + std::to_string(c));
+        CPI_THROW("paged block table has no block for chunk " + std::to_string(c));
       }
       block_table_host_[static_cast<std::size_t>(c)] = blk;
     }
@@ -607,7 +607,7 @@ std::vector<int> LlamaEngine::generate_stream(const std::vector<int>& prompt_tok
         std::ostringstream oss;
         oss << "TurboQuant cached first-token timeout: elapsed_ms=" << token_ms
             << " limit_ms=" << options_.tq_first_token_timeout_ms;
-        LLAMA_ENGINE_THROW(oss.str());
+        CPI_THROW(oss.str());
       }
     }
     if (active_grammar_ != nullptr) {
@@ -661,7 +661,7 @@ std::vector<int> LlamaEngine::generate_stream(const std::vector<int>& prompt_tok
 std::vector<std::pair<int, float>> LlamaEngine::inspect_next_logits(
     const std::vector<int>& prompt_tokens, int top_k) {
   if (prompt_tokens.empty()) {
-    LLAMA_ENGINE_THROW("inspect_next_logits requires non-empty prompt");
+    CPI_THROW("inspect_next_logits requires non-empty prompt");
   }
   if (top_k <= 0) {
     return {};
@@ -705,10 +705,10 @@ void LlamaEngine::verify_tokens(const std::vector<int>& tokens, int start_pos,
   if (options_.paged_kv_cache || prefill_chunk_size_ <= 1 ||
       (cached_int8_proj_enabled_ && !all_layers_cached) || kv_int4_enabled_ || tq3_enabled_ ||
       cfg.is_moe() || cfg.uses_non_full_attention()) {
-    LLAMA_ENGINE_THROW("verify_tokens requires the batched full-attention path");
+    CPI_THROW("verify_tokens requires the batched full-attention path");
   }
   if (K > prefill_chunk_size_) {
-    LLAMA_ENGINE_THROW("verify_tokens: K exceeds prefill_chunk_size_");
+    CPI_THROW("verify_tokens: K exceeds prefill_chunk_size_");
   }
 
   const int hidden = cfg.hidden_size;

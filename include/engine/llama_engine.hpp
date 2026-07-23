@@ -652,7 +652,7 @@ private:
   bool cached_int8_proj_enabled_ =
       false;                      // True when QKV/wo are also cached as INT8 (fp16 copies freed).
   int prefill_chunk_size_ = 256;  // Tokens per batched prefill pass; 256 saturates the GPU (16 was
-                                  // ~5.3x slower). Override via LLAMA_INFER_PREFILL_CHUNK_SIZE.
+                                  // ~5.3x slower). Override via CPI_PREFILL_CHUNK_SIZE.
   BenchmarkStats last_benchmark_stats_{};  // Statistics from the most recent generate/stream call.
 
   // CUDA streams and synchronisation events.

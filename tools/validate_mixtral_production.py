@@ -64,7 +64,7 @@ def main() -> int:
     ap.add_argument("--repo-id", default="mistralai/Mixtral-8x7B-Instruct-v0.1")
     ap.add_argument("--output-dir", type=Path, default=repo_root / "artifacts" / "e2e_mixtral_prod")
     ap.add_argument("--hf-token", default="")
-    ap.add_argument("--llama-infer", type=Path, default=repo_root / "build" / "Release" / "llama_infer.exe")
+    ap.add_argument("--llama-infer", type=Path, default=repo_root / "build" / "Release" / "cpi.exe")
     ap.add_argument("--chat-template", default="mistral")
     ap.add_argument("--max-context", type=int, default=4096)
     ap.add_argument("--max-new", type=int, default=64)
@@ -132,8 +132,8 @@ def main() -> int:
 
     if not tokenizer.exists():
         raise FileNotFoundError(f"tokenizer not found: {tokenizer}")
-    if not args.llama_infer.exists():
-        raise FileNotFoundError(f"llama_infer not found: {args.llama_infer}")
+    if not args.cpi.exists():
+        raise FileNotFoundError(f"cpi not found: {args.cpi}")
 
     warmup_prompt = "warmup"
     long_prompt = " ".join(["Explain MoE routing in detail."] * 512)
@@ -144,7 +144,7 @@ def main() -> int:
         ("int4", int4_model, "int4"),
     ]:
         cmd = [
-            str(args.llama_infer),
+            str(args.cpi),
             str(model),
             "--prompt",
             warmup_prompt,
@@ -168,7 +168,7 @@ def main() -> int:
 
         mem_before = query_gpu_mem_mb()
         bench = [
-            str(args.llama_infer),
+            str(args.cpi),
             str(model),
             "--prompt",
             long_prompt,
@@ -203,7 +203,7 @@ def main() -> int:
         start = time.time()
         out = run(
             [
-                str(args.llama_infer),
+                str(args.cpi),
                 str(int8_model),
                 "--weight-quant",
                 "int8",
@@ -228,7 +228,7 @@ def main() -> int:
         "repo_id": args.repo_id,
         "output_dir": str(args.output_dir),
         "sustained": sustained,
-        "llama_infer": str(args.llama_infer),
+        "cpi": str(args.cpi),
     }
     report_path = args.output_dir / "production_validation_report.json"
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")

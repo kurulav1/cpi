@@ -13,7 +13,7 @@ and the same plan built by `build_llama_plan()` — Metal is a backend, not a fo
 capability flags on the geometry, not forks.
 
 ```bash
-cmake -S . -B build -DLLAMA_ENGINE_ENABLE_CUDA=OFF -DLLAMA_ENGINE_ENABLE_METAL=ON       -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build -DCPI_ENABLE_CUDA=OFF -DCPI_ENABLE_METAL=ON       -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 
 export CPI_METAL_SOURCE=$PWD/src/kernels/metal/cpi_kernels.metal

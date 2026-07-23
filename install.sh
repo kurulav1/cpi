@@ -10,7 +10,7 @@ Prepares the repo for first use:
   2. Installs web dependencies
   3. Creates web/.env if missing
   4. Creates web/config.json if missing
-  5. Builds build/llama_infer if missing
+  5. Builds build/cpi if missing
 EOF
   exit 0
 fi
@@ -18,7 +18,7 @@ fi
 REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 WEB_DIR="$REPO_DIR/web"
 BUILD_DIR="$REPO_DIR/build"
-INFER_BIN="$BUILD_DIR/llama_infer"
+INFER_BIN="$BUILD_DIR/cpi"
 
 if [[ ! -f "$WEB_DIR/package.json" ]]; then
   echo "[install] Could not find web/package.json." >&2
@@ -39,11 +39,11 @@ if [[ ! -f "$WEB_DIR/config.json" && -f "$WEB_DIR/config.example.json" ]]; then
 fi
 
 if [[ ! -x "$INFER_BIN" ]]; then
-  echo "[install] Building llama_infer..."
+  echo "[install] Building cpi..."
   if [[ ! -f "$BUILD_DIR/CMakeCache.txt" ]]; then
     cmake -S "$REPO_DIR" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release
   fi
-  cmake --build "$BUILD_DIR" --target llama_infer -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
+  cmake --build "$BUILD_DIR" --target cpi -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
 fi
 
 echo "[install] Repo is prepared."

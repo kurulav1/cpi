@@ -30,7 +30,7 @@ flowchart TB
     direction TB
     subgraph POD["CPI pod"]
       WEB["Node server :3001<br/>REST + OpenAI API + Chat Studio UI"]
-      ENGINE["llama_infer — CUDA engine"]
+      ENGINE["cpi — CUDA engine"]
       WEB -->|spawns| ENGINE
     end
 
@@ -90,7 +90,7 @@ flowchart TB
  │     │ gradient ▼         │──▶  hostPath now;       │──▶  │   OpenAI API + Chat UI)│  │
  │  [filesystem collective] │  │  RWX PVC / S3 later  │  │  │      │ spawns          │  │
  │     export_cpt_to_hf ────┼──▶│ (.ll2c)             │  │  │      ▼                 │  │
- │     → convert_hf_to_bins │  └──────────────────────┘  │  │  llama_infer (CUDA)    │  │
+ │     → convert_hf_to_bins │  └──────────────────────┘  │  │  cpi (CUDA)    │  │
  └─────────────────────────┘                             │  └────────────────────────┘  │
                                                          │   served two ways:           │
                                                          │   A) Deployment+Service+KEDA │
@@ -112,7 +112,7 @@ flowchart TB
 |---|---|---|---|
 | **CPT Indexed Job** | data-parallel training, gang of ranks | filesystem gradient collective | NCCL + RDMA, gang scheduling |
 | **Model store** | the seam CPT writes / CPI reads | `hostPath /tmp/cpt-models` | RWX PVC or S3/MinIO + node cache |
-| **CPI pod** | Node web server (API + Chat UI) → `llama_infer` CUDA engine | 1 GPU shared via `/dev/dxg` | `nvidia.com/gpu` on a GPU node pool |
+| **CPI pod** | Node web server (API + Chat UI) → `cpi` CUDA engine | 1 GPU shared via `/dev/dxg` | `nvidia.com/gpu` on a GPU node pool |
 | **Path A: KEDA** | autoscale on queue depth (`cpi_inflight_requests`) | scales 1→3, shared GPU | scale across GPU nodes |
 | **Path B: KServe** | model-centric control plane (ISVC → runtime) | RawDeployment, no storageUri | Serverless/Knative, `storageUri` |
 | **VictoriaMetrics + vmagent** | metrics TSDB + scrape | `vmsingle` + emptyDir | VM Operator + PVs / cluster mode |

@@ -51,9 +51,9 @@ void LlamaEngine::copy_layer_weights_to_device(int layer, LayerDeviceWeights* ds
                              const void* src_override) {
     if (!weights_.has_tensor(name) && !src_override) {
       if (has_any_packed_lowbit_tensor(weights_, name)) {
-        LLAMA_ENGINE_THROW("packed low-bit tensor requires --weight-quant int8|int4: " + name);
+        CPI_THROW("packed low-bit tensor requires --weight-quant int8|int4: " + name);
       }
-      LLAMA_ENGINE_THROW("missing tensor: " + name);
+      CPI_THROW("missing tensor: " + name);
     }
     const void* src = src_override ? src_override : weights_.tensor_data(name);
     CUDA_CHECK(cudaMemcpyAsync(dst_fp16, src, bytes, cudaMemcpyHostToDevice, stream));
@@ -116,7 +116,7 @@ void LlamaEngine::copy_layer_weights_to_device(int layer, LayerDeviceWeights* ds
   if (quant) {
     if (!dst_i8 || !dst_i8->w1 || !dst_i8->w2 || !dst_i8->w3 || !dst_i8->s_w1 || !dst_i8->s_w2 ||
         !dst_i8->s_w3) {
-      LLAMA_ENGINE_THROW("missing weight-only int8 staging buffers");
+      CPI_THROW("missing weight-only int8 staging buffers");
     }
     dst_i8->mlp_int4 = false;
     dst_i8->proj_int4 = false;
@@ -168,9 +168,9 @@ void LlamaEngine::init_uncached_pinned_host_weights() {
   const auto pin_copy = [&](const std::string& name, void** out_ptr) -> bool {
     if (!weights_.has_tensor(name)) {
       if (has_any_packed_lowbit_tensor(weights_, name)) {
-        LLAMA_ENGINE_THROW("packed low-bit tensor requires --weight-quant int8|int4: " + name);
+        CPI_THROW("packed low-bit tensor requires --weight-quant int8|int4: " + name);
       }
-      LLAMA_ENGINE_THROW("missing tensor: " + name);
+      CPI_THROW("missing tensor: " + name);
     }
     const std::size_t bytes = weights_.tensor_bytes(name);
     void* ptr = nullptr;

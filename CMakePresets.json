@@ -18,7 +18,7 @@
       "inherits": "base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "LLAMA_ENGINE_ENABLE_CUDA": "OFF"
+        "CPI_ENABLE_CUDA": "OFF"
       }
     },
     {
@@ -28,7 +28,7 @@
       "inherits": "base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "LLAMA_ENGINE_ENABLE_CUDA": "ON",
+        "CPI_ENABLE_CUDA": "ON",
         "CMAKE_CUDA_ARCHITECTURES": "75;80;86;89;90;120"
       }
     }
@@ -38,14 +38,14 @@
       "name": "cpu-release",
       "configurePreset": "cpu-release",
       "targets": [
-        "llama_infer"
+        "cpi"
       ]
     },
     {
       "name": "cuda-distributable-release",
       "configurePreset": "cuda-distributable-release",
       "targets": [
-        "llama_infer",
+        "cpi",
         "cuda_bandwidth_bench",
         "moe_kernel_parity_test"
       ]

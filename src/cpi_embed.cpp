@@ -1,6 +1,6 @@
 // cpi_embed: CPI's embedding worker. Loads a BERT-family embedding model
 // (config-driven) and serves embeddings over a line-delimited JSON protocol on
-// stdin/stdout, mirroring how llama_infer serves chat. Driven by the Node
+// stdin/stdout, mirroring how cpi serves chat. Driven by the Node
 // server's /v1/embeddings route.
 //
 // Usage: cpi_embed <model_dir>
@@ -23,10 +23,10 @@
 // the tokenizer, the batching -- is backend-agnostic and this is the only place that knows.
 //
 // CUDA wins when both are available, matching resolve_engine's preference for the discrete GPU.
-#if LLAMA_ENGINE_HAS_CUDA
+#if CPI_HAS_CUDA
 #include "engine/bert_embedder.hpp"
 using CpiEmbedder = engine::BertEmbedder;
-#elif defined(LLAMA_ENGINE_ENABLE_METAL)
+#elif defined(CPI_ENABLE_METAL)
 #include "engine/metal_bert_embedder.hpp"
 using CpiEmbedder = engine::MetalBertEmbedder;
 #else

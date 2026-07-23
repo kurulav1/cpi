@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Simple quality/regression harness for llama_infer.
+Simple quality/regression harness for cpi.
 
 Runs a fixed prompt set and computes lightweight quality heuristics:
 - non-empty generated text
@@ -276,7 +276,7 @@ def run_one(
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--exe", default="build/Release/llama_infer.exe")
+    ap.add_argument("--exe", default="build/Release/cpi.exe")
     ap.add_argument("--model", required=True)
     ap.add_argument("--tokenizer", required=True)
     ap.add_argument("--prompts", default="tools/eval_prompts.json")

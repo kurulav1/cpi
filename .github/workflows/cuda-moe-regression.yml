@@ -55,7 +55,7 @@ jobs:
         shell: pwsh
         run: |
           python tools/ci/moe_regression_gate.py `
-            --llama-infer build/Release/llama_infer.exe `
+            --llama-infer build/Release/cpi.exe `
             --tokenizer artifacts/ci_mixtral/hf/tokenizer.model `
             --fp16-model artifacts/ci_mixtral/tiny-mixtral.ll2c `
             --int8-model artifacts/ci_mixtral/tiny-mixtral-int8.ll2c `

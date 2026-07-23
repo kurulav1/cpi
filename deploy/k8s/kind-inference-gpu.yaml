@@ -74,7 +74,7 @@ spec:
             - containerPort: 3001
           env:
             - { name: PORT, value: "3001" }
-            - { name: LLAMA_INFER_BIN, value: /app/bin/llama_infer }
+            - { name: CPI_BIN, value: /app/bin/cpi }
             - { name: LLAMA_MODEL_DIRS, value: /models }   # scanned recursively -> lists all models
             - { name: LLAMA_MODEL_PATH, value: /models/Qwen2.5-Coder-3B-Instruct/Qwen2.5-Coder-3B-Instruct.ll2c }
             - { name: LLAMA_TOKENIZER_PATH, value: /models/Qwen2.5-Coder-3B-Instruct/tokenizer.json }
@@ -84,7 +84,7 @@ spec:
             - { name: LLAMA_MAX_MEMORY_PERCENT, value: "100" }
           resources:
             # The 6.8GB model is resident in GPU VRAM, not host RAM; host footprint is
-            # the Node server + llama_infer buffers (~1-2GB). Keep requests modest so
+            # the Node server + cpi buffers (~1-2GB). Keep requests modest so
             # replicas/alternative paths fit the node; limit guards against leaks.
             requests:
               cpu: "1"

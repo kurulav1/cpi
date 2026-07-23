@@ -94,9 +94,9 @@ jobs:
       - name: Configure (Metal on, CUDA off)
         run: >
           cmake -S . -B build
-          -DLLAMA_ENGINE_ENABLE_CUDA=OFF
-          -DLLAMA_ENGINE_ENABLE_METAL=ON
-          -DLLAMA_ENGINE_ENABLE_SENTENCEPIECE=OFF
+          -DCPI_ENABLE_CUDA=OFF
+          -DCPI_ENABLE_METAL=ON
+          -DCPI_ENABLE_SENTENCEPIECE=OFF
           -DCMAKE_BUILD_TYPE=Release
       - name: Build
         run: cmake --build build --config Release -j
@@ -124,8 +124,8 @@ jobs:
       - name: Configure (CUDA off, sentencepiece off)
         run: >
           cmake -S . -B build
-          -DLLAMA_ENGINE_ENABLE_CUDA=OFF
-          -DLLAMA_ENGINE_ENABLE_SENTENCEPIECE=OFF
+          -DCPI_ENABLE_CUDA=OFF
+          -DCPI_ENABLE_SENTENCEPIECE=OFF
           -DCMAKE_BUILD_TYPE=Release
       - name: Build
         run: cmake --build build --config Release -j
@@ -150,13 +150,13 @@ jobs:
       - name: Configure (CUDA on, fixed arch, sentencepiece off)
         run: >
           cmake -S . -B build
-          -DLLAMA_ENGINE_ENABLE_CUDA=ON
-          -DLLAMA_ENGINE_ENABLE_SENTENCEPIECE=OFF
-          -DLLAMA_ENGINE_ENABLE_LTO=OFF
+          -DCPI_ENABLE_CUDA=ON
+          -DCPI_ENABLE_SENTENCEPIECE=OFF
+          -DCPI_ENABLE_LTO=OFF
           -DCMAKE_CUDA_ARCHITECTURES=89
           -DCMAKE_BUILD_TYPE=Release
       - name: Compile + link (no GPU execution)
-        run: cmake --build build --config Release --target llama_infer -j
+        run: cmake --build build --config Release --target cpi -j
 
   repo-hygiene:
     name: No committed build/model artifacts

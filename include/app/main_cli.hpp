@@ -56,5 +56,9 @@ void print_usage(std::ostream& os);
 ParsedArgs parse_args(int argc, char** argv);
 void apply_simple_mode_defaults(ParsedArgs* args);
 void validate_args(const ParsedArgs& args);
+// Backward-compat: map any set LLAMA_INFER_* env var onto its CPI_* successor (unless the new
+// name is already set), with a one-line deprecation notice. Call once at startup, before any
+// getenv. Removed in a future release.
+void apply_legacy_env_aliases();
 
 }  // namespace app::main_cli

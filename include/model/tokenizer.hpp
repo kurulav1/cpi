@@ -6,7 +6,7 @@
 //   - HfBpeTokenizer: a built-in BPE implementation loaded from a
 //     Hugging Face tokenizer.json file (always available).
 //   - SentencePiece: loaded via the sentencepiece library and invoked through
-//     helper executables, available only when LLAMA_ENGINE_HAS_SENTENCEPIECE
+//     helper executables, available only when CPI_HAS_SENTENCEPIECE
 //     is defined at compile time.
 //
 // Callers interact exclusively through this class; backend selection is
@@ -28,7 +28,7 @@ public:
   // Loads the tokenizer from the given model directory path.
   // If a tokenizer.json file is present the HfBpeTokenizer backend is used.
   // Otherwise, the SentencePiece backend is used (requires the
-  // LLAMA_ENGINE_HAS_SENTENCEPIECE compile-time flag).
+  // CPI_HAS_SENTENCEPIECE compile-time flag).
   // Throws on missing or malformed tokenizer files.
   void load(const std::string& path);
 
@@ -88,7 +88,7 @@ private:
   int unk_id_ = -1;     // Cached UNK token ID from the active backend.
   std::vector<int> special_ids_;  // All special token IDs collected from the backend.
   void* hf_bpe_ = nullptr;        // Owning pointer to HfBpeTokenizer (heap-allocated).
-#ifdef LLAMA_ENGINE_HAS_SENTENCEPIECE
+#ifdef CPI_HAS_SENTENCEPIECE
   void* sp_ = nullptr;  // Owning pointer to the SentencePiece processor.
 #endif
 };

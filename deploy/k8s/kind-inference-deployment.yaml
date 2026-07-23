@@ -44,8 +44,8 @@ spec:
           env:
             - name: PORT
               value: "3001"
-            - name: LLAMA_INFER_BIN
-              value: /app/bin/llama_infer
+            - name: CPI_BIN
+              value: /app/bin/cpi
             - name: LLAMA_MODEL_DIRS
               value: /models
             - name: LLAMA_MODEL_PATH
@@ -59,7 +59,7 @@ spec:
             - name: LLAMA_MAX_CONTEXT
               value: "8192"
             # Larger batched prefill pass (built-in default 16 is ~5.3x slower on GPU).
-            - name: LLAMA_INFER_PREFILL_CHUNK_SIZE
+            - name: CPI_PREFILL_CHUNK_SIZE
               value: "256"
             # CPU-only inference pegs the CPU at 100%, which trips CPI's resource
             # governor (default 85%). Relax it for this CPU smoke-test pod.

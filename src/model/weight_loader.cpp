@@ -192,7 +192,7 @@ void WeightLoader::open(const std::string& path) {
 const std::byte* WeightLoader::tensor_data(const std::string& name) const {
   const auto it = tensors_.find(name);
   if (it == tensors_.end()) {
-    LLAMA_ENGINE_THROW("tensor not found: " + name);
+    CPI_THROW("tensor not found: " + name);
   }
   return mmap_.data() + it->second.offset;
 }
@@ -200,7 +200,7 @@ const std::byte* WeightLoader::tensor_data(const std::string& name) const {
 std::size_t WeightLoader::tensor_bytes(const std::string& name) const {
   const auto it = tensors_.find(name);
   if (it == tensors_.end()) {
-    LLAMA_ENGINE_THROW("tensor not found: " + name);
+    CPI_THROW("tensor not found: " + name);
   }
   return it->second.bytes;
 }
@@ -221,12 +221,12 @@ std::vector<std::string> WeightLoader::tensor_names() const {
 
 void WeightLoader::parse_manifest() {
   if (!mmap_.valid() || mmap_.size() < sizeof(HeaderV1)) {
-    LLAMA_ENGINE_THROW("invalid model file");
+    CPI_THROW("invalid model file");
   }
 
   const auto* magic = reinterpret_cast<const char*>(mmap_.data());
   if (std::memcmp(magic, kMagic, sizeof(kMagic) - 1) != 0) {
-    LLAMA_ENGINE_THROW("unsupported weights format. expected LL2CUDA manifest");
+    CPI_THROW("unsupported weights format. expected LL2CUDA manifest");
   }
 
   const auto version = *reinterpret_cast<const std::int32_t*>(mmap_.data() + 8);
@@ -242,7 +242,7 @@ void WeightLoader::parse_manifest() {
 
   if (version >= 5) {
     if (mmap_.size() < sizeof(HeaderV5)) {
-      LLAMA_ENGINE_THROW("invalid v5 model header");
+      CPI_THROW("invalid v5 model header");
     }
     const auto* hdr = reinterpret_cast<const HeaderV5*>(mmap_.data());
     config_.vocab_size = hdr->vocab_size;
@@ -303,7 +303,7 @@ void WeightLoader::parse_manifest() {
           static_cast<std::size_t>(hdr->attention_type_count) * sizeof(std::int32_t);
       if (hdr->attention_type_offset < 0 ||
           static_cast<std::size_t>(hdr->attention_type_offset) + bytes > mmap_.size()) {
-        LLAMA_ENGINE_THROW("invalid v5 attention metadata table");
+        CPI_THROW("invalid v5 attention metadata table");
       }
       const auto* kinds =
           reinterpret_cast<const std::int32_t*>(mmap_.data() + hdr->attention_type_offset);
@@ -314,7 +314,7 @@ void WeightLoader::parse_manifest() {
     }
   } else if (version >= 4) {
     if (mmap_.size() < sizeof(HeaderV4)) {
-      LLAMA_ENGINE_THROW("invalid v4 model header");
+      CPI_THROW("invalid v4 model header");
     }
     const auto* hdr = reinterpret_cast<const HeaderV4*>(mmap_.data());
     config_.vocab_size = hdr->vocab_size;
@@ -342,7 +342,7 @@ void WeightLoader::parse_manifest() {
     config_.expert_intermediate_size = hdr->expert_intermediate_size;
   } else if (version >= 3) {
     if (mmap_.size() < sizeof(HeaderV3)) {
-      LLAMA_ENGINE_THROW("invalid v3 model header");
+      CPI_THROW("invalid v3 model header");
     }
     const auto* hdr = reinterpret_cast<const HeaderV3*>(mmap_.data());
     config_.vocab_size = hdr->vocab_size;
@@ -367,7 +367,7 @@ void WeightLoader::parse_manifest() {
     config_.expert_intermediate_size = 0;
   } else if (version >= 2) {
     if (mmap_.size() < sizeof(HeaderV2)) {
-      LLAMA_ENGINE_THROW("invalid v2 model header");
+      CPI_THROW("invalid v2 model header");
     }
     const auto* hdr = reinterpret_cast<const HeaderV2*>(mmap_.data());
     config_.vocab_size = hdr->vocab_size;
@@ -404,12 +404,12 @@ void WeightLoader::parse_manifest() {
 
   if (!config_.layer_attention_kinds.empty() &&
       static_cast<int>(config_.layer_attention_kinds.size()) != config_.num_layers) {
-    LLAMA_ENGINE_THROW("attention metadata count does not match num_layers");
+    CPI_THROW("attention metadata count does not match num_layers");
   }
 
   if (config_.num_kv_heads <= 0 || config_.num_heads <= 0 ||
       config_.num_heads % config_.num_kv_heads != 0) {
-    LLAMA_ENGINE_THROW("invalid attention head config in model header");
+    CPI_THROW("invalid attention head config in model header");
   }
 
   const auto* table = reinterpret_cast<const TensorEntry*>(mmap_.data() + table_offset);

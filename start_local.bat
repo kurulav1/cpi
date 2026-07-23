@@ -6,7 +6,7 @@ if /I "%~1"=="/?" goto :help
 
 for %%I in ("%~dp0.") do set "REPO_DIR=%%~fI"
 set "WEB_DIR=%REPO_DIR%\web"
-set "INFER_BIN=%REPO_DIR%\build\Release\llama_infer.exe"
+set "INFER_BIN=%REPO_DIR%\build\Release\cpi.exe"
 
 if not exist "%WEB_DIR%\package.json" (
   echo [start_local] Could not find web\package.json.
@@ -29,10 +29,10 @@ if not exist "%WEB_DIR%\config.json" (
 )
 
 if not exist "%INFER_BIN%" (
-  echo [start_local] llama_infer.exe is missing, building it now...
+  echo [start_local] cpi.exe is missing, building it now...
   cmake --fresh -S "%REPO_DIR%" -B "%REPO_DIR%\build" -A x64
   if errorlevel 1 exit /b 1
-  cmake --build "%REPO_DIR%\build" --config Release --target llama_infer
+  cmake --build "%REPO_DIR%\build" --config Release --target cpi
   if errorlevel 1 exit /b 1
 )
 
@@ -60,7 +60,7 @@ if errorlevel 1 (
 )
 
 echo [start_local] Starting local package on http://localhost:3001
-echo [start_local] The API launches llama_infer on demand for each chat request.
+echo [start_local] The API launches cpi on demand for each chat request.
 node server/index.mjs
 set "EXIT_CODE=%ERRORLEVEL%"
 popd
@@ -72,7 +72,7 @@ echo.
 echo Starts the non-Docker package:
 echo   1. Copies web\.env from web\.env.example if needed
 echo   2. Copies web\config.json from web\config.example.json if needed
-echo   3. Builds build\Release\llama_infer.exe if missing
+echo   3. Builds build\Release\cpi.exe if missing
 echo   4. Installs web dependencies with npm ci if needed
 echo   5. Builds the React UI
 echo   6. Starts the local server on http://localhost:3001

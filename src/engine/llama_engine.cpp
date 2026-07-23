@@ -78,9 +78,9 @@ bool linear_rowmajor_weight_lt(cublasLtHandle_t handle, std::vector<LtMatmulPlan
   // Decode deliberately keeps fp32: at batch 1 the projections are memory-bound GEMVs, so fp16
   // accumulation buys nothing there, and decode is where a logit error selects the wrong token.
   //
-  // LLAMA_INFER_GEMM_FP32_ACC=1 forces fp32 everywhere.
+  // CPI_GEMM_FP32_ACC=1 forces fp32 everywhere.
   static const bool force_fp32 = [] {
-    const char* e = std::getenv("LLAMA_INFER_GEMM_FP32_ACC");
+    const char* e = std::getenv("CPI_GEMM_FP32_ACC");
     return e && *e == '1';
   }();
   const bool fp16_acc = !force_fp32 && batch_size > 1 && output_type == CUDA_R_16F;
@@ -221,11 +221,11 @@ void linear_rowmajor_weight(cublasHandle_t handle, cublasLtHandle_t lt_handle,
 void require_tensor_bytes(const model::WeightLoader& weights, const std::string& name,
                           std::size_t expected_bytes) {
   if (!weights.has_tensor(name)) {
-    LLAMA_ENGINE_THROW("missing tensor: " + name);
+    CPI_THROW("missing tensor: " + name);
   }
   const std::size_t got = weights.tensor_bytes(name);
   if (got != expected_bytes) {
-    LLAMA_ENGINE_THROW("tensor size mismatch for " + name + ": expected " +
+    CPI_THROW("tensor size mismatch for " + name + ": expected " +
                        std::to_string(expected_bytes) + " bytes, got " + std::to_string(got) +
                        " bytes");
   }
@@ -246,7 +246,7 @@ void require_fp16_or_packed_lowbit_bytes(const model::WeightLoader& weights,
   const bool has_q8 = weights.has_tensor(q8name) && weights.has_tensor(sname);
   const bool has_q4 = weights.has_tensor(q4name) && weights.has_tensor(sname);
   if (!has_q8 && !has_q4) {
-    LLAMA_ENGINE_THROW("missing tensor: " + name + " (or packed int8/int4 alternative)");
+    CPI_THROW("missing tensor: " + name + " (or packed int8/int4 alternative)");
   }
   if (has_q8) {
     require_tensor_bytes(weights, q8name, expected_int8_bytes);
@@ -255,7 +255,7 @@ void require_fp16_or_packed_lowbit_bytes(const model::WeightLoader& weights,
   }
   const std::size_t got_scale = weights.tensor_bytes(sname);
   if (got_scale != sizeof(float) && got_scale != expected_scale_bytes) {
-    LLAMA_ENGINE_THROW("tensor size mismatch for " + sname + ": expected " +
+    CPI_THROW("tensor size mismatch for " + sname + ": expected " +
                        std::to_string(expected_scale_bytes) + " or " +
                        std::to_string(sizeof(float)) + " bytes, got " + std::to_string(got_scale) +
                        " bytes");
@@ -270,13 +270,13 @@ struct AttentionDims {
 
 int infer_mat_rows(const model::WeightLoader& weights, const std::string& name, int cols) {
   if (cols <= 0) {
-    LLAMA_ENGINE_THROW("invalid infer_mat_rows cols for tensor: " + name);
+    CPI_THROW("invalid infer_mat_rows cols for tensor: " + name);
   }
   if (weights.has_tensor(name)) {
     const std::size_t bytes = weights.tensor_bytes(name);
     const std::size_t row_bytes = static_cast<std::size_t>(cols) * sizeof(__half);
     if (row_bytes == 0 || (bytes % row_bytes) != 0) {
-      LLAMA_ENGINE_THROW("tensor size mismatch for " + name + ": not divisible by fp16 row bytes");
+      CPI_THROW("tensor size mismatch for " + name + ": not divisible by fp16 row bytes");
     }
     return static_cast<int>(bytes / row_bytes);
   }
@@ -285,7 +285,7 @@ int infer_mat_rows(const model::WeightLoader& weights, const std::string& name, 
     const std::size_t bytes = weights.tensor_bytes(q8name);
     const std::size_t row_bytes = static_cast<std::size_t>(cols);
     if (row_bytes == 0 || (bytes % row_bytes) != 0) {
-      LLAMA_ENGINE_THROW("tensor size mismatch for " + q8name +
+      CPI_THROW("tensor size mismatch for " + q8name +
                          ": not divisible by int8 row bytes");
     }
     return static_cast<int>(bytes / row_bytes);
@@ -296,40 +296,40 @@ int infer_mat_rows(const model::WeightLoader& weights, const std::string& name, 
     const std::size_t bytes = weights.tensor_bytes(q4name);
     const std::size_t row_bytes = static_cast<std::size_t>(packed_cols);
     if (row_bytes == 0 || (bytes % row_bytes) != 0) {
-      LLAMA_ENGINE_THROW("tensor size mismatch for " + q4name +
+      CPI_THROW("tensor size mismatch for " + q4name +
                          ": not divisible by int4 packed row bytes");
     }
     return static_cast<int>(bytes / row_bytes);
   }
-  LLAMA_ENGINE_THROW("missing tensor: " + name + " (or packed int8/int4 alternative)");
+  CPI_THROW("missing tensor: " + name + " (or packed int8/int4 alternative)");
 }
 
 AttentionDims infer_attention_dims(const model::WeightLoader& weights,
                                    const model::LlamaConfig& cfg) {
   if (cfg.num_heads <= 0 || cfg.num_kv_heads <= 0 || (cfg.num_heads % cfg.num_kv_heads) != 0) {
-    LLAMA_ENGINE_THROW("invalid attention head config in header");
+    CPI_THROW("invalid attention head config in header");
   }
   const int hidden = cfg.hidden_size;
   if (cfg.num_layers <= 0 || hidden <= 0) {
-    LLAMA_ENGINE_THROW("invalid model config in header");
+    CPI_THROW("invalid model config in header");
   }
   const std::string p = "layers.0";
   const int q_hidden = infer_mat_rows(weights, p + ".attention.wq", hidden);
   const int kv_hidden = infer_mat_rows(weights, p + ".attention.wk", hidden);
   const int vv_hidden = infer_mat_rows(weights, p + ".attention.wv", hidden);
   if (q_hidden <= 0 || (q_hidden % cfg.num_heads) != 0) {
-    LLAMA_ENGINE_THROW(
+    CPI_THROW(
         "invalid attention.wq shape: q_hidden must be positive and divisible by num_heads");
   }
   if (kv_hidden <= 0 || kv_hidden != vv_hidden) {
-    LLAMA_ENGINE_THROW("invalid attention.wk/wv shape: rows must be positive and equal");
+    CPI_THROW("invalid attention.wk/wv shape: rows must be positive and equal");
   }
   const int head_dim = q_hidden / cfg.num_heads;
   if (head_dim <= 0) {
-    LLAMA_ENGINE_THROW("invalid inferred attention head_dim");
+    CPI_THROW("invalid inferred attention head_dim");
   }
   if (kv_hidden != cfg.num_kv_heads * head_dim) {
-    LLAMA_ENGINE_THROW(
+    CPI_THROW(
         "invalid attention dims: wk rows must equal num_kv_heads * (wq_rows / num_heads)");
   }
   return AttentionDims{q_hidden, head_dim, kv_hidden};
@@ -340,7 +340,7 @@ void validate_tensor_layout(const model::WeightLoader& weights) {
   if (cfg.hidden_size <= 0 || cfg.intermediate_size <= 0 || cfg.vocab_size <= 0 ||
       cfg.num_layers <= 0 || cfg.num_heads <= 0 || cfg.num_kv_heads <= 0 ||
       cfg.num_heads % cfg.num_kv_heads != 0) {
-    LLAMA_ENGINE_THROW("invalid model config in header");
+    CPI_THROW("invalid model config in header");
   }
 
   const int hidden = cfg.hidden_size;
@@ -432,7 +432,7 @@ void validate_tensor_layout(const model::WeightLoader& weights) {
           static_cast<std::size_t>(inter) * sizeof(float));
     } else {
       if (moe_experts <= 0) {
-        LLAMA_ENGINE_THROW("invalid MoE config: num_local_experts must be > 0");
+        CPI_THROW("invalid MoE config: num_local_experts must be > 0");
       }
       require_fp16_or_packed_lowbit_bytes(
           weights, p + ".feed_forward.router",
@@ -468,7 +468,7 @@ void validate_tensor_layout(const model::WeightLoader& weights) {
   const bool has_tq3_codebook = weights.has_tensor("tq3_codebook");
   const bool has_tq3_signs = weights.has_tensor("tq3_signs_hidden");
   if (has_tq3_codebook != has_tq3_signs) {
-    LLAMA_ENGINE_THROW("incomplete TQ3 metadata: expected both tq3_codebook and tq3_signs_hidden");
+    CPI_THROW("incomplete TQ3 metadata: expected both tq3_codebook and tq3_signs_hidden");
   }
   if (has_tq3_codebook) {
     require_tensor_bytes(weights, "tq3_codebook", static_cast<std::size_t>(8) * sizeof(__half));
@@ -483,7 +483,7 @@ void validate_tensor_layout(const model::WeightLoader& weights) {
     std::memcpy(&objective, weights.tensor_data("tq_objective"), sizeof(std::int32_t));
     tq_objective = static_cast<int>(objective);
     if (tq_objective != 0 && tq_objective != 1) {
-      LLAMA_ENGINE_THROW("invalid tq_objective value: expected 0 (mse) or 1 (prod)");
+      CPI_THROW("invalid tq_objective value: expected 0 (mse) or 1 (prod)");
     }
   }
 
@@ -492,7 +492,7 @@ void validate_tensor_layout(const model::WeightLoader& weights) {
     if (!weights.has_tensor("tq_qjl_dim") || !weights.has_tensor("tq_qjl_seed") ||
         !weights.has_tensor("tq_qjl_indices_hidden") ||
         !weights.has_tensor("tq_qjl_signs_hidden")) {
-      LLAMA_ENGINE_THROW(
+      CPI_THROW(
           "incomplete Qprod metadata: expected "
           "tq_qjl_dim/tq_qjl_seed/tq_qjl_indices_hidden/tq_qjl_signs_hidden");
     }
@@ -502,7 +502,7 @@ void validate_tensor_layout(const model::WeightLoader& weights) {
     std::memcpy(&qjl_dim_i32, weights.tensor_data("tq_qjl_dim"), sizeof(std::int32_t));
     qjl_dim = static_cast<int>(qjl_dim_i32);
     if (qjl_dim <= 0 || qjl_dim > hidden) {
-      LLAMA_ENGINE_THROW("invalid tq_qjl_dim: expected in [1, hidden_size]");
+      CPI_THROW("invalid tq_qjl_dim: expected in [1, hidden_size]");
     }
     require_tensor_bytes(weights, "tq_qjl_indices_hidden",
                          static_cast<std::size_t>(qjl_dim) * sizeof(std::int32_t));
@@ -521,7 +521,7 @@ void validate_tensor_layout(const model::WeightLoader& weights) {
       return;
     }
     if (!has_packed || !has_scales) {
-      LLAMA_ENGINE_THROW("incomplete TQ3 tensor pair: expected both " + packed + " and " + scales);
+      CPI_THROW("incomplete TQ3 tensor pair: expected both " + packed + " and " + scales);
     }
     const std::size_t expected_packed =
         static_cast<std::size_t>(out_rows) * tq3_words_per_row * sizeof(std::uint32_t);
@@ -533,7 +533,7 @@ void validate_tensor_layout(const model::WeightLoader& weights) {
       const std::string residual_bits = base + ".tq3r";
       const std::string residual_scales = base + ".tq3rs";
       if (!weights.has_tensor(residual_bits) || !weights.has_tensor(residual_scales)) {
-        LLAMA_ENGINE_THROW("incomplete Qprod residual pair: expected both " + residual_bits +
+        CPI_THROW("incomplete Qprod residual pair: expected both " + residual_bits +
                            " and " + residual_scales);
       }
       const std::size_t expected_rbits =
@@ -1060,7 +1060,7 @@ void LlamaEngine::initialize(const EngineOptions& options) {
   run_startup_phase("validate", [&] { validate_tensor_layout(weights_); });
 
   if (options.max_batch != 1) {
-    LLAMA_ENGINE_THROW("only max_batch=1 is currently supported");
+    CPI_THROW("only max_batch=1 is currently supported");
   }
 
   const auto snap = runtime::collect_system_snapshot();
@@ -1080,7 +1080,7 @@ void LlamaEngine::initialize(const EngineOptions& options) {
     if (cfg.model_family == model::ModelFamily::Qwen3_5) {
       oss << " (Qwen3.5 metadata was detected successfully, but kernels are not implemented yet)";
     }
-    LLAMA_ENGINE_THROW(oss.str());
+    CPI_THROW(oss.str());
   }
   const AttentionDims attn_dims = infer_attention_dims(weights_, cfg);
   attn_q_hidden_ = attn_dims.q_hidden;
@@ -1179,7 +1179,7 @@ void LlamaEngine::initialize(const EngineOptions& options) {
   //
   // The cost is VRAM -- every prefill activation buffer scales with the chunk -- so size it from
   // a memory budget rather than a fixed constant, which would hurt small-VRAM GPUs.
-  int prefill_chunk_target = env_int_or_default("LLAMA_INFER_PREFILL_CHUNK_SIZE", 0);
+  int prefill_chunk_target = env_int_or_default("CPI_PREFILL_CHUNK_SIZE", 0);
   if (prefill_chunk_target <= 0) {
     const int kv_dim = cfg.num_kv_heads * (cfg.hidden_size / std::max(1, cfg.num_heads));
     // x, x_norm, att, out + q/k/v + the three ff buffers, fp16.
@@ -1203,7 +1203,7 @@ void LlamaEngine::initialize(const EngineOptions& options) {
     std::cout << "[engine] prefill_chunk=" << prefill_chunk_size_ << "\n";
   }
   lt_workspace_bytes_ =
-      env_workspace_bytes_or_default("LLAMA_INFER_LT_WORKSPACE_MB", lt_workspace_bytes_);
+      env_workspace_bytes_or_default("CPI_LT_WORKSPACE_MB", lt_workspace_bytes_);
   CUDA_CHECK(cudaStreamCreateWithFlags(&compute_stream_, cudaStreamNonBlocking));
   CUDA_CHECK(cudaStreamCreateWithFlags(&transfer_stream_, cudaStreamNonBlocking));
   for (auto& ev : streaming_ready_) {

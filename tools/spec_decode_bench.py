@@ -8,7 +8,7 @@ same harness-first discipline used for the decode-attention kernel work.
 
 Usage:
   python tools/spec_decode_bench.py \
-    --bin build/Release/llama_infer.exe \
+    --bin build/Release/cpi.exe \
     --target artifacts/hub/Qwen__Qwen2.5-7B-Instruct/Qwen2.5-7B-Instruct.ll2c \
     --draft  artifacts/hub/Qwen__Qwen2.5-0.5B-Instruct/Qwen2.5-0.5B-Instruct.ll2c \
     --tokenizer artifacts/hub/Qwen__Qwen2.5-7B-Instruct/hf/tokenizer.json \
@@ -45,7 +45,7 @@ SPEC = re.compile(r"accept_rate=([0-9.]+) tokens_per_round=([0-9.]+)")
 
 
 def run(bin_path, args, mutex):
-    env = dict(os.environ, LLAMA_INFER_INSTANCE_MUTEX=mutex)
+    env = dict(os.environ, CPI_INSTANCE_MUTEX=mutex)
     # Resolve the binary to an absolute path — a relative path is not reliably
     # found by subprocess on Windows.
     bin_path = os.path.abspath(bin_path)
@@ -58,7 +58,7 @@ def run(bin_path, args, mutex):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--bin", default="build/Release/llama_infer.exe")
+    ap.add_argument("--bin", default="build/Release/cpi.exe")
     ap.add_argument("--target", required=True)
     ap.add_argument("--draft", required=True)
     ap.add_argument("--tokenizer", required=True)

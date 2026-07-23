@@ -4,7 +4,7 @@
   "port": 3001,
 
   "inferBin": "",
-  "_inferBin_note": "Leave empty to auto-detect: build/Release/llama_infer.exe on Windows, build/llama_infer on Linux/macOS. Set explicitly if the binary is elsewhere.",
+  "_inferBin_note": "Leave empty to auto-detect: build/Release/cpi.exe on Windows, build/cpi on Linux/macOS. Set explicitly if the binary is elsewhere.",
 
   "modelDirs": [
     "../artifacts"

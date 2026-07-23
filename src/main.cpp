@@ -1,4 +1,4 @@
-// main.cpp - Command-line entry point for llama_infer.
+// main.cpp - Command-line entry point for cpi.
 //
 // Parses CLI arguments, configures tokenizer/prompt state, auto-selects the
 // execution engine, and dispatches runtime modes.
@@ -25,13 +25,13 @@
 // The image splicer is a template over the engine now (CUDA and Metal both use it), and its
 // header pulls in no backend types -- so it sits outside both guards.
 #include "app/image_prompt.hpp"
-#if LLAMA_ENGINE_HAS_CUDA
+#if CPI_HAS_CUDA
 #include "engine/plan_cuda_engine.hpp"
 #include "engine/llama4_cuda_engine.hpp"
 #include "engine/llama_engine.hpp"
 #include "engine/speculative_decoder.hpp"
 #endif
-#if LLAMA_ENGINE_ENABLE_METAL
+#if CPI_ENABLE_METAL
 #include "engine/plan_metal_engine.hpp"
 #include "engine/speculative_decoder.hpp"  // header-only template; harmless if CUDA already pulled it
 #include "model/image_preprocess.hpp"
@@ -58,7 +58,7 @@ using app::main_helpers::SingleInstanceGuard;
 
 namespace {
 
-#if LLAMA_ENGINE_HAS_CUDA
+#if CPI_HAS_CUDA
 
 // One image + a text question, end to end. The chat text carries a single `<|image|>`
 // placeholder; app::image_prompt::expand turns it into the real image span.
@@ -98,7 +98,7 @@ app::main_modes::GenerateMultimodalFn make_multimodal_fn(engine::PlanCudaEngine&
   };
 }
 
-#endif  // LLAMA_ENGINE_HAS_CUDA
+#endif  // CPI_HAS_CUDA
 
 // The fallback for every engine without a vision tower -- including all of them in a
 // CUDA-free build, where the overload above does not exist.
@@ -107,7 +107,7 @@ app::main_modes::GenerateMultimodalFn make_multimodal_fn(E&) {
   return nullptr;
 }
 
-#if LLAMA_ENGINE_ENABLE_METAL
+#if CPI_ENABLE_METAL
 // One image + a text question through the Metal Qwen3.5 tower, end to end. This is the CLI face
 // of the pipeline metal_vision_test gates: the tower, the splice, M-RoPE and the two-position
 // decode are all verified there against HuggingFace (MULTIMODAL_stream 8/8). What this adds is
@@ -284,6 +284,11 @@ int main(int argc, char** argv) {
   SetConsoleCP(CP_UTF8);
 #endif
 
+  // Backward-compat: the LLAMA_INFER_* environment variables were renamed to CPI_* in v0.2.0.
+  // Map any still-set old var onto its new name (unless the new one is already set) so existing
+  // .env files and scripts keep working, with a one-line deprecation notice.
+  app::main_cli::apply_legacy_env_aliases();
+
   // --version / --help are answered before anything else (no model, no instance lock), so they
   // work as plain informational commands.
 #ifndef CPI_VERSION
@@ -296,15 +301,15 @@ int main(int argc, char** argv) {
     const std::string a = argv[i];
     if (a == "--version" || a == "-V") {
       const char* backends =
-#if defined(LLAMA_ENGINE_HAS_CUDA) && LLAMA_ENGINE_HAS_CUDA
+#if defined(CPI_HAS_CUDA) && CPI_HAS_CUDA
           "cpu, cuda"
-#elif defined(LLAMA_ENGINE_HAS_METAL) && LLAMA_ENGINE_HAS_METAL
+#elif defined(CPI_HAS_METAL) && CPI_HAS_METAL
           "cpu, metal"
 #else
           "cpu"
 #endif
           ;
-      std::cout << "CPI (llama_infer) " CPI_VERSION " (" CPI_GIT_SHA ")\n"
+      std::cout << "cpi " CPI_VERSION " (" CPI_GIT_SHA ")\n"
                 << "backends: " << backends << "\n";
       return 0;
     }
@@ -316,7 +321,7 @@ int main(int argc, char** argv) {
 
   SingleInstanceGuard instance_guard;
   if (!instance_guard.acquire()) {
-    std::cerr << "Another llama_infer instance is already running.\n";
+    std::cerr << "Another cpi instance is already running.\n";
     return 3;
   }
 
@@ -459,7 +464,7 @@ int main(int argc, char** argv) {
     }
 
     // --- Engine initialization: auto-detect GPU, fall back to CPU ---
-#if LLAMA_ENGINE_HAS_CUDA
+#if CPI_HAS_CUDA
     int cuda_device_count = 0;
     cudaGetDeviceCount(&cuda_device_count);
 #else
@@ -468,7 +473,7 @@ int main(int argc, char** argv) {
     // Resolve the whole dispatch decision — model family (probe) + device
     // situation — into a single engine choice, replacing the former is_X/use_X
     // boolean tangle. (Gemma 4 without CUDA throws here, as before.)
-#if LLAMA_ENGINE_HAS_CUDA
+#if CPI_HAS_CUDA
     const bool cuda_available = cuda_device_count > 0;
 #else
     const bool cuda_available = false;
@@ -476,7 +481,7 @@ int main(int argc, char** argv) {
     // Apple Silicon: probe for a real Metal GPU (nil inside a GPU-less VM). Only matters when
     // there is no CUDA device -- Metal is the Mac's GPU fast path.
     bool metal_available = false;
-#if LLAMA_ENGINE_ENABLE_METAL
+#if CPI_ENABLE_METAL
     if (!cuda_available && !cli.force_cpu) {
       runtime::MetalContext mctx;
       metal_available = mctx.available();
@@ -517,7 +522,7 @@ int main(int argc, char** argv) {
           }
           break;
         case EngineChoice::LlamaCpu:
-#if LLAMA_ENGINE_HAS_CUDA
+#if CPI_HAS_CUDA
           std::cout << "[info] "
                     << (cli.force_cpu ? "CPU engine forced via --cpu flag."
                                       : "No CUDA device found.")
@@ -557,7 +562,7 @@ int main(int argc, char** argv) {
 
     auto run_with_engine = [&](auto& eng) {
       eng.initialize(cli.opts);
-#if LLAMA_ENGINE_HAS_CUDA
+#if CPI_HAS_CUDA
       if constexpr (std::is_same_v<std::decay_t<decltype(eng)>, engine::LlamaEngine>) {
         if (cli.parity_check) {
           // Pure gate: run the check and exit 0 (PASS) / 1 (FAIL) so a script/CI
@@ -587,7 +592,7 @@ int main(int argc, char** argv) {
           // Plain `return`: this block is inside a lambda, not main(). The Metal branch's
           // identical-looking `return 0` IS in main(). Getting these the same way round breaks
           // one compiler or the other, and each hides the other's error -- this one is behind
-          // #if LLAMA_ENGINE_HAS_CUDA, so a Mac build never sees it.
+          // #if CPI_HAS_CUDA, so a Mac build never sees it.
           return;
         }
       }
@@ -614,7 +619,7 @@ int main(int argc, char** argv) {
 
     using app::main_helpers::EngineChoice;
     switch (engine_choice) {
-#if LLAMA_ENGINE_HAS_CUDA
+#if CPI_HAS_CUDA
       // Gemma 4 and Qwen3.5 are both just op plans; the executor is the same.
       case EngineChoice::PlanCuda:
       case EngineChoice::Qwen35Cuda: {
@@ -642,7 +647,7 @@ int main(int argc, char** argv) {
         run_with_engine(llama4_cpu_eng);
         break;
       }
-#if LLAMA_ENGINE_ENABLE_METAL
+#if CPI_ENABLE_METAL
       // All three reach the same executor: Qwen3.5 and Gemma 4 are op plans like any other, and
       // the engine picks its builder from the container's family. The separate enum members exist
       // so the choice is recorded rather than inferred.
@@ -834,7 +839,7 @@ int main(int argc, char** argv) {
         run_with_engine(cpu_eng);
         break;
       }
-#if LLAMA_ENGINE_HAS_CUDA
+#if CPI_HAS_CUDA
       case EngineChoice::LlamaCuda: {
       if (!cli.draft_model_path.empty()) {
         // Speculative decoding: target (this model) + a small draft model that

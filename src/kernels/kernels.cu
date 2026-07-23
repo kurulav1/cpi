@@ -345,7 +345,7 @@ __global__ void rope_inplace_partial_table_kernel(half* q, half* k, int num_head
 
 // The device-position twin of rope_inplace_partial_table_kernel, byte-for-byte the same
 // arithmetic: only the position source differs. Keep the two in lockstep -- the graph gate
-// (graphs-on vs LLAMA_INFER_PLAN_NO_GRAPH streams must be token-identical) is what catches
+// (graphs-on vs CPI_PLAN_NO_GRAPH streams must be token-identical) is what catches
 // drift between them.
 // ---------------------------------------------------------------------------
 // Decode fusions (the kernel-count tax). At T=1 on this GPU every kernel costs ~11-14 us
@@ -1263,7 +1263,7 @@ void launch_rmsnorm(const half* x, const half* weight, half* y, int rows, int co
   // Fast path needs 128-bit alignment (cols % 8) and the row to fit in registers.
   constexpr int kThreads = 256;
   const bool legacy = [] {
-    const char* e = std::getenv("LLAMA_INFER_LEGACY_RMSNORM");
+    const char* e = std::getenv("CPI_LEGACY_RMSNORM");
     return e && *e == '1';
   }();
   if (!legacy && (cols % 8) == 0 && (cols / 8) <= kThreads * 8) {
@@ -1418,9 +1418,9 @@ void launch_attention_prefill(const half* q, const half* k_cache, const half* v_
   const dim3 grid(num_heads, num_tokens);
   // Fallback kernel: only reached when the engine's tensor-core prefill path is unavailable
   // (unsupported geometry, or a per-token `limits` / sliding `window` mask, which only this
-  // kernel implements). LLAMA_INFER_PREFILL_WARPS overrides the block width.
+  // kernel implements). CPI_PREFILL_WARPS overrides the block width.
   static const int env_warps = [] {
-    const char* e = std::getenv("LLAMA_INFER_PREFILL_WARPS");
+    const char* e = std::getenv("CPI_PREFILL_WARPS");
     return e ? atoi(e) : 0;
   }();
   if (head_dim > 0 && (head_dim % 2) == 0 && head_dim <= 256) {

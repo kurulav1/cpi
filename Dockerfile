@@ -35,7 +35,7 @@ COPY src ./src
 ARG CUDA_ARCHS="75-real;80-real;86-real;89-real;90-real;90-virtual"
 RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
-    && cmake --build build -j"$(nproc)" --target llama_infer
+    && cmake --build build -j"$(nproc)" --target cpi
 
 FROM node:22-bullseye-slim AS node-runtime
 
@@ -57,10 +57,10 @@ RUN npm install --omit=dev
 COPY web/server ./server
 COPY web/.env.example ./.env.example
 COPY --from=web-build /app/web/dist ./dist
-COPY --from=engine-build /app/build/llama_infer /app/bin/llama_infer
+COPY --from=engine-build /app/build/cpi /app/bin/cpi
 
 ENV PORT=3001 \
-    LLAMA_INFER_BIN=/app/bin/llama_infer \
+    CPI_BIN=/app/bin/cpi \
     LLAMA_MODEL_DIRS=/models \
     LLAMA_MODEL_PATH=/models/model.ll2c \
     LLAMA_TOKENIZER_PATH=/models/tokenizer.json \

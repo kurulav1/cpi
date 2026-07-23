@@ -89,7 +89,7 @@ void LlamaEngine::enforce_host_resource_limits(const char* stage) {
         << "% (limit=" << options_.max_cpu_percent << "%)"
         << " mem=" << sampled_memory_percent_ << "% (limit=" << options_.max_memory_percent << "%)"
         << " sustained_ms=" << over_ms;
-    LLAMA_ENGINE_THROW(oss.str());
+    CPI_THROW(oss.str());
   }
 
   const int throttle_ms = std::max(0, options_.resource_throttle_sleep_ms);
@@ -112,7 +112,7 @@ void LlamaEngine::check_tq_cached_init_timeout(const std::chrono::steady_clock::
   std::ostringstream oss;
   oss << "TurboQuant cached init timeout at layer=" << layer_index << " elapsed_ms=" << elapsed_ms
       << " limit_ms=" << options_.tq_cached_init_timeout_ms;
-  LLAMA_ENGINE_THROW(oss.str());
+  CPI_THROW(oss.str());
 }
 
 void LlamaEngine::load_static_weights() {
@@ -120,7 +120,7 @@ void LlamaEngine::load_static_weights() {
 
   const std::string emb_name = "tok_embeddings.weight";
   if (!weights_.has_tensor(emb_name)) {
-    LLAMA_ENGINE_THROW("missing tensor: " + emb_name);
+    CPI_THROW("missing tensor: " + emb_name);
   }
   const std::size_t emb_bytes = weights_.tensor_bytes(emb_name);
   CUDA_CHECK(cudaMalloc(&d_tok_embeddings_, emb_bytes));
@@ -129,7 +129,7 @@ void LlamaEngine::load_static_weights() {
 
   const std::string norm_name = "norm.weight";
   if (!weights_.has_tensor(norm_name)) {
-    LLAMA_ENGINE_THROW("missing tensor: " + norm_name);
+    CPI_THROW("missing tensor: " + norm_name);
   }
   const std::size_t norm_bytes = weights_.tensor_bytes(norm_name);
   CUDA_CHECK(cudaMalloc(&d_norm_out_, norm_bytes));
@@ -154,11 +154,11 @@ void LlamaEngine::load_static_weights() {
   // token, so it does NOT go through the dp4a path that would also quantize the activation.
   //
   // Row-wise scales: one per vocabulary row, so a few loud rows cannot squash the rest.
-  // LLAMA_INFER_FP16_LM_HEAD=1 keeps the LM head in fp16 even under --weight-quant. This is
+  // CPI_FP16_LM_HEAD=1 keeps the LM head in fp16 even under --weight-quant. This is
   // the ONE change in the engine that alters model output (quantization error lands directly in
   // the logits), so it needs an A/B switch for the perplexity gate.
   const bool force_fp16_lm_head = [] {
-    const char* e = std::getenv("LLAMA_INFER_FP16_LM_HEAD");
+    const char* e = std::getenv("CPI_FP16_LM_HEAD");
     return e && *e == '1';
   }();
   if (lowbit_streaming_enabled(options_) && !force_fp16_lm_head) {
@@ -221,7 +221,7 @@ void LlamaEngine::load_static_weights() {
       std::memcpy(&qjl_dim_i32, weights_.tensor_data("tq_qjl_dim"), sizeof(std::int32_t));
       tq_qjl_dim_ = static_cast<int>(qjl_dim_i32);
       if (tq_qjl_dim_ <= 0 || tq_qjl_dim_ > cfg.hidden_size) {
-        LLAMA_ENGINE_THROW("invalid tq_qjl_dim in model metadata");
+        CPI_THROW("invalid tq_qjl_dim in model metadata");
       }
       tq_qjl_words_ = (tq_qjl_dim_ + 31) / 32;
       const std::size_t qjl_idx_bytes =
@@ -238,11 +238,11 @@ void LlamaEngine::load_static_weights() {
 
     const std::string requested_mode = options_.tq_mode.empty() ? "auto" : options_.tq_mode;
     if (requested_mode != "auto" && requested_mode != "mse" && requested_mode != "prod") {
-      LLAMA_ENGINE_THROW("invalid tq_mode option: expected auto|mse|prod");
+      CPI_THROW("invalid tq_mode option: expected auto|mse|prod");
     }
     if (requested_mode == "prod") {
       if (!has_qjl_meta) {
-        LLAMA_ENGINE_THROW("--tq-mode=prod requested but Qprod metadata is missing from model");
+        CPI_THROW("--tq-mode=prod requested but Qprod metadata is missing from model");
       }
       tq_prod_enabled_ = true;
     } else if (requested_mode == "mse") {
@@ -273,7 +273,7 @@ void LlamaEngine::allocate_runtime_buffers() {
   const int ffn_inter = (expert_inter > inter) ? expert_inter : inter;
   kv_int4_enabled_ = options_.kv_cache_int4;
   if (kv_int4_enabled_ && options_.paged_kv_cache) {
-    LLAMA_ENGINE_THROW("kv_cache_int4 and paged_kv_cache are mutually exclusive");
+    CPI_THROW("kv_cache_int4 and paged_kv_cache are mutually exclusive");
   }
   const int head_dim = attn_head_dim_ > 0 ? attn_head_dim_ : (cfg.hidden_size / cfg.num_heads);
   const int kv_hidden = attn_kv_hidden_ > 0 ? attn_kv_hidden_ : (cfg.num_kv_heads * head_dim);
@@ -345,7 +345,7 @@ void LlamaEngine::allocate_runtime_buffers() {
   kv_capacity_tokens_ = options_.max_context;
   if (options_.paged_blocks) {
     const int bs = options_.paged_block_size > 0 ? options_.paged_block_size : 32;
-    if (const char* ov = std::getenv("LLAMA_INFER_KV_POOL_TOKENS")) {
+    if (const char* ov = std::getenv("CPI_KV_POOL_TOKENS")) {
       const int req = std::atoi(ov);
       if (req > kv_capacity_tokens_) kv_capacity_tokens_ = req;
     } else {

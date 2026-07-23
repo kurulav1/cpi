@@ -4,7 +4,7 @@ info:
   version: 0.1.0
   description: |
     HTTP API for CPI (Cross-Platform Inference) — the Node server in `web/` that fronts the
-    `llama_infer` engine. Two namespaces:
+    `cpi` engine. Two namespaces:
 
     - **`/api/*`** — CPI-native endpoints: inference, model management (Hugging Face download +
       quantization), health. Error envelope: `{ "error": "<message>" }`.

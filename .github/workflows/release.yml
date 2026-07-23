@@ -24,22 +24,22 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            asset: llama_infer-linux-x64-cpu
-            bin: build/llama_infer
+            asset: cpi-linux-x64-cpu
+            bin: build/cpi
           - os: windows-latest
-            asset: llama_infer-windows-x64-cpu
-            bin: build/Release/llama_infer.exe
+            asset: cpi-windows-x64-cpu
+            bin: build/Release/cpi.exe
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - name: Configure (CPU-only)
         run: >
           cmake -S . -B build
-          -DLLAMA_ENGINE_ENABLE_CUDA=OFF
-          -DLLAMA_ENGINE_ENABLE_SENTENCEPIECE=OFF
+          -DCPI_ENABLE_CUDA=OFF
+          -DCPI_ENABLE_SENTENCEPIECE=OFF
           -DCMAKE_BUILD_TYPE=Release
-      - name: Build llama_infer
-        run: cmake --build build --config Release --target llama_infer -j
+      - name: Build cpi
+        run: cmake --build build --config Release --target cpi -j
       - name: Stage package
         shell: bash
         run: |
@@ -68,18 +68,18 @@ jobs:
     # and the macOS asset is attached only when the runner build succeeds.
     continue-on-error: true
     env:
-      ASSET: llama_infer-macos-arm64-metal
+      ASSET: cpi-macos-arm64-metal
     steps:
       - uses: actions/checkout@v4
       - name: Configure (Metal, CUDA off)
         run: >
           cmake -S . -B build
-          -DLLAMA_ENGINE_ENABLE_CUDA=OFF
-          -DLLAMA_ENGINE_ENABLE_METAL=ON
-          -DLLAMA_ENGINE_ENABLE_SENTENCEPIECE=OFF
+          -DCPI_ENABLE_CUDA=OFF
+          -DCPI_ENABLE_METAL=ON
+          -DCPI_ENABLE_SENTENCEPIECE=OFF
           -DCMAKE_BUILD_TYPE=Release
-      - name: Build llama_infer
-        run: cmake --build build --config Release --target llama_infer -j
+      - name: Build cpi
+        run: cmake --build build --config Release --target cpi -j
       - name: Stage package
         shell: bash
         run: |
@@ -87,7 +87,7 @@ jobs:
           # alongside the binary and a launcher points CPI_METAL_SOURCE at them. Running the
           # bare binary also works if CPI_METAL_SOURCE is set by hand.
           mkdir -p "pkg/$ASSET/metal"
-          cp build/llama_infer "pkg/$ASSET/"
+          cp build/cpi "pkg/$ASSET/"
           cp src/kernels/metal/*.metal "pkg/$ASSET/metal/"
           cp README.md LICENSE NOTICE "pkg/$ASSET/" 2>/dev/null || true
           cat > "pkg/$ASSET/run.sh" <<'EOF'
@@ -95,9 +95,9 @@ jobs:
           # Launcher: resolve the bundle dir, point the Metal backend at the shipped shaders.
           DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
           export CPI_METAL_SOURCE="$DIR/metal"
-          exec "$DIR/llama_infer" "$@"
+          exec "$DIR/cpi" "$@"
           EOF
-          chmod +x "pkg/$ASSET/run.sh" "pkg/$ASSET/llama_infer"
+          chmod +x "pkg/$ASSET/run.sh" "pkg/$ASSET/cpi"
       - name: Archive
         shell: bash
         run: |
@@ -127,15 +127,15 @@ jobs:
           body: |
             ## CPI ${{ github.event.inputs.tag || github.ref_name }}
 
-            Prebuilt `llama_infer` binaries:
+            Prebuilt `cpi` binaries:
 
             | Asset | Platform | Backend |
             |---|---|---|
-            | `llama_infer-linux-x64-cpu` | Linux x64 | CPU |
-            | `llama_infer-windows-x64-cpu` | Windows x64 | CPU |
-            | `llama_infer-macos-arm64-metal` | macOS (Apple Silicon) | Metal GPU + CPU |
+            | `cpi-linux-x64-cpu` | Linux x64 | CPU |
+            | `cpi-windows-x64-cpu` | Windows x64 | CPU |
+            | `cpi-macos-arm64-metal` | macOS (Apple Silicon) | Metal GPU + CPU |
 
-            Verify a build with `llama_infer --version`.
+            Verify a build with `cpi --version`.
 
             ### macOS (Metal)
             The macOS asset is attached only when the hosted CI runner could build it; its Xcode
@@ -149,7 +149,7 @@ jobs:
             ./run.sh model.cpi --tokenizer tokenizer.json --prompt "..." --weight-quant int4
             ```
 
-            (or run `llama_infer` directly with `CPI_METAL_SOURCE=./metal` set). First launch
+            (or run `cpi` directly with `CPI_METAL_SOURCE=./metal` set). First launch
             may prompt Gatekeeper on an unsigned binary — allow it in System Settings › Privacy.
 
             ### GPU (CUDA) builds

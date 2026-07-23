@@ -26,8 +26,8 @@ namespace app::main_helpers {
 namespace {
 
 constexpr const char* kDefaultSystemPrompt = "You are a concise helpful assistant.";
-constexpr const char* kDefaultSingleInstanceMutex = "Local\\llama_infer_single_instance";
-constexpr const char* kDefaultSingleInstanceLockPath = "/tmp/llama_infer_single_instance.lock";
+constexpr const char* kDefaultSingleInstanceMutex = "Local\\cpi_single_instance";
+constexpr const char* kDefaultSingleInstanceLockPath = "/tmp/cpi_single_instance.lock";
 
 std::string env_or_default_string(const char* env_key, const char* fallback) {
 #ifdef _WIN32
@@ -165,7 +165,7 @@ SingleInstanceGuard::~SingleInstanceGuard() {
 bool SingleInstanceGuard::acquire() {
 #ifdef _WIN32
   const std::string mutex_name =
-      env_or_default_string("LLAMA_INFER_INSTANCE_MUTEX", kDefaultSingleInstanceMutex);
+      env_or_default_string("CPI_INSTANCE_MUTEX", kDefaultSingleInstanceMutex);
   mutex_ = CreateMutexA(nullptr, FALSE, mutex_name.c_str());
   if (!mutex_) {
     return false;
@@ -177,7 +177,7 @@ bool SingleInstanceGuard::acquire() {
   return true;
 #else
   const std::string lock_path =
-      env_or_default_string("LLAMA_INFER_LOCK_PATH", kDefaultSingleInstanceLockPath);
+      env_or_default_string("CPI_LOCK_PATH", kDefaultSingleInstanceLockPath);
   fd_ = open(lock_path.c_str(), O_CREAT | O_RDWR, 0644);
   if (fd_ < 0) {
     return false;

@@ -122,7 +122,7 @@ void LlamaEngine::forward_token(int token, int position, bool compute_logits,
 bool LlamaEngine::prefill_tc_prepare(int rows, int base_pos, int num_heads, int num_kv_heads,
                                      int head_dim) {
   static const bool legacy = [] {
-    const char* e = std::getenv("LLAMA_INFER_LEGACY_PREFILL_ATTN");
+    const char* e = std::getenv("CPI_LEGACY_PREFILL_ATTN");
     return e && *e == '1';
   }();
   if (legacy || rows <= 0 || num_kv_heads <= 0 || head_dim <= 0 ||

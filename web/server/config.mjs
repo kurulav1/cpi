@@ -2,6 +2,28 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+// Backward-compat: the server's env vars were renamed to CPI_* (LLAMA_INFER_X -> CPI_X, and the
+// bare LLAMA_X web vars -> CPI_X). Map any still-set old var onto its new name (unless the new one
+// is already set) before anything reads process.env, so existing web/.env files keep working.
+(function migrateLegacyEnv() {
+  const moved = [];
+  for (const key of Object.keys(process.env)) {
+    let next = null;
+    if (key.startsWith("LLAMA_INFER_")) next = "CPI_" + key.slice("LLAMA_INFER_".length);
+    else if (key.startsWith("LLAMA_")) next = "CPI_" + key.slice("LLAMA_".length);
+    if (next && process.env[next] === undefined) {
+      process.env[next] = process.env[key];
+      moved.push(key);
+    }
+  }
+  if (moved.length) {
+    console.error(
+      `[cpi] note: ${moved.length} deprecated LLAMA_* env var(s) mapped to CPI_* ` +
+        `(${moved.join(", ")}); rename them to CPI_* to silence this.`,
+    );
+  }
+})();
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const webRoot = path.resolve(__dirname, "..");
@@ -261,9 +283,9 @@ function splitPathList(rawValue) {
 
 function defaultBinaryPath() {
   if (process.platform === "win32") {
-    return path.resolve(repoRoot, "build", "Release", "llama_infer.exe");
+    return path.resolve(repoRoot, "build", "Release", "cpi.exe");
   }
-  return path.resolve(repoRoot, "build", "llama_infer");
+  return path.resolve(repoRoot, "build", "cpi");
 }
 
 function normalizeKey(value) {
@@ -1182,8 +1204,8 @@ function scoreTokenizerCandidate(modelPath, tokenizerPath) {
 function chooseTokenizer(modelPath, tokenizerCandidates, preferredTokenizerPath) {
   if (preferredTokenizerPath && fs.existsSync(preferredTokenizerPath)) {
     // Honor an explicitly-configured tokenizer only when it plausibly belongs to
-    // this model. Otherwise (e.g. LLAMA_TOKENIZER_PATH left pointing at the default
-    // model's tokenizer while LLAMA_MODEL_PATH names a different-family model) it
+    // this model. Otherwise (e.g. CPI_TOKENIZER_PATH left pointing at the default
+    // model's tokenizer while CPI_MODEL_PATH names a different-family model) it
     // would force the wrong chat template + stop tokens onto the model — which
     // silently breaks stopping (the model runs to max_new and spills special-token
     // text). In that case fall through to scoring the co-located candidates.
@@ -1367,7 +1389,7 @@ export const NON_BATCH_FAMILIES = new Set(["qwen3_5", "llama4", "cpt_gpt", "gemm
 
 // Can this MODEL ever use continuous batching? Request-level reasons to fall back to
 // single-flight (thinking, images, runtime quant) are checked separately.
-// Which GPU backend llama_infer will pick. The server had NO notion of this -- the only
+// Which GPU backend cpi will pick. The server had NO notion of this -- the only
 // platform test in it was `process.platform === "win32"` -- so every backend-specific rule was
 // written for CUDA and silently applied to Apple Silicon as well.
 //
@@ -1431,7 +1453,7 @@ function buildProfile(modelPath, tokenizerPath, baseConfig, source = "discovered
   const ropeTheta = inferRopeTheta(modelPath, modelConfig);
   const unsupportedReason = inferUnsupportedArchitecture(modelConfig);
 
-  // Native safetensors directories use llama_infer; CPT GPT exports use a
+  // Native safetensors directories use cpi; CPT GPT exports use a
   // lightweight Python worker until the native engine grows this architecture.
   const isSafetensorsDir = isSafetensorsModelDir(modelPath);
   const supportsCptGpt = isSafetensorsDir && family === "cpt_gpt";
@@ -1543,7 +1565,7 @@ function publicModelProfile(profile) {
 function discoverModelProfiles(baseConfig) {
   const preferredModelDir = getPreferredModelDir();
   const scanRoots = uniquePaths([
-    ...splitPathList(process.env.LLAMA_MODEL_DIRS || FILE_CONFIG.modelDirs || ""),
+    ...splitPathList(process.env.CPI_MODEL_DIRS || FILE_CONFIG.modelDirs || ""),
     ensureDirectory(preferredModelDir),
     ensureDirectory(baseConfig.modelPath),
     ensureDirectory(baseConfig.tokenizerPath),
@@ -1631,19 +1653,19 @@ function chooseSelectedProfile(profiles, configuredModelPath) {
 
 export function getRuntimeConfig() {
   const inferBin = resolveExistingPath(
-    pick("LLAMA_INFER_BIN", "inferBin", ""),
+    pick("CPI_BIN", "inferBin", ""),
     defaultBinaryPath()
   );
   const configuredModelPath = resolveExistingPath(
-    pick("LLAMA_MODEL_PATH", "modelPath", "")
+    pick("CPI_MODEL_PATH", "modelPath", "")
   );
   const configuredTokenizerPath = resolveExistingPath(
-    pick("LLAMA_TOKENIZER_PATH", "tokenizerPath", "")
+    pick("CPI_TOKENIZER_PATH", "tokenizerPath", "")
   );
-  const explicitTemplateRaw = pickRaw("LLAMA_CHAT_TEMPLATE", "chatTemplate");
+  const explicitTemplateRaw = pickRaw("CPI_CHAT_TEMPLATE", "chatTemplate");
   const hasExplicitTemplate = explicitTemplateRaw !== undefined && explicitTemplateRaw !== "";
   const explicitTemplate = hasExplicitTemplate ? explicitTemplateRaw : "";
-  const explicitSystemPromptRaw = pickRaw("LLAMA_SYSTEM_PROMPT", "systemPrompt");
+  const explicitSystemPromptRaw = pickRaw("CPI_SYSTEM_PROMPT", "systemPrompt");
   const hasExplicitSystemPrompt = explicitSystemPromptRaw !== undefined;
   const explicitSystemPrompt = hasExplicitSystemPrompt ? explicitSystemPromptRaw : "";
   const template = hasExplicitTemplate
@@ -1659,7 +1681,7 @@ export function getRuntimeConfig() {
     tokenizerPath: configuredTokenizerPath,
     template,
     forceCpu: readBoolSetting(
-      "LLAMA_FORCE_CPU",
+      "CPI_FORCE_CPU",
       "forceCpu",
       DEFAULT_RUNTIME.forceCpu
     ),
@@ -1667,74 +1689,74 @@ export function getRuntimeConfig() {
       ? explicitSystemPrompt
       : DEFAULT_RUNTIME.systemPrompt,
     maxNewTokens: readIntSetting(
-      "LLAMA_MAX_NEW",
+      "CPI_MAX_NEW",
       "maxNewTokens",
       DEFAULT_RUNTIME.maxNewTokens,
       32
     ),
     maxContext: readIntSetting(
-      "LLAMA_MAX_CONTEXT",
+      "CPI_MAX_CONTEXT",
       "maxContext",
       DEFAULT_RUNTIME.maxContext,
       128
     ),
     temperature: readFloatSetting(
-      "LLAMA_TEMPERATURE",
+      "CPI_TEMPERATURE",
       "temperature",
       DEFAULT_RUNTIME.temperature,
       0
     ),
-    topK: readIntSetting("LLAMA_TOP_K", "topK", DEFAULT_RUNTIME.topK, 0),
-    topP: readFloatSetting("LLAMA_TOP_P", "topP", DEFAULT_RUNTIME.topP, 0, 1),
+    topK: readIntSetting("CPI_TOP_K", "topK", DEFAULT_RUNTIME.topK, 0),
+    topP: readFloatSetting("CPI_TOP_P", "topP", DEFAULT_RUNTIME.topP, 0, 1),
     repeatPenalty: readFloatSetting(
-      "LLAMA_REPEAT_PENALTY",
+      "CPI_REPEAT_PENALTY",
       "repeatPenalty",
       DEFAULT_RUNTIME.repeatPenalty,
       1
     ),
     maxCpuPercent: readFloatSetting(
-      "LLAMA_MAX_CPU_PERCENT",
+      "CPI_MAX_CPU_PERCENT",
       "maxCpuPercent",
       DEFAULT_RUNTIME.maxCpuPercent,
       1,
       100
     ),
     maxMemoryPercent: readFloatSetting(
-      "LLAMA_MAX_MEMORY_PERCENT",
+      "CPI_MAX_MEMORY_PERCENT",
       "maxMemoryPercent",
       DEFAULT_RUNTIME.maxMemoryPercent,
       1,
       100
     ),
     resourceSampleMs: readIntSetting(
-      "LLAMA_RESOURCE_SAMPLE_MS",
+      "CPI_RESOURCE_SAMPLE_MS",
       "resourceSampleMs",
       DEFAULT_RUNTIME.resourceSampleMs,
       0
     ),
     resourceSustainMs: readIntSetting(
-      "LLAMA_RESOURCE_SUSTAIN_MS",
+      "CPI_RESOURCE_SUSTAIN_MS",
       "resourceSustainMs",
       DEFAULT_RUNTIME.resourceSustainMs,
       1
     ),
     resourceThrottleMs: readIntSetting(
-      "LLAMA_RESOURCE_THROTTLE_MS",
+      "CPI_RESOURCE_THROTTLE_MS",
       "resourceThrottleMs",
       DEFAULT_RUNTIME.resourceThrottleMs,
       0
     ),
     extraArgs: splitArgs(
-      pick("LLAMA_EXTRA_ARGS", "extraArgs", DEFAULT_RUNTIME.extraArgs)
+      pick("CPI_EXTRA_ARGS", "extraArgs", DEFAULT_RUNTIME.extraArgs)
     ),
     // Speculative decoding (off unless a draft model is configured). The path is
     // resolved like the other model paths; the worker only enables it when the
     // file exists (see buildInteractiveLaunchArgs).
     draftModel: resolveExistingPath(
-      pick("LLAMA_DRAFT_MODEL", "draftModel", DEFAULT_RUNTIME.draftModel)
+      pick("CPI_DRAFT_MODEL", "draftModel", DEFAULT_RUNTIME.draftModel)
     ),
     specTokens: readIntSetting(
-      "LLAMA_SPEC_TOKENS",
+      "CPI_SPEC_TOKENS",
       "specTokens",
       DEFAULT_RUNTIME.specTokens,
       1,

@@ -76,7 +76,7 @@ public:
     int pos = static_cast<int>(prompt_tokens.size()) - 1;  // position of `last`
     int last = prompt_tokens.back();                       // token consumed at `pos`
     bool stop = false;
-    const bool tree_probe_ = std::getenv("LLAMA_INFER_SPEC_TREE_PROBE") != nullptr;
+    const bool tree_probe_ = std::getenv("CPI_SPEC_TREE_PROBE") != nullptr;
     const std::vector<int> empty_history_;  // pure greedy: no repetition history
 
     auto emit = [&](int token) -> bool {
@@ -96,7 +96,7 @@ public:
       const int K = k_;
 
       // 1. Draft K tokens greedily. When the tree-opportunity probe is on
-      //    (LLAMA_INFER_SPEC_TREE_PROBE), also record each position's SECOND choice
+      //    (CPI_SPEC_TREE_PROBE), also record each position's SECOND choice
       //    via the slower host-logits path; production uses the fast argmax graph.
       std::vector<int> draft_tokens;
       std::vector<int> draft2;

@@ -1,4 +1,4 @@
-// Continuous-batching client for the llama_infer --interactive-batch worker.
+// Continuous-batching client for the cpi --interactive-batch worker.
 //
 // The default chat path (index.mjs) is single-flight: one request occupies the
 // worker at a time. This module instead multiplexes many concurrent requests
@@ -29,7 +29,7 @@ export function toBatchArgs(interactiveArgs) {
   return args;
 }
 
-// Create a batch worker around a spawned llama_infer --interactive-batch process.
+// Create a batch worker around a spawned cpi --interactive-batch process.
 // Returns { submit, activeCount, close }.
 export function createBatchWorker({ bin, args, env, cwd, onReadyError }) {
   const child = spawn(bin, args, { stdio: ["pipe", "pipe", "pipe"], env: env ?? process.env, cwd });
@@ -177,12 +177,12 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     process.exit(2);
   }
   const bin = process.platform === "win32"
-    ? "build/Release/llama_infer.exe"
-    : "build/llama_infer";
+    ? "build/Release/cpi.exe"
+    : "build/cpi";
   const args = toBatchArgs([
     model, "--tokenizer", tokenizer, "--max-context", "512", "--interactive", "--web"
   ]);
-  const env = { ...process.env, LLAMA_INFER_INSTANCE_MUTEX: "Local\\llama_infer_batch_selftest" };
+  const env = { ...process.env, CPI_INSTANCE_MUTEX: "Local\\cpi_batch_selftest" };
   const worker = createBatchWorker({ bin, args, env });
 
   const prompts = [

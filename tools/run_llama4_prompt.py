@@ -26,7 +26,7 @@ def build_prompt(system_prompt: str, user_prompt: str) -> str:
 def extract_output_tokens(stdout: str) -> list[int]:
     match = re.search(r"Output tokens:(.*)", stdout)
     if not match:
-        raise RuntimeError("llama_infer did not print an output token line")
+        raise RuntimeError("cpi did not print an output token line")
     token_text = match.group(1).strip()
     if not token_text:
         return []
@@ -35,11 +35,11 @@ def extract_output_tokens(stdout: str) -> list[int]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Run a Llama4 chat prompt through llama_infer using the HF tokenizer.json locally."
+        description="Run a Llama4 chat prompt through cpi using the HF tokenizer.json locally."
     )
     parser.add_argument("model_dir")
     parser.add_argument("prompt")
-    parser.add_argument("--binary", default=str(Path("build") / "Release" / "llama_infer.exe"))
+    parser.add_argument("--binary", default=str(Path("build") / "Release" / "cpi.exe"))
     parser.add_argument("--system-prompt", default="You are a concise helpful assistant.")
     parser.add_argument("--max-new", type=int, default=64)
     parser.add_argument("--temp", type=float, default=0.0)
