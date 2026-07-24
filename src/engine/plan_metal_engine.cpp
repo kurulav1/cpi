@@ -724,6 +724,16 @@ public:
   }
 
   void set_quant(int bits, int group) override {
+    // The quantized GEMV kernels walk a row 32 lanes at a time and assume a scale group never
+    // straddles two of those steps, so a group that is not a multiple of 32 reads the wrong
+    // scale for part of every row. It does not crash or look obviously wrong -- with
+    // --quant-group 16 the model still emits fluent-looking text while perplexity goes from
+    // 21.8 to 52435. Refuse it rather than let a silently-wrong number be measured.
+    if (group != 0 && group % 32 != 0) {
+      throw std::runtime_error("quant group must be a multiple of 32 (got " +
+                               std::to_string(group) + "): the GEMV kernels read one scale per " +
+                               "32-lane step, so a smaller group is silently miscomputed");
+    }
     bits_ = bits;
     group_ = group;
   }
@@ -1414,8 +1424,15 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
     // uses the blocked GEMM per op. The fused kernel routes each output row to its matrix.
     if (op.kind == OpKind::Gemv && op.qbits != 0 && T < kGemmMinTokens) {
       auto is_qgemv = [&](std::size_t j, opplan::Slot out) {
+        // The fused kernels take ONE bits/group for every matrix they concatenate (QGluParams
+        // carries a single pair), so siblings quantized at different widths must NOT fuse: the
+        // wider one's bytes would be decoded at the first op's width. That cannot happen under a
+        // uniform --weight-quant, which is why the check was never needed, but per-tensor schemes
+        // (CPI_METAL_PROMOTE_MB) mix widths within one q/k/v group and it produced pure garbage --
+        // perplexity 9e6 against a healthy 21.8.
         return j < ops.size() && ops[j].kind == OpKind::Gemv && ops[j].qbits != 0 &&
-               ops[j].out == out && ops[j].in == op.in;
+               ops[j].qbits == op.qbits && ops[j].qgroup == op.qgroup && ops[j].out == out &&
+               ops[j].in == op.in;
       };
       const bool qkv = op.out == opplan::Slot::Q && is_qgemv(oi + 1, opplan::Slot::K) &&
                        is_qgemv(oi + 2, opplan::Slot::V);
