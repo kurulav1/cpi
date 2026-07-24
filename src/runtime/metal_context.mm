@@ -16,6 +16,8 @@
 
 #include "runtime/metal_context.hpp"
 
+#include <mach-o/dyld.h>
+
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -126,7 +128,31 @@ bool MetalContext::load_library(const std::string& path_hint) {
     NSString* p = [NSString stringWithUTF8String:path.c_str()];
     lib = [dev newLibraryWithURL:[NSURL fileURLWithPath:p] error:&err];
   } else {
-    lib = [dev newDefaultLibrary];
+    // newDefaultLibrary only ever finds a metallib EMBEDDED IN A BUNDLE. These are plain
+    // CLI executables, so it returns nil even when cpi_kernels.metallib is sitting right
+    // next to the binary -- which made an installed copy unrunnable unless the user also
+    // had the MSL sources and set CPI_METAL_SOURCE. Look beside the executable first.
+    char exe[4096];
+    std::uint32_t exe_len = sizeof(exe);
+    if (_NSGetExecutablePath(exe, &exe_len) == 0) {
+      std::string dir(exe);
+      const std::size_t slash = dir.find_last_of('/');
+      dir = (slash == std::string::npos) ? std::string(".") : dir.substr(0, slash);
+      const std::string candidates[] = {
+          dir + "/cpi_kernels.metallib",
+          dir + "/../lib/cpi_kernels.metallib",       // install prefix: bin/ + lib/
+          dir + "/../Resources/cpi_kernels.metallib",  // .app bundle layout
+      };
+      for (const std::string& c : candidates) {
+        NSString* p = [NSString stringWithUTF8String:c.c_str()];
+        if (![[NSFileManager defaultManager] fileExistsAtPath:p]) continue;
+        NSError* cerr = nil;
+        lib = [dev newLibraryWithURL:[NSURL fileURLWithPath:p] error:&cerr];
+        if (lib != nil) break;
+        if (err == nil) err = cerr;  // keep the first real load error for the message
+      }
+    }
+    if (lib == nil) lib = [dev newDefaultLibrary];
   }
 
   if (lib == nil) {
