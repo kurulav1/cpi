@@ -47,6 +47,9 @@ struct NormParams {
   uint has_weight;     // 0 => weightless (ones)
 };
 
+// Widest head_dim any kernel stages in threadgroup memory (Gemma 4 runs 256/512).
+#define ATTN_MAX_HEAD_DIM 512
+
 // Fused per-head RMSNorm + RoPE (see cpi_rmsnorm_rope). Carries both ops' fields; MUST mirror
 // NormRopeParams in plan_metal_engine.cpp.
 struct NormRopeParams {

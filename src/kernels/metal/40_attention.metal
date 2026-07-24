@@ -6,7 +6,8 @@
 //
 // Cost is 2 arrays * ATTN_MAX_HEAD_DIM floats per threadgroup: 4 KB at 512, up from 2 KB. Well
 // inside the 32 KB budget, but it is OCCUPANCY that pays -- so this is measured, not assumed.
-#define ATTN_MAX_HEAD_DIM 512
+// ATTN_MAX_HEAD_DIM now lives in 00_common.metal: 10_dense.metal's fused RMSNorm+RoPE stages a
+// head with it too, and that file is concatenated BEFORE this one.
 // Query-block size of cpi_attention_prefill_wide, the head_dim > 256 variant of the scalar
 // prefill kernel. The main kernel's q_sh/acc are Q_BLOCK * 256 floats and cannot be raised to
 // ATTN_MAX_HEAD_DIM at Q_BLOCK 8: that is 2 * 16 KB against a 32 KB threadgroup budget.
