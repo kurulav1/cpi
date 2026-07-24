@@ -101,6 +101,10 @@ struct EmbedParams {
   std::uint32_t hidden, tokens;
 };
 
+struct EmbedQuantParams {
+  std::uint32_t hidden, tokens, bits, group;
+};
+
 // fp16 -> fp32, for the host-side quantizer. The weights are raw fp16 bytes in the
 // mmap; nothing else in this file needs to interpret them.
 //
@@ -511,6 +515,17 @@ public:
   //   scale = group_max_abs / 7   (7 = int4's max level; 127 for int8), floored at 1e-8
   //   q     = round(w / scale), clamped to [-8, 7]
   //   nibble = q < 0 ? q + 16 : q, packed low-then-high within each byte
+  // The Metal executor has cpi_embedding_lookup_quant, so it can gather from a packed row.
+  // CPI_METAL_QUANT_EMBED=0 keeps the tables fp16 -- the A/B for quality questions, and the
+  // bisection lever if a model ever looks wrong only under quantization.
+  bool quantize_embeddings() const override {
+    static const bool on = [] {
+      const char* e = std::getenv("CPI_METAL_QUANT_EMBED");
+      return e == nullptr || e[0] != '0';
+    }();
+    return bits_ != 0 && on;
+  }
+
   opplan::QuantWeight quant(const std::string& name, int out_dim, int in_dim) const override {
     if (bits_ == 0 || !wl_.has_tensor(name)) return {};
 
@@ -1373,6 +1388,17 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
     switch (op.kind) {
       case OpKind::EmbeddingLookup: {
         EmbedParams p{static_cast<std::uint32_t>(op.cols), static_cast<std::uint32_t>(T)};
+        if (op.qbits != 0) {
+          EmbedQuantParams qp{static_cast<std::uint32_t>(op.cols), static_cast<std::uint32_t>(T),
+                              static_cast<std::uint32_t>(op.qbits),
+                              static_cast<std::uint32_t>(op.qgroup)};
+          const void* qtb = tokens_in_seq_buf_ ? seq_tok_buf_.handle() : tok_buf_.handle();
+          const void* qbufs[] = {op.qweight, op.qscales, qtb, slot(op.out)};
+          ctx_.dispatch("cpi_embedding_lookup_quant", G::Threads,
+                        static_cast<std::size_t>(op.cols) * static_cast<std::size_t>(T), kTG, qbufs,
+                        nullptr, 4, &qp, sizeof(qp));
+          break;
+        }
         // WHICH BUFFER THE CALLER STAGED INTO, not how many tokens there are. These are not the
         // same question: a recurrent model prefills in chunks of exactly one token, which still
         // arrive in the sequence buffer. Keying this off `T > 1` made such a chunk read tok_buf_,

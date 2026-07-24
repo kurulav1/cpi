@@ -56,6 +56,13 @@ public:
     return {};
   }
 
+  // May the builder quantize EMBEDDING TABLES too, not just projections? Separate from quant()
+  // because it needs a backend that can gather from a packed row, and only the Metal executor
+  // has that kernel -- a backend whose EmbeddingLookup reads fp16 unconditionally would get a
+  // packed table and silently produce garbage. Default no: the fp16 path is what every existing
+  // backend implements.
+  virtual bool quantize_embeddings() const { return false; }
+
   // HOST value of a one-element tensor. The vision builder needs the clip BOUNDS as numbers
   // (they go into Op::clip_*, not into a buffer binding), and only the backend knows how to
   // read bytes out of its container. Default throws: a builder that needs scalars on a backend

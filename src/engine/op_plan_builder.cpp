@@ -60,6 +60,36 @@ Op add_inplace(Slot in) {
   return o;
 }
 
+// One place that decides how an embedding table is STORED, for all three builders.
+//
+// A backend that can gather from a packed row takes the quantized table; everything else keeps
+// the fp16 handle it always had. This is the largest single weight in some models and used to be
+// exempt from --weight-quant entirely: Gemma 4 E2B's embed_tokens_per_layer is
+// [vocab 262144][35 layers x 256] and stayed fp16 at 4.70 GB, which is most of why E2B took
+// 6.57 GB against llama.cpp Q4_0's 2.83.
+//
+// A TIED head costs nothing extra here: WeightSource::quant caches by tensor name, so the packed
+// copy the LmHead already asked for is the same buffer -- and the fp16 one, which fp16() only
+// materialises on demand, now never gets allocated at all.
+Op make_embed(const WeightSource& w, const std::string& name, Slot out, int cols, int vocab) {
+  Op o;
+  o.kind = OpKind::EmbeddingLookup;
+  o.out = out;
+  o.cols = cols;
+  if (w.quantize_embeddings() && vocab > 0) {
+    const QuantWeight q = w.quant(name, vocab, cols);
+    if (q.bits != 0) {
+      o.qweight = q.packed;
+      o.qscales = q.scales;
+      o.qbits = q.bits;
+      o.qgroup = q.group;
+      return o;
+    }
+  }
+  o.weight = w.fp16(name);
+  return o;
+}
+
 }  // namespace
 
 ModelPlan build_llama_plan(const LlamaGeometry& g, const WeightSource& w) {
@@ -78,12 +108,8 @@ ModelPlan build_llama_plan(const LlamaGeometry& g, const WeightSource& w) {
 
   // ---- prologue: token id -> embeddings -----------------------------------
   {
-    Op o;
-    o.kind = OpKind::EmbeddingLookup;
-    o.out = Slot::X;
-    o.weight = w.fp16("tok_embeddings.weight");
-    o.cols = g.hidden;
-    plan.prologue.push_back(o);
+    plan.prologue.push_back(
+        make_embed(w, "tok_embeddings.weight", Slot::X, g.hidden, g.vocab));
 
     if (g.scale_embeddings) {
       Op s;
@@ -312,12 +338,7 @@ ModelPlan build_qwen35_plan(const Qwen35Geometry& g, const WeightSource& w) {
   const int lin_conv_dim = lin_k_dim * 2 + lin_v_dim;  // in_proj_qkv emits q|k|v back to back
 
   {
-    Op e;
-    e.kind = OpKind::EmbeddingLookup;
-    e.out = Slot::X;
-    e.cols = H;
-    e.weight = w.fp16("tok_embeddings.weight");
-    plan.prologue.push_back(e);
+    plan.prologue.push_back(make_embed(w, "tok_embeddings.weight", Slot::X, H, g.vocab));
   }
   // Embeddings are final here (no scale, no PLE); multimodal prefill splices at this index.
   // Every builder must set this: an unset (0) embed_ready puts the splice before the lookup,
@@ -584,12 +605,7 @@ ModelPlan build_gemma4_plan(const Gemma4Geometry& g, const WeightSource& w) {
     return o;
   };
   auto embed = [&](const std::string& name, Slot out, int dim) {
-    Op o;
-    o.kind = OpKind::EmbeddingLookup;
-    o.out = out;
-    o.cols = dim;
-    o.weight = w.fp16(name);
-    return o;
+    return make_embed(w, name, out, dim, g.vocab);
   };
 
   // ── prologue: token -> embeddings (+ scale, and the PLE build when present) ──

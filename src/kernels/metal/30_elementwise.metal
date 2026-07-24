@@ -187,6 +187,47 @@ kernel void cpi_embedding_lookup(
   out[gid] = table[(ulong)tok * (ulong)p.hidden + i];
 }
 
+// Embedding lookup from a QUANTIZED table. Same gather, dequantizing as it reads.
+//
+// Worth it because an embedding table is the one weight quantization used to skip, and on
+// Gemma 4 it is most of the model: embed_tokens_per_layer is [vocab 262144][35 layers x 256]
+// and stayed fp16 at 4.70 GB under --weight-quant int4, which is why E2B took 6.57 GB against
+// llama.cpp Q4_0's 2.83. The row is gathered, not multiplied, so the dequant is a scalar
+// multiply per element -- the kernel stays trivially bandwidth-bound, on a quarter the bytes.
+//
+// Layout is the shared one (see WeightSource::quant): int4 packed two per byte low-then-high,
+// two's-complement decoded as (n ^ 8) - 8; int8 plain; fp16 scales, one per `group` elements
+// of the row, or one per row when group == 0.
+kernel void cpi_embedding_lookup_quant(
+    device const uchar* table  [[buffer(0)]],
+    device const half*  scales [[buffer(1)]],
+    device const int*   tokens [[buffer(2)]],
+    device half*        out    [[buffer(3)]],
+    constant EmbedQuantParams& p [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]) {
+  const uint total = p.hidden * p.tokens;
+  if (gid >= total) return;
+  const uint t = gid / p.hidden;
+  const uint i = gid % p.hidden;
+  const int tok = tokens[t];
+
+  const uint gsz = (p.group > 0u) ? p.group : p.hidden;
+  const uint groups = (p.hidden + gsz - 1u) / gsz;
+  const float sc = float(scales[(ulong)tok * (ulong)groups + i / gsz]);
+
+  float w;
+  if (p.bits == 4u) {
+    // Two values per byte: element i lives in byte i/2, low nibble for even i.
+    const ulong row = (ulong)tok * (ulong)((p.hidden + 1u) / 2u);
+    const uchar byte = table[row + (i >> 1u)];
+    const uchar nib = (i & 1u) ? (byte >> 4u) : (byte & 0x0Fu);
+    w = float(int(nib ^ 0x08u) - 8);
+  } else {
+    w = float(as_type<char>(table[(ulong)tok * (ulong)p.hidden + i]));
+  }
+  out[gid] = half(w * sc);
+}
+
 // ---------------------------------------------------------------------------
 // KV store: append this token's K and V to the layer's cache at `position`.
 // Cache layout [max_context][kv_heads * head_dim], matching the CUDA side.

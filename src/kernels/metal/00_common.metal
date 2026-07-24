@@ -175,6 +175,13 @@ struct EmbedParams {
   uint tokens;
 };
 
+struct EmbedQuantParams {
+  uint hidden;
+  uint tokens;
+  uint bits;   // 4 or 8
+  uint group;  // scale granularity along the row; 0 = one scale per row
+};
+
 // ---------------------------------------------------------------------------
 // RMSNorm -- one threadgroup per row. x is cached in registers only when it
 // fits; otherwise re-read. Reduction is fp32 in threadgroup memory.
