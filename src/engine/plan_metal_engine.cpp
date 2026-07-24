@@ -248,8 +248,14 @@ constexpr int kDecTG = 64;
 // 512 / 1024 / 2048, so it climbs well past "one threadgroup per core" and then flattens. Far
 // more threadgroups than the GPU has cores is the point -- each one is a short serial walk, and
 // oversubscribing is what hides its latency.
-constexpr int kAttnSplitTargetGroups = 512;
-constexpr int kAttnSplitMaxChunks = 64;
+// Chunk-count target for split-KV decode attention. Was 512, which caps chunks at
+// 512/heads (36 for a 14-head model) -- below what the key count supports at depth, so a deep
+// decode left the GPU under-filled. Raising it is +4.2% median at depth ~2862 (171.8 -> 179.0
+// tok/s, non-overlapping ranges) with no shallow regression; the split still degenerates to one
+// chunk when the depth cannot support more. Measured optimum: keep the 64-key block (smaller
+// blocks add per-chunk merge overhead faster than they add parallelism) and raise the caps.
+constexpr int kAttnSplitTargetGroups = 2048;
+constexpr int kAttnSplitMaxChunks = 128;
 constexpr int kArgmaxParts = 256;
 constexpr int kGemvTile = 8;  // MUST match GEMV_TILE in cpi_kernels.metal
 
