@@ -1058,11 +1058,88 @@ kernel void cpi_lm_head_quant(
   const uint simds_per_tg = nthr / 32u;
   const uint simd_id      = lid / 32u;
   const uint lane         = lid % 32u;
+  const uint gsz = (p.group == 0u) ? p.in_dim : p.group;
+
+  // The head is the biggest single read of a quantized decode step (vocab x hidden), and this
+  // kernel had BOTH known GEMV mistakes at once: 32-bit weight loads with a scalar per-nibble
+  // decode (the "narrow-load mistake" that cost ~40% in cpi_gemv_quant), and one row per
+  // simdgroup, re-reading the activation once per vocab row. This is the wide-load + four-rows
+  // shape from cpi_gemv_quant with fp32 outputs; the executor passes 64-thread threadgroups
+  // under the same predicate (in_dim % 32 == 0, group % 32 == 0).
+  if ((p.in_dim & 31u) == 0u && (gsz & 31u) == 0u) {
+    const uint r0 = (gid * simds_per_tg + simd_id) * 4u;
+    if (r0 >= p.out_dim) return;
+    const uint nrows = min(4u, p.out_dim - r0);
+    float acc4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const uint n32 = p.in_dim >> 5;
+    if (p.bits == 4u) {
+      for (uint k = lane; k < n32; k += 32u) {
+        const uint j0 = k << 5;
+        device const half4* x4 = (device const half4*)(in + j0);
+        float4 xev[4], xod[4];
+        for (uint w = 0u; w < 4u; ++w) {
+          const half4 xa = x4[2u * w];
+          const half4 xb = x4[2u * w + 1u];
+          xev[w] = float4(float(xa.x), float(xa.z), float(xb.x), float(xb.z));
+          xod[w] = float4(float(xa.y), float(xa.w), float(xb.y), float(xb.w));
+        }
+        for (uint r = 0u; r < nrows; ++r) {
+          const uint rr = r0 + r;
+          device const uint4* w128 =
+              (device const uint4*)(qw + (ulong)rr * (ulong)(p.in_dim >> 1));
+          const uint4 packed = w128[k];
+          const float sc = (scales + (ulong)rr * (ulong)p.groups)[j0 / gsz];
+          float sub = 0.0f;
+          for (uint w = 0u; w < 4u; ++w) {
+            const uint word =
+                (w == 0u) ? packed.x : (w == 1u) ? packed.y : (w == 2u) ? packed.z : packed.w;
+            const char4 lo = as_type<char4>((word & 0x0F0F0F0Fu) ^ 0x08080808u) - char4(8);
+            const char4 hi = as_type<char4>(((word >> 4u) & 0x0F0F0F0Fu) ^ 0x08080808u) - char4(8);
+            sub += dot(float4(lo), xev[w]) + dot(float4(hi), xod[w]);
+          }
+          acc4[r] += sub * sc;
+        }
+      }
+    } else {
+      for (uint k = lane; k < n32; k += 32u) {
+        const uint j0 = k << 5;
+        device const half4* x4 = (device const half4*)(in + j0);
+        float4 xv[8];
+        for (uint w = 0u; w < 8u; ++w) {
+          const half4 h = x4[w];
+          xv[w] = float4(float(h.x), float(h.y), float(h.z), float(h.w));
+        }
+        for (uint r = 0u; r < nrows; ++r) {
+          const uint rr = r0 + r;
+          device const uint4* w128 = (device const uint4*)(qw + (ulong)rr * (ulong)p.in_dim);
+          const uint4 pa = w128[2u * k];
+          const uint4 pb = w128[2u * k + 1u];
+          const float sc = (scales + (ulong)rr * (ulong)p.groups)[j0 / gsz];
+          float sub = 0.0f;
+          for (uint w = 0u; w < 8u; ++w) {
+            uint word;
+            if (w < 4u) {
+              word = (w == 0u) ? pa.x : (w == 1u) ? pa.y : (w == 2u) ? pa.z : pa.w;
+            } else {
+              word = (w == 4u) ? pb.x : (w == 5u) ? pb.y : (w == 6u) ? pb.z : pb.w;
+            }
+            sub += dot(float4(as_type<char4>(word)), xv[w]);
+          }
+          acc4[r] += sub * sc;
+        }
+      }
+    }
+    for (uint r = 0u; r < nrows; ++r) {
+      const float s = simd_sum(acc4[r]);
+      if (lane == 0u) out[r0 + r] = s;
+    }
+    return;
+  }
+
   const uint row = gid * simds_per_tg + simd_id;
   if (row >= p.out_dim) return;
 
   device const half* srow = scales + (ulong)row * (ulong)p.groups;
-  const uint gsz = (p.group == 0u) ? p.in_dim : p.group;
   float acc = 0.0f;
 
   if (p.bits == 4u) {

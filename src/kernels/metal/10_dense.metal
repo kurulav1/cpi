@@ -145,6 +145,36 @@ kernel void cpi_gemv_f16(
   // reads the weights once, so prefill traffic drops by up to TILE-fold.
   //
   // Decode is TILE=1 and behaves exactly as before.
+  // Four-rows-per-simdgroup DECODE path: one simdgroup owns four consecutive rows and the
+  // activation is loaded once for all of them. An fp16 square GEMV is half activation
+  // re-reads by traffic on the one-row shape (row = in_dim halfs, activation = in_dim halfs),
+  // so this cuts total traffic up to 1.6x. The executor passes 64-thread threadgroups under
+  // the SAME predicate (tokens == 1, in_dim % 8 == 0) -- keep them in lockstep.
+  if (p.tokens == 1u && (p.in_dim & 7u) == 0u) {
+    const uint r0 = (gid * simds_per_tg + simd_id) * 4u;
+    if (r0 >= p.out_dim) return;
+    const uint nrows = min(4u, p.out_dim - r0);
+    float acc4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    device const uint4* x4 = (device const uint4*)in;
+    const uint n4 = p.in_dim >> 3;
+    for (uint k = lane; k < n4; k += 32u) {
+      const uint4 xv = x4[k];  // read once, dotted against four weight rows
+      for (uint r = 0u; r < nrows; ++r) {
+        device const uint4* w4 = (device const uint4*)(W + (ulong)(r0 + r) * (ulong)p.in_dim);
+        acc4[r] += dot8_f32(w4[k], xv);
+      }
+    }
+    for (uint r = 0u; r < nrows; ++r) {
+      const float s = simd_sum(acc4[r]);
+      if (lane == 0u) {
+        float v = s;
+        if (p.has_bias != 0u) v += float(bias[r0 + r]);
+        out[r0 + r] = half(v);
+      }
+    }
+    return;
+  }
+
   const uint rows_per_tg = simds_per_tg;
   const uint row_blocks  = (p.out_dim + rows_per_tg - 1u) / rows_per_tg;
 
@@ -203,29 +233,40 @@ kernel void cpi_lm_head(
   const uint simds_per_tg = nthr / 32u;
   const uint simd_id      = lid / 32u;
   const uint lane         = lid % 32u;
+
+  // The LM head is the biggest single read of a decode step (vocab x hidden), so the load
+  // width matters most here -- and so does the four-rows-per-simdgroup shape: the head is
+  // always a single token, and one-row-per-simdgroup re-reads the whole activation once per
+  // vocab row. Executor passes 64-thread threadgroups under the same predicate.
+  if ((p.in_dim & 7u) == 0u) {
+    const uint r0 = (gid * simds_per_tg + simd_id) * 4u;
+    if (r0 >= p.out_dim) return;
+    const uint nrows = min(4u, p.out_dim - r0);
+    float acc4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    device const uint4* x4 = (device const uint4*)in;
+    const uint n4 = p.in_dim >> 3;
+    for (uint k = lane; k < n4; k += 32u) {
+      const uint4 xv = x4[k];
+      for (uint r = 0u; r < nrows; ++r) {
+        device const uint4* w4 = (device const uint4*)(W + (ulong)(r0 + r) * (ulong)p.in_dim);
+        acc4[r] += dot8_f32(w4[k], xv);
+      }
+    }
+    for (uint r = 0u; r < nrows; ++r) {
+      const float s = simd_sum(acc4[r]);
+      if (lane == 0u) out[r0 + r] = s;
+    }
+    return;
+  }
+
   const uint row = gid * simds_per_tg + simd_id;
   if (row >= p.out_dim) return;
 
   device const half* wrow = W + (ulong)row * (ulong)p.in_dim;
-
-  // The LM head is the biggest single read of a decode step (vocab x hidden), so the
-  // load width matters most here.
   float acc = 0.0f;
-  uint i = 0u;
-
-  if ((p.in_dim & 7u) == 0u) {
-    device const uint4* w4 = (device const uint4*)wrow;
-    device const uint4* x4 = (device const uint4*)in;
-    const uint n4 = p.in_dim >> 3;
-    for (uint k = lane; k < n4; k += 32u) {
-      acc += dot8_f32(w4[k], x4[k]);
-    }
-    i = n4 << 3;
-  }
-  for (uint k = i + lane; k < p.in_dim; k += 32u) {
+  for (uint k = lane; k < p.in_dim; k += 32u) {
     acc += float(wrow[k]) * float(in[k]);
   }
-
   acc = simd_sum(acc);
   if (lane == 0u) out[row] = acc;
 }

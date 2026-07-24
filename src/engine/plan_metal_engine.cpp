@@ -1552,9 +1552,12 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
               static_cast<std::size_t>(gemm_tokens) * static_cast<std::size_t>(op.cols) * 2,
               static_cast<std::size_t>(op.bias_offset) * sizeof(std::uint16_t)};
           const std::size_t tiles = static_cast<std::size_t>((rest + kGemvTile - 1) / kGemvTile);
+          // Four-rows-per-simdgroup decode shape (see cpi_gemv_f16): same rows-per-threadgroup,
+          // 64 threads instead of 256; predicate mirrored in the shader.
+          const bool f16_nr4 = rest == 1 && (op.in_dim % 8) == 0;
           ctx_.dispatch("cpi_gemv_f16", G::Groups,
-                        groups_for_rows(static_cast<std::size_t>(op.cols)) * tiles, kTG, bufs,
-                        roffs, 4, &p, sizeof(p));
+                        groups_for_rows(static_cast<std::size_t>(op.cols)) * tiles,
+                        f16_nr4 ? 64 : kTG, bufs, roffs, 4, &p, sizeof(p));
         }
         if (clip_out) {
           struct ClampParams {
@@ -1570,6 +1573,13 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
         break;
       }
       case OpKind::LmHead: {
+        // Four-rows-per-simdgroup head shape: the head kernels derive their row mapping from
+        // this same predicate -- keep engine and shader in lockstep (see cpi_lm_head_quant).
+        const int head_gsz = (op.qgroup > 0) ? op.qgroup : op.in_dim;
+        const bool head_nr4 = op.qbits != 0
+                                  ? ((op.in_dim % 32) == 0 && (head_gsz % 32) == 0)
+                                  : ((op.in_dim % 8) == 0);
+        const std::size_t head_tg = head_nr4 ? 64 : kTG;
         // Batched decode needs logits for EVERY row -- each row is a different sequence's
         // next token. One vocab GEMV per row: the rows are independent, so this is a GEMM's
         // worth of work either way. A paged PREFILL takes the last-row path below instead
@@ -1593,7 +1603,7 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
                                     op.qscales};
               const std::size_t offs[] = {0, in_off, out_off, 0};
               ctx_.dispatch("cpi_lm_head_quant", G::Groups,
-                            groups_for_rows(static_cast<std::size_t>(op.cols)), kTG, bufs, offs, 4,
+                            groups_for_rows(static_cast<std::size_t>(op.cols)), head_tg, bufs, offs, 4,
                             &p, sizeof(p));
             } else {
               GemvParams p{static_cast<std::uint32_t>(op.cols),
@@ -1601,7 +1611,7 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
               const void* bufs[] = {op.weight, slot(op.in), batch_logits_buf_.handle()};
               const std::size_t offs[] = {0, in_off, out_off};
               ctx_.dispatch("cpi_lm_head", G::Groups,
-                            groups_for_rows(static_cast<std::size_t>(op.cols)), kTG, bufs, offs, 3,
+                            groups_for_rows(static_cast<std::size_t>(op.cols)), head_tg, bufs, offs, 3,
                             &p, sizeof(p));
             }
           }
@@ -1632,7 +1642,7 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
                                     op.qscales};
               const std::size_t offs[] = {0, in_off, out_off, 0};
               ctx_.dispatch("cpi_lm_head_quant", G::Groups,
-                            groups_for_rows(static_cast<std::size_t>(op.cols)), kTG, bufs, offs, 4,
+                            groups_for_rows(static_cast<std::size_t>(op.cols)), head_tg, bufs, offs, 4,
                             &p, sizeof(p));
             } else {
               GemvParams p{static_cast<std::uint32_t>(op.cols),
@@ -1640,7 +1650,7 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
               const void* bufs[] = {op.weight, slot(op.in), batch_logits_buf_.handle()};
               const std::size_t offs[] = {0, in_off, out_off};
               ctx_.dispatch("cpi_lm_head", G::Groups,
-                            groups_for_rows(static_cast<std::size_t>(op.cols)), kTG, bufs, offs, 3,
+                            groups_for_rows(static_cast<std::size_t>(op.cols)), head_tg, bufs, offs, 3,
                             &p, sizeof(p));
             }
           }
@@ -1659,7 +1669,7 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
           const std::size_t offs[] = {
               0, static_cast<std::size_t>(T - 1) * static_cast<std::size_t>(op.in_dim) * 2, 0, 0};
           ctx_.dispatch("cpi_lm_head_quant", G::Groups,
-                        groups_for_rows(static_cast<std::size_t>(op.cols)), kTG, bufs, offs, 4, &p,
+                        groups_for_rows(static_cast<std::size_t>(op.cols)), head_tg, bufs, offs, 4, &p,
                         sizeof(p));
           break;
         }
@@ -1671,7 +1681,7 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
         const std::size_t offs[] = {
             0, static_cast<std::size_t>(T - 1) * static_cast<std::size_t>(op.in_dim) * 2, 0};
         ctx_.dispatch("cpi_lm_head", G::Groups, groups_for_rows(static_cast<std::size_t>(op.cols)),
-                      kTG, bufs, offs, 3, &p, sizeof(p));
+                      head_tg, bufs, offs, 3, &p, sizeof(p));
         break;
       }
       case OpKind::Rope: {
