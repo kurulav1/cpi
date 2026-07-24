@@ -230,7 +230,13 @@ inline bool simdgroup_layout_matches(runtime::MetalContext& ctx) {
 // walk is a serial loop in an idle machine. Splitting the keys across threadgroups costs a
 // second pass to merge them, which is why it is not worth it on a short context: below this
 // many keys the single-threadgroup kernel already wins.
-constexpr int kAttnSplitMinKeys = 256;
+// Split from the second key block onward. This was 256 on the assumption that the merge pass
+// costs more than it saves below that depth; measured on an M4 the opposite holds -- the
+// single-threadgroup-per-head kernel leaves a 10-core GPU running `heads` threadgroups, and
+// splitting from 64 keys up was +15% whole-model decode on a 0.5B at depth ~100 (+5% fp16).
+// Below 64 keys the block rounding yields one chunk and the split path degenerates to the
+// plain kernel's shape anyway.
+constexpr int kAttnSplitMinKeys = 64;
 // MUST match DEC_KEY_BLOCK / DEC_TG in cpi_kernels.metal. The decode split kernel runs a NARROW
 // threadgroup -- one thread per key, so the width has to match the keys in flight, not the 256
 // the rest of the file uses.
