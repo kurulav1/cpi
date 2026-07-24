@@ -1151,17 +1151,15 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
         return static_cast<std::size_t>(H);
     }
   };
-  // How many tokens a prefill chunk may hold. This is the single biggest lever on prefill
-  // speed, because a GEMM's efficiency climbs with its token count: on an M4 this model's
-  // projections run at 0.69 TFLOP/s over 28 tokens and 2.96 over 512, so a chunk that spills a
-  // short remainder pays for it twice over. Bigger is simply better -- one 635-token chunk beats
-  // 512+123 by 10% -- and the only thing stopping us is the slots, which is why the budget is
-  // what gets bounded here and not some round token count. (512 used to be that round number,
-  // picked for being "a few MB".)
+  // How many tokens a prefill chunk may hold -- the biggest lever on prefill speed, since GEMM
+  // efficiency climbs with token count (M4, this model's projections: 0.69 TFLOP/s over 28 tokens,
+  // 2.96 over 512), so a short remainder chunk is paid for twice. Bigger is better (a 635-token
+  // chunk beats 512+123 by 10%); the slots are the only limit, so the budget is bounded here
+  // rather than at a round token count.
   //
-  // Slots cost max_prefill * (every slot's width summed) * 2 bytes: ~37 KB per token for a 0.5B,
-  // ~123 KB for an 8B, so the cap only binds on the big models -- which is the point, since
-  // those are the ones that would otherwise quietly take hundreds of MB.
+  // Slots cost max_prefill * (summed slot widths) * 2 bytes: ~37 KB per token for a 0.5B, ~123 KB
+  // for an 8B, so the cap only binds on the big models -- the ones that would otherwise take
+  // hundreds of MB.
   std::size_t slot_bytes_per_token = 0;
   for (int i = 0; i < static_cast<int>(opplan::Slot::Count); ++i) {
     slot_bytes_per_token += slot_elems(static_cast<opplan::Slot>(i)) * sizeof(std::uint16_t);

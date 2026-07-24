@@ -1215,17 +1215,12 @@ __global__ void softmax_causal_rows_kernel(half* s, int chunk_stride, int keys, 
 
 // Builds the pointer arrays for the tensor-core prefill attention's batched GEMMs, ON DEVICE.
 //
-// These used to be built on the host into a pinned buffer and cudaMemcpyAsync'd. That is a
-// RACE: prefill_attention_tensorcore runs once per LAYER, so layer L+1 overwrote the staging
-// buffer while layer L's async copy was still in flight, and layer L's GEMMs could pick up
-// layer L+1's K/V pointers. It produced DIFFERENT LOGITS ON EVERY RUN.
-//
-// (It hid at first because the staging buffer was a pageable std::vector, and a pageable
-// cudaMemcpyAsync is effectively synchronous. "Optimising" it to pinned memory made the copy
-// genuinely async and exposed the bug that had been there all along.)
-//
-// Building them in a kernel on the compute stream makes the ordering structural: the pointers
-// cannot be written late or early relative to the GEMMs that consume them.
+// Building them in a kernel on the compute stream makes the ordering structural, so the pointers
+// cannot be written late or early relative to the GEMMs that consume them. A host build into a
+// pinned buffer, cudaMemcpyAsync'd, races: prefill_attention_tensorcore runs once per layer, so
+// layer L+1 overwrites the staging buffer while layer L's async copy is still in flight -- giving
+// different logits on every run. (A pageable staging vector hides it, being effectively
+// synchronous; pinning the buffer exposes it.)
 __global__ void build_attention_ptrs_kernel(const half* k_layer, const half* v_layer,
                                             const half* q, half* scores, half* out, void** ptrs,
                                             int num_heads, int group, int head_dim, int kchunk,

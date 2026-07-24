@@ -1,7 +1,5 @@
 // BERT-family embedding encoder -- the two kernels the rest of the tower does NOT already have.
-//
-// Porting src/engine/bert_embedder.cu to Metal turned out to be mostly assembly rather than
-// kernel work, because the Qwen3.5 vision tower already needed the same shapes:
+// The rest maps onto kernels the Qwen3.5 vision tower already needed:
 //
 //   CUDA embed_kernel          -> cpi_bert_embed          (here)
 //   CUDA layernorm_kernel      -> cpi_layernorm + cpi_add_inplace for the residual
@@ -9,9 +7,6 @@
 //   CUDA gelu_kernel           -> cpi_gelu_erf  (see the note below -- NOT cpi_gelu)
 //   CUDA attention_kernel      -> cpi_attention_bidirectional, written for the vision tower
 //   CUDA pool_normalize_kernel -> cpi_bert_pool_normalize (here)
-//
-// So this file is small on purpose. Anything that looked like it needed a new kernel was checked
-// against the existing set first.
 
 #include <metal_stdlib>
 using namespace metal;
