@@ -1277,6 +1277,21 @@ kernel void cpi_attention_decode_split(
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
+  // V-accumulate work split. Sweeping dims alone leaves most threads idle whenever
+  // head_dim/4 < nthr -- 16 of 64 for head_dim 64, so 75% of the threadgroup sat out the V pass
+  // while it walked every key serially. When the dims fit the threadgroup, give each thread a
+  // (dim, key-group) pair and keep its partial in a REGISTER: every thread works, reads stay
+  // contiguous within each key, and the key-group partials are combined once at the end instead
+  // of round-tripping tg_acc every block. Wider heads keep the original sweep.
+  const uint hd4v = p.head_dim >> 2u;
+  const uint kvd4 = kv_dim >> 2u;
+  const bool vsplit = (hd4v > 0u) && (hd4v <= nthr) && ((nthr % hd4v) == 0u);
+  const uint vDS = vsplit ? hd4v : nthr;         // threads sweeping dims
+  const uint vKG = vsplit ? (nthr / hd4v) : 1u;  // key groups running in parallel
+  const uint vdim = lid % vDS;
+  const uint vkg = lid / vDS;
+  float4 vacc = float4(0.0f);
+
   for (uint kb = c0; kb < c1; kb += DEC_KEY_BLOCK) {
     const uint nk = min((uint)DEC_KEY_BLOCK, c1 - kb);
 
@@ -1324,16 +1339,23 @@ kernel void cpi_attention_decode_split(
 
     {
       // V accumulate, float4 over dims: 4x fewer strided loads per thread.
-      threadgroup float4* acc4 = (threadgroup float4*)tg_acc;
       device const half4* vbase = (device const half4*)(v_cache + kv_head * p.head_dim);
-      const uint hd4v = p.head_dim >> 2u;
-      const uint kvd4 = kv_dim >> 2u;
-      for (uint i4 = lid; i4 < hd4v; i4 += nthr) {
-        float4 a = acc4[i4] * rescale;
-        for (uint j = 0u; j < nk; ++j) {
-          a += w_sh[j] * float4(vbase[(ulong)(kb + j) * (ulong)kvd4 + i4]);
+      if (vsplit) {
+        // Every thread owns (vdim, vkg) and walks only its share of the keys; the partial
+        // stays in a register until the combine after the block loop.
+        vacc *= rescale;
+        for (uint j = vkg; j < nk; j += vKG) {
+          vacc += w_sh[j] * float4(vbase[(ulong)(kb + j) * (ulong)kvd4 + vdim]);
         }
-        acc4[i4] = a;
+      } else {
+        threadgroup float4* acc4 = (threadgroup float4*)tg_acc;
+        for (uint i4 = lid; i4 < hd4v; i4 += nthr) {
+          float4 a = acc4[i4] * rescale;
+          for (uint j = 0u; j < nk; ++j) {
+            a += w_sh[j] * float4(vbase[(ulong)(kb + j) * (ulong)kvd4 + i4]);
+          }
+          acc4[i4] = a;
+        }
       }
     }
 
@@ -1343,6 +1365,17 @@ kernel void cpi_attention_decode_split(
       tg_max = new_max;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  // Fold the per-thread key-group partials into tg_acc, one group at a time. tg_acc was zeroed
+  // up front and left untouched by the split path, so this is the only writer. vKG barriers
+  // total (not per block), against a V pass that now runs on the whole threadgroup.
+  if (vsplit) {
+    threadgroup float4* acc4 = (threadgroup float4*)tg_acc;
+    for (uint r = 0u; r < vKG; ++r) {
+      if (vkg == r) acc4[vdim] += vacc;
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
   }
 
   // Unnormalized on purpose: 1/sum belongs to the merge, which is the only place the whole
