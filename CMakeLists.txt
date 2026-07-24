@@ -492,8 +492,7 @@ if(CPI_ENABLE_METAL)
   set_tests_properties(metal_decode_test PROPERTIES
     ENVIRONMENT "CPI_METALLIB=${CPI_METALLIB};CPI_METAL_SOURCE=${CPI_METAL_SRC}")
 
-  # Perplexity, the quality metric quantization decisions are ranked by. Needs a model and a
-  # corpus, so it is a tool rather than a ctest case.
+  # Perplexity. Needs a model and a corpus, so it is a tool rather than a ctest case.
   add_executable(metal_ppl src/tests/metal_ppl.cpp)
   target_link_libraries(metal_ppl PRIVATE cpi_engine)
   target_include_directories(metal_ppl PRIVATE include)

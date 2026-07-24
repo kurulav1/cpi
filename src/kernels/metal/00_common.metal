@@ -179,7 +179,7 @@ struct EmbedQuantParams {
   uint hidden;
   uint tokens;
   uint bits;   // 4 or 8
-  uint group;  // scale granularity along the row; 0 = one scale per row
+  uint group;  // scales per row span; 0 = one scale per row
 };
 
 // ---------------------------------------------------------------------------

@@ -1,16 +1,12 @@
-// Perplexity on Apple Silicon: the quality metric every quantization decision needs.
+// Perplexity, the metric quantization schemes are ranked by. Per-tensor reconstruction error
+// (CPI_METAL_QUANT_STATS) ranks tensors, not models, and greedy-prefix agreement against a
+// higher-precision reference is useless -- one early flip destroys the prefix, so it measures
+// when the first divergence landed (measured across promotion budgets: 26/26/3/1/74 chars,
+// non-monotonic). Perplexity averages over every position instead.
 //
-// Why this exists: quantization work had no way to be RANKED. Per-tensor reconstruction error
-// (CPI_METAL_QUANT_STATS) ranks TENSORS, not models, and the obvious behavioural proxy --
-// how many greedy tokens match a higher-precision reference -- is worthless: one early token
-// flip destroys the whole prefix, so it measures WHEN the first divergence landed, which is
-// near-random. Measured across promotion budgets it returned 26/26/3/1/74 characters,
-// non-monotonic. Perplexity averages over every position instead of stopping at the first
-// disagreement, so it is stable enough to compare two schemes that differ slightly.
-//
-// Method: teacher forcing. Feed the corpus one token at a time through the same decode path
-// generation uses, and accumulate -log P(actual next token) under the model's own distribution.
-// ppl = exp(mean NLL). Lower is better; equal-corpus, equal-tokenizer comparisons only.
+// Teacher forcing: feed the corpus one token at a time through the decode path generation uses
+// and accumulate -log P(actual next token). ppl = exp(mean NLL). Comparable only across runs
+// with the same corpus and tokenizer.
 
 #include <algorithm>
 #include <cmath>
@@ -91,8 +87,8 @@ int main(int argc, char** argv) {
   }
 
   engine::PlanMetalEngine eng;
-  // Context must cover the whole corpus: a wrapped position would silently score later tokens
-  // against the wrong history and quietly lower the perplexity.
+  // Context must cover the whole corpus: a wrapped position scores later tokens against the
+  // wrong history.
   eng.open(model, static_cast<int>(ids.size()) + 8, quant_bits, quant_group);
   eng.reset_kv_cache();
 
@@ -103,8 +99,8 @@ int main(int argc, char** argv) {
     const int target = ids[i + 1];
     if (target < 0 || target >= static_cast<int>(logits.size())) continue;
 
-    // log-softmax the stable way: subtract the max before exponentiating, or a vocab-sized
-    // sum of exp(logit) overflows to inf and every perplexity comes out as nan.
+    // Subtract the max before exponentiating: a vocab-sized sum of exp(logit) overflows to
+    // inf and every perplexity comes out nan.
     const float m = *std::max_element(logits.begin(), logits.end());
     double sum = 0.0;
     for (const float l : logits) sum += std::exp(static_cast<double>(l - m));

@@ -60,17 +60,11 @@ Op add_inplace(Slot in) {
   return o;
 }
 
-// One place that decides how an embedding table is STORED, for all three builders.
+// How an embedding table is stored, for all three builders. A backend that can gather from a
+// packed row takes the quantized table; everything else keeps the fp16 handle.
 //
-// A backend that can gather from a packed row takes the quantized table; everything else keeps
-// the fp16 handle it always had. This is the largest single weight in some models and used to be
-// exempt from --weight-quant entirely: Gemma 4 E2B's embed_tokens_per_layer is
-// [vocab 262144][35 layers x 256] and stayed fp16 at 4.70 GB, which is most of why E2B took
-// 6.57 GB against llama.cpp Q4_0's 2.83.
-//
-// A TIED head costs nothing extra here: WeightSource::quant caches by tensor name, so the packed
-// copy the LmHead already asked for is the same buffer -- and the fp16 one, which fp16() only
-// materialises on demand, now never gets allocated at all.
+// A tied head costs nothing extra: WeightSource::quant caches by tensor name, so the LmHead's
+// packed copy is the same buffer, and the fp16 one (materialised on demand) is never allocated.
 Op make_embed(const WeightSource& w, const std::string& name, Slot out, int cols, int vocab) {
   Op o;
   o.kind = OpKind::EmbeddingLookup;

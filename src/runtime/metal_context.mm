@@ -128,10 +128,8 @@ bool MetalContext::load_library(const std::string& path_hint) {
     NSString* p = [NSString stringWithUTF8String:path.c_str()];
     lib = [dev newLibraryWithURL:[NSURL fileURLWithPath:p] error:&err];
   } else {
-    // newDefaultLibrary only ever finds a metallib EMBEDDED IN A BUNDLE. These are plain
-    // CLI executables, so it returns nil even when cpi_kernels.metallib is sitting right
-    // next to the binary -- which made an installed copy unrunnable unless the user also
-    // had the MSL sources and set CPI_METAL_SOURCE. Look beside the executable first.
+    // newDefaultLibrary only finds a metallib embedded in a BUNDLE, so a plain CLI binary
+    // gets nil even with cpi_kernels.metallib in the same directory. Search there first.
     char exe[4096];
     std::uint32_t exe_len = sizeof(exe);
     if (_NSGetExecutablePath(exe, &exe_len) == 0) {
@@ -149,7 +147,7 @@ bool MetalContext::load_library(const std::string& path_hint) {
         NSError* cerr = nil;
         lib = [dev newLibraryWithURL:[NSURL fileURLWithPath:p] error:&cerr];
         if (lib != nil) break;
-        if (err == nil) err = cerr;  // keep the first real load error for the message
+        if (err == nil) err = cerr;  // keep the first real error for the message
       }
     }
     if (lib == nil) lib = [dev newDefaultLibrary];

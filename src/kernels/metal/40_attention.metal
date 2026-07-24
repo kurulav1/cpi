@@ -91,9 +91,9 @@ constant uint FC_q_dim [[function_constant(2)]];
 // accumulates into it. Gemma's head_dim 256 does not fit the fragment plan and keeps the
 // scalar kernel.
 // ---------------------------------------------------------------------------
-// The body, parameterized by its query block and register tile so the narrow and wide variants
-// cannot drift apart. The threadgroup arrays are the caller's: MSL cannot size an array from a
-// function constant, so each kernel declares its own at ITS max head_dim and passes them in.
+// Body shared by the narrow and wide variants, parameterized by query block and register tile.
+// The threadgroup arrays are the caller's: MSL cannot size an array from a function constant,
+// so each kernel declares its own at its max head_dim.
 template <uint QB, uint QT_, uint KT_>
 static void attn_prefill_mm_body(device const half* q, device const half* k_cache,
                                  device const half* v_cache, device half* out,
@@ -308,7 +308,7 @@ static void attn_prefill_mm_body(device const half* q, device const half* k_cach
   }
 }
 
-// head_dim <= 128: the tuned shape. 16 queries x a 2x2 register tile, ~15 KB of threadgroup memory.
+// head_dim <= 128: 16 queries x a 2x2 register tile, ~15 KB of threadgroup memory.
 kernel void cpi_attention_prefill_mm(device const half* q [[buffer(0)]],
                                      device const half* k_cache [[buffer(1)]],
                                      device const half* v_cache [[buffer(2)]],
@@ -333,16 +333,13 @@ kernel void cpi_attention_prefill_mm(device const half* q [[buffer(0)]],
                                                   nthr);
 }
 
-// 128 < head_dim <= 256 -- Gemma 4's SLIDING layers and Qwen3.5. Before this, every head_dim over
-// 128 fell to the scalar kernel and left the matrix units idle for the whole of attention, which on
-// Gemma 4 E2B is 41% of a 1728-token prefill: the largest single term in it.
+// 128 < head_dim <= 256 (Gemma 4's sliding layers, Qwen3.5). These used to fall to the scalar
+// kernel, leaving the matrix units idle for 41% of a Gemma prefill.
 //
-// The query block has to HALVE to pay for the wider rows -- q_sh + acc alone are QB*256*6 bytes, so
-// at 16 queries the four arrays come to 36 KB against a 32 KB budget. 8 queries is a single row
-// fragment, so the register tile must drop to QT 1 with it: QB 8 at QT 2 is exactly the
-// misconfiguration described above QMM_QT, which read past q_sh and failed the golden while every
-// benchmark looked fine. KT stays 2 -- key groups are what fill the simdgroups once the query tile
-// cannot.
+// The query block halves to pay for the wider rows: q_sh + acc alone are QB*256*6 bytes, so 16
+// queries puts the four arrays at 36 KB against a 32 KB budget. 8 queries is one row fragment,
+// so QT must drop to 1 with it -- QB 8 at QT 2 is the read-past-q_sh case described above
+// QMM_QT. KT stays 2: key groups fill the simdgroups once the query tile cannot.
 #define QMM_BLOCK_W 8
 kernel void cpi_attention_prefill_mm_wide(device const half* q [[buffer(0)]],
                                           device const half* k_cache [[buffer(1)]],

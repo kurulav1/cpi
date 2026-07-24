@@ -517,8 +517,8 @@ public:
   //   q     = round(w / scale), clamped to [-8, 7]
   //   nibble = q < 0 ? q + 16 : q, packed low-then-high within each byte
   // The Metal executor has cpi_embedding_lookup_quant, so it can gather from a packed row.
-  // CPI_METAL_QUANT_EMBED=0 keeps the tables fp16 -- the A/B for quality questions, and the
-  // bisection lever if a model ever looks wrong only under quantization.
+  // CPI_METAL_QUANT_EMBED=0 keeps the tables fp16: the A/B for quality, and the bisection
+  // lever if a model looks wrong only under quantization.
   bool quantize_embeddings() const override {
     static const bool on = [] {
       const char* e = std::getenv("CPI_METAL_QUANT_EMBED");
@@ -531,10 +531,9 @@ public:
     return quant_bits(name, out_dim, in_dim, bits_);
   }
 
-  // Embeddings can be quantized at a DIFFERENT width from the projections: they are gathered,
-  // not multiplied, so their bytes buy latency only through the one row a token reads, while
-  // their error lands on every layer's input. CPI_METAL_EMBED_BITS = 0 (fp16) | 4 | 8, default
-  // = the projection width.
+  // Embeddings may use a different width from the projections: they are gathered rather than
+  // multiplied, so their bytes buy latency only through the one row a token reads.
+  // CPI_METAL_EMBED_BITS = 0 (fp16) | 4 | 8, default = the projection width.
   opplan::QuantWeight quant_embedding(const std::string& name, int rows, int cols) const override {
     static const int eb = [this] {
       const char* e = std::getenv("CPI_METAL_EMBED_BITS");
@@ -545,19 +544,13 @@ public:
     return quant_bits(name, rows, cols, eb);
   }
 
-  // ERROR-RANKED PROMOTION ("spend bytes where the error is, not where the bytes are").
+  // Error-ranked promotion: int4 error is not uniform (Gemma 4 E2B's per_layer_input_gate
+  // tensors sit at rel_rms 0.16-0.20 against 0.11 for most projections, and are 0.2 MB each),
+  // so uniform int4 pins accuracy on tensors that cost almost nothing to promote.
   //
-  // int4 reconstruction error is far from uniform across a model: on Gemma 4 E2B the
-  // per_layer_input_gate tensors sit at rel_rms 0.16-0.20 while most projections are at 0.11 --
-  // and those worst tensors are 0.2 MB each. Uniform int4 leaves the model's accuracy pinned by
-  // tensors whose promotion would cost almost nothing, while an across-the-board int8 spends
-  // gigabytes on tensors that did not need it (measured: int8 embeddings cost 1.5 GB and 24% of
-  // prefill to refine a term the projections already dominate).
-  //
-  // CPI_METAL_PROMOTE_MB=<budget> promotes the worst-quantized tensors to int8, worst first,
-  // until the budget is spent. The ranking pass never reads a tensor it could not afford to
-  // promote anyway -- promotion cost follows from tensor_bytes alone -- which is what keeps the
-  // giant embedding tables from being scanned at all under a small budget.
+  // CPI_METAL_PROMOTE_MB=<budget> promotes worst-first to int8 until the budget is spent. The
+  // ranking pass never reads a tensor it could not afford to promote -- cost follows from
+  // tensor_bytes alone -- which keeps the multi-GB embedding tables from being scanned.
   void build_promotions() const {
     promotions_built_ = true;
     const char* e = std::getenv("CPI_METAL_PROMOTE_MB");
@@ -578,9 +571,8 @@ public:
       const double cost = static_cast<double>(elems) * 0.5;  // int4 0.5 B/elt -> int8 1.0
       if (cost > budget) continue;  // unaffordable: skip WITHOUT reading it
 
-      // Sampled error, not exact: groups are contiguous within a row and rows are contiguous,
-      // so grouping the flat array matches the real layout whenever in_dim % group == 0, and
-      // this only has to RANK. Bounded to a few thousand groups so the pass stays cheap.
+      // Sampled, not exact: groups and rows are both contiguous, so grouping the flat array
+      // matches the real layout whenever in_dim % group == 0, and this only has to rank.
       std::vector<std::uint16_t> conv;
       const std::uint16_t* src = fp16_data(n, conv);
       const int gsz = (group_ > 0) ? group_ : 64;
@@ -626,9 +618,8 @@ public:
     if (!promotions_built_) build_promotions();
     if (bits == 4 && promote_.count(name) != 0) bits = 8;
 
-    // Keyed by WIDTH as well as name: a tied head and its embedding table are the same tensor
-    // and may now be quantized differently, so a name-only key would hand one of them the
-    // other's packing.
+    // Keyed by width as well as name: a tied head and its embedding table are the same tensor
+    // and may use different widths, so a name-only key would hand one the other's packing.
     const std::string key = name + "/" + std::to_string(bits);
     auto it = qbufs_.find(key);
     if (it == qbufs_.end()) {
@@ -670,10 +661,8 @@ public:
             const float w_ref = fp16_to_f32(row[j]);
             int q = static_cast<int>(std::lround(w_ref * inv));
             {
-              // Reconstruction error against what the kernel will actually read back. Free
-              // (the values are in registers) and it is the only quantitative handle on a
-              // mixed-precision choice -- "the output still looks coherent" cannot rank two
-              // quantization schemes.
+              // Reconstruction error against what the kernel reads back; the values are already
+              // in registers, so it costs nothing.
               const int qc = (bits == 4) ? std::max(-8, std::min(7, q)) : std::max(-127, std::min(127, q));
               const double d = static_cast<double>(w_ref) - static_cast<double>(qc) * scale;
               err2 += d * d;
@@ -699,7 +688,6 @@ public:
       }
 
       // CPI_METAL_QUANT_STATS=1 prints per-tensor relative RMS error and the bytes it cost.
-      // How a partial/mixed-precision scheme gets RANKED instead of eyeballed.
       if (std::getenv("CPI_METAL_QUANT_STATS") != nullptr) {
         const double rel = (ref2 > 0.0) ? std::sqrt(err2 / ref2) : 0.0;
         const double mb = static_cast<double>(packed.size() +
@@ -724,11 +712,9 @@ public:
   }
 
   void set_quant(int bits, int group) override {
-    // The quantized GEMV kernels walk a row 32 lanes at a time and assume a scale group never
-    // straddles two of those steps, so a group that is not a multiple of 32 reads the wrong
-    // scale for part of every row. It does not crash or look obviously wrong -- with
-    // --quant-group 16 the model still emits fluent-looking text while perplexity goes from
-    // 21.8 to 52435. Refuse it rather than let a silently-wrong number be measured.
+    // The quantized GEMV kernels read one scale per 32-lane step, so a group that is not a
+    // multiple of 32 reads the wrong scale for part of every row. It does not crash or look
+    // wrong: --quant-group 16 still emits fluent text at perplexity 52435 against 21.8.
     if (group != 0 && group % 32 != 0) {
       throw std::runtime_error("quant group must be a multiple of 32 (got " +
                                std::to_string(group) + "): the GEMV kernels read one scale per " +
@@ -1424,12 +1410,10 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
     // uses the blocked GEMM per op. The fused kernel routes each output row to its matrix.
     if (op.kind == OpKind::Gemv && op.qbits != 0 && T < kGemmMinTokens) {
       auto is_qgemv = [&](std::size_t j, opplan::Slot out) {
-        // The fused kernels take ONE bits/group for every matrix they concatenate (QGluParams
-        // carries a single pair), so siblings quantized at different widths must NOT fuse: the
-        // wider one's bytes would be decoded at the first op's width. That cannot happen under a
-        // uniform --weight-quant, which is why the check was never needed, but per-tensor schemes
-        // (CPI_METAL_PROMOTE_MB) mix widths within one q/k/v group and it produced pure garbage --
-        // perplexity 9e6 against a healthy 21.8.
+        // The fused kernels carry ONE bits/group for every matrix they concatenate, so siblings
+        // at different widths must not fuse -- the wider one's bytes would be decoded at the
+        // first op's width. Uniform --weight-quant cannot violate this; per-tensor schemes
+        // (CPI_METAL_PROMOTE_MB) do, and it measured perplexity 9e6 against a healthy 21.8.
         return j < ops.size() && ops[j].kind == OpKind::Gemv && ops[j].qbits != 0 &&
                ops[j].qbits == op.qbits && ops[j].qgroup == op.qgroup && ops[j].out == out &&
                ops[j].in == op.in;
@@ -2050,22 +2034,18 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
           const void* mmbufs[] = {slot(op.in),  kbuf(layer).handle(),
                                   vbuf(layer).handle(), slot(op.out),
                                   pos_buf_.handle(),    kbuf(layer).handle()};
-          // NONE of the matrix-unit kernels read the per-token limits buffer -- they take
-          // block_tables in that binding slot. A multimodal prefill (bidirectional attention over
-          // an image span) must therefore stay on the scalar kernels, which do honour it. Silently
-          // running the mm path here would attend causally across image tokens: coherent-looking
-          // output, wrong image.
-          // CPI_METAL_MM_WIDE=0 forces 128 < head_dim <= 256 back to the scalar kernel: the
-          // bisection lever for a suspected wide-mm bug, and how its token stream is gated
-          // against the kernel it replaced.
+          // No matrix-unit kernel reads the per-token limits buffer (block_tables occupies that
+          // binding), so a multimodal prefill stays on the scalar kernels. Running the mm path
+          // here would attend causally across image tokens: coherent output, wrong image.
+          // CPI_METAL_MM_WIDE=0 forces 128 < head_dim <= 256 back to the scalar kernel -- the
+          // bisection lever, and how the wide kernel's token stream was gated against it.
           static const bool mm_wide_enabled = [] {
             const char* e = std::getenv("CPI_METAL_MM_WIDE");
             return e == nullptr || e[0] != '0';
           }();
           const bool mm_ok = !limits_active_;
-          // The kernels block over queries differently, so each derives its own grid -- sharing one
-          // `blocks` here would hand a kernel the other's tiling and quietly drop or double-run
-          // queries.
+          // The kernels block over queries differently, so each derives its own grid -- sharing
+          // one `blocks` would hand a kernel the other's tiling and drop or double-run queries.
           if (op.head_dim <= 128 && mm_ok) {
             // CPI_METAL_ATTN_QP=1 selects the query-partitioned research kernel (see the header
             // above it): 4 simdgroups x 8 queries, per-simdgroup scratch, simdgroup_barrier only.
@@ -2102,8 +2082,7 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
           } else if (op.head_dim <= 256 && mm_ok && mm_wide_enabled) {
             // The matrix-unit kernel's wide variant, at half the query block (see
             // cpi_attention_prefill_mm_wide). Gemma 4's sliding layers land here; they took the
-            // scalar kernel below purely because it was the only thing that fit head_dim 256, which
-            // left the matrix units idle for 41% of a Gemma prefill.
+            // scalar kernel below only because it was the one shape that fit head_dim 256.
             const std::size_t blocks =
                 static_cast<std::size_t>((T + kQMMBlockWide - 1) / kQMMBlockWide);
             specialize_mm_attn(ctx_, op);

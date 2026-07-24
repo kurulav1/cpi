@@ -49,10 +49,9 @@ public:
   // question, which is what lets a consumer be templated on the loader.
   [[nodiscard]] std::string tensor_dtype(const std::string& name) const;
 
-  // Every tensor in the container, sorted, so a consumer can walk the model without knowing its
-  // naming scheme. model::WeightLoader answers the same question, keeping the two surfaces
-  // interchangeable. Sorted rather than hash order because callers that RANK tensors must be
-  // deterministic across runs -- an unordered walk makes ties resolve differently each load.
+  // Every tensor in the container, so a consumer can walk the model without knowing its naming
+  // scheme. model::WeightLoader answers the same question. Sorted, not hash order: callers that
+  // rank tensors must resolve ties the same way on every load.
   [[nodiscard]] std::vector<std::string> tensor_names() const {
     std::vector<std::string> out;
     out.reserve(tensors_.size());

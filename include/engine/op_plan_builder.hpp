@@ -56,15 +56,13 @@ public:
     return {};
   }
 
-  // May the builder quantize EMBEDDING TABLES too, not just projections? Separate from quant()
-  // because it needs a backend that can gather from a packed row, and only the Metal executor
-  // has that kernel -- a backend whose EmbeddingLookup reads fp16 unconditionally would get a
-  // packed table and silently produce garbage. Default no: the fp16 path is what every existing
-  // backend implements.
+  // May the builder quantize embedding TABLES, not just projections? Needs a backend that can
+  // gather from a packed row; one whose EmbeddingLookup reads fp16 unconditionally would be
+  // handed a packed table and produce garbage. Default no.
   virtual bool quantize_embeddings() const { return false; }
 
-  // An embedding table, quantized at whatever width the backend picks for embeddings -- which
-  // need not be the projection width. Only reached when quantize_embeddings() is true.
+  // An embedding table, at whatever width the backend picks for embeddings -- which need not be
+  // the projection width. Only reached when quantize_embeddings() is true.
   virtual QuantWeight quant_embedding(const std::string& name, int rows, int cols) const {
     return quant(name, rows, cols);
   }

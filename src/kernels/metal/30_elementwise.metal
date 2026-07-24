@@ -187,17 +187,13 @@ kernel void cpi_embedding_lookup(
   out[gid] = table[(ulong)tok * (ulong)p.hidden + i];
 }
 
-// Embedding lookup from a QUANTIZED table. Same gather, dequantizing as it reads.
+// Embedding lookup from a quantized table: same gather, dequantizing as it reads. The row is
+// gathered rather than multiplied, so dequant is one scalar multiply per element and the kernel
+// stays bandwidth-bound on a quarter the bytes. Gemma 4's embed_tokens_per_layer is
+// [vocab 262144][35 layers x 256] = 4.70 GB fp16, most of that model.
 //
-// Worth it because an embedding table is the one weight quantization used to skip, and on
-// Gemma 4 it is most of the model: embed_tokens_per_layer is [vocab 262144][35 layers x 256]
-// and stayed fp16 at 4.70 GB under --weight-quant int4, which is why E2B took 6.57 GB against
-// llama.cpp Q4_0's 2.83. The row is gathered, not multiplied, so the dequant is a scalar
-// multiply per element -- the kernel stays trivially bandwidth-bound, on a quarter the bytes.
-//
-// Layout is the shared one (see WeightSource::quant): int4 packed two per byte low-then-high,
-// two's-complement decoded as (n ^ 8) - 8; int8 plain; fp16 scales, one per `group` elements
-// of the row, or one per row when group == 0.
+// Layout matches WeightSource::quant: int4 packed two per byte low-then-high, decoded as
+// (n ^ 8) - 8; int8 plain; fp16 scales, one per `group` elements, or one per row when group == 0.
 kernel void cpi_embedding_lookup_quant(
     device const uchar* table  [[buffer(0)]],
     device const half*  scales [[buffer(1)]],
