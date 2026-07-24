@@ -3278,7 +3278,7 @@ std::vector<int> PlanMetalEngine::generate_spec_lookup(const std::vector<int>& p
   std::vector<int> out;
   std::vector<int> history = prompt;
   static const bool no_stop = std::getenv("CPI_METAL_IGNORE_EOS") != nullptr;
-  int verifies = 0, drafted = 0, accepted = 0;
+  int verifies = 0, drafted = 0, accepted = 0, backoffs = 0;
   bool stop = false;
 
   // Record a generated token: append, stream it, and test the stop conditions. Returns false when
@@ -3292,13 +3292,22 @@ std::vector<int> PlanMetalEngine::generate_spec_lookup(const std::vector<int>& p
     return true;
   };
 
+  // ADAPTIVE SPECULATION. A verify costs ~5x a decode step, so it only pays when most of the
+  // drafted tokens are accepted. Prompt-lookup acceptance is a property of the MODEL and the
+  // text, not just the text: on the same repetitive prompt Qwen2.5 accepts 100% (7.2x) while
+  // Gemma 4 breaks the loop and accepts 15% -- which made blind speculation a 35% REGRESSION.
+  // Track acceptance and back off when drafting stops paying, re-probing periodically so a
+  // stretch of structured output still gets picked up.
+  float acc_ewma = 1.0f;
+  int spec_cooldown = 0;
   int pos = P;  // where `cur` will be written when it is next forwarded
   int cur = decode_next_token(prompt.back(), P - 1, 0.0f, history);  // first token
   stop = !record(cur);
   while (!stop && pos + 1 < max_context_) {
     int drafts[16];
     const int room = std::min(cap, max_context_ - pos - 1);
-    const int nd = metal_lookup_draft(history, 3, room, drafts);
+    const int nd = spec_cooldown > 0 ? 0 : metal_lookup_draft(history, 3, room, drafts);
+    if (spec_cooldown > 0) --spec_cooldown;
     if (nd <= 0) {
       cur = decode_next_token(cur, pos, 0.0f, history);
       ++pos;
@@ -3315,6 +3324,13 @@ std::vector<int> PlanMetalEngine::generate_spec_lookup(const std::vector<int>& p
       int a = 0;
       while (a < nd && verdict[a] == drafts[a]) ++a;
       accepted += a;
+      // Blend this verify's hit rate in; on a sustained miss, stop speculating for a while.
+      acc_ewma = 0.7f * acc_ewma + 0.3f * (static_cast<float>(a) / static_cast<float>(nd));
+      if (acc_ewma < 0.35f) {
+        spec_cooldown = 48;  // ~48 plain steps before the next probe
+        acc_ewma = 0.6f;     // neutral restart so one good probe re-enables speculation
+        ++backoffs;
+      }
       pos += a + 1;  // KV correct through the a-th accepted draft; rejected rows go stale
       bool cont = true;
       for (int i = 0; i < a; ++i) {
