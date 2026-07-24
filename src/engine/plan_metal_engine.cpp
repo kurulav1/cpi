@@ -3278,7 +3278,7 @@ std::vector<int> PlanMetalEngine::generate_spec_lookup(const std::vector<int>& p
   std::vector<int> out;
   std::vector<int> history = prompt;
   static const bool no_stop = std::getenv("CPI_METAL_IGNORE_EOS") != nullptr;
-  int verifies = 0, drafted = 0, accepted = 0;
+  int verifies = 0, drafted = 0, accepted = 0, backoffs = 0;
   bool stop = false;
 
   // Record a generated token: append, stream it, and test the stop conditions. Returns false when
@@ -3292,13 +3292,27 @@ std::vector<int> PlanMetalEngine::generate_spec_lookup(const std::vector<int>& p
     return true;
   };
 
+  // ADAPTIVE SPECULATION. A verify costs ~5x a decode step, so it only pays when most of the
+  // drafted tokens are accepted. Prompt-lookup acceptance is a property of the MODEL and the
+  // text, not just the text: on the same repetitive prompt Qwen2.5 accepts 100% (7.2x) while
+  // Gemma 4 breaks the loop and accepts 15% -- which made blind speculation a 35% REGRESSION.
+  // Track acceptance and back off when drafting stops paying, re-probing periodically so a
+  // stretch of structured output still gets picked up.
+  float acc_ewma = 1.0f;
+  int spec_cooldown = 0;
+  int spec_backoff = 0;
   int pos = P;  // where `cur` will be written when it is next forwarded
   int cur = decode_next_token(prompt.back(), P - 1, 0.0f, history);  // first token
   stop = !record(cur);
   while (!stop && pos + 1 < max_context_) {
     int drafts[16];
     const int room = std::min(cap, max_context_ - pos - 1);
-    const int nd = metal_lookup_draft(history, 3, room, drafts);
+    // 6-gram, not 3: a 3-gram matches spuriously on common short sequences, and a wrong draft
+    // costs a FULL verify (~10 decode steps on Gemma, whose batched path barely amortises
+    // weights). Requiring a longer match took Gemma from -17% to neutral while leaving Qwen's
+    // 1.76x untouched -- precision matters far more than recall when a miss is this expensive.
+    const int nd = spec_cooldown > 0 ? 0 : metal_lookup_draft(history, 6, room, drafts);
+    if (spec_cooldown > 0) --spec_cooldown;
     if (nd <= 0) {
       cur = decode_next_token(cur, pos, 0.0f, history);
       ++pos;
@@ -3315,6 +3329,21 @@ std::vector<int> PlanMetalEngine::generate_spec_lookup(const std::vector<int>& p
       int a = 0;
       while (a < nd && verdict[a] == drafts[a]) ++a;
       accepted += a;
+      // Blend this verify's hit rate in; on a sustained miss, stop speculating for a while.
+      acc_ewma = 0.7f * acc_ewma + 0.3f * (static_cast<float>(a) / static_cast<float>(nd));
+      // A verify that lands NOTHING is decisive on its own -- waiting for the average to sag
+      // just buys more full-price misses. Trip on that, or on a sagging average.
+      if (a == 0 || acc_ewma < 0.35f) {
+        // Exponential: each consecutive failure doubles the quiet period, so a model that
+        // simply never repeats settles at ~free instead of probing forever. A fully accepted
+        // verify clears the penalty, so a later run of structured text is still caught.
+        spec_backoff = (spec_backoff == 0) ? 32 : std::min(spec_backoff * 2, 2048);
+        spec_cooldown = spec_backoff;
+        acc_ewma = 0.6f;  // neutral restart: one good probe re-enables speculation
+        ++backoffs;
+      } else if (a == nd) {
+        spec_backoff = 0;  // drafting is paying again; forget the penalty
+      }
       pos += a + 1;  // KV correct through the a-th accepted draft; rejected rows go stale
       bool cont = true;
       for (int i = 0; i < a; ++i) {
@@ -3326,9 +3355,10 @@ std::vector<int> PlanMetalEngine::generate_spec_lookup(const std::vector<int>& p
     }
   }
   if (std::getenv("CPI_METAL_SPEC_STATS")) {
-    std::fprintf(stderr, "[spec] verifies=%d drafted=%d accepted=%d (%.1f%%) tokens=%zu\n",
+    std::fprintf(stderr,
+                 "[spec] verifies=%d drafted=%d accepted=%d (%.1f%%) backoffs=%d tokens=%zu\n",
                  verifies, drafted, accepted, drafted ? 100.0 * accepted / drafted : 0.0,
-                 out.size());
+                 backoffs, out.size());
   }
   return out;
 }
