@@ -6,6 +6,7 @@
 // memory-mapped so that the OS page cache can evict pages automatically
 // when RAM pressure is high.
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -47,6 +48,18 @@ public:
   // plausibly-scaled garbage instead of an error. model::WeightLoader answers "F16" to the same
   // question, which is what lets a consumer be templated on the loader.
   [[nodiscard]] std::string tensor_dtype(const std::string& name) const;
+
+  // Every tensor in the container, sorted, so a consumer can walk the model without knowing its
+  // naming scheme. model::WeightLoader answers the same question, keeping the two surfaces
+  // interchangeable. Sorted rather than hash order because callers that RANK tensors must be
+  // deterministic across runs -- an unordered walk makes ties resolve differently each load.
+  [[nodiscard]] std::vector<std::string> tensor_names() const {
+    std::vector<std::string> out;
+    out.reserve(tensors_.size());
+    for (const auto& kv : tensors_) out.push_back(kv.first);
+    std::sort(out.begin(), out.end());
+    return out;
+  }
 
   // The container's `__metadata__` block, verbatim JSON. A `.cpi` stores its whole LlamaConfig
   // here -- the self-describing replacement for the .ll2c binary header. Empty for a plain HF

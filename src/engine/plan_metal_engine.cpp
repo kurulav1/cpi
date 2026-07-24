@@ -7,6 +7,7 @@
 #include "runtime/fp16.hpp"
 
 #include <algorithm>
+#include <unordered_set>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -544,8 +545,86 @@ public:
     return quant_bits(name, rows, cols, eb);
   }
 
+  // ERROR-RANKED PROMOTION ("spend bytes where the error is, not where the bytes are").
+  //
+  // int4 reconstruction error is far from uniform across a model: on Gemma 4 E2B the
+  // per_layer_input_gate tensors sit at rel_rms 0.16-0.20 while most projections are at 0.11 --
+  // and those worst tensors are 0.2 MB each. Uniform int4 leaves the model's accuracy pinned by
+  // tensors whose promotion would cost almost nothing, while an across-the-board int8 spends
+  // gigabytes on tensors that did not need it (measured: int8 embeddings cost 1.5 GB and 24% of
+  // prefill to refine a term the projections already dominate).
+  //
+  // CPI_METAL_PROMOTE_MB=<budget> promotes the worst-quantized tensors to int8, worst first,
+  // until the budget is spent. The ranking pass never reads a tensor it could not afford to
+  // promote anyway -- promotion cost follows from tensor_bytes alone -- which is what keeps the
+  // giant embedding tables from being scanned at all under a small budget.
+  void build_promotions() const {
+    promotions_built_ = true;
+    const char* e = std::getenv("CPI_METAL_PROMOTE_MB");
+    if (e == nullptr) return;
+    const double budget = std::atof(e) * 1024.0 * 1024.0;
+    if (budget <= 0.0) return;
+
+    struct Cand {
+      std::string name;
+      double rel;
+      double cost;
+    };
+    std::vector<Cand> cands;
+    for (const std::string& n : wl_.tensor_names()) {
+      const std::size_t bytes = wl_.tensor_bytes(n);
+      const std::size_t elems = bytes / sizeof(std::uint16_t);
+      if (elems < 1024) continue;                       // biases, norms: not worth ranking
+      const double cost = static_cast<double>(elems) * 0.5;  // int4 0.5 B/elt -> int8 1.0
+      if (cost > budget) continue;  // unaffordable: skip WITHOUT reading it
+
+      // Sampled error, not exact: groups are contiguous within a row and rows are contiguous,
+      // so grouping the flat array matches the real layout whenever in_dim % group == 0, and
+      // this only has to RANK. Bounded to a few thousand groups so the pass stays cheap.
+      std::vector<std::uint16_t> conv;
+      const std::uint16_t* src = fp16_data(n, conv);
+      const int gsz = (group_ > 0) ? group_ : 64;
+      const std::size_t ngroups = elems / static_cast<std::size_t>(gsz);
+      if (ngroups == 0) continue;
+      const std::size_t want = std::min<std::size_t>(ngroups, 4096);
+      const std::size_t stride = ngroups / want;
+      double err2 = 0.0, ref2 = 0.0;
+      for (std::size_t gi = 0; gi < want; ++gi) {
+        const std::uint16_t* g = src + (gi * stride) * static_cast<std::size_t>(gsz);
+        float amax = 0.0f;
+        for (int j = 0; j < gsz; ++j) amax = std::max(amax, std::fabs(fp16_to_f32(g[j])));
+        float scale = amax / 7.0f;
+        if (scale < 1.0e-8f) scale = 1.0e-8f;
+        scale = fp16_to_f32(f32_to_fp16(scale));
+        const float inv = 1.0f / scale;
+        for (int j = 0; j < gsz; ++j) {
+          const float w = fp16_to_f32(g[j]);
+          const int q = std::max(-8, std::min(7, static_cast<int>(std::lround(w * inv))));
+          const double d = static_cast<double>(w) - static_cast<double>(q) * scale;
+          err2 += d * d;
+          ref2 += static_cast<double>(w) * static_cast<double>(w);
+        }
+      }
+      if (ref2 <= 0.0) continue;
+      cands.push_back({n, std::sqrt(err2 / ref2), cost});
+    }
+
+    std::sort(cands.begin(), cands.end(),
+              [](const Cand& a, const Cand& b) { return a.rel > b.rel; });
+    double spent = 0.0;
+    for (const Cand& c : cands) {
+      if (spent + c.cost > budget) continue;  // skip, don't stop: a cheaper worse tensor may fit
+      spent += c.cost;
+      promote_.insert(c.name);
+    }
+    std::fprintf(stderr, "[quant] promoted %zu tensors to int8, %.1f MB of a %.0f MB budget\n",
+                 promote_.size(), spent / (1024.0 * 1024.0), budget / (1024.0 * 1024.0));
+  }
+
   opplan::QuantWeight quant_bits(const std::string& name, int out_dim, int in_dim, int bits) const {
     if (bits == 0 || !wl_.has_tensor(name)) return {};
+    if (!promotions_built_) build_promotions();
+    if (bits == 4 && promote_.count(name) != 0) bits = 8;
 
     // Keyed by WIDTH as well as name: a tied head and its embedding table are the same tensor
     // and may now be quantized differently, so a name-only key would hand one of them the
@@ -693,6 +772,8 @@ private:
   Loader& wl_;
   std::unordered_map<std::string, runtime::MetalBuffer>& bufs_;
   mutable std::unordered_map<std::string, QBuf> qbufs_;
+  mutable std::unordered_set<std::string> promote_;  // tensors ranked up to int8
+  mutable bool promotions_built_ = false;
   int bits_ = 0;
   int group_ = 0;
 };
