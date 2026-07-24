@@ -1340,7 +1340,8 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
         const std::size_t total = static_cast<std::size_t>(n0 + n1 + n2);
         // Four-rows-per-simdgroup decode shape (see cpi_gemv_quant_cat): the shader
         // derives its row mapping from the same predicate -- keep them in lockstep.
-        const bool nr4 = T == 1 && a.qbits == 4 && (a.in_dim % 32) == 0 && (gsz % 32) == 0 &&
+        const bool nr4 = T == 1 && (a.qbits == 4 || a.qbits == 8) && (a.in_dim % 32) == 0 &&
+                         (gsz % 32) == 0 &&
                          a.bias == nullptr;
         // 64-thread threadgroups for the four-row shape: 8 rows per tg. The shader
         // derives everything from nthr; keep rows_per_tg == (tg/32)*4 in lockstep.
@@ -1454,8 +1455,8 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
             // threadgroups, activations loaded once per four rows; predicate mirrored in
             // the shader's row mapping.
             const int gsz0 = (op.qgroup == 0) ? op.in_dim : op.qgroup;
-            const bool nr4 = qrest == 1 && op.qbits == 4 && (op.in_dim % 32) == 0 &&
-                             (gsz0 % 32) == 0 && op.bias == nullptr;
+            const bool nr4 = qrest == 1 && (op.qbits == 4 || op.qbits == 8) &&
+                             (op.in_dim % 32) == 0 && (gsz0 % 32) == 0 && op.bias == nullptr;
             const std::size_t tgq = nr4 ? 64 : kTG;
             const std::size_t rows_per_tg = nr4 ? (tgq / 32) * 4 : kSimdsPerTG;
             const std::size_t rbq =

@@ -525,6 +525,51 @@ kernel void cpi_gemv_quant(
     return;
   }
 
+  // int8 twin of the four-rows-per-simdgroup decode path. int8 was previously excluded from
+  // this shape (the predicate read bits == 4), so every int8 decode fell to the generic
+  // one-row-per-simdgroup path below and left the activation re-read once per row. Bytes map
+  // straight onto the activations here -- no even/odd nibble split.
+  if (p.tokens == 1u && p.bits == 8u && (p.in_dim & 31u) == 0u && (gsz0 & 31u) == 0u &&
+      p.has_bias == 0u) {
+    const uint r0 = (gid * simds_per_tg + simd_id) * 4u;
+    if (r0 >= p.out_dim) return;
+    const uint nrows = min(4u, p.out_dim - r0);
+    float acc4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const uint n32 = p.in_dim >> 5;  // 32 weights per lane-step, as in the int4 path
+    for (uint k = lane; k < n32; k += 32u) {
+      const uint j0 = k << 5;
+      device const half4* x4 = (device const half4*)(in + j0);
+      float4 xv[8];
+      for (uint w = 0u; w < 8u; ++w) {
+        const half4 h = x4[w];
+        xv[w] = float4(float(h.x), float(h.y), float(h.z), float(h.w));
+      }
+      for (uint r = 0u; r < nrows; ++r) {
+        const uint rr = r0 + r;
+        device const uint4* w128 = (device const uint4*)(qw + (ulong)rr * (ulong)p.in_dim);
+        const uint4 pa = w128[2u * k];       // 32 int8 weights = two 128-bit loads
+        const uint4 pb = w128[2u * k + 1u];
+        const float sc = (scales + (ulong)rr * (ulong)p.groups)[j0 / gsz0];
+        float sub = 0.0f;
+        for (uint w = 0u; w < 8u; ++w) {
+          uint word;
+          if (w < 4u) {
+            word = (w == 0u) ? pa.x : (w == 1u) ? pa.y : (w == 2u) ? pa.z : pa.w;
+          } else {
+            word = (w == 4u) ? pb.x : (w == 5u) ? pb.y : (w == 6u) ? pb.z : pb.w;
+          }
+          sub += dot(float4(as_type<char4>(word)), xv[w]);
+        }
+        acc4[r] += sub * sc;
+      }
+    }
+    for (uint r = 0u; r < nrows; ++r) {
+      const float s = simd_sum(acc4[r]);
+      if (lane == 0u) out[r0 + r] = half(s);
+    }
+    return;
+  }
+
   const uint row_blocks = (p.out_dim + simds_per_tg - 1u) / simds_per_tg;
   const uint tile = gid / row_blocks;
   const uint blk  = gid % row_blocks;
@@ -803,6 +848,57 @@ kernel void cpi_gemv_quant_cat(
           const char4 lo = as_type<char4>((word & 0x0F0F0F0Fu) ^ 0x08080808u) - char4(8);
           const char4 hi = as_type<char4>(((word >> 4u) & 0x0F0F0F0Fu) ^ 0x08080808u) - char4(8);
           sub += dot(float4(lo), xev[w]) + dot(float4(hi), xod[w]);
+        }
+        acc4[r] += sub * scl;
+      }
+    }
+    for (uint r = 0u; r < nrows; ++r) {
+      const float s = simd_sum(acc4[r]);
+      if (lane == 0u) {
+        const uint g = r0 + r;
+        device half* o = (g < p.n0) ? out0 : (g < p.n0 + p.n1) ? out1 : out2;
+        const uint lr = (g < p.n0) ? g : (g < p.n0 + p.n1) ? (g - p.n0) : (g - p.n0 - p.n1);
+        o[lr] = half(s);
+      }
+    }
+    return;
+  }
+
+  // int8 twin of the four-rows-per-simdgroup cat path (q|k|v and gate|up at decode). Same
+  // segment routing; int8 rows are in_dim bytes and map straight onto the activations.
+  if (p.tokens == 1u && p.bits == 8u && (p.in_dim & 31u) == 0u && (gsz & 31u) == 0u &&
+      p.has_bias == 0u) {
+    const uint r0 = (gid * simds_per_tg + simd_id) * 4u;
+    if (r0 >= total) return;
+    const uint nrows = min(4u, total - r0);
+    float acc4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const uint n32 = p.in_dim >> 5;
+    for (uint k = lane; k < n32; k += 32u) {
+      const uint j0 = k << 5;
+      device const half4* x4 = (device const half4*)(in + j0);
+      float4 xv[8];
+      for (uint w = 0u; w < 8u; ++w) {
+        const half4 h = x4[w];
+        xv[w] = float4(float(h.x), float(h.y), float(h.z), float(h.w));
+      }
+      for (uint r = 0u; r < nrows; ++r) {
+        const uint g = r0 + r;
+        device const uchar* qw = (g < p.n0) ? qw0 : (g < p.n0 + p.n1) ? qw1 : qw2;
+        device const half* sc = (g < p.n0) ? sc0 : (g < p.n0 + p.n1) ? sc1 : sc2;
+        const uint lr = (g < p.n0) ? g : (g < p.n0 + p.n1) ? (g - p.n0) : (g - p.n0 - p.n1);
+        device const uint4* w128 = (device const uint4*)(qw + (ulong)lr * (ulong)p.in_dim);
+        const uint4 pa = w128[2u * k];
+        const uint4 pb = w128[2u * k + 1u];
+        const float scl = (sc + (ulong)lr * (ulong)p.groups)[j0 / gsz];
+        float sub = 0.0f;
+        for (uint w = 0u; w < 8u; ++w) {
+          uint word;
+          if (w < 4u) {
+            word = (w == 0u) ? pa.x : (w == 1u) ? pa.y : (w == 2u) ? pa.z : pa.w;
+          } else {
+            word = (w == 4u) ? pb.x : (w == 5u) ? pb.y : (w == 6u) ? pb.z : pb.w;
+          }
+          sub += dot(float4(as_type<char4>(word)), xv[w]);
         }
         acc4[r] += sub * scl;
       }
