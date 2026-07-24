@@ -3300,6 +3300,7 @@ std::vector<int> PlanMetalEngine::generate_spec_lookup(const std::vector<int>& p
   // stretch of structured output still gets picked up.
   float acc_ewma = 1.0f;
   int spec_cooldown = 0;
+  int spec_backoff = 0;
   int pos = P;  // where `cur` will be written when it is next forwarded
   int cur = decode_next_token(prompt.back(), P - 1, 0.0f, history);  // first token
   stop = !record(cur);
@@ -3326,10 +3327,18 @@ std::vector<int> PlanMetalEngine::generate_spec_lookup(const std::vector<int>& p
       accepted += a;
       // Blend this verify's hit rate in; on a sustained miss, stop speculating for a while.
       acc_ewma = 0.7f * acc_ewma + 0.3f * (static_cast<float>(a) / static_cast<float>(nd));
-      if (acc_ewma < 0.35f) {
-        spec_cooldown = 48;  // ~48 plain steps before the next probe
-        acc_ewma = 0.6f;     // neutral restart so one good probe re-enables speculation
+      // A verify that lands NOTHING is decisive on its own -- waiting for the average to sag
+      // just buys more full-price misses. Trip on that, or on a sagging average.
+      if (a == 0 || acc_ewma < 0.35f) {
+        // Exponential: each consecutive failure doubles the quiet period, so a model that
+        // simply never repeats settles at ~free instead of probing forever. A fully accepted
+        // verify clears the penalty, so a later run of structured text is still caught.
+        spec_backoff = (spec_backoff == 0) ? 32 : std::min(spec_backoff * 2, 2048);
+        spec_cooldown = spec_backoff;
+        acc_ewma = 0.6f;  // neutral restart: one good probe re-enables speculation
         ++backoffs;
+      } else if (a == nd) {
+        spec_backoff = 0;  // drafting is paying again; forget the penalty
       }
       pos += a + 1;  // KV correct through the a-th accepted draft; rejected rows go stale
       bool cont = true;
@@ -3342,9 +3351,10 @@ std::vector<int> PlanMetalEngine::generate_spec_lookup(const std::vector<int>& p
     }
   }
   if (std::getenv("CPI_METAL_SPEC_STATS")) {
-    std::fprintf(stderr, "[spec] verifies=%d drafted=%d accepted=%d (%.1f%%) tokens=%zu\n",
+    std::fprintf(stderr,
+                 "[spec] verifies=%d drafted=%d accepted=%d (%.1f%%) backoffs=%d tokens=%zu\n",
                  verifies, drafted, accepted, drafted ? 100.0 * accepted / drafted : 0.0,
-                 out.size());
+                 backoffs, out.size());
   }
   return out;
 }
