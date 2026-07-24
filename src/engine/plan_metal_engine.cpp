@@ -448,20 +448,11 @@ public:
     if (!wl_.has_tensor(name)) {
       throw std::runtime_error("weight not in the model file: " + name);
     }
-    // Unified memory: this "upload" is a memcpy into a buffer the GPU can read -- but ONLY when
-    // the container already holds fp16.
-    //
-    // A HuggingFace checkpoint is BF16 (Gemma 4's is, in all 2011 tensors). BF16 and FP16 are both
-    // 16 bits with different exponent splits, so memcpying one and reading it as the other is not
-    // an error, a crash or a NaN -- it is plausibly-scaled garbage that propagates. It cost this
-    // session a long hunt: the embedding table alone came out 2.6x its true magnitude, and every
-    // symptom downstream (huge projections, an inf in the MLP, NaN logits) was a consequence that
-    // looked like a local bug.
-    //
-    // Nothing caught it earlier because Metal had never loaded a HF checkpoint directly: .ll2c and
-    // .cpi are fp16 by construction (pack_ll2c.py and ll2c_to_cpi convert at packing time), so the
-    // conversion had always already happened upstream. CUDA does exactly this, at
-    // plan_cuda_engine.cu's "safetensors : bf16 ... we convert bf16 -> fp16".
+    // Unified memory: this "upload" is a memcpy into a GPU-readable buffer, but ONLY when the
+    // container already holds fp16. A HuggingFace checkpoint is BF16 -- same 16 bits, different
+    // exponent split -- so memcpying one and reading it as fp16 is plausibly-scaled garbage, not a
+    // crash or NaN. .ll2c and .cpi are fp16 by construction, which is why this only bites on a
+    // direct HF load; the conversion below is what CUDA does at plan_cuda_engine.cu's bf16 -> fp16.
     const std::size_t bytes = wl_.tensor_bytes(name);
     std::vector<std::uint16_t> conv;
     runtime::MetalBuffer b = ctx_.alloc_from(fp16_data(name, conv), bytes);

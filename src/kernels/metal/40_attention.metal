@@ -13,32 +13,19 @@
 // Halving the query block keeps the pair at 16 KB. Only head_dim > 256 layers (Gemma 4's full
 // layers) take the wide kernel; the tuned 256 path is untouched.
 #define Q_BLOCK_WIDE 4
-// The matrix-unit prefill kernel's query-block size. Separate from Q_BLOCK because the scalar
-// kernel sizes its shared arrays for head_dim 256 (Gemma) and cannot afford a wider block --
-// raising a shared constant would silently break a path whose golden is skipped on any host
-// without a Gemma checkpoint.
+// The matrix-unit prefill kernel's query-block size, in queries (QMM_BLOCK/8 row fragments).
+// Separate from Q_BLOCK: the scalar kernel sizes its shared arrays for head_dim 256 and cannot
+// afford a wider block. 16 fills the scoring loop, which runs qfs*n_kg work items -- with
+// n_kg = KEY_BLOCK/8 = 4, one query fragment leaves 4 of 8 simdgroups idle where two fill them.
+// Measured at T=2041 (attention 39% of the pass): 330 -> 301 ms (-9%) from 8 to 16, back to 330 at
+// 32 (four fragments loop twice for the same parallelism at more threadgroup memory). This is
+// purely about simdgroup occupancy in the score matmul, not K/V re-reads -- those are LLC-served.
 //
-// The block is QMM_BLOCK/8 query row fragments, and 16 (two fragments) is what fills the scoring
-// loop: it runs qfs*n_kg work items, and with n_kg = KEY_BLOCK/8 = 4 key groups, one query
-// fragment leaves 4 of the 8 simdgroups idle where two fill them all. Measured on a 2041-token
-// prefill -- where attention is 39% of the pass, not the 15% it is at 541 -- attention goes
-// 330 -> 301 ms (-9%) from 8 to 16, and back to 330 at 32 (four fragments loop twice for no more
-// parallelism and cost more threadgroup memory). At 541 tokens the change is real but invisible:
-// 9% of a 15% share is under the run-to-run noise, which is why it first read as a dead end when
-// measured only there. Measure a small term where it is small and you conclude it is zero.
+// Raising it above 8 requires the matrix ops to loop over QMM_BLOCK/8 fragments, which they now do;
+// before that a block of 16 scored only its first 8 queries and left the rest as garbage.
 //
-// It does NOT help by cutting K/V re-reads, the theory it was first tried under: those are
-// cache-served (a layer's K+V is ~277 KB at T=541, held in the LLC without trying), and 32 would
-// cut them further while running slower. It is only about keeping all 8 simdgroups busy in the
-// score matmul.
-//
-// Raising it USED to compute garbage -- the fragment plan scored exactly one simdgroup_float8x8
-// from row 0, so a block of 16 wrote its first 8 queries and left the rest as whatever shared
-// memory held (the fp16 GEMM's bug exactly, a tile widened past the threads that serve it). The
-// matrix ops below now loop over QMM_BLOCK/8 fragments, so it is a real knob.
-//
-// Threadgroup memory is the ceiling: q_sh + acc + sc_sh + pw_sh is QMM_BLOCK * (2*128 + 4*128 +
-// 4*32 + 2*32) bytes, so 16 costs ~15 KB of the 32 KB budget and 32 ~30 KB.
+// Threadgroup ceiling: q_sh + acc + sc_sh + pw_sh = QMM_BLOCK * (2*128 + 4*128 + 4*32 + 2*32)
+// bytes, so 16 is ~15 KB of the 32 KB budget and 32 is ~30 KB.
 #define QMM_BLOCK 16
 
 // The scoring and P.V loops hold a QMM_QT x QMM_KT register tile, so they walk query fragments in
@@ -220,16 +207,13 @@ static void attn_prefill_mm_body(device const half* q, device const half* k_cach
     // attention's per-block overhead, not its matmuls, is what makes this kernel slower than the
     // flash-attention path it is measured against.
     //
-    // Scale and the causal/window mask are folded in here rather than a separate sc_sh sweep: the
-    // softmax already holds the query and its keys, so the masked, scaled score feeds the reduction
-    // directly -- one fewer barrier and one fewer pass per block.
+    // Scale and the causal/window mask fold in here rather than a separate sc_sh sweep: the softmax
+    // already holds the query and its keys, so the masked, scaled score feeds the reduction
+    // directly -- one fewer barrier and pass per block.
     //
-    // Three things this loop does NOT cost, each measured and each reverted: a fast exp, skipping
-    // the accumulator rescale when the running max did not move, and interleaving two queries so
-    // their reduction chains overlap. All neutral. Taken with the phase decomposition (ATTN_RCA
-    // above), which prices this loop above either matmul despite its doing a sixty-fourth of their
-    // arithmetic, the cost is not in the body at all -- it is the score round-trip through
-    // threadgroup memory that phase-partitioning forces, which no edit inside the phase can remove.
+    // Falsified, do not retry (all neutral): a fast exp, skipping the accumulator rescale when the
+    // max did not move, interleaving two queries' reductions. Per ATTN_RCA the cost is not in this
+    // body but in the score round-trip through threadgroup memory that phase-partitioning forces.
 #if !(ATTN_RCA & 2)
     for (uint qi = simd_id; qi < nq; qi += n_simd) {
       const uint pos_i = base + t0 + qi;
@@ -364,75 +348,44 @@ kernel void cpi_attention_prefill_mm_wide(device const half* q [[buffer(0)]],
 // ---------------------------------------------------------------------------
 // Register-resident prefill attention (head_dim <= 128).
 //
-// The phase-partitioned kernel above spills the score matrix to threadgroup memory between
-// scoring, softmax and P.V. The in-kernel decomposition (ATTN_RCA) priced that round trip, not the
-// arithmetic, as what the softmax phase actually costs: a fast exp, skipping the accumulator
-// rescale and overlapping the reduction chains all measured neutral, because none of them touch
-// the traffic. This kernel never spills it. S is computed into simdgroup_float8x8 REGISTERS, the
-// softmax rewrites those registers in place, and P.V consumes them -- no threadgroup memory at
-// all, and no barrier anywhere in the key loop.
+// S is computed into simdgroup_float8x8 registers, the softmax rewrites them in place and P.V
+// consumes them: no threadgroup memory and no barrier in the key loop, where the phase-partitioned
+// kernel above spills S between each phase. Q is gathered and the output scattered per lane, so the
+// threadgroup footprint is zero and occupancy is register-bound.
 //
-// That needs to know which lane of a simdgroup holds which element of an 8x8 fragment, which MSL
-// does not document. It is not guessed: cpi_simdgroup_layout_probe below writes the mapping out,
-// the engine runs it once at start-up, and this kernel is selected only if the device agrees with
-// what is assumed here. Anything else falls back to the phase-partitioned kernel.
-//
-// The measured mapping -- 8x8 fragment, 32-wide simd, exactly 2 elements per lane, and identical
-// for the half and float fragments (which is what lets P be written back for the matmul):
+// Depends on which lane of a simdgroup holds which element of an 8x8 fragment, which MSL does not
+// document. cpi_simdgroup_layout_probe measures it at start-up and the engine selects this kernel
+// only if the device matches; anything else keeps the phase-partitioned kernel. Measured mapping
+// (32-wide simd, 2 elements per lane, identical for half and float fragments, which is what lets P
+// be written back for the matmul):
 //     row         = ((lane & 16) >> 2) | ((lane & 6) >> 1)
 //     col of e[0] = ((lane & 8) >> 1) | ((lane & 1) << 1),   e[1] at col + 1
+// A row therefore lives in four lanes differing only in bits 0 and 3 (row reduction = two shuffles,
+// not a 32-lane simd_max), and a lane holds the same row of every fragment, so each lane tracks one
+// query's running max and sum in registers.
 //
-// Two consequences carry the kernel. A row lives in exactly FOUR lanes, differing only in bits 0
-// and 3, so a row-wise reduction is two shuffles instead of the five a 32-lane simd_max costs. And
-// a lane sits in the same row of every fragment, so each lane simply tracks one query's running
-// max and sum in registers -- the online softmax needs no shared state, and the accumulator
-// rescale becomes two multiplies on the lane's own elements rather than a pass over shared memory.
-//
-// Q is gathered per lane rather than staged through threadgroup memory, and the output scattered
-// per lane, so this kernel's threadgroup footprint is ZERO and occupancy is bounded only by
-// registers. Both happen once per threadgroup, not per key block.
-//
-// STATUS: CORRECT (goldens pass) and RESEARCH-ONLY -- it LOSES, decisively, and it loses for a
-// reason that retires the idea rather than this implementation of it. Attention costs ~283 ms
-// against the phase-partitioned kernel's ~117 ms at T=2041, so opting in (CPI_METAL_ATTN_FA=1)
-// makes prefill ~774 ms instead of 612. Decomposed against the other kernel (FA_RCA above):
+// STATUS: correct (goldens pass) but RESEARCH-ONLY, and slower by enough to retire the idea.
+// Attention ~283 ms vs the phase kernel's ~117 at T=2041; CPI_METAL_ATTN_FA=1 makes prefill ~774 ms
+// against 612. Per phase (FA_RCA above):
 //
 //                  scoring   softmax    P.V     total
 //   phase           48 ms     60 ms    50 ms    117 ms
 //   register-res.  130 ms     63 ms   107 ms    283 ms
 //
-// The softmax is the point of this kernel and it costs THE SAME, 63 against 60. Keeping the score
-// matrix in registers, never spilling it, reducing over four lanes instead of thirty-two -- none of
-// it moves the number. So the phase kernel's 60 ms was never the threadgroup round trip it was
-// blamed on; it is intrinsic per-element work (exp, masking, the reductions) over ~700M score
-// elements, and it costs that wherever S lives. Which is also why every attack on it through memory
-// layout came back neutral: a fast exp, skipping the rescale, interleaving the reductions, staging
-// K/V, pre-transposing K, query tiling, block width. All aimed at a cost that is not memory-shaped.
+// The softmax is this kernel's whole point and costs the same (63 vs 60), so the phase kernel's
+// 60 ms is intrinsic per-element work over ~700M score elements, not the threadgroup round trip it
+// was attributed to. That also explains why every memory-shaped attack on it measured neutral.
 //
-// Every variant was tried and every one is worse:
+// Falsified, do not retry: FA_QT 1/FA_KB 32 753 ms (best), 1/64 789, 2/32 820 (fragment spill),
+// 2/64 1006; K/V staged in threadgroup memory 775 vs 771; K pre-transposed in that copy 769;
+// head_dim as a compile-time constant neutral. The matmuls are 2.2-2.7x slower and none of
+// registers, occupancy, the transposing load, cross-simdgroup redundancy, intensity or block width
+// accounts for it.
 //
-//   FA_QT 1, FA_KB 32   753 ms      <- best
-//   FA_QT 1, FA_KB 64   789
-//   FA_QT 2, FA_KB 32   820         <- register pressure; the doubled fragment set spills
-//   FA_QT 2, FA_KB 64  1006
-//   K/V staged in threadgroup memory (once the staged key loop was made threadgroup-uniform, which
-//     it has to be because the copy barriers): 775 staged vs 771 not, i.e. nothing -- so the
-//     FA_NSG-fold re-reading of each block across simdgroups was never the cost either
-//   K pre-transposed during that copy, so the fragment load needs no transpose: 769, also nothing
-//   head_dim as a compile-time constant (in case the fragment arrays were spilling): neutral
-//   maxTotalThreadsPerThreadgroup is 1024 here and this kernel uses ZERO threadgroup memory, so it
-//     is not register- or occupancy-limited in any way the driver will admit to
-//
-// The matmuls are 2.2-2.7x slower and nothing tested explains it: not registers, not occupancy, not
-// the transposing load, not the cross-simdgroup redundancy, not intensity, not block width. What
-// IS established is that the softmax gains nothing from being register-resident, which removes the
-// reason to keep pulling on this thread.
-//
-// Where the remaining gap actually is: the phase kernel's three phases sum to 158 ms serial but
-// cost 117, so only ~35% overlaps, and that overlap comes entirely from concurrent threadgroups --
-// its three barriers per key block serialise scoring, softmax and P.V within one. Overlapped, that
-// is max(48, 60, 50) rather than their sum, which is llama.cpp's ~66 ms arrived at from our own
-// measured phase costs. The lever is pipelining the key loop, not making any phase cheaper.
+// Remaining gap in the phase kernel: its phases sum to 158 ms serial but cost 117, so only ~35%
+// overlaps and that comes from concurrent threadgroups -- three barriers per key block serialise
+// the phases within one. Fully overlapped is max(48, 60, 50), which is llama.cpp's ~66 ms. The
+// lever is pipelining the key loop, not making a phase cheaper.
 // ---------------------------------------------------------------------------
 #define FA_NSG 4                       // simdgroups per threadgroup; one query row fragment each
 #define FA_QBLK (8u * FA_NSG)          // queries per threadgroup
@@ -653,37 +606,24 @@ kernel void cpi_attention_prefill_fa(device const half* q [[buffer(0)]],
 // this uses 4 simdgroups and a 32-key block rather than the 8 and 128 the phase-partitioned kernel
 // settled on. Selected by CPI_METAL_ATTN_QP=1; the proven kernel above stays the default.
 //
-// STATUS: CORRECT (goldens pass) but currently 3.9x SLOWER -- 449 ms of attention at T=2042 against
-// the phase-partitioned kernel's 116 ms. The decomposition is not what is wrong; the BLOCK SIZE is.
-// Giving every simdgroup private scratch multiplies the scratch by NSG, which forces QP_KB down to
-// 32 where the phase kernel runs 128. The online softmax (its two simd reductions plus the
-// accumulator rescale) runs once per (query, key block), so a 32-key block does 4x the softmax work
-// of a 128-key one -- and that same effect is what made 32 -> 128 the single largest win on the
-// phase kernel. Hoisting the query fragments out of the key-group loop (intensity 0.5 -> 0.8) was
-// measured neutral, confirming the cost is the softmax count, not fragment loads.
+// STATUS: correct (goldens pass) but 3.9x slower -- 449 ms of attention at T=2042 vs the phase
+// kernel's 116. The block size is the cause, not the decomposition: private per-simdgroup scratch
+// multiplies the budget by NSG and forces QP_KB to 32 where the phase kernel runs 128. The online
+// softmax runs once per (query, key block), so a 32-key block does 4x the softmax work -- the same
+// effect that made 32 -> 128 the largest win on the phase kernel. Hoisting query fragments out of
+// the key-group loop (intensity 0.5 -> 0.8) was neutral, confirming the cost is softmax count.
 //
-// So making this competitive is a MEMORY problem, not a restructuring one: it needs the per-
-// simdgroup scratch to fit a 128-key block, which means sizing the arrays to the actual head_dim
-// instead of the 128 maximum (dynamic threadgroup memory via setThreadgroupMemoryLength) and
-// re-tuning NSG against QP_KB. At head_dim 64 that alone would roughly halve the scratch. Left here
-// behind the flag because it is correct and the remaining work is parameter tuning rather than a
-// rewrite -- which is a much better starting point than the blank page this began as.
+// Making it competitive is a memory problem: the per-simdgroup scratch must fit a 128-key block,
+// which means sizing the arrays to the real head_dim (dynamic threadgroup memory) and re-tuning NSG
+// against QP_KB. Left behind the flag as parameter-tuning work rather than a rewrite.
 #define QP_NSG  4                     // simdgroups per threadgroup
 #define QP_QPS  8                     // queries per simdgroup == one 8x8 row fragment
 #define QP_QBLK (QP_QPS * QP_NSG)     // 32 queries per threadgroup
-// Keys per block, == the simd width, so lane == key and there is nothing to fold before the
-// reduction. That looked like this kernel's whole problem: the cap is the threadgroup budget
-// (per-simdgroup scratch times QP_NSG, and with q_sh and acc sized for head_dim 128 the four
-// simdgroups already spend ~30 KB of 32 KB here), and a narrow block leaves the softmax as almost
-// pure reduction latency.
-//
-// It was tried. Sizing q_sh and acc at dispatch from the real head_dim lifts the cap, and wider is
-// monotonically WORSE: 32 keys 743 ms, 64 764, 96 852, against 610 for the phase-partitioned
-// kernel. Threadgroup memory buys occupancy, not block width -- it decides how many threadgroups
-// stay resident per core, and at 96 keys only one fits. Latency hiding is worth more here than any
-// fold. The dynamic-allocation plumbing was reverted with the hypothesis (it also let a caller that
-// forgot to size the arrays get zero-length ones silently, which is how it broke the window golden).
-// Query-partitioning is not being held back by this constant.
+// Keys per block, == the simd width, so lane == key with nothing to fold before the reduction. The
+// cap is the threadgroup budget (per-simdgroup scratch times QP_NSG; q_sh and acc sized for
+// head_dim 128 already spend ~30 KB of 32 KB). Widening it via dynamic head_dim sizing was tried
+// and is monotonically worse -- 32 keys 743 ms, 64 764, 96 852 -- because threadgroup memory buys
+// occupancy, not block width: at 96 keys only one threadgroup stays resident per core.
 #define QP_KB   32
 kernel void cpi_attention_prefill_qp(device const half* q [[buffer(0)]],
                                      device const half* k_cache [[buffer(1)]],
@@ -1865,10 +1805,8 @@ kernel void cpi_attention_bidirectional(
   threadgroup float sc[BIATTN_CHUNK];
   threadgroup float red[BIATTN_CHUNK / 32];
   threadgroup float acc[BIATTN_MAXDIM];   // running unnormalised output
-  // [2] holds the max from BEFORE this chunk. The rescale factor is exp(prev_max - run_max),
-  // and reading stats[0] after it has been updated makes that exp(0) == 1 -- a no-op rescale
-  // that silently drops the correction whenever the max grows, which for a softmax whose
-  // first chunk happens to hold the largest score is most of the time.
+  // [2] holds the max from BEFORE this chunk: the rescale is exp(prev_max - run_max), and reading
+  // an already-updated stats[0] makes that exp(0) == 1, dropping the correction when the max grows.
   threadgroup float stats[3];             // [0] running max, [1] running sum, [2] previous max
 
   for (uint d = lid; d < p.head_dim; d += nthr) acc[d] = 0.0f;

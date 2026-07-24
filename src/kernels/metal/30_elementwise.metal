@@ -148,12 +148,9 @@ kernel void cpi_gelu_mul(
   // mantissa bits either. Nothing is approximated here.
   //
   // It exists because Gemma 4's norm gains are large (7-47 in E2B): activations reach ~165 into
-  // the MLP and the GeGLU product passes fp16's 65504, which becomes inf and then NaN at the next
-  // accumulation. Saturating instead (the previous behaviour) kept it finite but was LOSSY, and
-  // the loss compounded into repetition over a long generation.
-  //
-  // The clamp stays as a backstop for anything still out of range after scaling. It is a no-op
-  // for every value that fits, so no existing model's arithmetic changes.
+  // the MLP and the GeGLU product passes fp16's 65504, going inf then NaN. Saturating instead kept
+  // it finite but lossy, and the loss compounded into repetition over long generations. The clamp
+  // stays as a backstop, a no-op for values that fit, so no existing model's arithmetic changes.
   // in2 may be a window of a WIDER row than out's. Flat indexing is only correct when the two
   // strides match, which is why an aux_offset plan used to be forced to one token at a time --
   // this makes it correct for a whole prefill chunk instead.

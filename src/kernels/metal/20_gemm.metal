@@ -26,22 +26,14 @@
 // without a hardcoded number drifting out of step, which is how this kernel once came to write
 // half its rows.
 //
-// 4x4 IS THE CEILING, AND THE REASON IS THE REGISTER FILE. Measured with metal_gemm_bench
-// (correct at both settings, interleaved, warm):
+// 4x4 is the ceiling, bounded by the register file. Measured with metal_gemm_bench:
 //
 //   RF=4, FBM=64  (32x32/simdgroup, 16 accumulator fragments)   2.90 TFLOP/s
 //   RF=8, FBM=128 (64x32/simdgroup, 32 accumulator fragments)   0.38 TFLOP/s   <- 7.6x SLOWER
 //
-// 32 accumulator fragments is 64 float registers per lane before wf/af, and it spills. Raising
-// arithmetic intensity by holding more of the output per thread is therefore not available on
-// this hardware: the trade buys fewer loads and pays for them in spill traffic, at a ruinous
-// rate.
-//
-// Worth stating plainly because this REINSTATES a finding that was wrongly overturned. Two
-// sessions concluded this kernel was against a register-file wall; that was then "corrected" to
-// a simdgroup-starvation diagnosis, on the strength of a 2764 -> 3780 tok/s result which turned
-// out to be the kernel skipping half its writes. The starvation theory is dead (more simdgroups
-// measured slower once the geometry was consistent). The register-file wall is real.
+// 32 accumulator fragments is 64 float registers per lane before wf/af, and it spills. Holding
+// more of the output per thread to raise intensity trades fewer loads for spill traffic at a
+// ruinous rate; more simdgroups also measured slower once the geometry was consistent.
 #define GEMM_RF 4
 #define GEMM_CF 4
 
@@ -76,34 +68,17 @@ typedef float gemm_acc_e;
 // K per stage: how much arithmetic each barrier buys, since the fill and the matrix ops are
 // separated by barriers.
 //
-//   fp16  (GEMM_FBK 32): the depth does not matter. Measured with metal_gemm_bench at 16 / 32
-//     / 64: 2.85 / 2.89 / 2.86 TFLOP/s -- a 1.5% spread, i.e. nothing. This block used to
-//     claim "fp16 (GEMM_BK 64): deeper is better -- 8 matrix steps per fill instead of 4",
-//     describing a GEMM_BK that no kernel had read since the fp16 path moved to GEMM_FBK.
-//     The claim was documenting a constant that did nothing. It is deleted rather than
-//     corrected in place, because a dead define is how it survived.
-//   quant (GEMM_QBK 32): deeper is WORSE. The quant tile also holds a scale row, so doubling
-//     K doubles its threadgroup memory, and the 8B's GEMM is compute-bound -- it needs the
-//     occupancy to hide latency more than it needs fewer barriers. Measured: 161 -> 148 tok/s.
-//     (Unlike the fp16 claim above, GEMM_QBK is live and this has not been re-measured with
-//     the current harness.)
+//   fp16  (GEMM_FBK 32): depth does not matter -- 16/32/64 measure 2.85/2.89/2.86 TFLOP/s.
+//   quant (GEMM_QBK 32): deeper is worse. The quant tile also holds a scale row, so doubling K
+//     doubles its threadgroup memory, and the 8B's GEMM is compute-bound: it needs the occupancy
+//     to hide latency more than it needs fewer barriers. Measured 161 -> 148 tok/s at 32 -> 64.
 //
-// GEMM_QBK must also not exceed the quantization group (64 by default), or a K-block would
-// straddle two scales. The dispatch guards that.
-// GEMM_FBM is the fp16 row tile, and it MUST stay in step with the host's kGemmFBM, which
-// derives both the thread count (one simdgroup per 32x32 sub-tile of FBM x BN) and the grid
-// (out_dim / FBM row blocks) from it. That coupling is the whole reason this comment exists:
-//
-// This tile was once raised 64 -> 128 "over 8 simdgroups (256 threads)", reported as
-// 2764 -> 3780 tok/s. The kernel changed; the host's thread count did not. So it ran 128
-// threads = 4 simdgroups against a 128-row tile and wrote only half the rows of each one --
-// and the "speedup" was simply the work it skipped. Nothing failed: the GEMM only runs at
-// T >= kGemmMinTokens, and no golden prompt is that long. Re-measured with the geometry
-// actually consistent, 128 rows over 8 simdgroups is ~3% SLOWER than 64 over 4, so the tile
-// is back to 64 and the premise (more simdgroups hide fragment-load latency) is unsupported.
-//
-// Both configurations are now checked against a CPU reference in metal_smoke, which derives
-// its dispatch from these same constants rather than restating them.
+// GEMM_QBK must not exceed the quantization group (64 by default), or a K-block straddles two
+// scales; the dispatch guards that.
+// GEMM_FBM is the fp16 row tile and MUST stay in step with the host's kGemmFBM, which derives both
+// the thread count (one simdgroup per 32x32 sub-tile of FBM x BN) and the grid (out_dim / FBM row
+// blocks) from it. 128 rows over 8 simdgroups measured ~3% slower than 64 over 4. Both are checked
+// against a CPU reference in metal_smoke, which derives its dispatch from these same constants.
 #define GEMM_QBK 32
 #define GEMM_FBM 64
 #define GEMM_FBK 32
