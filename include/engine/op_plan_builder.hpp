@@ -63,6 +63,12 @@ public:
   // backend implements.
   virtual bool quantize_embeddings() const { return false; }
 
+  // An embedding table, quantized at whatever width the backend picks for embeddings -- which
+  // need not be the projection width. Only reached when quantize_embeddings() is true.
+  virtual QuantWeight quant_embedding(const std::string& name, int rows, int cols) const {
+    return quant(name, rows, cols);
+  }
+
   // HOST value of a one-element tensor. The vision builder needs the clip BOUNDS as numbers
   // (they go into Op::clip_*, not into a buffer binding), and only the backend knows how to
   // read bytes out of its container. Default throws: a builder that needs scalars on a backend

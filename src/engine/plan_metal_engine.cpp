@@ -527,17 +527,40 @@ public:
   }
 
   opplan::QuantWeight quant(const std::string& name, int out_dim, int in_dim) const override {
-    if (bits_ == 0 || !wl_.has_tensor(name)) return {};
+    return quant_bits(name, out_dim, in_dim, bits_);
+  }
 
-    auto it = qbufs_.find(name);
+  // Embeddings can be quantized at a DIFFERENT width from the projections: they are gathered,
+  // not multiplied, so their bytes buy latency only through the one row a token reads, while
+  // their error lands on every layer's input. CPI_METAL_EMBED_BITS = 0 (fp16) | 4 | 8, default
+  // = the projection width.
+  opplan::QuantWeight quant_embedding(const std::string& name, int rows, int cols) const override {
+    static const int eb = [this] {
+      const char* e = std::getenv("CPI_METAL_EMBED_BITS");
+      if (e == nullptr) return bits_;
+      const int v = std::atoi(e);
+      return (v == 0 || v == 4 || v == 8) ? v : bits_;
+    }();
+    return quant_bits(name, rows, cols, eb);
+  }
+
+  opplan::QuantWeight quant_bits(const std::string& name, int out_dim, int in_dim, int bits) const {
+    if (bits == 0 || !wl_.has_tensor(name)) return {};
+
+    // Keyed by WIDTH as well as name: a tied head and its embedding table are the same tensor
+    // and may now be quantized differently, so a name-only key would hand one of them the
+    // other's packing.
+    const std::string key = name + "/" + std::to_string(bits);
+    auto it = qbufs_.find(key);
     if (it == qbufs_.end()) {
       std::vector<std::uint16_t> conv;
       const std::uint16_t* src = fp16_data(name, conv);
       const int gsz = (group_ > 0) ? group_ : in_dim;
       const int groups = (in_dim + gsz - 1) / gsz;
-      const float max_q = (bits_ == 4) ? 7.0f : 127.0f;
+      const float max_q = (bits == 4) ? 7.0f : 127.0f;
+      double err2 = 0.0, ref2 = 0.0;  // for the reconstruction-error report
 
-      const std::size_t packed_row = (bits_ == 4) ? static_cast<std::size_t>((in_dim + 1) / 2)
+      const std::size_t packed_row = (bits == 4) ? static_cast<std::size_t>((in_dim + 1) / 2)
                                                   : static_cast<std::size_t>(in_dim);
       std::vector<std::uint8_t> packed(static_cast<std::size_t>(out_dim) * packed_row, 0);
       // Scales are stored fp16, not fp32: for group-32 int4 the scale is one value per 32
@@ -565,8 +588,19 @@ public:
 
           const float inv = 1.0f / scale;
           for (int j = j0; j < j1; ++j) {
-            int q = static_cast<int>(std::lround(fp16_to_f32(row[j]) * inv));
-            if (bits_ == 4) {
+            const float w_ref = fp16_to_f32(row[j]);
+            int q = static_cast<int>(std::lround(w_ref * inv));
+            {
+              // Reconstruction error against what the kernel will actually read back. Free
+              // (the values are in registers) and it is the only quantitative handle on a
+              // mixed-precision choice -- "the output still looks coherent" cannot rank two
+              // quantization schemes.
+              const int qc = (bits == 4) ? std::max(-8, std::min(7, q)) : std::max(-127, std::min(127, q));
+              const double d = static_cast<double>(w_ref) - static_cast<double>(qc) * scale;
+              err2 += d * d;
+              ref2 += static_cast<double>(w_ref) * static_cast<double>(w_ref);
+            }
+            if (bits == 4) {
               q = std::max(-8, std::min(7, q));
               const std::uint8_t nib = static_cast<std::uint8_t>(q < 0 ? q + 16 : q);
               std::uint8_t& byte = packed[static_cast<std::size_t>(r) * packed_row +
@@ -585,17 +619,27 @@ public:
         }
       }
 
+      // CPI_METAL_QUANT_STATS=1 prints per-tensor relative RMS error and the bytes it cost.
+      // How a partial/mixed-precision scheme gets RANKED instead of eyeballed.
+      if (std::getenv("CPI_METAL_QUANT_STATS") != nullptr) {
+        const double rel = (ref2 > 0.0) ? std::sqrt(err2 / ref2) : 0.0;
+        const double mb = static_cast<double>(packed.size() +
+                                              scales.size() * sizeof(std::uint16_t)) / (1024.0 * 1024.0);
+        std::fprintf(stderr, "[quant] %-52s int%d g%-4d rel_rms=%.5f  %8.1f MB\n", name.c_str(),
+                     bits, group_, rel, mb);
+      }
+
       QBuf qb;
       qb.packed = ctx_.alloc_from(packed.data(), packed.size());
       qb.scales = ctx_.alloc_from(scales.data(), scales.size() * sizeof(std::uint16_t));
       qb.groups = groups;
-      it = qbufs_.emplace(name, std::move(qb)).first;
+      it = qbufs_.emplace(key, std::move(qb)).first;
     }
 
     opplan::QuantWeight q;
     q.packed = it->second.packed.handle();
     q.scales = it->second.scales.handle();
-    q.bits = bits_;
+    q.bits = bits;
     q.group = group_;
     return q;
   }

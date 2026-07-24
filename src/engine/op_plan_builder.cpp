@@ -77,7 +77,7 @@ Op make_embed(const WeightSource& w, const std::string& name, Slot out, int cols
   o.out = out;
   o.cols = cols;
   if (w.quantize_embeddings() && vocab > 0) {
-    const QuantWeight q = w.quant(name, vocab, cols);
+    const QuantWeight q = w.quant_embedding(name, vocab, cols);
     if (q.bits != 0) {
       o.qweight = q.packed;
       o.qscales = q.scales;
