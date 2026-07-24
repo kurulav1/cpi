@@ -3307,7 +3307,11 @@ std::vector<int> PlanMetalEngine::generate_spec_lookup(const std::vector<int>& p
   while (!stop && pos + 1 < max_context_) {
     int drafts[16];
     const int room = std::min(cap, max_context_ - pos - 1);
-    const int nd = spec_cooldown > 0 ? 0 : metal_lookup_draft(history, 3, room, drafts);
+    // 6-gram, not 3: a 3-gram matches spuriously on common short sequences, and a wrong draft
+    // costs a FULL verify (~10 decode steps on Gemma, whose batched path barely amortises
+    // weights). Requiring a longer match took Gemma from -17% to neutral while leaving Qwen's
+    // 1.76x untouched -- precision matters far more than recall when a miss is this expensive.
+    const int nd = spec_cooldown > 0 ? 0 : metal_lookup_draft(history, 6, room, drafts);
     if (spec_cooldown > 0) --spec_cooldown;
     if (nd <= 0) {
       cur = decode_next_token(cur, pos, 0.0f, history);
