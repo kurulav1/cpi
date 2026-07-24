@@ -178,6 +178,7 @@ constexpr int kGemmQBK = 32;  // MUST match GEMM_QBK in the shader (quantized)
 constexpr int kQBlock = 8;      // MUST match Q_BLOCK in cpi_kernels.metal (scalar prefill)
 constexpr int kQBlockWide = 4;  // MUST match Q_BLOCK_WIDE (scalar prefill, head_dim > 256)
 constexpr int kQMMBlock = 16;   // MUST match QMM_BLOCK in cpi_kernels.metal (matrix-unit prefill)
+constexpr int kQMMBlockWide = 8;  // MUST match QMM_BLOCK_W (matrix-unit prefill, 128 < head_dim <= 256)
 constexpr int kKeyBlock = 32;   // MUST match KEY_BLOCK in cpi_kernels.metal (scalar / decode)
 constexpr int kMMKeyBlock = 128; // MUST match MM_KEY_BLOCK (matrix-unit prefill attention)
 // MUST match QP_QBLK / (QP_NSG*32) in the query-partitioned attention kernel.
@@ -1876,17 +1877,28 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
         // them. Decode is a single query and has nothing to block over -- it keeps the
         // per-token kernel.
         if (T >= kQBlock) {
-          // head_dim <= 128 runs the matrix-unit kernel; Gemma's 256 keeps the scalar one. The
-          // two block over queries differently, so each derives its own grid -- sharing one
+          // p.paged stays 0, so block_tables is never read -- but the binding must exist,
+          // because dispatch() puts the params block at index n_buffers.
+          const void* mmbufs[] = {slot(op.in),  kbuf(layer).handle(),
+                                  vbuf(layer).handle(), slot(op.out),
+                                  pos_buf_.handle(),    kbuf(layer).handle()};
+          // NONE of the matrix-unit kernels read the per-token limits buffer -- they take
+          // block_tables in that binding slot. A multimodal prefill (bidirectional attention over
+          // an image span) must therefore stay on the scalar kernels, which do honour it. Silently
+          // running the mm path here would attend causally across image tokens: coherent-looking
+          // output, wrong image.
+          // CPI_METAL_MM_WIDE=0 forces 128 < head_dim <= 256 back to the scalar kernel: the
+          // bisection lever for a suspected wide-mm bug, and how its token stream is gated
+          // against the kernel it replaced.
+          static const bool mm_wide_enabled = [] {
+            const char* e = std::getenv("CPI_METAL_MM_WIDE");
+            return e == nullptr || e[0] != '0';
+          }();
+          const bool mm_ok = !limits_active_;
+          // The kernels block over queries differently, so each derives its own grid -- sharing one
           // `blocks` here would hand a kernel the other's tiling and quietly drop or double-run
           // queries.
-          if (op.head_dim <= 128) {
-            // p.paged stays 0, so block_tables is never read -- but the binding must exist,
-            // because dispatch() puts the params block at index n_buffers.
-            const void* mmbufs[] = {slot(op.in), kbuf(layer).handle(),
-                                    vbuf(layer).handle(),
-                                    slot(op.out), pos_buf_.handle(),
-                                    kbuf(layer).handle()};
+          if (op.head_dim <= 128 && mm_ok) {
             // CPI_METAL_ATTN_QP=1 selects the query-partitioned research kernel (see the header
             // above it): 4 simdgroups x 8 queries, per-simdgroup scratch, simdgroup_barrier only.
             static const bool qp = [] {
@@ -1919,6 +1931,17 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
                             static_cast<std::size_t>(op.heads) * blocks, kTG, mmbufs, nullptr, 6, &p,
                             sizeof(p));
             }
+          } else if (op.head_dim <= 256 && mm_ok && mm_wide_enabled) {
+            // The matrix-unit kernel's wide variant, at half the query block (see
+            // cpi_attention_prefill_mm_wide). Gemma 4's sliding layers land here; they took the
+            // scalar kernel below purely because it was the only thing that fit head_dim 256, which
+            // left the matrix units idle for 41% of a Gemma prefill.
+            const std::size_t blocks =
+                static_cast<std::size_t>((T + kQMMBlockWide - 1) / kQMMBlockWide);
+            specialize_mm_attn(ctx_, op);
+            ctx_.dispatch("cpi_attention_prefill_mm_wide", G::Groups,
+                          static_cast<std::size_t>(op.heads) * blocks, kTG, mmbufs, nullptr, 6, &p,
+                          sizeof(p));
           } else if (op.head_dim <= 256) {
             const std::size_t blocks = static_cast<std::size_t>((T + kQBlock - 1) / kQBlock);
             ctx_.dispatch("cpi_attention_prefill", G::Groups,

@@ -91,23 +91,23 @@ constant uint FC_q_dim [[function_constant(2)]];
 // accumulates into it. Gemma's head_dim 256 does not fit the fragment plan and keeps the
 // scalar kernel.
 // ---------------------------------------------------------------------------
-kernel void cpi_attention_prefill_mm(device const half* q [[buffer(0)]],
-                                     device const half* k_cache [[buffer(1)]],
-                                     device const half* v_cache [[buffer(2)]],
-                                     device half* out [[buffer(3)]],
-                                     device const int* positions [[buffer(4)]],
-                                     // ONE sequence's logical->physical block map, used only when
-                                     // p.paged != 0. Bound to a dummy otherwise (the params block
-                                     // must stay last, so the slot cannot simply be absent).
-                                     device const int* block_tables [[buffer(5)]],
-                                     constant AttnParams& p [[buffer(6)]],
-                                     uint gid [[threadgroup_position_in_grid]],
-                                     uint lid [[thread_position_in_threadgroup]],
-                                     uint nthr [[threads_per_threadgroup]]) {
+// The body, parameterized by its query block and register tile so the narrow and wide variants
+// cannot drift apart. The threadgroup arrays are the caller's: MSL cannot size an array from a
+// function constant, so each kernel declares its own at ITS max head_dim and passes them in.
+template <uint QB, uint QT_, uint KT_>
+static void attn_prefill_mm_body(device const half* q, device const half* k_cache,
+                                 device const half* v_cache, device half* out,
+                                 device const int* positions, device const int* block_tables,
+                                 constant AttnParams& p, threadgroup half* q_sh,
+                                 threadgroup float* acc, threadgroup float* sc_sh,
+                                 threadgroup half* pw_sh, threadgroup float* m_sh,
+                                 threadgroup float* l_sh, uint gid, uint lid, uint nthr) {
+  static_assert(QB % (8u * QT_) == 0u,
+                "query block must be a whole number of QT-sized fragment groups");
   const uint head = gid % p.heads;
-  const uint t0 = (gid / p.heads) * QMM_BLOCK;
+  const uint t0 = (gid / p.heads) * QB;
   if (t0 >= p.tokens) return;
-  const uint nq = min((uint)QMM_BLOCK, p.tokens - t0);
+  const uint nq = min((uint)QB, p.tokens - t0);
 
   uint base = p.position;
   if (p.use_position_buffer != 0u) base = uint(positions[0]);
@@ -116,30 +116,20 @@ kernel void cpi_attention_prefill_mm(device const half* q [[buffer(0)]],
   const uint kv_head = head / group;
   const uint kv_dim = FC_kv_dim;
   const uint q_dim = FC_q_dim;
-  const uint hd = FC_head_dim;  // <= 128, compile-time
+  const uint hd = FC_head_dim;  // bounded by the caller's arrays, compile-time
 
   const uint simd_id = lid / 32u;
   const uint lane = lid % 32u;
   const uint n_simd = nthr / 32u;
 
-  // Sized for the largest head_dim the kernel supports: a function constant is not a
-  // constant expression to MSL, so it cannot bound an array. Only the loops and the
-  // addressing get specialized.
-  threadgroup half q_sh[QMM_BLOCK * 128];         // [query][d]
-  threadgroup float acc[QMM_BLOCK * 128];         // [query][d] fp32 output accumulator
-  threadgroup float sc_sh[QMM_BLOCK * MM_KEY_BLOCK]; // scores [query][key]
-  threadgroup half pw_sh[QMM_BLOCK * MM_KEY_BLOCK];  // softmax weights [query][key], half for the matmul
-  threadgroup float m_sh[QMM_BLOCK];              // running max per query
-  threadgroup float l_sh[QMM_BLOCK];              // running sum per query
-
-  // Zero the FULL QMM_BLOCK rows, not just nq: the matrix ops load 8-row fragments, so the
+  // Zero the FULL QB rows, not just nq: the matrix ops load 8-row fragments, so the
   // padding rows must be defined (0) rather than garbage that could turn into NaN.
-  for (uint c = lid; c < QMM_BLOCK * hd; c += nthr) {
+  for (uint c = lid; c < QB * hd; c += nthr) {
     const uint qi = c / hd, i = c % hd;
     q_sh[qi * hd + i] = (qi < nq) ? q[(ulong)(t0 + qi) * (ulong)q_dim + head * hd + i] : half(0);
     acc[qi * hd + i] = 0.0f;
   }
-  for (uint qi = lid; qi < QMM_BLOCK; qi += nthr) {
+  for (uint qi = lid; qi < QB; qi += nthr) {
     m_sh[qi] = -INFINITY;
     l_sh[qi] = 0.0f;
   }
@@ -176,12 +166,12 @@ kernel void cpi_attention_prefill_mm(device const half* q [[buffer(0)]],
     // 4 loads feed 4 MACs (intensity 1.0), and with qfs=2 and n_kg up to 16 the tile count still
     // fills all 8 simdgroups.
     //
-    // Query fragments past qfs are safe to compute BECAUSE QMM_BLOCK is a whole number of QT-sized
-    // groups (enforced at the top of the file): q_sh is zeroed over the FULL QMM_BLOCK rows, so they
+    // Query fragments past qfs are safe to compute BECAUSE QB is a whole number of QT-sized
+    // groups (the static_assert above): q_sh is zeroed over the FULL QB rows, so they
     // contribute zeros that the softmax's nq bound ignores. Key groups past n_kg are NOT safe
     // to read (they can run off the end of the KV cache), so their load is clamped and their store
     // suppressed.
-    constexpr uint QT = QMM_QT, KT = QMM_KT;
+    constexpr uint QT = QT_, KT = KT_;
     const uint qt_n = (qfs + QT - 1u) / QT;
     const uint kt_n = (n_kg + KT - 1u) / KT;
 #if !(ATTN_RCA & 1)
@@ -219,7 +209,7 @@ kernel void cpi_attention_prefill_mm(device const half* q [[buffer(0)]],
 #else
     // RCA bit 0: scoring matmul stubbed. sc_sh still written so the softmax is still fed.
     (void)qt_n; (void)kt_n; (void)QT; (void)KT;
-    for (uint c = lid; c < QMM_BLOCK * MM_KEY_BLOCK; c += nthr) sc_sh[c] = 0.0f;
+    for (uint c = lid; c < QB * MM_KEY_BLOCK; c += nthr) sc_sh[c] = 0.0f;
 #endif
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -316,6 +306,62 @@ kernel void cpi_attention_prefill_mm(device const half* q [[buffer(0)]],
     const float inv = (l_sh[qi] > 0.0f) ? 1.0f / l_sh[qi] : 0.0f;
     out[(ulong)(t0 + qi) * (ulong)q_dim + head * hd + i] = half(acc[qi * hd + i] * inv);
   }
+}
+
+// head_dim <= 128: the tuned shape. 16 queries x a 2x2 register tile, ~15 KB of threadgroup memory.
+kernel void cpi_attention_prefill_mm(device const half* q [[buffer(0)]],
+                                     device const half* k_cache [[buffer(1)]],
+                                     device const half* v_cache [[buffer(2)]],
+                                     device half* out [[buffer(3)]],
+                                     device const int* positions [[buffer(4)]],
+                                     // ONE sequence's logical->physical block map, used only when
+                                     // p.paged != 0. Bound to a dummy otherwise (the params block
+                                     // must stay last, so the slot cannot simply be absent).
+                                     device const int* block_tables [[buffer(5)]],
+                                     constant AttnParams& p [[buffer(6)]],
+                                     uint gid [[threadgroup_position_in_grid]],
+                                     uint lid [[thread_position_in_threadgroup]],
+                                     uint nthr [[threads_per_threadgroup]]) {
+  threadgroup half q_sh[QMM_BLOCK * 128];
+  threadgroup float acc[QMM_BLOCK * 128];
+  threadgroup float sc_sh[QMM_BLOCK * MM_KEY_BLOCK];
+  threadgroup half pw_sh[QMM_BLOCK * MM_KEY_BLOCK];
+  threadgroup float m_sh[QMM_BLOCK];
+  threadgroup float l_sh[QMM_BLOCK];
+  attn_prefill_mm_body<QMM_BLOCK, QMM_QT, QMM_KT>(q, k_cache, v_cache, out, positions, block_tables,
+                                                  p, q_sh, acc, sc_sh, pw_sh, m_sh, l_sh, gid, lid,
+                                                  nthr);
+}
+
+// 128 < head_dim <= 256 -- Gemma 4's SLIDING layers and Qwen3.5. Before this, every head_dim over
+// 128 fell to the scalar kernel and left the matrix units idle for the whole of attention, which on
+// Gemma 4 E2B is 41% of a 1728-token prefill: the largest single term in it.
+//
+// The query block has to HALVE to pay for the wider rows -- q_sh + acc alone are QB*256*6 bytes, so
+// at 16 queries the four arrays come to 36 KB against a 32 KB budget. 8 queries is a single row
+// fragment, so the register tile must drop to QT 1 with it: QB 8 at QT 2 is exactly the
+// misconfiguration described above QMM_QT, which read past q_sh and failed the golden while every
+// benchmark looked fine. KT stays 2 -- key groups are what fill the simdgroups once the query tile
+// cannot.
+#define QMM_BLOCK_W 8
+kernel void cpi_attention_prefill_mm_wide(device const half* q [[buffer(0)]],
+                                          device const half* k_cache [[buffer(1)]],
+                                          device const half* v_cache [[buffer(2)]],
+                                          device half* out [[buffer(3)]],
+                                          device const int* positions [[buffer(4)]],
+                                          device const int* block_tables [[buffer(5)]],
+                                          constant AttnParams& p [[buffer(6)]],
+                                          uint gid [[threadgroup_position_in_grid]],
+                                          uint lid [[thread_position_in_threadgroup]],
+                                          uint nthr [[threads_per_threadgroup]]) {
+  threadgroup half q_sh[QMM_BLOCK_W * 256];
+  threadgroup float acc[QMM_BLOCK_W * 256];
+  threadgroup float sc_sh[QMM_BLOCK_W * MM_KEY_BLOCK];
+  threadgroup half pw_sh[QMM_BLOCK_W * MM_KEY_BLOCK];
+  threadgroup float m_sh[QMM_BLOCK_W];
+  threadgroup float l_sh[QMM_BLOCK_W];
+  attn_prefill_mm_body<QMM_BLOCK_W, 1, QMM_KT>(q, k_cache, v_cache, out, positions, block_tables, p,
+                                               q_sh, acc, sc_sh, pw_sh, m_sh, l_sh, gid, lid, nthr);
 }
 
 // ---------------------------------------------------------------------------
