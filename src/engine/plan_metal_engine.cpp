@@ -36,6 +36,14 @@ struct NormParams {
   float eps;
   std::uint32_t weight_offset, has_weight;
 };
+// Fused per-head RMSNorm + RoPE. MUST mirror NormRopeParams in 00_common.metal -- this going
+// stale is how the kernel reads a field the host never wrote.
+struct NormRopeParams {
+  std::uint32_t heads, head_dim, tokens, position;
+  std::uint32_t use_position_buffer, row_stride, rotary_dim;
+  std::uint32_t weight_offset, has_weight;
+  float theta, eps;
+};
 struct GemvParams {
   std::uint32_t out_dim, in_dim, tokens, has_bias;
 };
@@ -1240,6 +1248,42 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
         grp_read = 0;
         grp_written = ~0ull;
       }
+    }
+
+    // PEEPHOLE FUSION: a per-head RmsNorm in place on a slot immediately followed by RoPE on
+    // that same slot (Gemma's q_norm/k_norm -> rope) is one pass. Both ops read and write the
+    // same head vector, so fusing halves the traffic AND removes ~70 dispatches/token on a
+    // 35-layer Gemma, where encode cost -- not the GPU -- is the limiter. Gated to the plain
+    // 1-D rope: M-RoPE and batched per-row positions keep the separate ops.
+    if (op.kind == OpKind::RmsNorm && op.in == op.out && oi + 1 < ops.size() &&
+        ops[oi + 1].kind == OpKind::Rope && ops[oi + 1].in == op.out &&
+        ops[oi + 1].out == op.out && op.rows == ops[oi + 1].heads &&
+        op.cols == ops[oi + 1].head_dim &&
+        // 512 == ATTN_MAX_HEAD_DIM: the fused kernel stages one head in threadgroup memory.
+        op.cols <= 512 && batch_ == nullptr && !mrope_active_) {
+      const opplan::Op& rp = ops[oi + 1];
+      ctx_.set_next_barrier(true);
+      grp_read = 0;
+      grp_written = ~0ull;
+      NormRopeParams np{static_cast<std::uint32_t>(rp.heads),
+                        static_cast<std::uint32_t>(rp.head_dim),
+                        static_cast<std::uint32_t>(T),
+                        static_cast<std::uint32_t>(position),
+                        1u,
+                        0u,
+                        static_cast<std::uint32_t>(rp.rotary_dim),
+                        op.norm_offset ? 1u : 0u,
+                        op.weight != nullptr ? 1u : 0u,
+                        rp.scale,
+                        op.eps};
+      const void* wb = op.weight != nullptr ? op.weight : slot(op.in);
+      const void* bufs[] = {slot(op.in), wb, pos_buf_.handle()};
+      ctx_.dispatch("cpi_rmsnorm_rope", G::Groups,
+                    static_cast<std::size_t>(rp.heads) * static_cast<std::size_t>(T), kTG, bufs,
+                    nullptr, 3, &np, sizeof(np));
+      ++oi;  // consume the Rope
+      if (profile) profile_tick("RmsNorm+Rope(fused)");
+      continue;
     }
 
     // PEEPHOLE FUSION: `X += delta` (AddInplace) immediately followed by `XNorm = rmsnorm(X)`

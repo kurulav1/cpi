@@ -46,6 +46,87 @@ kernel void cpi_rmsnorm(
 }
 
 // ---------------------------------------------------------------------------
+// Fused per-head RMSNorm + RoPE. Gemma normalizes each attention head (q_norm/k_norm) and then
+// immediately rotates it, so the plan runs two ops that each read and write the same head
+// vector. This does both in one pass: the head is loaded once into threadgroup memory,
+// normalized there, rotated, and written back once. One threadgroup per (token, head).
+//
+// Numerics match [cpi_rmsnorm; cpi_rope] exactly -- the normalized values are rounded to half
+// before rotating, the same as the two-op sequence writing and re-reading the slot.
+// ---------------------------------------------------------------------------
+kernel void cpi_rmsnorm_rope(
+    device half*        x         [[buffer(0)]],
+    device const half*  weight    [[buffer(1)]],
+    device const int*   positions [[buffer(2)]],
+    constant NormRopeParams& p    [[buffer(3)]],
+    uint  gid  [[threadgroup_position_in_grid]],
+    uint  lid  [[thread_position_in_threadgroup]],
+    uint  nthr [[threads_per_threadgroup]]) {
+  const uint token = gid / p.heads;
+  const uint head  = gid % p.heads;
+  if (token >= p.tokens) return;
+
+  const uint stride = (p.row_stride != 0u) ? p.row_stride : (p.heads * p.head_dim);
+  const uint base = token * stride + head * p.head_dim;
+
+  threadgroup float hv[ATTN_MAX_HEAD_DIM];
+  threadgroup float partial[32];
+
+  float ss = 0.0f;
+  for (uint i = lid; i < p.head_dim; i += nthr) {
+    const float v = float(x[base + i]);
+    hv[i] = v;
+    ss += v * v;
+  }
+  ss = simd_sum(ss);
+  const uint simd_id = lid / 32u;
+  const uint simd_lane = lid % 32u;
+  const uint n_simd = (nthr + 31u) / 32u;
+  if (simd_lane == 0u) partial[simd_id] = ss;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_id == 0u) {
+    float v = (simd_lane < n_simd) ? partial[simd_lane] : 0.0f;
+    v = simd_sum(v);
+    if (simd_lane == 0u) partial[0] = v;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const float inv = rsqrt(partial[0] / float(p.head_dim) + p.eps);
+  for (uint i = lid; i < p.head_dim; i += nthr) {
+    float w = 1.0f;
+    if (p.has_weight != 0u) {
+      w = float(weight[i]);
+      if (p.weight_offset != 0u) w += 1.0f;  // Gemma stores (w - 1)
+    }
+    // Round to half here: the unfused pair stores the normed head before RoPE reloads it.
+    hv[i] = float(half(hv[i] * inv * w));
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const uint rot = (p.rotary_dim != 0u) ? p.rotary_dim : p.head_dim;
+  const uint half_rot = rot / 2u;
+  uint pos = (p.use_position_buffer != 0u) ? uint(positions[0]) : p.position;
+  pos += token;  // sequence chunk: row t is token base+t
+
+  for (uint i = lid; i < p.head_dim; i += nthr) {
+    float v;
+    if (i < half_rot) {
+      const float freq = pow(p.theta, -float(2u * i) / float(rot));
+      const float ang = float(pos) * freq;
+      v = hv[i] * cos(ang) - hv[i + half_rot] * sin(ang);
+    } else if (i < rot) {
+      const uint j = i - half_rot;
+      const float freq = pow(p.theta, -float(2u * j) / float(rot));
+      const float ang = float(pos) * freq;
+      v = hv[j] * sin(ang) + hv[i] * cos(ang);
+    } else {
+      v = hv[i];  // lanes past the rotary width pass through
+    }
+    x[base + i] = half(v);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Fused residual-add + RMSNorm. The plan does `X += delta` (AddInplace) then
 // `XNorm = rmsnorm(X)` back to back, each a full read+write of the residual. This does both
 // in one pass: add delta into X (written back), then normalise the summed value. Saves one

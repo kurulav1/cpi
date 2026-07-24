@@ -47,6 +47,22 @@ struct NormParams {
   uint has_weight;     // 0 => weightless (ones)
 };
 
+// Fused per-head RMSNorm + RoPE (see cpi_rmsnorm_rope). Carries both ops' fields; MUST mirror
+// NormRopeParams in plan_metal_engine.cpp.
+struct NormRopeParams {
+  uint heads;
+  uint head_dim;
+  uint tokens;
+  uint position;
+  uint use_position_buffer;
+  uint row_stride;
+  uint rotary_dim;      // lanes rotated from the head's start; 0 => all of head_dim
+  uint weight_offset;   // 1 => scale by (1 + w) [Gemma]
+  uint has_weight;
+  float theta;
+  float eps;
+};
+
 // True LayerNorm: subtracts the mean and scales by weight, then adds bias. RMSNorm does
 // neither, so this cannot be folded into NormParams -- a bias pointer has nowhere to go there.
 struct LayerNormParams {
