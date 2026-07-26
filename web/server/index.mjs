@@ -56,6 +56,66 @@ app.get("/metrics", (_req, res) => {
   res.send(obsMetrics.render());
 });
 
+// â”€â”€ public-demo hardening â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Only active when getRuntimeConfig().demoMode is on. This server is otherwise a
+// single-user local admin tool: model downloads, quant jobs and filesystem pickers
+// are all unauthenticated, so exposing it publicly without this would let any visitor
+// fill the disk or burn the GPU. Demo mode refuses that admin surface and rate-limits
+// generation per client IP. Generation SIZE is clamped separately, at the handlers,
+// because it is a request field rather than a route.
+const DEMO_BLOCKED = [
+  /^\/api\/hub(\/|$)/, // model downloads: arbitrary repo -> arbitrary dir -> full disk
+  /^\/api\/quant\/(convert|select|jobs|status)(\/|$)/, // compute-heavy conversions
+  /^\/api\/system\// // pick-folder / model-dir: walks the host filesystem
+];
+// Rate-limited paths: the ones that pin the single GPU. Health/models stay cheap and
+// unlimited so the frontend can poll them.
+const DEMO_RATE_PATHS = [
+  /^\/api\/chat\/stream$/,
+  /^\/api\/generate$/,
+  /^\/v1\/chat\/completions$/
+];
+const demoHits = new Map(); // ip -> { count, resetAt }
+function demoClientIp(req) {
+  // req.ip honours Express 'trust proxy' (off by default), so it is the TCP peer
+  // address here -- unspoofable for the direct-exposure case. Behind an ALB, set
+  // 'trust proxy' so this becomes the real client IP from X-Forwarded-For.
+  return req.ip || req.socket?.remoteAddress || "unknown";
+}
+app.use((req, res, next) => {
+  const cfg = getRuntimeConfig();
+  if (!cfg.demoMode) return next();
+  if (DEMO_BLOCKED.some((re) => re.test(req.path))) {
+    return res.status(403).json({ error: "This endpoint is disabled in demo mode." });
+  }
+  if (DEMO_RATE_PATHS.some((re) => re.test(req.path))) {
+    const ip = demoClientIp(req);
+    const now = Date.now();
+    let rec = demoHits.get(ip);
+    if (!rec || now >= rec.resetAt) {
+      rec = { count: 0, resetAt: now + cfg.demoRateWindowMs };
+      demoHits.set(ip, rec);
+    }
+    rec.count += 1;
+    if (rec.count > cfg.demoRateMax) {
+      const retry = Math.max(1, Math.ceil((rec.resetAt - now) / 1000));
+      res.set("Retry-After", String(retry));
+      return res
+        .status(429)
+        .json({ error: `Rate limit exceeded. Try again in ${retry}s.` });
+    }
+  }
+  next();
+});
+// Evict expired rate-limit records so the map cannot grow without bound. unref() so
+// this timer never keeps the process alive on its own.
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, rec] of demoHits) {
+    if (now >= rec.resetAt) demoHits.delete(ip);
+  }
+}, 60000).unref();
+
 // The OpenAPI 3.1 definition for this server. Served straight from docs/openapi.yaml (read per
 // request so edits show up without a restart); point any OpenAPI viewer or code generator at it.
 app.get("/openapi.yaml", (_req, res) => {
@@ -839,8 +899,13 @@ function buildCliArgs(config, body) {
     Number(selectedProfile.maxPositionEmbeddings) || 0,
     Number(config.maxContext) || 0
   );
+  // Demo mode caps the ceiling itself, so no client field (maxContext, longFormMode,
+  // explicitLong) can lift context past demoMaxContext and pin the shared GPU.
+  const contextCeiling = config.demoMode
+    ? Math.min(maxSupportedContext, config.demoMaxContext)
+    : maxSupportedContext;
   const maxContext = Math.round(
-    clampNumber(body.maxContext, 128, maxSupportedContext, config.maxContext)
+    clampNumber(body.maxContext, 128, contextCeiling, Math.min(config.maxContext, contextCeiling))
   );
   const autoMaxTokens = body.autoMaxTokens === undefined
     ? true
@@ -916,9 +981,15 @@ ${msgs[last].content ?? ""}` };
   const explicitMaxTokens = body.maxNewTokens ?? body.max_tokens;
   const hasExplicitMaxTokens =
     explicitMaxTokens !== undefined && explicitMaxTokens !== null;
-  const maxNewTokens = (autoMaxTokens && !hasExplicitMaxTokens)
+  const maxNewTokens0 = (autoMaxTokens && !hasExplicitMaxTokens)
     ? computeDynamicMaxNewTokens(body, selectedProfile, maxContext, thinking)
     : Math.round(clampNumber(explicitMaxTokens, 32, 4096, config.maxNewTokens));
+  // Demo mode: hard-cap the per-request generation length regardless of how it was
+  // derived (auto heuristic or explicit client budget), so one caller cannot hold the
+  // single GPU for a 4096-token generation.
+  const maxNewTokens = config.demoMode
+    ? Math.min(maxNewTokens0, config.demoMaxNewTokens)
+    : maxNewTokens0;
   // min_new_tokens: suppress EOS until this many tokens are generated (prevents
   // early greedy truncation on collapsed/repeated runs). Clamped to [0, max].
   const minNewTokens = Math.round(

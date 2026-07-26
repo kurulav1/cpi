@@ -151,7 +151,19 @@ const DEFAULT_RUNTIME = Object.freeze({
   // Speculative decoding: a small draft model (same tokenizer family) speculates
   // for the served target. Empty = off. specTokens = drafts per round.
   draftModel: "",
-  specTokens: 5
+  specTokens: 5,
+  // Public-demo lockdown. When on, the server refuses the admin surface (model
+  // downloads, quantization jobs, filesystem pickers), hard-clamps generation size
+  // regardless of what a client asks, and rate-limits per IP. Off = the full local
+  // admin tool. See the demo middleware in index.mjs.
+  demoMode: false,
+  // Per-IP request budget for /api and /v1 when demoMode is on: at most
+  // demoRateMax requests per demoRateWindowMs. Also caps generation size so one
+  // caller cannot pin the single GPU with a 100k-token request.
+  demoRateMax: 30,
+  demoRateWindowMs: 60000,
+  demoMaxNewTokens: 512,
+  demoMaxContext: 4096
 });
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -1761,6 +1773,31 @@ export function getRuntimeConfig() {
       DEFAULT_RUNTIME.specTokens,
       1,
       16
+    ),
+    demoMode: readBoolSetting("CPI_DEMO_MODE", "demoMode", DEFAULT_RUNTIME.demoMode),
+    demoRateMax: readIntSetting(
+      "CPI_DEMO_RATE_MAX",
+      "demoRateMax",
+      DEFAULT_RUNTIME.demoRateMax,
+      1
+    ),
+    demoRateWindowMs: readIntSetting(
+      "CPI_DEMO_RATE_WINDOW_MS",
+      "demoRateWindowMs",
+      DEFAULT_RUNTIME.demoRateWindowMs,
+      1000
+    ),
+    demoMaxNewTokens: readIntSetting(
+      "CPI_DEMO_MAX_NEW",
+      "demoMaxNewTokens",
+      DEFAULT_RUNTIME.demoMaxNewTokens,
+      1
+    ),
+    demoMaxContext: readIntSetting(
+      "CPI_DEMO_MAX_CONTEXT",
+      "demoMaxContext",
+      DEFAULT_RUNTIME.demoMaxContext,
+      128
     )
   };
 
