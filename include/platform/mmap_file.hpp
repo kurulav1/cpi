@@ -15,6 +15,7 @@
 // the source in the default (invalid) state.
 
 #include <cstddef>
+#include <stdexcept>
 #include <string>
 
 namespace platform {

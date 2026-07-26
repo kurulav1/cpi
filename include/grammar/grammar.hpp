@@ -15,6 +15,7 @@
 // bytes (see GrammarSampler).
 
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <vector>
 

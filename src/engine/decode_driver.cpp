@@ -1,6 +1,7 @@
 #include "engine/decode_driver.hpp"
 
 #include <chrono>
+#include <stdexcept>
 
 #include "engine/sampling.hpp"
 

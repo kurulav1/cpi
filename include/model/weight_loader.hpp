@@ -10,6 +10,7 @@
 // is embedded in the header and is exposed through config().
 
 #include <cstddef>
+#include <stdexcept>
 #include <string>
 #include <vector>
 #include <unordered_map>

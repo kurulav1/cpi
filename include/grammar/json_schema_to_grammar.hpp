@@ -13,6 +13,7 @@
 // grammar::Grammar::parse() root.
 
 #include <string>
+#include <stdexcept>
 
 namespace grammar {
 
