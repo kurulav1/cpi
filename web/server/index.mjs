@@ -984,12 +984,18 @@ ${msgs[last].content ?? ""}` };
   const maxNewTokens0 = (autoMaxTokens && !hasExplicitMaxTokens)
     ? computeDynamicMaxNewTokens(body, selectedProfile, maxContext, thinking)
     : Math.round(clampNumber(explicitMaxTokens, 32, 4096, config.maxNewTokens));
-  // Demo mode: hard-cap the per-request generation length regardless of how it was
-  // derived (auto heuristic or explicit client budget), so one caller cannot hold the
-  // single GPU for a 4096-token generation.
-  const maxNewTokens = config.demoMode
-    ? Math.min(maxNewTokens0, config.demoMaxNewTokens)
-    : maxNewTokens0;
+  let maxNewTokens = maxNewTokens0;
+  if (config.demoMode) {
+    // Demo mode gives every response the FULL demoMaxNewTokens headroom instead of the
+    // conservative auto-heuristic pick (which caps detailed answers around 1536). A budget
+    // is only a ceiling -- the model still emits EOS when it is actually done, so short
+    // answers stay short -- so this makes long answers able to run without letting a
+    // request exceed the demo ceiling. An explicit smaller client max is still respected.
+    const headroom = Math.max(256, maxContext - 256); // leave room for the prompt
+    maxNewTokens = hasExplicitMaxTokens
+      ? Math.min(maxNewTokens0, config.demoMaxNewTokens)
+      : Math.min(config.demoMaxNewTokens, headroom);
+  }
   // min_new_tokens: suppress EOS until this many tokens are generated (prevents
   // early greedy truncation on collapsed/repeated runs). Clamped to [0, max].
   const minNewTokens = Math.round(
