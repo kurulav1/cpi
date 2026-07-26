@@ -22,35 +22,12 @@ export default defineConfig(({ mode }) => {
     plugins: [
       react(),
       tailwindcss(),
-      VitePWA({
-        registerType: "autoUpdate",
-        includeAssets: ["icons/*.png", "icons/*.svg"],
-        manifest: {
-          name: "CPI - CUDA Inference",
-          short_name: "CPI",
-          description: "Local LLM inference via CUDA",
-          theme_color: "#0f172a",
-          background_color: "#0f172a",
-          display: "standalone",
-          orientation: "landscape",
-          scope: "/",
-          start_url: "/",
-          icons: [
-            { src: "icons/icon-192.png", sizes: "192x192", type: "image/png" },
-            {
-              src: "icons/icon-512.png",
-              sizes: "512x512",
-              type: "image/png",
-              purpose: "any maskable"
-            }
-          ]
-        },
-        workbox: {
-          // Cache all static assets; skip API routes.
-          globPatterns: ["**/*.{js,css,html,svg,png,woff2}"],
-          navigateFallbackDenylist: [/^\/api/, /^\/v1/]
-        }
-      })
+      // Service worker DISABLED for the public demo. A precaching SW is pure downside here:
+      // it serves nothing offline that matters and is a common cause of blank/stale pages on
+      // mobile (it only activates over https, which is why the CloudFront URL surfaced it).
+      // selfDestroying builds a SW that unregisters itself and clears its caches, so any phone
+      // that already installed the old one gets cleaned up on the next visit.
+      VitePWA({ selfDestroying: true })
     ],
     server: {
       port: devPort,
