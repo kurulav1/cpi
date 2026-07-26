@@ -96,7 +96,7 @@ async function fetchJson(url, options) {
 // in insecure contexts, so build a v4 UUID from it; fall back to time+random if even that is gone.
 function genId() {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
-    return genId();
+    return crypto.randomUUID();
   }
   if (typeof crypto !== "undefined" && typeof crypto.getRandomValues === "function") {
     const b = crypto.getRandomValues(new Uint8Array(16));
