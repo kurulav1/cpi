@@ -90,8 +90,26 @@ async function fetchJson(url, options) {
   return payload;
 }
 
+// genId() exists ONLY in a secure context (https or localhost). Served over plain
+// http on an IP -- a demo box, a LAN address -- it is undefined, and calling it throws during
+// the first render, so the whole app mounts to a blank page. crypto.getRandomValues IS available
+// in insecure contexts, so build a v4 UUID from it; fall back to time+random if even that is gone.
+function genId() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return genId();
+  }
+  if (typeof crypto !== "undefined" && typeof crypto.getRandomValues === "function") {
+    const b = crypto.getRandomValues(new Uint8Array(16));
+    b[6] = (b[6] & 0x0f) | 0x40; // version 4
+    b[8] = (b[8] & 0x3f) | 0x80; // variant
+    const h = Array.from(b, (x) => x.toString(16).padStart(2, "0"));
+    return `${h.slice(0, 4).join("")}-${h.slice(4, 6).join("")}-${h.slice(6, 8).join("")}-${h.slice(8, 10).join("")}-${h.slice(10, 16).join("")}`;
+  }
+  return `id-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
 function createMsg(role, content, extra = {}) {
-  return { id: crypto.randomUUID(), role, content, ...extra };
+  return { id: genId(), role, content, ...extra };
 }
 
 function seedMessages() {
@@ -1281,7 +1299,7 @@ export default function App() {
     const active = storedChats.find((c) => c.id === storedActiveId) || null;
     return {
       chats: storedChats,
-      activeChatId: active ? active.id : crypto.randomUUID(),
+      activeChatId: active ? active.id : genId(),
       messages: active
         ? [...seedMessages(), ...active.messages.map((m) => createMsg(m.role, m.content))]
         : seedMessages()
@@ -1616,7 +1634,7 @@ export default function App() {
 
   function startNewChat() {
     abortRef.current?.abort();
-    setActiveChatId(crypto.randomUUID());
+    setActiveChatId(genId());
     updateMessages(seedMessages());
     setRunMeta(null);
     setError("");
