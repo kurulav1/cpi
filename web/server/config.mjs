@@ -152,14 +152,10 @@ const DEFAULT_RUNTIME = Object.freeze({
   // for the served target. Empty = off. specTokens = drafts per round.
   draftModel: "",
   specTokens: 5,
-  // Public-demo lockdown. When on, the server refuses the admin surface (model
-  // downloads, quantization jobs, filesystem pickers), hard-clamps generation size
-  // regardless of what a client asks, and rate-limits per IP. Off = the full local
-  // admin tool. See the demo middleware in index.mjs.
+  // Public-demo lockdown (see the demo middleware in index.mjs): refuse the admin surface,
+  // clamp generation size, rate-limit per IP. Off = the full local admin tool.
   demoMode: false,
-  // Per-IP request budget for /api and /v1 when demoMode is on: at most
-  // demoRateMax requests per demoRateWindowMs. Also caps generation size so one
-  // caller cannot pin the single GPU with a 100k-token request.
+  // Per-IP: at most demoRateMax requests per demoRateWindowMs on the generation routes.
   demoRateMax: 30,
   demoRateWindowMs: 60000,
   demoMaxNewTokens: 512,

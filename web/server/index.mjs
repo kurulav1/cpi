@@ -56,20 +56,16 @@ app.get("/metrics", (_req, res) => {
   res.send(obsMetrics.render());
 });
 
-// â”€â”€ public-demo hardening â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-// Only active when getRuntimeConfig().demoMode is on. This server is otherwise a
-// single-user local admin tool: model downloads, quant jobs and filesystem pickers
-// are all unauthenticated, so exposing it publicly without this would let any visitor
-// fill the disk or burn the GPU. Demo mode refuses that admin surface and rate-limits
-// generation per client IP. Generation SIZE is clamped separately, at the handlers,
-// because it is a request field rather than a route.
+// -- public-demo hardening (only when getRuntimeConfig().demoMode is on) --
+// The admin surface (model downloads, quant jobs, filesystem pickers) is unauthenticated, so
+// demo mode refuses it and rate-limits generation per IP. Generation size is clamped at the
+// handlers, since it is a request field not a route.
 const DEMO_BLOCKED = [
   /^\/api\/hub(\/|$)/, // model downloads: arbitrary repo -> arbitrary dir -> full disk
   /^\/api\/quant\/(convert|select|jobs|status)(\/|$)/, // compute-heavy conversions
   /^\/api\/system\// // pick-folder / model-dir: walks the host filesystem
 ];
-// Rate-limited paths: the ones that pin the single GPU. Health/models stay cheap and
-// unlimited so the frontend can poll them.
+// The paths that pin the single GPU. Health/models stay unlimited for frontend polling.
 const DEMO_RATE_PATHS = [
   /^\/api\/chat\/stream$/,
   /^\/api\/generate$/,
@@ -77,9 +73,7 @@ const DEMO_RATE_PATHS = [
 ];
 const demoHits = new Map(); // ip -> { count, resetAt }
 function demoClientIp(req) {
-  // req.ip honours Express 'trust proxy' (off by default), so it is the TCP peer
-  // address here -- unspoofable for the direct-exposure case. Behind an ALB, set
-  // 'trust proxy' so this becomes the real client IP from X-Forwarded-For.
+  // req.ip is the TCP peer (trust proxy off); set 'trust proxy' behind an ALB for X-Forwarded-For.
   return req.ip || req.socket?.remoteAddress || "unknown";
 }
 app.use((req, res, next) => {
@@ -107,8 +101,7 @@ app.use((req, res, next) => {
   }
   next();
 });
-// Evict expired rate-limit records so the map cannot grow without bound. unref() so
-// this timer never keeps the process alive on its own.
+// Evict expired rate-limit records so the map cannot grow without bound.
 setInterval(() => {
   const now = Date.now();
   for (const [ip, rec] of demoHits) {
@@ -899,8 +892,7 @@ function buildCliArgs(config, body) {
     Number(selectedProfile.maxPositionEmbeddings) || 0,
     Number(config.maxContext) || 0
   );
-  // Demo mode caps the ceiling itself, so no client field (maxContext, longFormMode,
-  // explicitLong) can lift context past demoMaxContext and pin the shared GPU.
+  // Demo mode caps the ceiling, so no client field can lift context past demoMaxContext.
   const contextCeiling = config.demoMode
     ? Math.min(maxSupportedContext, config.demoMaxContext)
     : maxSupportedContext;
@@ -986,11 +978,9 @@ ${msgs[last].content ?? ""}` };
     : Math.round(clampNumber(explicitMaxTokens, 32, 4096, config.maxNewTokens));
   let maxNewTokens = maxNewTokens0;
   if (config.demoMode) {
-    // Demo mode gives every response the FULL demoMaxNewTokens headroom instead of the
-    // conservative auto-heuristic pick (which caps detailed answers around 1536). A budget
-    // is only a ceiling -- the model still emits EOS when it is actually done, so short
-    // answers stay short -- so this makes long answers able to run without letting a
-    // request exceed the demo ceiling. An explicit smaller client max is still respected.
+    // Give every response the full demoMaxNewTokens headroom rather than the auto-heuristic's
+    // conservative pick. A budget is only a ceiling (the model still emits EOS when done), so
+    // short answers stay short while long ones can run. An explicit smaller client max wins.
     const headroom = Math.max(256, maxContext - 256); // leave room for the prompt
     maxNewTokens = hasExplicitMaxTokens
       ? Math.min(maxNewTokens0, config.demoMaxNewTokens)

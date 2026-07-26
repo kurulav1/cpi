@@ -22,11 +22,8 @@ export default defineConfig(({ mode }) => {
     plugins: [
       react(),
       tailwindcss(),
-      // Service worker DISABLED for the public demo. A precaching SW is pure downside here:
-      // it serves nothing offline that matters and is a common cause of blank/stale pages on
-      // mobile (it only activates over https, which is why the CloudFront URL surfaced it).
-      // selfDestroying builds a SW that unregisters itself and clears its caches, so any phone
-      // that already installed the old one gets cleaned up on the next visit.
+      // Service worker disabled: a precaching SW serves nothing useful here and is a common
+      // cause of blank/stale pages. selfDestroying unregisters any copy already installed.
       VitePWA({ selfDestroying: true })
     ],
     server: {

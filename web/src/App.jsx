@@ -90,10 +90,9 @@ async function fetchJson(url, options) {
   return payload;
 }
 
-// genId() exists ONLY in a secure context (https or localhost). Served over plain
-// http on an IP -- a demo box, a LAN address -- it is undefined, and calling it throws during
-// the first render, so the whole app mounts to a blank page. crypto.getRandomValues IS available
-// in insecure contexts, so build a v4 UUID from it; fall back to time+random if even that is gone.
+// crypto.randomUUID() exists only in a secure context (https or localhost); over plain http it
+// is undefined. crypto.getRandomValues works everywhere, so build a v4 UUID from it, then fall
+// back to time+random.
 function genId() {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
     return crypto.randomUUID();
