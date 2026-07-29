@@ -38,6 +38,15 @@ struct StreamParams {
   // drives its own termination, so the scheduler does not also floor the length (see step()).
   int min_new_tokens = 0;
   float temperature = 0.0f;
+  // Sampling shape, PER REQUEST. These used to live on BatchSchedulerOptions (scheduler-global),
+  // which silently ignored a client's top_p/top_k in the batched path and made every request in a
+  // server share one setting -- and, because repetition_penalty is global, a server started with
+  // penalty > 1 could never take the device top-k fast path for anyone. The caller fills these
+  // from the request (falling back to its own defaults); the scheduler reads only these.
+  int top_k = 0;
+  float top_p = 1.0f;
+  float repetition_penalty = 1.0f;
+  int no_repeat_ngram_size = 0;
   std::vector<int> stop_ids;
   // Non-owning; the caller keeps it alive until the request finishes.
   grammar::GrammarSampler* grammar = nullptr;
@@ -88,7 +97,8 @@ public:
   // row samples (temperature > 0), so the candidate set is exactly what the host sampler builds.
   virtual bool decode_batched_topk(const std::vector<int>& tokens,
                                    const std::vector<int>& positions,
-                                   const std::vector<int>& block_tables_flat, int max_blocks, int k,
+                                   const std::vector<int>& block_tables_flat, int max_blocks,
+                                   const std::vector<int>& k,
                                    std::vector<std::vector<detail::SampleCandidate>>& out_cand) {
     (void)tokens;
     (void)positions;
@@ -100,16 +110,12 @@ public:
   }
 };
 
-// Sampling and limits the scheduler applies. These mirror the engine options the CUDA path
-// read directly off LlamaEngine::options_; passing them in is what removes the dependency.
+// Non-sampling limits the scheduler applies. Sampling shape (top_k / top_p / repetition_penalty /
+// no_repeat_ngram_size) is PER REQUEST on StreamParams, not here -- it varies per client.
 struct BatchSchedulerOptions {
   int paged_block_size = 32;
   int max_context = 2048;
   int eos_token_id = -1;
-  int top_k = 0;
-  float top_p = 1.0f;
-  float repetition_penalty = 1.0f;
-  int no_repeat_ngram_size = 0;
   bool verbose = false;
 };
 

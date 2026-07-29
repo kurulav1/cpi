@@ -66,6 +66,8 @@ void execute_engine_modes(const RunExecutionOptions& options, const std::vector<
 // here. The gate used to exist because the scheduler lived inside LlamaEngine.
 void run_interactive_batch(engine::BatchScheduler& sched, model::Tokenizer& tokenizer,
                            const std::vector<std::string>& default_stop_texts, bool default_add_bos,
-                           int default_max_new, float default_temp);
+                           int default_max_new, float default_temp, int default_top_k,
+                           float default_top_p, float default_repeat_penalty,
+                           int default_no_repeat);
 
 }  // namespace app::main_modes

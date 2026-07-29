@@ -26,9 +26,9 @@
 // header pulls in no backend types -- so it sits outside both guards.
 #include "app/image_prompt.hpp"
 #if CPI_HAS_CUDA
-#include "engine/plan_cuda_engine.hpp"
 #include "engine/llama4_cuda_engine.hpp"
 #include "engine/llama_engine.hpp"
+#include "engine/plan_cuda_engine.hpp"
 #include "engine/speculative_decoder.hpp"
 #endif
 #if CPI_ENABLE_METAL
@@ -134,8 +134,8 @@ std::vector<int> generate_multimodal_metal(engine::PlanMetalEngine& meng,
                                               std::getenv("CPI_IMAGE_CAUSAL") != nullptr);
     if (info_out) {
       *info_out << "[image] " << image_path << "  " << ip.grid_w << "x" << ip.grid_h
-                << " patches -> " << ip.image_tokens << " image tokens; prompt = "
-                << ip.tokens.size() << " tokens\n\n";
+                << " patches -> " << ip.image_tokens
+                << " image tokens; prompt = " << ip.tokens.size() << " tokens\n\n";
     }
     (void)eos;  // the engine stops on its own config's eos, exactly as PlanCudaEngine does
     return meng.generate_multimodal(ip.tokens, ip.embeds, ip.limits, max_new, /*temp=*/0.0f,
@@ -160,9 +160,9 @@ std::vector<int> generate_multimodal_metal(engine::PlanMetalEngine& meng,
   const model::image::Image img = model::image::load_png(image_path);
   const float mean[3] = {0.5f, 0.5f, 0.5f};
   const float stdv[3] = {0.5f, 0.5f, 0.5f};
-  const model::image::Qwen2VLPatches pp = model::image::qwen2vl_preprocess(
-      img, c.vision_patch_size, c.vision_temporal_patch_size, merge, mean, stdv, kMinPixels,
-      kMaxPixels);
+  const model::image::Qwen2VLPatches pp =
+      model::image::qwen2vl_preprocess(img, c.vision_patch_size, c.vision_temporal_patch_size,
+                                       merge, mean, stdv, kMinPixels, kMaxPixels);
 
   // 2. Tower -> soft tokens.
   const std::vector<float> soft = meng.encode_image(pp.pixels, pp.grid_h, pp.grid_w);
@@ -209,15 +209,13 @@ std::vector<int> generate_multimodal_metal(engine::PlanMetalEngine& meng,
   }
 
   if (info_out != nullptr) {
-    *info_out << "[image] " << image_path << "  " << pp.grid_w << "x" << pp.grid_h
-              << " patches -> " << n_soft << " soft tokens; prompt = " << toks.size()
-              << " tokens\n\n";
+    *info_out << "[image] " << image_path << "  " << pp.grid_w << "x" << pp.grid_h << " patches -> "
+              << n_soft << " soft tokens; prompt = " << toks.size() << " tokens\n\n";
   }
 
   // 4. M-RoPE positions, prefill all but the last token, then decode with the rotary and cache
   //    positions kept apart (an image span advances the rotary counter by its MERGED extent).
-  const std::vector<std::int32_t> mpos =
-      engine::build_mrope_positions(toks, kImageToken, mh, mw);
+  const std::vector<std::int32_t> mpos = engine::build_mrope_positions(toks, kImageToken, mh, mw);
   const int n_tok = static_cast<int>(toks.size());
   const std::vector<int> head(toks.begin(), toks.end() - 1);
   const std::vector<std::vector<float>> head_embeds(embeds.begin(), embeds.end() - 1);
@@ -255,14 +253,12 @@ void run_with_image_metal(engine::PlanMetalEngine& meng, const app::main_cli::Pa
   // Gemma's chat text carries the placeholder inside the user turn -- the same string CUDA's
   // run_with_image builds, so the two CLIs ask the model the same question the same way.
   const std::string text =
-      meng.has_vision()
-          ? "<|turn>user\n<|image|>\n" + cli.prompt_text + "<turn|>\n<|turn>model\n"
-          : cli.prompt_text;
+      meng.has_vision() ? "<|turn>user\n<|image|>\n" + cli.prompt_text + "<turn|>\n<|turn>model\n"
+                        : cli.prompt_text;
   const std::vector<int> base = tokenizer.encode(text, /*add_bos=*/meng.has_vision());
   const auto t0 = std::chrono::steady_clock::now();
-  const std::vector<int> gen =
-      generate_multimodal_metal(meng, base, cli.image_path, cli.max_new, cli.opts.eos_token_id,
-                                nullptr, &info_out);
+  const std::vector<int> gen = generate_multimodal_metal(meng, base, cli.image_path, cli.max_new,
+                                                         cli.opts.eos_token_id, nullptr, &info_out);
   const auto t1 = std::chrono::steady_clock::now();
   const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
@@ -309,8 +305,7 @@ int main(int argc, char** argv) {
           "cpu"
 #endif
           ;
-      std::cout << "cpi " CPI_VERSION " (" CPI_GIT_SHA ")\n"
-                << "backends: " << backends << "\n";
+      std::cout << "cpi " CPI_VERSION " (" CPI_GIT_SHA ")\n" << "backends: " << backends << "\n";
       return 0;
     }
     if (a == "--help" || a == "-h") {
@@ -498,8 +493,7 @@ int main(int argc, char** argv) {
                        "engine.\n";
           break;
         case EngineChoice::Qwen35Cuda:
-          std::cout
-              << "[info] Detected a Qwen3.5 model. Using the Qwen3.5 CUDA engine.\n";
+          std::cout << "[info] Detected a Qwen3.5 model. Using the Qwen3.5 CUDA engine.\n";
           break;
         case EngineChoice::Qwen35Cpu:
           std::cout << "[info] Detected a Qwen3.5 model. Using the Qwen3.5 CPU engine.\n";
@@ -587,8 +581,10 @@ int main(int argc, char** argv) {
           if (!use_tokenizer) {
             throw std::runtime_error("--interactive-batch requires --tokenizer");
           }
-          app::main_modes::run_interactive_batch(eng.batch_scheduler(), tokenizer, cli.stop_texts,
-                                                 !cli.force_no_bos, cli.max_new, cli.temp);
+          app::main_modes::run_interactive_batch(
+              eng.batch_scheduler(), tokenizer, cli.stop_texts, !cli.force_no_bos, cli.max_new,
+              cli.temp, cli.opts.top_k, cli.opts.top_p, cli.opts.repetition_penalty,
+              cli.opts.no_repeat_ngram_size);
           // Plain `return`: this block is inside a lambda, not main(). The Metal branch's
           // identical-looking `return 0` IS in main(). Getting these the same way round breaks
           // one compiler or the other, and each hides the other's error -- this one is behind
@@ -679,7 +675,8 @@ int main(int argc, char** argv) {
         // own weights. Not compatible with --interactive-batch (that path is its own server).
         if (!cli.draft_model_path.empty()) {
           if (cli.interactive_batch) {
-            throw std::runtime_error("--draft-model and --interactive-batch are mutually exclusive");
+            throw std::runtime_error(
+                "--draft-model and --interactive-batch are mutually exclusive");
           }
           engine::PlanMetalEngine target_eng;
           const int tgt_quant = cli.opts.int8_streaming ? cli.opts.streaming_quant_bits : 0;
@@ -780,14 +777,11 @@ int main(int argc, char** argv) {
           engine::BatchSchedulerOptions bo;
           bo.max_context = cli.opts.max_context;
           bo.eos_token_id = cli.opts.eos_token_id;
-          bo.top_k = cli.opts.top_k;
-          bo.top_p = cli.opts.top_p;
-          bo.repetition_penalty = cli.opts.repetition_penalty;
-          bo.no_repeat_ngram_size = cli.opts.no_repeat_ngram_size;
           bo.verbose = cli.opts.verbose;
-          app::main_modes::run_interactive_batch(meng.batch_scheduler(bo), tokenizer,
-                                                 cli.stop_texts, !cli.force_no_bos, cli.max_new,
-                                                 cli.temp);
+          app::main_modes::run_interactive_batch(
+              meng.batch_scheduler(bo), tokenizer, cli.stop_texts, !cli.force_no_bos, cli.max_new,
+              cli.temp, cli.opts.top_k, cli.opts.top_p, cli.opts.repetition_penalty,
+              cli.opts.no_repeat_ngram_size);
           return 0;
         }
         auto make_samp = [&](float temperature) {
@@ -796,10 +790,10 @@ int main(int argc, char** argv) {
           s.top_k = cli.opts.top_k;
           s.top_p = cli.opts.top_p;
           // --repeat-penalty and --no-repeat-ngram were parsed, stored, and then dropped here.
-          // The batch path below already forwards them (bo.repetition_penalty), so the flags
-          // worked under --interactive-batch and silently did nothing everywhere else -- which
-          // is the shape of bug that reads as "the model is repetitive on Mac" rather than as a
-          // missing feature. Sampling has carried both fields all along.
+          // The batch path below forwards them per-request via StreamParams, so the flags worked
+          // under --interactive-batch and silently did nothing everywhere else -- which is the
+          // shape of bug that reads as "the model is repetitive on Mac" rather than as a missing
+          // feature. Sampling has carried both fields all along.
           s.repetition_penalty = cli.opts.repetition_penalty;
           s.no_repeat_ngram_size = cli.opts.no_repeat_ngram_size;
           s.eos_id = cli.opts.eos_token_id;
@@ -814,9 +808,12 @@ int main(int argc, char** argv) {
             [&](const std::vector<int>& p, int max_new, float temperature,
                 const std::function<bool(int)>& on_token,
                 const engine::GenerationConstraints* constraints) {
-              return meng.generate_stream(p, max_new, make_samp(temperature), on_token, constraints);
+              return meng.generate_stream(p, max_new, make_samp(temperature), on_token,
+                                          constraints);
             },
-            [&](const std::vector<int>& p, int top_k) { return meng.inspect_next_logits(p, top_k); },
+            [&](const std::vector<int>& p, int top_k) {
+              return meng.inspect_next_logits(p, top_k);
+            },
             [&]() -> const engine::BenchmarkStats& { return meng.last_benchmark_stats(); },
             // Multimodal over the bridge. Null when the container has no vision tower, so a
             // text-only model still fails the request cleanly ("this model cannot take images")
@@ -841,65 +838,65 @@ int main(int argc, char** argv) {
       }
 #if CPI_HAS_CUDA
       case EngineChoice::LlamaCuda: {
-      if (!cli.draft_model_path.empty()) {
-        // Speculative decoding: target (this model) + a small draft model that
-        // shares the tokenizer. Initialize the target first so the draft's VRAM
-        // budgeting sees the remaining free memory.
-        engine::LlamaEngine target_eng;
-        target_eng.initialize(cli.opts);
+        if (!cli.draft_model_path.empty()) {
+          // Speculative decoding: target (this model) + a small draft model that
+          // shares the tokenizer. Initialize the target first so the draft's VRAM
+          // budgeting sees the remaining free memory.
+          engine::LlamaEngine target_eng;
+          target_eng.initialize(cli.opts);
 
-        engine::EngineOptions draft_opts = cli.opts;
-        draft_opts.model_path = cli.draft_model_path;
-        // Quantize the (fp16) draft to int8 at load so it fits fully in the VRAM
-        // left after the int4 target — a partially-cached, layer-streamed draft
-        // is far too slow to be a useful speculator. int8 is near-lossless for a
-        // small model, so acceptance is essentially unchanged.
-        draft_opts.int8_streaming = true;
-        draft_opts.streaming_quant_bits = 8;
-        draft_opts.prefer_lowbit_cache = true;
-        draft_opts.gpu_cache_all = true;
-        engine::LlamaEngine draft_eng;
-        draft_eng.initialize(draft_opts);
+          engine::EngineOptions draft_opts = cli.opts;
+          draft_opts.model_path = cli.draft_model_path;
+          // Quantize the (fp16) draft to int8 at load so it fits fully in the VRAM
+          // left after the int4 target — a partially-cached, layer-streamed draft
+          // is far too slow to be a useful speculator. int8 is near-lossless for a
+          // small model, so acceptance is essentially unchanged.
+          draft_opts.int8_streaming = true;
+          draft_opts.streaming_quant_bits = 8;
+          draft_opts.prefer_lowbit_cache = true;
+          draft_opts.gpu_cache_all = true;
+          engine::LlamaEngine draft_eng;
+          draft_eng.initialize(draft_opts);
 
-        engine::SpeculativeDecoder spec(draft_eng, target_eng, cli.spec_tokens);
-        const int eos = cli.opts.eos_token_id;
-        app::main_modes::execute_engine_modes(
-            run_opts, prompt_tokens, stop_token_ids, cli.stop_texts,
-            use_tokenizer ? &tokenizer : nullptr,
-            [&](const std::vector<int>& p, int max_new, float /*temperature*/) {
-              return spec.generate(p, max_new, eos, nullptr);
-            },
-            [&](const std::vector<int>& p, int max_new, float temperature,
-                const std::function<bool(int)>& on_token,
-                const engine::GenerationConstraints* constraints) {
-              // Grammar-constrained decoding can't run on the speculative verify
-              // path (it argmaxes K drafts on-device, which a logit mask can't
-              // reach). Fall back to non-speculative single-token decode on the
-              // target engine, which honours the grammar. Unconstrained requests
-              // still use the fast speculative path.
-              if (constraints != nullptr && constraints->grammar != nullptr) {
-                return target_eng.generate_stream(p, max_new, temperature, on_token, constraints);
-              }
-              return spec.generate(p, max_new, eos, on_token);
-            },
-            [&](const std::vector<int>& p, int top_k) {
-              return target_eng.inspect_next_logits(p, top_k);
-            },
-            [&]() -> const engine::BenchmarkStats& { return target_eng.last_benchmark_stats(); });
+          engine::SpeculativeDecoder spec(draft_eng, target_eng, cli.spec_tokens);
+          const int eos = cli.opts.eos_token_id;
+          app::main_modes::execute_engine_modes(
+              run_opts, prompt_tokens, stop_token_ids, cli.stop_texts,
+              use_tokenizer ? &tokenizer : nullptr,
+              [&](const std::vector<int>& p, int max_new, float /*temperature*/) {
+                return spec.generate(p, max_new, eos, nullptr);
+              },
+              [&](const std::vector<int>& p, int max_new, float temperature,
+                  const std::function<bool(int)>& on_token,
+                  const engine::GenerationConstraints* constraints) {
+                // Grammar-constrained decoding can't run on the speculative verify
+                // path (it argmaxes K drafts on-device, which a logit mask can't
+                // reach). Fall back to non-speculative single-token decode on the
+                // target engine, which honours the grammar. Unconstrained requests
+                // still use the fast speculative path.
+                if (constraints != nullptr && constraints->grammar != nullptr) {
+                  return target_eng.generate_stream(p, max_new, temperature, on_token, constraints);
+                }
+                return spec.generate(p, max_new, eos, on_token);
+              },
+              [&](const std::vector<int>& p, int top_k) {
+                return target_eng.inspect_next_logits(p, top_k);
+              },
+              [&]() -> const engine::BenchmarkStats& { return target_eng.last_benchmark_stats(); });
 
-        if (!quiet_output) {
-          const auto& s = spec.stats();
-          std::cerr << "[spec] rounds=" << s.rounds << " drafted=" << s.drafted
-                    << " accepted=" << s.accepted << " emitted=" << s.emitted
-                    << " accept_rate=" << s.accept_rate()
-                    << " tokens_per_round=" << s.tokens_per_round()
-                    << " tree2_recovery_rate=" << s.tree2_recovery_rate()
-                    << " spec_tokens=" << cli.spec_tokens << "\n";
+          if (!quiet_output) {
+            const auto& s = spec.stats();
+            std::cerr << "[spec] rounds=" << s.rounds << " drafted=" << s.drafted
+                      << " accepted=" << s.accepted << " emitted=" << s.emitted
+                      << " accept_rate=" << s.accept_rate()
+                      << " tokens_per_round=" << s.tokens_per_round()
+                      << " tree2_recovery_rate=" << s.tree2_recovery_rate()
+                      << " spec_tokens=" << cli.spec_tokens << "\n";
+          }
+        } else {
+          engine::LlamaEngine gpu_eng;
+          run_with_engine(gpu_eng);
         }
-      } else {
-        engine::LlamaEngine gpu_eng;
-        run_with_engine(gpu_eng);
-      }
         break;
       }
 #endif

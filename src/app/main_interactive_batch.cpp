@@ -12,9 +12,6 @@
 // ever needed admit/step/cancel/active, and engine::BatchScheduler is backend-free, so this
 // whole file no longer knows or cares which GPU is underneath it. That is what took the
 // #if CPI_HAS_CUDA off it.
-#include "app/main_modes.hpp"
-
-
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -31,6 +28,7 @@
 #include <vector>
 
 #include "app/main_helpers.hpp"
+#include "app/main_modes.hpp"
 #include "engine/batch_scheduler.hpp"
 #include "grammar/grammar.hpp"
 #include "grammar/grammar_sampler.hpp"
@@ -50,7 +48,9 @@ using app::main_helpers::sanitize_stream_text;
 
 void run_interactive_batch(engine::BatchScheduler& sched, model::Tokenizer& tokenizer,
                            const std::vector<std::string>& default_stop_texts, bool default_add_bos,
-                           int default_max_new, float default_temp) {
+                           int default_max_new, float default_temp, int default_top_k,
+                           float default_top_p, float default_repeat_penalty,
+                           int default_no_repeat) {
   std::mutex out_mu;
   const auto write_event = [&](const std::string& type, const std::string& id,
                                const std::string& extra) {
@@ -107,6 +107,13 @@ void run_interactive_batch(engine::BatchScheduler& sched, model::Tokenizer& toke
         in.params.max_new_tokens = mn;
         in.params.temperature = tp;
         in.params.min_new_tokens = std::max(0, json_get_int(line, "min_new", 0));
+        // Per-request sampling shape (falls back to the server defaults). Previously these were
+        // scheduler-global, so a client's top_p/top_k was silently ignored in the batched path.
+        in.params.top_k = json_get_int(line, "top_k", default_top_k);
+        in.params.top_p = json_get_float(line, "top_p", default_top_p);
+        in.params.repetition_penalty =
+            json_get_float(line, "repeat_penalty", default_repeat_penalty);
+        in.params.no_repeat_ngram_size = json_get_int(line, "no_repeat_ngram", default_no_repeat);
         in.json_schema = json_get_raw_value(line, "json_schema");
 
         std::vector<int> stop_ids;
@@ -153,7 +160,7 @@ void run_interactive_batch(engine::BatchScheduler& sched, model::Tokenizer& toke
   // finishes and frees blocks. Since the pool is always >= max_context, any one
   // request fits alone, so a preempted request always resumes eventually.
   struct ResumeInfo {
-    std::vector<int> prompt;  // original prompt tokens (pre-generation)
+    std::vector<int> prompt;      // original prompt tokens (pre-generation)
     engine::StreamParams params;  // original params (grammar ptr preserved)
     int orig_max_new = 0;
     int orig_min_new = 0;
@@ -224,8 +231,8 @@ void run_interactive_batch(engine::BatchScheduler& sched, model::Tokenizer& toke
         DetokState st;
         st.t0 = std::chrono::steady_clock::now();
         detok[in.id] = std::move(st);
-        resume[in.id] = ResumeInfo{in.tokens, in.params, in.params.max_new_tokens,
-                                   in.params.min_new_tokens, 0};
+        resume[in.id] =
+            ResumeInfo{in.tokens, in.params, in.params.max_new_tokens, in.params.min_new_tokens, 0};
         write_event("start", in.id, "");
       } catch (const std::exception& e) {
         write_event("error", in.id, "\"error\":\"" + json_escape(e.what()) + "\"");
@@ -330,4 +337,3 @@ void run_interactive_batch(engine::BatchScheduler& sched, model::Tokenizer& toke
 }
 
 }  // namespace app::main_modes
-

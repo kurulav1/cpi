@@ -187,19 +187,25 @@ bool BatchScheduler::step(std::vector<StreamEvent>& events) {
     const char* e = std::getenv("CPI_BATCH_TOPK");
     return e == nullptr || e[0] != '0';
   }();
+  // Eligibility is now PER ROW (each request's own params): the whole batch takes the fast path
+  // only if every row samples (temperature > 0), asks for top-k, and uses no full-vocabulary
+  // feature (repetition penalty, n-gram blocking) or grammar. Per-row top_k is passed down.
   bool used_topk = false;
-  if (topk_enabled && opts_.top_k > 0 && opts_.repetition_penalty <= 1.0f &&
-      opts_.no_repeat_ngram_size <= 1) {
+  if (topk_enabled) {
     bool eligible = true;
+    std::vector<int> ks;
+    ks.reserve(static_cast<std::size_t>(B));
     for (const auto& s : seqs_) {
-      if (s.params.grammar || s.params.temperature <= 0.0f) {
+      if (s.params.grammar || s.params.temperature <= 0.0f || s.params.top_k <= 0 ||
+          s.params.repetition_penalty > 1.0f || s.params.no_repeat_ngram_size > 1) {
         eligible = false;
         break;
       }
+      ks.push_back(s.params.top_k);
     }
     if (eligible) {
-      used_topk = backend_->decode_batched_topk(toks, poss, flat, max_blocks, opts_.top_k,
-                                                batch_cand_scratch_);
+      used_topk =
+          backend_->decode_batched_topk(toks, poss, flat, max_blocks, ks, batch_cand_scratch_);
     }
   }
 
@@ -240,8 +246,8 @@ bool BatchScheduler::step(std::vector<StreamEvent>& events) {
                                   }),
                    cand.end());
       }
-      finish_row(b,
-                 detail::dispatch_sample_from_candidates(cand, s.params.temperature, opts_.top_p));
+      finish_row(
+          b, detail::dispatch_sample_from_candidates(cand, s.params.temperature, s.params.top_p));
     }
   } else {
     std::vector<std::vector<float>>& logits = batch_logits_scratch_;
@@ -255,9 +261,9 @@ bool BatchScheduler::step(std::vector<StreamEvent>& events) {
           static_cast<std::size_t>(opts_.eos_token_id) < lg.size()) {
         lg[static_cast<std::size_t>(opts_.eos_token_id)] = -std::numeric_limits<float>::infinity();
       }
-      finish_row(b, detail::dispatch_sample_from_logits(lg, s.params.temperature, opts_.top_k,
-                                                        opts_.top_p, opts_.repetition_penalty,
-                                                        opts_.no_repeat_ngram_size, s.history));
+      finish_row(b, detail::dispatch_sample_from_logits(lg, s.params.temperature, s.params.top_k,
+                                                        s.params.top_p, s.params.repetition_penalty,
+                                                        s.params.no_repeat_ngram_size, s.history));
     }
   }
 

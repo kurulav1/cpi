@@ -322,32 +322,37 @@ void LlamaEngine::decode_step_batched_logits(const std::vector<int>& tokens,
 
 bool LlamaEngine::decode_step_batched_topk(
     const std::vector<int>& tokens, const std::vector<int>& positions,
-    const std::vector<int>& block_tables_flat, int max_blocks, int k,
+    const std::vector<int>& block_tables_flat, int max_blocks, const std::vector<int>& k,
     std::vector<std::vector<detail::SampleCandidate>>& out_cand) {
   // MUST match llama_engine_graph.cpp: the shared d_topk_/d_cand_ buffers are sized to these.
   constexpr int kMaxDeviceTopK = 1024;
   constexpr int kCandCapacity = 4096;
   const int vocab = weights_.config().vocab_size;
-  if (k <= 0 || k > kMaxDeviceTopK || k >= vocab) return false;
+  // Every row's k must be usable by the device top-k (the caller falls back to the logits path
+  // for the whole batch otherwise -- a per-row split is a later refinement).
+  for (int kb : k)
+    if (kb <= 0 || kb > kMaxDeviceTopK || kb >= vocab) return false;
 
   const int batch = decode_step_batched_forward(tokens, positions, block_tables_flat, max_blocks);
+  if (static_cast<int>(k.size()) != batch) return false;
   out_cand.resize(static_cast<std::size_t>(batch));
   if (batch == 0) return true;
   const int hidden = weights_.config().hidden_size;
   batched_lm_head(batch, hidden, vocab);
   ensure_device_topk_buffers();
 
-  // Per row: device top-k (the k-th value is the threshold) then a gather of every finite logit
-  // >= threshold -- exactly the candidate set sample_from_logits_topk builds on the host, so only
-  // those (a few dozen) cross the bus instead of the full vocab. Same logic as the single-sequence
-  // graph path, looped over the batch's rows.
+  // Per row: device top-k (the row's k-th value is the threshold) then a gather of every finite
+  // logit >= threshold -- exactly the candidate set sample_from_logits_topk builds on the host, so
+  // only those (a few dozen) cross the bus instead of the full vocab. Same logic as the
+  // single-sequence graph path, looped over the batch's rows.
   for (int b = 0; b < batch; ++b) {
+    const int kb = k[static_cast<std::size_t>(b)];
     const float* row = d_batch_logits_ + static_cast<std::size_t>(b) * vocab;
     CUDA_CHECK(cudaMemsetAsync(d_cand_count_, 0, sizeof(int), compute_stream_));
-    kernels::launch_topk_float(row, vocab, k, d_topk_part_val_, d_topk_part_idx_, d_topk_val_,
+    kernels::launch_topk_float(row, vocab, kb, d_topk_part_val_, d_topk_part_idx_, d_topk_val_,
                                d_topk_idx_, compute_stream_);
-    kernels::launch_gather_ge_threshold(row, vocab, d_topk_val_ + (k - 1), d_cand_idx_, d_cand_val_,
-                                        d_cand_count_, kCandCapacity, compute_stream_);
+    kernels::launch_gather_ge_threshold(row, vocab, d_topk_val_ + (kb - 1), d_cand_idx_,
+                                        d_cand_val_, d_cand_count_, kCandCapacity, compute_stream_);
     CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
 
     int count = 0;
@@ -381,8 +386,8 @@ bool LlamaEngine::decode_step_batched_topk(
       CUDA_CHECK(cudaMemcpy(host.data(), row, static_cast<std::size_t>(vocab) * sizeof(float),
                             cudaMemcpyDeviceToHost));
       std::vector<float> part(host);
-      std::nth_element(part.begin(), part.begin() + (k - 1), part.end(), std::greater<float>());
-      const float kth = part[static_cast<std::size_t>(k - 1)];
+      std::nth_element(part.begin(), part.begin() + (kb - 1), part.end(), std::greater<float>());
+      const float kth = part[static_cast<std::size_t>(kb - 1)];
       std::vector<int> ref;
       for (int i = 0; i < vocab; ++i)
         if (std::isfinite(host[static_cast<std::size_t>(i)]) &&
@@ -528,7 +533,8 @@ public:
   }
 
   bool decode_batched_topk(const std::vector<int>& tokens, const std::vector<int>& positions,
-                           const std::vector<int>& block_tables_flat, int max_blocks, int k,
+                           const std::vector<int>& block_tables_flat, int max_blocks,
+                           const std::vector<int>& k,
                            std::vector<std::vector<detail::SampleCandidate>>& out_cand) override {
     return e_->decode_step_batched_topk(tokens, positions, block_tables_flat, max_blocks, k,
                                         out_cand);
@@ -547,10 +553,6 @@ BatchScheduler& LlamaEngine::ensure_scheduler() {
     o.paged_block_size = options_.paged_block_size > 0 ? options_.paged_block_size : 32;
     o.max_context = options_.max_context;
     o.eos_token_id = options_.eos_token_id;
-    o.top_k = options_.top_k;
-    o.top_p = options_.top_p;
-    o.repetition_penalty = options_.repetition_penalty;
-    o.no_repeat_ngram_size = options_.no_repeat_ngram_size;
     o.verbose = options_.verbose;
     scheduler_ = std::make_unique<BatchScheduler>(batch_adapter_.get(), block_alloc_.get(), o);
   }
@@ -591,6 +593,12 @@ std::vector<std::vector<int>> LlamaEngine::run_batch(const std::vector<BatchRequ
     StreamParams p;
     p.max_new_tokens = requests[i].max_new_tokens;
     p.temperature = requests[i].temperature;
+    // Sampling shape is now per-request; the bench/single-flight caller fills it from the
+    // engine-wide options so behaviour is unchanged.
+    p.top_k = options_.top_k;
+    p.top_p = options_.top_p;
+    p.repetition_penalty = options_.repetition_penalty;
+    p.no_repeat_ngram_size = options_.no_repeat_ngram_size;
     if (requests[i].eos_id >= 0) p.stop_ids.push_back(requests[i].eos_id);
     const std::string id = std::to_string(i);
     id_to_index[id] = i;

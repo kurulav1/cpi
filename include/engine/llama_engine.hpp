@@ -423,7 +423,8 @@ public:
   // sampler. Returns false (caller falls back to the logits path) when k is out of the device
   // top-k range or a row hits a pathological tie count.
   bool decode_step_batched_topk(const std::vector<int>& tokens, const std::vector<int>& positions,
-                                const std::vector<int>& block_tables_flat, int max_blocks, int k,
+                                const std::vector<int>& block_tables_flat, int max_blocks,
+                                const std::vector<int>& k,
                                 std::vector<std::vector<detail::SampleCandidate>>& out_cand);
 
   // Parity gate for decode_step_batched: prefill `prompt_tokens`, then for
