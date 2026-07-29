@@ -17,19 +17,13 @@ std::mt19937& sampler_rng() {
   return rng;
 }
 
-// Fast sampling path for the common chat configuration (temperature > 0,
-// 0 < top_k < vocab, no repetition penalty, no n-gram blocking).
-//
-// The full sampler below scales, softmaxes and — for top_p — std::sorts the
-// entire vocabulary (~128k entries) on every decoded token, even though only
-// the top_k (default 40) candidates can ever be chosen. This collapses that to
-// the top_k set first, so the per-token work drops from an O(vocab log vocab)
-// sort to an O(top_k log top_k) one. The resulting distribution is identical to
-// the full path: top_k keeps exactly the entries >= the k-th largest logit
-// (ties included), and the nucleus for top_p is always a subset of that set.
-// Draws a token from an already-selected candidate set. Factored out of the top-k
-// sampler so the device-side top-k path can reuse the identical math + RNG: given
-// the same candidates it returns the same token (see sampling.hpp).
+// The single sampling traversal. Every temperature > 0 path -- the fast top-k path below, the
+// full sample_from_logits path, and the device top-k path -- turns its logits into a candidate set
+// and draws through HERE: softmax over the candidates, top_p nucleus, one uniform draw walked in
+// probability order. Having exactly one traversal is what makes those paths agree token-for-token
+// (not merely in distribution) for a given seed, so which route a request takes -- host vs device,
+// fast vs full -- never changes the sampled token. The candidate set is O(top_k), so this also
+// avoids the O(vocab log vocab) full-vocabulary sort the sampler once did on every decoded token.
 int sample_from_candidates(std::vector<engine::detail::SampleCandidate>& cand, float temperature,
                            float top_p) {
   using Candidate = engine::detail::SampleCandidate;
@@ -221,95 +215,32 @@ int sample_from_logits(std::vector<float>& logits, float temperature, int top_k,
     return static_cast<int>(std::max_element(logits.begin(), logits.end()) - logits.begin());
   }
 
-  const float inv_temp = 1.0f / temperature;
-  float max_logit = -std::numeric_limits<float>::infinity();
-  for (float v : logits) {
-    if (std::isfinite(v)) {
-      max_logit = std::max(max_logit, v * inv_temp);
-    }
-  }
-  if (!std::isfinite(max_logit)) {
-    return 0;
-  }
-
-  float sum = 0.0f;
-  for (float& v : logits) {
-    v = v * inv_temp;
-  }
-
+  // Build the same top_k candidate set sample_from_logits_topk does -- but on THESE (sanitized,
+  // penalized, n-gram-banned) logits -- and delegate the softmax / nucleus / draw to the shared
+  // sample_from_candidates. A single traversal in the codebase is the point: the device top-k path
+  // already samples through sample_from_candidates, so with an identical candidate set and seed
+  // this fallback now returns the identical TOKEN, not merely the same distribution. This path used
+  // to walk the vocab in INDEX order while the candidate path walks in PROBABILITY order, so which
+  // route a request took -- decided by whether the whole batch was fast-path eligible, i.e. by
+  // other clients' concurrent requests -- changed the sampled token for a fixed seed, and made
+  // CPI_BATCH_TOPK=0 an unreliable A/B for penalty rows. top_k selects the same set on the unscaled
+  // logits (inv_temp is a positive, order-preserving scale), matching the fast path's threshold.
+  std::vector<engine::detail::SampleCandidate> cand;
   if (top_k > 0 && top_k < static_cast<int>(logits.size())) {
-    std::vector<float> copy = logits;
-    std::nth_element(copy.begin(), copy.begin() + (top_k - 1), copy.end(), std::greater<float>());
-    const float kth = copy[top_k - 1];
-    for (float& v : logits) {
-      if (v < kth) {
-        v = -std::numeric_limits<float>::infinity();
-      }
+    std::vector<float> part(logits);
+    std::nth_element(part.begin(), part.begin() + (top_k - 1), part.end(), std::greater<float>());
+    const float kth = part[static_cast<std::size_t>(top_k - 1)];
+    for (std::size_t i = 0; i < logits.size(); ++i) {
+      const float v = logits[i];
+      if (std::isfinite(v) && v >= kth) cand.push_back({static_cast<int>(i), v});
+    }
+  } else {
+    for (std::size_t i = 0; i < logits.size(); ++i) {
+      const float v = logits[i];
+      if (std::isfinite(v)) cand.push_back({static_cast<int>(i), v});
     }
   }
-
-  std::vector<float> probs(logits.size(), 0.0f);
-  sum = 0.0f;
-  for (std::size_t i = 0; i < logits.size(); ++i) {
-    if (!std::isfinite(logits[i])) {
-      continue;
-    }
-    probs[i] = std::exp(logits[i] - max_logit);
-    sum += probs[i];
-  }
-  if (sum <= 0.0f) {
-    return 0;
-  }
-  for (float& p : probs) {
-    p /= sum;
-  }
-
-  if (top_p > 0.0f && top_p < 1.0f) {
-    std::vector<int> idx(probs.size());
-    for (std::size_t i = 0; i < idx.size(); ++i) {
-      idx[i] = static_cast<int>(i);
-    }
-    std::sort(idx.begin(), idx.end(), [&](int a, int b) { return probs[a] > probs[b]; });
-
-    float csum = 0.0f;
-    std::vector<char> keep(probs.size(), 0);
-    for (int id : idx) {
-      if (probs[id] <= 0.0f) {
-        continue;
-      }
-      keep[id] = 1;
-      csum += probs[id];
-      if (csum >= top_p) {
-        break;
-      }
-    }
-
-    float renorm = 0.0f;
-    for (std::size_t i = 0; i < probs.size(); ++i) {
-      if (!keep[i]) {
-        probs[i] = 0.0f;
-      }
-      renorm += probs[i];
-    }
-    if (renorm > 0.0f) {
-      for (float& p : probs) {
-        p /= renorm;
-      }
-    }
-  }
-
-  std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-  const float r = dist(sampler_rng());
-
-  float acc = 0.0f;
-  for (std::size_t i = 0; i < probs.size(); ++i) {
-    acc += probs[i];
-    if (r <= acc) {
-      return static_cast<int>(i);
-    }
-  }
-
-  return static_cast<int>(std::max_element(probs.begin(), probs.end()) - probs.begin());
+  return sample_from_candidates(cand, temperature, top_p);
 }
 
 bool has_degenerate_tail(const std::vector<int>& ids, std::size_t prompt_size) {
