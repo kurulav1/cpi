@@ -84,8 +84,7 @@ bool linear_rowmajor_weight_lt(cublasLtHandle_t handle, std::vector<LtMatmulPlan
     return e && *e == '1';
   }();
   const bool fp16_acc = !force_fp32 && batch_size > 1 && output_type == CUDA_R_16F;
-  const cublasComputeType_t compute_type =
-      fp16_acc ? CUBLAS_COMPUTE_16F : CUBLAS_COMPUTE_32F;
+  const cublasComputeType_t compute_type = fp16_acc ? CUBLAS_COMPUTE_16F : CUBLAS_COMPUTE_32F;
 
   LtMatmulPlan* plan = nullptr;
   const LtMatmulPlanKey key{out_features, in_features, batch_size, output_type};
@@ -180,8 +179,8 @@ bool linear_rowmajor_weight_lt(cublasLtHandle_t handle, std::vector<LtMatmulPlan
   // __half, and handing cuBLAS a float* there reinterprets the bits as garbage.
   const __half alpha_h = __float2half(1.0f);
   const __half beta_h = __float2half(0.0f);
-  const void* alpha_p = fp16_acc ? static_cast<const void*>(&alpha_h)
-                                 : static_cast<const void*>(&alpha);
+  const void* alpha_p =
+      fp16_acc ? static_cast<const void*>(&alpha_h) : static_cast<const void*>(&alpha);
   const void* beta_p =
       fp16_acc ? static_cast<const void*>(&beta_h) : static_cast<const void*>(&beta);
 
@@ -225,9 +224,8 @@ void require_tensor_bytes(const model::WeightLoader& weights, const std::string&
   }
   const std::size_t got = weights.tensor_bytes(name);
   if (got != expected_bytes) {
-    CPI_THROW("tensor size mismatch for " + name + ": expected " +
-                       std::to_string(expected_bytes) + " bytes, got " + std::to_string(got) +
-                       " bytes");
+    CPI_THROW("tensor size mismatch for " + name + ": expected " + std::to_string(expected_bytes) +
+              " bytes, got " + std::to_string(got) + " bytes");
   }
 }
 
@@ -256,9 +254,8 @@ void require_fp16_or_packed_lowbit_bytes(const model::WeightLoader& weights,
   const std::size_t got_scale = weights.tensor_bytes(sname);
   if (got_scale != sizeof(float) && got_scale != expected_scale_bytes) {
     CPI_THROW("tensor size mismatch for " + sname + ": expected " +
-                       std::to_string(expected_scale_bytes) + " or " +
-                       std::to_string(sizeof(float)) + " bytes, got " + std::to_string(got_scale) +
-                       " bytes");
+              std::to_string(expected_scale_bytes) + " or " + std::to_string(sizeof(float)) +
+              " bytes, got " + std::to_string(got_scale) + " bytes");
   }
 }
 
@@ -285,8 +282,7 @@ int infer_mat_rows(const model::WeightLoader& weights, const std::string& name, 
     const std::size_t bytes = weights.tensor_bytes(q8name);
     const std::size_t row_bytes = static_cast<std::size_t>(cols);
     if (row_bytes == 0 || (bytes % row_bytes) != 0) {
-      CPI_THROW("tensor size mismatch for " + q8name +
-                         ": not divisible by int8 row bytes");
+      CPI_THROW("tensor size mismatch for " + q8name + ": not divisible by int8 row bytes");
     }
     return static_cast<int>(bytes / row_bytes);
   }
@@ -296,8 +292,7 @@ int infer_mat_rows(const model::WeightLoader& weights, const std::string& name, 
     const std::size_t bytes = weights.tensor_bytes(q4name);
     const std::size_t row_bytes = static_cast<std::size_t>(packed_cols);
     if (row_bytes == 0 || (bytes % row_bytes) != 0) {
-      CPI_THROW("tensor size mismatch for " + q4name +
-                         ": not divisible by int4 packed row bytes");
+      CPI_THROW("tensor size mismatch for " + q4name + ": not divisible by int4 packed row bytes");
     }
     return static_cast<int>(bytes / row_bytes);
   }
@@ -318,8 +313,7 @@ AttentionDims infer_attention_dims(const model::WeightLoader& weights,
   const int kv_hidden = infer_mat_rows(weights, p + ".attention.wk", hidden);
   const int vv_hidden = infer_mat_rows(weights, p + ".attention.wv", hidden);
   if (q_hidden <= 0 || (q_hidden % cfg.num_heads) != 0) {
-    CPI_THROW(
-        "invalid attention.wq shape: q_hidden must be positive and divisible by num_heads");
+    CPI_THROW("invalid attention.wq shape: q_hidden must be positive and divisible by num_heads");
   }
   if (kv_hidden <= 0 || kv_hidden != vv_hidden) {
     CPI_THROW("invalid attention.wk/wv shape: rows must be positive and equal");
@@ -329,8 +323,7 @@ AttentionDims infer_attention_dims(const model::WeightLoader& weights,
     CPI_THROW("invalid inferred attention head_dim");
   }
   if (kv_hidden != cfg.num_kv_heads * head_dim) {
-    CPI_THROW(
-        "invalid attention dims: wk rows must equal num_kv_heads * (wq_rows / num_heads)");
+    CPI_THROW("invalid attention dims: wk rows must equal num_kv_heads * (wq_rows / num_heads)");
   }
   return AttentionDims{q_hidden, head_dim, kv_hidden};
 }
@@ -533,8 +526,8 @@ void validate_tensor_layout(const model::WeightLoader& weights) {
       const std::string residual_bits = base + ".tq3r";
       const std::string residual_scales = base + ".tq3rs";
       if (!weights.has_tensor(residual_bits) || !weights.has_tensor(residual_scales)) {
-        CPI_THROW("incomplete Qprod residual pair: expected both " + residual_bits +
-                           " and " + residual_scales);
+        CPI_THROW("incomplete Qprod residual pair: expected both " + residual_bits + " and " +
+                  residual_scales);
       }
       const std::size_t expected_rbits =
           static_cast<std::size_t>(out_rows) * qjl_words_per_row * sizeof(std::uint32_t);
@@ -1188,27 +1181,24 @@ void LlamaEngine::initialize(const EngineOptions& options) {
   if (prefill_chunk_target <= 0) {
     const int kv_dim = cfg.num_kv_heads * (cfg.hidden_size / std::max(1, cfg.num_heads));
     // x, x_norm, att, out + q/k/v + the three ff buffers, fp16.
-    const std::size_t per_token =
-        (static_cast<std::size_t>(cfg.hidden_size) * 4 +
-         static_cast<std::size_t>(cfg.intermediate_size) * 3 +
-         static_cast<std::size_t>(cfg.hidden_size + 2 * kv_dim)) *
-        sizeof(__half);
+    const std::size_t per_token = (static_cast<std::size_t>(cfg.hidden_size) * 4 +
+                                   static_cast<std::size_t>(cfg.intermediate_size) * 3 +
+                                   static_cast<std::size_t>(cfg.hidden_size + 2 * kv_dim)) *
+                                  sizeof(__half);
 
     std::size_t free_bytes = 0, total_bytes = 0;
     cudaMemGetInfo(&free_bytes, &total_bytes);
     // Spend at most 512 MB, and never more than 5% of what is actually free.
-    const std::size_t budget =
-        std::min<std::size_t>(std::size_t{512} << 20, free_bytes / 20);
+    const std::size_t budget = std::min<std::size_t>(std::size_t{512} << 20, free_bytes / 20);
     const std::size_t fits = (per_token > 0) ? (budget / per_token) : 2048;
-    prefill_chunk_target = static_cast<int>(
-        std::min<std::size_t>(2048, std::max<std::size_t>(256, fits)));
+    prefill_chunk_target =
+        static_cast<int>(std::min<std::size_t>(2048, std::max<std::size_t>(256, fits)));
   }
   prefill_chunk_size_ = std::max(1, std::min(options_.max_context, prefill_chunk_target));
   if (options_.verbose) {
     std::cout << "[engine] prefill_chunk=" << prefill_chunk_size_ << "\n";
   }
-  lt_workspace_bytes_ =
-      env_workspace_bytes_or_default("CPI_LT_WORKSPACE_MB", lt_workspace_bytes_);
+  lt_workspace_bytes_ = env_workspace_bytes_or_default("CPI_LT_WORKSPACE_MB", lt_workspace_bytes_);
   CUDA_CHECK(cudaStreamCreateWithFlags(&compute_stream_, cudaStreamNonBlocking));
   CUDA_CHECK(cudaStreamCreateWithFlags(&transfer_stream_, cudaStreamNonBlocking));
   for (auto& ev : streaming_ready_) {

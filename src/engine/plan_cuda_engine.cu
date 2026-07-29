@@ -4,21 +4,21 @@
 // model's spec. Reuses the shared kernels (rmsnorm scale=w, rope table, tiled
 // decode attention, gelu-mul, gemv).
 #include <cublas_v2.h>
+
 #include <algorithm>
+#include <cctype>
 #include <chrono>
-#include <map>
-#include <string>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
-#include <cctype>
-#include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 #include "engine/generation_constraints.hpp"
@@ -413,7 +413,7 @@ void PlanCudaEngine::upload_int4(const std::string& name, int rows, int cols) {
   qw.packed = d_w;
   qw.scales = d_scales;
   qw.group = group;
-  qw.pf_i8 = (bits == 8 && group == 0) ? d_w : d_pf;      // alias when already rowwise int8
+  qw.pf_i8 = (bits == 8 && group == 0) ? d_w : d_pf;  // alias when already rowwise int8
   qw.pf_scales = (bits == 8 && group == 0) ? d_scales : d_pf_s;
   qdev_[name] = qw;
 }
@@ -512,9 +512,9 @@ void PlanCudaEngine::allocate_buffers() {
     G4_CHECK(cudaMalloc(&d_tok_, sizeof(int)));
     G4_CHECK(cudaMalloc(&d_position_, sizeof(int)));
     G4_CHECK(cudaMalloc(&d_argmax_, sizeof(int)));
-  argmax_parts_ = kernels::argmax_partition_count(cfg_.vocab);
-  G4_CHECK(cudaMalloc(&d_argmax_pv_, static_cast<std::size_t>(argmax_parts_) * sizeof(float)));
-  G4_CHECK(cudaMalloc(&d_argmax_pi_, static_cast<std::size_t>(argmax_parts_) * sizeof(int)));
+    argmax_parts_ = kernels::argmax_partition_count(cfg_.vocab);
+    G4_CHECK(cudaMalloc(&d_argmax_pv_, static_cast<std::size_t>(argmax_parts_) * sizeof(float)));
+    G4_CHECK(cudaMalloc(&d_argmax_pi_, static_cast<std::size_t>(argmax_parts_) * sizeof(int)));
     const int topk_parts = kernels::topk_partition_count(cfg_.vocab);
     const std::size_t part_n = static_cast<std::size_t>(topk_parts) * kMaxDeviceTopK;
     G4_CHECK(cudaMalloc(&d_topk_part_val_, part_n * sizeof(float)));
@@ -835,7 +835,8 @@ void PlanCudaEngine::load_all(const std::string& cpi_path) {
   // int4, since per-row int8 needs no groups -- while EmbeddingLookup keeps the fp16 table.
   if (quantize && d_head_q_ == nullptr) {
     const __half* emb = static_cast<const __half*>(dev_at(W + "embed_tokens.weight"));
-    const std::size_t n = static_cast<std::size_t>(cfg_.vocab) * static_cast<std::size_t>(cfg_.hidden);
+    const std::size_t n =
+        static_cast<std::size_t>(cfg_.vocab) * static_cast<std::size_t>(cfg_.hidden);
     if (weight_quant_bits_ == 4 && (cfg_.hidden % 32) == 0) {
       // int4 runs: grouped-int4 head (~5 bpw with scales) on the dp4a f32 path -- half
       // the bytes of the int8 head, which was already at roofline. Packed via the same
@@ -845,8 +846,8 @@ void PlanCudaEngine::load_all(const std::string& cpi_path) {
       std::int8_t* tmp_i8 = nullptr;
       G4_CHECK(cudaMalloc(&tmp_i8, n));
       G4_CHECK(cudaMalloc(&d_head_q_, n / 2));
-      G4_CHECK(cudaMalloc(&d_head_qs_, static_cast<std::size_t>(cfg_.vocab) * n_groups *
-                                           sizeof(float)));
+      G4_CHECK(
+          cudaMalloc(&d_head_qs_, static_cast<std::size_t>(cfg_.vocab) * n_groups * sizeof(float)));
       kernels::launch_quantize_groupwise_fp16_to_int8(emb, tmp_i8, d_head_qs_, cfg_.vocab,
                                                       cfg_.hidden, group, stream_, 7);
       kernels::launch_pack_rowwise_int8_to_int4(tmp_i8, d_head_q_, cfg_.vocab, cfg_.hidden,
@@ -936,7 +937,8 @@ void PlanCudaEngine::open(const std::string& cpi_path, int max_context) {
   if ((weight_quant_bits_ == 4 || weight_quant_bits_ == 8) && d_act_i8_ == nullptr &&
       std::getenv("CPI_CUDA_NO_DP4A") == nullptr) {
     G4_CHECK(cudaMalloc(&d_act_i8_, std::size_t(16) * 65536));  // up to 16 tokens' activations
-    G4_CHECK(cudaMalloc(&d_act_qs_, std::size_t(16) * (65536 / 32) * sizeof(float)));  // g32 x scales, up to 16 tokens
+    G4_CHECK(cudaMalloc(&d_act_qs_, std::size_t(16) * (65536 / 32) *
+                                        sizeof(float)));  // g32 x scales, up to 16 tokens
     // Largest projection on the supported models is <= 16384 x 4096 halfs (128 MB is the
     // ceiling; E2B's largest is 12288 x 1536 = 38 MB). Sized generously once.
     G4_CHECK(cudaMalloc(&d_seq_dequant_, std::size_t(16384) * 4096 * sizeof(__half)));
@@ -972,8 +974,7 @@ void PlanCudaEngine::open(const std::string& cpi_path, int max_context) {
       build_rope_tables();
       allocate_buffers();
       build_plan();
-      persist_enabled_ =
-          std::getenv("CPI_CUDA_PERSISTENT") != nullptr && compile_persistent_plan();
+      persist_enabled_ = std::getenv("CPI_CUDA_PERSISTENT") != nullptr && compile_persistent_plan();
       // The vision tower, when the checkpoint ships one. Opt out with
       // CPI_NO_VISION=1 (it costs VRAM even on text-only prompts).
       // Sequence prefill is a capability of the PLAN: partial RoPE and delta-net have no
@@ -1026,8 +1027,7 @@ void PlanCudaEngine::open(const std::string& cpi_path, int max_context) {
   build_rope_tables();
   allocate_buffers();
   build_plan();  // resolve the per-layer forward into a data op-plan (once)
-  persist_enabled_ =
-      std::getenv("CPI_CUDA_PERSISTENT") != nullptr && compile_persistent_plan();
+  persist_enabled_ = std::getenv("CPI_CUDA_PERSISTENT") != nullptr && compile_persistent_plan();
   // Sequence prefill: this route must set the capability flag too, or every .cpi model
   // prefills token-by-token (orders of magnitude slower than the batched path).
   seq_prefill_ok_ = plan_can_sequence_prefill();
@@ -1832,8 +1832,7 @@ void PlanCudaEngine::build_plan() {
     // CPI_PLAN_NO_MOE=1 drops the routed branch, leaving the dense MLP only.
     // Bisection aid: it separates "the shared Gemma path is wrong" from "the MoE ops
     // are wrong" (the model is degraded but must stay finite and coherent-ish).
-    if (cfg_.enable_moe_block && !std::getenv("CPI_PLAN_NO_MOE"))
-      append_moe_ffn_ops(ops, p, L);
+    if (cfg_.enable_moe_block && !std::getenv("CPI_PLAN_NO_MOE")) append_moe_ffn_ops(ops, p, L);
     rms(Slot::Tmp, Slot::Tmp, W("post_feedforward_layernorm.weight"), 1, H);
     add_x(Slot::Tmp);
 
@@ -1894,8 +1893,8 @@ void PlanCudaEngine::build_plan() {
 // Sequence-mode GEMM: y[T,out] = x[T,in] * W[out,in]^T via cublasGemmEx (fp16 in, fp32
 // accumulate) -- the classic row-major-as-column-major call. Falls back to the hand-rolled
 // GEMM when cuBLAS is disabled or the op carries activation clips (vision projections).
-bool PlanCudaEngine::seq_gemm_cublas(const __half* w, const __half* x, __half* y, int out,
-                                     int in, int T) {
+bool PlanCudaEngine::seq_gemm_cublas(const __half* w, const __half* x, __half* y, int out, int in,
+                                     int T) {
   static const bool disabled = std::getenv("CPI_CUDA_NO_CUBLAS") != nullptr;
   if (disabled) return false;
   if (cublas_ == nullptr) {
@@ -1906,9 +1905,9 @@ bool PlanCudaEngine::seq_gemm_cublas(const __half* w, const __half* x, __half* y
   cublasHandle_t h = static_cast<cublasHandle_t>(cublas_);
   cublasSetStream(h, stream_);
   const float alpha = 1.0f, beta = 0.0f;
-  const cublasStatus_t st = cublasGemmEx(
-      h, CUBLAS_OP_T, CUBLAS_OP_N, out, T, in, &alpha, w, CUDA_R_16F, in, x, CUDA_R_16F, in,
-      &beta, y, CUDA_R_16F, out, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+  const cublasStatus_t st = cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N, out, T, in, &alpha, w,
+                                         CUDA_R_16F, in, x, CUDA_R_16F, in, &beta, y, CUDA_R_16F,
+                                         out, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
   return st == CUBLAS_STATUS_SUCCESS;
 }
 
@@ -1942,17 +1941,17 @@ bool PlanCudaEngine::prefill_attention_tc(const __half* q, const __half* k, cons
   const int out_stride = heads * hd;
   for (int c0 = 0; c0 < rows; c0 += kChunk) {
     const int chunk = std::min(kChunk, rows - c0);
-    kernels::launch_build_attention_ptrs(k, v, q, d_pf_scores_, out, d_pf_ptrs_, heads, group,
-                                         hd, kChunk, keys, q_stride, out_stride, c0, stream_);
+    kernels::launch_build_attention_ptrs(k, v, q, d_pf_scores_, out, d_pf_ptrs_, heads, group, hd,
+                                         kChunk, keys, q_stride, out_stride, c0, stream_);
     const void* const* A1 = const_cast<const void* const*>(d_pf_ptrs_);
     const void* const* B1 = const_cast<const void* const*>(d_pf_ptrs_ + heads);
     void* const* C1 = d_pf_ptrs_ + 2 * heads;
     const void* const* A2 = const_cast<const void* const*>(d_pf_ptrs_ + 3 * heads);
     const void* const* B2 = const_cast<const void* const*>(d_pf_ptrs_ + 4 * heads);
     void* const* C2 = d_pf_ptrs_ + 5 * heads;
-    if (cublasGemmBatchedEx(h, CUBLAS_OP_T, CUBLAS_OP_N, keys, chunk, hd, &scale, A1,
-                            CUDA_R_16F, kv_stride, B1, CUDA_R_16F, q_stride, &zero, C1,
-                            CUDA_R_16F, keys, heads, CUBLAS_COMPUTE_32F,
+    if (cublasGemmBatchedEx(h, CUBLAS_OP_T, CUBLAS_OP_N, keys, chunk, hd, &scale, A1, CUDA_R_16F,
+                            kv_stride, B1, CUDA_R_16F, q_stride, &zero, C1, CUDA_R_16F, keys, heads,
+                            CUBLAS_COMPUTE_32F,
                             CUBLAS_GEMM_DEFAULT_TENSOR_OP) != CUBLAS_STATUS_SUCCESS)
       return false;
     kernels::launch_softmax_causal_rows(d_pf_scores_, heads, kChunk, chunk, keys, base_pos + c0,
@@ -2064,10 +2063,10 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
         const bool three = c != nullptr && c->kind == OpKind::Gemv && c->qbits == 0 &&
                            c->bias == nullptr && c->in == op.in && c->in_dim == op.in_dim &&
                            c->out != c->in && c->out != op.out && c->out != b.out;
-        kernels::launch_rowmajor_half_gemv_cat(
-            HW(op.weight), S(op.out), op.cols, HW(b.weight), S(b.out), b.cols,
-            three ? HW(c->weight) : nullptr, three ? S(c->out) : nullptr, three ? c->cols : 0,
-            S(op.in), op.in_dim, stream_);
+        kernels::launch_rowmajor_half_gemv_cat(HW(op.weight), S(op.out), op.cols, HW(b.weight),
+                                               S(b.out), b.cols, three ? HW(c->weight) : nullptr,
+                                               three ? S(c->out) : nullptr, three ? c->cols : 0,
+                                               S(op.in), op.in_dim, stream_);
         idx += three ? 2 : 1;
         goto op_done;
       }
@@ -2114,11 +2113,10 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
     {
       static const bool ab_elem = std::getenv("CPI_CUDA_ABLATE_ELEMENTWISE") != nullptr;
       static const bool ab_norm = std::getenv("CPI_CUDA_ABLATE_NORMS") != nullptr;
-      if (!seq &&
-          ((ab_elem && (op.kind == OpKind::AddInplace || op.kind == OpKind::GeluMul ||
-                        op.kind == OpKind::ScaleCopy || op.kind == OpKind::CopySlot)) ||
-           (ab_norm && (op.kind == OpKind::RmsNorm || op.kind == OpKind::Rope ||
-                        op.kind == OpKind::KvStore)))) {
+      if (!seq && ((ab_elem && (op.kind == OpKind::AddInplace || op.kind == OpKind::GeluMul ||
+                                op.kind == OpKind::ScaleCopy || op.kind == OpKind::CopySlot)) ||
+                   (ab_norm && (op.kind == OpKind::RmsNorm || op.kind == OpKind::Rope ||
+                                op.kind == OpKind::KvStore)))) {
         goto op_done;
       }
     }
@@ -2139,8 +2137,8 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
                                                             op.in_dim, stream_);
           }
           kernels::launch_weight_only_int4_matvec_grouped_dp4a_f32(
-              QW(op.qweight), QS(op.qscales), d_act_i8_, d_act_qs_, d_logits_, op.cols,
-              op.in_dim, op.qgroup, stream_);
+              QW(op.qweight), QS(op.qscales), d_act_i8_, d_act_qs_, d_logits_, op.cols, op.in_dim,
+              op.qgroup, stream_);
           break;
         }
         if (op.qbits == 8) {
@@ -2190,8 +2188,8 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
         // fp16-activation kernel -- it is bandwidth-bound already and its dp4a variant
         // measured slower. CPI_CUDA_NO_DP4A=1 keeps the fp16-activation kernels for
         // int4 too.
-        if (!seq && d_act_i8_ != nullptr && op.bias == nullptr && op.qbits == 4 &&
-            op.qgroup > 0 && (op.qgroup % 32) == 0 && (op.in_dim % 32) == 0) {
+        if (!seq && d_act_i8_ != nullptr && op.bias == nullptr && op.qbits == 4 && op.qgroup > 0 &&
+            (op.qgroup % 32) == 0 && (op.in_dim % 32) == 0) {
           if (actq_src != S(op.in) || actq_len != op.in_dim) {
             kernels::launch_quantize_fp16_to_int8_perm8_g32(S(op.in), d_act_i8_, d_act_qs_,
                                                             op.in_dim, stream_);
@@ -2208,9 +2206,9 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
               ops[idx + 2].in2 == ops[idx + 1].out && ops[idx + 2].cols == op.cols &&
               ops[idx + 1].cols == op.cols && ops[idx + 2].out != op.in) {
             kernels::launch_weight_only_int4_matvec_grouped_dp4a_glu(
-                QW(op.qweight), QS(op.qscales), QW(ops[idx + 1].qweight),
-                QS(ops[idx + 1].qscales), d_act_i8_, d_act_qs_, S(ops[idx + 2].out), op.cols,
-                op.in_dim, op.qgroup, stream_, tune_gemv_warps_);
+                QW(op.qweight), QS(op.qscales), QW(ops[idx + 1].qweight), QS(ops[idx + 1].qscales),
+                d_act_i8_, d_act_qs_, S(ops[idx + 2].out), op.cols, op.in_dim, op.qgroup, stream_,
+                tune_gemv_warps_);
             idx += 2;
             break;
           }
@@ -2233,16 +2231,15 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
               kernels::launch_weight_only_int4_matvec_grouped_dp4a_cat(
                   QW(op.qweight), QS(op.qscales), S(op.out), op.cols, QW(b->qweight),
                   QS(b->qscales), S(b->out), b->cols, c ? QW(c->qweight) : nullptr,
-                  c ? QS(c->qscales) : nullptr, c ? S(c->out) : nullptr, c ? c->cols : 0,
-                  d_act_i8_, d_act_qs_, op.in_dim, op.qgroup, stream_, tune_gemv_warps_);
+                  c ? QS(c->qscales) : nullptr, c ? S(c->out) : nullptr, c ? c->cols : 0, d_act_i8_,
+                  d_act_qs_, op.in_dim, op.qgroup, stream_, tune_gemv_warps_);
               idx += c ? 2 : 1;
               break;
             }
           }
-          kernels::launch_weight_only_int4_matvec_grouped_dp4a(QW(op.qweight), QS(op.qscales),
-                                                               d_act_i8_, d_act_qs_, S(op.out),
-                                                               op.cols, op.in_dim, op.qgroup,
-                                                               stream_, tune_gemv_warps_);
+          kernels::launch_weight_only_int4_matvec_grouped_dp4a(
+              QW(op.qweight), QS(op.qscales), d_act_i8_, d_act_qs_, S(op.out), op.cols, op.in_dim,
+              op.qgroup, stream_, tune_gemv_warps_);
           if (S(op.out) == actq_src) actq_src = nullptr;
           break;
         }
@@ -2258,8 +2255,8 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
             mtq_len = op.in_dim;
           }
           kernels::launch_weight_only_int4_matvec_grouped_dp4a_mt(
-              QW(op.qweight), QS(op.qscales), d_act_i8_, d_act_qs_, S(op.out), op.cols,
-              op.in_dim, op.qgroup, T, stream_);
+              QW(op.qweight), QS(op.qscales), d_act_i8_, d_act_qs_, S(op.out), op.cols, op.in_dim,
+              op.qgroup, T, stream_);
           break;
         }
         // SEQUENCE mode with quantized weights: dequantize into scratch and run the real
@@ -2288,16 +2285,16 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
           bool ok = true;
           for (int t0 = 0; t0 < T && ok; t0 += 512) {
             const int chunk = std::min(512, T - t0);
-            ok = cublasGemmEx(ch, CUBLAS_OP_T, CUBLAS_OP_N, op.cols, chunk, op.in_dim, &ialpha,
-                              op.pf_qweight, CUDA_R_8I, op.in_dim,
-                              d_seq_x8_ + static_cast<std::size_t>(t0) * op.in_dim, CUDA_R_8I,
-                              op.in_dim, &ibeta, d_seq_i32_, CUDA_R_32I, op.cols,
-                              CUBLAS_COMPUTE_32I,
-                              CUBLAS_GEMM_DEFAULT_TENSOR_OP) == CUBLAS_STATUS_SUCCESS;
+            ok =
+                cublasGemmEx(ch, CUBLAS_OP_T, CUBLAS_OP_N, op.cols, chunk, op.in_dim, &ialpha,
+                             op.pf_qweight, CUDA_R_8I, op.in_dim,
+                             d_seq_x8_ + static_cast<std::size_t>(t0) * op.in_dim, CUDA_R_8I,
+                             op.in_dim, &ibeta, d_seq_i32_, CUDA_R_32I, op.cols, CUBLAS_COMPUTE_32I,
+                             CUBLAS_GEMM_DEFAULT_TENSOR_OP) == CUBLAS_STATUS_SUCCESS;
             if (ok) {
-              kernels::launch_i32_scale_to_fp16(
-                  d_seq_i32_, static_cast<const float*>(op.pf_qscales), d_seq_xs_, S(op.out),
-                  op.cols, chunk, t0, stream_);
+              kernels::launch_i32_scale_to_fp16(d_seq_i32_,
+                                                static_cast<const float*>(op.pf_qscales), d_seq_xs_,
+                                                S(op.out), op.cols, chunk, t0, stream_);
             }
           }
           if (ok) break;
@@ -2314,27 +2311,24 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
             throw std::runtime_error("sequence prefill: unsupported quant layout");
           }
           if (!seq_gemm_cublas(d_seq_dequant_, S(op.in), S(op.out), op.cols, op.in_dim, T)) {
-            kernels::launch_rowmajor_half_gemm_f16(d_seq_dequant_, S(op.in), S(op.out), op.cols,
-                                                   op.in_dim, T, stream_, op.clip_in_min,
-                                                   op.clip_in_max, op.clip_out_min,
-                                                   op.clip_out_max);
+            kernels::launch_rowmajor_half_gemm_f16(
+                d_seq_dequant_, S(op.in), S(op.out), op.cols, op.in_dim, T, stream_, op.clip_in_min,
+                op.clip_in_max, op.clip_out_min, op.clip_out_max);
           }
           break;
         }
         // int8 GLU fusion: [gate Gemv][up Gemv][GeluMul] -> one paired-warp launch.
         if (!seq && op.qbits == 8 && op.qgroup == 0 && op.bias == nullptr &&
             (op.in_dim % 16) == 0 && idx + 2 < n && ops[idx + 1].kind == OpKind::Gemv &&
-            ops[idx + 1].qbits == 8 && ops[idx + 1].qgroup == 0 &&
-            ops[idx + 1].bias == nullptr && ops[idx + 1].in == op.in &&
-            ops[idx + 1].in_dim == op.in_dim && ops[idx + 1].cols == op.cols &&
-            ops[idx + 2].kind == OpKind::GeluMul && ops[idx + 2].aux_ptr == nullptr &&
-            ops[idx + 2].aux_offset == 0 && ops[idx + 2].in == op.out &&
-            ops[idx + 2].in2 == ops[idx + 1].out && ops[idx + 2].cols == op.cols &&
-            ops[idx + 2].out != op.in) {
+            ops[idx + 1].qbits == 8 && ops[idx + 1].qgroup == 0 && ops[idx + 1].bias == nullptr &&
+            ops[idx + 1].in == op.in && ops[idx + 1].in_dim == op.in_dim &&
+            ops[idx + 1].cols == op.cols && ops[idx + 2].kind == OpKind::GeluMul &&
+            ops[idx + 2].aux_ptr == nullptr && ops[idx + 2].aux_offset == 0 &&
+            ops[idx + 2].in == op.out && ops[idx + 2].in2 == ops[idx + 1].out &&
+            ops[idx + 2].cols == op.cols && ops[idx + 2].out != op.in) {
           kernels::launch_weight_only_int8_matvec_glu(
-              QW(op.qweight), QS(op.qscales), QW(ops[idx + 1].qweight),
-              QS(ops[idx + 1].qscales), S(op.in), S(ops[idx + 2].out), op.cols, op.in_dim,
-              stream_);
+              QW(op.qweight), QS(op.qscales), QW(ops[idx + 1].qweight), QS(ops[idx + 1].qscales),
+              S(op.in), S(ops[idx + 2].out), op.cols, op.in_dim, stream_);
           idx += 2;
           break;
         }
@@ -2357,10 +2351,9 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
                                std::isfinite(op.clip_out_min) || std::isfinite(op.clip_out_max);
           if (clipped ||
               !seq_gemm_cublas(HW(op.weight), S(op.in), S(op.out), op.cols, op.in_dim, T)) {
-            kernels::launch_rowmajor_half_gemm_f16(HW(op.weight), S(op.in), S(op.out), op.cols,
-                                                   op.in_dim, T, stream_, op.clip_in_min,
-                                                   op.clip_in_max, op.clip_out_min,
-                                                   op.clip_out_max);
+            kernels::launch_rowmajor_half_gemm_f16(
+                HW(op.weight), S(op.in), S(op.out), op.cols, op.in_dim, T, stream_, op.clip_in_min,
+                op.clip_in_max, op.clip_out_min, op.clip_out_max);
           }
         } else {
           kernels::launch_rowmajor_half_gemv_f16(HW(op.weight), S(op.in), S(op.out), op.cols,
@@ -2414,8 +2407,8 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
           // kept Gemma 4 decode launching ~700 kernels per token from the host.
           if (device_pos_mode_) {
             kernels::launch_rope_inplace_partial_table_device_pos(
-                S(op.in), S(op.in2), op.heads, op.kv_heads, op.head_dim, op.rotary_dim,
-                d_position_, cosT, sinT, stream_);
+                S(op.in), S(op.in2), op.heads, op.kv_heads, op.head_dim, op.rotary_dim, d_position_,
+                cosT, sinT, stream_);
           } else {
             kernels::launch_rope_inplace_partial_table(S(op.in), S(op.in2), op.heads, op.kv_heads,
                                                        op.head_dim, op.rotary_dim, position, cosT,
@@ -2425,11 +2418,11 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
           // Sequence prefill: token t sits at position (chunk start + t). The spec-verify
           // graph reads the base position from the device instead.
           if (spec_seq_device_pos_) {
-            kernels::launch_rope_seq_table_device_pos(S(op.in), op.heads, op.head_dim,
-                                                      d_position_, T, cosT, sinT, 0, stream_);
+            kernels::launch_rope_seq_table_device_pos(S(op.in), op.heads, op.head_dim, d_position_,
+                                                      T, cosT, sinT, 0, stream_);
           } else {
-            kernels::launch_rope_seq_table(S(op.in), op.heads, op.head_dim, position, T, cosT,
-                                           sinT, 0, stream_);
+            kernels::launch_rope_seq_table(S(op.in), op.heads, op.head_dim, position, T, cosT, sinT,
+                                           0, stream_);
           }
         } else if (device_pos_mode_) {
           // Single-tensor RoPE via the device-position kernel (k-branch guarded off
@@ -2466,7 +2459,8 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
           // Sequence prefill appends T rows at once: the K/V slots are [T][kvdim] and the
           // cache rows are contiguous, so it is the same copy, T times as long.
           const std::size_t rows = static_cast<std::size_t>(T);
-          static const bool kv_debug = std::getenv("CPI_KV_DEBUG") != nullptr;  // cached, not per-append
+          static const bool kv_debug =
+              std::getenv("CPI_KV_DEBUG") != nullptr;  // cached, not per-append
           if (kv_debug)
             std::fprintf(stderr, "[kvdbg] layer=%d T=%d pos=%d kvdim=%zu kc=%p vc=%p K=%p V=%p\n",
                          layer, T, position, kvdim, (void*)kc, (void*)vc, (void*)S(Slot::K),
@@ -2557,9 +2551,9 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
                   S(op.in), kc, vc, S(op.out), d_position_, window, op.heads, op.kv_heads,
                   op.head_dim, d_split_m_, d_split_l_, d_split_o_, cs, chunks, stream_);
             } else {
-              kernels::launch_attention_split_any(
-                  S(op.in), kc, vc, S(op.out), position + 1, window, op.heads, op.kv_heads,
-                  op.head_dim, d_split_m_, d_split_l_, d_split_o_, cs, chunks, stream_);
+              kernels::launch_attention_split_any(S(op.in), kc, vc, S(op.out), position + 1, window,
+                                                  op.heads, op.kv_heads, op.head_dim, d_split_m_,
+                                                  d_split_l_, d_split_o_, cs, chunks, stream_);
             }
             break;
           }
@@ -2638,12 +2632,12 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
       cudaEventSynchronize(ev1);
       float ms = 0.0f;
       cudaEventElapsedTime(&ms, ev0, ev1);
-      static const char* kProfNames[] = {"RmsNorm", "Gemv", "Rope", "ScaleCopy", "CopySlot",
-                                         "KvStore", "Attention", "GeluMul", "AddInplace",
-                                         "AddRmsNorm", "Embedding", "LmHead", "SiluMul",
-                                         "SplitHeads", "SigmoidGate", "LinConv1d", "RepeatHeads",
-                                         "LinAttnStep", "MulVec", "MoeRouter", "MoeGateUp",
-                                         "MoeDown", "PatchEmbed", "Rope2D", "AvgPool", "Standardize"};
+      static const char* kProfNames[] = {
+          "RmsNorm",   "Gemv",       "Rope",        "ScaleCopy",  "CopySlot",    "KvStore",
+          "Attention", "GeluMul",    "AddInplace",  "AddRmsNorm", "Embedding",   "LmHead",
+          "SiluMul",   "SplitHeads", "SigmoidGate", "LinConv1d",  "RepeatHeads", "LinAttnStep",
+          "MulVec",    "MoeRouter",  "MoeGateUp",   "MoeDown",    "PatchEmbed",  "Rope2D",
+          "AvgPool",   "Standardize"};
       const int ki = static_cast<int>(op.kind);
       std::string key = (ki >= 0 && ki < 26) ? kProfNames[ki] : "Unknown";
       // Split the two op kinds that hide very different shapes under one name.
@@ -3011,9 +3005,9 @@ void PlanCudaEngine::forward_one(int token, int position, bool compute_logits,
   if (compute_logits && per_layer_rms == nullptr && persist_enabled_) {
     G4_CHECK(cudaMemcpyAsync(d_tok_, &token, sizeof(int), cudaMemcpyHostToDevice, stream_));
     G4_CHECK(cudaMemcpyAsync(d_position_, &position, sizeof(int), cudaMemcpyHostToDevice, stream_));
-    if (kernels::launch_persistent_decode(
-            static_cast<const kernels::PersistOp*>(d_persist_ops_), persist_n_ops_, d_tok_,
-            d_position_, persist_blocks_, stream_)) {
+    if (kernels::launch_persistent_decode(static_cast<const kernels::PersistOp*>(d_persist_ops_),
+                                          persist_n_ops_, d_tok_, d_position_, persist_blocks_,
+                                          stream_)) {
       if (!defer_host_logits_) publish_host_logits();
       return;
     }
@@ -3421,9 +3415,8 @@ bool PlanCudaEngine::load_tuning() {
   if (csd == 16 || csd == 32 || csd == 64) tune_attn_cs_deep_ = csd;
   const int th = tuning_field(s, "attn_deep_tokens", tune_attn_deep_tokens_);
   if (th >= 256 && th <= 65536) tune_attn_deep_tokens_ = th;
-  std::fprintf(stderr, "[tune] loaded %s: gemv_warps=%d attn_cs=%d/%d@%d\n",
-               tuning_path().c_str(), tune_gemv_warps_, tune_attn_cs_shallow_,
-               tune_attn_cs_deep_, tune_attn_deep_tokens_);
+  std::fprintf(stderr, "[tune] loaded %s: gemv_warps=%d attn_cs=%d/%d@%d\n", tuning_path().c_str(),
+               tune_gemv_warps_, tune_attn_cs_shallow_, tune_attn_cs_deep_, tune_attn_deep_tokens_);
   return true;
 }
 
@@ -3436,8 +3429,7 @@ void PlanCudaEngine::save_tuning() const {
     std::fprintf(stderr, "[tune] could not write %s\n", path.c_str());
     return;
   }
-  out << "{\"gemv_warps\":" << tune_gemv_warps_
-      << ",\"attn_cs_shallow\":" << tune_attn_cs_shallow_
+  out << "{\"gemv_warps\":" << tune_gemv_warps_ << ",\"attn_cs_shallow\":" << tune_attn_cs_shallow_
       << ",\"attn_cs_deep\":" << tune_attn_cs_deep_
       << ",\"attn_deep_tokens\":" << tune_attn_deep_tokens_ << "}\n";
   std::fprintf(stderr, "[tune] saved %s\n", path.c_str());
@@ -3462,8 +3454,8 @@ void PlanCudaEngine::autotune() {
       {"attn_cs_shallow", &tune_attn_cs_shallow_, {16, 32}, shallow_pos},
       {"attn_cs_deep", &tune_attn_cs_deep_, {32, 64}, deep_pos},
   };
-  std::fprintf(stderr, "[tune] autotuning (depths %d/%d, %d replays per candidate)\n",
-               shallow_pos, deep_pos, iters);
+  std::fprintf(stderr, "[tune] autotuning (depths %d/%d, %d replays per candidate)\n", shallow_pos,
+               deep_pos, iters);
   for (auto& k : knobs) {
     // Deep knobs are pointless when the context cannot reach the crossover.
     if (k.depth + 1 < tune_attn_deep_tokens_ && k.value == &tune_attn_cs_deep_) {
@@ -3651,9 +3643,9 @@ void PlanCudaEngine::spec_forward_t16() {
       static_cast<const std::int8_t*>(head.qweight), static_cast<const float*>(head.qscales),
       d_act_i8_, d_act_qs_, d_mt_logits_, head.cols, head.in_dim, head.qgroup, T, stream_);
   for (int t = 0; t < T; ++t) {
-    kernels::launch_argmax_float(d_mt_logits_ + static_cast<std::size_t>(t) * head.cols,
-                                 head.cols, d_spec_argmax_ + t, stream_, d_argmax_pv_,
-                                 d_argmax_pi_, argmax_parts_);
+    kernels::launch_argmax_float(d_mt_logits_ + static_cast<std::size_t>(t) * head.cols, head.cols,
+                                 d_spec_argmax_ + t, stream_, d_argmax_pv_, d_argmax_pi_,
+                                 argmax_parts_);
   }
   spec_seq_device_pos_ = false;
 }
@@ -3667,8 +3659,8 @@ bool PlanCudaEngine::spec_graph_init() {
   try {
     const opplan::Op& head = plan_.epilogue.back();
     if (d_mt_logits_ == nullptr) {
-      G4_CHECK(cudaMalloc(&d_mt_logits_,
-                          16ull * static_cast<std::size_t>(head.cols) * sizeof(float)));
+      G4_CHECK(
+          cudaMalloc(&d_mt_logits_, 16ull * static_cast<std::size_t>(head.cols) * sizeof(float)));
     }
     G4_CHECK(cudaMalloc(&d_spec_argmax_, 16 * sizeof(int)));
     int max_heads = 0, max_hd = 0;
@@ -3686,7 +3678,8 @@ bool PlanCudaEngine::spec_graph_init() {
         16ull * static_cast<std::size_t>(max_heads) * static_cast<std::size_t>(spec_attn_chunks_);
     G4_CHECK(cudaMalloc(&d_spec_split_m_, cells * sizeof(float)));
     G4_CHECK(cudaMalloc(&d_spec_split_l_, cells * sizeof(float)));
-    G4_CHECK(cudaMalloc(&d_spec_split_o_, cells * static_cast<std::size_t>(max_hd) * sizeof(float)));
+    G4_CHECK(
+        cudaMalloc(&d_spec_split_o_, cells * static_cast<std::size_t>(max_hd) * sizeof(float)));
     static const bool graph_off = [] {
       const char* e = std::getenv("CPI_CUDA_SPEC_GRAPH");
       return e && *e == '0';
@@ -3735,8 +3728,8 @@ void PlanCudaEngine::verify_greedy(const int* tokens, int k, int pos, int* out_a
         spec_forward_t16();  // CPI_CUDA_SPEC_GRAPH=0: same kernel stream, launched eagerly
       }
       int tmp[16];
-      G4_CHECK(cudaMemcpyAsync(tmp, d_spec_argmax_, 16 * sizeof(int), cudaMemcpyDeviceToHost,
-                               stream_));
+      G4_CHECK(
+          cudaMemcpyAsync(tmp, d_spec_argmax_, 16 * sizeof(int), cudaMemcpyDeviceToHost, stream_));
       G4_CHECK(cudaStreamSynchronize(stream_));
       for (int i = 0; i < k; ++i) out_argmax[i] = tmp[i];
       return;
@@ -3759,8 +3752,8 @@ void PlanCudaEngine::verify_greedy(const int* tokens, int k, int pos, int* out_a
     // Batched head: one weight pass produces all k positions' logits (the per-position
     // gemv re-read the 262K-row head k times and dominated the verify's GPU time).
     if (d_mt_logits_ == nullptr) {
-      G4_CHECK(cudaMalloc(&d_mt_logits_, 16ull * static_cast<std::size_t>(head.cols) *
-                                             sizeof(float)));
+      G4_CHECK(
+          cudaMalloc(&d_mt_logits_, 16ull * static_cast<std::size_t>(head.cols) * sizeof(float)));
     }
     kernels::launch_quantize_fp16_to_int8_perm8_g32_mt(xn, d_act_i8_, d_act_qs_, head.in_dim, k,
                                                        stream_);
@@ -3771,8 +3764,8 @@ void PlanCudaEngine::verify_greedy(const int* tokens, int k, int pos, int* out_a
       kernels::launch_argmax_float(d_mt_logits_ + static_cast<std::size_t>(t) * head.cols,
                                    head.cols, d_argmax_, stream_, d_argmax_pv_, d_argmax_pi_,
                                    argmax_parts_);
-      G4_CHECK(cudaMemcpyAsync(out_argmax + t, d_argmax_, sizeof(int), cudaMemcpyDeviceToHost,
-                               stream_));
+      G4_CHECK(
+          cudaMemcpyAsync(out_argmax + t, d_argmax_, sizeof(int), cudaMemcpyDeviceToHost, stream_));
     }
     G4_CHECK(cudaStreamSynchronize(stream_));
     return;
@@ -3780,17 +3773,17 @@ void PlanCudaEngine::verify_greedy(const int* tokens, int k, int pos, int* out_a
   for (int t = 0; t < k; ++t) {
     const __half* row = xn + static_cast<std::size_t>(t) * head.in_dim;
     if (head.qbits == 8) {
-      kernels::launch_weight_only_int8_gemv_f32(
-          static_cast<const std::int8_t*>(head.qweight), static_cast<const float*>(head.qscales),
-          row, d_logits_, head.cols, head.in_dim, stream_);
+      kernels::launch_weight_only_int8_gemv_f32(static_cast<const std::int8_t*>(head.qweight),
+                                                static_cast<const float*>(head.qscales), row,
+                                                d_logits_, head.cols, head.in_dim, stream_);
     } else {
       kernels::launch_rowmajor_half_gemv_f32(static_cast<const __half*>(head.weight), row,
                                              d_logits_, head.cols, head.in_dim, stream_);
     }
     kernels::launch_argmax_float(d_logits_, head.cols, d_argmax_, stream_, d_argmax_pv_,
                                  d_argmax_pi_, argmax_parts_);
-    G4_CHECK(cudaMemcpyAsync(out_argmax + t, d_argmax_, sizeof(int), cudaMemcpyDeviceToHost,
-                             stream_));
+    G4_CHECK(
+        cudaMemcpyAsync(out_argmax + t, d_argmax_, sizeof(int), cudaMemcpyDeviceToHost, stream_));
   }
   G4_CHECK(cudaStreamSynchronize(stream_));
 }
@@ -3923,8 +3916,7 @@ std::vector<int> PlanCudaEngine::generate_stream(const std::vector<int>& prompt,
     synchronize();
     stats_.decode_ms = msf(d0, clock::now());
     if (std::getenv("CPI_CUDA_SPEC_STATS")) {
-      std::fprintf(stderr,
-                   "[spec] verifies=%d drafted=%d accepted=%d (%.1f%%) tokens=%d\n",
+      std::fprintf(stderr, "[spec] verifies=%d drafted=%d accepted=%d (%.1f%%) tokens=%d\n",
                    verify_calls, drafted, accepted_total,
                    drafted > 0 ? 100.0 * accepted_total / drafted : 0.0,
                    static_cast<int>(stats_.generated_tokens));

@@ -15,10 +15,10 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <cstring>
-#include <functional>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -138,7 +138,8 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
                                    static_cast<__half*>(d_x_), batch, hidden, compute_stream_);
   if (cfg.scale_embeddings)  // Gemma: scale token embeddings by sqrt(hidden)
     kernels::launch_scale_copy(static_cast<__half*>(d_x_), static_cast<const __half*>(d_x_),
-                               batch * hidden, std::sqrt(static_cast<float>(hidden)), compute_stream_);
+                               batch * hidden, std::sqrt(static_cast<float>(hidden)),
+                               compute_stream_);
 
   for (int layer = 0; layer < cfg.num_layers; ++layer) {
     const LayerDeviceWeights* lw = &layer_cache_[static_cast<std::size_t>(layer)];
@@ -177,8 +178,8 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
                               cfg.norm_eps, compute_stream_);
       kernels::launch_rmsnorm(static_cast<const __half*>(d_prefill_k_),
                               static_cast<const __half*>(lw->k_norm),
-                              static_cast<__half*>(d_prefill_k_), batch * cfg.num_kv_heads, head_dim,
-                              cfg.norm_eps, compute_stream_);
+                              static_cast<__half*>(d_prefill_k_), batch * cfg.num_kv_heads,
+                              head_dim, cfg.norm_eps, compute_stream_);
     }
 
     kernels::launch_rope_inplace_perpos(static_cast<__half*>(d_prefill_q_),
@@ -319,11 +320,10 @@ void LlamaEngine::decode_step_batched_logits(const std::vector<int>& tokens,
     prof_head_s_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
 }
 
-bool LlamaEngine::decode_step_batched_topk(const std::vector<int>& tokens,
-                                           const std::vector<int>& positions,
-                                           const std::vector<int>& block_tables_flat, int max_blocks,
-                                           int k,
-                                           std::vector<std::vector<detail::SampleCandidate>>& out_cand) {
+bool LlamaEngine::decode_step_batched_topk(
+    const std::vector<int>& tokens, const std::vector<int>& positions,
+    const std::vector<int>& block_tables_flat, int max_blocks, int k,
+    std::vector<std::vector<detail::SampleCandidate>>& out_cand) {
   // MUST match llama_engine_graph.cpp: the shared d_topk_/d_cand_ buffers are sized to these.
   constexpr int kMaxDeviceTopK = 1024;
   constexpr int kCandCapacity = 4096;
@@ -385,7 +385,8 @@ bool LlamaEngine::decode_step_batched_topk(const std::vector<int>& tokens,
       const float kth = part[static_cast<std::size_t>(k - 1)];
       std::vector<int> ref;
       for (int i = 0; i < vocab; ++i)
-        if (std::isfinite(host[static_cast<std::size_t>(i)]) && host[static_cast<std::size_t>(i)] >= kth)
+        if (std::isfinite(host[static_cast<std::size_t>(i)]) &&
+            host[static_cast<std::size_t>(i)] >= kth)
           ref.push_back(i);
       std::vector<int> got;
       got.reserve(cand.size());

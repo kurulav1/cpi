@@ -276,13 +276,11 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
       }
       if (lw->q_norm && lw->k_norm) {
         kernels::launch_rmsnorm(static_cast<const __half*>(d_q_),
-                                       static_cast<const __half*>(lw->q_norm),
-                                       static_cast<__half*>(d_q_), cfg.num_heads, head_dim,
-                                       cfg.norm_eps, compute_stream_);
+                                static_cast<const __half*>(lw->q_norm), static_cast<__half*>(d_q_),
+                                cfg.num_heads, head_dim, cfg.norm_eps, compute_stream_);
         kernels::launch_rmsnorm(static_cast<const __half*>(d_k_),
-                                       static_cast<const __half*>(lw->k_norm),
-                                       static_cast<__half*>(d_k_), cfg.num_kv_heads, head_dim,
-                                       cfg.norm_eps, compute_stream_);
+                                static_cast<const __half*>(lw->k_norm), static_cast<__half*>(d_k_),
+                                cfg.num_kv_heads, head_dim, cfg.norm_eps, compute_stream_);
       }
       kernels::launch_rope_inplace_table(static_cast<__half*>(d_q_), static_cast<__half*>(d_k_),
                                          cfg.num_heads, cfg.num_kv_heads, head_dim, position,
@@ -389,8 +387,8 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
           matvec_device_weight(ebase + ".w3", expert_inter, hidden,
                                static_cast<const __half*>(d_x_norm_), moe_ff_up, d_moe_w3_,
                                d_moe_w3_q_, d_moe_s_w3_);
-          detail::launch_gated_glu(weights_.config().mlp_gelu, moe_ff_gate, moe_ff_up, moe_ff_up, expert_inter,
-                                   compute_stream_);
+          detail::launch_gated_glu(weights_.config().mlp_gelu, moe_ff_gate, moe_ff_up, moe_ff_up,
+                                   expert_inter, compute_stream_);
           matvec_device_weight(ebase + ".w2", hidden, expert_inter, moe_ff_up,
                                static_cast<__half*>(d_ff3_), d_moe_w2_, d_moe_w2_q_, d_moe_s_w2_);
         });
@@ -454,13 +452,11 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
     }
     if (lw->q_norm && lw->k_norm) {
       kernels::launch_rmsnorm(static_cast<const __half*>(d_q_),
-                                     static_cast<const __half*>(lw->q_norm),
-                                     static_cast<__half*>(d_q_), cfg.num_heads, head_dim,
-                                     cfg.norm_eps, compute_stream_);
+                              static_cast<const __half*>(lw->q_norm), static_cast<__half*>(d_q_),
+                              cfg.num_heads, head_dim, cfg.norm_eps, compute_stream_);
       kernels::launch_rmsnorm(static_cast<const __half*>(d_k_),
-                                     static_cast<const __half*>(lw->k_norm),
-                                     static_cast<__half*>(d_k_), cfg.num_kv_heads, head_dim,
-                                     cfg.norm_eps, compute_stream_);
+                              static_cast<const __half*>(lw->k_norm), static_cast<__half*>(d_k_),
+                              cfg.num_kv_heads, head_dim, cfg.norm_eps, compute_stream_);
     }
     kernels::launch_rope_inplace_table(static_cast<__half*>(d_q_), static_cast<__half*>(d_k_),
                                        cfg.num_heads, cfg.num_kv_heads, head_dim, position,
@@ -625,13 +621,11 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
 
     if (lw->q_norm && lw->k_norm) {
       kernels::launch_rmsnorm(static_cast<const __half*>(d_q_),
-                                     static_cast<const __half*>(lw->q_norm),
-                                     static_cast<__half*>(d_q_), cfg.num_heads, head_dim,
-                                     cfg.norm_eps, compute_stream_);
+                              static_cast<const __half*>(lw->q_norm), static_cast<__half*>(d_q_),
+                              cfg.num_heads, head_dim, cfg.norm_eps, compute_stream_);
       kernels::launch_rmsnorm(static_cast<const __half*>(d_k_),
-                                     static_cast<const __half*>(lw->k_norm),
-                                     static_cast<__half*>(d_k_), cfg.num_kv_heads, head_dim,
-                                     cfg.norm_eps, compute_stream_);
+                              static_cast<const __half*>(lw->k_norm), static_cast<__half*>(d_k_),
+                              cfg.num_kv_heads, head_dim, cfg.norm_eps, compute_stream_);
     }
     kernels::launch_rope_inplace_table(static_cast<__half*>(d_q_), static_cast<__half*>(d_k_),
                                        cfg.num_heads, cfg.num_kv_heads, head_dim, position,
@@ -725,9 +719,8 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
             static_cast<const __half*>(d_x_norm_), static_cast<__half*>(d_ff2_), inter, hidden,
             compute_stream_);
       } else {
-        resident_projection_half(lw->w13, d_x_norm_, d_ff1_, 2 * inter, hidden,
-                                 resident_qkv_warps_, resident_qkv_tile_pairs_,
-                                 resident_qkv_rows_per_warp_);
+        resident_projection_half(lw->w13, d_x_norm_, d_ff1_, 2 * inter, hidden, resident_qkv_warps_,
+                                 resident_qkv_tile_pairs_, resident_qkv_rows_per_warp_);
         detail::launch_gated_glu(weights_.config().mlp_gelu, static_cast<const __half*>(d_ff1_),
                                  static_cast<const __half*>(d_ff2_), static_cast<__half*>(d_ff2_),
                                  inter, compute_stream_);
@@ -783,13 +776,11 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
 
     if (lw->q_norm && lw->k_norm) {
       kernels::launch_rmsnorm(static_cast<const __half*>(d_q_),
-                                     static_cast<const __half*>(lw->q_norm),
-                                     static_cast<__half*>(d_q_), cfg.num_heads, head_dim,
-                                     cfg.norm_eps, compute_stream_);
+                              static_cast<const __half*>(lw->q_norm), static_cast<__half*>(d_q_),
+                              cfg.num_heads, head_dim, cfg.norm_eps, compute_stream_);
       kernels::launch_rmsnorm(static_cast<const __half*>(d_k_),
-                                     static_cast<const __half*>(lw->k_norm),
-                                     static_cast<__half*>(d_k_), cfg.num_kv_heads, head_dim,
-                                     cfg.norm_eps, compute_stream_);
+                              static_cast<const __half*>(lw->k_norm), static_cast<__half*>(d_k_),
+                              cfg.num_kv_heads, head_dim, cfg.norm_eps, compute_stream_);
     }
     kernels::launch_rope_inplace_table(static_cast<__half*>(d_q_), static_cast<__half*>(d_k_),
                                        cfg.num_heads, cfg.num_kv_heads, head_dim, position,
@@ -1013,13 +1004,11 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
 
     if (lw->q_norm && lw->k_norm) {
       kernels::launch_rmsnorm(static_cast<const __half*>(d_q_),
-                                     static_cast<const __half*>(lw->q_norm),
-                                     static_cast<__half*>(d_q_), cfg.num_heads, head_dim,
-                                     cfg.norm_eps, compute_stream_);
+                              static_cast<const __half*>(lw->q_norm), static_cast<__half*>(d_q_),
+                              cfg.num_heads, head_dim, cfg.norm_eps, compute_stream_);
       kernels::launch_rmsnorm(static_cast<const __half*>(d_k_),
-                                     static_cast<const __half*>(lw->k_norm),
-                                     static_cast<__half*>(d_k_), cfg.num_kv_heads, head_dim,
-                                     cfg.norm_eps, compute_stream_);
+                              static_cast<const __half*>(lw->k_norm), static_cast<__half*>(d_k_),
+                              cfg.num_kv_heads, head_dim, cfg.norm_eps, compute_stream_);
     }
     kernels::launch_rope_inplace_table(static_cast<__half*>(d_q_), static_cast<__half*>(d_k_),
                                        cfg.num_heads, cfg.num_kv_heads, head_dim, position,

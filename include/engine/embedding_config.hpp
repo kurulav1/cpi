@@ -7,8 +7,8 @@
 // `1_Pooling/config.json` and sensible defaults. This is the "core" abstraction:
 // a new embedding model is served by dropping its directory in, no code change.
 
-#include <string>
 #include <stdexcept>
+#include <string>
 
 namespace engine {
 

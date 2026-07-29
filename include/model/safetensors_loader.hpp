@@ -63,8 +63,12 @@ public:
   // The container's `__metadata__` block, verbatim JSON. A `.cpi` stores its whole LlamaConfig
   // here -- the self-describing replacement for the .ll2c binary header. Empty for a plain HF
   // checkpoint, which keeps its config in a separate config.json.
-  [[nodiscard]] bool has_metadata() const { return !metadata_json_.empty(); }
-  [[nodiscard]] const std::string& metadata_json() const { return metadata_json_; }
+  [[nodiscard]] bool has_metadata() const {
+    return !metadata_json_.empty();
+  }
+  [[nodiscard]] const std::string& metadata_json() const {
+    return metadata_json_;
+  }
 
 private:
   struct TensorMeta {

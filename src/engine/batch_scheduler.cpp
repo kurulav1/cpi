@@ -199,7 +199,7 @@ bool BatchScheduler::step(std::vector<StreamEvent>& events) {
     }
     if (eligible) {
       used_topk = backend_->decode_batched_topk(toks, poss, flat, max_blocks, opts_.top_k,
-                                                 batch_cand_scratch_);
+                                                batch_cand_scratch_);
     }
   }
 
@@ -212,8 +212,8 @@ bool BatchScheduler::step(std::vector<StreamEvent>& events) {
     s.last_token = tok;
     ++s.pos;
     ++s.generated;
-    const bool is_stop =
-        std::find(s.params.stop_ids.begin(), s.params.stop_ids.end(), tok) != s.params.stop_ids.end();
+    const bool is_stop = std::find(s.params.stop_ids.begin(), s.params.stop_ids.end(), tok) !=
+                         s.params.stop_ids.end();
     const char* reason = "";
     bool fin = false;
     if (is_stop) {
@@ -240,7 +240,8 @@ bool BatchScheduler::step(std::vector<StreamEvent>& events) {
                                   }),
                    cand.end());
       }
-      finish_row(b, detail::dispatch_sample_from_candidates(cand, s.params.temperature, opts_.top_p));
+      finish_row(b,
+                 detail::dispatch_sample_from_candidates(cand, s.params.temperature, opts_.top_p));
     }
   } else {
     std::vector<std::vector<float>>& logits = batch_logits_scratch_;
@@ -254,9 +255,9 @@ bool BatchScheduler::step(std::vector<StreamEvent>& events) {
           static_cast<std::size_t>(opts_.eos_token_id) < lg.size()) {
         lg[static_cast<std::size_t>(opts_.eos_token_id)] = -std::numeric_limits<float>::infinity();
       }
-      finish_row(b, detail::dispatch_sample_from_logits(
-                        lg, s.params.temperature, opts_.top_k, opts_.top_p,
-                        opts_.repetition_penalty, opts_.no_repeat_ngram_size, s.history));
+      finish_row(b, detail::dispatch_sample_from_logits(lg, s.params.temperature, opts_.top_k,
+                                                        opts_.top_p, opts_.repetition_penalty,
+                                                        opts_.no_repeat_ngram_size, s.history));
     }
   }
 

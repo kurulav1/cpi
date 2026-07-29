@@ -353,7 +353,8 @@ __device__ __forceinline__ void attention_step_chunk_stats_core(
 
   // Score every key in the chunk. Key (chunk_start + i) belongs to warp (i % WarpsPerBlock)
   // exactly as the old tile loop assigned it, so each dot is the same fp sequence.
-  const int score_warps = blockDim.x / warpSize;  // launchers may raise threads for more parallel dots
+  const int score_warps =
+      blockDim.x / warpSize;  // launchers may raise threads for more parallel dots
   for (int t = chunk_start + warp_id; t < chunk_end; t += score_warps) {
     const int base = cache_index(t, kv_head, 0, num_kv_heads, head_dim);
     const half2* q2 = reinterpret_cast<const half2*>(q_shared);
@@ -524,9 +525,9 @@ template <int WarpsPerBlock>
 __global__ void attention_step_chunk_stats_any_kernel(const half* q, const half* k_cache,
                                                       const half* v_cache, float* chunk_m,
                                                       float* chunk_l, float* chunk_o, int seq_len,
-                                                      int num_heads, int num_kv_heads,
-                                                      int head_dim, int chunk_size,
-                                                      int scratch_chunks, int k_start) {
+                                                      int num_heads, int num_kv_heads, int head_dim,
+                                                      int chunk_size, int scratch_chunks,
+                                                      int k_start) {
   attention_step_chunk_stats_core<WarpsPerBlock>(q, k_cache, v_cache, chunk_m, chunk_l, chunk_o,
                                                  seq_len, num_heads, num_kv_heads, head_dim,
                                                  chunk_size, scratch_chunks, k_start);
@@ -592,12 +593,11 @@ __device__ __forceinline__ void attention_step_chunk_reduce_any_core(
 }
 
 __global__ void attention_step_chunk_reduce_any_kernel(const float* chunk_m, const float* chunk_l,
-                                                       const float* chunk_o, half* out,
-                                                       int seq_len, int num_heads, int head_dim,
-                                                       int chunk_size, int scratch_chunks,
-                                                       int k_start) {
-  attention_step_chunk_reduce_any_core(chunk_m, chunk_l, chunk_o, out, seq_len, num_heads,
-                                       head_dim, chunk_size, scratch_chunks, k_start);
+                                                       const float* chunk_o, half* out, int seq_len,
+                                                       int num_heads, int head_dim, int chunk_size,
+                                                       int scratch_chunks, int k_start) {
+  attention_step_chunk_reduce_any_core(chunk_m, chunk_l, chunk_o, out, seq_len, num_heads, head_dim,
+                                       chunk_size, scratch_chunks, k_start);
 }
 
 __global__ void attention_step_chunk_reduce_any_device_pos_kernel(
@@ -606,8 +606,8 @@ __global__ void attention_step_chunk_reduce_any_device_pos_kernel(
     int window) {
   const int seq_len = position_ptr[0] + 1;
   const int k_start = (window > 0 && seq_len > window) ? seq_len - window : 0;
-  attention_step_chunk_reduce_any_core(chunk_m, chunk_l, chunk_o, out, seq_len, num_heads,
-                                       head_dim, chunk_size, scratch_chunks, k_start);
+  attention_step_chunk_reduce_any_core(chunk_m, chunk_l, chunk_o, out, seq_len, num_heads, head_dim,
+                                       chunk_size, scratch_chunks, k_start);
 }
 
 // Multi-query twins for the graphed speculative verify: blockIdx.z / blockIdx.y select the
@@ -1093,12 +1093,10 @@ constexpr int kGqaFusedMaxSeq = 256;
 // GPU busy. It writes per-Q-head chunk partials in the exact layout the existing
 // attention_step_chunk_reduce* kernels consume, so pass 2 is unchanged.
 template <int HeadDim>
-__device__ __forceinline__ void gqa_split_chunk_stats_core(const half* q, const half* k_cache,
-                                                           const half* v_cache, float* chunk_m,
-                                                           float* chunk_l, float* chunk_o,
-                                                           int seq_len, int num_kv_heads,
-                                                           int group_size, int chunk_size,
-                                                           int blocks_per_chunk, int scratch_chunks) {
+__device__ __forceinline__ void gqa_split_chunk_stats_core(
+    const half* q, const half* k_cache, const half* v_cache, float* chunk_m, float* chunk_l,
+    float* chunk_o, int seq_len, int num_kv_heads, int group_size, int chunk_size,
+    int blocks_per_chunk, int scratch_chunks) {
   // chunk_size is the split step (<= warpSize=32), so lane `t` owns token `t`. A
   // grid block sweeps blocks_per_chunk such sub-chunks with a running online
   // softmax, so long context runs on fewer, larger, latency-hiding blocks instead
@@ -1218,12 +1216,10 @@ __device__ __forceinline__ void gqa_split_chunk_stats_core(const half* q, const 
 }
 
 template <int HeadDim>
-__global__ void attention_step_chunk_stats_gqa_split_kernel(const half* q, const half* k_cache,
-                                                            const half* v_cache, float* chunk_m,
-                                                            float* chunk_l, float* chunk_o,
-                                                            int seq_len, int num_kv_heads,
-                                                            int group_size, int chunk_size,
-                                                            int blocks_per_chunk, int scratch_chunks) {
+__global__ void attention_step_chunk_stats_gqa_split_kernel(
+    const half* q, const half* k_cache, const half* v_cache, float* chunk_m, float* chunk_l,
+    float* chunk_o, int seq_len, int num_kv_heads, int group_size, int chunk_size,
+    int blocks_per_chunk, int scratch_chunks) {
   gqa_split_chunk_stats_core<HeadDim>(q, k_cache, v_cache, chunk_m, chunk_l, chunk_o, seq_len,
                                       num_kv_heads, group_size, chunk_size, blocks_per_chunk,
                                       scratch_chunks);
@@ -1602,7 +1598,7 @@ __device__ __forceinline__ void gqa_split_chunk_stats_batched_core(
   const int b = blockIdx.z;
   const int seq_len = seq_lens[b];
   const int kv_head = blockIdx.x;
-  const int coarse = blockIdx.y;                 // coarse chunk = blocks_per_chunk paged blocks
+  const int coarse = blockIdx.y;  // coarse chunk = blocks_per_chunk paged blocks
   const int first_block = coarse * blocks_per_chunk;
   if (first_block * block_size >= seq_len) return;
 
@@ -1729,10 +1725,9 @@ __global__ void attention_step_chunk_stats_gqa_split_batched_kernel(
     const int* __restrict__ seq_lens, int max_blocks, float* chunk_m, float* chunk_l,
     float* chunk_o, int num_heads, int num_kv_heads, int group_size, int block_size,
     int blocks_per_chunk, int scratch_chunks) {
-  gqa_split_chunk_stats_batched_core<HeadDim>(q, k_pool, v_pool, block_tables, seq_lens, max_blocks,
-                                              chunk_m, chunk_l, chunk_o, num_heads, num_kv_heads,
-                                              group_size, block_size, blocks_per_chunk,
-                                              scratch_chunks);
+  gqa_split_chunk_stats_batched_core<HeadDim>(
+      q, k_pool, v_pool, block_tables, seq_lens, max_blocks, chunk_m, chunk_l, chunk_o, num_heads,
+      num_kv_heads, group_size, block_size, blocks_per_chunk, scratch_chunks);
 }
 
 void launch_attention_step_batched_paged(const half* q, const half* k_pool, const half* v_pool,
@@ -1782,16 +1777,16 @@ void launch_attention_step_batched_paged(const half* q, const half* k_pool, cons
     const dim3 grid_g(num_kv_heads, coarse_chunks, batch);
     if (head_dim == 128) {
       attention_step_chunk_stats_gqa_split_batched_kernel<128>
-          <<<grid_g, threads_g, smem_g, stream>>>(
-              q, k_pool, v_pool, block_tables, seq_lens, max_blocks, scratch_m, scratch_l,
-              scratch_o, num_heads, num_kv_heads, group_size, block_size, blocks_per_chunk,
-              scratch_chunks);
+          <<<grid_g, threads_g, smem_g, stream>>>(q, k_pool, v_pool, block_tables, seq_lens,
+                                                  max_blocks, scratch_m, scratch_l, scratch_o,
+                                                  num_heads, num_kv_heads, group_size, block_size,
+                                                  blocks_per_chunk, scratch_chunks);
     } else {
       attention_step_chunk_stats_gqa_split_batched_kernel<256>
-          <<<grid_g, threads_g, smem_g, stream>>>(
-              q, k_pool, v_pool, block_tables, seq_lens, max_blocks, scratch_m, scratch_l,
-              scratch_o, num_heads, num_kv_heads, group_size, block_size, blocks_per_chunk,
-              scratch_chunks);
+          <<<grid_g, threads_g, smem_g, stream>>>(q, k_pool, v_pool, block_tables, seq_lens,
+                                                  max_blocks, scratch_m, scratch_l, scratch_o,
+                                                  num_heads, num_kv_heads, group_size, block_size,
+                                                  blocks_per_chunk, scratch_chunks);
     }
   } else {
     const std::size_t smem = static_cast<std::size_t>(head_dim) * sizeof(half) +
@@ -1847,8 +1842,8 @@ void launch_attention_step_device_pos(const half* q, const half* k_cache, const 
   // DECODE GRAPH captures, so it is the one that actually runs during generation --
   // widening only the host-position one changed nothing measurable.
   const bool head_dim_fast = (head_dim == 64 || head_dim == 128);
-  const bool split_available = allow_split && scratch_m && scratch_l && scratch_o &&
-                               scratch_chunks > 0 && head_dim_fast;
+  const bool split_available =
+      allow_split && scratch_m && scratch_l && scratch_o && scratch_chunks > 0 && head_dim_fast;
   if (window <= 0 && !split_available && num_kv_heads > 0 && num_heads > num_kv_heads &&
       (num_heads % num_kv_heads) == 0 && head_dim_fast) {
     const int group_size_val = num_heads / num_kv_heads;
@@ -1979,13 +1974,12 @@ void launch_increment_int(int* value, cudaStream_t stream) {
   increment_int_kernel<<<1, 1, 0, stream>>>(value);
 }
 
-void launch_attention_split_any(const half* q, const half* k_cache, const half* v_cache,
-                                half* out, int seq_len, int window, int num_heads,
-                                int num_kv_heads, int head_dim, float* scratch_m,
-                                float* scratch_l, float* scratch_o, int chunk_size,
-                                int scratch_chunks, cudaStream_t stream) {
-  constexpr int warps = 4;       // merge-tile template arg (arithmetic order pinned)
-  constexpr int threads = 256;   // score/merge thread count -- runtime-derived in-kernel
+void launch_attention_split_any(const half* q, const half* k_cache, const half* v_cache, half* out,
+                                int seq_len, int window, int num_heads, int num_kv_heads,
+                                int head_dim, float* scratch_m, float* scratch_l, float* scratch_o,
+                                int chunk_size, int scratch_chunks, cudaStream_t stream) {
+  constexpr int warps = 4;      // merge-tile template arg (arithmetic order pinned)
+  constexpr int threads = 256;  // score/merge thread count -- runtime-derived in-kernel
   const int k_start = (window > 0 && seq_len > window) ? seq_len - window : 0;
   const std::size_t smem = static_cast<std::size_t>(head_dim) * sizeof(half) +
                            static_cast<std::size_t>(2 * warps + 4) * sizeof(float) +
@@ -1999,14 +1993,14 @@ void launch_attention_split_any(const half* q, const half* k_cache, const half* 
       scratch_chunks, k_start);
 }
 
-void launch_attention_split_any_device_pos(const half* q, const half* k_cache,
-                                           const half* v_cache, half* out, const int* position,
-                                           int window, int num_heads, int num_kv_heads,
-                                           int head_dim, float* scratch_m, float* scratch_l,
-                                           float* scratch_o, int chunk_size, int scratch_chunks,
+void launch_attention_split_any_device_pos(const half* q, const half* k_cache, const half* v_cache,
+                                           half* out, const int* position, int window,
+                                           int num_heads, int num_kv_heads, int head_dim,
+                                           float* scratch_m, float* scratch_l, float* scratch_o,
+                                           int chunk_size, int scratch_chunks,
                                            cudaStream_t stream) {
-  constexpr int warps = 4;       // merge-tile template arg (arithmetic order pinned)
-  constexpr int threads = 256;   // score/merge thread count -- runtime-derived in-kernel
+  constexpr int warps = 4;      // merge-tile template arg (arithmetic order pinned)
+  constexpr int threads = 256;  // score/merge thread count -- runtime-derived in-kernel
   const std::size_t smem = static_cast<std::size_t>(head_dim) * sizeof(half) +
                            static_cast<std::size_t>(2 * warps + 4) * sizeof(float) +
                            static_cast<std::size_t>(warps * head_dim) * sizeof(half);
@@ -2020,14 +2014,13 @@ void launch_attention_split_any_device_pos(const half* q, const half* k_cache,
 }
 
 void launch_attention_split_any_mt_device_pos(const half* q, const half* k_cache,
-                                              const half* v_cache, half* out,
-                                              const int* position, int tokens, int window,
-                                              int num_heads, int num_kv_heads, int head_dim,
-                                              float* scratch_m, float* scratch_l,
-                                              float* scratch_o, int chunk_size,
+                                              const half* v_cache, half* out, const int* position,
+                                              int tokens, int window, int num_heads,
+                                              int num_kv_heads, int head_dim, float* scratch_m,
+                                              float* scratch_l, float* scratch_o, int chunk_size,
                                               int scratch_chunks, cudaStream_t stream) {
-  constexpr int warps = 4;       // merge-tile template arg (arithmetic order pinned)
-  constexpr int threads = 256;   // score/merge thread count -- runtime-derived in-kernel
+  constexpr int warps = 4;      // merge-tile template arg (arithmetic order pinned)
+  constexpr int threads = 256;  // score/merge thread count -- runtime-derived in-kernel
   const std::size_t smem = static_cast<std::size_t>(head_dim) * sizeof(half) +
                            static_cast<std::size_t>(2 * warps + 4) * sizeof(float) +
                            static_cast<std::size_t>(warps * head_dim) * sizeof(half);

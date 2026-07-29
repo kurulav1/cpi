@@ -86,7 +86,8 @@ public:
   // (the caller then falls back to decode_batched_logits). The caller guarantees the batch needs
   // no full-vocabulary features (repetition penalty, n-gram blocking, grammar) and that every
   // row samples (temperature > 0), so the candidate set is exactly what the host sampler builds.
-  virtual bool decode_batched_topk(const std::vector<int>& tokens, const std::vector<int>& positions,
+  virtual bool decode_batched_topk(const std::vector<int>& tokens,
+                                   const std::vector<int>& positions,
                                    const std::vector<int>& block_tables_flat, int max_blocks, int k,
                                    std::vector<std::vector<detail::SampleCandidate>>& out_cand) {
     (void)tokens;

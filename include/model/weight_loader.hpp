@@ -12,8 +12,8 @@
 #include <cstddef>
 #include <stdexcept>
 #include <string>
-#include <vector>
 #include <unordered_map>
+#include <vector>
 
 #include "model/llama_config.hpp"
 #include "platform/mmap_file.hpp"

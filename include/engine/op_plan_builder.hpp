@@ -59,7 +59,9 @@ public:
   // May the builder quantize embedding TABLES, not just projections? Needs a backend that can
   // gather from a packed row; one whose EmbeddingLookup reads fp16 unconditionally would be
   // handed a packed table and produce garbage. Default no.
-  virtual bool quantize_embeddings() const { return false; }
+  virtual bool quantize_embeddings() const {
+    return false;
+  }
 
   // An embedding table, at whatever width the backend picks for embeddings -- which need not be
   // the projection width. Only reached when quantize_embeddings() is true.
@@ -226,7 +228,7 @@ struct Gemma4Geometry {
   // Layers at or after this index reuse another layer's K/V and project none of their own.
   // 0 means no sharing at all (the 12B and the MoE).
   int first_shared_layer = 0;
-  bool attention_k_eq_v = false;   // full layers: V reuses the raw k_proj output, there is no v_proj
+  bool attention_k_eq_v = false;  // full layers: V reuses the raw k_proj output, there is no v_proj
   bool use_double_wide_mlp = false;
 
   // Per-Layer Embeddings width. 0 = this checkpoint has none (12B, MoE), and the whole PLE
@@ -241,7 +243,9 @@ struct Gemma4Geometry {
   // Gemma 4 ships HuggingFace tensor names, so both prefixes are explicit rather than assumed.
   std::string weight_prefix = "model.language_model.";
 
-  [[nodiscard]] bool has_ple() const { return ple > 0; }
+  [[nodiscard]] bool has_ple() const {
+    return ple > 0;
+  }
   [[nodiscard]] int head_dim_of(int layer) const {
     return layer_full[layer] ? head_dim_full : head_dim_sliding;
   }
@@ -249,7 +253,9 @@ struct Gemma4Geometry {
     return layer_full[layer] ? kv_heads_full : kv_heads_sliding;
   }
   // Only the FULL layers of a k_eq_v checkpoint share V with K.
-  [[nodiscard]] bool k_eq_v(int layer) const { return attention_k_eq_v && layer_full[layer] != 0; }
+  [[nodiscard]] bool k_eq_v(int layer) const {
+    return attention_k_eq_v && layer_full[layer] != 0;
+  }
   [[nodiscard]] bool is_shared(int layer) const {
     return first_shared_layer > 0 && layer >= first_shared_layer;
   }

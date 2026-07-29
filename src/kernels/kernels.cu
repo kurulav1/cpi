@@ -5,10 +5,10 @@
 // the performance-critical implementation details used by RMSNorm, embedding,
 // RoPE, and prefill-attention kernels.
 
-#include <cstdlib>
 #include <cuda_fp16.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
 
 #include "runtime/cuda_utils.cuh"
@@ -424,10 +424,8 @@ __global__ void rmsnorm_rope_kernel(half* s, const half* w, int head_dim, int po
     const int i0 = pair;
     const int i1 = pair + half_dim;
     // Normalise both lanes of the pair, rounded to half exactly as the unfused norm wrote them.
-    const float n0 =
-        __half2float(__float2half(__half2float(row[i0]) * inv * __half2float(w[i0])));
-    const float n1 =
-        __half2float(__float2half(__half2float(row[i1]) * inv * __half2float(w[i1])));
+    const float n0 = __half2float(__float2half(__half2float(row[i0]) * inv * __half2float(w[i0])));
+    const float n1 = __half2float(__float2half(__half2float(row[i1]) * inv * __half2float(w[i1])));
     const int table_idx = pos * half_dim + pair;
     const float c = cos_table[table_idx];
     const float sn = sin_table[table_idx];
@@ -436,12 +434,9 @@ __global__ void rmsnorm_rope_kernel(half* s, const half* w, int head_dim, int po
   }
 }
 
-__global__ void rope_inplace_partial_table_device_pos_kernel(half* q, half* k, int num_heads_q,
-                                                             int num_heads_k, int head_dim,
-                                                             int rotary_dim,
-                                                             const int* position_ptr,
-                                                             const float* cos_table,
-                                                             const float* sin_table) {
+__global__ void rope_inplace_partial_table_device_pos_kernel(
+    half* q, half* k, int num_heads_q, int num_heads_k, int head_dim, int rotary_dim,
+    const int* position_ptr, const float* cos_table, const float* sin_table) {
   const int position = position_ptr[0];
   const int head = blockIdx.x;
   const int pair = threadIdx.x;
@@ -628,9 +623,9 @@ __global__ void attention_prefill_kernel_fallback(const half* q, const half* k_c
   //                    while the surrounding text stays causal.
   //   causal         : its own prefix.
   //   otherwise      : the whole sequence (a vision encoder).
-  const int limit = limits ? limits[token]
-                           : (causal ? (start_position + token + 1)
-                                     : (start_position + num_tokens));
+  const int limit = limits
+                        ? limits[token]
+                        : (causal ? (start_position + token + 1) : (start_position + num_tokens));
   // Sliding-window layers only see the last `window` keys. The decode path has always
   // done this; the prefill kernel never did (Llama has no windows), so a Gemma prompt
   // longer than the window would have been silently wrong.
@@ -726,9 +721,9 @@ __global__ void attention_prefill_kernel_tiled(const half* q, const half* k_cach
   //                    while the surrounding text stays causal.
   //   causal         : its own prefix.
   //   otherwise      : the whole sequence (a vision encoder).
-  const int limit = limits ? limits[token]
-                           : (causal ? (start_position + token + 1)
-                                     : (start_position + num_tokens));
+  const int limit = limits
+                        ? limits[token]
+                        : (causal ? (start_position + token + 1) : (start_position + num_tokens));
   // Sliding-window layers only see the last `window` keys. The decode path has always
   // done this; the prefill kernel never did (Llama has no windows), so a Gemma prompt
   // longer than the window would have been silently wrong.
@@ -978,8 +973,8 @@ __global__ void rmsnorm_fast_kernel(const half* __restrict__ x, const half* __re
   const int row = blockIdx.x;
   const int tid = threadIdx.x;
   const int vecs = cols / 8;
-  const int4* x4 =
-      reinterpret_cast<const int4*>(x + static_cast<std::size_t>(row) * static_cast<std::size_t>(cols));
+  const int4* x4 = reinterpret_cast<const int4*>(x + static_cast<std::size_t>(row) *
+                                                         static_cast<std::size_t>(cols));
 
   int4 buf[kMaxVecs];
   float acc = 0.0f;
@@ -1145,8 +1140,8 @@ __global__ void rmsnorm_quant_perm8_kernel(const half* __restrict__ x, const hal
 // a zero weight is what drops them from the P.V product.
 __global__ void softmax_causal_rows_kernel(half* s, int chunk_stride, int keys, int q_start,
                                            int window) {
-  const int i = blockIdx.x;   // query within the chunk
-  const int h = blockIdx.y;   // head
+  const int i = blockIdx.x;  // query within the chunk
+  const int h = blockIdx.y;  // head
   // chunk_stride is the ALLOCATED rows per head (kChunk), not the rows in flight: the GEMM
   // writes its per-head slice at h * kChunk * keys, so the stride must match that even when
   // the final chunk is short. grid.x carries the rows actually written.
@@ -1221,10 +1216,10 @@ __global__ void softmax_causal_rows_kernel(half* s, int chunk_stride, int keys, 
 // layer L+1 overwrites the staging buffer while layer L's async copy is still in flight -- giving
 // different logits on every run. (A pageable staging vector hides it, being effectively
 // synchronous; pinning the buffer exposes it.)
-__global__ void build_attention_ptrs_kernel(const half* k_layer, const half* v_layer,
-                                            const half* q, half* scores, half* out, void** ptrs,
-                                            int num_heads, int group, int head_dim, int kchunk,
-                                            int keys, int q_stride, int out_stride, int c0) {
+__global__ void build_attention_ptrs_kernel(const half* k_layer, const half* v_layer, const half* q,
+                                            half* scores, half* out, void** ptrs, int num_heads,
+                                            int group, int head_dim, int kchunk, int keys,
+                                            int q_stride, int out_stride, int c0) {
   const int h = blockIdx.x * blockDim.x + threadIdx.x;
   if (h >= num_heads) {
     return;
@@ -1233,8 +1228,8 @@ __global__ void build_attention_ptrs_kernel(const half* k_layer, const half* v_l
   half* srow = scores + static_cast<std::size_t>(h) * kchunk * keys;
 
   ptrs[h] = const_cast<half*>(k_layer + static_cast<std::size_t>(kvh) * head_dim);
-  ptrs[num_heads + h] = const_cast<half*>(
-      q + static_cast<std::size_t>(c0) * q_stride + static_cast<std::size_t>(h) * head_dim);
+  ptrs[num_heads + h] = const_cast<half*>(q + static_cast<std::size_t>(c0) * q_stride +
+                                          static_cast<std::size_t>(h) * head_dim);
   ptrs[2 * num_heads + h] = srow;
   ptrs[3 * num_heads + h] = const_cast<half*>(v_layer + static_cast<std::size_t>(kvh) * head_dim);
   ptrs[4 * num_heads + h] = srow;
@@ -1355,9 +1350,9 @@ void launch_rope_inplace_device_pos(half* q, half* k, int num_heads_q, int num_h
 }
 
 void launch_rope_inplace_batched_strided(half* q, half* k, int num_tokens, int num_heads_q,
-                                        int num_heads_k, int head_dim, int start_position,
-                                        const float* cos_table, const float* sin_table,
-                                        int q_row_stride, int k_row_stride, cudaStream_t stream) {
+                                         int num_heads_k, int head_dim, int start_position,
+                                         const float* cos_table, const float* sin_table,
+                                         int q_row_stride, int k_row_stride, cudaStream_t stream) {
   const int threads = head_dim / 2;
   const int blocks = (num_heads_q > num_heads_k) ? num_heads_q : num_heads_k;
   const dim3 grid(blocks, num_tokens);
@@ -1371,8 +1366,8 @@ void launch_rope_inplace_batched(half* q, half* k, int num_tokens, int num_heads
                                  const float* sin_table, cudaStream_t stream) {
   // Natural (contiguous) strides -> identical to before the stride parameters existed.
   launch_rope_inplace_batched_strided(q, k, num_tokens, num_heads_q, num_heads_k, head_dim,
-                                      start_position, cos_table, sin_table,
-                                      num_heads_q * head_dim, num_heads_k * head_dim, stream);
+                                      start_position, cos_table, sin_table, num_heads_q * head_dim,
+                                      num_heads_k * head_dim, stream);
 }
 
 // Per-position RoPE (P2 batched decode): each of num_tokens rows uses its own
@@ -1392,17 +1387,15 @@ void launch_build_attention_ptrs(const half* k_layer, const half* v_layer, const
                                  int c0, cudaStream_t stream) {
   const int threads = 64;
   const int blocks = (num_heads + threads - 1) / threads;
-  build_attention_ptrs_kernel<<<blocks, threads, 0, stream>>>(k_layer, v_layer, q, scores, out,
-                                                              ptrs, num_heads, group, head_dim,
-                                                              kchunk, keys, q_stride, out_stride,
-                                                              c0);
+  build_attention_ptrs_kernel<<<blocks, threads, 0, stream>>>(
+      k_layer, v_layer, q, scores, out, ptrs, num_heads, group, head_dim, kchunk, keys, q_stride,
+      out_stride, c0);
 }
 
 void launch_softmax_causal_rows(half* scores, int heads, int chunk_stride, int rows, int keys,
                                 int q_start, cudaStream_t stream, int window) {
   const dim3 grid(static_cast<unsigned>(rows), static_cast<unsigned>(heads));
-  softmax_causal_rows_kernel<<<grid, 256, 0, stream>>>(scores, chunk_stride, keys, q_start,
-                                                       window);
+  softmax_causal_rows_kernel<<<grid, 256, 0, stream>>>(scores, chunk_stride, keys, q_start, window);
 }
 
 void launch_attention_prefill(const half* q, const half* k_cache, const half* v_cache, half* out,

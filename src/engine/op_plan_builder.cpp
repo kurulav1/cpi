@@ -102,8 +102,7 @@ ModelPlan build_llama_plan(const LlamaGeometry& g, const WeightSource& w) {
 
   // ---- prologue: token id -> embeddings -----------------------------------
   {
-    plan.prologue.push_back(
-        make_embed(w, "tok_embeddings.weight", Slot::X, g.hidden, g.vocab));
+    plan.prologue.push_back(make_embed(w, "tok_embeddings.weight", Slot::X, g.hidden, g.vocab));
 
     if (g.scale_embeddings) {
       Op s;
@@ -621,8 +620,8 @@ ModelPlan build_gemma4_plan(const Gemma4Geometry& g, const WeightSource& w) {
       pro.push_back(
           gemv(Slot::X, Slot::PleAll, w, WP + "per_layer_model_projection.weight", tot, H));
       pro.push_back(scale(Slot::PleAll, tot, std::pow(static_cast<float>(H), -0.5f)));
-      pro.push_back(norm(Slot::PleAll, Slot::PleAll, w.fp16(WP + "per_layer_projection_norm.weight"),
-                         g.num_layers, ple));
+      pro.push_back(norm(Slot::PleAll, Slot::PleAll,
+                         w.fp16(WP + "per_layer_projection_norm.weight"), g.num_layers, ple));
       // per_layer_inputs = (ple + ple_raw) * 2^-0.5
       pro.push_back(add_into(Slot::PleAll, Slot::PleRaw, tot));
       pro.push_back(scale(Slot::PleAll, tot, std::pow(2.0f, -0.5f)));
@@ -752,7 +751,8 @@ ModelPlan build_gemma4_plan(const Gemma4Geometry& g, const WeightSource& w) {
       ops.push_back(m);
     }
     ops.push_back(gemv(Slot::Inter, Slot::Tmp, w, p + "mlp.down_proj.weight", H, inter));
-    ops.push_back(norm(Slot::Tmp, Slot::Tmp, w.fp16(p + "post_feedforward_layernorm.weight"), 1, H));
+    ops.push_back(
+        norm(Slot::Tmp, Slot::Tmp, w.fp16(p + "post_feedforward_layernorm.weight"), 1, H));
     ops.push_back(add_into(Slot::X, Slot::Tmp, H));
 
     // --- Per-Layer Input injection ---
@@ -764,8 +764,8 @@ ModelPlan build_gemma4_plan(const Gemma4Geometry& g, const WeightSource& w) {
       gt.in = Slot::PleGate;
       gt.out = Slot::PleGate;
       gt.cols = ple;
-      gt.in2 = Slot::PleAll;     // gelu(gate) * per_layer_input[L]...
-      gt.aux_offset = L * ple;   // ...which is layer L's window of the packed table
+      gt.in2 = Slot::PleAll;    // gelu(gate) * per_layer_input[L]...
+      gt.aux_offset = L * ple;  // ...which is layer L's window of the packed table
       ops.push_back(gt);
       ops.push_back(gemv(Slot::PleGate, Slot::Tmp, w, p + "per_layer_projection.weight", H, ple));
       ops.push_back(

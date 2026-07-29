@@ -20,8 +20,8 @@ int SequenceModel::sample(const DecodeParams& params, const std::vector<int>& hi
 }
 
 std::vector<int> run_decode(SequenceModel& model, const std::vector<int>& prompt,
-                            const DecodeParams& params,
-                            const std::function<bool(int)>& on_token, BenchmarkStats* stats) {
+                            const DecodeParams& params, const std::function<bool(int)>& on_token,
+                            BenchmarkStats* stats) {
   using clock = std::chrono::steady_clock;
   const auto ms = [](clock::time_point a, clock::time_point b) {
     return std::chrono::duration<double, std::milli>(b - a).count();
@@ -34,7 +34,8 @@ std::vector<int> run_decode(SequenceModel& model, const std::vector<int>& prompt
   // cryptic CUDA invalid-argument (found via a 2049-token prompt against the 2048
   // default). Fail with the actual reason instead.
   if (P >= model.max_context())
-    throw std::runtime_error("prompt (" + std::to_string(P) + " tokens) does not fit the context (" +
+    throw std::runtime_error("prompt (" + std::to_string(P) +
+                             " tokens) does not fit the context (" +
                              std::to_string(model.max_context()) + "); raise --max-context");
   model.reset_state();
   if (stats) {

@@ -28,9 +28,9 @@
 #include <utility>
 #include <vector>
 
+#include "engine/batch_scheduler.hpp"
 #include "engine/engine_types.hpp"
 #include "engine/generation_constraints.hpp"
-#include "engine/batch_scheduler.hpp"
 #include "engine/paged_kv.hpp"
 #include "model/weight_loader.hpp"
 
@@ -134,8 +134,10 @@ private:
     void* norm_att_bias = nullptr;  // Optional pre-attention norm bias [hidden].
     void* norm_ffn_bias = nullptr;  // Optional pre-FFN norm bias [hidden].
     void* bqkv = nullptr;  // Fused QKV bias vector [q_dim + kv_dim + kv_dim]; null if unused.
-    void* q_norm = nullptr;  // Per-head RMSNorm scale for Q [head_dim]; null unless has_qk_norm (Qwen3).
-    void* k_norm = nullptr;  // Per-head RMSNorm scale for K [head_dim]; null unless has_qk_norm (Qwen3).
+    void* q_norm =
+        nullptr;  // Per-head RMSNorm scale for Q [head_dim]; null unless has_qk_norm (Qwen3).
+    void* k_norm =
+        nullptr;  // Per-head RMSNorm scale for K [head_dim]; null unless has_qk_norm (Qwen3).
   };
 
   // Weight pointers for a single transformer layer stored in host page-locked
@@ -567,7 +569,7 @@ private:
   std::int8_t* d_lm_head_i8_ = nullptr;
   float* d_lm_head_i8_scales_ = nullptr;
   bool lm_head_int8_ = false;
-  void* d_lm_head_bias_ = nullptr;    // Optional lm_head bias [vocab].
+  void* d_lm_head_bias_ = nullptr;  // Optional lm_head bias [vocab].
 
   // Per-step decode scratch buffers on device.
   int* d_token_id_ = nullptr;    // Single-element device buffer holding the current input token ID.
@@ -588,14 +590,14 @@ private:
   void* d_prefill_ff2_ = nullptr;         // Prefill-sized down-projection output buffer.
   std::int8_t* d_prefill_i8_ = nullptr;   // INT8 quantised activations for prefill INT8 path.
   float* d_prefill_i8_scales_ = nullptr;  // Per-row scales accompanying d_prefill_i8_.
-  void* d_ff3_ = nullptr;             // Up-projection (w3) output buffer (SwiGLU second operand).
-  void* d_logits_ = nullptr;          // Raw logit vector output from the LM head.
-  int* d_argmax_ = nullptr;           // Single-element device buffer for the argmax result.
+  void* d_ff3_ = nullptr;     // Up-projection (w3) output buffer (SwiGLU second operand).
+  void* d_logits_ = nullptr;  // Raw logit vector output from the LM head.
+  int* d_argmax_ = nullptr;   // Single-element device buffer for the argmax result.
   // Tensor-core prefill attention (see prefill_attention_tensorcore).
-  void* d_attn_scores_ = nullptr;        // [heads][chunk][keys] score matrix, fp16.
+  void* d_attn_scores_ = nullptr;  // [heads][chunk][keys] score matrix, fp16.
   std::size_t attn_scores_bytes_ = 0;
-  void** d_gemm_ptrs_ = nullptr;         // device pointer arrays for cublasGemmBatchedEx (6 x heads)
-  std::size_t gemm_ptrs_capacity_ = 0;   // pointers, not bytes
+  void** d_gemm_ptrs_ = nullptr;        // device pointer arrays for cublasGemmBatchedEx (6 x heads)
+  std::size_t gemm_ptrs_capacity_ = 0;  // pointers, not bytes
   float* d_argmax_part_val_ = nullptr;  // Per-block partials for the two-phase greedy argmax.
   int* d_argmax_part_idx_ = nullptr;
   int argmax_parts_ = 0;

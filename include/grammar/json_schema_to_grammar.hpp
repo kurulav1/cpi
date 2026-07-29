@@ -12,8 +12,8 @@
 // The generated grammar's entry rule is named "root", matching the default
 // grammar::Grammar::parse() root.
 
-#include <string>
 #include <stdexcept>
+#include <string>
 
 namespace grammar {
 
