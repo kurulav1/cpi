@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "engine/llama_engine.hpp"
+#include "engine/sampling.hpp"  // dispatch_sample_from_candidates (top-k verify closure)
 #include "grammar/grammar_sampler.hpp"
 #include "llama_engine_internal.hpp"
 #include "runtime/cuda_utils.cuh"
@@ -475,8 +476,34 @@ bool LlamaEngine::decode_step_batched_topk(
       for (const auto& c : cand) got.push_back(c.id);
       std::sort(ref.begin(), ref.end());
       if (ref != got) {
-        std::fprintf(stderr, "[topk-verify] MISMATCH row=%d device=%zu host=%zu\n", b, got.size(),
-                     ref.size());
+        std::fprintf(stderr, "[topk-verify] MISMATCH(set) row=%d device=%zu host=%zu\n", b,
+                     got.size(), ref.size());
+      }
+
+      // Closure over the id-set check: run the ACTUAL shared sampler
+      // (dispatch_sample_from_candidates -- the exact code the scheduler uses to turn candidates
+      // into a token) on BOTH the device candidate set and the host reference set, seeded
+      // identically, and compare the drawn token. Because both go through the same traversal, an
+      // agreeing token proves the sets AND their values agree -- the id-set check above ignores the
+      // candidate VALUES, so this catches a penalty/sanitize value bug that leaves the ids intact.
+      // We deliberately do NOT compare against the full sample_from_logits path: it walks the vocab
+      // in index order while the candidate path walks in probability order, so the two map the same
+      // RNG draw to different tokens by construction (distributionally equal, not token-identical).
+      // top_p = 1 keeps the whole candidate set (most value-sensitive); several seeds guard against
+      // a coincidental agreement masking a value difference.
+      std::vector<detail::SampleCandidate> host_cand;
+      host_cand.reserve(ref.size());
+      for (int id : ref) host_cand.push_back({id, host[static_cast<std::size_t>(id)]});
+      for (unsigned seed : {1u, 7u, 99u}) {
+        std::vector<detail::SampleCandidate> dc(cand), hc(host_cand);
+        detail::dispatch_seed_sampler_rng(seed);
+        const int td = detail::dispatch_sample_from_candidates(dc, 1.0f, 1.0f);
+        detail::dispatch_seed_sampler_rng(seed);
+        const int th = detail::dispatch_sample_from_candidates(hc, 1.0f, 1.0f);
+        if (td != th) {
+          std::fprintf(stderr, "[topk-verify] MISMATCH(token) row=%d seed=%u device=%d host=%d\n",
+                       b, seed, td, th);
+        }
       }
     }
   }
