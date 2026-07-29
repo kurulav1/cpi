@@ -18,21 +18,44 @@ int main(int argc, char** argv) {
   std::vector<int> tokens = {818, 5279, 529, 7001, 563};
   int expect = 7001;
   int gen = 0;
-  int graph_bench = 0;  // >0: run the CUDA-graph decode A/B benchmark for N iters
-  int graph_pos = 0;    // decode position for --graph-bench (pads prefill; exercises the window)
+  int graph_bench = 0;   // >0: run the CUDA-graph decode A/B benchmark for N iters
+  int graph_pos = 0;     // decode position for --graph-bench (pads prefill; exercises the window)
   int weight_quant = 0;  // 0 fp16, 4 or 8: on-load weight-only quant (llama-bench-comparable)
+  std::vector<int> ppl_tokens;  // --ppl-tokens: teacher-forced perplexity over this id sequence
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
-    if (a == "--model" && i + 1 < argc) cpi = argv[++i];
-    else if (a == "--expect" && i + 1 < argc) expect = std::stoi(argv[++i]);
-    else if (a == "--gen" && i + 1 < argc) gen = std::stoi(argv[++i]);
-    else if (a == "--graph-bench" && i + 1 < argc) graph_bench = std::stoi(argv[++i]);
-    else if (a == "--weight-quant" && i + 1 < argc) weight_quant = std::stoi(argv[++i]);
-    else if (a == "--graph-pos" && i + 1 < argc) graph_pos = std::stoi(argv[++i]);
+    if (a == "--model" && i + 1 < argc)
+      cpi = argv[++i];
+    else if (a == "--ppl-tokens" && i + 1 < argc) {
+      std::string s = argv[++i], cur;
+      for (char c : s) {
+        if (c == ',') {
+          ppl_tokens.push_back(std::stoi(cur));
+          cur.clear();
+        } else
+          cur += c;
+      }
+      if (!cur.empty()) ppl_tokens.push_back(std::stoi(cur));
+    } else if (a == "--expect" && i + 1 < argc)
+      expect = std::stoi(argv[++i]);
+    else if (a == "--gen" && i + 1 < argc)
+      gen = std::stoi(argv[++i]);
+    else if (a == "--graph-bench" && i + 1 < argc)
+      graph_bench = std::stoi(argv[++i]);
+    else if (a == "--weight-quant" && i + 1 < argc)
+      weight_quant = std::stoi(argv[++i]);
+    else if (a == "--graph-pos" && i + 1 < argc)
+      graph_pos = std::stoi(argv[++i]);
     else if (a == "--tokens" && i + 1 < argc) {
       tokens.clear();
       std::string s = argv[++i], cur;
-      for (char c : s) { if (c == ',') { tokens.push_back(std::stoi(cur)); cur.clear(); } else cur += c; }
+      for (char c : s) {
+        if (c == ',') {
+          tokens.push_back(std::stoi(cur));
+          cur.clear();
+        } else
+          cur += c;
+      }
       if (!cur.empty()) tokens.push_back(std::stoi(cur));
     }
   }
@@ -65,6 +88,42 @@ int main(int argc, char** argv) {
       return 0;
     }
 
+    if (!ppl_tokens.empty()) {
+      // Teacher-forced perplexity: for each position i>=1, forward the prefix tokens[0..i-1] and
+      // score the ground-truth next token tokens[i] via nll = logsumexp(logits) -
+      // logits[tokens[i]]. Output-space quality metric; run at fp16 / int8 / int4 and compare the
+      // delta.
+      double nll = 0.0;
+      int cnt = 0;
+      int argmatch = 0;  // greedy top-1 == ground-truth next token (teacher-forced accuracy)
+      const int n = static_cast<int>(ppl_tokens.size());
+      for (int i = 1; i < n; ++i) {
+        std::vector<int> pre(ppl_tokens.begin(), ppl_tokens.begin() + i);
+        auto lg = eng.forward_logits(pre, nullptr);
+        const int tgt = ppl_tokens[static_cast<std::size_t>(i)];
+        if (tgt < 0 || tgt >= static_cast<int>(lg.size())) continue;
+        double mx = -1e30;
+        int am = 0;
+        for (int v = 0; v < static_cast<int>(lg.size()); ++v) {
+          if (lg[v] > mx) {
+            mx = lg[v];
+            am = v;
+          }
+        }
+        double se = 0.0;
+        for (float v : lg) se += std::exp(static_cast<double>(v) - mx);
+        const double lse = mx + std::log(se);
+        nll += lse - static_cast<double>(lg[tgt]);
+        if (am == tgt) ++argmatch;
+        ++cnt;
+      }
+      const double mean_nll = cnt > 0 ? nll / cnt : 0.0;
+      std::printf("[ppl] weight_quant=%d tokens_scored=%d ppl=%.5f nll/tok=%.5f top1_acc=%.4f\n",
+                  weight_quant, cnt, std::exp(mean_nll), mean_nll,
+                  cnt > 0 ? static_cast<double>(argmatch) / cnt : 0.0);
+      return 0;
+    }
+
     std::vector<float> rms;
     auto logits = eng.forward_logits(tokens, &rms);
 
@@ -78,8 +137,8 @@ int main(int argc, char** argv) {
       ss += (double)logits[i] * logits[i];
       if (logits[i] > logits[argmax]) argmax = i;
     }
-    std::printf("logits rms=%.4f  argmax=%d  (expected=%d)\n",
-                std::sqrt(ss / logits.size()), argmax, expect);
+    std::printf("logits rms=%.4f  argmax=%d  (expected=%d)\n", std::sqrt(ss / logits.size()),
+                argmax, expect);
     std::vector<int> idx(logits.size());
     for (int i = 0; i < (int)idx.size(); ++i) idx[i] = i;
     std::partial_sort(idx.begin(), idx.begin() + 10, idx.end(),
