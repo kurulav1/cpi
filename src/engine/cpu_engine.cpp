@@ -1,25 +1,25 @@
-// cpu_engine.cpp Ã¢â‚¬â€ CPU inference engine for LLaMA-family models.
+// cpu_engine.cpp — CPU inference engine for LLaMA-family models.
 //
 // Optimization techniques applied:
 //
-//      Ã¢â‚¬â€ AVX2 256-bit vector arithmetic (8 FP32 values per SIMD lane).
+//      — AVX2 256-bit vector arithmetic (8 FP32 values per SIMD lane).
 //        Weights are stored as FP16 in the .ll2c file; the F16C instruction
 //        _mm256_cvtph_ps converts 8 half-precision values to 8 single-
 //        precision values in one instruction, keeping conversion overhead
 //        close to zero.
 //
-//      Ã¢â‚¬â€ 4-output register blocking: each OpenMP thread processes four
+//      — 4-output register blocking: each OpenMP thread processes four
 //        consecutive output rows of the weight matrix per inner-loop trip,
 //        loading the same 8-element slice of the input vector once and
 //        multiplying it against four rows.  This quadruples arithmetic
 //        intensity relative to one-row-at-a-time traversal.
 //
-//      Ã¢â‚¬â€ _mm_prefetch hints issued 20 iterations ahead inside the FP16
-//        weight stream.  At 2 bytes per FP16 element, 20Ãƒâ€”8 = 160 elements
-//        = 320 bytes Ã¢â€°Ë† 5 cache lines are prefetched per row per iteration,
+//      — _mm_prefetch hints issued 20 iterations ahead inside the FP16
+//        weight stream.  At 2 bytes per FP16 element, 20×8 = 160 elements
+//        = 320 bytes ≈ 5 cache lines are prefetched per row per iteration,
 //        hiding DRAM-to-L1 latency for the dominant memory-bound GEMV.
 //
-//     Ã¢â‚¬â€ #pragma omp parallel for with dynamic scheduling partitions the
+//     — #pragma omp parallel for with dynamic scheduling partitions the
 //        output-row dimension across all available hardware threads, giving
 //        near-linear scaling on multi-core CPUs.
 
@@ -41,7 +41,7 @@
 #include "common.hpp"
 #include "grammar/grammar_sampler.hpp"
 
-// SIMD headers Ã¢â‚¬â€ included unconditionally; individual code paths are
+// SIMD headers — included unconditionally; individual code paths are
 // guarded by feature macros set by the compiler when AVX2 / F16C are enabled.
 // The x86 intrinsic headers do not exist on other ISAs (Apple Silicon / ARM),
 // so the include itself must be gated, not just the code paths below. Every
@@ -81,7 +81,7 @@ inline void prefetch_r(const void* p) {
 }
 
 // ============================================================
-// FP16 Ã¢â€ â€™ FP32 conversion
+// FP16 → FP32 conversion
 // ============================================================
 
 // Software fallback: convert a single IEEE 754 half-precision value
@@ -117,7 +117,7 @@ inline float fp16_to_fp32(uint16_t h) {
 // SIMD GEMV helpers
 // ============================================================
 
-// Horizontal sum of an __m256 register (8 x float Ã¢â€ â€™ float).
+// Horizontal sum of an __m256 register (8 x float → float).
 #if defined(__AVX__)
 inline float hsum256(__m256 v) {
   const __m128 hi = _mm256_extractf128_ps(v, 1);
@@ -137,15 +137,15 @@ inline float hsum256(__m256 v) {
 #define CPU_ENGINE_HAVE_F16C 1
 #endif
 
-// gemv_fp16_impl Ã¢â‚¬â€ y[0..M) = W[MÃƒâ€”N] * x[N]
+// gemv_fp16_impl — y[0..M) = W[M×N] * x[N]
 //
-// W  : row-major FP16 weight matrix, [M rows Ãƒâ€” N cols]
+// W  : row-major FP16 weight matrix, [M rows × N cols]
 // x  : FP32 input vector, length N
 // y  : FP32 output vector, length M (written, not accumulated)
 //
 // Inner loop processes 8 elements per AVX2 iteration, 4 output rows per
 // OpenMP thread iteration (register blocking), with prefetch 160 FP16
-// elements (320 bytes Ã¢â€°Ë† 5 cache lines) ahead on the first row pointer.
+// elements (320 bytes ≈ 5 cache lines) ahead on the first row pointer.
 //
 // Requires M to be a multiple of 4 and N to be a multiple of 8.
 // The caller (gemv_fp16) pads if necessary.
@@ -176,9 +176,9 @@ static void gemv_fp16_impl(const uint16_t* CPI_RESTRICT W, const float* CPI_REST
       // Load input slice (FP32, 8 elements = 32 bytes).
       const __m256 xv = _mm256_loadu_ps(x + j);
 
-      // Load 8Ãƒâ€”FP16 per row, convert to FP32, fused-multiply-add.
+      // Load 8×FP16 per row, convert to FP32, fused-multiply-add.
       // _mm256_cvtph_ps takes a 128-bit register of 8 fp16 and returns
-      // a 256-bit register of 8 fp32 Ã¢â‚¬â€ one instruction, no precision loss.
+      // a 256-bit register of 8 fp32 — one instruction, no precision loss.
       acc0 = _mm256_fmadd_ps(
           _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(r0 + j))), xv, acc0);
       acc1 = _mm256_fmadd_ps(
@@ -215,7 +215,7 @@ static void gemv_fp16_impl(const uint16_t* CPI_RESTRICT W, const float* CPI_REST
 
       const __m256 xv = _mm256_loadu_ps(x + j);
 
-      // Software FP16Ã¢â€ â€™FP32 conversion for 8 elements.
+      // Software FP16→FP32 conversion for 8 elements.
       float tmp0[8], tmp1[8], tmp2[8], tmp3[8];
       for (int k = 0; k < 8; ++k) {
         tmp0[k] = fp16_to_fp32(r0[j + k]);
@@ -261,7 +261,7 @@ static void gemv_fp16_impl(const uint16_t* CPI_RESTRICT W, const float* CPI_REST
 #endif
 }
 
-// gemv_fp32_impl Ã¢â‚¬â€ same blocking/prefetch structure as gemv_fp16_impl but for
+// gemv_fp32_impl — same blocking/prefetch structure as gemv_fp16_impl but for
 // weights already stored as FP32 (e.g. dequantised INT8 MLP weights).
 static void gemv_fp32_impl(const float* CPI_RESTRICT W, const float* CPI_RESTRICT x,
                            float* CPI_RESTRICT y, int M, int N) {
@@ -324,7 +324,7 @@ static void gemv_fp32_impl(const float* CPI_RESTRICT W, const float* CPI_RESTRIC
 }  // namespace
 
 // ============================================================
-// CpuLlamaEngine Ã¢â‚¬â€ public API
+// CpuLlamaEngine — public API
 // ============================================================
 
 // FP32-weight GEMV (used for dequantised INT8 MLP weights).
@@ -913,7 +913,7 @@ void CpuLlamaEngine::initialize(const EngineOptions& options) {
                                                   : tok_embeddings_;  // tied weights
   lm_head_bias_ = weights_.has_tensor("output.bias") ? ptr16("output.bias") : nullptr;
 
-  // Helper: dequantise INT8 row-major weight [M Ãƒâ€” N] with per-row or global
+  // Helper: dequantise INT8 row-major weight [M × N] with per-row or global
   // FP32 scales into a pre-allocated FP32 buffer.
   // If scale_count == 1 the single value is a global scale for the whole
   // tensor; otherwise scale_count == M and each row has its own scale.
@@ -1071,7 +1071,7 @@ void CpuLlamaEngine::initialize(const EngineOptions& options) {
   logits_.assign(static_cast<std::size_t>(V), 0.f);
   moe_router_logits_.assign(static_cast<std::size_t>(std::max(1, cfg_.num_local_experts)), 0.f);
   moe_accum_.assign(static_cast<std::size_t>(H), 0.f);
-  // scores_: per head Ãƒâ€” max_context (used inside attention())
+  // scores_: per head × max_context (used inside attention())
   scores_.assign(static_cast<std::size_t>(NH) * static_cast<std::size_t>(max_ctx), 0.f);
 
   // --- KV cache ---
@@ -1150,7 +1150,7 @@ std::vector<int> CpuLlamaEngine::generate_stream(const std::vector<int>& prompt_
 
   // --- Prefill ---
   // Process every prompt token to fill the KV cache.  The last forward_token
-  // call leaves logits_ primed to predict the first new token Ã¢â‚¬â€ no extra
+  // call leaves logits_ primed to predict the first new token — no extra
   // forward pass is needed before the first sample.
   const auto prefill_start = std::chrono::steady_clock::now();
   int pos = 0;
@@ -1188,7 +1188,7 @@ std::vector<int> CpuLlamaEngine::generate_stream(const std::vector<int>& prompt_
     if (!on_token(next)) break;
     if (pos >= max_ctx) break;
 
-    // Forward on the sampled token Ã¢â€ â€™ updates logits_ for the next step.
+    // Forward on the sampled token → updates logits_ for the next step.
     forward_token(next, pos++);
   }
   const auto decode_end = std::chrono::steady_clock::now();

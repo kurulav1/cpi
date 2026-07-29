@@ -1266,7 +1266,11 @@ void launch_attention_step(const half* q, const half* k_cache, const half* v_cac
                            int seq_len, int num_heads, int num_kv_heads, int head_dim,
                            cudaStream_t stream, float* scratch_m, float* scratch_l,
                            float* scratch_o, int scratch_chunks, bool allow_split) {
-  const bool force_fallback = std::getenv("CPI_FORCE_FALLBACK_DECODE_ATTENTION") != nullptr;
+  // Cached once: getenv on every launch (per layer, per token) is needless work and, more to the
+  // point, is not required to be thread-safe against a concurrent setenv in a threaded server.
+  static const bool force_fallback = [] {
+    return std::getenv("CPI_FORCE_FALLBACK_DECODE_ATTENTION") != nullptr;
+  }();
   if (force_fallback) {
     constexpr int threads = 128;
     const std::size_t smem = static_cast<std::size_t>(head_dim) * sizeof(half) +
@@ -1810,7 +1814,11 @@ void launch_attention_step_device_pos(const half* q, const half* k_cache, const 
                                       int num_kv_heads, int head_dim, cudaStream_t stream,
                                       float* scratch_m, float* scratch_l, float* scratch_o,
                                       int scratch_chunks, bool allow_split, int window) {
-  const bool force_fallback = std::getenv("CPI_FORCE_FALLBACK_DECODE_ATTENTION") != nullptr;
+  // Cached once: getenv on every launch (per layer, per token) is needless work and, more to the
+  // point, is not required to be thread-safe against a concurrent setenv in a threaded server.
+  static const bool force_fallback = [] {
+    return std::getenv("CPI_FORCE_FALLBACK_DECODE_ATTENTION") != nullptr;
+  }();
   if (force_fallback) {
     constexpr int threads = 128;
     const std::size_t smem = static_cast<std::size_t>(head_dim) * sizeof(half) +

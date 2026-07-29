@@ -2466,7 +2466,8 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
           // Sequence prefill appends T rows at once: the K/V slots are [T][kvdim] and the
           // cache rows are contiguous, so it is the same copy, T times as long.
           const std::size_t rows = static_cast<std::size_t>(T);
-          if (std::getenv("CPI_KV_DEBUG"))
+          static const bool kv_debug = std::getenv("CPI_KV_DEBUG") != nullptr;  // cached, not per-append
+          if (kv_debug)
             std::fprintf(stderr, "[kvdbg] layer=%d T=%d pos=%d kvdim=%zu kc=%p vc=%p K=%p V=%p\n",
                          layer, T, position, kvdim, (void*)kc, (void*)vc, (void*)S(Slot::K),
                          (void*)S(Slot::V));

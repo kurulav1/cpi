@@ -983,7 +983,7 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
                  [&] { launch_norm(d_x_, lw->norm_att, lw->norm_att_bias, d_x_norm_, 1, hidden); });
 
     run_profiled(last_benchmark_stats_.decode_qkv_ms, [&] {
-      // Rotate x_norm Ã¢â€ â€™ d_x_tq3_ then run TQ3 GEMV for wqkv.
+      // Rotate x_norm → d_x_tq3_ then run TQ3 GEMV for wqkv.
       CUDA_CHECK(cudaMemcpyAsync(d_x_tq3_, d_x_norm_,
                                  static_cast<std::size_t>(hidden) * sizeof(__half),
                                  cudaMemcpyDeviceToDevice, compute_stream_));
@@ -1055,7 +1055,7 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
     });
 
     run_profiled(last_benchmark_stats_.decode_wo_ms, [&] {
-      // Rotate att Ã¢â€ â€™ d_x_tq3_ for TQ3 wo GEMV.
+      // Rotate att → d_x_tq3_ for TQ3 wo GEMV.
       CUDA_CHECK(cudaMemcpyAsync(d_x_tq3_, d_att_,
                                  static_cast<std::size_t>(hidden) * sizeof(__half),
                                  cudaMemcpyDeviceToDevice, compute_stream_));
@@ -1082,7 +1082,7 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
 
     run_profiled(last_benchmark_stats_.decode_mlp_ms, [&] {
       if (tq->w13) {
-        // Rotate x_norm Ã¢â€ â€™ d_x_tq3_ for TQ3 w13 GEMV.
+        // Rotate x_norm → d_x_tq3_ for TQ3 w13 GEMV.
         CUDA_CHECK(cudaMemcpyAsync(d_x_tq3_, d_x_norm_,
                                    static_cast<std::size_t>(hidden) * sizeof(__half),
                                    cudaMemcpyDeviceToDevice, compute_stream_));

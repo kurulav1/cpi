@@ -33,6 +33,8 @@ namespace engine {
 // header to do so.
 struct StreamParams {
   int max_new_tokens = 16;
+  // Suppress EOS until this many tokens are generated. IGNORED when `grammar` is set: a grammar
+  // drives its own termination, so the scheduler does not also floor the length (see step()).
   int min_new_tokens = 0;
   float temperature = 0.0f;
   std::vector<int> stop_ids;
