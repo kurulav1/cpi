@@ -45,7 +45,13 @@ __device__ __forceinline__ void warp_argmax(float& value, int& index) {
   for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
     const float other_value = __shfl_down_sync(0xffffffffu, value, offset);
     const int other_index = __shfl_down_sync(0xffffffffu, index, offset);
-    if (other_value > value) {
+    // Ties resolve to the LOWEST index, matching the host's std::max_element (first maximum). A
+    // plain `>` would keep the lower lane, but the strided per-thread scan means the lower lane
+    // does not hold the lower index -- and the sanitize clamp to +/-80 manufactures exact ties out
+    // of distinct raw logits, so this is a case the greedy path actively hits, not a float-equality
+    // curiosity. Fixing it here covers both reduction stages and every kernel that uses
+    // warp_argmax.
+    if (other_value > value || (other_value == value && other_index < index)) {
       value = other_value;
       index = other_index;
     }

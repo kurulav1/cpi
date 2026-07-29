@@ -563,6 +563,18 @@ if(CPI_ENABLE_CUDA)
   )
   add_test(NAME moe_kernel_parity_test COMMAND moe_kernel_parity_test)
 
+  # Batched greedy argmax tie-break vs the host's lowest-index rule (std::max_element).
+  add_executable(argmax_tiebreak_test
+    src/tests/argmax_tiebreak_test.cu
+  )
+  target_include_directories(argmax_tiebreak_test PRIVATE include)
+  target_link_libraries(argmax_tiebreak_test PRIVATE cpi_engine)
+  set_target_properties(argmax_tiebreak_test PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+  )
+  add_test(NAME argmax_tiebreak_test COMMAND argmax_tiebreak_test)
+
   # Image preprocessing: bicubic resize vs PIL + patch-grid layout.
   add_executable(image_preprocess_test
     src/tests/image_preprocess_test.cpp
