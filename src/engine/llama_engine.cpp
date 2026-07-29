@@ -838,6 +838,11 @@ LlamaEngine::~LlamaEngine() {
     cudaFree(d_batch_logits_);
     d_batch_logits_ = nullptr;
   }
+  if (h_batch_logits_) {
+    cudaFreeHost(h_batch_logits_);
+    h_batch_logits_ = nullptr;
+    h_batch_logits_cap_ = 0;
+  }
   if (d_bs_scratch_m_) {
     cudaFree(d_bs_scratch_m_);
     d_bs_scratch_m_ = nullptr;

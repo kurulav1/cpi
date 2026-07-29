@@ -499,6 +499,11 @@ private:
   void batched_lm_head(int batch, int hidden, int vocab);
   float* d_batch_logits_ = nullptr;  // [max_batch * vocab] float LM-head output
   int d_batch_logits_cap_ = 0;       // capacity in rows
+  // Persistent PINNED host mirror for the [batch][vocab] D2H copy. Pinned so the copy
+  // runs at full PCIe bandwidth and can be async; reused so no ~batch*vocab alloc per
+  // decode step. Grown on demand alongside d_batch_logits_.
+  float* h_batch_logits_ = nullptr;
+  int h_batch_logits_cap_ = 0;  // capacity in rows
   // Persistent split-K attention scratch for batched decode (grown on demand).
   float* d_bs_scratch_m_ = nullptr;
   float* d_bs_scratch_l_ = nullptr;

@@ -178,7 +178,7 @@ bool BatchScheduler::step(std::vector<StreamEvent>& events) {
     }
   }
 
-  std::vector<std::vector<float>> logits;
+  std::vector<std::vector<float>>& logits = batch_logits_scratch_;
   backend_->decode_batched_logits(toks, poss, flat, max_blocks, logits);
 
   // Sample each row with its own params/grammar, then retire finished requests.

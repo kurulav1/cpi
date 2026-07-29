@@ -147,6 +147,9 @@ private:
   BlockAllocator* alloc_;
   BatchSchedulerOptions opts_;
   std::vector<StreamSeq> seqs_;
+  // Reused across steps so per-row logit buffers keep their vocab-sized capacity instead of
+  // reallocating every decode step (the backend fills it via decode_batched_logits).
+  std::vector<std::vector<float>> batch_logits_scratch_;
   std::vector<CachedPrefix> prefix_cache_;
   std::uint64_t prefix_cache_tick_ = 0;
   static constexpr std::size_t kPrefixCacheEntries = 32;

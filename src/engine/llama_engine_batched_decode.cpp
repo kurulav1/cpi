@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
@@ -278,7 +279,9 @@ void LlamaEngine::decode_step_batched_logits(const std::vector<int>& tokens,
   static const bool prof = std::getenv("CPI_BATCH_PROFILE") != nullptr;
   const auto t0 = std::chrono::steady_clock::now();
   const int batch = decode_step_batched_forward(tokens, positions, block_tables_flat, max_blocks);
-  out_logits.assign(static_cast<std::size_t>(batch), {});
+  // resize (not assign) so rows kept from a previous step retain their vocab-sized capacity;
+  // the copy loop below reuses it instead of reallocating every row every step.
+  out_logits.resize(static_cast<std::size_t>(batch));
   if (batch == 0) return;
   const int hidden = weights_.config().hidden_size;
   const int vocab = weights_.config().vocab_size;
@@ -287,15 +290,28 @@ void LlamaEngine::decode_step_batched_logits(const std::vector<int>& tokens,
     prof_fwd_s_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   }
   const auto t1 = std::chrono::steady_clock::now();
-  // One batched GEMM, then one coalesced D2H copy of the whole [batch][vocab] block.
+  // One batched GEMM, then one coalesced D2H copy of the whole [batch][vocab] block into a
+  // persistent PINNED buffer -- pinned dst copies at ~full PCIe bandwidth (a pageable dst
+  // stages through a driver bounce buffer at ~half) and the copy can be issued async, so the
+  // single stream sync covers both the GEMM and the transfer. The buffer is reused across
+  // steps rather than freshly allocating ~batch*vocab floats every decode.
   batched_lm_head(batch, hidden, vocab);
-  std::vector<float> host(static_cast<std::size_t>(batch) * vocab);
+  const std::size_t need = static_cast<std::size_t>(batch) * static_cast<std::size_t>(vocab);
+  if (batch > h_batch_logits_cap_) {
+    if (h_batch_logits_) cudaFreeHost(h_batch_logits_);
+    CUDA_CHECK(cudaHostAlloc(&h_batch_logits_, need * sizeof(float), cudaHostAllocDefault));
+    h_batch_logits_cap_ = batch;
+  }
+  CUDA_CHECK(cudaMemcpyAsync(h_batch_logits_, d_batch_logits_, need * sizeof(float),
+                             cudaMemcpyDeviceToHost, compute_stream_));
   CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
-  CUDA_CHECK(cudaMemcpy(host.data(), d_batch_logits_, host.size() * sizeof(float),
-                        cudaMemcpyDeviceToHost));
+  // Copy into out_logits reusing each row's existing capacity (resize on a same-size row is a
+  // no-op, and out_logits is a scheduler-owned scratch reused across steps), so there is no
+  // per-row reallocation. The remaining copy is a plain pinned->host memcpy.
   for (int b = 0; b < batch; ++b) {
-    out_logits[b].assign(host.begin() + static_cast<std::ptrdiff_t>(b) * vocab,
-                         host.begin() + static_cast<std::ptrdiff_t>(b + 1) * vocab);
+    const float* src = h_batch_logits_ + static_cast<std::size_t>(b) * vocab;
+    out_logits[b].resize(static_cast<std::size_t>(vocab));
+    std::memcpy(out_logits[b].data(), src, static_cast<std::size_t>(vocab) * sizeof(float));
   }
   if (prof)
     prof_head_s_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
