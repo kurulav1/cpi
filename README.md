@@ -66,24 +66,37 @@ same RTX 5090. The "1 req" column is the identical engine at batch 1.
 | Qwen2.5-Coder-3B | 3B | 152k | ~126 tok/s | 999 (7.8×) | 1198 (9.5×) | 1763 (13.8×) | 13.8× |
 | Llama-2-7b-chat | 7B | 32k | ~85 tok/s | 1000 (11.7×) | 1532 (17.9×) | 2118 (24.1×) | 24.1× |
 | Qwen2.5-7B-Instruct | 7B | 152k | ~85 tok/s | 807 (9.5×) | 1132 (13.3×) | 1475 (17.6×) | 17.6× |
-| Llama-3.1-8B-Instruct | 8B | 128k | ~80 tok/s | 775 (9.7×) | 1105 (14.2×) | 1457 (18.2×) | 18.2× |
+| Llama-3.1-8B-Instruct | 8B | 128k | ~80 tok/s | 951 (11.9×) | 1733 (21.7×) | 2469 (30.9×) | 30.9× @64 |
+
+The 8B row is re-measured on the current **device-argmax** greedy path (the default). Before the
+device argmax, the same greedy path shipped the full logit block and reached 1795 tok/s at batch 64
+(still selectable with `CPI_BATCH_ARGMAX=0`); the older 1457 predates the v2 pinned-staging + scratch
+reuse. The other rows predate the device-argmax path and were not re-measured on this pass — they
+would rise similarly.
 
 Notes:
 
-- **Larger, compute-bound models batch better**: the 8B reaches ~18× aggregate and is still climbing
+- **Larger, compute-bound models batch better**: the 8B reaches ~31× aggregate and is still climbing
   at batch 64, while the tiny 0.5B plateaus near ~7× (its slim compute can't hide per-step overhead).
-- **Smaller vocabularies batch better**: each step transfers a `[batch × vocab]` logit block, so the
-  32k-vocab models (Llama-2, TinyLlama) outscale the 128–152k-vocab ones at the same batch size.
+- **Smaller vocabularies batch better** (on the full-logits path): shipping a `[batch × vocab]` logit
+  block each step is why the 32k-vocab models (Llama-2, TinyLlama) outscale the 128–152k-vocab ones in
+  the rows above. The device top-k / argmax paths keep that block off the bus, so the effect now shows
+  up only in the LM-head GEMV compute (which still scales with vocab), not the transfer.
 - **No single-request penalty on real models**: the batch-1 slowdown (batched GEMM vs the tuned
   single-token kernel) is a small-model artifact and vanishes by 7–8B (~1.0×).
-- **Sampling (temperature > 0) now runs on device and no longer trails greedy.** Top-k / top-p
-  and the repetition penalty are applied to the batched logits on the GPU, so only ~k candidates
-  per row cross to the host instead of the full `[batch × vocab]` block. Measured on Llama-3.1-8B
-  at batch 64 (top-k 40, repetition penalty 1.05): **453 tok/s on the old host-side path → 1973
-  tok/s on device**, a 4.4× lift that carries sampled throughput above the greedy row above. The
-  host-side path is still selectable with `CPI_BATCH_TOPK=0` (an A/B lever and a safety switch).
-  Grammar-constrained and n-gram-blocked requests still sample on the host, since both need the
-  full vocabulary.
+- **Sampling (temperature > 0) decides on device too.** Top-k / top-p and the repetition penalty
+  are applied to the batched logits on the GPU, so only ~k candidates per row cross to the host
+  instead of the full `[batch × vocab]` block. Two baselines at Llama-3.1-8B batch 64 (top-k 40),
+  because the honest comparison depends on whether the host still has its own fast path:
+  - **vs the host's own top-k shortcut** (no penalty): 815 → 1918 tok/s, **2.35×**.
+  - **at repetition penalty 1.05** (the served default): 453 → 1973 tok/s, **4.36×** — but part of
+    that ratio is the host *losing* its shortcut, not the device winning: `sample_from_logits`
+    disables its top-k fast path for penalty > 1 and falls back to a full-vocabulary softmax + sort,
+    while the device applies the penalty *before* the top-k and keeps the fast path.
+
+  Greedy device argmax (next bullet) still leads sampling at this batch (2469 vs 1973). The host
+  path is selectable with `CPI_BATCH_TOPK=0` (A/B lever + safety switch); grammar-constrained and
+  n-gram-blocked requests still sample on the host, since both need the full vocabulary.
 - **Greedy (temperature ≤ 0) also decides on device.** A batched argmax returns one winner id per
   row (B ints) instead of the full logit block; the repetition penalty and the min-tokens EOS
   suppression are applied on the GPU first, so the winner matches the host token-for-token. This is
