@@ -322,7 +322,7 @@ void LlamaEngine::decode_step_batched_logits(const std::vector<int>& tokens,
 
 bool LlamaEngine::decode_step_batched_topk(
     const std::vector<int>& tokens, const std::vector<int>& positions,
-    const std::vector<int>& block_tables_flat, int max_blocks, const std::vector<int>& k,
+    const std::vector<int>& block_tables_flat, int max_blocks, const BatchTopkParams& sp,
     std::vector<std::vector<detail::SampleCandidate>>& out_cand) {
   // MUST match llama_engine_graph.cpp: the shared d_topk_/d_cand_ buffers are sized to these.
   constexpr int kMaxDeviceTopK = 1024;
@@ -330,23 +330,73 @@ bool LlamaEngine::decode_step_batched_topk(
   const int vocab = weights_.config().vocab_size;
   // Every row's k must be usable by the device top-k (the caller falls back to the logits path
   // for the whole batch otherwise -- a per-row split is a later refinement).
-  for (int kb : k)
+  for (int kb : sp.k)
     if (kb <= 0 || kb > kMaxDeviceTopK || kb >= vocab) return false;
 
   const int batch = decode_step_batched_forward(tokens, positions, block_tables_flat, max_blocks);
-  if (static_cast<int>(k.size()) != batch) return false;
+  if (static_cast<int>(sp.k.size()) != batch) return false;
   out_cand.resize(static_cast<std::size_t>(batch));
   if (batch == 0) return true;
   const int hidden = weights_.config().hidden_size;
   batched_lm_head(batch, hidden, vocab);
   ensure_device_topk_buffers();
 
+  // Repetition penalty lives BEFORE the top-k, on device, so the candidate set matches the host
+  // slow path without shipping the vocab. In verify mode, snapshot the raw logits first so the
+  // host reference can reproduce sanitize+penalty independently.
+  static const bool verify = std::getenv("CPI_BATCH_TOPK_VERIFY") != nullptr;
+  std::vector<float> raw;
+  if (verify) {
+    // batched_lm_head wrote d_batch_logits_ on compute_stream_; a default-stream copy would race
+    // it, so sync first and snapshot the final pre-penalty logits the reference reproduces from.
+    CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
+    raw.resize(static_cast<std::size_t>(batch) * vocab);
+    CUDA_CHECK(cudaMemcpy(raw.data(), d_batch_logits_, raw.size() * sizeof(float),
+                          cudaMemcpyDeviceToHost));
+  }
+  bool any_penalty = false;
+  for (float p : sp.penalty)
+    if (p > 1.0f) {
+      any_penalty = true;
+      break;
+    }
+  if (any_penalty) {
+    if (batch > d_penalty_cap_) {
+      if (d_penalty_) cudaFree(d_penalty_);
+      CUDA_CHECK(cudaMalloc(&d_penalty_, static_cast<std::size_t>(batch) * sizeof(float)));
+      d_penalty_cap_ = batch;
+    }
+    CUDA_CHECK(cudaMemcpyAsync(d_penalty_, sp.penalty.data(),
+                               static_cast<std::size_t>(batch) * sizeof(float),
+                               cudaMemcpyHostToDevice, compute_stream_));
+    kernels::launch_sanitize_penalty_rows(d_batch_logits_, vocab, d_penalty_, batch,
+                                          compute_stream_);
+    const int total = static_cast<int>(sp.penalty_ids.size());
+    if (total > 0) {
+      if (total > d_seen_cap_) {
+        if (d_seen_ids_) cudaFree(d_seen_ids_);
+        if (d_seen_rows_) cudaFree(d_seen_rows_);
+        CUDA_CHECK(cudaMalloc(&d_seen_ids_, static_cast<std::size_t>(total) * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_seen_rows_, static_cast<std::size_t>(total) * sizeof(int)));
+        d_seen_cap_ = total;
+      }
+      CUDA_CHECK(cudaMemcpyAsync(d_seen_ids_, sp.penalty_ids.data(),
+                                 static_cast<std::size_t>(total) * sizeof(int),
+                                 cudaMemcpyHostToDevice, compute_stream_));
+      CUDA_CHECK(cudaMemcpyAsync(d_seen_rows_, sp.penalty_rows.data(),
+                                 static_cast<std::size_t>(total) * sizeof(int),
+                                 cudaMemcpyHostToDevice, compute_stream_));
+      kernels::launch_repetition_penalty(d_batch_logits_, vocab, d_seen_ids_, d_seen_rows_,
+                                         d_penalty_, total, compute_stream_);
+    }
+  }
+
   // Per row: device top-k (the row's k-th value is the threshold) then a gather of every finite
   // logit >= threshold -- exactly the candidate set sample_from_logits_topk builds on the host, so
   // only those (a few dozen) cross the bus instead of the full vocab. Same logic as the
   // single-sequence graph path, looped over the batch's rows.
   for (int b = 0; b < batch; ++b) {
-    const int kb = k[static_cast<std::size_t>(b)];
+    const int kb = sp.k[static_cast<std::size_t>(b)];
     const float* row = d_batch_logits_ + static_cast<std::size_t>(b) * vocab;
     CUDA_CHECK(cudaMemsetAsync(d_cand_count_, 0, sizeof(int), compute_stream_));
     kernels::launch_topk_float(row, vocab, kb, d_topk_part_val_, d_topk_part_idx_, d_topk_val_,
@@ -377,14 +427,26 @@ bool LlamaEngine::decode_step_batched_topk(
                 return a.id < b.id;
               });
 
-    // CPI_BATCH_TOPK_VERIFY=1: prove the device candidate set equals what the host sampler would
-    // build from the full logits (the k-th largest as threshold, every finite logit >= it). If
-    // the ID sets ever differ, the fast path could sample a different token than the full path.
-    static const bool verify = std::getenv("CPI_BATCH_TOPK_VERIFY") != nullptr;
+    // CPI_BATCH_TOPK_VERIFY=1: rebuild the candidate set the host slow path would produce from the
+    // RAW logits (sanitize, then repetition penalty, then the k-th-largest threshold and gather of
+    // every finite logit >= it) and compare id-sets. If they ever differ, the fast path could
+    // sample a different token than the full path.
     if (verify) {
-      std::vector<float> host(static_cast<std::size_t>(vocab));
-      CUDA_CHECK(cudaMemcpy(host.data(), row, static_cast<std::size_t>(vocab) * sizeof(float),
-                            cudaMemcpyDeviceToHost));
+      std::vector<float> host(raw.begin() + static_cast<std::ptrdiff_t>(b) * vocab,
+                              raw.begin() + static_cast<std::ptrdiff_t>(b + 1) * vocab);
+      const float p = sp.penalty[static_cast<std::size_t>(b)];
+      if (p > 1.0f) {
+        for (float& v : host)
+          v = std::isfinite(v) ? std::min(80.0f, std::max(-80.0f, v)) : -INFINITY;
+        for (std::size_t i = 0; i < sp.penalty_ids.size(); ++i) {
+          if (sp.penalty_rows[i] != b) continue;
+          const int id = sp.penalty_ids[i];
+          if (id >= 0 && id < vocab)
+            host[static_cast<std::size_t>(id)] = host[static_cast<std::size_t>(id)] > 0.0f
+                                                     ? host[static_cast<std::size_t>(id)] / p
+                                                     : host[static_cast<std::size_t>(id)] * p;
+        }
+      }
       std::vector<float> part(host);
       std::nth_element(part.begin(), part.begin() + (kb - 1), part.end(), std::greater<float>());
       const float kth = part[static_cast<std::size_t>(kb - 1)];
@@ -534,9 +596,9 @@ public:
 
   bool decode_batched_topk(const std::vector<int>& tokens, const std::vector<int>& positions,
                            const std::vector<int>& block_tables_flat, int max_blocks,
-                           const std::vector<int>& k,
+                           const BatchTopkParams& sp,
                            std::vector<std::vector<detail::SampleCandidate>>& out_cand) override {
-    return e_->decode_step_batched_topk(tokens, positions, block_tables_flat, max_blocks, k,
+    return e_->decode_step_batched_topk(tokens, positions, block_tables_flat, max_blocks, sp,
                                         out_cand);
   }
 

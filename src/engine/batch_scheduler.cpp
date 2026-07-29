@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <limits>
 #include <stdexcept>
+#include <unordered_set>
 
 #include "engine/sampling.hpp"
 #include "grammar/grammar_sampler.hpp"
@@ -187,25 +188,40 @@ bool BatchScheduler::step(std::vector<StreamEvent>& events) {
     const char* e = std::getenv("CPI_BATCH_TOPK");
     return e == nullptr || e[0] != '0';
   }();
-  // Eligibility is now PER ROW (each request's own params): the whole batch takes the fast path
-  // only if every row samples (temperature > 0), asks for top-k, and uses no full-vocabulary
-  // feature (repetition penalty, n-gram blocking) or grammar. Per-row top_k is passed down.
+  // Eligibility is PER ROW (each request's own params): the whole batch takes the fast path only
+  // if every row samples (temperature > 0), asks for top-k, and uses no n-gram blocking or
+  // grammar (which need the full vocab on the host). Repetition penalty is applied ON DEVICE
+  // before the top-k, so it no longer vetoes the fast path -- each penalty row's unique seen ids
+  // are gathered and passed down.
   bool used_topk = false;
   if (topk_enabled) {
     bool eligible = true;
-    std::vector<int> ks;
-    ks.reserve(static_cast<std::size_t>(B));
-    for (const auto& s : seqs_) {
-      if (s.params.grammar || s.params.temperature <= 0.0f || s.params.top_k <= 0 ||
-          s.params.repetition_penalty > 1.0f || s.params.no_repeat_ngram_size > 1) {
+    BatchTopkParams& sp = batch_topk_scratch_;
+    sp.k.clear();
+    sp.penalty.clear();
+    sp.penalty_ids.clear();
+    sp.penalty_rows.clear();
+    for (int b = 0; b < B; ++b) {
+      const StreamParams& pr = seqs_[static_cast<std::size_t>(b)].params;
+      if (pr.grammar || pr.temperature <= 0.0f || pr.top_k <= 0 || pr.no_repeat_ngram_size > 1) {
         eligible = false;
         break;
       }
-      ks.push_back(s.params.top_k);
+      sp.k.push_back(pr.top_k);
+      sp.penalty.push_back(pr.repetition_penalty);
+      if (pr.repetition_penalty > 1.0f) {
+        // Unique seen ids for this row -- matches the host's unordered_set(history).
+        const auto& hist = seqs_[static_cast<std::size_t>(b)].history;
+        std::unordered_set<int> seen(hist.begin(), hist.end());
+        for (int id : seen) {
+          sp.penalty_ids.push_back(id);
+          sp.penalty_rows.push_back(b);
+        }
+      }
     }
     if (eligible) {
       used_topk =
-          backend_->decode_batched_topk(toks, poss, flat, max_blocks, ks, batch_cand_scratch_);
+          backend_->decode_batched_topk(toks, poss, flat, max_blocks, sp, batch_cand_scratch_);
     }
   }
 

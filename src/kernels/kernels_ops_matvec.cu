@@ -3,13 +3,13 @@
 // CUDA kernels and host launch wrappers for pointwise ops, quant/dequant,
 // weight-only matvec, projection GEMV, and argmax helpers.
 
-#include <cstdlib>
 #include <cuda_fp16.h>
 #include <math_constants.h>  // CUDART_INF_F (device top-k reductions)
 #include <sm_61_intrinsics.h>
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <type_traits>
 
 #include "runtime/kernels.cuh"
@@ -1078,8 +1078,8 @@ __global__ void gemv_wide_kernel(const half* __restrict__ w, const half* __restr
   }
   const int lane = threadIdx.x & (warpSize - 1);
   const int vecs = in_features / 8;  // 8 halves per int4
-  const int4* wrow = reinterpret_cast<const int4*>(
-      w + static_cast<std::size_t>(row) * static_cast<std::size_t>(in_features));
+  const int4* wrow = reinterpret_cast<const int4*>(w + static_cast<std::size_t>(row) *
+                                                           static_cast<std::size_t>(in_features));
   const int4* xv = reinterpret_cast<const int4*>(x);
 
   // Prefetch kUnroll chunks before consuming any of them.
@@ -1164,8 +1164,8 @@ __global__ void gemv_wide_cat_kernel(const half* __restrict__ w0, half* __restri
   }
   const int lane = threadIdx.x & (warpSize - 1);
   const int vecs = in_features / 8;
-  const int4* wrow =
-      reinterpret_cast<const int4*>(w + static_cast<std::size_t>(r) * static_cast<std::size_t>(in_features));
+  const int4* wrow = reinterpret_cast<const int4*>(w + static_cast<std::size_t>(r) *
+                                                           static_cast<std::size_t>(in_features));
   const int4* xv = reinterpret_cast<const int4*>(x);
 
   constexpr int kUnroll = 4;
@@ -1216,8 +1216,7 @@ static bool use_wide_gemv() {
 template <typename OutT>
 static void launch_rowmajor_half_gemv(const half* w, const half* x, OutT* y, int out_features,
                                       int in_features, cudaStream_t stream, int warps_per_block,
-                                      int tile_pairs, int rows_per_warp,
-                                      half* residual = nullptr) {
+                                      int tile_pairs, int rows_per_warp, half* residual = nullptr) {
   if (use_wide_gemv() && (in_features % 8) == 0) {
     // Do not route the short shapes here to the split-K kernel: it measured slower end to end.
     // The shared-memory reduction costs more than the extra parallelism buys at these sizes,
@@ -1295,7 +1294,7 @@ void launch_split_interleaved_head_halves(const half* src, half* first, half* se
 }
 
 void launch_linear_conv1d_silu(const half* conv_weight, float* conv_state, half* qkv_mix,
-                                      int channels, int kernel_size, cudaStream_t stream) {
+                               int channels, int kernel_size, cudaStream_t stream) {
   constexpr int threads = 256;
   const int blocks = (channels + threads - 1) / threads;
   qwen35_linear_conv1d_silu_kernel<<<blocks, threads, 0, stream>>>(conv_weight, conv_state, qkv_mix,
@@ -1303,8 +1302,8 @@ void launch_linear_conv1d_silu(const half* conv_weight, float* conv_state, half*
 }
 
 void launch_repeat_linear_heads(const half* qkv_mix, half* q_out, half* k_out, half* v_out,
-                                       int num_key_heads, int num_value_heads, int key_head_dim,
-                                       int value_head_dim, cudaStream_t stream) {
+                                int num_key_heads, int num_value_heads, int key_head_dim,
+                                int value_head_dim, cudaStream_t stream) {
   constexpr int threads = 256;
   const int head_repeat = num_value_heads / num_key_heads;
   const int width = key_head_dim > value_head_dim ? key_head_dim : value_head_dim;
@@ -1315,11 +1314,10 @@ void launch_repeat_linear_heads(const half* qkv_mix, half* q_out, half* k_out, h
 }
 
 void launch_linear_attention_step(const half* q, const half* k, const half* v, const half* z,
-                                         const half* a, const half* b, const float* norm_weight,
-                                         const float* a_log, const half* dt_bias,
-                                         float* recurrent_state, half* out, int num_heads,
-                                         int key_head_dim, int value_head_dim, float rms_eps,
-                                         cudaStream_t stream) {
+                                  const half* a, const half* b, const float* norm_weight,
+                                  const float* a_log, const half* dt_bias, float* recurrent_state,
+                                  half* out, int num_heads, int key_head_dim, int value_head_dim,
+                                  float rms_eps, cudaStream_t stream) {
   int threads = key_head_dim > value_head_dim ? key_head_dim : value_head_dim;
   if (threads < 32) {
     threads = 32;
@@ -1519,8 +1517,8 @@ __global__ void half_gemv_glu_kernel(const half* __restrict__ wg, const half* __
   if (row < out_features) {
     const half* w = is_up ? wu : wg;
     const int vecs = in_features / 8;
-    const int4* wrow = reinterpret_cast<const int4*>(
-        w + static_cast<std::size_t>(row) * static_cast<std::size_t>(in_features));
+    const int4* wrow = reinterpret_cast<const int4*>(w + static_cast<std::size_t>(row) *
+                                                             static_cast<std::size_t>(in_features));
     const int4* xv4 = reinterpret_cast<const int4*>(x);
     constexpr int kUnroll = 4;
     int4 wbuf[kUnroll];
@@ -1565,15 +1563,15 @@ __global__ void half_gemv_glu_kernel(const half* __restrict__ wg, const half* __
   }
 }
 
-void launch_half_gemv_glu(const half* wg, const half* wu, const half* x, half* y,
-                          int out_features, int in_features, cudaStream_t stream) {
+void launch_half_gemv_glu(const half* wg, const half* wu, const half* x, half* y, int out_features,
+                          int in_features, cudaStream_t stream) {
   if ((in_features % 8) != 0) {
     return;  // caller gates
   }
   constexpr int kRows = 4;
   const int blocks = (out_features + kRows - 1) / kRows;
-  half_gemv_glu_kernel<kRows><<<blocks, kRows * 64, 0, stream>>>(wg, wu, x, y, out_features,
-                                                                 in_features);
+  half_gemv_glu_kernel<kRows>
+      <<<blocks, kRows * 64, 0, stream>>>(wg, wu, x, y, out_features, in_features);
 }
 
 void launch_quantize_fp16_to_int8_perm8_g32(const half* src, std::int8_t* dst, float* scales,
@@ -1604,8 +1602,7 @@ void launch_quantize_fp16_to_int8_perm8(const half* src, std::int8_t* dst, float
 // int8-GEMM epilogue for the sequence prefill: the cuBLAS 8-bit GEMM leaves int32 dots in
 // column-major [out, chunk]; this folds the rowwise weight scale and per-token activation
 // scale and writes fp16 row-major [T, out] at token offset t0.
-__global__ void i32_scale_to_fp16_kernel(const int* __restrict__ acc,
-                                         const float* __restrict__ sw,
+__global__ void i32_scale_to_fp16_kernel(const int* __restrict__ acc, const float* __restrict__ sw,
                                          const float* __restrict__ sx, half* __restrict__ y,
                                          int out, int chunk, int t0) {
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1613,17 +1610,16 @@ __global__ void i32_scale_to_fp16_kernel(const int* __restrict__ acc,
   if (idx >= total) return;
   const int r = idx % out;
   const int lt = idx / out;
-  y[static_cast<std::size_t>(t0 + lt) * out + r] =
-      __float2half(static_cast<float>(acc[static_cast<std::size_t>(lt) * out + r]) * sw[r] *
-                   sx[t0 + lt]);
+  y[static_cast<std::size_t>(t0 + lt) * out + r] = __float2half(
+      static_cast<float>(acc[static_cast<std::size_t>(lt) * out + r]) * sw[r] * sx[t0 + lt]);
 }
 
 void launch_i32_scale_to_fp16(const int* acc, const float* sw, const float* sx, half* y, int out,
                               int chunk, int t0, cudaStream_t stream) {
   const int total = out * chunk;
   const int threads = 256;
-  i32_scale_to_fp16_kernel<<<(total + threads - 1) / threads, threads, 0, stream>>>(
-      acc, sw, sx, y, out, chunk, t0);
+  i32_scale_to_fp16_kernel<<<(total + threads - 1) / threads, threads, 0, stream>>>(acc, sw, sx, y,
+                                                                                    out, chunk, t0);
 }
 
 void launch_rowmajor_half_gemv_cat(const half* w0, half* y0, int n0, const half* w1, half* y1,
@@ -1665,10 +1661,11 @@ void launch_argmax_float(const float* logits, int n, int* out_index, cudaStream_
   argmax_float_kernel<<<1, threads, 0, stream>>>(logits, n, out_index);
 }
 
-// â”€â”€ device top-k candidate selection (sampled decode) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// â”€â”€ device top-k candidate selection (sampled decode)
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 namespace {
 
-constexpr int kTopkChunk = 2048;    // elements per partition block (8 KB shared)
+constexpr int kTopkChunk = 2048;  // elements per partition block (8 KB shared)
 constexpr int kTopkThreads = 256;
 
 // Block-wide argmax over a shared buffer; returns {value,index} on thread 0 and
@@ -1680,22 +1677,34 @@ __device__ __forceinline__ void block_argmax_mask(float* s, int len, float* red_
   int bi = -1;
   for (int i = threadIdx.x; i < len; i += THREADS) {
     const float v = s[i];
-    if (v > bv) { bv = v; bi = i; }
+    if (v > bv) {
+      bv = v;
+      bi = i;
+    }
   }
   for (int off = 16; off > 0; off >>= 1) {
     const float ov = __shfl_down_sync(0xffffffffu, bv, off);
     const int oi = __shfl_down_sync(0xffffffffu, bi, off);
-    if (ov > bv) { bv = ov; bi = oi; }
+    if (ov > bv) {
+      bv = ov;
+      bi = oi;
+    }
   }
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
-  if (lane == 0) { red_v[warp] = bv; red_i[warp] = bi; }
+  if (lane == 0) {
+    red_v[warp] = bv;
+    red_i[warp] = bi;
+  }
   __syncthreads();
   if (threadIdx.x == 0) {
     float mv = -CUDART_INF_F;
     int mi = -1;
     for (int w = 0; w < THREADS / 32; ++w) {
-      if (red_v[w] > mv) { mv = red_v[w]; mi = red_i[w]; }
+      if (red_v[w] > mv) {
+        mv = red_v[w];
+        mi = red_i[w];
+      }
     }
     *out_v = mv;
     *out_i = mi;
@@ -1770,7 +1779,9 @@ __global__ void gather_ge_threshold_kernel(const float* __restrict__ logits, int
 
 }  // namespace
 
-int topk_partition_count(int n) { return (n + kTopkChunk - 1) / kTopkChunk; }
+int topk_partition_count(int n) {
+  return (n + kTopkChunk - 1) / kTopkChunk;
+}
 
 void launch_topk_float(const float* logits, int n, int k, float* part_val, int* part_idx,
                        float* out_val, int* out_idx, cudaStream_t stream) {
@@ -1781,8 +1792,7 @@ void launch_topk_float(const float* logits, int n, int k, float* part_val, int* 
 }
 
 void launch_gather_ge_threshold(const float* logits, int n, const float* threshold, int* out_idx,
-                                float* out_val, int* out_count, int capacity,
-                                cudaStream_t stream) {
+                                float* out_val, int* out_count, int capacity, cudaStream_t stream) {
   constexpr int threads = 256;
   const int blocks = min(1024, (n + threads - 1) / threads);
   gather_ge_threshold_kernel<<<blocks, threads, 0, stream>>>(logits, n, threshold, out_idx, out_val,
@@ -1793,6 +1803,56 @@ void launch_convert_bf16_to_fp16(const std::uint16_t* src, half* dst, int n, cud
   constexpr int threads = 256;
   const int blocks = (n + threads - 1) / threads;
   convert_bf16_to_fp16_kernel<<<blocks, threads, 0, stream>>>(src, dst, n);
+}
+
+// Repetition-penalty support for the batched device top-k path. The host slow path (see
+// sample_from_logits) SANITIZES logits (non-finite -> -inf, clamp to [+-80]) and then divides a
+// seen token's logit by the penalty (or multiplies, if negative) -- both BEFORE building the
+// top-k candidate set. Doing it on-device keeps the full vocab off the host bus. Both kernels
+// touch ONLY rows whose penalty > 1: a non-penalty row in the same batch must keep the exact
+// fast-path (no-sanitize) semantics it would have on its own.
+
+// [batch][vocab]: clamp/deinf the penalty rows only.
+__global__ void sanitize_penalty_rows_kernel(float* logits, int vocab, const float* penalties,
+                                             long total) {
+  const long i = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= total) return;
+  const int b = static_cast<int>(i / vocab);
+  if (penalties[b] <= 1.0f) return;
+  const float v = logits[i];
+  logits[i] = isfinite(v) ? fminf(80.0f, fmaxf(-80.0f, v)) : -INFINITY;
+}
+
+// One thread per (row, seen-token) pair. seen ids are unique within a row, so the writes never
+// collide. penalty[b] is guaranteed > 1 for every row that contributes a pair.
+__global__ void repetition_penalty_kernel(float* logits, int vocab, const int* seen_ids,
+                                          const int* seen_rows, const float* penalties, int total) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= total) return;
+  const int id = seen_ids[i];
+  if (id < 0 || id >= vocab) return;
+  const int b = seen_rows[i];
+  const float p = penalties[b];
+  float* l = &logits[static_cast<long>(b) * vocab + id];
+  *l = (*l > 0.0f) ? (*l / p) : (*l * p);
+}
+
+void launch_sanitize_penalty_rows(float* logits, int vocab, const float* penalties, int batch,
+                                  cudaStream_t stream) {
+  const long total = static_cast<long>(batch) * vocab;
+  constexpr int threads = 256;
+  const long blocks = (total + threads - 1) / threads;
+  sanitize_penalty_rows_kernel<<<static_cast<unsigned>(blocks), threads, 0, stream>>>(
+      logits, vocab, penalties, total);
+}
+
+void launch_repetition_penalty(float* logits, int vocab, const int* seen_ids, const int* seen_rows,
+                               const float* penalties, int total, cudaStream_t stream) {
+  if (total <= 0) return;
+  constexpr int threads = 256;
+  const int blocks = (total + threads - 1) / threads;
+  repetition_penalty_kernel<<<blocks, threads, 0, stream>>>(logits, vocab, seen_ids, seen_rows,
+                                                            penalties, total);
 }
 
 }  // namespace kernels

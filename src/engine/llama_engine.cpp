@@ -836,6 +836,20 @@ LlamaEngine::~LlamaEngine() {
     h_batch_logits_ = nullptr;
     h_batch_logits_cap_ = 0;
   }
+  if (d_penalty_) {
+    cudaFree(d_penalty_);
+    d_penalty_ = nullptr;
+    d_penalty_cap_ = 0;
+  }
+  if (d_seen_ids_) {
+    cudaFree(d_seen_ids_);
+    d_seen_ids_ = nullptr;
+  }
+  if (d_seen_rows_) {
+    cudaFree(d_seen_rows_);
+    d_seen_rows_ = nullptr;
+  }
+  d_seen_cap_ = 0;
   if (d_bs_scratch_m_) {
     cudaFree(d_bs_scratch_m_);
     d_bs_scratch_m_ = nullptr;

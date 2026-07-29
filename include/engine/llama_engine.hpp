@@ -424,7 +424,7 @@ public:
   // top-k range or a row hits a pathological tie count.
   bool decode_step_batched_topk(const std::vector<int>& tokens, const std::vector<int>& positions,
                                 const std::vector<int>& block_tables_flat, int max_blocks,
-                                const std::vector<int>& k,
+                                const BatchTopkParams& sp,
                                 std::vector<std::vector<detail::SampleCandidate>>& out_cand);
 
   // Parity gate for decode_step_batched: prefill `prompt_tokens`, then for
@@ -516,6 +516,13 @@ private:
   // decode step. Grown on demand alongside d_batch_logits_.
   float* h_batch_logits_ = nullptr;
   int h_batch_logits_cap_ = 0;  // capacity in rows
+  // Device scratch for the batched device top-k fast path's repetition penalty: per-row penalty,
+  // and the flattened (id, row) pairs of seen tokens. Grown on demand.
+  float* d_penalty_ = nullptr;
+  int d_penalty_cap_ = 0;  // rows
+  int* d_seen_ids_ = nullptr;
+  int* d_seen_rows_ = nullptr;
+  int d_seen_cap_ = 0;  // pairs
   // Persistent split-K attention scratch for batched decode (grown on demand).
   float* d_bs_scratch_m_ = nullptr;
   float* d_bs_scratch_l_ = nullptr;

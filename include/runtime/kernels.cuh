@@ -197,26 +197,23 @@ bool launch_persistent_decode(const PersistOp* ops, int n_ops, const int* tok, c
 // Grid is (num_heads, scratch_chunks) with per-chunk seq/window guards, so it is graph-safe
 // and fills the GPU where the single-block-per-head tiled path cannot (Gemma 4: 8 heads on a
 // 170-SM card). The reduce merges chunk softmax stats exactly (log-sum-exp).
-void launch_attention_split_any(const half* q, const half* k_cache, const half* v_cache,
-                                half* out, int seq_len, int window, int num_heads,
-                                int num_kv_heads, int head_dim, float* scratch_m,
-                                float* scratch_l, float* scratch_o, int chunk_size,
-                                int scratch_chunks, cudaStream_t stream);
-void launch_attention_split_any_device_pos(const half* q, const half* k_cache,
-                                           const half* v_cache, half* out, const int* position,
-                                           int window, int num_heads, int num_kv_heads,
-                                           int head_dim, float* scratch_m, float* scratch_l,
-                                           float* scratch_o, int chunk_size, int scratch_chunks,
-                                           cudaStream_t stream);
+void launch_attention_split_any(const half* q, const half* k_cache, const half* v_cache, half* out,
+                                int seq_len, int window, int num_heads, int num_kv_heads,
+                                int head_dim, float* scratch_m, float* scratch_l, float* scratch_o,
+                                int chunk_size, int scratch_chunks, cudaStream_t stream);
+void launch_attention_split_any_device_pos(const half* q, const half* k_cache, const half* v_cache,
+                                           half* out, const int* position, int window,
+                                           int num_heads, int num_kv_heads, int head_dim,
+                                           float* scratch_m, float* scratch_l, float* scratch_o,
+                                           int chunk_size, int scratch_chunks, cudaStream_t stream);
 // Multi-query (T <= 16) device-position form for the graphed speculative verify: query
 // token t attends causally over cache[0 .. *position + t], q/out use the sequence-slot
 // stride, scratch gains a leading token axis (sized tokens * num_heads * scratch_chunks).
 void launch_attention_split_any_mt_device_pos(const half* q, const half* k_cache,
-                                              const half* v_cache, half* out,
-                                              const int* position, int tokens, int window,
-                                              int num_heads, int num_kv_heads, int head_dim,
-                                              float* scratch_m, float* scratch_l,
-                                              float* scratch_o, int chunk_size,
+                                              const half* v_cache, half* out, const int* position,
+                                              int tokens, int window, int num_heads,
+                                              int num_kv_heads, int head_dim, float* scratch_m,
+                                              float* scratch_l, float* scratch_o, int chunk_size,
                                               int scratch_chunks, cudaStream_t stream);
 // Sequence form of the device-position KV append: `rows` K/V rows land at device base
 // position + row. Graph-capturable replacement for the host-offset seq memcpys.
@@ -566,18 +563,17 @@ void launch_split_interleaved_head_halves(const half* src, half* first, half* se
 
 // Qwen3.5 linear-attention helpers.
 void launch_linear_conv1d_silu(const half* conv_weight, float* conv_state, half* qkv_mix,
-                                      int channels, int kernel_size, cudaStream_t stream);
+                               int channels, int kernel_size, cudaStream_t stream);
 
 void launch_repeat_linear_heads(const half* qkv_mix, half* q_out, half* k_out, half* v_out,
-                                       int num_key_heads, int num_value_heads, int key_head_dim,
-                                       int value_head_dim, cudaStream_t stream);
+                                int num_key_heads, int num_value_heads, int key_head_dim,
+                                int value_head_dim, cudaStream_t stream);
 
 void launch_linear_attention_step(const half* q, const half* k, const half* v, const half* z,
-                                         const half* a, const half* b, const float* norm_weight,
-                                         const float* a_log, const half* dt_bias,
-                                         float* recurrent_state, half* out, int num_heads,
-                                         int key_head_dim, int value_head_dim, float rms_eps,
-                                         cudaStream_t stream);
+                                  const half* a, const half* b, const float* norm_weight,
+                                  const float* a_log, const half* dt_bias, float* recurrent_state,
+                                  half* out, int num_heads, int key_head_dim, int value_head_dim,
+                                  float rms_eps, cudaStream_t stream);
 
 // launch_scale_copy
 //
@@ -887,9 +883,9 @@ void launch_weight_only_int4_matvec_grouped(const std::int8_t* w_packed, const f
                                             const half* x, half* y, int out_features,
                                             int in_features, int group, cudaStream_t stream);
 
-void launch_weight_only_int8_matvec_grouped(const std::int8_t* w, const float* scales, const half* x,
-                                            half* y, int out_features, int in_features, int group,
-                                            cudaStream_t stream);
+void launch_weight_only_int8_matvec_grouped(const std::int8_t* w, const float* scales,
+                                            const half* x, half* y, int out_features,
+                                            int in_features, int group, cudaStream_t stream);
 
 // launch_weight_only_int4_matvec_batched
 //
@@ -962,9 +958,9 @@ void launch_weight_only_int4_matvec_dual_dp4a(
 //
 //   x        - q or k, fp16 [tokens, num_heads, head_dim]; modified in place
 //   pos_x/y  - per-patch integer coordinates on device [tokens]
-void launch_rope_2d_inplace(half* x, const int* pos_x, const int* pos_y, int num_heads, int head_dim,
-                            int tokens, const float* cos_table, const float* sin_table,
-                            cudaStream_t stream);
+void launch_rope_2d_inplace(half* x, const int* pos_x, const int* pos_y, int num_heads,
+                            int head_dim, int tokens, const float* cos_table,
+                            const float* sin_table, cudaStream_t stream);
 
 // launch_patch_embed
 //
@@ -1035,10 +1031,9 @@ void launch_rope_seq_table(half* x, int num_heads, int head_dim, int start_posit
                            cudaStream_t stream);
 // Device-position twin (base position read from device memory) so a captured graph can
 // replay sequence RoPE at any position. Identical rotation math.
-void launch_rope_seq_table_device_pos(half* x, int num_heads, int head_dim,
-                                      const int* position_ptr, int tokens, const float* cos_table,
-                                      const float* sin_table, int rotary_dim,
-                                      cudaStream_t stream);
+void launch_rope_seq_table_device_pos(half* x, int num_heads, int head_dim, const int* position_ptr,
+                                      int tokens, const float* cos_table, const float* sin_table,
+                                      int rotary_dim, cudaStream_t stream);
 
 // launch_rowmajor_half_gemm_f16
 //
@@ -1087,11 +1082,10 @@ void launch_quantize_fp16_to_int8_perm8_g32_mt(const half* src, std::int8_t* dst
 // group % 32 == 0 (silently returns otherwise -- caller gates). `warps` (2/4/8) is the
 // rows-per-block shape knob probed by the per-box autotuner; all variants are
 // bit-identical (row math is warp-local).
-void launch_weight_only_int4_matvec_grouped_dp4a(const std::int8_t* w_packed,
-                                                 const float* scales, const std::int8_t* xq,
-                                                 const float* x_scale, half* y, int out_features,
-                                                 int in_features, int group, cudaStream_t stream,
-                                                 int warps = 4);
+void launch_weight_only_int4_matvec_grouped_dp4a(const std::int8_t* w_packed, const float* scales,
+                                                 const std::int8_t* xq, const float* x_scale,
+                                                 half* y, int out_features, int in_features,
+                                                 int group, cudaStream_t stream, int warps = 4);
 
 // launch_rmsnorm_quant_perm8
 //
@@ -1106,21 +1100,24 @@ void launch_rmsnorm_quant_perm8(const half* x, const half* w, half* y, std::int8
 // Up to three grouped int4 dp4a GEMVs sharing one perm8-quantized activation, run as ONE
 // launch (q|k|v, gate|up). Same per-row math as the non-cat variant; pass n2 = 0 for two
 // segments. Same gating: in_features % 32 == 0, group % 32 == 0.
-void launch_weight_only_int4_matvec_grouped_dp4a_cat(
-    const std::int8_t* w0, const float* s0, half* y0, int n0, const std::int8_t* w1,
-    const float* s1, half* y1, int n1, const std::int8_t* w2, const float* s2, half* y2, int n2,
-    const std::int8_t* xq, const float* x_scale, int in_features, int group, cudaStream_t stream,
-    int warps = 4);
+void launch_weight_only_int4_matvec_grouped_dp4a_cat(const std::int8_t* w0, const float* s0,
+                                                     half* y0, int n0, const std::int8_t* w1,
+                                                     const float* s1, half* y1, int n1,
+                                                     const std::int8_t* w2, const float* s2,
+                                                     half* y2, int n2, const std::int8_t* xq,
+                                                     const float* x_scale, int in_features,
+                                                     int group, cudaStream_t stream, int warps = 4);
 
 // launch_weight_only_int4_matvec_grouped_dp4a_glu
 //
 // Fused GeGLU: out[r] = gelu_tanh(gate_r) * up_r with both grouped-int4 dp4a dots computed
 // in one warp against the shared perm8 activation. Numerics match [gate gemv; up gemv;
 // gelu_mul]: dots round to fp16 before the gelu. Same gating as the other dp4a launchers.
-void launch_weight_only_int4_matvec_grouped_dp4a_glu(
-    const std::int8_t* wg, const float* sg, const std::int8_t* wu, const float* su,
-    const std::int8_t* xq, const float* x_scale, half* y, int out_features, int in_features,
-    int group, cudaStream_t stream, int warps = 4);
+void launch_weight_only_int4_matvec_grouped_dp4a_glu(const std::int8_t* wg, const float* sg,
+                                                     const std::int8_t* wu, const float* su,
+                                                     const std::int8_t* xq, const float* x_scale,
+                                                     half* y, int out_features, int in_features,
+                                                     int group, cudaStream_t stream, int warps = 4);
 
 // launch_weight_only_int4_matvec_grouped_dp4a_f32
 //
@@ -1145,8 +1142,8 @@ void launch_weight_only_int8_matvec_glu(const std::int8_t* wg, const float* sg,
 //
 // Fused fp16 GeGLU: out[r] = gelu_tanh(gate_r) * up_r, paired-warp shape, gelu on the
 // fp16-rounded dots. in_features % 8 == 0.
-void launch_half_gemv_glu(const half* wg, const half* wu, const half* x, half* y,
-                          int out_features, int in_features, cudaStream_t stream);
+void launch_half_gemv_glu(const half* wg, const half* wu, const half* x, half* y, int out_features,
+                          int in_features, cudaStream_t stream);
 
 // launch_dequant_int4_grouped / launch_dequant_int8_rowwise
 //
@@ -1179,8 +1176,7 @@ void launch_weight_only_int4_matvec_grouped_dp4a_mt_f32(const std::int8_t* w_pac
                                                         const float* scales, const std::int8_t* xq,
                                                         const float* x_scales, float* y,
                                                         int out_features, int in_features,
-                                                        int group, int tokens,
-                                                        cudaStream_t stream);
+                                                        int group, int tokens, cudaStream_t stream);
 
 // launch_rowmajor_half_gemv_cat
 //
@@ -1252,6 +1248,16 @@ void launch_topk_float(const float* logits, int n, int k, float* part_val, int* 
                        float* out_val, int* out_idx, cudaStream_t stream);
 void launch_gather_ge_threshold(const float* logits, int n, const float* threshold, int* out_idx,
                                 float* out_val, int* out_count, int capacity, cudaStream_t stream);
+
+// Repetition penalty for the batched device top-k path, applied to [batch][vocab] logits BEFORE
+// the top-k so the candidate set matches the host sampler's slow path. Both touch only rows whose
+// penalties[b] > 1. Call sanitize first (non-finite -> -inf, clamp [+-80]), then the penalty over
+// each row's UNIQUE seen token ids (seen_ids[i] in row seen_rows[i]); seen ids are unique per row
+// so the penalty writes never collide.
+void launch_sanitize_penalty_rows(float* logits, int vocab, const float* penalties, int batch,
+                                  cudaStream_t stream);
+void launch_repetition_penalty(float* logits, int vocab, const int* seen_ids, const int* seen_rows,
+                               const float* penalties, int total, cudaStream_t stream);
 
 // launch_convert_bf16_to_fp16
 //

@@ -67,6 +67,17 @@ struct StreamEvent {
   const char* finish_reason = "";
 };
 
+// Per-row inputs to the device top-k fast path. penalty[b] <= 1 means "no repetition penalty for
+// row b". penalty_ids / penalty_rows are the flattened UNIQUE seen token ids for the penalty rows
+// (penalty_ids[i] belongs to row penalty_rows[i]); the backend applies the penalty on-device
+// before the top-k, so the candidate set still matches the host sampler's slow path.
+struct BatchTopkParams {
+  std::vector<int> k;             // [batch] per-row top_k
+  std::vector<float> penalty;     // [batch] per-row repetition_penalty (<= 1 => none)
+  std::vector<int> penalty_ids;   // flattened unique seen ids across penalty rows
+  std::vector<int> penalty_rows;  // parallel to penalty_ids: which row each id belongs to
+};
+
 // What the scheduler needs from a GPU. Two calls.
 class BatchBackend {
 public:
@@ -98,13 +109,13 @@ public:
   virtual bool decode_batched_topk(const std::vector<int>& tokens,
                                    const std::vector<int>& positions,
                                    const std::vector<int>& block_tables_flat, int max_blocks,
-                                   const std::vector<int>& k,
+                                   const BatchTopkParams& sp,
                                    std::vector<std::vector<detail::SampleCandidate>>& out_cand) {
     (void)tokens;
     (void)positions;
     (void)block_tables_flat;
     (void)max_blocks;
-    (void)k;
+    (void)sp;
     (void)out_cand;
     return false;
   }
@@ -180,6 +191,7 @@ private:
   std::vector<std::vector<float>> batch_logits_scratch_;
   // Reused per-row candidate scratch for the device top-k fast path.
   std::vector<std::vector<detail::SampleCandidate>> batch_cand_scratch_;
+  BatchTopkParams batch_topk_scratch_;  // reused per-row k / penalty / seen-id inputs
   std::vector<CachedPrefix> prefix_cache_;
   std::uint64_t prefix_cache_tick_ = 0;
   static constexpr std::size_t kPrefixCacheEntries = 32;
