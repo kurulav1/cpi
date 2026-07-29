@@ -76,9 +76,14 @@ Notes:
   32k-vocab models (Llama-2, TinyLlama) outscale the 128–152k-vocab ones at the same batch size.
 - **No single-request penalty on real models**: the batch-1 slowdown (batched GEMM vs the tuned
   single-token kernel) is a small-model artifact and vanishes by 7–8B (~1.0×).
-- **Sampling (temperature > 0) currently runs ~half the greedy throughput at high batch** (e.g.
-  Llama-3.1-8B batch 64: 747 vs 1457 tok/s) because top-k/top-p sampling runs per row on the host;
-  on-device sampling is planned.
+- **Sampling (temperature > 0) now runs on device and no longer trails greedy.** Top-k / top-p
+  and the repetition penalty are applied to the batched logits on the GPU, so only ~k candidates
+  per row cross to the host instead of the full `[batch × vocab]` block. Measured on Llama-3.1-8B
+  at batch 64 (top-k 40, repetition penalty 1.05): **453 tok/s on the old host-side path → 1973
+  tok/s on device**, a 4.4× lift that carries sampled throughput above the greedy row above. The
+  host-side path is still selectable with `CPI_BATCH_TOPK=0` (an A/B lever and a safety switch).
+  Grammar-constrained and n-gram-blocked requests still sample on the host, since both need the
+  full vocabulary.
 - **Shared-prefix reuse**: concurrent requests that share a leading prefix (a common system prompt, a
   multi-turn chat) adopt each other's cached KV blocks instead of re-prefilling. A small per-worker LRU
   keeps several distinct prefixes live at once, so interleaved requests don't evict each other; on a long

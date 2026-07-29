@@ -362,7 +362,13 @@ bool LlamaEngine::decode_step_batched_topk(
     }
   if (any_penalty) {
     if (batch > d_penalty_cap_) {
-      if (d_penalty_) cudaFree(d_penalty_);
+      // Reset the pointer/cap before the malloc: if it throws (OOM), the next grow must not
+      // cudaFree the already-freed pointer.
+      if (d_penalty_) {
+        cudaFree(d_penalty_);
+        d_penalty_ = nullptr;
+        d_penalty_cap_ = 0;
+      }
       CUDA_CHECK(cudaMalloc(&d_penalty_, static_cast<std::size_t>(batch) * sizeof(float)));
       d_penalty_cap_ = batch;
     }
@@ -374,8 +380,17 @@ bool LlamaEngine::decode_step_batched_topk(
     const int total = static_cast<int>(sp.penalty_ids.size());
     if (total > 0) {
       if (total > d_seen_cap_) {
-        if (d_seen_ids_) cudaFree(d_seen_ids_);
-        if (d_seen_rows_) cudaFree(d_seen_rows_);
+        // Same OOM safety as above: null both and drop the cap before either malloc, so a throw
+        // can't leave a freed pointer that the next grow double-frees.
+        if (d_seen_ids_) {
+          cudaFree(d_seen_ids_);
+          d_seen_ids_ = nullptr;
+        }
+        if (d_seen_rows_) {
+          cudaFree(d_seen_rows_);
+          d_seen_rows_ = nullptr;
+        }
+        d_seen_cap_ = 0;
         CUDA_CHECK(cudaMalloc(&d_seen_ids_, static_cast<std::size_t>(total) * sizeof(int)));
         CUDA_CHECK(cudaMalloc(&d_seen_rows_, static_cast<std::size_t>(total) * sizeof(int)));
         d_seen_cap_ = total;
