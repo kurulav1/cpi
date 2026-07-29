@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -22,10 +23,22 @@ int main(int argc, char** argv) {
   int graph_pos = 0;     // decode position for --graph-bench (pads prefill; exercises the window)
   int weight_quant = 0;  // 0 fp16, 4 or 8: on-load weight-only quant (llama-bench-comparable)
   std::vector<int> ppl_tokens;  // --ppl-tokens: teacher-forced perplexity over this id sequence
+  int ppl_stride = 1;    // --ppl-stride K: score every K-th position (subsample a big corpus)
+  int ppl_warm = 1;      // --ppl-warm W: skip the first W positions (so each has real context)
+  int ppl_win = 0;       // --ppl-win W: cap context to BOS + last W tokens (0 = full prefix)
+  std::string ppl_file;  // --ppl-file: read comma/whitespace-separated ids from a file
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     if (a == "--model" && i + 1 < argc)
       cpi = argv[++i];
+    else if (a == "--ppl-stride" && i + 1 < argc)
+      ppl_stride = std::max(1, std::stoi(argv[++i]));
+    else if (a == "--ppl-warm" && i + 1 < argc)
+      ppl_warm = std::max(1, std::stoi(argv[++i]));
+    else if (a == "--ppl-win" && i + 1 < argc)
+      ppl_win = std::stoi(argv[++i]);
+    else if (a == "--ppl-file" && i + 1 < argc)
+      ppl_file = argv[++i];
     else if (a == "--ppl-tokens" && i + 1 < argc) {
       std::string s = argv[++i], cur;
       for (char c : s) {
@@ -88,17 +101,45 @@ int main(int argc, char** argv) {
       return 0;
     }
 
+    if (!ppl_file.empty()) {
+      std::ifstream f(ppl_file);
+      std::string cur;
+      char c;
+      while (f.get(c)) {
+        if (c == ',' || c == ' ' || c == '\n' || c == '\r' || c == '\t') {
+          if (!cur.empty()) {
+            ppl_tokens.push_back(std::stoi(cur));
+            cur.clear();
+          }
+        } else {
+          cur += c;
+        }
+      }
+      if (!cur.empty()) ppl_tokens.push_back(std::stoi(cur));
+    }
+
     if (!ppl_tokens.empty()) {
-      // Teacher-forced perplexity: for each position i>=1, forward the prefix tokens[0..i-1] and
-      // score the ground-truth next token tokens[i] via nll = logsumexp(logits) -
-      // logits[tokens[i]]. Output-space quality metric; run at fp16 / int8 / int4 and compare the
-      // delta.
+      // Teacher-forced perplexity: for each scored position i, forward the FULL prefix
+      // tokens[0..i-1] (BOS-anchored, real left context) and score the ground-truth next token
+      // tokens[i] via nll = logsumexp(logits) - logits[tokens[i]]. --ppl-stride subsamples which
+      // positions are scored so a large corpus stays affordable; --ppl-warm skips the first W
+      // positions so every scored one has non-trivial context. Output-space quality metric.
       double nll = 0.0;
       int cnt = 0;
       int argmatch = 0;  // greedy top-1 == ground-truth next token (teacher-forced accuracy)
       const int n = static_cast<int>(ppl_tokens.size());
-      for (int i = 1; i < n; ++i) {
-        std::vector<int> pre(ppl_tokens.begin(), ppl_tokens.begin() + i);
+      for (int i = ppl_warm; i < n; i += ppl_stride) {
+        // Full prefix by default; with --ppl-win W, cap context to BOS + the last W tokens so each
+        // prefill is bounded (O(N*W) instead of O(N^2)). BOS (ppl_tokens[0]) is kept so the window
+        // is anchored -- dropping it makes Gemma's logits garbage.
+        std::vector<int> pre;
+        if (ppl_win > 0 && i > ppl_win) {
+          pre.reserve(static_cast<std::size_t>(ppl_win) + 1);
+          pre.push_back(ppl_tokens[0]);
+          pre.insert(pre.end(), ppl_tokens.begin() + (i - ppl_win), ppl_tokens.begin() + i);
+        } else {
+          pre.assign(ppl_tokens.begin(), ppl_tokens.begin() + i);
+        }
         auto lg = eng.forward_logits(pre, nullptr);
         const int tgt = ppl_tokens[static_cast<std::size_t>(i)];
         if (tgt < 0 || tgt >= static_cast<int>(lg.size())) continue;
