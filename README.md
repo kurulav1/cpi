@@ -84,6 +84,12 @@ Notes:
   host-side path is still selectable with `CPI_BATCH_TOPK=0` (an A/B lever and a safety switch).
   Grammar-constrained and n-gram-blocked requests still sample on the host, since both need the
   full vocabulary.
+- **Greedy (temperature ≤ 0) also decides on device.** A batched argmax returns one winner id per
+  row (B ints) instead of the full logit block; the repetition penalty and the min-tokens EOS
+  suppression are applied on the GPU first, so the winner matches the host token-for-token. This is
+  a smaller win than sampling — greedy's host work was already a single argmax scan, so only the
+  bus transfer is saved — but still lifts Llama-3.1-8B batch 64 from **1795 to 2469 tok/s** (1.38×).
+  Selectable with `CPI_BATCH_ARGMAX=0`.
 - **Shared-prefix reuse**: concurrent requests that share a leading prefix (a common system prompt, a
   multi-turn chat) adopt each other's cached KV blocks instead of re-prefilling. A small per-worker LRU
   keeps several distinct prefixes live at once, so interleaved requests don't evict each other; on a long

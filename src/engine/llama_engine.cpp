@@ -850,6 +850,15 @@ LlamaEngine::~LlamaEngine() {
     d_seen_rows_ = nullptr;
   }
   d_seen_cap_ = 0;
+  if (d_argmax_blocked_) {
+    cudaFree(d_argmax_blocked_);
+    d_argmax_blocked_ = nullptr;
+  }
+  if (d_argmax_out_) {
+    cudaFree(d_argmax_out_);
+    d_argmax_out_ = nullptr;
+  }
+  d_argmax_cap_ = 0;
   if (d_bs_scratch_m_) {
     cudaFree(d_bs_scratch_m_);
     d_bs_scratch_m_ = nullptr;

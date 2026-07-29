@@ -427,6 +427,13 @@ public:
                                 const BatchTopkParams& sp,
                                 std::vector<std::vector<detail::SampleCandidate>>& out_cand);
 
+  // Greedy device argmax over a batched decode step: returns each row's winner id in out_ids
+  // (resized to batch) via a device reduction, sanitizing + applying repetition penalty on-device
+  // so the winners match the host greedy path. Returns false only if the batch is empty.
+  bool decode_step_batched_argmax(const std::vector<int>& tokens, const std::vector<int>& positions,
+                                  const std::vector<int>& block_tables_flat, int max_blocks,
+                                  const BatchArgmaxParams& ap, std::vector<int>& out_ids);
+
   // Parity gate for decode_step_batched: prefill `prompt_tokens`, then for
   // `num_steps` decode steps compare the batched path (N=1 and N=2 duplicate
   // rows) against the single-token path token-for-token. Prints PASS/FAIL.
@@ -523,6 +530,10 @@ private:
   int* d_seen_ids_ = nullptr;
   int* d_seen_rows_ = nullptr;
   int d_seen_cap_ = 0;  // pairs
+  // Device scratch for the greedy argmax fast path: per-row blocked id and per-row winner id.
+  int* d_argmax_blocked_ = nullptr;
+  int* d_argmax_out_ = nullptr;
+  int d_argmax_cap_ = 0;  // rows
   // Persistent split-K attention scratch for batched decode (grown on demand).
   float* d_bs_scratch_m_ = nullptr;
   float* d_bs_scratch_l_ = nullptr;

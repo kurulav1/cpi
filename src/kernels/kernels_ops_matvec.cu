@@ -874,6 +874,52 @@ __global__ void argmax_float_kernel(const float* logits, int n, int* out_index) 
     }
   }
 }
+
+// Batched greedy argmax: one block per row, argmax over that row's vocab logits. Sanitizes inline
+// (non-finite -> -inf, clamp to +/-80) so the winner matches the host greedy path, which clamps
+// before argmax -- the clamp changes ties when two logits both exceed +/-80. blocked[b] is an id
+// to exclude (the host sets its logit to -inf to suppress EOS below min_new_tokens); -1 means none.
+// Lowest index wins ties, matching std::max_element.
+__global__ void batched_argmax_sanitized_kernel(const float* logits, int vocab, const int* blocked,
+                                                int* out_ids) {
+  const int b = blockIdx.x;
+  const float* row = logits + static_cast<long>(b) * vocab;
+  const int blk = (blocked != nullptr) ? blocked[b] : -1;
+  const int tid = threadIdx.x;
+  const int lane = tid & (warpSize - 1);
+  const int warp = tid / warpSize;
+  const int warp_count = (blockDim.x + warpSize - 1) / warpSize;
+  __shared__ float warp_max[32];
+  __shared__ int warp_idx[32];
+
+  float local_max = -3.402823466e+38F;
+  int local_idx = 0;
+  for (int i = tid; i < vocab; i += blockDim.x) {
+    if (i == blk) continue;
+    float v = row[i];
+    v = isfinite(v) ? fminf(80.0f, fmaxf(-80.0f, v)) : -INFINITY;
+    if (v > local_max) {
+      local_max = v;
+      local_idx = i;
+    }
+  }
+
+  warp_argmax(local_max, local_idx);
+  if (lane == 0) {
+    warp_max[warp] = local_max;
+    warp_idx[warp] = local_idx;
+  }
+  __syncthreads();
+
+  if (warp == 0) {
+    float block_max = (lane < warp_count) ? warp_max[lane] : -3.402823466e+38F;
+    int block_idx = (lane < warp_count) ? warp_idx[lane] : 0;
+    warp_argmax(block_max, block_idx);
+    if (lane == 0) {
+      out_ids[b] = block_idx;
+    }
+  }
+}
 }  // namespace
 
 // Host launch wrappers for pointwise/quant/matvec/projection kernels.
@@ -1853,6 +1899,14 @@ void launch_repetition_penalty(float* logits, int vocab, const int* seen_ids, co
   const int blocks = (total + threads - 1) / threads;
   repetition_penalty_kernel<<<blocks, threads, 0, stream>>>(logits, vocab, seen_ids, seen_rows,
                                                             penalties, total);
+}
+
+void launch_batched_argmax(const float* logits, int vocab, const int* blocked, int* out_ids,
+                           int batch, cudaStream_t stream) {
+  if (batch <= 0) return;
+  constexpr int threads = 256;  // one block per row, full-vocab strided reduction
+  batched_argmax_sanitized_kernel<<<static_cast<unsigned>(batch), threads, 0, stream>>>(
+      logits, vocab, blocked, out_ids);
 }
 
 }  // namespace kernels

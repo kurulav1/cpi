@@ -1259,6 +1259,13 @@ void launch_sanitize_penalty_rows(float* logits, int vocab, const float* penalti
 void launch_repetition_penalty(float* logits, int vocab, const int* seen_ids, const int* seen_rows,
                                const float* penalties, int total, cudaStream_t stream);
 
+// Batched greedy argmax over [batch][vocab] logits: one winner id per row into out_ids[batch].
+// Sanitizes inline (non-finite -> -inf, clamp [+-80]) so the winner matches the host greedy path.
+// blocked[batch] is a per-row id to exclude (EOS suppression below min_new_tokens); pass nullptr
+// or -1 entries for none. For penalty rows, run sanitize + penalty first (as the top-k path does).
+void launch_batched_argmax(const float* logits, int vocab, const int* blocked, int* out_ids,
+                           int batch, cudaStream_t stream);
+
 // launch_convert_bf16_to_fp16
 //
 // Converts raw BF16 bit patterns to fp16:

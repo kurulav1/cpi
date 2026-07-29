@@ -78,6 +78,17 @@ struct BatchTopkParams {
   std::vector<int> penalty_rows;  // parallel to penalty_ids: which row each id belongs to
 };
 
+// Per-row inputs to the device greedy (argmax) fast path. Same penalty layout as BatchTopkParams
+// (the argmax is taken over the penalized, sanitized logits, matching the host greedy path);
+// blocked[b] is a token id to exclude for row b (the EOS id when the row is still below
+// min_new_tokens), or -1 for none.
+struct BatchArgmaxParams {
+  std::vector<float> penalty;     // [batch] per-row repetition_penalty (<= 1 => none)
+  std::vector<int> penalty_ids;   // flattened unique seen ids across penalty rows
+  std::vector<int> penalty_rows;  // parallel to penalty_ids: which row each id belongs to
+  std::vector<int> blocked;       // [batch] id to exclude (EOS below min_new), -1 = none
+};
+
 // What the scheduler needs from a GPU. Two calls.
 class BatchBackend {
 public:
@@ -117,6 +128,24 @@ public:
     (void)max_blocks;
     (void)sp;
     (void)out_cand;
+    return false;
+  }
+
+  // Optional fast path for GREEDY rows (temperature <= 0): one decode step returning each row's
+  // argmax token via a DEVICE reduction, so only B ints cross to the host instead of the full
+  // [batch][vocab] logits. Returns false when the backend has no device argmax. The caller
+  // guarantees the batch needs no full-vocabulary host feature (n-gram blocking, grammar) and that
+  // every row is greedy; repetition penalty is applied on-device before the argmax.
+  virtual bool decode_batched_argmax(const std::vector<int>& tokens,
+                                     const std::vector<int>& positions,
+                                     const std::vector<int>& block_tables_flat, int max_blocks,
+                                     const BatchArgmaxParams& ap, std::vector<int>& out_ids) {
+    (void)tokens;
+    (void)positions;
+    (void)block_tables_flat;
+    (void)max_blocks;
+    (void)ap;
+    (void)out_ids;
     return false;
   }
 };
@@ -191,7 +220,9 @@ private:
   std::vector<std::vector<float>> batch_logits_scratch_;
   // Reused per-row candidate scratch for the device top-k fast path.
   std::vector<std::vector<detail::SampleCandidate>> batch_cand_scratch_;
-  BatchTopkParams batch_topk_scratch_;  // reused per-row k / penalty / seen-id inputs
+  BatchTopkParams batch_topk_scratch_;      // reused per-row k / penalty / seen-id inputs
+  BatchArgmaxParams batch_argmax_scratch_;  // reused per-row penalty / blocked inputs (greedy path)
+  std::vector<int> batch_argmax_out_;       // reused per-row winner ids (greedy path)
   std::vector<CachedPrefix> prefix_cache_;
   std::uint64_t prefix_cache_tick_ = 0;
   static constexpr std::size_t kPrefixCacheEntries = 32;

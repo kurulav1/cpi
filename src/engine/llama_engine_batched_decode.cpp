@@ -483,6 +483,140 @@ bool LlamaEngine::decode_step_batched_topk(
   return true;
 }
 
+bool LlamaEngine::decode_step_batched_argmax(const std::vector<int>& tokens,
+                                             const std::vector<int>& positions,
+                                             const std::vector<int>& block_tables_flat,
+                                             int max_blocks, const BatchArgmaxParams& ap,
+                                             std::vector<int>& out_ids) {
+  const int vocab = weights_.config().vocab_size;
+  const int batch = decode_step_batched_forward(tokens, positions, block_tables_flat, max_blocks);
+  out_ids.resize(static_cast<std::size_t>(batch));
+  if (batch == 0) return false;
+  if (static_cast<int>(ap.penalty.size()) != batch ||
+      static_cast<int>(ap.blocked.size()) != batch) {
+    return false;
+  }
+  const int hidden = weights_.config().hidden_size;
+  batched_lm_head(batch, hidden, vocab);
+
+  // In verify mode, snapshot the raw (pre-penalty) logits so the host reference can reproduce the
+  // whole greedy path independently. batched_lm_head wrote on compute_stream_, so sync first.
+  static const bool verify = std::getenv("CPI_BATCH_TOPK_VERIFY") != nullptr;
+  std::vector<float> raw;
+  if (verify) {
+    CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
+    raw.resize(static_cast<std::size_t>(batch) * vocab);
+    CUDA_CHECK(cudaMemcpy(raw.data(), d_batch_logits_, raw.size() * sizeof(float),
+                          cudaMemcpyDeviceToHost));
+  }
+
+  // Repetition penalty on-device for penalty rows: sanitize the row, then scale each unique seen
+  // id -- identical to the top-k path, so the argmax runs on the same logits the host would. The
+  // argmax kernel also sanitizes inline, so NON-penalty rows need no separate sanitize here.
+  bool any_penalty = false;
+  for (float p : ap.penalty)
+    if (p > 1.0f) {
+      any_penalty = true;
+      break;
+    }
+  if (any_penalty) {
+    if (batch > d_penalty_cap_) {
+      if (d_penalty_) {
+        cudaFree(d_penalty_);
+        d_penalty_ = nullptr;
+        d_penalty_cap_ = 0;
+      }
+      CUDA_CHECK(cudaMalloc(&d_penalty_, static_cast<std::size_t>(batch) * sizeof(float)));
+      d_penalty_cap_ = batch;
+    }
+    CUDA_CHECK(cudaMemcpyAsync(d_penalty_, ap.penalty.data(),
+                               static_cast<std::size_t>(batch) * sizeof(float),
+                               cudaMemcpyHostToDevice, compute_stream_));
+    kernels::launch_sanitize_penalty_rows(d_batch_logits_, vocab, d_penalty_, batch,
+                                          compute_stream_);
+    const int total = static_cast<int>(ap.penalty_ids.size());
+    if (total > 0) {
+      if (total > d_seen_cap_) {
+        if (d_seen_ids_) {
+          cudaFree(d_seen_ids_);
+          d_seen_ids_ = nullptr;
+        }
+        if (d_seen_rows_) {
+          cudaFree(d_seen_rows_);
+          d_seen_rows_ = nullptr;
+        }
+        d_seen_cap_ = 0;
+        CUDA_CHECK(cudaMalloc(&d_seen_ids_, static_cast<std::size_t>(total) * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_seen_rows_, static_cast<std::size_t>(total) * sizeof(int)));
+        d_seen_cap_ = total;
+      }
+      CUDA_CHECK(cudaMemcpyAsync(d_seen_ids_, ap.penalty_ids.data(),
+                                 static_cast<std::size_t>(total) * sizeof(int),
+                                 cudaMemcpyHostToDevice, compute_stream_));
+      CUDA_CHECK(cudaMemcpyAsync(d_seen_rows_, ap.penalty_rows.data(),
+                                 static_cast<std::size_t>(total) * sizeof(int),
+                                 cudaMemcpyHostToDevice, compute_stream_));
+      kernels::launch_repetition_penalty(d_batch_logits_, vocab, d_seen_ids_, d_seen_rows_,
+                                         d_penalty_, total, compute_stream_);
+    }
+  }
+
+  // Grow the argmax buffers and upload the per-row blocked id, then reduce.
+  if (batch > d_argmax_cap_) {
+    if (d_argmax_blocked_) {
+      cudaFree(d_argmax_blocked_);
+      d_argmax_blocked_ = nullptr;
+    }
+    if (d_argmax_out_) {
+      cudaFree(d_argmax_out_);
+      d_argmax_out_ = nullptr;
+    }
+    d_argmax_cap_ = 0;
+    CUDA_CHECK(cudaMalloc(&d_argmax_blocked_, static_cast<std::size_t>(batch) * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_argmax_out_, static_cast<std::size_t>(batch) * sizeof(int)));
+    d_argmax_cap_ = batch;
+  }
+  CUDA_CHECK(cudaMemcpyAsync(d_argmax_blocked_, ap.blocked.data(),
+                             static_cast<std::size_t>(batch) * sizeof(int), cudaMemcpyHostToDevice,
+                             compute_stream_));
+  kernels::launch_batched_argmax(d_batch_logits_, vocab, d_argmax_blocked_, d_argmax_out_, batch,
+                                 compute_stream_);
+  CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
+  CUDA_CHECK(cudaMemcpy(out_ids.data(), d_argmax_out_,
+                        static_cast<std::size_t>(batch) * sizeof(int), cudaMemcpyDeviceToHost));
+
+  // CPI_BATCH_TOPK_VERIFY=1: rebuild the winner the host greedy path would pick from the RAW logits
+  // (sanitize all -> repetition penalty -> block EOS -> argmax) and compare. The inline re-clamp in
+  // the kernel only touches values already <= -80 or a shrunk positive, so it never changes which
+  // id wins; the reference deliberately does not re-clamp after the penalty, matching the host.
+  if (verify) {
+    for (int b = 0; b < batch; ++b) {
+      std::vector<float> host(raw.begin() + static_cast<std::ptrdiff_t>(b) * vocab,
+                              raw.begin() + static_cast<std::ptrdiff_t>(b + 1) * vocab);
+      for (float& v : host) v = std::isfinite(v) ? std::min(80.0f, std::max(-80.0f, v)) : -INFINITY;
+      const float p = ap.penalty[static_cast<std::size_t>(b)];
+      if (p > 1.0f) {
+        for (std::size_t i = 0; i < ap.penalty_ids.size(); ++i) {
+          if (ap.penalty_rows[i] != b) continue;
+          const int id = ap.penalty_ids[i];
+          if (id >= 0 && id < vocab)
+            host[static_cast<std::size_t>(id)] = host[static_cast<std::size_t>(id)] > 0.0f
+                                                     ? host[static_cast<std::size_t>(id)] / p
+                                                     : host[static_cast<std::size_t>(id)] * p;
+        }
+      }
+      const int blk = ap.blocked[static_cast<std::size_t>(b)];
+      if (blk >= 0 && blk < vocab) host[static_cast<std::size_t>(blk)] = -INFINITY;
+      const int ref = static_cast<int>(std::max_element(host.begin(), host.end()) - host.begin());
+      if (ref != out_ids[static_cast<std::size_t>(b)]) {
+        std::fprintf(stderr, "[argmax-verify] MISMATCH row=%d device=%d host=%d\n", b,
+                     out_ids[static_cast<std::size_t>(b)], ref);
+      }
+    }
+  }
+  return true;
+}
+
 void LlamaEngine::run_batched_decode_check(const std::vector<int>& prompt_tokens, int num_steps) {
   if (!options_.paged_blocks || !seq_blocks_) {
     throw std::runtime_error("batched-decode check requires --paged-blocks");
@@ -615,6 +749,13 @@ public:
                            std::vector<std::vector<detail::SampleCandidate>>& out_cand) override {
     return e_->decode_step_batched_topk(tokens, positions, block_tables_flat, max_blocks, sp,
                                         out_cand);
+  }
+
+  bool decode_batched_argmax(const std::vector<int>& tokens, const std::vector<int>& positions,
+                             const std::vector<int>& block_tables_flat, int max_blocks,
+                             const BatchArgmaxParams& ap, std::vector<int>& out_ids) override {
+    return e_->decode_step_batched_argmax(tokens, positions, block_tables_flat, max_blocks, ap,
+                                          out_ids);
   }
 
 private:

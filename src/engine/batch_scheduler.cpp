@@ -225,6 +225,51 @@ bool BatchScheduler::step(std::vector<StreamEvent>& events) {
     }
   }
 
+  // Try the device greedy (argmax) fast path when the top-k path did not run: a batch of greedy
+  // rows returns B winner ids via a device reduction instead of shipping [batch][vocab] logits for
+  // a host argmax. Eligible only if EVERY row is greedy (temperature <= 0) with no grammar and no
+  // n-gram blocking (both need the full vocab on the host); repetition penalty is applied on-device
+  // before the argmax, and EOS is excluded per row while below min_new_tokens.
+  // CPI_BATCH_ARGMAX=0 forces the full-logits path (A/B lever and a safety switch).
+  static const bool argmax_enabled = [] {
+    const char* e = std::getenv("CPI_BATCH_ARGMAX");
+    return e == nullptr || e[0] != '0';
+  }();
+  bool used_argmax = false;
+  if (!used_topk && argmax_enabled) {
+    bool eligible = true;
+    BatchArgmaxParams& ap = batch_argmax_scratch_;
+    ap.penalty.clear();
+    ap.penalty_ids.clear();
+    ap.penalty_rows.clear();
+    ap.blocked.clear();
+    for (int b = 0; b < B; ++b) {
+      const StreamSeq& s = seqs_[static_cast<std::size_t>(b)];
+      const StreamParams& pr = s.params;
+      if (pr.grammar || pr.temperature > 0.0f || pr.no_repeat_ngram_size > 1) {
+        eligible = false;
+        break;
+      }
+      ap.penalty.push_back(pr.repetition_penalty);
+      if (pr.repetition_penalty > 1.0f) {
+        const auto& hist = s.history;
+        std::unordered_set<int> seen(hist.begin(), hist.end());
+        for (int id : seen) {
+          ap.penalty_ids.push_back(id);
+          ap.penalty_rows.push_back(b);
+        }
+      }
+      // Suppress EOS below the min_new floor by excluding it from the argmax (the argmax-path
+      // equivalent of the -inf logit the full path sets).
+      const bool block_eos = s.generated < pr.min_new_tokens && opts_.eos_token_id >= 0;
+      ap.blocked.push_back(block_eos ? opts_.eos_token_id : -1);
+    }
+    if (eligible) {
+      used_argmax =
+          backend_->decode_batched_argmax(toks, poss, flat, max_blocks, ap, batch_argmax_out_);
+    }
+  }
+
   std::vector<int> finished;  // indices into seqs_
   // Common post-sample bookkeeping, shared by both the candidate and full-logits paths.
   auto finish_row = [&](int b, int tok) {
@@ -264,6 +309,11 @@ bool BatchScheduler::step(std::vector<StreamEvent>& events) {
       }
       finish_row(
           b, detail::dispatch_sample_from_candidates(cand, s.params.temperature, s.params.top_p));
+    }
+  } else if (used_argmax) {
+    // Device already picked each row's winner (penalty + EOS suppression applied on-device).
+    for (int b = 0; b < B; ++b) {
+      finish_row(b, batch_argmax_out_[static_cast<std::size_t>(b)]);
     }
   } else {
     std::vector<std::vector<float>>& logits = batch_logits_scratch_;
