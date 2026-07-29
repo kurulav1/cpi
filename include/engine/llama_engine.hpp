@@ -415,6 +415,15 @@ public:
                                   const std::vector<int>& block_tables_flat, int max_blocks,
                                   std::vector<std::vector<float>>& out_logits);
 
+  // Device top-k fast path for the streaming batcher: same forward as decode_step_batched_logits,
+  // then a per-row device top-k + gather so only each row's ~k candidates cross to the host (not
+  // the full vocab). out_cand[b] is the row's candidate set, index-sorted to match the host
+  // sampler. Returns false (caller falls back to the logits path) when k is out of the device
+  // top-k range or a row hits a pathological tie count.
+  bool decode_step_batched_topk(const std::vector<int>& tokens, const std::vector<int>& positions,
+                                const std::vector<int>& block_tables_flat, int max_blocks, int k,
+                                std::vector<std::vector<detail::SampleCandidate>>& out_cand);
+
   // Parity gate for decode_step_batched: prefill `prompt_tokens`, then for
   // `num_steps` decode steps compare the batched path (N=1 and N=2 duplicate
   // rows) against the single-token path token-for-token. Prints PASS/FAIL.

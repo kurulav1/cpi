@@ -14,7 +14,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
+#include <functional>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
@@ -317,6 +319,87 @@ void LlamaEngine::decode_step_batched_logits(const std::vector<int>& tokens,
     prof_head_s_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
 }
 
+bool LlamaEngine::decode_step_batched_topk(const std::vector<int>& tokens,
+                                           const std::vector<int>& positions,
+                                           const std::vector<int>& block_tables_flat, int max_blocks,
+                                           int k,
+                                           std::vector<std::vector<detail::SampleCandidate>>& out_cand) {
+  // MUST match llama_engine_graph.cpp: the shared d_topk_/d_cand_ buffers are sized to these.
+  constexpr int kMaxDeviceTopK = 1024;
+  constexpr int kCandCapacity = 4096;
+  const int vocab = weights_.config().vocab_size;
+  if (k <= 0 || k > kMaxDeviceTopK || k >= vocab) return false;
+
+  const int batch = decode_step_batched_forward(tokens, positions, block_tables_flat, max_blocks);
+  out_cand.resize(static_cast<std::size_t>(batch));
+  if (batch == 0) return true;
+  const int hidden = weights_.config().hidden_size;
+  batched_lm_head(batch, hidden, vocab);
+  ensure_device_topk_buffers();
+
+  // Per row: device top-k (the k-th value is the threshold) then a gather of every finite logit
+  // >= threshold -- exactly the candidate set sample_from_logits_topk builds on the host, so only
+  // those (a few dozen) cross the bus instead of the full vocab. Same logic as the single-sequence
+  // graph path, looped over the batch's rows.
+  for (int b = 0; b < batch; ++b) {
+    const float* row = d_batch_logits_ + static_cast<std::size_t>(b) * vocab;
+    CUDA_CHECK(cudaMemsetAsync(d_cand_count_, 0, sizeof(int), compute_stream_));
+    kernels::launch_topk_float(row, vocab, k, d_topk_part_val_, d_topk_part_idx_, d_topk_val_,
+                               d_topk_idx_, compute_stream_);
+    kernels::launch_gather_ge_threshold(row, vocab, d_topk_val_ + (k - 1), d_cand_idx_, d_cand_val_,
+                                        d_cand_count_, kCandCapacity, compute_stream_);
+    CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
+
+    int count = 0;
+    CUDA_CHECK(cudaMemcpy(&count, d_cand_count_, sizeof(int), cudaMemcpyDeviceToHost));
+    if (count <= 0 || count > kCandCapacity) return false;  // pathological tie -> caller falls back
+    std::vector<int> idx(static_cast<std::size_t>(count));
+    std::vector<float> val(static_cast<std::size_t>(count));
+    CUDA_CHECK(cudaMemcpy(idx.data(), d_cand_idx_, static_cast<std::size_t>(count) * sizeof(int),
+                          cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(val.data(), d_cand_val_, static_cast<std::size_t>(count) * sizeof(float),
+                          cudaMemcpyDeviceToHost));
+    auto& cand = out_cand[static_cast<std::size_t>(b)];
+    cand.resize(static_cast<std::size_t>(count));
+    for (int i = 0; i < count; ++i) {
+      cand[static_cast<std::size_t>(i)] = {idx[static_cast<std::size_t>(i)],
+                                           val[static_cast<std::size_t>(i)]};
+    }
+    // The gather appends atomically (arbitrary order); the host builds in index order. Sort to
+    // match so a seeded run produces the same token as the host path.
+    std::sort(cand.begin(), cand.end(),
+              [](const detail::SampleCandidate& a, const detail::SampleCandidate& b) {
+                return a.id < b.id;
+              });
+
+    // CPI_BATCH_TOPK_VERIFY=1: prove the device candidate set equals what the host sampler would
+    // build from the full logits (the k-th largest as threshold, every finite logit >= it). If
+    // the ID sets ever differ, the fast path could sample a different token than the full path.
+    static const bool verify = std::getenv("CPI_BATCH_TOPK_VERIFY") != nullptr;
+    if (verify) {
+      std::vector<float> host(static_cast<std::size_t>(vocab));
+      CUDA_CHECK(cudaMemcpy(host.data(), row, static_cast<std::size_t>(vocab) * sizeof(float),
+                            cudaMemcpyDeviceToHost));
+      std::vector<float> part(host);
+      std::nth_element(part.begin(), part.begin() + (k - 1), part.end(), std::greater<float>());
+      const float kth = part[static_cast<std::size_t>(k - 1)];
+      std::vector<int> ref;
+      for (int i = 0; i < vocab; ++i)
+        if (std::isfinite(host[static_cast<std::size_t>(i)]) && host[static_cast<std::size_t>(i)] >= kth)
+          ref.push_back(i);
+      std::vector<int> got;
+      got.reserve(cand.size());
+      for (const auto& c : cand) got.push_back(c.id);
+      std::sort(ref.begin(), ref.end());
+      if (ref != got) {
+        std::fprintf(stderr, "[topk-verify] MISMATCH row=%d device=%zu host=%zu\n", b, got.size(),
+                     ref.size());
+      }
+    }
+  }
+  return true;
+}
+
 void LlamaEngine::run_batched_decode_check(const std::vector<int>& prompt_tokens, int num_steps) {
   if (!options_.paged_blocks || !seq_blocks_) {
     throw std::runtime_error("batched-decode check requires --paged-blocks");
@@ -441,6 +524,13 @@ public:
                              const std::vector<int>& block_tables_flat, int max_blocks,
                              std::vector<std::vector<float>>& out_logits) override {
     e_->decode_step_batched_logits(tokens, positions, block_tables_flat, max_blocks, out_logits);
+  }
+
+  bool decode_batched_topk(const std::vector<int>& tokens, const std::vector<int>& positions,
+                           const std::vector<int>& block_tables_flat, int max_blocks, int k,
+                           std::vector<std::vector<detail::SampleCandidate>>& out_cand) override {
+    return e_->decode_step_batched_topk(tokens, positions, block_tables_flat, max_blocks, k,
+                                        out_cand);
   }
 
 private:

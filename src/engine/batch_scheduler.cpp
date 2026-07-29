@@ -178,31 +178,40 @@ bool BatchScheduler::step(std::vector<StreamEvent>& events) {
     }
   }
 
-  std::vector<std::vector<float>>& logits = batch_logits_scratch_;
-  backend_->decode_batched_logits(toks, poss, flat, max_blocks, logits);
-
-  // Sample each row with its own params/grammar, then retire finished requests.
-  std::vector<int> finished;  // indices into seqs_
-  for (int b = 0; b < B; ++b) {
-    StreamSeq& s = seqs_[static_cast<std::size_t>(b)];
-    std::vector<float>& lg = logits[static_cast<std::size_t>(b)];
-
-    if (s.params.grammar) s.params.grammar->apply_mask(lg);
-    // Suppress EOS until min_new_tokens (skip when a grammar drives termination).
-    if (s.generated < s.params.min_new_tokens && !s.params.grammar && opts_.eos_token_id >= 0 &&
-        static_cast<std::size_t>(opts_.eos_token_id) < lg.size()) {
-      lg[static_cast<std::size_t>(opts_.eos_token_id)] = -std::numeric_limits<float>::infinity();
+  // Try the device top-k fast path: only ~k candidates/row cross to the host instead of the full
+  // [batch][vocab] logits. Valid only without full-vocabulary features (repetition penalty,
+  // n-gram blocking) and without any grammar, and only when every row actually samples
+  // (temperature > 0). Anything else uses the full-logits path.
+  // CPI_BATCH_TOPK=0 forces the full-logits path (A/B lever and a safety switch).
+  static const bool topk_enabled = [] {
+    const char* e = std::getenv("CPI_BATCH_TOPK");
+    return e == nullptr || e[0] != '0';
+  }();
+  bool used_topk = false;
+  if (topk_enabled && opts_.top_k > 0 && opts_.repetition_penalty <= 1.0f &&
+      opts_.no_repeat_ngram_size <= 1) {
+    bool eligible = true;
+    for (const auto& s : seqs_) {
+      if (s.params.grammar || s.params.temperature <= 0.0f) {
+        eligible = false;
+        break;
+      }
     }
+    if (eligible) {
+      used_topk = backend_->decode_batched_topk(toks, poss, flat, max_blocks, opts_.top_k,
+                                                 batch_cand_scratch_);
+    }
+  }
 
-    const int tok = detail::dispatch_sample_from_logits(lg, s.params.temperature, opts_.top_k,
-                                                        opts_.top_p, opts_.repetition_penalty,
-                                                        opts_.no_repeat_ngram_size, s.history);
+  std::vector<int> finished;  // indices into seqs_
+  // Common post-sample bookkeeping, shared by both the candidate and full-logits paths.
+  auto finish_row = [&](int b, int tok) {
+    StreamSeq& s = seqs_[static_cast<std::size_t>(b)];
     if (s.params.grammar) s.params.grammar->accept(tok);
     s.history.push_back(tok);
     s.last_token = tok;
     ++s.pos;
     ++s.generated;
-
     const bool is_stop =
         std::find(s.params.stop_ids.begin(), s.params.stop_ids.end(), tok) != s.params.stop_ids.end();
     const char* reason = "";
@@ -216,6 +225,39 @@ bool BatchScheduler::step(std::vector<StreamEvent>& events) {
     }
     events.push_back(StreamEvent{s.id, tok, fin, reason});
     if (fin) finished.push_back(b);
+  };
+
+  if (used_topk) {
+    for (int b = 0; b < B; ++b) {
+      StreamSeq& s = seqs_[static_cast<std::size_t>(b)];
+      auto& cand = batch_cand_scratch_[static_cast<std::size_t>(b)];
+      // min_new_tokens: below the floor, drop EOS from the candidate set (the candidate-path
+      // equivalent of the -inf logit the full path sets).
+      if (s.generated < s.params.min_new_tokens && opts_.eos_token_id >= 0) {
+        cand.erase(std::remove_if(cand.begin(), cand.end(),
+                                  [&](const detail::SampleCandidate& c) {
+                                    return c.id == opts_.eos_token_id;
+                                  }),
+                   cand.end());
+      }
+      finish_row(b, detail::dispatch_sample_from_candidates(cand, s.params.temperature, opts_.top_p));
+    }
+  } else {
+    std::vector<std::vector<float>>& logits = batch_logits_scratch_;
+    backend_->decode_batched_logits(toks, poss, flat, max_blocks, logits);
+    for (int b = 0; b < B; ++b) {
+      StreamSeq& s = seqs_[static_cast<std::size_t>(b)];
+      std::vector<float>& lg = logits[static_cast<std::size_t>(b)];
+      if (s.params.grammar) s.params.grammar->apply_mask(lg);
+      // Suppress EOS until min_new_tokens (skip when a grammar drives termination).
+      if (s.generated < s.params.min_new_tokens && !s.params.grammar && opts_.eos_token_id >= 0 &&
+          static_cast<std::size_t>(opts_.eos_token_id) < lg.size()) {
+        lg[static_cast<std::size_t>(opts_.eos_token_id)] = -std::numeric_limits<float>::infinity();
+      }
+      finish_row(b, detail::dispatch_sample_from_logits(
+                        lg, s.params.temperature, opts_.top_k, opts_.top_p,
+                        opts_.repetition_penalty, opts_.no_repeat_ngram_size, s.history));
+    }
   }
 
   // Free finished requests' blocks and remove them (iterate high->low to keep indices valid).

@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "engine/paged_kv.hpp"
+#include "engine/sampling.hpp"
 
 namespace grammar {
 class GrammarSampler;
@@ -78,6 +79,24 @@ public:
                                      const std::vector<int>& positions,
                                      const std::vector<int>& block_tables_flat, int max_blocks,
                                      std::vector<std::vector<float>>& out_logits) = 0;
+
+  // Optional fast path: one decode step returning each row's top-k candidate set via a DEVICE
+  // top-k reduction, so only ~k candidates per row cross to the host instead of the full
+  // [batch][vocab] logits. Returns false when the backend has no device top-k or k is unusable
+  // (the caller then falls back to decode_batched_logits). The caller guarantees the batch needs
+  // no full-vocabulary features (repetition penalty, n-gram blocking, grammar) and that every
+  // row samples (temperature > 0), so the candidate set is exactly what the host sampler builds.
+  virtual bool decode_batched_topk(const std::vector<int>& tokens, const std::vector<int>& positions,
+                                   const std::vector<int>& block_tables_flat, int max_blocks, int k,
+                                   std::vector<std::vector<detail::SampleCandidate>>& out_cand) {
+    (void)tokens;
+    (void)positions;
+    (void)block_tables_flat;
+    (void)max_blocks;
+    (void)k;
+    (void)out_cand;
+    return false;
+  }
 };
 
 // Sampling and limits the scheduler applies. These mirror the engine options the CUDA path
@@ -152,6 +171,8 @@ private:
   // Reused across steps so per-row logit buffers keep their vocab-sized capacity instead of
   // reallocating every decode step (the backend fills it via decode_batched_logits).
   std::vector<std::vector<float>> batch_logits_scratch_;
+  // Reused per-row candidate scratch for the device top-k fast path.
+  std::vector<std::vector<detail::SampleCandidate>> batch_cand_scratch_;
   std::vector<CachedPrefix> prefix_cache_;
   std::uint64_t prefix_cache_tick_ = 0;
   static constexpr std::size_t kPrefixCacheEntries = 32;
