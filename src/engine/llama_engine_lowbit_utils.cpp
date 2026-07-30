@@ -130,6 +130,43 @@ void quantize_rowwise_to_int8(const __half* src, int rows, int cols, int quant_b
   }
 }
 
+void quantize_groupwise_to_int8(const __half* src, int rows, int cols, int group, int quant_bits,
+                                std::int8_t* dst, float* scales) {
+  if (group <= 0 || group >= cols) {
+    quantize_rowwise_to_int8(src, rows, cols, quant_bits, dst, scales);
+    return;
+  }
+  const int max_q = streaming_quant_maxq(quant_bits);
+  const float max_q_f = static_cast<float>(max_q);
+  const int n_groups = (cols + group - 1) / group;
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+  for (int row = 0; row < rows; ++row) {
+    const std::size_t row_off = static_cast<std::size_t>(row) * static_cast<std::size_t>(cols);
+    const std::size_t scale_row = static_cast<std::size_t>(row) * static_cast<std::size_t>(n_groups);
+    for (int g = 0; g < n_groups; ++g) {
+      const int c0 = g * group;
+      const int c1 = std::min(cols, c0 + group);
+      float max_abs = 0.0f;
+      for (int col = c0; col < c1; ++col) {
+        max_abs =
+            std::max(max_abs, std::abs(__half2float(src[row_off + static_cast<std::size_t>(col)])));
+      }
+      float scale = max_abs / max_q_f;
+      if (scale < kMinRowwiseQuantScale) {
+        scale = kMinRowwiseQuantScale;
+      }
+      scales[scale_row + static_cast<std::size_t>(g)] = scale;
+      for (int col = c0; col < c1; ++col) {
+        const float q = __half2float(src[row_off + static_cast<std::size_t>(col)]) / scale;
+        const float clamped = std::max(-max_q_f, std::min(max_q_f, q));
+        dst[row_off + static_cast<std::size_t>(col)] = static_cast<std::int8_t>(std::lrint(clamped));
+      }
+    }
+  }
+}
+
 void unpack_rowwise_int4_to_int8(const std::int8_t* src, int rows, int cols, std::int8_t* dst) {
   const int packed_cols = (cols + 1) / 2;
   for (int row = 0; row < rows; ++row) {

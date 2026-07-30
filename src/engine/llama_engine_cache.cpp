@@ -100,6 +100,27 @@ void LlamaEngine::init_layer_cache() {
   // Attention projections cache at INT8 by default for quality. CPI_PROJ_INT4=1 caches them at
   // INT4 too (saves ~1.9 GB on the 32B) -- opt-in until the quality delta is validated per model.
   const bool enable_proj_int4 = quant_bits == 4 && std::getenv("CPI_PROJ_INT4") != nullptr;
+  // CPI_MLP_INT4_GROUP=N (power of two, e.g. 128) stores MLP int4 weights with one scale per group
+  // of N input columns instead of one per row -- ~18% -> ~11% weight error (llama.cpp Q4_0 uses
+  // block-32). Opt-in until validated per model. Only valid when the resident dp4a decode funnel is
+  // used (hidden/inter %4 == 0) and the model stores fp16 MLP weights on disk (we quantize on load);
+  // otherwise the non-dp4a fallback would misread the grouped scales, so we stay per-row there.
+  mlp_quant_group_ = 0;
+  if (quant_bits == 4) {
+    if (const char* g = std::getenv("CPI_MLP_INT4_GROUP")) {
+      const int gv = std::atoi(g);
+      if (gv > 0 && (gv & (gv - 1)) == 0) {
+        mlp_quant_group_ = gv;
+      }
+    }
+  }
+  const bool model_fp16_mlp = weights_.has_tensor("layers.0.feed_forward.w1") &&
+                              !has_packed_int4_tensor(weights_, "layers.0.feed_forward.w1") &&
+                              !has_packed_int8_tensor(weights_, "layers.0.feed_forward.w1");
+  const int mlp_gq =
+      (mlp_quant_group_ > 0 && (hidden & 3) == 0 && (inter & 3) == 0 && model_fp16_mlp)
+          ? mlp_quant_group_
+          : 0;
   cached_int8_mlp_enabled_ = false;
   const std::size_t fp16_attention_bytes =
       bytes_for_matrix(q_hidden, hidden) + bytes_for_matrix(hidden, q_hidden) +
@@ -497,6 +518,10 @@ void LlamaEngine::init_layer_cache() {
         cached_int8_mlp_enabled_ && can_cache_layer_mlp_as_lowbit(weights_, layer, quant_bits);
     const bool use_cached_int4 = use_cached_int8 && (quant_bits == 4);
     lw_i8.mlp_int4 = use_cached_int4;
+    lw_i8.mlp_group = use_cached_int4 ? mlp_gq : 0;
+    // Group counts along each MLP matrix's input dimension (1 when per-row).
+    const int mlp_ng_hidden = kernels::quant_group_count(hidden, lw_i8.mlp_group);  // w1, w3 [.,hidden]
+    const int mlp_ng_inter = kernels::quant_group_count(inter, lw_i8.mlp_group);    // w2 [.,inter]
     // TQ3 path owns wqkv/wo/w13 via packed weights. Otherwise, only cache
     // projection weights in low-bit form when low-bit streaming was requested.
     const bool use_proj_int8 = !tq3_enabled_ && lowbit_streaming_enabled(options_);
@@ -539,13 +564,19 @@ void LlamaEngine::init_layer_cache() {
     const cudaError_t a7 = use_cached_int8 ? cudaMalloc(&lw_i8.w2, w2_bytes) : cudaSuccess;
     const cudaError_t a8 = use_cached_int8 ? cudaMalloc(&lw_i8.w3, w3_bytes) : cudaSuccess;
     const cudaError_t a9 =
-        use_cached_int8 ? cudaMalloc(&lw_i8.s_w1, static_cast<std::size_t>(inter) * sizeof(float))
+        use_cached_int8 ? cudaMalloc(&lw_i8.s_w1, static_cast<std::size_t>(inter) *
+                                                      static_cast<std::size_t>(mlp_ng_hidden) *
+                                                      sizeof(float))
                         : cudaSuccess;
     const cudaError_t a10 =
-        use_cached_int8 ? cudaMalloc(&lw_i8.s_w2, static_cast<std::size_t>(hidden) * sizeof(float))
+        use_cached_int8 ? cudaMalloc(&lw_i8.s_w2, static_cast<std::size_t>(hidden) *
+                                                      static_cast<std::size_t>(mlp_ng_inter) *
+                                                      sizeof(float))
                         : cudaSuccess;
     const cudaError_t a11 =
-        use_cached_int8 ? cudaMalloc(&lw_i8.s_w3, static_cast<std::size_t>(inter) * sizeof(float))
+        use_cached_int8 ? cudaMalloc(&lw_i8.s_w3, static_cast<std::size_t>(inter) *
+                                                      static_cast<std::size_t>(mlp_ng_hidden) *
+                                                      sizeof(float))
                         : cudaSuccess;
     const cudaError_t a12 =
         use_proj_int8
@@ -870,9 +901,18 @@ void LlamaEngine::init_layer_cache() {
 
         if (weights_.has_tensor(name)) {
           std::vector<std::int8_t> q(elems, 0);
-          std::vector<float> s(static_cast<std::size_t>(rows), 0.0f);
-          quantize_rowwise_to_int8(tensor_half(weights_, name), rows, cols, quant_bits, q.data(),
-                                   s.data());
+          // Group-wise int4 (mlp_gq>0) narrows each scale to `mlp_gq` columns: rows*n_groups scales.
+          // The int8 values (hence the packed nibbles) keep the same layout, so packing is unchanged.
+          const int group = (target_i4 && mlp_gq > 0) ? mlp_gq : 0;
+          const int ng = kernels::quant_group_count(cols, group);
+          std::vector<float> s(static_cast<std::size_t>(rows) * static_cast<std::size_t>(ng), 0.0f);
+          if (group > 0) {
+            quantize_groupwise_to_int8(tensor_half(weights_, name), rows, cols, group, quant_bits,
+                                       q.data(), s.data());
+          } else {
+            quantize_rowwise_to_int8(tensor_half(weights_, name), rows, cols, quant_bits, q.data(),
+                                     s.data());
+          }
           if (target_i4) {
             std::vector<std::int8_t> packed(packed_i4_bytes, 0);
             pack_rowwise_int8_to_int4(q.data(), rows, cols, packed.data());

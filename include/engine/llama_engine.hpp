@@ -178,7 +178,11 @@ private:
     std::int8_t* w2 = nullptr;  // Device INT8 down-projection weight matrix.
     std::int8_t* w3 = nullptr;  // Device INT8 up-projection weight matrix.
     bool mlp_int4 = false;      // True when w1/w2/w3 are packed INT4 (two signed nibbles per byte).
-    float* s_w1 = nullptr;      // Device per-row dequantisation scales for w1.
+    int mlp_group = 0;          // >0: s_w1/s_w2/s_w3 hold one scale per group of N input columns
+                                // (group-wise int4). 0: one scale per row (legacy). Self-describing
+                                // so streaming (per-row) and resident (grouped) buffers can't confuse
+                                // a consumer.
+    float* s_w1 = nullptr;      // Device dequantisation scales for w1 ([rows] or [rows,n_groups]).
     float* s_w2 = nullptr;      // Device per-row dequantisation scales for w2.
     float* s_w3 = nullptr;      // Device per-row dequantisation scales for w3.
     // Projection weights quantised at layer-cache init time (null when unused).
@@ -228,6 +232,13 @@ private:
 
   // Executes the INT8 w2 (down) MLP projection for a resident layer.
   void resident_int8_mlp_w2(const LayerDeviceInt8Weights& lw_i8, int hidden, int inter);
+
+  // Group-wise int4 MLP matvec over `rows` tokens (rows==1 for decode). Reads a plain fp16
+  // activation, so it serves both decode and prefill without an activation-quant step. Correct-first:
+  // loops the single-token grouped GEMV. TODO(perf): perm8 grouped_dp4a_mt kernel for prefill.
+  void mlp_int4_matvec_grouped_rows(const std::int8_t* w, const float* scales, const __half* x,
+                                    __half* y, int rows, int out_features, int in_features,
+                                    int group);
 
   // Processes the prompt token-by-token (sequential prefill) without using
   // chunked attention.  Used as a fallback when the prompt fits in a single
@@ -783,6 +794,8 @@ private:
   int resident_mlp_w2_warps_ = 4;            // Warps-per-block for the w2 INT8 MLP kernel.
   int resident_mlp_w2_tile_packed4_ = 128;   // Packed-4 tile count for the w2 INT8 kernel.
   int resident_mlp_w2_warps_per_row_ = 1;    // Warps per output row in the w2 INT8 kernel.
+  int mlp_quant_group_ = 0;  // CPI_MLP_INT4_GROUP: group-wise int4 MLP weight-scale granularity
+                             // (0 = per-row legacy; 128 = llama.cpp Q4_0-style). Resident cache only.
   int resident_int8_qkv_warps_ = 8;          // Warps-per-block for the INT8 QKV dp4a kernel.
   int resident_int8_qkv_tile_packed4_ = 256;  // Packed-4 tile count for the INT8 QKV kernel.
   int resident_int8_qkv_warps_per_row_ = 2;   // Warps per output row in the INT8 QKV kernel.

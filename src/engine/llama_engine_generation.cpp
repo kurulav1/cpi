@@ -299,7 +299,16 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
 
     launch_norm(d_x_, lw->norm_ffn, lw->norm_ffn_bias, d_x_norm_, rows, hidden);
 
-    if (lw_i8 && lw_i8->w1 && lw_i8->w2 && lw_i8->w3 && can_use_dp4a_prefill) {
+    if (lw_i8 && lw_i8->w1 && lw_i8->w2 && lw_i8->w3 && lw_i8->mlp_group > 0) {
+      // Group-wise int4 MLP (w1/w3): fp16 activation, no dp4a activation-quant. Must match the
+      // decode funnel's grouped scales; a per-row batched kernel here would misread them.
+      mlp_int4_matvec_grouped_rows(lw_i8->w1, lw_i8->s_w1, static_cast<const __half*>(d_x_norm_),
+                                   static_cast<__half*>(d_prefill_ff1_), rows, inter, hidden,
+                                   lw_i8->mlp_group);
+      mlp_int4_matvec_grouped_rows(lw_i8->w3, lw_i8->s_w3, static_cast<const __half*>(d_x_norm_),
+                                   static_cast<__half*>(d_prefill_ff2_), rows, inter, hidden,
+                                   lw_i8->mlp_group);
+    } else if (lw_i8 && lw_i8->w1 && lw_i8->w2 && lw_i8->w3 && can_use_dp4a_prefill) {
       kernels::launch_quantize_rowwise_fp16_to_int8(static_cast<const __half*>(d_x_norm_),
                                                     d_prefill_i8_, d_prefill_i8_scales_, rows,
                                                     hidden, compute_stream_);
@@ -356,7 +365,13 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
           rows * inter, compute_stream_);
     }
 
-    if (lw_i8 && lw_i8->w1 && lw_i8->w2 && lw_i8->w3 && can_use_dp4a_prefill) {
+    if (lw_i8 && lw_i8->w1 && lw_i8->w2 && lw_i8->w3 && lw_i8->mlp_group > 0) {
+      // Group-wise int4 MLP (w2): fp16 post-GLU activation (d_prefill_ff2_).
+      mlp_int4_matvec_grouped_rows(lw_i8->w2, lw_i8->s_w2,
+                                   static_cast<const __half*>(d_prefill_ff2_),
+                                   static_cast<__half*>(d_ff3_), rows, hidden, inter,
+                                   lw_i8->mlp_group);
+    } else if (lw_i8 && lw_i8->w1 && lw_i8->w2 && lw_i8->w3 && can_use_dp4a_prefill) {
       kernels::launch_quantize_rowwise_fp16_to_int8(static_cast<const __half*>(d_prefill_ff2_),
                                                     d_prefill_i8_, d_prefill_i8_scales_, rows,
                                                     inter, compute_stream_);

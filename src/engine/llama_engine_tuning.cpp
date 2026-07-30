@@ -146,8 +146,29 @@ void LlamaEngine::resident_projection_float(const void* w, const void* x, void* 
       out_features, in_features, compute_stream_, warps_per_block, tile_pairs, rows_per_warp);
 }
 
+void LlamaEngine::mlp_int4_matvec_grouped_rows(const std::int8_t* w, const float* scales,
+                                               const __half* x, __half* y, int rows,
+                                               int out_features, int in_features, int group) {
+  for (int r = 0; r < rows; ++r) {
+    kernels::launch_weight_only_int4_matvec_grouped(
+        w, scales, x + static_cast<std::size_t>(r) * static_cast<std::size_t>(in_features),
+        y + static_cast<std::size_t>(r) * static_cast<std::size_t>(out_features), out_features,
+        in_features, group, compute_stream_);
+  }
+}
+
 void LlamaEngine::resident_int8_mlp_w13(const LayerDeviceInt8Weights& lw_i8, int inter,
                                         int hidden) {
+  if (lw_i8.mlp_int4 && lw_i8.mlp_group > 0) {
+    // Group-wise int4: read the fp16 FFN-norm activation (d_x_norm_) directly -- the grouped kernel
+    // takes fp16 x, so we bypass the dp4a int8-activation path. The caller's activation-quant into
+    // d_prefill_i8_ is then unused (harmless; d_x_norm_ is only read, never overwritten).
+    mlp_int4_matvec_grouped_rows(lw_i8.w1, lw_i8.s_w1, static_cast<const __half*>(d_x_norm_),
+                                 static_cast<__half*>(d_ff1_), 1, inter, hidden, lw_i8.mlp_group);
+    mlp_int4_matvec_grouped_rows(lw_i8.w3, lw_i8.s_w3, static_cast<const __half*>(d_x_norm_),
+                                 static_cast<__half*>(d_ff2_), 1, inter, hidden, lw_i8.mlp_group);
+    return;
+  }
   if (lw_i8.mlp_int4) {
     kernels::launch_weight_only_int4_matvec_dual_dp4a(
         lw_i8.w1, lw_i8.s_w1, lw_i8.w3, lw_i8.s_w3, d_prefill_i8_, d_prefill_i8_scales_,
@@ -162,6 +183,12 @@ void LlamaEngine::resident_int8_mlp_w13(const LayerDeviceInt8Weights& lw_i8, int
 }
 
 void LlamaEngine::resident_int8_mlp_w2(const LayerDeviceInt8Weights& lw_i8, int hidden, int inter) {
+  if (lw_i8.mlp_int4 && lw_i8.mlp_group > 0) {
+    // Group-wise int4: w2 reads the fp16 post-GLU activation (d_ff2_) directly.
+    mlp_int4_matvec_grouped_rows(lw_i8.w2, lw_i8.s_w2, static_cast<const __half*>(d_ff2_),
+                                 static_cast<__half*>(d_ff3_), 1, hidden, inter, lw_i8.mlp_group);
+    return;
+  }
   if (lw_i8.mlp_int4) {
     kernels::launch_weight_only_int4_matvec_dp4a(
         lw_i8.w2, lw_i8.s_w2, d_prefill_i8_, d_prefill_i8_scales_, static_cast<__half*>(d_ff3_),

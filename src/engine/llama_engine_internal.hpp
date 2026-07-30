@@ -33,6 +33,11 @@ float packed_quant_scale(const model::WeightLoader& weights, const std::string& 
 std::size_t packed_quant_scale_bytes(const model::WeightLoader& weights, const std::string& base);
 void quantize_rowwise_to_int8(const __half* src, int rows, int cols, int quant_bits,
                               std::int8_t* dst, float* scales);
+// Like quantize_rowwise_to_int8 but with one scale per group of `group` contiguous columns
+// (group<=0 falls back to per-row). Scales are [rows, quant_group_count(cols, group)] row-major.
+// The int8 output layout is identical to per-row, so packing is unchanged.
+void quantize_groupwise_to_int8(const __half* src, int rows, int cols, int group, int quant_bits,
+                                std::int8_t* dst, float* scales);
 void unpack_rowwise_int4_to_int8(const std::int8_t* src, int rows, int cols, std::int8_t* dst);
 void pack_rowwise_int8_to_int4(const std::int8_t* src, int rows, int cols, std::int8_t* dst);
 void load_rowwise_scales(const model::WeightLoader& weights, const std::string& base, int rows,
