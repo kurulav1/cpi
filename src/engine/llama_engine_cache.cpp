@@ -97,9 +97,9 @@ void LlamaEngine::init_layer_cache() {
     return;
   }
   const int quant_bits = clamp_streaming_quant_bits(options_.streaming_quant_bits);
-  // Keep attention projections at INT8 by default for stability/quality.
-  // INT4 projection caching can be re-enabled after additional calibration.
-  const bool enable_proj_int4 = false;
+  // Attention projections cache at INT8 by default for quality. CPI_PROJ_INT4=1 caches them at
+  // INT4 too (saves ~1.9 GB on the 32B) -- opt-in until the quality delta is validated per model.
+  const bool enable_proj_int4 = quant_bits == 4 && std::getenv("CPI_PROJ_INT4") != nullptr;
   cached_int8_mlp_enabled_ = false;
   const std::size_t fp16_attention_bytes =
       bytes_for_matrix(q_hidden, hidden) + bytes_for_matrix(hidden, q_hidden) +
