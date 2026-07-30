@@ -415,6 +415,28 @@ void PlanCudaEngine::upload_int4(const std::string& name, int rows, int cols) {
   qw.group = group;
   qw.pf_i8 = (bits == 8 && group == 0) ? d_w : d_pf;  // alias when already rowwise int8
   qw.pf_scales = (bits == 8 && group == 0) ? d_scales : d_pf_s;
+  if (moe_stream_ && bits == 4 && name.find("experts.") != std::string::npos) {
+    // Expert STREAMING (step 2): keep the quantized experts on HOST and FREE the device copy -- the
+    // memory win. They stream K-at-a-time per layer (stage_moe_experts, now H2D). Device VRAM no
+    // longer holds ~90% of the model; a >VRAM MoE becomes runnable. (Host store is pageable; for a
+    // model too big for host RAM too, this would be mmap-backed -- the K3 case.)
+    const std::size_t wbytes = static_cast<std::size_t>(rows) * ((cols + 1) / 2);
+    const std::size_t sbytes = static_cast<std::size_t>(rows) * n_groups * sizeof(float);
+    void* hw = std::malloc(wbytes);
+    void* hs = std::malloc(sbytes);
+    if (!hw || !hs)
+      throw std::runtime_error("host alloc failed for streamed experts (RAM too small): " + name);
+    G4_CHECK(cudaMemcpy(hw, d_w, wbytes, cudaMemcpyDeviceToHost));
+    G4_CHECK(cudaMemcpy(hs, d_scales, sbytes, cudaMemcpyDeviceToHost));
+    cudaFree(d_w);
+    cudaFree(d_scales);
+    qw.packed = static_cast<std::int8_t*>(hw);
+    qw.scales = static_cast<float*>(hs);
+    qw.pf_i8 = nullptr;
+    qw.pf_scales = nullptr;
+    qw.host = true;
+    moe_experts_on_host_ = true;
+  }
   qdev_[name] = qw;
 }
 
@@ -597,7 +619,7 @@ void PlanCudaEngine::allocate_buffers() {
       for (std::size_t k = 0; k < K; ++k) ident[k] = static_cast<int>(k);
       G4_CHECK(cudaMemcpy(d_moe_identity_idx_, ident.data(), K * sizeof(int),
                           cudaMemcpyHostToDevice));
-      std::fprintf(stderr, "[moe] expert streaming ON (staging %zu experts/layer, D2D)\n", K);
+      std::fprintf(stderr, "[moe] expert streaming ON (staging %zu experts/layer)\n", K);
     }
   }
   al(&d_ple_raw_, ple_tot);
@@ -2004,15 +2026,16 @@ void PlanCudaEngine::stage_moe_experts(const void* qw, const float* qs, int rpe,
                            cudaMemcpyDeviceToHost, stream_));
   G4_CHECK(cudaStreamSynchronize(stream_));
   const std::int8_t* w = static_cast<const std::int8_t*>(qw);
+  // Step 2: when the experts live on host, this is H2D (the memory win); step-1 D2D otherwise.
+  const cudaMemcpyKind kind =
+      moe_experts_on_host_ ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToDevice;
   for (int k = 0; k < K; ++k) {
     const std::size_t e = static_cast<std::size_t>(h_moe_idx_[k]);
     const std::size_t rp = static_cast<std::size_t>(rpe);
-    // Step 1: D2D from the resident matrix (verifies the remap). Step 2 swaps qw/qs to host (H2D).
     G4_CHECK(cudaMemcpyAsync(dst_w + static_cast<std::size_t>(k) * rp * row_bytes,
-                             w + e * rp * row_bytes, rp * row_bytes, cudaMemcpyDeviceToDevice,
-                             stream_));
+                             w + e * rp * row_bytes, rp * row_bytes, kind, stream_));
     G4_CHECK(cudaMemcpyAsync(dst_s + static_cast<std::size_t>(k) * rp * ng, qs + e * rp * ng,
-                             rp * ng * sizeof(float), cudaMemcpyDeviceToDevice, stream_));
+                             rp * ng * sizeof(float), kind, stream_));
   }
 }
 

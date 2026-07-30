@@ -367,6 +367,7 @@ private:
     // one extra int8 copy. nullptr = use the dequant-to-fp16 fallback.
     std::int8_t* pf_i8 = nullptr;
     float* pf_scales = nullptr;
+    bool host = false;  // true = packed/scales live on HOST (expert streaming); stage_moe H2D's them
   };
   std::unordered_map<std::string, QuantWeight> qdev_;  // name -> quantized weight
   int weight_quant_bits_ = 0;                          // 0 = fp16, 4 = int4, 8 = int8
@@ -440,6 +441,7 @@ private:
   // will source experts from host (H2D) so a >VRAM MoE (K3-scale) can run. The router still writes
   // d_moe_idx_ on device; we D2H those K indices to issue the per-expert copies.
   bool moe_stream_ = false;
+  bool moe_experts_on_host_ = false;         // step 2: experts migrated to host, streamed H2D
   std::int8_t* d_moe_stage_gu_ = nullptr;    // [K*2*MI, (H+1)/2] int4 gate_up staging
   float* d_moe_stage_gu_s_ = nullptr;        // [K*2*MI, n_groups(H)] scales
   std::int8_t* d_moe_stage_dn_ = nullptr;    // [K*H, (MI+1)/2] int4 down staging
