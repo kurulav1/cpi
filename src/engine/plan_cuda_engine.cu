@@ -571,6 +571,34 @@ void PlanCudaEngine::allocate_buffers() {
     al(&d_moe_out_, H);
     G4_CHECK(cudaMalloc(&d_moe_idx_, static_cast<std::size_t>(cfg_.top_k_experts) * sizeof(int)));
     G4_CHECK(cudaMalloc(&d_moe_w_, static_cast<std::size_t>(cfg_.top_k_experts) * sizeof(float)));
+    moe_stream_ = std::getenv("CPI_MOE_STREAM") != nullptr;
+    if (moe_stream_) {
+      const std::size_t K = cfg_.top_k_experts;
+      const int MI = cfg_.moe_intermediate_size;  // H is already in scope (cfg_.hidden)
+      // The expert quant group is ADAPTIVE (see upload_int4): weight_quant_group_ halved until it
+      // divides the row (gate_up over H=2816 keeps 128; down over MI=704 lands on 64). Size the
+      // staging scales with the SAME effective group, or the per-expert scale copy overflows.
+      auto eff_group = [&](int cols) {
+        int g = weight_quant_group_;
+        if (g > 0 && (g & (g - 1)) != 0) g = 0;
+        while (g > 0 && (g > cols || cols % g != 0)) g /= 2;
+        return g == 1 ? 0 : g;
+      };
+      const int ng_gu = kernels::quant_group_count(H, eff_group(H));
+      const int ng_dn = kernels::quant_group_count(MI, eff_group(MI));
+      const std::size_t gu_rows = K * 2 * static_cast<std::size_t>(MI);
+      const std::size_t dn_rows = K * static_cast<std::size_t>(H);
+      G4_CHECK(cudaMalloc(&d_moe_stage_gu_, gu_rows * ((H + 1) / 2)));
+      G4_CHECK(cudaMalloc(&d_moe_stage_gu_s_, gu_rows * ng_gu * sizeof(float)));
+      G4_CHECK(cudaMalloc(&d_moe_stage_dn_, dn_rows * ((MI + 1) / 2)));
+      G4_CHECK(cudaMalloc(&d_moe_stage_dn_s_, dn_rows * ng_dn * sizeof(float)));
+      G4_CHECK(cudaMalloc(&d_moe_identity_idx_, K * sizeof(int)));
+      std::vector<int> ident(K);
+      for (std::size_t k = 0; k < K; ++k) ident[k] = static_cast<int>(k);
+      G4_CHECK(cudaMemcpy(d_moe_identity_idx_, ident.data(), K * sizeof(int),
+                          cudaMemcpyHostToDevice));
+      std::fprintf(stderr, "[moe] expert streaming ON (staging %zu experts/layer, D2D)\n", K);
+    }
   }
   al(&d_ple_raw_, ple_tot);
   al(&d_ple_, ple_tot);
@@ -1964,6 +1992,30 @@ bool PlanCudaEngine::prefill_attention_tc(const __half* q, const __half* k, cons
   return true;
 }
 
+void PlanCudaEngine::stage_moe_experts(const void* qw, const float* qs, int rpe, int in_features,
+                                       int group, std::int8_t* dst_w, float* dst_s) {
+  const int K = cfg_.top_k_experts;
+  const std::size_t row_bytes = (in_features + 1) / 2;  // int4 packed row
+  const std::size_t ng = kernels::quant_group_count(in_features, group);
+  if (static_cast<int>(h_moe_idx_.size()) < K) h_moe_idx_.resize(K);
+  // The router wrote the selection on device; bring the K indices to the host to issue the copies.
+  // This host sync per MoE layer is what makes streaming graph-incompatible (MoE layers run eager).
+  G4_CHECK(cudaMemcpyAsync(h_moe_idx_.data(), d_moe_idx_, static_cast<std::size_t>(K) * sizeof(int),
+                           cudaMemcpyDeviceToHost, stream_));
+  G4_CHECK(cudaStreamSynchronize(stream_));
+  const std::int8_t* w = static_cast<const std::int8_t*>(qw);
+  for (int k = 0; k < K; ++k) {
+    const std::size_t e = static_cast<std::size_t>(h_moe_idx_[k]);
+    const std::size_t rp = static_cast<std::size_t>(rpe);
+    // Step 1: D2D from the resident matrix (verifies the remap). Step 2 swaps qw/qs to host (H2D).
+    G4_CHECK(cudaMemcpyAsync(dst_w + static_cast<std::size_t>(k) * rp * row_bytes,
+                             w + e * rp * row_bytes, rp * row_bytes, cudaMemcpyDeviceToDevice,
+                             stream_));
+    G4_CHECK(cudaMemcpyAsync(dst_s + static_cast<std::size_t>(k) * rp * ng, qs + e * rp * ng,
+                             rp * ng * sizeof(float), cudaMemcpyDeviceToDevice, stream_));
+  }
+}
+
 void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer, int position,
                                  const ExecCtx& ctx) {
   using namespace opplan;
@@ -2386,16 +2438,35 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
                                                 stream_, HW(op.weight));
         break;
       case OpKind::MoeGateUpGeglu:
-        kernels::launch_moe_gate_up_geglu(
-            op.qbits ? static_cast<const void*>(op.qweight) : static_cast<const void*>(op.weight),
-            QS(op.qscales), op.qbits, op.qgroup, S(op.in), d_moe_idx_, S(op.out), op.cols,
-            op.in_dim, op.heads, stream_);
+        if (moe_stream_ && op.qbits) {
+          // gate_up is [E*2*MI, H]: rows-per-expert = 2*cols, in_features = in_dim (=H).
+          stage_moe_experts(op.qweight, QS(op.qscales), 2 * op.cols, op.in_dim, op.qgroup,
+                            d_moe_stage_gu_, d_moe_stage_gu_s_);
+          kernels::launch_moe_gate_up_geglu(d_moe_stage_gu_, d_moe_stage_gu_s_, op.qbits, op.qgroup,
+                                            S(op.in), d_moe_identity_idx_, S(op.out), op.cols,
+                                            op.in_dim, op.heads, stream_);
+        } else {
+          kernels::launch_moe_gate_up_geglu(
+              op.qbits ? static_cast<const void*>(op.qweight) : static_cast<const void*>(op.weight),
+              QS(op.qscales), op.qbits, op.qgroup, S(op.in), d_moe_idx_, S(op.out), op.cols,
+              op.in_dim, op.heads, stream_);
+        }
         break;
       case OpKind::MoeDownAccum:
-        kernels::launch_moe_down_accum(
-            op.qbits ? static_cast<const void*>(op.qweight) : static_cast<const void*>(op.weight),
-            QS(op.qscales), op.qbits, op.qgroup, S(op.in), d_moe_idx_, d_moe_w_, S(op.out), op.cols,
-            op.in_dim, op.heads, stream_);
+        if (moe_stream_ && op.qbits) {
+          // down is [E*H, MI]: rows-per-expert = cols (=H), in_features = in_dim (=MI). The routing
+          // weights (d_moe_w_) are indexed by selection position k, so they stay as-is.
+          stage_moe_experts(op.qweight, QS(op.qscales), op.cols, op.in_dim, op.qgroup,
+                            d_moe_stage_dn_, d_moe_stage_dn_s_);
+          kernels::launch_moe_down_accum(d_moe_stage_dn_, d_moe_stage_dn_s_, op.qbits, op.qgroup,
+                                         S(op.in), d_moe_identity_idx_, d_moe_w_, S(op.out), op.cols,
+                                         op.in_dim, op.heads, stream_);
+        } else {
+          kernels::launch_moe_down_accum(
+              op.qbits ? static_cast<const void*>(op.qweight) : static_cast<const void*>(op.weight),
+              QS(op.qscales), op.qbits, op.qgroup, S(op.in), d_moe_idx_, d_moe_w_, S(op.out), op.cols,
+              op.in_dim, op.heads, stream_);
+        }
         break;
       case OpKind::Rope: {
         const float* cosT = op.rope_table == RopeTable::Full ? d_cos_full_ : d_cos_sliding_;

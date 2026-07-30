@@ -434,6 +434,22 @@ private:
   __half* d_moe_out_ = nullptr;        // [hidden]
   int* d_moe_idx_ = nullptr;           // [top_k] selected experts
   float* d_moe_w_ = nullptr;           // [top_k] routing weights
+  // Expert STREAMING (CPI_MOE_STREAM): stage only the top_k selected experts into K contiguous
+  // slots and feed the kernels an identity index [0..K-1] (so slot k == the k-th selected expert).
+  // Step 1 stages from the resident matrix (D2D) to verify the remap is token-identical; Step 2
+  // will source experts from host (H2D) so a >VRAM MoE (K3-scale) can run. The router still writes
+  // d_moe_idx_ on device; we D2H those K indices to issue the per-expert copies.
+  bool moe_stream_ = false;
+  std::int8_t* d_moe_stage_gu_ = nullptr;    // [K*2*MI, (H+1)/2] int4 gate_up staging
+  float* d_moe_stage_gu_s_ = nullptr;        // [K*2*MI, n_groups(H)] scales
+  std::int8_t* d_moe_stage_dn_ = nullptr;    // [K*H, (MI+1)/2] int4 down staging
+  float* d_moe_stage_dn_s_ = nullptr;        // [K*H, n_groups(MI)] scales
+  int* d_moe_identity_idx_ = nullptr;        // [K] = {0,1,...,K-1}
+  std::vector<int> h_moe_idx_;               // host scratch for the D2H of d_moe_idx_
+  // Stage the top_k selected experts (indices in d_moe_idx_) from a quantized [E*rpe, ...] source
+  // into dst_w/dst_s slots [0..K-1]. rpe = rows per expert (2*MI for gate_up, H for down).
+  void stage_moe_experts(const void* qw, const float* qs, int rows_per_expert, int in_features,
+                         int group, std::int8_t* dst_w, float* dst_s);
   float* d_logits_ = nullptr;    // [vocab]
   int* d_tok_ = nullptr;         // current token id (device); EmbeddingLookup reads it
   int* d_position_ = nullptr;    // current decode position (device); device-pos ops read it
