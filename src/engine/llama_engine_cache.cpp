@@ -100,16 +100,16 @@ void LlamaEngine::init_layer_cache() {
   // Attention projections cache at INT8 by default for quality. CPI_PROJ_INT4=1 caches them at
   // INT4 too (saves ~1.9 GB on the 32B) -- opt-in until the quality delta is validated per model.
   const bool enable_proj_int4 = quant_bits == 4 && std::getenv("CPI_PROJ_INT4") != nullptr;
-  // CPI_MLP_INT4_GROUP=N (power of two, e.g. 128) stores MLP int4 weights with one scale per group
-  // of N input columns instead of one per row -- ~18% -> ~11% weight error (llama.cpp Q4_0 uses
-  // block-32). Opt-in until validated per model. Only valid when the resident dp4a decode funnel is
-  // used (hidden/inter %4 == 0) and the model stores fp16 MLP weights on disk (we quantize on load);
-  // otherwise the non-dp4a fallback would misread the grouped scales, so we stay per-row there.
+  // CPI_MLP_INT4_GROUP=N (power of two >= 32, e.g. 128) stores MLP int4 weights with one scale per
+  // group of N input columns instead of one per row -- ~18% -> ~11% weight error (llama.cpp Q4_0
+  // uses block-32). Opt-in until validated per model. Requires the perm8 grouped-dp4a path
+  // (in_features % 32 == 0, group % 32 == 0) and a model that stores fp16 MLP weights on disk (we
+  // quantize on load); otherwise we stay per-row so no consumer misreads the grouped scales.
   mlp_quant_group_ = 0;
   if (quant_bits == 4) {
     if (const char* g = std::getenv("CPI_MLP_INT4_GROUP")) {
       const int gv = std::atoi(g);
-      if (gv > 0 && (gv & (gv - 1)) == 0) {
+      if (gv >= 32 && (gv & (gv - 1)) == 0) {
         mlp_quant_group_ = gv;
       }
     }
@@ -118,7 +118,8 @@ void LlamaEngine::init_layer_cache() {
                               !has_packed_int4_tensor(weights_, "layers.0.feed_forward.w1") &&
                               !has_packed_int8_tensor(weights_, "layers.0.feed_forward.w1");
   const int mlp_gq =
-      (mlp_quant_group_ > 0 && (hidden & 3) == 0 && (inter & 3) == 0 && model_fp16_mlp)
+      (mlp_quant_group_ >= 32 && (mlp_quant_group_ % 32) == 0 && (hidden % 32) == 0 &&
+       (inter % 32) == 0 && model_fp16_mlp)
           ? mlp_quant_group_
           : 0;
   cached_int8_mlp_enabled_ = false;

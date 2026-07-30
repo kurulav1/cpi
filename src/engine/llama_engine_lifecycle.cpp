@@ -309,6 +309,11 @@ void LlamaEngine::allocate_runtime_buffers() {
   CUDA_CHECK(cudaMalloc(
       &d_prefill_i8_, static_cast<std::size_t>(rows) * static_cast<std::size_t>(max_lowbit_cols)));
   CUDA_CHECK(cudaMalloc(&d_prefill_i8_scales_, static_cast<std::size_t>(rows) * sizeof(float)));
+  // Per-group(32) activation scales for the perm8-g32 quant feeding the grouped int4 dp4a MLP.
+  CUDA_CHECK(cudaMalloc(
+      &d_prefill_perm8_scales_, static_cast<std::size_t>(rows) *
+                                    ((static_cast<std::size_t>(max_lowbit_cols) + 31) / 32) *
+                                    sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_ff3_, bytes_for_matrix(rows, hidden)));
   CUDA_CHECK(cudaMalloc(&d_logits_, static_cast<std::size_t>(cfg.vocab_size) * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_argmax_, sizeof(int)));

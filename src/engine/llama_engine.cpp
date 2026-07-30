@@ -719,6 +719,10 @@ LlamaEngine::~LlamaEngine() {
     cudaFree(d_prefill_i8_scales_);
     d_prefill_i8_scales_ = nullptr;
   }
+  if (d_prefill_perm8_scales_) {
+    cudaFree(d_prefill_perm8_scales_);
+    d_prefill_perm8_scales_ = nullptr;
+  }
   free_ptr(d_logits_);
   if (d_argmax_) {
     cudaFree(d_argmax_);

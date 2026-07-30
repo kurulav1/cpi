@@ -233,12 +233,13 @@ private:
   // Executes the INT8 w2 (down) MLP projection for a resident layer.
   void resident_int8_mlp_w2(const LayerDeviceInt8Weights& lw_i8, int hidden, int inter);
 
-  // Group-wise int4 MLP matvec over `rows` tokens (rows==1 for decode). Reads a plain fp16
-  // activation, so it serves both decode and prefill without an activation-quant step. Correct-first:
-  // loops the single-token grouped GEMV. TODO(perf): perm8 grouped_dp4a_mt kernel for prefill.
-  void mlp_int4_matvec_grouped_rows(const std::int8_t* w, const float* scales, const __half* x,
-                                    __half* y, int rows, int out_features, int in_features,
-                                    int group);
+  // Group-wise int4 MLP matvec over `rows` tokens against a PRE-QUANTIZED perm8-g32 activation
+  // (xq + x_scales). rows==1 -> single-token grouped_dp4a; rows>1 -> grouped_dp4a_mt looped in
+  // batches of 8 (its per-launch token cap), weights streamed once per batch. Same dp4a speed as
+  // the per-row path, with the group-wise weight-scale quality.
+  void mlp_int4_grouped_dp4a(const std::int8_t* w, const float* scales, const std::int8_t* xq,
+                             const float* x_scales, __half* y, int rows, int out_features,
+                             int in_features, int group);
 
   // Processes the prompt token-by-token (sequential prefill) without using
   // chunked attention.  Used as a fallback when the prompt fits in a single
@@ -625,6 +626,8 @@ private:
   void* d_prefill_ff2_ = nullptr;         // Prefill-sized down-projection output buffer.
   std::int8_t* d_prefill_i8_ = nullptr;   // INT8 quantised activations for prefill INT8 path.
   float* d_prefill_i8_scales_ = nullptr;  // Per-row scales accompanying d_prefill_i8_.
+  float* d_prefill_perm8_scales_ = nullptr;  // Per-group(32) scales for the perm8-g32 activation
+                                             // quant feeding grouped int4 dp4a MLP. [rows, cols/32].
   void* d_ff3_ = nullptr;     // Up-projection (w3) output buffer (SwiGLU second operand).
   void* d_logits_ = nullptr;  // Raw logit vector output from the LM head.
   int* d_argmax_ = nullptr;   // Single-element device buffer for the argmax result.
