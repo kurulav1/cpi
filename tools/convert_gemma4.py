@@ -148,6 +148,17 @@ def main():
     if has_ple:
         per_layer += ["per_layer_input_gate.weight", "per_layer_projection.weight",
                       "post_per_layer_input_norm.weight"]
+    if cfg.get("enable_moe_block"):
+        # MoE (26B-A4B): dense-MLP (already above) + top-k experts, summed. The experts
+        # are ~90% of the model and get quantized to int4 on load (upload_int4), so they
+        # fit in VRAM. Extra branch norms are Gemma-4-MoE-specific.
+        per_layer += [
+            "pre_feedforward_layernorm_2.weight",
+            "post_feedforward_layernorm_1.weight",
+            "post_feedforward_layernorm_2.weight",
+            "router.proj.weight", "router.scale", "router.per_expert_scale",
+            "experts.gate_up_proj", "experts.down_proj",
+        ]
     for L in range(nl):
         for t in per_layer:
             hf_name = PREFIX + f"layers.{L}.{t}"
@@ -182,6 +193,11 @@ def main():
             missing.append(hf_name)
             continue
         shape = hdr[hf_name]["shape"]
+        if out_name.endswith(("experts.gate_up_proj", "experts.down_proj")):
+            # 3-D [E, A, B] experts are contiguous row-major; store as 2-D [E*A, B] so the
+            # engine treats them as one tall matrix (an expert = a row offset) and quantizes
+            # them -- upload_int4 only quantizes 2-D manifest shapes, else falls back to fp16.
+            shape = [shape[0] * shape[1], shape[2]]
         nbytes = 2  # fp16
         for d in shape:
             nbytes *= d

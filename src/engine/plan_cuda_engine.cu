@@ -1016,12 +1016,11 @@ void PlanCudaEngine::open(const std::string& cpi_path, int max_context) {
   parse_manifest(manifest);
   if (static_cast<int>(cfg_.layer_full.size()) != cfg_.num_layers)
     throw std::runtime_error("layer_types count mismatch");
-  if (cfg_.enable_moe_block)
+  if (cfg_.enable_moe_block && weight_quant_bits_ != 4 && weight_quant_bits_ != 8)
     throw std::runtime_error(
-        "Gemma 4 MoE (e.g. 26B-A4B, " + std::to_string(cfg_.num_experts) +
-        " experts) is not yet runnable: the fp16 experts exceed 32GB VRAM, so it "
-        "needs int4 weights + expert streaming. The forward math is specced in "
-        "memory:cpi-gemma4-arch (dense-MLP + top-k experts, summed).");
+        "Gemma 4 MoE (" + std::to_string(cfg_.num_experts) +
+        " experts) needs quantized experts to fit in VRAM: run with --weight-quant int4 "
+        "(or int8). The fp16 experts alone (~90% of the model) exceed 32GB.");
   G4_CHECK(cudaStreamCreate(&stream_));
   load_all(cpi_path);
   build_rope_tables();
@@ -2884,6 +2883,12 @@ bool PlanCudaEngine::plan_can_sequence_prefill() const {
     for (const Op& o : lp.ops) {
       if (o.kind == OpKind::Rope && o.rotary_dim > 0) return false;
       if (o.kind == OpKind::LinearAttentionStep || o.kind == OpKind::LinearConv1d) return false;
+      // MoE routing/expert kernels are single-token (the router writes one token's expert
+      // selection); they have no multi-row sequence form yet, so MoE plans keep the
+      // token-by-token prefill (like partial-RoPE / delta-net above).
+      if (o.kind == OpKind::MoeRouterTopk || o.kind == OpKind::MoeGateUpGeglu ||
+          o.kind == OpKind::MoeDownAccum)
+        return false;
     }
   }
   return !plan_.layers.empty();
