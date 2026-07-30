@@ -1,5 +1,6 @@
 #include "platform/mmap_file.hpp"
 
+#include <cstdlib>
 #include <filesystem>
 
 #include "common.hpp"
@@ -108,9 +109,37 @@ void MMapFile::open(const std::string& path) {
 #endif
 }
 
+// Available physical RAM in bytes (0 if it can't be determined).
+static std::size_t available_physical_ram() {
+#ifdef _WIN32
+  MEMORYSTATUSEX ms;
+  ms.dwLength = sizeof(ms);
+  return GlobalMemoryStatusEx(&ms) ? static_cast<std::size_t>(ms.ullAvailPhys) : 0;
+#else
+  const long pages = sysconf(_SC_AVPHYS_PAGES);
+  const long page_size = sysconf(_SC_PAGESIZE);
+  return (pages > 0 && page_size > 0) ? static_cast<std::size_t>(pages) * page_size : 0;
+#endif
+}
+
 void MMapFile::prefetch() const {
   if (!valid()) {
     return;
+  }
+  // Skip the whole-file read-ahead when it would thrash. A model larger than free RAM cannot be
+  // held in the page cache, so prefetching it just DOUBLE-READS: the OS blocks in the prefetch
+  // call, then its background read evicts pages before the loader reaches them and competes with
+  // the loader's own mmap faults. Measured on the 32B int4 (23 GB, ~12 GB free): skipping this
+  // ~halves cold start (44s -> 20s). Small models that fit in RAM still benefit from the prefetch.
+  // CPI_NO_MMAP_PREFETCH=1 forces skip; CPI_FORCE_MMAP_PREFETCH=1 forces the read-ahead.
+  if (std::getenv("CPI_NO_MMAP_PREFETCH") != nullptr) {
+    return;
+  }
+  if (std::getenv("CPI_FORCE_MMAP_PREFETCH") == nullptr) {
+    const std::size_t avail = available_physical_ram();
+    if (avail > 0 && size_ > avail) {
+      return;  // would not fit in the page cache -> prefetch would only double the disk traffic
+    }
   }
 #ifdef _WIN32
   // PrefetchVirtualMemory asynchronously reads the pages into the working set.
