@@ -479,9 +479,18 @@ void LlamaEngine::init_layer_cache() {
   }
   layer_cache_i8_.resize(static_cast<std::size_t>(requested_layers));
   int built = 0;
+  // CPI_STARTUP_PROFILE: split the per-layer cost into cudaMalloc churn vs the H2D/quant sync-wait.
+  const bool cache_prof = std::getenv("CPI_STARTUP_PROFILE") != nullptr;
+  double t_alloc_ms = 0, t_sync_ms = 0;
+  using prof_clk = std::chrono::steady_clock;
+  const auto prof_ms = [](prof_clk::time_point a) {
+    return std::chrono::duration<double, std::milli>(prof_clk::now() - a).count();
+  };
+
   for (int layer = 0; layer < requested_layers; ++layer) {
     enforce_host_resource_limits("cache_init.layer_begin");
     check_tq_cached_init_timeout(cache_init_start, layer);
+    const auto t_alloc0 = prof_clk::now();
     auto& lw = layer_cache_[static_cast<std::size_t>(layer)];
     auto& lw_i8 = layer_cache_i8_[static_cast<std::size_t>(layer)];
     const bool use_cached_int8 =
@@ -561,6 +570,7 @@ void LlamaEngine::init_layer_cache() {
     const cudaError_t a15 =
         use_proj_int8 ? cudaMalloc(&lw_i8.s_wo, static_cast<std::size_t>(hidden) * sizeof(float))
                       : cudaSuccess;
+    t_alloc_ms += prof_ms(t_alloc0);
     if (a0 != cudaSuccess || a1 != cudaSuccess || a2 != cudaSuccess || a3 != cudaSuccess ||
         a4 != cudaSuccess || a5 != cudaSuccess || a6 != cudaSuccess || a7 != cudaSuccess ||
         a8 != cudaSuccess || a9 != cudaSuccess || a10 != cudaSuccess || a11 != cudaSuccess ||
@@ -926,8 +936,10 @@ void LlamaEngine::init_layer_cache() {
     }
 
     // Single sync per layer (was 3): wait for all H2D transfers and GPU quantization.
+    const auto t_sync0 = prof_clk::now();
     CUDA_CHECK(cudaStreamSynchronize(transfer_stream_));
     CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
+    t_sync_ms += prof_ms(t_sync0);
 
     // Free FP16 staging buffers now that quantization is confirmed complete.
     // (Skipped for TQ3: fp16 wqkv/wo were never allocated.)
@@ -942,6 +954,10 @@ void LlamaEngine::init_layer_cache() {
     check_tq_cached_init_timeout(cache_init_start, layer);
   }
 
+  if (cache_prof) {
+    std::cout << "[startup]   cache-copy.loop alloc_ms=" << static_cast<long>(t_alloc_ms)
+              << " sync_wait_ms=" << static_cast<long>(t_sync_ms) << " layers=" << built << "\n";
+  }
   cached_layer_count_ = built;
   cached_int8_proj_enabled_ = !tq3_enabled_ && lowbit_streaming_enabled(options_) && (built > 0);
   layer_cache_.resize(static_cast<std::size_t>(cached_layer_count_));
@@ -1093,11 +1109,10 @@ void LlamaEngine::init_layer_cache() {
     for (int layer = 0; layer < cached_layer_count_; ++layer) {
       const auto& tq = layer_cache_tq3_[static_cast<std::size_t>(layer)];
       if (!tq.wqkv || !tq.wo || !tq.w13) {
-        CPI_THROW("TurboQuant model is missing packed weights for layer " +
-                           std::to_string(layer) + " (wqkv=" + (tq.wqkv ? "ok" : "MISSING") +
-                           " wo=" + (tq.wo ? "ok" : "MISSING") +
-                           " w13=" + (tq.w13 ? "ok" : "MISSING") +
-                           "). Rebuild the model with turbo_quant_convert.py.");
+        CPI_THROW("TurboQuant model is missing packed weights for layer " + std::to_string(layer) +
+                  " (wqkv=" + (tq.wqkv ? "ok" : "MISSING") + " wo=" + (tq.wo ? "ok" : "MISSING") +
+                  " w13=" + (tq.w13 ? "ok" : "MISSING") +
+                  "). Rebuild the model with turbo_quant_convert.py.");
       }
     }
   }

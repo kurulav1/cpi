@@ -1241,13 +1241,24 @@ void LlamaEngine::initialize(const EngineOptions& options) {
   run_startup_phase("static-load", [&] { load_static_weights(); });
   run_startup_phase("runtime-buffers", [&] { allocate_runtime_buffers(); });
   run_startup_phase("cache-copy", [&] {
-    init_layer_cache();
+    const bool prof = std::getenv("CPI_STARTUP_PROFILE") != nullptr;
+    auto sub = [&](const char* n, auto&& fn) {
+      const auto t0 = std::chrono::steady_clock::now();
+      fn();
+      if (prof) {
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - t0)
+                            .count();
+        std::cout << "[startup]   cache-copy." << n << " ms=" << ms << "\n";
+      }
+    };
+    sub("init_layer_cache", [&] { init_layer_cache(); });
     if (!cfg.is_moe()) {
       if (lowbit_streaming_enabled(options_)) {
-        init_uncached_pinned_host_weights();
-        init_uncached_int8_host_weights();
+        sub("uncached_pinned", [&] { init_uncached_pinned_host_weights(); });
+        sub("uncached_int8", [&] { init_uncached_int8_host_weights(); });
       } else {
-        init_uncached_pinned_host_weights();
+        sub("uncached_pinned", [&] { init_uncached_pinned_host_weights(); });
       }
     }
   });
