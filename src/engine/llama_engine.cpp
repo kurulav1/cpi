@@ -1319,6 +1319,24 @@ void LlamaEngine::initialize(const EngineOptions& options) {
     }
   }
 
+  // Free the fp16 LM head once the int8 head serves inference. project_lm_head_logits() routes to
+  // the resident int8 head (d_lm_head_i8_, near-lossless) when lm_head_int8_ is set, so the 1.45 GB
+  // fp16 head is dead for single-sequence decode. Two consumers still need the fp16 head, so gate:
+  // the BATCHED lm-head (batched_lm_head) uses it and only runs under --paged-blocks; the autotuner
+  // references it. CPI_FP16_LM_HEAD=1 keeps the head in fp16 (lm_head_int8_ stays false).
+  if (lm_head_int8_ && d_lm_head_ != nullptr && !options_.paged_blocks &&
+      std::getenv("CPI_AUTOTUNE") == nullptr) {
+    cudaFree(d_lm_head_);
+    d_lm_head_ = nullptr;
+    if (startup_vram) {
+      std::size_t vfree = 0, vtot = 0;
+      if (cudaMemGetInfo(&vfree, &vtot) == cudaSuccess) {
+        std::cout << "[startup] freed fp16 lm head (int8 head active); vram_used_gb="
+                  << ((vtot - vfree) / (1024.0 * 1024.0 * 1024.0)) << "\n";
+      }
+    }
+  }
+
   if (options_.verbose) {
     const auto startup_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                 std::chrono::steady_clock::now() - startup_begin)

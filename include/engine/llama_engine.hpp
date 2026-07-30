@@ -355,6 +355,11 @@ private:
                                  int in_features, int warps_per_block = 0, int tile_pairs = 0,
                                  int rows_per_warp = 1);
 
+  // Single-sequence LM-head projection: x_norm[hidden] -> logits[vocab] (fp32). Uses the resident
+  // int8 head (d_lm_head_i8_) when lm_head_int8_ is set -- near-lossless and lets the fp16 head be
+  // freed under single-sequence deployment -- else the fp16 head. Bias is added by the caller.
+  void project_lm_head_logits(const __half* x_norm, float* logits);
+
   // Applies either RMSNorm or true LayerNorm based on model config.
   // Optional bias is applied in-kernel for LayerNorm or as a post-add for RMSNorm.
   void launch_norm(const void* x, const void* weight, const void* bias, void* y, int rows,

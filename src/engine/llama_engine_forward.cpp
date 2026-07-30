@@ -1,11 +1,10 @@
 #include <cuda_fp16.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
-#include <vector>
-
-#include <algorithm>
 #include <utility>
+#include <vector>
 
 #include "common.hpp"
 #include "engine/llama_engine.hpp"
@@ -74,9 +73,7 @@ void LlamaEngine::forward_token(int token, int position, bool compute_logits,
                [&] { launch_norm(d_x_, d_norm_out_, d_norm_out_bias_, d_x_norm_, 1, hidden); });
 
   run_profiled(last_benchmark_stats_.decode_lm_head_ms, [&] {
-    resident_projection_float(d_lm_head_, d_x_norm_, d_logits_, cfg.vocab_size, hidden,
-                              resident_lm_head_warps_, resident_lm_head_tile_pairs_,
-                              resident_lm_head_rows_per_warp_);
+    project_lm_head_logits(static_cast<const __half*>(d_x_norm_), static_cast<float*>(d_logits_));
     if (d_lm_head_bias_) {
       kernels::launch_add_bias_inplace_float_from_half(static_cast<float*>(d_logits_),
                                                        static_cast<const __half*>(d_lm_head_bias_),
@@ -90,15 +87,13 @@ void LlamaEngine::forward_token(int token, int position, bool compute_logits,
     CUDA_CHECK(cudaMemcpy(out_logits->data(), d_logits_, out_logits->size() * sizeof(float),
                           cudaMemcpyDeviceToHost));
   } else if (out_argmax) {
-    kernels::launch_argmax_float(static_cast<const float*>(d_logits_), cfg.vocab_size,
-                               d_argmax_, compute_stream_, d_argmax_part_val_,
-                               d_argmax_part_idx_, argmax_parts_);
+    kernels::launch_argmax_float(static_cast<const float*>(d_logits_), cfg.vocab_size, d_argmax_,
+                                 compute_stream_, d_argmax_part_val_, d_argmax_part_idx_,
+                                 argmax_parts_);
     CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
     CUDA_CHECK(cudaMemcpy(out_argmax, d_argmax_, sizeof(int), cudaMemcpyDeviceToHost));
   }
 }
-
-
 
 // ---------------------------------------------------------------------------------------
 // Tensor-core prefill attention.
@@ -192,7 +187,6 @@ bool LlamaEngine::prefill_attention_tensorcore(const void* q, const void* k_laye
   const float zero = 0.0f;
   const float one = 1.0f;
 
-
   const std::size_t ptrs_needed = 6 * static_cast<std::size_t>(num_heads);
   if (ptrs_needed > gemm_ptrs_capacity_) {
     if (d_gemm_ptrs_) {
@@ -232,10 +226,10 @@ bool LlamaEngine::prefill_attention_tensorcore(const void* q, const void* k_laye
     // stride q_stride, read column-major as [D, chunk] -- OP_N. The column-major result
     // [keys, chunk] with ld=keys IS the row-major [chunk, keys] the softmax wants.
     // 1/sqrt(head_dim) rides in as alpha, so no separate scaling pass.
-    CUBLAS_CHECK(cublasGemmBatchedEx(
-        cublas_, CUBLAS_OP_T, CUBLAS_OP_N, keys, chunk, head_dim, &scale, A1, CUDA_R_16F,
-        kv_stride, B1, CUDA_R_16F, q_stride, &zero, C1, CUDA_R_16F, keys, num_heads,
-        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    CUBLAS_CHECK(cublasGemmBatchedEx(cublas_, CUBLAS_OP_T, CUBLAS_OP_N, keys, chunk, head_dim,
+                                     &scale, A1, CUDA_R_16F, kv_stride, B1, CUDA_R_16F, q_stride,
+                                     &zero, C1, CUDA_R_16F, keys, num_heads, CUBLAS_COMPUTE_32F,
+                                     CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 
     kernels::launch_softmax_causal_rows(sh, num_heads, kChunk, chunk, keys, base_pos + c0,
                                         compute_stream_);
@@ -243,12 +237,24 @@ bool LlamaEngine::prefill_attention_tensorcore(const void* q, const void* k_laye
     // O(D x chunk, col-major, ld=out_stride) = V(D x keys) * P(keys x chunk)
     // V is row-major [keys, D] -> column-major [D, keys], OP_N. P is the row-major
     // [chunk, keys] we just wrote -> column-major [keys, chunk] with ld=keys, OP_N.
-    CUBLAS_CHECK(cublasGemmBatchedEx(
-        cublas_, CUBLAS_OP_N, CUBLAS_OP_N, head_dim, chunk, keys, &one, A2, CUDA_R_16F, kv_stride,
-        B2, CUDA_R_16F, keys, &zero, C2, CUDA_R_16F, out_stride, num_heads, CUBLAS_COMPUTE_32F,
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    CUBLAS_CHECK(cublasGemmBatchedEx(cublas_, CUBLAS_OP_N, CUBLAS_OP_N, head_dim, chunk, keys, &one,
+                                     A2, CUDA_R_16F, kv_stride, B2, CUDA_R_16F, keys, &zero, C2,
+                                     CUDA_R_16F, out_stride, num_heads, CUBLAS_COMPUTE_32F,
+                                     CUBLAS_GEMM_DEFAULT_TENSOR_OP));
   }
   return true;
+}
+
+void LlamaEngine::project_lm_head_logits(const __half* x_norm, float* logits) {
+  const auto& cfg = weights_.config();
+  if (lm_head_int8_ && d_lm_head_i8_ != nullptr) {
+    kernels::launch_weight_only_int8_gemv_f32(d_lm_head_i8_, d_lm_head_i8_scales_, x_norm, logits,
+                                              cfg.vocab_size, cfg.hidden_size, compute_stream_);
+  } else {
+    resident_projection_float(d_lm_head_, x_norm, logits, cfg.vocab_size, cfg.hidden_size,
+                              resident_lm_head_warps_, resident_lm_head_tile_pairs_,
+                              resident_lm_head_rows_per_warp_);
+  }
 }
 
 }  // namespace engine

@@ -1,7 +1,7 @@
-#include <cstdlib>
 #include <cuda_fp16.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <iostream>
 
 #include "common.hpp"
@@ -36,10 +36,9 @@ bool LlamaEngine::can_use_greedy_decode_graph() const {
          !options_.paged_blocks &&  // paged decode uses the non-graph split-K block-gather path
          !options_.profile_decode_phases && !kv_int4_enabled_ && !tq3_enabled_ && !cfg.is_moe() &&
          !cfg.use_layernorm && !cfg.has_qk_norm && !cfg.scale_embeddings &&
-         (attn_q_hidden_ <= 0 || attn_q_hidden_ == cfg.hidden_size) &&
-         !has_any_layer_norm_bias_ && !has_any_layer_output_bias_ &&
-         !weights_.has_tensor("norm.bias") && !weights_.has_tensor("output.bias") &&
-         !cfg.uses_non_full_attention();
+         (attn_q_hidden_ <= 0 || attn_q_hidden_ == cfg.hidden_size) && !has_any_layer_norm_bias_ &&
+         !has_any_layer_output_bias_ && !weights_.has_tensor("norm.bias") &&
+         !weights_.has_tensor("output.bias") && !cfg.uses_non_full_attention();
 }
 
 void LlamaEngine::destroy_greedy_decode_graph() {
@@ -187,9 +186,7 @@ void LlamaEngine::init_greedy_decode_graph() {
     }
     // Always warm the custom LM-head kernel (used in all graph captures to avoid cuBLAS fallback
     // issues).
-    resident_projection_float(d_lm_head_, d_x_norm_, d_logits_, cfg.vocab_size, hidden,
-                              resident_lm_head_warps_, resident_lm_head_tile_pairs_,
-                              resident_lm_head_rows_per_warp_);
+    project_lm_head_logits(static_cast<const __half*>(d_x_norm_), static_cast<float*>(d_logits_));
     CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
   }
 
@@ -435,12 +432,10 @@ void LlamaEngine::init_greedy_decode_graph() {
                           static_cast<__half*>(d_x_norm_), 1, hidden, norm_eps, compute_stream_);
   // Always use custom kernel in graph capture: cuBLASLt may fall through to
   // cublasGemmEx which is not graph-capturable, causing INVALID_VALUE errors.
-  resident_projection_float(d_lm_head_, d_x_norm_, d_logits_, cfg.vocab_size, hidden,
-                            resident_lm_head_warps_, resident_lm_head_tile_pairs_,
-                            resident_lm_head_rows_per_warp_);
-  kernels::launch_argmax_float(static_cast<const float*>(d_logits_), cfg.vocab_size,
-                               d_argmax_, compute_stream_, d_argmax_part_val_,
-                               d_argmax_part_idx_, argmax_parts_);
+  project_lm_head_logits(static_cast<const __half*>(d_x_norm_), static_cast<float*>(d_logits_));
+  kernels::launch_argmax_float(static_cast<const float*>(d_logits_), cfg.vocab_size, d_argmax_,
+                               compute_stream_, d_argmax_part_val_, d_argmax_part_idx_,
+                               argmax_parts_);
   kernels::launch_copy_int(d_argmax_, d_token_id_, compute_stream_);
   kernels::launch_increment_int(d_decode_position_, compute_stream_);
 
@@ -584,9 +579,7 @@ void LlamaEngine::init_logits_decode_graph() {
                                  resident_wo_tile_pairs_, resident_wo_rows_per_warp_);
       }
     }
-    resident_projection_float(d_lm_head_, d_x_norm_, d_logits_, cfg.vocab_size, hidden,
-                              resident_lm_head_warps_, resident_lm_head_tile_pairs_,
-                              resident_lm_head_rows_per_warp_);
+    project_lm_head_logits(static_cast<const __half*>(d_x_norm_), static_cast<float*>(d_logits_));
     CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
   }
 
@@ -766,8 +759,9 @@ void LlamaEngine::init_logits_decode_graph() {
                                resident_qkv_tile_pairs_, resident_qkv_rows_per_warp_);
     }
 
-    detail::launch_gated_glu(weights_.config().mlp_gelu, static_cast<const __half*>(d_ff1_), static_cast<const __half*>(d_ff2_),
-                             static_cast<__half*>(d_ff2_), inter, compute_stream_);
+    detail::launch_gated_glu(weights_.config().mlp_gelu, static_cast<const __half*>(d_ff1_),
+                             static_cast<const __half*>(d_ff2_), static_cast<__half*>(d_ff2_),
+                             inter, compute_stream_);
 
     if (tq) {
       resident_projection_half(lw->w2, d_ff2_, d_ff3_, hidden, inter, resident_wo_warps_,
@@ -803,9 +797,7 @@ void LlamaEngine::init_logits_decode_graph() {
   kernels::launch_rmsnorm(static_cast<const __half*>(d_x_), static_cast<const __half*>(d_norm_out_),
                           static_cast<__half*>(d_x_norm_), 1, hidden, norm_eps, compute_stream_);
   // Always use custom kernel in graph capture — same reason as greedy graph.
-  resident_projection_float(d_lm_head_, d_x_norm_, d_logits_, cfg.vocab_size, hidden,
-                            resident_lm_head_warps_, resident_lm_head_tile_pairs_,
-                            resident_lm_head_rows_per_warp_);
+  project_lm_head_logits(static_cast<const __half*>(d_x_norm_), static_cast<float*>(d_logits_));
   // Note: no argmax/copy_int/increment_int — caller reads d_logits_ for sampling.
 
   CUDA_CHECK(cudaStreamEndCapture(compute_stream_, &logits_decode_graph_));
