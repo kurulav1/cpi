@@ -1065,6 +1065,7 @@ void LlamaEngine::initialize(const EngineOptions& options) {
   enforce_host_resource_limits("startup.begin");
 
   const auto startup_begin = std::chrono::steady_clock::now();
+  static const bool startup_vram = std::getenv("CPI_STARTUP_PROFILE") != nullptr;
   const auto run_startup_phase = [&](const char* phase, auto&& fn) {
     const auto phase_begin = std::chrono::steady_clock::now();
     fn();
@@ -1073,7 +1074,14 @@ void LlamaEngine::initialize(const EngineOptions& options) {
       const auto phase_end = std::chrono::steady_clock::now();
       const auto phase_ms =
           std::chrono::duration_cast<std::chrono::milliseconds>(phase_end - phase_begin).count();
-      std::cout << "[startup] phase=" << phase << " ms=" << phase_ms << "\n";
+      std::cout << "[startup] phase=" << phase << " ms=" << phase_ms;
+      if (startup_vram) {
+        std::size_t vfree = 0, vtot = 0;
+        if (cudaMemGetInfo(&vfree, &vtot) == cudaSuccess) {
+          std::cout << " vram_used_gb=" << ((vtot - vfree) / (1024.0 * 1024.0 * 1024.0));
+        }
+      }
+      std::cout << "\n";
     }
   };
 
@@ -1267,6 +1275,49 @@ void LlamaEngine::initialize(const EngineOptions& options) {
     init_greedy_decode_graph();
     init_logits_decode_graph();
   });
+
+  // Reclaim streaming staging when every layer is resident. The streaming decode double-buffer
+  // (streaming_layer_weights_[2] / _i8_[2]) is only used for layers >= cached_layer_count_, so once
+  // the model is fully cached it is never touched again -- ~2.8 GB on the 32B (fp16 wqkv/wo/w13/w2
+  // + int8 MLP per slot x2). Slot-0's int8 buffer was scratch during cache-copy only. Freeing it
+  // returns that VRAM to steady-state headroom (nvidia-smi, and the KV pool) at zero quality cost.
+  // The pointers are nulled, so the destructor's later free is a no-op.
+  if (!weights_.config().is_moe() && cached_layer_count_ == weights_.config().num_layers) {
+    const auto cf = [](void* p) {
+      if (p) cudaFree(p);
+    };
+    for (auto& lw : streaming_layer_weights_) {
+      cf(lw.wqkv);
+      cf(lw.wo);
+      cf(lw.bo);
+      cf(lw.w13);
+      cf(lw.w2);
+      cf(lw.norm_att);
+      cf(lw.norm_ffn);
+      cf(lw.norm_att_bias);
+      cf(lw.norm_ffn_bias);
+      cf(lw.bqkv);
+      cf(lw.q_norm);
+      cf(lw.k_norm);
+      lw = {};
+    }
+    for (auto& iw : streaming_layer_weights_i8_) {
+      cf(iw.w1);
+      cf(iw.w2);
+      cf(iw.w3);
+      cf(iw.s_w1);
+      cf(iw.s_w2);
+      cf(iw.s_w3);
+      iw = {};
+    }
+    if (startup_vram) {
+      std::size_t vfree = 0, vtot = 0;
+      if (cudaMemGetInfo(&vfree, &vtot) == cudaSuccess) {
+        std::cout << "[startup] freed streaming staging (fully cached); vram_used_gb="
+                  << ((vtot - vfree) / (1024.0 * 1024.0 * 1024.0)) << "\n";
+      }
+    }
+  }
 
   if (options_.verbose) {
     const auto startup_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
