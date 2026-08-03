@@ -874,18 +874,142 @@ void PlanCudaEngine::parse_deepseek_config(const std::string& model_dir) {
     throw std::runtime_error("DeepSeek-V2 config.json is missing required MLA/geometry fields");
 }
 
-// --- DeepSeek-V2 loader/plan: implemented phase by phase (Phase 1b config parse landed; loader/ops
-// follow). Stubs keep the translation unit linking while the pieces come online. ---
-__half* PlanCudaEngine::upload_host_fp16(const std::string&, const std::vector<__half>&, int, int) {
-  throw std::runtime_error("upload_host_fp16: not implemented yet");
+// --- DeepSeek-V2 loader/plan (Phase 1c loader landed; MLA op + plan follow). ---
+
+// Upload a host-built fp16 [rows,cols] weight under `name` (e.g. the zero-padded o_proj that has no
+// counterpart tensor to read from the checkpoint).
+__half* PlanCudaEngine::upload_host_fp16(const std::string& name, const std::vector<__half>& host,
+                                         int rows, int cols) {
+  (void)rows;
+  (void)cols;
+  __half* d = nullptr;
+  G4_CHECK(cudaMalloc(&d, host.size() * sizeof(__half)));
+  G4_CHECK(cudaMemcpy(d, host.data(), host.size() * sizeof(__half), cudaMemcpyHostToDevice));
+  dev_[name] = d;
+  return d;
 }
-void PlanCudaEngine::fuse_upload_experts_int4(const std::string&, const std::vector<__half>&, int,
-                                              int) {
-  throw std::runtime_error("fuse_upload_experts_int4: not implemented yet");
+
+// Quantize a host-built fp16 [rows,cols] weight to int4 (group-wise) and register it under `name`.
+// Same quant path as upload_int4 but from a caller buffer -- DeepSeek's fused expert matrices are
+// synthesized in host memory (no such tensor exists to read by name). Experts are the memory hog, so
+// they are ALWAYS int4 regardless of the global weight-quant flag (mirrors the Gemma MoE requirement).
+void PlanCudaEngine::fuse_upload_experts_int4(const std::string& name,
+                                              const std::vector<__half>& host, int rows, int cols) {
+  int group = weight_quant_group_;
+  if (group > 0 && (group & (group - 1)) != 0) group = 0;
+  while (group > 0 && (group > cols || (cols % group) != 0)) group /= 2;
+  if (group == 1) group = 0;
+
+  __half* d_fp16 = nullptr;
+  G4_CHECK(cudaMalloc(&d_fp16, host.size() * sizeof(__half)));
+  G4_CHECK(cudaMemcpy(d_fp16, host.data(), host.size() * sizeof(__half), cudaMemcpyHostToDevice));
+  std::int8_t* d_i8 = nullptr;
+  float* d_scales = nullptr;
+  const std::size_t n = static_cast<std::size_t>(rows) * cols;
+  const int n_groups = kernels::quant_group_count(cols, group);
+  G4_CHECK(cudaMalloc(&d_i8, n));
+  G4_CHECK(cudaMalloc(&d_scales, static_cast<std::size_t>(rows) * n_groups * sizeof(float)));
+  if (group > 0)
+    kernels::launch_quantize_groupwise_fp16_to_int8(d_fp16, d_i8, d_scales, rows, cols, group,
+                                                    stream_, 7);
+  else
+    kernels::launch_quantize_rowwise_fp16_to_int8(d_fp16, d_i8, d_scales, rows, cols, stream_, 7);
+  std::int8_t* d_packed = nullptr;
+  G4_CHECK(cudaMalloc(&d_packed, static_cast<std::size_t>(rows) * ((cols + 1) / 2)));
+  kernels::launch_pack_rowwise_int8_to_int4(d_i8, d_packed, rows, cols, stream_);
+  G4_CHECK(cudaStreamSynchronize(stream_));
+  cudaFree(d_i8);
+  cudaFree(d_fp16);
+
+  QuantWeight qw;
+  qw.packed = d_packed;
+  qw.scales = d_scales;
+  qw.group = group;
+  qw.pf_i8 = nullptr;
+  qw.pf_scales = nullptr;
+  qdev_[name] = qw;
 }
+
 void PlanCudaEngine::load_deepseek_weights() {
-  throw std::runtime_error("load_deepseek_weights: not implemented yet");
+  const bool quant = weight_quant_bits_ == 4 || weight_quant_bits_ == 8;
+  const int H = cfg_.hidden;
+  const int nh = cfg_.num_heads;
+  const int qk = cfg_.qk_nope_head_dim + cfg_.qk_rope_head_dim;  // 192, the padded head_dim
+  const int vhd = cfg_.v_head_dim;                               // 128
+  const int kva = cfg_.kv_lora_rank + cfg_.qk_rope_head_dim;     // 576
+  const int kvb = nh * (cfg_.qk_nope_head_dim + vhd);            // nh*256
+  const int MI = cfg_.moe_intermediate_size;                     // 1408
+  auto proj = [&](const std::string& nm, int r, int c) {
+    if (quant)
+      upload_int4(nm, r, c);
+    else
+      upload(nm, r, c);
+  };
+
+  upload("model.embed_tokens.weight", cfg_.vocab, H);
+  upload("model.norm.weight", 1, H);
+  if (st_.has_tensor("lm_head.weight")) upload("lm_head.weight", cfg_.vocab, H);
+
+  for (int L = 0; L < cfg_.num_layers; ++L) {
+    const std::string p = "model.layers." + std::to_string(L) + ".";
+    upload(p + "input_layernorm.weight", 1, H);
+    upload(p + "post_attention_layernorm.weight", 1, H);
+
+    // ── MLA attention weights ──
+    if (cfg_.q_lora_rank > 0) {
+      proj(p + "self_attn.q_a_proj.weight", cfg_.q_lora_rank, H);
+      upload(p + "self_attn.q_a_layernorm.weight", 1, cfg_.q_lora_rank);
+      proj(p + "self_attn.q_b_proj.weight", nh * qk, cfg_.q_lora_rank);
+    } else {
+      proj(p + "self_attn.q_proj.weight", nh * qk, H);
+    }
+    proj(p + "self_attn.kv_a_proj_with_mqa.weight", kva, H);
+    upload(p + "self_attn.kv_a_layernorm.weight", 1, cfg_.kv_lora_rank);
+    proj(p + "self_attn.kv_b_proj.weight", kvb, cfg_.kv_lora_rank);
+    // o_proj is [H, nh*v_head]; PAD to [H, nh*qk] with zero columns per head so the standard
+    // Attention op can run at head_dim=qk (V padded to qk) and o_proj still consumes it directly.
+    {
+      const auto oh = read_host_fp16(p + "self_attn.o_proj.weight", H, nh * vhd);
+      std::vector<__half> pad(static_cast<std::size_t>(H) * nh * qk, __float2half(0.0f));
+      for (int r = 0; r < H; ++r)
+        for (int h = 0; h < nh; ++h)
+          for (int d = 0; d < vhd; ++d)
+            pad[(static_cast<std::size_t>(r) * nh + h) * qk + d] =
+                oh[(static_cast<std::size_t>(r) * nh + h) * vhd + d];
+      upload_host_fp16(p + "self_attn.o_proj.weight", pad, H, nh * qk);
+    }
+
+    // ── MoE (layers >= first_k_dense_replace) or a dense MLP (the first layers) ──
+    const bool moe = L >= cfg_.first_k_dense_replace && cfg_.num_experts > 0;
+    if (moe) {
+      upload(p + "mlp.gate.weight", cfg_.num_experts, H);  // router logits proj (fp16)
+      // Fuse the per-expert gate/up/down into the [E*2*MI,H] / [E*H,MI] layout the MoE ops expect.
+      std::vector<__half> gate_up(static_cast<std::size_t>(cfg_.num_experts) * 2 * MI * H);
+      std::vector<__half> down(static_cast<std::size_t>(cfg_.num_experts) * H * MI);
+      for (int e = 0; e < cfg_.num_experts; ++e) {
+        const std::string ep = p + "mlp.experts." + std::to_string(e) + ".";
+        const auto g = read_host_fp16(ep + "gate_proj.weight", MI, H);
+        const auto u = read_host_fp16(ep + "up_proj.weight", MI, H);
+        const auto dn = read_host_fp16(ep + "down_proj.weight", H, MI);
+        std::copy(g.begin(), g.end(), gate_up.begin() + static_cast<std::size_t>(e) * 2 * MI * H);
+        std::copy(u.begin(), u.end(),
+                  gate_up.begin() + (static_cast<std::size_t>(e) * 2 * MI + MI) * H);
+        std::copy(dn.begin(), dn.end(), down.begin() + static_cast<std::size_t>(e) * H * MI);
+      }
+      fuse_upload_experts_int4(p + "mlp.experts.gate_up_proj", gate_up, cfg_.num_experts * 2 * MI, H);
+      fuse_upload_experts_int4(p + "mlp.experts.down_proj", down, cfg_.num_experts * H, MI);
+      const int SI = MI * cfg_.n_shared_experts;  // shared-expert SwiGLU intermediate
+      proj(p + "mlp.shared_experts.gate_proj.weight", SI, H);
+      proj(p + "mlp.shared_experts.up_proj.weight", SI, H);
+      proj(p + "mlp.shared_experts.down_proj.weight", H, SI);
+    } else {
+      proj(p + "mlp.gate_proj.weight", cfg_.intermediate, H);
+      proj(p + "mlp.up_proj.weight", cfg_.intermediate, H);
+      proj(p + "mlp.down_proj.weight", H, cfg_.intermediate);
+    }
+  }
 }
+
 void PlanCudaEngine::build_deepseek_plan() {
   throw std::runtime_error("build_deepseek_plan: not implemented yet");
 }
@@ -1125,15 +1249,22 @@ void PlanCudaEngine::open(const std::string& cpi_path, int max_context) {
       // cpi-deepseek-v2lite-status memory).
       wprefix_ = "model.";
       parse_deepseek_config(cpi_path);
-      char msg[512];
+      if (max_ctx_ <= 0) max_ctx_ = std::min(4096, cfg_.max_position_embeddings);
+      G4_CHECK(cudaStreamCreate(&stream_));
+      std::size_t free_before = 0, total_vram = 0;
+      G4_CHECK(cudaMemGetInfo(&free_before, &total_vram));
+      load_deepseek_weights();
+      std::size_t free_after = 0;
+      G4_CHECK(cudaMemGetInfo(&free_after, &total_vram));
+      char msg[640];
       std::snprintf(msg, sizeof(msg),
-                    "DeepSeek-V2 config parsed OK (layers=%d hidden=%d heads=%d kv_lora=%d "
-                    "qk=%d+%d v=%d experts=%d/top%d shared=%d dense_layers=%d vocab=%d). "
-                    "Loader/MLA op/plan are the next phases.",
+                    "DeepSeek-V2 config+weights LOADED (layers=%d hidden=%d heads=%d kv_lora=%d "
+                    "qk=%d+%d v=%d experts=%d/top%d shared=%d dense_layers=%d vocab=%d). Weights use "
+                    "%.2f GB VRAM (%.2f GB free of %.2f). MLA op + plan are the next phases.",
                     cfg_.num_layers, cfg_.hidden, cfg_.num_heads, cfg_.kv_lora_rank,
                     cfg_.qk_nope_head_dim, cfg_.qk_rope_head_dim, cfg_.v_head_dim, cfg_.num_experts,
-                    cfg_.top_k_experts, cfg_.n_shared_experts, cfg_.first_k_dense_replace,
-                    cfg_.vocab);
+                    cfg_.top_k_experts, cfg_.n_shared_experts, cfg_.first_k_dense_replace, cfg_.vocab,
+                    (free_before - free_after) / 1e9, free_after / 1e9, total_vram / 1e9);
       throw std::runtime_error(msg);
     }
     parse_qwen35_config(cpi_path);
