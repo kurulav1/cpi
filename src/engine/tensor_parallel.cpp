@@ -13,6 +13,7 @@
 #include <stdexcept>
 
 #include "runtime/cuda_utils.cuh"
+#include "runtime/kernels.cuh"
 
 namespace engine {
 
@@ -130,6 +131,98 @@ void TensorParallelLinear::forward(const void* d_input_fp16, int batch, void* d_
         ctx.d_partial, out_bytes, cudaMemcpyDeviceToDevice, stream));
 
     row_offset += ctx.out_rows * batch;
+  }
+}
+
+RowParallelLinear::~RowParallelLinear() {
+  for (auto& ctx : contexts_) {
+    if (ctx.handle) {
+      cudaSetDevice(ctx.device);
+      cublasDestroy(ctx.handle);
+      ctx.handle = nullptr;
+    }
+    if (ctx.d_weight) {
+      cudaSetDevice(ctx.device);
+      cudaFree(ctx.d_weight);
+      ctx.d_weight = nullptr;
+    }
+    if (ctx.d_partial) {
+      cudaSetDevice(ctx.device);
+      cudaFree(ctx.d_partial);
+      ctx.d_partial = nullptr;
+    }
+  }
+}
+
+// Split the INPUT columns (K) greedily across ranks and upload each W[:, in_slice] shard.
+void RowParallelLinear::initialize(int world_size, int in_features, int out_features,
+                                   const std::vector<const void*>& shard_weights_fp16,
+                                   const std::vector<int>& devices) {
+  if (world_size <= 0) {
+    throw std::invalid_argument("world_size must be > 0");
+  }
+  if (static_cast<int>(shard_weights_fp16.size()) < world_size) {
+    throw std::invalid_argument("missing shard weight pointers");
+  }
+  if (!devices.empty() && static_cast<int>(devices.size()) < world_size) {
+    throw std::invalid_argument("devices map, when given, must cover every rank");
+  }
+  in_features_ = in_features;
+  out_features_ = out_features;
+  contexts_.clear();
+  contexts_.resize(world_size);
+
+  int cols_remaining = in_features;
+  for (int rank = 0; rank < world_size; ++rank) {
+    auto& ctx = contexts_[rank];
+    ctx.device = devices.empty() ? rank : devices[rank];
+    ctx.in_rows = cols_remaining / (world_size - rank);  // input columns for this rank
+    cols_remaining -= ctx.in_rows;
+
+    CUDA_CHECK(cudaSetDevice(ctx.device));
+    CUBLAS_CHECK(cublasCreate(&ctx.handle));
+    const std::size_t shard_bytes = static_cast<std::size_t>(out_features_) *
+                                    static_cast<std::size_t>(ctx.in_rows) * sizeof(__half);
+    CUDA_CHECK(cudaMalloc(&ctx.d_weight, shard_bytes));
+    CUDA_CHECK(
+        cudaMemcpy(ctx.d_weight, shard_weights_fp16[rank], shard_bytes, cudaMemcpyHostToDevice));
+  }
+}
+
+// Per-rank GEMM over its input slice -> partial[out, batch]; then sum the partials (all-reduce).
+void RowParallelLinear::forward(const std::vector<const void*>& shard_inputs_fp16, int batch,
+                                void* d_output_fp16, cudaStream_t stream) {
+  constexpr float alpha = 1.0f;
+  constexpr float beta = 0.0f;
+  const std::size_t count = static_cast<std::size_t>(out_features_) * static_cast<std::size_t>(batch);
+  const std::size_t out_bytes = count * sizeof(__half);
+
+  for (std::size_t r = 0; r < contexts_.size(); ++r) {
+    auto& ctx = contexts_[r];
+    CUDA_CHECK(cudaSetDevice(ctx.device));
+    CUBLAS_CHECK(cublasSetStream(ctx.handle, stream));
+    if (ctx.d_partial) {
+      cudaFree(ctx.d_partial);
+      ctx.d_partial = nullptr;
+    }
+    CUDA_CHECK(cudaMalloc(&ctx.d_partial, out_bytes));
+    // partial[out, batch] = W_r[out, in_r] * x_r[in_r, batch] (column-major, N/N).
+    CUBLAS_CHECK(cublasGemmEx(ctx.handle, CUBLAS_OP_N, CUBLAS_OP_N, out_features_, batch, ctx.in_rows,
+                              &alpha, ctx.d_weight, CUDA_R_16F, out_features_, shard_inputs_fp16[r],
+                              CUDA_R_16F, ctx.in_rows, &beta, ctx.d_partial, CUDA_R_16F,
+                              out_features_, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+  }
+
+  // ALL-REDUCE (sum) the partials -> d_output. On a single GPU every partial lives on device 0, so
+  // this is a local add-chain. For real multi-GPU this exact step becomes ncclAllReduce(SUM) -- the
+  // one cluster-gated piece; everything above is verifiable here.
+  CUDA_CHECK(cudaSetDevice(contexts_[0].device));
+  CUDA_CHECK(cudaMemcpyAsync(d_output_fp16, contexts_[0].d_partial, out_bytes,
+                             cudaMemcpyDeviceToDevice, stream));
+  for (std::size_t r = 1; r < contexts_.size(); ++r) {
+    kernels::launch_add_inplace(static_cast<__half*>(d_output_fp16),
+                                static_cast<const __half*>(contexts_[r].d_partial),
+                                static_cast<int>(count), stream);
   }
 }
 

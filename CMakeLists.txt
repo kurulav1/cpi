@@ -614,6 +614,19 @@ if(CPI_ENABLE_CUDA)
   )
   add_test(NAME tensor_parallel_test COMMAND tensor_parallel_test)
 
+  # Multi-GPU prep brick 2: RowParallelLinear (input-split + all-reduce) verified on ONE GPU vs the
+  # unsharded forward. The all-reduce is the ncclAllReduce seam for real multi-GPU.
+  add_executable(row_parallel_test
+    src/tests/row_parallel_test.cu
+  )
+  target_include_directories(row_parallel_test PRIVATE include)
+  target_link_libraries(row_parallel_test PRIVATE cpi_engine)
+  set_target_properties(row_parallel_test PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+  )
+  add_test(NAME row_parallel_test COMMAND row_parallel_test)
+
   # Image preprocessing: bicubic resize vs PIL + patch-grid layout.
   add_executable(image_preprocess_test
     src/tests/image_preprocess_test.cpp
