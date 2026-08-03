@@ -742,6 +742,15 @@ if(CPI_ENABLE_CUDA)
   add_test(NAME deepseek_mla_real_test
            COMMAND deepseek_mla_real_test ${CMAKE_SOURCE_DIR}/artifacts/deepseek_mla_ref)
 
+  # DeepSeek-V2 YARN rope frequencies reproduce transformers' inv_freq (host-only; skips if the HF
+  # reference dump is absent). Prerequisite for the in-engine MLA op.
+  add_executable(deepseek_rope_test
+    src/tests/deepseek_rope_test.cpp
+  )
+  target_include_directories(deepseek_rope_test PRIVATE include)
+  add_test(NAME deepseek_rope_test
+           COMMAND deepseek_rope_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
   # Image preprocessing: bicubic resize vs PIL + patch-grid layout.
   add_executable(image_preprocess_test
     src/tests/image_preprocess_test.cpp
