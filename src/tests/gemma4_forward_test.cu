@@ -127,6 +127,7 @@ int main(int argc, char** argv) {
       double nll = 0.0;
       int cnt = 0;
       int argmatch = 0;  // greedy top-1 == ground-truth next token (teacher-forced accuracy)
+      std::vector<double> nlls;  // per-token nll, for median/tail (mean PPL is outlier-sensitive)
       const int n = static_cast<int>(ppl_tokens.size());
       for (int i = ppl_warm; i < n; i += ppl_stride) {
         // Full prefix by default; with --ppl-win W, cap context to BOS + the last W tokens so each
@@ -154,14 +155,27 @@ int main(int argc, char** argv) {
         double se = 0.0;
         for (float v : lg) se += std::exp(static_cast<double>(v) - mx);
         const double lse = mx + std::log(se);
-        nll += lse - static_cast<double>(lg[tgt]);
+        const double tok_nll = lse - static_cast<double>(lg[tgt]);
+        nll += tok_nll;
+        nlls.push_back(tok_nll);
         if (am == tgt) ++argmatch;
         ++cnt;
       }
       const double mean_nll = cnt > 0 ? nll / cnt : 0.0;
-      std::printf("[ppl] weight_quant=%d tokens_scored=%d ppl=%.5f nll/tok=%.5f top1_acc=%.4f\n",
-                  weight_quant, cnt, std::exp(mean_nll), mean_nll,
-                  cnt > 0 ? static_cast<double>(argmatch) / cnt : 0.0);
+      // Median and tail: if the median NLL is flat across configs while the MEAN (hence PPL)
+      // diverges, the difference is driven by a few confident-wrong outliers, not a broad shift.
+      double median_nll = 0.0, p90_nll = 0.0, max_nll = 0.0;
+      if (!nlls.empty()) {
+        std::sort(nlls.begin(), nlls.end());
+        median_nll = nlls[nlls.size() / 2];
+        p90_nll = nlls[(nlls.size() * 9) / 10];
+        max_nll = nlls.back();
+      }
+      std::printf(
+          "[ppl] weight_quant=%d scored=%d ppl=%.4f mean_nll=%.4f median_nll=%.4f p90=%.4f "
+          "max=%.4f top1_acc=%.4f\n",
+          weight_quant, cnt, std::exp(mean_nll), mean_nll, median_nll, p90_nll, max_nll,
+          cnt > 0 ? static_cast<double>(argmatch) / cnt : 0.0);
       return 0;
     }
 
