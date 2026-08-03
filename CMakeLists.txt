@@ -688,6 +688,19 @@ if(CPI_ENABLE_CUDA)
   target_include_directories(shard_plan_test PRIVATE include)
   add_test(NAME shard_plan_test COMMAND shard_plan_test)
 
+  # DeepSeek-style Multi-head Latent Attention (MLA) verified on-device vs an fp32 oracle -- isolated
+  # groundwork for native DeepSeek-V3/R1 (full checkpoints are model-blocked on this box).
+  add_executable(mla_attention_test
+    src/tests/mla_attention_test.cu
+  )
+  target_include_directories(mla_attention_test PRIVATE include)
+  target_link_libraries(mla_attention_test PRIVATE cpi_engine)
+  set_target_properties(mla_attention_test PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+  )
+  add_test(NAME mla_attention_test COMMAND mla_attention_test)
+
   # Image preprocessing: bicubic resize vs PIL + patch-grid layout.
   add_executable(image_preprocess_test
     src/tests/image_preprocess_test.cpp
