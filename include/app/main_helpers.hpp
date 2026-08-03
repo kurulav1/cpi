@@ -56,7 +56,7 @@ std::string auto_detect_tokenizer_path(const std::string& model_path);
 
 // Which engine family a model maps to. The CPU-vs-CUDA choice is a separate,
 // runtime concern (force_cpu / device availability), not a model property.
-enum class ModelFamilyKind { Llama, Gemma4, Qwen35, Llama4 };
+enum class ModelFamilyKind { Llama, Gemma4, Qwen35, Llama4, DeepSeekV2 };
 
 // Centralized model-identity classification: the single place that inspects a
 // model path and reports its engine family + the raw facts dispatch keys off.

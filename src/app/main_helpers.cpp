@@ -836,6 +836,10 @@ std::string infer_safetensors_model_family(const std::string& path) {
       json.find("\"architectures\":[\"Llama4") != std::string::npos) {
     return "llama4";
   }
+  if (root_model_type.find("deepseek_v2") != std::string::npos ||
+      json.find("\"DeepseekV2ForCausalLM\"") != std::string::npos) {
+    return "deepseek_v2";
+  }
   return "";
 }
 
@@ -883,6 +887,10 @@ ModelProbe probe_model(const std::string& model_path) {
     p.kind = ModelFamilyKind::Gemma4;
   } else if (p.safetensors_family == "qwen3_5") {
     p.kind = ModelFamilyKind::Qwen35;
+  } else if (p.safetensors_family == "deepseek_v2") {
+    // DeepSeek-V2 (MLA attention + fine-grained MoE) ships as a HuggingFace directory; the op-plan
+    // executor reads it like Gemma 4's MoE checkpoint.
+    p.kind = ModelFamilyKind::DeepSeekV2;
   } else if (!p.is_safetensors_dir &&
              model::peek_container_family(model_path) == model::ModelFamily::Qwen3_5) {
     // A .ll2c container records its family in the header; ask it. Without this a Qwen3.5
@@ -931,6 +939,10 @@ EngineChoice resolve_engine(const ModelProbe& probe, bool cuda_available, bool m
             "the model directory, or drop --cpu to use the GPU engine, which does read .ll2c.");
       }
       return EngineChoice::Qwen35Cpu;
+    case ModelFamilyKind::DeepSeekV2:
+      // DeepSeek-V2 runs on the CUDA op-plan engine (MLA + MoE). No CPU/Metal path yet.
+      if (use_gpu) return EngineChoice::PlanCuda;
+      throw std::runtime_error("DeepSeek-V2 currently requires a CUDA GPU (MLA/MoE op plan)");
     case ModelFamilyKind::Llama4:
       return use_gpu ? EngineChoice::Llama4Cuda : EngineChoice::Llama4Cpu;
     case ModelFamilyKind::Llama:

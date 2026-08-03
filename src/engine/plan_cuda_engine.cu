@@ -1045,6 +1045,14 @@ void PlanCudaEngine::open(const std::string& cpi_path, int max_context) {
       G4_CHECK(cudaStreamSynchronize(stream_));
       return;
     }
+    if (mt.rfind("deepseek_v2", 0) == 0) {
+      // DeepSeek-V2 (MLA latent attention + fine-grained MoE). Weights are HF-native under "model.".
+      // WIP bring-up: config/loader/plan land phase by phase (see cpi-deepseek-v2lite-status memory).
+      wprefix_ = "model.";
+      throw std::runtime_error(
+          "DeepSeek-V2 recognized but its op-plan loader is not wired yet (WIP: MLA op + MoE + "
+          "loader in progress). Detection/config scaffolding is in place.");
+    }
     parse_qwen35_config(cpi_path);
     if (max_ctx_ <= 0 ||
         (cfg_.max_position_embeddings > 0 && max_ctx_ > cfg_.max_position_embeddings))
