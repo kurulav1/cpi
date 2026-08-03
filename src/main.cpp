@@ -489,8 +489,11 @@ int main(int argc, char** argv) {
       using app::main_helpers::EngineChoice;
       switch (engine_choice) {
         case EngineChoice::PlanCuda:
-          std::cout << "[info] Detected a Gemma 4 (.cpi) model. Using the generic op-plan CUDA "
-                       "engine.\n";
+          std::cout << "[info] Detected a "
+                    << (model_probe.kind == app::main_helpers::ModelFamilyKind::DeepSeekV2
+                            ? "DeepSeek-V2"
+                            : "Gemma 4")
+                    << " model. Using the generic op-plan CUDA engine.\n";
           break;
         case EngineChoice::Qwen35Cuda:
           std::cout << "[info] Detected a Qwen3.5 model. Using the Qwen3.5 CUDA engine.\n";
