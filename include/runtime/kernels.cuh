@@ -621,6 +621,21 @@ void launch_moe_router_topk_softmax(const half* logits, int experts, int top_k, 
                                     float* topk_prob, cudaStream_t stream,
                                     const half* per_expert_scale = nullptr);
 
+// launch_moe_router_sigmoid_topk
+//
+// Kimi-K3-style router: SIGMOID gate per expert (independent, not softmax), optional grouped
+// node-limited selection, top-k, then normalise the selected gates to sum 1. Supports top_k up to
+// 32 (K3 uses 16, above the softmax router's hard cap of 8). Groundwork for K3 -- not yet wired to
+// a model (its 896/top-16 MoE needs this router + expert streaming + MXFP4); gated in isolation by
+// moe_router_sigmoid_test.
+//   n_group / topk_group - grouped routing: experts split into n_group contiguous groups; a group's
+//     score is the sum of its top-2 gates; the top `topk_group` groups are kept and top-k is taken
+//     within them (DeepSeek-V3 style). n_group<=1 or a degenerate grouping -> flat top-k.
+//   topk_weight - selected experts' normalised sigmoid gates [top_k].
+void launch_moe_router_sigmoid_topk(const half* logits, int experts, int top_k, int n_group,
+                                    int topk_group, int* topk_idx, float* topk_weight,
+                                    cudaStream_t stream);
+
 // launch_moe_gate_up_geglu / launch_moe_down_accum
 //
 // The expert feed-forward, with the selected experts read from DEVICE memory

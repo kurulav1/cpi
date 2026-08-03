@@ -588,6 +588,19 @@ if(CPI_ENABLE_CUDA)
   )
   add_test(NAME mxfp4_dequant_test COMMAND mxfp4_dequant_test)
 
+  # Kimi-K3-style MoE router (sigmoid gates, grouped node-limited top-16) vs a host reference.
+  # Gates the routing math before it is wired to a model.
+  add_executable(moe_router_sigmoid_test
+    src/tests/moe_router_sigmoid_test.cu
+  )
+  target_include_directories(moe_router_sigmoid_test PRIVATE include)
+  target_link_libraries(moe_router_sigmoid_test PRIVATE cpi_engine)
+  set_target_properties(moe_router_sigmoid_test PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+  )
+  add_test(NAME moe_router_sigmoid_test COMMAND moe_router_sigmoid_test)
+
   # Image preprocessing: bicubic resize vs PIL + patch-grid layout.
   add_executable(image_preprocess_test
     src/tests/image_preprocess_test.cpp

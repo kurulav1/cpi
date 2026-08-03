@@ -481,6 +481,111 @@ __global__ void moe_router_topk_softmax_kernel(const half* logits, int experts, 
   }
 }
 
+// Kimi-K3-style router: SIGMOID gates (independent per expert, not softmax-normalised), optional
+// grouped node-limited selection (top-2-per-group score -> top `topk_group` groups -> top-k within
+// the selected groups, DeepSeek-V3 style), then normalise the SELECTED gates to sum 1. n_group<=1
+// (or a degenerate grouping) falls back to a flat top-k. Single-thread for an exact lowest-index
+// tie-break, matching moe_router_topk_softmax_kernel. top_k up to 32 (K3 uses 16, > the softmax
+// router's hard cap of 8). NOTE: not yet wired to a model -- isolation-gated groundwork.
+__global__ void moe_router_sigmoid_topk_kernel(const half* logits, int experts, int top_k,
+                                               int n_group, int topk_group, int* topk_idx,
+                                               float* topk_weight) {
+  extern __shared__ float gate[];  // [experts]
+  if (threadIdx.x != 0) return;
+  if (experts <= 0 || top_k <= 0) return;
+
+  for (int e = 0; e < experts; ++e)
+    gate[e] = 1.0f / (1.0f + expf(-__half2float(logits[e])));
+
+  constexpr int kMaxTopK = 32;
+  constexpr int kMaxGroups = 64;
+  const int kk = top_k < kMaxTopK ? top_k : kMaxTopK;
+
+  const bool grouped = (n_group > 1 && topk_group > 0 && topk_group < n_group &&
+                        n_group <= kMaxGroups && (experts % n_group) == 0);
+  const int gsize = grouped ? experts / n_group : experts;
+  int sel_groups[kMaxGroups];
+  int n_sel = 0;
+  if (grouped) {
+    float gscore[kMaxGroups];
+    for (int g = 0; g < n_group; ++g) {
+      float b0 = -1.0f, b1 = -1.0f;  // top-2 gates define the group's score
+      for (int i = 0; i < gsize; ++i) {
+        const float v = gate[g * gsize + i];
+        if (v > b0) {
+          b1 = b0;
+          b0 = v;
+        } else if (v > b1) {
+          b1 = v;
+        }
+      }
+      gscore[g] = b0 + (b1 > 0.0f ? b1 : 0.0f);
+    }
+    bool gused[kMaxGroups];
+    for (int g = 0; g < n_group; ++g) gused[g] = false;
+    for (int s = 0; s < topk_group; ++s) {
+      int bg = -1;
+      float bv = -1.0f;
+      for (int g = 0; g < n_group; ++g) {
+        if (gused[g]) continue;
+        if (gscore[g] > bv) {
+          bv = gscore[g];
+          bg = g;
+        }
+      }
+      if (bg < 0) break;
+      gused[bg] = true;
+      sel_groups[n_sel++] = bg;
+    }
+  }
+
+  int picked[kMaxTopK];
+  float picked_gate[kMaxTopK];
+  for (int k = 0; k < kk; ++k) {
+    int be = -1;
+    float bv = -1.0f;
+    for (int e = 0; e < experts; ++e) {
+      if (grouped) {
+        const int g = e / gsize;
+        bool ok = false;
+        for (int s = 0; s < n_sel; ++s)
+          if (sel_groups[s] == g) {
+            ok = true;
+            break;
+          }
+        if (!ok) continue;
+      }
+      bool used = false;
+      for (int p = 0; p < k; ++p)
+        if (picked[p] == e) {
+          used = true;
+          break;
+        }
+      if (used) continue;
+      if (gate[e] > bv) {  // strict '>' => lowest index wins ties
+        bv = gate[e];
+        be = e;
+      }
+    }
+    picked[k] = be;
+    picked_gate[k] = (be >= 0) ? gate[be] : 0.0f;
+  }
+
+  float sum = 0.0f;
+  for (int k = 0; k < kk; ++k)
+    if (picked[k] >= 0) sum += picked_gate[k];
+  const float inv = 1.0f / fmaxf(sum, 1.0e-8f);
+  for (int k = 0; k < top_k; ++k) {
+    if (k < kk && picked[k] >= 0) {
+      topk_idx[k] = picked[k];
+      topk_weight[k] = picked_gate[k] * inv;
+    } else {
+      topk_idx[k] = 0;
+      topk_weight[k] = 0.0f;
+    }
+  }
+}
+
 __global__ void convert_bf16_to_fp16_kernel(const std::uint16_t* src, half* dst, int n) {
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= n) {
@@ -1052,6 +1157,17 @@ void launch_moe_router_topk_softmax(const half* logits, int experts, int top_k, 
   const std::size_t smem = static_cast<std::size_t>(experts) * sizeof(float);
   moe_router_topk_softmax_kernel<<<1, 32, smem, stream>>>(logits, experts, top_k, topk_idx,
                                                           topk_prob, per_expert_scale);
+}
+
+void launch_moe_router_sigmoid_topk(const half* logits, int experts, int top_k, int n_group,
+                                    int topk_group, int* topk_idx, float* topk_weight,
+                                    cudaStream_t stream) {
+  if (experts <= 0 || top_k <= 0) {
+    return;
+  }
+  const std::size_t smem = static_cast<std::size_t>(experts) * sizeof(float);
+  moe_router_sigmoid_topk_kernel<<<1, 32, smem, stream>>>(logits, experts, top_k, n_group,
+                                                          topk_group, topk_idx, topk_weight);
 }
 
 void launch_dequant_int8_to_fp16(const int8_t* src, half* dst, int n, float scale,
