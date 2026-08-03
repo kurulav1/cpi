@@ -751,6 +751,18 @@ if(CPI_ENABLE_CUDA)
   add_test(NAME deepseek_rope_test
            COMMAND deepseek_rope_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+  # DeepSeek MLA assemble+rope kernel (per-head K/V assembly + interleaved rope) verified fp16 vs fp32.
+  add_executable(deepseek_mla_assemble_test
+    src/tests/deepseek_mla_assemble_test.cu
+  )
+  target_include_directories(deepseek_mla_assemble_test PRIVATE include)
+  target_link_libraries(deepseek_mla_assemble_test PRIVATE cpi_engine)
+  set_target_properties(deepseek_mla_assemble_test PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+  )
+  add_test(NAME deepseek_mla_assemble_test COMMAND deepseek_mla_assemble_test)
+
   # Image preprocessing: bicubic resize vs PIL + patch-grid layout.
   add_executable(image_preprocess_test
     src/tests/image_preprocess_test.cpp
