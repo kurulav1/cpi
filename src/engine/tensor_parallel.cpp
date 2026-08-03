@@ -46,12 +46,16 @@ TensorParallelLinear::~TensorParallelLinear() {
 // evenly divisible by world_size. Each shard is uploaded synchronously from
 // the corresponding host pointer in shard_weights_fp16.
 void TensorParallelLinear::initialize(int world_size, int in_features, int out_features,
-                                      const std::vector<const void*>& shard_weights_fp16) {
+                                      const std::vector<const void*>& shard_weights_fp16,
+                                      const std::vector<int>& devices) {
   if (world_size <= 0) {
     throw std::invalid_argument("world_size must be > 0");
   }
   if (static_cast<int>(shard_weights_fp16.size()) < world_size) {
     throw std::invalid_argument("missing shard weight pointers");
+  }
+  if (!devices.empty() && static_cast<int>(devices.size()) < world_size) {
+    throw std::invalid_argument("devices map, when given, must cover every rank");
   }
 
   in_features_ = in_features;
@@ -63,7 +67,7 @@ void TensorParallelLinear::initialize(int world_size, int in_features, int out_f
   int rows_remaining = out_features;
   for (int rank = 0; rank < world_size; ++rank) {
     auto& ctx = contexts_[rank];
-    ctx.device = rank;
+    ctx.device = devices.empty() ? rank : devices[rank];
     // Divide remaining rows evenly across remaining devices so no row is missed.
     ctx.out_rows = rows_remaining / (world_size - rank);
     rows_remaining -= ctx.out_rows;

@@ -33,8 +33,13 @@ public:
   // out_features      - total number of output rows before sharding (M dimension).
   // shard_weights_fp16 - host pointers to fp16 weight shards, one per device.
   //                      Each shard covers (out_features / world_size) rows.
+  // devices           - optional rank->CUDA-device map. Empty => rank r uses device r (real
+  //                      multi-GPU). Passing all-zeros runs every rank on device 0, which lets the
+  //                      sharding math be verified on a single GPU (tensor_parallel_test) -- the
+  //                      cross-device transport is the only piece that then needs real hardware.
   void initialize(int world_size, int in_features, int out_features,
-                  const std::vector<const void*>& shard_weights_fp16);
+                  const std::vector<const void*>& shard_weights_fp16,
+                  const std::vector<int>& devices = {});
 
   // Runs the row-parallel fp16 GEMM across all devices and concatenates results.
   //

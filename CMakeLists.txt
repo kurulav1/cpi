@@ -601,6 +601,19 @@ if(CPI_ENABLE_CUDA)
   )
   add_test(NAME moe_router_sigmoid_test COMMAND moe_router_sigmoid_test)
 
+  # Multi-GPU prep brick 1: TensorParallelLinear sharding math verified on ONE GPU (N ranks all
+  # mapped to device 0) vs the unsharded forward. Only the cross-device transport needs real HW.
+  add_executable(tensor_parallel_test
+    src/tests/tensor_parallel_test.cu
+  )
+  target_include_directories(tensor_parallel_test PRIVATE include)
+  target_link_libraries(tensor_parallel_test PRIVATE cpi_engine)
+  set_target_properties(tensor_parallel_test PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+  )
+  add_test(NAME tensor_parallel_test COMMAND tensor_parallel_test)
+
   # Image preprocessing: bicubic resize vs PIL + patch-grid layout.
   add_executable(image_preprocess_test
     src/tests/image_preprocess_test.cpp
