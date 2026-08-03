@@ -1154,6 +1154,17 @@ void launch_dequant_int4_grouped(const std::int8_t* w_packed, const float* scale
 void launch_dequant_int8_rowwise(const std::int8_t* w, const float* scales, half* out, int rows,
                                  int cols, cudaStream_t stream);
 
+// launch_dequant_mxfp4
+//
+// Whole-matrix dequant of OCP MXFP4 to fp16. Each element is an E2M1 4-bit float (1 sign, 2 exp,
+// 1 mantissa -> magnitudes {0,.5,1,1.5,2,3,4,6}); each block of 32 columns shares an E8M0 scale
+// (8-bit power-of-two exponent, value = 2^(code - 127)). `packed` is [rows, cols/2] nibbles (two
+// per byte, low nibble first); `scales` is [rows, cols/32] E8M0 bytes. cols % 32 == 0.
+// value(row,col) = e2m1[nibble] * 2^(scales[row, col/32] - 127). This is the K3 weight format;
+// the decode is validated in isolation (mxfp4_dequant_test) ahead of wiring it into the matvecs.
+void launch_dequant_mxfp4(const std::uint8_t* packed, const std::uint8_t* scales, half* out,
+                          int rows, int cols, cudaStream_t stream);
+
 // launch_i32_scale_to_fp16
 //
 // Epilogue for the int8-direct sequence GEMM: fp16 y[t0+lt, r] = i32[lt, r] * sw[r] * sx[t].

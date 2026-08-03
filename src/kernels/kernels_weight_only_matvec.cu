@@ -1585,6 +1585,35 @@ __global__ void dequant_int8_rowwise_kernel(const int8_t* __restrict__ w,
   }
 }
 
+// OCP MXFP4: E2M1 element x per-block-of-32 E8M0 scale. See kernels.cuh:launch_dequant_mxfp4.
+__device__ __forceinline__ float e2m1_to_float(unsigned nib) {
+  // Magnitudes for the 3 low bits (S EE M); bit 3 is the sign.
+  const float mag[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+  const float v = mag[nib & 0x7u];
+  return (nib & 0x8u) ? -v : v;
+}
+__global__ void dequant_mxfp4_kernel(const std::uint8_t* __restrict__ packed,
+                                     const std::uint8_t* __restrict__ scales, half* __restrict__ out,
+                                     int rows, int cols) {
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const int nblk = cols >> 5;  // cols / 32
+  const int pc = cols >> 1;    // packed bytes per row
+  const std::uint8_t* prow = packed + static_cast<std::size_t>(row) * pc;
+  const std::uint8_t* srow = scales + static_cast<std::size_t>(row) * nblk;
+  for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+    const std::uint8_t byte = prow[c >> 1];
+    const unsigned nib = (c & 1) ? (byte >> 4) : (byte & 0x0fu);
+    const float scale = exp2f(static_cast<int>(srow[c >> 5]) - 127);
+    out[static_cast<std::size_t>(row) * cols + c] = __float2half(e2m1_to_float(nib) * scale);
+  }
+}
+void launch_dequant_mxfp4(const std::uint8_t* packed, const std::uint8_t* scales, half* out,
+                          int rows, int cols, cudaStream_t stream) {
+  if ((cols & 31) != 0) return;  // block-32 required
+  dequant_mxfp4_kernel<<<rows, 256, 0, stream>>>(packed, scales, out, rows, cols);
+}
+
 void launch_dequant_int4_grouped(const std::int8_t* w_packed, const float* scales, half* out,
                                  int rows, int cols, int group, cudaStream_t stream) {
   const int shift = group_shift_of(group);

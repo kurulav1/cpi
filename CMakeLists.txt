@@ -575,6 +575,19 @@ if(CPI_ENABLE_CUDA)
   )
   add_test(NAME argmax_tiebreak_test COMMAND argmax_tiebreak_test)
 
+  # MXFP4 (K3 weight format) dequant: device kernel == host reference, E2M1 LUT + representable
+  # round-trip. Gates the decode math before it is wired into the matvec path.
+  add_executable(mxfp4_dequant_test
+    src/tests/mxfp4_dequant_test.cu
+  )
+  target_include_directories(mxfp4_dequant_test PRIVATE include)
+  target_link_libraries(mxfp4_dequant_test PRIVATE cpi_engine)
+  set_target_properties(mxfp4_dequant_test PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+  )
+  add_test(NAME mxfp4_dequant_test COMMAND mxfp4_dequant_test)
+
   # Image preprocessing: bicubic resize vs PIL + patch-grid layout.
   add_executable(image_preprocess_test
     src/tests/image_preprocess_test.cpp
