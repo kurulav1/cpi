@@ -627,6 +627,19 @@ if(CPI_ENABLE_CUDA)
   )
   add_test(NAME row_parallel_test COMMAND row_parallel_test)
 
+  # Multi-GPU prep brick 3: expert-parallel MoE (experts sharded across ranks, dispatch + combine)
+  # verified on ONE GPU vs all-local, using the real MoE kernels. The per-rank sum is the all_to_all seam.
+  add_executable(expert_parallel_test
+    src/tests/expert_parallel_test.cu
+  )
+  target_include_directories(expert_parallel_test PRIVATE include)
+  target_link_libraries(expert_parallel_test PRIVATE cpi_engine)
+  set_target_properties(expert_parallel_test PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+  )
+  add_test(NAME expert_parallel_test COMMAND expert_parallel_test)
+
   # Image preprocessing: bicubic resize vs PIL + patch-grid layout.
   add_executable(image_preprocess_test
     src/tests/image_preprocess_test.cpp
