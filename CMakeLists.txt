@@ -728,6 +728,20 @@ if(CPI_ENABLE_CUDA)
   )
   add_test(NAME deepseek_mla_stack_test COMMAND deepseek_mla_stack_test)
 
+  # DeepSeek MLA op matched against a REAL DeepSeek-V2-Lite layer dumped from transformers (test-driven
+  # against real weights). Skips cleanly if the artifact hasn't been generated (tools/deepseek_mla_oracle.py).
+  add_executable(deepseek_mla_real_test
+    src/tests/deepseek_mla_real_test.cu
+  )
+  target_include_directories(deepseek_mla_real_test PRIVATE include)
+  target_link_libraries(deepseek_mla_real_test PRIVATE cpi_engine)
+  set_target_properties(deepseek_mla_real_test PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+  )
+  add_test(NAME deepseek_mla_real_test
+           COMMAND deepseek_mla_real_test ${CMAKE_SOURCE_DIR}/artifacts/deepseek_mla_ref)
+
   # Image preprocessing: bicubic resize vs PIL + patch-grid layout.
   add_executable(image_preprocess_test
     src/tests/image_preprocess_test.cpp
