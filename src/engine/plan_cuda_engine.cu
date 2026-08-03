@@ -3938,10 +3938,27 @@ std::vector<int> PlanCudaEngine::generate_stream(const std::vector<int>& prompt,
 
   // Speculative greedy decode (CPI_CUDA_SPEC=<k>: up to k prompt-lookup drafts per
   // batched verify, batch = drafts+1 <= 16). Greedy-only and sampler-neutral (no
-  // penalties, no grammar): every emitted token is a verified argmax, so the stream
-  // must be identical to the plain greedy stream — that is the correctness gate.
+  // penalties, no grammar).
+  //
+  // KNOWN-NON-LOSSLESS (2026-08): the intended invariant -- output identical to plain greedy -- does
+  // NOT hold. The batched verify uses the seq/mt kernels while the nd==0 fallback uses the decode
+  // kernels; the two round differently on near-ties, so the emitted stream diverges from plain greedy
+  // AND depends on the draft policy (3-gram vs 6-gram give different output). It can cascade into
+  // repetition loops. Making it lossless requires reconciling the verify and decode kernel numerics
+  // (prefill-parity-class work) -- see memory:cpi-cuda-spec-decode. Until then this is EXPERIMENTAL.
   const char* spec_env = std::getenv("CPI_CUDA_SPEC");
   const int spec_k = spec_env ? std::min(std::atoi(spec_env), 15) : 0;
+  if (spec_k >= 1) {
+    static bool warned = false;
+    if (!warned) {
+      std::fprintf(stderr,
+                   "[warn] CPI_CUDA_SPEC is EXPERIMENTAL and NON-LOSSLESS: the batched verify and "
+                   "plain decode use different kernels, so the output differs from greedy decoding "
+                   "(and depends on the draft policy). Do not use it for reference/production "
+                   "output. See memory:cpi-cuda-spec-decode.\n");
+      warned = true;
+    }
+  }
   if (spec_k >= 1 && temperature <= 0.0f && seq_prefill_ok_ && !prompt.empty() &&
       p.repetition_penalty == 1.0f && p.no_repeat_ngram_size == 0) {
     using clock = std::chrono::steady_clock;
