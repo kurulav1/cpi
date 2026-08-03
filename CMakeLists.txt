@@ -162,7 +162,6 @@ if(CPI_ENABLE_CUDA)
   list(APPEND CPI_ENGINE_SOURCES
     src/runtime/system_info.cpp
     src/runtime/cuda_utils.cu
-    src/runtime/kv_cache.cpp
     src/kernels/kernels.cu
     src/kernels/kernels_attention_decode.cu
     src/kernels/kernels_persistent_decode.cu
@@ -652,6 +651,19 @@ if(CPI_ENABLE_CUDA)
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
   )
   add_test(NAME collective_test COMMAND collective_test)
+
+  # Multi-GPU prep brick 4: pipeline-parallel layer partitioning verified on ONE GPU -- a stack of
+  # layers split into P contiguous stages, activation handed across each stage boundary, vs unsharded.
+  add_executable(pipeline_parallel_test
+    src/tests/pipeline_parallel_test.cu
+  )
+  target_include_directories(pipeline_parallel_test PRIVATE include)
+  target_link_libraries(pipeline_parallel_test PRIVATE cpi_engine)
+  set_target_properties(pipeline_parallel_test PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+  )
+  add_test(NAME pipeline_parallel_test COMMAND pipeline_parallel_test)
 
   # Image preprocessing: bicubic resize vs PIL + patch-grid layout.
   add_executable(image_preprocess_test

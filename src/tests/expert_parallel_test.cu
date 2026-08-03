@@ -61,11 +61,14 @@ int main() {
   cudaMemcpy(y_full.data(), dY, H * sizeof(half), cudaMemcpyDeviceToHost);
 
   int fail = 0;
-  for (int ws : {2, 3, 4}) {  // ws=3 is an uneven expert split (last rank owns the remainder)
+  // ws=3 uneven split; ws=8 is one expert per rank (finest split); ws=12 > E exercises the degenerate
+  // path where the trailing ranks own an empty range and must contribute exactly zero.
+  for (int ws : {2, 3, 4, 8, 12}) {
     std::vector<float> y_ep(H, 0.0f);
     for (int r = 0; r < ws; ++r) {
       int lo = 0, hi = 0;
       engine::expert_parallel_range(E, ws, r, &lo, &hi);
+      if (lo >= hi) continue;  // empty stage (world_size > experts): owns no experts, contributes 0
       std::vector<int> lidx(TK);
       std::vector<float> mw(TK);
       engine::expert_parallel_dispatch(E, ws, r, idx.data(), w.data(), TK, lidx.data(), mw.data());

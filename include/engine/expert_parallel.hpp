@@ -13,11 +13,25 @@
 
 namespace engine {
 
-// [lo, hi) global experts owned by `rank`. Contiguous even split; the last rank takes the remainder.
+// [lo, hi) global experts owned by `rank` under a balanced greedy split -- each rank gets floor or
+// ceil(experts/world_size), the same partition policy as the TP row split and the PP stage split (see
+// pipeline_parallel.hpp), so every parallelism dimension shards the same way. Contiguous, tiles
+// [0, experts) with no gap or overlap for ANY world_size. Unlike an even-split-plus-last-rank-remainder
+// scheme this stays load-balanced and degrades cleanly when world_size > experts (trailing ranks get
+// an empty [x, x) range and own no experts) instead of piling every leftover onto the final rank.
 inline void expert_parallel_range(int experts, int world_size, int rank, int* lo, int* hi) {
-  const int per = experts / world_size;
-  *lo = rank * per;
-  *hi = (rank == world_size - 1) ? experts : (*lo + per);
+  int rem = experts;
+  int off = 0;
+  for (int r = 0; r <= rank; ++r) {
+    const int count = rem / (world_size - r);
+    if (r == rank) {
+      *lo = off;
+      *hi = off + count;
+      return;
+    }
+    off += count;
+    rem -= count;
+  }
 }
 
 // For one token's top-k selections (global expert ids + weights), fill this rank's LOCAL expert
