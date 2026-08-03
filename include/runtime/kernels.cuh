@@ -654,7 +654,7 @@ void launch_moe_router_sigmoid_topk(const half* logits, int experts, int top_k, 
 //   y                    - [hidden], the routing-weighted sum over the top_k experts
 void launch_moe_gate_up_geglu(const void* w, const float* scales, int qbits, int group,
                               const half* x, const int* topk_idx, half* inter_out, int inter,
-                              int hidden, int top_k, cudaStream_t stream);
+                              int hidden, int top_k, cudaStream_t stream, bool use_gelu = true);
 
 void launch_moe_down_accum(const void* w, const float* scales, int qbits, int group,
                            const half* inter_in, const int* topk_idx, const float* topk_weight,

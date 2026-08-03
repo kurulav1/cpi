@@ -964,6 +964,10 @@ __half* PlanCudaEngine::upload_host_fp16(const std::string& name, const std::vec
 // they are ALWAYS int4 regardless of the global weight-quant flag (mirrors the Gemma MoE requirement).
 void PlanCudaEngine::fuse_upload_experts_int4(const std::string& name,
                                               const std::vector<__half>& host, int rows, int cols) {
+  // CPI_DS_EXPERT_BITS=8 keeps experts int8 (diagnostic: distinguishes int4 quant drift from a bug).
+  static const int ebits = std::getenv("CPI_DS_EXPERT_BITS")
+                               ? std::atoi(std::getenv("CPI_DS_EXPERT_BITS"))
+                               : 4;
   int group = weight_quant_group_;
   if (group > 0 && (group & (group - 1)) != 0) group = 0;
   while (group > 0 && (group > cols || (cols % group) != 0)) group /= 2;
@@ -975,23 +979,30 @@ void PlanCudaEngine::fuse_upload_experts_int4(const std::string& name,
   std::int8_t* d_i8 = nullptr;
   float* d_scales = nullptr;
   const std::size_t n = static_cast<std::size_t>(rows) * cols;
+  const int max_q = ebits == 8 ? 127 : 7;
   const int n_groups = kernels::quant_group_count(cols, group);
   G4_CHECK(cudaMalloc(&d_i8, n));
   G4_CHECK(cudaMalloc(&d_scales, static_cast<std::size_t>(rows) * n_groups * sizeof(float)));
   if (group > 0)
     kernels::launch_quantize_groupwise_fp16_to_int8(d_fp16, d_i8, d_scales, rows, cols, group,
-                                                    stream_, 7);
+                                                    stream_, max_q);
   else
-    kernels::launch_quantize_rowwise_fp16_to_int8(d_fp16, d_i8, d_scales, rows, cols, stream_, 7);
-  std::int8_t* d_packed = nullptr;
-  G4_CHECK(cudaMalloc(&d_packed, static_cast<std::size_t>(rows) * ((cols + 1) / 2)));
-  kernels::launch_pack_rowwise_int8_to_int4(d_i8, d_packed, rows, cols, stream_);
-  G4_CHECK(cudaStreamSynchronize(stream_));
-  cudaFree(d_i8);
+    kernels::launch_quantize_rowwise_fp16_to_int8(d_fp16, d_i8, d_scales, rows, cols, stream_, max_q);
+  std::int8_t* d_w = d_i8;
+  if (ebits == 4) {
+    std::int8_t* d_packed = nullptr;
+    G4_CHECK(cudaMalloc(&d_packed, static_cast<std::size_t>(rows) * ((cols + 1) / 2)));
+    kernels::launch_pack_rowwise_int8_to_int4(d_i8, d_packed, rows, cols, stream_);
+    G4_CHECK(cudaStreamSynchronize(stream_));
+    cudaFree(d_i8);
+    d_w = d_packed;
+  } else {
+    G4_CHECK(cudaStreamSynchronize(stream_));  // int8: keep d_i8 unpacked
+  }
   cudaFree(d_fp16);
 
   QuantWeight qw;
-  qw.packed = d_packed;
+  qw.packed = d_w;
   qw.scales = d_scales;
   qw.group = group;
   qw.pf_i8 = nullptr;
@@ -1084,11 +1095,14 @@ void PlanCudaEngine::append_deepseek_moe_ffn_ops(std::vector<opplan::Op>& ops, c
   const int H = cfg_.hidden, E = cfg_.num_experts, K = cfg_.top_k_experts;
   const int MI = cfg_.moe_intermediate_size, SI = MI * std::max(1, cfg_.n_shared_experts);
   auto Wd = [&](const char* t) { return static_cast<const __half*>(dev_[p + t]); };
+  static const int ebits = std::getenv("CPI_DS_EXPERT_BITS")
+                               ? std::atoi(std::getenv("CPI_DS_EXPERT_BITS"))
+                               : 4;
   auto bind_expert = [&](Op& o, const char* t) {
-    const auto q = qdev_.find(p + t);  // fused experts are ALWAYS int4 (fuse_upload_experts_int4)
+    const auto q = qdev_.find(p + t);  // fused experts are int4 (or int8 under CPI_DS_EXPERT_BITS=8)
     o.qweight = q->second.packed;
     o.qscales = q->second.scales;
-    o.qbits = 4;
+    o.qbits = ebits;
     o.qgroup = q->second.group;
   };
   auto gemv = [&](Slot in, Slot out, const char* t, int out_dim, int in_dim) {
@@ -3006,12 +3020,12 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
                             d_moe_stage_gu_, d_moe_stage_gu_s_);
           kernels::launch_moe_gate_up_geglu(d_moe_stage_gu_, d_moe_stage_gu_s_, op.qbits, op.qgroup,
                                             S(op.in), d_moe_identity_idx_, S(op.out), op.cols,
-                                            op.in_dim, op.heads, stream_);
+                                            op.in_dim, op.heads, stream_, op.mlp_gelu);
         } else {
           kernels::launch_moe_gate_up_geglu(
               op.qbits ? static_cast<const void*>(op.qweight) : static_cast<const void*>(op.weight),
               QS(op.qscales), op.qbits, op.qgroup, S(op.in), d_moe_idx_, S(op.out), op.cols,
-              op.in_dim, op.heads, stream_);
+              op.in_dim, op.heads, stream_, op.mlp_gelu);
         }
         break;
       case OpKind::MoeDownAccum:
@@ -3512,6 +3526,23 @@ void PlanCudaEngine::build_qwen35_plan() {
 void PlanCudaEngine::run_layer(int layer, int position) {
   const std::vector<opplan::Op>& ops = plan_.layers[layer].ops;
   execute_ops(ops.data(), ops.size(), layer, position);
+  // Debug: CPI_DS_DUMP=<file> dumps Slot::X (post-layer hidden) at position CPI_DS_DUMP_POS to compare
+  // against the HF golden trace, layer by layer (localises the first divergent op).
+  static const char* dsdump = std::getenv("CPI_DS_DUMP");
+  if (dsdump) {
+    static const int dpos = std::getenv("CPI_DS_DUMP_POS") ? std::atoi(std::getenv("CPI_DS_DUMP_POS")) : 0;
+    if (position == dpos) {
+      G4_CHECK(cudaStreamSynchronize(stream_));
+      std::vector<__half> h(cfg_.hidden);
+      G4_CHECK(cudaMemcpy(h.data(), slot_ptr_[static_cast<int>(opplan::Slot::X)],
+                          cfg_.hidden * sizeof(__half), cudaMemcpyDeviceToHost));
+      std::vector<float> f(cfg_.hidden);
+      for (int i = 0; i < cfg_.hidden; ++i) f[i] = __half2float(h[i]);
+      std::FILE* fp = std::fopen(dsdump, layer == 0 ? "wb" : "ab");
+      std::fwrite(f.data(), sizeof(float), cfg_.hidden, fp);
+      std::fclose(fp);
+    }
+  }
 }
 
 // Process one token at `position`, reusing the KV cache from earlier positions.

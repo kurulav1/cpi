@@ -78,7 +78,8 @@ struct Weight {
 // per output element per selected expert.
 template <int BITS>
 __global__ void moe_gate_up_geglu_kernel(Weight<BITS> w, const half* x, const int* topk_idx,
-                                         half* inter_out, int inter, int hidden, int top_k) {
+                                         half* inter_out, int inter, int hidden, int top_k,
+                                         bool use_gelu) {
   const int r = blockIdx.x;
   const int k = blockIdx.y;
   if (r >= inter || k >= top_k) {
@@ -115,7 +116,8 @@ __global__ void moe_gate_up_geglu_kernel(Weight<BITS> w, const half* x, const in
       gs += smem[i];
       us += smem[warps + i];
     }
-    inter_out[static_cast<std::size_t>(k) * inter + r] = __float2half(gelu_tanh(gs) * us);
+    const float act = use_gelu ? gelu_tanh(gs) : (gs / (1.0f + __expf(-gs)));  // GELU or SiLU
+    inter_out[static_cast<std::size_t>(k) * inter + r] = __float2half(act * us);
   }
 }
 
@@ -199,19 +201,22 @@ Weight<BITS> make_weight(const void* w, const float* scales, int in_features, in
 
 void launch_moe_gate_up_geglu(const void* w, const float* scales, int qbits, int group,
                               const half* x, const int* topk_idx, half* inter_out, int inter,
-                              int hidden, int top_k, cudaStream_t stream) {
+                              int hidden, int top_k, cudaStream_t stream, bool use_gelu) {
   const int threads = threads_for(hidden);
   const dim3 grid(static_cast<unsigned>(inter), static_cast<unsigned>(top_k));
   const std::size_t smem = static_cast<std::size_t>(2 * (threads / 32)) * sizeof(float);
   if (qbits == 4) {
     moe_gate_up_geglu_kernel<4><<<grid, threads, smem, stream>>>(
-        make_weight<4>(w, scales, hidden, group), x, topk_idx, inter_out, inter, hidden, top_k);
+        make_weight<4>(w, scales, hidden, group), x, topk_idx, inter_out, inter, hidden, top_k,
+        use_gelu);
   } else if (qbits == 8) {
     moe_gate_up_geglu_kernel<8><<<grid, threads, smem, stream>>>(
-        make_weight<8>(w, scales, hidden, group), x, topk_idx, inter_out, inter, hidden, top_k);
+        make_weight<8>(w, scales, hidden, group), x, topk_idx, inter_out, inter, hidden, top_k,
+        use_gelu);
   } else {
     moe_gate_up_geglu_kernel<0><<<grid, threads, smem, stream>>>(
-        make_weight<0>(w, nullptr, hidden, 0), x, topk_idx, inter_out, inter, hidden, top_k);
+        make_weight<0>(w, nullptr, hidden, 0), x, topk_idx, inter_out, inter, hidden, top_k,
+        use_gelu);
   }
 }
 
