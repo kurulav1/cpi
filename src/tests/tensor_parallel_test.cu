@@ -69,31 +69,33 @@ int case_ws(const std::vector<half>& W, int out, int in, const half* dX, int bat
   }
   const float rel = maxrel / denom;
   const bool pass = rel < 1e-2f;  // sharding is exact math; any delta is cuBLAS tiling noise
-  std::printf("%s[world=%d]: %d/%zu bit-exact vs unsharded, max rel diff %.2e\n",
-              pass ? "PASS" : "FAIL", ws, exact, ref.size(), rel);
+  std::printf("%s[world=%d batch=%d]: %d/%zu bit-exact vs unsharded, max rel diff %.2e\n",
+              pass ? "PASS" : "FAIL", ws, batch, exact, ref.size(), rel);
   return pass ? 0 : 1;
 }
 
 }  // namespace
 
 int main() {
-  const int out = 512, in = 256, batch = 1;
+  const int out = 512, in = 256;
   std::mt19937 rng(3);
   std::normal_distribution<float> nd(0, 0.3f);
   std::vector<half> W((size_t)out * in);
   for (auto& v : W) v = __float2half(nd(rng));
-  std::vector<half> X((size_t)in * batch);
-  for (auto& v : X) v = __float2half(nd(rng));
 
-  half* dX = nullptr;
-  cudaMalloc(&dX, X.size() * sizeof(half));
-  cudaMemcpy(dX, X.data(), X.size() * sizeof(half), cudaMemcpyHostToDevice);
-
-  const std::vector<half> ref = run(W, out, in, dX, batch, 1);  // unsharded reference
   int fail = 0;
-  fail |= case_ws(W, out, in, dX, batch, 2, ref);
-  fail |= case_ws(W, out, in, dX, batch, 4, ref);
-  fail |= case_ws(W, out, in, dX, batch, 7, ref);  // uneven split (512 not divisible by 7)
-  cudaFree(dX);
+  for (int batch : {1, 4}) {  // batch=4 exercises the strided concat (prefill layout)
+    std::vector<half> X((size_t)in * batch);
+    for (auto& v : X) v = __float2half(nd(rng));
+    half* dX = nullptr;
+    cudaMalloc(&dX, X.size() * sizeof(half));
+    cudaMemcpy(dX, X.data(), X.size() * sizeof(half), cudaMemcpyHostToDevice);
+
+    const std::vector<half> ref = run(W, out, in, dX, batch, 1);  // unsharded reference
+    fail |= case_ws(W, out, in, dX, batch, 2, ref);
+    fail |= case_ws(W, out, in, dX, batch, 4, ref);
+    fail |= case_ws(W, out, in, dX, batch, 7, ref);  // uneven split (512 not divisible by 7)
+    cudaFree(dX);
+  }
   return fail;
 }

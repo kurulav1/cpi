@@ -640,6 +640,19 @@ if(CPI_ENABLE_CUDA)
   )
   add_test(NAME expert_parallel_test COMMAND expert_parallel_test)
 
+  # Multi-GPU prep: the collective abstraction (LocalCollective::all_reduce_sum) verified on one GPU.
+  # The seam where NcclCollective drops in for real multi-GPU.
+  add_executable(collective_test
+    src/tests/collective_test.cu
+  )
+  target_include_directories(collective_test PRIVATE include)
+  target_link_libraries(collective_test PRIVATE cpi_engine)
+  set_target_properties(collective_test PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+  )
+  add_test(NAME collective_test COMMAND collective_test)
+
   # Image preprocessing: bicubic resize vs PIL + patch-grid layout.
   add_executable(image_preprocess_test
     src/tests/image_preprocess_test.cpp

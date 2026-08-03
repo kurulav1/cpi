@@ -93,7 +93,7 @@ void TensorParallelLinear::initialize(int world_size, int in_features, int out_f
 // batch is constant during inference.
 void TensorParallelLinear::forward(const void* d_input_fp16, int batch, void* d_output_fp16,
                                    cudaStream_t stream) {
-  int row_offset = 0;
+  int row_off = 0;  // this shard's first output row, WITHIN a column (element offset)
 
   constexpr float alpha = 1.0f;
   constexpr float beta = 0.0f;
@@ -123,14 +123,20 @@ void TensorParallelLinear::forward(const void* d_input_fp16, int batch, void* d_
                               CUDA_R_16F, ctx.out_rows, CUBLAS_COMPUTE_32F,
                               CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 
-    // Copy this shard's result to the correct row range in the output buffer.
-    // row_offset tracks the element (not byte) position because element size
-    // is sizeof(__half) and we cast to char* for byte arithmetic.
-    CUDA_CHECK(cudaMemcpyAsync(
-        static_cast<char*>(d_output_fp16) + static_cast<std::size_t>(row_offset) * sizeof(__half),
-        ctx.d_partial, out_bytes, cudaMemcpyDeviceToDevice, stream));
+    // Scatter this shard's rows into the full column-major [out_features, batch] output (ld =
+    // out_features): for each of the `batch` columns, the shard's out_rows land at row_off. A 2D
+    // copy handles the stride; for batch=1 it degenerates to the old contiguous copy. This is the
+    // correct concat for prefill (batch>1), not just decode.
+    CUDA_CHECK(cudaMemcpy2DAsync(
+        static_cast<char*>(d_output_fp16) + static_cast<std::size_t>(row_off) * sizeof(__half),
+        static_cast<std::size_t>(out_features_) * sizeof(__half),  // dst pitch = full column
+        ctx.d_partial,
+        static_cast<std::size_t>(ctx.out_rows) * sizeof(__half),  // src pitch = shard column
+        static_cast<std::size_t>(ctx.out_rows) * sizeof(__half),  // width  = shard rows
+        static_cast<std::size_t>(batch),                          // height = columns
+        cudaMemcpyDeviceToDevice, stream));
 
-    row_offset += ctx.out_rows * batch;
+    row_off += ctx.out_rows;
   }
 }
 
