@@ -33,23 +33,42 @@ def shard_index():
 
 
 def load_by_prefix(index, prefix, module):
-    """Load tensors whose name starts with `prefix` into `module` (strip prefix). float32."""
+    """Load tensors whose name starts with `prefix` into `module` (strip prefix). float32.
+
+    CRUCIAL: transformers' DeepseekV2Moe stores experts FUSED (experts.gate_up_proj [E,2*MI,H],
+    experts.down_proj [E,H,MI]) while the checkpoint ships per-expert tensors. from_pretrained fuses
+    them; a manual load_state_dict does NOT -- so we fuse here, or the routed experts stay at random
+    init and the whole trace is silently wrong (learned this the hard way)."""
+    import torch
     from safetensors import safe_open
 
     by_shard = {}
     for k in index:
         if k.startswith(prefix):
             by_shard.setdefault(index[k], []).append(k)
-    state = {}
+    raw = {}
     for shard, keys in by_shard.items():
         with safe_open(os.path.join(MODEL_DIR, shard), framework="pt") as f:
             for k in keys:
-                state[k[len(prefix):]] = f.get_tensor(k).float()
-    missing, unexpected = module.load_state_dict(state, strict=False)
+                raw[k[len(prefix):]] = f.get_tensor(k).float()
+
+    # Fuse per-expert gate/up/down into the module's expected layout.
+    experts = {}
+    for name in list(raw):
+        parts = name.split(".")
+        if len(parts) >= 4 and parts[0] == "mlp" and parts[1] == "experts" and parts[2].isdigit():
+            experts.setdefault(int(parts[2]), {})[parts[3]] = raw.pop(name)
+    if experts:
+        E = max(experts) + 1
+        raw["mlp.experts.gate_up_proj"] = torch.stack(
+            [torch.cat([experts[e]["gate_proj"], experts[e]["up_proj"]], 0) for e in range(E)])
+        raw["mlp.experts.down_proj"] = torch.stack([experts[e]["down_proj"] for e in range(E)])
+
+    missing, unexpected = module.load_state_dict(raw, strict=False)
     hard = [m for m in missing if m.endswith((".weight", ".bias"))]
     if hard:
         print(f"  MISSING under {prefix}: {hard[:6]}", file=sys.stderr)
-    return state
+    return raw
 
 
 def one_tensor(index, name):
