@@ -714,6 +714,20 @@ if(CPI_ENABLE_CUDA)
   )
   add_test(NAME kda_attention_test COMMAND kda_attention_test)
 
+  # DeepSeek MLA composed into a multi-layer decoder stack (MLA + SwiGLU, pre-norm, residuals) verified
+  # device vs oracle -- the "wire MLA toward a DeepSeek-arch config" step (synthetic weights; a native-
+  # MLA checkpoint is the only remaining end-to-end gate).
+  add_executable(deepseek_mla_stack_test
+    src/tests/deepseek_mla_stack_test.cu
+  )
+  target_include_directories(deepseek_mla_stack_test PRIVATE include)
+  target_link_libraries(deepseek_mla_stack_test PRIVATE cpi_engine)
+  set_target_properties(deepseek_mla_stack_test PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+  )
+  add_test(NAME deepseek_mla_stack_test COMMAND deepseek_mla_stack_test)
+
   # Image preprocessing: bicubic resize vs PIL + patch-grid layout.
   add_executable(image_preprocess_test
     src/tests/image_preprocess_test.cpp
