@@ -740,7 +740,7 @@ int main(int argc, char** argv) {
           break;
         }
         engine::PlanMetalEngine meng;
-        // --weight-quant int4/int8 (a.k.a. --int4-streaming) maps to on-load host quantization;
+        // --weight-quant int4/int8 maps to on-load host quantization;
         // otherwise fp16. This is what lets a large model (e.g. an 8B) serve on a 16 GB Mac.
         const int metal_quant_bits = cli.opts.int8_streaming ? cli.opts.streaming_quant_bits : 0;
         // Continuous batching needs the KV as a paged pool, and the pool is sized by open(),

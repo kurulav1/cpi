@@ -116,7 +116,7 @@ def build_infer_cmd(
         "2048",
     ]
     if int8_streaming:
-        cmd += ["--int8-streaming"]
+        cmd += ["--weight-quant", "int8"]
     if cache_mode == "uncached":
         cmd += ["--gpu-cache-layers", "0"]
     elif cache_mode == "cached":

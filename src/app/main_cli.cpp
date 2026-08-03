@@ -142,7 +142,7 @@ void print_usage(std::ostream& os) {
         "[--tq-cached-init-timeout-ms n] [--tq-first-token-timeout-ms n] "
         "[--allow-legacy-chat-tokenizer] "
         "[--no-bos] [--eos-token n] [--no-loop-guard] "
-        "[--int8-streaming|--int4-streaming|--weight-quant none|int8|int4] "
+        "[--weight-quant none|int8|int4] "
         "[--paged-kv-cache] [--web] [--interactive] [--simple]\n";
 }
 
@@ -347,16 +347,6 @@ ParsedArgs parse_args(int argc, char** argv) {
       args.stop_texts.push_back(need_val("--stop-text"));
     } else if (arg == "--rope-theta") {
       args.opts.rope_theta = std::stof(need_val("--rope-theta"));
-    } else if (arg == "--int8-streaming") {
-      args.opts.int8_streaming = true;
-      args.opts.streaming_quant_bits = 8;
-      args.opts.prefer_lowbit_cache = true;
-      args.weight_quant_set = true;
-    } else if (arg == "--int4-streaming") {
-      args.opts.int8_streaming = true;
-      args.opts.streaming_quant_bits = 4;
-      args.opts.prefer_lowbit_cache = true;
-      args.weight_quant_set = true;
     } else if (arg == "--weight-quant") {
       const std::string mode = need_val("--weight-quant");
       args.weight_quant_set = true;
