@@ -665,6 +665,15 @@ if(CPI_ENABLE_CUDA)
   )
   add_test(NAME pipeline_parallel_test COMMAND pipeline_parallel_test)
 
+  # Multi-GPU prep brick 5: the multi-PROCESS collective prototype -- ring all-reduce over real TCP
+  # sockets (ranks as threads, each a genuine 127.0.0.1 endpoint), the distributed control flow that a
+  # single-process test can't reach. Host-only (no CUDA); the transport NcclCollective replaces.
+  add_executable(socket_ring_allreduce_test
+    src/tests/socket_ring_allreduce_test.cpp
+  )
+  target_include_directories(socket_ring_allreduce_test PRIVATE include)
+  add_test(NAME socket_ring_allreduce_test COMMAND socket_ring_allreduce_test)
+
   # Image preprocessing: bicubic resize vs PIL + patch-grid layout.
   add_executable(image_preprocess_test
     src/tests/image_preprocess_test.cpp
