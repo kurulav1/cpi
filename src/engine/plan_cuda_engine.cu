@@ -816,6 +816,80 @@ void PlanCudaEngine::parse_qwen35_config(const std::string& model_dir) {
     throw std::runtime_error("Qwen3.5 config.json is missing required text_config fields");
 }
 
+void PlanCudaEngine::parse_deepseek_config(const std::string& model_dir) {
+  // DeepSeek-V2-Lite config.json is FLAT (no text_config nesting).
+  const std::string raw = mini::read_text_file(std::filesystem::path(model_dir) / "config.json");
+  cfg_.family = Family::DeepSeekV2;
+  cfg_.vocab = mini::json_get_int(raw, "vocab_size", 0);
+  cfg_.hidden = mini::json_get_int(raw, "hidden_size", 0);
+  cfg_.intermediate = mini::json_get_int(raw, "intermediate_size", 0);  // the dense-layer MLP width
+  cfg_.num_layers = mini::json_get_int(raw, "num_hidden_layers", 0);
+  cfg_.num_heads = mini::json_get_int(raw, "num_attention_heads", 0);
+  cfg_.rms_eps = mini::json_get_float(raw, "rms_norm_eps", 1e-6f);
+  cfg_.max_position_embeddings = mini::json_get_int(raw, "max_position_embeddings", 4096);
+  cfg_.eos_token_id = mini::json_get_int(raw, "eos_token_id", -1);
+  cfg_.bos_token_id = mini::json_get_int(raw, "bos_token_id", 0);
+  cfg_.tie_word_embeddings = mini::json_get_bool(raw, "tie_word_embeddings", false);
+
+  // MLA geometry. q_lora_rank is `null` for V2-Lite (json_get_int -> 0 = direct q_proj).
+  cfg_.q_lora_rank = mini::json_get_int(raw, "q_lora_rank", 0);
+  cfg_.kv_lora_rank = mini::json_get_int(raw, "kv_lora_rank", 0);
+  cfg_.qk_nope_head_dim = mini::json_get_int(raw, "qk_nope_head_dim", 0);
+  cfg_.qk_rope_head_dim = mini::json_get_int(raw, "qk_rope_head_dim", 0);
+  cfg_.v_head_dim = mini::json_get_int(raw, "v_head_dim", 0);
+  // The shared Attention op + KV cache use ONE head_dim; we pad V up to the qk head dim (see the
+  // o_proj padding in the loader), so every per-layer head_dim is qk_nope+qk_rope.
+  const int qk_head_dim = cfg_.qk_nope_head_dim + cfg_.qk_rope_head_dim;
+  cfg_.head_dim = qk_head_dim;
+  cfg_.head_dim_full = cfg_.head_dim_sliding = qk_head_dim;
+  cfg_.num_kv_heads = cfg_.num_kv_heads_full = cfg_.num_kv_heads_sliding = cfg_.num_heads;
+
+  // MoE.
+  cfg_.num_experts = mini::json_get_int(raw, "n_routed_experts", 0);
+  cfg_.top_k_experts = mini::json_get_int(raw, "num_experts_per_tok", 0);
+  cfg_.moe_intermediate_size = mini::json_get_int(raw, "moe_intermediate_size", 0);
+  cfg_.n_shared_experts = mini::json_get_int(raw, "n_shared_experts", 0);
+  cfg_.first_k_dense_replace = mini::json_get_int(raw, "first_k_dense_replace", 0);
+  cfg_.routed_scaling_factor = mini::json_get_float(raw, "routed_scaling_factor", 1.0f);
+  cfg_.enable_moe_block = cfg_.num_experts > 0;
+
+  // YARN rope (used at load to build inv_freq + the mscale attention scaling).
+  cfg_.rope_theta = mini::json_get_float(raw, "rope_theta", 10000.0f);
+  const std::string rope = mini::json_extract_object(raw, "rope_scaling");
+  if (!rope.empty()) {
+    cfg_.yarn_factor = mini::json_get_float(rope, "factor", 1.0f);
+    cfg_.yarn_mscale = mini::json_get_float(rope, "mscale", 1.0f);
+    cfg_.yarn_beta_fast = mini::json_get_float(rope, "beta_fast", 32.0f);
+    cfg_.yarn_beta_slow = mini::json_get_float(rope, "beta_slow", 1.0f);
+    cfg_.yarn_original_max_pos =
+        mini::json_get_int(rope, "original_max_position_embeddings", 4096);
+  }
+
+  // All layers use MLA (full-attention kind); layers >= first_k_dense_replace are MoE.
+  cfg_.layer_full.assign(cfg_.num_layers, 1);
+
+  if (cfg_.vocab <= 0 || cfg_.hidden <= 0 || cfg_.num_layers <= 0 || cfg_.num_heads <= 0 ||
+      cfg_.kv_lora_rank <= 0 || cfg_.qk_nope_head_dim <= 0 || cfg_.qk_rope_head_dim <= 0 ||
+      cfg_.v_head_dim <= 0)
+    throw std::runtime_error("DeepSeek-V2 config.json is missing required MLA/geometry fields");
+}
+
+// --- DeepSeek-V2 loader/plan: implemented phase by phase (Phase 1b config parse landed; loader/ops
+// follow). Stubs keep the translation unit linking while the pieces come online. ---
+__half* PlanCudaEngine::upload_host_fp16(const std::string&, const std::vector<__half>&, int, int) {
+  throw std::runtime_error("upload_host_fp16: not implemented yet");
+}
+void PlanCudaEngine::fuse_upload_experts_int4(const std::string&, const std::vector<__half>&, int,
+                                              int) {
+  throw std::runtime_error("fuse_upload_experts_int4: not implemented yet");
+}
+void PlanCudaEngine::load_deepseek_weights() {
+  throw std::runtime_error("load_deepseek_weights: not implemented yet");
+}
+void PlanCudaEngine::build_deepseek_plan() {
+  throw std::runtime_error("build_deepseek_plan: not implemented yet");
+}
+
 void PlanCudaEngine::load_qwen35_weights() {
   const bool quant = weight_quant_bits_ == 4 || weight_quant_bits_ == 8;
   const int H = cfg_.hidden;
@@ -1047,11 +1121,20 @@ void PlanCudaEngine::open(const std::string& cpi_path, int max_context) {
     }
     if (mt.rfind("deepseek_v2", 0) == 0) {
       // DeepSeek-V2 (MLA latent attention + fine-grained MoE). Weights are HF-native under "model.".
-      // WIP bring-up: config/loader/plan land phase by phase (see cpi-deepseek-v2lite-status memory).
+      // WIP bring-up: config parse is live; loader/ops/plan land phase by phase (see
+      // cpi-deepseek-v2lite-status memory).
       wprefix_ = "model.";
-      throw std::runtime_error(
-          "DeepSeek-V2 recognized but its op-plan loader is not wired yet (WIP: MLA op + MoE + "
-          "loader in progress). Detection/config scaffolding is in place.");
+      parse_deepseek_config(cpi_path);
+      char msg[512];
+      std::snprintf(msg, sizeof(msg),
+                    "DeepSeek-V2 config parsed OK (layers=%d hidden=%d heads=%d kv_lora=%d "
+                    "qk=%d+%d v=%d experts=%d/top%d shared=%d dense_layers=%d vocab=%d). "
+                    "Loader/MLA op/plan are the next phases.",
+                    cfg_.num_layers, cfg_.hidden, cfg_.num_heads, cfg_.kv_lora_rank,
+                    cfg_.qk_nope_head_dim, cfg_.qk_rope_head_dim, cfg_.v_head_dim, cfg_.num_experts,
+                    cfg_.top_k_experts, cfg_.n_shared_experts, cfg_.first_k_dense_replace,
+                    cfg_.vocab);
+      throw std::runtime_error(msg);
     }
     parse_qwen35_config(cpi_path);
     if (max_ctx_ <= 0 ||

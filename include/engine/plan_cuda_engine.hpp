@@ -153,6 +153,20 @@ class PlanCudaEngine : public runtime::SequenceModel {
   // unchanged -- only the tensor-name prefix and the shape source differ.
   void parse_gemma4_st_config(const std::string& model_dir);
 
+  // ── DeepSeek-V2 recipe (MLA latent attention + fine-grained MoE). Same shared
+  //    executor/sampler/quantizer/graph below; only parse + load + plan differ. ──
+  void parse_deepseek_config(const std::string& model_dir);
+  void load_deepseek_weights();
+  void build_deepseek_plan();
+  // Fuse DeepSeek's per-expert un-fused gate/up/down into the single [E*2*MI,H]/[E*H,MI]
+  // tensors the shared MoE ops expect, quantizing from a host buffer (no such tensor exists
+  // in the checkpoint to read by name). Registers under a synthetic `name`.
+  void fuse_upload_experts_int4(const std::string& name, const std::vector<__half>& host_rowmajor,
+                                int rows, int cols);
+  // Upload a host-built fp16 [rows,cols] weight under `name` (e.g. the zero-padded o_proj).
+  __half* upload_host_fp16(const std::string& name, const std::vector<__half>& host, int rows,
+                           int cols);
+
   // ── vision tower ──
   // Its own config, slots and plan, but the SAME executor (in sequence mode) and the
   // same ops. A vision encoder is a capability, not a second engine.
