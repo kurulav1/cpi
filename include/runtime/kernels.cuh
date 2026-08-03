@@ -619,7 +619,7 @@ void launch_scale_add_inplace(half* dst, const half* src, int n, float scale, cu
 //                      result exactly as it was).
 void launch_moe_router_topk_softmax(const half* logits, int experts, int top_k, int* topk_idx,
                                     float* topk_prob, cudaStream_t stream,
-                                    const half* per_expert_scale = nullptr);
+                                    const half* per_expert_scale = nullptr, bool renorm = true);
 
 // launch_moe_router_sigmoid_topk
 //

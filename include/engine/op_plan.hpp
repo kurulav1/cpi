@@ -57,6 +57,11 @@ enum class Slot : std::uint8_t {
   MoeLogits,    // router logits [num_experts]
   MoeInter,     // [top_k, moe_inter] gelu(gate)*up, per selected expert
   MoeOut,       // [hidden] routing-weighted sum over the selected experts
+  // DeepSeek-V2 MLA working set (latent attention). MlaCkv = kv_a_proj output [kv_lora+qk_rope],
+  // MlaLatent = kv_a_layernorm(latent) [kv_lora], MlaKvb = kv_b_proj output [nh*(qk_nope+v_head)].
+  MlaCkv,
+  MlaLatent,
+  MlaKvb,
   Count
 };
 
@@ -110,6 +115,12 @@ enum class OpKind : std::uint8_t {
                    // cols = moe_inter, in_dim = hidden, heads = top_k
   MoeDownAccum,    // sum_k topk_weight[k] * down[expert_k] . MoeInter[k]  -> MoeOut
                    // cols = hidden, in_dim = moe_inter, heads = top_k
+
+  // ── DeepSeek-V2 MLA (Multi-head Latent Attention) ──
+  MlaAssembleRope,  // assemble per-head K=[k_nope|roped shared k_pe] (from MlaKvb + MlaCkv's k_pe) and
+                    // V=[v|zeros] into Slot::K/Slot::V, and interleaved-rope Slot::Q's q_pe in place.
+                    // heads=nh, head_dim=qk_nope+qk_rope, key_head_dim=qk_nope, value_head_dim=v_head,
+                    // rotary_dim=qk_rope, in_dim=kv_lora, scale=attention_scaling, aux_ptr=inv_freq.
 
   // ── extensions for vision encoders ──
   // A vision tower differs from a text decoder in only a few places: positions are
@@ -189,6 +200,10 @@ struct Op {
   // "SiLU", so the day someone wires this flag into that kernel, Gemma 4 would silently change
   // activation and produce fluent nonsense. True means "unset == what it does today".
   bool mlp_gelu = true;
+  // MoeRouterTopk: renormalise the selected experts' softmax probs to sum 1. DEFAULTS TRUE (Gemma /
+  // Mixtral). DeepSeek-V2-Lite sets norm_topk_prob=false, so it emits this false to keep the raw
+  // top-k softmax weights.
+  bool moe_renorm = true;
   int rotary_dim = 0;        // Rope: >0 rotates only the first rotary_dim of each
                              // head (partial RoPE) and pairs Q (in) with K (in2)
   // Delta-net geometry + its extra weights. The recurrence needs a float RMS-norm

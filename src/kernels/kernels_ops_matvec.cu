@@ -400,7 +400,7 @@ __global__ void scale_add_inplace_kernel(half* dst, const half* src, int n, floa
 
 __global__ void moe_router_topk_softmax_kernel(const half* logits, int experts, int top_k,
                                                int* topk_idx, float* topk_prob,
-                                               const half* per_expert_scale) {
+                                               const half* per_expert_scale, bool renorm) {
   extern __shared__ float probs[];
   if (threadIdx.x != 0) {
     return;
@@ -463,7 +463,9 @@ __global__ void moe_router_topk_softmax_kernel(const half* logits, int experts, 
   for (int k = 0; k < capped_topk; ++k) {
     picked_sum += picked_prob[k];
   }
-  const float inv_pick_sum = 1.0f / fmaxf(picked_sum, 1.0e-8f);
+  // renorm: rescale the selected probs to sum 1 (Gemma/Mixtral). DeepSeek's norm_topk_prob=false
+  // keeps the raw top-k softmax weights, so it passes renorm=false and this is a no-op scale.
+  const float inv_pick_sum = renorm ? 1.0f / fmaxf(picked_sum, 1.0e-8f) : 1.0f;
 
   for (int k = 0; k < top_k; ++k) {
     if (k < capped_topk) {
@@ -1150,13 +1152,13 @@ void launch_scale_add_inplace(half* dst, const half* src, int n, float scale, cu
 
 void launch_moe_router_topk_softmax(const half* logits, int experts, int top_k, int* topk_idx,
                                     float* topk_prob, cudaStream_t stream,
-                                    const half* per_expert_scale) {
+                                    const half* per_expert_scale, bool renorm) {
   if (experts <= 0 || top_k <= 0) {
     return;
   }
   const std::size_t smem = static_cast<std::size_t>(experts) * sizeof(float);
   moe_router_topk_softmax_kernel<<<1, 32, smem, stream>>>(logits, experts, top_k, topk_idx,
-                                                          topk_prob, per_expert_scale);
+                                                          topk_prob, per_expert_scale, renorm);
 }
 
 void launch_moe_router_sigmoid_topk(const half* logits, int experts, int top_k, int n_group,

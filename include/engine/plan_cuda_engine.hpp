@@ -158,6 +158,7 @@ class PlanCudaEngine : public runtime::SequenceModel {
   void parse_deepseek_config(const std::string& model_dir);
   void load_deepseek_weights();
   void build_deepseek_plan();
+  void append_deepseek_moe_ffn_ops(std::vector<opplan::Op>& ops, const std::string& p);
   // Fuse DeepSeek's per-expert un-fused gate/up/down into the single [E*2*MI,H]/[E*H,MI]
   // tensors the shared MoE ops expect, quantizing from a host buffer (no such tensor exists
   // in the checkpoint to read by name). Registers under a synthetic `name`.
@@ -449,6 +450,12 @@ private:
   __half* d_moe_out_ = nullptr;        // [hidden]
   int* d_moe_idx_ = nullptr;           // [top_k] selected experts
   float* d_moe_w_ = nullptr;           // [top_k] routing weights
+  // DeepSeek-V2 MLA working set + rope table.
+  __half* d_mla_ckv_ = nullptr;      // [kv_lora + qk_rope]  (kv_a_proj output)
+  __half* d_mla_latent_ = nullptr;   // [kv_lora]            (kv_a_layernorm output)
+  __half* d_mla_kvb_ = nullptr;      // [nh*(qk_nope+v_head)] (kv_b_proj output)
+  float* d_inv_freq_ = nullptr;      // [qk_rope/2]          (YARN inverse frequencies)
+  float mla_attn_scaling_ = 1.0f;    // YARN mscale (1.0 for V2-Lite)
   // Expert STREAMING (CPI_MOE_STREAM): stage only the top_k selected experts into K contiguous
   // slots and feed the kernels an identity index [0..K-1] (so slot k == the k-th selected expert).
   // Step 1 stages from the resident matrix (D2D) to verify the remap is token-identical; Step 2

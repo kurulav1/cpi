@@ -23,6 +23,8 @@
 
 #include "engine/generation_constraints.hpp"
 #include "engine/plan_cuda_engine.hpp"
+#include "engine/deepseek_rope.hpp"
+#include "engine/mla_assemble.hpp"
 #include "engine/sampling.hpp"
 #include "model/json_mini.hpp"
 #include "runtime/kernels.cuh"
@@ -568,6 +570,73 @@ void PlanCudaEngine::allocate_buffers() {
     return;
   }
 
+  if (cfg_.family == Family::DeepSeekV2) {
+    const int H = cfg_.hidden;
+    const int nh = cfg_.num_heads;
+    const int qkhd = cfg_.head_dim;                    // qk_nope+qk_rope (V padded to this)
+    const int kvw = nh * qkhd;                         // K/V per-token width
+    const int E = cfg_.num_experts, K = cfg_.top_k_experts, MI = cfg_.moe_intermediate_size;
+    const int maxinter = std::max(cfg_.intermediate, MI * std::max(1, cfg_.n_shared_experts));
+    auto al = [&](__half** p, std::size_t n) { G4_CHECK(cudaMalloc(p, n * sizeof(__half))); };
+    al(&d_x_, H);
+    al(&d_x_norm_, H);
+    al(&d_tmp_, H);
+    al(&d_q_, kvw);
+    al(&d_k_, kvw);
+    al(&d_v_, kvw);
+    al(&d_att_, kvw);
+    al(&d_gate_, maxinter);
+    al(&d_up_, maxinter);
+    al(&d_inter_, maxinter);
+    al(&d_mla_ckv_, cfg_.kv_lora_rank + cfg_.qk_rope_head_dim);
+    al(&d_mla_latent_, cfg_.kv_lora_rank);
+    al(&d_mla_kvb_, static_cast<std::size_t>(nh) * (cfg_.qk_nope_head_dim + cfg_.v_head_dim));
+    // MoE working set (experts always int4).
+    al(&d_moe_router_in_, H);
+    al(&d_moe_logits_, E);
+    al(&d_moe_inter_, static_cast<std::size_t>(K) * MI);
+    al(&d_moe_out_, H);
+    G4_CHECK(cudaMalloc(&d_moe_idx_, static_cast<std::size_t>(K) * sizeof(int)));
+    G4_CHECK(cudaMalloc(&d_moe_w_, static_cast<std::size_t>(K) * sizeof(float)));
+    // YARN inverse frequencies (filled in open()).
+    G4_CHECK(cudaMalloc(&d_inv_freq_, static_cast<std::size_t>(cfg_.qk_rope_head_dim / 2) * sizeof(float)));
+    // Sampling / logits scratch (same as the other families).
+    G4_CHECK(cudaMalloc(&d_logits_, static_cast<std::size_t>(cfg_.vocab) * sizeof(float)));
+    G4_CHECK(cudaMalloc(&d_tok_, sizeof(int)));
+    G4_CHECK(cudaMalloc(&d_position_, sizeof(int)));
+    G4_CHECK(cudaMalloc(&d_argmax_, sizeof(int)));
+    argmax_parts_ = kernels::argmax_partition_count(cfg_.vocab);
+    G4_CHECK(cudaMalloc(&d_argmax_pv_, static_cast<std::size_t>(argmax_parts_) * sizeof(float)));
+    G4_CHECK(cudaMalloc(&d_argmax_pi_, static_cast<std::size_t>(argmax_parts_) * sizeof(int)));
+    const int topk_parts = kernels::topk_partition_count(cfg_.vocab);
+    const std::size_t part_n = static_cast<std::size_t>(topk_parts) * kMaxDeviceTopK;
+    G4_CHECK(cudaMalloc(&d_topk_part_val_, part_n * sizeof(float)));
+    G4_CHECK(cudaMalloc(&d_topk_part_idx_, part_n * sizeof(int)));
+    G4_CHECK(cudaMalloc(&d_topk_val_, kMaxDeviceTopK * sizeof(float)));
+    G4_CHECK(cudaMalloc(&d_topk_idx_, kMaxDeviceTopK * sizeof(int)));
+    G4_CHECK(cudaMalloc(&d_cand_idx_, kCandCapacity * sizeof(int)));
+    G4_CHECK(cudaMalloc(&d_cand_val_, kCandCapacity * sizeof(float)));
+    G4_CHECK(cudaMalloc(&d_cand_count_, sizeof(int)));
+    std::vector<__half> ones(std::max(qkhd, H), __float2half(1.0f));
+    G4_CHECK(cudaMalloc(&d_ones_, ones.size() * sizeof(__half)));
+    G4_CHECK(cudaMemcpy(d_ones_, ones.data(), ones.size() * sizeof(__half), cudaMemcpyHostToDevice));
+    // Split-K decode-attention scratch (head_dim 192 > 128 -> the wide-head path).
+    split_any_chunks_ = (max_ctx_ + kSplitAnyChunk - 1) / kSplitAnyChunk;
+    const std::size_t split_cells = static_cast<std::size_t>(nh) * split_any_chunks_;
+    G4_CHECK(cudaMalloc(&d_split_m_, split_cells * sizeof(float)));
+    G4_CHECK(cudaMalloc(&d_split_l_, split_cells * sizeof(float)));
+    G4_CHECK(cudaMalloc(&d_split_o_, split_cells * static_cast<std::size_t>(qkhd) * sizeof(float)));
+    // Per-layer K/V caches (reconstructed K/V at width nh*qkhd).
+    caches_k_.assign(cfg_.num_layers, nullptr);
+    caches_v_.assign(cfg_.num_layers, nullptr);
+    for (int L = 0; L < cfg_.num_layers; ++L) {
+      const std::size_t bytes = static_cast<std::size_t>(max_ctx_) * kvw * sizeof(__half);
+      G4_CHECK(cudaMalloc(&caches_k_[L], bytes));
+      G4_CHECK(cudaMalloc(&caches_v_[L], bytes));
+    }
+    return;
+  }
+
   const int H = cfg_.hidden;
   const int maxhd = std::max(cfg_.head_dim_full, cfg_.head_dim_sliding);
   const int maxq = cfg_.num_heads * maxhd;
@@ -939,12 +1008,10 @@ void PlanCudaEngine::load_deepseek_weights() {
   const int kva = cfg_.kv_lora_rank + cfg_.qk_rope_head_dim;     // 576
   const int kvb = nh * (cfg_.qk_nope_head_dim + vhd);            // nh*256
   const int MI = cfg_.moe_intermediate_size;                     // 1408
-  auto proj = [&](const std::string& nm, int r, int c) {
-    if (quant)
-      upload_int4(nm, r, c);
-    else
-      upload(nm, r, c);
-  };
+  // Keep the (small) MLA/dense/shared projections FP16 -- only the experts are int4 (the memory hog).
+  // This keeps the forward close to the fp32 reference trace for verification; (void)quant silences it.
+  (void)quant;
+  auto proj = [&](const std::string& nm, int r, int c) { upload(nm, r, c); };
 
   upload("model.embed_tokens.weight", cfg_.vocab, H);
   upload("model.norm.weight", 1, H);
@@ -1010,8 +1077,253 @@ void PlanCudaEngine::load_deepseek_weights() {
   }
 }
 
+// DeepSeek MoE FFN (router softmax-top-k WITHOUT renorm + fused int4 experts + a shared SwiGLU),
+// all reading Slot::XNorm (= post_attention_layernorm output), accumulating into Slot::X.
+void PlanCudaEngine::append_deepseek_moe_ffn_ops(std::vector<opplan::Op>& ops, const std::string& p) {
+  using namespace opplan;
+  const int H = cfg_.hidden, E = cfg_.num_experts, K = cfg_.top_k_experts;
+  const int MI = cfg_.moe_intermediate_size, SI = MI * std::max(1, cfg_.n_shared_experts);
+  auto Wd = [&](const char* t) { return static_cast<const __half*>(dev_[p + t]); };
+  auto bind_expert = [&](Op& o, const char* t) {
+    const auto q = qdev_.find(p + t);  // fused experts are ALWAYS int4 (fuse_upload_experts_int4)
+    o.qweight = q->second.packed;
+    o.qscales = q->second.scales;
+    o.qbits = 4;
+    o.qgroup = q->second.group;
+  };
+  auto gemv = [&](Slot in, Slot out, const char* t, int out_dim, int in_dim) {
+    Op o;
+    o.kind = OpKind::Gemv;
+    o.in = in;
+    o.out = out;
+    o.cols = out_dim;
+    o.in_dim = in_dim;
+    o.weight = Wd(t);
+    ops.push_back(o);
+  };
+  auto add_x = [&](Slot src) {
+    Op o;
+    o.kind = OpKind::AddInplace;
+    o.out = Slot::X;
+    o.in = src;
+    o.cols = H;
+    ops.push_back(o);
+  };
+
+  // router: logits = gate . XNorm ; softmax -> top-k, NO renorm (norm_topk_prob=false), scale 1.0.
+  gemv(Slot::XNorm, Slot::MoeLogits, "mlp.gate.weight", E, H);
+  {
+    Op o;
+    o.kind = OpKind::MoeRouterTopk;
+    o.in = Slot::MoeLogits;
+    o.weight = nullptr;
+    o.cols = E;
+    o.heads = K;
+    o.moe_renorm = false;
+    ops.push_back(o);
+  }
+  // routed experts (SiLU SwiGLU) on XNorm -> MoeOut ; X += MoeOut.
+  {
+    Op o;
+    o.kind = OpKind::MoeGateUpGeglu;
+    o.in = Slot::XNorm;
+    o.out = Slot::MoeInter;
+    o.cols = MI;
+    o.in_dim = H;
+    o.heads = K;
+    o.mlp_gelu = false;
+    bind_expert(o, "mlp.experts.gate_up_proj");
+    ops.push_back(o);
+  }
+  {
+    Op o;
+    o.kind = OpKind::MoeDownAccum;
+    o.in = Slot::MoeInter;
+    o.out = Slot::MoeOut;
+    o.cols = H;
+    o.in_dim = MI;
+    o.heads = K;
+    bind_expert(o, "mlp.experts.down_proj");
+    ops.push_back(o);
+  }
+  add_x(Slot::MoeOut);
+  // shared expert (SwiGLU) on XNorm -> Tmp ; X += Tmp.
+  gemv(Slot::XNorm, Slot::Gate, "mlp.shared_experts.gate_proj.weight", SI, H);
+  gemv(Slot::XNorm, Slot::Up, "mlp.shared_experts.up_proj.weight", SI, H);
+  {
+    Op o;
+    o.kind = OpKind::SiluMul;
+    o.in = Slot::Gate;
+    o.in2 = Slot::Up;
+    o.out = Slot::Inter;
+    o.cols = SI;
+    ops.push_back(o);
+  }
+  gemv(Slot::Inter, Slot::Tmp, "mlp.shared_experts.down_proj.weight", H, SI);
+  add_x(Slot::Tmp);
+}
+
 void PlanCudaEngine::build_deepseek_plan() {
-  throw std::runtime_error("build_deepseek_plan: not implemented yet");
+  using namespace opplan;
+  // Wire the decode slot pointers (build_plan does this for the Gemma path; DeepSeek needs its own).
+  slot_ptr_[static_cast<int>(Slot::X)] = d_x_;
+  slot_ptr_[static_cast<int>(Slot::XNorm)] = d_x_norm_;
+  slot_ptr_[static_cast<int>(Slot::Q)] = d_q_;
+  slot_ptr_[static_cast<int>(Slot::K)] = d_k_;
+  slot_ptr_[static_cast<int>(Slot::V)] = d_v_;
+  slot_ptr_[static_cast<int>(Slot::Att)] = d_att_;
+  slot_ptr_[static_cast<int>(Slot::Tmp)] = d_tmp_;
+  slot_ptr_[static_cast<int>(Slot::Gate)] = d_gate_;
+  slot_ptr_[static_cast<int>(Slot::Up)] = d_up_;
+  slot_ptr_[static_cast<int>(Slot::Inter)] = d_inter_;
+  slot_ptr_[static_cast<int>(Slot::MoeRouterIn)] = d_moe_router_in_;
+  slot_ptr_[static_cast<int>(Slot::MoeLogits)] = d_moe_logits_;
+  slot_ptr_[static_cast<int>(Slot::MoeInter)] = d_moe_inter_;
+  slot_ptr_[static_cast<int>(Slot::MoeOut)] = d_moe_out_;
+  slot_ptr_[static_cast<int>(Slot::MlaCkv)] = d_mla_ckv_;
+  slot_ptr_[static_cast<int>(Slot::MlaLatent)] = d_mla_latent_;
+  slot_ptr_[static_cast<int>(Slot::MlaKvb)] = d_mla_kvb_;
+
+  const int H = cfg_.hidden, nh = cfg_.num_heads;
+  const int qkhd = cfg_.head_dim, kvw = nh * qkhd;
+  const int kva = cfg_.kv_lora_rank + cfg_.qk_rope_head_dim;
+  const int kvb = nh * (cfg_.qk_nope_head_dim + cfg_.v_head_dim);
+  if (cfg_.q_lora_rank > 0)
+    throw std::runtime_error("DeepSeek q_lora_rank>0 (q-LoRA) not wired yet; V2-Lite is direct q_proj");
+
+  {
+    Op e;
+    e.kind = OpKind::EmbeddingLookup;
+    e.out = Slot::X;
+    e.cols = H;
+    e.weight = static_cast<const __half*>(dev_["model.embed_tokens.weight"]);
+    plan_.prologue.push_back(e);
+  }
+
+  plan_.layers.assign(cfg_.num_layers, LayerPlan{});
+  for (int L = 0; L < cfg_.num_layers; ++L) {
+    const std::string p = "model.layers." + std::to_string(L) + ".";
+    LayerPlan& lp = plan_.layers[L];
+    lp.layer_index = L;
+    auto& ops = lp.ops;
+    auto W = [&](const char* t) { return static_cast<const __half*>(dev_[p + t]); };
+    auto rms = [&](Slot in, Slot out, const char* t, int rows, int cols) {
+      Op o;
+      o.kind = OpKind::RmsNorm;  // plain DeepSeek RMSNorm (no 1+w offset)
+      o.in = in;
+      o.out = out;
+      o.weight = W(t);
+      o.rows = rows;
+      o.cols = cols;
+      ops.push_back(o);
+    };
+    auto gemv = [&](Slot in, Slot out, const char* t, int out_dim, int in_dim) {
+      Op o;
+      o.kind = OpKind::Gemv;
+      o.in = in;
+      o.out = out;
+      o.cols = out_dim;
+      o.in_dim = in_dim;
+      const auto q = qdev_.find(p + t);
+      if (q != qdev_.end()) {
+        o.qweight = q->second.packed;
+        o.qscales = q->second.scales;
+        o.qbits = weight_quant_bits_;
+        o.qgroup = q->second.group;
+      } else {
+        o.weight = W(t);
+      }
+      ops.push_back(o);
+    };
+    auto add_x = [&](Slot src) {
+      Op o;
+      o.kind = OpKind::AddInplace;
+      o.out = Slot::X;
+      o.in = src;
+      o.cols = H;
+      ops.push_back(o);
+    };
+
+    rms(Slot::X, Slot::XNorm, "input_layernorm.weight", 1, H);
+    // ── MLA attention ──
+    gemv(Slot::XNorm, Slot::Q, "self_attn.q_proj.weight", nh * qkhd, H);
+    gemv(Slot::XNorm, Slot::MlaCkv, "self_attn.kv_a_proj_with_mqa.weight", kva, H);
+    rms(Slot::MlaCkv, Slot::MlaLatent, "self_attn.kv_a_layernorm.weight", 1, cfg_.kv_lora_rank);
+    gemv(Slot::MlaLatent, Slot::MlaKvb, "self_attn.kv_b_proj.weight", kvb, cfg_.kv_lora_rank);
+    {
+      Op o;
+      o.kind = OpKind::MlaAssembleRope;
+      o.heads = nh;
+      o.head_dim = qkhd;
+      o.key_head_dim = cfg_.qk_nope_head_dim;
+      o.rotary_dim = cfg_.qk_rope_head_dim;
+      o.value_head_dim = cfg_.v_head_dim;
+      o.in_dim = cfg_.kv_lora_rank;
+      o.scale = mla_attn_scaling_;
+      o.aux_ptr = d_inv_freq_;
+      ops.push_back(o);
+    }
+    {
+      Op o;
+      o.kind = OpKind::KvStore;
+      o.cols = kvw;
+      ops.push_back(o);
+    }
+    {
+      Op o;
+      o.kind = OpKind::Attention;
+      o.in = Slot::Q;
+      o.out = Slot::Att;
+      o.heads = nh;
+      o.kv_heads = nh;
+      o.head_dim = qkhd;
+      o.full_attention = true;
+      o.sliding_window = 0;
+      ops.push_back(o);
+    }
+    gemv(Slot::Att, Slot::Tmp, "self_attn.o_proj.weight", H, nh * qkhd);
+    add_x(Slot::Tmp);
+
+    // ── MLP: dense (first_k_dense_replace layers) or MoE ──
+    rms(Slot::X, Slot::XNorm, "post_attention_layernorm.weight", 1, H);
+    if (L >= cfg_.first_k_dense_replace && cfg_.num_experts > 0) {
+      append_deepseek_moe_ffn_ops(ops, p);
+    } else {
+      gemv(Slot::XNorm, Slot::Gate, "mlp.gate_proj.weight", cfg_.intermediate, H);
+      gemv(Slot::XNorm, Slot::Up, "mlp.up_proj.weight", cfg_.intermediate, H);
+      {
+        Op o;
+        o.kind = OpKind::SiluMul;
+        o.in = Slot::Gate;
+        o.in2 = Slot::Up;
+        o.out = Slot::Inter;
+        o.cols = cfg_.intermediate;
+        ops.push_back(o);
+      }
+      gemv(Slot::Inter, Slot::Tmp, "mlp.down_proj.weight", H, cfg_.intermediate);
+      add_x(Slot::Tmp);
+    }
+  }
+
+  {
+    Op n;
+    n.kind = OpKind::RmsNorm;
+    n.in = Slot::X;
+    n.out = Slot::XNorm;
+    n.weight = static_cast<const __half*>(dev_["model.norm.weight"]);
+    n.rows = 1;
+    n.cols = H;
+    plan_.epilogue.push_back(n);
+    Op h;
+    h.kind = OpKind::LmHead;
+    h.in = Slot::XNorm;
+    const char* head =
+        dev_.count("lm_head.weight") ? "lm_head.weight" : "model.embed_tokens.weight";
+    h.weight = static_cast<const __half*>(dev_[head]);
+    h.cols = cfg_.vocab;
+    h.in_dim = H;
+    plan_.epilogue.push_back(h);
+  }
 }
 
 void PlanCudaEngine::load_qwen35_weights() {
@@ -1251,21 +1563,23 @@ void PlanCudaEngine::open(const std::string& cpi_path, int max_context) {
       parse_deepseek_config(cpi_path);
       if (max_ctx_ <= 0) max_ctx_ = std::min(4096, cfg_.max_position_embeddings);
       G4_CHECK(cudaStreamCreate(&stream_));
-      std::size_t free_before = 0, total_vram = 0;
-      G4_CHECK(cudaMemGetInfo(&free_before, &total_vram));
       load_deepseek_weights();
-      std::size_t free_after = 0;
-      G4_CHECK(cudaMemGetInfo(&free_after, &total_vram));
-      char msg[640];
-      std::snprintf(msg, sizeof(msg),
-                    "DeepSeek-V2 config+weights LOADED (layers=%d hidden=%d heads=%d kv_lora=%d "
-                    "qk=%d+%d v=%d experts=%d/top%d shared=%d dense_layers=%d vocab=%d). Weights use "
-                    "%.2f GB VRAM (%.2f GB free of %.2f). MLA op + plan are the next phases.",
-                    cfg_.num_layers, cfg_.hidden, cfg_.num_heads, cfg_.kv_lora_rank,
-                    cfg_.qk_nope_head_dim, cfg_.qk_rope_head_dim, cfg_.v_head_dim, cfg_.num_experts,
-                    cfg_.top_k_experts, cfg_.n_shared_experts, cfg_.first_k_dense_replace, cfg_.vocab,
-                    (free_before - free_after) / 1e9, free_after / 1e9, total_vram / 1e9);
-      throw std::runtime_error(msg);
+      allocate_buffers();
+      {
+        const engine::YarnRope y = engine::deepseek_yarn_rope(
+            cfg_.qk_rope_head_dim, cfg_.rope_theta, cfg_.yarn_factor, cfg_.yarn_beta_fast,
+            cfg_.yarn_beta_slow, cfg_.yarn_original_max_pos, cfg_.yarn_mscale, cfg_.yarn_mscale);
+        mla_attn_scaling_ = y.attention_scaling;
+        G4_CHECK(cudaMemcpy(d_inv_freq_, y.inv_freq.data(), y.inv_freq.size() * sizeof(float),
+                            cudaMemcpyHostToDevice));
+      }
+      build_deepseek_plan();
+      // MLA ops (MlaAssembleRope) have only a T==1 path, so drive prefill token-by-token (also what
+      // the MoE layers require). Graph capture bakes the host `position` into MlaAssembleRope, so run
+      // eager for now (CPI_PLAN_NO_GRAPH=1). Persistent decode is off unless CPI_CUDA_PERSISTENT set.
+      seq_prefill_ok_ = false;
+      G4_CHECK(cudaStreamSynchronize(stream_));
+      return;
     }
     parse_qwen35_config(cpi_path);
     if (max_ctx_ <= 0 ||
@@ -1876,6 +2190,9 @@ void PlanCudaEngine::build_plan() {
   slot_ptr_[static_cast<int>(Slot::MoeLogits)] = d_moe_logits_;
   slot_ptr_[static_cast<int>(Slot::MoeInter)] = d_moe_inter_;
   slot_ptr_[static_cast<int>(Slot::MoeOut)] = d_moe_out_;
+  slot_ptr_[static_cast<int>(Slot::MlaCkv)] = d_mla_ckv_;
+  slot_ptr_[static_cast<int>(Slot::MlaLatent)] = d_mla_latent_;
+  slot_ptr_[static_cast<int>(Slot::MlaKvb)] = d_mla_kvb_;
 
   if (cfg_.family == Family::Qwen35) {
     build_qwen35_plan();
@@ -2680,7 +2997,7 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
         // Writes the selected experts to DEVICE buffers; the expert ops below read
         // them there, so a token never round-trips to the host mid-layer.
         kernels::launch_moe_router_topk_softmax(S(op.in), op.cols, op.heads, d_moe_idx_, d_moe_w_,
-                                                stream_, HW(op.weight));
+                                                stream_, HW(op.weight), op.moe_renorm);
         break;
       case OpKind::MoeGateUpGeglu:
         if (moe_stream_ && op.qbits) {
@@ -2713,6 +3030,16 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
               op.in_dim, op.heads, stream_);
         }
         break;
+      case OpKind::MlaAssembleRope: {
+        // DeepSeek MLA: assemble per-head K/V from the kv_b output + shared k_pe, rope q_pe/k_pe.
+        // Runs at T==1 (MoE forces token-by-token, so no sequence path). heads=nh,
+        // key_head_dim=qk_nope, rotary_dim=qk_rope, value_head_dim=v_head, in_dim=kv_lora.
+        engine::launch_mla_assemble_rope(S(Slot::Q), S(Slot::MlaKvb), S(Slot::MlaCkv), S(Slot::K),
+                                         S(Slot::V), static_cast<const float*>(op.aux_ptr), op.heads,
+                                         op.key_head_dim, op.rotary_dim, op.value_head_dim, op.in_dim,
+                                         position, op.scale, stream_);
+        break;
+      }
       case OpKind::Rope: {
         const float* cosT = op.rope_table == RopeTable::Full ? d_cos_full_ : d_cos_sliding_;
         const float* sinT = op.rope_table == RopeTable::Full ? d_sin_full_ : d_sin_sliding_;
