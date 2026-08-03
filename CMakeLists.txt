@@ -701,6 +701,19 @@ if(CPI_ENABLE_CUDA)
   )
   add_test(NAME mla_attention_test COMMAND mla_attention_test)
 
+  # Kimi Delta Attention (KDA): per-channel gated delta-rule linear attention (recurrent state, no KV
+  # cache) verified on-device vs an fp32 oracle. Isolated groundwork for Kimi K3 (model-blocked here).
+  add_executable(kda_attention_test
+    src/tests/kda_attention_test.cu
+  )
+  target_include_directories(kda_attention_test PRIVATE include)
+  target_link_libraries(kda_attention_test PRIVATE cpi_engine)
+  set_target_properties(kda_attention_test PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+  )
+  add_test(NAME kda_attention_test COMMAND kda_attention_test)
+
   # Image preprocessing: bicubic resize vs PIL + patch-grid layout.
   add_executable(image_preprocess_test
     src/tests/image_preprocess_test.cpp
