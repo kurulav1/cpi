@@ -353,6 +353,12 @@ add_executable(cpi
 )
 target_link_libraries(cpi PRIVATE cpi_engine)
 
+# shard_planner: pre-deployment "will it fit, on how many GPUs" report for a model + tp/pp/ep split.
+# Pure host arithmetic over header-only shard_plan.hpp -- no GPU, no cluster, no engine link -- so it
+# builds on any platform. Part of the multi-GPU/HPC prep track (see include/engine/shard_plan.hpp).
+add_executable(shard_planner src/app/shard_planner.cpp)
+target_include_directories(shard_planner PRIVATE include)
+
 # Backward-compat alias: the binary was renamed llama_infer -> cpi. Drop a `llama_infer` next to it
 # (symlink on Unix, copy on Windows) so existing local scripts keep working for one release. This
 # is source-build only; the release archives ship `cpi`.
@@ -673,6 +679,14 @@ if(CPI_ENABLE_CUDA)
   )
   target_include_directories(socket_ring_allreduce_test PRIVATE include)
   add_test(NAME socket_ring_allreduce_test COMMAND socket_ring_allreduce_test)
+
+  # Shard-fit planner invariants: TP/EP/PP divisors actually divide the footprint; fit scan returns
+  # only feasible, world-sorted configs. Host-only (no CUDA); pairs with the empirical world=1 checks.
+  add_executable(shard_plan_test
+    src/tests/shard_plan_test.cpp
+  )
+  target_include_directories(shard_plan_test PRIVATE include)
+  add_test(NAME shard_plan_test COMMAND shard_plan_test)
 
   # Image preprocessing: bicubic resize vs PIL + patch-grid layout.
   add_executable(image_preprocess_test
