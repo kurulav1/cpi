@@ -11,7 +11,6 @@
 #include <cstdlib>
 #include <vector>
 
-#include "runtime/cuda_utils.cuh"
 #include "runtime/kernels.cuh"
 
 namespace kernels {

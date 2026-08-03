@@ -7,7 +7,6 @@
 #include <utility>
 #include <vector>
 
-#include "common.hpp"
 #include "llama_engine_internal.hpp"
 #include "runtime/cuda_utils.cuh"
 #include "runtime/kernels.cuh"

@@ -28,7 +28,6 @@
 
 #include "engine/llama_engine.hpp"
 #include "engine/sampling.hpp"  // dispatch_sample_from_candidates (top-k verify closure)
-#include "grammar/grammar_sampler.hpp"
 #include "llama_engine_internal.hpp"
 #include "runtime/cuda_utils.cuh"
 #include "runtime/kernels.cuh"

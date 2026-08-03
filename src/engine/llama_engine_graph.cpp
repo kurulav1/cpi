@@ -4,7 +4,6 @@
 #include <cstdlib>
 #include <iostream>
 
-#include "common.hpp"
 #include "engine/llama_engine.hpp"
 #include "engine/sampling.hpp"
 #include "llama_engine_internal.hpp"
