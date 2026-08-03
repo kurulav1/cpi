@@ -105,7 +105,7 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
   if (cfg.is_moe()) {
     const int experts = std::max(1, cfg.num_local_experts);
     const int top_k =
-        std::max(1, std::min(cfg.num_experts_per_tok > 0 ? cfg.num_experts_per_tok : 2, experts));
+        std::max(1, std::min(cfg.effective_experts_per_tok(), experts));
     const int expert_inter = cfg.effective_expert_intermediate_size() > 0
                                  ? cfg.effective_expert_intermediate_size()
                                  : inter;

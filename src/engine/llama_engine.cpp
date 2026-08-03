@@ -1193,7 +1193,7 @@ void LlamaEngine::initialize(const EngineOptions& options) {
     }
     if (cfg.is_moe()) {
       std::cout << " moe_experts=" << cfg.num_local_experts
-                << " moe_topk=" << (cfg.num_experts_per_tok > 0 ? cfg.num_experts_per_tok : 2);
+                << " moe_topk=" << (cfg.effective_experts_per_tok());
       if (cfg.expert_intermediate_size > 0) {
         std::cout << " expert_inter=" << cfg.expert_intermediate_size;
       }

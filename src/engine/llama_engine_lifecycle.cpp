@@ -443,7 +443,7 @@ void LlamaEngine::allocate_runtime_buffers() {
   if (cfg.is_moe()) {
     const int experts = std::max(1, cfg.num_local_experts);
     const int top_k =
-        std::max(1, std::min(cfg.num_experts_per_tok > 0 ? cfg.num_experts_per_tok : 2, experts));
+        std::max(1, std::min(cfg.effective_experts_per_tok(), experts));
     const std::size_t expert_w13_bytes =
         static_cast<std::size_t>(expert_inter) * static_cast<std::size_t>(hidden) * sizeof(__half);
     const std::size_t expert_w2_bytes =

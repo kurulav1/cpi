@@ -110,6 +110,12 @@ struct LlamaConfig {
   std::int32_t num_local_experts = 0;  // Number of MoE experts per layer (0 = dense FFN).
   std::int32_t num_experts_per_tok =
       0;  // Router top-k experts selected per token (Mixtral uses 2).
+  static constexpr int kDefaultExpertsPerTok = 2;  // MoE top-k fallback when the config omits it.
+  // Experts routed per token, applying the MoE default when unspecified (was spelled inline as
+  // `num_experts_per_tok > 0 ? num_experts_per_tok : 2` in several call sites).
+  [[nodiscard]] int effective_experts_per_tok() const {
+    return num_experts_per_tok > 0 ? num_experts_per_tok : kDefaultExpertsPerTok;
+  }
   std::int32_t expert_intermediate_size = 0;  // Expert FFN hidden size (0 = use intermediate_size).
   float partial_rotary_factor = 1.0f;     // Phi/Qwen-style partial RoPE factor (1.0 = full rotary).
   std::int32_t linear_num_key_heads = 0;  // Linear-attention (delta-net) geometry.

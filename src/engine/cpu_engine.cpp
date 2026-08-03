@@ -599,7 +599,7 @@ void CpuLlamaEngine::mlp_moe(int layer) {
                     ? cfg_.effective_expert_intermediate_size()
                     : cfg_.intermediate_size;
   const int top_k =
-      std::max(1, std::min(cfg_.num_experts_per_tok > 0 ? cfg_.num_experts_per_tok : 2,
+      std::max(1, std::min(cfg_.effective_experts_per_tok(),
                            cfg_.num_local_experts));
 
   auto gemv_any = [&](const uint16_t* w_fp16, const float* w_fp32, float* out, int M, int N,
@@ -885,7 +885,7 @@ void CpuLlamaEngine::initialize(const EngineOptions& options) {
     }
     if (cfg_.is_moe()) {
       std::cout << " moe_experts=" << cfg_.num_local_experts
-                << " moe_topk=" << (cfg_.num_experts_per_tok > 0 ? cfg_.num_experts_per_tok : 2)
+                << " moe_topk=" << (cfg_.effective_experts_per_tok())
                 << " expert_inter=" << expert_inter;
     }
     std::cout << "\n";
@@ -1137,7 +1137,7 @@ std::vector<int> CpuLlamaEngine::generate_stream(const std::vector<int>& prompt_
     }
   } grammar_scope{&active_grammar_};
 
-  const int eos_id = 2;  // Llama2 EOS token
+  const int eos_id = options_.eos_token_id;  // from config/--eos-token (was hardcoded to Llama2's 2)
   const int max_ctx = options_.max_context;
   const int top_k = options_.top_k;
   const float rep_p = options_.repetition_penalty;
