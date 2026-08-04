@@ -116,6 +116,7 @@ PlanCudaEngine::~PlanCudaEngine() {
   cudaFree(d_cand_count_);
   cudaFree(d_persist_ops_);
   if (cublas_ != nullptr) cublasDestroy(static_cast<cublasHandle_t>(cublas_));
+  cudaFree(d_cublas_ws_);
   cudaFree(d_pf_scores_);
   cudaFree(d_pf_ptrs_);
   cudaFree(d_seq_dequant_);
@@ -2548,6 +2549,10 @@ bool PlanCudaEngine::seq_gemm_cublas(const __half* w, const __half* x, __half* y
     cublasHandle_t h = nullptr;
     if (cublasCreate(&h) != CUBLAS_STATUS_SUCCESS) return false;
     cublas_ = h;
+    // A persistent workspace so cuBLAS does not allocate/free one per call (which serializes
+    // the host and idles the GPU across the many per-layer projection GEMMs).
+    constexpr std::size_t kWs = 32u << 20;
+    if (cudaMalloc(&d_cublas_ws_, kWs) == cudaSuccess) cublasSetWorkspace(h, d_cublas_ws_, kWs);
   }
   cublasHandle_t h = static_cast<cublasHandle_t>(cublas_);
   cublasSetStream(h, stream_);
@@ -2573,6 +2578,8 @@ bool PlanCudaEngine::grouped_gemm_ex(int m, int k, const std::vector<int>& n_per
     cublasHandle_t nh = nullptr;
     if (cublasCreate(&nh) != CUBLAS_STATUS_SUCCESS) return false;
     cublas_ = nh;
+    constexpr std::size_t kWs = 32u << 20;
+    if (cudaMalloc(&d_cublas_ws_, kWs) == cudaSuccess) cublasSetWorkspace(nh, d_cublas_ws_, kWs);
   }
   cublasHandle_t h = static_cast<cublasHandle_t>(cublas_);
   cublasSetStream(h, stream_);
@@ -2709,7 +2716,7 @@ bool PlanCudaEngine::prefill_attention_tc(const __half* q, const __half* k, cons
   static const bool disabled = std::getenv("CPI_CUDA_NO_TC_PREFILL") != nullptr;
   if (disabled || cublas_ == nullptr) return false;
   if (heads <= 0 || kv_heads <= 0 || (heads % kv_heads) != 0) return false;
-  constexpr int kChunk = 256;
+  constexpr int kChunk = 1024;
   if (d_pf_scores_ == nullptr) {
     // heads x kChunk x max_ctx fp16 scores + 6*heads device pointers.
     if (cudaMalloc(&d_pf_scores_, static_cast<std::size_t>(heads) * kChunk * max_ctx_ *

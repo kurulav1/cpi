@@ -588,6 +588,7 @@ private:
   // the hand-rolled GEMM cannot reach tensor-core rates. Decode never touches this.
   // CPI_CUDA_NO_CUBLAS=1 restores the fallback.
   void* cublas_ = nullptr;  // cublasHandle_t, kept as void* to keep cublas out of the header
+  void* d_cublas_ws_ = nullptr;  // persistent cuBLAS workspace (set once; avoids per-call alloc)
   // Tensor-core attention prefill (full-attention layers): scores scratch + device
   // pointer arrays, the LlamaEngine machinery adapted. Lazy-allocated on first use.
   __half* d_pf_scores_ = nullptr;
