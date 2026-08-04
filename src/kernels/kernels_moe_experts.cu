@@ -184,6 +184,91 @@ void launch_moe_gate_up_geglu(const void* w, const float* scales, int qbits, int
   }
 }
 
+// dp4a MoE gate_up: warp per output row r (expert k = blockIdx.y). The activation xq is the perm8-int8
+// quantised XNorm (shared across all experts, quantised once by the caller); int4 expert weights are
+// unpacked to int8 and dotted with dp4a. inter[k,r] = act(gate.xq) * (up.xq). Same weight packing +
+// perm8 activation layout as the general int4 dp4a matvec (verified path); we just index the expert row.
+__global__ void moe_gate_up_geglu_dp4a_kernel(const std::int8_t* __restrict__ wg,
+                                              const float* __restrict__ sg,
+                                              const std::int8_t* __restrict__ xq,
+                                              const float* __restrict__ x_scale,
+                                              const int* __restrict__ topk_idx, half* inter_out,
+                                              int inter, int hidden, int top_k, int group_shift,
+                                              int n_groups, bool use_gelu) {
+  const int warps_per_block = blockDim.x / warpSize;
+  const int r = blockIdx.x * warps_per_block + (threadIdx.x / warpSize);
+  const int k = blockIdx.y;
+  if (r >= inter || k >= top_k) return;
+  const int lane = threadIdx.x & (warpSize - 1);
+  const int packed_cols = hidden / 2;
+  const int chunks = packed_cols / 16;  // uint4 = 16 bytes = 32 int4 weights
+  const std::size_t base = static_cast<std::size_t>(topk_idx[k]) * static_cast<std::size_t>(2 * inter);
+  const uint4* wgrow =
+      reinterpret_cast<const uint4*>(wg + (base + r) * static_cast<std::size_t>(packed_cols));
+  const uint4* wurow = reinterpret_cast<const uint4*>(
+      wg + (base + inter + r) * static_cast<std::size_t>(packed_cols));
+  const float* sgrow = sg + (base + r) * static_cast<std::size_t>(n_groups);
+  const float* surow = sg + (base + inter + r) * static_cast<std::size_t>(n_groups);
+
+  float gf = 0.0f, uf = 0.0f;
+  for (int c = lane; c < chunks; c += warpSize) {
+    const uint4 wgv = wgrow[c];
+    const uint4 wuv = wurow[c];
+    const uint4 xa = reinterpret_cast<const uint4*>(xq)[2 * c];
+    const uint4 xb = reinterpret_cast<const uint4*>(xq)[2 * c + 1];
+    const int xv[8] = {static_cast<int>(xa.x), static_cast<int>(xa.y), static_cast<int>(xa.z),
+                       static_cast<int>(xa.w), static_cast<int>(xb.x), static_cast<int>(xb.y),
+                       static_cast<int>(xb.z), static_cast<int>(xb.w)};
+    const float xs = x_scale[c];
+    const float gs = sgrow[(c * 32) >> group_shift] * xs;
+    const float us = surow[(c * 32) >> group_shift] * xs;
+    const unsigned* wgu = reinterpret_cast<const unsigned*>(&wgv);
+    const unsigned* wuu = reinterpret_cast<const unsigned*>(&wuv);
+    int g = 0, u = 0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const unsigned gw = wgu[i], uw = wuu[i];
+      const int gwlo = __vsubss4(static_cast<int>((gw & 0x0F0F0F0Fu) ^ 0x08080808u), 0x08080808);
+      const int gwhi =
+          __vsubss4(static_cast<int>(((gw >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u), 0x08080808);
+      const int uwlo = __vsubss4(static_cast<int>((uw & 0x0F0F0F0Fu) ^ 0x08080808u), 0x08080808);
+      const int uwhi =
+          __vsubss4(static_cast<int>(((uw >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u), 0x08080808);
+      g = __dp4a(gwlo, xv[2 * i], g);
+      g = __dp4a(gwhi, xv[2 * i + 1], g);
+      u = __dp4a(uwlo, xv[2 * i], u);
+      u = __dp4a(uwhi, xv[2 * i + 1], u);
+    }
+    gf += static_cast<float>(g) * gs;
+    uf += static_cast<float>(u) * us;
+  }
+  gf = warp_sum(gf);
+  uf = warp_sum(uf);
+  if (lane == 0) {
+    const float act = use_gelu ? gelu_tanh(gf) : (gf / (1.0f + __expf(-gf)));
+    inter_out[static_cast<std::size_t>(k) * inter + r] = __float2half(act * uf);
+  }
+}
+
+// group_shift such that (col >> shift) is the weight-group index; group must be a power of two.
+static inline int moe_group_shift(int group) {
+  int s = 0;
+  while ((1 << s) < group) ++s;
+  return s;
+}
+
+void launch_moe_gate_up_geglu_dp4a(const void* wg, const float* sg, const std::int8_t* xq,
+                                   const float* x_scale, const int* topk_idx, half* inter_out,
+                                   int inter, int hidden, int top_k, int group, cudaStream_t stream,
+                                   bool use_gelu) {
+  constexpr int threads = 256;
+  constexpr int wpb = threads / 32;
+  const dim3 grid(static_cast<unsigned>((inter + wpb - 1) / wpb), static_cast<unsigned>(top_k));
+  moe_gate_up_geglu_dp4a_kernel<<<grid, threads, 0, stream>>>(
+      static_cast<const std::int8_t*>(wg), sg, xq, x_scale, topk_idx, inter_out, inter, hidden,
+      top_k, moe_group_shift(group), quant_group_count(hidden, group), use_gelu);
+}
+
 void launch_moe_down_accum(const void* w, const float* scales, int qbits, int group,
                            const half* inter_in, const int* topk_idx, const float* topk_weight,
                            half* y, int hidden, int inter, int top_k, cudaStream_t stream) {

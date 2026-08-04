@@ -656,6 +656,14 @@ void launch_moe_gate_up_geglu(const void* w, const float* scales, int qbits, int
                               const half* x, const int* topk_idx, half* inter_out, int inter,
                               int hidden, int top_k, cudaStream_t stream, bool use_gelu = true);
 
+// dp4a int4 variant: `xq`/`x_scale` = the perm8-int8 quantised activation (quantise the fp16 input once
+// with launch_quantize_fp16_to_int8_perm8_g32). group must be a power of two, multiple of 32, dividing
+// hidden. Decode (batch-1) only.
+void launch_moe_gate_up_geglu_dp4a(const void* wg, const float* sg, const std::int8_t* xq,
+                                   const float* x_scale, const int* topk_idx, half* inter_out,
+                                   int inter, int hidden, int top_k, int group, cudaStream_t stream,
+                                   bool use_gelu = true);
+
 void launch_moe_down_accum(const void* w, const float* scales, int qbits, int group,
                            const half* inter_in, const int* topk_idx, const float* topk_weight,
                            half* y, int hidden, int inter, int top_k, cudaStream_t stream);

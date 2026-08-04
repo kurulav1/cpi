@@ -3048,6 +3048,14 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
           kernels::launch_moe_gate_up_geglu(d_moe_stage_gu_, d_moe_stage_gu_s_, op.qbits, op.qgroup,
                                             S(op.in), d_moe_identity_idx_, S(op.out), op.cols,
                                             op.in_dim, op.heads, stream_, op.mlp_gelu);
+        } else if (!seq && op.qbits == 4 && op.qgroup > 0 && (op.qgroup % 32) == 0 &&
+                   (op.in_dim % 32) == 0 && d_act_i8_ != nullptr) {
+          // dp4a: quantise the (shared) activation once, then int8xint4 dot per expert.
+          kernels::launch_quantize_fp16_to_int8_perm8_g32(S(op.in), d_act_i8_, d_act_qs_, op.in_dim,
+                                                          stream_);
+          kernels::launch_moe_gate_up_geglu_dp4a(op.qweight, QS(op.qscales), d_act_i8_, d_act_qs_,
+                                                 d_moe_idx_, S(op.out), op.cols, op.in_dim, op.heads,
+                                                 op.qgroup, stream_, op.mlp_gelu);
         } else {
           kernels::launch_moe_gate_up_geglu(
               op.qbits ? static_cast<const void*>(op.qweight) : static_cast<const void*>(op.weight),
