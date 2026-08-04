@@ -71,4 +71,56 @@ inline void launch_mla_assemble_rope(__half* Q, const __half* kvb, const __half*
       attn_scaling);
 }
 
+// Batched (T>1) variant for sequence prefill: one thread per (token t, head h). Token t is at absolute
+// position start_position + t; its slices are Q/K/V[t*nh*qkhd..], kvb[t*nh*kvh..], ckv[t*kva..]. Same
+// per-head assembly + interleaved rope as the T==1 kernel. Foundational piece for batched DeepSeek
+// prefill (the MoE grouped-GEMM + seq-prefill enable are the remaining pieces).
+__global__ inline void mla_assemble_rope_seq_kernel(__half* Q, const __half* kvb, const __half* ckv,
+                                                    __half* K, __half* V, const float* inv_freq,
+                                                    int nh, int qk_nope, int qk_rope, int v_head,
+                                                    int kv_lora, int T, int start_position,
+                                                    float attn_scaling) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= T * nh) return;
+  const int t = idx / nh;
+  const int h = idx % nh;
+  const int position = start_position + t;
+  const int qkhd = qk_nope + qk_rope;
+  const int kvh = qk_nope + v_head;
+  const int half = qk_rope / 2;
+
+  __half* q = Q + (size_t)t * nh * qkhd + (size_t)h * qkhd + qk_nope;
+  for (int p = 0; p < half; ++p) {
+    const float ang = position * inv_freq[p], c = cosf(ang), s = sinf(ang);
+    const float x0 = __half2float(q[2 * p]), x1 = __half2float(q[2 * p + 1]);
+    q[2 * p] = __float2half(attn_scaling * (x0 * c - x1 * s));
+    q[2 * p + 1] = __float2half(attn_scaling * (x0 * s + x1 * c));
+  }
+  __half* k = K + (size_t)t * nh * qkhd + (size_t)h * qkhd;
+  const __half* kn = kvb + (size_t)t * nh * kvh + (size_t)h * kvh;
+  for (int a = 0; a < qk_nope; ++a) k[a] = kn[a];
+  const __half* kpe = ckv + (size_t)t * (kv_lora + qk_rope) + kv_lora;
+  for (int p = 0; p < half; ++p) {
+    const float ang = position * inv_freq[p], c = cosf(ang), s = sinf(ang);
+    const float x0 = __half2float(kpe[2 * p]), x1 = __half2float(kpe[2 * p + 1]);
+    k[qk_nope + 2 * p] = __float2half(attn_scaling * (x0 * c - x1 * s));
+    k[qk_nope + 2 * p + 1] = __float2half(attn_scaling * (x0 * s + x1 * c));
+  }
+  __half* v = V + (size_t)t * nh * qkhd + (size_t)h * qkhd;
+  const __half* vv = kvb + (size_t)t * nh * kvh + (size_t)h * kvh + qk_nope;
+  for (int b = 0; b < v_head; ++b) v[b] = vv[b];
+  for (int b = v_head; b < qkhd; ++b) v[b] = __float2half(0.0f);
+}
+
+inline void launch_mla_assemble_rope_seq(__half* Q, const __half* kvb, const __half* ckv, __half* K,
+                                         __half* V, const float* inv_freq, int nh, int qk_nope,
+                                         int qk_rope, int v_head, int kv_lora, int T,
+                                         int start_position, float attn_scaling,
+                                         cudaStream_t stream) {
+  const int n = T * nh;
+  mla_assemble_rope_seq_kernel<<<(n + 127) / 128, 128, 0, stream>>>(
+      Q, kvb, ckv, K, V, inv_freq, nh, qk_nope, qk_rope, v_head, kv_lora, T, start_position,
+      attn_scaling);
+}
+
 }  // namespace engine

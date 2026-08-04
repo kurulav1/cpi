@@ -91,5 +91,41 @@ int main() {
   const bool pass = rel < 5e-3f;  // fp16 rounding
   std::printf("%s[MLA assemble+rope]: K/V/Q device vs fp32 oracle, max rel %.2e\n",
               pass ? "PASS" : "FAIL", rel);
-  return pass ? 0 : 1;
+
+  // ---- T>1 seq kernel: batched must equal token-by-token. Replicate the single token across T=4
+  // positions; token 3 (position 3) must match the T==1 result above (which used position=3). ----
+  const int Tn = 4;
+  std::vector<__half> Qs(Tn * nh * qkhd), kvbs(Tn * nh * kvh), ckvs(Tn * (kv_lora + qk_rope));
+  for (int t = 0; t < Tn; ++t) {
+    std::copy(Q.begin(), Q.end(), Qs.begin() + (size_t)t * nh * qkhd);
+    std::copy(kvb.begin(), kvb.end(), kvbs.begin() + (size_t)t * nh * kvh);
+    std::copy(ckv.begin(), ckv.end(), ckvs.begin() + (size_t)t * (kv_lora + qk_rope));
+  }
+  __half* dQs = devh(Qs);
+  __half* dkvbs = devh(kvbs);
+  __half* dckvs = devh(ckvs);
+  __half *dKs, *dVs;
+  cudaMalloc(&dKs, (size_t)Tn * nh * qkhd * sizeof(__half));
+  cudaMalloc(&dVs, (size_t)Tn * nh * qkhd * sizeof(__half));
+  engine::launch_mla_assemble_rope_seq(dQs, dkvbs, dckvs, dKs, dVs, dinv, nh, qk_nope, qk_rope,
+                                       v_head, kv_lora, Tn, /*start_position=*/0, scaling, 0);
+  cudaDeviceSynchronize();
+  std::vector<__half> Ks(Tn * nh * qkhd), Vs(Tn * nh * qkhd), Qsd(Tn * nh * qkhd);
+  cudaMemcpy(Ks.data(), dKs, Ks.size() * sizeof(__half), cudaMemcpyDeviceToHost);
+  cudaMemcpy(Vs.data(), dVs, Vs.size() * sizeof(__half), cudaMemcpyDeviceToHost);
+  cudaMemcpy(Qsd.data(), dQs, Qsd.size() * sizeof(__half), cudaMemcpyDeviceToHost);
+  float seqrel = 0, seqden = 1e-4f;
+  const int off = (position) * nh * qkhd;  // seq token index == position (start=0)
+  for (int i = 0; i < nh * qkhd; ++i) {
+    seqrel = std::max(seqrel, std::fabs(__half2float(Kd[i]) - __half2float(Ks[off + i])));
+    seqrel = std::max(seqrel, std::fabs(__half2float(Vd[i]) - __half2float(Vs[off + i])));
+    seqrel = std::max(seqrel, std::fabs(__half2float(Qd[i]) - __half2float(Qsd[off + i])));
+    seqden = std::max(seqden, std::fabs(__half2float(Kd[i])));
+  }
+  const float srel = seqrel / seqden;
+  const bool spass = srel < 1e-3f;
+  std::printf("%s[MLA assemble+rope T>1]: seq token@pos%d == token-by-token, max rel %.2e\n",
+              spass ? "PASS" : "FAIL", position, srel);
+
+  return (pass && spass) ? 0 : 1;
 }
