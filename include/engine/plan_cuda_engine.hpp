@@ -146,6 +146,12 @@ class PlanCudaEngine : public runtime::SequenceModel {
   // false to fall back to the per-token loop (routing not built, or no cuBLAS).
   bool moe_grouped_gate_up(const opplan::Op& op, __half* xnorm, int T);
   bool moe_grouped_down(const opplan::Op& op, __half* moe_out, int T);
+  // One cublasGemmGroupedBatchedEx over all (fp16) expert GEMMs: group g computes C[g] = A[g]^T . B[g]
+  // with A [m,k] row-major (OP_T), B [n_g,k] row-major, C [n_g,m] row-major. Collapses the ~64
+  // per-expert calls into one, killing the tiny-GEMM launch-latency floor. false on failure.
+  bool grouped_gemm_ex(int m, int k, const std::vector<int>& n_per_group,
+                       const std::vector<const void*>& A, const std::vector<const void*>& B,
+                       const std::vector<void*>& C);
   void verify_greedy(const int* tokens, int k, int pos, int* out_argmax);
   void load_all(const std::string& cpi_path);
   // ── Qwen3.5 recipe (config parse + weight load + plan build). The executor,
@@ -467,6 +473,12 @@ private:
   __half* d_moe_gate_g_ = nullptr;    // [P, moe_inter] gate GEMM out, then SiLU(gate)*up in place
   __half* d_moe_up_g_ = nullptr;      // [P, moe_inter] up GEMM out
   __half* d_moe_outg_ = nullptr;      // [P, hidden]   per-expert down GEMM out
+  __half* d_moe_dqw_ = nullptr;       // [E*2*MI, H] all experts dequanted once (reused for down)
+  // cublasGemmGroupedBatchedEx wants the A/B/C pointer arrays in DEVICE memory (scalar arrays stay
+  // host). Sized 2*E groups (gate_up's worst case). Verified in isolation.
+  const void** d_gg_A_ = nullptr;
+  const void** d_gg_B_ = nullptr;
+  void** d_gg_C_ = nullptr;
   int* d_moe_perm_ = nullptr;         // [P] source token id per grouped row
   float* d_moe_rweight_ = nullptr;    // [P] routing weight per grouped row
   float* d_moe_out_f32_ = nullptr;    // [max_tokens, hidden] fp32 scatter accumulator

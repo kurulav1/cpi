@@ -125,6 +125,10 @@ PlanCudaEngine::~PlanCudaEngine() {
   cudaFree(d_moe_gate_g_);
   cudaFree(d_moe_up_g_);
   cudaFree(d_moe_outg_);
+  cudaFree(d_moe_dqw_);
+  cudaFree(d_gg_A_);
+  cudaFree(d_gg_B_);
+  cudaFree(d_gg_C_);
   cudaFree(d_moe_perm_);
   cudaFree(d_moe_rweight_);
   cudaFree(d_moe_out_f32_);
@@ -2554,6 +2558,38 @@ bool PlanCudaEngine::seq_gemm_cublas(const __half* w, const __half* x, __half* y
   return st == CUBLAS_STATUS_SUCCESS;
 }
 
+// One cublasGemmGroupedBatchedEx over every expert GEMM (group_size 1 each): C[g] = A[g]^T . B[g],
+// A [m,k] row-major (OP_T), B [n_g,k] row-major, C [n_g,m] row-major -- the same layout as
+// seq_gemm_cublas, batched. The array params live in host memory; the pointers inside them are
+// device addresses. Collapses ~64 tiny per-expert calls into one, removing the per-GEMM latency
+// floor that dominated grouped-MoE prefill's fixed cost.
+bool PlanCudaEngine::grouped_gemm_ex(int m, int k, const std::vector<int>& n_per_group,
+                                     const std::vector<const void*>& A,
+                                     const std::vector<const void*>& B,
+                                     const std::vector<void*>& C) {
+  const int G = static_cast<int>(n_per_group.size());
+  if (G == 0) return true;
+  if (cublas_ == nullptr) {
+    cublasHandle_t nh = nullptr;
+    if (cublasCreate(&nh) != CUBLAS_STATUS_SUCCESS) return false;
+    cublas_ = nh;
+  }
+  cublasHandle_t h = static_cast<cublasHandle_t>(cublas_);
+  cublasSetStream(h, stream_);
+  std::vector<cublasOperation_t> ta(G, CUBLAS_OP_T), tb(G, CUBLAS_OP_N);
+  std::vector<int> ma(G, m), na(n_per_group), ka(G, k), lda(G, k), ldb(G, k), ldc(G, m), gs(G, 1);
+  std::vector<float> alpha(G, 1.0f), beta(G, 0.0f);
+  // The pointer arrays must live in device memory; the scalar arrays stay on host.
+  G4_CHECK(cudaMemcpyAsync(d_gg_A_, A.data(), G * sizeof(void*), cudaMemcpyHostToDevice, stream_));
+  G4_CHECK(cudaMemcpyAsync(d_gg_B_, B.data(), G * sizeof(void*), cudaMemcpyHostToDevice, stream_));
+  G4_CHECK(cudaMemcpyAsync(d_gg_C_, C.data(), G * sizeof(void*), cudaMemcpyHostToDevice, stream_));
+  const cublasStatus_t st = cublasGemmGroupedBatchedEx(
+      h, ta.data(), tb.data(), ma.data(), na.data(), ka.data(), alpha.data(), d_gg_A_, CUDA_R_16F,
+      lda.data(), d_gg_B_, CUDA_R_16F, ldb.data(), beta.data(), d_gg_C_, CUDA_R_16F, ldc.data(), G,
+      gs.data(), CUBLAS_COMPUTE_32F);
+  return st == CUBLAS_STATUS_SUCCESS;
+}
+
 // Grouped-GEMM MoE gate_up (DeepSeek seq prefill). Routes on the host (T*top_k is tiny), buckets
 // tokens by expert, gathers each expert's rows, then dequant+cuBLAS gate & up GEMMs per expert and
 // a single SiLU-gate over the whole grouped batch. The gated inter stays in d_moe_gate_g_ (grouped
@@ -2591,25 +2627,33 @@ bool PlanCudaEngine::moe_grouped_gate_up(const opplan::Op& op, __half* xnorm, in
                            cudaMemcpyHostToDevice, stream_));
   engine::launch_moe_gather_rows(xnorm, d_moe_perm_, d_moe_gather_, H, P, stream_);
 
-  const std::size_t ng = kernels::quant_group_count(H, group);
-  const std::size_t rowbytes = static_cast<std::size_t>(H) / 2;  // int4 packed row
-  const std::int8_t* qw = static_cast<const std::int8_t*>(op.qweight);
-  const float* qs = static_cast<const float*>(op.qscales);
+  // Dequant ALL experts' fused [E*2MI, H] gate_up in one launch, then one grouped GEMM: two groups
+  // per expert (gate rows [e*2MI, +MI), up rows [+MI, +2MI)) into the separate gate_g/up_g buffers.
+  kernels::launch_dequant_int4_grouped(static_cast<const std::int8_t*>(op.qweight),
+                                       static_cast<const float*>(op.qscales), d_moe_dqw_,
+                                       E * 2 * MI, H, group, stream_);
+  std::vector<int> ng_list;
+  std::vector<const void*> A, B;
+  std::vector<void*> C;
+  ng_list.reserve(2 * E);
+  A.reserve(2 * E);
+  B.reserve(2 * E);
+  C.reserve(2 * E);
   for (int e = 0; e < E; ++e) {
     const int n_e = off[e + 1] - off[e];
     if (n_e <= 0) continue;
-    // Dequant expert e's fused [2*MI, H] weight (rows e*2MI..), then gate & up GEMMs.
-    const std::size_t roff = static_cast<std::size_t>(e) * 2 * MI;
-    kernels::launch_dequant_int4_grouped(qw + roff * rowbytes, qs + roff * ng, d_seq_dequant_,
-                                         2 * MI, H, group, stream_);
-    __half* gathE = d_moe_gather_ + static_cast<std::size_t>(off[e]) * H;
-    if (!seq_gemm_cublas(d_seq_dequant_, gathE, d_moe_gate_g_ + static_cast<std::size_t>(off[e]) * MI,
-                         MI, H, n_e))
-      return false;
-    if (!seq_gemm_cublas(d_seq_dequant_ + static_cast<std::size_t>(MI) * H, gathE,
-                         d_moe_up_g_ + static_cast<std::size_t>(off[e]) * MI, MI, H, n_e))
-      return false;
+    const __half* We = d_moe_dqw_ + static_cast<std::size_t>(e) * 2 * MI * H;
+    const __half* Be = d_moe_gather_ + static_cast<std::size_t>(off[e]) * H;
+    A.push_back(We);  // gate rows
+    B.push_back(Be);
+    C.push_back(d_moe_gate_g_ + static_cast<std::size_t>(off[e]) * MI);
+    ng_list.push_back(n_e);
+    A.push_back(We + static_cast<std::size_t>(MI) * H);  // up rows
+    B.push_back(Be);
+    C.push_back(d_moe_up_g_ + static_cast<std::size_t>(off[e]) * MI);
+    ng_list.push_back(n_e);
   }
+  if (!grouped_gemm_ex(MI, H, ng_list, A, B, C)) return false;
   // SiLU-gate the whole grouped batch in place: gate_g = silu(gate_g) * up_g.
   kernels::launch_silu_mul(d_moe_gate_g_, d_moe_up_g_, d_moe_gate_g_, P * MI, stream_);
   moe_grouped_total_ = P;  // success: down() may now consume the cached routing + gated inter
@@ -2623,20 +2667,26 @@ bool PlanCudaEngine::moe_grouped_down(const opplan::Op& op, __half* moe_out, int
   const int E = cfg_.num_experts, H = op.cols, MI = op.in_dim, group = op.qgroup;
   const int P = moe_grouped_total_;
   const std::vector<int>& off = h_moe_off_;
-  const std::size_t ng = kernels::quant_group_count(MI, group);
-  const std::size_t rowbytes = static_cast<std::size_t>(MI) / 2;
-  const std::int8_t* qw = static_cast<const std::int8_t*>(op.qweight);
-  const float* qs = static_cast<const float*>(op.qscales);
+  // Dequant ALL experts' [E*H, MI] down in one launch, then one grouped GEMM (one group/expert).
+  kernels::launch_dequant_int4_grouped(static_cast<const std::int8_t*>(op.qweight),
+                                       static_cast<const float*>(op.qscales), d_moe_dqw_, E * H, MI,
+                                       group, stream_);
+  std::vector<int> ng_list;
+  std::vector<const void*> A, B;
+  std::vector<void*> C;
+  ng_list.reserve(E);
+  A.reserve(E);
+  B.reserve(E);
+  C.reserve(E);
   for (int e = 0; e < E; ++e) {
     const int n_e = off[e + 1] - off[e];
     if (n_e <= 0) continue;
-    const std::size_t roff = static_cast<std::size_t>(e) * H;  // down expert e at row e*H
-    kernels::launch_dequant_int4_grouped(qw + roff * rowbytes, qs + roff * ng, d_seq_dequant_, H, MI,
-                                         group, stream_);
-    if (!seq_gemm_cublas(d_seq_dequant_, d_moe_gate_g_ + static_cast<std::size_t>(off[e]) * MI,
-                         d_moe_outg_ + static_cast<std::size_t>(off[e]) * H, H, MI, n_e))
-      return false;
+    A.push_back(d_moe_dqw_ + static_cast<std::size_t>(e) * H * MI);  // down expert e at row e*H
+    B.push_back(d_moe_gate_g_ + static_cast<std::size_t>(off[e]) * MI);
+    C.push_back(d_moe_outg_ + static_cast<std::size_t>(off[e]) * H);
+    ng_list.push_back(n_e);
   }
+  if (!grouped_gemm_ex(H, MI, ng_list, A, B, C)) return false;
   // Scatter each grouped row's weighted output back to its source token (fp32 accumulate; a token
   // receives top_k contributions from different experts), then convert to fp16 MoeOut.
   G4_CHECK(cudaMemsetAsync(d_moe_out_f32_, 0, static_cast<std::size_t>(T) * H * sizeof(float),
@@ -3824,6 +3874,12 @@ void PlanCudaEngine::allocate_sequence_buffers(int max_tokens) {
       G4_CHECK(cudaMalloc(&d_moe_gate_g_, P * MI * sizeof(__half)));
       G4_CHECK(cudaMalloc(&d_moe_up_g_, P * MI * sizeof(__half)));
       G4_CHECK(cudaMalloc(&d_moe_outg_, P * H * sizeof(__half)));
+      // All experts dequanted at once (one launch) so the grouped GEMM reads contiguous fp16.
+      // gate_up is the larger of the two: [E*2*MI, H]; down [E*H, MI] reuses it.
+      G4_CHECK(cudaMalloc(&d_moe_dqw_, static_cast<std::size_t>(E) * 2 * MI * H * sizeof(__half)));
+      G4_CHECK(cudaMalloc(&d_gg_A_, static_cast<std::size_t>(2) * E * sizeof(void*)));
+      G4_CHECK(cudaMalloc(&d_gg_B_, static_cast<std::size_t>(2) * E * sizeof(void*)));
+      G4_CHECK(cudaMalloc(&d_gg_C_, static_cast<std::size_t>(2) * E * sizeof(void*)));
       G4_CHECK(cudaMalloc(&d_moe_perm_, P * sizeof(int)));
       G4_CHECK(cudaMalloc(&d_moe_rweight_, P * sizeof(float)));
       G4_CHECK(cudaMalloc(&d_moe_out_f32_, static_cast<std::size_t>(max_tokens) * H * sizeof(float)));
