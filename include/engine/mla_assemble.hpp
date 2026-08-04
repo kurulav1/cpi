@@ -17,6 +17,8 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <cstdlib>
+
 namespace engine {
 
 __global__ inline void mla_assemble_rope_kernel(__half* Q, const __half* kvb, const __half* ckv,
@@ -59,6 +61,57 @@ __global__ inline void mla_assemble_rope_kernel(__half* Q, const __half* kvb, co
   for (int b = v_head; b < qkhd; ++b) v[b] = __float2half(0.0f);
 }
 
+// High-occupancy variant: ONE block per head (blockDim threads) instead of one thread per head. The
+// original kernel put all of a head's work (128 sin/cos transcendentals + 320 copies) on a single
+// thread and launched only nh(=16) threads total -- one warp on one SM. Here each head's block computes
+// the per-pair cos/sin ONCE into shared memory (q_pe and k_pe rope share the same angles) and spreads
+// the copies/rotations across its threads. Same math as the T==1 kernel above (verified vs the oracle).
+__global__ inline void mla_assemble_rope_fast_kernel(__half* Q, const __half* kvb, const __half* ckv,
+                                                     __half* K, __half* V, const float* inv_freq, int nh,
+                                                     int qk_nope, int qk_rope, int v_head, int kv_lora,
+                                                     int position, const int* d_position,
+                                                     float attn_scaling) {
+  const int h = blockIdx.x;
+  if (h >= nh) return;
+  const int tid = threadIdx.x;
+  if (d_position) position = *d_position;  // graph-capturable: position read on-device
+  const int qkhd = qk_nope + qk_rope;
+  const int kvh = qk_nope + v_head;
+  const int half = qk_rope / 2;
+
+  extern __shared__ float2 cs[];  // [half] (cos, sin) per rope pair -- shared by q_pe and k_pe
+  for (int p = tid; p < half; p += blockDim.x) {
+    const float ang = position * inv_freq[p];
+    cs[p] = make_float2(cosf(ang), sinf(ang));
+  }
+  __syncthreads();
+
+  __half* q = Q + (size_t)h * qkhd + qk_nope;
+  __half* k = K + (size_t)h * qkhd;
+  __half* v = V + (size_t)h * qkhd;
+  const __half* kn = kvb + (size_t)h * kvh;
+  const __half* vv = kn + qk_nope;
+  const __half* kpe = ckv + kv_lora;  // shared rope key (same for every head)
+
+  // q_pe rope in place (one thread per pair: reads x0,x1 then writes both -> no in-place race).
+  for (int p = tid; p < half; p += blockDim.x) {
+    const float2 sc = cs[p];
+    const float x0 = __half2float(q[2 * p]), x1 = __half2float(q[2 * p + 1]);
+    q[2 * p] = __float2half(attn_scaling * (x0 * sc.x - x1 * sc.y));
+    q[2 * p + 1] = __float2half(attn_scaling * (x0 * sc.y + x1 * sc.x));
+  }
+  // K = [k_nope copy | k_pe roped].
+  for (int a = tid; a < qk_nope; a += blockDim.x) k[a] = kn[a];
+  for (int p = tid; p < half; p += blockDim.x) {
+    const float2 sc = cs[p];
+    const float x0 = __half2float(kpe[2 * p]), x1 = __half2float(kpe[2 * p + 1]);
+    k[qk_nope + 2 * p] = __float2half(attn_scaling * (x0 * sc.x - x1 * sc.y));
+    k[qk_nope + 2 * p + 1] = __float2half(attn_scaling * (x0 * sc.y + x1 * sc.x));
+  }
+  // V = [v copy | zero pad to qkhd].
+  for (int b = tid; b < qkhd; b += blockDim.x) v[b] = (b < v_head) ? vv[b] : __float2half(0.0f);
+}
+
 // d_position: when non-null, the token position is read on-device (graph-capturable); otherwise the
 // host `position` is used.
 inline void launch_mla_assemble_rope(__half* Q, const __half* kvb, const __half* ckv, __half* K,
@@ -66,7 +119,18 @@ inline void launch_mla_assemble_rope(__half* Q, const __half* kvb, const __half*
                                      int qk_rope, int v_head, int kv_lora, int position,
                                      const int* d_position, float attn_scaling,
                                      cudaStream_t stream) {
-  mla_assemble_rope_kernel<<<(nh + 63) / 64, 64, 0, stream>>>(
+  static const bool slow = [] {
+    const char* e = std::getenv("CPI_DS_SLOW_ASSEMBLE");
+    return e && e[0] == '1';
+  }();
+  if (slow) {
+    mla_assemble_rope_kernel<<<(nh + 63) / 64, 64, 0, stream>>>(
+        Q, kvb, ckv, K, V, inv_freq, nh, qk_nope, qk_rope, v_head, kv_lora, position, d_position,
+        attn_scaling);
+    return;
+  }
+  const int half = qk_rope / 2;
+  mla_assemble_rope_fast_kernel<<<nh, 128, half * sizeof(float2), stream>>>(
       Q, kvb, ckv, K, V, inv_freq, nh, qk_nope, qk_rope, v_head, kv_lora, position, d_position,
       attn_scaling);
 }
