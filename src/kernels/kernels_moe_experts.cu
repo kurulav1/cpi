@@ -73,23 +73,19 @@ struct Weight {
   }
 };
 
-// inter[k, r] = gelu(gate) * up, where gate and up are rows r and (inter + r) of
-// the selected expert's fused gate_up matrix. Grid is (inter, top_k): one block
-// per output element per selected expert.
+// inter[k, r] = act(gate) * up, where gate and up are rows r and (inter + r) of the selected expert's
+// fused gate_up matrix. ONE WARP per output element (grid.x groups warps_per_block rows; grid.y =
+// top_k) -- far more output rows in flight per SM than the old block-per-row form, and no shared-memory
+// block reduction (just a warp shuffle). Memory-bound int4/int8 matvec, so occupancy is what matters.
 template <int BITS>
 __global__ void moe_gate_up_geglu_kernel(Weight<BITS> w, const half* x, const int* topk_idx,
                                          half* inter_out, int inter, int hidden, int top_k,
                                          bool use_gelu) {
-  const int r = blockIdx.x;
+  const int warps_per_block = blockDim.x / warpSize;
+  const int r = blockIdx.x * warps_per_block + (threadIdx.x / warpSize);
   const int k = blockIdx.y;
-  if (r >= inter || k >= top_k) {
-    return;
-  }
-  extern __shared__ float smem[];
-  const int tid = threadIdx.x;
-  const int lane = tid & (warpSize - 1);
-  const int warp = tid / warpSize;
-  const int warps = blockDim.x / warpSize;
+  if (r >= inter || k >= top_k) return;
+  const int lane = threadIdx.x & (warpSize - 1);
 
   const std::size_t base =
       static_cast<std::size_t>(topk_idx[k]) * static_cast<std::size_t>(2 * inter);
@@ -97,7 +93,7 @@ __global__ void moe_gate_up_geglu_kernel(Weight<BITS> w, const half* x, const in
   const std::size_t up_row = base + static_cast<std::size_t>(inter + r);
 
   float g = 0.0f, u = 0.0f;
-  for (int c = tid; c < hidden; c += blockDim.x) {
+  for (int c = lane; c < hidden; c += warpSize) {
     const float xv = __half2float(x[c]);
     g += w.at(gate_row, c) * xv;
     u += w.at(up_row, c) * xv;
@@ -105,38 +101,22 @@ __global__ void moe_gate_up_geglu_kernel(Weight<BITS> w, const half* x, const in
   g = warp_sum(g);
   u = warp_sum(u);
   if (lane == 0) {
-    smem[warp] = g;
-    smem[warps + warp] = u;
-  }
-  __syncthreads();
-
-  if (tid == 0) {
-    float gs = 0.0f, us = 0.0f;
-    for (int i = 0; i < warps; ++i) {
-      gs += smem[i];
-      us += smem[warps + i];
-    }
-    const float act = use_gelu ? gelu_tanh(gs) : (gs / (1.0f + __expf(-gs)));  // GELU or SiLU
-    inter_out[static_cast<std::size_t>(k) * inter + r] = __float2half(act * us);
+    const float act = use_gelu ? gelu_tanh(g) : (g / (1.0f + __expf(-g)));  // GELU or SiLU
+    inter_out[static_cast<std::size_t>(k) * inter + r] = __float2half(act * u);
   }
 }
 
-// y[r] = sum_k topk_weight[k] * dot(down[expert_k].row(r), inter[k]).
-// One block per output row; the block walks all top_k experts so the weighted sum
-// needs no atomics and no second pass.
+// y[r] = sum_k topk_weight[k] * dot(down[expert_k].row(r), inter[k]). ONE WARP per output row: the warp
+// walks all top_k experts (weighted sum, no atomics), reducing each expert's dot with a warp shuffle --
+// no shared memory, no __syncthreads. grid.x groups warps_per_block output rows.
 template <int BITS>
 __global__ void moe_down_accum_kernel(Weight<BITS> w, const half* inter_in, const int* topk_idx,
                                       const float* topk_weight, half* y, int hidden, int inter,
                                       int top_k) {
-  const int r = blockIdx.x;
-  if (r >= hidden) {
-    return;
-  }
-  extern __shared__ float smem[];
-  const int tid = threadIdx.x;
-  const int lane = tid & (warpSize - 1);
-  const int warp = tid / warpSize;
-  const int warps = blockDim.x / warpSize;
+  const int warps_per_block = blockDim.x / warpSize;
+  const int r = blockIdx.x * warps_per_block + (threadIdx.x / warpSize);
+  if (r >= hidden) return;
+  const int lane = threadIdx.x & (warpSize - 1);
 
   float acc = 0.0f;
   for (int k = 0; k < top_k; ++k) {
@@ -144,31 +124,14 @@ __global__ void moe_down_accum_kernel(Weight<BITS> w, const half* inter_in, cons
                                 static_cast<std::size_t>(hidden) +
                             static_cast<std::size_t>(r);
     const half* xk = inter_in + static_cast<std::size_t>(k) * inter;
-
     float d = 0.0f;
-    for (int c = tid; c < inter; c += blockDim.x) {
+    for (int c = lane; c < inter; c += warpSize) {
       d += w.at(row, c) * __half2float(xk[c]);
     }
-    d = warp_sum(d);
-    if (lane == 0) {
-      smem[warp] = d;
-    }
-    __syncthreads();
-    if (tid == 0) {
-      float t = 0.0f;
-      for (int i = 0; i < warps; ++i) {
-        t += smem[i];
-      }
-      smem[warps] = t;  // stash the full dot for this expert
-    }
-    __syncthreads();
-    acc += topk_weight[k] * smem[warps];
-    __syncthreads();  // smem is reused by the next expert
+    d = warp_sum(d);  // full dot for expert k (valid on lane 0)
+    acc += topk_weight[k] * d;
   }
-
-  if (tid == 0) {
-    y[r] = __float2half(acc);
-  }
+  if (lane == 0) y[r] = __float2half(acc);
 }
 
 int threads_for(int n) {
@@ -202,19 +165,20 @@ Weight<BITS> make_weight(const void* w, const float* scales, int in_features, in
 void launch_moe_gate_up_geglu(const void* w, const float* scales, int qbits, int group,
                               const half* x, const int* topk_idx, half* inter_out, int inter,
                               int hidden, int top_k, cudaStream_t stream, bool use_gelu) {
-  const int threads = threads_for(hidden);
-  const dim3 grid(static_cast<unsigned>(inter), static_cast<unsigned>(top_k));
-  const std::size_t smem = static_cast<std::size_t>(2 * (threads / 32)) * sizeof(float);
+  // Warp-per-output-row: 8 warps/block, grid.x groups rows, grid.y = top_k. No shared memory.
+  constexpr int threads = 256;
+  constexpr int wpb = threads / 32;
+  const dim3 grid(static_cast<unsigned>((inter + wpb - 1) / wpb), static_cast<unsigned>(top_k));
   if (qbits == 4) {
-    moe_gate_up_geglu_kernel<4><<<grid, threads, smem, stream>>>(
+    moe_gate_up_geglu_kernel<4><<<grid, threads, 0, stream>>>(
         make_weight<4>(w, scales, hidden, group), x, topk_idx, inter_out, inter, hidden, top_k,
         use_gelu);
   } else if (qbits == 8) {
-    moe_gate_up_geglu_kernel<8><<<grid, threads, smem, stream>>>(
+    moe_gate_up_geglu_kernel<8><<<grid, threads, 0, stream>>>(
         make_weight<8>(w, scales, hidden, group), x, topk_idx, inter_out, inter, hidden, top_k,
         use_gelu);
   } else {
-    moe_gate_up_geglu_kernel<0><<<grid, threads, smem, stream>>>(
+    moe_gate_up_geglu_kernel<0><<<grid, threads, 0, stream>>>(
         make_weight<0>(w, nullptr, hidden, 0), x, topk_idx, inter_out, inter, hidden, top_k,
         use_gelu);
   }
@@ -223,18 +187,20 @@ void launch_moe_gate_up_geglu(const void* w, const float* scales, int qbits, int
 void launch_moe_down_accum(const void* w, const float* scales, int qbits, int group,
                            const half* inter_in, const int* topk_idx, const float* topk_weight,
                            half* y, int hidden, int inter, int top_k, cudaStream_t stream) {
-  const int threads = threads_for(inter);
-  const std::size_t smem = static_cast<std::size_t>(threads / 32 + 1) * sizeof(float);
+  // Warp-per-output-row: 8 warps/block, grid.x groups rows. No shared memory.
+  constexpr int threads = 256;
+  constexpr int wpb = threads / 32;
+  const unsigned blocks = static_cast<unsigned>((hidden + wpb - 1) / wpb);
   if (qbits == 4) {
-    moe_down_accum_kernel<4><<<hidden, threads, smem, stream>>>(
+    moe_down_accum_kernel<4><<<blocks, threads, 0, stream>>>(
         make_weight<4>(w, scales, inter, group), inter_in, topk_idx, topk_weight, y, hidden, inter,
         top_k);
   } else if (qbits == 8) {
-    moe_down_accum_kernel<8><<<hidden, threads, smem, stream>>>(
+    moe_down_accum_kernel<8><<<blocks, threads, 0, stream>>>(
         make_weight<8>(w, scales, inter, group), inter_in, topk_idx, topk_weight, y, hidden, inter,
         top_k);
   } else {
-    moe_down_accum_kernel<0><<<hidden, threads, smem, stream>>>(
+    moe_down_accum_kernel<0><<<blocks, threads, 0, stream>>>(
         make_weight<0>(w, nullptr, inter, 0), inter_in, topk_idx, topk_weight, y, hidden, inter,
         top_k);
   }
