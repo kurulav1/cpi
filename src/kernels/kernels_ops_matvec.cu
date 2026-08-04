@@ -398,14 +398,11 @@ __global__ void scale_add_inplace_kernel(half* dst, const half* src, int n, floa
   dst[i] = __float2half(acc);
 }
 
-__global__ void moe_router_topk_softmax_kernel(const half* logits, int experts, int top_k,
-                                               int* topk_idx, float* topk_prob,
-                                               const half* per_expert_scale, bool renorm) {
-  extern __shared__ float probs[];
-  if (threadIdx.x != 0) {
-    return;
-  }
-
+// One token's softmax top-k route. Single-threaded (called by lane 0) for an exact lowest-index
+// tie-break; `probs` is a per-block [experts] scratch. Shared by the single-token and T>1 kernels.
+__device__ inline void moe_route_token(const half* logits, int experts, int top_k, int* topk_idx,
+                                       float* topk_prob, const half* per_expert_scale, bool renorm,
+                                       float* probs) {
   if (experts <= 0 || top_k <= 0) {
     return;
   }
@@ -481,6 +478,27 @@ __global__ void moe_router_topk_softmax_kernel(const half* logits, int experts, 
       topk_prob[k] = 0.0f;
     }
   }
+}
+
+__global__ void moe_router_topk_softmax_kernel(const half* logits, int experts, int top_k,
+                                               int* topk_idx, float* topk_prob,
+                                               const half* per_expert_scale, bool renorm) {
+  extern __shared__ float probs[];
+  if (threadIdx.x != 0) return;
+  moe_route_token(logits, experts, top_k, topk_idx, topk_prob, per_expert_scale, renorm, probs);
+}
+
+// Sequence prefill: route all T tokens in ONE launch (one block per token) instead of T single-block
+// launches. The per-token loop was ~16.5k tiny latency-bound launches = the top prefill cost.
+__global__ void moe_router_topk_softmax_seq_kernel(const half* logits, int experts, int top_k,
+                                                   int* topk_idx, float* topk_prob,
+                                                   const half* per_expert_scale, bool renorm, int T) {
+  extern __shared__ float probs[];
+  const int t = blockIdx.x;
+  if (t >= T || threadIdx.x != 0) return;
+  moe_route_token(logits + static_cast<std::size_t>(t) * experts, experts, top_k,
+                  topk_idx + static_cast<std::size_t>(t) * top_k,
+                  topk_prob + static_cast<std::size_t>(t) * top_k, per_expert_scale, renorm, probs);
 }
 
 // Kimi-K3-style router: SIGMOID gates (independent per expert, not softmax-normalised), optional
@@ -1159,6 +1177,17 @@ void launch_moe_router_topk_softmax(const half* logits, int experts, int top_k, 
   const std::size_t smem = static_cast<std::size_t>(experts) * sizeof(float);
   moe_router_topk_softmax_kernel<<<1, 32, smem, stream>>>(logits, experts, top_k, topk_idx,
                                                           topk_prob, per_expert_scale, renorm);
+}
+
+void launch_moe_router_topk_softmax_seq(const half* logits, int experts, int top_k, int* topk_idx,
+                                        float* topk_prob, int T, cudaStream_t stream,
+                                        const half* per_expert_scale, bool renorm) {
+  if (experts <= 0 || top_k <= 0 || T <= 0) {
+    return;
+  }
+  const std::size_t smem = static_cast<std::size_t>(experts) * sizeof(float);
+  moe_router_topk_softmax_seq_kernel<<<T, 32, smem, stream>>>(
+      logits, experts, top_k, topk_idx, topk_prob, per_expert_scale, renorm, T);
 }
 
 void launch_moe_router_sigmoid_topk(const half* logits, int experts, int top_k, int n_group,

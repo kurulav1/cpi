@@ -621,6 +621,11 @@ void launch_moe_router_topk_softmax(const half* logits, int experts, int top_k, 
                                     float* topk_prob, cudaStream_t stream,
                                     const half* per_expert_scale = nullptr, bool renorm = true);
 
+// Sequence prefill: route all T tokens (logits [T, experts]) in one launch -> topk_idx/prob [T, top_k].
+void launch_moe_router_topk_softmax_seq(const half* logits, int experts, int top_k, int* topk_idx,
+                                        float* topk_prob, int T, cudaStream_t stream,
+                                        const half* per_expert_scale = nullptr, bool renorm = true);
+
 // launch_moe_router_sigmoid_topk
 //
 // Kimi-K3-style router: SIGMOID gate per expert (independent, not softmax), optional grouped

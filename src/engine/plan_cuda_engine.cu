@@ -3209,12 +3209,10 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
         // Writes the selected experts to DEVICE buffers; the expert ops below read
         // them there, so a token never round-trips to the host mid-layer.
         if (seq) {
-          for (int t = 0; t < T; ++t)
-            kernels::launch_moe_router_topk_softmax(
-                S(op.in) + static_cast<std::size_t>(t) * op.cols, op.cols, op.heads,
-                d_moe_idx_seq_ + static_cast<std::size_t>(t) * op.heads,
-                d_moe_w_seq_ + static_cast<std::size_t>(t) * op.heads, stream_, HW(op.weight),
-                op.moe_renorm);
+          // All T tokens in one launch (was a per-token loop = the top prefill cost).
+          kernels::launch_moe_router_topk_softmax_seq(S(op.in), op.cols, op.heads, d_moe_idx_seq_,
+                                                      d_moe_w_seq_, T, stream_, HW(op.weight),
+                                                      op.moe_renorm);
         } else {
           kernels::launch_moe_router_topk_softmax(S(op.in), op.cols, op.heads, d_moe_idx_, d_moe_w_,
                                                   stream_, HW(op.weight), op.moe_renorm);
