@@ -269,6 +269,75 @@ void launch_moe_gate_up_geglu_dp4a(const void* wg, const float* sg, const std::i
       top_k, moe_group_shift(group), quant_group_count(hidden, group), use_gelu);
 }
 
+// dp4a MoE down: warp per output row r; walk the top_k experts, dp4a(down[expert_k].row(r),
+// inter_int8[k]). The activation is per-expert inter[k], quantised by the caller (mt perm8: xq_all =
+// [top_k, inter] int8, xs_all = [top_k, inter/32] scales). y[r] = sum_k topk_weight[k] * dot.
+__global__ void moe_down_accum_dp4a_kernel(const std::int8_t* __restrict__ wd,
+                                           const float* __restrict__ sd,
+                                           const std::int8_t* __restrict__ xq_all,
+                                           const float* __restrict__ xs_all,
+                                           const int* __restrict__ topk_idx,
+                                           const float* __restrict__ topk_weight, half* y,
+                                           int hidden, int inter, int top_k, int group_shift,
+                                           int n_groups) {
+  const int warps_per_block = blockDim.x / warpSize;
+  const int r = blockIdx.x * warps_per_block + (threadIdx.x / warpSize);
+  if (r >= hidden) return;
+  const int lane = threadIdx.x & (warpSize - 1);
+  const int packed_cols = inter / 2;
+  const int chunks = packed_cols / 16;
+  const int xs_stride = inter / 32;
+
+  float acc = 0.0f;
+  for (int k = 0; k < top_k; ++k) {
+    const std::size_t down_row =
+        static_cast<std::size_t>(topk_idx[k]) * static_cast<std::size_t>(hidden) +
+        static_cast<std::size_t>(r);
+    const uint4* wrow =
+        reinterpret_cast<const uint4*>(wd + down_row * static_cast<std::size_t>(packed_cols));
+    const float* srow = sd + down_row * static_cast<std::size_t>(n_groups);
+    const std::int8_t* xq = xq_all + static_cast<std::size_t>(k) * inter;
+    const float* xs = xs_all + static_cast<std::size_t>(k) * xs_stride;
+    float d = 0.0f;
+    for (int c = lane; c < chunks; c += warpSize) {
+      const uint4 wv = wrow[c];
+      const uint4 xa = reinterpret_cast<const uint4*>(xq)[2 * c];
+      const uint4 xb = reinterpret_cast<const uint4*>(xq)[2 * c + 1];
+      const int xv[8] = {static_cast<int>(xa.x), static_cast<int>(xa.y), static_cast<int>(xa.z),
+                         static_cast<int>(xa.w), static_cast<int>(xb.x), static_cast<int>(xb.y),
+                         static_cast<int>(xb.z), static_cast<int>(xb.w)};
+      const float s = srow[(c * 32) >> group_shift] * xs[c];
+      const unsigned* wu = reinterpret_cast<const unsigned*>(&wv);
+      int dd = 0;
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const unsigned word = wu[i];
+        const int wlo = __vsubss4(static_cast<int>((word & 0x0F0F0F0Fu) ^ 0x08080808u), 0x08080808);
+        const int whi =
+            __vsubss4(static_cast<int>(((word >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u), 0x08080808);
+        dd = __dp4a(wlo, xv[2 * i], dd);
+        dd = __dp4a(whi, xv[2 * i + 1], dd);
+      }
+      d += static_cast<float>(dd) * s;
+    }
+    d = warp_sum(d);
+    acc += topk_weight[k] * d;
+  }
+  if (lane == 0) y[r] = __float2half(acc);
+}
+
+void launch_moe_down_accum_dp4a(const void* wd, const float* sd, const std::int8_t* xq_all,
+                                const float* xs_all, const int* topk_idx, const float* topk_weight,
+                                half* y, int hidden, int inter, int top_k, int group,
+                                cudaStream_t stream) {
+  constexpr int threads = 256;
+  constexpr int wpb = threads / 32;
+  const unsigned blocks = static_cast<unsigned>((hidden + wpb - 1) / wpb);
+  moe_down_accum_dp4a_kernel<<<blocks, threads, 0, stream>>>(
+      static_cast<const std::int8_t*>(wd), sd, xq_all, xs_all, topk_idx, topk_weight, y, hidden,
+      inter, top_k, moe_group_shift(group), quant_group_count(inter, group));
+}
+
 void launch_moe_down_accum(const void* w, const float* scales, int qbits, int group,
                            const half* inter_in, const int* topk_idx, const float* topk_weight,
                            half* y, int hidden, int inter, int top_k, cudaStream_t stream) {

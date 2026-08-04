@@ -3072,6 +3072,14 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
           kernels::launch_moe_down_accum(d_moe_stage_dn_, d_moe_stage_dn_s_, op.qbits, op.qgroup,
                                          S(op.in), d_moe_identity_idx_, d_moe_w_, S(op.out), op.cols,
                                          op.in_dim, op.heads, stream_);
+        } else if (!seq && op.qbits == 4 && op.qgroup > 0 && (op.qgroup % 32) == 0 &&
+                   (op.in_dim % 32) == 0 && d_act_i8_ != nullptr) {
+          // dp4a: quantise the top_k per-expert inter vectors (op.heads rows x op.in_dim), then dot.
+          kernels::launch_quantize_fp16_to_int8_perm8_g32_mt(S(op.in), d_act_i8_, d_act_qs_,
+                                                             op.in_dim, op.heads, stream_);
+          kernels::launch_moe_down_accum_dp4a(op.qweight, QS(op.qscales), d_act_i8_, d_act_qs_,
+                                              d_moe_idx_, d_moe_w_, S(op.out), op.cols, op.in_dim,
+                                              op.heads, op.qgroup, stream_);
         } else {
           kernels::launch_moe_down_accum(
               op.qbits ? static_cast<const void*>(op.qweight) : static_cast<const void*>(op.weight),

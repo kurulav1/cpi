@@ -664,6 +664,13 @@ void launch_moe_gate_up_geglu_dp4a(const void* wg, const float* sg, const std::i
                                    int inter, int hidden, int top_k, int group, cudaStream_t stream,
                                    bool use_gelu = true);
 
+// dp4a int4 down-accum: xq_all/xs_all = the top_k per-expert inter vectors, mt-quantised to perm8-int8
+// (launch_quantize_fp16_to_int8_perm8_g32_mt with rows=top_k, cols=inter). Decode (batch-1) only.
+void launch_moe_down_accum_dp4a(const void* wd, const float* sd, const std::int8_t* xq_all,
+                                const float* xs_all, const int* topk_idx, const float* topk_weight,
+                                half* y, int hidden, int inter, int top_k, int group,
+                                cudaStream_t stream);
+
 void launch_moe_down_accum(const void* w, const float* scales, int qbits, int group,
                            const half* inter_in, const int* topk_idx, const float* topk_weight,
                            half* y, int hidden, int inter, int top_k, cudaStream_t stream);
