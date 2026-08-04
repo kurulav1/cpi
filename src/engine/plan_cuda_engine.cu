@@ -1597,6 +1597,14 @@ void PlanCudaEngine::open(const std::string& cpi_path, int max_context) {
       G4_CHECK(cudaStreamCreate(&stream_));
       load_deepseek_weights();
       allocate_buffers();
+      // int4 decode routes through dp4a with int8 activations, which needs this scratch. The shared
+      // path allocates it only for .cpi/.ll2c (this dir branch returns before it), so without this the
+      // DeepSeek int4 projections silently fell to the slow fp16-activation matvec.
+      if (weight_quant_bits_ == 4 && d_act_i8_ == nullptr &&
+          std::getenv("CPI_CUDA_NO_DP4A") == nullptr) {
+        G4_CHECK(cudaMalloc(&d_act_i8_, std::size_t(16) * 65536));
+        G4_CHECK(cudaMalloc(&d_act_qs_, std::size_t(16) * (65536 / 32) * sizeof(float)));
+      }
       {
         const engine::YarnRope y = engine::deepseek_yarn_rope(
             cfg_.qk_rope_head_dim, cfg_.rope_theta, cfg_.yarn_factor, cfg_.yarn_beta_fast,
