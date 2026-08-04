@@ -2988,12 +2988,12 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
         // norm would read the wrong slices for t>0. Loop the T==1 norm per token with the true
         // input stride; output MlaLatent is contiguous [T][kv_lora].
         if (seq && op.in == Slot::MlaCkv && op.out == Slot::MlaLatent) {
+          // All T tokens in one launch: normalize the [kv_lora] latent prefix (in_stride=kva) into
+          // contiguous MlaLatent (out_stride=cols). The per-token loop was ~16.5k host launches.
           const int kva = op.cols + cfg_.qk_rope_head_dim;
-          for (int t = 0; t < T; ++t)
-            kernels::launch_rmsnorm(S(op.in) + static_cast<std::size_t>(t) * kva,
-                                    HW(op.weight) ? HW(op.weight) : d_ones_,
-                                    S(op.out) + static_cast<std::size_t>(t) * op.cols, 1, op.cols,
-                                    cfg_.rms_eps, stream_);
+          kernels::launch_rmsnorm_seq_strided(S(op.in), HW(op.weight) ? HW(op.weight) : d_ones_,
+                                              S(op.out), op.cols, kva, op.cols, T, cfg_.rms_eps,
+                                              stream_);
           break;
         }
         // norm_offset ⇒ the weight is applied as (1 + w) (Qwen3.5-style).

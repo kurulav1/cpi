@@ -61,6 +61,11 @@ constexpr int kAccPerThread = 8;
 void launch_rmsnorm(const half* x, const half* weight, half* y, int rows, int cols, float eps,
                     cudaStream_t stream);
 
+// Batched RMSNorm over T rows with separate in/out row strides (DeepSeek kv_a_layernorm over the
+// [kv_lora] prefix of MlaCkv). One launch for all T tokens. Requires cols % 8 == 0.
+void launch_rmsnorm_seq_strided(const half* x, const half* weight, half* y, int cols, int in_stride,
+                                int out_stride, int T, float eps, cudaStream_t stream);
+
 // launch_rmsnorm_offset
 //
 // Qwen3.5-style RMSNorm where the stored weight is an additive offset from 1:

@@ -1031,6 +1031,67 @@ __global__ void rmsnorm_fast_kernel(const half* __restrict__ x, const half* __re
   }
 }
 
+// Batched RMSNorm over T rows with SEPARATE in/out row strides -- for DeepSeek's kv_a_layernorm,
+// which normalizes only the [kv_lora] prefix of the wider MlaCkv=[latent|k_pe] row (in_stride=kva)
+// into a contiguous MlaLatent (out_stride=kv_lora). One block per token in ONE launch: the seq path
+// was looping the T==1 norm per token (~16.5k host launches). cols % 8 == 0.
+template <int Threads>
+__global__ void rmsnorm_seq_strided_kernel(const half* __restrict__ x, const half* __restrict__ w,
+                                           half* __restrict__ y, int cols, int in_stride,
+                                           int out_stride, int T, float eps) {
+  const int row = blockIdx.x;
+  if (row >= T) return;
+  constexpr int kMaxVecs = 8;
+  const int tid = threadIdx.x;
+  const int vecs = cols / 8;
+  const int4* x4 =
+      reinterpret_cast<const int4*>(x + static_cast<std::size_t>(row) * in_stride);
+  int4 buf[kMaxVecs];
+  float acc = 0.0f;
+  int n = 0;
+  for (int i = tid; i < vecs; i += Threads, ++n) {
+    buf[n] = x4[i];
+    const half2* h = reinterpret_cast<const half2*>(&buf[n]);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const float2 v = __half22float2(h[j]);
+      acc += v.x * v.x + v.y * v.y;
+    }
+  }
+#pragma unroll
+  for (int off = warpSize / 2; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+  __shared__ float partial[Threads / 32];
+  __shared__ float inv_shared;
+  const int warp = tid / warpSize, lane = tid & (warpSize - 1);
+  if (lane == 0) partial[warp] = acc;
+  __syncthreads();
+  if (tid == 0) {
+    float total = 0.0f;
+#pragma unroll
+    for (int i = 0; i < Threads / 32; ++i) total += partial[i];
+    inv_shared = rsqrtf(total / static_cast<float>(cols) + eps);
+  }
+  __syncthreads();
+  const float inv = inv_shared;
+  const int4* w4 = reinterpret_cast<const int4*>(w);
+  int4* y4 = reinterpret_cast<int4*>(y + static_cast<std::size_t>(row) * out_stride);
+  n = 0;
+  for (int i = tid; i < vecs; i += Threads, ++n) {
+    const int4 wpack = w4[i];
+    const half2* xh = reinterpret_cast<const half2*>(&buf[n]);
+    const half2* wh = reinterpret_cast<const half2*>(&wpack);
+    int4 out;
+    half2* oh = reinterpret_cast<half2*>(&out);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const float2 xv = __half22float2(xh[j]);
+      const float2 wv = __half22float2(wh[j]);
+      oh[j] = __floats2half2_rn(xv.x * inv * wv.x, xv.y * inv * wv.y);
+    }
+    y4[i] = out;
+  }
+}
+
 // rmsnorm_fast + perm8 int8 activation quantization in one kernel, for the rows=1 norms
 // whose output feeds dp4a int4 projections (XNorm sites). The normed row never leaves
 // registers: fp16 y is written as usual, then the fp16-ROUNDED values are quantized
@@ -1261,6 +1322,14 @@ void launch_rmsnorm(const half* x, const half* weight, half* y, int rows, int co
   }
   const int threads = choose_rmsnorm_threads(cols);
   rmsnorm_kernel_simple<<<rows, threads, 0, stream>>>(x, weight, y, cols, eps);
+}
+
+void launch_rmsnorm_seq_strided(const half* x, const half* weight, half* y, int cols, int in_stride,
+                                int out_stride, int T, float eps, cudaStream_t stream) {
+  if (T <= 0 || cols <= 0) return;
+  constexpr int kThreads = 256;
+  rmsnorm_seq_strided_kernel<kThreads>
+      <<<T, kThreads, 0, stream>>>(x, weight, y, cols, in_stride, out_stride, T, eps);
 }
 
 void launch_rmsnorm_offset(const half* x, const half* weight, half* y, int rows, int cols,
