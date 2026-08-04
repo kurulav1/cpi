@@ -1019,12 +1019,15 @@ void PlanCudaEngine::load_deepseek_weights() {
   const int kva = cfg_.kv_lora_rank + cfg_.qk_rope_head_dim;     // 576
   const int kvb = nh * (cfg_.qk_nope_head_dim + vhd);            // nh*256
   const int MI = cfg_.moe_intermediate_size;                     // 1408
-  // MLA/dense/shared projections stay FP16 (only the experts are int4). Quantizing these to int4 would
-  // cut decode bandwidth (the shared expert alone is ~2x the routed experts in bytes) and is the next
-  // decode lever, but the int4 decode path illegal-accesses on one of these projections' dims/group --
-  // needs isolating before it can be turned on. (void)quant until then.
-  (void)quant;
-  auto proj = [&](const std::string& nm, int r, int c) { upload(nm, r, c); };
+  // MLA/dense/shared projections honor --weight-quant int4 (like llama.cpp Q4) to cut decode bandwidth
+  // -- the shared expert alone is ~2x the routed experts in fp16 bytes. o_proj stays fp16 (host-built
+  // padded tensor). Experts are always int4.
+  auto proj = [&](const std::string& nm, int r, int c) {
+    if (quant)
+      upload_int4(nm, r, c);
+    else
+      upload(nm, r, c);
+  };
 
   upload("model.embed_tokens.weight", cfg_.vocab, H);
   upload("model.norm.weight", 1, H);
@@ -1114,7 +1117,15 @@ void PlanCudaEngine::append_deepseek_moe_ffn_ops(std::vector<opplan::Op>& ops, c
     o.out = out;
     o.cols = out_dim;
     o.in_dim = in_dim;
-    o.weight = Wd(t);
+    const auto q = qdev_.find(p + t);  // shared-expert projections are int4 under --weight-quant
+    if (q != qdev_.end()) {
+      o.qweight = q->second.packed;
+      o.qscales = q->second.scales;
+      o.qbits = weight_quant_bits_;
+      o.qgroup = q->second.group;
+    } else {
+      o.weight = Wd(t);
+    }
     ops.push_back(o);
   };
   auto add_x = [&](Slot src) {
