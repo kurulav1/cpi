@@ -3,7 +3,7 @@
 
 PIL is the resampler HF actually uses, so this is the right oracle. Resizing is the one
 preprocessing step where a subtle mismatch (wrong bicubic `a`, or no antialias filter on
-downscale) costs accuracy silently instead of failing loudly -- hence a real gate.
+downscale) costs accuracy silently instead of failing loudly; hence a real gate.
 
   python tools/make_resize_fixtures.py
 """

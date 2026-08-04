@@ -236,7 +236,7 @@ struct JsonParser {
       expect(':');
       if (key == "dtype") {
         // Captured because the value decides whether a consumer must CONVERT. Everything CPI
-        // packs itself is F16, but a HuggingFace checkpoint is usually BF16 -- same width,
+        // packs itself is F16, but a HuggingFace checkpoint is usually BF16; same width,
         // different exponent split, so reading one as the other is silent garbage rather than
         // an error.
         dtype = parse_string();
@@ -283,8 +283,8 @@ struct JsonParser {
       const std::string name = parse_string();
       expect(':');
       if (name == "__metadata__") {
-        // CAPTURE it rather than discard. For a `.cpi` this block is the model's whole config --
-        // the self-describing replacement for the .ll2c binary header -- so throwing it away
+        // CAPTURE it rather than discard. For a `.cpi` this block is the model's whole config
+        // the self-describing replacement for the .ll2c binary header; so throwing it away
         // would leave the container unreadable by anything but a shape-guesser.
         skip_ws();
         const char* mstart = s;
@@ -334,11 +334,11 @@ void SafetensorsLoader::open(const std::string& model_dir) {
   if (fs::is_regular_file(root)) {
     if (root.extension() == ".safetensors") {
       // Long-standing behaviour: naming one shard of a sharded model means "the model beside
-      // it". Preserved exactly -- PlanCudaEngine relies on it.
+      // it". Preserved exactly; PlanCudaEngine relies on it.
       root = root.parent_path();
     } else {
       // A SELF-CONTAINED container (.cpi): one file that IS the whole model, in safetensors
-      // layout. Globbing its parent would be wrong twice over -- it would miss this file (the
+      // layout. Globbing its parent would be wrong twice over; it would miss this file (the
       // extension does not match) and could pick up an unrelated model sitting next to it.
       shard_paths.push_back(root);
       single_file = true;
@@ -405,7 +405,7 @@ void SafetensorsLoader::open(const std::string& model_dir) {
       tensors_.emplace(name, TensorMeta{shard_index, start, end_offset, dtype});
     });
     // A `.cpi` carries its config here. Sharded HF models normally do not, so an empty block is
-    // not an error -- only the .cpi path requires one, and it says so itself.
+    // not an error; only the .cpi path requires one, and it says so itself.
     if (!parser.metadata_raw.empty()) metadata_json_ = parser.metadata_raw;
 
     shards_.push_back(std::move(mmap));

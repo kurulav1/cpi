@@ -4,20 +4,20 @@
 // rank. Rank r runs layers [lo, hi) on the activation it receives, then hands the resulting activation
 // to rank r+1. The layer partition is pure host index math (below); the stage-to-stage handoff is a
 // single activation transfer that becomes a point-to-point send on a real cluster and is a local
-// device copy on one box -- which is what makes the partition + handoff logic verifiable here
+// device copy on one box; which is what makes the partition + handoff logic verifiable here
 // (pipeline_parallel_test), exactly like the TP/EP bricks. Scope is single-NODE (see
 // memory:cpi-multi-gpu-hpc-prep); the cross-rank transport is the only cluster-gated piece.
 //
-// The split is the SAME balanced greedy split TensorParallelLinear uses for output rows, so every
+// The split is the same balanced greedy split TensorParallelLinear uses for output rows, so every
 // parallelism dimension partitions the same way: each stage gets floor or ceil of layers/world,
-// contiguous, no gap or overlap. It degrades cleanly when world_size > num_layers -- the trailing
+// contiguous, no gap or overlap. It degrades cleanly when world_size > num_layers; the trailing
 // ranks get an empty [x, x) range and act as identity pass-throughs.
 
 namespace engine {
 
 // [lo, hi) contiguous layers owned by `rank` under a balanced greedy split of `num_layers` across
 // `world_size` ranks. Each rank gets floor or ceil(num_layers/world_size) layers; the ranges tile
-// [0, num_layers) with no gap or overlap for ANY world_size (including world_size > num_layers, where
+// [0, num_layers) with no gap or overlap for any world_size (including world_size > num_layers, where
 // the trailing ranks get an empty range). lo == hi means the stage runs no layers (identity handoff).
 inline void pipeline_parallel_stage_range(int num_layers, int world_size, int rank, int* lo,
                                           int* hi) {

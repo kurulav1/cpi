@@ -1,4 +1,4 @@
-// Invariants for the shard-fit planner (engine/shard_plan.hpp) -- pure host arithmetic, no GPU. Checks
+// Invariants for the shard-fit planner (engine/shard_plan.hpp); pure host arithmetic, no GPU. Checks
 // that the sharding divisors actually divide the footprint the way TP/EP/PP claim, and that the fit
 // scan only returns configs that fit and are ordered by world size. Complements the empirical
 // validation (the planner reproduces the known single-GPU footprints of real models at world=1).
@@ -99,7 +99,7 @@ int main() {
     check(!opts.empty(), "fit scan finds at least one feasible split for the 8B on 24 GB");
     check(all_fit, "every scanned option fits the budget");
     check(sorted, "scan options are ordered by world size");
-    // The 8B fp16 (~16 GB weights + KV) fits on ONE 24 GB GPU, so the smallest world must be 1.
+    // The 8B fp16 (~16 GB weights + KV) fits on one 24 GB GPU, so the smallest world must be 1.
     check(opts.front().world() == 1, "8B fp16 fits world=1 on 24 GB");
   }
 

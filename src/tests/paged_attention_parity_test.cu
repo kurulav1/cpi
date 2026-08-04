@@ -1,8 +1,8 @@
 // Parity test for the paged split-K decode attention (P3 phase 2b).
 //
 // Proves launch_attention_step_paged (reads K/V through a per-chunk block table
-// into a block pool) produces the SAME output as the contiguous
-// launch_attention_step, under a deliberately NON-CONTIGUOUS block table. Same
+// into a block pool) produces the same output as the contiguous
+// launch_attention_step, under a deliberately non-contiguous block table. Same
 // online-softmax arithmetic on the same values => expect bit-identical output.
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

@@ -1,7 +1,7 @@
 ﻿# Does the wide GEMV change what the models SAY?
 #
 # The wide GEMV (int4 loads, one warp per row) accumulates each row in a different order
-# than the tiled kernel, so it is deliberately NOT bit-identical -- fp32 sums are
+# than the tiled kernel, so it is deliberately not bit-identical; fp32 sums are
 # order-dependent. The question that actually matters is whether that last-bit difference
 # ever changes a greedy argmax. Run every model both ways and diff the decoded text.
 #
@@ -50,7 +50,7 @@ def run(weights, tokenizer, tiled):
     # GREEDY (--temp 0). The default is temp=0.8, i.e. RNG sampling: there, a last-bit logit
     # change eventually flips a draw and the texts diverge for a legitimate reason, so the
     # gate could not tell a real numerics change from a bug. Greedy is deterministic, so a
-    # text difference means an argmax actually flipped -- which is the signal we want.
+    # text difference means an argmax actually flipped; which is the signal we want.
     # (The device-topk sampler is validated separately: at a collapsed temperature the
     # softmax becomes an argmax, so it must reproduce greedy exactly. It does.)
     out = subprocess.run(
@@ -62,7 +62,7 @@ def run(weights, tokenizer, tiled):
     # Compare the TOKEN IDS, not the prose.
     #
     # The CLI streams tokens to stdout as it decodes, and the engine's own [engine]/[perf] lines
-    # interleave with that stream -- so a token can land *inside* a diagnostic line
+    # interleave with that stream; so a token can land *inside* a diagnostic line
     # (" The[engine] decode_step i=2 sky pos=13"). That interleaving is I/O-order dependent and
     # varies run to run, which made the gate report a DIFF on a run whose token stream was
     # bit-for-bit identical. Filtering lines that START with "[" does not help: the noise is

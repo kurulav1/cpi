@@ -1,9 +1,9 @@
-// Isolated fp16 GEMM benchmark -- that CHECKS WHAT IT TIMES.
+// Isolated fp16 GEMM benchmark; that CHECKS what IT TIMES.
 //
 // This exists because of what happened to this kernel. It was tuned for two sessions against
 // end-to-end wall-clock, a change raised its row tile without raising its thread count, and it
 // began writing half the rows of every tile. That measured as +37%, and was accepted, because
-// a kernel that skips half its writes is not slower -- it is faster. No gate caught it: the
+// a kernel that skips half its writes is not slower; it is faster. No gate caught it: the
 // GEMM only runs at T >= kGemmMinTokens and every golden prompt was shorter than that.
 //
 // So: every configuration this benchmark reports a number for is spot-checked against a CPU
@@ -31,18 +31,18 @@
 
 namespace {
 
-// Shared with the engine. This one is a BENCH, so its accuracy column was never load-bearing --
+// Shared with the engine. This one is a BENCH, so its accuracy column was never load-bearing
 // which is exactly why a private, differently-rounding copy could sit here unnoticed.
 inline std::uint16_t f32_to_f16(float f) { return cpi::f32_to_f16(f); }
 inline float f16_to_f32(std::uint16_t h) { return cpi::f16_to_f32(h); }
 
-// MUST match the shader / engine. The whole bug was a copy of these drifting, so they are
+// must match the shader / engine. The whole bug was a copy of these drifting, so they are
 // stated once and everything below derives from them.
 //
 // And "everything" has to mean everything: this file previously derived the GRID from kFBM but
-// still computed the thread count as 32 * (kFBM/32) * (kBN/32) -- a formula that silently
+// still computed the thread count as 32 * (kFBM/32) * (kBN/32); a formula that silently
 // assumed 32x32 per simdgroup. The moment the per-simdgroup tile became a variable, that line
-// handed the kernel twice the threads it wanted and the bench reported WRONG. The bench caught
+// handed the kernel twice the threads it wanted and the bench reported wrong. The bench caught
 // it, which is the design working, but the lesson is the same one that started all this: a
 // restated formula is a bug with a delay.
 constexpr std::uint32_t kFBM = 64;  // GEMM_FBM: rows per threadgroup
@@ -87,13 +87,13 @@ int main(int argc, char** argv) {
       {"gate_proj 4864x896", 4864, 896},
       {"up_proj   4864x896", 4864, 896},
       {"down_proj 896x4864", 896, 4864},
-      // Fused shapes, pricing the fusion the plan does NOT do: qkv is q|k|v stacked (896+128+128)
+      // Fused shapes, pricing the fusion the plan does not do: qkv is q|k|v stacked (896+128+128)
       // and gateup is gate|up stacked (2*4864), both from the same input. The measured verdict, at
-      // T=512: gateup fused is 3.25 TFLOP/s vs its parts' 3.20 -- the big MLP GEMMs are already
+      // T=512: gateup fused is 3.25 TFLOP/s vs its parts' 3.20; the big MLP GEMMs are already
       // grid-saturated, so fusing them saves only a dispatch (~0.4%). qkv fused is 2.87 vs its
-      // parts' effective ~1.6 -- a real 0.48 -> 0.37 ms/layer win, but ONLY because it rescues the
+      // parts' effective ~1.6; a real 0.48 -> 0.37 ms/layer win, but only because it rescues the
       // grid-starved k_proj/v_proj (128 rows = 18 threadgroups), which are 1.5% of the FLOPs.
-      // Net prefill win ~1.8% at T=512, shrinking as T grows and k/v stop being starved -- not
+      // Net prefill win ~1.8% at T=512, shrinking as T grows and k/v stop being starved; not
       // worth the weight-concat + slot-splitting plumbing (q/k/v would share one buffer that RoPE
       // and the KV-store then slice). The GEMM is at its practical ceiling; this documents why.
       {"[fused qkv    1152x896]", 1152, 896},
@@ -110,7 +110,7 @@ int main(int argc, char** argv) {
     // instead of hammering one. This exists because the single-matrix default does not
     // reproduce a prefill: a real pass walks 24 layers x 7 matrices (~716 MB) once each, while
     // one matrix reused 20x sits in cache. The default reports 2.85 TFLOP/s where a real
-    // prefill achieves ~1.87 for the same shapes -- so the default is measuring the cache, and
+    // prefill achieves ~1.87 for the same shapes; so the default is measuring the cache, and
     // any limiter read from it describes the cache-hot case, not the one that matters.
     const int rotate = [] {
       const char* e = std::getenv("CPI_METAL_GEMM_ROTATE");
@@ -143,9 +143,9 @@ int main(int argc, char** argv) {
     const std::size_t threads = 32 * (kFBM / (8 * kRF)) * (kBN / (8 * kCF));
     const void* bufs[] = {bW.handle(), bA.handle(), bo.handle(), bW.handle()};
 
-    // WARM UP UNTIL THE CLOCK STOPS RAMPING, not for a fixed few dispatches. Three was not
+    // WARM UP UNTIL the CLOCK STOPS RAMPING, not for a fixed few dispatches. Three was not
     // enough and it cost a wrong conclusion: an A/B of GEMM_FBK 32 vs 64 read as +15% for 64,
-    // and interleaving the runs showed it was the FIRST measurement in each process that was
+    // and interleaving the runs showed it was the first measurement in each process that was
     // slow, whichever config it happened to be. The GPU ramps over ~100 ms; anything measured
     // before that is measuring the ramp.
     const auto warm_start = std::chrono::steady_clock::now();
@@ -177,14 +177,14 @@ int main(int argc, char** argv) {
                             .count());
     }
 
-    // CPI_METAL_GPUTRACE=<path> captures ONE dispatch of this shape into a .gputrace for
+    // CPI_METAL_GPUTRACE=<path> captures one dispatch of this shape into a .gputrace for
     // Xcode's Metal Debugger, which is the only thing on Apple Silicon that reports occupancy
-    // and the limiter -- the numbers that would explain why this kernel sits at ~53% of peak
+    // and the limiter; the numbers that would explain why this kernel sits at ~53% of peak
     // when it does not spill and the GPU is at its Maximum performance state. One dispatch,
     // because a capture records every command and the file grows fast.
     //
     // The timing above is already done, so the capture cannot distort the number this
-    // benchmark reports -- which matters, given a capture makes everything slower.
+    // benchmark reports; which matters, given a capture makes everything slower.
     if (const char* gt = std::getenv("CPI_METAL_GPUTRACE")) {
       const std::string path = std::string(gt) + "-" + std::to_string(s.out_dim) + "x" +
                                std::to_string(s.in_dim) + ".gputrace";
@@ -200,15 +200,15 @@ int main(int argc, char** argv) {
 
     // Leave `bo` holding W's result: with rotate>1 the timed loop's last dispatch may have used
     // a rotation matrix, and then the spot check below compares W's expected values against
-    // some other matrix's output and reports WRONG. (It did. The bench refusing to print a
-    // number it cannot verify is the design working -- the bug was mine, in the harness.)
+    // some other matrix's output and reports wrong. (It did. The bench refusing to print a
+    // number it cannot verify is the design working; the bug was mine, in the harness.)
     if (rotate > 1) {
       ctx.dispatch("cpi_gemm_f16", runtime::MetalContext::Grid::Groups, grid, threads, bufs,
                    nullptr, 4, &p, sizeof(p));
       ctx.commit_and_wait();
     }
 
-    // CHECK WHAT WE TIMED. A spot check, not the full product: 128 random (token,row) dot
+    // CHECK what WE TIMED. A spot check, not the full product: 128 random (token,row) dot
     // products on the host. A kernel writing half its rows fails this immediately, which is
     // the entire reason the benchmark refuses to report a number without it.
     const auto* o = static_cast<const std::uint16_t*>(bo.contents());
@@ -235,8 +235,8 @@ int main(int argc, char** argv) {
     }
     std::printf("  %-20s  %7.2f ms/rep   %5.2f TFLOP/s   (max|d|=%.3g)\n", s.name, ms / reps,
                 flop / (ms / 1000.0) / 1e12, worst);
-    // The `[fused ...]` shapes are informational -- they price a fusion the plan does not do, so
-    // they must NOT enter the aggregate (that would double-count gate/up as both parts and fused).
+    // The `[fused ...]` shapes are informational; they price a fusion the plan does not do, so
+    // they must not enter the aggregate (that would double-count gate/up as both parts and fused).
     if (s.name[0] == '[') continue;
     total_flop += flop;
     total_ms += ms;

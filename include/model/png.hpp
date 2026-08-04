@@ -1,6 +1,6 @@
 // Hand-rolled PNG decoder.
 //
-// No libpng, no zlib -- the DEFLATE decompressor (RFC 1951), the PNG filters
+// No libpng, no zlib; the DEFLATE decompressor (RFC 1951), the PNG filters
 // (RFC 2083) and the chunk parser are all here. That is the point: CPI does not take
 // third-party dependencies, and an image decoder is not an exception.
 //

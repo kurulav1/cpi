@@ -47,7 +47,7 @@ private:
     const uint16_t* bqkv = nullptr;  // fused q||k||v projection bias (Qwen2 et al.)
     // Per-head RMSNorm on Q and K, applied after projection and before RoPE (Qwen3).
     // One [head_dim] weight shared across heads. Without these the CPU engine
-    // silently produces a WRONG model for every Qwen3 checkpoint -- it does not
+    // silently produces a wrong model for every Qwen3 checkpoint; it does not
     // crash, it just computes something else.
     const uint16_t* q_norm = nullptr;
     const uint16_t* k_norm = nullptr;

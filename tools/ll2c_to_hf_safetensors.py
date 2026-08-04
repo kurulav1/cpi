@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """Rebuild an HF-format safetensors file from a CPI .ll2c container.
 
-Why this exists: to benchmark CPI against llama.cpp on a real-size model we need the SAME
-weights in GGUF form, and the original HF safetensors had been deleted -- only the .ll2c
+Why this exists: to benchmark CPI against llama.cpp on a real-size model we need the same
+weights in GGUF form, and the original HF safetensors had been deleted, only the .ll2c
 remained. Rather than re-download 16 GB, reconstruct the HF file from the .ll2c and hand it to
 llama.cpp's own convert_hf_to_gguf.py.
 
 Going through llama.cpp's converter (instead of writing GGUF directly) is the whole point: it
-gets the tokenizer, the metadata, and -- critically -- the Q/K PERMUTATION right.
+gets the tokenizer, the metadata, and, critically, the Q/K permutation right.
 
-  ⚠ THE PERMUTATION. HF stores q_proj/k_proj permuted for its rotate_half RoPE; llama.cpp's
+  ⚠ the permutation. HF stores q_proj/k_proj permuted for its rotate_half RoPE; llama.cpp's
   converter permutes them back. That is only correct if the bytes we hand it are raw HF layout.
-  CPI's own converter does NOT permute (checked), so the .ll2c holds exactly the HF bytes and
+  CPI's own converter does not permute (checked), so the .ll2c holds exactly the HF bytes and
   the round-trip is sound. If CPI ever starts permuting at load time, this script silently
-  produces a subtly wrong model -- the kind that still generates fluent text. The caller MUST
+  produces a subtly wrong model, the kind that still generates fluent text. The caller must
   sanity-check llama.cpp's generation before trusting any benchmark built on the output.
 
 Streams tensor-by-tensor; never holds the model in RAM.
@@ -60,7 +60,7 @@ def hf_name(ll2c: str) -> str:
 
 
 def shape_for(ll2c: str, cfg: dict) -> list:
-    """Shape is NOT stored per tensor in the .ll2c -- derive it, then cross-check the byte count."""
+    """Shape is not stored per tensor in the .ll2c; derive it, then cross-check the byte count."""
     hidden = cfg["hidden"]
     inter = cfg["inter"]
     vocab = cfg["vocab"]
@@ -98,14 +98,14 @@ def main() -> int:
         v = HDR_V4.unpack(f.read(HDR_V4.size))
         if v[0] != MAGIC:
             raise ValueError("not an .ll2c file")
-        # Field order per tools/validate_ll2c.py. Do NOT guess it: every field is an int, so a
+        # Field order per tools/validate_ll2c.py. Do not guess it: every field is an int, so a
         # wrong index yields a plausible-looking config (heads=8, kv_heads=1) that only blows up
         # much later, on a byte-count mismatch.
         (_magic, _version, vocab, hidden, inter, layers, heads, kv_heads, _max_seq, _tp,
          ntensors, table_off) = v[:12]
         cfg = dict(vocab=vocab, hidden=hidden, inter=inter, layers=layers, heads=heads,
                    kv_heads=kv_heads, q_hidden=hidden)
-        # The tensor table lives at table_off -- NOT immediately after the header.
+        # The tensor table lives at table_off; not immediately after the header.
         f.seek(table_off)
         entries = []
         for _ in range(ntensors):
@@ -116,7 +116,7 @@ def main() -> int:
           f"layers={cfg['layers']} heads={cfg['heads']} kv_heads={cfg['kv_heads']} "
           f"tensors={ntensors}")
 
-    # Build the safetensors header. Byte counts are CROSS-CHECKED against the derived shapes --
+    # Build the safetensors header. Byte counts are CROSS-CHECKED against the derived shapes
     # a shape mistake here would produce a model that loads and generates garbage.
     header = {}
     cursor = 0
@@ -155,7 +155,7 @@ def main() -> int:
             if (i + 1) % 50 == 0:
                 print(f"  {i + 1}/{len(plan)} tensors", flush=True)
 
-    # config.json / tokenizer.json come along unchanged -- llama.cpp's converter needs them.
+    # config.json / tokenizer.json come along unchanged; llama.cpp's converter needs them.
     hf = Path(args.hf_src)
     for f in ("config.json", "tokenizer.json", "tokenizer_config.json",
               "special_tokens_map.json", "generation_config.json"):

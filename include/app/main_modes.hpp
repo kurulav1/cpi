@@ -41,7 +41,7 @@ using GenerateStreamFn = std::function<std::vector<int>(
     const std::vector<int>& prompt_tokens, int max_new_tokens, float temperature,
     const std::function<bool(int)>& on_token, const engine::GenerationConstraints* constraints)>;
 // Streams a reply for a prompt that contains an <|image|> placeholder. Null for engines
-// with no vision tower -- the request then fails cleanly instead of silently ignoring the
+// with no vision tower; the request then fails cleanly instead of silently ignoring the
 // picture.
 using GenerateMultimodalFn = std::function<std::vector<int>(
     const std::vector<int>& base_tokens, const std::string& image_path, int max_new_tokens,
@@ -61,7 +61,7 @@ void execute_engine_modes(const RunExecutionOptions& options, const std::vector<
 // Multiplexed continuous-batching interactive worker (opt-in, --interactive-batch).
 // See main_interactive_batch.cpp.
 //
-// Takes the scheduler rather than an engine, and is NOT gated on CUDA: engine::BatchScheduler
+// Takes the scheduler rather than an engine, and is not gated on CUDA: engine::BatchScheduler
 // is backend-free, so whichever engine built it (LlamaEngine or PlanMetalEngine) is invisible
 // here. The gate used to exist because the scheduler lived inside LlamaEngine.
 void run_interactive_batch(engine::BatchScheduler& sched, model::Tokenizer& tokenizer,

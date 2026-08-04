@@ -2,7 +2,7 @@
 
 // DeepSeek-V2/V3 Multi-head Latent Attention, matching transformers' DeepseekV2Attention exactly (the
 // real V2-Lite structure, verified in deepseek_mla_real_test against an HF dump). Differs from the
-// generic mla_forward.hpp brick: (1) NO q-lora -- q is a direct projection; (2) a SINGLE
+// generic mla_forward.hpp brick: (1) no q-lora; q is a direct projection; (2) a SINGLE
 // kv_a_proj_with_mqa produces [latent(kv_lora) | k_pe(qk_rope)] and the k_pe head is shared across all
 // heads; (3) kv_a_layernorm (RMSNorm) on the latent before kv_b up-projection; (4) INTERLEAVED-complex
 // RoPE (pairs (2p,2p+1)) using the model's inv_freq, with the rotated vectors scaled by

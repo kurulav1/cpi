@@ -2,7 +2,7 @@
 //
 // This is the gate that makes the v7 whitelist bug impossible to repeat. That bug shipped a
 // container with all-zero vision geometry because a field existed upstream and not in the
-// packer's whitelist, and nothing compared the two. Here the writer, the reader AND this
+// packer's whitelist, and nothing compared the two. Here the writer, the reader and this
 // comparison are all generated from the one CPI_CONFIG_FIELDS list, so:
 //
 //   - a field added to the list is written, read and checked at once;
@@ -51,7 +51,7 @@ int main() {
   in.model_family = model::ModelFamily::Qwen3_5;
   in.layer_attention_kinds = {model::AttentionKind::Linear, model::AttentionKind::Full,
                               model::AttentionKind::SlidingWindow, model::AttentionKind::Linear};
-  // Gemma 4 KV sharing. Deliberately includes indices ABOVE 9: layer_attention_kinds encodes one
+  // Gemma 4 KV sharing. Deliberately includes indices above 9: layer_attention_kinds encodes one
   // digit per entry, and reusing that scheme here would silently turn 13 into 1 and 3. A 35-layer
   // E2B shares 20 layers onto sources in the teens, so this is the real case, not a corner one.
   in.kv_source = {0, 7, 13, 13, 14, 27};
@@ -97,15 +97,15 @@ int main() {
             std::to_string(in.kv_source.size()));
   checked += 4;
 
-  // THE RESIDUAL HOLE, and why this count is pinned.
+  // the RESIDUAL HOLE, and why this count is pinned.
   //
-  // The X-macro guarantees the writer and the reader agree -- a field in the list is in both. It
-  // does NOT guarantee the list covers LlamaConfig: add a member to the struct and forget this
+  // The X-macro guarantees the writer and the reader agree; a field in the list is in both. It
+  // does not guarantee the list covers LlamaConfig: add a member to the struct and forget this
   // file, and everything above still passes while the new field silently rides its default. That
   // is the v7 whitelist bug wearing a different hat.
   //
   // Pinning the count is the cheap half of the guard: REMOVING a field from the list trips it
-  // immediately. For ADDING one, LlamaConfig's declaration carries a pointer back here -- a
+  // immediately. For ADDING one, LlamaConfig's declaration carries a pointer back here; a
   // sizeof() static_assert would be stronger but is not portable, because std::string/std::vector
   // differ in size between MSVC and libc++ and the number would be wrong on one of them.
   check("field count (update when CPI_CONFIG_FIELDS changes)", checked == 55,

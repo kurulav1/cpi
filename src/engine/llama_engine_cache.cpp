@@ -98,10 +98,10 @@ void LlamaEngine::init_layer_cache() {
   }
   const int quant_bits = clamp_streaming_quant_bits(options_.streaming_quant_bits);
   // Attention projections cache at INT8 by default for quality. CPI_PROJ_INT4=1 caches them at
-  // INT4 too (saves ~1.9 GB on the 32B) -- opt-in until the quality delta is validated per model.
+  // INT4 too (saves ~1.9 GB on the 32B); opt-in until the quality delta is validated per model.
   const bool enable_proj_int4 = quant_bits == 4 && std::getenv("CPI_PROJ_INT4") != nullptr;
   // CPI_MLP_INT4_GROUP=N (power of two >= 32, e.g. 128) stores MLP int4 weights with one scale per
-  // group of N input columns instead of one per row -- ~18% -> ~11% weight error (llama.cpp Q4_0
+  // group of N input columns instead of one per row; ~18% -> ~11% weight error (llama.cpp Q4_0
   // uses block-32). Opt-in until validated per model. Requires the perm8 grouped-dp4a path
   // (in_features % 32 == 0, group % 32 == 0) and a model that stores fp16 MLP weights on disk (we
   // quantize on load); otherwise we stay per-row so no consumer misreads the grouped scales.
@@ -156,7 +156,7 @@ void LlamaEngine::init_layer_cache() {
       lowbit_w13_bytes + lowbit_w2_bytes +
       static_cast<std::size_t>(inter + hidden + inter) * sizeof(float);
   // TQ3 layer footprint: packed 3-bit wqkv/wo/w13 + fp16 scales + fp16 w2 + 2 norms.
-  // wqkv/wo/w13 are NOT loaded as fp16; int8 proj is also skipped.
+  // wqkv/wo/w13 are not loaded as fp16; int8 proj is also skipped.
   const std::size_t wpr_tq3 = static_cast<std::size_t>((hidden + 9) / 10);
   const std::size_t tq3_per_layer_bytes =
       static_cast<std::size_t>(q_hidden + 2 * kv_hidden) * wpr_tq3 * sizeof(uint32_t) +

@@ -158,20 +158,20 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
     // Q's copy stays deliberately: reading Q in place changes the attention GEMM's leading
     // dimension, which makes cuBLAS select a different algorithm that sums in a different order
     // and perturbs the logits. Keeping the copy pins the stride and the result stays
-    // bit-identical -- and it also measured faster, the better-aligned GEMM more than paying for
+    // bit-identical; and it also measured faster, the better-aligned GEMM more than paying for
     // the copy.
     //
     // Not eligible when:
     //   - QK-norm (Qwen3): launch_rmsnorm treats its input as contiguous [rows*heads, head_dim],
-    //     which K inside the strided QKV buffer is not -- it would normalise the wrong slices.
+    //     which K inside the strided QKV buffer is not; it would normalise the wrong slices.
     //   - paged blocks: launch_store_kv_paged requires contiguous K/V.
     const bool fused_kv = !(lw->q_norm && lw->k_norm) &&
                           !(options_.paged_blocks && d_block_table_ != nullptr);
     auto* qkv_rw = static_cast<__half*>(d_qkv_);
     const int qkv_row = q_hidden + 2 * kv_hidden;
 
-    // Bias BEFORE the split, so the copy carries the biased values (it used to be applied to the
-    // three split buffers afterwards -- same arithmetic, one launch instead of three).
+    // Bias before the split, so the copy carries the biased values (it used to be applied to the
+    // three split buffers afterwards; same arithmetic, one launch instead of three).
     if (lw->bqkv && fused_kv) {
       kernels::launch_add_bias_broadcast(qkv_rw, static_cast<const __half*>(lw->bqkv), rows,
                                          qkv_row, compute_stream_);
@@ -234,7 +234,7 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
                                               head_dim, bs, compute_stream_);
     } else {
       // Store K/V into the cache. On the in-place path these read straight out of the fused QKV
-      // buffer (source pitch = the whole QKV row) instead of from the split copies -- same bytes,
+      // buffer (source pitch = the whole QKV row) instead of from the split copies; same bytes,
       // one fewer copy each to produce them.
       const __half* k_src = fused_kv ? (qkv_rw + q_hidden) : static_cast<__half*>(d_prefill_k_);
       const __half* v_src =
@@ -249,13 +249,13 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
 
       // Tensor cores first: Q.K^T and P.V as cuBLAS batched GEMMs. Falls back to the kernel if
       // the geometry is unsupported or the score matrix would be too big. This is plain causal
-      // text prefill -- no per-token limits, no sliding window -- which is exactly the case the
+      // text prefill, no per-token limits, no sliding window, which is exactly the case the
       // GEMM path covers; the vision/bidirectional paths never reach here.
       //
       // On the in-place path Q lives in the fused buffer, so the stride is a whole QKV row.
-      // The fallback kernel cannot take a stride -- which is why inplace_qkv requires tc_ready.
+      // The fallback kernel cannot take a stride; which is why inplace_qkv requires tc_ready.
       // q_hidden, always: Q keeps its contiguous copy so cuBLAS sees the same leading dimension
-      // and picks the same algorithm -- which is what keeps this bit-identical.
+      // and picks the same algorithm; which is what keeps this bit-identical.
       if (!prefill_attention_tensorcore(d_prefill_q_, k_layer, v_layer, d_att_, rows, base_pos,
                                         cfg.num_heads, cfg.num_kv_heads, head_dim, q_hidden)) {
         kernels::launch_attention_prefill(static_cast<const __half*>(d_prefill_q_), k_layer,
@@ -358,7 +358,7 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
       fused_glu = true;
     }
 
-    // NOT inside the else: the quantized branches above fill d_prefill_ff1_/ff2_ with separate
+    // not inside the else: the quantized branches above fill d_prefill_ff1_/ff2_ with separate
     // GEMMs and still need this. Folding it into the fp16 branch would compile, run, and
     // silently skip the activation for int8/int4.
     if (!fused_glu) {
@@ -545,14 +545,14 @@ std::vector<int> LlamaEngine::generate_stream(const std::vector<int>& prompt_tok
   // allocator is exercised against real sequence lengths (allocation + pool
   // sizing + no-exhaustion + release across requests). Bookkeeping only in 2a —
   // the KV hot path still uses the flat cache, so output stays byte-identical.
-  // Physical block ids are intentionally NOT contiguous/identity (the free-list
+  // Physical block ids are intentionally not contiguous/identity (the free-list
   // hands blocks back LIFO across requests) — that permutation is exactly what
   // paging enables, and is consumed by the phase-2b gather kernel that will read
   // KV through this table instead of a flat offset.
   if (seq_blocks_) {
     // Phase 2d: allocate this sequence's blocks and publish its block table
     // (host + device). The allocator's free-list is LIFO, so requests after the
-    // first get NON-CONTIGUOUS physical blocks — exercising real paging. Prefill
+    // first get non-contiguous physical blocks — exercising real paging. Prefill
     // + decode KV writes and both attention reads all go through this table, so
     // byte-identical output proves non-contiguous paging works.
     seq_blocks_->clear();
@@ -748,7 +748,7 @@ void LlamaEngine::verify_tokens(const std::vector<int>& tokens, int start_pos,
   launch_norm(d_x_, d_norm_out_, d_norm_out_bias_, d_x_norm_, K, hidden);
 
   // Batched LM head: one GEMM projects all K normed rows in d_x_norm_ through the
-  // lm_head, reading its ~1 GB weight ONCE — the per-position loop re-read it K
+  // lm_head, reading its ~1 GB weight once — the per-position loop re-read it K
   // times (K x the lm_head bandwidth per verify). Consistent with the verify's
   // layer projections, which already run through the batched cuBLAS path. Then a
   // per-row device argmax (only K ints cross the bus).

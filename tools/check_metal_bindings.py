@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """Two mechanical checks on the Metal kernels and the C++ that dispatches them.
 
-1. Every Metal kernel must take its params block as its LAST buffer binding.
+1. Every Metal kernel must take its params block as its last buffer binding.
 2. Every tile constant the shader defines and the C++ mirrors must agree.
 
-MetalContext::dispatch() binds the params block at index n_buffers -- i.e. after
+MetalContext::dispatch() binds the params block at index n_buffers, i.e. after
 every data buffer. A kernel that declares `constant XParams& p [[buffer(k)]]` with
 another buffer at an index above k would therefore have its params written over
 that buffer.
 
 That mistake compiles perfectly. `metal -Werror` cannot see it, the CI job stays
-green, and it only misbehaves on real hardware -- as garbage numbers, which read
+green, and it only misbehaves on real hardware, as garbage numbers, which read
 like a kernel math bug rather than a binding bug. Three kernels had it (rope,
 kv_store, attention_decode), which is exactly why this is enforced mechanically
 instead of by care.
@@ -18,9 +18,9 @@ instead of by care.
 Also checks that buffer indices within a kernel are contiguous from 0, since
 dispatch() binds them positionally.
 
-The second check exists because the tile constants live in three places -- the shader
-#define, the engine's mirror, and metal_smoke's mirror -- and a caller whose tile size
-disagrees with the shader does not fail to build. It computes a WRONG ANSWER, and only
+The second check exists because the tile constants live in three places, the shader
+#define, the engine's mirror, and metal_smoke's mirror, and a caller whose tile size
+disagrees with the shader does not fail to build. It computes a wrong ANSWER, and only
 in the shapes that particular caller exercises. That is not hypothetical: metal_smoke
 restated GEMM_BN as 64 while the shader moved to 32, and every gemm_f16 check failed
 with max_abs ~3.8 while the engine (which mirrors the constant correctly) stayed right
@@ -38,7 +38,7 @@ SHADER_DIR = Path("src/kernels/metal")
 # shader #define -> every C++ constant that must equal it, as (file, name).
 #
 # Add a file here the moment it restates a tile constant. metal_gemm_bench was missed on the
-# first pass of this table and drifted to a wrong tile within the hour -- it caught itself only
+# first pass of this table and drifted to a wrong tile within the hour; it caught itself only
 # because it verifies against a reference, which the next such file might not.
 ENGINE = "src/engine/plan_metal_engine.cpp"
 SMOKE = "src/tests/metal_smoke.cpp"
@@ -103,7 +103,7 @@ def check_mirrors() -> list:
                 )
     return problems
 
-# `kernel void name( ... ) {`  -- capture the name and the parameter list.
+# `kernel void name( ... ) {` ; capture the name and the parameter list.
 KERNEL = re.compile(r"kernel\s+void\s+(\w+)\s*\((.*?)\)\s*\{", re.S)
 BUFFER = re.compile(r"\[\[buffer\((\d+)\)\]\]")
 
@@ -111,7 +111,7 @@ BUFFER = re.compile(r"\[\[buffer\((\d+)\)\]\]")
 def main() -> int:
     # The kernels live as family files (00_common, 10_dense, ...); the single-file
     # cpi_kernels.metal is a BUILD ARTIFACT and is absent from a fresh checkout. This used to
-    # read only that path, so on CI -- which runs against a checkout -- it printed "not found"
+    # read only that path, so on CI, which runs against a checkout, it printed "not found"
     # and returned 1 without checking a single kernel. Read the family files.
     parts = [f for f in sorted(SHADER_DIR.glob("*.metal")) if f.name != SRC.name]
     if not parts and SRC.exists():

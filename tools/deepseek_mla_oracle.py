@@ -131,7 +131,7 @@ def main():
     json.dump(meta, open(args.out + ".meta.json", "w"), indent=2)
     # Plain whitespace scalars for the C++ test to read without a JSON parser. Tensors follow in .bin
     # in this fixed order: hidden, attn_out, q_proj, kv_a_proj_with_mqa, kv_a_layernorm, kv_b_proj,
-    # o_proj, inv_freq -- the C++ side derives offsets from the dims below.
+    # o_proj, inv_freq; the C++ side derives offsets from the dims below.
     with open(args.out + ".dims", "w") as f:
         f.write(f"{cfg.hidden_size} {cfg.num_attention_heads} {cfg.qk_nope_head_dim} "
                 f"{cfg.qk_rope_head_dim} {cfg.v_head_dim} {cfg.kv_lora_rank} {T} "

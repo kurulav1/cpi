@@ -275,7 +275,7 @@ def read_ll2c_mmap(path: Path):
                  f"fields it cannot see")
 
     if version >= 5:
-        # Parse with the struct the FILE uses, and preserve its version -- this tool writes the
+        # Parse with the struct the file uses, and preserve its version; this tool writes the
         # header back out, so hardcoding 5 here would relabel a v6 file as v5 and strand the
         # delta-net dimensions it carries.
         if version >= 7:

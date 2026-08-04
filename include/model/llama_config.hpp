@@ -26,9 +26,9 @@ enum class ModelFamily : std::int32_t {
   Qwen3_5 = 7,  // Qwen3.5 mixed-attention family (gated delta-net + gated full attention).
   Qwen3 = 8,    // Qwen3 dense (rope_theta=1000000, per-head QK-norm, no QKV bias).
   Gemma = 9,    // Gemma 1 (GeGLU MLP, embedding scale, (1+w) RMSNorm, tied embeddings).
-  // Gemma 4 is NOT Gemma 1 with more layers: per-layer embeddings, KV sharing, a different
+  // Gemma 4 is not Gemma 1 with more layers: per-layer embeddings, KV sharing, a different
   // head_dim and RoPE base for sliding vs full layers, and a double-wide MLP on the shared
-  // layers. It gets its own identity so a container can say which it is -- a Gemma 4 `.cpi`
+  // layers. It gets its own identity so a container can say which it is; a Gemma 4 `.cpi`
   // that reported itself as Gemma would route to a builder that cannot describe it.
   Gemma4 = 10,
 };
@@ -74,10 +74,10 @@ inline const char* attention_kind_name(AttentionKind kind) {
 // Architectural hyper-parameters for a LLaMA-family transformer model.
 // All fields correspond directly to the matching entries in the model's
 // config.json.  Default values match the LLaMA-7B configuration.
-// ADDING A FIELD HERE? Add it to CPI_CONFIG_FIELDS in model/config_json.hpp and bump the count in
+// ADDING A FIELD here? Add it to CPI_CONFIG_FIELDS in model/config_json.hpp and bump the count in
 // config_json_test.cpp. That list is what serialises this struct into a `.cpi` container's
 // __metadata__; a field missing from it is written as its default and read back as its default,
-// silently -- which is precisely how container v7 shipped with all-zero vision geometry.
+// silently; which is precisely how container v7 shipped with all-zero vision geometry.
 struct LlamaConfig {
   std::int32_t vocab_size = 32000;         // Number of token embeddings.
   std::int32_t hidden_size = 4096;         // Dimension of the residual stream (d_model).
@@ -99,8 +99,8 @@ struct LlamaConfig {
   bool has_qk_norm = false;         // Per-head RMSNorm on Q and K after projection (Qwen3).
   bool mlp_gelu = false;            // MLP gate uses GeGLU (tanh GELU) instead of SwiGLU (Gemma).
   bool scale_embeddings = false;    // Scale token embeddings by sqrt(hidden_size) (Gemma).
-  // Qwen3.5 full-attention layers: the q projection emits [q | gate] PER HEAD -- so it is
-  // twice as wide as heads*head_dim implies -- and the attention output is multiplied by
+  // Qwen3.5 full-attention layers: the q projection emits [q | gate] per head; so it is
+  // twice as wide as heads*head_dim implies; and the attention output is multiplied by
   // sigmoid(gate) before the output projection. Without this flag the doubled q_proj reads
   // as a head_dim twice the real one, which converts cleanly and computes nonsense.
   bool attn_output_gate = false;
@@ -122,7 +122,7 @@ struct LlamaConfig {
   std::int32_t linear_num_value_heads = 0;
   // The three dimensions the delta-net state buffers are sized from. The head COUNTS above have
   // been in the container since v5, but without these a backend can only know how many heads
-  // there are, not how wide -- which is why the Metal engine could not allocate the conv window
+  // there are, not how wide; which is why the Metal engine could not allocate the conv window
   // or the recurrent matrix. Container v6 carries them; a v5 file leaves them 0.
   std::int32_t linear_key_head_dim = 0;
   std::int32_t linear_value_head_dim = 0;
@@ -142,21 +142,21 @@ struct LlamaConfig {
 
   // ── Gemma 4 ───────────────────────────────────────────────────────────────────────────────
   // Added the same way Qwen3.5's linear-attention fields were: this family's geometry is not
-  // uniform, and the alternative -- a second config struct threaded through every backend -- means
+  // uniform, and the alternative, a second config struct threaded through every backend, means
   // two descriptions of the same model drifting apart. Every field is zero/false for other
   // families, so nothing else changes shape.
   //
   // Per-Layer Embeddings (E2B has them; the 12B and the MoE do not). ple > 0 IS the "has PLE"
-  // signal, so presence and geometry cannot disagree -- same rule as vision_depth above.
+  // signal, so presence and geometry cannot disagree; same rule as vision_depth above.
   std::int32_t hidden_size_per_layer_input = 0;
   std::int32_t vocab_size_per_layer_input = 0;
   // KV sharing: the last num_kv_shared_layers layers reuse another layer's K/V instead of
-  // projecting their own. kv_source is derived (not stored in the checkpoint) -- see
-  // engine::parse_gemma4_text_config, which is the ONE place that rule is written down.
+  // projecting their own. kv_source is derived (not stored in the checkpoint); see
+  // engine::parse_gemma4_text_config, which is the one place that rule is written down.
   std::int32_t num_kv_shared_layers = 0;
   std::int32_t first_shared_layer = 0;
   std::vector<std::int32_t> kv_source;
-  // Gemma 4 has a DIFFERENT head_dim for sliding vs full layers (E2B: 256 / 512), so the single
+  // Gemma 4 has a different head_dim for sliding vs full layers (E2B: 256 / 512), so the single
   // head_dim above cannot describe it. 0 means "not this family, use head_dim".
   std::int32_t head_dim_sliding = 0;
   std::int32_t head_dim_full = 0;

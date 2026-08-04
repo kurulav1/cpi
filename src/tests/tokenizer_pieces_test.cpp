@@ -74,7 +74,7 @@ int main() {
   const std::vector<std::string>& pieces = tok.token_pieces();
   check(pieces.size() >= 7, "table covers all vocab ids");
 
-  // Leading word-boundary marker becomes a leading space (NOT stripped).
+  // Leading word-boundary marker becomes a leading space (not stripped).
   check(pieces.size() > 3 && pieces[3] == " the", "leading-space token -> ' the'");
   // A plain digit token maps to its literal byte.
   check(pieces.size() > 4 && pieces[4] == "3", "digit token '3' -> '3'");

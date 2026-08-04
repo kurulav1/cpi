@@ -1,5 +1,5 @@
 // Verifies Multi-head Latent Attention (MLA, the DeepSeek-V2/V3/R1 attention) on-device against a host
-// fp32 oracle -- isolated, model-blocked groundwork for native DeepSeek-V3/R1 (full checkpoints don't
+// fp32 oracle; isolated, model-blocked groundwork for native DeepSeek-V3/R1 (full checkpoints don't
 // fit this box), the same way the MXFP4 and DeepSeek-router bricks were landed. The MLA forward itself
 // lives in engine/mla_forward.hpp (reused by deepseek_mla_stack_test); this test exercises a single
 // layer and cross-checks the header's device path against its independent host path.

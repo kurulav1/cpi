@@ -193,7 +193,7 @@ bool launch_persistent_decode(const PersistOp* ops, int n_ops, const int* tok, c
 
 // launch_attention_split_any / _device_pos
 //
-// Split-K decode attention for ANY even head_dim <= kTiledMaxHeadDim, sliding-window aware.
+// Split-K decode attention for any even head_dim <= kTiledMaxHeadDim, sliding-window aware.
 // Grid is (num_heads, scratch_chunks) with per-chunk seq/window guards, so it is graph-safe
 // and fills the GPU where the single-block-per-head tiled path cannot (Gemma 4: 8 heads on a
 // 170-SM card). The reduce merges chunk softmax stats exactly (log-sum-exp).
@@ -239,7 +239,7 @@ void launch_rmsnorm_rope(half* s, const half* w, int heads, int head_dim, int po
 
 // launch_rope_inplace_partial_table_device_pos
 //
-// The partial-RoPE variant with the position read from a device pointer -- the piece that
+// The partial-RoPE variant with the position read from a device pointer; the piece that
 // makes plans carrying partial RoPE (Gemma 4's full layers, Qwen3.5's attention layers)
 // graph-capturable. Same table layout as launch_rope_inplace_partial_table.
 void launch_rope_inplace_partial_table_device_pos(half* q, half* k, int num_heads_q,
@@ -281,7 +281,7 @@ void launch_rope_inplace_device_pos(half* q, half* k, int num_heads_q, int num_h
 // Batched RoPE where Q and K rows carry an explicit stride, so they can be rotated IN PLACE
 // inside the fused QKV buffer instead of being copied out to contiguous buffers first. Prefill
 // is host-bound and those copies were 3 of the 7 cudaMemcpy2DAsync per layer.
-// launch_rope_inplace_batched is this with the natural strides -- bit-identical.
+// launch_rope_inplace_batched is this with the natural strides; bit-identical.
 void launch_rope_inplace_batched_strided(half* q, half* k, int num_tokens, int num_heads_q,
                                          int num_heads_k, int head_dim, int start_position,
                                          const float* cos_table, const float* sin_table,
@@ -430,7 +430,7 @@ void launch_increment_int(int* value, cudaStream_t stream);
 // Kernel selection: tiled (flash-attention style) when head_dim even and
 // <=256, otherwise scalar per-token online softmax fallback.
 //   causal       - true (default): each token attends only to its own prefix.
-//                  false: every token attends to the WHOLE sequence -- the
+//                  false: every token attends to the whole sequence; the
 //                  bidirectional self-attention a vision encoder needs.
 //   limits       - optional DEVICE array [num_tokens]: the exclusive key limit for each
 //                  token, overriding `causal`. This is what makes an image span
@@ -442,8 +442,8 @@ void launch_increment_int(int* value, cudaStream_t stream);
 //                  was silently wrong here.
 // launch_build_attention_ptrs
 //
-// Builds the cublasGemmBatchedEx pointer arrays for the tensor-core prefill attention ON THE
-// DEVICE. Doing this from the host into a reused pinned buffer is a race -- the function runs
+// Builds the cublasGemmBatchedEx pointer arrays for the tensor-core prefill attention ON the
+// DEVICE. Doing this from the host into a reused pinned buffer is a race; the function runs
 // once per layer, so the next layer overwrites the staging buffer while the previous async copy
 // is still in flight. Building them on the compute stream makes the ordering structural.
 void launch_build_attention_ptrs(const half* k_layer, const half* v_layer, const half* q,
@@ -453,9 +453,9 @@ void launch_build_attention_ptrs(const half* k_layer, const half* v_layer, const
 
 // launch_gated_glu_interleaved
 //
-// silu(gate)*up (or gelu) read straight off the FUSED w13 output [tokens, 2*inter]: gate at
+// silu(gate)*up (or gelu) read straight off the fused w13 output [tokens, 2*inter]: gate at
 // [t][i], up at [t][inter+i]. Prefill used to split that into two buffers with a pair of
-// cudaMemcpy2DAsync first -- copies that only un-interleaved data the next kernel reads
+// cudaMemcpy2DAsync first; copies that only un-interleaved data the next kernel reads
 // elementwise anyway. Prefill is host-bound, so those copies cost real time.
 // Bit-identical to split-then-glu.
 void launch_gated_glu_interleaved(const half* ff13, half* out, int inter, int tokens, bool gelu,
@@ -465,7 +465,7 @@ void launch_gated_glu_interleaved(const half* ff13, half* out, int inter, int to
 //
 // In-place causal row-softmax over a [heads][chunk][keys] score matrix. Row (h, i) belongs to
 // query token (q_start + i) and may attend to keys j <= q_start + i; masked entries are set to
-// ZERO (they feed a GEMM, not another softmax, so zero is what drops them).
+// zero (they feed a GEMM, not another softmax, so zero is what drops them).
 //
 // This is the middle of the tensor-core prefill attention: cuBLAS batched GEMM produces the
 // scores, this normalises them, and a second GEMM consumes them as P.
@@ -614,7 +614,7 @@ void launch_scale_add_inplace(half* dst, const half* src, int n, float scale, cu
 //   topk_prob   - selected normalized gate probabilities [top_k]
 //   stream      - CUDA stream
 //   per_expert_scale - optional learned per-expert gain, fp16 [experts], applied to
-//                      the weight AFTER the top-k renormalisation (Gemma MoE has
+//                      the weight after the top-k renormalisation (Gemma MoE has
 //                      one; pass nullptr for routers that do not, which leaves the
 //                      result exactly as it was).
 void launch_moe_router_topk_softmax(const half* logits, int experts, int top_k, int* topk_idx,
@@ -625,7 +625,7 @@ void launch_moe_router_topk_softmax(const half* logits, int experts, int top_k, 
 //
 // Kimi-K3-style router: SIGMOID gate per expert (independent, not softmax), optional grouped
 // node-limited selection, top-k, then normalise the selected gates to sum 1. Supports top_k up to
-// 32 (K3 uses 16, above the softmax router's hard cap of 8). Groundwork for K3 -- not yet wired to
+// 32 (K3 uses 16, above the softmax router's hard cap of 8). Groundwork for K3; not yet wired to
 // a model (its 896/top-16 MoE needs this router + expert streaming + MXFP4); gated in isolation by
 // moe_router_sigmoid_test.
 //   n_group / topk_group - grouped routing: experts split into n_group contiguous groups; a group's
@@ -639,7 +639,7 @@ void launch_moe_router_sigmoid_topk(const half* logits, int experts, int top_k, 
 // launch_moe_gate_up_geglu / launch_moe_down_accum
 //
 // The expert feed-forward, with the selected experts read from DEVICE memory
-// (topk_idx, written by the router) -- no host round-trip, so the decode graph
+// (topk_idx, written by the router); no host round-trip, so the decode graph
 // stays capturable.
 //
 // Experts are one contiguous matrix each, so selecting expert e is a row offset:
@@ -788,7 +788,7 @@ void launch_pack_rowwise_int8_to_int4(const std::int8_t* src, std::int8_t* dst, 
 //
 // int8 weight-only GEMV with fp16 activations and FLOAT output: the LM head.
 //   y[row] = scales[row] * sum_k w[row, k] * x[k]
-// Only the WEIGHTS are quantized -- x stays fp16 and the dot accumulates in fp32. The dp4a
+// Only the weights are quantized; x stays fp16 and the dot accumulates in fp32. The dp4a
 // kernels quantize the activation too, which is the wrong trade in the one layer that decides
 // the output token (x is 8 KB; the weight is 1 GB). An 8B LM head is 1.05 GB fp16; int8 halves
 // it, and that is 22% of everything an int4 8B reads per token.
@@ -981,8 +981,8 @@ void launch_weight_only_int4_matvec_dual_dp4a(
 // launch_rope_2d_inplace
 //
 // 2-D RoPE over a sequence of patches. A head's channels split into two halves: the
-// FIRST rotates by the patch's x coordinate, the SECOND by its y. Within each half the
-// rotation is rotate_half (channel j pairs with j + half/2) -- the same convention the
+// first rotates by the patch's x coordinate, the second by its y. Within each half the
+// rotation is rotate_half (channel j pairs with j + half/2); the same convention the
 // 1-D table kernel uses, so cos/sin tables are built identically (here over the SPATIAL
 // half-dim: head_dim/4 entries per position).
 //
@@ -996,7 +996,7 @@ void launch_rope_2d_inplace(half* x, const int* pos_x, const int* pos_y, int num
 //
 // out[t] = proj . (2*(pixels[t] - 0.5)) + pos_table[0][x_t] + pos_table[1][y_t]
 //
-// Gemma applies no mean/std image normalisation -- it rescales [0,1] to [-1,1] here.
+// Gemma applies no mean/std image normalisation; it rescales [0,1] to [-1,1] here.
 // The position table is [2, pos_table_size, hidden]: x indexes plane 0, y plane 1, and
 // the two are summed. Patches with a negative coordinate are padding and emit zeros.
 //
@@ -1009,7 +1009,7 @@ void launch_patch_embed(const half* proj, const float* pixels, const half* pos_t
 //
 // 2-D average pool over k x k patch cells, then a `gain` (sqrt(hidden)) multiply.
 // Padding patches are zero and contribute nothing, but the divisor stays k*k (as HF
-// does) -- dividing by the live count instead would change the numbers.
+// does); dividing by the live count instead would change the numbers.
 void launch_avg_pool_patches(const half* in, const int* pos_x, const int* pos_y, half* out,
                              int tokens, int hidden, int k, int cells_x, int out_tokens, float gain,
                              cudaStream_t stream);
@@ -1031,11 +1031,11 @@ void launch_gelu_mul_strided(const half* a, const half* b, half* out, int n, int
 // launch_gemv_splitk_f16
 //
 // GEMV with one BLOCK per output row and 8 warps splitting the input dimension.
-// The default GEMV gives one WARP per row, so its parallelism is the ROW COUNT -- ample for
+// The default GEMV gives one WARP per row, so its parallelism is the row count; ample for
 // a 151936-row LM head, and only ~10% of the GPU for a 896-row o_proj, which then runs 8x
 // off peak because memory latency is never hidden. Use this for SHORT-and-wide GEMVs.
 // Reduction order differs from the one-warp kernel, so results are equal to fp32 rounding
-// but NOT bit-identical -- opt in per call site.
+// but not bit-identical; opt in per call site.
 void launch_gemv_splitk_f16(const half* w, const half* x, half* y, int out_features,
                             int in_features, cudaStream_t stream, half* residual = nullptr);
 
@@ -1043,10 +1043,10 @@ void launch_gemv_splitk_f16(const half* w, const half* x, half* y, int out_featu
 //
 // Fused SwiGLU projection: out[i] = silu(dot(w_gate[i], x)) * dot(w_up[i], x).
 // Replaces gate-GEMV + up-GEMV + silu_mul (3 kernels -> 1). At batch 1 each kernel costs
-// a fixed ~2.7us of scheduling regardless of its size, and that tax -- not bandwidth --
+// a fixed ~2.7us of scheduling regardless of its size, and that tax; not bandwidth --
 // is what separates a small model from the roofline.
 // g and u are rounded to fp16 before the multiply, exactly as the unfused path does when
-// it stores them between kernels, so the result is BYTE-IDENTICAL.
+// it stores them between kernels, so the result is byte-identical.
 void launch_swiglu_gemv_f16(const half* w_gate, const half* w_up, const half* x, half* out,
                             int inter, int in_features, cudaStream_t stream);
 
@@ -1070,8 +1070,8 @@ void launch_rope_seq_table_device_pos(half* x, int num_heads, int head_dim, cons
 // Sequence-mode GEMM: y[t, m] = sum_k w[m, k] * x[t, k], for `tokens` rows of x.
 // Same weight layout as the GEMV below, so one bound weight serves both.
 //
-// A tiled GEMM sums K in a different order than the GEMV, so the two do NOT agree
-// bit-for-bit -- single-token work must keep using the GEMV or decode output shifts.
+// A tiled GEMM sums K in a different order than the GEMV, so the two do not agree
+// bit-for-bit; single-token work must keep using the GEMV or decode output shifts.
 // in_min/in_max/out_min/out_max: clipped projections (Gemma 4 E2B's vision tower)
 // clamp the activation on the way IN and the result on the way OUT. +-inf = no clamp.
 void launch_rowmajor_half_gemm_f16(const half* w, const half* x, half* y, int out_features,
@@ -1081,7 +1081,7 @@ void launch_rowmajor_half_gemm_f16(const half* w, const half* x, half* y, int ou
 
 //   residual (optional): fuses the residual add into the epilogue --
 //     residual[row] = __hadd(residual[row], (half)dot)   and `y` is left untouched.
-//   Saves a whole add_inplace launch. BYTE-IDENTICAL: the dot is rounded to fp16 first
+//   Saves a whole add_inplace launch. byte-identical: the dot is rounded to fp16 first
 //   (what the unfused store does) and combined with __hadd (what add_inplace does).
 void launch_rowmajor_half_gemv_f16(const half* w, const half* x, half* y, int out_features,
                                    int in_features, cudaStream_t stream, int warps_per_block = 0,
@@ -1092,7 +1092,7 @@ void launch_rowmajor_half_gemv_f16(const half* w, const half* x, half* y, int ou
 //
 // Batch-1 rowwise int8 activation quantization (same max/scale/rounding as
 // launch_quantize_rowwise_fp16_to_int8) with even/odd bytes deinterleaved per 8-column
-// window -- the layout launch_weight_only_int4_matvec_grouped_dp4a consumes. cols % 8 == 0.
+// window; the layout launch_weight_only_int4_matvec_grouped_dp4a consumes. cols % 8 == 0.
 void launch_quantize_fp16_to_int8_perm8(const half* src, std::int8_t* dst, float* scales, int cols,
                                         cudaStream_t stream);
 
@@ -1107,9 +1107,9 @@ void launch_quantize_fp16_to_int8_perm8_g32_mt(const half* src, std::int8_t* dst
 
 // launch_weight_only_int4_matvec_grouped_dp4a
 //
-// Batch-1 grouped int4(weight) x int8(activation) GEMV via dp4a. `xq` MUST hold the
+// Batch-1 grouped int4(weight) x int8(activation) GEMV via dp4a. `xq` must hold the
 // perm8-quantized activation and `x_scale` its scale. Requires in_features % 32 == 0 and
-// group % 32 == 0 (silently returns otherwise -- caller gates). `warps` (2/4/8) is the
+// group % 32 == 0 (silently returns otherwise; caller gates). `warps` (2/4/8) is the
 // rows-per-block shape knob probed by the per-box autotuner; all variants are
 // bit-identical (row math is warp-local).
 void launch_weight_only_int4_matvec_grouped_dp4a(const std::int8_t* w_packed, const float* scales,
@@ -1127,7 +1127,7 @@ void launch_rmsnorm_quant_perm8(const half* x, const half* w, half* y, std::int8
 
 // launch_weight_only_int4_matvec_grouped_dp4a_cat
 //
-// Up to three grouped int4 dp4a GEMVs sharing one perm8-quantized activation, run as ONE
+// Up to three grouped int4 dp4a GEMVs sharing one perm8-quantized activation, run as one
 // launch (q|k|v, gate|up). Same per-row math as the non-cat variant; pass n2 = 0 for two
 // segments. Same gating: in_features % 32 == 0, group % 32 == 0.
 void launch_weight_only_int4_matvec_grouped_dp4a_cat(const std::int8_t* w0, const float* s0,
@@ -1221,7 +1221,7 @@ void launch_weight_only_int4_matvec_grouped_dp4a_mt_f32(const std::int8_t* w_pac
 
 // launch_rowmajor_half_gemv_cat
 //
-// Up to three batch-1 fp16 GEMVs sharing one input vector, run as ONE launch (q|k|v,
+// Up to three batch-1 fp16 GEMVs sharing one input vector, run as one launch (q|k|v,
 // gate|up). Per-row arithmetic mirrors the wide gemv exactly, so results are bit-identical
 // to three separate launches. Requires in_features % 8 == 0. Pass n2 = 0 (w2/y2 null) for
 // a two-segment cat.
@@ -1259,7 +1259,7 @@ void launch_rowmajor_half_gemv_f32(const half* w, const half* x, float* y, int o
 // warp 0) within a single block of 256 threads.
 // Two-phase when part_val/part_idx scratch is supplied (sized argmax_partition_count(n)),
 // otherwise a single block scans the whole vector. Supply the scratch: the single-block form
-// launches <<<1,256>>> over the entire vocab -- one SM out of 170 -- and measured 149.6 us on
+// launches <<<1,256>>> over the entire vocab, one SM out of 170, and measured 149.6 us on
 // Qwen2.5's 151936-wide head, 12% of all GPU time, to read 608 KB.
 constexpr int kArgmaxMaxParts = 1024;
 int argmax_partition_count(int n);
@@ -1290,7 +1290,7 @@ void launch_topk_float(const float* logits, int n, int k, float* part_val, int* 
 void launch_gather_ge_threshold(const float* logits, int n, const float* threshold, int* out_idx,
                                 float* out_val, int* out_count, int capacity, cudaStream_t stream);
 
-// Repetition penalty for the batched device top-k path, applied to [batch][vocab] logits BEFORE
+// Repetition penalty for the batched device top-k path, applied to [batch][vocab] logits before
 // the top-k so the candidate set matches the host sampler's slow path. Both touch only rows whose
 // penalties[b] > 1. Call sanitize first (non-finite -> -inf, clamp [+-80]), then the penalty over
 // each row's UNIQUE seen token ids (seen_ids[i] in row seen_rows[i]); seen ids are unique per row

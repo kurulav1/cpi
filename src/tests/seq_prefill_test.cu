@@ -1,11 +1,11 @@
 // Gate for sequence-mode text prefill.
 //
-// Prefilling a prompt in ONE pass must agree with feeding it token by token: same KV
+// Prefilling a prompt in one pass must agree with feeding it token by token: same KV
 // cache, same logits, same continuation. This is the check that catches a wrong RoPE
 // position, an off-by-one in the KV append, or a missing sliding-window k_start.
 //
 // The sliding-window case is the one worth insisting on: Gemma windows its sliding
-// layers at 512, and the prefill kernel had NO window support (Llama never needed it),
+// layers at 512, and the prefill kernel had no window support (Llama never needed it),
 // so a prompt longer than the window would have been silently wrong. The long-prompt
 // case below is there precisely to fail if that regresses.
 
@@ -95,7 +95,7 @@ int main(int argc, char** argv) {
   int failures = 0;
   failures += run_case(model, "short", 12);
   failures += run_case(model, "medium", 200);
-  // Longer than Gemma's 512 sliding window -- this is the case that fails if the
+  // Longer than Gemma's 512 sliding window; this is the case that fails if the
   // prefill kernel forgets its per-token k_start.
   failures += run_case(model, "beyond window", 700);
 

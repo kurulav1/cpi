@@ -1,13 +1,13 @@
 // Gate for the hand-rolled image preprocessing.
 //
 // 1. resize_bicubic vs PIL (the resampler HF actually uses). PIL's 8-bit path is
-//    deterministic -- fixed-point filter coefficients, 8-bit intermediate between the
-//    two passes -- so we reproduce it EXACTLY and the bar is byte-equality, not a
+//    deterministic; fixed-point filter coefficients, 8-bit intermediate between the
+//    two passes; so we reproduce it exactly and the bar is byte-equality, not a
 //    tolerance. (Float math alone gets to ~0.3 mean error with individual pixels off by
 //    7 levels; that would have been easy to wave through as "close enough".)
 //
 // 2. to_patches: the grid geometry and, crucially, the patch memory layout
-//    ([y][x][channel], channel innermost) -- getting that transposed would feed the
+//    ([y][x][channel], channel innermost); getting that transposed would feed the
 //    encoder a scrambled image while looking perfectly plausible.
 
 #include <cmath>
@@ -76,7 +76,7 @@ int main(int argc, char** argv) {
     }
     const double mae = sum / static_cast<double>(ref_rgb.size());
     // PIL's 8-bit resample is deterministic (fixed-point coefficients, 8-bit
-    // intermediate), so we reproduce it EXACTLY rather than settle for a tolerance.
+    // intermediate), so we reproduce it exactly rather than settle for a tolerance.
     const bool ok = worst == 0;
     if (!ok) ++failures;
     std::printf("  [%s] %-12s %dx%d -> %dx%d   mean abs err %.3f, worst %d (of 255)\n",

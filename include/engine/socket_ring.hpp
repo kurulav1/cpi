@@ -1,16 +1,16 @@
 #pragma once
 
-// Ring all-reduce over real TCP sockets -- the transport-logic prototype for a future multi-node
+// Ring all-reduce over real TCP sockets; the transport-logic prototype for a future multi-node
 // collective (the layer NcclCollective replaces on a real cluster; see collective.hpp). Unlike the
 // single-process LocalCollective (one address space, buffers copied device-to-device), this exercises
 // the DISTRIBUTED control flow that only appears when ranks are genuinely separate endpoints:
 //   * ring connection setup (each rank listens, connects to its successor, accepts its predecessor)
-//     with connect-retry -- the handshake-ordering / deadlock surface,
+//     with connect-retry; the handshake-ordering / deadlock surface,
 //   * the two-phase ring algorithm (scatter-reduce then all-gather, 2*(world-1) steps),
 //   * byte-level send/recv with partial-IO loops (a short read/write is normal on a stream socket and
 //     is the classic transport bug a single-process test can never surface).
 //
-// Ranks may be separate processes or threads; they share NO state and talk ONLY over 127.0.0.1
+// Ranks may be separate processes or threads; they share no state and talk only over 127.0.0.1
 // sockets, so the isolation that matters for correctness holds either way. Portable over Winsock and
 // BSD sockets. Header-only (inline); it is verification/prototype infrastructure, not on the hot path.
 
@@ -66,7 +66,7 @@ inline void send_all(socket_t s, const void* buf, std::size_t n) {
 }
 
 // Read exactly n bytes, looping over short reads (a single recv may return fewer than requested, or a
-// message may span several TCP segments -- handling this is the whole point of the exercise).
+// message may span several TCP segments; handling this is the whole point of the exercise).
 inline void recv_all(socket_t s, void* buf, std::size_t n) {
   char* p = static_cast<char*>(buf);
   std::size_t got = 0;
@@ -78,7 +78,7 @@ inline void recv_all(socket_t s, void* buf, std::size_t n) {
 }
 
 // A rank's two ring links: a socket to its successor (send) and from its predecessor (recv). Connecting
-// the ring is where handshake ordering bites -- every rank listens first, then connect-retries its
+// the ring is where handshake ordering bites; every rank listens first, then connect-retries its
 // successor (whose listener may not be up yet), then accepts its predecessor.
 class SocketRing {
 public:
@@ -154,7 +154,7 @@ public:
     std::vector<float> tmp;
     for (int b = 0; b < world_; ++b) tmp.resize(std::max<int>(tmp.size(), len[b]));
 
-    // Phase 1 -- scatter-reduce: world-1 steps. Send one block to the successor while receiving the
+    // Phase 1; scatter-reduce: world-1 steps. Send one block to the successor while receiving the
     // predecessor's block and accumulating it. Send-then-recv is deadlock-free here because each block
     // is far smaller than the socket send buffer, so send() returns before recv() is posted.
     for (int step = 0; step < world_ - 1; ++step) {
@@ -163,7 +163,7 @@ public:
       exchange_add(data + off[send_b], len[send_b], data + off[recv_b], len[recv_b], tmp.data());
     }
 
-    // Phase 2 -- all-gather: world-1 steps. Rotate the fully-reduced blocks so every rank ends with all
+    // Phase 2; all-gather: world-1 steps. Rotate the fully-reduced blocks so every rank ends with all
     // of them. Received block overwrites (it is already the final sum), it is not accumulated.
     for (int step = 0; step < world_ - 1; ++step) {
       const int send_b = (rank_ - step + 1 + 2 * world_) % world_;

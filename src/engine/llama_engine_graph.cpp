@@ -14,7 +14,7 @@ namespace engine {
 
 bool LlamaEngine::can_use_greedy_decode_graph() const {
   // Greedy decode CUDA graph. Verified byte-identical to the non-graph path for
-  // fp16, int8 AND int4 once the RMSNorm eps was sourced from the model config
+  // fp16, int8 and int4 once the RMSNorm eps was sourced from the model config
   // (it had been hardcoded to 1e-5, which corrupted models like Qwen2.5 that use
   // 1e-6 — the corruption compounded badly through int8/int4 quantization).
   // Requires: all layers resident, full attention, standard attention dims, and
@@ -197,11 +197,11 @@ void LlamaEngine::init_greedy_decode_graph() {
 
   for (int layer = 0; layer < cfg.num_layers; ++layer) {
     // Set when a projection folded the residual add into its own epilogue, so the shared
-    // add_inplace below is skipped. The int8 / tq3 branches do NOT fold it and still need
-    // the add -- moving the add into one branch would silently drop the residual for them.
+    // add_inplace below is skipped. The int8 / tq3 branches do not fold it and still need
+    // the add; moving the add into one branch would silently drop the residual for them.
     bool fused_residual = false;
     const auto* lw = &layer_cache_[static_cast<std::size_t>(layer)];
-    // Include lw_i8 when either int8 MLP weights (w1) OR int8 projection weights
+    // Include lw_i8 when either int8 MLP weights (w1) or int8 projection weights
     // (wqkv) are present.  Using only w1 as the gate causes lw_i8=nullptr for
     // models like TinyLlama that have int8 projections but no int8 MLP, which
     // falls through to cublasGemmEx inside graph capture and triggers INVALID_VALUE.
@@ -368,9 +368,9 @@ void LlamaEngine::init_greedy_decode_graph() {
       }
       fused_glu = false;
     } else if (!weights_.config().mlp_gelu) {
-      // FUSED: gate+up GEMV and silu_mul in ONE kernel. At batch 1 every kernel costs a
-      // fixed ~2.7 us of scheduling regardless of how little it does, and that tax -- not
-      // bandwidth -- is what holds a small model off the roofline. The fused kernel rounds
+      // fused: gate+up GEMV and silu_mul in one kernel. At batch 1 every kernel costs a
+      // fixed ~2.7 us of scheduling regardless of how little it does, and that tax; not
+      // bandwidth; is what holds a small model off the roofline. The fused kernel rounds
       // g and u to fp16 before silu(g)*u, exactly as the unfused path does when it stores
       // them between kernels, so the output is byte-identical.
       kernels::launch_swiglu_gemv_f16(
@@ -446,7 +446,7 @@ void LlamaEngine::init_greedy_decode_graph() {
       cudaGraphInstantiate(&greedy_decode_graph_exec_, greedy_decode_graph_, nullptr, nullptr, 0));
 
   // How many kernels does one decoded token actually cost? At batch 1 on a small model,
-  // per-kernel scheduling overhead -- not bandwidth -- is what separates us from the
+  // per-kernel scheduling overhead, not bandwidth, is what separates us from the
   // roofline, so the node count is the number to optimise against.
   if (std::getenv("CPI_GRAPH_NODES")) {
     std::size_t n = 0;
@@ -590,8 +590,8 @@ void LlamaEngine::init_logits_decode_graph() {
 
   for (int layer = 0; layer < cfg.num_layers; ++layer) {
     // Set when a projection folded the residual add into its own epilogue, so the shared
-    // add_inplace below is skipped. The int8 / tq3 branches do NOT fold it and still need
-    // the add -- moving the add into one branch would silently drop the residual for them.
+    // add_inplace below is skipped. The int8 / tq3 branches do not fold it and still need
+    // the add; moving the add into one branch would silently drop the residual for them.
     bool fused_residual = false;
     const auto* lw = &layer_cache_[static_cast<std::size_t>(layer)];
     const LayerDeviceInt8Weights* lw_i8 = (layer < static_cast<int>(layer_cache_i8_.size()) &&
@@ -890,7 +890,7 @@ bool LlamaEngine::decode_next_token_device_topk(int token, int position, float t
   kernels::launch_topk_float(static_cast<const float*>(d_logits_), vocab, k, d_topk_part_val_,
                              d_topk_part_idx_, d_topk_val_, d_topk_idx_, compute_stream_);
   // Threshold = the k-th largest logit, so {i : logit_i >= kth} is exactly the candidate set
-  // the host sampler would have built -- ties at the k-th value included.
+  // the host sampler would have built; ties at the k-th value included.
   kernels::launch_gather_ge_threshold(static_cast<const float*>(d_logits_), vocab,
                                       d_topk_val_ + (k - 1), d_cand_idx_, d_cand_val_,
                                       d_cand_count_, kCandCapacity, compute_stream_);
@@ -899,7 +899,7 @@ bool LlamaEngine::decode_next_token_device_topk(int token, int position, float t
   int count = 0;
   CUDA_CHECK(cudaMemcpy(&count, d_cand_count_, sizeof(int), cudaMemcpyDeviceToHost));
   if (count <= 0 || count > kCandCapacity) {
-    return false;  // pathological tie count -- let the host path handle it
+    return false;  // pathological tie count; let the host path handle it
   }
   std::vector<int> idx(static_cast<std::size_t>(count));
   std::vector<float> val(static_cast<std::size_t>(count));

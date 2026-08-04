@@ -1,8 +1,8 @@
 // Vision-encoder kernels: 2-D RoPE, patch embedding, and spatial average pooling.
 //
 // These are general ops, not a model. A vision tower differs from a text decoder in
-// only a few places -- positions are 2-D, the input is pixels rather than token ids,
-// and the patch grid is pooled down to a fixed number of soft tokens -- and each of
+// only a few places; positions are 2-D, the input is pixels rather than token ids,
+// and the patch grid is pooled down to a fixed number of soft tokens; and each of
 // those is one op here. Everything else (norms, GEMM, GeGLU, attention) is shared.
 
 #include <cuda_fp16.h>
@@ -15,9 +15,9 @@
 namespace kernels {
 namespace {
 
-// 2-D RoPE. The head's channels are split into two halves: the FIRST half rotates by
-// the patch's x coordinate, the SECOND by its y coordinate. Within each half the
-// rotation is rotate_half -- channel j pairs with j + (half/2) -- the same convention
+// 2-D RoPE. The head's channels are split into two halves: the first half rotates by
+// the patch's x coordinate, the second by its y coordinate. Within each half the
+// rotation is rotate_half, channel j pairs with j + (half/2), the same convention
 // the 1-D table kernel already uses, so cos/sin tables are built the same way.
 //
 // Grid: (heads, tokens). Threads: head_dim/2, one per rotated pair across both halves.

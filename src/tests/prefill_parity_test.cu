@@ -1,8 +1,8 @@
 // Sequence-prefill parity: the batched prompt path must agree with token-by-token
-// stepping. This test exists because FOUR stacked prefill defects (driver never batching,
+// stepping. This test exists because four stacked prefill defects (driver never batching,
 // the .cpi route never enabling sequencing, context overflow crashing as a cryptic CUDA
 // error, and quant sequence mode computing only token 0's K/V) all lived behind a suite
-// that stayed green -- nothing compared the two prefill paths.
+// that stayed green; nothing compared the two prefill paths.
 //
 // For each precision (fp16, int4, int8):
 //   1. per-token prefill of a fixed prompt -> greedy next token + logits
@@ -117,9 +117,9 @@ int main(int argc, char** argv) {
       float tol;
     };
     // Quant tolerances are wider: the batched path dequantizes to fp16 GEMMs while the
-    // per-token path quantizes ACTIVATIONS through dp4a -- int4's act-quant noise
+    // per-token path quantizes ACTIVATIONS through dp4a; int4's act-quant noise
     // compounds over 35 layers and measures ~2.3 max on healthy runs (int8 ~0.2, fp16
-    // ~0.05). Garbage KV -- the bug class this test exists for -- differs by ~30+ and
+    // ~0.05). Garbage KV, the bug class this test exists for, differs by ~30+ and
     // flips the argmax, which stays the hard gate.
     const Cfg cfgs[] = {{"fp16", 0, 0.5f}, {"int4", 4, 4.0f}, {"int8", 8, 1.0f}};
     for (const Cfg& c : cfgs) {

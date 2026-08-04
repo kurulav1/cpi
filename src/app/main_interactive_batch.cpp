@@ -8,7 +8,7 @@
 // single worker (start / delta / done / error), tagged by request id, so the
 // Node layer can multiplex several SSE streams onto one worker.
 //
-// Requires a tokenizer + --paged-blocks. Takes the scheduler, NOT an engine: the worker only
+// Requires a tokenizer + --paged-blocks. Takes the scheduler, not an engine: the worker only
 // ever needed admit/step/cancel/active, and engine::BatchScheduler is backend-free, so this
 // whole file no longer knows or cares which GPU is underneath it. That is what took the
 // #if CPI_HAS_CUDA off it.

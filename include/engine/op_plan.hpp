@@ -10,7 +10,7 @@
 // launches whose only variation is per-layer geometry + capability flags
 // (head_dim, kv_heads, sliding vs full, KV-share, k==v, PLE, layer scalar…).
 // Today that variation is resolved with `if`s inside the hot loop, once per
-// token. The op-plan resolves it ONCE at load: the builder walks the model
+// token. The op-plan resolves it once at load: the builder walks the model
 // descriptor and emits a `std::vector<Op>` per layer with every conditional
 // already decided and every weight pointer already bound. The hot loop then
 // just iterates ops — branch-free over identity, and a fixed sequence that a
@@ -83,7 +83,7 @@ enum class OpKind : std::uint8_t {
   Attention,        // single-query attention over the cache (sliding window aware)
   GeluMul,          // out = gelu(a) * b   (GeGLU / PLE gate)
   AddInplace,       // out += in           (residual; out defaults to X)
-  AddRmsNorm,       // FUSED residual add + RMSNorm, never emitted by the builder: the Metal
+  AddRmsNorm,       // fused residual add + RMSNorm, never emitted by the builder: the Metal
                     // engine folds an AddInplace(delta -> X) immediately followed by
                     // RmsNorm(X -> XNorm) into one pass. in = delta, aux slot = X (residual,
                     // updated in place), out = XNorm. Saves a full read+write of the residual.
@@ -155,7 +155,7 @@ struct Op {
   // Llama's do not). nullptr = no bias, which is every model the CUDA executor
   // currently plans, so its behaviour is unchanged.
   //
-  // The .ll2c stores Q/K/V's biases FUSED as one `attention.bqkv` tensor laid out
+  // The .ll2c stores Q/K/V's biases fused as one `attention.bqkv` tensor laid out
   // [bq | bk | bv], so all three ops point at the same handle and are distinguished
   // by bias_offset (in elements, not bytes).
   const void* bias = nullptr;
@@ -192,15 +192,15 @@ struct Op {
   Slot out2 = Slot::X;       // SplitHeadHalves' second output (the gate half)
   bool norm_offset = false;  // RmsNorm uses (1 + weight) instead of weight
   // MoeGateUpGeglu: the expert FFN's gate activation. The op's name says Geglu because Gemma 4
-  // -- its first tenant -- is GeGLU, but Mixtral's experts are SwiGLU, so the activation has to
+  //, its first tenant, is GeGLU, but Mixtral's experts are SwiGLU, so the activation has to
   // travel with the op rather than with its name.
   //
-  // DEFAULTS TRUE, which is deliberate: Gemma 4's builder predates this field and does not set
+  // defaults true, which is deliberate: Gemma 4's builder predates this field and does not set
   // it, and the CUDA kernel hardcodes tanh-GELU. Defaulting false would make an unset field mean
   // "SiLU", so the day someone wires this flag into that kernel, Gemma 4 would silently change
   // activation and produce fluent nonsense. True means "unset == what it does today".
   bool mlp_gelu = true;
-  // MoeRouterTopk: renormalise the selected experts' softmax probs to sum 1. DEFAULTS TRUE (Gemma /
+  // MoeRouterTopk: renormalise the selected experts' softmax probs to sum 1. defaults true (Gemma /
   // Mixtral). DeepSeek-V2-Lite sets norm_topk_prob=false, so it emits this false to keep the raw
   // top-k softmax weights.
   bool moe_renorm = true;
@@ -221,7 +221,7 @@ struct Op {
   // Clipped projections (Gemma 4 E2B's vision tower ships per-projection activation
   // bounds and CLAMPS both the input and the output of every linear). Infinite by
   // default, so every other model's Gemv is untouched. The INPUT clamp is the one
-  // that matters numerically -- it changes the dot product, not just its range.
+  // that matters numerically; it changes the dot product, not just its range.
   float clip_in_min = -std::numeric_limits<float>::infinity();
   float clip_in_max = std::numeric_limits<float>::infinity();
   float clip_out_min = -std::numeric_limits<float>::infinity();
@@ -238,10 +238,10 @@ struct LayerPlan {
 };
 
 struct ModelPlan {
-  // Index into `prologue` at which the token embeddings are FINAL -- i.e. straight after
-  // the embedding lookup and its scale, and BEFORE anything that reads them. Multimodal
+  // Index into `prologue` at which the token embeddings are FINAL; i.e. straight after
+  // the embedding lookup and its scale, and before anything that reads them. Multimodal
   // prefill splices image embeddings in here. It matters: Gemma E2B projects its
-  // per-layer inputs FROM the embeddings, so splicing after the prologue would compute
+  // per-layer inputs from the embeddings, so splicing after the prologue would compute
   // them from the placeholder token instead of the image (HF projects them post-scatter).
   std::size_t embed_ready = 0;
   std::vector<Op> prologue;       // token → embeddings (+ scale, PLE build)

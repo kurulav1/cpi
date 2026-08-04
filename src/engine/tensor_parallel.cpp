@@ -93,7 +93,7 @@ void TensorParallelLinear::initialize(int world_size, int in_features, int out_f
 // batch is constant during inference.
 void TensorParallelLinear::forward(const void* d_input_fp16, int batch, void* d_output_fp16,
                                    cudaStream_t stream) {
-  int row_off = 0;  // this shard's first output row, WITHIN a column (element offset)
+  int row_off = 0;  // this shard's first output row, within a column (element offset)
 
   constexpr float alpha = 1.0f;
   constexpr float beta = 0.0f;
@@ -219,8 +219,8 @@ void RowParallelLinear::forward(const std::vector<const void*>& shard_inputs_fp1
                               out_features_, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
   }
 
-  // ALL-REDUCE (sum) the partials -> d_output. On a single GPU every partial lives on device 0, so
-  // this is a local add-chain. For real multi-GPU this exact step becomes ncclAllReduce(SUM) -- the
+  // all-REDUCE (sum) the partials -> d_output. On a single GPU every partial lives on device 0, so
+  // this is a local add-chain. For real multi-GPU this exact step becomes ncclAllReduce(SUM); the
   // one cluster-gated piece; everything above is verifiable here.
   CUDA_CHECK(cudaSetDevice(contexts_[0].device));
   CUDA_CHECK(cudaMemcpyAsync(d_output_fp16, contexts_[0].d_partial, out_bytes,

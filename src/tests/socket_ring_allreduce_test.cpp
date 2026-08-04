@@ -1,9 +1,9 @@
-// Verifies the ring all-reduce over REAL TCP sockets (engine/socket_ring.hpp) -- the multi-process
+// Verifies the ring all-reduce over real TCP sockets (engine/socket_ring.hpp); the multi-process
 // collective prototype that stands in for a cluster we don't have. Each rank is a std::thread that is a
-// genuine TCP endpoint on 127.0.0.1; ranks share NO memory and communicate only over sockets, so this
+// genuine TCP endpoint on 127.0.0.1; ranks share no memory and communicate only over sockets, so this
 // exercises the actual distributed control flow (ring connect handshake, scatter-reduce + all-gather,
-// partial send/recv) exactly as separate processes on separate nodes would -- only the transport
-// underneath (loopback here, NCCL/NIC on a cluster) differs. Element counts are chosen NOT divisible by
+// partial send/recv) exactly as separate processes on separate nodes would; only the transport
+// underneath (loopback here, NCCL/NIC on a cluster) differs. Element counts are chosen not divisible by
 // the world size so the ragged balanced-block split is exercised. Result is checked against the naive
 // elementwise sum.
 #include <atomic>
@@ -25,7 +25,7 @@
 namespace {
 
 // Rank r contributes input[i] = r*count + i (all integer-valued, exact in fp32 for these sizes). The
-// elementwise sum over R ranks is then count*R*(R-1)/2 + R*i -- a closed form we can check exactly, and
+// elementwise sum over R ranks is then count*R*(R-1)/2 + R*i; a closed form we can check exactly, and
 // the per-rank ramp makes any block-boundary or block-index mistake in the ring show up as a mismatch.
 float expected(int i, int world, int count) {
   return static_cast<float>(count) * world * (world - 1) / 2.0f + static_cast<float>(world) * i;
@@ -76,7 +76,7 @@ int main() {
 
   int fail = 0;
   int idx = 0;
-  // world=1 is the trivial no-op ring; the rest each use a count NOT divisible by the world size so the
+  // world=1 is the trivial no-op ring; the rest each use a count not divisible by the world size so the
   // ragged block split (last blocks shorter) is exercised, not just the clean case.
   for (int world : {1, 2, 3, 4, 8}) {
     const uint16_t base = static_cast<uint16_t>(pid_base + idx++ * 16);

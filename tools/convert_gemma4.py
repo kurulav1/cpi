@@ -2,13 +2,13 @@
 """Convert a HuggingFace Gemma 4 checkpoint to a CPI Gemma4 weight file.
 
 Gemma 4 is a dedicated engine fork (see memory: cpi-gemma4-arch), not a
-LlamaEngine absorb. This extracts the TEXT tower only (ignores vision_tower /
+LlamaEngine absorb. This extracts the text tower only (ignores vision_tower /
 audio_tower), converts bf16 -> fp16, and writes a safetensors-format blob
 (same container as .ll2c: 8-byte LE header length, JSON directory, raw data)
 plus an embedded __metadata__ config block the engine reads.
 
 Unlike Gemma 1/2/3, Gemma4RMSNorm uses scale = w (weight init to ones), so we
-do NOT fold +1 into norm weights. Embedding scale (sqrt(hidden)) and per-layer
+do not fold +1 into norm weights. Embedding scale (sqrt(hidden)) and per-layer
 scales are applied at runtime by the engine.
 
 Usage:
@@ -67,7 +67,7 @@ def main():
     nl = tc["num_hidden_layers"]
     layer_types = tc["layer_types"]
 
-    # Actual per-layer head_dim comes from the WEIGHTS (q_norm.weight length),
+    # Actual per-layer head_dim comes from the weights (q_norm.weight length),
     # not config: E2B's full layers use global_head_dim=512, but 12B's use 256
     # even though both configs advertise global_head_dim=512.
     def q_norm_dim(L):
@@ -181,7 +181,7 @@ def main():
     cfg["kv_source"] = kv_source
     cfg["first_shared_layer"] = first_shared
 
-    # Pass 1: compute fp16 byte offsets from shapes WITHOUT loading data (a 12B
+    # Pass 1: compute fp16 byte offsets from shapes without loading data (a 12B
     # text tower is ~23GB — buffering all tensors in RAM blows up the pagefile).
     out_hdr = {}
     offset = 0
@@ -196,7 +196,7 @@ def main():
         if out_name.endswith(("experts.gate_up_proj", "experts.down_proj")):
             # 3-D [E, A, B] experts are contiguous row-major; store as 2-D [E*A, B] so the
             # engine treats them as one tall matrix (an expert = a row offset) and quantizes
-            # them -- upload_int4 only quantizes 2-D manifest shapes, else falls back to fp16.
+            # them; upload_int4 only quantizes 2-D manifest shapes, else falls back to fp16.
             shape = [shape[0] * shape[1], shape[2]]
         nbytes = 2  # fp16
         for d in shape:
@@ -227,7 +227,7 @@ def main():
 
     # Robust, dependency-free sidecar the C++ engine parses (avoids JSON parsing
     # in the loader). data_start = 8 + len(hdr_json); tensor offsets are relative
-    # to data_start. One TENSOR line per tensor: name dtype d0,d1,... offset bytes.
+    # to data_start. One tensor line per tensor: name dtype d0,d1,... offset bytes.
     data_start = 8 + len(hdr_json)
     man = os.path.splitext(args.out)[0] + ".manifest"
     with open(man, "w", encoding="utf-8") as f:
@@ -238,7 +238,7 @@ def main():
                 f.write(f"CFGJSON {k} {json.dumps(v)}\n")
             else:
                 f.write(f"CFG {k} {v}\n")
-        # Reasoning ("thinking") descriptor — SHIPS WITH THE MODEL so the runtime
+        # Reasoning ("thinking") descriptor — SHIPS with the model so the runtime
         # carries no per-model knowledge (it just reads this). Gemma 4 enables
         # thinking with a <|think|> system turn and delimits the reasoning block in
         # its output with the special tokens <|channel> … <channel|>, which the

@@ -1,12 +1,12 @@
 #pragma once
 
-// Reusable Multi-head Latent Attention (MLA) forward -- the DeepSeek-V2/V3/R1 attention -- promoted out
+// Reusable Multi-head Latent Attention (MLA) forward, the DeepSeek-V2/V3/R1 attention, promoted out
 // of mla_attention_test so it can be composed into a decoder stack (deepseek_mla_stack_test) and, once
 // a native-MLA checkpoint is in hand, wired into the engine. fp32, "naive reconstruction" form: cache
 // the low-rank latent c_KV + the shared decoupled RoPE key k_R, up-project per-head K/V each step. See
 // mla_attention_test for the standalone device-vs-oracle correctness proof (max rel ~1.9e-7).
 //
-// Provides BOTH a device path (small hand-rolled kernels) and an independent host path, so a caller can
+// Provides both a device path (small hand-rolled kernels) and an independent host path, so a caller can
 // oracle one against the other. Scratch is allocated per call (verification/prototype code, not the
 // hot path). Layouts are row-major; weights are [out, in] (y_n = dot(row, weight_n)).
 
@@ -30,7 +30,7 @@ struct MLADims {
   int hd() const { return qk_nope + qk_rope; }
 };
 
-// Device pointers for the device path, host pointers for the host path -- same struct, caller supplies
+// Device pointers for the device path, host pointers for the host path; same struct, caller supplies
 // the right memory space.
 struct MLAWeights {
   const float* WDQ = nullptr;   // [q_lora, H]
@@ -112,7 +112,7 @@ inline float* alloc(size_t n) {
   return p;
 }
 
-// Host mirrors (independent implementation -- valid as an oracle for the device path).
+// Host mirrors (independent implementation; valid as an oracle for the device path).
 inline void mm_host(const float* A, const float* W, float* C, int M, int N, int K) {
   for (int m = 0; m < M; ++m)
     for (int n = 0; n < N; ++n) {

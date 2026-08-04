@@ -2,7 +2,7 @@
 //
 // The DEFLATE side is a straight canonical-Huffman inflater. The only subtlety worth
 // calling out is that DEFLATE packs bits LSB-first within a byte, but Huffman CODES are
-// read MSB-first -- a bit reader that gets that backwards decodes the fixed-Huffman
+// read MSB-first; a bit reader that gets that backwards decodes the fixed-Huffman
 // blocks fine and then falls apart on dynamic ones, which is a miserable bug to chase.
 // Here, read_bits() is LSB-first and decode_symbol() walks the code bit by bit,
 // accumulating in code-order.
@@ -65,7 +65,7 @@ class BitReader {
 };
 
 // Canonical Huffman, built from code lengths (RFC 1951 §3.2.2). Decoding walks the code
-// one bit at a time, comparing against the first code of each length -- simple, and fast
+// one bit at a time, comparing against the first code of each length; simple, and fast
 // enough that image decode is nowhere near the bottleneck.
 class Huffman {
  public:

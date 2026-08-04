@@ -1,7 +1,7 @@
 // Reference-oracle parity for decode attention (Phase 0 safety net).
 //
 // Unlike paged_attention_parity_test (which checks paged == contiguous — a
-// self-consistency test that passes even when BOTH paths are wrong the same
+// self-consistency test that passes even when both paths are wrong the same
 // way), this test compares launch_attention_step against an INDEPENDENT naive
 // float reference computed on the host. It sweeps head_dim ∈ {64,128,256} and a
 // range of GQA ratios so a kernel that assumes head_dim <= blockDim (the class
@@ -34,7 +34,7 @@
 namespace {
 
 // Host reference: naive per-head softmax attention over `seq_len` cached tokens,
-// reading the SAME fp16 values the kernel reads (via __half2float) so the only
+// reading the same fp16 values the kernel reads (via __half2float) so the only
 // difference is float summation order. K/V layout is [seq_len, num_kv_heads,
 // head_dim] row-major, matching cache_index(t, kv, d) = (t*num_kv_heads+kv)*head_dim+d.
 void reference_attention(const std::vector<half>& q, const std::vector<half>& k,

@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Text-only logits oracle for Qwen3.5 -- the control the multimodal gate needs.
+"""Text-only logits oracle for Qwen3.5, the control the multimodal gate needs.
 
 FIRST_STEP_LOGITS showed the Metal port's multimodal logits differ from HuggingFace's by
 mean_abs 0.64 at the very first generated step. That is far too large to be fp16 noise, but it
-does not say WHERE: the tower, the splice, M-RoPE and the text stack are all upstream of it.
+does not say where: the tower, the splice, M-RoPE and the text stack are all upstream of it.
 
 This isolates the text stack. Same model, same engine, no image: no tower, no splice, and 1-D
 rope instead of M-RoPE. If the port's text-only logits match this, the defect is in the
 multimodal-specific path. If they drift the same way, vision is a red herring and the text stack
-is wrong -- which nothing would currently catch, because Qwen3.5 has no text gate in src/tests.
+is wrong, which nothing would currently catch, because Qwen3.5 has no text gate in src/tests.
 
     python tools/qwen35_text_oracle.py --model ~/models/qwen35-0.8b-hf --out ~/models/q35_text
 
@@ -51,7 +51,7 @@ def main() -> int:
     (out_dir / "text_first_step_logits.f32").write_bytes(
         logits.numpy().astype("<f4").tobytes())
 
-    # Greedy continuation too, by re-running the full forward each step -- no KV cache, so a
+    # Greedy continuation too, by re-running the full forward each step; no KV cache, so a
     # cache bug on either side cannot quietly align the two.
     stream, cur = [], list(ids)
     for _ in range(args.steps):

@@ -15,7 +15,7 @@ namespace {
 
 // A projection. Asks the backend whether it wants this weight quantized; if so the op
 // carries the packed handle and its scales instead of the fp16 one, and the executor
-// dispatches a weight-only matvec. Norms and the embedding table are never quantized --
+// dispatches a weight-only matvec. Norms and the embedding table are never quantized
 // they are lookups and elementwise scales, not matmuls, and quantizing them buys
 // nothing while costing accuracy.
 Op gemv(Slot in, Slot out, const WeightSource& w, const std::string& name, int out_dim,
@@ -145,9 +145,9 @@ ModelPlan build_llama_plan(const LlamaGeometry& g, const WeightSource& w) {
       lp.ops.push_back(v);
     }
 
-    // Qwen3: per-head RMSNorm on Q and K, after projection and BEFORE RoPE. One
+    // Qwen3: per-head RMSNorm on Q and K, after projection and before RoPE. One
     // [head_dim] weight shared across heads, so it is the ordinary RmsNorm op with
-    // rows = heads -- a new capability, not a new kernel.
+    // rows = heads; a new capability, not a new kernel.
     if (g.has_qk_norm) {
       Op qn = rmsnorm(Slot::Q, Slot::Q, w.fp16(p + "attention.q_norm"), g.head_dim, g.rms_eps,
                       g.norm_offset);
@@ -160,7 +160,7 @@ ModelPlan build_llama_plan(const LlamaGeometry& g, const WeightSource& w) {
       lp.ops.push_back(kn);
     }
 
-    // RoPE rotates Q and K in place. Two ops -- they differ only in head count,
+    // RoPE rotates Q and K in place. Two ops; they differ only in head count,
     // and keeping them separate is what lets a GQA model share one kernel.
     {
       Op q;
@@ -209,14 +209,14 @@ ModelPlan build_llama_plan(const LlamaGeometry& g, const WeightSource& w) {
     lp.ops.push_back(gemv(Slot::Att, Slot::Tmp, w, p + "attention.wo", g.hidden, q_dim));
     lp.ops.push_back(add_inplace(Slot::Tmp));
 
-    // MLP block. Dense SwiGLU/GeGLU, or -- for an MoE model -- router + selected experts.
+    // MLP block. Dense SwiGLU/GeGLU, or, for an MoE model, router + selected experts.
     // The norm and the residual add are shared: only what sits between them differs.
     lp.ops.push_back(rmsnorm(Slot::X, Slot::XNorm, w.fp16(p + "ffn_norm.weight"), g.hidden,
                              g.rms_eps, g.norm_offset));
     if (g.num_experts > 0) {
       const int einter = g.expert_inter > 0 ? g.expert_inter : g.inter;
       // Router logits: [experts]. Tiny (experts x hidden), so it stays fp16 even when the
-      // projections are quantized -- quantizing a matrix this small buys nothing and the
+      // projections are quantized; quantizing a matrix this small buys nothing and the
       // routing decision is the one place an error picks a different expert outright.
       lp.ops.push_back(gemv(Slot::XNorm, Slot::MoeLogits, w, p + "feed_forward.router",
                             g.num_experts, g.hidden));
@@ -232,7 +232,7 @@ ModelPlan build_llama_plan(const LlamaGeometry& g, const WeightSource& w) {
       }
       {
         // Per selected expert: act(gate) * up -> MoeInter[k]. Mixtral is SwiGLU, and the op
-        // name says Geglu for historical reasons -- the kernel takes the activation from the
+        // name says Geglu for historical reasons; the kernel takes the activation from the
         // geometry, as the dense path does.
         Op o;
         o.kind = OpKind::MoeGateUpGeglu;
@@ -284,7 +284,7 @@ ModelPlan build_llama_plan(const LlamaGeometry& g, const WeightSource& w) {
   plan.epilogue.push_back(
       rmsnorm(Slot::X, Slot::XNorm, w.fp16("norm.weight"), g.hidden, g.rms_eps, g.norm_offset));
   {
-    // A tied LM head reuses the embedding table -- same weights, transposed use.
+    // A tied LM head reuses the embedding table; same weights, transposed use.
     const bool untied = w.has("output.weight");
     const std::string head = untied ? "output.weight" : "tok_embeddings.weight";
     Op o;
@@ -294,11 +294,11 @@ ModelPlan build_llama_plan(const LlamaGeometry& g, const WeightSource& w) {
     o.in_dim = g.hidden;
 
     // The LM head is the single biggest read of a decode step (vocab x hidden), so it
-    // is the most valuable thing to quantize -- tied or not. A tied head shares WEIGHTS
+    // is the most valuable thing to quantize; tied or not. A tied head shares weights
     // with the embedding table, not storage: WeightSource::quant packs a separate copy,
     // and the EmbeddingLookup op keeps its own fp16 handle, so the lookup is untouched.
     // (This used to skip tied heads, which left Qwen2.5 and Gemma paying a full fp16
-    // vocab x hidden read per token in every quant mode -- the single largest slice of
+    // vocab x hidden read per token in every quant mode; the single largest slice of
     // their decode traffic.)
     const QuantWeight q = w.quant(head, g.vocab, g.hidden);
     if (q.bits != 0) {
@@ -345,8 +345,8 @@ ModelPlan build_qwen35_plan(const Qwen35Geometry& g, const WeightSource& w) {
     lp.layer_index = L;
     auto& ops = lp.ops;
 
-    // Qwen3.5 scales by (1 + w), and unlike Gemma the converter does NOT fold the +1 into the
-    // stored weights -- that fold is gated on the Gemma family. So the offset is applied here,
+    // Qwen3.5 scales by (1 + w), and unlike Gemma the converter does not fold the +1 into the
+    // stored weights; that fold is gated on the Gemma family. So the offset is applied here,
     // matching the CUDA and CPU implementations. Getting it wrong scales every norm by ~2 and
     // compounds; it would surface as a divergence at the very first layer.
     auto rms = [&](Slot in, Slot out, const std::string& t, int rows, int cols) {
@@ -389,7 +389,7 @@ ModelPlan build_qwen35_plan(const Qwen35Geometry& g, const WeightSource& w) {
 
     if (!g.layer_is_linear[static_cast<std::size_t>(L)]) {
       // ---- gated full attention ----
-      // wq is TWICE q_dim: it projects [q | gate] per head, and the gate multiplies the attention
+      // wq is twice q_dim: it projects [q | gate] per head, and the gate multiplies the attention
       // output before o_proj. Treating it as an ordinary q projection reads a head_dim twice the
       // real one and converts cleanly into nonsense.
       rms(Slot::X, Slot::XNorm, "attention_norm.weight", 1, H);
@@ -455,8 +455,8 @@ ModelPlan build_qwen35_plan(const Qwen35Geometry& g, const WeightSource& w) {
       gemv(Slot::Att, Slot::Tmp, "attention.wo", H, q_dim);
     } else {
       // ---- gated delta-net ----
-      // These layers ARE pre-normed, exactly like the attention ones -- the four projections read
-      // the normalised state, not the raw residual. linear_attn.norm is a SECOND norm inside the
+      // These layers are pre-normed, exactly like the attention ones; the four projections read
+      // the normalised state, not the raw residual. linear_attn.norm is a second norm inside the
       // block (value_head_dim wide, gated by z) and does not stand in for this one. Feeding the
       // projections raw X leaves the whole block orthogonal to the reference at layer 1.
       rms(Slot::X, Slot::XNorm, "attention_norm.weight", 1, H);
@@ -578,7 +578,7 @@ ModelPlan build_gemma4_plan(const Gemma4Geometry& g, const WeightSource& w) {
     o.rows = rows;
     o.cols = cols;
     o.eps = g.rms_eps;
-    return o;  // NOTE: norm_offset stays false -- Gemma 4 stores raw gains, not (w - 1).
+    return o;  // NOTE: norm_offset stays false; Gemma 4 stores raw gains, not (w - 1).
   };
   auto scale = [&](Slot s, int len, float sc) {
     Op o;
@@ -606,7 +606,7 @@ ModelPlan build_gemma4_plan(const Gemma4Geometry& g, const WeightSource& w) {
     std::vector<Op>& pro = plan.prologue;
     pro.push_back(embed(WP + "embed_tokens.weight", Slot::X, H));
     pro.push_back(scale(Slot::X, H, std::sqrt(static_cast<float>(H))));
-    // Image embeddings splice in HERE, before anything reads X -- and the per-layer-input
+    // Image embeddings splice in here, before anything reads X; and the per-layer-input
     // projection below DOES read X, which is why this marker is before it and not after the
     // prologue (HF projects the per-layer inputs from the post-scatter embeddings).
     plan.embed_ready = pro.size();
@@ -642,13 +642,13 @@ ModelPlan build_gemma4_plan(const Gemma4Geometry& g, const WeightSource& w) {
     LayerPlan& lp = plan.layers[L];
     lp.layer_index = L;
     std::vector<Op>& ops = lp.ops;
-    // Gemma 4's two RoPE configurations. rope_table names WHICH for backends that precompute
+    // Gemma 4's two RoPE configurations. rope_table names which for backends that precompute
     // tables (CUDA); scale and rotary_dim carry the same choice as VALUES, for backends that
     // compute the angles in-shader (Metal, which does not look at rope_table at all). Both are set
-    // because the plan is one description shared by both executors -- setting only the enum leaves
+    // because the plan is one description shared by both executors; setting only the enum leaves
     // Metal on Op::scale's default theta of 1.0, i.e. every lane at the same frequency.
     const float theta = full ? g.rope_theta_full : g.rope_theta_sliding;
-    // Partial rotary applies to the FULL layers only, and must be even -- an odd count leaves a
+    // Partial rotary applies to the full layers only, and must be even; an odd count leaves a
     // half-pair no rotation kernel can turn. 0 means "all of head_dim", which is what the sliding
     // layers want.
     int rot = 0;
@@ -675,12 +675,12 @@ ModelPlan build_gemma4_plan(const Gemma4Geometry& g, const WeightSource& w) {
     ops.push_back(gemv(Slot::XNorm, Slot::Q, w, p + "self_attn.q_proj.weight", qdim, H));
     ops.push_back(norm(Slot::Q, Slot::Q, w.fp16(p + "self_attn.q_norm.weight"), nq, hd));
     ops.push_back(rope(Slot::Q, nq));
-    // A KV-SHARED layer projects no K/V at all: it reads the cache another layer filled. Emitting
+    // A KV-shared layer projects no K/V at all: it reads the cache another layer filled. Emitting
     // the projections anyway would not just waste work, it would overwrite that cache.
     if (!shared) {
       ops.push_back(gemv(Slot::XNorm, Slot::K, w, p + "self_attn.k_proj.weight", kvdim, H));
       if (g.k_eq_v(L)) {
-        Op c;  // V shares the RAW k_proj output -- copied before k_norm and rope touch K.
+        Op c;  // V shares the raw k_proj output; copied before k_norm and rope touch K.
         c.kind = OpKind::CopySlot;
         c.in = Slot::K;
         c.out = Slot::V;
@@ -692,9 +692,9 @@ ModelPlan build_gemma4_plan(const Gemma4Geometry& g, const WeightSource& w) {
       ops.push_back(norm(Slot::K, Slot::K, w.fp16(p + "self_attn.k_norm.weight"), nkv, hd));
       ops.push_back(rope(Slot::K, nkv));
       ops.push_back(norm(Slot::V, Slot::V, nullptr, nkv, hd));  // weightless v-norm (ones)
-      // Every field matters here, and CUDA's own Gemma builder sets only `cols` -- its executor
+      // Every field matters here, and CUDA's own Gemma builder sets only `cols`; its executor
       // reads the K and V slots by hardcoded name, so the rest is implied. The Metal executor
-      // takes them FROM THE OP (slot(op.in), slot(op.in2), op.kv_heads, op.head_dim), so an
+      // takes them from the OP (slot(op.in), slot(op.in2), op.kv_heads, op.head_dim), so an
       // under-specified KvStore writes nothing, the cache stays zero, and attention then
       // correctly returns zero over an empty cache. That is the same mistake as leaving
       // Op::scale unset on the Rope ops: a plan is one description read by two executors, so it
@@ -719,7 +719,7 @@ ModelPlan build_gemma4_plan(const Gemma4Geometry& g, const WeightSource& w) {
       a.full_attention = full;
       a.sliding_window = g.sliding_window;
       // Gemma 4 specifies a NET attention scale of 1.0, and the Metal executor applies
-      // op.scale directly -- so state 1.0 here rather than pre-scaling Q by sqrt(head_dim)
+      // op.scale directly; so state 1.0 here rather than pre-scaling Q by sqrt(head_dim)
       // with a ScaleCopy and cancelling it against 1/sqrt(head_dim). The old pair cost a
       // dispatch per layer and an extra fp16 rounding of Q. (CUDA's own Gemma builder keeps
       // the pre-scale because its kernel applies 1/sqrt(head_dim) internally; if it ever
@@ -736,7 +736,7 @@ ModelPlan build_gemma4_plan(const Gemma4Geometry& g, const WeightSource& w) {
     ops.push_back(gemv(Slot::XNorm, Slot::Gate, w, p + "mlp.gate_proj.weight", inter, H));
     ops.push_back(gemv(Slot::XNorm, Slot::Up, w, p + "mlp.up_proj.weight", inter, H));
     // NOTE: no fp16 headroom scaling here, deliberately. The GeGLU product DID overflow fp16
-    // while attention was returning zero -- an unattenuated residual made the pre-FFN norm huge --
+    // while attention was returning zero; an unattenuated residual made the pre-FFN norm huge
     // but that was a consequence of the under-specified KvStore, not a property of the model.
     // With attention working, this product peaks around 45 against a 65504 ceiling. A scale op per
     // layer to fix a problem that no longer exists is just cost. The shader keeps a clamp as a
@@ -809,8 +809,8 @@ ModelPlan build_gemma4_plan(const Gemma4Geometry& g, const WeightSource& w) {
 // through WeightSource instead of a device-pointer map. Keep the two in lockstep until CUDA
 // delegates here; the cross-backend soft-token gate is what catches drift meanwhile.
 //
-// Same RMSNorm note as the text plan: PLAIN rmsnorm, no (1 + w) offset. The vision Attention op
-// carries NO scale of its own -- a ScaleCopy pre-multiplies Q by sqrt(head_dim) so the kernel's
+// Same RMSNorm note as the text plan: plain rmsnorm, no (1 + w) offset. The vision Attention op
+// carries no scale of its own; a ScaleCopy pre-multiplies Q by sqrt(head_dim) so the kernel's
 // 1/sqrt(head_dim) cancels to the tower's scaling of 1.0. Executors apply 1/sqrt(head_dim),
 // not Op::scale, exactly as they do for text.
 ModelPlan build_gemma4_vision_plan(const Gemma4VisionGeometry& g, const WeightSource& w) {
@@ -860,7 +860,7 @@ ModelPlan build_gemma4_vision_plan(const Gemma4VisionGeometry& g, const WeightSo
       o.in_dim = in_dim;
       o.weight = w.fp16(p + t);
       if (g.clipped_linears) {
-        // "<proj>.linear.weight" -> "<proj>." -- the bounds live beside the projection.
+        // "<proj>.linear.weight" -> "<proj>."; the bounds live beside the projection.
         const std::string tn(t);
         const std::string base = p + tn.substr(0, tn.find("linear.weight"));
         o.clip_in_min = w.scalar(base + "input_min");
@@ -888,7 +888,7 @@ ModelPlan build_gemma4_vision_plan(const Gemma4VisionGeometry& g, const WeightSo
       ops.push_back(o);
     };
 
-    // The same sandwich-norm shape as a Gemma TEXT layer. The differences are that
+    // The same sandwich-norm shape as a Gemma text layer. The differences are that
     // attention is bidirectional and the positions are 2-D.
     rms(Slot::X, Slot::XNorm, w.fp16(p + "input_layernorm.weight"), 1, H);
     gemv(Slot::XNorm, Slot::Q, "self_attn.q_proj.linear.weight", qdim, H);
@@ -941,7 +941,7 @@ ModelPlan build_gemma4_vision_plan(const Gemma4VisionGeometry& g, const WeightSo
   }
 
   // Epilogue: standardize, when the checkpoint has it (E2B does not). Pooling and projection
-  // are NOT ops -- pooling changes the token count, so the executor has to be re-entered with
+  // are not ops; pooling changes the token count, so the executor has to be re-entered with
   // the new count; see encode_image.
   if (g.standardize) {
     Op o;

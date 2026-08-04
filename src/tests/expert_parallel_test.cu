@@ -1,4 +1,4 @@
-// Verifies expert-parallel MoE on a single GPU: shard the experts across N ranks, run the REAL MoE
+// Verifies expert-parallel MoE on a single GPU: shard the experts across N ranks, run the real MoE
 // kernels (gate_up_geglu + down_accum) on each rank's expert sub-matrix with dispatched local indices
 // + masked weights, sum the per-rank outputs, and check the result matches the all-local MoE. Brick 3
 // of multi-GPU prep; the per-rank sum is the all_to_all-combine seam that becomes a collective on a

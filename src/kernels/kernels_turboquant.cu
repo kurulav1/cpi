@@ -115,7 +115,7 @@ __global__ void tq3_gemv_f16_kernel(const uint32_t* __restrict__ w_packed,
     for (int k = 0; k < 10; ++k) {
       const int j = base_j + k;
       const int idx = (packed >> (k * 3)) & 0x7;
-      // __shfl_sync MUST be called unconditionally by all warp lanes so the
+      // __shfl_sync must be called unconditionally by all warp lanes so the
       // 0xFFFFFFFF convergence requirement is satisfied.  The j < in_features
       // guard below prevents accumulating out-of-range elements.
       const float cb_val = __shfl_sync(0xFFFFFFFF, my_cb, idx);

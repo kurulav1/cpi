@@ -1,4 +1,4 @@
-// shard_planner -- pre-deployment "will it fit, on how many GPUs" report. Reads a model's config.json
+// shard_planner; pre-deployment "will it fit, on how many GPUs" report. Reads a model's config.json
 // (or takes dims on the command line), then prints the EXACT per-rank VRAM footprint for a chosen
 // tensor/pipeline/expert split and scans for the minimum world size that fits a target GPU. Pure host
 // arithmetic (no GPU, no cluster); validate it by checking world=1 reproduces the known single-GPU

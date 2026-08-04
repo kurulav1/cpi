@@ -13,7 +13,7 @@ per-kernel perf regression check.
 Notes:
 - Run with the GPU otherwise idle (stop the web server) — a co-resident model
   adds contention/clock noise (~8-10%) that inflates false positives.
-- The metric is GB/s (higher is better); the gate flags DROPS below baseline.
+- The metric is GB/s (higher is better); the gate flags drops below baseline.
 - Each shape is measured best-of-N (--repeat, default 3): the max over runs is
   the least clock/thermal/contention-perturbed estimate, so it is reproducible
   run-to-run. Single-shot benching swings 40%+ on the high-batch/long-context
@@ -40,7 +40,7 @@ BASELINE = Path(__file__).resolve().parent / "kernel_perf_baseline.json"
 # attention_decode is different: its high-batch/long-context shapes have a ~40-45%
 # run-to-run NOISE FLOOR here (one shape swung -32/-39/-41/-45% across windows that
 # changed nothing). The cause is cross-window thermal/clock drift — best-of-N absorbs
-# drift WITHIN a window but not the temperature difference BETWEEN a baseline capture
+# drift within a window but not the temperature difference between a baseline capture
 # and a gate run minutes later. On a consumer WDDM GPU that floor is irreducible for a
 # wall-clock-throttled microbench, so the attention gate is deliberately coarse: it
 # only catches GROSS regressions (fallback kernel / wrong head_dim path / disabled

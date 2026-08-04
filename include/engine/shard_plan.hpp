@@ -2,20 +2,20 @@
 
 // Shard-fit / memory planner: given a model's dimensions, a weight/KV quantisation, and a 3D
 // parallelism split (tensor x pipeline x expert), compute the EXACT per-rank VRAM footprint and scan
-// for the minimum world size that fits a target GPU. Pure host arithmetic -- no GPU, no cluster -- so
+// for the minimum world size that fits a target GPU. Pure host arithmetic, no GPU, no cluster, so
 // it runs anywhere and is verifiable by reproducing the known single-GPU footprints at world=1.
 //
 // The per-tensor byte formulas mirror the engine's own resident-footprint accounting
 // (llama_engine_cache.cpp): fp16 = rows*cols*2; int8 = rows*cols + one fp32 scale per output row;
 // int4 = rows*ceil(cols/2) + one fp32 scale per output row (per-row scales, the engine default). This
-// is a structural estimate of WEIGHTS + KV; a coarse activation working-set is reported separately and
+// is a structural estimate of weights + KV; a coarse activation working-set is reported separately and
 // labelled, since it is workload-dependent, not a fixed allocation.
 //
 // The `weight_quant` here is applied UNIFORMLY to every weight; the engine actually runs MIXED
 // precision (MLP at this quant, projections int8, embedding/head fp16 on CUDA). The int4-MLP dominates
-// so the total still lands on the real footprint -- validated against the known world=1 numbers:
+// so the total still lands on the real footprint; validated against the known world=1 numbers:
 // Llama-8B fp16 = 8.03B*2 exactly, Qwen-32B int4 @32k ctx ~= 24.9 GB, Gemma-4 26B-A4B int4 experts
-// ~= 12 GB -- but treat the per-component lines as an approximation of the true per-tensor policy.
+// ~= 12 GB; but treat the per-component lines as an approximation of the true per-tensor policy.
 //
 // Sharding model (standard 3D mesh, world = tp * pp * ep):
 //   * pp (pipeline): a rank owns ceil(num_layers / pp) contiguous layers. The embedding sits on the
@@ -146,7 +146,7 @@ inline Footprint estimate_footprint(const ModelDims& d, const PlanConfig& pc) {
     f.dense_mlp = mlp_per_layer * static_cast<std::size_t>(layers_on_rank);
   }
 
-  // --- experts (split ep ways; each expert's matrices are NOT tp-split in this model) ---
+  // --- experts (split ep ways; each expert's matrices are not tp-split in this model) ---
   if (d.is_moe()) {
     const int experts_on_rank = ceil_div(d.num_experts, pc.ep);
     const std::size_t per_expert = matrix_bytes(2LL * d.expert_intermediate, d.hidden, wq) +  // gate_up

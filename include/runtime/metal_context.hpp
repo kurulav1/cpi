@@ -8,7 +8,7 @@
 // this boundary as an opaque handle and the .mm file does the bridging.
 //
 // The other reason it matters: unified memory. On Apple Silicon the GPU and CPU
-// share physical memory, so a "device buffer" is host-addressable -- contents()
+// share physical memory, so a "device buffer" is host-addressable; contents()
 // returns a pointer you can read and write directly, with no copy. Most of the
 // H2D/D2H machinery the CUDA path needs simply has no counterpart here.
 
@@ -58,7 +58,7 @@ public:
   MetalContext(const MetalContext&) = delete;
   MetalContext& operator=(const MetalContext&) = delete;
 
-  // True when a real GPU was found. This is FALSE on GitHub's macOS runners --
+  // True when a real GPU was found. This is false on GitHub's macOS runners
   // they are VMs with no GPU, so MTLCreateSystemDefaultDevice() returns nil.
   // Callers must check; do not assume a Mac has a usable Metal device.
   bool available() const {
@@ -73,7 +73,7 @@ public:
   // Compiles the shaders from MSL SOURCE at runtime, via newLibraryWithSource.
   //
   // This is what makes a bare Mac usable. The offline `metal` compiler ships with
-  // Xcode -- NOT with the Command Line Tools -- so requiring a .metallib would mean
+  // Xcode, not with the Command Line Tools, so requiring a .metallib would mean
   // a ~15 GB Xcode download just to run a kernel. But the Metal *framework* carries
   // its own compiler service, which is present on every Mac, so the shader source
   // can simply be handed to the driver.
@@ -116,7 +116,7 @@ public:
   // strides measured 612 -> 593 ms on a 2041-token prefill, for identical output.
   //
   // Values are uint32 because that is what the shapes are. The pipeline cache is keyed by the
-  // kernel name AND these values, so each distinct shape compiles once and is then reused; a model
+  // kernel name and these values, so each distinct shape compiles once and is then reused; a model
   // has one shape, so this is a handful of pipelines for the process lifetime.
   //
   // Unlike a silently-defaulted binding, getting this wrong is LOUD: a kernel that declares a
@@ -129,10 +129,10 @@ public:
   // True GPU nanoseconds per kernel, from the device's timestamp counter set. This is what the
   // host-timed CPI_METAL_PROFILE could never be: that one wraps every op in commit-and-wait and
   // measures WALL time, so each op carries a command-buffer round trip it does not pay in a real
-  // pass -- roughly 3x, concentrated in the cheap ops, which are exactly the ones being weighed.
+  // pass; roughly 3x, concentrated in the cheap ops, which are exactly the ones being weighed.
   //
-  // The M4 exposes ONE counter set ("timestamp", one counter) and supports sampling only at
-  // stage boundaries -- there is no dispatch-boundary sampling and no ALU/limiter counter
+  // The M4 exposes one counter set ("timestamp", one counter) and supports sampling only at
+  // stage boundaries; there is no dispatch-boundary sampling and no ALU/limiter counter
   // reachable from the Metal API at all. Those live only in Xcode's GPU debugger. Timing is what
   // a CLI can have, so timing is what this gives.
   //
@@ -147,7 +147,7 @@ public:
   // Submits everything encoded so far and blocks until the GPU is done.
   void commit_and_wait();
 
-  // Submits everything encoded so far WITHOUT waiting, so the GPU starts on it while the host
+  // Submits everything encoded so far without waiting, so the GPU starts on it while the host
   // encodes the next batch of work. Command buffers on this (serial) queue begin execution in
   // submission order and every buffer here uses tracked resources, so cross-buffer hazards
   // (step N+1 reading what step N wrote) are ordered by the driver. Pair with wait_pending().
@@ -162,7 +162,7 @@ public:
   }
 
   // Instrumentation for the overhead-vs-kernel question. gpu_busy_ms is the summed
-  // GPUEndTime-GPUStartTime of every committed command buffer -- time the GPU was actually
+  // GPUEndTime-GPUStartTime of every committed command buffer; time the GPU was actually
   // running kernels, which against wall-clock reveals how much is dispatch/CPU overhead.
   // dispatches counts compute encoders created; cmdbufs counts submissions.
   double gpu_busy_ms() const {
@@ -184,12 +184,12 @@ public:
   //
   // Writes a .gputrace for the work between begin and end, which Xcode's Metal Debugger opens
   // and annotates with the things that actually explain a kernel's speed: occupancy, the
-  // limiter, ALU vs memory. Those numbers are NOT available any other way on this hardware --
+  // limiter, ALU vs memory. Those numbers are not available any other way on this hardware
   // MTLCounterSampleBuffer cannot sample at dispatch boundaries on Apple Silicon (asking
   // aborts the process), and xctrace's Metal System Trace template captures exactly one GPU
   // counter, "RT Unit Active", which is about raytracing.
   //
-  // Requires MTL_CAPTURE_ENABLED=1 in the environment BEFORE the device is created; Metal
+  // Requires MTL_CAPTURE_ENABLED=1 in the environment before the device is created; Metal
   // refuses to arm capture otherwise, and says so. Returns false with last_error() set rather
   // than throwing, because a profiling aid must never be able to break a normal run.
   //

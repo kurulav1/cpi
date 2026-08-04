@@ -1,10 +1,10 @@
 // Parity test: the top_k fast path and the full sampler must sample IDENTICALLY.
 //
 // The full path (sample_from_logits, temperature > 0) now builds a top_k candidate set and
-// delegates the softmax / nucleus / draw to sample_from_candidates -- the same shared routine the
+// delegates the softmax / nucleus / draw to sample_from_candidates; the same shared routine the
 // fast path (sample_from_logits_topk) and the device top-k path use. So the two are no longer only
 // distributionally equal (they used to walk the vocab in different orders); with the same candidate
-// set and the same RNG they return the SAME token. The functions below are standalone mirrors (no
+// set and the same RNG they return the same token. The functions below are standalone mirrors (no
 // CUDA) of the shared candidate sampler and the two entry points, and the test asserts:
 //   1. neither ever emits a token outside the top_k / nucleus set, and
 //   2. under a shared seed the two paths agree token-for-token, every draw.
@@ -133,7 +133,7 @@ int main() {
     std::uniform_int_distribution<int> pick(0, vocab - 1);
     for (int p = 0; p < 60; ++p) logits[pick(gen)] += 8.0f + (p % 5);
 
-    // SHARED seed: the two paths must now draw the identical token every iteration, not merely
+    // shared seed: the two paths must now draw the identical token every iteration, not merely
     // agree in aggregate.
     std::mt19937 rng_full(777), rng_fast(777);
     std::unordered_set<int> emitted;

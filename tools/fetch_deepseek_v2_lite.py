@@ -2,7 +2,7 @@
 """Download DeepSeek-V2-Lite (the smallest native-MLA DeepSeek) into artifacts/hub for MLA TDD.
 
 Reads the HF token from .env (never takes it on the command line). Pulls only the weights + configs +
-tokenizer (safetensors, not any duplicate .bin/gguf). Idempotent -- resumes / skips already-present
+tokenizer (safetensors, not any duplicate .bin/gguf). Idempotent; resumes / skips already-present
 files, so it is safe to re-run.
 """
 import os

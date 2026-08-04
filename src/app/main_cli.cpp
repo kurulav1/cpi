@@ -340,7 +340,7 @@ ParsedArgs parse_args(int argc, char** argv) {
       args.opts.loop_guard = false;
     } else if (arg == "--no-prefix-reuse") {
       // Required to BENCHMARK prefill. With reuse on, a repeated prompt skips prefill entirely
-      // (prefill_ms=0.00), so the only prefill that can be timed is a COLD one -- and a cold
+      // (prefill_ms=0.00), so the only prefill that can be timed is a cold one; and a cold
       // prefill is dominated by one-time cuBLAS plan setup, not by prefill work.
       args.opts.disable_prefix_reuse = true;
     } else if (arg == "--stop-text") {

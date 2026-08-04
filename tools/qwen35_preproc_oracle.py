@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Reference oracle for Qwen3.5's IMAGE PREPROCESSING.
+"""Reference oracle for Qwen3.5's image PREPROCESSING.
 
 The tower's gate (qwen35_vision_oracle.py) starts from an already-patchified tensor, which
-leaves everything upstream of it -- resize, normalisation, patch layout -- ungated. This dumps
+leaves everything upstream of it, resize, normalisation, patch layout, ungated. This dumps
 what HuggingFace's processor actually produces for a real image so the C++ side can be compared
 against it rather than derived from reading the code.
 
@@ -28,10 +28,10 @@ from transformers import AutoImageProcessor
 
 
 def synthetic_image(w: int, h: int) -> np.ndarray:
-    """A deterministic RGB image that varies along BOTH axes and differs per channel.
+    """A deterministic RGB image that varies along both axes and differs per channel.
 
     A flat or single-channel-varying image would hide a transposed resize, a channel swap, or a
-    row/column mix-up -- all of which produce a tensor of the right shape.
+    row/column mix-up; all of which produce a tensor of the right shape.
     """
     ys, xs = np.mgrid[0:h, 0:w].astype(np.float32)
     r = 0.5 + 0.5 * np.sin(xs * 0.11 + ys * 0.03)

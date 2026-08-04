@@ -78,7 +78,7 @@ def main():
         inputs_embeds=stage_patch, attention_mask=~padding, pixel_position_ids=pos
     ).last_hidden_state
 
-    # after exactly ONE encoder layer: separates a structural bug from a compounding one
+    # after exactly one encoder layer: separates a structural bug from a compounding one
     from transformers.masking_utils import create_bidirectional_mask
     _mask = create_bidirectional_mask(
         config=vision.encoder.config, inputs_embeds=stage_patch, attention_mask=~padding

@@ -92,7 +92,7 @@ def detect_family(cfg: dict) -> str:
     if model_type == "qwen2":
         return FAMILY_QWEN2
     # The text half of a Qwen3.5 checkpoint reports "qwen3_5_text"; the multimodal wrapper
-    # reports "qwen3_5". Match both, and match them BEFORE the generic "qwen" fallback below,
+    # reports "qwen3_5". Match both, and match them before the generic "qwen" fallback below,
     # which would otherwise classify this family as qwen2 and map the wrong tensor names.
     if model_type.startswith("qwen3_5"):
         return FAMILY_QWEN3_5
@@ -133,8 +133,8 @@ def unsupported_reason(cfg: dict) -> str:
     if "qwen3_5" in model_type:
         # Mixed linear/full attention is now expressible: the container records a per-layer
         # attention kind (v5) and the delta-net geometry (v6), and every op the block needs has a
-        # kernel. What this conversion does NOT carry is the vision tower and the MTP head -- both
-        # are present in these checkpoints and both are skipped, so the result is the TEXT model.
+        # kernel. What this conversion does not carry is the vision tower and the MTP head; both
+        # are present in these checkpoints and both are skipped, so the result is the text model.
         if not has_linear_attention:
             return "Qwen3.5 is not supported by the native CPI engine yet."
         return ""
@@ -188,7 +188,7 @@ def load_index(hf_dir: Path) -> dict:
         header_len = struct.unpack("<Q", f.read(8))[0]
         header = json.loads(f.read(header_len).decode("utf-8"))
 
-    # Point at the file actually opened, not the canonical name -- they differ whenever a repo
+    # Point at the file actually opened, not the canonical name; they differ whenever a repo
     # ships one shard under a sharded filename.
     weight_map = {k: single_path.name for k in header if k != "__metadata__"}
     return {"weight_map": weight_map}
@@ -240,7 +240,7 @@ def read_safetensor_blob(safetensor_path: Path, tensor_name: str):
 # ---------------------------------------------------------------------------
 
 # NOTE on the lookups below: Python evaluates a .get() default EAGERLY, so
-# `text_cfg.get(k, hf_cfg[k])` raises KeyError whenever k is absent from the TOP level -- even
+# `text_cfg.get(k, hf_cfg[k])` raises KeyError whenever k is absent from the TOP level; even
 # when text_config supplies it. That is every nested-config model (Qwen3.5 keeps everything under
 # text_config), and it read as "this model has no attention heads" rather than as a lookup bug.
 # hf_cfg.get() keeps the fallback lazy.
@@ -252,7 +252,7 @@ def extract_model_config(hf_cfg: dict, family: str) -> dict:
 
     # Newer HF configs (Qwen3.5 and later) nest every rope knob under "rope_parameters" instead of
     # leaving them at the top level. Reading only the flat key silently yields the FAMILY DEFAULT
-    # theta and a full-rotary factor -- a model that loads, runs, and is wrong.
+    # theta and a full-rotary factor; a model that loads, runs, and is wrong.
     def rope_param(key, default):
         for scope in (text_cfg, hf_cfg):
             nested = scope.get("rope_parameters") or scope.get("rope_scaling") or {}
@@ -265,7 +265,7 @@ def extract_model_config(hf_cfg: dict, family: str) -> dict:
     rope_theta = float(rope_param("rope_theta", DEFAULT_ROPE_THETA.get(family, 10000.0)))
 
     # Vision geometry, when the checkpoint is multimodal. Empty for text-only models, which
-    # leaves every field zero in the container -- the engine reads depth == 0 as "no tower"
+    # leaves every field zero in the container; the engine reads depth == 0 as "no tower"
     # rather than needing a separate flag.
     vc = hf_cfg.get("vision_config") or {}
     vision_cfg = {}
@@ -315,7 +315,7 @@ def extract_model_config(hf_cfg: dict, family: str) -> dict:
 
     # Per-head QK-norm (RMSNorm on Q and K after projection): Qwen3 dense.
     # Qwen3.5's full-attention layers carry q_norm/k_norm too. Missing it here does not fail the
-    # conversion -- it drops both tensors from the mapping, so the container is quietly short two
+    # conversion; it drops both tensors from the mapping, so the container is quietly short two
     # weights per attention layer and the engine skips a normalisation it needs.
     has_qk_norm = family in (FAMILY_QWEN3, FAMILY_QWEN3_5)
 
@@ -405,7 +405,7 @@ def build_qwen35_vision_mapping(depth: int):
 
     Names are flattened to vision.* so the container's flat namespace stays readable and the
     engine can find them without knowing HuggingFace's nesting. patch_embed.proj is a Conv3d
-    whose stride equals its kernel, which makes it a plain Linear -- its [768,3,2,16,16] weight
+    whose stride equals its kernel, which makes it a plain Linear; its [768,3,2,16,16] weight
     is already contiguous as [768,1536], so it is stored as-is and reinterpreted, not reshaped.
     """
     V = "model.visual."
@@ -439,7 +439,7 @@ def build_qwen35_vision_mapping(depth: int):
 def build_qwen35_mapping(num_layers: int, layer_types: list, has_qk_norm: bool,
                          vision_depth: int = 0):
     """Qwen3.5: tensors sit under model.language_model, and each layer is EITHER delta-net or
-    full attention -- `layer_types` says which, and the two carry disjoint tensor sets.
+    full attention; `layer_types` says which, and the two carry disjoint tensor sets.
 
     The vision tower is included when vision_depth > 0 (see build_qwen35_vision_mapping). The
     multi-token-prediction head (mtp.*) is still deliberately skipped, and the caller reports it
@@ -455,8 +455,8 @@ def build_qwen35_mapping(num_layers: int, layer_types: list, has_qk_norm: bool,
         kind = layer_types[i] if i < len(layer_types) else "full_attention"
         items.append((f"{P}layers.{i}.post_attention_layernorm.weight",
                       f"layers.{i}.ffn_norm.weight", True))
-        # Both layer kinds have input_layernorm -- the delta-net block normalises its input the
-        # same way the attention block does. linear_attn.norm is a SECOND, narrower norm inside
+        # Both layer kinds have input_layernorm; the delta-net block normalises its input the
+        # same way the attention block does. linear_attn.norm is a second, narrower norm inside
         # the block (value_head_dim wide, gated by z), not a replacement for this one. Emitting
         # this only for attention layers leaves the delta-net block reading raw residual: the
         # container loads, the model runs, and the block is orthogonal to the reference.
@@ -469,7 +469,7 @@ def build_qwen35_mapping(num_layers: int, layer_types: list, has_qk_norm: bool,
         ])
         if "linear" in kind:
             # Delta-net. linear_attn.norm is the OUTPUT norm inside the block (value_head_dim
-            # wide, gated by z) -- it is in ADDITION to the input_layernorm emitted above.
+            # wide, gated by z); it is in ADDITION to the input_layernorm emitted above.
             items.extend([
                 (f"{P}layers.{i}.linear_attn.in_proj_qkv.weight",
                  f"layers.{i}.linear_attn.in_proj_qkv", True),

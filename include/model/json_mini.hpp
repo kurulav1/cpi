@@ -8,7 +8,7 @@
 
 // A JSON reader has no business requiring CUDA. It did: one helper below converts to fp16 via
 // __float2half, and the unconditional include made this header unusable from the Metal and
-// CPU-only builds -- which is where the vision work needs it. Guarded so a CUDA build keeps
+// CPU-only builds; which is where the vision work needs it. Guarded so a CUDA build keeps
 // the intrinsic (bit-for-bit unchanged) and everything else gets the portable path.
 #if defined(__has_include)
 #  if __has_include(<cuda_fp16.h>)
@@ -46,8 +46,8 @@ inline std::uint16_t float_to_half_bits(float value) {
   std::memcpy(&bits, &h, sizeof(bits));
   return bits;
 #else
-  // Round-to-nearest-even, matching __float2half. The obvious fallback -- shift the mantissa
-  // down and drop the low bits -- truncates instead, which biases every converted weight
+  // Round-to-nearest-even, matching __float2half. The obvious fallback; shift the mantissa
+  // down and drop the low bits; truncates instead, which biases every converted weight
   // toward zero. Small per weight, systematic across a whole tensor, and invisible unless
   // something compares the two backends' weights directly.
   std::uint32_t x = 0;
@@ -60,7 +60,7 @@ inline std::uint16_t float_to_half_bits(float value) {
     return static_cast<std::uint16_t>(sign | 0x7C00u | (man != 0u ? 0x200u : 0u));
   }
   if (exp > 15) return static_cast<std::uint16_t>(sign | 0x7C00u);  // overflow -> Inf
-  // Below 2^-25 -- HALF the smallest subnormal -- everything rounds to zero. The tempting
+  // Below 2^-25, half the smallest subnormal, everything rounds to zero. The tempting
   // bound is 2^-24, the smallest subnormal itself, but values between the two round UP to it
   // and returning zero for them loses the only bit they had. Also keeps `shift` <= 24, so the
   // shifts below stay defined.

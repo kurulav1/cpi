@@ -14,7 +14,7 @@ struct SpeculativeStats {
   int accepted = 0;  // draft tokens accepted (excludes correction/bonus tokens)
   int emitted = 0;   // total tokens emitted
   // Tree-speculation opportunity probe: rounds that rejected before K, and of
-  // those, how many where the draft's SECOND choice at the rejection position
+  // those, how many where the draft's second choice at the rejection position
   // equalled the target's token (a width-2 tree would have recovered there).
   int mismatch_rounds = 0;
   int tree2_recoveries = 0;
@@ -37,7 +37,7 @@ struct SpeculativeStats {
 //
 // A TEMPLATE over the engine type rather than a class bound to one engine: the algorithm is
 // backend-free, and both LlamaEngine (CUDA) and PlanMetalEngine expose the same five methods it
-// needs -- reset_kv_cache, prefill_prompt, decode_next_token, decode_next_token2, verify_tokens.
+// needs; reset_kv_cache, prefill_prompt, decode_next_token, decode_next_token2, verify_tokens.
 // Class template argument deduction makes `SpeculativeDecoder spec(draft, target, k)` pick the
 // engine type from its arguments, so callers read identically on either backend. Header-only for
 // the same reason: it now compiles into the Metal build, which has no speculative_decoder.cpp.
@@ -96,7 +96,7 @@ public:
       const int K = k_;
 
       // 1. Draft K tokens greedily. When the tree-opportunity probe is on
-      //    (CPI_SPEC_TREE_PROBE), also record each position's SECOND choice
+      //    (CPI_SPEC_TREE_PROBE), also record each position's second choice
       //    via the slower host-logits path; production uses the fast argmax graph.
       std::vector<int> draft_tokens;
       std::vector<int> draft2;

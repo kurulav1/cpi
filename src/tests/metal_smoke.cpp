@@ -2,13 +2,13 @@
 //
 // This is the first thing to run on real Apple Silicon. In CI it still builds and
 // still runs, but MTLCreateSystemDefaultDevice() returns nil inside GitHub's macOS
-// VM, so it reports SKIP and exits 0 -- a green CI here means "it compiles and
+// VM, so it reports SKIP and exits 0; a green CI here means "it compiles and
 // links", never "the kernels are correct". Only a real GPU can say that.
 //
 // Tolerances are loose on purpose: the shaders accumulate in fp32 but read/write
 // fp16, and the accumulation ORDER differs from the CPU reference, so exact
 // equality is not the bar. What we are checking is that each kernel computes the
-// right function -- a transposed index or a bad stride blows past these bounds by
+// right function; a transposed index or a bad stride blows past these bounds by
 // orders of magnitude.
 
 #include <algorithm>
@@ -27,7 +27,7 @@
 namespace {
 
 // Shared with the engine on purpose. A "minimal fp16 <-> fp32, so this test depends on nothing"
-// local copy is how this test came to round differently from the code it gates -- the kernels
+// local copy is how this test came to round differently from the code it gates; the kernels
 // convert with Metal's half(), which is IEEE, so a truncating harness charges the shader for its
 // own error. include/runtime/fp16.hpp, gated by metal_fp16_test.
 inline std::uint16_t f32_to_f16(float f) { return cpi::f32_to_f16(f); }
@@ -67,7 +67,7 @@ void check(const std::string& name, const Result& r, double tol) {
   if (!ok) ++failures;
 }
 
-// Parameter blocks -- must match the layouts in cpi_kernels.metal exactly.
+// Parameter blocks; must match the layouts in cpi_kernels.metal exactly.
 struct NormParams {
   std::uint32_t rows, cols;
   float eps;
@@ -209,10 +209,10 @@ int main() {
   }
 
   // ---- GEMM (fp16), the multi-token prefill path -------------------------
-  // MUST match GEMM_FBM / GEMM_BN in cpi_kernels.metal (and kGemmFBM / kGemmBN in the engine).
+  // must match GEMM_FBM / GEMM_BN in cpi_kernels.metal (and kGemmFBM / kGemmBN in the engine).
   constexpr std::uint32_t kSmokeGemmFBM = 64;   // rows per threadgroup
   constexpr std::uint32_t kSmokeGemmBN = 32;    // tokens per tile
-  // This kernel had NO check of its own: it was benchmarked heavily and gated only
+  // This kernel had no check of its own: it was benchmarked heavily and gated only
   // indirectly, through end-to-end goldens. A prefill chunk and a token-at-a-time run
   // disagreed on Metal, and the split fell exactly on the GEMV/GEMM boundary, so the
   // question "is the GEMM itself right?" needs an answer that does not route through
@@ -479,7 +479,7 @@ int main() {
   // Same story as the fp16 GEMM above: this kernel had no check of its own, and it only runs
   // at T >= kGemmMinTokens, which no golden prompt reaches. It carries the 8B's entire
   // quantized prefill.
-  // MUST match GEMM_BM / GEMM_QBN in cpi_kernels.metal (kGemmFBM's quant siblings).
+  // must match GEMM_BM / GEMM_QBN in cpi_kernels.metal (kGemmFBM's quant siblings).
   constexpr std::uint32_t kSmokeGemmBM = 64;    // quant rows per threadgroup
   constexpr std::uint32_t kSmokeGemmQBN = 128;  // quant tokens per tile
   for (int bits : {8, 4}) {
@@ -534,7 +534,7 @@ int main() {
         std::uint32_t out_dim, in_dim, tokens, bits, group, groups, has_bias;
       } p{out_dim, in_dim, T, static_cast<std::uint32_t>(bits), group, groups_n, 0};
 
-      // Derived from the tile constants, the same rule the engine uses -- never restated.
+      // Derived from the tile constants, the same rule the engine uses; never restated.
       const std::size_t tiles = (T + kSmokeGemmQBN - 1) / kSmokeGemmQBN;
       const std::size_t grid = (out_dim / kSmokeGemmBM) * tiles;
       const std::size_t threads = 32 * (kSmokeGemmBM / 32) * (kSmokeGemmQBN / 32);
@@ -562,7 +562,7 @@ int main() {
   }
 
   // ---- Attention (decode, prefill scalar, prefill matrix-unit) -----------
-  // The last kernel family with no reference check, and the largest. THREE kernels hide
+  // The last kernel family with no reference check, and the largest. three kernels hide
   // behind one op, chosen by (tokens, head_dim), so the sweep below is built to land on each:
   //   T < Q_BLOCK(8)          -> cpi_attention_decode      (one threadgroup per query)
   //   T >= 8, head_dim <= 128 -> cpi_attention_prefill_mm  (simdgroup matrix units)
@@ -574,7 +574,7 @@ int main() {
   // kernels compute it with an ONLINE softmax over key blocks, which is a different order of
   // operations, so agreement here is meaningful rather than tautological.
   {
-    struct AP {  // MUST match AttnParams in cpi_kernels.metal
+    struct AP {  // must match AttnParams in cpi_kernels.metal
       std::uint32_t heads, kv_heads, head_dim, position, max_context, window;
       float scale;
       std::uint32_t use_position_buffer, tokens;
@@ -586,8 +586,8 @@ int main() {
       std::uint32_t heads, kv_heads, head_dim, tokens, window, base;
     };
     // `base` is the position of the first query, and for decode it is the whole point.
-    // A decode at position 0 attends to exactly ONE key: the softmax weight is 1 and the
-    // output is just V[0], so it exercises no softmax, no accumulation, no online rescale --
+    // A decode at position 0 attends to exactly one key: the softmax weight is 1 and the
+    // output is just V[0], so it exercises no softmax, no accumulation, no online rescale
     // it passes at max_abs == 0.00000 while proving nothing. Decode is tested at position 40,
     // against a populated cache, which is the shape it actually runs in (one query, many keys,
     // several KEY_BLOCK iterations with a running max).
@@ -604,7 +604,7 @@ int main() {
         {"prefill scalar hd256 T=16", 4, 2, 256, 16, 0, 0},  // Gemma's head_dim
         {"prefill scalar hd256 T=33", 4, 1, 256, 33, 0, 0},  // MQA + partial block
     };
-    constexpr std::uint32_t kQBlockSmoke = 8;  // MUST match Q_BLOCK in cpi_kernels.metal
+    constexpr std::uint32_t kQBlockSmoke = 8;  // must match Q_BLOCK in cpi_kernels.metal
 
     for (const Case& c : cases) {
       const std::uint32_t hd = c.head_dim, T = c.tokens;
@@ -628,15 +628,15 @@ int main() {
 
       AP p{c.heads, c.kv_heads, hd, 0, max_ctx, c.window, scale, 1, T, 0, 0, 0};
       // The scalar prefill and decode kernels take per-token limits at buffer(5) (multimodal
-      // image spans); use_limits is 0 so the binding is a never-read dummy -- but it must
+      // image spans); use_limits is 0 so the binding is a never-read dummy; but it must
       // exist, or dispatch() writes the params block over it. Same shape as the mm case below.
       const void* bufs[] = {bq.handle(), bk.handle(), bv.handle(),
                             bo.handle(), bp.handle(), bp.handle()};
-      // The engine's own choice, reproduced -- testing a kernel production does not pick
+      // The engine's own choice, reproduced; testing a kernel production does not pick
       // would prove nothing about production.
       if (T >= kQBlockSmoke && hd <= 128) {
         // The matrix kernel takes a block table at buffer(5) for paged prefill, so its params
-        // block sits at 6. p.paged is 0 here, so the table is never read -- but the binding must
+        // block sits at 6. p.paged is 0 here, so the table is never read; but the binding must
         // exist or dispatch() would write the params over it. (This is what the gate caught when
         // the kernel gained that buffer and this caller did not: check_metal_bindings.py checks
         // the SHADER's ordering, not that a caller passes the right buffer count.)
@@ -644,7 +644,7 @@ int main() {
         const void* mmbufs[] = {bq.handle(), bk.handle(), bv.handle(),
                                 bo.handle(), bp.handle(), bk.handle()};
         // This kernel is specialized on its shape, so the constants have to be supplied here too,
-        // in the order it declares them. Omitting them fails pipeline creation outright -- which
+        // in the order it declares them. Omitting them fails pipeline creation outright; which
         // is how the gate caught this caller when the kernel gained them.
         const std::uint32_t spec[3] = {hd, kv_dim, q_dim};
         ctx.set_next_specialization(spec, 3);
@@ -732,8 +732,8 @@ int main() {
 
   // ---- linear attention (delta-net) family --------------------------------
   //
-  // These six have no end-to-end golden on this backend yet -- the Qwen3.5 checkpoint that
-  // exercises them is not converted here -- so a CPU reference IS the gate. Two of them carry
+  // These six have no end-to-end golden on this backend yet; the Qwen3.5 checkpoint that
+  // exercises them is not converted here; so a CPU reference IS the gate. Two of them carry
   // state across steps (the conv window and the recurrent matrix), and the reference reproduces
   // that state update too, which is the part a shape-only check would miss.
   {
@@ -884,7 +884,7 @@ int main() {
     check("repeat_heads.v", compare(pull(bv, vh * vdim), wv), 0.001);
   }
   {
-    // The recurrent step, run TWICE so the carried state is part of what is checked.
+    // The recurrent step, run twice so the carried state is part of what is checked.
     const std::uint32_t H = 3, kdim = 32, vdim = 32, ss = kdim * vdim;
     const float eps = 1e-6f;
     std::vector<std::uint16_t> q(H * kdim), k(H * kdim), v(H * vdim), z(H * vdim), av(H), bv2(H),
@@ -1050,7 +1050,7 @@ int main() {
     std::vector<std::int32_t> px(tok), py(tok);
     for (auto& v : in) v = f32_to_f16(dist(rng));
     for (std::uint32_t t = 0; t < tok; ++t) { px[t] = t % 4; py[t] = (t / 4) % 4; }
-    px[3] = -1; py[9] = -1;  // padding must be skipped but must NOT shrink the divisor
+    px[3] = -1; py[9] = -1;  // padding must be skipped but must not shrink the divisor
 
     auto bi = ctx.alloc_from(in.data(), in.size()*2);
     auto bpx = ctx.alloc_from(px.data(), px.size()*4), bpy = ctx.alloc_from(py.data(), py.size()*4);
@@ -1099,19 +1099,19 @@ int main() {
 
   {
     // LayerNorm, gated against an fp64 reference rather than a rearrangement of the kernel's
-    // own algebra -- a reference sharing the kernel's formulation confirms only that it was
+    // own algebra; a reference sharing the kernel's formulation confirms only that it was
     // transcribed twice.
     //
-    // TWO row scales, deliberately. Row 1 carries values around 1600, which is what the
+    // two row scales, deliberately. Row 1 carries values around 1600, which is what the
     // Qwen3.5 vision tower's last block actually produces. Squared that is ~2.6e6, past
     // fp16's 65504, so this row is what makes the case discriminating: patching the kernel's
     // variance accumulator to half moves it from max_abs 0.0005 to 1.21. A case built only
     // from unit-scale noise passes either way, which is how a tower that runs and is wrong
     // gets shipped.
     //
-    // It does NOT discriminate the one-pass E[x^2] - E[x]^2 form: this data is zero-mean, so
+    // It does not discriminate the one-pass E[x^2] - E[x]^2 form: this data is zero-mean, so
     // nothing cancels, and that variant was measured to pass here unchanged. Catching it
-    // would need a large-mean/small-variance row -- not added, because the tower's real
+    // would need a large-mean/small-variance row; not added, because the tower's real
     // activations are near zero-mean (max |mean|/stddev 0.5) and a test should gate risks
     // this model actually has.
     const std::uint32_t rows = 4, cols = 768, n = rows * cols;
@@ -1155,11 +1155,11 @@ int main() {
   }
 
   {
-    // Bidirectional attention, against a plain fp64 softmax over ALL keys.
+    // Bidirectional attention, against a plain fp64 softmax over all keys.
     //
     // tokens deliberately exceeds BIATTN_CHUNK so the online-softmax path runs more than one
     // chunk. With a single chunk the running-max rescale is never exercised and a kernel that
-    // drops it entirely still passes -- which was the state of this kernel before the control
+    // drops it entirely still passes; which was the state of this kernel before the control
     // below caught it.
     const std::uint32_t tokens = 100, heads = 3, hd = 64, dim = heads * hd;
     const std::uint32_t n = tokens * dim;
@@ -1212,7 +1212,7 @@ int main() {
     //     rope BIT FOR BIT. That is the property that makes it safe to enable for a whole
     //     sequence rather than switching per token, and it is checked against the kernel's own
     //     1-D path rather than a reimplementation of it.
-    // (2) It actually splits axes: with three DIFFERENT axis positions the result must differ
+    // (2) It actually splits axes: with three different axis positions the result must differ
     //     from the 1-D answer, or the section boundaries are being ignored.
     const std::uint32_t heads = 2, head_dim = 256, rot = 64, tokens = 5;
     const std::uint32_t n = tokens * heads * head_dim;

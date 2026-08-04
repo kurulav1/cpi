@@ -15,7 +15,7 @@ here), and it isolates the model from the resize/normalise step, which has its o
     python tools/qwen35_multimodal_oracle.py --model ~/models/qwen35-0.8b-hf \
                                              --out artifacts/q35_mm --max-new 8
 
-WHAT THIS FOUND, first run, before any comparison: the text stack uses M-RoPE for multimodal
+what this FOUND, first run, before any comparison: the text stack uses M-RoPE for multimodal
 input and the Metal port does not. For <vision_start> + 16 image tokens + <vision_end> + 4 text
 tokens the model assigns
 
@@ -27,7 +27,7 @@ against a naive 0..21. Two consequences, and the second is the one that bites:
 
   - image tokens carry a 4x4 (h, w) grid rather than a running index, with mrope_section
     [11, 11, 10] splitting each head's rotary lanes across the t, h and w axes;
-  - the image block advances the counter by only 4 -- the MERGED grid width -- so every text
+  - the image block advances the counter by only 4, the MERGED grid width, so every text
     token after the image sits at 5..9 where a 1-D counter puts it at 17..21.
 
 So the splice can be perfectly correct and the whole remainder of the prompt still be rotated to
@@ -46,7 +46,7 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGe
 
 
 def build_patches(cfg, grid_h: int, grid_w: int) -> torch.Tensor:
-    """The SAME synthetic patch tensor qwen35_vision_oracle.py builds.
+    """The same synthetic patch tensor qwen35_vision_oracle.py builds.
 
     It has to be bit-identical, or this oracle and the tower oracle describe different images and
     a disagreement between them means nothing.
@@ -95,7 +95,7 @@ def main() -> int:
     # tokens get 3-D (t, h, w) position ids rather than one running index, and the mrope_section
     # [11, 11, 10] splits the head's rotary lanes between those axes.
     #
-    # This is a REAL gap in the port, not a detail of the harness: PlanMetalEngine advances one
+    # This is a real gap in the port, not a detail of the harness: PlanMetalEngine advances one
     # scalar position per token. The soft tokens can be spliced perfectly and still sit at the
     # wrong positions.
     mm_token_type_ids = torch.tensor(
@@ -107,11 +107,11 @@ def main() -> int:
     generated = out[0, input_ids.shape[1]:].tolist()
 
     # First-step logits too: a token stream that matches proves agreement at the argmax, but the
-    # logits show HOW close, which is what tells drift apart from a genuine disagreement.
+    # logits show how close, which is what tells drift apart from a genuine disagreement.
     #
     # And the POST-SPLICE hidden state, which is what localises a disagreement. The logits are
     # downstream of four subsystems at once (tower, splice, M-RoPE, text stack); the input to
-    # layer 0 is downstream of only two -- the embedding lookup and the image scatter. If ours
+    # layer 0 is downstream of only two; the embedding lookup and the image scatter. If ours
     # matches this, the splice is right and the defect is M-RoPE or the text stack; if it does
     # not, no amount of looking at the text stack will help.
     #

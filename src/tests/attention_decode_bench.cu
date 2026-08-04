@@ -2,10 +2,10 @@
 // optimizing). Decode attention has seq_q=1 attending over a long KV cache, so
 // it is memory-bound reading K/V (~0.5 flop/byte) — tensor cores can't help a
 // single-token query. The lever is bytes read, so the metric that matters is
-// achieved KV-read bandwidth vs the ~1.79 TB/s peak, NOT FLOPs.
+// achieved KV-read bandwidth vs the ~1.79 TB/s peak, not FLOPs.
 //
 // Measures launch_attention_step_batched_paged (the serving path) across batch
-// and context, reporting effective KV bandwidth = (K+V bytes that MUST be read
+// and context, reporting effective KV bandwidth = (K+V bytes that must be read
 // once) / time. Low % of peak => headroom (poor coalescing, redundant per-head
 // re-reads, or low occupancy); near peak => the kernel is at its floor and a
 // rewrite won't help (the same conclusion int4_gemv_bench reached for GEMV).
@@ -138,7 +138,7 @@ int main() {
         CK(cudaEventElapsedTime(&ms, t0, t1));
         const double per_call_ms = ms / iters;
 
-        // Minimum KV bytes that MUST be read: each cached K and V element once.
+        // Minimum KV bytes that must be read: each cached K and V element once.
         const double kv_bytes = static_cast<double>(batch) * L * kv_hidden * 2.0 * sizeof(half);
         const double gbs = kv_bytes / (per_call_ms * 1e-3) / 1e9;
 

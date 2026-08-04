@@ -2,7 +2,7 @@
 //
 // tools/make_png_fixtures.py writes PNGs (via Python's zlib, i.e. a real DEFLATE
 // encoder we did not write) plus the expected RGB bytes. Our decoder must reproduce
-// them EXACTLY -- image decoding is lossless, so anything short of byte-equality is a
+// them exactly; image decoding is lossless, so anything short of byte-equality is a
 // bug, not a tolerance.
 //
 // The fixtures deliberately cover the cases that break naive inflaters: dynamic

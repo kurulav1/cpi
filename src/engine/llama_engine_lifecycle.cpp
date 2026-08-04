@@ -149,13 +149,13 @@ void LlamaEngine::load_static_weights() {
 
   // Weight-only int8 LM head, when the user asked for a quantized model.
   //
-  // Only the WEIGHTS are quantized -- the activation stays fp16 and the dot accumulates in
+  // Only the weights are quantized; the activation stays fp16 and the dot accumulates in
   // fp32 (see launch_weight_only_int8_gemv_f32). This is the one layer that decides the output
-  // token, so it does NOT go through the dp4a path that would also quantize the activation.
+  // token, so it does not go through the dp4a path that would also quantize the activation.
   //
   // Row-wise scales: one per vocabulary row, so a few loud rows cannot squash the rest.
   // CPI_FP16_LM_HEAD=1 keeps the LM head in fp16 even under --weight-quant. This is
-  // the ONE change in the engine that alters model output (quantization error lands directly in
+  // the one change in the engine that alters model output (quantization error lands directly in
   // the logits), so it needs an A/B switch for the perplexity gate.
   const bool force_fp16_lm_head = [] {
     const char* e = std::getenv("CPI_FP16_LM_HEAD");
@@ -317,8 +317,8 @@ void LlamaEngine::allocate_runtime_buffers() {
   CUDA_CHECK(cudaMalloc(&d_ff3_, bytes_for_matrix(rows, hidden)));
   CUDA_CHECK(cudaMalloc(&d_logits_, static_cast<std::size_t>(cfg.vocab_size) * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_argmax_, sizeof(int)));
-  // Scratch for the two-phase argmax. Without it the greedy argmax runs as ONE BLOCK over the
-  // whole vocab (one SM out of 170) and cost ~150 us/token on a 151936-wide head -- 12% of all
+  // Scratch for the two-phase argmax. Without it the greedy argmax runs as one BLOCK over the
+  // whole vocab (one SM out of 170) and cost ~150 us/token on a 151936-wide head; 12% of all
   // GPU time, to read 608 KB that peak bandwidth delivers in 0.34 us.
   argmax_parts_ = kernels::argmax_partition_count(cfg.vocab_size);
   CUDA_CHECK(
@@ -396,7 +396,7 @@ void LlamaEngine::allocate_runtime_buffers() {
     CUDA_CHECK(cudaMalloc(&d_block_table_, static_cast<std::size_t>(num_blocks) * sizeof(int)));
     std::vector<int> table(static_cast<std::size_t>(num_blocks));
     // Identity mapping (byte-identical). CPI_PAGED_SCRAMBLE reverses it: a
-    // diagnostic that MUST corrupt output iff the paged gather is truly live
+    // diagnostic that must corrupt output iff the paged gather is truly live
     // (writes are still contiguous), proving the paged read path is engaged.
     const bool scramble = std::getenv("CPI_PAGED_SCRAMBLE") != nullptr;
     for (int i = 0; i < num_blocks; ++i) {

@@ -4,11 +4,11 @@
 // here is shared with the text path except the kernels and the weight source: the tower runs
 // once per image, over a patch grid rather than a token sequence, at its own hidden size. Its
 // buffers are therefore allocated per call rather than drawn from the engine's slot pool, which
-// is sized for text geometry -- the tower's cost is twelve blocks of GEMMs, so a handful of
+// is sized for text geometry; the tower's cost is twelve blocks of GEMMs, so a handful of
 // allocations does not register.
 //
 // The arithmetic here is the same sequence metal_vision_test gates against the HuggingFace
-// oracle. That test now also runs THIS path (see encode_image there), so the two cannot drift.
+// oracle. That test now also runs this path (see encode_image there), so the two cannot drift.
 
 #include <algorithm>
 #include <cmath>
@@ -66,8 +66,8 @@ constexpr int kGemmTG = 32 * (kGemmFBM / (8 * kGemmRF)) * (kGemmBN / (8 * kGemmC
 
 // Bilinear resample of the learned position table onto the patch grid, then a reorder into
 // merge-unit-major order. Both details are load-bearing and neither announces itself if wrong:
-// the samples are linspace(0, side-1, n) with the endpoint INCLUDED, and patch (i, j) does NOT
-// land at row i*w + j -- the blocks see patches grouped by the 2x2 unit the merger later folds.
+// the samples are linspace(0, side-1, n) with the endpoint INCLUDED, and patch (i, j) does not
+// land at row i*w + j; the blocks see patches grouped by the 2x2 unit the merger later folds.
 //
 // Host-side on purpose: O(patches * hidden) once per image against twelve blocks at
 // O(patches^2 * dim), so a bespoke gather kernel would add surface area that can be silently
@@ -121,8 +121,8 @@ std::vector<float> interpolate_pos_embed(const float* table, int side, int h, in
 }
 
 // Per-token cos/sin for the vision rotation, half a head_dim wide (cos[i] == cos[i+half]).
-// The frequency vector is [row_freqs | col_freqs], each head_dim/4 long -- not one geometric
-// series over head_dim/2 -- and the tokens are enumerated in the same merge-unit-major order
+// The frequency vector is [row_freqs | col_freqs], each head_dim/4 long; not one geometric
+// series over head_dim/2; and the tokens are enumerated in the same merge-unit-major order
 // the position table uses.
 void build_rope_tables(int h, int w, int head_dim, int merge, float theta,
                        std::vector<float>& cosb, std::vector<float>& sinb) {
@@ -164,8 +164,8 @@ void build_rope_tables(int h, int w, int head_dim, int merge, float theta,
 //     its MERGED grid, then advances next by max(merged_h, merged_w).
 //
 // That last step is the one that matters and the one a reimplementation gets wrong. An image of
-// 16 tokens advances the counter by 4, not 16, so every text token AFTER an image sits four
-// positions past the image's start -- 5..9 for the reference prompt, where a 1-D counter puts
+// 16 tokens advances the counter by 4, not 16, so every text token after an image sits four
+// positions past the image's start; 5..9 for the reference prompt, where a 1-D counter puts
 // them at 17..21. Getting the image span right and the tail wrong still corrupts the answer.
 //
 // Verified against the transformers dump for <vision_start> + 16 image + <vision_end> + 4 text;
@@ -188,8 +188,8 @@ std::vector<std::int32_t> build_mrope_positions(const std::vector<int>& tokens, 
       ++i;
       continue;
     }
-    // A run of image tokens. Its length must be exactly merged_h * merged_w -- one placeholder
-    // per soft token -- or the grid this walks does not describe the run.
+    // A run of image tokens. Its length must be exactly merged_h * merged_w; one placeholder
+    // per soft token; or the grid this walks does not describe the run.
     int run = 0;
     while (i + run < n && tokens[static_cast<std::size_t>(i + run)] == image_token_id) ++run;
     const int expect = merged_h * merged_w;
@@ -208,7 +208,7 @@ std::vector<std::int32_t> build_mrope_positions(const std::vector<int>& tokens, 
   return pos;
 }
 
-// Where the M-RoPE counter ended -- the position the FIRST generated token takes. Not the token
+// Where the M-RoPE counter ended; the position the first generated token takes. Not the token
 // count: an image span advances the counter by its merged extent, so after 16 image tokens the
 // two differ by 12 and using the token count rotates every generated token wrongly.
 int mrope_next_position(const std::vector<int>& tokens, int image_token_id, int merged_h,
@@ -218,7 +218,7 @@ int mrope_next_position(const std::vector<int>& tokens, int image_token_id, int 
   const int n = static_cast<int>(tokens.size());
   if (n == 0) return 0;
   // The last token's t axis, plus one. For a trailing text token all three axes agree; for a
-  // trailing IMAGE token the counter has already advanced past the span, so take the max.
+  // trailing image token the counter has already advanced past the span, so take the max.
   int last = 0;
   for (int axis = 0; axis < 3; ++axis) {
     last = std::max(last, static_cast<int>(pos[static_cast<std::size_t>(axis) * n + (n - 1)]));
@@ -266,8 +266,8 @@ std::vector<float> PlanMetalEngine::encode_image(const std::vector<float>& patch
     return h;
   };
   opplan::WeightSource& ws = weight_source();
-  // Resolve EVERY vision tensor before the first dispatch. WeightSource::fp16 uploads on first
-  // use -- it allocates a Metal buffer and memcpys into it -- and doing that while a compute
+  // Resolve every vision tensor before the first dispatch. WeightSource::fp16 uploads on first
+  // use, it allocates a Metal buffer and memcpys into it, and doing that while a compute
   // encoder is open is not something the encoder's already-queued work is ordered against.
   // Touching them all up front also keeps the twelve blocks free of upload stalls.
   std::vector<std::string> names = {"patch_embed.weight", "patch_embed.bias", "pos_embed.weight",
@@ -314,9 +314,9 @@ std::vector<float> PlanMetalEngine::encode_image(const std::vector<float>& patch
   // ---- + interpolated position table ----
   {
     // From the LOADER, not the WeightSource. WeightSource::fp16 hands back an opaque Metal
-    // buffer handle -- its own comment says these are never dereferenced as pointers -- and
+    // buffer handle, its own comment says these are never dereferenced as pointers, and
     // reading one as fp16 data is how this first went wrong: a SIGBUS, then, once the layout
-    // shifted, 16384 NaNs that the test happily reported as PASS.
+    // shifted, 16384 NaNs that the test happily reported as pass.
     //
     // The position table is the one vision tensor the CPU has to read, because the resample is
     // done host-side; everything else stays on the GPU as a handle.
@@ -326,13 +326,13 @@ std::vector<float> PlanMetalEngine::encode_image(const std::vector<float>& patch
     for (std::size_t i = 0; i < tab32.size(); ++i) tab32[i] = f16_bits_to_f32(tab[i]);
     const std::vector<float> pos =
         interpolate_pos_embed(tab32.data(), side, grid_h, grid_w, hidden, merge);
-    // Add the position table in fp32 and round ONCE, rather than rounding the table to fp16
+    // Add the position table in fp32 and round once, rather than rounding the table to fp16
     // first and adding in the kernel.
     //
     // The interpolated table is not the stored one: bilinear blending of four bf16 rows with
     // fractional weights produces values with full f32 mantissa content, so rounding it before
     // the add throws away bits the add would otherwise keep. Measured on the M4, this halves the
-    // tower's error -- ENGINE_encode_image rel 0.01010 -> 0.00508 -- and it is what the
+    // tower's error, ENGINE_encode_image rel 0.01010 -> 0.00508, and it is what the
     // reference (and metal_vision_test's END_TO_END path) does.
     //
     // Host-side rather than a kernel: one pass over tokens*hidden, against twelve blocks of
@@ -412,7 +412,7 @@ std::vector<float> PlanMetalEngine::encode_image(const std::vector<float>& patch
     gemm(W(B + "mlp.fc1.weight"), bnorm, binter, W(B + "mlp.fc1.bias"), inter, hidden, tokens);
     {
       // tanh GELU here: the BLOCKS specify hidden_act = "gelu_pytorch_tanh". The merger below
-      // uses the exact erf form instead -- they are different functions and the tower uses both.
+      // uses the exact erf form instead; they are different functions and the tower uses both.
       ElemParams p{static_cast<std::uint32_t>(tokens) * static_cast<std::uint32_t>(inter), 1.0f};
       const void* bufs[] = {binter.handle()};
       ctx_.dispatch("cpi_gelu", runtime::MetalContext::Grid::Threads,
@@ -431,8 +431,8 @@ std::vector<float> PlanMetalEngine::encode_image(const std::vector<float>& patch
     // leaving "the output is wrong" across twelve of them; it is how the fp32 position add above
     // was tracked down, and it showed the remainder is diffuse rather than any single block.
     //
-    // Splitting the command buffer here is numerically neutral -- MetalContext barriers before
-    // every dispatch by default (metal_context.mm:430) -- so this observes without perturbing.
+    // Splitting the command buffer here is numerically neutral; MetalContext barriers before
+    // every dispatch by default (metal_context.mm:430); so this observes without perturbing.
     // Verified: with the dump on, ENGINE_encode_image is bit-identical at rel=0.01009724.
     if (const char* dd = std::getenv("CPI_VISION_DUMP_BLOCKS")) {
       ctx_.commit_and_wait();
@@ -451,7 +451,7 @@ std::vector<float> PlanMetalEngine::encode_image(const std::vector<float>& patch
   // ---- merger: LayerNorm per patch, then each 2x2 unit becomes one row ----
   //
   // The fold moves no data. Patches are already in merge-unit-major order, so four consecutive
-  // rows ARE one unit and [tokens][hidden] reinterprets as [tokens/4][4*hidden] in place.
+  // rows are one unit and [tokens][hidden] reinterprets as [tokens/4][4*hidden] in place.
   auto bmi = ctx_.alloc(static_cast<std::size_t>(soft) * inter_m * 2);
   auto bout = ctx_.alloc(static_cast<std::size_t>(soft) * out_hidden * 2);
   {
@@ -464,7 +464,7 @@ std::vector<float> PlanMetalEngine::encode_image(const std::vector<float>& patch
   }
   gemm(W("merger.fc1.weight"), bnorm, bmi, W("merger.fc1.bias"), inter_m, inter_m, soft);
   {
-    // erf, not tanh -- the merger's nn.GELU() defaults to approximate='none'.
+    // erf, not tanh; the merger's nn.GELU() defaults to approximate='none'.
     ElemParams p{static_cast<std::uint32_t>(soft) * static_cast<std::uint32_t>(inter_m), 1.0f};
     const void* bufs[] = {bmi.handle()};
     ctx_.dispatch("cpi_gelu_erf", runtime::MetalContext::Grid::Threads,
@@ -519,8 +519,8 @@ void PlanMetalEngine::init_gemma_vision(const std::string& model_dir) {
     gvis_rope_sin_ = ctx_.alloc_from(ss.data(), ss.size() * sizeof(float));
   }
 
-  // Sized for the soft-token budget times the pool window -- 280 * 3 * 3 = 2520 patches on E2B
-  // -- rounded up. The image preprocessor never emits more (it downscales to the budget).
+  // Sized for the soft-token budget times the pool window; 280 * 3 * 3 = 2520 patches on E2B
+  //; rounded up. The image preprocessor never emits more (it downscales to the budget).
   gvis_max_patches_ = 2560;
   const int P = gvis_max_patches_;
   const int H = v.hidden;
@@ -537,7 +537,7 @@ void PlanMetalEngine::init_gemma_vision(const std::string& model_dir) {
   using opplan::Slot;
   al(Slot::X, static_cast<std::size_t>(H));
   al(Slot::XNorm, static_cast<std::size_t>(H));
-  // Tmp doubles as the projector's output, which is TEXT-hidden wide.
+  // Tmp doubles as the projector's output, which is text-hidden wide.
   al(Slot::Tmp, static_cast<std::size_t>(std::max(H, cfg_.hidden_size)));
   al(Slot::Q, static_cast<std::size_t>(qdim));
   al(Slot::K, static_cast<std::size_t>(kvdim));
@@ -590,14 +590,14 @@ std::vector<float> PlanMetalEngine::encode_image(const std::vector<float>& pixel
 
   vision_pass_ = true;
   try {
-    // The tower is bidirectional and cacheless: ONE pass over all P patches.
+    // The tower is bidirectional and cacheless: one pass over all P patches.
     execute_ops(gvis_plan_.prologue, -1, 0, P);
     for (const opplan::LayerPlan& lp : gvis_plan_.layers) {
       execute_ops(lp.ops, lp.layer_index, 0, P);
     }
     execute_ops(gvis_plan_.epilogue, -1, 0, P);
 
-    // Pool the patches down to out_tokens soft tokens, then project into text space -- direct
+    // Pool the patches down to out_tokens soft tokens, then project into text space; direct
     // dispatches, not plan ops, because pooling changes the token count (see the builder note).
     const int k = gvis_.pooling_kernel;
     int max_x = 0;

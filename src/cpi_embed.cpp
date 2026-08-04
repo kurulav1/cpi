@@ -19,8 +19,8 @@
 #include "model/wordpiece_tokenizer.hpp"
 
 // One embedder, chosen at compile time. The two implementations deliberately expose the same
-// initialize/embed/dim/max_tokens/config surface, so everything below this point -- the protocol,
-// the tokenizer, the batching -- is backend-agnostic and this is the only place that knows.
+// initialize/embed/dim/max_tokens/config surface, so everything below this point; the protocol,
+// the tokenizer, the batching; is backend-agnostic and this is the only place that knows.
 //
 // CUDA wins when both are available, matching resolve_engine's preference for the discrete GPU.
 #if CPI_HAS_CUDA

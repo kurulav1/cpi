@@ -1,7 +1,7 @@
 // Parity test for batched paged decode attention (P2 primitive).
 //
 // Runs one decode step for a BATCH of sequences (varied lengths, per-sequence
-// NON-CONTIGUOUS block tables, shared KV pool) via
+// non-contiguous block tables, shared KV pool) via
 // launch_attention_step_batched_paged, and checks each sequence's output matches
 // an independent single-sequence launch_attention_step_paged call (itself parity-
 // verified against the contiguous kernel). Proves batching is a pure throughput
@@ -47,7 +47,7 @@ int main() {
   std::vector<half> kp(static_cast<std::size_t>(pool_blocks) * block_size * kv_hidden,
                        __float2half(0.0f));
   std::vector<half> vp = kp;
-  // Per-sequence q + a NON-CONTIGUOUS block table (distinct physical blocks per seq).
+  // Per-sequence q + a non-contiguous block table (distinct physical blocks per seq).
   std::vector<half> q(static_cast<std::size_t>(batch) * num_heads * head_dim);
   {
     auto qq = rnd(q.size());

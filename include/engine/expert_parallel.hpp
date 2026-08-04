@@ -5,7 +5,7 @@
 // the STANDARD MoE kernels on its own expert sub-matrix, with the selections REMAPPED to local expert
 // indices and the off-rank selections' weights MASKED to zero; the per-rank outputs then SUM to the
 // full MoE result (each global expert contributes exactly once, on its owner). That sum is the
-// all_to_all-combine seam -- for real multi-GPU it becomes a collective; on one GPU it is a local add,
+// all_to_all-combine seam; for real multi-GPU it becomes a collective; on one GPU it is a local add,
 // which is what makes the dispatch/combine logic verifiable here (expert_parallel_test).
 //
 // Header-only host index logic (no GPU); pairs with the existing launch_moe_gate_up_geglu /
@@ -13,10 +13,10 @@
 
 namespace engine {
 
-// [lo, hi) global experts owned by `rank` under a balanced greedy split -- each rank gets floor or
+// [lo, hi) global experts owned by `rank` under a balanced greedy split; each rank gets floor or
 // ceil(experts/world_size), the same partition policy as the TP row split and the PP stage split (see
 // pipeline_parallel.hpp), so every parallelism dimension shards the same way. Contiguous, tiles
-// [0, experts) with no gap or overlap for ANY world_size. Unlike an even-split-plus-last-rank-remainder
+// [0, experts) with no gap or overlap for any world_size. Unlike an even-split-plus-last-rank-remainder
 // scheme this stays load-balanced and degrades cleanly when world_size > experts (trailing ranks get
 // an empty [x, x) range and own no experts) instead of piling every leftover onto the final rank.
 inline void expert_parallel_range(int experts, int world_size, int rank, int* lo, int* hi) {

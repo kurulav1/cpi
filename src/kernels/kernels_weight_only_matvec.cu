@@ -80,7 +80,7 @@ __device__ __forceinline__ int load_packed_int4x4(const int8_t* row_packed, int 
 //
 // Separate from the dp4a matvecs for two reasons. The LM head must emit fp32 logits (the argmax
 // and the top-k sampler read floats) and every dp4a kernel writes half; and it quantizes the
-// WEIGHTS ONLY -- x stays fp16 and the dot accumulates in fp32. The dp4a path would also
+// weights only; x stays fp16 and the dot accumulates in fp32. The dp4a path would also
 // quantize x, which is the wrong trade in the layer that selects the output token: the
 // activation is a few KB against a weight matrix measured in GB.
 //
@@ -527,7 +527,7 @@ __global__ void weight_only_int4_matvec_grouped_wide_kernel(const int8_t* __rest
 
 // Grouped int4 x int8-activation dp4a matvec. The activation vector must be quantized with
 // launch_quantize_fp16_to_int8_perm8 (even/odd bytes deinterleaved per 8-column window):
-// `word & 0x0F0F0F0F` extracts a byte-word's four EVEN columns and `(word >> 4) & ...` the
+// `word & 0x0F0F0F0F` extracts a byte-word's four even columns and `(word >> 4) & ...` the
 // four ODD columns, each pairing with one aligned 32-bit load of the permuted x. Nibbles
 // are re-signed with a single __vsubss4. Per 32-weight chunk the dot is EXACT int32, then
 // scaled by the chunk's group scale; the activation scale applies once at the end.
@@ -578,8 +578,8 @@ __global__ void weight_only_int4_matvec_grouped_dp4a_wide_kernel(
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
           const unsigned word = wu[i];  // window 4c+i: 4 bytes = 8 weights
-          // Nibbles are TWO'S COMPLEMENT (pack stores q & 0xF), so the decode is
-          // (n ^ 8) - 8 (sign extension), NOT n - 8 -- xor first, then subtract.
+          // Nibbles are two'S COMPLEMENT (pack stores q & 0xF), so the decode is
+          // (n ^ 8) - 8 (sign extension), not n - 8; xor first, then subtract.
           const int wlo =
               __vsubss4(static_cast<int>((word & 0x0F0F0F0Fu) ^ 0x08080808u), 0x08080808);
           const int whi =
@@ -598,7 +598,7 @@ __global__ void weight_only_int4_matvec_grouped_dp4a_wide_kernel(
 }
 
 // Segment-routed twin of the grouped dp4a kernel: up to three int4 projections sharing one
-// perm8-quantized activation run as ONE launch (q|k|v, gate|up). Same per-row arithmetic;
+// perm8-quantized activation run as one launch (q|k|v, gate|up). Same per-row arithmetic;
 // only the grid packing differs (see gemv_wide_cat_kernel for the pattern).
 template <int Warps>
 __global__ void weight_only_int4_matvec_grouped_dp4a_cat_kernel(
@@ -690,7 +690,7 @@ __device__ __forceinline__ float glu_gelu_tanh_f32(float x) {
 }
 
 // Fused GeGLU dp4a matvec: out[r] = gelu(gate_r) * up_r with no Gate/Up round-trip and
-// no elementwise launch. Each warp owns ONE row of ONE matrix (two-rows-per-warp variants
+// no elementwise launch. Each warp owns one row of one matrix (two-rows-per-warp variants
 // measured slower): warps 0..3 take four gate rows, warps 4..7 their up partners, and a
 // small shared-memory epilogue pairs them. Numerics match the unfused path: both dots
 // round to fp16 before the gelu.
@@ -899,7 +899,7 @@ __global__ void weight_only_int8_matvec_glu_kernel(const int8_t* __restrict__ wg
   }
 }
 
-// Multi-token grouped dp4a matvec: T tokens (<= 8) share ONE pass over the weights --
+// Multi-token grouped dp4a matvec: T tokens (<= 8) share one pass over the weights
 // each warp's weight chunk is decoded once and dotted against every token's perm8
 // activation. This is what makes a speculative verify pass cost about one decode step's
 // weight traffic for k tokens, and it also serves short prefill remainders. Activations
@@ -1239,7 +1239,7 @@ __global__ void weight_only_int4_matvec_dp4a_tiled_kernel(const int8_t* w_packed
     // Narrower requests leave the warps stalled on memory latency even at full occupancy.
     //
     // Reordering the accumulation is safe here (unlike in the fp16 GEMVs): __dp4a accumulates
-    // in int32, so the sum is exact and integer addition is associative -- the result is
+    // in int32, so the sum is exact and integer addition is associative; the result is
     // bit-identical whatever the order.
     const int8_t* tile_w = row_w + static_cast<std::size_t>(tile_base) * 2;
     const bool aligned16 = (reinterpret_cast<std::uintptr_t>(tile_w) & 15u) == 0u;
@@ -1550,7 +1550,7 @@ void launch_weight_only_int8_matvec_glu(const std::int8_t* wg, const float* sg,
 
 // Dequantize a whole packed matrix back to fp16. Prefill-only: sequence mode runs the
 // real fp16 GEMM over a dequantized scratch copy (one matrix at a time) instead of a
-// batched quant matvec -- the GEMM amortizes the dequant at any real prompt length, and
+// batched quant matvec; the GEMM amortizes the dequant at any real prompt length, and
 // decode keeps its dp4a kernels. Grouped int4 variant; group % 2 == 0.
 __global__ void dequant_int4_grouped_kernel(const int8_t* __restrict__ w_packed,
                                             const float* __restrict__ scales,

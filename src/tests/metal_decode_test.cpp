@@ -1,19 +1,19 @@
 // Metal decode, checked on real weights.
 //
-// TWO ORACLES:
+// two ORACLES:
 //
-//   1. The CPU engine (fp32 end to end) on the first forward -- argmax and top-5.
+//   1. The CPU engine (fp32 end to end) on the first forward; argmax and top-5.
 //   2. A golden token stream from the CUDA backend for the whole greedy sequence.
 //
 // A CAUTIONARY NOTE, because it nearly cost us a real bug. When Metal first diverged
 // from the CPU engine at token 11 with a 0.55 logit gap, that was diagnosed as "the
-// fp16/fp32 activation gap -- expected". It was not. The CPU engine had rope_theta
+// fp16/fp32 activation gap; expected". It was not. The CPU engine had rope_theta
 // hardcoded to 10000 and was rotating every Q and K by the wrong angle for every
 // model that does not use that base (Qwen2.5, Qwen3, Llama 3). Metal was right and
 // the oracle was broken. With that fixed, all three engines agree token-for-token.
 //
 // The lesson: when a new backend disagrees with a reference, the reference is a
-// suspect too. Do not reach for "expected numerical drift" -- it is the explanation
+// suspect too. Do not reach for "expected numerical drift"; it is the explanation
 // that makes a bug invisible.
 //
 // Usage:  metal_decode_test <model.ll2c> [num_tokens] [golden.txt]
@@ -132,7 +132,7 @@ int main(int argc, char** argv) {
   std::printf("\n  CPU  top-5:");
   for (const auto& p : cpu_top) std::printf("  %d(%.3f)", p.first, p.second);
 
-  // Metal's own top-5, so the RANKING can be compared -- not just the winner. An
+  // Metal's own top-5, so the RANKING can be compared; not just the winner. An
   // argmax can agree by luck on an easy token while the distribution underneath is
   // quietly wrong; the ordering of the runners-up is far more sensitive.
   std::vector<int> idx(mlogits.size());
@@ -159,7 +159,7 @@ int main(int argc, char** argv) {
   std::printf("  argmax agreement: %s\n", argmax_ok ? "PASS" : "FAIL");
 
   // A quantized model legitimately deviates from the fp16 oracle, so the bound is
-  // looser -- but it is still a BOUND, not an exemption. These are set from measured
+  // looser; but it is still a BOUND, not an exemption. These are set from measured
   // behaviour, an order of magnitude above the observed error and far below what a
   // structural break produces (a bad kernel yields hundreds, or NaN):
   //
@@ -189,7 +189,7 @@ int main(int argc, char** argv) {
   // in a different order than CUDA does, and reordering an fp32 sum changes its
   // rounding by ~5e-3. Greedy decoding turns that into a discrete choice, so on a
   // near-tie the two backends can legitimately pick different tokens while both being
-  // correct -- and they rejoin immediately after.
+  // correct; and they rejoin immediately after.
   //
   // So a divergence is only forgiven when it happens at a genuine tie: the top-2
   // logits within the noise floor. A divergence at a CONFIDENT token is a real bug and
@@ -225,7 +225,7 @@ int main(int argc, char** argv) {
 
   bool golden_ok = true;
   if (quant != 0) {
-    // A quantized model is a different model -- it cannot reproduce the fp16 golden and
+    // A quantized model is a different model; it cannot reproduce the fp16 golden and
     // should not be asked to. Its gate is the CPU oracle above (argmax + a bound).
     std::printf("\n  quantized: golden-stream gate skipped (gated on the CPU oracle instead)\n");
   } else if (golden.empty()) {
@@ -238,14 +238,14 @@ int main(int argc, char** argv) {
     if (agree == n) {
       std::printf("\n  Metal reproduces the CUDA stream (%zu tokens): PASS\n", n);
     } else {
-      // The streams forked. A tie at the fork explains THAT token -- fp32 sum ordering differs
-      // between backends, so a near-equal choice can fall either way -- but it explains nothing
+      // The streams forked. A tie at the fork explains that token; fp32 sum ordering differs
+      // between backends, so a near-equal choice can fall either way; but it explains nothing
       // after it: once the two pick different tokens they are different sequences, and a forked
       // continuation cannot be compared to the golden at all.
       //
       // This used to stop here and pass on the strength of that one tie. It was a false pass: a
       // deliberately broken merge kernel forked at a tie, collapsed into repeated EOS for the
-      // next hundred tokens, agreed with the CPU engine on 21 of 128 -- and the gate went green.
+      // next hundred tokens, agreed with the CPU engine on 21 of 128; and the gate went green.
       //
       // So teacher-force the GOLDEN prefix and judge every position on its own: at each step
       // Metal sees the reference's tokens, not its own, and has to predict the reference's next

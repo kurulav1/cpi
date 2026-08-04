@@ -34,7 +34,7 @@
 
 namespace engine {
 
-// The batched decode path implements ONLY the plain fp16 full-attention resident
+// The batched decode path implements only the plain fp16 full-attention resident
 // case (lw->wqkv/wo/w13/w2 fp16, non-paged single-token path otherwise). Reject
 // anything else with a clear message instead of dereferencing null fp16 weights
 // (int8/int4 keep their weights in layer_cache_i8_, MoE/TQ3 use other caches).
@@ -294,7 +294,7 @@ void LlamaEngine::decode_step_batched_logits(const std::vector<int>& tokens,
   }
   const auto t1 = std::chrono::steady_clock::now();
   // One batched GEMM, then one coalesced D2H copy of the whole [batch][vocab] block into a
-  // persistent PINNED buffer -- pinned dst copies at ~full PCIe bandwidth (a pageable dst
+  // persistent PINNED buffer; pinned dst copies at ~full PCIe bandwidth (a pageable dst
   // stages through a driver bounce buffer at ~half) and the copy can be issued async, so the
   // single stream sync covers both the GEMM and the transfer. The buffer is reused across
   // steps rather than freshly allocating ~batch*vocab floats every decode.
@@ -324,12 +324,12 @@ bool LlamaEngine::decode_step_batched_topk(
     const std::vector<int>& tokens, const std::vector<int>& positions,
     const std::vector<int>& block_tables_flat, int max_blocks, const BatchTopkParams& sp,
     std::vector<std::vector<detail::SampleCandidate>>& out_cand) {
-  // MUST match llama_engine_graph.cpp: the shared d_topk_/d_cand_ buffers are sized to these.
+  // must match llama_engine_graph.cpp: the shared d_topk_/d_cand_ buffers are sized to these.
   constexpr int kMaxDeviceTopK = 1024;
   constexpr int kCandCapacity = 4096;
   const int vocab = weights_.config().vocab_size;
   // Every row's k must be usable by the device top-k (the caller falls back to the logits path
-  // for the whole batch otherwise -- a per-row split is a later refinement).
+  // for the whole batch otherwise; a per-row split is a later refinement).
   for (int kb : sp.k)
     if (kb <= 0 || kb > kMaxDeviceTopK || kb >= vocab) return false;
 
@@ -341,7 +341,7 @@ bool LlamaEngine::decode_step_batched_topk(
   batched_lm_head(batch, hidden, vocab);
   ensure_device_topk_buffers();
 
-  // Repetition penalty lives BEFORE the top-k, on device, so the candidate set matches the host
+  // Repetition penalty lives before the top-k, on device, so the candidate set matches the host
   // slow path without shipping the vocab. In verify mode, snapshot the raw logits first so the
   // host reference can reproduce sanitize+penalty independently.
   static const bool verify = std::getenv("CPI_BATCH_TOPK_VERIFY") != nullptr;
@@ -407,7 +407,7 @@ bool LlamaEngine::decode_step_batched_topk(
   }
 
   // Per row: device top-k (the row's k-th value is the threshold) then a gather of every finite
-  // logit >= threshold -- exactly the candidate set sample_from_logits_topk builds on the host, so
+  // logit >= threshold; exactly the candidate set sample_from_logits_topk builds on the host, so
   // only those (a few dozen) cross the bus instead of the full vocab. Same logic as the
   // single-sequence graph path, looped over the batch's rows.
   for (int b = 0; b < batch; ++b) {
@@ -443,7 +443,7 @@ bool LlamaEngine::decode_step_batched_topk(
               });
 
     // CPI_BATCH_TOPK_VERIFY=1: rebuild the candidate set the host slow path would produce from the
-    // RAW logits (sanitize, then repetition penalty, then the k-th-largest threshold and gather of
+    // raw logits (sanitize, then repetition penalty, then the k-th-largest threshold and gather of
     // every finite logit >= it) and compare id-sets. If they ever differ, the fast path could
     // sample a different token than the full path.
     if (verify) {
@@ -480,12 +480,12 @@ bool LlamaEngine::decode_step_batched_topk(
       }
 
       // Closure over the id-set check: run the ACTUAL shared sampler
-      // (dispatch_sample_from_candidates -- the exact code the scheduler uses to turn candidates
-      // into a token) on BOTH the device candidate set and the host reference set, seeded
+      // (dispatch_sample_from_candidates; the exact code the scheduler uses to turn candidates
+      // into a token) on both the device candidate set and the host reference set, seeded
       // identically, and compare the drawn token. Because both go through the same traversal, an
-      // agreeing token proves the sets AND their values agree -- the id-set check above ignores the
+      // agreeing token proves the sets and their values agree; the id-set check above ignores the
       // candidate VALUES, so this catches a penalty/sanitize value bug that leaves the ids intact.
-      // We deliberately do NOT compare against the full sample_from_logits path: it walks the vocab
+      // We deliberately do not compare against the full sample_from_logits path: it walks the vocab
       // in index order while the candidate path walks in probability order, so the two map the same
       // RNG draw to different tokens by construction (distributionally equal, not token-identical).
       // top_p = 1 keeps the whole candidate set (most value-sensitive); several seeds guard against
@@ -537,8 +537,8 @@ bool LlamaEngine::decode_step_batched_argmax(const std::vector<int>& tokens,
   }
 
   // Repetition penalty on-device for penalty rows: sanitize the row, then scale each unique seen
-  // id -- identical to the top-k path, so the argmax runs on the same logits the host would. The
-  // argmax kernel also sanitizes inline, so NON-penalty rows need no separate sanitize here.
+  // id; identical to the top-k path, so the argmax runs on the same logits the host would. The
+  // argmax kernel also sanitizes inline, so non-penalty rows need no separate sanitize here.
   bool any_penalty = false;
   for (float p : ap.penalty)
     if (p > 1.0f) {
@@ -611,7 +611,7 @@ bool LlamaEngine::decode_step_batched_argmax(const std::vector<int>& tokens,
   CUDA_CHECK(cudaMemcpy(out_ids.data(), d_argmax_out_,
                         static_cast<std::size_t>(batch) * sizeof(int), cudaMemcpyDeviceToHost));
 
-  // CPI_BATCH_TOPK_VERIFY=1: rebuild the winner the host greedy path would pick from the RAW logits
+  // CPI_BATCH_TOPK_VERIFY=1: rebuild the winner the host greedy path would pick from the raw logits
   // (sanitize all -> repetition penalty -> block EOS -> argmax) and compare. The inline re-clamp in
   // the kernel only touches values already <= -80 or a shrunk positive, so it never changes which
   // id wins; the reference deliberately does not re-clamp after the penalty, matching the host.
@@ -742,8 +742,8 @@ std::vector<int> LlamaEngine::greedy_generate_single(const std::vector<int>& pro
   return out;
 }
 
-// The backend half of continuous batching. Everything else the scheduler does -- admission,
-// preemption, block growth, the shared-prefix LRU, sampling, retirement -- is host logic and
+// The backend half of continuous batching. Everything else the scheduler does; admission,
+// preemption, block growth, the shared-prefix LRU, sampling, retirement; is host logic and
 // now lives in engine::BatchScheduler, shared with Metal. These are the only two operations
 // that ever needed a GPU, which is why keeping the rest in this class made batching CUDA-only.
 class LlamaEngine::BatchAdapter final : public BatchBackend {
@@ -989,7 +989,7 @@ void LlamaEngine::ensure_batch_state_buffers(int batch, int max_blocks) {
     batch_buffers_max_seqs_ = batch;
   }
   // The block table is batch*max_blocks ints. Both factors vary independently and
-  // the batch can regrow after shrinking, so size against the REAL capacity — the
+  // the batch can regrow after shrinking, so size against the real capacity — the
   // previous product of high-watermarks over-reported it and let a larger request
   // overflow the buffer (device-side memcpy past the end).
   const std::size_t need = static_cast<std::size_t>(batch) * static_cast<std::size_t>(max_blocks);

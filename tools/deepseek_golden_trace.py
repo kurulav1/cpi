@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Streaming HF golden trace for DeepSeek-V2-Lite: run the real model ONE LAYER AT A TIME (load that
+"""Streaming HF golden trace for DeepSeek-V2-Lite: run the real model one layer AT A TIME (load that
 layer's weights from the safetensors shards, forward, free) so a 16B model traces in <2GB RAM, and dump
 the per-layer hidden states + final logits. This is the reference CPI's op-plan forward is verified
 against, layer by layer (the "compare vs a real engine at every stage" plan).
@@ -35,9 +35,9 @@ def shard_index():
 def load_by_prefix(index, prefix, module):
     """Load tensors whose name starts with `prefix` into `module` (strip prefix). float32.
 
-    CRUCIAL: transformers' DeepseekV2Moe stores experts FUSED (experts.gate_up_proj [E,2*MI,H],
+    crucial: transformers' DeepseekV2Moe stores experts fused (experts.gate_up_proj [E,2*MI,H],
     experts.down_proj [E,H,MI]) while the checkpoint ships per-expert tensors. from_pretrained fuses
-    them; a manual load_state_dict does NOT -- so we fuse here, or the routed experts stay at random
+    them; a manual load_state_dict does not; so we fuse here, or the routed experts stay at random
     init and the whole trace is silently wrong (learned this the hard way)."""
     import torch
     from safetensors import safe_open

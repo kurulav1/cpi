@@ -326,7 +326,7 @@ bool is_byte_token(const std::string& piece, unsigned char* value) {
 // The function parses four top-level sections of the JSON:
 //   "added_tokens"  — special tokens (BOS, EOS, etc.) with their ids.
 //   "normalizer"    — identifies the word-boundary marker string (default
-//                     U+2581 LOWER ONE EIGHTH BLOCK, "▁", used by SentencePiece
+//                     U+2581 LOWER one EIGHTH BLOCK, "▁", used by SentencePiece
 //                     and many HF models) so spaces can be reconstructed on
 //                     decode.
 //   "decoder"       — determines whether a leading space should be stripped
@@ -394,7 +394,7 @@ void HfBpeTokenizer::load(const std::string& path) {
             //
             // Canonical names (<bos>/<eos>) win outright; the legacy
             // SentencePiece names (<s>/</s>) only fill a gap. Gemma's vocab
-            // carries BOTH — its real BOS is <bos> (id 2) while <s> (id 204) is
+            // carries both — its real BOS is <bos> (id 2) while <s> (id 204) is
             // an inert leftover, so matching <s> there would prepend the wrong
             // BOS and produce fluent-looking garbage.
             if (content == "<bos>" || content == "<|begin_of_text|>") {

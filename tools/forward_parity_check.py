@@ -7,7 +7,7 @@ o-proj, residual, RMSNorm, SwiGLU, residual] -> final norm -> lm-head), then
 compares: the argmax must agree and the max logit diff must be within tolerance.
 
 This is the safety harness for forward-path refactors (kernel fusion): run it
-BEFORE a change (record max_abs_diff and PASS), make the change, run it AFTER —
+before a change (record max_abs_diff and pass), make the change, run it after —
 correctness is preserved iff it still PASSes with an unchanged max_abs_diff. A
 byte-identical fusion leaves max_abs_diff untouched; a bug diverges sharply (a
 missing QKV bias, for instance, took Qwen2.5's max_abs from 0.07 to 21).
@@ -18,11 +18,11 @@ Usage:
     --model artifacts/hub/Qwen__Qwen2.5-0.5B-Instruct/Qwen2.5-0.5B-Instruct.ll2c \
     --tokenizer artifacts/hub/Qwen__Qwen2.5-0.5B-Instruct/hf/tokenizer.json
 
-Exit code 0 = PASS, 1 = FAIL (mirrors the CLI), so it drops into a gate.
+Exit code 0 = pass, 1 = FAIL (mirrors the CLI), so it drops into a gate.
 
 Verified baseline 2026-07-05 (5090, --gpu-cache-all): Qwen2.5-0.5B max_abs 0.066,
-Llama-3.1-8B max_abs 0.012 — both PASS. The CPU reference handles the fused
-attention.bqkv bias, so it is valid for Qwen2-family AND Llama-family models.
+Llama-3.1-8B max_abs 0.012 — both pass. The CPU reference handles the fused
+attention.bqkv bias, so it is valid for Qwen2-family and Llama-family models.
 """
 import argparse
 import os

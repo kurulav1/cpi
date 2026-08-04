@@ -1,6 +1,6 @@
 // Checks that build_llama_plan emits the op sequence a Llama-style decode needs.
 //
-// Runs everywhere -- no CUDA, no Metal, no GPU, no weights. The WeightSource is a
+// Runs everywhere; no CUDA, no Metal, no GPU, no weights. The WeightSource is a
 // stub that hands back a distinct fake handle per tensor name, so the test can also
 // assert that each op got bound to the RIGHT tensor, not merely to something.
 //
@@ -186,7 +186,7 @@ int main() {
   }
 
   // ---- Qwen2's QKV bias ---------------------------------------------------
-  // Dropping it does not crash -- it yields fluent nonsense -- so it is asserted.
+  // Dropping it does not crash, it yields fluent nonsense, so it is asserted.
   {
     LlamaGeometry gq = g;
     gq.has_qkv_bias = true;
@@ -195,7 +195,7 @@ int main() {
     const auto& ops = pq.layers[1].ops;
     // The .ll2c fuses the three biases into one [bq | bk | bv] tensor, so all three
     // ops share a handle and differ only by offset. Getting the offsets wrong would
-    // feed K the tail of Q's bias -- fluent nonsense, not a crash.
+    // feed K the tail of Q's bias; fluent nonsense, not a crash.
     const void* bqkv = wq.handle_for("layers.1.attention.bqkv");
     expect(ops[1].bias == bqkv && ops[2].bias == bqkv && ops[3].bias == bqkv,
            "Q/K/V biases all point at the fused bqkv tensor");
@@ -207,9 +207,9 @@ int main() {
   }
 
   // ---- Qwen3's per-head QK-norm -------------------------------------------
-  // A per-head RMSNorm on Q and K, after projection and BEFORE RoPE. It is the
-  // ordinary RmsNorm op with rows = heads, not a new kernel -- that is the point of
-  // the seam. Note Qwen3's head_dim is NOT hidden/heads.
+  // A per-head RMSNorm on Q and K, after projection and before RoPE. It is the
+  // ordinary RmsNorm op with rows = heads, not a new kernel; that is the point of
+  // the seam. Note Qwen3's head_dim is not hidden/heads.
   {
     LlamaGeometry gq;
     gq.num_layers = 2;
@@ -269,8 +269,8 @@ int main() {
   // ---- Gemma 4 -------------------------------------------------------------
   //
   // E2B's shape, scaled down so the op lists stay readable: alternating sliding/full layers with
-  // a DIFFERENT head_dim each, the tail of them sharing KV, per-layer embeddings, and a
-  // double-wide MLP on the shared layers. Each check below is a rule that fails silently -- the
+  // a different head_dim each, the tail of them sharing KV, per-layer embeddings, and a
+  // double-wide MLP on the shared layers. Each check below is a rule that fails silently; the
   // model still runs and still produces fluent-looking text when any of them is wrong.
   {
     Gemma4Geometry gg;
@@ -279,9 +279,9 @@ int main() {
     gg.inter = 128;
     gg.vocab = 999;
     gg.heads = 4;
-    // Deliberately NOT 1e-6f: that is Op::eps's own default, so a builder that never assigns eps
+    // Deliberately not 1e-6f: that is Op::eps's own default, so a builder that never assigns eps
     // would still satisfy the "carries eps" check below. The control caught this test passing
-    // while measuring nothing -- the value has to be one the default cannot accidentally match.
+    // while measuring nothing; the value has to be one the default cannot accidentally match.
     gg.rms_eps = 7.5e-5f;
     gg.sliding_window = 512;
     gg.head_dim_sliding = 16;
@@ -301,13 +301,13 @@ int main() {
     const ModelPlan pg = build_gemma4_plan(gg, wg);
 
     expect(static_cast<int>(pg.layers.size()) == 6, "gemma4: one LayerPlan per layer");
-    // The image splice point must sit after the embedding scale but BEFORE the PLE build, because
-    // the per-layer inputs are projected FROM the embeddings. Splicing after the whole prologue
+    // The image splice point must sit after the embedding scale but before the PLE build, because
+    // the per-layer inputs are projected from the embeddings. Splicing after the whole prologue
     // would compute them from the placeholder token instead of the image.
     expect(pg.embed_ready == 2, "gemma4: embed_ready precedes the PLE build");
     expect(pg.prologue.size() > 2, "gemma4: PLE build emitted into the prologue");
 
-    // KV sharing: a shared layer must project NO K/V and store nothing -- emitting the projections
+    // KV sharing: a shared layer must project no K/V and store nothing; emitting the projections
     // would not merely waste work, it would overwrite the cache it is supposed to be reading.
     auto has_kind = [](const std::vector<Op>& ops, OpKind k) {
       for (const Op& o : ops)
@@ -330,7 +330,7 @@ int main() {
     expect(att0 && !att0->full_attention, "gemma4: layer 0 is sliding");
     expect(att2 && att2->full_attention, "gemma4: layer 2 is full");
 
-    // THE TRAP THAT PROMPTED THIS TEST: the CUDA executor reads a global rms_eps and would run
+    // the trap that PROMPTED this TEST: the CUDA executor reads a global rms_eps and would run
     // fine with op.eps unset; the Metal executor reads op.eps. A plan missing it normalises with
     // no epsilon on one backend only.
     int norms = 0, norms_with_eps = 0, offset_norms = 0;
@@ -351,7 +351,7 @@ int main() {
     expect(offset_norms == 0, "gemma4: no RmsNorm uses the (1+w) offset form");
 
     // RoPE carries its configuration as VALUES, not just as the rope_table enum. A backend that
-    // computes angles in-shader (Metal) never reads rope_table, and Op::scale defaults to 1.0f --
+    // computes angles in-shader (Metal) never reads rope_table, and Op::scale defaults to 1.0f
     // a theta of 1.0 rotates every lane at the same frequency and is a wrong model, not an error.
     auto rope_of = [&](int L) {
       const Op* r = nullptr;
@@ -365,7 +365,7 @@ int main() {
     expect(r2 && r2->scale == 1000000.0f, "gemma4: full layer rope theta 1e6");
     expect(r0 && r0->rope_table == RopeTable::Sliding, "gemma4: sliding layer names its table");
     expect(r2 && r2->rope_table == RopeTable::Full, "gemma4: full layer names its table");
-    // Partial rotary on the FULL layers only, and even: 32 * 0.25 = 8.
+    // Partial rotary on the full layers only, and even: 32 * 0.25 = 8.
     expect(r0 && r0->rotary_dim == 0, "gemma4: sliding layer rotates all of head_dim");
     expect(r2 && r2->rotary_dim == 8 && r2->rotary_dim % 2 == 0,
            "gemma4: full layer rotary_dim is 0.25*head_dim and even");
@@ -415,10 +415,10 @@ int main() {
   // The bug class this session kept producing, four times: an op that CUDA's executor can run
   // because it INFERS the missing fields (it reads K and V from hardcoded slots, applies
   // 1/sqrt(head_dim) in-kernel, selects a rope table by enum), and that Metal's executor cannot,
-  // because it reads those same things OFF THE OP. Symptoms ranged from a wrong rope frequency to
-  // KvStore writing nothing at all -- and none of them failed at build time, on any machine.
+  // because it reads those same things OFF the OP. Symptoms ranged from a wrong rope frequency to
+  // KvStore writing nothing at all; and none of them failed at build time, on any machine.
   //
-  // A plan is ONE description read by TWO executors, so "complete" is the requirement, not
+  // A plan is one description read by two executors, so "complete" is the requirement, not
   // "sufficient for whichever executor infers the most". This walks every op of every builder and
   // asserts the fields its kind actually needs. CPU-only, no GPU, no weights.
   {
@@ -469,8 +469,8 @@ int main() {
             break;
           case OpKind::AddInplace:
             // cols == 0 legitimately means "a hidden-wide residual add", which is what every
-            // AddInplace in the Llama and Qwen3.5 plans is. Only a NON-residual add (Gemma 4's
-            // per-layer-embedding table, 8960 wide) has to say so -- and the executors now honour
+            // AddInplace in the Llama and Qwen3.5 plans is. Only a non-residual add (Gemma 4's
+            // per-layer-embedding table, 8960 wide) has to say so; and the executors now honour
             // it either way, which is the actual fix. Nothing to require here.
             break;
           case OpKind::CopySlot:

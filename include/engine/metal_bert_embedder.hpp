@@ -1,17 +1,17 @@
 #pragma once
 
-// Metal BERT-family sentence-embedding encoder -- the Apple Silicon counterpart of
+// Metal BERT-family sentence-embedding encoder; the Apple Silicon counterpart of
 // engine::BertEmbedder, which is CUDA (cublas + six __global__ kernels) and therefore left
 // embeddings, RAG and folder-search dead on a Mac.
 //
 // The interface deliberately MIRRORS BertEmbedder rather than generalising it: same
 // initialize/embed/dim/max_tokens/config surface, so cpi_embed picks one at compile time and the
-// serving protocol above it does not change. A shared abstract base would buy nothing here --
+// serving protocol above it does not change. A shared abstract base would buy nothing here
 // there are exactly two implementations and they share no state.
 //
 // The port is mostly assembly. Of the six CUDA kernels only two had no Metal equivalent
 // (see src/kernels/metal/85_bert.metal); the rest are kernels the Qwen3.5 vision tower already
-// needed -- cpi_layernorm, cpi_gemm_f16 (which applies its own bias), cpi_gelu_erf and
+// needed; cpi_layernorm, cpi_gemm_f16 (which applies its own bias), cpi_gelu_erf and
 // cpi_attention_bidirectional.
 
 #include <cstdint>

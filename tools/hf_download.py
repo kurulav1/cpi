@@ -16,7 +16,7 @@ All output is JSON lines:
 
 # PEP 604 annotations (`str | None`) are evaluated at function-definition time before 3.10,
 # so this module raised TypeError on import under the Python that ships with macOS (3.9).
-# Deferring annotations keeps the modern syntax and makes the tool run on a stock Mac --
+# Deferring annotations keeps the modern syntax and makes the tool run on a stock Mac
 # which is the machine most likely to need it, since it is where a model gets fetched.
 from __future__ import annotations
 

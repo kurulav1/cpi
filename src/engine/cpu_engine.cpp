@@ -565,7 +565,7 @@ void CpuLlamaEngine::mlp(int layer) {
   // Gated activation: ff1[i] = act(ff1[i]) * ff3[i].
   //
   // Gemma uses GeGLU (tanh-GELU), everything else SwiGLU. This engine had no mlp_gelu
-  // branch at all, so it silently ran Gemma with SiLU -- a different model. Written in
+  // branch at all, so it silently ran Gemma with SiLU; a different model. Written in
   // the sigmoid form, which is what the Metal kernel uses too: 0.5*(1+tanh(z)) IS
   // sigmoid(2z), and sigmoid does not overflow at either end.
   if (cfg_.mlp_gelu) {
@@ -691,7 +691,7 @@ void CpuLlamaEngine::forward_token(int token, int pos) {
   // 1. Token embedding lookup: x = embed[token]
   //
   // Gemma scales the embeddings by sqrt(hidden). This engine did not, so it ran a
-  // completely different model for every Gemma checkpoint -- no crash, just wrong. It
+  // completely different model for every Gemma checkpoint; no crash, just wrong. It
   // went unnoticed because nothing cross-checked the CPU engine against CUDA on Gemma.
   const uint16_t* emb_row = tok_embeddings_ + static_cast<std::ptrdiff_t>(token) * H;
   const float emb_scale = cfg_.scale_embeddings ? std::sqrt(static_cast<float>(H)) : 1.0f;
@@ -723,7 +723,7 @@ void CpuLlamaEngine::forward_token(int token, int pos) {
     }
 
     // Per-head QK-norm (Qwen3): RMS-normalise each head of Q and of K with a shared
-    // [head_dim] weight, AFTER projection and BEFORE RoPE. Order matters -- doing it
+    // [head_dim] weight, after projection and before RoPE. Order matters; doing it
     // after RoPE changes the result. Mirrors the CUDA path exactly
     // (llama_engine_forward_decode.cpp: launch_rmsnorm over num_heads x head_dim).
 
@@ -775,7 +775,7 @@ int CpuLlamaEngine::sample_token(float temperature, int top_k, const std::vector
   float* logits = logits_.data();
 
   // Repetition penalty: downscale logits of tokens already in the context.
-  // Penalize each unique token ONCE (HF semantics). Iterating raw history would
+  // Penalize each unique token once (HF semantics). Iterating raw history would
   // divide a token's logit by rep_penalty^(occurrences), exponentially
   // suppressing frequent tokens (space, common words) in long contexts and
   // collapsing generation into word-merged gibberish.
@@ -1091,10 +1091,10 @@ void CpuLlamaEngine::initialize(const EngineOptions& options) {
   // --- Precompute RoPE tables ---
   // cos[pos][d] = cos(pos / theta^(2d/head_dim))
   //
-  // The base is the MODEL'S rope_theta, not 10000. It was hardcoded to 10000 here,
+  // The base is the model'S rope_theta, not 10000. It was hardcoded to 10000 here,
   // which is right for Llama 2 and wrong for most things since: Qwen2.5 and Qwen3 use
   // 1e6, Llama 3 uses 5e5. A wrong base does not crash and does not produce obvious
-  // garbage -- it rotates every query and key by the wrong angle, which degrades the
+  // garbage; it rotates every query and key by the wrong angle, which degrades the
   // model in a way that looks like ordinary numerical drift.
   const float rope_theta = cfg_.effective_rope_theta();
   const int half_hd = head_dim_ / 2;

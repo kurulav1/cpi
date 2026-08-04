@@ -6,10 +6,10 @@
 // per-request sampling and retirement are all pure host bookkeeping over
 // engine::BlockAllocator / SequenceBlockTable (which are themselves backend-free). This
 // logic lived inside LlamaEngine, which made continuous batching a CUDA-only feature for
-// no reason other than where the code sat: of its ~200 lines, exactly TWO touch a GPU.
+// no reason other than where the code sat: of its ~200 lines, exactly two touch a GPU.
 //
 // Those two are the BatchBackend interface below. A backend supplies a suffix prefill and a
-// batched decode step; everything else is shared. That keeps the second backend honest --
+// batched decode step; everything else is shared. That keeps the second backend honest
 // Metal gets the same admission policy, the same preemption order and the same prefix cache
 // as CUDA, because it is literally the same code, not a reimplementation that agrees today.
 //
@@ -38,9 +38,9 @@ struct StreamParams {
   // drives its own termination, so the scheduler does not also floor the length (see step()).
   int min_new_tokens = 0;
   float temperature = 0.0f;
-  // Sampling shape, PER REQUEST. These used to live on BatchSchedulerOptions (scheduler-global),
+  // Sampling shape, per request. These used to live on BatchSchedulerOptions (scheduler-global),
   // which silently ignored a client's top_p/top_k in the batched path and made every request in a
-  // server share one setting -- and, because repetition_penalty is global, a server started with
+  // server share one setting; and, because repetition_penalty is global, a server started with
   // penalty > 1 could never take the device top-k fast path for anyone. The caller fills these
   // from the request (falling back to its own defaults); the scheduler reads only these.
   int top_k = 0;
@@ -54,10 +54,10 @@ struct StreamParams {
 
 // One token for one request.
 //
-// finish_reason is "eos" | "stop" | "length" | "preempted". PREEMPTED IS PART OF THE
+// finish_reason is "eos" | "stop" | "length" | "preempted". PREEMPTED IS PART OF the
 // CONTRACT, not an error: it arrives with token == -1 and means the KV pool ran out and this
 // request's blocks were reclaimed so older ones could finish. The caller is expected to
-// re-admit it with (prompt + generated-so-far) and a decremented budget -- the scheduler
+// re-admit it with (prompt + generated-so-far) and a decremented budget; the scheduler
 // deliberately does not do that itself, because only the caller knows the request's remaining
 // budget and whether it still wants the answer.
 struct StreamEvent {
@@ -96,7 +96,7 @@ public:
 
   // Prefill prompt[shared .. end) into the sequence described by `block_table`. The KV for
   // [0, shared) is already in the pool via adopted (refcounted) blocks, so it must not be
-  // recomputed -- and must not be assumed contiguous with the suffix.
+  // recomputed; and must not be assumed contiguous with the suffix.
   //
   // Must be complete before returning: the scheduler may reuse shared engine state (a block
   // table upload, a scratch buffer) on the very next call.
@@ -151,7 +151,7 @@ public:
 };
 
 // Non-sampling limits the scheduler applies. Sampling shape (top_k / top_p / repetition_penalty /
-// no_repeat_ngram_size) is PER REQUEST on StreamParams, not here -- it varies per client.
+// no_repeat_ngram_size) is per request on StreamParams, not here; it varies per client.
 struct BatchSchedulerOptions {
   int paged_block_size = 32;
   int max_context = 2048;
@@ -169,12 +169,12 @@ public:
   BatchScheduler& operator=(const BatchScheduler&) = delete;
 
   // THROWS if the KV pool cannot seat the prompt. The caller rejects the request (or, when
-  // re-admitting a preempted one, retries later) -- it is not a scheduler decision.
+  // re-admitting a preempted one, retries later); it is not a scheduler decision.
   void admit(const std::string& id, const std::vector<int>& prompt_tokens,
              const StreamParams& params);
 
   // Advance every running request by one token. Returns false only when nothing ran; note it
-  // returns TRUE with events when all survivors were preempted, so the caller still sees them.
+  // returns true with events when all survivors were preempted, so the caller still sees them.
   bool step(std::vector<StreamEvent>& events);
 
   bool cancel(const std::string& id);
@@ -183,7 +183,7 @@ public:
   // Drop the shared-prefix cache. The caller must do this whenever the KV cache is wiped
   // underneath the scheduler (reset_kv_cache): the cached entries hold refcounted blocks whose
   // CONTENTS the wipe invalidates, and nothing about the block ids themselves would reveal
-  // that -- a later admit would happily adopt them and prefill garbage. Running sequences are
+  // that; a later admit would happily adopt them and prefill garbage. Running sequences are
   // deliberately left alone, matching the behaviour this replaced.
   void clear_prefix_cache();
 

@@ -3,7 +3,7 @@
 // warp_argmax reduces with __shfl_down_sync; a plain `>` keeps the lower LANE on a tie, but the
 // strided per-thread scan means the lower lane does not hold the lower index. The host greedy path
 // (std::max_element) resolves ties to the lowest INDEX, and the sanitize clamp to +/-80
-// manufactures exact ties out of distinct raw logits -- so a lowest-lane rule makes device greedy
+// manufactures exact ties out of distinct raw logits; so a lowest-lane rule makes device greedy
 // pick a different token than the host. Each row below places the lower index at a higher lane so
 // the two rules disagree; the test passes only when the device matches std::max_element (lowest
 // index wins).

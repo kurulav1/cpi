@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Writes PNG fixtures + their expected RGB bytes, for the hand-rolled decoder's gate.
 
-Uses Python's zlib (a DEFLATE encoder we did NOT write), so the test is a real
+Uses Python's zlib (a DEFLATE encoder we did not write), so the test is a real
 cross-check rather than our code agreeing with itself. The cases are chosen to break
 naive inflaters: dynamic Huffman, stored blocks, overlapping back-references, all five
 scanline filters, and every supported colour type.
@@ -26,7 +26,7 @@ def chunk(tag: bytes, data: bytes) -> bytes:
 
 
 def write_png(name, width, height, color_type, raw_rows, expect_rgb, palette=None, level=6):
-    """raw_rows: list of bytes, one per scanline, WITHOUT the filter byte."""
+    """raw_rows: list of bytes, one per scanline, without the filter byte."""
     channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[color_type]
     # Cycle through all five filters so the decoder must implement each one.
     body = bytearray()

@@ -27,11 +27,11 @@ struct TensorSlice {
   std::size_t bytes = 0;   // Size of the tensor data in bytes.
 };
 
-// Reads ONLY the model family from a .ll2c container, without mapping its weights.
+// Reads only the model family from a .ll2c container, without mapping its weights.
 //
 // Engine selection has to know the family before it commits to an engine, and opening a
 // multi-gigabyte container to ask one question is not an option. Returns ModelFamily::Llama for
-// anything it cannot read -- a missing or unreadable file is not this function's error to report,
+// anything it cannot read; a missing or unreadable file is not this function's error to report,
 // and the caller's normal open() path will produce a better message.
 [[nodiscard]] ModelFamily peek_container_family(const std::string& path);
 
@@ -57,15 +57,15 @@ public:
   [[nodiscard]] bool has_tensor(const std::string& name) const;
 
   // Part of the loader surface SafetensorsLoader also presents, so a consumer can be templated on
-  // the loader rather than written twice. A .ll2c is fp16 by construction -- pack_ll2c.py converts
-  // at packing time -- so this is a constant here, and the answer is what lets an uploader convert
+  // the loader rather than written twice. A .ll2c is fp16 by construction; pack_ll2c.py converts
+  // at packing time; so this is a constant here, and the answer is what lets an uploader convert
   // BF16 from a HuggingFace checkpoint without special-casing which container it came from.
   [[nodiscard]] std::string tensor_dtype(const std::string& name) const {
     return has_tensor(name) ? std::string("F16") : std::string();
   }
 
   // Every tensor name in the container, sorted. Needed to REPACK a .ll2c into another container
-  // without a hardcoded name list -- the list would be a second place the model's tensor set is
+  // without a hardcoded name list; the list would be a second place the model's tensor set is
   // written down, and those drift (see the v7 vision-geometry whitelist).
   [[nodiscard]] std::vector<std::string> tensor_names() const;
 

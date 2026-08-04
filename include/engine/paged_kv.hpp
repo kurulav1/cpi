@@ -12,7 +12,7 @@
 // by several sequences (an identical system-prompt prefix) via reference counts,
 // which is what makes concurrent shared-prefix (P4) cheap.
 //
-// This module is the allocator + block-table logic ONLY. Wiring it into the KV
+// This module is the allocator + block-table logic only. Wiring it into the KV
 // write/read hot path (paged attention) and batched multi-sequence decode are
 // later phases; keeping this piece pure makes it unit-testable without a GPU.
 namespace engine {

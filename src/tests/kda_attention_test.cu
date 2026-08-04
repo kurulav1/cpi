@@ -1,11 +1,11 @@
-// Verifies Kimi Delta Attention (KDA) -- the gated delta-rule linear attention -- on-device against a
+// Verifies Kimi Delta Attention (KDA), the gated delta-rule linear attention, on-device against a
 // host oracle. Isolated, model-blocked groundwork for Kimi K3 (whose checkpoint doesn't fit this box).
-// CPI already runs the Qwen3.5 gated delta-net with a PER-HEAD SCALAR decay (verified). KDA's
+// CPI already runs the Qwen3.5 gated delta-net with a per-head SCALAR decay (verified). KDA's
 // distinction is FINE-GRAINED gating: a decay vector over the key channels, so each key dimension of
 // the recurrent state forgets at its own rate. This brick implements that per-channel gated delta rule
 // as a standalone recurrence and checks it against a plain-C++ oracle.
 //
-// Per head, running state S[key_dim, value_dim] (no KV cache -- a recurrent state), for token t:
+// Per head, running state S[key_dim, value_dim] (no KV cache; a recurrent state), for token t:
 //   S <- diag(g_t) S                       (per-key-channel decay; g_t in (0,1)^key_dim)   << KDA
 //   u  = (v_t - Sᵀ k_t) * beta_t           (delta correction, beta_t in (0,1))
 //   S <- S + k_t ⊗ u                       (rank-1 update)

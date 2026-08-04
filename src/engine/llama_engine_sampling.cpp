@@ -24,7 +24,7 @@ int LlamaEngine::decode_next_token(int token, int position, float temperature,
       active_grammar_->apply_mask(h_logits);
     }
     // Block EOS so greedy/sampling cannot terminate before min_new_tokens. Skip
-    // when a grammar is active: a completed grammar may permit ONLY EOS, and also
+    // when a grammar is active: a completed grammar may permit only EOS, and also
     // masking it would leave no legal token (deadlock). Grammar manages its own
     // termination, so it takes precedence over min_new_tokens.
     if (suppress_eos_ && active_grammar_ == nullptr && options_.eos_token_id >= 0 &&
@@ -48,7 +48,7 @@ int LlamaEngine::decode_next_token(int token, int position, float temperature,
     return next;
   }
 
-  // Sampled decode (temperature>0) -- the path real chat takes. Select the candidate set on
+  // Sampled decode (temperature>0); the path real chat takes. Select the candidate set on
   // the GPU so the host never sees the full vocab. Only eligible when the shared host
   // sampler's semantics are exactly reproducible from a top-k candidate set: a repetition
   // penalty or an n-gram block rescores logits OUTSIDE the top-k (a penalised token can fall

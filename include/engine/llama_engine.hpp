@@ -74,7 +74,7 @@ class LlamaEngine {
   // internal decode/prefill/verify methods.
   // SpeculativeDecoder is a TEMPLATE now (one algorithm over both engines), so the friend
   // declaration has to be too. `friend class SpeculativeDecoder;` also implicitly DECLARED it as
-  // a non-template here, which then collided with the real definition -- MSVC: "class template
+  // a non-template here, which then collided with the real definition; MSVC: "class template
   // has already been declared as a non-class template". Metal never saw this because it does not
   // include llama_engine.hpp.
   template <typename EngineT>
@@ -108,7 +108,7 @@ public:
 
   // Runs a numerical parity check of the GPU decode forward against an
   // independent CPU-reference forward for prompt_tokens, printing max_abs_diff and
-  // the top-token match. Returns true when the GPU and CPU argmax agree AND the
+  // the top-token match. Returns true when the GPU and CPU argmax agree and the
   // max logit diff is within tolerance — i.e. a pass/fail gate for verifying that
   // a forward-path change (e.g. kernel fusion) preserved correctness.
   bool run_parity_check(const std::vector<int>& prompt_tokens);
@@ -303,8 +303,8 @@ private:
                                     void* out, int rows, int base_pos, int num_heads,
                                     int num_kv_heads, int head_dim, int q_stride);
 
-  // Eligibility + scratch allocation for the above, decided ONCE per chunk. The caller needs the
-  // answer BEFORE the layer loop: if it skips the Q/K/V split copies and the tensor-core path
+  // Eligibility + scratch allocation for the above, decided once per chunk. The caller needs the
+  // answer before the layer loop: if it skips the Q/K/V split copies and the tensor-core path
   // then declined mid-loop, there would be no contiguous Q left to fall back to.
   bool prefill_tc_prepare(int rows, int base_pos, int num_heads, int num_kv_heads, int head_dim);
 
@@ -314,7 +314,7 @@ private:
   bool run_logits_decode_graph(int token, int position);
 
   // Device-side top-k sampling. The host-logits path copies the whole vocab to the host
-  // every token -- 608 KB for Qwen2.5's 151936 logits -- and then sorts it there. Measured
+  // every token, 608 KB for Qwen2.5's 151936 logits, and then sorts it there. Measured
   // at 0.73 ms/token, which is 45% of a 0.5B decode step and DWARFS every kernel in it.
   // Greedy (temp<=0) already argmaxes on-device and avoids this; temperature>0 is the path
   // real chat actually takes, and it was paying full price.
@@ -355,7 +355,7 @@ private:
   void resident_projection_half(const void* w, const void* x, void* y, int out_features,
                                 int in_features, int warps_per_block = 0, int tile_pairs = 0,
                                 int rows_per_warp = 1);
-  // Same projection with the residual add FOLDED INTO the epilogue, so the separate
+  // Same projection with the residual add folded into the epilogue, so the separate
   // add_inplace launch disappears. At batch 1 a kernel costs a fixed ~1.7 us whatever it
   // does, and adding `hidden` elements is far cheaper than launching a kernel to do it.
   void resident_projection_half_residual(const void* w, const void* x, void* residual,
@@ -368,8 +368,8 @@ private:
                                  int rows_per_warp = 1);
 
   // Single-sequence LM-head projection: x_norm[hidden] -> logits[vocab] (fp32). Uses the resident
-  // int8 head (d_lm_head_i8_) when lm_head_int8_ is set -- near-lossless and lets the fp16 head be
-  // freed under single-sequence deployment -- else the fp16 head. Bias is added by the caller.
+  // int8 head (d_lm_head_i8_) when lm_head_int8_ is set; near-lossless and lets the fp16 head be
+  // freed under single-sequence deployment; else the fp16 head. Bias is added by the caller.
   void project_lm_head_logits(const __half* x_norm, float* logits);
 
   // Applies either RMSNorm or true LayerNorm based on model config.
@@ -453,7 +453,7 @@ public:
 
   // Parity gate for decode_step_batched: prefill `prompt_tokens`, then for
   // `num_steps` decode steps compare the batched path (N=1 and N=2 duplicate
-  // rows) against the single-token path token-for-token. Prints PASS/FAIL.
+  // rows) against the single-token path token-for-token. Prints pass/FAIL.
   void run_batched_decode_check(const std::vector<int>& prompt_tokens, int num_steps);
 
   // One request in a concurrently-scheduled batch.
@@ -476,7 +476,7 @@ public:
 
   // Parity gate for the scheduler: builds several distinct-length sequences from
   // `base_prompt`, generates them concurrently via run_batch and each alone via
-  // the single-sequence path, and compares token-for-token. Prints PASS/FAIL.
+  // the single-sequence path, and compares token-for-token. Prints pass/FAIL.
   void run_scheduler_check(const std::vector<int>& base_prompt, int max_new, int eos_id);
 
   // Throughput benchmark: sweeps batch sizes, comparing serial single-sequence
@@ -514,7 +514,7 @@ public:
   int stream_active() const;
 
   // The scheduler driving those methods, built on first use. Exposed because the app-layer
-  // batch worker now takes a BatchScheduler& directly -- it never needed the engine. No
+  // batch worker now takes a BatchScheduler& directly; it never needed the engine. No
   // options argument: this engine already carries them in EngineOptions.
   BatchScheduler& batch_scheduler() {
     return ensure_scheduler();
@@ -599,7 +599,7 @@ private:
   void* d_norm_out_ = nullptr;        // Final RMSNorm scale vector on device.
   void* d_norm_out_bias_ = nullptr;   // Optional final norm bias [hidden].
   void* d_lm_head_ = nullptr;         // LM-head projection weight matrix on device.
-  // int8 LM head (weight-only). An 8B's LM head is 1.05 GB in fp16 -- 22% of everything an
+  // int8 LM head (weight-only). An 8B's LM head is 1.05 GB in fp16; 22% of everything an
   // int4 8B reads per token. Built only when weight quantization is on. The fp16 copy is KEPT:
   // the batched-decode path drives the LM head through cuBLAS and still needs it.
   std::int8_t* d_lm_head_i8_ = nullptr;

@@ -14,7 +14,7 @@ Usage:
     --tokenizer artifacts/hub/Qwen__Qwen2.5-7B-Instruct/hf/tokenizer.json \
     [--k 3 4 5] [--max-new 200] [--prompt "..."]
 
-Draft and target MUST share a tokenizer. Reads [perf] tok_per_s and [spec]
+Draft and target must share a tokenizer. Reads [perf] tok_per_s and [spec]
 accept_rate/tokens_per_round from the CLI's stderr.
 
 Measured baseline 2026-07-05 (Qwen2.5 7B target + 0.5B draft, 5090, code prompt):
@@ -23,12 +23,12 @@ Measured baseline 2026-07-05 (Qwen2.5 7B target + 0.5B draft, 5090, code prompt)
   spec K=5  103 tok/s (1.11x)  accept 0.67  3.77 tok/round
 Round cost attributed (K=5): ~19 ms draft + ~18 ms verify. Acceptance is already
 good (3.6 tok/round would be ~3.6x if free) — the wall is overhead, split two
-ways with DIFFERENT causes:
+ways with different causes:
   - Draft (5 x 3.75 ms): the 0.5B draft IS graphed (greedy_decode_graph enabled),
     so launches are amortized. 3.75 ms is genuine execution of ~900 tiny kernels
     (each a few us even under graph replay) — ~5.6x off the ~0.67 ms weight
-    roofline. Lever: reduce kernel COUNT (forward-path fusion). Large effort.
-  - Verify (~18 ms): run_batched_chunk (~37 kernel launches) is NOT graphed, so
+    roofline. Lever: reduce kernel count (forward-path fusion). Large effort.
+  - Verify (~18 ms): run_batched_chunk (~37 kernel launches) is not graphed, so
     it pays full per-round launch overhead. Lever: capture it in a fixed-K CUDA
     graph (CPI already graphs single-token decode). Tractable, ~1.2x.
 No single change reaches 2x: it needs verify-graphing (~1.2x, tractable) + draft

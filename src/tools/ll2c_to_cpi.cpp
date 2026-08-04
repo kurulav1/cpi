@@ -3,18 +3,18 @@
 //   ll2c_to_cpi <in.ll2c> <out.cpi>
 //
 // Written in C++ rather than Python ON PURPOSE: model::WeightLoader already parses every header
-// version (v1..v7) and yields a LlamaConfig. A Python repacker would be a SECOND place the header
-// layout is written down, and this codebase's recurring defect is exactly that -- a constant or a
+// version (v1..v7) and yields a LlamaConfig. A Python repacker would be a second place the header
+// layout is written down, and this codebase's recurring defect is exactly that; a constant or a
 // field list living in two files and drifting (the v7 vision-geometry whitelist, the GEMM tile
 // constants, the five copies of f32->f16).
 //
-// TENSOR NAMES ARE PRESERVED EXACTLY. This is a container change, not a naming change: the same
+// tensor NAMES are PRESERVED exactly. This is a container change, not a naming change: the same
 // names go in and out, so no name map is involved and the op plan is untouched. That is what
-// makes the gate meaningful -- .cpi and .ll2c must generate identical tokens, and if they do, the
+// makes the gate meaningful; .cpi and .ll2c must generate identical tokens, and if they do, the
 // only thing that changed is how the bytes were stored.
 //
-// Shapes are written FLAT ([num_fp16_elements]). A .ll2c stores no per-tensor shape at all --
-// shapes are derived from the config -- and the consumer only needs a pointer and a byte count.
+// Shapes are written flat ([num_fp16_elements]). A .ll2c stores no per-tensor shape at all
+// shapes are derived from the config; and the consumer only needs a pointer and a byte count.
 // Inventing 2-D shapes here would mean re-deriving them from the config, i.e. a third place the
 // model's geometry is written down, for no gain.
 

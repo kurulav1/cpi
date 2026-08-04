@@ -6,7 +6,7 @@
 
 namespace engine {
 
-// NOTE: no `namespace mini = engine::mini;` alias here -- we are already inside `engine`, so the
+// NOTE: no `namespace mini = engine::mini;` alias here; we are already inside `engine`, so the
 // alias collides with the namespace it names (error C2386) and `mini::` resolves on its own.
 
 PlanModelConfig parse_gemma4_text_config(const std::string& config_json) {
@@ -52,8 +52,8 @@ PlanModelConfig parse_gemma4_text_config(const std::string& config_json) {
   c.layer_full.assign(c.num_layers, 0);
   for (int L = 0; L < c.num_layers && L < static_cast<int>(types.size()); ++L)
     c.layer_full[L] = (types[L] == "full_attention") ? 1 : 0;
-  // KV sharing: the last num_kv_shared_layers layers do NOT project their own K/V --
-  // they reuse the cache of the LAST NON-SHARED LAYER OF THE SAME TYPE (sliding vs
+  // KV sharing: the last num_kv_shared_layers layers do not project their own K/V
+  // they reuse the cache of the last non-shared layer OF the same TYPE (sliding vs
   // full). E2B shares 20 of its 35 layers; the MoE and 12B share none. Getting this
   // wrong still runs, and still produces fluent-looking garbage.
   c.first_shared_layer = c.num_kv_shared_layers > 0 ? c.num_layers - c.num_kv_shared_layers : 0;
@@ -93,15 +93,15 @@ model::LlamaConfig gemma4_to_llama_config(const PlanModelConfig& g) {
   c.norm_eps = g.rms_eps;
   c.sliding_window = g.sliding_window;
   c.tie_word_embeddings = g.tie_word_embeddings;
-  // NOTE: bos/eos token ids are deliberately not carried here. LlamaConfig has no such fields --
-  // they belong to the tokenizer, not the model geometry -- and inventing them would put a second
+  // NOTE: bos/eos token ids are deliberately not carried here. LlamaConfig has no such fields
+  // they belong to the tokenizer, not the model geometry; and inventing them would put a second
   // source of truth beside tokenizer_config.json.
   // Gemma's MLP is GeGLU and its embeddings are scaled by sqrt(hidden). Both are capabilities the
   // shared geometry already has; neither is a fork.
   c.mlp_gelu = true;
   c.scale_embeddings = true;
 
-  // LlamaConfig has no single head_dim -- every other family derives it from the Q projection's
+  // LlamaConfig has no single head_dim; every other family derives it from the Q projection's
   // shape. Gemma 4 cannot be described that way (its head_dim differs per layer type), which is
   // exactly why the pair below exists and why PlanMetalEngine::open skips the shape probe for it.
   c.head_dim_sliding = g.head_dim_sliding;

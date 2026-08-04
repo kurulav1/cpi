@@ -1,7 +1,7 @@
 // Expanding an image placeholder into a real image span.
 //
-// The chat text carries a single `<|image|>` placeholder token -- exactly how HF's
-// processor does it -- and this expands that one token into
+// The chat text carries a single `<|image|>` placeholder token; exactly how HF's
+// processor does it; and this expands that one token into
 //   <boi> <image> x N <eoi>
 // where the N image tokens' EMBEDDINGS are the vision tower's soft tokens. Doing it this
 // way means the ordinary chat-template rendering (CLI or web) needs no image-awareness
@@ -9,7 +9,7 @@
 //
 // A TEMPLATE over the engine, not a PlanCudaEngine function: PlanMetalEngine now carries the
 // same four-method surface (has_vision / can_sequence_prefill / vision_config / encode_image),
-// and this file is the one place the splice layout lives -- a per-backend copy is how the two
+// and this file is the one place the splice layout lives; a per-backend copy is how the two
 // would drift. Header-only so a CUDA-free build never sees a CUDA type.
 
 #pragma once
@@ -76,7 +76,7 @@ ImagePrompt expand(Engine& eng, const std::vector<int>& base_tokens, const std::
     }
   }
   const int H = static_cast<int>(soft.size()) / grid.soft_tokens;
-  // One image token per LIVE pooled cell -- NOT per padded cell. Using the padded budget
+  // One image token per live pooled cell; not per padded cell. Using the padded budget
   // slides the span out of alignment with the real soft tokens.
   const int n_image = grid.live_soft_tokens;
 

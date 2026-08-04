@@ -20,8 +20,8 @@ struct PatchGrid {
   int num_patches = 0;   // including padding
   // What the ENCODER emits: padded_patches / pooling^2 (HF's output_length).
   int soft_tokens = 0;
-  // What the TEXT STREAM reserves: the LIVE grid only, (grid_w/k) * (grid_h/k). The
-  // trailing padded cells are not image tokens -- inserting them shifts the whole span
+  // What the text STREAM reserves: the live grid only, (grid_w/k) * (grid_h/k). The
+  // trailing padded cells are not image tokens; inserting them shifts the whole span
   // out of alignment with the real soft tokens, and the model then reports seeing no
   // image at all.
   int live_soft_tokens = 0;
@@ -55,13 +55,13 @@ struct Qwen2VLPatches {
 // (tools/qwen35_preproc_oracle.py, tests/metal_preproc_test).
 //
 // Four steps, each of which a reimplementation gets wrong quietly:
-//   1. SMART RESIZE -- the target size is not fixed. Both sides are rounded to a multiple of
+//   1. SMART RESIZE; the target size is not fixed. Both sides are rounded to a multiple of
 //      patch*merge with the pixel area held inside [min_pixels, max_pixels]; a 140x200 image
 //      becomes 224x320, not something derived from a single "shortest edge".
 //   2. bicubic resample to that size (PIL filter, a = -0.5).
 //   3. normalise: (pixel/255 - mean) / std, per channel.
-//   4. patchify into MERGE-UNIT-MAJOR order -- the same order the tower's position table and
-//      RoPE use -- with the single frame repeated temporal_patch times.
+//   4. patchify into MERGE-UNIT-MAJOR order; the same order the tower's position table and
+//      RoPE use; with the single frame repeated temporal_patch times.
 Qwen2VLPatches qwen2vl_preprocess(const Image& img, int patch_size, int temporal_patch_size,
                                   int merge_size, const float mean[3], const float std[3],
                                   long min_pixels, long max_pixels);

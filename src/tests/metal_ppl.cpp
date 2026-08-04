@@ -1,6 +1,6 @@
 // Perplexity, the metric quantization schemes are ranked by. Per-tensor reconstruction error
 // (CPI_METAL_QUANT_STATS) ranks tensors, not models, and greedy-prefix agreement against a
-// higher-precision reference is useless -- one early flip destroys the prefix, so it measures
+// higher-precision reference is useless; one early flip destroys the prefix, so it measures
 // when the first divergence landed (measured across promotion budgets: 26/26/3/1/74 chars,
 // non-monotonic). Perplexity averages over every position instead.
 //

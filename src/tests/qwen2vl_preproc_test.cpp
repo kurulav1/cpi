@@ -3,7 +3,7 @@
 //   ./qwen2vl_preproc_test <oracle_dir>   (oracle_dir = tools/qwen35_preproc_oracle.py --out)
 //
 // The oracle wrote the exact uint8 image it fed the processor and the [patches, 1536] tensor the
-// processor produced. This starts from those SAME bytes -- so a mismatch is two implementations
+// processor produced. This starts from those same bytes; so a mismatch is two implementations
 // disagreeing, not two different images. Pure CPU: no Metal, so it runs on CI and Windows.
 //
 // The resize is the one step where a small deviation quietly costs accuracy (it is bicubic, and
@@ -120,7 +120,7 @@ int main(int argc, char** argv) {
   }
   const double mean_abs = sum / static_cast<double>(ref.size());
   // Tolerance on the MAX. The normalise and patchify are exact integer/affine ops, so the only
-  // source of error is the bicubic resample vs PIL's. 0.02 on a [-1,1] tensor is ~1% -- tight
+  // source of error is the bicubic resample vs PIL's. 0.02 on a [-1,1] tensor is ~1%; tight
   // enough to catch a wrong filter or a transposed axis, loose enough for last-bit resample
   // differences. Both controls (wrong patch order, wrong normalise) blow past it.
   const bool ok = mx <= 0.02f;

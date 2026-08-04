@@ -36,10 +36,10 @@ HDR_V5 = struct.Struct("<8siiiiiiiiiiQffiiiiiifiiiQ")
 # v6 appends the three delta-net dimensions. This tool REWRITES the header, so it must use the
 # struct that matches the file it read: parsing a v6 file as v5 and writing 112 bytes back would
 # emit a file whose version field says 6 while the appended fields are missing, and the next
-# reader would take the bytes after them -- the attention blob -- as those dimensions.
+# reader would take the bytes after them, the attention blob, as those dimensions.
 HDR_V6 = struct.Struct("<8siiiiiiiiiiQffiiiiiifiiiQiii")
 # v7 appends the vision tower's geometry. Quantization never touches those weights (they are
-# not in the per-layer MLP/attention set it rewrites), but the header must round-trip intact --
+# not in the per-layer MLP/attention set it rewrites), but the header must round-trip intact
 # writing a v6 header over a v7 file would drop the tower's geometry and leave the tensors
 # behind it unreachable.
 HDR_V7 = struct.Struct("<8siiiiiiiiiiQffiiiiiifiiiQiii" + "i" * 10)

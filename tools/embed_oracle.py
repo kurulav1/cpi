@@ -3,7 +3,7 @@
 
 cpi_embed produces 384 plausible-looking floats whether or not the encoder is right, so the only
 thing that separates a working port from a broken one is a reference. This runs the same model
-through HuggingFace in fp32, mean-pools over the attention mask and L2-normalises -- which is
+through HuggingFace in fp32, mean-pools over the attention mask and L2-normalises; which is
 exactly what sentence-transformers' all-MiniLM-L6-v2 does, and what BertEmbedder/MetalBertEmbedder
 implement.
 

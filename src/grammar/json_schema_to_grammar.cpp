@@ -310,7 +310,7 @@ class GrammarBuilder {
 public:
   std::string build(const JsonValue& schema) {
     const std::string root_ref = visit(schema, "root");
-    // Leading whitespace is tolerated, but there is deliberately NO trailing
+    // Leading whitespace is tolerated, but there is deliberately no trailing
     // whitespace rule: once the top-level value closes, the only grammar-legal
     // continuation is EOS, which forces a clean stop rather than letting the
     // model ramble past the closing brace.

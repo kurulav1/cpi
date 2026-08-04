@@ -1,20 +1,20 @@
 // Gates the CONTAINER-IDENTITY probe: which engine a `.cpi` resolves to.
 //
-// This exists because a `.cpi` says nothing about the model inside it -- it is a container format,
-// not a family -- so probe_model looks at the safetensors `__metadata__` block. The trap it walked
+// This exists because a `.cpi` says nothing about the model inside it; it is a container format,
+// not a family; so probe_model looks at the safetensors `__metadata__` block. The trap it walked
 // into, and the reason for this file: a metadata block is not proof the block is OURS.
 //
 //   * OUR containers (ll2c_to_cpi) write config_to_json's schema:  model_family, hidden_size, ...
 //   * Gemma 4's converter writes its OWN schema:                   family, hidden, vocab, ...
 //
 // config_from_json reads only the first, so handed the second it returns a fully DEFAULTED
-// LlamaConfig -- and LlamaConfig::hidden_size defaults to 4096, not 0. The original predicate
-// `c.hidden_size > 0` was therefore true for EVERY container carrying any metadata, which routed
+// LlamaConfig; and LlamaConfig::hidden_size defaults to 4096, not 0. The original predicate
+// `c.hidden_size > 0` was therefore true for every container carrying any metadata, which routed
 // Gemma 4 `.cpi` files to LlamaEngine (a `.ll2c`-only reader). It failed with
-// "unsupported weights format. expected LL2CUDA manifest" -- an error naming a format nobody asked
+// "unsupported weights format. expected LL2CUDA manifest"; an error naming a format nobody asked
 // for, from an engine nobody selected.
 //
-// CONTROL, at the bottom: this file asserts that a defaulted parse really does yield hidden_size
+// control, at the bottom: this file asserts that a defaulted parse really does yield hidden_size
 // 4096, so the fix is pinned to the actual mechanism rather than to a symptom. If someone changes
 // that default to 0 the control fails loudly and this comment stops being true.
 
@@ -72,7 +72,7 @@ int main() {
   check(mh::probe_model(gemma.string()).kind == mh::ModelFamilyKind::Gemma4,
         "gemma4 .cpi (foreign metadata schema) -> Gemma4");
 
-  // 2. No metadata at all -- the pre-config_to_json Gemma 4 containers.
+  // 2. No metadata at all; the pre-config_to_json Gemma 4 containers.
   const auto bare = dir / "bare.cpi";
   write_container(bare, "");
   check(mh::probe_model(bare.string()).kind == mh::ModelFamilyKind::Gemma4,
@@ -88,7 +88,7 @@ int main() {
   check(mh::probe_model(repacked.string()).kind == mh::ModelFamilyKind::Llama,
         "repacked .cpi (config_to_json schema) -> Llama");
 
-  // 4. OUR container, Qwen3.5 -- the family that needs its own engine.
+  // 4. OUR container, Qwen3.5; the family that needs its own engine.
   model::LlamaConfig q35;
   q35.model_family = model::ModelFamily::Qwen3_5;
   q35.hidden_size = 1024;
@@ -97,9 +97,9 @@ int main() {
   check(mh::probe_model(q35_path.string()).kind == mh::ModelFamilyKind::Qwen35,
         "qwen3.5 .cpi (config_to_json schema) -> Qwen35");
 
-  // 5. CONTROL. Without this the four checks above could all pass while testing nothing, because
-  //    they never state WHY the old predicate was wrong. Parsing foreign metadata must yield a
-  //    fully defaulted config -- and that default must be the non-zero value that made
+  // 5. control. Without this the four checks above could all pass while testing nothing, because
+  //    they never state why the old predicate was wrong. Parsing foreign metadata must yield a
+  //    fully defaulted config; and that default must be the non-zero value that made
   //    `hidden_size > 0` vacuous. Both halves are asserted.
   const model::LlamaConfig defaulted = model::config_from_json(kGemma4Metadata);
   check(defaulted.hidden_size == 4096,

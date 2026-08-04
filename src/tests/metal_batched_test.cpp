@@ -2,25 +2,25 @@
 //
 // The paged pool and the contiguous cache coincide when a sequence's block table is the
 // IDENTITY map: phys = block_table[pos/bs]*bs + pos%bs collapses to pos when block i maps to
-// block i. That is what lets this compare the two paths directly -- same engine, same pool,
-// same KV bytes -- so any disagreement is the batched kernels' own doing rather than a
+// block i. That is what lets this compare the two paths directly; same engine, same pool,
+// same KV bytes; so any disagreement is the batched kernels' own doing rather than a
 // different model, a different cache, or a different prefill.
 //
 // The cases, in the order they narrow things down:
-//   N=1  -- the paged gather, the per-row rope position, the LM-head row offset.
-//   N=2, duplicate rows -- the batch dimension itself. A row-indexing bug (reading row 0's
+//   N=1 ; the paged gather, the per-row rope position, the LM-head row offset.
+//   N=2, duplicate rows; the batch dimension itself. A row-indexing bug (reading row 0's
 //        query for row 1, or writing both rows to one logit slice) survives N=1 and dies here.
-//   wrong block table -- a NEGATIVE control. Everything above uses the identity table, where
+//   wrong block table; a NEGATIVE control. Everything above uses the identity table, where
 //        phys == pos, so a kernel ignoring the table entirely would pass. The answer must change.
-//   chunk sweep -- paged prefill at several row counts. This is what caught the fp16 GEMM
+//   chunk sweep; paged prefill at several row counts. This is what caught the fp16 GEMM
 //        being dispatched with half the threads it needs: it only misbehaves at
 //        T >= kGemmMinTokens, and no golden prompt is that long.
-//   ragged batch -- two DIFFERENT sequences, different lengths, different positions, disjoint
+//   ragged batch; two different sequences, different lengths, different positions, disjoint
 //        blocks, stepping together. The case continuous batching exists for.
 //
 // A note on tolerances: comparisons that cross kernels (a GEMM path vs the token-at-a-time
 // GEMV) are held to kCrossKernelTol, because the matrix units accumulate in a different
-// order. Comparisons between two runs of the SAME kernel are held to EXACT equality -- that
+// order. Comparisons between two runs of the same kernel are held to EXACT equality; that
 // is where batching contamination would show, and there is no excuse for a difference.
 
 #include <chrono>
@@ -34,7 +34,7 @@
 
 namespace {
 
-// Largest |a - b| over the vocab, plus whether the argmax agrees -- the two numbers that
+// Largest |a - b| over the vocab, plus whether the argmax agrees; the two numbers that
 // actually matter: tiny logit noise is survivable, a different argmax is a different token.
 struct Diff {
   float max_abs = 0.0f;
@@ -44,8 +44,8 @@ struct Diff {
 
 // Comparing a GEMM-based path against a GEMV-based one cannot be bit-exact: the matrix
 // units accumulate in a different order. 0.05 is the tolerance metal_smoke holds both
-// kernels to against a CPU reference. Comparisons between two runs of the SAME kernel stay
-// exact (== 0) -- those are checked separately below.
+// kernels to against a CPU reference. Comparisons between two runs of the same kernel stay
+// exact (== 0); those are checked separately below.
 constexpr float kCrossKernelTol = 5e-2f;
 
 Diff compare(const std::vector<float>& a, const std::vector<float>& b) {
@@ -75,7 +75,7 @@ int main(int argc, char** argv) {
   }
   const std::string model = argv[1];
   // Deliberately small: the prompts below are ~24 tokens, and at the serving default of 32
-  // they would each fit in ONE block, so a "shuffled" table would never cross a block
+  // they would each fit in one block, so a "shuffled" table would never cross a block
   // boundary and the gather would go untested. At 8 a 24-token history spans three blocks.
   const int block_size = (argc > 2) ? std::atoi(argv[2]) : 8;
   const int max_ctx = 1024;  // room for the long-prompt timing at the end
@@ -94,13 +94,13 @@ int main(int argc, char** argv) {
   std::printf("[metal_batched] %s | pool %d blocks x %d tokens\n", eng.device_name().c_str(),
               blocks, block_size);
 
-  // A short deterministic prompt. The content is irrelevant -- this compares two code paths
+  // A short deterministic prompt. The content is irrelevant; this compares two code paths
   // on identical state, it does not judge the model's output.
   std::vector<int> prompt;
   for (int i = 0; i < 24; ++i) prompt.push_back(100 + i);
 
   // Lay down the history one token at a time. With an identity block table these contiguous
-  // writes ARE the paged layout, which is the whole trick.
+  // writes are the paged layout, which is the whole trick.
   for (std::size_t i = 0; i + 1 < prompt.size(); ++i) {
     eng.forward_token(prompt[i], static_cast<int>(i));
   }
@@ -111,9 +111,9 @@ int main(int argc, char** argv) {
   // Reference: the single-sequence path.
   const std::vector<float> ref = eng.forward_token(last_tok, last_pos);
 
-  // Cross-check the CONTIGUOUS chunked prefill against the token-at-a-time reference.
+  // Cross-check the contiguous chunked prefill against the token-at-a-time reference.
   // inspect_next_logits() prefills the whole prompt in one chunk, so at 24 tokens it takes
-  // the same cpi_gemm_f16 path that the batched prefill breaks on. If THIS disagrees too,
+  // the same cpi_gemm_f16 path that the batched prefill breaks on. If this disagrees too,
   // the fault is pre-existing and has nothing to do with batching.
   {
     int ref_argmax = 0;
@@ -154,7 +154,7 @@ int main(int argc, char** argv) {
 
   // ---- N = 2, duplicate rows ---------------------------------------------
   // Both rows share the identity table (legitimately: shared blocks are what refcounting is
-  // for) and sit at the same position, so both must equal the reference AND each other.
+  // for) and sit at the same position, so both must equal the reference and each other.
   {
     std::vector<int> bt2;
     bt2.insert(bt2.end(), identity.begin(), identity.end());
@@ -188,7 +188,7 @@ int main(int argc, char** argv) {
   // Everything above uses the identity table, where phys == pos. That makes the two paths
   // comparable, but it also means a kernel that ignored the block table completely and
   // indexed by raw position would pass every check so far. So: point the table at blocks the
-  // sequence never wrote. The answer MUST change. If it does not, the gather is a fiction and
+  // sequence never wrote. The answer must change. If it does not, the gather is a fiction and
   // the identity results were a coincidence.
   {
     std::vector<int> wrong(static_cast<std::size_t>(max_blocks));
@@ -217,14 +217,14 @@ int main(int argc, char** argv) {
   // ---- Paged prefill into SHUFFLED blocks --------------------------------
   //
   // Everything above leaned on the identity table. This lays the same sequence down through
-  // a shuffled table -- its history is scattered across the pool in an order that has nothing
-  // to do with its positions -- and then decodes it. It must still reproduce the contiguous
+  // a shuffled table; its history is scattered across the pool in an order that has nothing
+  // to do with its positions; and then decodes it. It must still reproduce the contiguous
   // reference exactly. This is the first check that paged PREFILL works at all, and the first
   // where phys != pos throughout.
   const std::vector<int> blocks_a = {5, 2, 9, 0};
   // Sweep the chunk length. T=1 per call is exact but T=23 in one pass is not, so something
   // branches on the row count. Each L is self-contained: lay the history down contiguously,
-  // take the reference, then redo it as ONE paged chunk of L rows and compare.
+  // take the reference, then redo it as one paged chunk of L rows and compare.
   {
     std::vector<int> ident2(static_cast<std::size_t>(max_blocks));
     for (int i = 0; i < max_blocks; ++i) ident2[static_cast<std::size_t>(i)] = i;
@@ -246,9 +246,9 @@ int main(int argc, char** argv) {
 
   // ---- A genuinely ragged batch ------------------------------------------
   //
-  // The case continuous batching exists for, and the one nothing above covers: two DIFFERENT
+  // The case continuous batching exists for, and the one nothing above covers: two different
   // sequences, of different lengths, at different positions, in disjoint blocks, stepping
-  // together. Each must get exactly the answer it gets alone -- if a kernel leaks one row's
+  // together. Each must get exactly the answer it gets alone; if a kernel leaks one row's
   // query, length or block table into another, this is where it shows.
   {
     std::vector<int> prompt_b;
@@ -289,7 +289,7 @@ int main(int argc, char** argv) {
                   oka ? "PASS" : "FAIL", static_cast<int>(prompt.size()), da.max_abs);
       std::printf("  %s  ragged: seq B (len %d) batched == alone: max|d|=%.3g\n",
                   okb ? "PASS" : "FAIL", static_cast<int>(prompt_b.size()), db.max_abs);
-      // Two different sequences must not agree -- if they do, one row is reading the other's
+      // Two different sequences must not agree; if they do, one row is reading the other's
       // state and every "match" above is vacuous.
       const Diff dab = compare(both[0], both[1]);
       const bool distinct = dab.max_abs > 0.0f;
@@ -301,24 +301,24 @@ int main(int argc, char** argv) {
 
   // ---- What does the O(T^2) paged prefill actually cost? ----------------
   //
-  // prefill_paged reuses the DECODE attention kernel, so every query re-walks the whole
-  // history -- O(T^2) device traffic, the very thing the contiguous path's query-block
+  // prefill_paged reuses the decode attention kernel, so every query re-walks the whole
+  // history; O(T^2) device traffic, the very thing the contiguous path's query-block
   // kernels exist to avoid. That shortcut was deliberate, but "known" is not "measured",
   // and the size of it is what decides whether a paged query-block kernel is worth writing.
   //
   // Same engine, same weights, same tokens; only the prefill path differs. (inspect_next_logits
   // prefills n-1 tokens and then runs one decode step, so it carries ~one step of overhead the
-  // paged side does not -- irrelevant unless the ratio comes out near 1.)
+  // paged side does not; irrelevant unless the ratio comes out near 1.)
   {
     std::vector<int> longp;
-    // Under max_prefill_ (512): prefill_paged takes ONE chunk -- the BatchAdapter is what
+    // Under max_prefill_ (512): prefill_paged takes one chunk; the BatchAdapter is what
     // chunks longer prompts. 480 is still long enough for O(T^2) to show if it is there.
     for (int i = 0; i < 480; ++i) longp.push_back(1000 + (i * 7) % 20000);
     std::vector<int> tbl(static_cast<std::size_t>(blocks));
     for (int i = 0; i < blocks; ++i) tbl[static_cast<std::size_t>(i)] = i;
 
-    // Warm BOTH paths first. The GPU clock ramps, and on this machine the first measurement
-    // of anything reads ~15% slow whichever path happens to go first -- that artifact already
+    // Warm both paths first. The GPU clock ramps, and on this machine the first measurement
+    // of anything reads ~15% slow whichever path happens to go first; that artifact already
     // produced one wrong conclusion in this backend's history.
     eng.prefill_paged(longp, 0, tbl);
     eng.inspect_next_logits(longp, 1);

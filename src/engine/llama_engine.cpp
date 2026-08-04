@@ -1210,7 +1210,7 @@ void LlamaEngine::initialize(const EngineOptions& options) {
   //
   // Chunking is exact: output is unchanged whatever the size.
   //
-  // The cost is VRAM -- every prefill activation buffer scales with the chunk -- so size it from
+  // The cost is VRAM, every prefill activation buffer scales with the chunk, so size it from
   // a memory budget rather than a fixed constant, which would hurt small-VRAM GPUs.
   int prefill_chunk_target = env_int_or_default("CPI_PREFILL_CHUNK_SIZE", 0);
   if (prefill_chunk_target <= 0) {
@@ -1282,7 +1282,7 @@ void LlamaEngine::initialize(const EngineOptions& options) {
 
   // Reclaim streaming staging when every layer is resident. The streaming decode double-buffer
   // (streaming_layer_weights_[2] / _i8_[2]) is only used for layers >= cached_layer_count_, so once
-  // the model is fully cached it is never touched again -- ~2.8 GB on the 32B (fp16 wqkv/wo/w13/w2
+  // the model is fully cached it is never touched again; ~2.8 GB on the 32B (fp16 wqkv/wo/w13/w2
   // + int8 MLP per slot x2). Slot-0's int8 buffer was scratch during cache-copy only. Freeing it
   // returns that VRAM to steady-state headroom (nvidia-smi, and the KV pool) at zero quality cost.
   // The pointers are nulled, so the destructor's later free is a no-op.
@@ -1326,7 +1326,7 @@ void LlamaEngine::initialize(const EngineOptions& options) {
   // Free the fp16 LM head once the int8 head serves inference. project_lm_head_logits() routes to
   // the resident int8 head (d_lm_head_i8_, near-lossless) when lm_head_int8_ is set, so the 1.45 GB
   // fp16 head is dead for single-sequence decode. Two consumers still need the fp16 head, so gate:
-  // the BATCHED lm-head (batched_lm_head) uses it and only runs under --paged-blocks; the autotuner
+  // the batched lm-head (batched_lm_head) uses it and only runs under --paged-blocks; the autotuner
   // references it. CPI_FP16_LM_HEAD=1 keeps the head in fp16 (lm_head_int8_ stays false).
   if (lm_head_int8_ && d_lm_head_ != nullptr && !options_.paged_blocks &&
       std::getenv("CPI_AUTOTUNE") == nullptr) {

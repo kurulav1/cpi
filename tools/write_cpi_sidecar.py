@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Write a `cpi.json` sidecar (chat + reasoning descriptors) next to a model.
 
-Descriptors SHIP WITH THE MODEL so the runtime carries no per-model knowledge -- it just
+Descriptors SHIP with the model so the runtime carries no per-model knowledge; it just
 reads them. A `.cpi` container carries them in its manifest (CFGJSON lines); a HuggingFace
 safetensors directory needs this sidecar instead.
 
 That gap was real: the Gemma 4 HF directories (the only container that still carries the
-vision tower) had a chat descriptor but NO reasoning descriptor, so the web UI reported
-the vision-capable variant as unable to think and the .cpi variant as unable to see --
+vision tower) had a chat descriptor but no reasoning descriptor, so the web UI reported
+the vision-capable variant as unable to think and the .cpi variant as unable to see
 the same model, split across two containers with half its capabilities each.
 
   python tools/write_cpi_sidecar.py --model artifacts/hub/google__gemma-4-E2B-it/hf

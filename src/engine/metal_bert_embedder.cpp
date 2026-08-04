@@ -44,7 +44,7 @@ struct BertPoolParams {
 };
 
 // Must match plan_metal_engine.cpp and the shader. Restated here rather than shared because the
-// shader owns them; if they drift, the GEMM covers the wrong rows silently -- which is why the
+// shader owns them; if they drift, the GEMM covers the wrong rows silently; which is why the
 // out_dim check below refuses instead of trusting.
 constexpr int kGemmBN = 32;
 constexpr int kGemmFBM = 64;
@@ -215,7 +215,7 @@ std::vector<float> MetalBertEmbedder::embed(const std::vector<int>& token_ids) {
     linear(w.k_w, w.k_b, x_, k_, H, H, L);
     linear(w.v_w, w.v_b, x_, v_, H, H, L);
     {
-      // row_stride 0 means "packed", i.e. heads*head_dim -- q, k and v are separate buffers here,
+      // row_stride 0 means "packed", i.e. heads*head_dim; q, k and v are separate buffers here,
       // not the fused block the vision tower feeds this kernel. Passing the vision path's
       // 3*hidden would read each row from two thirds of the way into the wrong tensor.
       BiAttnParams p{static_cast<std::uint32_t>(L), static_cast<std::uint32_t>(heads),
@@ -246,11 +246,11 @@ std::vector<float> MetalBertEmbedder::embed(const std::vector<int>& token_ids) {
     BertPoolParams p{static_cast<std::uint32_t>(L), static_cast<std::uint32_t>(H),
                      cfg_.pooling == PoolingMode::Mean ? 1u : 0u, cfg_.normalize ? 1u : 0u};
     const void* bufs[] = {x_.handle(), pooled_.handle()};
-    // ONE threadgroup of 256: the kernel's tree reduction halves from nthr and assumes a power
+    // one threadgroup of 256: the kernel's tree reduction halves from nthr and assumes a power
     // of two, and the whole output vector must be visible to the normalising pass.
     //
-    // The buffer COUNT is 2 and must equal the array length. It said 3 here, which read one
-    // element past `bufs` and bound whatever that garbage pointer was -- a SIGBUS on the first
+    // The buffer count is 2 and must equal the array length. It said 3 here, which read one
+    // element past `bufs` and bound whatever that garbage pointer was; a SIGBUS on the first
     // embed() call, after initialize() had already reported success.
     ctx_.dispatch("cpi_bert_pool_normalize", runtime::MetalContext::Grid::Groups, 1, 256, bufs,
                   nullptr, 2, &p, sizeof(p));

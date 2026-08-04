@@ -1,4 +1,4 @@
-// TEST-DRIVEN validation of the DeepSeek MLA op (engine/mla_deepseek.hpp) against a REAL DeepSeek-V2-
+// TEST-DRIVEN validation of the DeepSeek MLA op (engine/mla_deepseek.hpp) against a real DeepSeek-V2-
 // Lite layer: tools/deepseek_mla_oracle.py runs transformers' DeepseekV2Attention on layer 0's actual
 // weights and dumps {hidden, weights, inv_freq, attn_out}; this loads that dump, runs mla_prefill_
 // deepseek on the same real weights + input, and checks the output matches HF. This is the end-to-end
@@ -31,7 +31,7 @@ int main(int argc, char** argv) {
   std::ifstream df(stem + ".dims");
   if (!df) {
     std::printf("SKIP: %s.dims not found (run tools/deepseek_mla_oracle.py first)\n", stem.c_str());
-    return 0;  // not a failure -- the artifact is generated out-of-band
+    return 0;  // not a failure; the artifact is generated out-of-band
   }
   engine::DSMLADims m;
   int seq = 0;

@@ -11,9 +11,9 @@
 // or the single-GPU verification where every rank's buffer sits on device 0). world_size()==1 => the
 // ops are no-ops, so the world=1 path is exactly today's single-GPU engine.
 //
-// LocalCollective implements the ops with local device copies/adds -- verifiable on one box, and the
+// LocalCollective implements the ops with local device copies/adds; verifiable on one box, and the
 // correct single-node-multi-GPU behaviour via peer copies. A NcclCollective wrapping ncclCommInitAll
-// (single-node, one process, multiple GPUs) is the ONLY piece that needs real multi-GPU hardware; it
+// (single-node, one process, multiple GPUs) is the only piece that needs real multi-GPU hardware; it
 // slots in behind this interface, declared in an HPC build. This is the seam that keeps NCCL a single
 // isolated dependency instead of threaded through the engine. Scope is single-NODE (see
 // memory:cpi-multi-gpu-hpc-prep); multi-node (one process per rank) is out of scope.

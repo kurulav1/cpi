@@ -7,11 +7,11 @@
 // Read the numbers with two caveats:
 //
 //   * TIME KERNELS IN A CUDA GRAPH, not back-to-back on a stream. A stream launch carries
-//     several microseconds of driver submission overhead, which is what you end up timing --
+//     several microseconds of driver submission overhead, which is what you end up timing
 //     it makes unrelated kernels of different sizes all look like they cost the same. Decode
 //     runs inside a graph anyway. bench_graph() below does this; bench() is kept for contrast.
 //
-//   * A LOOP OVER ONE MATRIX MEASURES L2, NOT HBM. Everything but the LM head fits in cache
+//   * A LOOP over one MATRIX measures L2, not HBM. Everything but the LM head fits in cache
 //     here, so those figures are best-case. Real decode streams each weight from HBM once.
 //
 // Neither caveat is academic: both will happily report a starved kernel as a fast one.
@@ -99,7 +99,7 @@ double bench_splitk(const __half* w, const __half* x, __half* y, int out, int in
   return ms / iters;
 }
 
-// Times the kernel inside a CUDA graph -- which is what decode actually runs, and which
+// Times the kernel inside a CUDA graph; which is what decode actually runs, and which
 // excludes the per-launch driver overhead that stream timing folds into the result.
 double bench_graph(const __half* w, const __half* x, float* y, int out, int in, int warps,
                    int tile, int rows, int reps) {
@@ -299,7 +299,7 @@ int main() {
     cudaEventCreate(&a);
     cudaEventCreate(&b);
 
-    // (1) sync after EVERY launch -- what decode does today.
+    // (1) sync after every launch; what decode does today.
     auto t0 = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < kLaunches; ++i) {
       cudaGraphLaunch(ge, s);
@@ -309,7 +309,7 @@ int main() {
     const double per_sync =
         std::chrono::duration<double, std::milli>(t1 - t0).count() / kLaunches;
 
-    // (2) launch back-to-back, sync ONCE at the end.
+    // (2) launch back-to-back, sync once at the end.
     t0 = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < kLaunches; ++i) cudaGraphLaunch(ge, s);
     cudaStreamSynchronize(s);

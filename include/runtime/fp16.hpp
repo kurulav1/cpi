@@ -19,7 +19,7 @@
 // old converter failed it on 16296 of 23009 values. metal_fp16_test now gates this header, and
 // will read that fixture if handed it.
 //
-// Deliberately ONE portable implementation rather than an #ifdef split onto __fp16: a second code
+// Deliberately one portable implementation rather than an #ifdef split onto __fp16: a second code
 // path is a second thing to verify, and these run once per weight upload where the cost is noise
 // next to the memcpy they feed.
 
@@ -41,7 +41,7 @@ inline std::uint16_t f32_to_f16(float f) {
     return static_cast<std::uint16_t>(sign | 0x7C00u | (mag > 0x7F800000u ? 0x0200u : 0x0000u));
   }
   // 0x477FF000 is 65520.0f, the midpoint between fp16's largest finite value and 2^16. Anything
-  // at or above it rounds to infinity -- NOT to 65504, which is what a truncating converter
+  // at or above it rounds to infinity; not to 65504, which is what a truncating converter
   // returns and is the one case where truncation looks "safer" while being non-conforming.
   if (mag >= 0x477FF000u) return static_cast<std::uint16_t>(sign | 0x7C00u);
 

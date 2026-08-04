@@ -1,20 +1,20 @@
-// Persistent-decode interpreter: the WHOLE single-token forward in one cooperative launch.
+// Persistent-decode interpreter: the whole single-token forward in one cooperative launch.
 //
 // The measured ceiling that forced this design (see memory: cpi-decode-kernel-count): after
 // graph capture, split-K attention and two falsified fusion passes, Gemma 4 decode still spent
-// ~3 ms/token crossing ~800 kernel boundaries -- more than its ~2.5 ms of mandatory weight
+// ~3 ms/token crossing ~800 kernel boundaries; more than its ~2.5 ms of mandatory weight
 // bandwidth. No per-kernel change touches that floor; executing the plan INSIDE one kernel
 // does. The op plan is already data, so this is the same plan the eager executor and the CUDA
 // graph walk, compiled to a device array of resolved descriptors and interpreted by a grid
 // that stays resident for the whole token: block-strided work per op, grid.sync() between ops.
 //
-// Deliberately NOT a re-derivation of the model: every op body mirrors the standalone kernel
-// it replaces (same accumulation types, same rounding points). Reduction GROUPING differs --
-// work is grid-strided instead of per-launch -- so streams can shift at near-ties, exactly as
+// Deliberately not a re-derivation of the model: every op body mirrors the standalone kernel
+// it replaces (same accumulation types, same rounding points). Reduction GROUPING differs
+// work is grid-strided instead of per-launch; so streams can shift at near-ties, exactly as
 // the split-K attention change did; the gates are output quality and the eager path, not
 // byte-identity.
 //
-// Scope: the op kinds a Gemma 4 DECODE plan uses (embed, scale, copy, add, gemv, rmsnorm,
+// Scope: the op kinds a Gemma 4 decode plan uses (embed, scale, copy, add, gemv, rmsnorm,
 // table-rope, gelumul, kv-store, split attention, lm-head). A plan containing anything else
 // (MoE, delta-net) is rejected at compile time by the engine and falls back to the graph path.
 
@@ -133,7 +133,7 @@ __global__ void persistent_decode_kernel(const PersistOp* __restrict__ ops, int 
       }
       case PersistOp::kRope: {
         // Table rope, in place, whole head (partial rotary lives in the table as identity
-        // rotations -- same convention as build_rope_tables).
+        // rotations; same convention as build_rope_tables).
         const int pos = pos_ptr[0];
         const int half_dim = op.head_dim / 2;
         const int pairs = op.heads * half_dim;
@@ -153,7 +153,7 @@ __global__ void persistent_decode_kernel(const PersistOp* __restrict__ ops, int 
       }
       case PersistOp::kGemv: {
         // One WARP per output row, rows grid-warp-strided. 128-bit loads (8 halfs per
-        // instruction) -- 32-bit loads left the warp latency-bound and measurably behind the
+        // instruction); 32-bit loads left the warp latency-bound and measurably behind the
         // standalone matvec. fp32 accumulate, one fp16 round at the write.
         const float4* inv4 = reinterpret_cast<const float4*>(op.in);
         const int oct = op.in_dim / 8;

@@ -67,14 +67,14 @@ std::string read_text(const std::string& path) {
 
 // Was a local truncating copy. That mattered here specifically: this harness is the reference
 // the engine is compared against, and the container it is compared to was packed by pack_ll2c.py
-// with numpy's IEEE rounding. Truncating made END_TO_END look BETTER than it was -- 0.00257
-// against 0.00383 with a correct converter -- and that flattering 1.49x was half the apparent
+// with numpy's IEEE rounding. Truncating made END_TO_END look BETTER than it was; 0.00257
+// against 0.00383 with a correct converter; and that flattering 1.49x was half the apparent
 // engine-vs-harness gap. See include/runtime/fp16.hpp.
 inline std::uint16_t f32_to_f16(float f) { return cpi::f32_to_f16(f); }
 inline float f16_to_f32(std::uint16_t h) { return cpi::f16_to_f32(h); }
 
 // Reports max and mean absolute error. Both, because a mean alone hides a single wrong element
-// among thousands of right ones -- which is what an off-by-one in a permutation looks like.
+// among thousands of right ones; which is what an off-by-one in a permutation looks like.
 void check(const char* name, const std::vector<float>& got, const std::vector<float>& want,
            float tol) {
   if (got.size() != want.size()) {
@@ -82,9 +82,9 @@ void check(const char* name, const std::vector<float>& got, const std::vector<fl
     ++failures;
     return;
   }
-  // NaN must be caught EXPLICITLY. std::max(x, NaN) returns x -- every comparison with NaN is
-  // false -- so an all-NaN result accumulates a max of 0 and passes every tolerance in this
-  // file. That is not hypothetical: the engine path returned NaN and this reported PASS.
+  // NaN must be caught EXPLICITLY. std::max(x, NaN) returns x; every comparison with NaN is
+  // false; so an all-NaN result accumulates a max of 0 and passes every tolerance in this
+  // file. That is not hypothetical: the engine path returned NaN and this reported pass.
   std::size_t nans = 0;
   for (std::size_t i = 0; i < got.size(); ++i) {
     if (!std::isfinite(got[i])) ++nans;
@@ -129,12 +129,12 @@ constexpr int kGemmTG = 32 * (kGemmFBM / (8 * kGemmRF)) * (kGemmBN / (8 * kGemmC
 //
 // Two things here are easy to get wrong and neither announces itself:
 //
-//   1. The sample positions are linspace(0, side-1, n) -- endpoint INCLUSIVE. Using n even
+//   1. The sample positions are linspace(0, side-1, n); endpoint INCLUSIVE. Using n even
 //      steps (i * side / n) instead of n - 1 (i * (side-1) / (n-1)) shifts every sample and
 //      still produces a smooth, plausible table.
 //
 //   2. The result is reordered into merge-unit-major order before being returned, so patch
-//      (i, j) does NOT land at row i*w + j. The blocks therefore see patches grouped by the
+//      (i, j) does not land at row i*w + j. The blocks therefore see patches grouped by the
 //      2x2 unit the merger will later fold, not in raster order.
 std::vector<float> interpolate_pos_embed(const std::vector<float>& table, int side, int h, int w,
                                          int hidden, int merge) {
@@ -214,15 +214,15 @@ std::vector<std::uint16_t> to_f16(const std::vector<float>& v) {
 // One Qwen3_5VisionBlock:
 //   x += proj(attn(rope(qkv(LN1(x)))));  x += fc2(gelu(fc1(LN2(x))))
 //
-// Pre-norm on both halves, and the residual is the UNNORMALISED x -- writing the norm back into
+// Pre-norm on both halves, and the residual is the UNNORMALISED x; writing the norm back into
 // x instead would still train-shaped-run and be wrong.
 struct BlockDebug {
-  // qkv_preroped is captured BEFORE the rotation, because that is what the reference's hook on
+  // qkv_preroped is captured before the rotation, because that is what the reference's hook on
   // attn.qkv sees. Comparing the rotated buffer against it reports a failure for q and k that
-  // is not a failure -- which it did, and cost a bisect step.
-  // attn_out is captured AFTER the output projection, because the reference's hook is on the
+  // is not a failure; which it did, and cost a bisect step.
+  // attn_out is captured after the output projection, because the reference's hook is on the
   // whole attention MODULE and proj is its last step. Capturing the pre-proj value and
-  // comparing it to that hook reports a failure that is not one -- the second time this exact
+  // comparing it to that hook reports a failure that is not one; the second time this exact
   // mistake was made in this file, after the pre/post-rope one above.
   std::vector<float> norm1, qkv_preroped, norm2, attn_out, inter;
 };
@@ -313,7 +313,7 @@ std::vector<float> run_vision_block(runtime::MetalContext& ctx, const std::vecto
                    static_cast<std::uint32_t>(head_dim),
                    1.0f / std::sqrt(static_cast<float>(head_dim)),
                    static_cast<std::uint32_t>(hidden * 3)};
-    // q, k, v at offsets 0, hidden, 2*hidden -- but the kernel strides by heads*head_dim, which
+    // q, k, v at offsets 0, hidden, 2*hidden; but the kernel strides by heads*head_dim, which
     // is `hidden`, so each needs its own base offset into the fused buffer.
     const void* bufs[] = {bqkv.handle(), bqkv.handle(), bqkv.handle(), battn.handle()};
     const std::size_t offs[] = {0, static_cast<std::size_t>(hidden) * 2,
@@ -365,8 +365,8 @@ std::vector<float> run_vision_block(runtime::MetalContext& ctx, const std::vecto
 }
 
 // The patch merger: LayerNorm per patch, fold each 2x2 unit into one row, fc1 -> exact GELU ->
-// fc2. The fold needs no data movement -- patches are already in merge-unit-major order, so
-// four consecutive rows ARE one unit and [tokens][hidden] reinterprets as [tokens/4][4*hidden].
+// fc2. The fold needs no data movement; patches are already in merge-unit-major order, so
+// four consecutive rows are one unit and [tokens][hidden] reinterprets as [tokens/4][4*hidden].
 std::vector<float> run_merger(runtime::MetalContext& ctx, const std::vector<float>& in,
                               const std::string& dir, int tokens, int hidden, int merge,
                               int inter_m, int out_hidden, int soft) {
@@ -406,7 +406,7 @@ std::vector<float> run_merger(runtime::MetalContext& ctx, const std::vector<floa
   {
     ElemParams p{static_cast<std::uint32_t>(soft) * static_cast<std::uint32_t>(inter_m), 1.0f};
     const void* bufs[] = {bi.handle()};
-    // erf, not tanh -- the merger's nn.GELU() defaults to approximate='none'.
+    // erf, not tanh; the merger's nn.GELU() defaults to approximate='none'.
     ctx.dispatch("cpi_gelu_erf", runtime::MetalContext::Grid::Threads,
                  static_cast<std::size_t>(soft) * inter_m, 256, bufs, nullptr, 1, &p, sizeof(p));
   }
@@ -421,8 +421,8 @@ std::vector<float> run_merger(runtime::MetalContext& ctx, const std::vector<floa
 // Per-token cos/sin for the vision RoPE, half a head_dim wide (cos[i] == cos[i+half], so only
 // the first half is stored).
 //
-// The frequency vector is [row_freqs | col_freqs], each head_dim/4 long -- NOT one geometric
-// series over head_dim/2. And the per-token (row, col) must be enumerated in the SAME
+// The frequency vector is [row_freqs | col_freqs], each head_dim/4 long; not one geometric
+// series over head_dim/2. And the per-token (row, col) must be enumerated in the same
 // merge-unit-major order the position table uses, or the rotation is applied to the wrong
 // patches while still looking like a well-formed rotation.
 void build_vision_rope(int h, int w, int head_dim, int merge, float theta,
@@ -463,7 +463,7 @@ int main(int argc, char** argv) {
     return 2;
   }
   // Unbuffered: this test can crash the process (it drives a GPU and mmaps a multi-GB
-  // container), and a buffered stdout loses every line printed before the fault -- which reads
+  // container), and a buffered stdout loses every line printed before the fault; which reads
   // as "it produced no output" rather than "it died at stage N".
   std::setvbuf(stdout, nullptr, _IONBF, 0);
 
@@ -511,7 +511,7 @@ int main(int argc, char** argv) {
   // ---- stage 1: patch embed ----
   // Conv3d with stride == kernel_size over an input reshaped so each sample IS one patch, so
   // it reduces to Linear(patch_dim -> hidden). The [768,3,2,16,16] weight is already contiguous
-  // in exactly that order, so it needs no rearrangement -- only reinterpretation.
+  // in exactly that order, so it needs no rearrangement; only reinterpretation.
   {
     std::vector<std::uint16_t> hw(w_proj.size()), hx(pixels.size()), hb(b_proj.size());
     for (std::size_t i = 0; i < w_proj.size(); ++i) hw[i] = f32_to_f16(w_proj[i]);
@@ -553,7 +553,7 @@ int main(int argc, char** argv) {
     auto ba = ctx.alloc_from(ha.data(), ha.size() * 2);
     auto bb = ctx.alloc_from(hb.data(), hb.size() * 2);
     ElemParams p{static_cast<std::uint32_t>(ha.size()), 1.0f};
-    // cpi_add_inplace is (in, out) and writes buffer 1, so the accumulator must be SECOND.
+    // cpi_add_inplace is (in, out) and writes buffer 1, so the accumulator must be second.
     const void* bufs[] = {bb.handle(), ba.handle()};
     ctx.dispatch("cpi_add_inplace", runtime::MetalContext::Grid::Threads, ha.size(), 256, bufs,
                  nullptr, 2, &p, sizeof(p));
@@ -564,7 +564,7 @@ int main(int argc, char** argv) {
     // Fed the ORACLE's patch embed, not ours, so this isolates the add and the position table
     // from any error already measured in stage 1.
     check("pos_embed_added", got, want_sum, 0.02f);
-    // Our own sum, from our own patch embed -- the stage check above deliberately used the
+    // Our own sum, from our own patch embed; the stage check above deliberately used the
     // oracle's, to isolate the add. This is what the end-to-end run starts from.
     our_sum.resize(our_patch_embed.size());
     for (std::size_t i = 0; i < our_sum.size(); ++i) our_sum[i] = our_patch_embed[i] + pos[i];
@@ -606,7 +606,7 @@ int main(int argc, char** argv) {
     // ---- the remaining 11 blocks ----
     //
     // Chained: block N is fed the port's own output for N-1, not the oracle's. That is the
-    // point -- per-block checks against the reference would hide error that only shows up once
+    // point; per-block checks against the reference would hide error that only shows up once
     // it compounds, and the tower has to survive its own output twelve times over.
     const int depth = engine::mini::json_get_int(geo, "depth");
     std::vector<float> cur = got;
@@ -639,11 +639,11 @@ int main(int argc, char** argv) {
     // Gated on RELATIVE error, not absolute. The stack's activations span 8 -> 1657 across
     // blocks, so one absolute tolerance is either meaningless early or unenforceable late.
     //
-    // The threshold is derived, not chosen to pass. Rounding the reference to fp16 and back --
-    // representation error with no arithmetic at all -- costs max_abs 0.48 on this tensor. The
+    // The threshold is derived, not chosen to pass. Rounding the reference to fp16 and back
+    // representation error with no arithmetic at all; costs max_abs 0.48 on this tensor. The
     // port lands at 10.06, which is 21x that floor, and the MEAN ratio is 24x. Those agreeing
     // is the signal: a real bug puts a few elements far out, giving a high max ratio against a
-    // low mean one. The per-block curve above says the same thing -- relative error is flat at
+    // low mean one. The per-block curve above says the same thing; relative error is flat at
     // ~0.0005 for blocks 1-10 and only moves when block 11's activations jump 34x.
     //
     // 0.02 sits ~3x above the measured 0.006 and far below anything a bug produced here: the
@@ -670,8 +670,8 @@ int main(int argc, char** argv) {
   // Fed the ORACLE's block_11 so this measures the merger alone rather than inheriting the
   // stack's accumulated error.
   //
-  // The 2x2 fold needs NO data movement. The norm is applied per patch over hidden, and the
-  // patches are already in merge-unit-major order, so four consecutive rows ARE one unit --
+  // The 2x2 fold needs no data movement. The norm is applied per patch over hidden, and the
+  // patches are already in merge-unit-major order, so four consecutive rows are one unit
   // regrouping [tokens][768] as [tokens/4][3072] is a reinterpretation of the same buffer.
   {
     const int inter_m = hidden * merge * merge;               // 3072
@@ -738,11 +738,11 @@ int main(int argc, char** argv) {
   // Everything above reads the oracle's own fp32 weight dumps, so it gates the arithmetic while
   // assuming the plumbing. This re-runs it against the container the converter produces, which
   // is what the engine will actually load. A name that does not survive conversion, a tensor
-  // stored transposed, a geometry field dropped by the packer's whitelist -- none of those can
+  // stored transposed, a geometry field dropped by the packer's whitelist; none of those can
   // be seen upstream of here.
   if (argc >= 3) {
     // Loader-agnostic. This block byte-checks tensors straight out of the container, so it has
-    // to know the format -- and the engine now accepts BOTH .ll2c and .cpi/safetensors. Opening
+    // to know the format; and the engine now accepts both .ll2c and .cpi/safetensors. Opening
     // WeightLoader unconditionally is what made a repacked .cpi throw "expected LL2CUDA manifest"
     // here while the engine loaded it fine.
     const std::string cpath = argv[2];
@@ -779,8 +779,8 @@ int main(int argc, char** argv) {
       std::printf("  %-22s container geometry disagrees with the oracle  FAIL\n", "container_tower");
       ++failures;
     } else {
-      // The container stores fp16; the oracle dumps fp32. Compare the WEIGHTS directly rather
-      // than only the outputs -- a transposed or truncated tensor can still produce plausible
+      // The container stores fp16; the oracle dumps fp32. Compare the weights directly rather
+      // than only the outputs; a transposed or truncated tensor can still produce plausible
       // activations, and this says which tensor rather than which stage.
       int checked = 0, bad = 0;
       const std::vector<std::pair<std::string, std::string>> pairs = {
@@ -863,10 +863,10 @@ int main(int argc, char** argv) {
 
   // ---- the splice: soft tokens standing in for placeholder tokens ----
   //
-  // There is no oracle past this point -- the reference dump stops at soft tokens -- so this
+  // There is no oracle past this point, the reference dump stops at soft tokens, so this
   // gates the two things that CAN be checked without one: that the spliced rows are the ones
   // that reach the residual stream, and that a prompt containing them generates without
-  // diverging into NaN. It does NOT check that the model's ANSWER is right; that needs a full
+  // diverging into NaN. It does not check that the model's ANSWER is right; that needs a full
   // multimodal comparison against HuggingFace, which is a heavier harness than this.
   if (argc >= 3) {
     engine::PlanMetalEngine eng;
@@ -876,8 +876,8 @@ int main(int argc, char** argv) {
     const int n_soft = static_cast<int>(soft.size()) / out_hidden;
 
     // A prompt of arbitrary text tokens with n_soft placeholders in the middle. The ids do not
-    // matter for the placeholders -- their embeddings are overwritten -- but they must be in
-    // range, and using a REAL id rather than 0 is deliberate: 0 often maps to a padding
+    // matter for the placeholders, their embeddings are overwritten, but they must be in
+    // range, and using a real id rather than 0 is deliberate: 0 often maps to a padding
     // embedding that is all zeros, which would make a failed splice look like a working one.
     std::vector<int> toks = {760, 6511};
     std::vector<std::vector<float>> embeds(toks.size());
@@ -894,7 +894,7 @@ int main(int argc, char** argv) {
     std::printf("      spliced %d soft tokens into a %zu-token prompt\n", n_soft, toks.size());
 
     // Generation must survive the spliced prompt. NaN or a hang here is the failure mode that
-    // matters -- a wrong-but-finite answer cannot be judged without a multimodal oracle.
+    // matters; a wrong-but-finite answer cannot be judged without a multimodal oracle.
     bool finite = true;
     int next = toks.back();
     for (int i = 0; i < 4; ++i) {
@@ -911,8 +911,8 @@ int main(int argc, char** argv) {
                 finite ? "logits finite over 4 steps  PASS" : "NON-FINITE logits  FAIL");
     if (!finite) ++failures;
 
-    // CONTROL: the same prompt with NO splice must produce different logits. "Finite" alone
-    // says nothing -- a splice that silently did nothing also produces finite logits, and that
+    // control: the same prompt with no splice must produce different logits. "Finite" alone
+    // says nothing; a splice that silently did nothing also produces finite logits, and that
     // is precisely the failure this whole file keeps running into. Comparing against the
     // unspliced run is the only thing that shows the soft tokens reached the residual stream.
     {
@@ -976,10 +976,10 @@ int main(int argc, char** argv) {
     }
   }
 
-  // ---- THE END: Metal's token stream vs the reference's ----
+  // ---- the END: Metal's token stream vs the reference's ----
   //
   // Everything else in this file compares activations. This compares ANSWERS, which is the only
-  // check that covers the tower, the splice, M-RoPE and the text stack at once -- and the only
+  // check that covers the tower, the splice, M-RoPE and the text stack at once; and the only
   // one that can tell a wrong-but-finite result from a right one.
   //
   // Reference stream from tools/qwen35_multimodal_oracle.py on the same synthetic image and
@@ -998,7 +998,7 @@ int main(int argc, char** argv) {
     // the multimodal drift in two: whatever remains with the oracle's inputs belongs to the
     // splice, M-RoPE and the text stack, and whatever the swap removes was the tower's own fp16
     // error propagating. Without this the two are indistinguishable, and 16 of the 22 positions
-    // carry tower output -- enough that "the logits drift" says nothing about where.
+    // carry tower output; enough that "the logits drift" says nothing about where.
     const std::vector<float>& soft_src =
         (std::getenv("CPI_MM_ORACLE_SOFT") != nullptr) ? want_soft : soft;
     if (std::getenv("CPI_MM_ORACLE_SOFT") != nullptr) {
@@ -1023,9 +1023,9 @@ int main(int argc, char** argv) {
 
     // Prefill everything EXCEPT the last token, then push that one through forward_token.
     //
-    // prefill_multimodal consumes every token it is handed -- prefill_chunks(n) covers all n --
+    // prefill_multimodal consumes every token it is handed; prefill_chunks(n) covers all n
     // and there is no accessor for the logits it leaves behind. So prefilling all of `toks` and
-    // then calling forward_token(toks.back()) feeds the final token TWICE, at n-1 and again at
+    // then calling forward_token(toks.back()) feeds the final token twice, at n-1 and again at
     // n, which corrupts the KV cache and shifts every position after it.
     //
     // This loop did exactly that, and it is what MULTIMODAL_stream was really measuring. The
@@ -1047,7 +1047,7 @@ int main(int argc, char** argv) {
     // Two counters, because M-RoPE makes them diverge. The ROTARY position continues the merged
     // counter: mrope_next_position reports where the next token goes, so the last prompt token
     // is one before it, and generated tokens step up by one from there. The CACHE position is the
-    // real sequence index -- head.size() tokens were prefilled, so the last prompt token occupies
+    // real sequence index; head.size() tokens were prefilled, so the last prompt token occupies
     // slot head.size()-1 and the first generated token lands at head.size(). Passing the rotary
     // position for both is the bug this file used to carry: K/V written into an image slot and
     // attention truncated to the rotary position.
@@ -1063,7 +1063,7 @@ int main(int argc, char** argv) {
       // MULTIMODAL_stream compares eight argmax decisions. That is 8 bits of evidence about a
       // 248320-wide vector, and it cannot tell "our logits are slightly off" from "our logits
       // are badly off but the ordering survived". qwen35_multimodal_oracle.py has been dumping
-      // first_step_logits.f32 since it was written and NOTHING has ever compared against it --
+      // first_step_logits.f32 since it was written and nothing has ever compared against it
       // the same written-but-unrun pattern as the fp16 fixture.
       //
       // Step 0 specifically, because it is the last position where the two runs are guaranteed
@@ -1111,12 +1111,12 @@ int main(int argc, char** argv) {
             // on top of it. It is set above the text-only control's 0.12 on purpose: this prompt
             // carries fp16 TOWER output at 16 of its 22 positions and a 3-D M-RoPE rotary, where
             // the text control has neither, so 0.22 here is the same order of error the clean 1-D
-            // path shows at 0.12 -- not a defect.
+            // path shows at 0.12; not a defect.
             //
             // The history is worth keeping: this read 0.484 while the KV cache was being indexed
             // by the rotary position instead of the sequence index (11 of 21 prompt tokens
             // dropped from attention). Splitting the two positions took it to 0.218 and the
-            // stream to 8/8. Do not widen this further to absorb a real regression -- if it
+            // stream to 8/8. Do not widen this further to absorb a real regression; if it
             // climbs back toward 0.4, the cache/rotary split has broken again.
             const double mean_abs = sum / static_cast<double>(lg.size());
             std::printf("  %-22s max_abs=%.4f  mean_abs=%.4f  tol_mean=0.30  %s\n",

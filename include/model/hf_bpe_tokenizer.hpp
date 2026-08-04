@@ -68,7 +68,7 @@ public:
 
   // Returns a per-token byte table: token_pieces()[id] is the raw bytes token
   // `id` emits (byte-level / byte-fallback resolved, word-boundary marker -> a
-  // space, NO sequence-level leading-space strip). Special/added tokens map to
+  // space, no sequence-level leading-space strip). Special/added tokens map to
   // an empty string. Built once at load(); used by grammar-constrained decoding.
   const std::vector<std::string>& token_pieces() const {
     return token_pieces_;

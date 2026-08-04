@@ -11,8 +11,8 @@ namespace model {
 namespace image {
 namespace {
 
-// PIL's BICUBIC kernel (a = -0.5). Note PIL uses a = -0.5, NOT the -0.75 that OpenCV
-// uses -- they give visibly different results, and HF resamples with PIL.
+// PIL's BICUBIC kernel (a = -0.5). Note PIL uses a = -0.5, not the -0.75 that OpenCV
+// uses; they give visibly different results, and HF resamples with PIL.
 float bicubic_kernel(float x) {
   constexpr float a = -0.5f;
   x = std::fabs(x);
@@ -25,7 +25,7 @@ float bicubic_kernel(float x) {
   return 0.0f;
 }
 
-// One resampling pass along a single axis, reproducing PIL's 8-bit path EXACTLY.
+// One resampling pass along a single axis, reproducing PIL's 8-bit path exactly.
 //
 // Two details make it exact rather than merely close, and both are invisible until you
 // diff against PIL:
@@ -33,7 +33,7 @@ float bicubic_kernel(float x) {
 //     used as doubles;
 //   - the horizontal pass writes an 8-BIT intermediate, so the vertical pass resamples
 //     already-rounded values.
-// Downscaling stretches the filter support by 1/scale -- that is what "antialias" means.
+// Downscaling stretches the filter support by 1/scale; that is what "antialias" means.
 // Without it a 2x downscale point-samples and aliases badly (tens of levels off).
 constexpr int kPrecisionBits = 22;
 
@@ -104,7 +104,7 @@ Image resize_bicubic(const Image& src, int out_w, int out_h) {
   if (out_w == src.width && out_h == src.height) return src;
 
   constexpr int kC = 3;
-  // Horizontal pass, then vertical -- with an 8-bit intermediate, as PIL does.
+  // Horizontal pass, then vertical; with an 8-bit intermediate, as PIL does.
   std::vector<std::uint8_t> mid(static_cast<std::size_t>(out_w) * src.height * kC);
   resample_axis(src.rgb, mid, src.width, out_w, src.height, kC, /*horizontal=*/true);
 
@@ -122,7 +122,7 @@ PatchGrid to_patches(const Image& img, int patch_size, int pooling_kernel, int m
     throw std::runtime_error("image: bad patch parameters");
 
   // Largest aspect-preserving size that (a) fits the patch budget and (b) has both
-  // sides divisible by patch*pooling -- so the patch grid pools evenly.
+  // sides divisible by patch*pooling; so the patch grid pools evenly.
   const int max_patches = max_soft_tokens * pooling_kernel * pooling_kernel;
   const double total_px = static_cast<double>(img.width) * img.height;
   const double target_px = static_cast<double>(max_patches) * patch_size * patch_size;
@@ -156,7 +156,7 @@ PatchGrid to_patches(const Image& img, int patch_size, int pooling_kernel, int m
       g.pos_x[static_cast<std::size_t>(p)] = px;
       g.pos_y[static_cast<std::size_t>(p)] = py;
       float* out = &g.pixels[static_cast<std::size_t>(p) * patch_dim];
-      // Within a patch the order is [y][x][channel] -- CHANNEL INNERMOST.
+      // Within a patch the order is [y][x][channel]; CHANNEL INNERMOST.
       for (int y = 0; y < patch_size; ++y) {
         for (int x = 0; x < patch_size; ++x) {
           const int sy = py * patch_size + y;
@@ -223,7 +223,7 @@ Qwen2VLPatches qwen2vl_preprocess(const Image& img, int patch_size, int temporal
 
   // Rows in MERGE-UNIT-MAJOR order: (block_h, block_w, merge_h, merge_w), matching the tower.
   // Row content: (channel, temporal, patch_h, patch_w). The single frame is repeated across the
-  // temporal axis, so every temporal slice is identical -- but it must still be written, or the
+  // temporal axis, so every temporal slice is identical; but it must still be written, or the
   // patch_dim stride is wrong and the tower reads channels out of a neighbouring patch.
   const int bh = gh / merge_size, bw = gw / merge_size;
   std::size_t row = 0;

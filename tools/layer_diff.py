@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Compare two per-layer activation dumps and report the FIRST layer that diverges.
+"""Compare two per-layer activation dumps and report the first layer that diverges.
 
 A port that disagrees only in its final token tells you nothing about where it went wrong. For
-Qwen3.5 there are three independent suspects per layer -- the delta-net block, the gated
-attention block, the MLP -- times 24 layers, so "the output is wrong" is a search, not a finding.
+Qwen3.5 there are three independent suspects per layer, the delta-net block, the gated
+attention block, the MLP, times 24 layers, so "the output is wrong" is a search, not a finding.
 This turns it into a line number.
 
 Dumps are written by setting CPI_Q35_DUMP=<dir> (see qwen35_cpu_engine.cpp); each file is
@@ -14,9 +14,9 @@ embedding, before any layer runs.
 
 Exit code is 1 when a layer diverges past tolerance, so it can gate.
 
-Reading the output: divergence that starts at layer N and GROWS is a bug in layer N. Divergence
+Reading the output: divergence that starts at layer N and grows is a bug in layer N. Divergence
 that appears at layer N already large, with N-1 clean, is the same thing. Divergence that is
-small everywhere and never grows is fp16-vs-fp32 accumulation, not a bug -- raise --tol.
+small everywhere and never grows is fp16-vs-fp32 accumulation, not a bug, raise --tol.
 """
 
 import argparse
@@ -73,9 +73,9 @@ def main() -> int:
         return 1
 
     # ONSET, not tolerance. Divergence grows as it propagates, so the first layer to exceed a
-    # tolerance is many layers downstream of the cause -- injecting a 5% error at layer 11 and
+    # tolerance is many layers downstream of the cause; injecting a 5% error at layer 11 and
     # asking "where does max_abs first exceed 0.05" answers layer 24. The cause is the first
-    # layer that stops matching AT ALL, so that is what gets reported; the tolerance only decides
+    # layer that stops matching AT all, so that is what gets reported; the tolerance only decides
     # the exit code.
     first_onset = None
     first_bad = None

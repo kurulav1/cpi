@@ -309,7 +309,7 @@ void l2norm_inplace(float* x, int n, float eps = 1e-6f) {
 void Qwen35CpuEngine::gemv_bf16(const std::uint16_t* W, const float* x, float* y, int M, int N) {
 #if !defined(CPI_X86_SIMD)
   // Scalar fallback (Apple Silicon / ARM). Accumulation order differs from the
-  // AVX2 path, so results are not bit-identical across ISAs -- expected, and
+  // AVX2 path, so results are not bit-identical across ISAs; expected, and
   // this is a reference path, not a serving one.
 #pragma omp parallel for schedule(static)
   for (int i = 0; i < M; ++i) {
@@ -567,8 +567,8 @@ void Qwen35CpuEngine::allocate_runtime_buffers() {
 void Qwen35CpuEngine::load_weight_pointers() {
   tok_embeddings_ = require_bf16_tensor(weights_, "model.language_model.embed_tokens.weight");
   norm_out_ = require_bf16_tensor(weights_, "model.language_model.norm.weight");
-  // Tied embeddings: the released Qwen3.5 checkpoints set tie_word_embeddings and ship NO
-  // lm_head.weight, so the output projection IS the embedding table -- same [vocab, hidden]
+  // Tied embeddings: the released Qwen3.5 checkpoints set tie_word_embeddings and ship no
+  // lm_head.weight, so the output projection IS the embedding table; same [vocab, hidden]
   // shape, so it aliases directly. Requiring the tensor unconditionally made every such
   // checkpoint fail to load with "missing tensor: lm_head.weight".
   lm_head_ = weights_.has_tensor("lm_head.weight")
@@ -610,7 +610,7 @@ void Qwen35CpuEngine::load_weight_pointers() {
 // CPI_Q35_DUMP=<dir> writes this engine's hidden state after every layer, as
 // layer_NN_pos_MM.f32 (hidden_size floats, native endianness), plus the embedding as layer_-1.
 //
-// This exists so the Metal port can be diffed LAYER BY LAYER rather than by its final token. A
+// This exists so the Metal port can be diffed layer BY layer rather than by its final token. A
 // port that disagrees only in its output tells you nothing about where; the delta-net block, the
 // gated attention block and the MLP are three independent suspects per layer, times 24 layers.
 // Off unless the variable is set, so it costs a getenv per forward.

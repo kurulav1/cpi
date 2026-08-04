@@ -668,7 +668,7 @@ std::string cleanup_repeated_sentences(const std::string& text) {
 }
 
 // Detects degenerate repetition loops (the failure mode the aggressive
-// cleanup pipeline below exists for). Healthy output must NOT match: the
+// cleanup pipeline below exists for). Healthy output must not match: the
 // cleanup collapses newlines/indentation and re-joins sentences with single
 // spaces, which corrupts code blocks ("self.data" -> "self. data") and any
 // formatted text.
@@ -860,13 +860,13 @@ ModelProbe probe_model(const std::string& model_path) {
     try {
       model::SafetensorsLoader probe;
       probe.open(model_path);
-      // A `__metadata__` block is NOT proof the block is OURS. Gemma 4's converter writes one too,
+      // A `__metadata__` block is not proof the block is OURS. Gemma 4's converter writes one too,
       // in its own schema (`family`, `hidden`, `vocab`), and none of those keys are the ones
-      // config_from_json reads -- so it hands back a fully DEFAULTED LlamaConfig. Identify the
+      // config_from_json reads; so it hands back a fully DEFAULTED LlamaConfig. Identify the
       // schema by a key `config_to_json` always emits, and never by a parsed VALUE: the old test
       // here was `c.hidden_size > 0`, and hidden_size defaults to 4096, so it was true for every
       // container that had any metadata at all. That silently routed Gemma 4 `.cpi` files to
-      // LlamaEngine, which reads `.ll2c` only -- a shipped, working path broken by a probe that
+      // LlamaEngine, which reads `.ll2c` only; a shipped, working path broken by a probe that
       // looked like it was checking something.
       if (probe.has_metadata() &&
           !engine::mini::json_get_string(probe.metadata_json(), "model_family").empty()) {
@@ -895,7 +895,7 @@ ModelProbe probe_model(const std::string& model_path) {
              model::peek_container_family(model_path) == model::ModelFamily::Qwen3_5) {
     // A .ll2c container records its family in the header; ask it. Without this a Qwen3.5
     // container fell through to ModelFamilyKind::Llama and reached PlanMetalEngine by accident
-    // rather than by recognition -- which happened to be the right engine, so nothing complained.
+    // rather than by recognition; which happened to be the right engine, so nothing complained.
     p.kind = ModelFamilyKind::Qwen35;
   } else if (p.is_safetensors_dir) {
     p.kind = ModelFamilyKind::Llama4;
@@ -909,7 +909,7 @@ EngineChoice resolve_engine(const ModelProbe& probe, bool cuda_available, bool m
                             bool force_cpu) {
   const bool use_gpu = cuda_available && !force_cpu;
   // Metal is the Apple-Silicon fast path when there is no CUDA device: it covers the
-  // Llama family (dense .ll2c -- Llama/Qwen2/Qwen3/Gemma), the same scope PlanMetalEngine
+  // Llama family (dense .ll2c; Llama/Qwen2/Qwen3/Gemma), the same scope PlanMetalEngine
   // supports. CUDA wins when present; Metal beats CPU otherwise.
   const bool use_metal = metal_available && !cuda_available && !force_cpu;
   switch (probe.kind) {

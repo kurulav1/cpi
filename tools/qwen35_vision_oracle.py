@@ -2,7 +2,7 @@
 """Reference oracle for the Qwen3.5 VISION tower.
 
 Runs HuggingFace's Qwen3_5VisionModel on a DETERMINISTIC synthetic image and dumps the
-activation after EVERY stage, so a Metal port can be bisected to a stage instead of being
+activation after every stage, so a Metal port can be bisected to a stage instead of being
 compared only at the end. "The soft tokens are wrong" is a search across a patch embed, a
 position interpolation, 12 blocks and a merger; a per-stage dump turns it into a lookup.
 
@@ -34,7 +34,7 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel
 def build_input(cfg: Qwen3_5VisionConfig, grid_h: int, grid_w: int):
     """A fixed, reproducible 'image', already patchified the way the tower expects.
 
-    hidden_states is (num_patches, in_channels * temporal_patch_size * patch_size**2) --
+    hidden_states is (num_patches, in_channels * temporal_patch_size * patch_size**2)
     the tower's own patch_embed reshapes this into per-patch [C, T, P, P] volumes, so the
     flattening order here has to match that view exactly. Getting it wrong produces a
     tower that runs and is wrong, which is the failure mode this whole file exists to
@@ -44,7 +44,7 @@ def build_input(cfg: Qwen3_5VisionConfig, grid_h: int, grid_w: int):
     n = grid_h * grid_w
     idx = torch.arange(n, dtype=torch.float32).unsqueeze(1)
     k = torch.arange(patch_dim, dtype=torch.float32).unsqueeze(0)
-    # Deterministic, non-trivial, bounded to [0,1], and varying along BOTH axes: a pattern
+    # Deterministic, non-trivial, bounded to [0,1], and varying along both axes: a pattern
     # constant across patches would hide a patch-indexing bug, and one constant within a
     # patch would hide a channel-ordering bug.
     pixels = 0.5 + 0.5 * torch.sin(0.1 * idx + 0.037 * k)
@@ -67,7 +67,7 @@ def main() -> int:
     full_cfg = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
     cfg = Qwen3_5VisionConfig(**full_cfg["vision_config"])
 
-    # The grid must be a whole number of merge units in both axes -- the merger folds
+    # The grid must be a whole number of merge units in both axes; the merger folds
     # spatial_merge_size**2 patches into one soft token and a partial unit has nothing to
     # fold. Caught here rather than as a reshape error 200 lines deeper.
     if args.grid_h % cfg.spatial_merge_size or args.grid_w % cfg.spatial_merge_size:
@@ -183,9 +183,9 @@ def main() -> int:
     write("input_pixels", pixels, 0)
     for i, (name, t) in enumerate(stages, start=1):
         write(name, t, i)
-    # NOT the tower's product. last_hidden_state is the pre-merge block output (num_patches,
+    # not the tower's product. last_hidden_state is the pre-merge block output (num_patches,
     # hidden_size); the soft tokens the text model actually consumes are the MERGER's output
-    # (num_patches / spatial_merge_size**2, out_hidden_size) -- stage_16 above. Dumped anyway
+    # (num_patches / spatial_merge_size**2, out_hidden_size); stage_16 above. Dumped anyway
     # because it is a free extra checkpoint, but named so it cannot be mistaken for the result.
     out_t = out if isinstance(out, torch.Tensor) else out.last_hidden_state
     write("last_hidden_state_premerge", out_t.detach().to(torch.float32).contiguous(),
@@ -194,7 +194,7 @@ def main() -> int:
 
     # The vision weights, in the same fp32 layout, so a port can be gated before the container
     # format carries them. The converter does not emit model.visual.* yet, and waiting for it
-    # would mean the arithmetic is only checkable once the plumbing is done -- which is the
+    # would mean the arithmetic is only checkable once the plumbing is done; which is the
     # wrong order. These stay useful afterwards as the test's fixture.
     wdir = out_dir / "weights"
     wdir.mkdir(exist_ok=True)

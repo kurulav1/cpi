@@ -81,7 +81,7 @@ float silu(float x) {
 void Llama4CpuEngine::gemv_bf16(const std::uint16_t* W, const float* x, float* y, int M, int N) {
 #if !defined(CPI_X86_SIMD)
   // Scalar fallback (Apple Silicon / ARM). Accumulation order differs from the
-  // AVX2 path, so results are not bit-identical across ISAs -- expected, and
+  // AVX2 path, so results are not bit-identical across ISAs; expected, and
   // this is a reference path, not a serving one.
 #pragma omp parallel for schedule(static)
   for (int i = 0; i < M; ++i) {

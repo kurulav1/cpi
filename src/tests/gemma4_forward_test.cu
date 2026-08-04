@@ -119,7 +119,7 @@ int main(int argc, char** argv) {
     }
 
     if (!ppl_tokens.empty()) {
-      // Teacher-forced perplexity: for each scored position i, forward the FULL prefix
+      // Teacher-forced perplexity: for each scored position i, forward the full prefix
       // tokens[0..i-1] (BOS-anchored, real left context) and score the ground-truth next token
       // tokens[i] via nll = logsumexp(logits) - logits[tokens[i]]. --ppl-stride subsamples which
       // positions are scored so a large corpus stays affordable; --ppl-warm skips the first W
@@ -132,7 +132,7 @@ int main(int argc, char** argv) {
       for (int i = ppl_warm; i < n; i += ppl_stride) {
         // Full prefix by default; with --ppl-win W, cap context to BOS + the last W tokens so each
         // prefill is bounded (O(N*W) instead of O(N^2)). BOS (ppl_tokens[0]) is kept so the window
-        // is anchored -- dropping it makes Gemma's logits garbage.
+        // is anchored; dropping it makes Gemma's logits garbage.
         std::vector<int> pre;
         if (ppl_win > 0 && i > ppl_win) {
           pre.reserve(static_cast<std::size_t>(ppl_win) + 1);

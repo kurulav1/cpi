@@ -3,7 +3,7 @@
 // Backend-neutral model config for the op-plan engines.
 //
 // This is the config that PlanCudaEngine and PlanMetalEngine both need in order to BUILD a plan:
-// geometry, per-layer attention kinds, RoPE parameters, KV sharing. None of it is CUDA-specific --
+// geometry, per-layer attention kinds, RoPE parameters, KV sharing. None of it is CUDA-specific
 // it is the answer to "what shape is this model", which is the same question on every backend.
 //
 // It used to be a struct nested inside PlanCudaEngine, in a header that includes <cuda_runtime.h>.
@@ -12,8 +12,8 @@
 // toolkit. Lifting it here is what lets the plan builder move to op_plan_builder.cpp beside
 // build_llama_plan and build_qwen35_plan.
 //
-// PlanCudaEngine aliases its private Family/Config to these, so the field names below MUST stay
-// exactly as they were -- ~1800 lines of `cfg_.<field>` depend on them. Renaming a field here is
+// PlanCudaEngine aliases its private Family/Config to these, so the field names below must stay
+// exactly as they were; ~1800 lines of `cfg_.<field>` depend on them. Renaming a field here is
 // not a cleanup, it is a silent behaviour change in whichever engine you forget to update.
 //
 // This file must compile with no CUDA and no Metal toolkit present.
@@ -27,7 +27,7 @@
 namespace engine {
 
 // Which model recipe builds the plan. The EXECUTOR, sampler, quantizer, decode graph and KV/state
-// machinery are shared; only the config parse, weight load and plan recipe differ -- so a "new
+// machinery are shared; only the config parse, weight load and plan recipe differ; so a "new
 // model" is a recipe, not an engine.
 enum class PlanFamily { Gemma4, Qwen35, DeepSeekV2 };
 
@@ -86,14 +86,14 @@ struct PlanModelConfig {
 
 // Parses Gemma 4's geometry out of a HuggingFace `config.json`.
 //
-// Takes the WHOLE file text and reaches into `text_config` itself, because that nesting is part of
+// Takes the whole file text and reaches into `text_config` itself, because that nesting is part of
 // Gemma 4's format rather than the caller's business. Throws if `text_config` is absent or if the
-// required fields (vocab / hidden / layers) are missing -- a config that parses to zeros would
+// required fields (vocab / hidden / layers) are missing; a config that parses to zeros would
 // otherwise produce a model that allocates nothing and generates garbage.
 //
 // Also derives what the checkpoint states only implicitly: `layer_full` from `layer_types`, and
 // `kv_source` from `num_kv_shared_layers` (the last N layers reuse the cache of the last
-// non-shared layer OF THE SAME TYPE -- sliding and full are tracked separately, and getting it
+// non-shared layer OF the same TYPE; sliding and full are tracked separately, and getting it
 // wrong still runs and still produces fluent-looking garbage).
 PlanModelConfig parse_gemma4_text_config(const std::string& config_json);
 
@@ -106,7 +106,7 @@ PlanModelConfig parse_gemma4_text_config(const std::string& config_json);
 model::LlamaConfig gemma4_to_llama_config(const PlanModelConfig& g);
 
 // True when a HuggingFace config.json describes a Gemma 4 model. Checks `model_type` in
-// text_config, falling back to the root -- the same place PlanCudaEngine::open looks, and the same
+// text_config, falling back to the root; the same place PlanCudaEngine::open looks, and the same
 // place probe_model's directory sniff looks.
 bool config_json_is_gemma4(const std::string& config_json);
 

@@ -23,7 +23,7 @@
 #include "engine/llama4_cpu_engine.hpp"
 #include "engine/qwen35_cpu_engine.hpp"
 // The image splicer is a template over the engine now (CUDA and Metal both use it), and its
-// header pulls in no backend types -- so it sits outside both guards.
+// header pulls in no backend types; so it sits outside both guards.
 #include "app/image_prompt.hpp"
 #if CPI_HAS_CUDA
 #include "engine/llama4_cuda_engine.hpp"
@@ -79,7 +79,7 @@ void run_with_image(engine::PlanCudaEngine& eng, const app::main_cli::ParsedArgs
       eng.generate_multimodal(ip.tokens, ip.embeds, ip.limits, cli.max_new, cli.temp, nullptr);
   const auto t1 = std::chrono::steady_clock::now();
   const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-  // Decode the whole sequence at once -- decoding token by token loses the word-boundary
+  // Decode the whole sequence at once; decoding token by token loses the word-boundary
   // markers and runs every word together.
   std::cout << tokenizer.decode(out) << "\n";
   std::cout << "\n[perf] generated_tokens=" << out.size() << " elapsed_ms=" << ms
@@ -100,7 +100,7 @@ app::main_modes::GenerateMultimodalFn make_multimodal_fn(engine::PlanCudaEngine&
 
 #endif  // CPI_HAS_CUDA
 
-// The fallback for every engine without a vision tower -- including all of them in a
+// The fallback for every engine without a vision tower; including all of them in a
 // CUDA-free build, where the overload above does not exist.
 template <typename E>
 app::main_modes::GenerateMultimodalFn make_multimodal_fn(E&) {
@@ -111,21 +111,21 @@ app::main_modes::GenerateMultimodalFn make_multimodal_fn(E&) {
 // One image + a text question through the Metal Qwen3.5 tower, end to end. This is the CLI face
 // of the pipeline metal_vision_test gates: the tower, the splice, M-RoPE and the two-position
 // decode are all verified there against HuggingFace (MULTIMODAL_stream 8/8). What this adds is
-// only the two ends the test stubs -- real image preprocessing (qwen2vl_preprocess, byte-exact vs
+// only the two ends the test stubs; real image preprocessing (qwen2vl_preprocess, byte-exact vs
 // the HF processor) and detokenised output.
 //
-// The special-token ids are Qwen3.5's and are NOT in the .ll2c container, so they are stated here
+// The special-token ids are Qwen3.5's and are not in the .ll2c container, so they are stated here
 // with provenance. A different vision model would need its own ids and template.
 // The reusable core: base prompt tokens + an image path -> generated tokens, streaming each one
 // through on_token. Both the one-shot CLI (--image) and the REST/web bridge's multimodal route go
-// through THIS, so there is one path and it is the one metal_vision_test gates -- rather than a
+// through this, so there is one path and it is the one metal_vision_test gates; rather than a
 // second, unverified copy behind the server.
 std::vector<int> generate_multimodal_metal(engine::PlanMetalEngine& meng,
                                            const std::vector<int>& base_tokens,
                                            const std::string& image_path, int max_new, int eos,
                                            const std::function<bool(int)>& on_token,
                                            std::ostream* info_out) {
-  // GEMMA 4's tower first: the SAME expand + generate_multimodal pair the CUDA path runs --
+  // GEMMA 4's tower first: the same expand + generate_multimodal pair the CUDA path runs
   // the splice layout lives in one templated header, and the engines carry the same surface.
   // (meng.has_vision() is the Gemma tower; config().has_vision_tower() is Qwen3.5's, carried
   // by container v7. A model has one or the other, never both.)
@@ -250,7 +250,7 @@ std::vector<int> generate_multimodal_metal(engine::PlanMetalEngine& meng,
 // One image + a text question on the command line. A thin wrapper over the shared core above.
 void run_with_image_metal(engine::PlanMetalEngine& meng, const app::main_cli::ParsedArgs& cli,
                           model::Tokenizer& tokenizer, std::ostream& info_out) {
-  // Gemma's chat text carries the placeholder inside the user turn -- the same string CUDA's
+  // Gemma's chat text carries the placeholder inside the user turn; the same string CUDA's
   // run_with_image builds, so the two CLIs ask the model the same question the same way.
   const std::string text =
       meng.has_vision() ? "<|turn>user\n<|image|>\n" + cli.prompt_text + "<turn|>\n<|turn>model\n"
@@ -474,7 +474,7 @@ int main(int argc, char** argv) {
     const bool cuda_available = false;
 #endif
     // Apple Silicon: probe for a real Metal GPU (nil inside a GPU-less VM). Only matters when
-    // there is no CUDA device -- Metal is the Mac's GPU fast path.
+    // there is no CUDA device; Metal is the Mac's GPU fast path.
     bool metal_available = false;
 #if CPI_ENABLE_METAL
     if (!cuda_available && !cli.force_cpu) {
@@ -507,7 +507,7 @@ int main(int argc, char** argv) {
         case EngineChoice::Llama4Cpu:
           std::cout << "[info] Detected a safetensors model. Using the Llama4 CPU engine.\n";
           // SAY that the GPU is being skipped. On a Mac this path is reached with a perfectly
-          // good Metal device present -- Llama4 has its own engine (llama4_cuda_engine) with no
+          // good Metal device present; Llama4 has its own engine (llama4_cuda_engine) with no
           // Metal counterpart, so resolve_engine falls back to CPU. That fallback used to be
           // silent, which reads as "CPI is slow on this model" rather than "CPI is not using
           // your GPU". A degradation nobody can attribute is the same failure mode as --image
@@ -562,7 +562,7 @@ int main(int argc, char** argv) {
 #if CPI_HAS_CUDA
       if constexpr (std::is_same_v<std::decay_t<decltype(eng)>, engine::LlamaEngine>) {
         if (cli.parity_check) {
-          // Pure gate: run the check and exit 0 (PASS) / 1 (FAIL) so a script/CI
+          // Pure gate: run the check and exit 0 (pass) / 1 (FAIL) so a script/CI
           // can verify a forward-path change preserved correctness.
           const bool ok = eng.run_parity_check(prompt_tokens);
           std::cout.flush();
@@ -590,7 +590,7 @@ int main(int argc, char** argv) {
               cli.opts.no_repeat_ngram_size);
           // Plain `return`: this block is inside a lambda, not main(). The Metal branch's
           // identical-looking `return 0` IS in main(). Getting these the same way round breaks
-          // one compiler or the other, and each hides the other's error -- this one is behind
+          // one compiler or the other, and each hides the other's error; this one is behind
           // #if CPI_HAS_CUDA, so a Mac build never sees it.
           return;
         }
@@ -653,26 +653,26 @@ int main(int argc, char** argv) {
       case EngineChoice::Qwen35Metal:
       case EngineChoice::Gemma4Metal:
       case EngineChoice::LlamaMetal: {
-        // Apple Silicon GPU path for the main binary -- the same PlanMetalEngine the metal_infer
+        // Apple Silicon GPU path for the main binary; the same PlanMetalEngine the metal_infer
         // tool uses, wired into the standard serving modes so the REST/web bridge runs on a Mac.
-        // What actually works here, verified on an M4 rather than assumed -- the comment this
+        // What actually works here, verified on an M4 rather than assumed; the comment this
         // replaces claimed "fp16 for now; grammar-constrained decode and a Metal vision tower are
         // not yet wired", and two thirds of that was stale:
         //
         //   int4/int8 weight-quant  yes (--weight-quant, below)
         //   continuous batching     yes (--interactive-batch, two concurrent streams interleaved)
-        //   grammar / JSON-schema   yes -- proven by forcing a field name the model would never
+        //   grammar / JSON-schema   yes; proven by forcing a field name the model would never
         //                           emit unprompted; without the schema it produces "name"/"id"
         //   vision tower            yes, both of them: Qwen3.5 (gated 8/8 vs HF) and Gemma 4
         //                           (expand + generate_multimodal, gated vs the CUDA tower's
-        //                           soft tokens) -- run_with_image_metal routes by which tower
+        //                           soft tokens); run_with_image_metal routes by which tower
         //                           the model carries.
         //   speculative decoding    yes (--draft-model, the block just below).
         if (!cli.image_path.empty() && !use_tokenizer) {
           throw std::runtime_error("--image requires --tokenizer");
         }
         // Speculative decoding: a small DRAFT proposes K tokens, this model (the TARGET) checks
-        // them in one parallel verify pass, and only its own argmax is ever emitted -- so the
+        // them in one parallel verify pass, and only its own argmax is ever emitted; so the
         // output is identical to plain greedy decoding of the target, just faster when the draft
         // guesses well. Two PlanMetalEngine instances; unified memory means each just holds its
         // own weights. Not compatible with --interactive-batch (that path is its own server).
@@ -710,7 +710,7 @@ int main(int argc, char** argv) {
                   const engine::GenerationConstraints* constraints) {
                 // Grammar can't ride the speculative verify path (it argmaxes drafts on-device,
                 // which a logit mask can't reach), so a constrained request falls back to the
-                // target's own single-token decode -- same choice the CUDA path makes.
+                // target's own single-token decode; same choice the CUDA path makes.
                 if (constraints != nullptr && constraints->grammar != nullptr) {
                   engine::PlanMetalEngine::Sampling s;
                   s.temperature = temperature;
@@ -747,7 +747,7 @@ int main(int argc, char** argv) {
         // otherwise fp16. This is what lets a large model (e.g. an 8B) serve on a 16 GB Mac.
         const int metal_quant_bits = cli.opts.int8_streaming ? cli.opts.streaming_quant_bits : 0;
         // Continuous batching needs the KV as a paged pool, and the pool is sized by open(),
-        // so this has to be decided BEFORE the model loads -- not when the first request
+        // so this has to be decided before the model loads; not when the first request
         // arrives. Sized to the same budget the CUDA path uses: enough blocks for
         // --paged-blocks-tokens, defaulting to a few max_context-worth of concurrent sequences.
         if (cli.interactive_batch) {
@@ -756,7 +756,7 @@ int main(int argc, char** argv) {
           // VRAM budget, which does not transfer: on unified memory the KV competes with the
           // weights and the OS for the same pool, so "how many bytes are free" is a different
           // question here and deserves its own answer rather than a copied heuristic. Until
-          // then this is a fixed, stated default -- the scheduler preempts newest-first when
+          // then this is a fixed, stated default; the scheduler preempts newest-first when
           // it runs out, which is a real behaviour rather than a crash.
           const int pool_tokens = cli.opts.max_context * 4;
           meng.set_paged_kv((pool_tokens + bs - 1) / bs, bs);
@@ -775,7 +775,7 @@ int main(int argc, char** argv) {
           if (!use_tokenizer) {
             throw std::runtime_error("--interactive-batch requires --tokenizer");
           }
-          // The same worker and the same scheduler CUDA drives -- this branch exists only to
+          // The same worker and the same scheduler CUDA drives; this branch exists only to
           // build the engine, not to reimplement serving.
           engine::BatchSchedulerOptions bo;
           bo.max_context = cli.opts.max_context;
@@ -794,7 +794,7 @@ int main(int argc, char** argv) {
           s.top_p = cli.opts.top_p;
           // --repeat-penalty and --no-repeat-ngram were parsed, stored, and then dropped here.
           // The batch path below forwards them per-request via StreamParams, so the flags worked
-          // under --interactive-batch and silently did nothing everywhere else -- which is the
+          // under --interactive-batch and silently did nothing everywhere else; which is the
           // shape of bug that reads as "the model is repetitive on Mac" rather than as a missing
           // feature. Sampling has carried both fields all along.
           s.repetition_penalty = cli.opts.repetition_penalty;

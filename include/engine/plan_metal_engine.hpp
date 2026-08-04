@@ -1,18 +1,18 @@
 #pragma once
 
-// The Metal executor for the op-plan IR -- the Apple Silicon sibling of
+// The Metal executor for the op-plan IR; the Apple Silicon sibling of
 // PlanCudaEngine.
 //
 // Same plan, different backend: build_llama_plan() produces the op list, and this
 // walks it. The IR carries weights as opaque handles, which here are MTLBuffer
-// objects rather than raw device pointers -- that is exactly why op_plan.hpp types
+// objects rather than raw device pointers; that is exactly why op_plan.hpp types
 // them as void* and not __half*.
 //
 // Unified memory removes most of what the CUDA engine spends code on: a weight is
 // "uploaded" by memcpy into a shared buffer, and logits are read back by simply
 // looking at the buffer. No streams, no staging, no async copies.
 //
-// Scope: fp16, dense, uniform-geometry decode (Llama/Qwen2). No quantization -- Metal
+// Scope: fp16, dense, uniform-geometry decode (Llama/Qwen2). No quantization; Metal
 // has no __dp4a equivalent, so the int4/int8 paths need a different kernel and are
 // deliberately out of scope here.
 
@@ -72,7 +72,7 @@ public:
   void open(const std::string& weights_path, int max_context = 2048, int quant_bits = 0,
             int quant_group = 0, float rope_theta_override = 0.0f);
 
-  // Runs the vision tower over ONE pre-patchified image and returns its soft tokens:
+  // Runs the vision tower over one pre-patchified image and returns its soft tokens:
   // (grid_h*grid_w)/(merge^2) rows of vision_out_hidden_size, which equals the text model's
   // hidden size so they can be spliced straight into the token stream.
   //
@@ -84,8 +84,8 @@ public:
   // Prefills a prompt containing image tokens. `embeds` is indexed by absolute position; an
   // empty row leaves that token's own embedding in place. Rows are spliced AS-IS.
   // `mrope_positions` is the [3][tokens] array from build_mrope_positions(); empty keeps the
-  // plain 1-D rope path. After this returns, generation continues on 1-D positions -- generated
-  // tokens are text, so their axes are equal -- but the caller must pass the M-ROPE counter,
+  // plain 1-D rope path. After this returns, generation continues on 1-D positions; generated
+  // tokens are text, so their axes are equal; but the caller must pass the M-ROPE counter,
   // not the token index, which build_mrope_positions reports via mrope_next_position().
   void prefill_multimodal(const std::vector<int>& tokens,
                           const std::vector<std::vector<float>>& embeds,
@@ -101,14 +101,14 @@ public:
     return gvis_;
   }
   // Images need a sequence prefill (the span is bidirectional, so its tokens must be computed
-  // together). True whenever the plan allows chunked prefill -- i.e. not a recurrent model and
+  // together). True whenever the plan allows chunked prefill; i.e. not a recurrent model and
   // not forced token-by-token via CPI_METAL_SEQ_AUX.
   bool can_sequence_prefill() const {
     return !has_recurrent_ops_;
   }
 
   // Gemma 4's tower: pre-patchified pixels + per-patch grid coordinates -> `out_tokens` soft
-  // tokens of the TEXT hidden size. The overload above is Qwen3.5's tower; the two differ in
+  // tokens of the text hidden size. The overload above is Qwen3.5's tower; the two differ in
   // architecture (RMSNorm/2-D RoPE/avg-pool vs LayerNorm/M-RoPE/spatial-merge), not just shape.
   std::vector<float> encode_image(const std::vector<float>& pixels, const std::vector<int>& pos_x,
                                   const std::vector<int>& pos_y, int out_tokens);
@@ -125,7 +125,7 @@ public:
     return quant_bits_;
   }
 
-  // Bytes of GPU-resident WEIGHT buffers. This -- not RSS -- is the number that says
+  // Bytes of GPU-resident WEIGHT buffers. This, not RSS, is the number that says
   // whether a model fits: the mmap'd fp16 file stays resident because the quantizer
   // reads it, but those pages are clean and file-backed, so they are evictable.
   std::size_t weight_bytes() const;
@@ -143,7 +143,7 @@ public:
   // They diverge under M-RoPE: an image span advances the rotary counter by its MERGED extent,
   // so a 16-token image advances it by 4 and every later token sits 12 behind its sequence
   // index. Passing one value for both wrote K/V on top of an image token and truncated
-  // attention to the rotary position -- 11 of 21 prompt tokens silently dropped.
+  // attention to the rotary position; 11 of 21 prompt tokens silently dropped.
   const std::vector<float>& forward_token(int token, int position, int cache_position = -1);
 
   // ---- Speculative decoding surface ----
@@ -154,7 +154,7 @@ public:
   // weights.
 
   // Drops single-sequence prefix-reuse state so the next prefill starts from position 0. The KV
-  // cache itself needs no clearing -- it is addressed by absolute position and overwritten.
+  // cache itself needs no clearing; it is addressed by absolute position and overwritten.
   void reset_kv_cache();
 
   // Fills the cache with the prompt EXCEPT its last token, at positions [0, P-2]. The last token
@@ -173,20 +173,20 @@ public:
   // tree-opportunity probe (CPI_SPEC_TREE_PROBE) uses `second`.
   int decode_next_token2(int token, int position, int* second);
 
-  // Runs `tokens` as ONE causal chunk at [start_pos, start_pos+K-1] and returns, per position i,
-  // the target's argmax AFTER consuming tokens[i] -- i.e. its prediction for position start_pos+i+1.
+  // Runs `tokens` as one causal chunk at [start_pos, start_pos+K-1] and returns, per position i,
+  // the target's argmax after consuming tokens[i]; i.e. its prediction for position start_pos+i+1.
   // This is the one operation that makes speculation faster than plain decode: the target checks K
   // drafts in a single forward pass. K must be <= max_prefill_. Uniform-geometry (Llama/Qwen2)
-  // models only -- a recurrent model has no parallel token dimension to verify over.
+  // models only; a recurrent model has no parallel token dimension to verify over.
   void verify_tokens(const std::vector<int>& tokens, int start_pos, std::vector<int>& out_argmax);
 
   // Capture a .gputrace of whatever runs between these, for Xcode's Metal Debugger.
   //
-  // metal_gemm_bench can already capture ITS dispatches -- but a bench is not a prefill, and
+  // metal_gemm_bench can already capture ITS dispatches; but a bench is not a prefill, and
   // reading a limiter off one and calling it the kernel's was a real mistake here: the bench's
   // own per-shape times predict 137 ms of GEMM for a 541-token prefill that actually spends
   // ~207 ms. Same kernels, same shapes, 1.5x apart, and cache/shape-mix/chunking are all
-  // eliminated. Only a trace of the PASS can say where that goes.
+  // eliminated. Only a trace of the pass can say where that goes.
   //
   // Requires MTL_CAPTURE_ENABLED=1 before the process starts. Returns false (with
   // last_error()) rather than throwing: a profiling aid must not be able to break a run.
@@ -199,8 +199,8 @@ public:
 
   // ---- Batched paged decode (continuous batching) --------------------------
   //
-  // Sizes the KV as one paged POOL per layer -- num_blocks blocks of block_size tokens,
-  // shared by every sequence -- rather than a contiguous max_context run. A contiguous cache
+  // Sizes the KV as one paged POOL per layer; num_blocks blocks of block_size tokens,
+  // shared by every sequence; rather than a contiguous max_context run. A contiguous cache
   // cannot serve concurrent sequences without reserving max_context per slot; paging lets
   // them grow independently, and lets two sequences share an identical prompt prefix by
   // refcounting its blocks. Call before open().
@@ -208,7 +208,7 @@ public:
   // The pool layout and block-table arithmetic match the CUDA paged path exactly, so a table
   // built by the shared (and entirely backend-free) engine::SequenceBlockTable means the same
   // thing on either backend. Note the two layouts coincide when a block table is the identity
-  // map -- which is what the parity gate exploits.
+  // map; which is what the parity gate exploits.
   void set_paged_kv(int num_blocks, int block_size);
   bool paged_kv() const {
     return paged_blocks_ > 0;
@@ -218,14 +218,14 @@ public:
   // token, positions[b] its position, and block_tables_flat is a [N][max_blocks] row-major
   // table of physical block ids. out_logits is resized to N rows of vocab_size.
   //
-  // This walks the SAME op plan the single-sequence path walks. Only rope (per-row
+  // This walks the same op plan the single-sequence path walks. Only rope (per-row
   // positions), the KV scatter and attention (paged gathers) differ, because every other op
   // is row-independent and already runs T rows at once for prefill.
   void decode_step_batched_logits(const std::vector<int>& tokens, const std::vector<int>& positions,
                                   const std::vector<int>& block_tables_flat, int max_blocks,
                                   std::vector<std::vector<float>>& out_logits);
 
-  // Prefills `tokens` at start_position into ONE sequence's paged blocks. block_table maps
+  // Prefills `tokens` at start_position into one sequence's paged blocks. block_table maps
   // that sequence's logical blocks to physical ones; it must already cover the whole range.
   //
   // This is the batched paged path with the rows being consecutive tokens of one sequence
@@ -233,8 +233,8 @@ public:
   // start_position+t+1, which is exactly the causal mask prefill needs, and every row shares
   // the one block table. So it needs no kernels of its own.
   //
-  // The catch, and it is deliberate for now: attention here is the DECODE kernel, so each
-  // query walks the whole history and the pass is O(T^2) in device traffic -- the very thing
+  // The catch, and it is deliberate for now: attention here is the decode kernel, so each
+  // query walks the whole history and the pass is O(T^2) in device traffic; the very thing
   // the single-sequence query-block prefill kernels exist to avoid. Correct first. The
   // contiguous path is untouched and keeps its fast kernels; only the paged (batched-server)
   // prefill pays this, and giving it the query-block treatment is a known follow-up.
@@ -243,7 +243,7 @@ public:
 
   // The continuous-batching scheduler for this engine, built on first use.
   //
-  // It is engine::BatchScheduler -- the SAME class LlamaEngine drives, not a Metal
+  // It is engine::BatchScheduler; the same class LlamaEngine drives, not a Metal
   // reimplementation. Admission, newest-first preemption, block growth and the shared-prefix
   // LRU are identical to CUDA's by construction rather than by agreement, because this engine
   // supplies only the two operations that need a GPU (BatchBackend::prefill_suffix and
@@ -261,7 +261,7 @@ public:
   std::vector<int> generate_spec_lookup(const std::vector<int>& prompt, int max_new, int spec_k,
                                         const std::function<bool(int)>& emit);
 
-  // Sampled decode, through CPI's shared sampler -- the same code path LlamaEngine
+  // Sampled decode, through CPI's shared sampler; the same code path LlamaEngine
   // uses, not a second implementation. Greedy (temperature <= 0) still takes the
   // on-GPU argmax; anything else needs the logits on the host anyway, because
   // repetition penalty and n-gram blocking rescore tokens outside any top-k set.
@@ -297,7 +297,7 @@ public:
     return prefill_tokens_;
   }
 
-  // GPU-busy time and dispatch/submission counts since the last reset -- for the
+  // GPU-busy time and dispatch/submission counts since the last reset; for the
   // overhead-vs-kernel question. See MetalContext.
   double gpu_busy_ms() const {
     return ctx_.gpu_busy_ms();
@@ -320,7 +320,7 @@ private:
   void dump_profile() const;
 
   // CPI_METAL_GPUPROFILE=1: true per-kernel GPU nanoseconds, from the device timestamp counters,
-  // rather than the host times dump_profile() reports. See MetalContext::enable_gpu_profile --
+  // rather than the host times dump_profile() reports. See MetalContext::enable_gpu_profile
   // it serialises dispatches to bracket them, so the individual numbers are honest and their
   // sum is larger than a real pass.
   void dump_gpu_profile();
@@ -333,7 +333,7 @@ private:
   // The shared T=1 op walk (prologue/layers/epilogue), after host state is staged.
   void encode_forward_body(int position);
   // Chained decode step: token comes from the previous step's on-GPU argmax, position from a
-  // cpi_set_i32 dispatch. No host writes to tok_buf_/pos_buf_ -- earlier steps may still be
+  // cpi_set_i32 dispatch. No host writes to tok_buf_/pos_buf_; earlier steps may still be
   // executing.
   void encode_forward_chained(int position);
   // Encodes a whole prefill chunk: T tokens through the tower in one pass.
@@ -342,12 +342,12 @@ private:
   void splice_embeds(int start_position, int T);
 
   // MetalWeights is defined inside plan_metal_engine.cpp, so it is an incomplete type in every
-  // other translation unit -- including the vision tower's. This upcast is defined there, where
+  // other translation unit; including the vision tower's. This upcast is defined there, where
   // it is complete, rather than moving the class into the header just to satisfy one caller.
   opplan::WeightSource& weight_source();
 
   // How to cut a prefill of `n` tokens into chunks no larger than a slot. Splitting evenly
-  // beats filling greedily -- see the definition.
+  // beats filling greedily; see the definition.
   std::vector<int> prefill_chunks(int n) const;
   // How many key chunks a decode's attention should split into at this position. 1 means the
   // context is too short to be worth the merge pass.
@@ -355,9 +355,9 @@ private:
   void* slot(opplan::Slot s) const;
 
   runtime::MetalContext ctx_;
-  // TWO container formats, one engine. `.ll2c` (typed binary header) goes through WeightLoader;
+  // two container formats, one engine. `.ll2c` (typed binary header) goes through WeightLoader;
   // `.cpi` and HuggingFace safetensors directories go through SafetensorsLoader, with the config
-  // coming from the container's JSON __metadata__ instead of a struct. Only one is populated --
+  // coming from the container's JSON __metadata__ instead of a struct. Only one is populated
   // from_safetensors_ says which.
   model::WeightLoader weights_;
   model::SafetensorsLoader st_;
@@ -383,8 +383,8 @@ private:
   int paged_block_size_ = 0;  // tokens per block
 
   // Batched-decode scratch, grown on demand rather than sized for a worst-case batch.
-  runtime::MetalBuffer batch_pos_buf_;     // int32[B]   -- each row's own position
-  runtime::MetalBuffer batch_seqlen_buf_;  // int32[B]   -- each row's own length
+  runtime::MetalBuffer batch_pos_buf_;     // int32[B]  ; each row's own position
+  runtime::MetalBuffer batch_seqlen_buf_;  // int32[B]  ; each row's own length
   runtime::MetalBuffer batch_bt_buf_;      // int32[B * max_blocks]
   runtime::MetalBuffer batch_logits_buf_;  // float[B * vocab]
   int batch_cap_ = 0;        // rows the scratch is sized for
@@ -397,14 +397,14 @@ private:
     int batch;
     int max_blocks;
     int block_size;
-    // Prefill wants logits for the LAST row only -- its earlier tokens exist to fill the KV
-    // cache, and a vocab GEMV per row would cost T of them instead of one. Batched DECODE
+    // Prefill wants logits for the last row only; its earlier tokens exist to fill the KV
+    // cache, and a vocab GEMV per row would cost T of them instead of one. Batched decode
     // wants every row, because there each row is a different sequence's next token.
     bool logits_last_only;
   };
   const BatchCtx* batch_ = nullptr;
 
-  // Set only during verify_tokens: makes the single-sequence LmHead op emit logits for EVERY
+  // Set only during verify_tokens: makes the single-sequence LmHead op emit logits for every
   // position of the chunk (into batch_logits_buf_) instead of the last one alone. A normal
   // prefill leaves it false and pays one vocab GEMV, not T.
   bool prefill_all_logits_ = false;
@@ -415,12 +415,12 @@ private:
   std::vector<runtime::MetalBuffer> slots_;  // indexed by opplan::Slot
   std::vector<runtime::MetalBuffer> k_cache_;
   std::vector<runtime::MetalBuffer> v_cache_;
-  // Which layer OWNS the cache each layer reads. Identity for every family except Gemma 4, whose
+  // Which layer owns the cache each layer reads. Identity for every family except Gemma 4, whose
   // trailing layers reuse an earlier layer's K/V instead of projecting their own (E2B shares 20 of
   // 35). Those layers allocate nothing and index through here.
   //
   // An index map rather than aliased buffers because runtime::MetalBuffer is move-only and owns
-  // its allocation -- copying one to alias it would double-free. Always read the caches through
+  // its allocation; copying one to alias it would double-free. Always read the caches through
   // kbuf()/vbuf(); indexing k_cache_ by layer directly is correct only when nothing is shared,
   // which is exactly the kind of "works until it doesn't" this is here to prevent.
   std::vector<int> kv_owner_;
@@ -434,7 +434,7 @@ private:
 
   // MoE: the router's selection, carried between ops on the device so a token never
   // round-trips to the host mid-layer. Only allocated for MoE models.
-  // float[GEMM_SPLITK * tokens * out_dim] -- per-split partial sums for the split-K GEMM.
+  // float[GEMM_SPLITK * tokens * out_dim]; per-split partial sums for the split-K GEMM.
   // Allocated lazily, and only ever for the narrow-output projections that take that path.
   runtime::MetalBuffer gemm_partial_buf_;
 
@@ -451,7 +451,7 @@ private:
   bool has_recurrent_ops_ = false;
 
   // Which buffer the current forward's token ids were staged into. Set by whichever entry point
-  // staged them, because the token COUNT does not answer this -- a one-token prefill chunk still
+  // staged them, because the token count does not answer this; a one-token prefill chunk still
   // arrives in the sequence buffer.
   bool tokens_in_seq_buf_ = false;
 
@@ -465,7 +465,7 @@ private:
   opplan::Gemma4VisionGeometry gvis_{};
   opplan::ModelPlan gvis_plan_;
   // Vision-pass slot set. execute_ops resolves slots through slot(), which reads vslots_ instead
-  // of slots_ while vision_pass_ is true -- the same executor, re-pointed, exactly as CUDA's
+  // of slots_ while vision_pass_ is true; the same executor, re-pointed, exactly as CUDA's
   // ExecCtx carries a different slot array for the tower.
   std::vector<runtime::MetalBuffer> vslots_;
   bool vision_pass_ = false;
@@ -481,7 +481,7 @@ private:
 
   // Per-token key limits for multimodal prefill (the bidirectional image span). Armed only for
   // the duration of generate_multimodal's prefill; attention reads it when limits_active_.
-  runtime::MetalBuffer seq_limits_buf_;  // int32[max_prefill] -- this CHUNK's limits
+  runtime::MetalBuffer seq_limits_buf_;  // int32[max_prefill]; this CHUNK's limits
   bool limits_active_ = false;
   // From the Gemma config.json at open(); LlamaConfig deliberately has no eos field.
   int eos_token_id_ = -1;
@@ -500,11 +500,11 @@ private:
   // uses, so a divergence can be bisected to a buffer. No-op unless CPI_Q35_DUMP is set.
   void dump_named_slot(const char* name, int layer, int position, opplan::Slot sl, int n);
 
-  runtime::MetalBuffer moe_idx_buf_;  // int32[top_k]  -- selected expert ids
-  runtime::MetalBuffer moe_w_buf_;    // float[top_k]  -- their renormalised routing weights
+  runtime::MetalBuffer moe_idx_buf_;  // int32[top_k] ; selected expert ids
+  runtime::MetalBuffer moe_w_buf_;    // float[top_k] ; their renormalised routing weights
 
   runtime::MetalBuffer tok_buf_;      // int32[1]
-  runtime::MetalBuffer seq_tok_buf_;  // int32[max_prefill] -- a whole prompt chunk
+  runtime::MetalBuffer seq_tok_buf_;  // int32[max_prefill]; a whole prompt chunk
   runtime::MetalBuffer pos_buf_;      // int32[1]
   // Split-KV decode attention scratch: per (head, chunk) softmax stats and the unnormalized
   // partial accumulators the merge pass folds together.
@@ -520,7 +520,7 @@ private:
   runtime::MetalBuffer verify_amax_val_;  // float[max_prefill * parts]
   runtime::MetalBuffer verify_amax_idx_;  // int32[max_prefill * parts]
   runtime::MetalBuffer verify_argmax_;    // int32[max_prefill]
-  runtime::MetalBuffer chain_ring_;   // int32[kChainBlock] -- chained decode's per-block tokens
+  runtime::MetalBuffer chain_ring_;   // int32[kChainBlock]; chained decode's per-block tokens
 
   std::vector<float> logits_;
   double prefill_ms_ = 0.0;
@@ -531,7 +531,7 @@ private:
 
   // The concrete weight source is templated on the loader (.ll2c vs safetensors), so the engine
   // holds it through this small interface: WeightSource plus the two things only the Metal
-  // backend needs -- its quantization policy and its GPU byte count.
+  // backend needs; its quantization policy and its GPU byte count.
   class MetalWeightsBase : public opplan::WeightSource {
   public:
     virtual void set_quant(int bits, int group) = 0;

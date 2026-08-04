@@ -132,7 +132,7 @@ struct HeaderV6 {
 
 // HeaderV7 appends the vision tower's geometry to V6, by the same strict-append rule: every
 // earlier field keeps its offset, so a v6 reader parses a v7 file and a v7 reader parses a v6
-// file with the vision fields left at 0. depth == 0 IS the "no tower" signal -- there is no
+// file with the vision fields left at 0. depth == 0 IS the "no tower" signal; there is no
 // separate flag that could disagree with the geometry.
 struct HeaderV7 {
   HeaderV6 v6;
@@ -157,7 +157,7 @@ struct TensorEntry {
 
 // The packer (tools/pack_ll2c.py) states these layouts a second time, as a struct format string,
 // and nothing but arithmetic keeps the two in step. Pin the sizes: a field added on one side and
-// not the other shifts every field after it, which does not fail to build or to load -- it reads
+// not the other shifts every field after it, which does not fail to build or to load; it reads
 // plausible garbage out of the wrong offsets. pack_ll2c.py asserts the same two numbers.
 static_assert(sizeof(HeaderV5) == 112, "HeaderV5 layout drifted from pack_ll2c.py's HEADER_FMT");
 static_assert(sizeof(HeaderV6) == 124, "HeaderV6 layout drifted from pack_ll2c.py's HEADER_FMT");
@@ -274,7 +274,7 @@ void WeightLoader::parse_manifest() {
     config_.linear_num_key_heads = hdr->linear_num_key_heads;
     config_.linear_num_value_heads = hdr->linear_num_value_heads;
 
-    // v6 appended the delta-net dimensions. Guard on BOTH the version and the mapped size: a
+    // v6 appended the delta-net dimensions. Guard on both the version and the mapped size: a
     // truncated file that claims v6 would otherwise read past the mapping.
     if (version >= 6 && mmap_.size() >= sizeof(HeaderV6)) {
       const auto* h6 = reinterpret_cast<const HeaderV6*>(mmap_.data());
@@ -283,7 +283,7 @@ void WeightLoader::parse_manifest() {
       config_.linear_conv_kernel_dim = h6->linear_conv_kernel_dim;
     }
 
-    // v7 appended the vision tower's geometry. Same guard on version AND mapped size.
+    // v7 appended the vision tower's geometry. Same guard on version and mapped size.
     if (version >= 7 && mmap_.size() >= sizeof(HeaderV7)) {
       const auto* h7 = reinterpret_cast<const HeaderV7*>(mmap_.data());
       config_.vision_depth = h7->vision_depth;

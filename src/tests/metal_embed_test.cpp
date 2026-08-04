@@ -3,17 +3,17 @@
 //   ./metal_embed_test <model_dir> <oracle_dir>    (oracle_dir = tools/embed_oracle.py --out)
 //
 // cpi_embed emits 384 plausible-looking floats whether or not the encoder is correct, and the
-// vector is never read by a human -- it goes straight into a cosine ranking. So "it produced
+// vector is never read by a human; it goes straight into a cosine ranking. So "it produced
 // numbers" is worth nothing here and this compares against a reference.
 //
-// WHAT THIS GATE CAN AND CANNOT SEE, both established by deliberately breaking the encoder:
+// what this GATE CAN and cannot SEE, both established by deliberately breaking the encoder:
 //
 //   * Wrong attention row_stride (passing the vision tower's fused-qkv 3*hidden where BERT has
 //     separate q/k/v buffers): per-sentence cosine collapses to 0.17-0.68. CAUGHT, decisively.
 //   * Tanh GELU instead of the exact erf form: cosine stays 1.00000 and max_abs moves from
-//     ~1.9e-4 to ~3.7e-4. NOT CAUGHT. That difference is ~4e-4 per element and six layers is not
+//     ~1.9e-4 to ~3.7e-4. not CAUGHT. That difference is ~4e-4 per element and six layers is not
 //     enough depth for it to surface above fp16 noise. The erf choice is therefore asserted from
-//     bert_embedder.cu and the model's hidden_act, NOT proven here -- do not read a pass as
+//     bert_embedder.cu and the model's hidden_act, not proven here; do not read a pass as
 //     evidence about the activation.
 //
 // The tolerance is on the COSINE, because that is what an embedding is for: a port can differ
@@ -35,7 +35,7 @@ namespace {
 
 int failures = 0;
 
-// MUST match SENTENCES in tools/embed_oracle.py, in order.
+// must match SENTENCES in tools/embed_oracle.py, in order.
 const char* kSentences[] = {
     "a photo of a cat",
     "a photo of a dog",
@@ -127,7 +127,7 @@ int main(int argc, char** argv) {
   }
   // 0.9995: the measured value is 1.00000 and the wrong-stride control scored 0.17, so anything
   // in between is a defect rather than drift. Not tightened to 0.9999 because the reference is
-  // fp32 and this is fp16 -- leave room for the arithmetic, not for a bug.
+  // fp32 and this is fp16; leave room for the arithmetic, not for a bug.
   const bool ok = worst_cos >= 0.9995;
   std::printf("  %-24s worst_cos=%.5f  worst_max_abs=%.5f  tol_cos=0.9995  %s\n", "EMBED_VS_ORACLE",
               worst_cos, worst_abs, ok ? "PASS" : "FAIL");

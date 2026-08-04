@@ -2,16 +2,16 @@
 
 // LlamaConfig <-> JSON, for the `.cpi` (safetensors) container's `__metadata__` block.
 //
-// WHY THIS FILE HAS AN X-MACRO INSTEAD OF TWO HAND-WRITTEN FUNCTIONS
+// why this file HAS AN X-MACRO INSTEAD OF two HAND-WRITTEN FUNCTIONS
 //
 // A config serializer is exactly the shape of the bug that shipped container v7 with all-zero
 // vision geometry: `pack_ll2c.py::load_config` is a WHITELIST, so a field present upstream and
 // absent from the list was dropped silently, and the container reported success. Two hand-written
-// functions here would reintroduce that -- add a field to the writer, forget the reader, and the
+// functions here would reintroduce that; add a field to the writer, forget the reader, and the
 // model loads with a zeroed field and generates fluent nonsense.
 //
-// So both directions are generated from ONE list. A field added to CPI_CONFIG_FIELDS appears in
-// the writer AND the reader AND the round-trip test simultaneously; it is not possible to add it
+// So both directions are generated from one list. A field added to CPI_CONFIG_FIELDS appears in
+// the writer and the reader and the round-trip test simultaneously; it is not possible to add it
 // to one and not the others. A field left OUT of the list is missing from all three, which is
 // what the round-trip test (config_json_test) exists to catch: it fills a config with distinct
 // values, round-trips it, and compares field by field using this same list.
@@ -28,7 +28,7 @@
 
 namespace model {
 
-// X(member, json_key, kind) -- kind is one of I (int32), F (float), B (bool).
+// X(member, json_key, kind); kind is one of I (int32), F (float), B (bool).
 #define CPI_CONFIG_FIELDS(X)                                                  \
   X(vocab_size, "vocab_size", I)                                              \
   X(hidden_size, "hidden_size", I)                                            \
@@ -84,7 +84,7 @@ namespace model {
 
 // Serializes to a flat JSON object. Values are strings, because safetensors' `__metadata__` is
 // specified as a string->string map and readers in the wild (including HF's) reject anything else
-// -- so the container stays valid safetensors and `safetensors.safe_open` can read it.
+//; so the container stays valid safetensors and `safetensors.safe_open` can read it.
 inline std::string config_to_json(const LlamaConfig& c) {
   std::string s = "{";
   bool first = true;
@@ -122,7 +122,7 @@ inline std::string config_to_json(const LlamaConfig& c) {
   }
   put("layer_attention_kinds", kinds);
   // Gemma 4's KV sharing: which layer's K/V each layer reads. COMMA-SEPARATED, not one digit each
-  // like the kinds above -- these are layer INDICES and a 35-layer model already exceeds 9, so the
+  // like the kinds above; these are layer INDICES and a 35-layer model already exceeds 9, so the
   // compact form would silently truncate layer 10 to '1'. Empty for every other family.
   std::string kvsrc;
   for (std::size_t i = 0; i < c.kv_source.size(); ++i) {

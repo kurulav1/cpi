@@ -284,7 +284,7 @@ std::vector<__half> PlanCudaEngine::read_host_fp16(const std::string& name, int 
 
 // Shapes for the safetensors path. A .cpi carries them in its manifest; a HF
 // directory does not, so they are derived from config.json into st_shapes_ at load.
-// Resolving here is what lets the SHARED Gemma loader call upload("...") with no
+// Resolving here is what lets the shared Gemma loader call upload("...") with no
 // dims and still work against either container.
 std::pair<int, int> PlanCudaEngine::shape_of(const std::string& name) const {
   auto it = st_shapes_.find(name);
@@ -293,7 +293,7 @@ std::pair<int, int> PlanCudaEngine::shape_of(const std::string& name) const {
 }
 
 // Weight lookup that FAILS LOUDLY. dev_ is a map, so dev_[name] on a missing key
-// silently inserts nullptr -- which the ops then read as "weightless norm" or a GEMV
+// silently inserts nullptr; which the ops then read as "weightless norm" or a GEMV
 // against a null matrix, producing zeros instead of an error. Every bound weight goes
 // through here; genuinely weightless ops pass nullptr explicitly.
 const __half* PlanCudaEngine::dev_at(const std::string& name) const {
@@ -353,7 +353,7 @@ void PlanCudaEngine::upload_int4(const std::string& name, int rows, int cols) {
   // group does not divide it, HALVE until it does rather than dropping to per-row:
   // per-row IS the failure mode group-wise scales exist to fix, so falling back to
   // it would silently reintroduce it on exactly the tensors that need it. Gemma MoE
-  // hits this -- its down projections are 704 and 2112 wide, neither divisible by
+  // hits this; its down projections are 704 and 2112 wide, neither divisible by
   // 128, so they land on 64.
   int group = weight_quant_group_;
   if (group > 0 && (group & (group - 1)) != 0) {
@@ -418,10 +418,10 @@ void PlanCudaEngine::upload_int4(const std::string& name, int rows, int cols) {
   qw.pf_i8 = (bits == 8 && group == 0) ? d_w : d_pf;  // alias when already rowwise int8
   qw.pf_scales = (bits == 8 && group == 0) ? d_scales : d_pf_s;
   if (moe_stream_ && bits == 4 && name.find("experts.") != std::string::npos) {
-    // Expert STREAMING (step 2): keep the quantized experts on HOST and FREE the device copy -- the
+    // Expert STREAMING (step 2): keep the quantized experts on HOST and FREE the device copy; the
     // memory win. They stream K-at-a-time per layer (stage_moe_experts, now H2D). Device VRAM no
     // longer holds ~90% of the model; a >VRAM MoE becomes runnable. (Host store is pageable; for a
-    // model too big for host RAM too, this would be mmap-backed -- the K3 case.)
+    // model too big for host RAM too, this would be mmap-backed; the K3 case.)
     const std::size_t wbytes = static_cast<std::size_t>(rows) * ((cols + 1) / 2);
     const std::size_t sbytes = static_cast<std::size_t>(rows) * n_groups * sizeof(float);
     void* hw = std::malloc(wbytes);
@@ -668,7 +668,7 @@ void PlanCudaEngine::allocate_buffers() {
       const int MI = cfg_.moe_intermediate_size;  // H is already in scope (cfg_.hidden)
       // The expert quant group is ADAPTIVE (see upload_int4): weight_quant_group_ halved until it
       // divides the row (gate_up over H=2816 keeps 128; down over MI=704 lands on 64). Size the
-      // staging scales with the SAME effective group, or the per-expert scale copy overflows.
+      // staging scales with the same effective group, or the per-expert scale copy overflows.
       auto eff_group = [&](int cols) {
         int g = weight_quant_group_;
         if (g > 0 && (g & (g - 1)) != 0) g = 0;
@@ -713,7 +713,7 @@ void PlanCudaEngine::allocate_buffers() {
   G4_CHECK(cudaMalloc(&d_cand_count_, sizeof(int)));
   // ones for weightless v-norm
   // d_ones_ backs every WEIGHTLESS norm, so it must be as long as the widest vector any
-  // of them normalises -- not just the widest head. The vision projector normalises over
+  // of them normalises; not just the widest head. The vision projector normalises over
   // the vision hidden size, which is far wider than a head: sizing this to maxhd read off
   // the end of the buffer (silently, with garbage "ones").
   std::vector<__half> ones(std::max(maxhd, cfg_.hidden), __float2half(1.0f));
@@ -721,7 +721,7 @@ void PlanCudaEngine::allocate_buffers() {
   G4_CHECK(cudaMemcpy(d_ones_, ones.data(), ones.size() * sizeof(__half), cudaMemcpyHostToDevice));
 
   // Split-K decode-attention scratch for the wide-head path (head_dim > 128, window or not).
-  // Without it every decode attention runs ONE block per head -- 8 blocks on this GPU -- and
+  // Without it every decode attention runs one block per head, 8 blocks on this GPU, and
   // the whole windowed KV walk serialises inside them. ~2 MB at Gemma E2B geometry.
   split_any_chunks_ = (max_ctx_ + kSplitAnyChunk - 1) / kSplitAnyChunk;
   const std::size_t split_cells =
@@ -754,13 +754,13 @@ void PlanCudaEngine::allocate_buffers() {
 
 // ── Qwen3.5 recipe ───────────────────────────────────────────────────────────
 // Config + weights + plan. Everything else (executor, sampler, quantizer, decode
-// graph, KV/state) is the SAME shared machinery Gemma runs on.
+// graph, KV/state) is the same shared machinery Gemma runs on.
 
 // Gemma 4 from a HuggingFace safetensors directory. The .cpi path gets its config
 // from the container manifest; this reads the same facts out of config.json and,
 // crucially, registers every tensor's SHAPE (the safetensors header carries none we
 // use). With Config + st_shapes_ + wprefix_ filled in, the shared Gemma loader and
-// plan builder run unchanged -- the MoE checkpoint is not a second Gemma port.
+// plan builder run unchanged; the MoE checkpoint is not a second Gemma port.
 void PlanCudaEngine::parse_gemma4_st_config(const std::string& model_dir) {
   const std::string raw = mini::read_text_file(std::filesystem::path(model_dir) / "config.json");
 
@@ -804,8 +804,8 @@ void PlanCudaEngine::parse_gemma4_st_config(const std::string& model_dir) {
     put(p + "mlp.gate_proj.weight", cfg_.intermediate, H);
     put(p + "mlp.up_proj.weight", cfg_.intermediate, H);
     put(p + "mlp.down_proj.weight", H, cfg_.intermediate);
-    // The KV-shared layers run a DOUBLE-WIDE MLP. This override must come AFTER the
-    // puts above -- registering it first just gets overwritten, which silently reads
+    // The KV-shared layers run a double-WIDE MLP. This override must come after the
+    // puts above; registering it first just gets overwritten, which silently reads
     // half of each shared layer's weight and produces garbage.
     if (cfg_.use_double_wide_mlp && cfg_.first_shared_layer > 0 && L >= cfg_.first_shared_layer) {
       put(p + "mlp.gate_proj.weight", cfg_.intermediate * 2, H);
@@ -886,7 +886,7 @@ void PlanCudaEngine::parse_qwen35_config(const std::string& model_dir) {
 }
 
 void PlanCudaEngine::parse_deepseek_config(const std::string& model_dir) {
-  // DeepSeek-V2-Lite config.json is FLAT (no text_config nesting).
+  // DeepSeek-V2-Lite config.json is flat (no text_config nesting).
   const std::string raw = mini::read_text_file(std::filesystem::path(model_dir) / "config.json");
   cfg_.family = Family::DeepSeekV2;
   cfg_.vocab = mini::json_get_int(raw, "vocab_size", 0);
@@ -906,7 +906,7 @@ void PlanCudaEngine::parse_deepseek_config(const std::string& model_dir) {
   cfg_.qk_nope_head_dim = mini::json_get_int(raw, "qk_nope_head_dim", 0);
   cfg_.qk_rope_head_dim = mini::json_get_int(raw, "qk_rope_head_dim", 0);
   cfg_.v_head_dim = mini::json_get_int(raw, "v_head_dim", 0);
-  // The shared Attention op + KV cache use ONE head_dim; we pad V up to the qk head dim (see the
+  // The shared Attention op + KV cache use one head_dim; we pad V up to the qk head dim (see the
   // o_proj padding in the loader), so every per-layer head_dim is qk_nope+qk_rope.
   const int qk_head_dim = cfg_.qk_nope_head_dim + cfg_.qk_rope_head_dim;
   cfg_.head_dim = qk_head_dim;
@@ -959,9 +959,9 @@ __half* PlanCudaEngine::upload_host_fp16(const std::string& name, const std::vec
 }
 
 // Quantize a host-built fp16 [rows,cols] weight to int4 (group-wise) and register it under `name`.
-// Same quant path as upload_int4 but from a caller buffer -- DeepSeek's fused expert matrices are
+// Same quant path as upload_int4 but from a caller buffer; DeepSeek's fused expert matrices are
 // synthesized in host memory (no such tensor exists to read by name). Experts are the memory hog, so
-// they are ALWAYS int4 regardless of the global weight-quant flag (mirrors the Gemma MoE requirement).
+// they are always int4 regardless of the global weight-quant flag (mirrors the Gemma MoE requirement).
 void PlanCudaEngine::fuse_upload_experts_int4(const std::string& name,
                                               const std::vector<__half>& host, int rows, int cols) {
   // CPI_DS_EXPERT_BITS=8 keeps experts int8 (diagnostic: distinguishes int4 quant drift from a bug).
@@ -1020,7 +1020,7 @@ void PlanCudaEngine::load_deepseek_weights() {
   const int kvb = nh * (cfg_.qk_nope_head_dim + vhd);            // nh*256
   const int MI = cfg_.moe_intermediate_size;                     // 1408
   // MLA/dense/shared projections honor --weight-quant int4 (like llama.cpp Q4) to cut decode bandwidth
-  // -- the shared expert alone is ~2x the routed experts in fp16 bytes. o_proj stays fp16 (host-built
+  //; the shared expert alone is ~2x the routed experts in fp16 bytes. o_proj stays fp16 (host-built
   // padded tensor). Experts are always int4.
   auto proj = [&](const std::string& nm, int r, int c) {
     if (quant)
@@ -1098,7 +1098,7 @@ void PlanCudaEngine::load_deepseek_weights() {
   }
 }
 
-// DeepSeek MoE FFN (router softmax-top-k WITHOUT renorm + fused int4 experts + a shared SwiGLU),
+// DeepSeek MoE FFN (router softmax-top-k without renorm + fused int4 experts + a shared SwiGLU),
 // all reading Slot::XNorm (= post_attention_layernorm output), accumulating into Slot::X.
 void PlanCudaEngine::append_deepseek_moe_ffn_ops(std::vector<opplan::Op>& ops, const std::string& p) {
   using namespace opplan;
@@ -1142,7 +1142,7 @@ void PlanCudaEngine::append_deepseek_moe_ffn_ops(std::vector<opplan::Op>& ops, c
     ops.push_back(o);
   };
 
-  // router: logits = gate . XNorm ; softmax -> top-k, NO renorm (norm_topk_prob=false), scale 1.0.
+  // router: logits = gate . XNorm ; softmax -> top-k, no renorm (norm_topk_prob=false), scale 1.0.
   gemv(Slot::XNorm, Slot::MoeLogits, "mlp.gate.weight", E, H);
   {
     Op o;
@@ -1380,7 +1380,7 @@ void PlanCudaEngine::load_qwen35_weights() {
     proj(p + "mlp.up_proj.weight", cfg_.intermediate, H);
     proj(p + "mlp.down_proj.weight", H, cfg_.intermediate);
 
-    if (cfg_.layer_full[L]) {  // full attention (q_proj is a FUSED q|gate)
+    if (cfg_.layer_full[L]) {  // full attention (q_proj is a fused q|gate)
       proj(p + "self_attn.q_proj.weight", full_q_dim_ * 2, H);
       proj(p + "self_attn.k_proj.weight", full_kv_dim_, H);
       proj(p + "self_attn.v_proj.weight", full_kv_dim_, H);
@@ -1410,7 +1410,7 @@ void PlanCudaEngine::load_all(const std::string& cpi_path) {
   if (has_ple()) {  // E2B has Per-Layer Embeddings; 12B does not
     upload(W + "embed_tokens_per_layer.weight");
     // The PLE projections are ordinary 2-D matmuls and ride the same quantiser (and the
-    // dp4a decode path) as attn/mlp -- they were the last fp16 gemvs in the quant token
+    // dp4a decode path) as attn/mlp; they were the last fp16 gemvs in the quant token
     // (~180 us/token): model_projection is [layers*ple x H], each layer adds a gate and a
     // down-projection below. Norms stay fp16 as everywhere else.
     if (weight_quant_bits_ == 4 || weight_quant_bits_ == 8)
@@ -1423,14 +1423,14 @@ void PlanCudaEngine::load_all(const std::string& cpi_path) {
   // The dense projections carry ~all the weight; norms/embeddings stay fp16.
   const bool quantize = weight_quant_bits_ == 4 || weight_quant_bits_ == 8;
   // The tied LM head re-reads the whole fp16 embedding table every token (~0.5 ms on E2B's
-  // 262K x 1536). Quant runs give the HEAD a rowwise-int8 packed copy -- int8 even under
-  // int4, since per-row int8 needs no groups -- while EmbeddingLookup keeps the fp16 table.
+  // 262K x 1536). Quant runs give the head a rowwise-int8 packed copy; int8 even under
+  // int4, since per-row int8 needs no groups; while EmbeddingLookup keeps the fp16 table.
   if (quantize && d_head_q_ == nullptr) {
     const __half* emb = static_cast<const __half*>(dev_at(W + "embed_tokens.weight"));
     const std::size_t n =
         static_cast<std::size_t>(cfg_.vocab) * static_cast<std::size_t>(cfg_.hidden);
     if (weight_quant_bits_ == 4 && (cfg_.hidden % 32) == 0) {
-      // int4 runs: grouped-int4 head (~5 bpw with scales) on the dp4a f32 path -- half
+      // int4 runs: grouped-int4 head (~5 bpw with scales) on the dp4a f32 path; half
       // the bytes of the int8 head, which was already at roofline. Packed via the same
       // int8-then-pack pipeline as every projection.
       const int group = weight_quant_group_ > 0 ? weight_quant_group_ : 128;
@@ -1502,7 +1502,7 @@ void PlanCudaEngine::load_all(const std::string& cpi_path) {
     if (cfg_.enable_moe_block) {
       // Norms and the tiny router stay fp16; the EXPERTS are ~90% of the model, so
       // they go through the same quantiser as any other projection (they are plain
-      // 2-D matrices here -- see parse_gemma4_st_config).
+      // 2-D matrices here; see parse_gemma4_st_config).
       for (const char* t :
            {"pre_feedforward_layernorm_2.weight", "post_feedforward_layernorm_1.weight",
             "post_feedforward_layernorm_2.weight", "router.proj.weight", "router.scale",
@@ -1543,7 +1543,7 @@ void PlanCudaEngine::open(const std::string& cpi_path, int max_context) {
   if (std::getenv("CPI_PLAN_NO_DEVICE_TOPK")) device_topk_enabled_ = false;
 
   // A directory ⇒ HuggingFace safetensors; a file ⇒ .cpi. Within a directory the
-  // architecture comes from config.json's model_type -- the engine reads whichever
+  // architecture comes from config.json's model_type; the engine reads whichever
   // container and architecture the model actually ships, with no name matching on
   // the path.
   std::error_code ec;
@@ -1558,7 +1558,7 @@ void PlanCudaEngine::open(const std::string& cpi_path, int max_context) {
       parse_gemma4_st_config(cpi_path);
       if (max_ctx_ <= 0) max_ctx_ = 4096;
       // Decode-graph capture stays ON: every op in this plan has a device-position variant
-      // (partial RoPE gained its twin -- launch_rope_inplace_partial_table_device_pos; the
+      // (partial RoPE gained its twin; launch_rope_inplace_partial_table_device_pos; the
       // sliding/full attention and KV store already had theirs). Gate: graphs-on and
       // CPI_PLAN_NO_GRAPH=1 must produce token-identical streams.
       G4_CHECK(cudaStreamCreate(&stream_));
@@ -1615,7 +1615,7 @@ void PlanCudaEngine::open(const std::string& cpi_path, int max_context) {
       }
       build_deepseek_plan();
       // Batched sequence prefill: MlaAssembleRope has a T>1 kernel and the MoE ops loop the T==1
-      // kernels per token (d_moe_idx_seq_), so the whole prompt runs in one pass -- the projections,
+      // kernels per token (d_moe_idx_seq_), so the whole prompt runs in one pass; the projections,
       // MLA attention and o_proj batch as GEMMs; only the experts stay matvec. Decode uses CUDA-graph
       // capture (MlaAssembleRope's device-position variant keeps the graph position-correct on replay;
       // verified token-identical to eager). Persistent decode stays off unless CPI_CUDA_PERSISTENT.
@@ -1837,7 +1837,7 @@ void PlanCudaEngine::parse_vision_config(const std::string& model_dir) {
 
 // cos/sin over the SPATIAL half-dim: inv_freq = theta^(-2j/spatial_dim) with
 // spatial_dim = head_dim/2, giving head_dim/4 entries per position. Both axes share
-// the table -- x and y get identical frequency ranges (they are separate positions,
+// the table; x and y get identical frequency ranges (they are separate positions,
 // not separate frequency bands).
 void PlanCudaEngine::build_vision_rope_tables() {
   const int pairs = vcfg_.head_dim / 4;
@@ -1884,7 +1884,7 @@ void PlanCudaEngine::load_vision_weights() {
     auto put = [&](const std::string& n, int r, int c) { st_shapes_[p + n] = {r, c}; };
     // NOTE the ".linear." infix: the projections are wrapped in Gemma4ClippableLinear.
     // Its clamp bounds are +-inf and are absent from the checkpoint, so it is a plain
-    // Linear -- do not implement the clipping.
+    // Linear; do not implement the clipping.
     put("input_layernorm.weight", 1, H);
     put("post_attention_layernorm.weight", 1, H);
     put("pre_feedforward_layernorm.weight", 1, H);
@@ -1900,7 +1900,7 @@ void PlanCudaEngine::load_vision_weights() {
     put("mlp.down_proj.linear.weight", H, vcfg_.intermediate);
     // Clipped projections: E2B ships input/output activation bounds per linear and HF
     // CLAMPS with them. The 26B sets use_clipped_linears=false and ships none. Skipping
-    // these does not crash -- it silently changes the numbers, which is why the gate
+    // these does not crash; it silently changes the numbers, which is why the gate
     // caught it and inspection did not.
     if (vcfg_.clipped_linears) {
       for (const char* proj :
@@ -2042,7 +2042,7 @@ void PlanCudaEngine::build_vision_plan() {
       ops.push_back(o);
     };
 
-    // The same sandwich-norm shape as a Gemma TEXT layer. The differences are that
+    // The same sandwich-norm shape as a Gemma text layer. The differences are that
     // attention is bidirectional and the positions are 2-D.
     rms(Slot::X, Slot::XNorm, W("input_layernorm.weight"), 1, H);
     gemv(Slot::XNorm, Slot::Q, "self_attn.q_proj.linear.weight", qdim, H);
@@ -2094,8 +2094,8 @@ void PlanCudaEngine::build_vision_plan() {
     add_x(Slot::Tmp);
   }
 
-  // Epilogue: standardize, when the checkpoint has it. Pooling and projection are NOT
-  // ops -- pooling changes the token count, so the executor has to be re-entered with
+  // Epilogue: standardize, when the checkpoint has it. Pooling and projection are not
+  // ops; pooling changes the token count, so the executor has to be re-entered with
   // the new count; see encode_image.
   if (vcfg_.standardize) {
     Op o;
@@ -2125,7 +2125,7 @@ std::vector<float> PlanCudaEngine::encode_image_stage(const std::vector<float>& 
   ExecCtx ctx{vslot_ptr_.data(), P, /*causal=*/false};
   execute_ops(vplan_.prologue.data(), vplan_.prologue.size(), 0, 0, ctx);
   // stage >= 0: run that many whole layers, return Slot::X.
-  // stage <  0: run the first |stage| OPS of layer 0 and return Slot::Q -- lets the
+  // stage <  0: run the first |stage| OPS of layer 0 and return Slot::Q; lets the
   //             gate look inside a layer (e.g. Q straight after RoPE).
   std::size_t n;
   const __half* src;
@@ -2172,7 +2172,7 @@ std::vector<float> PlanCudaEngine::encode_image(const std::vector<float>& pixels
   G4_CHECK(cudaMemcpyAsync(d_vis_pos_y_, pos_y.data(), pos_y.size() * sizeof(int),
                            cudaMemcpyHostToDevice, stream_));
 
-  // The tower is bidirectional and cacheless: ONE sequence pass over all P patches.
+  // The tower is bidirectional and cacheless: one sequence pass over all P patches.
   ExecCtx ctx{vslot_ptr_.data(), P, /*causal=*/false};
   execute_ops(vplan_.prologue.data(), vplan_.prologue.size(), 0, 0, ctx);
   for (int L = 0; L < vcfg_.layers; ++L)
@@ -2269,7 +2269,7 @@ void PlanCudaEngine::build_plan() {
     };
     emb((wprefix_ + "embed_tokens.weight").c_str(), Slot::X, H);
     sc(Slot::X, H, std::sqrt((float)H));  // embed * sqrt(hidden)
-    // Image embeddings are spliced in HERE -- before anything reads X. In particular the
+    // Image embeddings are spliced in here; before anything reads X. In particular the
     // per-layer-input projection below reads X, and HF projects it from the POST-scatter
     // embeddings.
     plan_.embed_ready = pro.size();
@@ -2426,7 +2426,7 @@ void PlanCudaEngine::build_plan() {
       st.cols = kvdim;
       ops.push_back(st);
     }
-    // net attention scale = 1.0: sqrt(hd) is FOLDED INTO the q_norm weight at load (it
+    // net attention scale = 1.0: sqrt(hd) is folded into the q_norm weight at load (it
     // commutes with the rotation), cancelling the kernel's internal 1/sqrt(hd) without a
     // per-layer ScaleCopy op.
     {
@@ -2486,7 +2486,7 @@ void PlanCudaEngine::build_plan() {
       add_x(Slot::Tmp);
     }
 
-    // --- per-layer scalar (a checkpoint without one means 1.0 -- emitting a no-op
+    // --- per-layer scalar (a checkpoint without one means 1.0; emitting a no-op
     // ScaleCopy per layer costs a real ~1 us kernel-latency floor each) ---
     if (layer_scalar_host_[L] != 1.0f) scale(Slot::X, H, layer_scalar_host_[L]);
   }
@@ -2524,7 +2524,7 @@ void PlanCudaEngine::build_plan() {
 // the executor's device token buffer (EmbeddingLookup). `layer` selects the
 // cache for KvStore/Attention; the prologue/epilogue pass -1 (no such ops).
 // Sequence-mode GEMM: y[T,out] = x[T,in] * W[out,in]^T via cublasGemmEx (fp16 in, fp32
-// accumulate) -- the classic row-major-as-column-major call. Falls back to the hand-rolled
+// accumulate); the classic row-major-as-column-major call. Falls back to the hand-rolled
 // GEMM when cuBLAS is disabled or the op carries activation clips (vision projections).
 bool PlanCudaEngine::seq_gemm_cublas(const __half* w, const __half* x, __half* y, int out, int in,
                                      int T) {
@@ -2544,9 +2544,9 @@ bool PlanCudaEngine::seq_gemm_cublas(const __half* w, const __half* x, __half* y
   return st == CUBLAS_STATUS_SUCCESS;
 }
 
-// Tensor-core attention prefill for FULL-attention layers: batched QK^T -> causal
+// Tensor-core attention prefill for full-attention layers: batched QK^T -> causal
 // softmax -> PV via cuBLAS, the LlamaEngine machinery (device-built pointer arrays keep
-// GQA groups straight). The scalar fallback measured 5 ms PER LAYER at 1216 tokens --
+// GQA groups straight). The scalar fallback measured 5 ms per layer at 1216 tokens
 // 32% of the whole prefill; this does the same work in tensor-core GEMMs. Sliding
 // layers keep the masked tiled kernel (the window mask lives only there).
 bool PlanCudaEngine::prefill_attention_tc(const __half* q, const __half* k, const __half* v,
@@ -2634,7 +2634,7 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
   auto QS = [](const void* p) { return static_cast<const float*>(p); };
   // Sequence mode multiplies an op's extent by the token count. RmsNorm normalises
   // over `cols` in groups of `rows`, and slots are [tokens][rows*cols] contiguous, so
-  // N tokens is just N times as many groups -- no new kernel.
+  // N tokens is just N times as many groups; no new kernel.
   const int T = ctx.tokens;
   const bool seq = T > 1;
   auto rows_x = [&](int rows) { return rows * T; };
@@ -2667,7 +2667,7 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
   cudaEvent_t ev0 = nullptr, ev1 = nullptr;
   // dp4a activation-quant cache: adjacent quant Gemvs reading the same vector (q/k/v,
   // gate/up) share one quantize launch. Slots are reused within a layer (XNorm is written
-  // twice with the same pointer and length), so identity alone would hit stale -- ANY
+  // twice with the same pointer and length), so identity alone would hit stale; any
   // non-Gemv op invalidates, which keeps exactly the adjacent-run reuse and nothing else.
   const void* actq_src = nullptr;
   int actq_len = 0;
@@ -2682,17 +2682,17 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
       cudaEventRecord(ev0, stream_);
     }
 
-    // DECODE FUSION PEEPHOLES -- OPT-IN (CPI_PLAN_FUSE=1), because the premise was
+    // decode FUSION PEEPHOLES; OPT-IN (CPI_PLAN_FUSE=1), because the premise was
     // measured and did not survive. The eager profiler prices every tiny op at ~11-14 us,
     // which made these two patterns (~200 of Gemma 4's ~870 per-token kernels) look like a
     // fifth of the token; fused-vs-unfused interleaved A/B under GRAPH replay measured
-    // 100.2/103.2 vs 101.1/105.5 tok/s -- neutral to slightly negative. The ~12 us was
+    // 100.2/103.2 vs 101.1/105.5 tok/s; neutral to slightly negative. The ~12 us was
     // LAUNCH cost that graph replay already amortises, not execution the fusion could
     // remove: a limiter read off the eager path cannot be quoted as the graph's. Kept as an
     // experiment lever, not a default: fusion also changes reduction order, so opt-in runs
     // may shift near-tie tokens.
-    // ADJACENT-PROJECTION CAT -- default ON (CPI_CUDA_NO_CAT=1 restores split launches).
-    // Two or three fp16 decode projections reading the SAME input vector (q|k|v, gate|up)
+    // ADJACENT-PROJECTION CAT; default ON (CPI_CUDA_NO_CAT=1 restores split launches).
+    // Two or three fp16 decode projections reading the same input vector (q|k|v, gate|up)
     // run as one launch. Unlike the opt-in fusions below this survives its measurement:
     // the 256-row k/v grids are pure exposed latency behind q's launch, and the cat kernel
     // is per-row bit-identical to the split wide gemv, so the token stream cannot move.
@@ -2766,7 +2766,7 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
     }
 
     // Op-CLASS ablation levers, graph-safe (they change what gets captured). Output is
-    // GARBAGE by design -- like CPI_CUDA_ABLATE_ATTENTION they price an op class under
+    // garbage by design; like CPI_CUDA_ABLATE_ATTENTION they price an op class under
     // graph replay, which no profiler can do. Never set outside an experiment.
     {
       static const bool ab_elem = std::getenv("CPI_CUDA_ABLATE_ELEMENTWISE") != nullptr;
@@ -2785,7 +2785,7 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
                                          op.cols, stream_);
         break;
       case OpKind::LmHead:
-        // In sequence mode only the LAST token's logits are wanted -- running the head
+        // In sequence mode only the last token's logits are wanted; running the head
         // over the whole prompt would cost a 262K-wide GEMM per token for nothing.
         if (op.qbits == 4 && d_act_i8_ != nullptr) {
           const __half* head_in =
@@ -2852,11 +2852,11 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
         }
         break;
       case OpKind::Gemv:
-        // Weight encoding AND scale granularity were chosen at load; the op just
+        // Weight encoding and scale granularity were chosen at load; the op just
         // carries them.
         // int4 decode Gemvs route through dp4a with int8 activations: quantize the input
         // vector once per adjacent run, then integer dots. int8 stays on the wide
-        // fp16-activation kernel -- it is bandwidth-bound already and its dp4a variant
+        // fp16-activation kernel; it is bandwidth-bound already and its dp4a variant
         // measured slower. CPI_CUDA_NO_DP4A=1 keeps the fp16-activation kernels for
         // int4 too.
         if (!seq && d_act_i8_ != nullptr && op.bias == nullptr && op.qbits == 4 && op.qgroup > 0 &&
@@ -2867,8 +2867,8 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
             actq_src = S(op.in);
             actq_len = op.in_dim;
           }
-          // GLU fusion: [gate Gemv][up Gemv][GeluMul] collapses into ONE kernel writing
-          // the activated product -- no Gate/Up round-trip, no elementwise launch.
+          // GLU fusion: [gate Gemv][up Gemv][GeluMul] collapses into one kernel writing
+          // the activated product; no Gate/Up round-trip, no elementwise launch.
           if (idx + 2 < n && ops[idx + 1].kind == OpKind::Gemv && ops[idx + 1].qbits == 4 &&
               ops[idx + 1].qgroup == op.qgroup && ops[idx + 1].bias == nullptr &&
               ops[idx + 1].in == op.in && ops[idx + 1].in_dim == op.in_dim &&
@@ -2883,8 +2883,8 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
             idx += 2;
             break;
           }
-          // Adjacent same-input int4 Gemvs (q/k/v, gate/up) run as ONE cat launch,
-          // mirroring the fp16 cat peephole -- ~2 fewer medium-gemv launches per site.
+          // Adjacent same-input int4 Gemvs (q/k/v, gate/up) run as one cat launch,
+          // mirroring the fp16 cat peephole; ~2 fewer medium-gemv launches per site.
           {
             auto same = [&](const Op& o2) {
               return o2.kind == OpKind::Gemv && o2.qbits == 4 && o2.qgroup == op.qgroup &&
@@ -2915,7 +2915,7 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
           break;
         }
         // Short quantized sequences (a speculative verify, a tail chunk) stream the
-        // weights ONCE for all tokens through the multi-token dp4a kernel instead of
+        // weights once for all tokens through the multi-token dp4a kernel instead of
         // paying a whole-model dequant round.
         if (seq && T <= 16 && op.qbits == 4 && op.qgroup > 0 && (op.qgroup % 32) == 0 &&
             (op.in_dim % 32) == 0 && op.bias == nullptr && d_act_i8_ != nullptr) {
@@ -2932,13 +2932,13 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
         }
         // SEQUENCE mode with quantized weights: dequantize into scratch and run the real
         // fp16 GEMM. The quant matvec kernels are batch-1; calling them with T tokens
-        // computed only token 0 and filled the KV cache with garbage -- the reason the
+        // computed only token 0 and filled the KV cache with garbage; the reason the
         // .cpi route historically never enabled sequence prefill.
         // int8-DIRECT sequence GEMM: 8-bit x 8-bit -> int32 via cuBLAS, per-token rowwise
         // activation scales folded in the epilogue. Reads a quarter of the dequant
         // round-trip's bytes. Falls through to dequant+fp16 GEMM when the op has no
         // prefill copy or cuBLAS declines the shape.
-        // MEASURED AND LOST as a default (162-172 ms vs the dequant path's 146-150 on
+        // measured and lost as a default (162-172 ms vs the dequant path's 146-150 on
         // p1200): plain cublasGemmEx int8 does not hit IMMA on this stack; doing this
         // right needs cublasLt ordered layouts. Kept as an OPT-IN experiment.
         static const bool int8_prefill = std::getenv("CPI_CUDA_INT8_PREFILL") != nullptr;
@@ -3160,7 +3160,7 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
         const float* sinT = op.rope_table == RopeTable::Full ? d_sin_full_ : d_sin_sliding_;
         if (op.rotary_dim > 0) {
           // Partial RoPE over Q (in) and K (in2) together. The device-position twin is what
-          // makes partial-RoPE plans graph-capturable -- it was the ONE missing kernel that
+          // makes partial-RoPE plans graph-capturable; it was the one missing kernel that
           // kept Gemma 4 decode launching ~700 kernels per token from the host.
           if (device_pos_mode_) {
             kernels::launch_rope_inplace_partial_table_device_pos(
@@ -3233,7 +3233,7 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
       }
       case OpKind::Attention: {
         if (seq && ctx.cached) {
-          // TEXT prefill: K/V were appended to this layer's cache by KvStore, so attend
+          // text prefill: K/V were appended to this layer's cache by KvStore, so attend
           // over the CACHE (it also holds any earlier context). Full-attention layers with
           // no image limits take the tensor-core cuBLAS path; sliding layers pass their
           // window to the masked tiled kernel, and ctx.limits (when set) makes an image
@@ -3261,7 +3261,7 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
           break;
         }
         if (seq) {
-          // Cacheless sequence (a vision tower): the K/V slots ARE the "cache", and
+          // Cacheless sequence (a vision tower): the K/V slots are the "cache", and
           // causal comes from the context (false for a bidirectional encoder).
           kernels::launch_attention_prefill(S(op.in), S(Slot::K), S(Slot::V), S(op.out), T, 0,
                                             op.heads, op.kv_heads, op.head_dim, stream_,
@@ -3273,7 +3273,7 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
         const std::size_t kvdim = static_cast<std::size_t>(op.kv_heads) * op.head_dim;
         {
           // CPI_CUDA_ABLATE_ATTENTION=1 skips every decode attention dispatch. The output is
-          // GARBAGE -- that is the point: it prices attention under the graph by removing it,
+          // garbage; that is the point: it prices attention under the graph by removing it,
           // which no profiler distortion can confuse. Never set outside an experiment.
           static const bool ablate_attn = std::getenv("CPI_CUDA_ABLATE_ATTENTION") != nullptr;
           if (ablate_attn && !seq) break;
@@ -3281,10 +3281,10 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
           // Wide heads (Gemma's 256/512) take the any-head_dim SPLIT-K path when its scratch
           // exists: the tiled single-block-per-head kernel leaves a 170-SM GPU running 8
           // blocks, and the whole windowed KV walk serialises inside them. The split's grid is
-          // (heads x chunks) with per-chunk seq/window guards -- graph-safe -- and eager and
+          // (heads x chunks) with per-chunk seq/window guards, graph-safe, and eager and
           // graph share the same kernels so the two stay bit-identical.
           if (d_split_o_ != nullptr && op.head_dim > 128) {
-            // Grid sizing: the depth bucket (set by forward_one; falls back to max) --
+            // Grid sizing: the depth bucket (set by forward_one; falls back to max)
             // and a sliding layer never needs more chunks than its window can span.
             int chunks = attn_chunk_budget_ > 0 ? attn_chunk_budget_ : split_any_chunks_;
             // Depth-adaptive chunk size: fine chunks maximize parallelism shallow, but
@@ -3744,7 +3744,7 @@ void PlanCudaEngine::allocate_sequence_buffers(int max_tokens) {
   G4_CHECK(cudaMalloc(&d_seq_limits_, static_cast<std::size_t>(max_tokens) * sizeof(int)));
 }
 
-// Prefill a whole prompt in ONE pass instead of token by token.
+// Prefill a whole prompt in one pass instead of token by token.
 //
 // Two things this buys, beyond speed:
 //   - image soft tokens can be spliced over the embeddings of the image placeholder
@@ -3807,7 +3807,7 @@ void PlanCudaEngine::prefill_sequence(const std::vector<int>& tokens, int start_
     execute_ops(plan_.layers[L].ops.data(), plan_.layers[L].ops.size(), L, start_position, ctx);
   execute_ops(plan_.epilogue.data(), plan_.epilogue.size(), 0, start_position, ctx);
   G4_CHECK(cudaStreamSynchronize(stream_));
-  publish_host_logits();  // logits of the LAST prompt token, ready for the first sample
+  publish_host_logits();  // logits of the last prompt token, ready for the first sample
 }
 
 void PlanCudaEngine::forward_one(int token, int position, bool compute_logits,
@@ -3819,7 +3819,7 @@ void PlanCudaEngine::forward_one(int token, int position, bool compute_logits,
   // Skipped for the per-layer-rms parity dump (it syncs mid-forward). The graph
   // writes the KV cache at d_position_, so it interleaves correctly with the eager
   // prefill (which fills earlier rows via host position).
-  // Persistent decode: the whole token as ONE cooperative launch over the compiled plan.
+  // Persistent decode: the whole token as one cooperative launch over the compiled plan.
   // Falls back to the graph path if the launch is ever rejected (co-residency).
   if (compute_logits && per_layer_rms == nullptr && persist_enabled_) {
     G4_CHECK(cudaMemcpyAsync(d_tok_, &token, sizeof(int), cudaMemcpyHostToDevice, stream_));
@@ -3835,12 +3835,12 @@ void PlanCudaEngine::forward_one(int token, int position, bool compute_logits,
 
   if (compute_logits && per_layer_rms == nullptr && decode_graph_enabled_) {
     // The split-attention grid is frozen at capture, so a graph captured for max_ctx
-    // launches (heads x max_chunks) blocks per layer FOREVER -- at depth 400 with a 4096
+    // launches (heads x max_chunks) blocks per layer FOREVER; at depth 400 with a 4096
     // context that is ~90% dead blocks, and it measured as most of attention's 1.3 ms.
     // Capture instead for a power-of-two DEPTH BUCKET (>= 512 tokens) and re-capture when
     // generation crosses into the next bucket: a handful of ~ms captures per generation
-    // buys grids at most 2x the live depth. Math is unchanged -- dead chunks never
-    // contribute -- so graph and eager stay bit-identical.
+    // buys grids at most 2x the live depth. Math is unchanged; dead chunks never
+    // contribute; so graph and eager stay bit-identical.
     if (split_any_chunks_ > 0) {
       int need_chunks = (position + 1 + kSplitAnyChunk - 1) / kSplitAnyChunk;
       int bucket = 512 / kSplitAnyChunk;
@@ -3937,7 +3937,7 @@ int PlanCudaEngine::sample(const runtime::DecodeParams& params, const std::vecto
     G4_CHECK(cudaMemsetAsync(d_cand_count_, 0, sizeof(int), stream_));
     kernels::launch_topk_float(d_logits_, cfg_.vocab, k, d_topk_part_val_, d_topk_part_idx_,
                                d_topk_val_, d_topk_idx_, stream_);
-    // Threshold = the k-th largest RAW logit. The final softcap is monotonic, so
+    // Threshold = the k-th largest raw logit. The final softcap is monotonic, so
     // {i : raw_i >= raw_kth} is exactly the host's softcapped candidate set.
     kernels::launch_gather_ge_threshold(d_logits_, cfg_.vocab, d_topk_val_ + (k - 1), d_cand_idx_,
                                         d_cand_val_, d_cand_count_, kCandCapacity, stream_);
@@ -3986,9 +3986,9 @@ std::vector<float> PlanCudaEngine::forward_logits(const std::vector<int>& tokens
 }
 
 // Compile the (already-data) decode plan into the persistent interpreter's device
-// descriptors. Returns false -- leaving the graph path in charge -- when the plan uses any
+// descriptors. Returns false, leaving the graph path in charge, when the plan uses any
 // kind the interpreter does not implement (MoE, delta-net, quantized projections, biases,
-// rotary_dim ropes). Every pointer is resolved HERE, once, exactly as build_plan resolved
+// rotary_dim ropes). Every pointer is resolved here, once, exactly as build_plan resolved
 // them for the eager executor.
 bool PlanCudaEngine::compile_persistent_plan() {
   using namespace opplan;
@@ -4180,7 +4180,7 @@ void PlanCudaEngine::capture_decode_graph() {
 // ── Per-box autotuning ──────────────────────────────────────────────────────────────
 // The objective is the real workload: ms per decode-graph replay at a representative
 // depth, not a kernel microbench (microbenches repeatedly ranked candidates wrong during
-// the parity campaign -- the graph replay is what generation actually runs).
+// the parity campaign; the graph replay is what generation actually runs).
 
 double PlanCudaEngine::time_decode_at(int pos, int iters) {
   using clock = std::chrono::steady_clock;
@@ -4405,7 +4405,7 @@ void PlanCudaEngine::initialize(const EngineOptions& options) {
   samp_top_p_ = options.top_p;
   samp_rep_penalty_ = options.repetition_penalty;
   samp_no_repeat_ngram_ = options.no_repeat_ngram_size;
-  // Weight-only quantization (--weight-quant int8|int4). Must be set BEFORE open():
+  // Weight-only quantization (--weight-quant int8|int4). Must be set before open():
   // load_all quantizes each projection as it streams in, so the fp16 model never
   // lands on the GPU whole (Gemma 12B is ~24 GB fp16 and would OOM first).
   if (options.int8_streaming) {
@@ -4418,7 +4418,7 @@ void PlanCudaEngine::initialize(const EngineOptions& options) {
   // per-row int4 gives one scale for a whole 3840-15360-wide row, so a single
   // outlier weight coarsens the entire row, and over 48 layers x 7 matmuls that
   // compounds into garbage (Gemma 12B produced "t/t/t/t/..."). Group-wise costs
-  // 32 bits per group -- 4.25 bits/weight instead of 4. int8's 255 levels do not
+  // 32 bits per group; 4.25 bits/weight instead of 4. int8's 255 levels do not
   // need it, so it stays per-row and byte-identical to before.
   // Override with CPI_PLAN_QUANT_GROUP (0 = per-row, else a power of two).
   if (weight_quant_bits_ == 4) {
@@ -4524,11 +4524,11 @@ bool PlanCudaEngine::spec_graph_init() {
 // Greedy speculative verify: forward `k` tokens (the pending token plus k-1 drafts) at
 // positions pos.., then compute each position's greedy argmax. Returns the argmaxes; the
 // caller accepts the longest draft prefix they confirm. KV rows for rejected positions go
-// stale in place -- attention never reads past the current position, and later steps
+// stale in place; attention never reads past the current position, and later steps
 // overwrite them.
 //
-// Fast path: the fixed-T=16 forward captured by spec_graph_init replays as ONE graph
-// launch (drafts padded by repeating the last token -- padded rows write KV that later
+// Fast path: the fixed-T=16 forward captured by spec_graph_init replays as one graph
+// launch (drafts padded by repeating the last token; padded rows write KV that later
 // steps overwrite before ever reading). Falls back to the eager seq forward when the
 // batch would cross max_context or the plan is not an int4 one.
 void PlanCudaEngine::verify_greedy(const int* tokens, int k, int pos, int* out_argmax) {
@@ -4648,8 +4648,8 @@ std::vector<int> PlanCudaEngine::generate_stream(const std::vector<int>& prompt,
   // (this engine previously ignored it, unlike the other engines).
   p.seed = constraints ? constraints->seed : -1;
   // Contract: generate_stream returns prompt+generated. main_modes strips
-  // prompt_tokens.size(), and ONLY when the result is longer than the prompt — so
-  // returning generated-only silently produced an EMPTY final "Decoded text".
+  // prompt_tokens.size(), and only when the result is longer than the prompt — so
+  // returning generated-only silently produced an empty final "Decoded text".
   // It went unnoticed because the streamed on_token text still looked correct.
   p.include_prompt = !prompt.empty();
   // sample() pulls logits off the device lazily (greedy argmax / host copy), so
@@ -4660,12 +4660,12 @@ std::vector<int> PlanCudaEngine::generate_stream(const std::vector<int>& prompt,
   // batched verify, batch = drafts+1 <= 16). Greedy-only and sampler-neutral (no
   // penalties, no grammar).
   //
-  // KNOWN-NON-LOSSLESS (2026-08): the intended invariant -- output identical to plain greedy -- does
-  // NOT hold. The batched verify uses the seq/mt kernels while the nd==0 fallback uses the decode
+  // KNOWN-non-LOSSLESS (2026-08): the intended invariant, output identical to plain greedy, does
+  // not hold. The batched verify uses the seq/mt kernels while the nd==0 fallback uses the decode
   // kernels; the two round differently on near-ties, so the emitted stream diverges from plain greedy
-  // AND depends on the draft policy (3-gram vs 6-gram give different output). It can cascade into
+  // and depends on the draft policy (3-gram vs 6-gram give different output). It can cascade into
   // repetition loops. Making it lossless requires reconciling the verify and decode kernel numerics
-  // (prefill-parity-class work) -- see memory:cpi-cuda-spec-decode. Until then this is EXPERIMENTAL.
+  // (prefill-parity-class work); see memory:cpi-cuda-spec-decode. Until then this is EXPERIMENTAL.
   const char* spec_env = std::getenv("CPI_CUDA_SPEC");
   const int spec_k = spec_env ? std::min(std::atoi(spec_env), 15) : 0;
   if (spec_k >= 1) {

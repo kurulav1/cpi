@@ -157,7 +157,7 @@ bool LlamaEngine::run_parity_check(const std::vector<int>& prompt_tokens) {
           __half2float(emb[static_cast<std::size_t>(tok) * static_cast<std::size_t>(hidden) + i]);
     }
     // Gemma: scale token embeddings by sqrt(hidden). The reference was missing this too, so the
-    // parity check was comparing a broken GPU path against a broken CPU path -- and the two
+    // parity check was comparing a broken GPU path against a broken CPU path; and the two
     // brokennesses partially cancelled, which is worse than either alone: FIXING the GPU made the
     // reported max_abs_diff go UP (35.8 -> 53.2). An oracle that shares the bug it is meant to
     // catch will happily certify the bug and then flag the fix.
@@ -268,8 +268,8 @@ bool LlamaEngine::run_parity_check(const std::vector<int>& prompt_tokens) {
       normalize_cpu(x, norm_ffn, norm_ffn_bias, cfg.use_layernorm, cfg.norm_eps, &x_norm);
       matvec_rowmajor(w1, x_norm, inter, hidden, &ff1);
       matvec_rowmajor(w3, x_norm, inter, hidden, &ff2);
-      // SwiGLU, or GeGLU for Gemma. The reference hard-coded SiLU, so it ran the WRONG
-      // ACTIVATION for every gelu model -- it could never have validated one.
+      // SwiGLU, or GeGLU for Gemma. The reference hard-coded SiLU, so it ran the wrong
+      // ACTIVATION for every gelu model; it could never have validated one.
       for (int i = 0; i < inter; ++i) {
         const float g = ff1[static_cast<std::size_t>(i)];
         const float act =
@@ -310,10 +310,10 @@ bool LlamaEngine::run_parity_check(const std::vector<int>& prompt_tokens) {
   const int gpu_top =
       static_cast<int>(std::max_element(gpu_logits.begin(), gpu_logits.end()) - gpu_logits.begin());
   // The GPU (fp16/cuBLAS) and CPU (float) forwards never match bit-for-bit, so the
-  // gate is: argmax agrees (the greedy output is unchanged) AND the max logit diff
+  // gate is: argmax agrees (the greedy output is unchanged) and the max logit diff
   // is within a loose sanity bound (a real forward bug diverges by >> this). To
   // verify a forward-path change (fusion) preserved correctness, run before and
-  // after and confirm PASS with an unchanged max_abs_diff.
+  // after and confirm pass with an unchanged max_abs_diff.
   constexpr double kMaxAbsTol = 5.0;
   const bool pass = (cpu_top == gpu_top) && (max_abs < kMaxAbsTol);
   std::cout << "[parity] top_token_cpu=" << cpu_top << " top_token_gpu=" << gpu_top << "\n";

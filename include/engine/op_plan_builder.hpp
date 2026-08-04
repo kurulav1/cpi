@@ -4,7 +4,7 @@
 //
 // A plan is just data (op_plan.hpp): which ops, in what order, over what geometry,
 // with weights bound as opaque handles. Nothing about that is CUDA-specific, so the
-// builder does not belong inside a CUDA engine -- it belongs here, where a Metal
+// builder does not belong inside a CUDA engine; it belongs here, where a Metal
 // executor can call it too.
 //
 // Weights are resolved through WeightSource rather than a device-pointer map, which
@@ -40,7 +40,7 @@ public:
   // Device handle for an fp16 tensor. Throws if it is not loaded.
   virtual const void* fp16(const std::string& name) const = 0;
 
-  // True when the tensor exists at all -- used for optional weights (a model may
+  // True when the tensor exists at all; used for optional weights (a model may
   // or may not have QK-norm, a bias, a tied LM head...).
   virtual bool has(const std::string& name) const = 0;
 
@@ -63,7 +63,7 @@ public:
     return false;
   }
 
-  // An embedding table, at whatever width the backend picks for embeddings -- which need not be
+  // An embedding table, at whatever width the backend picks for embeddings; which need not be
   // the projection width. Only reached when quantize_embeddings() is true.
   virtual QuantWeight quant_embedding(const std::string& name, int rows, int cols) const {
     return quant(name, rows, cols);
@@ -80,7 +80,7 @@ public:
 
 // Geometry of a uniform-geometry, Llama-style decoder: every layer identical,
 // SwiGLU MLP, RMSNorm, full causal attention, half-split RoPE. Llama 2/3, Qwen2.5,
-// Mistral. (Gemma and Qwen3.5 are NOT this -- their per-layer geometry varies, and
+// Mistral. (Gemma and Qwen3.5 are not this; their per-layer geometry varies, and
 // they keep their own builders.)
 struct LlamaGeometry {
   int num_layers = 0;
@@ -94,8 +94,8 @@ struct LlamaGeometry {
   float rope_theta = 10000.0f;
 
   // Qwen2's Q/K/V projections carry an additive bias; Llama's and Mistral's do not.
-  // Getting this wrong does not crash -- it produces a model that generates fluent
-  // nonsense -- so it is explicit rather than inferred.
+  // Getting this wrong does not crash; it produces a model that generates fluent
+  // nonsense; so it is explicit rather than inferred.
   bool has_qkv_bias = false;
 
   // Qwen3 applies a per-head RMSNorm to Q and to K after projection, before RoPE.
@@ -103,12 +103,12 @@ struct LlamaGeometry {
   // RmsNorm with rows = heads rather than a new op.
   bool has_qk_norm = false;
 
-  // NOTE head_dim is NOT hidden/heads in general. Qwen3-0.6B has hidden=1024,
+  // NOTE head_dim is not hidden/heads in general. Qwen3-0.6B has hidden=1024,
   // heads=16 and head_dim=128 (so q_dim=2048 != hidden). Deriving it from hidden
-  // silently builds the wrong model -- callers must set it from the weights.
+  // silently builds the wrong model; callers must set it from the weights.
 
   // Gemma's MLP is GeGLU (tanh-GELU), not SwiGLU, and its RMSNorm weights are stored
-  // as (w - 1) so the norm scales by (1 + w). Both are ops that already exist -- a
+  // as (w - 1) so the norm scales by (1 + w). Both are ops that already exist; a
   // capability flag, not a fork.
   bool mlp_gelu = false;
   bool norm_offset = false;
@@ -134,11 +134,11 @@ struct LlamaGeometry {
   int experts_per_tok = 0;
   int expert_inter = 0;  // per-expert FFN width; falls back to `inter` when 0
 
-  // The expert kernels want ONE tensor per layer, not one per expert:
+  // The expert kernels want one tensor per layer, not one per expert:
   //   <prefix>feed_forward.experts.gate_up  [num_experts * 2 * expert_inter, hidden]
   //   <prefix>feed_forward.experts.down     [num_experts * hidden, expert_inter]
   // A .ll2c stores them per expert (experts.<e>.w1 / .w3 / .w2), so a backend's WeightSource
-  // is what concatenates them -- the builder names what it needs and the backend materialises
+  // is what concatenates them; the builder names what it needs and the backend materialises
   // it, which keeps the layout decision next to the memory that holds it.
 };
 
@@ -157,13 +157,13 @@ ModelPlan build_llama_plan(const LlamaGeometry& g, const WeightSource& w);
 // which comes from `layer_is_linear`, per layer, because it is not derivable from anything else.
 //
 // This is a separate builder rather than a flag on LlamaGeometry because the two layer kinds have
-// disjoint tensor sets and disjoint op sequences -- a "uniform geometry" struct cannot describe a
-// model whose geometry is not uniform. It is still the SHARED core: every op below already exists
+// disjoint tensor sets and disjoint op sequences; a "uniform geometry" struct cannot describe a
+// model whose geometry is not uniform. It is still the shared core: every op below already exists
 // and every backend executes them with the same kernels.
 //
 // Names are the canonical .ll2c ones the converter emits, reached through WeightSource. CUDA's own
 // Qwen3.5 path predates this and reads HF names straight from safetensors, so adopting this there
-// needs a name-mapping WeightSource -- see the note at PlanCudaEngine::build_qwen35_plan.
+// needs a name-mapping WeightSource; see the note at PlanCudaEngine::build_qwen35_plan.
 struct Qwen35Geometry {
   int num_layers = 0;
   int hidden = 0;
@@ -185,7 +185,7 @@ struct Qwen35Geometry {
   int lin_value_head_dim = 0;
   int lin_conv_kernel = 0;
 
-  // Per layer: true = gated delta-net, false = full attention. MUST be num_layers long.
+  // Per layer: true = gated delta-net, false = full attention. must be num_layers long.
   std::vector<bool> layer_is_linear;
 };
 
@@ -193,12 +193,12 @@ ModelPlan build_qwen35_plan(const Qwen35Geometry& g, const WeightSource& w);
 
 // Geometry of a Gemma 4 decoder. A third sibling rather than a flag on LlamaGeometry, for the
 // reason given at num_experts above: this family's per-layer geometry is not uniform, and its MoE
-// is not Mixtral's. Layers alternate SLIDING and FULL attention with a DIFFERENT head_dim, kv-head
+// is not Mixtral's. Layers alternate SLIDING and full attention with a different head_dim, kv-head
 // count and RoPE base each (E2B: 256/512), the last `num_kv_shared_layers` reuse an earlier
 // layer's K/V instead of projecting their own, and E2B additionally carries Per-Layer Embeddings
 // that the prologue folds in.
 //
-// Every op this needs already exists and every backend executes them with the same kernels -- this
+// Every op this needs already exists and every backend executes them with the same kernels; this
 // is the shared core, not a fork. Confirmed by counting: all 26 OpKinds are implemented on both
 // the CUDA and Metal executors.
 struct Gemma4Geometry {
@@ -216,13 +216,13 @@ struct Gemma4Geometry {
 
   // ...and a different RoPE base per layer type, with PARTIAL rotary on the full layers only.
   // These must be set: Op::scale carries theta on backends that compute RoPE in-shader rather
-  // than from a table, and it defaults to 1.0f -- a theta of 1.0 makes every lane rotate at the
+  // than from a table, and it defaults to 1.0f; a theta of 1.0 makes every lane rotate at the
   // same frequency, which is a wrong model rather than an error.
   float rope_theta_sliding = 10000.0f;
   float rope_theta_full = 1000000.0f;
-  float partial_rotary_full = 1.0f;  // fraction of head_dim that rotates on FULL layers
+  float partial_rotary_full = 1.0f;  // fraction of head_dim that rotates on full layers
 
-  // Per layer: 1 = full attention, 0 = sliding. MUST be num_layers long.
+  // Per layer: 1 = full attention, 0 = sliding. must be num_layers long.
   std::vector<int> layer_full;
 
   // Layers at or after this index reuse another layer's K/V and project none of their own.
@@ -252,7 +252,7 @@ struct Gemma4Geometry {
   [[nodiscard]] int kv_heads_of(int layer) const {
     return layer_full[layer] ? kv_heads_full : kv_heads_sliding;
   }
-  // Only the FULL layers of a k_eq_v checkpoint share V with K.
+  // Only the full layers of a k_eq_v checkpoint share V with K.
   [[nodiscard]] bool k_eq_v(int layer) const {
     return attention_k_eq_v && layer_full[layer] != 0;
   }
@@ -261,8 +261,8 @@ struct Gemma4Geometry {
   }
 };
 
-// NOTE on RMSNorm: Gemma 4 uses PLAIN rmsnorm, NOT the (1 + w) form. Gemma 1/2 store their norm
-// weights as (w - 1); Gemma 4 does not -- measured on the E2B checkpoint, whose input_layernorm
+// NOTE on RMSNorm: Gemma 4 uses plain rmsnorm, not the (1 + w) form. Gemma 1/2 store their norm
+// weights as (w - 1); Gemma 4 does not; measured on the E2B checkpoint, whose input_layernorm
 // values are 9.375 / 7.97 / 10.69, i.e. raw multiplicative gains rather than offsets around zero.
 // Applying the offset form here scales by ~2 at every norm, which compounds and overflows fp16 by
 // about layer 2. So no op below sets norm_offset.
@@ -271,7 +271,7 @@ ModelPlan build_gemma4_plan(const Gemma4Geometry& g, const WeightSource& w);
 // Geometry of Gemma 4's VISION tower (`vision_config` in the checkpoint). The tower is a
 // text-shaped sandwich-norm encoder with three differences, each already an op: positions are
 // 2-D (Rope2D), the input is pixels (PatchEmbed), and attention is bidirectional (the executor's
-// cacheless mode). Pooling and projection into text space are NOT in the plan -- pooling changes
+// cacheless mode). Pooling and projection into text space are not in the plan; pooling changes
 // the token count, so the executor is re-entered with the new count; see the engines'
 // encode_image.
 struct Gemma4VisionGeometry {
@@ -289,12 +289,12 @@ struct Gemma4VisionGeometry {
   float rope_theta = 100.0f;
   bool standardize = false;
   // E2B ships per-projection activation bounds and HF CLAMPS with them; the 26B sets this false
-  // and ships none. Skipping them does not crash -- it silently changes the numbers.
+  // and ships none. Skipping them does not crash; it silently changes the numbers.
   bool clipped_linears = false;
 };
 
 // The vision plan, previously built privately inside PlanCudaEngine::build_vision_plan. One
-// description, two executors -- the same argument that moved the text builders here. Clip bounds
+// description, two executors; the same argument that moved the text builders here. Clip bounds
 // are read through WeightSource::scalar (only when g.clipped_linears).
 ModelPlan build_gemma4_vision_plan(const Gemma4VisionGeometry& g, const WeightSource& w);
 

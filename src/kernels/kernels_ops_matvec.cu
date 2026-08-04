@@ -47,7 +47,7 @@ __device__ __forceinline__ void warp_argmax(float& value, int& index) {
     const int other_index = __shfl_down_sync(0xffffffffu, index, offset);
     // Ties resolve to the LOWEST index, matching the host's std::max_element (first maximum). A
     // plain `>` would keep the lower lane, but the strided per-thread scan means the lower lane
-    // does not hold the lower index -- and the sanitize clamp to +/-80 manufactures exact ties out
+    // does not hold the lower index; and the sanitize clamp to +/-80 manufactures exact ties out
     // of distinct raw logits, so this is a case the greedy path actively hits, not a float-equality
     // curiosity. Fixing it here covers both reduction stages and every kernel that uses
     // warp_argmax.
@@ -113,7 +113,7 @@ __device__ __forceinline__ float gelu_tanh_f32(float x) {
 // Gated GLU read straight off the fused gate+up buffer.
 //
 // The prefill MLP emits w13 as one [tokens, 2*inter] matrix. Reading gate at [t][i] and up at
-// [t][inter+i] avoids splitting it into two buffers first -- those copies only un-interleave
+// [t][inter+i] avoids splitting it into two buffers first; those copies only un-interleave
 // data this kernel reads elementwise anyway, and prefill is bound by host-side API calls, so a
 // copy that buys nothing still costs.
 //
@@ -488,7 +488,7 @@ __global__ void moe_router_topk_softmax_kernel(const half* logits, int experts, 
 // the selected groups, DeepSeek-V3 style), then normalise the SELECTED gates to sum 1. n_group<=1
 // (or a degenerate grouping) falls back to a flat top-k. Single-thread for an exact lowest-index
 // tie-break, matching moe_router_topk_softmax_kernel. top_k up to 32 (K3 uses 16, > the softmax
-// router's hard cap of 8). NOTE: not yet wired to a model -- isolation-gated groundwork.
+// router's hard cap of 8). NOTE: not yet wired to a model; isolation-gated groundwork.
 __global__ void moe_router_sigmoid_topk_kernel(const half* logits, int experts, int top_k,
                                                int n_group, int topk_group, int* topk_idx,
                                                float* topk_weight) {
@@ -782,10 +782,10 @@ __device__ __forceinline__ void store_projection_value<float>(float* y, int row,
 }
 
 // Shared-memory half2 GEMV used by resident projection layers and the LM head.
-// `residual` (optional): fuse the residual add into the epilogue --
+// `residual` (optional): fuse the residual add into the epilogue
 //     residual[row] = __hadd(residual[row], (half)dot)
 // instead of storing the dot and running a separate add_inplace kernel over it.
-// BYTE-IDENTICAL: the dot is rounded to fp16 first (exactly what the unfused store does)
+// byte-identical: the dot is rounded to fp16 first (exactly what the unfused store does)
 // and combined with __hadd (exactly what add_inplace does). At batch 1 a kernel costs a
 // fixed ~1.7 us however little it does, so deleting the add is worth more than the add.
 template <int WarpsPerBlock, int TilePairs, int RowsPerWarp, typename OutT>
@@ -874,7 +874,7 @@ __global__ void rowmajor_half_gemv_kernel(const half* w, const half* x, OutT* y,
 // Tie-break: `>` (strictly greater) everywhere, exactly as the single-block kernel, so a
 // duplicated maximum resolves the same way it always did within a slice. Across slices the
 // decomposition differs, so an EXACT tie between two equal maxima in different blocks could
-// resolve differently -- the greedy 6-model gate is what proves this does not bite.
+// resolve differently; the greedy 6-model gate is what proves this does not bite.
 __global__ void argmax_partial_kernel(const float* __restrict__ logits, int n,
                                       float* __restrict__ part_val, int* __restrict__ part_idx) {
   const int tid = threadIdx.x;
@@ -990,7 +990,7 @@ __global__ void argmax_float_kernel(const float* logits, int n, int* out_index) 
 
 // Batched greedy argmax: one block per row, argmax over that row's vocab logits. Sanitizes inline
 // (non-finite -> -inf, clamp to +/-80) so the winner matches the host greedy path, which clamps
-// before argmax -- the clamp changes ties when two logits both exceed +/-80. blocked[b] is an id
+// before argmax; the clamp changes ties when two logits both exceed +/-80. blocked[b] is an id
 // to exclude (the host sets its logit to -inf to suppress EOS below min_new_tokens); -1 means none.
 // Lowest index wins ties, matching std::max_element.
 __global__ void batched_argmax_sanitized_kernel(const float* logits, int vocab, const int* blocked,
@@ -1230,7 +1230,7 @@ void launch_pack_rowwise_int8_to_int4(const int8_t* src, int8_t* dst, int rows, 
 // GEMV shaped for streaming weights from HBM: one warp per output row, 128-bit loads, no
 // shared tile.
 //
-// The tiled kernel above reads the weight row as half2 -- 32 bits per thread. That is fine
+// The tiled kernel above reads the weight row as half2; 32 bits per thread. That is fine
 // out of L2, but decode streams each weight from HBM exactly once, and 32-bit requests leave
 // far too few bytes in flight to cover the latency. Reading int4 (8 halves) quarters the
 // request count and keeps several loads in flight per thread. The shared staging of x is
@@ -1259,7 +1259,7 @@ __global__ void gemv_wide_kernel(const half* __restrict__ w, const half* __restr
   // that iteration's load. Issuing several loads up front turns latency into throughput.
   //
   // The accumulation order is unchanged (lane, lane+32, lane+64, ...), so this is bit-identical
-  // to the un-prefetched kernel -- purely a scheduling change.
+  // to the un-prefetched kernel; purely a scheduling change.
   constexpr int kUnroll = 4;
   float acc = 0.0f;
   int4 wbuf[kUnroll];
@@ -1304,9 +1304,9 @@ __global__ void gemv_wide_kernel(const half* __restrict__ w, const half* __restr
 }
 
 // Segment-routed gemv_wide_kernel: up to three projections sharing one input vector run as
-// ONE launch (q|k|v, gate|up). A warp resolves its global row to (matrix, output, local row)
-// and then runs gemv_wide_kernel's exact inner loop -- same lane stride, same unroll, same
-// warp_sum, same fp16 rounding -- so a cat'd launch is bit-identical to the split launches;
+// one launch (q|k|v, gate|up). A warp resolves its global row to (matrix, output, local row)
+// and then runs gemv_wide_kernel's exact inner loop; same lane stride, same unroll, same
+// warp_sum, same fp16 rounding; so a cat'd launch is bit-identical to the split launches;
 // only the grid packing differs. Warp-per-row with no shared memory, so partial trailing
 // blocks need no cross-warp care.
 template <int Warps>
@@ -1511,7 +1511,7 @@ void launch_rowmajor_half_gemv_f16(const half* w, const half* x, half* y, int ou
 // Rowwise int8 activation quantization with a PERMUTED byte layout for the grouped-dp4a
 // int4 matvec: within each 8-column window the even columns land in bytes 0-3 and the odd
 // columns in bytes 4-7. The int4 packing stores column pairs (2j, 2j+1) as a byte's
-// (lo, hi) nibbles, so `word & 0x0F0F0F0F` yields four EVEN columns -- this layout lets
+// (lo, hi) nibbles, so `word & 0x0F0F0F0F` yields four even columns; this layout lets
 // that mask line up with one 32-bit load of x instead of a gather. Same max/scale/rounding
 // semantics as quantize_rowwise_fp16_to_int8_kernel. Requires cols % 8 == 0; batch 1.
 __global__ void quantize_fp16_to_int8_perm8_kernel(const half* __restrict__ src,
@@ -1573,9 +1573,9 @@ __global__ void quantize_fp16_to_int8_perm8_kernel(const half* __restrict__ src,
 
 // Group-32 variant: one scale per 32 columns instead of one
 // per vector. A group is exactly one dp4a chunk (32 weights), so the matvec's per-chunk
-// int32 dot picks up s_w[chunk] * s_x[chunk] -- and quantization needs NO global max:
+// int32 dot picks up s_w[chunk] * s_x[chunk]; and quantization needs no global max:
 // each thread owns one 8-column window, a 4-lane butterfly maxes the group, and the
-// kernel is embarrassingly multi-block (the rowwise version ran ONE block even at 12288
+// kernel is embarrassingly multi-block (the rowwise version ran one block even at 12288
 // columns). Finer scales also quantize x strictly more precisely. cols % 32 == 0.
 __global__ void quantize_fp16_to_int8_perm8_g32_kernel(const half* __restrict__ src,
                                                        int8_t* __restrict__ dst,
@@ -1622,7 +1622,7 @@ __global__ void quantize_fp16_to_int8_perm8_g32_kernel(const half* __restrict__ 
 }
 
 // Multi-row twin of the g32 quantizer: blockIdx.y selects the row, so T rows quantize in
-// ONE launch (a speculative verify otherwise pays T launches per Gemv site). Per row the
+// one launch (a speculative verify otherwise pays T launches per Gemv site). Per row the
 // math is identical to the single-row kernel; scales pack [row][group].
 __global__ void quantize_fp16_to_int8_perm8_g32_mt_kernel(const half* __restrict__ src_all,
                                                           int8_t* __restrict__ dst_all,
@@ -1819,7 +1819,7 @@ void launch_argmax_float(const float* logits, int n, int* out_index, cudaStream_
                          float* part_val, int* part_idx, int parts) {
   constexpr int threads = 256;
   // Two-phase when the caller supplies scratch. The single-block kernel below launches
-  // <<<1, 256>>> over the WHOLE vocab -- one SM out of 170, each thread walking ~594 logits
+  // <<<1, 256>>> over the whole vocab; one SM out of 170, each thread walking ~594 logits
   // in a serial dependent max-chain. It measured 149.6 us per token on Qwen2.5's 151936-wide
   // head: 12% of all GPU time, to read 608 KB that peak bandwidth would deliver in 0.34 us.
   // It cost as much as the LM head GEMV, which reads 272 MB.
@@ -1977,9 +1977,9 @@ void launch_convert_bf16_to_fp16(const std::uint16_t* src, half* dst, int n, cud
 
 // Repetition-penalty support for the batched device top-k path. The host slow path (see
 // sample_from_logits) SANITIZES logits (non-finite -> -inf, clamp to [+-80]) and then divides a
-// seen token's logit by the penalty (or multiplies, if negative) -- both BEFORE building the
+// seen token's logit by the penalty (or multiplies, if negative); both before building the
 // top-k candidate set. Doing it on-device keeps the full vocab off the host bus. Both kernels
-// touch ONLY rows whose penalty > 1: a non-penalty row in the same batch must keep the exact
+// touch only rows whose penalty > 1: a non-penalty row in the same batch must keep the exact
 // fast-path (no-sanitize) semantics it would have on its own.
 
 // [batch][vocab]: clamp/deinf the penalty rows only.

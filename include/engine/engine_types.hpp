@@ -22,7 +22,7 @@ struct EngineOptions {
   // Disables reuse of the previous request's KV prefix. Off by default (reuse is a real win for
   // chat, where every turn re-sends the history). Needed for BENCHMARKING prefill: with reuse on,
   // a second run of the same prompt skips prefill entirely and reports prefill_ms=0.00, so the
-  // only prefill you can ever time is a COLD one -- which is dominated by one-time cuBLAS plan
+  // only prefill you can ever time is a cold one; which is dominated by one-time cuBLAS plan
   // setup and is not a steady-state number.
   bool disable_prefix_reuse = false;
   bool int8_streaming = false;

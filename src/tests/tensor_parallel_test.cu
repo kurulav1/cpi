@@ -1,6 +1,6 @@
 // Verifies TensorParallelLinear's sharding math ON A SINGLE GPU: split a weight across N simulated
 // ranks (all mapped to device 0) and check the concatenated output matches the unsharded (world=1)
-// forward. This is the first brick of multi-GPU prep -- the sharding/combine logic is provable here;
+// forward. This is the first brick of multi-GPU prep; the sharding/combine logic is provable here;
 // only the cross-device transport (NCCL) then needs a real cluster. Decode case (batch=1).
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -27,7 +27,7 @@ void split(int out, int ws, std::vector<int>& off, std::vector<int>& rows) {
   }
 }
 
-// Run the TP linear with `ws` ranks, ALL on device 0. W is the full column-major [out, in] weight
+// Run the TP linear with `ws` ranks, all on device 0. W is the full column-major [out, in] weight
 // (ld = out); each shard is repacked to its own column-major [rows_r, in] (ld = rows_r).
 std::vector<half> run(const std::vector<half>& W, int out, int in, const half* dX, int batch,
                       int ws) {

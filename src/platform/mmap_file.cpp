@@ -127,7 +127,7 @@ void MMapFile::prefetch() const {
     return;
   }
   // Skip the whole-file read-ahead when it would thrash. A model larger than free RAM cannot be
-  // held in the page cache, so prefetching it just DOUBLE-READS: the OS blocks in the prefetch
+  // held in the page cache, so prefetching it just double-reads: the OS blocks in the prefetch
   // call, then its background read evicts pages before the loader reaches them and competes with
   // the loader's own mmap faults. Measured on the 32B int4 (23 GB, ~12 GB free): skipping this
   // ~halves cold start (44s -> 20s). Small models that fit in RAM still benefit from the prefetch.

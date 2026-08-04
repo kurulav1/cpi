@@ -3,7 +3,7 @@
 // 1. vs a CPU fp32 reference, over shapes that exercise the tile edges (dims that
 //    are not multiples of 32, tokens=1, K smaller than a tile).
 // 2. vs the existing GEMV row-by-row: the GEMM must agree with it to within fp16
-//    tolerance. It will NOT agree bit-for-bit -- the two sum K in different orders --
+//    tolerance. It will not agree bit-for-bit; the two sum K in different orders
 //    which is exactly why the executor keeps single-token work on the GEMV path.
 
 #include <cuda_fp16.h>
@@ -65,7 +65,7 @@ int main() {
     CK(cudaMemcpy(dx, hx.data(), xn * sizeof(__half), cudaMemcpyHostToDevice));
 
     kernels::launch_rowmajor_half_gemm_f16(dw, dx, dy, s.out_features, s.in_features, s.tokens, 0);
-    // The GEMV one token at a time -- the path decode actually takes.
+    // The GEMV one token at a time; the path decode actually takes.
     for (int t = 0; t < s.tokens; ++t) {
       kernels::launch_rowmajor_half_gemv_f16(dw, dx + static_cast<std::size_t>(t) * s.in_features,
                                              dy_gemv + static_cast<std::size_t>(t) * s.out_features,

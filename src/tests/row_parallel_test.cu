@@ -26,7 +26,7 @@ void split(int in, int ws, std::vector<int>& off, std::vector<int>& rows) {
   }
 }
 
-// W is column-major [out, in] (ld = out), so an input-column slice is CONTIGUOUS (W + off*out); the
+// W is column-major [out, in] (ld = out), so an input-column slice is contiguous (W + off*out); the
 // input x is [in] so its slice is contiguous too (dX + off). No repack needed.
 std::vector<half> run(const std::vector<half>& W, int out, int in, const half* dX, int batch,
                       int ws) {
@@ -59,7 +59,7 @@ int case_ws(const std::vector<half>& W, int out, int in, const half* dX, int bat
     denom = std::max(denom, std::fabs(fa));
   }
   const float rel = maxabs / denom;
-  // Row-parallel sums fp16 partials, so it is NOT bit-exact vs the single fp32-accumulated GEMM;
+  // Row-parallel sums fp16 partials, so it is not bit-exact vs the single fp32-accumulated GEMM;
   // the delta is fp16 partial-rounding. A tight fp16 tolerance still catches any real sharding bug.
   const bool pass = rel < 2e-2f;
   std::printf("%s[world=%d]: row-parallel all-reduce vs unsharded, max rel diff %.2e\n",

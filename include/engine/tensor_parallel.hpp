@@ -35,7 +35,7 @@ public:
   //                      Each shard covers (out_features / world_size) rows.
   // devices           - optional rank->CUDA-device map. Empty => rank r uses device r (real
   //                      multi-GPU). Passing all-zeros runs every rank on device 0, which lets the
-  //                      sharding math be verified on a single GPU (tensor_parallel_test) -- the
+  //                      sharding math be verified on a single GPU (tensor_parallel_test); the
   //                      cross-device transport is the only piece that then needs real hardware.
   void initialize(int world_size, int in_features, int out_features,
                   const std::vector<const void*>& shard_weights_fp16,
@@ -69,8 +69,8 @@ private:
 
 // Row-parallel linear: the complement of TensorParallelLinear. The weight is split by INPUT columns
 // (the K dimension); each rank holds W[:, in_slice] and its slice of the input, computes a PARTIAL
-// output over its inputs, and the partials are ALL-REDUCED (summed) into the full output. A
-// column-parallel layer's sharded output feeds a row-parallel layer with no gather between them --
+// output over its inputs, and the partials are all-REDUCED (summed) into the full output. A
+// column-parallel layer's sharded output feeds a row-parallel layer with no gather between them
 // the standard Megatron tensor-parallel block. Verified single-GPU (row_parallel_test); the sum is
 // where ncclAllReduce plugs in for real multi-GPU (the one cluster-gated step).
 class RowParallelLinear {

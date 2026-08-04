@@ -100,7 +100,7 @@ void LlamaEngine::forward_token(int token, int position, bool compute_logits,
 // Q.K^T and P.V are ordinary GEMMs; routing them through cuBLAS runs them on the tensor cores,
 // where attention_prefill_kernel_tiled uses only the scalar FMA pipe.
 //
-// Done in chunks of query rows so the score matrix stays bounded -- a full [heads][seq][seq]
+// Done in chunks of query rows so the score matrix stays bounded; a full [heads][seq][seq]
 // matrix is tens of GB at long context, whereas chunked it is heads x chunk x keys.
 //
 // GQA requires cublasGemmBatchedEx (pointer arrays) rather than the strided-batched call: the
@@ -204,7 +204,7 @@ bool LlamaEngine::prefill_attention_tensorcore(const void* q, const void* k_laye
     const int chunk = std::min(kChunk, rows - c0);
 
     // Pointer arrays are built ON DEVICE, on this stream. Staging them from the host into a
-    // reused pinned buffer was a race -- this function runs once per LAYER, so the next layer
+    // reused pinned buffer was a race; this function runs once per layer, so the next layer
     // overwrote the buffer while the previous async copy was still in flight, and the GEMMs
     // could read the wrong layer's K/V. It gave different logits on every run.
     kernels::launch_build_attention_ptrs(kh, vh, qh, sh, oh, d_gemm_ptrs_, num_heads, group,
@@ -221,8 +221,8 @@ bool LlamaEngine::prefill_attention_tensorcore(const void* q, const void* k_laye
     // S(keys x chunk, col-major, ld=keys) = alpha * K^T(keys x D) * Q(D x chunk)
     //
     // K is row-major [keys, D] with row stride kv_stride, which cuBLAS reads column-major as
-    // [D, keys] with ld=kv_stride -- so OP_T gives [keys, D]. Q is row-major [chunk, D] with row
-    // stride q_stride, read column-major as [D, chunk] -- OP_N. The column-major result
+    // [D, keys] with ld=kv_stride; so OP_T gives [keys, D]. Q is row-major [chunk, D] with row
+    // stride q_stride, read column-major as [D, chunk]; OP_N. The column-major result
     // [keys, chunk] with ld=keys IS the row-major [chunk, keys] the softmax wants.
     // 1/sqrt(head_dim) rides in as alpha, so no separate scaling pass.
     CUBLAS_CHECK(cublasGemmBatchedEx(cublas_, CUBLAS_OP_T, CUBLAS_OP_N, keys, chunk, head_dim,

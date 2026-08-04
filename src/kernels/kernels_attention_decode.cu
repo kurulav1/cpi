@@ -314,7 +314,7 @@ __device__ __forceinline__ void attention_step_chunk_stats_core(
     float* chunk_o, int seq_len, int num_heads, int num_kv_heads, int head_dim, int chunk_size,
     int scratch_chunks, int k_start = 0) {
   // Same score per key as the tile-loop original (same warp mapping, lane stride and
-  // warp_sum) and the same tile-merge arithmetic in the same order; what changed is WHO
+  // warp_sum) and the same tile-merge arithmetic in the same order; what changed is who
   // computes it. All keys are scored up front (one barrier), then every thread runs the
   // tile-merge recurrence redundantly in registers instead of round-tripping running
   // stats through shared memory with a single-thread serial section per tile. V is read
@@ -325,7 +325,7 @@ __device__ __forceinline__ void attention_step_chunk_stats_core(
   float* score_shared = reinterpret_cast<float*>(q_shared + head_dim);
 
   const int head = blockIdx.x;
-  // blockIdx.y maps to the first LIVE chunk, so a windowed layer's grid only needs to span
+  // blockIdx.y maps to the first live chunk, so a windowed layer's grid only needs to span
   // the window: launchers may size grid.y to the live chunk count instead of the whole
   // scratch range. Scratch stays absolutely indexed; with k_start == 0 this is the old
   // mapping, and any grid larger than the live range still exits on the guards below.
@@ -385,7 +385,7 @@ __device__ __forceinline__ void attention_step_chunk_stats_core(
   for (int tile_base = chunk_start; tile_base < chunk_end; tile_base += WarpsPerBlock) {
     const int tile_tokens = min(WarpsPerBlock, chunk_end - tile_base);
     // Compile-time trip counts with predication: the runtime-bound versions could not
-    // unroll, so every V load waited on the previous FMA -- a serial load-use chain that
+    // unroll, so every V load waited on the previous FMA; a serial load-use chain that
     // block-level overlap hides at depth and nothing hides shallow. Unrolled, the loads
     // batch.
     float tile_m = neg_inf<float>();
@@ -516,9 +516,9 @@ __global__ void attention_step_chunk_reduce_kernel(const float* chunk_m, const f
   }
 }
 
-// ANY-head_dim split-K wrappers (Gemma 4's 256/512, Qwen3.5's 256), window-aware. The
+// any-head_dim split-K wrappers (Gemma 4's 256/512, Qwen3.5's 256), window-aware. The
 // stats core already handles arbitrary head_dim (kAccPerThread accumulators); these add the
-// window (as a k_start clip) and a reduce whose accumulator survives head_dim > blockDim --
+// window (as a k_start clip) and a reduce whose accumulator survives head_dim > blockDim
 // the original reduce's scalar acc is correct only when every thread owns one output dim,
 // which is exactly why the split path was gated to head_dim <= 128.
 template <int WarpsPerBlock>
@@ -548,11 +548,11 @@ __global__ void attention_step_chunk_stats_any_device_pos_kernel(
 __device__ __forceinline__ void attention_step_chunk_reduce_any_core(
     const float* chunk_m, const float* chunk_l, const float* chunk_o, half* out, int seq_len,
     int num_heads, int head_dim, int chunk_size, int scratch_chunks, int k_start) {
-  // Every thread runs the m/l scan redundantly in registers -- identical inputs in
+  // Every thread runs the m/l scan redundantly in registers; identical inputs in
   // identical order give identical values, so the old per-chunk single-thread section and
-  // its TWO barriers (x26 chunks) vanish without moving a rounding. The m/l loads are
+  // its two barriers (x26 chunks) vanish without moving a rounding. The m/l loads are
   // same-address broadcasts.
-  // TWO-PASS combine: the running-rescale recurrence (acc = acc*alpha + o*beta) is a
+  // two-pass combine: the running-rescale recurrence (acc = acc*alpha + o*beta) is a
   // serial dependency across chunks, which dominates deep. Pass 1 finds the global max
   // (scalar, broadcast loads); pass 2 accumulates independent o_c * exp(m_c - M)
   // products, which pipeline freely. One exp scale per chunk instead of a running
@@ -1088,7 +1088,7 @@ constexpr int kGqaFusedMaxSeq = 256;
 // from HBM. The GQA-fused kernel avoids that but launches only num_kv_heads
 // blocks (poor occupancy at long context). This kernel combines both: grid.x =
 // num_kv_heads (one block per KV head, `group_size` warps = one per query head),
-// grid.y = KV chunk. Each K/V token is loaded to shared ONCE per group per chunk
+// grid.y = KV chunk. Each K/V token is loaded to shared once per group per chunk
 // and reused across the group's warps, while num_kv_heads×chunks blocks keep the
 // GPU busy. It writes per-Q-head chunk partials in the exact layout the existing
 // attention_step_chunk_reduce* kernels consume, so pass 2 is unchanged.
@@ -1285,7 +1285,7 @@ void launch_attention_step(const half* q, const half* k_cache, const half* v_cac
   // head_dim 64 and 128 both matter: 128 is Llama's, 64 is Qwen2.5's (and plenty of
   // small models'). Gating these fast paths on 128 ALONE dropped every head_dim-64 model
   // onto the fallback kernel, which runs one block per head and walks the whole KV inside
-  // it -- so decode got slower the longer the context grew.
+  // it; so decode got slower the longer the context grew.
   if (num_kv_heads > 0 && num_heads > num_kv_heads && (num_heads % num_kv_heads) == 0 &&
       (head_dim == 64 || head_dim == 128) && seq_len <= kGqaFusedMaxSeq) {
     const int group_size_val = num_heads / num_kv_heads;
@@ -1308,7 +1308,7 @@ void launch_attention_step(const half* q, const half* k_cache, const half* v_cac
   constexpr int split_chunk_size = 32;
   // Split-K over KV chunks: grid is num_heads x ceil(seq/32) blocks instead of num_heads,
   // which is what stops per-token cost from growing with context. The generic chunk-stats
-  // kernel takes head_dim at RUNTIME -- only this gate was pinning it to 128.
+  // kernel takes head_dim at RUNTIME; only this gate was pinning it to 128.
   if (allow_split && scratch_m && scratch_l && scratch_o && scratch_chunks > 0 &&
       (head_dim == 64 || head_dim == 128) && seq_len >= 64) {
     constexpr int warps = 4;
@@ -1582,7 +1582,7 @@ __global__ void attention_step_chunk_reduce_batched_kernel(const float* chunk_m,
 
 // Batched + paged GQA-shared variant of split-K pass 1. grid = (num_kv_heads,
 // chunk, batch); blockDim = group_size*32 (one warp per query head in the KV
-// group). Each block loads one KV chunk ONCE into shared and reuses it across the
+// group). Each block loads one KV chunk once into shared and reuses it across the
 // group's query heads, so KV traffic drops by group_size vs the per-query-head
 // batched kernel (which re-reads each KV token once per head). chunk_size ==
 // block_size (<= 32): chunk c of sequence b maps to physical block
@@ -1603,7 +1603,7 @@ __device__ __forceinline__ void gqa_split_chunk_stats_batched_core(
   if (first_block * block_size >= seq_len) return;
 
   // K and V are used in disjoint phases (K for scores, V for the output sum), so
-  // they share ONE tile buffer: stage K, score, then overwrite with V. Peak smem
+  // they share one tile buffer: stage K, score, then overwrite with V. Peak smem
   // is a single block_size*HeadDim tile (unchanged by coarsening — the tile is
   // reused across the coarse chunk's sub-blocks), keeping occupancy high while a
   // single grid block now streams blocks_per_chunk*block_size tokens. Fewer,
@@ -1687,7 +1687,7 @@ __device__ __forceinline__ void gqa_split_chunk_stats_batched_core(
     w_sh[warp_id * block_size + lane] = weight;
     __syncthreads();  // all warps done reading K + weights ready; safe to overwrite with V
 
-    // Phase 2: stage the paged V tile into the SAME buffer, then weighted sum into
+    // Phase 2: stage the paged V tile into the same buffer, then weighted sum into
     // the running output (each lane owns HeadDim/32 channels).
     for (int i8 = tid; i8 < tile_tokens * kHd8; i8 += blockDim.x) {
       const int t = i8 / kHd8;
@@ -1759,7 +1759,7 @@ void launch_attention_step_batched_paged(const half* q, const half* k_pool, cons
   // (num_kv_heads*chunks*batch) above a floor so SMs stay filled, and cap the
   // coarsening so no single block streams too serially.
   // Long context favours fewer, larger blocks (better latency hiding); short context keeps
-  // roughly one block per chunk. Tuned empirically -- see attention_decode_bench.
+  // roughly one block per chunk. Tuned empirically; see attention_decode_bench.
   const int blocks_per_chunk =
       gqa_shared ? pick_blocks_per_chunk(total_blocks, static_cast<long long>(num_kv_heads) * batch)
                  : 1;
@@ -1839,7 +1839,7 @@ void launch_attention_step_device_pos(const half* q, const half* k_cache, const 
   // dominated long-context decode. GQA-fused stays as the fallback when split is
   // disabled (--no-split-attention).
   // Same head_dim widening as the host-position launcher. This is the launcher the CUDA
-  // DECODE GRAPH captures, so it is the one that actually runs during generation --
+  // decode GRAPH captures, so it is the one that actually runs during generation
   // widening only the host-position one changed nothing measurable.
   const bool head_dim_fast = (head_dim == 64 || head_dim == 128);
   const bool split_available =
@@ -1979,7 +1979,7 @@ void launch_attention_split_any(const half* q, const half* k_cache, const half* 
                                 int head_dim, float* scratch_m, float* scratch_l, float* scratch_o,
                                 int chunk_size, int scratch_chunks, cudaStream_t stream) {
   constexpr int warps = 4;      // merge-tile template arg (arithmetic order pinned)
-  constexpr int threads = 256;  // score/merge thread count -- runtime-derived in-kernel
+  constexpr int threads = 256;  // score/merge thread count; runtime-derived in-kernel
   const int k_start = (window > 0 && seq_len > window) ? seq_len - window : 0;
   const std::size_t smem = static_cast<std::size_t>(head_dim) * sizeof(half) +
                            static_cast<std::size_t>(2 * warps + 4) * sizeof(float) +
@@ -2000,7 +2000,7 @@ void launch_attention_split_any_device_pos(const half* q, const half* k_cache, c
                                            int chunk_size, int scratch_chunks,
                                            cudaStream_t stream) {
   constexpr int warps = 4;      // merge-tile template arg (arithmetic order pinned)
-  constexpr int threads = 256;  // score/merge thread count -- runtime-derived in-kernel
+  constexpr int threads = 256;  // score/merge thread count; runtime-derived in-kernel
   const std::size_t smem = static_cast<std::size_t>(head_dim) * sizeof(half) +
                            static_cast<std::size_t>(2 * warps + 4) * sizeof(float) +
                            static_cast<std::size_t>(warps * head_dim) * sizeof(half);
@@ -2020,7 +2020,7 @@ void launch_attention_split_any_mt_device_pos(const half* q, const half* k_cache
                                               float* scratch_l, float* scratch_o, int chunk_size,
                                               int scratch_chunks, cudaStream_t stream) {
   constexpr int warps = 4;      // merge-tile template arg (arithmetic order pinned)
-  constexpr int threads = 256;  // score/merge thread count -- runtime-derived in-kernel
+  constexpr int threads = 256;  // score/merge thread count; runtime-derived in-kernel
   const std::size_t smem = static_cast<std::size_t>(head_dim) * sizeof(half) +
                            static_cast<std::size_t>(2 * warps + 4) * sizeof(float) +
                            static_cast<std::size_t>(warps * head_dim) * sizeof(half);

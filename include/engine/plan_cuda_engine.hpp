@@ -60,7 +60,7 @@ class PlanCudaEngine : public runtime::SequenceModel {
   const BenchmarkStats& last_benchmark_stats() const { return stats_; }
 
   // Run the token sequence through the text tower and return the softcapped
-  // logits of the LAST position. If per_layer_rms != nullptr, fills it with each
+  // logits of the last position. If per_layer_rms != nullptr, fills it with each
   // layer's output RMS (parity vs the oracle). Resets KV state each call.
   std::vector<float> forward_logits(const std::vector<int>& tokens,
                                     std::vector<float>* per_layer_rms = nullptr);
@@ -121,14 +121,14 @@ class PlanCudaEngine : public runtime::SequenceModel {
   }
 
  private:
-  // Which model recipe builds the plan, and the geometry it builds from. BOTH now live in
+  // Which model recipe builds the plan, and the geometry it builds from. both now live in
   // engine/plan_model_config.hpp, a header with no CUDA in it, because PlanMetalEngine needs the
-  // same answers -- "what shape is this model" is not a backend question. These aliases keep every
+  // same answers; "what shape is this model" is not a backend question. These aliases keep every
   // existing `cfg_.<field>` and `Family::Gemma4` in this engine compiling unchanged; the field
   // names in the shared struct are deliberately identical for that reason.
   //
   // The EXECUTOR, sampler, quantizer, decode graph and KV/state machinery are shared; only the
-  // config parse, weight load and plan recipe differ -- so a "new model" is a recipe, not an
+  // config parse, weight load and plan recipe differ; so a "new model" is a recipe, not an
   // engine, and a new BACKEND for an existing model should be a routing change, not a fork.
   using Family = engine::PlanFamily;
   using Config = engine::PlanModelConfig;
@@ -144,13 +144,13 @@ class PlanCudaEngine : public runtime::SequenceModel {
   void verify_greedy(const int* tokens, int k, int pos, int* out_argmax);
   void load_all(const std::string& cpi_path);
   // ── Qwen3.5 recipe (config parse + weight load + plan build). The executor,
-  //    sampler, quantizer, graph and state machinery below are all SHARED. ──
+  //    sampler, quantizer, graph and state machinery below are all shared. ──
   void parse_qwen35_config(const std::string& model_dir);
   void load_qwen35_weights();
   void build_qwen35_plan();
   // Gemma 4 from a HuggingFace safetensors directory (the MoE checkpoint ships that
-  // way). Fills Config + st_shapes_ so the SHARED Gemma loader and plan builder run
-  // unchanged -- only the tensor-name prefix and the shape source differ.
+  // way). Fills Config + st_shapes_ so the shared Gemma loader and plan builder run
+  // unchanged; only the tensor-name prefix and the shape source differ.
   void parse_gemma4_st_config(const std::string& model_dir);
 
   // ── DeepSeek-V2 recipe (MLA latent attention + fine-grained MoE). Same shared
@@ -169,7 +169,7 @@ class PlanCudaEngine : public runtime::SequenceModel {
                            int cols);
 
   // ── vision tower ──
-  // Its own config, slots and plan, but the SAME executor (in sequence mode) and the
+  // Its own config, slots and plan, but the same executor (in sequence mode) and the
   // same ops. A vision encoder is a capability, not a second engine.
   struct VisionConfig {
     bool present = false;
@@ -177,7 +177,7 @@ class PlanCudaEngine : public runtime::SequenceModel {
     int patch_size = 0, pos_table_size = 0, pooling_kernel = 1;
     float rms_eps = 1e-6f, rope_theta = 100.0f;
     bool standardize = false;
-    bool clipped_linears = false;  // E2B: every projection clamps its input AND output
+    bool clipped_linears = false;  // E2B: every projection clamps its input and output
   };
   // Per-projection activation bounds, keyed by the projection's tensor prefix.
   struct ClipBounds {
@@ -199,7 +199,7 @@ class PlanCudaEngine : public runtime::SequenceModel {
 
   // Sequence-mode text prefill buffers. seq_prefill_ok_ is false for plans the sequence
   // path cannot yet run (partial RoPE / delta-net), which then keep the token-by-token
-  // prefill -- a capability decision on the PLAN, not on a model name.
+  // prefill; a capability decision on the PLAN, not on a model name.
   bool seq_prefill_ok_ = false;
   int seq_max_tokens_ = 0;
   std::vector<__half*> seq_buffers_;
@@ -216,15 +216,15 @@ class PlanCudaEngine : public runtime::SequenceModel {
   void build_vision_rope_tables();
 
 public:
-  // Encodes one image into soft tokens in the TEXT embedding space.
+  // Encodes one image into soft tokens in the text embedding space.
   //   pixels  - [num_patches, 3*patch^2], row-major, channel-last, values in [0,1]
   //   pos_x/y - patch grid coordinates; -1 marks a padding patch
   // Returns [out_tokens, text_hidden] on the host.
-  // Prefill a whole prompt in ONE sequence pass (instead of token-by-token).
+  // Prefill a whole prompt in one sequence pass (instead of token-by-token).
   //   embeds  - optional per-token embedding overrides (image soft tokens); an entry
   //             with an empty vector means "look the token up as usual"
   //   limits  - optional per-token key limits (bidirectional image spans)
-  // Returns logits for the LAST token.
+  // Returns logits for the last token.
   void prefill_sequence(const std::vector<int>& tokens, int start_position,
                         const std::vector<std::vector<float>>& embeds,
                         const std::vector<int>& limits);
@@ -260,7 +260,7 @@ private:
   float* upload_f32(const std::string& name, int n);       // float weights (delta-net norm / A_log)
   __half* upload(const std::string& name, int rows = 0, int cols = 0);
   // Loads a weight and quantizes it to int4 on the GPU, freeing the fp16 copy
-  // immediately. Done PER TENSOR during load: uploading the whole model in fp16
+  // immediately. Done per tensor during load: uploading the whole model in fp16
   // first and quantizing afterwards would peak at the fp16 footprint — exactly the
   // OOM this exists to avoid (Gemma 12B is ~24 GB fp16). Peak here is one tensor.
   void upload_int4(const std::string& name, int rows = 0, int cols = 0);
@@ -278,7 +278,7 @@ private:
   // prologue/epilogue, which contain none.
   // Execution context. Decode runs one token against a KV cache; a vision encoder
   // runs a whole SEQUENCE of patches with no cache and no causal mask. Both drive the
-  // same op list through the same executor -- only the context differs.
+  // same op list through the same executor; only the context differs.
   //
   // INVARIANT: at tokens == 1 every op takes the identical kernel + arguments it took
   // before sequence mode existed. Byte-identical decode is therefore structural, not
@@ -288,7 +288,7 @@ private:
     __half* const* slots = nullptr;  // which slot table (text or vision)
     int tokens = 1;                  // 1 = decode; N = sequence
     bool causal = true;              // false = bidirectional (vision)
-    // cached: a TEXT prefill -- K/V are appended to this layer's KV cache and attention
+    // cached: a text prefill; K/V are appended to this layer's KV cache and attention
     // runs over the cache. A vision tower sets this false: it keeps no cache and attends
     // over the K/V slots directly.
     bool cached = false;
@@ -395,11 +395,11 @@ private:
 
   // Weight-name prefix. Empty for a .cpi container (its manifest already stores
   // stripped names); "model.language_model." for a HuggingFace safetensors dir.
-  // Keeping it here means ONE Gemma plan builder serves both containers instead of
+  // Keeping it here means one Gemma plan builder serves both containers instead of
   // a second copy that differs only in string keys.
   std::string wprefix_;
   // Tensor shapes for the safetensors path, where the container carries no shape
-  // index (unlike .cpi's manifest) -- derived from config.json at load.
+  // index (unlike .cpi's manifest); derived from config.json at load.
   std::unordered_map<std::string, std::pair<int, int>> st_shapes_;
   std::vector<float> layer_scalar_host_;         // per-layer scalar values
 
@@ -522,7 +522,7 @@ private:
   // the full vocab-sized logit vector; only the ~k candidates come back.
   static constexpr int kMaxDeviceTopK = 256;
   static constexpr int kCandCapacity = kMaxDeviceTopK + 64;  // slack for ties at the k-th logit
-  // Persistent decode: the plan compiled to device-side op descriptors, executed as ONE
+  // Persistent decode: the plan compiled to device-side op descriptors, executed as one
   // cooperative launch per token (kernels_persistent_decode.cu). Compiled after build_plan;
   // a plan with kinds the interpreter lacks compiles to "unsupported" and decode keeps the
   // graph path. persist_enabled_ also drops to false if the cooperative launch is rejected.
@@ -532,7 +532,7 @@ private:
   int persist_blocks_ = 0;
   bool persist_enabled_ = false;
 
-  // Rowwise-int8 packed copy of the tied embedding table, used by the LM head ONLY on
+  // Rowwise-int8 packed copy of the tied embedding table, used by the LM head only on
   // quant runs (EmbeddingLookup keeps reading the fp16 table). nullptr = fp16 head.
   std::int8_t* d_head_q_ = nullptr;
   float* d_head_qs_ = nullptr;
@@ -540,7 +540,7 @@ private:
   int head_qgroup_ = 0;
 
   // Decode activation-quant scratch for the dp4a matvec paths (one vector + one scale).
-  // int8 runs hold the plain rowwise layout, int4 runs the perm8 layout -- a run is one
+  // int8 runs hold the plain rowwise layout, int4 runs the perm8 layout; a run is one
   // or the other, so the buffer is shared. nullptr = dp4a routing off.
   std::int8_t* d_act_i8_ = nullptr;
   float* d_act_qs_ = nullptr;

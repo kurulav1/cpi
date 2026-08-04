@@ -16,7 +16,7 @@
 
 namespace {
 
-// Host mirror of moe_router_sigmoid_topk_kernel. Takes the SAME half-rounded logits the device sees.
+// Host mirror of moe_router_sigmoid_topk_kernel. Takes the same half-rounded logits the device sees.
 void ref_router(const std::vector<float>& g_in, int experts, int top_k, int n_group, int topk_group,
                 std::vector<int>& idx, std::vector<float>& w) {
   std::vector<float> gate(experts);

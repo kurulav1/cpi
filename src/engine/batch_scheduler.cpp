@@ -65,7 +65,7 @@ void BatchScheduler::admit(const std::string& id, const std::vector<int>& prompt
   s.pos = static_cast<int>(prompt_tokens.size()) - 1;
   s.params = params;
 
-  // Shared-prefix reuse: adopt the cached prefix's KV blocks for the longest WHOLE-BLOCK
+  // Shared-prefix reuse: adopt the cached prefix's KV blocks for the longest whole-BLOCK
   // common prefix, so only the suffix is prefilled. Capped below the prompt length so the
   // final block is always (re)prefilled to seed decode. Must run before grow_table allocates.
   int shared_tokens = 0;
@@ -147,7 +147,7 @@ bool BatchScheduler::step(std::vector<StreamEvent>& events) {
   // pressure grow_table first reclaims prefix-cache blocks; if a sequence still cannot grow,
   // preempt it (free its KV, report "preempted") rather than throwing and taking down the
   // whole batch. Sequences are held in admission order and grown oldest-first, so the newest
-  // hit the wall first -- preemption is newest-first, preserving older (closer-to-finish)
+  // hit the wall first; preemption is newest-first, preserving older (closer-to-finish)
   // requests.
   for (std::size_t b = 0; b < seqs_.size();) {
     try {
@@ -188,10 +188,10 @@ bool BatchScheduler::step(std::vector<StreamEvent>& events) {
     const char* e = std::getenv("CPI_BATCH_TOPK");
     return e == nullptr || e[0] != '0';
   }();
-  // Eligibility is PER ROW (each request's own params): the whole batch takes the fast path only
+  // Eligibility is per row (each request's own params): the whole batch takes the fast path only
   // if every row samples (temperature > 0), asks for top-k, and uses no n-gram blocking or
   // grammar (which need the full vocab on the host). Repetition penalty is applied ON DEVICE
-  // before the top-k, so it no longer vetoes the fast path -- each penalty row's unique seen ids
+  // before the top-k, so it no longer vetoes the fast path; each penalty row's unique seen ids
   // are gathered and passed down.
   bool used_topk = false;
   if (topk_enabled) {
@@ -210,7 +210,7 @@ bool BatchScheduler::step(std::vector<StreamEvent>& events) {
       sp.k.push_back(pr.top_k);
       sp.penalty.push_back(pr.repetition_penalty);
       if (pr.repetition_penalty > 1.0f) {
-        // Unique seen ids for this row -- matches the host's unordered_set(history).
+        // Unique seen ids for this row; matches the host's unordered_set(history).
         const auto& hist = seqs_[static_cast<std::size_t>(b)].history;
         std::unordered_set<int> seen(hist.begin(), hist.end());
         for (int id : seen) {
@@ -227,7 +227,7 @@ bool BatchScheduler::step(std::vector<StreamEvent>& events) {
 
   // Try the device greedy (argmax) fast path when the top-k path did not run: a batch of greedy
   // rows returns B winner ids via a device reduction instead of shipping [batch][vocab] logits for
-  // a host argmax. Eligible only if EVERY row is greedy (temperature <= 0) with no grammar and no
+  // a host argmax. Eligible only if every row is greedy (temperature <= 0) with no grammar and no
   // n-gram blocking (both need the full vocab on the host); repetition penalty is applied on-device
   // before the argmax, and EOS is excluded per row while below min_new_tokens.
   // CPI_BATCH_ARGMAX=0 forces the full-logits path (A/B lever and a safety switch).

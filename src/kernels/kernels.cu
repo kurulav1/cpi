@@ -343,12 +343,12 @@ __global__ void rope_inplace_partial_table_kernel(half* q, half* k, int num_head
 }
 
 // The device-position twin of rope_inplace_partial_table_kernel, byte-for-byte the same
-// arithmetic: only the position source differs. Keep the two in lockstep -- the graph gate
+// arithmetic: only the position source differs. Keep the two in lockstep; the graph gate
 // (graphs-on vs CPI_PLAN_NO_GRAPH streams must be token-identical) is what catches
 // drift between them.
 // ---------------------------------------------------------------------------
 // Decode fusions (the kernel-count tax). At T=1 on this GPU every kernel costs ~11-14 us
-// REGARDLESS of size -- a 3 KB residual add prices the same as a 1 MB GEMV -- so Gemma 4's
+// REGARDLESS of size, a 3 KB residual add prices the same as a 1 MB GEMV, so Gemma 4's
 // ~870-op token spent more time entering kernels than running them. These fuse the two
 // highest-count patterns; the executor's peepholes decide when they apply.
 
@@ -533,7 +533,7 @@ __global__ void rope_inplace_perpos_kernel(half* q, half* k, int num_tokens, int
 // q_row_stride / k_row_stride let this rotate Q and K IN PLACE inside the fused QKV buffer,
 // rather than requiring them to be copied out into contiguous [tokens, heads*head_dim] buffers
 // first. Prefill is host-bound and those copies were 3 of the 7 cudaMemcpy2DAsync per layer.
-// Passing the natural strides (num_heads * head_dim) reproduces the old behaviour EXACTLY.
+// Passing the natural strides (num_heads * head_dim) reproduces the old behaviour exactly.
 __global__ void rope_inplace_batched_kernel(half* q, half* k, int num_tokens, int num_heads_q,
                                             int num_heads_k, int head_dim, int start_position,
                                             const float* cos_table, const float* sin_table,
@@ -600,7 +600,7 @@ __global__ void attention_prefill_kernel_fallback(const half* q, const half* k_c
   const int kv_head =
       ((head / group_size) < kv_heads_safe) ? (head / group_size) : (kv_heads_safe - 1);
   // Each thread owns head_dim/blockDim OUTPUT channels. A SCALAR accumulator silently
-  // drops every channel past blockDim -- with Gemma's head_dim=512 full layers on 128
+  // drops every channel past blockDim; with Gemma's head_dim=512 full layers on 128
   // threads that is 3/4 of the head, computed and written as if it did not exist. The
   // decode kernel was fixed for exactly this; the prefill fallback never was, because
   // Llama's head_dim (128) always fit in one thread's slot.
@@ -617,7 +617,7 @@ __global__ void attention_prefill_kernel_fallback(const half* q, const half* k_c
 #pragma unroll
   for (int j = 0; j < kOutPer; ++j) acc[j] = 0.0f;
   // How far this token may see:
-  //   limits != null : per-token key limit -- this is what makes an IMAGE SPAN
+  //   limits != null : per-token key limit; this is what makes an image span
   //                    bidirectional (every token in the span sees the whole span)
   //                    while the surrounding text stays causal.
   //   causal         : its own prefix.
@@ -715,7 +715,7 @@ __global__ void attention_prefill_kernel_tiled(const half* q, const half* k_cach
       ((head / group_size) < kv_heads_safe) ? (head / group_size) : (kv_heads_safe - 1);
   const int head_pairs = head_dim / 2;
   // How far this token may see:
-  //   limits != null : per-token key limit -- this is what makes an IMAGE SPAN
+  //   limits != null : per-token key limit; this is what makes an image span
   //                    bidirectional (every token in the span sees the whole span)
   //                    while the surrounding text stays causal.
   //   causal         : its own prefix.
@@ -738,7 +738,7 @@ __global__ void attention_prefill_kernel_tiled(const half* q, const half* k_cach
   __syncthreads();
 
   // Each thread owns head_dim/blockDim output channels (2 at head_dim=256 with
-  // 128 threads), so the accumulator MUST be an array — a scalar conflates the
+  // 128 threads), so the accumulator must be an array — a scalar conflates the
   // strided output dims into one, corrupting head_dim > blockDim (256).
   constexpr int kOutPerThread = (256 + WarpsPerBlock * 32 - 1) / (WarpsPerBlock * 32);
   float acc[kOutPerThread];
@@ -1031,10 +1031,10 @@ __global__ void rmsnorm_fast_kernel(const half* __restrict__ x, const half* __re
   }
 }
 
-// rmsnorm_fast + perm8 int8 activation quantization in ONE kernel, for the rows=1 norms
+// rmsnorm_fast + perm8 int8 activation quantization in one kernel, for the rows=1 norms
 // whose output feeds dp4a int4 projections (XNorm sites). The normed row never leaves
-// registers: fp16 y is written as usual, then the fp16-ROUNDED values are quantized --
-// exactly what the separate quantize kernel would read back -- so the fused path is
+// registers: fp16 y is written as usual, then the fp16-ROUNDED values are quantized
+// exactly what the separate quantize kernel would read back; so the fused path is
 // bit-identical to [rmsnorm_fast; quantize_fp16_to_int8_perm8]. cols <= Threads * 8.
 template <int Threads>
 __global__ void rmsnorm_quant_perm8_kernel(const half* __restrict__ x, const half* __restrict__ w,
@@ -1135,7 +1135,7 @@ __global__ void rmsnorm_quant_perm8_kernel(const half* __restrict__ x, const hal
 // result feeds straight back into a second GEMM as P.
 //
 // Row (h, i) is query token (q_start + i), so it may attend to keys j <= q_start + i. Masked
-// entries are written as ZERO, not -inf: they are consumed by a GEMM, not another softmax, so
+// entries are written as zero, not -inf: they are consumed by a GEMM, not another softmax, so
 // a zero weight is what drops them from the P.V product.
 __global__ void softmax_causal_rows_kernel(half* s, int chunk_stride, int keys, int q_start,
                                            int window) {
@@ -1147,7 +1147,7 @@ __global__ void softmax_causal_rows_kernel(half* s, int chunk_stride, int keys, 
   half* row = s + (static_cast<std::size_t>(h) * chunk_stride + i) * keys;
 
   const int valid = min(keys, q_start + i + 1);  // causal bound
-  // Sliding window: keys below (q_abs - window + 1) are masked out entirely -- excluded
+  // Sliding window: keys below (q_abs - window + 1) are masked out entirely; excluded
   // from max and sum, written as zero (they feed a GEMM, so zero drops them from P.V).
   const int lo = (window > 0) ? max(0, q_start + i + 1 - window) : 0;
   const int tid = threadIdx.x;
@@ -1173,10 +1173,10 @@ __global__ void softmax_causal_rows_kernel(half* s, int chunk_stride, int keys, 
   __syncthreads();
   const float mx = sh_max;
 
-  // Sum WITHOUT writing: the scores stay in fp16-from-the-GEMM until the single final store.
+  // Sum without writing: the scores stay in fp16-from-the-GEMM until the single final store.
   //
   // The first version wrote exp() back into the row here and then multiplied by 1/sum in a
-  // second pass -- rounding every probability to fp16 TWICE. The old kernel keeps them in fp32
+  // second pass; rounding every probability to fp16 twice. The old kernel keeps them in fp32
   // throughout, so that doubled the precision loss for no reason. One rounding is unavoidable
   // (the second GEMM consumes P as fp16); two is just sloppy.
   float sum = 0.0f;
@@ -1212,7 +1212,7 @@ __global__ void softmax_causal_rows_kernel(half* s, int chunk_stride, int keys, 
 // Building them in a kernel on the compute stream makes the ordering structural, so the pointers
 // cannot be written late or early relative to the GEMMs that consume them. A host build into a
 // pinned buffer, cudaMemcpyAsync'd, races: prefill_attention_tensorcore runs once per layer, so
-// layer L+1 overwrites the staging buffer while layer L's async copy is still in flight -- giving
+// layer L+1 overwrites the staging buffer while layer L's async copy is still in flight; giving
 // different logits on every run. (A pageable staging vector hides it, being effectively
 // synchronous; pinning the buffer exposes it.)
 __global__ void build_attention_ptrs_kernel(const half* k_layer, const half* v_layer, const half* q,
@@ -1414,7 +1414,7 @@ void launch_attention_prefill(const half* q, const half* k_cache, const half* v_
     if (head_dim <= 64) {
       // Do not change the default width: the warp count sets the fp32 accumulation order in
       // the softmax/dot reduction, so a different value shifts logits and can flip a greedy
-      // argmax. Wider blocks are not worth that here -- this kernel is bound by scalar-FMA
+      // argmax. Wider blocks are not worth that here; this kernel is bound by scalar-FMA
       // throughput, not occupancy.
       const int w = (env_warps > 0) ? env_warps : 2;
       const std::size_t smem64 = static_cast<std::size_t>(head_dim) * sizeof(half) +

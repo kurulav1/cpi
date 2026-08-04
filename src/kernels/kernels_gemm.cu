@@ -11,8 +11,8 @@
 // a few hundred patches at once, so it needs a real fp16 GEMM.
 //
 // NOTE ON NUMERICS: a tiled GEMM sums K in a different order than the GEMV, so the
-// two do NOT agree bit-for-bit. The executor therefore keeps dispatching single-token
-// work to the GEMV -- sequence mode must not perturb decode output.
+// two do not agree bit-for-bit. The executor therefore keeps dispatching single-token
+// work to the GEMV; sequence mode must not perturb decode output.
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -123,16 +123,16 @@ void launch_gelu_mul_strided(const half* a, const half* b, half* out, int n, int
 
 
 
-// Fused SwiGLU projection: gate-GEMV + up-GEMV + silu_mul in ONE kernel.
+// Fused SwiGLU projection: gate-GEMV + up-GEMV + silu_mul in one kernel.
 //
 //   out[i] = silu( dot(w_gate[i], x) ) * dot(w_up[i], x)
 //
 // Why: at batch 1 each kernel costs a fixed ~2.7 us of scheduling no matter how little
-// it does, and a 0.5B model spends over HALF its per-token budget on that tax rather
+// it does, and a 0.5B model spends over half its per-token budget on that tax rather
 // than on memory traffic. gate/up/silu were three kernels touching the same x; now they
-// are one. No weight relayout -- the kernel simply takes both weight pointers.
+// are one. No weight relayout; the kernel simply takes both weight pointers.
 //
-// BYTE-IDENTICAL by construction: g and u are rounded to fp16 BEFORE silu(g)*u, exactly
+// byte-identical by construction: g and u are rounded to fp16 before silu(g)*u, exactly
 // as the three-kernel version does when it stores them. Accumulating in fp32 straight
 // through would be more accurate and would silently change every model's output.
 template <int WarpsPerBlock, int TilePairs>
@@ -183,7 +183,7 @@ __global__ void swiglu_gemv_f16_kernel(const half* __restrict__ w_gate,
   gacc = warp_sum_f(gacc);
   uacc = warp_sum_f(uacc);
   if (active && lane == 0) {
-    // Round to fp16 first -- this is what the unfused path stores between kernels.
+    // Round to fp16 first; this is what the unfused path stores between kernels.
     const float g = __half2float(__float2half(gacc));
     const float u = __half2float(__float2half(uacc));
     const float silu = g / (1.0f + __expf(-g));
@@ -206,8 +206,8 @@ void launch_swiglu_gemv_f16(const half* w_gate, const half* w_up, const half* x,
 // reduced in shared memory.
 //
 // The existing GEMV gives one WARP per output row, so its parallelism is set by the row
-// COUNT. That is fine for a 151936-row LM head (4.8M threads) and useless for a 896-row
-// o_proj (29k threads on a GPU that runs ~348k) -- the machine sits 90% idle and memory
+// count. That is fine for a 151936-row LM head (4.8M threads) and useless for a 896-row
+// o_proj (29k threads on a GPU that runs ~348k); the machine sits 90% idle and memory
 // latency is never hidden, which is why those GEMVs measured 6-8x off peak while the tall
 // ones sat at peak.
 //
@@ -215,7 +215,7 @@ void launch_swiglu_gemv_f16(const half* w_gate, const half* w_up, const half* x,
 // the short-and-wide shapes that were starving.
 //
 // NOTE ON NUMERICS: partial sums are combined across warps, so the reduction order differs
-// from the one-warp kernel -- results agree to fp32 rounding but are NOT bit-identical.
+// from the one-warp kernel; results agree to fp32 rounding but are not bit-identical.
 // That is why this is opt-in per call site, not a silent replacement.
 template <int Warps>
 __global__ void gemv_splitk_f16_kernel(const half* __restrict__ w, const half* __restrict__ x,
@@ -236,7 +236,7 @@ __global__ void gemv_splitk_f16_kernel(const half* __restrict__ w, const half* _
     const half2* w2 = reinterpret_cast<const half2*>(wrow);
     const half2* x2 = reinterpret_cast<const half2*>(x);
     // Warp `warp` strides the pairs; every thread keeps several loads in flight, which is
-    // the whole point -- latency hiding, not extra bandwidth.
+    // the whole point; latency hiding, not extra bandwidth.
     for (int i = warp * warpSize + lane; i < pairs; i += Warps * warpSize) {
       const float2 wv = __half22float2(w2[i]);
       const float2 xv = __half22float2(x2[i]);

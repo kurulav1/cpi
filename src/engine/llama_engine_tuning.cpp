@@ -131,7 +131,7 @@ void LlamaEngine::resident_projection_float(const void* w, const void* x, void* 
                                             int in_features, int warps_per_block, int tile_pairs,
                                             int rows_per_warp) {
   // The LM head is the only fp32-output projection, and when it is quantized this is the one
-  // place that has to know. Every caller -- the eager forward and BOTH decode-graph captures --
+  // place that has to know. Every caller; the eager forward and both decode-graph captures
   // funnels through here, so routing it here means the graph picks it up too. (Two launchers
   // have bitten this engine before: the graph has its own copy of the layer code.)
   if (lm_head_int8_ && w == d_lm_head_ && d_lm_head_i8_ != nullptr) {
@@ -170,7 +170,7 @@ void LlamaEngine::resident_int8_mlp_w13(const LayerDeviceInt8Weights& lw_i8, int
   if (lw_i8.mlp_int4 && lw_i8.mlp_group > 0) {
     // Group-wise int4 via perm8 dp4a: quantize the fp16 FFN-norm activation (d_x_norm_) to perm8-g32
     // once, then two grouped dp4a GEMVs (w1, w3) share it. Overwrites the caller's rowwise
-    // d_prefill_i8_ (that quant is then dead, harmless -- same stream, d_x_norm_ unmodified).
+    // d_prefill_i8_ (that quant is then dead, harmless; same stream, d_x_norm_ unmodified).
     kernels::launch_quantize_fp16_to_int8_perm8_g32(
         static_cast<const __half*>(d_x_norm_), static_cast<std::int8_t*>(d_prefill_i8_),
         static_cast<float*>(d_prefill_perm8_scales_), hidden, compute_stream_);

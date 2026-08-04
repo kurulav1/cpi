@@ -3,7 +3,7 @@
 // The experts are stored as one contiguous matrix each, not as N separate
 // tensors: gate_up is [num_experts * 2 * inter, hidden] and down is
 // [num_experts * hidden, inter], both row-major. Expert e's rows simply start at
-// e * rows_per_expert, so an expert selection is a row offset -- which means the
+// e * rows_per_expert, so an expert selection is a row offset; which means the
 // existing quantiser and its group-wise scales apply unchanged, and the expert
 // weights (which are ~90% of an MoE model) get quantised like any other matrix.
 //
@@ -45,7 +45,7 @@ __device__ __forceinline__ int load_signed_int4(const std::int8_t* row, int col)
 // One weight element, dequantised. BITS: 0 = fp16, 8 = int8, 4 = packed int4.
 //
 // Per-row scales are expressed as group_shift = 31 / n_groups = 1, which makes
-// (col >> 31) == 0 for every real column -- so the per-row and group-wise cases
+// (col >> 31) == 0 for every real column; so the per-row and group-wise cases
 // use the same indexing with no branch in the inner loop.
 template <int BITS>
 struct Weight {
@@ -74,8 +74,8 @@ struct Weight {
 };
 
 // inter[k, r] = act(gate) * up, where gate and up are rows r and (inter + r) of the selected expert's
-// fused gate_up matrix. ONE WARP per output element (grid.x groups warps_per_block rows; grid.y =
-// top_k) -- far more output rows in flight per SM than the old block-per-row form, and no shared-memory
+// fused gate_up matrix. one WARP per output element (grid.x groups warps_per_block rows; grid.y =
+// top_k); far more output rows in flight per SM than the old block-per-row form, and no shared-memory
 // block reduction (just a warp shuffle). Memory-bound int4/int8 matvec, so occupancy is what matters.
 template <int BITS>
 __global__ void moe_gate_up_geglu_kernel(Weight<BITS> w, const half* x, const int* topk_idx,
@@ -106,8 +106,8 @@ __global__ void moe_gate_up_geglu_kernel(Weight<BITS> w, const half* x, const in
   }
 }
 
-// y[r] = sum_k topk_weight[k] * dot(down[expert_k].row(r), inter[k]). ONE WARP per output row: the warp
-// walks all top_k experts (weighted sum, no atomics), reducing each expert's dot with a warp shuffle --
+// y[r] = sum_k topk_weight[k] * dot(down[expert_k].row(r), inter[k]). one WARP per output row: the warp
+// walks all top_k experts (weighted sum, no atomics), reducing each expert's dot with a warp shuffle
 // no shared memory, no __syncthreads. grid.x groups warps_per_block output rows.
 template <int BITS>
 __global__ void moe_down_accum_kernel(Weight<BITS> w, const half* inter_in, const int* topk_idx,

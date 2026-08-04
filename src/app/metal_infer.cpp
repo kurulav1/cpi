@@ -108,8 +108,8 @@ int main(int argc, char** argv) {
   std::fprintf(stderr, "[metal] prompt: %zu tokens\n", ids.size());
 
   // CPI_METAL_GPUTRACE=<path> captures this run for Xcode's Metal Debugger. Unlike
-  // metal_gemm_bench's capture, this is a REAL pass: real weights, real dependent ops, real
-  // slot reuse, and the chunk sizes a prefill really issues -- all of which matter, because a
+  // metal_gemm_bench's capture, this is a real pass: real weights, real dependent ops, real
+  // slot reuse, and the chunk sizes a prefill really issues; all of which matter, because a
   // limiter read off the bench describes the bench, and the bench is free to time a shape the
   // engine never runs.
   //
