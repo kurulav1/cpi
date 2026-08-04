@@ -1059,7 +1059,12 @@ void PlanCudaEngine::load_deepseek_weights() {
           for (int d = 0; d < vhd; ++d)
             pad[(static_cast<std::size_t>(r) * nh + h) * qk + d] =
                 oh[(static_cast<std::size_t>(r) * nh + h) * vhd + d];
-      upload_host_fp16(p + "self_attn.o_proj.weight", pad, H, nh * qk);
+      // int4 under --weight-quant (biggest attention read); else fp16. The padded zero columns
+      // quantize to 0, so o_proj still consumes the padded Att slot directly either way.
+      if (quant)
+        fuse_upload_experts_int4(p + "self_attn.o_proj.weight", pad, H, nh * qk);
+      else
+        upload_host_fp16(p + "self_attn.o_proj.weight", pad, H, nh * qk);
     }
 
     // ── MoE (layers >= first_k_dense_replace) or a dense MLP (the first layers) ──
