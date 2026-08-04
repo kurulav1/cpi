@@ -52,6 +52,13 @@ export const CHAT_SPECS = {
     user: { prefix: "<｜User｜>", suffix: "" },
     assistant: { prefix: "<｜Assistant｜>", suffix: "<｜end▁of▁sentence｜>" },
     generationPrompt: "<｜Assistant｜>"
+  },
+  "deepseek-v2": {
+    join: "", addBos: false, bosLiteral: "<｜begin▁of▁sentence｜>",
+    system: { mode: "prepend", suffix: "\n\n" },
+    user: { prefix: "User: ", suffix: "\n\n" },
+    assistant: { prefix: "Assistant: ", suffix: "<｜end▁of▁sentence｜>" },
+    generationPrompt: "Assistant:"
   }
 };
 CHAT_SPECS.llama4 = { ...CHAT_SPECS.llama3 };

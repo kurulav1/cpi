@@ -577,14 +577,20 @@ function buildQuantState(modelPath, extraArgs, { isSafetensorsDir = false, famil
   // while we run it at int8/int4 daily.
   const isCpi = String(modelPath || "").toLowerCase().endsWith(".cpi");
   const nativeRuntimeQuant =
-    isCpi || (isSafetensorsDir && (normalizedFamily === "qwen3_5" || normalizedFamily === "gemma4"));
+    isCpi || (isSafetensorsDir && (normalizedFamily === "qwen3_5" || normalizedFamily === "gemma4" ||
+                                   normalizedFamily === "deepseek_v2"));
   const qwen35Safetensors = nativeRuntimeQuant;
+  // DeepSeek-V2-Lite is 16B: fp16 (~32 GB) does not fit alongside the KV cache on a
+  // 32 GB card, so it defaults to int4 (~9.4 GB) when nothing is configured. gemma4 /
+  // qwen3_5 keep their "none" default (small models that fit fp16).
+  const runtimeQuantDefault = normalizedFamily === "deepseek_v2" ? "int4" : "none";
+  const preferConfigured = configuredMode === "int8" || configuredMode === "int4";
   const fallback = {
     format: isSafetensorsDir ? "safetensors" : isCpi ? "cpi" : "unknown",
     configuredMode,
-    recommendedMode: configuredMode,
+    recommendedMode: (qwen35Safetensors && !preferConfigured) ? runtimeQuantDefault : configuredMode,
     effectiveMode: qwen35Safetensors
-      ? (configuredMode === "int8" || configuredMode === "int4" ? configuredMode : "none")
+      ? (preferConfigured ? configuredMode : runtimeQuantDefault)
       : configuredMode,
     selectableModes: qwen35Safetensors ? ["none", "int8", "int4"] : ["none"],
     packed: { int8: false, int4: false, tq3: false },
@@ -1037,6 +1043,11 @@ function inferProfileFamily(modelPath, hfConfig) {
   if (modelType.includes("qwen2")) {
     return "qwen";
   }
+  // DeepSeek-V2 (native MLA + fine-grained MoE) runs natively on the op-plan engine
+  // from the safetensors dir -- its own family, like gemma4/qwen3_5/llama4.
+  if (modelType.includes("deepseek_v2") || rootModelType.includes("deepseek_v2")) {
+    return "deepseek_v2";
+  }
   return modelFamilyName(path.basename(modelPath || ""));
 }
 
@@ -1087,6 +1098,14 @@ function inferTemplate(modelPath, tokenizerPath, fallbackTemplate, hfConfig, hfT
   if ((mt.includes("qwen3") || rmt.includes("qwen3")) &&
       !mt.includes("qwen3_5") && !rmt.includes("qwen3_5")) {
     return "qwen3";
+  }
+
+  // DeepSeek-V2 (native MLA + fine-grained MoE, e.g. DeepSeek-V2-Lite) uses a plain
+  // User:/Assistant: text template with the U+FF5C sentence tokens -- distinct from
+  // DeepSeek-R1's <｜User｜>/<｜Assistant｜> reasoning format. Key on model_type so it
+  // doesn't fall through to the llama4 safetensors default below.
+  if (mt.includes("deepseek_v2") || rmt.includes("deepseek_v2")) {
+    return "deepseek-v2";
   }
 
   const templateFromTokenizerConfig = inferTemplateFromChatTemplate(
@@ -1393,7 +1412,7 @@ export function readModelChat(modelPath) {
 // Families that run on their own engine rather than LlamaEngine's batched path.
 // (Shared with index.mjs's isBatchCompatible, which adds the REQUEST-level checks --
 // thinking, runtime quantization, images. One source of truth for the profile-level part.)
-export const NON_BATCH_FAMILIES = new Set(["qwen3_5", "llama4", "cpt_gpt", "gemma4"]);
+export const NON_BATCH_FAMILIES = new Set(["qwen3_5", "llama4", "cpt_gpt", "gemma4", "deepseek_v2"]);
 
 // Can this MODEL ever use continuous batching? Request-level reasons to fall back to
 // single-flight (thinking, images, runtime quant) are checked separately.
@@ -1469,7 +1488,9 @@ function buildProfile(modelPath, tokenizerPath, baseConfig, source = "discovered
   // container that still carries its vision tower -- the .cpi converter strips it), so it
   // no longer "needs conversion".
   const supportsNativeSafetensors =
-    isSafetensorsDir && (family === "llama4" || family === "qwen3_5" || family === "gemma4");
+    isSafetensorsDir &&
+    (family === "llama4" || family === "qwen3_5" || family === "gemma4" ||
+     family === "deepseek_v2");
   const modelExists = Boolean(modelPath) && fs.existsSync(modelPath);
   const tokenizerExists = Boolean(tokenizerPath) && fs.existsSync(tokenizerPath);
   const filesExist =

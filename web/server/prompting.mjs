@@ -13,6 +13,9 @@ const STOP_SEQUENCES = {
   gemma:    ["<turn|>", "<|turn>"],
   // DeepSeek-R1 special tokens use U+FF5C (｜) and U+2581 (▁).
   "deepseek-r1": ["<｜end▁of▁sentence｜>", "<｜User｜>", "<｜Assistant｜>"],
+  // DeepSeek-V2 is a plain User:/Assistant: text template (not R1's special tokens);
+  // it ends a turn with the sentence-end token, and "\nUser:" guards a runaway turn.
+  "deepseek-v2": ["<｜end▁of▁sentence｜>", "\nUser:"],
   plain:    []
 };
 
@@ -487,6 +490,24 @@ function formatDeepseekR1(turns, systemPrompt) {
   return out;
 }
 
+// DeepSeek-V2 (e.g. DeepSeek-V2-Lite): a plain-text template, NOT R1's reasoning
+// format. BOS is emitted literally (the tokenizer maps the text form to the BOS id;
+// relying on the worker's add_bos would drop it). System prompt (if any) is prepended
+// raw + "\n\n". Each turn is "User: {msg}\n\n" then "Assistant: {msg}<eos>"; a pending
+// turn primes "Assistant:" (no trailing space -- the model emits the leading space, as
+// in the model's own chat_template). Distinct from formatDeepseekR1 (special tokens +
+// <think> prime).
+function formatDeepseekV2(turns, systemPrompt) {
+  const BOS = "<｜begin▁of▁sentence｜>";
+  const EOS = "<｜end▁of▁sentence｜>";
+  let out = BOS + (systemPrompt ? `${systemPrompt}\n\n` : "");
+  for (const turn of turns) {
+    out += `User: ${turn.user}\n\n`;
+    out += turn.assistant ? `Assistant: ${turn.assistant}${EOS}` : "Assistant:";
+  }
+  return out;
+}
+
 function formatPlain(turns, systemPrompt) {
   const lines = [`System: ${systemPrompt}`];
 
@@ -549,7 +570,7 @@ export function renderChat(turns, systemPrompt, chat, prime = "") {
   });
 
   let out = blocks.join(chat.join ?? "");
-  if (S.mode === "prepend" && sys) out = sys + out;
+  if (S.mode === "prepend" && sys) out = `${S.prefix ?? ""}${sys}${S.suffix ?? ""}` + out;
   out = (chat.bosLiteral ?? "") + out;
   return chat.trim ? out.trim() : out;
 }
@@ -718,6 +739,16 @@ export function buildPromptPackage(messages, options = {}) {
       template,
       thinking: true,  // R1 always emits a <think> block
       stopTexts: STOP_SEQUENCES["deepseek-r1"],
+      addBos: false    // BOS token is emitted literally in the prompt
+    };
+  }
+
+  if (template === "deepseek-v2") {
+    return {
+      messages: chatMessages,
+      prompt: formatDeepseekV2(turns, effectiveSystemPrompt),
+      template,
+      stopTexts: STOP_SEQUENCES["deepseek-v2"],
       addBos: false    // BOS token is emitted literally in the prompt
     };
   }

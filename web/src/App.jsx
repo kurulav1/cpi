@@ -18,6 +18,7 @@ const TEMPLATES = [
   { value: "phi3",            label: "Phi-3" },
   { value: "qwen2",           label: "Qwen 2" },
   { value: "qwen3_5",         label: "Qwen 3.5" },
+  { value: "deepseek-v2",     label: "DeepSeek-V2" },
   { value: "plain",           label: "Plain" },
 ];
 
