@@ -141,6 +141,11 @@ class PlanCudaEngine : public runtime::SequenceModel {
 
   void parse_manifest(const std::string& manifest_path);
   bool seq_gemm_cublas(const __half* w, const __half* x, __half* y, int out, int in, int T);
+  // Grouped-GEMM MoE seq prefill (DeepSeek). gate_up builds+caches the host routing, gathers per
+  // expert and runs gate/up GEMM + SiLU; down runs the down GEMM and scatters into MoeOut. Return
+  // false to fall back to the per-token loop (routing not built, or no cuBLAS).
+  bool moe_grouped_gate_up(const opplan::Op& op, __half* xnorm, int T);
+  bool moe_grouped_down(const opplan::Op& op, __half* moe_out, int T);
   void verify_greedy(const int* tokens, int k, int pos, int* out_argmax);
   void load_all(const std::string& cpi_path);
   // ── Qwen3.5 recipe (config parse + weight load + plan build). The executor,
@@ -454,6 +459,22 @@ private:
   // T==1 kernels per token in seq mode (DeepSeek batched prefill), reading token t's slot.
   int* d_moe_idx_seq_ = nullptr;
   float* d_moe_w_seq_ = nullptr;
+
+  // Grouped-GEMM MoE prefill (CPI_DS_MOE_GROUPED): route on the host, bucket tokens per expert,
+  // then one dequant+cuBLAS GEMM per expert instead of a matvec per token. Buffers sized for the
+  // worst case P = max_tokens * top_k routings. gate_g doubles as the SiLU-gated inter (in place).
+  __half* d_moe_gather_ = nullptr;    // [P, hidden]   gathered token rows, grouped by expert
+  __half* d_moe_gate_g_ = nullptr;    // [P, moe_inter] gate GEMM out, then SiLU(gate)*up in place
+  __half* d_moe_up_g_ = nullptr;      // [P, moe_inter] up GEMM out
+  __half* d_moe_outg_ = nullptr;      // [P, hidden]   per-expert down GEMM out
+  int* d_moe_perm_ = nullptr;         // [P] source token id per grouped row
+  float* d_moe_rweight_ = nullptr;    // [P] routing weight per grouped row
+  float* d_moe_out_f32_ = nullptr;    // [max_tokens, hidden] fp32 scatter accumulator
+  std::vector<int> h_moe_idx_seq_;    // host copy of the [T*top_k] selections for routing
+  std::vector<float> h_moe_w_seq_;    // host copy of the [T*top_k] weights
+  std::vector<int> h_moe_off_;        // [E+1] grouped-row offset per expert (cached gate_up->down)
+  std::vector<int> h_moe_perm_;       // [P] source token id per grouped row (cached gate_up->down)
+  int moe_grouped_total_ = 0;         // P for the current chunk (cached gate_up->down)
   // DeepSeek-V2 MLA working set + rope table.
   __half* d_mla_ckv_ = nullptr;      // [kv_lora + qk_rope]  (kv_a_proj output)
   __half* d_mla_latent_ = nullptr;   // [kv_lora]            (kv_a_layernorm output)
