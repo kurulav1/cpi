@@ -4,7 +4,7 @@
 Each stage of the port is gated against one of these tensors, in isolation, so a
 discrepancy points at exactly one component:
 
-  image.png            the fixed input image (CPI reads THIS, not a re-encode)
+  image.png            the fixed input image (CPI reads this, not a re-encode)
   pixel_values.bin     CLIP preprocess output [1,3,336,336]  -> gates CPI preprocessing
   tower_hidden.bin     vision tower hidden_states[-2] [1,577,1024] (incl. CLS)
                                                         -> gates the CLIP ViT tower
@@ -15,11 +15,11 @@ discrepancy points at exactly one component:
                                                         -> gates end-to-end splice+LLM
   meta.json            shapes + the config knobs CPI must match
 
-Everything is float32, C-contiguous, little-endian raw bytes -- a CPI parity test
+Everything is float32, C-contiguous, little-endian raw bytes; a CPI parity test
 mmaps the file and compares element-wise.
 
 Run once after the checkpoint is downloaded:
-  python oracle/llava/dump_oracle.py <checkpoint_dir> <out_dir>
+  python tools/llava_oracle.py <checkpoint_dir> <out_dir>
 """
 import json
 import os
