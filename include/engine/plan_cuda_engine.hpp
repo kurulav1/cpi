@@ -450,6 +450,10 @@ private:
   __half* d_moe_out_ = nullptr;        // [hidden]
   int* d_moe_idx_ = nullptr;           // [top_k] selected experts
   float* d_moe_w_ = nullptr;           // [top_k] routing weights
+  // Sequence-prefill routing: one [top_k] slot per token ([max_tokens][top_k]). The MoE ops loop the
+  // T==1 kernels per token in seq mode (DeepSeek batched prefill), reading token t's slot.
+  int* d_moe_idx_seq_ = nullptr;
+  float* d_moe_w_seq_ = nullptr;
   // DeepSeek-V2 MLA working set + rope table.
   __half* d_mla_ckv_ = nullptr;      // [kv_lora + qk_rope]  (kv_a_proj output)
   __half* d_mla_latent_ = nullptr;   // [kv_lora]            (kv_a_layernorm output)

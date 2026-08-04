@@ -1614,11 +1614,15 @@ void PlanCudaEngine::open(const std::string& cpi_path, int max_context) {
                             cudaMemcpyHostToDevice));
       }
       build_deepseek_plan();
-      // MLA ops (MlaAssembleRope) have only a T==1 path, so drive prefill token-by-token (also what
-      // the MoE layers require). Decode uses CUDA-graph capture (MlaAssembleRope has a device-position
-      // variant, so the graph is position-correct on replay; verified token-identical to eager).
-      // Persistent decode stays off unless CPI_CUDA_PERSISTENT is set.
-      seq_prefill_ok_ = false;
+      // Batched sequence prefill: MlaAssembleRope has a T>1 kernel and the MoE ops loop the T==1
+      // kernels per token (d_moe_idx_seq_), so the whole prompt runs in one pass -- the projections,
+      // MLA attention and o_proj batch as GEMMs; only the experts stay matvec. Decode uses CUDA-graph
+      // capture (MlaAssembleRope's device-position variant keeps the graph position-correct on replay;
+      // verified token-identical to eager). Persistent decode stays off unless CPI_CUDA_PERSISTENT.
+      // CPI_DS_NO_SEQ_PREFILL=1 forces the old token-by-token prefill (a correctness escape hatch).
+      seq_prefill_ok_ =
+          std::getenv("CPI_DS_NO_SEQ_PREFILL") == nullptr && plan_can_sequence_prefill();
+      if (seq_prefill_ok_) allocate_sequence_buffers(std::min(max_ctx_, 4096));
       G4_CHECK(cudaStreamSynchronize(stream_));
       return;
     }
@@ -2825,6 +2829,19 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
           actq_set_now = true;
           break;
         }
+        // DeepSeek kv_a_layernorm normalizes only the [kv_lora] latent PREFIX of the wider
+        // MlaCkv=[latent | k_pe] row (per-token stride kva != cols), so the contiguous seq
+        // norm would read the wrong slices for t>0. Loop the T==1 norm per token with the true
+        // input stride; output MlaLatent is contiguous [T][kv_lora].
+        if (seq && op.in == Slot::MlaCkv && op.out == Slot::MlaLatent) {
+          const int kva = op.cols + cfg_.qk_rope_head_dim;
+          for (int t = 0; t < T; ++t)
+            kernels::launch_rmsnorm(S(op.in) + static_cast<std::size_t>(t) * kva,
+                                    HW(op.weight) ? HW(op.weight) : d_ones_,
+                                    S(op.out) + static_cast<std::size_t>(t) * op.cols, 1, op.cols,
+                                    cfg_.rms_eps, stream_);
+          break;
+        }
         // norm_offset ⇒ the weight is applied as (1 + w) (Qwen3.5-style).
         if (op.norm_offset) {
           kernels::launch_rmsnorm_offset(S(op.in), HW(op.weight), S(op.out), rows_x(op.rows),
@@ -3037,11 +3054,32 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
       case OpKind::MoeRouterTopk:
         // Writes the selected experts to DEVICE buffers; the expert ops below read
         // them there, so a token never round-trips to the host mid-layer.
-        kernels::launch_moe_router_topk_softmax(S(op.in), op.cols, op.heads, d_moe_idx_, d_moe_w_,
-                                                stream_, HW(op.weight), op.moe_renorm);
+        if (seq) {
+          for (int t = 0; t < T; ++t)
+            kernels::launch_moe_router_topk_softmax(
+                S(op.in) + static_cast<std::size_t>(t) * op.cols, op.cols, op.heads,
+                d_moe_idx_seq_ + static_cast<std::size_t>(t) * op.heads,
+                d_moe_w_seq_ + static_cast<std::size_t>(t) * op.heads, stream_, HW(op.weight),
+                op.moe_renorm);
+        } else {
+          kernels::launch_moe_router_topk_softmax(S(op.in), op.cols, op.heads, d_moe_idx_, d_moe_w_,
+                                                  stream_, HW(op.weight), op.moe_renorm);
+        }
         break;
       case OpKind::MoeGateUpGeglu:
-        if (moe_stream_ && op.qbits) {
+        if (seq) {
+          // Sequence prefill: loop the (verified) T==1 scalar kernel per token, reading token t's
+          // routing slot and writing its [top_k*MI] inter block. Experts stay matvec; the win is that
+          // the projections/attention around the MoE batch as GEMMs.
+          for (int t = 0; t < T; ++t)
+            kernels::launch_moe_gate_up_geglu(
+                op.qbits ? static_cast<const void*>(op.qweight) : static_cast<const void*>(op.weight),
+                QS(op.qscales), op.qbits, op.qgroup,
+                S(op.in) + static_cast<std::size_t>(t) * op.in_dim,
+                d_moe_idx_seq_ + static_cast<std::size_t>(t) * op.heads,
+                S(op.out) + static_cast<std::size_t>(t) * op.heads * op.cols, op.cols, op.in_dim,
+                op.heads, stream_, op.mlp_gelu);
+        } else if (moe_stream_ && op.qbits) {
           // gate_up is [E*2*MI, H]: rows-per-expert = 2*cols, in_features = in_dim (=H).
           stage_moe_experts(op.qweight, QS(op.qscales), 2 * op.cols, op.in_dim, op.qgroup,
                             d_moe_stage_gu_, d_moe_stage_gu_s_);
@@ -3064,7 +3102,19 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
         }
         break;
       case OpKind::MoeDownAccum:
-        if (moe_stream_ && op.qbits) {
+        if (seq) {
+          // Sequence prefill: loop the T==1 scalar down/accum per token. Reads token t's [top_k*MI]
+          // inter block + its routing slot, accumulates into token t's output row.
+          for (int t = 0; t < T; ++t)
+            kernels::launch_moe_down_accum(
+                op.qbits ? static_cast<const void*>(op.qweight) : static_cast<const void*>(op.weight),
+                QS(op.qscales), op.qbits, op.qgroup,
+                S(op.in) + static_cast<std::size_t>(t) * op.heads * op.in_dim,
+                d_moe_idx_seq_ + static_cast<std::size_t>(t) * op.heads,
+                d_moe_w_seq_ + static_cast<std::size_t>(t) * op.heads,
+                S(op.out) + static_cast<std::size_t>(t) * op.cols, op.cols, op.in_dim, op.heads,
+                stream_);
+        } else if (moe_stream_ && op.qbits) {
           // down is [E*H, MI]: rows-per-expert = cols (=H), in_features = in_dim (=MI). The routing
           // weights (d_moe_w_) are indexed by selection position k, so they stay as-is.
           stage_moe_experts(op.qweight, QS(op.qscales), op.cols, op.in_dim, op.qgroup,
@@ -3091,11 +3141,18 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
         // DeepSeek MLA: assemble per-head K/V from the kv_b output + shared k_pe, rope q_pe/k_pe.
         // Runs at T==1 (MoE forces token-by-token, so no sequence path). heads=nh,
         // key_head_dim=qk_nope, rotary_dim=qk_rope, value_head_dim=v_head, in_dim=kv_lora.
-        engine::launch_mla_assemble_rope(S(Slot::Q), S(Slot::MlaKvb), S(Slot::MlaCkv), S(Slot::K),
-                                         S(Slot::V), static_cast<const float*>(op.aux_ptr), op.heads,
-                                         op.key_head_dim, op.rotary_dim, op.value_head_dim, op.in_dim,
-                                         position, device_pos_mode_ ? d_position_ : nullptr,
-                                         op.scale, stream_);
+        if (seq) {
+          engine::launch_mla_assemble_rope_seq(
+              S(Slot::Q), S(Slot::MlaKvb), S(Slot::MlaCkv), S(Slot::K), S(Slot::V),
+              static_cast<const float*>(op.aux_ptr), op.heads, op.key_head_dim, op.rotary_dim,
+              op.value_head_dim, op.in_dim, T, position, op.scale, stream_);
+        } else {
+          engine::launch_mla_assemble_rope(
+              S(Slot::Q), S(Slot::MlaKvb), S(Slot::MlaCkv), S(Slot::K), S(Slot::V),
+              static_cast<const float*>(op.aux_ptr), op.heads, op.key_head_dim, op.rotary_dim,
+              op.value_head_dim, op.in_dim, position, device_pos_mode_ ? d_position_ : nullptr,
+              op.scale, stream_);
+        }
         break;
       }
       case OpKind::Rope: {
@@ -3601,11 +3658,13 @@ bool PlanCudaEngine::plan_can_sequence_prefill() const {
     for (const Op& o : lp.ops) {
       if (o.kind == OpKind::Rope && o.rotary_dim > 0) return false;
       if (o.kind == OpKind::LinearAttentionStep || o.kind == OpKind::LinearConv1d) return false;
-      // MoE routing/expert kernels are single-token (the router writes one token's expert
-      // selection); they have no multi-row sequence form yet, so MoE plans keep the
-      // token-by-token prefill (like partial-RoPE / delta-net above).
-      if (o.kind == OpKind::MoeRouterTopk || o.kind == OpKind::MoeGateUpGeglu ||
-          o.kind == OpKind::MoeDownAccum)
+      // MoE routing/expert kernels are single-token. DeepSeek's seq path loops the T==1 kernels
+      // per token (d_moe_idx_seq_ holds one [top_k] slot per token), so its MoE plans CAN
+      // sequence-prefill; other MoE families (Gemma) have no seq loop wired, so they keep the
+      // token-by-token prefill.
+      if ((o.kind == OpKind::MoeRouterTopk || o.kind == OpKind::MoeGateUpGeglu ||
+           o.kind == OpKind::MoeDownAccum) &&
+          cfg_.family != Family::DeepSeekV2)
         return false;
     }
   }
@@ -3613,6 +3672,43 @@ bool PlanCudaEngine::plan_can_sequence_prefill() const {
 }
 
 void PlanCudaEngine::allocate_sequence_buffers(int max_tokens) {
+  if (cfg_.family == Family::DeepSeekV2) {
+    const int H = cfg_.hidden, nh = cfg_.num_heads, qkhd = cfg_.head_dim;
+    const int kvw = nh * qkhd;
+    const int E = cfg_.num_experts, K = cfg_.top_k_experts, MI = cfg_.moe_intermediate_size;
+    const int maxinter = std::max(cfg_.intermediate, MI * std::max(1, cfg_.n_shared_experts));
+    seq_max_tokens_ = max_tokens;
+    auto al = [&](opplan::Slot slot, std::size_t per_token) {
+      __half* d = nullptr;
+      G4_CHECK(cudaMalloc(&d, static_cast<std::size_t>(max_tokens) * per_token * sizeof(__half)));
+      sslot_ptr_[static_cast<int>(slot)] = d;
+      seq_buffers_.push_back(d);
+    };
+    using opplan::Slot;
+    al(Slot::X, H);
+    al(Slot::XNorm, H);
+    al(Slot::Tmp, H);
+    al(Slot::Q, kvw);
+    al(Slot::K, kvw);
+    al(Slot::V, kvw);
+    al(Slot::Att, kvw);
+    al(Slot::Gate, maxinter);
+    al(Slot::Up, maxinter);
+    al(Slot::Inter, maxinter);
+    al(Slot::MlaCkv, cfg_.kv_lora_rank + cfg_.qk_rope_head_dim);
+    al(Slot::MlaLatent, cfg_.kv_lora_rank);
+    al(Slot::MlaKvb, static_cast<std::size_t>(nh) * (cfg_.qk_nope_head_dim + cfg_.v_head_dim));
+    al(Slot::MoeRouterIn, H);
+    al(Slot::MoeLogits, E);
+    al(Slot::MoeInter, static_cast<std::size_t>(K) * MI);
+    al(Slot::MoeOut, H);
+    G4_CHECK(cudaMalloc(&d_moe_idx_seq_, static_cast<std::size_t>(max_tokens) * K * sizeof(int)));
+    G4_CHECK(cudaMalloc(&d_moe_w_seq_, static_cast<std::size_t>(max_tokens) * K * sizeof(float)));
+    G4_CHECK(cudaMalloc(&d_seq_tokens_, static_cast<std::size_t>(max_tokens) * sizeof(int)));
+    G4_CHECK(cudaMalloc(&d_seq_limits_, static_cast<std::size_t>(max_tokens) * sizeof(int)));
+    return;
+  }
+
   const int H = cfg_.hidden;
   const int maxhd = std::max(cfg_.head_dim_full, cfg_.head_dim_sliding);
   const int maxq = cfg_.num_heads * maxhd;
