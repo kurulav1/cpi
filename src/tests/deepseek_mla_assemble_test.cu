@@ -70,7 +70,7 @@ int main() {
   cudaMalloc(&dinv, half * sizeof(float));
   cudaMemcpy(dinv, inv_freq.data(), half * sizeof(float), cudaMemcpyHostToDevice);
   engine::launch_mla_assemble_rope(dQ, dkvb, dckv, dK, dV, dinv, nh, qk_nope, qk_rope, v_head,
-                                   kv_lora, position, scaling, 0);
+                                   kv_lora, position, nullptr, scaling, 0);
   cudaDeviceSynchronize();
   std::vector<__half> Kd(nh * qkhd), Vd(nh * qkhd), Qd(nh * qkhd);
   cudaMemcpy(Kd.data(), dK, Kd.size() * sizeof(__half), cudaMemcpyDeviceToHost);

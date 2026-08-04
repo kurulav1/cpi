@@ -1589,8 +1589,9 @@ void PlanCudaEngine::open(const std::string& cpi_path, int max_context) {
       }
       build_deepseek_plan();
       // MLA ops (MlaAssembleRope) have only a T==1 path, so drive prefill token-by-token (also what
-      // the MoE layers require). Graph capture bakes the host `position` into MlaAssembleRope, so run
-      // eager for now (CPI_PLAN_NO_GRAPH=1). Persistent decode is off unless CPI_CUDA_PERSISTENT set.
+      // the MoE layers require). Decode uses CUDA-graph capture (MlaAssembleRope has a device-position
+      // variant, so the graph is position-correct on replay; verified token-identical to eager).
+      // Persistent decode stays off unless CPI_CUDA_PERSISTENT is set.
       seq_prefill_ok_ = false;
       G4_CHECK(cudaStreamSynchronize(stream_));
       return;
@@ -3051,7 +3052,8 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
         engine::launch_mla_assemble_rope(S(Slot::Q), S(Slot::MlaKvb), S(Slot::MlaCkv), S(Slot::K),
                                          S(Slot::V), static_cast<const float*>(op.aux_ptr), op.heads,
                                          op.key_head_dim, op.rotary_dim, op.value_head_dim, op.in_dim,
-                                         position, op.scale, stream_);
+                                         position, device_pos_mode_ ? d_position_ : nullptr,
+                                         op.scale, stream_);
         break;
       }
       case OpKind::Rope: {

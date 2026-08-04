@@ -22,9 +22,11 @@ namespace engine {
 __global__ inline void mla_assemble_rope_kernel(__half* Q, const __half* kvb, const __half* ckv,
                                                 __half* K, __half* V, const float* inv_freq, int nh,
                                                 int qk_nope, int qk_rope, int v_head, int kv_lora,
-                                                int position, float attn_scaling) {
+                                                int position, const int* d_position,
+                                                float attn_scaling) {
   const int h = blockIdx.x * blockDim.x + threadIdx.x;
   if (h >= nh) return;
+  if (d_position) position = *d_position;  // graph-capturable: position read on-device
   const int qkhd = qk_nope + qk_rope;
   const int kvh = qk_nope + v_head;
   const int half = qk_rope / 2;
@@ -57,13 +59,16 @@ __global__ inline void mla_assemble_rope_kernel(__half* Q, const __half* kvb, co
   for (int b = v_head; b < qkhd; ++b) v[b] = __float2half(0.0f);
 }
 
+// d_position: when non-null, the token position is read on-device (graph-capturable); otherwise the
+// host `position` is used.
 inline void launch_mla_assemble_rope(__half* Q, const __half* kvb, const __half* ckv, __half* K,
                                      __half* V, const float* inv_freq, int nh, int qk_nope,
                                      int qk_rope, int v_head, int kv_lora, int position,
-                                     float attn_scaling, cudaStream_t stream) {
-  mla_assemble_rope_kernel<<<(nh + 63) / 64, 64, 0, stream>>>(Q, kvb, ckv, K, V, inv_freq, nh,
-                                                              qk_nope, qk_rope, v_head, kv_lora,
-                                                              position, attn_scaling);
+                                     const int* d_position, float attn_scaling,
+                                     cudaStream_t stream) {
+  mla_assemble_rope_kernel<<<(nh + 63) / 64, 64, 0, stream>>>(
+      Q, kvb, ckv, K, V, inv_freq, nh, qk_nope, qk_rope, v_head, kv_lora, position, d_position,
+      attn_scaling);
 }
 
 }  // namespace engine
