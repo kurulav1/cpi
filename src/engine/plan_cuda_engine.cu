@@ -1019,8 +1019,10 @@ void PlanCudaEngine::load_deepseek_weights() {
   const int kva = cfg_.kv_lora_rank + cfg_.qk_rope_head_dim;     // 576
   const int kvb = nh * (cfg_.qk_nope_head_dim + vhd);            // nh*256
   const int MI = cfg_.moe_intermediate_size;                     // 1408
-  // Keep the (small) MLA/dense/shared projections FP16 -- only the experts are int4 (the memory hog).
-  // This keeps the forward close to the fp32 reference trace for verification; (void)quant silences it.
+  // MLA/dense/shared projections stay FP16 (only the experts are int4). Quantizing these to int4 would
+  // cut decode bandwidth (the shared expert alone is ~2x the routed experts in bytes) and is the next
+  // decode lever, but the int4 decode path illegal-accesses on one of these projections' dims/group --
+  // needs isolating before it can be turned on. (void)quant until then.
   (void)quant;
   auto proj = [&](const std::string& nm, int r, int c) { upload(nm, r, c); };
 
