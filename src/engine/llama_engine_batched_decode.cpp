@@ -49,8 +49,12 @@ void LlamaEngine::require_batched_supported() const {
     why = "MoE models are not supported by the batched path";
   else if (cfg.uses_non_full_attention())
     why = "sliding-window / non-full-attention models are not supported";
-  else if (kv_int4_enabled_)
-    why = "INT4 KV cache is not supported by the batched path";
+  else if (kv_int4_enabled_ &&
+           !kernels::paged_quant_attention_supported(
+               cfg.num_heads, cfg.num_kv_heads,
+               attn_head_dim_ > 0 ? attn_head_dim_ : (cfg.hidden_size / cfg.num_heads),
+               options_.paged_block_size > 0 ? options_.paged_block_size : 32))
+    why = "quantized KV cache requires head_dim 128 and a GQA group for the batched path";
   else if (tq3_enabled_)
     why = "TurboQuant (TQ3) models are not supported by the batched path";
   else if (cached_int8_proj_enabled_ || cached_int8_mlp_enabled_) {
@@ -187,19 +191,41 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
                                         cfg.num_kv_heads, head_dim, d_batch_positions_, d_rope_cos_,
                                         d_rope_sin_, compute_stream_);
 
-    auto* k_pool =
-        static_cast<__half*>(d_k_cache_) + static_cast<std::size_t>(layer) * layer_stride;
-    auto* v_pool =
-        static_cast<__half*>(d_v_cache_) + static_cast<std::size_t>(layer) * layer_stride;
-    kernels::launch_store_kv_batched_paged(k_pool, v_pool, static_cast<const __half*>(d_prefill_k_),
-                                           static_cast<const __half*>(d_prefill_v_),
-                                           d_batch_block_tables_, d_batch_positions_, max_blocks,
-                                           batch, kv_hidden, bs, compute_stream_);
+    if (kv_int4_enabled_) {
+      const std::size_t k_row = static_cast<std::size_t>(head_dim * kv_quant_kbits_ / 8);
+      const std::size_t v_row = static_cast<std::size_t>(head_dim * kv_quant_vbits_ / 8);
+      const std::size_t token_heads = static_cast<std::size_t>(kv_capacity_tokens_) *
+                                      static_cast<std::size_t>(cfg.num_kv_heads);
+      auto* kq = d_k_cache_i4_ + static_cast<std::size_t>(layer) * token_heads * k_row;
+      auto* vq = d_v_cache_i4_ + static_cast<std::size_t>(layer) * token_heads * v_row;
+      auto* ksc = d_k_scales_ + static_cast<std::size_t>(layer) * token_heads;
+      auto* vsc = d_v_scales_ + static_cast<std::size_t>(layer) * token_heads;
+      kernels::launch_store_kv_batched_paged_quant(
+          static_cast<const __half*>(d_prefill_k_), static_cast<const __half*>(d_prefill_v_), kq,
+          vq, ksc, vsc, d_batch_block_tables_, d_batch_positions_, max_blocks, batch,
+          cfg.num_kv_heads, head_dim, bs, kv_quant_kbits_, kv_quant_vbits_, kv_quant_rot_,
+          compute_stream_);
+      kernels::launch_attention_step_batched_paged_quant(
+          static_cast<const __half*>(d_prefill_q_), kq, vq, ksc, vsc, d_batch_block_tables_,
+          d_batch_seq_lens_, max_blocks, max_seq, static_cast<__half*>(d_att_), batch,
+          cfg.num_heads, cfg.num_kv_heads, head_dim, bs, kv_quant_kbits_, kv_quant_vbits_,
+          kv_quant_rot_, compute_stream_, scratch_m, scratch_l, scratch_o, chunks);
+    } else {
+      auto* k_pool =
+          static_cast<__half*>(d_k_cache_) + static_cast<std::size_t>(layer) * layer_stride;
+      auto* v_pool =
+          static_cast<__half*>(d_v_cache_) + static_cast<std::size_t>(layer) * layer_stride;
+      kernels::launch_store_kv_batched_paged(
+          k_pool, v_pool, static_cast<const __half*>(d_prefill_k_),
+          static_cast<const __half*>(d_prefill_v_), d_batch_block_tables_, d_batch_positions_,
+          max_blocks, batch, kv_hidden, bs, compute_stream_);
 
-    kernels::launch_attention_step_batched_paged(
-        static_cast<const __half*>(d_prefill_q_), k_pool, v_pool, d_batch_block_tables_,
-        d_batch_seq_lens_, max_blocks, max_seq, static_cast<__half*>(d_att_), batch, cfg.num_heads,
-        cfg.num_kv_heads, head_dim, bs, compute_stream_, scratch_m, scratch_l, scratch_o, chunks);
+      kernels::launch_attention_step_batched_paged(
+          static_cast<const __half*>(d_prefill_q_), k_pool, v_pool, d_batch_block_tables_,
+          d_batch_seq_lens_, max_blocks, max_seq, static_cast<__half*>(d_att_), batch,
+          cfg.num_heads, cfg.num_kv_heads, head_dim, bs, compute_stream_, scratch_m, scratch_l,
+          scratch_o, chunks);
+    }
 
     detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
                                             lt_workspace_bytes_, compute_stream_, lw->wo, d_att_,

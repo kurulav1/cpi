@@ -303,6 +303,14 @@ void LlamaEngine::allocate_runtime_buffers() {
   if (const char* env = std::getenv("CPI_KV_WIN")) {
     kv_quant_win_ = std::max(0, std::atoi(env));
   }
+  if (kv_int4_enabled_ && options_.paged_blocks) {
+    const int bs = options_.paged_block_size > 0 ? options_.paged_block_size : 32;
+    if (!kernels::paged_quant_attention_supported(cfg.num_heads, cfg.num_kv_heads, head_dim, bs)) {
+      CPI_THROW(
+          "quantized KV with --paged-blocks requires head_dim 128, a GQA group of 4..32 heads, "
+          "and block size <= 32");
+    }
+  }
   const int kv_hidden = attn_kv_hidden_ > 0 ? attn_kv_hidden_ : (cfg.num_kv_heads * head_dim);
   const int rows = prefill_chunk_size_;
   int max_lowbit_cols = (hidden > inter) ? hidden : inter;
@@ -399,8 +407,17 @@ void LlamaEngine::allocate_runtime_buffers() {
       const std::size_t weight_reserve_b =
           static_cast<std::size_t>(cfg.num_layers) * per_layer_weight_b;
       const std::size_t headroom_b = static_cast<std::size_t>(3) << 30;  // 3 GiB
-      const std::size_t per_token_kv_b = static_cast<std::size_t>(cfg.num_layers) *
-                                         static_cast<std::size_t>(kv_hidden) * 2 * sizeof(__half);
+      // Quantized KV stores head_dim*bits/8 bytes per element plus one fp16
+      // scale per (token, head) for K and V each, so the same VRAM budget holds
+      // proportionally more tokens (the capacity multiplier).
+      const std::size_t per_token_kv_b =
+          kv_int4_enabled_
+              ? static_cast<std::size_t>(cfg.num_layers) *
+                    static_cast<std::size_t>(cfg.num_kv_heads) *
+                    (static_cast<std::size_t>(head_dim * (kv_quant_kbits_ + kv_quant_vbits_) / 8) +
+                     2 * sizeof(__half))
+              : static_cast<std::size_t>(cfg.num_layers) * static_cast<std::size_t>(kv_hidden) * 2 *
+                    sizeof(__half);
       if (free_b > weight_reserve_b + headroom_b && per_token_kv_b > 0) {
         const std::size_t budget_b = free_b - weight_reserve_b - headroom_b;
         const long long auto_tokens = static_cast<long long>(budget_b / per_token_kv_b);
@@ -517,9 +534,10 @@ void LlamaEngine::allocate_runtime_buffers() {
                                static_cast<std::size_t>(kv_capacity_tokens_) *
                                static_cast<std::size_t>(kv_hidden) * sizeof(__half);
   if (kv_int4_enabled_) {
-    // Quantized KV: 4- or 8-bit rows + per-head fp16 scales; fp16 KV buffers not allocated.
+    // Quantized KV: 4- or 8-bit rows + per-head fp16 scales; fp16 KV buffers not
+    // allocated. Strided by kv_capacity_tokens_ so the enlarged paged pool works.
     const std::size_t rows = static_cast<std::size_t>(cfg.num_layers) *
-                             static_cast<std::size_t>(options_.max_context) *
+                             static_cast<std::size_t>(kv_capacity_tokens_) *
                              static_cast<std::size_t>(cfg.num_kv_heads);
     const std::size_t k_bytes = rows * static_cast<std::size_t>(head_dim * kv_quant_kbits_ / 8);
     const std::size_t v_bytes = rows * static_cast<std::size_t>(head_dim * kv_quant_vbits_ / 8);
@@ -627,7 +645,7 @@ void LlamaEngine::reset_kv_cache() {
                                static_cast<std::size_t>(kv_hidden) * sizeof(__half);
   if (kv_int4_enabled_) {
     const std::size_t rows = static_cast<std::size_t>(cfg.num_layers) *
-                             static_cast<std::size_t>(options_.max_context) *
+                             static_cast<std::size_t>(kv_capacity_tokens_) *
                              static_cast<std::size_t>(cfg.num_kv_heads);
     const std::size_t k_bytes = rows * static_cast<std::size_t>(head_dim * kv_quant_kbits_ / 8);
     const std::size_t v_bytes = rows * static_cast<std::size_t>(head_dim * kv_quant_vbits_ / 8);

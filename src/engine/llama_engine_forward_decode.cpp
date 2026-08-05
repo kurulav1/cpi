@@ -79,7 +79,7 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
     const auto [attn_start, attn_seq_len] = attention_bounds(layer, position);
     const std::size_t k_row = static_cast<std::size_t>(head_dim * kv_quant_kbits_ / 8);
     const std::size_t v_row = static_cast<std::size_t>(head_dim * kv_quant_vbits_ / 8);
-    const std::size_t token_heads = static_cast<std::size_t>(options_.max_context) *
+    const std::size_t token_heads = static_cast<std::size_t>(kv_capacity_tokens_) *
                                     static_cast<std::size_t>(cfg.num_kv_heads);
     auto* kq = d_k_cache_i4_ + static_cast<std::size_t>(layer) * token_heads * k_row;
     auto* vq = d_v_cache_i4_ + static_cast<std::size_t>(layer) * token_heads * v_row;
@@ -99,10 +99,33 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
                                 : nullptr;
     auto* ring_v = d_kv_ring_v_ ? d_kv_ring_v_ + static_cast<std::size_t>(layer) * ring_stride
                                 : nullptr;
+    if (options_.paged_blocks) {
+      // Paged quantized pool: store through the single-sequence block table and
+      // run the batched-paged quant attention at batch 1. The fp16 sink/window
+      // override is not wired for paged mode yet (needs stable per-sequence
+      // slots), so quality here is the no-window tier.
+      ensure_batch_state_buffers(1, 1);
+      const int seq_len_h = position + 1;
+      CUDA_CHECK(cudaMemcpyAsync(d_batch_positions_, &position, sizeof(int),
+                                 cudaMemcpyHostToDevice, compute_stream_));
+      CUDA_CHECK(cudaMemcpyAsync(d_batch_seq_lens_, &seq_len_h, sizeof(int),
+                                 cudaMemcpyHostToDevice, compute_stream_));
+      const int bs = options_.paged_block_size > 0 ? options_.paged_block_size : 32;
+      kernels::launch_store_kv_paged_quant(
+          static_cast<const __half*>(d_k_), static_cast<const __half*>(d_v_), kv_hidden, kq, vq,
+          ks, vs, d_block_table_, position, 1, cfg.num_kv_heads, head_dim, bs, kv_quant_kbits_,
+          kv_quant_vbits_, kv_quant_rot_, compute_stream_);
+      kernels::launch_attention_step_batched_paged_quant(
+          static_cast<const __half*>(d_q_), kq, vq, ks, vs, d_block_table_, d_batch_seq_lens_, 0,
+          seq_len_h, static_cast<__half*>(d_att_), 1, cfg.num_heads, cfg.num_kv_heads, head_dim,
+          bs, kv_quant_kbits_, kv_quant_vbits_, kv_quant_rot_, compute_stream_, d_attn_chunk_m_,
+          d_attn_chunk_l_, d_attn_chunk_o_, attn_chunk_capacity_);
+      return;
+    }
     kernels::launch_store_kv_quant(
         static_cast<const __half*>(d_k_), static_cast<const __half*>(d_v_), kq, vq, ks, vs,
         sink_k, sink_v, ring_k, ring_v, kv_quant_sink_, kv_quant_win_, position,
-        cfg.num_kv_heads, head_dim, options_.max_context, kv_quant_kbits_, kv_quant_vbits_,
+        cfg.num_kv_heads, head_dim, kv_capacity_tokens_, kv_quant_kbits_, kv_quant_vbits_,
         kv_quant_rot_, compute_stream_);
     const std::size_t head_off =
         static_cast<std::size_t>(attn_start) * static_cast<std::size_t>(cfg.num_kv_heads);

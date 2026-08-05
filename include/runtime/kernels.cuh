@@ -1435,6 +1435,47 @@ void launch_attention_step_quant(const half* q, const int8_t* k_cache, const int
                                  float* scratch_o = nullptr, int scratch_chunks = 0,
                                  bool allow_split = false);
 
+// Quantized paged-pool KV (kernels_paged_quant.cu). Pool layout mirrors the
+// fp16 paged pool: flat (num_blocks * block_size) physical token slots per
+// layer, row stride head_dim * bits / 8 bytes per (slot, kv_head), parallel
+// [slots, kv_heads] fp16 scale array. Same quant recipe as the contiguous
+// quantized cache; rotate_k stores K Hadamard-rotated and the attention
+// launcher rotates Q to match.
+
+// Scatter + quantize `rows` contiguous KV rows at positions
+// base_pos..base_pos+rows-1 through `block_table`. src_stride is in halves
+// (pass kv_hidden, or the fused-QKV row stride to read K/V in place).
+void launch_store_kv_paged_quant(const half* k_src, const half* v_src, int src_stride,
+                                 int8_t* k_pool, int8_t* v_pool, half* k_scales, half* v_scales,
+                                 const int* block_table, int base_pos, int rows, int num_kv_heads,
+                                 int head_dim, int block_size, int k_bits, int v_bits,
+                                 bool rotate_k, cudaStream_t stream);
+
+// Batched decode scatter: one token per sequence via per-sequence block tables
+// and positions (device arrays, [batch] and [batch * max_blocks]).
+void launch_store_kv_batched_paged_quant(const half* k_src, const half* v_src, int8_t* k_pool,
+                                         int8_t* v_pool, half* k_scales, half* v_scales,
+                                         const int* block_tables, const int* positions,
+                                         int max_blocks, int batch, int num_kv_heads,
+                                         int head_dim, int block_size, int k_bits, int v_bits,
+                                         bool rotate_k, cudaStream_t stream);
+
+// Eligibility for the quantized batched paged attention (GQA-shared tier is
+// the only implementation): head_dim 128, real GQA group, block_size <= 32,
+// group_size * 32 >= head_dim (Q rotation needs one thread per element).
+bool paged_quant_attention_supported(int num_heads, int num_kv_heads, int head_dim,
+                                     int block_size);
+
+// Batched split-K decode attention over the quantized paged pool (GQA-shared,
+// one grid block per (kv_head, paged block, sequence)). Scratch layout and
+// semantics match launch_attention_step_batched_paged.
+void launch_attention_step_batched_paged_quant(
+    const half* q, const int8_t* k_pool, const int8_t* v_pool, const half* k_scales,
+    const half* v_scales, const int* block_tables, const int* seq_lens, int max_blocks,
+    int max_seq_len, half* out, int batch, int num_heads, int num_kv_heads, int head_dim,
+    int block_size, int k_bits, int v_bits, bool rotate_k, cudaStream_t stream, float* scratch_m,
+    float* scratch_l, float* scratch_o, int scratch_chunks);
+
 // ── TurboQuant 3-bit (TQ3) kernels ───────────────────────────────────────────
 
 // launch_hadamard_rotate_fp16

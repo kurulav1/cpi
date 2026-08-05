@@ -166,6 +166,7 @@ if(CPI_ENABLE_CUDA)
     src/kernels/kernels_attention_decode.cu
     src/kernels/kernels_persistent_decode.cu
     src/kernels/kernels_attention_decode_int4.cu
+    src/kernels/kernels_paged_quant.cu
     src/kernels/kernels_ops_matvec.cu
     src/kernels/kernels_moe_experts.cu
     src/kernels/kernels_gemm.cu
