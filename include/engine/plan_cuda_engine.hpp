@@ -509,6 +509,18 @@ private:
   __half* d_mla_ckv_ = nullptr;      // [kv_lora + qk_rope]  (kv_a_proj output)
   __half* d_mla_latent_ = nullptr;   // [kv_lora]            (kv_a_layernorm output)
   __half* d_mla_kvb_ = nullptr;      // [nh*(qk_nope+v_head)] (kv_b_proj output)
+
+  // ── Absorbed-MLA decode (DeepSeek): latent cache + absorbed weights ──
+  bool mla_absorb_ = false;             // absorbed decode enabled (CPI_DS_NO_ABSORB=1 disables)
+  std::vector<__half*> caches_lat_;     // per layer: [max_ctx, kv_lora + qk_rope]
+  std::vector<__half*> mla_w_ukt_;      // per layer: [nh][kv_lora][qk_nope] fp16
+  std::vector<__half*> mla_w_uv_;       // per layer: [nh][v_head][kv_lora] fp16
+  __half* d_mla_qabs_ = nullptr;        // [nh, kv_lora + qk_rope]
+  __half* d_mla_attlat_ = nullptr;      // [nh, kv_lora]
+  float* d_mla_abs_m_ = nullptr;        // split-K scratch [nh, chunks]
+  float* d_mla_abs_l_ = nullptr;
+  float* d_mla_abs_o_ = nullptr;        // [nh, chunks, kv_lora]
+  int mla_abs_chunks_ = 0;
   float* d_inv_freq_ = nullptr;      // [qk_rope/2]          (YARN inverse frequencies)
   float mla_attn_scaling_ = 1.0f;    // YARN mscale (1.0 for V2-Lite)
   // Expert streaming (CPI_MOE_STREAM): stage only the top_k selected experts into K contiguous

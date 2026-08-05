@@ -62,6 +62,8 @@ enum class Slot : std::uint8_t {
   MlaCkv,
   MlaLatent,
   MlaKvb,
+  MlaQAbs,    // absorbed query [nh, kv_lora+qk_rope] (decode-only scratch)
+  MlaAttLat,  // attention-weighted latent [nh, kv_lora] (decode-only scratch)
   Count
 };
 
@@ -121,6 +123,18 @@ enum class OpKind : std::uint8_t {
                     // V=[v|zeros] into Slot::K/Slot::V, and interleaved-rope Slot::Q's q_pe in place.
                     // heads=nh, head_dim=qk_nope+qk_rope, key_head_dim=qk_nope, value_head_dim=v_head,
                     // rotary_dim=qk_rope, in_dim=kv_lora, scale=attention_scaling, aux_ptr=inv_freq.
+  // Absorbed-MLA decode: attend over the 576-dim latent cache instead of the
+  // materialized per-head K/V (~9x less attention bandwidth at depth). Prefill
+  // keeps the materialized path; these ops run alongside it.
+  MlaLatStore,      // append [MlaLatent | roped k_pe from Slot::K head 0] to the layer's latent
+                    // cache (runs in BOTH decode and seq modes). in_dim=kv_lora,
+                    // rotary_dim=qk_rope, key_head_dim=qk_nope, head_dim=qkhd, heads=nh.
+  MlaQAbsorb,       // MlaQAbs[i] = [W_UK[i]^T q_nope[i] | q_pe[i]] per head (decode only).
+                    // weight = w_uk_t [nh][kv_lora][qk_nope]. Fields as MlaLatStore.
+  MlaAbsorbedAttn,  // single-query attention over the latent cache: scores over kv_lora+qk_rope,
+                    // V = first kv_lora dims -> MlaAttLat (decode only). scale = rsqrt(qkhd).
+  MlaVDecompress,   // Slot::Att[i, 0..v_head) = W_UV[i] MlaAttLat[i]; pads to qkhd zeroed
+                    // (decode only). weight = w_uv [nh][v_head][kv_lora]. value_head_dim=v_head.
 
   // ── extensions for vision encoders ──
   // A vision tower differs from a text decoder in only a few places: positions are
@@ -184,6 +198,7 @@ struct Op {
   int kv_heads = 0;  // Attention kv heads
   int head_dim = 0;  // Rope/Attention head_dim
   RopeTable rope_table = RopeTable::Full;
+  bool decode_skip = false;     // skip this op in single-token decode (absorbed-MLA replaces it)
   bool full_attention = false;  // Attention: full (no window) vs sliding
   int sliding_window = 0;       // Attention: window size (0 = unbounded)
   float scale = 1.0f;           // ScaleCopy multiplier (SqrtHeadDim/layer scalar folded in)

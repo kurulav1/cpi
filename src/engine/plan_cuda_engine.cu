@@ -24,6 +24,7 @@
 #include "engine/generation_constraints.hpp"
 #include "engine/plan_cuda_engine.hpp"
 #include "engine/deepseek_rope.hpp"
+#include "engine/mla_absorb.hpp"
 #include "engine/mla_assemble.hpp"
 #include "engine/moe_grouped.hpp"
 #include "engine/sampling.hpp"
@@ -76,6 +77,14 @@ PlanCudaEngine::~PlanCudaEngine() {
     cudaFree(caches_k_[L]);
     cudaFree(caches_v_[L]);
   }
+  for (auto* p : caches_lat_) cudaFree(p);
+  for (auto* p : mla_w_ukt_) cudaFree(p);
+  for (auto* p : mla_w_uv_) cudaFree(p);
+  cudaFree(d_mla_qabs_);
+  cudaFree(d_mla_attlat_);
+  cudaFree(d_mla_abs_m_);
+  cudaFree(d_mla_abs_l_);
+  cudaFree(d_mla_abs_o_);
   cudaFree(d_cos_sliding_);
   cudaFree(d_sin_sliding_);
   cudaFree(d_cos_full_);
@@ -649,6 +658,26 @@ void PlanCudaEngine::allocate_buffers() {
       G4_CHECK(cudaMalloc(&caches_k_[L], bytes));
       G4_CHECK(cudaMalloc(&caches_v_[L], bytes));
     }
+    // Absorbed-MLA decode: latent caches + absorbed query/output scratch. The
+    // materialized caches above stay (prefill uses them); decode attends over
+    // the latent rows instead, cutting attention reads ~9x at depth.
+    // mla_absorb_ was decided (and the absorbed weights uploaded) before this runs.
+    if (mla_absorb_) {
+      const int kva_w = cfg_.kv_lora_rank + cfg_.qk_rope_head_dim;
+      caches_lat_.assign(cfg_.num_layers, nullptr);
+      for (int L = 0; L < cfg_.num_layers; ++L) {
+        const std::size_t bytes = static_cast<std::size_t>(max_ctx_) * kva_w * sizeof(__half);
+        G4_CHECK(cudaMalloc(&caches_lat_[L], bytes));
+      }
+      al(&d_mla_qabs_, static_cast<std::size_t>(nh) * kva_w);
+      al(&d_mla_attlat_, static_cast<std::size_t>(nh) * cfg_.kv_lora_rank);
+      mla_abs_chunks_ = (max_ctx_ + 63) / 64;
+      const std::size_t cells = static_cast<std::size_t>(nh) * mla_abs_chunks_;
+      G4_CHECK(cudaMalloc(&d_mla_abs_m_, cells * sizeof(float)));
+      G4_CHECK(cudaMalloc(&d_mla_abs_l_, cells * sizeof(float)));
+      G4_CHECK(cudaMalloc(&d_mla_abs_o_,
+                          cells * static_cast<std::size_t>(cfg_.kv_lora_rank) * sizeof(float)));
+    }
     return;
   }
 
@@ -1047,6 +1076,10 @@ void PlanCudaEngine::load_deepseek_weights() {
   upload("model.embed_tokens.weight", cfg_.vocab, H);
   upload("model.norm.weight", 1, H);
   if (st_.has_tensor("lm_head.weight")) upload("lm_head.weight", cfg_.vocab, H);
+  if (mla_absorb_) {
+    mla_w_ukt_.assign(cfg_.num_layers, nullptr);
+    mla_w_uv_.assign(cfg_.num_layers, nullptr);
+  }
 
   for (int L = 0; L < cfg_.num_layers; ++L) {
     const std::string p = "model.layers." + std::to_string(L) + ".";
@@ -1064,6 +1097,36 @@ void PlanCudaEngine::load_deepseek_weights() {
     proj(p + "self_attn.kv_a_proj_with_mqa.weight", kva, H);
     upload(p + "self_attn.kv_a_layernorm.weight", 1, cfg_.kv_lora_rank);
     proj(p + "self_attn.kv_b_proj.weight", kvb, cfg_.kv_lora_rank);
+    if (mla_absorb_) {
+      // Absorbed-layout fp16 copies of kv_b's two halves: w_ukt [nh][kv_lora][qk_nope]
+      // (K-nope rows transposed, output-major) and w_uv [nh][v_head][kv_lora].
+      const int lora = cfg_.kv_lora_rank;
+      const int nope = cfg_.qk_nope_head_dim;
+      const int kvh = nope + vhd;
+      const auto kb = read_host_fp16(p + "self_attn.kv_b_proj.weight", kvb, lora);
+      std::vector<__half> ukt(static_cast<std::size_t>(nh) * lora * nope);
+      std::vector<__half> uv(static_cast<std::size_t>(nh) * vhd * lora);
+      for (int i = 0; i < nh; ++i) {
+        for (int d = 0; d < nope; ++d) {
+          const std::size_t src = (static_cast<std::size_t>(i) * kvh + d) * lora;
+          for (int j = 0; j < lora; ++j) {
+            ukt[(static_cast<std::size_t>(i) * lora + j) * nope + d] = kb[src + j];
+          }
+        }
+        for (int d = 0; d < vhd; ++d) {
+          const std::size_t src = (static_cast<std::size_t>(i) * kvh + nope + d) * lora;
+          for (int j = 0; j < lora; ++j) {
+            uv[(static_cast<std::size_t>(i) * vhd + d) * lora + j] = kb[src + j];
+          }
+        }
+      }
+      G4_CHECK(cudaMalloc(&mla_w_ukt_[L], ukt.size() * sizeof(__half)));
+      G4_CHECK(cudaMemcpy(mla_w_ukt_[L], ukt.data(), ukt.size() * sizeof(__half),
+                          cudaMemcpyHostToDevice));
+      G4_CHECK(cudaMalloc(&mla_w_uv_[L], uv.size() * sizeof(__half)));
+      G4_CHECK(cudaMemcpy(mla_w_uv_[L], uv.data(), uv.size() * sizeof(__half),
+                          cudaMemcpyHostToDevice));
+    }
     // o_proj is [H, nh*v_head]; pad to [H, nh*qk] with zero columns per head so the standard
     // Attention op can run at head_dim=qk (V padded to qk) and o_proj still consumes it directly.
     {
@@ -1230,6 +1293,8 @@ void PlanCudaEngine::build_deepseek_plan() {
   slot_ptr_[static_cast<int>(Slot::MlaCkv)] = d_mla_ckv_;
   slot_ptr_[static_cast<int>(Slot::MlaLatent)] = d_mla_latent_;
   slot_ptr_[static_cast<int>(Slot::MlaKvb)] = d_mla_kvb_;
+  slot_ptr_[static_cast<int>(Slot::MlaQAbs)] = d_mla_qabs_;
+  slot_ptr_[static_cast<int>(Slot::MlaAttLat)] = d_mla_attlat_;
 
   const int H = cfg_.hidden, nh = cfg_.num_heads;
   const int qkhd = cfg_.head_dim, kvw = nh * qkhd;
@@ -1316,6 +1381,16 @@ void PlanCudaEngine::build_deepseek_plan() {
       o.cols = kvw;
       ops.push_back(o);
     }
+    if (mla_absorb_) {
+      Op o;
+      o.kind = OpKind::MlaLatStore;
+      o.heads = nh;
+      o.head_dim = qkhd;
+      o.key_head_dim = cfg_.qk_nope_head_dim;
+      o.rotary_dim = cfg_.qk_rope_head_dim;
+      o.in_dim = cfg_.kv_lora_rank;
+      ops.push_back(o);
+    }
     {
       Op o;
       o.kind = OpKind::Attention;
@@ -1326,7 +1401,32 @@ void PlanCudaEngine::build_deepseek_plan() {
       o.head_dim = qkhd;
       o.full_attention = true;
       o.sliding_window = 0;
+      // Absorbed decode replaces this op at T==1; prefill still runs it.
+      o.decode_skip = mla_absorb_;
       ops.push_back(o);
+    }
+    if (mla_absorb_) {
+      Op o;
+      o.kind = OpKind::MlaQAbsorb;
+      o.heads = nh;
+      o.head_dim = qkhd;
+      o.key_head_dim = cfg_.qk_nope_head_dim;
+      o.rotary_dim = cfg_.qk_rope_head_dim;
+      o.in_dim = cfg_.kv_lora_rank;
+      o.weight = mla_w_ukt_[L];
+      ops.push_back(o);
+      Op a;
+      a.kind = OpKind::MlaAbsorbedAttn;
+      a.heads = nh;
+      a.head_dim = qkhd;
+      a.in_dim = cfg_.kv_lora_rank;
+      a.rotary_dim = cfg_.qk_rope_head_dim;
+      a.value_head_dim = cfg_.v_head_dim;
+      // Fused reduce+decompress writes Slot::Att directly via w_uv.
+      a.weight = mla_w_uv_[L];
+      // The materialized head's softmax scale; mscale is already in the roped parts.
+      a.scale = 1.0f / std::sqrt(static_cast<float>(qkhd));
+      ops.push_back(a);
     }
     gemv(Slot::Att, Slot::Tmp, "self_attn.o_proj.weight", H, nh * qkhd);
     add_x(Slot::Tmp);
@@ -1610,6 +1710,16 @@ void PlanCudaEngine::open(const std::string& cpi_path, int max_context) {
       parse_deepseek_config(cpi_path);
       if (max_ctx_ <= 0) max_ctx_ = std::min(4096, cfg_.max_position_embeddings);
       G4_CHECK(cudaStreamCreate(&stream_));
+      // Absorbed-MLA decode (CPI_DS_ABSORB=1, opt-in): token-identical to the
+      // materialized path and reads ~9x fewer attention bytes at depth, but V2-Lite
+      // decode is MoE-weight-bound at practical depths and the extra per-layer
+      // kernels cost more than the attention bytes save (191 vs 252 tok/s at depth
+      // 2048), so materialized stays the default. Becomes profitable with the
+      // latent-only design (decode skips kv_b+assemble; prefill decompresses from
+      // the latent cache), which is the follow-up. Decided before the weight load:
+      // the loader uploads the absorbed-layout kv_b copies, and allocate_buffers
+      // sizes the latent caches. The kernel's accumulators cover kv_lora <= 512.
+      mla_absorb_ = std::getenv("CPI_DS_ABSORB") != nullptr && cfg_.kv_lora_rank <= 512;
       load_deepseek_weights();
       allocate_buffers();
       // int4 decode routes through dp4a with int8 activations, which needs this scratch. The shared
@@ -3365,6 +3475,37 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
               op.in_dim, op.heads, stream_);
         }
         break;
+      case OpKind::MlaLatStore: {
+        // Append [latent | roped k_pe] rows to the latent cache; runs in every
+        // mode (decode single, graph device-pos, seq prefill, spec seq).
+        const int rows = seq ? T : 1;
+        const int* dpos =
+            (device_pos_mode_ || spec_seq_device_pos_) ? d_position_ : nullptr;
+        engine::launch_mla_lat_store(S(Slot::MlaLatent), S(Slot::K), caches_lat_[layer],
+                                     op.in_dim, op.key_head_dim, op.rotary_dim, op.head_dim,
+                                     op.heads, rows, position, dpos, max_ctx_, stream_);
+        break;
+      }
+      case OpKind::MlaQAbsorb: {
+        if (seq) break;  // decode-only
+        engine::launch_mla_q_absorb(S(Slot::Q), static_cast<const __half*>(op.weight),
+                                    S(Slot::MlaQAbs), op.heads, op.key_head_dim, op.rotary_dim,
+                                    op.head_dim, op.in_dim, stream_);
+        break;
+      }
+      case OpKind::MlaAbsorbedAttn: {
+        if (seq) break;  // decode-only
+        const int kdim = op.in_dim + op.rotary_dim;
+        engine::launch_mla_absorbed_attention(
+            S(Slot::MlaQAbs), caches_lat_[layer], static_cast<const __half*>(op.weight),
+            S(Slot::Att), op.heads, kdim, op.in_dim, op.value_head_dim, op.head_dim, op.scale,
+            position + 1, device_pos_mode_ ? d_position_ : nullptr, d_mla_abs_m_, d_mla_abs_l_,
+            d_mla_abs_o_, mla_abs_chunks_, device_pos_mode_, stream_);
+        break;
+      }
+      case OpKind::MlaVDecompress: {
+        break;  // folded into MlaAbsorbedAttn's fused reduce+decompress
+      }
       case OpKind::MlaAssembleRope: {
         // DeepSeek MLA: assemble per-head K/V from the kv_b output + shared k_pe, rope q_pe/k_pe.
         // Runs at T==1 (MoE forces token-by-token, so no sequence path). heads=nh,
@@ -3460,6 +3601,7 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
         break;
       }
       case OpKind::Attention: {
+        if (!seq && op.decode_skip) break;  // absorbed-MLA decode replaces this op
         if (seq && ctx.cached) {
           // text prefill: K/V were appended to this layer's cache by KvStore, so attend
           // over the cache (it also holds any earlier context). Full-attention layers with
