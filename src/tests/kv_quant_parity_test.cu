@@ -35,6 +35,8 @@ struct QuantConfig {
   int k_bits;
   int v_bits;
   bool rot;
+  int sink_n;
+  int win_n;
   const char* label;
 };
 
@@ -72,10 +74,14 @@ int main() {
   const int head_dim = 128;
   const int max_context = 256;
   const QuantConfig configs[] = {
-      {4, 4, false, "K4V4"},
-      {4, 4, true, "K4V4+rot"},
-      {8, 4, false, "K8V4"},
-      {8, 8, false, "K8V8"},
+      {4, 4, false, 0, 0, "K4V4"},
+      {4, 4, true, 0, 0, "K4V4+rot"},
+      {8, 4, false, 0, 0, "K8V4"},
+      {8, 8, false, 0, 0, "K8V8"},
+      // Sink + recent-window fp16 override; win 32 so seq 200 has all three
+      // regions (sink, quantized middle, fp16 window).
+      {4, 4, true, 8, 32, "K4V4+r+sw"},
+      {8, 4, false, 8, 32, "K8V4+sw"},
   };
   const int seq_lens[] = {1, 33, 200};
   const double kCosGate = 0.999;
@@ -109,6 +115,21 @@ int main() {
       CK(cudaMalloc(&dvc, static_cast<std::size_t>(max_context) * num_kv_heads * v_row));
       CK(cudaMalloc(&dks, static_cast<std::size_t>(max_context) * num_kv_heads * sizeof(half)));
       CK(cudaMalloc(&dvs, static_cast<std::size_t>(max_context) * num_kv_heads * sizeof(half)));
+      half *dsk = nullptr, *dsv = nullptr, *drk = nullptr, *drv = nullptr;
+      if (c.sink_n > 0) {
+        const std::size_t n = static_cast<std::size_t>(c.sink_n) * kv_elems * sizeof(half);
+        CK(cudaMalloc(&dsk, n));
+        CK(cudaMalloc(&dsv, n));
+        CK(cudaMemset(dsk, 0, n));
+        CK(cudaMemset(dsv, 0, n));
+      }
+      if (c.win_n > 0) {
+        const std::size_t n = static_cast<std::size_t>(c.win_n) * kv_elems * sizeof(half);
+        CK(cudaMalloc(&drk, n));
+        CK(cudaMalloc(&drv, n));
+        CK(cudaMemset(drk, 0, n));
+        CK(cudaMemset(drv, 0, n));
+      }
 
       for (int t = 0; t < seq_len; ++t) {
         k_raw[t].resize(kv_elems);
@@ -122,8 +143,9 @@ int main() {
         }
         CK(cudaMemcpy(dk_in, kh.data(), kv_elems * sizeof(half), cudaMemcpyHostToDevice));
         CK(cudaMemcpy(dv_in, vh.data(), kv_elems * sizeof(half), cudaMemcpyHostToDevice));
-        kernels::launch_store_kv_quant(dk_in, dv_in, dkc, dvc, dks, dvs, t, num_kv_heads, head_dim,
-                                       max_context, c.k_bits, c.v_bits, c.rot, 0);
+        kernels::launch_store_kv_quant(dk_in, dv_in, dkc, dvc, dks, dvs, dsk, dsv, drk, drv,
+                                       c.sink_n, c.win_n, t, num_kv_heads, head_dim, max_context,
+                                       c.k_bits, c.v_bits, c.rot, 0);
       }
       CK(cudaDeviceSynchronize());
 
@@ -186,13 +208,25 @@ int main() {
           fwht_host(qh);
           for (int d = 0; d < head_dim; ++d) qh[d] = __half2float(__float2half(qh[d]));
         }
+        const auto in_fp16 = [&](int t) {
+          return t < c.sink_n || (c.win_n > 0 && t >= seq_len - c.win_n);
+        };
         double m = -1e30;
         for (int t = 0; t < seq_len; ++t) {
-          const float ks = __half2float(ksc[static_cast<std::size_t>(t) * num_kv_heads + kv]);
-          const std::size_t kb = (static_cast<std::size_t>(t) * num_kv_heads + kv) *
-                                 static_cast<std::size_t>(k_row);
           double s = 0.0;
-          for (int d = 0; d < head_dim; ++d) s += qh[d] * dequant_elem(kc, kb, d, c.k_bits, ks);
+          if (in_fp16(t)) {
+            std::vector<float> kf(k_raw[t].begin() + kv * head_dim,
+                                  k_raw[t].begin() + (kv + 1) * head_dim);
+            if (c.rot) fwht_host(kf);
+            for (int d = 0; d < head_dim; ++d) {
+              s += qh[d] * __half2float(__float2half(kf[d]));
+            }
+          } else {
+            const float ks = __half2float(ksc[static_cast<std::size_t>(t) * num_kv_heads + kv]);
+            const std::size_t kb = (static_cast<std::size_t>(t) * num_kv_heads + kv) *
+                                   static_cast<std::size_t>(k_row);
+            for (int d = 0; d < head_dim; ++d) s += qh[d] * dequant_elem(kc, kb, d, c.k_bits, ks);
+          }
           s *= scale;
           scores[t] = s;
           m = std::max(m, s);
@@ -205,12 +239,19 @@ int main() {
         const double inv_l = 1.0 / l;
         for (int t = 0; t < seq_len; ++t) {
           const double w = scores[t] * inv_l;
-          const float vs = __half2float(vsc[static_cast<std::size_t>(t) * num_kv_heads + kv]);
-          const std::size_t vb = (static_cast<std::size_t>(t) * num_kv_heads + kv) *
-                                 static_cast<std::size_t>(v_row);
-          for (int d = 0; d < head_dim; ++d) {
-            ref[static_cast<std::size_t>(h) * head_dim + d] +=
-                static_cast<float>(w * dequant_elem(vc, vb, d, c.v_bits, vs));
+          if (in_fp16(t)) {
+            for (int d = 0; d < head_dim; ++d) {
+              ref[static_cast<std::size_t>(h) * head_dim + d] += static_cast<float>(
+                  w * __half2float(__float2half(v_raw[t][kv * head_dim + d])));
+            }
+          } else {
+            const float vs = __half2float(vsc[static_cast<std::size_t>(t) * num_kv_heads + kv]);
+            const std::size_t vb = (static_cast<std::size_t>(t) * num_kv_heads + kv) *
+                                   static_cast<std::size_t>(v_row);
+            for (int d = 0; d < head_dim; ++d) {
+              ref[static_cast<std::size_t>(h) * head_dim + d] +=
+                  static_cast<float>(w * dequant_elem(vc, vb, d, c.v_bits, vs));
+            }
           }
         }
       }
@@ -229,9 +270,10 @@ int main() {
       for (int path = 0; path < 2; ++path) {
         const bool split = (path == 1);
         kernels::launch_attention_step_quant(
-            dq_, dkc, dvc, dks, dvs, dout, seq_len, num_heads, num_kv_heads, head_dim, c.k_bits,
-            c.v_bits, c.rot, 0, split ? sm : nullptr, split ? sl : nullptr, split ? so : nullptr,
-            split ? chunkn : 0, split);
+            dq_, dkc, dvc, dks, dvs, dsk, dsv, drk, drv, c.sink_n, c.win_n, 0, dout, seq_len,
+            num_heads, num_kv_heads, head_dim, c.k_bits, c.v_bits, c.rot, 0,
+            split ? sm : nullptr, split ? sl : nullptr, split ? so : nullptr, split ? chunkn : 0,
+            split);
         CK(cudaDeviceSynchronize());
         std::vector<half> got(out_elems);
         CK(cudaMemcpy(got.data(), dout, out_elems * sizeof(half), cudaMemcpyDeviceToHost));
@@ -261,6 +303,10 @@ int main() {
       cudaFree(dvc);
       cudaFree(dks);
       cudaFree(dvs);
+      if (dsk) cudaFree(dsk);
+      if (dsv) cudaFree(dsv);
+      if (drk) cudaFree(drk);
+      if (drv) cudaFree(drv);
       cudaFree(sm);
       cudaFree(sl);
       cudaFree(so);

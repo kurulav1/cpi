@@ -689,6 +689,12 @@ private:
   int kv_quant_kbits_ = 4;               // Bits per K element (4 or 8).
   int kv_quant_vbits_ = 4;               // Bits per V element (4 or 8).
   bool kv_quant_rot_ = false;            // Hadamard-rotate K before quantizing.
+  int kv_quant_sink_ = 16;               // Sink tokens kept fp16 (0 disables).
+  int kv_quant_win_ = 128;               // Recent-window tokens kept fp16 (0 disables).
+  __half* d_kv_sink_k_ = nullptr;        // fp16 sink K [layers, sink_n, kv_heads, head_dim].
+  __half* d_kv_sink_v_ = nullptr;        // fp16 sink V, same layout.
+  __half* d_kv_ring_k_ = nullptr;        // fp16 recent-K ring [layers, win_n, kv_heads, head_dim].
+  __half* d_kv_ring_v_ = nullptr;        // fp16 recent-V ring, same layout.
   std::int8_t* d_k_cache_i4_ = nullptr;  // Quantized K cache [layers, ctx, kv_heads, row_bytes].
   std::int8_t* d_v_cache_i4_ = nullptr;  // Quantized V cache [layers, ctx, kv_heads, row_bytes].
   __half* d_k_scales_ = nullptr;         // Per-head K dequant scales [layers, ctx, kv_heads].

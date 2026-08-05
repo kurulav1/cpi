@@ -895,6 +895,22 @@ LlamaEngine::~LlamaEngine() {
     cudaFree(d_k_scales_);
     d_k_scales_ = nullptr;
   }
+  if (d_kv_sink_k_) {
+    cudaFree(d_kv_sink_k_);
+    d_kv_sink_k_ = nullptr;
+  }
+  if (d_kv_sink_v_) {
+    cudaFree(d_kv_sink_v_);
+    d_kv_sink_v_ = nullptr;
+  }
+  if (d_kv_ring_k_) {
+    cudaFree(d_kv_ring_k_);
+    d_kv_ring_k_ = nullptr;
+  }
+  if (d_kv_ring_v_) {
+    cudaFree(d_kv_ring_v_);
+    d_kv_ring_v_ = nullptr;
+  }
   if (d_tq3_codebook_) {
     cudaFree(d_tq3_codebook_);
     d_tq3_codebook_ = nullptr;

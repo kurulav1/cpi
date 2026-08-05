@@ -297,6 +297,12 @@ void LlamaEngine::allocate_runtime_buffers() {
     // The R3 rotation kernels assume head_dim 128; fall back to unrotated K.
     kv_quant_rot_ = false;
   }
+  if (const char* env = std::getenv("CPI_KV_SINK")) {
+    kv_quant_sink_ = std::max(0, std::atoi(env));
+  }
+  if (const char* env = std::getenv("CPI_KV_WIN")) {
+    kv_quant_win_ = std::max(0, std::atoi(env));
+  }
   const int kv_hidden = attn_kv_hidden_ > 0 ? attn_kv_hidden_ : (cfg.num_kv_heads * head_dim);
   const int rows = prefill_chunk_size_;
   int max_lowbit_cols = (hidden > inter) ? hidden : inter;
@@ -526,11 +532,32 @@ void LlamaEngine::allocate_runtime_buffers() {
     CUDA_CHECK(cudaMemset(d_v_cache_i4_, 0, v_bytes));
     CUDA_CHECK(cudaMemset(d_k_scales_, 0, sc_bytes));
     CUDA_CHECK(cudaMemset(d_v_scales_, 0, sc_bytes));
+    // fp16 sink and recent-window side buffers (small: (sink+win) tokens/layer).
+    const std::size_t sink_bytes = static_cast<std::size_t>(cfg.num_layers) *
+                                   static_cast<std::size_t>(kv_quant_sink_) *
+                                   static_cast<std::size_t>(kv_hidden) * sizeof(__half);
+    const std::size_t ring_bytes = static_cast<std::size_t>(cfg.num_layers) *
+                                   static_cast<std::size_t>(kv_quant_win_) *
+                                   static_cast<std::size_t>(kv_hidden) * sizeof(__half);
+    if (sink_bytes > 0) {
+      CUDA_CHECK(cudaMalloc(&d_kv_sink_k_, sink_bytes));
+      CUDA_CHECK(cudaMalloc(&d_kv_sink_v_, sink_bytes));
+      CUDA_CHECK(cudaMemset(d_kv_sink_k_, 0, sink_bytes));
+      CUDA_CHECK(cudaMemset(d_kv_sink_v_, 0, sink_bytes));
+    }
+    if (ring_bytes > 0) {
+      CUDA_CHECK(cudaMalloc(&d_kv_ring_k_, ring_bytes));
+      CUDA_CHECK(cudaMalloc(&d_kv_ring_v_, ring_bytes));
+      CUDA_CHECK(cudaMemset(d_kv_ring_k_, 0, ring_bytes));
+      CUDA_CHECK(cudaMemset(d_kv_ring_v_, 0, ring_bytes));
+    }
     if (options_.verbose) {
       std::cout << "[engine] kv_quant=K" << kv_quant_kbits_ << "V" << kv_quant_vbits_
-                << (kv_quant_rot_ ? "+rot" : "") << "  KV VRAM: "
-                << (k_bytes + v_bytes + sc_bytes * 2) / (1024 * 1024) << " MiB"
-                << " (vs " << (kv_bytes * 2) / (1024 * 1024) << " MiB fp16)\n";
+                << (kv_quant_rot_ ? "+rot" : "") << " sink=" << kv_quant_sink_
+                << " win=" << kv_quant_win_ << "  KV VRAM: "
+                << (k_bytes + v_bytes + sc_bytes * 2 + (sink_bytes + ring_bytes) * 2) /
+                       (1024 * 1024)
+                << " MiB (vs " << (kv_bytes * 2) / (1024 * 1024) << " MiB fp16)\n";
     }
   } else if (options_.paged_kv_cache) {
     const std::size_t stage_bytes = static_cast<std::size_t>(options_.max_context) *
@@ -609,6 +636,20 @@ void LlamaEngine::reset_kv_cache() {
     CUDA_CHECK(cudaMemset(d_v_cache_i4_, 0, v_bytes));
     CUDA_CHECK(cudaMemset(d_k_scales_, 0, sc_bytes));
     CUDA_CHECK(cudaMemset(d_v_scales_, 0, sc_bytes));
+    const std::size_t sink_bytes = static_cast<std::size_t>(cfg.num_layers) *
+                                   static_cast<std::size_t>(kv_quant_sink_) *
+                                   static_cast<std::size_t>(kv_hidden) * sizeof(__half);
+    const std::size_t ring_bytes = static_cast<std::size_t>(cfg.num_layers) *
+                                   static_cast<std::size_t>(kv_quant_win_) *
+                                   static_cast<std::size_t>(kv_hidden) * sizeof(__half);
+    if (d_kv_sink_k_) {
+      CUDA_CHECK(cudaMemset(d_kv_sink_k_, 0, sink_bytes));
+      CUDA_CHECK(cudaMemset(d_kv_sink_v_, 0, sink_bytes));
+    }
+    if (d_kv_ring_k_) {
+      CUDA_CHECK(cudaMemset(d_kv_ring_k_, 0, ring_bytes));
+      CUDA_CHECK(cudaMemset(d_kv_ring_v_, 0, ring_bytes));
+    }
     return;
   }
   if (options_.paged_kv_cache) {

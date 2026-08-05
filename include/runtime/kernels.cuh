@@ -1408,15 +1408,29 @@ void launch_attention_step_int4(const half* q, const int8_t* k_cache_i4, const i
 //
 // Cache row strides: K = head_dim * k_bits / 8 bytes, V = head_dim * v_bits / 8
 // bytes per (token, kv_head). Scale tables are [max_context, num_kv_heads] fp16.
+//
+// Sink / recent-window fp16 override (quality: keeps attention sinks and the
+// newest tokens exact): when k_sink/v_sink are non-null the store kernel also
+// writes the (rotated) fp16 K and raw fp16 V of absolute positions < sink_n
+// into them ([sink_n, num_kv_heads, head_dim]); when k_ring/v_ring are
+// non-null every position is also written to ring slot position % win_n
+// ([win_n, num_kv_heads, head_dim]). The attention kernels read these fp16
+// buffers for sink tokens and for tokens younger than win_n, and the
+// quantized cache otherwise. attn_start is the absolute position of the first
+// cached token the (possibly offset) cache pointers refer to. Pass nulls and
+// zeros to disable.
 void launch_store_kv_quant(const half* k, const half* v, int8_t* k_cache, int8_t* v_cache,
-                           half* k_scales, half* v_scales, int position, int num_kv_heads,
-                           int head_dim, int max_context, int k_bits, int v_bits, bool rotate_k,
-                           cudaStream_t stream);
+                           half* k_scales, half* v_scales, half* k_sink, half* v_sink,
+                           half* k_ring, half* v_ring, int sink_n, int win_n, int position,
+                           int num_kv_heads, int head_dim, int max_context, int k_bits,
+                           int v_bits, bool rotate_k, cudaStream_t stream);
 
 void launch_attention_step_quant(const half* q, const int8_t* k_cache, const int8_t* v_cache,
-                                 const half* k_scales, const half* v_scales, half* out,
-                                 int seq_len, int num_heads, int num_kv_heads, int head_dim,
-                                 int k_bits, int v_bits, bool rotate_k, cudaStream_t stream,
+                                 const half* k_scales, const half* v_scales, const half* k_sink,
+                                 const half* v_sink, const half* k_ring, const half* v_ring,
+                                 int sink_n, int win_n, int attn_start, half* out, int seq_len,
+                                 int num_heads, int num_kv_heads, int head_dim, int k_bits,
+                                 int v_bits, bool rotate_k, cudaStream_t stream,
                                  float* scratch_m = nullptr, float* scratch_l = nullptr,
                                  float* scratch_o = nullptr, int scratch_chunks = 0,
                                  bool allow_split = false);

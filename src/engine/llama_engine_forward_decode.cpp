@@ -85,15 +85,31 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
     auto* vq = d_v_cache_i4_ + static_cast<std::size_t>(layer) * token_heads * v_row;
     auto* ks = d_k_scales_ + static_cast<std::size_t>(layer) * token_heads;
     auto* vs = d_v_scales_ + static_cast<std::size_t>(layer) * token_heads;
+    const std::size_t sink_stride = static_cast<std::size_t>(kv_quant_sink_) *
+                                    static_cast<std::size_t>(cfg.num_kv_heads) *
+                                    static_cast<std::size_t>(head_dim);
+    const std::size_t ring_stride = static_cast<std::size_t>(kv_quant_win_) *
+                                    static_cast<std::size_t>(cfg.num_kv_heads) *
+                                    static_cast<std::size_t>(head_dim);
+    auto* sink_k = d_kv_sink_k_ ? d_kv_sink_k_ + static_cast<std::size_t>(layer) * sink_stride
+                                : nullptr;
+    auto* sink_v = d_kv_sink_v_ ? d_kv_sink_v_ + static_cast<std::size_t>(layer) * sink_stride
+                                : nullptr;
+    auto* ring_k = d_kv_ring_k_ ? d_kv_ring_k_ + static_cast<std::size_t>(layer) * ring_stride
+                                : nullptr;
+    auto* ring_v = d_kv_ring_v_ ? d_kv_ring_v_ + static_cast<std::size_t>(layer) * ring_stride
+                                : nullptr;
     kernels::launch_store_kv_quant(
         static_cast<const __half*>(d_k_), static_cast<const __half*>(d_v_), kq, vq, ks, vs,
-        position, cfg.num_kv_heads, head_dim, options_.max_context, kv_quant_kbits_,
-        kv_quant_vbits_, kv_quant_rot_, compute_stream_);
+        sink_k, sink_v, ring_k, ring_v, kv_quant_sink_, kv_quant_win_, position,
+        cfg.num_kv_heads, head_dim, options_.max_context, kv_quant_kbits_, kv_quant_vbits_,
+        kv_quant_rot_, compute_stream_);
     const std::size_t head_off =
         static_cast<std::size_t>(attn_start) * static_cast<std::size_t>(cfg.num_kv_heads);
     kernels::launch_attention_step_quant(
         static_cast<const __half*>(d_q_), kq + head_off * k_row, vq + head_off * v_row,
-        ks + head_off, vs + head_off, static_cast<__half*>(d_att_), attn_seq_len, cfg.num_heads,
+        ks + head_off, vs + head_off, sink_k, sink_v, ring_k, ring_v, kv_quant_sink_,
+        kv_quant_win_, attn_start, static_cast<__half*>(d_att_), attn_seq_len, cfg.num_heads,
         cfg.num_kv_heads, head_dim, kv_quant_kbits_, kv_quant_vbits_, kv_quant_rot_,
         compute_stream_, d_attn_chunk_m_, d_attn_chunk_l_, d_attn_chunk_o_, attn_chunk_capacity_,
         !options_.disable_split_attention);

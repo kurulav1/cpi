@@ -124,11 +124,16 @@ __global__ void attention_step_chunk_reduce_kernel(const float* chunk_m, const f
 // Quantize and store one K/V pair with per-head scales.
 // Grid: dim3(num_kv_heads).  Block: dim3(head_dim).
 // Shared memory: [head_dim k_buf][head_dim v_buf][num_warps k_warp][num_warps v_warp][2 scales].
+// When sink/ring buffers are provided, the (rotated) fp16 values are also
+// written there: sinks at absolute positions < sink_n (permanent), and every
+// position into ring slot position % win_n. Attention reads these fp16 copies
+// for sink and recent-window tokens instead of the quantized cache.
 template <int KBits, int VBits, bool RotK>
 __global__ void store_kv_quant_kernel(const half* k, const half* v, int8_t* k_cache,
                                       int8_t* v_cache, half* k_scales, half* v_scales,
-                                      int position, int num_kv_heads, int head_dim,
-                                      int max_context) {
+                                      half* k_sink, half* v_sink, half* k_ring, half* v_ring,
+                                      int sink_n, int win_n, int position, int num_kv_heads,
+                                      int head_dim, int max_context) {
   extern __shared__ float smem[];
   const int kv_head = blockIdx.x;
   const int tid = threadIdx.x;
@@ -155,6 +160,18 @@ __global__ void store_kv_quant_kernel(const half* k, const half* v, int8_t* k_ca
     fwht_shared(k_buf, tid, head_dim);
     k_buf[tid] *= rsqrtf(static_cast<float>(head_dim));
     __syncthreads();
+  }
+
+  if (win_n > 0 && k_ring != nullptr) {
+    const int slot = position % win_n;
+    const int ri = (slot * num_kv_heads + kv_head) * head_dim + tid;
+    k_ring[ri] = __float2half(k_buf[tid]);
+    v_ring[ri] = __float2half(v_buf[tid]);
+  }
+  if (position < sink_n && k_sink != nullptr) {
+    const int si = (position * num_kv_heads + kv_head) * head_dim + tid;
+    k_sink[si] = __float2half(k_buf[tid]);
+    v_sink[si] = __float2half(v_buf[tid]);
   }
 
   float kabs = fabsf(k_buf[tid]);
@@ -227,11 +244,30 @@ __device__ __forceinline__ void rotate_q_shared(half* q_shared, float* qbuf, int
   __syncthreads();
 }
 
+// Sink/window fp16 override: token index t is relative to the (possibly
+// offset) cache base; attn_start restores the absolute position. Sink tokens
+// (absolute < sink_n) and recent tokens (absolute >= seq_end - win_n) read the
+// fp16 side buffers written by the store kernel instead of the quantized cache.
+__device__ __forceinline__ const half* kv_fp16_source(const half* sink, const half* ring,
+                                                      int t_abs, int seq_end_abs, int sink_n,
+                                                      int win_n, int num_kv_heads, int kv_head,
+                                                      int head_dim) {
+  if (t_abs < sink_n && sink != nullptr) {
+    return sink + (t_abs * num_kv_heads + kv_head) * head_dim;
+  }
+  if (win_n > 0 && ring != nullptr && t_abs >= seq_end_abs - win_n) {
+    return ring + ((t_abs % win_n) * num_kv_heads + kv_head) * head_dim;
+  }
+  return nullptr;
+}
+
 template <int WarpsPerBlock, int KBits, int VBits, bool RotK>
 __global__ void attention_step_chunk_stats_quant_kernel(
     const half* q, const int8_t* k_cache, const int8_t* v_cache, const half* k_scales,
-    const half* v_scales, float* chunk_m, float* chunk_l, float* chunk_o, int seq_len,
-    int num_heads, int num_kv_heads, int head_dim, int chunk_size, int scratch_chunks) {
+    const half* v_scales, const half* k_sink, const half* v_sink, const half* k_ring,
+    const half* v_ring, int sink_n, int win_n, int attn_start, float* chunk_m, float* chunk_l,
+    float* chunk_o, int seq_len, int num_heads, int num_kv_heads, int head_dim, int chunk_size,
+    int scratch_chunks) {
   extern __shared__ unsigned char smem_bytes[];
   half* q_shared = reinterpret_cast<half*>(smem_bytes);
   float* score_shared = reinterpret_cast<float*>(q_shared + head_dim);
@@ -278,15 +314,23 @@ __global__ void attention_step_chunk_stats_quant_kernel(
   for (int tile_base = chunk_start; tile_base < chunk_end; tile_base += WarpsPerBlock) {
     const int tile_tokens = min(WarpsPerBlock, chunk_end - tile_base);
 
-    // Phase 1a: quantized K dot-product; each warp handles one tile token.
+    // Phase 1a: K dot-product; each warp handles one tile token, reading fp16
+    // sink/window buffers where applicable and the quantized cache otherwise.
     {
       const int t = tile_base + warp_id;
       float score = neg_inf<float>();
       if (warp_id < tile_tokens) {
-        const float kscale = __half2float(k_scales[t * num_kv_heads + kv_head]);
-        const int8_t* k_q = k_cache + (t * num_kv_heads + kv_head) * k_row;
+        const int t_abs = attn_start + t;
+        const half* kf = kv_fp16_source(k_sink, k_ring, t_abs, attn_start + seq_len, sink_n,
+                                        win_n, num_kv_heads, kv_head, head_dim);
         float partial = 0.0f;
-        if (KBits == 4) {
+        if (kf != nullptr) {
+          for (int i = lane; i < head_dim; i += warpSize) {
+            partial += __half2float(q_shared[i]) * __half2float(kf[i]);
+          }
+        } else if (KBits == 4) {
+          const float kscale = __half2float(k_scales[t * num_kv_heads + kv_head]);
+          const int8_t* k_q = k_cache + (t * num_kv_heads + kv_head) * k_row;
           for (int i = lane; i < head_dim / 2; i += warpSize) {
             const int8_t b = k_q[i];
             const float k0 = static_cast<float>(((int)b << 28) >> 28) * kscale;
@@ -295,6 +339,8 @@ __global__ void attention_step_chunk_stats_quant_kernel(
             partial += __half2float(q_shared[2 * i + 1]) * k1;
           }
         } else {
+          const float kscale = __half2float(k_scales[t * num_kv_heads + kv_head]);
+          const int8_t* k_q = k_cache + (t * num_kv_heads + kv_head) * k_row;
           for (int i = lane; i < head_dim; i += warpSize) {
             partial += __half2float(q_shared[i]) * static_cast<float>(k_q[i]) * kscale;
           }
@@ -306,14 +352,23 @@ __global__ void attention_step_chunk_stats_quant_kernel(
       }
     }
 
-    // Phase 1b: dequantize V into shared v_tile.
+    // Phase 1b: stage V into shared v_tile (fp16 copy or dequant).
     for (int i = 0; i < tile_tokens; ++i) {
       const int t = tile_base + i;
-      const float vscale = __half2float(v_scales[t * num_kv_heads + kv_head]);
-      const int8_t* v_q = v_cache + (t * num_kv_heads + kv_head) * v_row;
+      const int t_abs = attn_start + t;
+      const half* vf = kv_fp16_source(v_sink, v_ring, t_abs, attn_start + seq_len, sink_n, win_n,
+                                      num_kv_heads, kv_head, head_dim);
       half* vt = v_tile + i * head_dim;
-      for (int d = tid; d < head_dim; d += blockDim.x) {
-        vt[d] = __float2half(kv_load<VBits>(v_q, d, vscale));
+      if (vf != nullptr) {
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+          vt[d] = vf[d];
+        }
+      } else {
+        const float vscale = __half2float(v_scales[t * num_kv_heads + kv_head]);
+        const int8_t* v_q = v_cache + (t * num_kv_heads + kv_head) * v_row;
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+          vt[d] = __float2half(kv_load<VBits>(v_q, d, vscale));
+        }
       }
     }
     __syncthreads();
@@ -376,7 +431,10 @@ __global__ void attention_step_chunk_stats_quant_kernel(
 template <int WarpsPerBlock, int KBits, int VBits, bool RotK>
 __global__ void attention_step_kernel_quant(const half* q, const int8_t* k_cache,
                                             const int8_t* v_cache, const half* k_scales,
-                                            const half* v_scales, half* out, int seq_len,
+                                            const half* v_scales, const half* k_sink,
+                                            const half* v_sink, const half* k_ring,
+                                            const half* v_ring, int sink_n, int win_n,
+                                            int attn_start, half* out, int seq_len,
                                             int num_heads, int num_kv_heads, int head_dim) {
   extern __shared__ unsigned char smem_bytes[];
   half* q_shared = reinterpret_cast<half*>(smem_bytes);
@@ -418,15 +476,23 @@ __global__ void attention_step_kernel_quant(const half* q, const int8_t* k_cache
   for (int tile_base = 0; tile_base < seq_len; tile_base += WarpsPerBlock) {
     const int tile_tokens = min(WarpsPerBlock, seq_len - tile_base);
 
-    // Phase 1a: each warp computes the K.Q score for its tile token.
+    // Phase 1a: each warp computes the K.Q score for its tile token, reading
+    // fp16 sink/window buffers where applicable.
     {
       const int t = tile_base + warp_id;
       float score = -1.0e30f;
       if (warp_id < tile_tokens) {
-        const float kscale = __half2float(k_scales[t * num_kv_heads + kv_head]);
-        const int8_t* k_q = k_cache + (t * num_kv_heads + kv_head) * k_row;
+        const int t_abs = attn_start + t;
+        const half* kf = kv_fp16_source(k_sink, k_ring, t_abs, attn_start + seq_len, sink_n,
+                                        win_n, num_kv_heads, kv_head, head_dim);
         float partial = 0.0f;
-        if (KBits == 4) {
+        if (kf != nullptr) {
+          for (int i = lane; i < head_dim; i += warpSize) {
+            partial += __half2float(q_shared[i]) * __half2float(kf[i]);
+          }
+        } else if (KBits == 4) {
+          const float kscale = __half2float(k_scales[t * num_kv_heads + kv_head]);
+          const int8_t* k_q = k_cache + (t * num_kv_heads + kv_head) * k_row;
           for (int i = lane; i < head_dim / 2; i += warpSize) {
             const int8_t b = k_q[i];
             const float k0 = static_cast<float>(((int)b << 28) >> 28) * kscale;
@@ -435,6 +501,8 @@ __global__ void attention_step_kernel_quant(const half* q, const int8_t* k_cache
             partial += __half2float(q_shared[2 * i + 1]) * k1;
           }
         } else {
+          const float kscale = __half2float(k_scales[t * num_kv_heads + kv_head]);
+          const int8_t* k_q = k_cache + (t * num_kv_heads + kv_head) * k_row;
           for (int i = lane; i < head_dim; i += warpSize) {
             partial += __half2float(q_shared[i]) * static_cast<float>(k_q[i]) * kscale;
           }
@@ -446,15 +514,24 @@ __global__ void attention_step_kernel_quant(const half* q, const int8_t* k_cache
       }
     }
 
-    // Phase 1b: stage V tile: dequantize to fp16 in shared mem.
+    // Phase 1b: stage V tile in shared mem (fp16 copy or dequant).
     {
       for (int i = 0; i < tile_tokens; ++i) {
         const int t = tile_base + i;
-        const float vscale = __half2float(v_scales[t * num_kv_heads + kv_head]);
-        const int8_t* v_q = v_cache + (t * num_kv_heads + kv_head) * v_row;
+        const int t_abs = attn_start + t;
+        const half* vf = kv_fp16_source(v_sink, v_ring, t_abs, attn_start + seq_len, sink_n,
+                                        win_n, num_kv_heads, kv_head, head_dim);
         half* vt = v_tile + i * head_dim;
-        for (int d = tid; d < head_dim; d += blockDim.x) {
-          vt[d] = __float2half(kv_load<VBits>(v_q, d, vscale));
+        if (vf != nullptr) {
+          for (int d = tid; d < head_dim; d += blockDim.x) {
+            vt[d] = vf[d];
+          }
+        } else {
+          const float vscale = __half2float(v_scales[t * num_kv_heads + kv_head]);
+          const int8_t* v_q = v_cache + (t * num_kv_heads + kv_head) * v_row;
+          for (int d = tid; d < head_dim; d += blockDim.x) {
+            vt[d] = __float2half(kv_load<VBits>(v_q, d, vscale));
+          }
         }
       }
     }
@@ -524,9 +601,10 @@ std::size_t quant_attn_smem(int head_dim, bool rot_k) {
 // Host launch wrappers.
 
 void launch_store_kv_quant(const half* k, const half* v, int8_t* k_cache, int8_t* v_cache,
-                           half* k_scales, half* v_scales, int position, int num_kv_heads,
-                           int head_dim, int max_context, int k_bits, int v_bits, bool rotate_k,
-                           cudaStream_t stream) {
+                           half* k_scales, half* v_scales, half* k_sink, half* v_sink,
+                           half* k_ring, half* v_ring, int sink_n, int win_n, int position,
+                           int num_kv_heads, int head_dim, int max_context, int k_bits,
+                           int v_bits, bool rotate_k, cudaStream_t stream) {
   const int num_warps = head_dim / 32;
   const std::size_t smem =
       static_cast<std::size_t>(2 * head_dim + 2 * num_warps + 2) * sizeof(float);
@@ -537,7 +615,8 @@ void launch_store_kv_quant(const half* k, const half* v, int8_t* k_cache, int8_t
   rotate_k = rotate_k && head_dim == 128;
 #define CPI_STORE_CASE(KB, VB, RK)                                                             \
   store_kv_quant_kernel<KB, VB, RK><<<grid, block, smem, stream>>>(                            \
-      k, v, k_cache, v_cache, k_scales, v_scales, position, num_kv_heads, head_dim, max_context)
+      k, v, k_cache, v_cache, k_scales, v_scales, k_sink, v_sink, k_ring, v_ring, sink_n,      \
+      win_n, position, num_kv_heads, head_dim, max_context)
   if (k_bits == 4 && v_bits == 4 && rotate_k) {
     CPI_STORE_CASE(4, 4, true);
   } else if (k_bits == 4 && v_bits == 4) {
@@ -551,9 +630,11 @@ void launch_store_kv_quant(const half* k, const half* v, int8_t* k_cache, int8_t
 }
 
 void launch_attention_step_quant(const half* q, const int8_t* k_cache, const int8_t* v_cache,
-                                 const half* k_scales, const half* v_scales, half* out,
-                                 int seq_len, int num_heads, int num_kv_heads, int head_dim,
-                                 int k_bits, int v_bits, bool rotate_k, cudaStream_t stream,
+                                 const half* k_scales, const half* v_scales, const half* k_sink,
+                                 const half* v_sink, const half* k_ring, const half* v_ring,
+                                 int sink_n, int win_n, int attn_start, half* out, int seq_len,
+                                 int num_heads, int num_kv_heads, int head_dim, int k_bits,
+                                 int v_bits, bool rotate_k, cudaStream_t stream,
                                  float* scratch_m, float* scratch_l, float* scratch_o,
                                  int scratch_chunks, bool allow_split) {
   constexpr int warps = kQuantAttnWarps;
@@ -577,16 +658,17 @@ void launch_attention_step_quant(const half* q, const int8_t* k_cache, const int
     if (split) {                                                                               \
       attention_step_chunk_stats_quant_kernel<warps, KB, VB, RK>                               \
           <<<split_grid, threads, smem, stream>>>(q, k_cache, v_cache, k_scales, v_scales,     \
-                                                  scratch_m, scratch_l, scratch_o, seq_len,    \
-                                                  num_heads, num_kv_heads, head_dim,           \
-                                                  split_chunk_size, scratch_chunks);           \
+                                                  k_sink, v_sink, k_ring, v_ring, sink_n,      \
+                                                  win_n, attn_start, scratch_m, scratch_l,     \
+                                                  scratch_o, seq_len, num_heads, num_kv_heads, \
+                                                  head_dim, split_chunk_size, scratch_chunks); \
       attention_step_chunk_reduce_kernel<<<num_heads, threads, 0, stream>>>(                   \
           scratch_m, scratch_l, scratch_o, out, seq_len, num_heads, head_dim,                  \
           split_chunk_size, scratch_chunks);                                                   \
     } else {                                                                                   \
       attention_step_kernel_quant<warps, KB, VB, RK><<<num_heads, threads, smem, stream>>>(    \
-          q, k_cache, v_cache, k_scales, v_scales, out, seq_len, num_heads, num_kv_heads,      \
-          head_dim);                                                                           \
+          q, k_cache, v_cache, k_scales, v_scales, k_sink, v_sink, k_ring, v_ring, sink_n,     \
+          win_n, attn_start, out, seq_len, num_heads, num_kv_heads, head_dim);                 \
     }                                                                                          \
   } while (0)
   if (k_bits == 4 && v_bits == 4 && rot) {
@@ -605,8 +687,9 @@ void launch_attention_step_quant(const half* q, const int8_t* k_cache, const int
 void launch_store_kv_int4(const half* k, const half* v, int8_t* k_cache_i4, int8_t* v_cache_i4,
                           half* k_scales, half* v_scales, int position, int num_kv_heads,
                           int head_dim, int max_context, cudaStream_t stream) {
-  launch_store_kv_quant(k, v, k_cache_i4, v_cache_i4, k_scales, v_scales, position, num_kv_heads,
-                        head_dim, max_context, 4, 4, false, stream);
+  launch_store_kv_quant(k, v, k_cache_i4, v_cache_i4, k_scales, v_scales, nullptr, nullptr,
+                        nullptr, nullptr, 0, 0, position, num_kv_heads, head_dim, max_context, 4,
+                        4, false, stream);
 }
 
 void launch_attention_step_int4(const half* q, const int8_t* k_cache_i4, const int8_t* v_cache_i4,
@@ -614,9 +697,10 @@ void launch_attention_step_int4(const half* q, const int8_t* k_cache_i4, const i
                                 int num_heads, int num_kv_heads, int head_dim, cudaStream_t stream,
                                 float* scratch_m, float* scratch_l, float* scratch_o,
                                 int scratch_chunks, bool allow_split) {
-  launch_attention_step_quant(q, k_cache_i4, v_cache_i4, k_scales, v_scales, out, seq_len,
-                              num_heads, num_kv_heads, head_dim, 4, 4, false, stream, scratch_m,
-                              scratch_l, scratch_o, scratch_chunks, allow_split);
+  launch_attention_step_quant(q, k_cache_i4, v_cache_i4, k_scales, v_scales, nullptr, nullptr,
+                              nullptr, nullptr, 0, 0, 0, out, seq_len, num_heads, num_kv_heads,
+                              head_dim, 4, 4, false, stream, scratch_m, scratch_l, scratch_o,
+                              scratch_chunks, allow_split);
 }
 
 }  // namespace kernels
