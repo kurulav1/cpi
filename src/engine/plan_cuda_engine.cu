@@ -671,7 +671,7 @@ void PlanCudaEngine::allocate_buffers() {
       }
       al(&d_mla_qabs_, static_cast<std::size_t>(nh) * kva_w);
       al(&d_mla_attlat_, static_cast<std::size_t>(nh) * cfg_.kv_lora_rank);
-      mla_abs_chunks_ = (max_ctx_ + 63) / 64;
+      mla_abs_chunks_ = (max_ctx_ + 31) / 32;  // must match the launcher's kChunk
       const std::size_t cells = static_cast<std::size_t>(nh) * mla_abs_chunks_;
       G4_CHECK(cudaMalloc(&d_mla_abs_m_, cells * sizeof(float)));
       G4_CHECK(cudaMalloc(&d_mla_abs_l_, cells * sizeof(float)));
@@ -1710,16 +1710,13 @@ void PlanCudaEngine::open(const std::string& cpi_path, int max_context) {
       parse_deepseek_config(cpi_path);
       if (max_ctx_ <= 0) max_ctx_ = std::min(4096, cfg_.max_position_embeddings);
       G4_CHECK(cudaStreamCreate(&stream_));
-      // Absorbed-MLA decode (CPI_DS_ABSORB=1, opt-in): token-identical to the
-      // materialized path and reads ~9x fewer attention bytes at depth, but V2-Lite
-      // decode is MoE-weight-bound at practical depths and the extra per-layer
-      // kernels cost more than the attention bytes save (191 vs 252 tok/s at depth
-      // 2048), so materialized stays the default. Becomes profitable with the
-      // latent-only design (decode skips kv_b+assemble; prefill decompresses from
-      // the latent cache), which is the follow-up. Decided before the weight load:
-      // the loader uploads the absorbed-layout kv_b copies, and allocate_buffers
-      // sizes the latent caches. The kernel's accumulators cover kv_lora <= 512.
-      mla_absorb_ = std::getenv("CPI_DS_ABSORB") != nullptr && cfg_.kv_lora_rank <= 512;
+      // Absorbed-MLA decode (default; CPI_DS_NO_ABSORB=1 restores materialized):
+      // token-identical to the materialized path and reads ~9x fewer attention
+      // bytes at depth, giving a much flatter decode curve (336/325/293 tok/s at
+      // depth 7/512/2048 vs materialized 351/319/251). Decided before the weight
+      // load: the loader uploads the absorbed-layout kv_b copies, and
+      // allocate_buffers sizes the latent caches. Accumulators cover kv_lora <= 512.
+      mla_absorb_ = std::getenv("CPI_DS_NO_ABSORB") == nullptr && cfg_.kv_lora_rank <= 512;
       load_deepseek_weights();
       allocate_buffers();
       // int4 decode routes through dp4a with int8 activations, which needs this scratch. The shared
@@ -3498,9 +3495,9 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
         const int kdim = op.in_dim + op.rotary_dim;
         engine::launch_mla_absorbed_attention(
             S(Slot::MlaQAbs), caches_lat_[layer], static_cast<const __half*>(op.weight),
-            S(Slot::Att), op.heads, kdim, op.in_dim, op.value_head_dim, op.head_dim, op.scale,
-            position + 1, device_pos_mode_ ? d_position_ : nullptr, d_mla_abs_m_, d_mla_abs_l_,
-            d_mla_abs_o_, mla_abs_chunks_, device_pos_mode_, stream_);
+            S(Slot::MlaAttLat), S(Slot::Att), op.heads, kdim, op.in_dim, op.value_head_dim,
+            op.head_dim, op.scale, position + 1, device_pos_mode_ ? d_position_ : nullptr,
+            d_mla_abs_m_, d_mla_abs_l_, d_mla_abs_o_, mla_abs_chunks_, device_pos_mode_, stream_);
         break;
       }
       case OpKind::MlaVDecompress: {

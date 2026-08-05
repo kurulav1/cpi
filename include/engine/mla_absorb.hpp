@@ -136,14 +136,17 @@ __global__ inline void mla_absorbed_attn_stats_kernel(const __half* q_abs, const
   }
   __syncthreads();
 
-  // Phase 2: chunk max + weights recomputed redundantly per thread in registers
-  // (no serial section, no per-token accumulator rescale), then a fixed-weight
-  // V pass with two accumulators per thread (256 threads x 2 = 512 dims).
+  // Phase 2: chunk max scanned redundantly per thread (n <= 32 shared reads),
+  // then the softmax weights are materialized ONCE into shared and the V pass
+  // reads them as broadcasts (no per-thread expf).
   const int n = chunk_end - chunk_start;
   float cm = -3.4e38f;
   for (int i = 0; i < n; ++i) cm = fmaxf(cm, score_sh[i]);
+  __syncthreads();
+  if (tid < n) score_sh[tid] = expf(score_sh[tid] - cm);
+  __syncthreads();
   float cl = 0.0f;
-  for (int i = 0; i < n; ++i) cl += expf(score_sh[i] - cm);
+  for (int i = 0; i < n; ++i) cl += score_sh[i];
 
   const int ci = h * scratch_chunks + chunk;
   if (tid == 0) {
@@ -154,7 +157,7 @@ __global__ inline void mla_absorbed_attn_stats_kernel(const __half* q_abs, const
   const int d0 = tid;
   const int d1 = tid + blockDim.x;
   for (int i = 0; i < n; ++i) {
-    const float w = expf(score_sh[i] - cm);
+    const float w = score_sh[i];
     const __half* row = cache + static_cast<size_t>(chunk_start + i) * kdim;
     if (d0 < vdim) acc0 += w * __half2float(row[d0]);
     if (d1 < vdim) acc1 += w * __half2float(row[d1]);
@@ -163,74 +166,76 @@ __global__ inline void mla_absorbed_attn_stats_kernel(const __half* q_abs, const
   if (d1 < vdim) chunk_o[static_cast<size_t>(ci) * vdim + d1] = acc1;
 }
 
-// Split-K pass 2, fused with the V decompression: merge a head's chunk
-// partials into the attention-weighted latent (shared memory), then each warp
-// computes W_UV rows against it and writes the padded Att row directly. One
-// block per head; saves a kernel launch and the MlaAttLat round-trip.
-__global__ inline void mla_absorbed_reduce_decompress_kernel(
-    const float* chunk_m, const float* chunk_l, const float* chunk_o, const __half* w_uv,
-    __half* att, int seq_len, const int* d_position, int vdim, int v_head, int qkhd,
-    int chunk_size, int scratch_chunks) {
+// Split-K pass 2: barrier-free merge of a head's chunk partials into the
+// normalized attention-weighted latent (out_lat). Tiny (grid nh); the
+// bandwidth-heavy decompress runs as its own well-parallel kernel after.
+__global__ inline void mla_absorbed_reduce_kernel(const float* chunk_m, const float* chunk_l,
+                                                  const float* chunk_o, __half* out_lat,
+                                                  int seq_len, const int* d_position, int vdim,
+                                                  int chunk_size, int scratch_chunks) {
   if (d_position) seq_len = *d_position + 1;
-  extern __shared__ float rsm[];  // [vdim] merged latent
-  float* lat_sh = rsm;
+  // Grid (nh, vdim/blockDim): each block owns one dim slice, so the scratch
+  // read spreads across nh*slices blocks. The m/l scans are cheap broadcasts.
   const int h = blockIdx.x;
-  const int tid = threadIdx.x;
+  const int d = blockIdx.y * blockDim.x + threadIdx.x;
   const int chunk_count = min(scratch_chunks, (seq_len + chunk_size - 1) / chunk_size);
-
-  // Two-pass barrier-free merge (every thread scans the tiny m/l arrays
-  // redundantly in registers; the loads are same-address broadcasts): pass 1
-  // global max, pass 2 independent exp-weighted sums.
   float gm = -3.4e38f;
   for (int c = 0; c < chunk_count; ++c) {
     gm = fmaxf(gm, chunk_m[h * scratch_chunks + c]);
   }
   float gl = 0.0f;
-  float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  float acc = 0.0f;
   for (int c = 0; c < chunk_count; ++c) {
     const int idx = h * scratch_chunks + c;
     const float cl = chunk_l[idx];
     const float w = (cl == 0.0f) ? 0.0f : expf(chunk_m[idx] - gm);
     gl += cl * w;
-    const size_t base = (static_cast<size_t>(h) * scratch_chunks + c) * vdim;
-    int j = 0;
-    for (int d = tid; d < vdim; d += blockDim.x, ++j) {
-      acc[j] += chunk_o[base + d] * w;
+    if (d < vdim) {
+      acc += chunk_o[(static_cast<size_t>(h) * scratch_chunks + c) * vdim + d] * w;
     }
   }
-  const float inv_l = 1.0f / fmaxf(gl, 1e-8f);
-  int j = 0;
-  for (int d = tid; d < vdim; d += blockDim.x, ++j) {
-    lat_sh[d] = acc[j] * inv_l;
-  }
-  __syncthreads();
-
-  // Decompress: each warp walks output dims d = warp, warp+4, ...; pads zeroed.
-  const int warp_id = tid / 32;
-  const int lane = tid & 31;
-  __half* out = att + static_cast<size_t>(h) * qkhd;
-  for (int d = warp_id; d < qkhd; d += 4) {
-    if (d >= v_head) {
-      if (lane == 0) out[d] = __float2half(0.0f);
-      continue;
-    }
-    const __half* w = w_uv + (static_cast<size_t>(h) * v_head + d) * vdim;
-    float a = 0.0f;
-    for (int k = lane; k < vdim; k += 32) {
-      a += __half2float(w[k]) * lat_sh[k];
-    }
-    for (int off = 16; off > 0; off >>= 1) a += __shfl_down_sync(0xffffffffu, a, off);
-    if (lane == 0) out[d] = __float2half(a);
+  if (d < vdim) {
+    out_lat[static_cast<size_t>(h) * vdim + d] = __float2half(acc / fmaxf(gl, 1e-8f));
   }
 }
 
+// Decompress: Att[h, d] = W_UV[h][d] . lat[h] for d < v_head, pads zeroed.
+// Grid (nh, qkhd/4), one output per warp: the 2MB weight read spreads over
+// ~500 blocks instead of nh, which is what makes it bandwidth- rather than
+// occupancy-bound. lat rows are L2-hot (1KB per head).
+__global__ inline void mla_v_decompress_kernel(const __half* out_lat, const __half* w_uv,
+                                               __half* att, int nh, int vdim, int v_head,
+                                               int qkhd) {
+  const int h = blockIdx.x;
+  const int d = blockIdx.y * (blockDim.x / 32) + threadIdx.x / 32;
+  const int lane = threadIdx.x & 31;
+  if (h >= nh || d >= qkhd) return;
+  __half* out = att + static_cast<size_t>(h) * qkhd;
+  if (d >= v_head) {
+    if (lane == 0) out[d] = __float2half(0.0f);
+    return;
+  }
+  const __half2* w2 =
+      reinterpret_cast<const __half2*>(w_uv + (static_cast<size_t>(h) * v_head + d) * vdim);
+  const __half2* l2 =
+      reinterpret_cast<const __half2*>(out_lat + static_cast<size_t>(h) * vdim);
+  float a = 0.0f;
+  for (int p = lane; p < vdim / 2; p += 32) {
+    const float2 wv = __half22float2(w2[p]);
+    const float2 lv = __half22float2(l2[p]);
+    a += wv.x * lv.x + wv.y * lv.y;
+  }
+  for (int off = 16; off > 0; off >>= 1) a += __shfl_down_sync(0xffffffffu, a, off);
+  if (lane == 0) out[d] = __float2half(a);
+}
+
 inline void launch_mla_absorbed_attention(const __half* q_abs, const __half* cache,
-                                          const __half* w_uv, __half* att, int nh, int kdim,
-                                          int vdim, int v_head, int qkhd, float scale,
-                                          int seq_len, const int* d_position, float* sm,
-                                          float* sl, float* so, int scratch_chunks,
+                                          const __half* w_uv, __half* out_lat, __half* att,
+                                          int nh, int kdim, int vdim, int v_head, int qkhd,
+                                          float scale, int seq_len, const int* d_position,
+                                          float* sm, float* sl, float* so, int scratch_chunks,
                                           bool fixed_grid, cudaStream_t stream) {
-  constexpr int kChunk = 64;
+  constexpr int kChunk = 32;
   const int chunks =
       fixed_grid ? scratch_chunks
                  : min(scratch_chunks, (seq_len + kChunk - 1) / kChunk);
@@ -238,9 +243,11 @@ inline void launch_mla_absorbed_attention(const __half* q_abs, const __half* cac
   const size_t smem = (static_cast<size_t>(kdim) + kChunk) * sizeof(float);
   mla_absorbed_attn_stats_kernel<<<grid, 256, smem, stream>>>(
       q_abs, cache, sm, sl, so, seq_len, d_position, kdim, vdim, scale, kChunk, scratch_chunks);
-  const size_t rsmem = static_cast<size_t>(vdim) * sizeof(float);
-  mla_absorbed_reduce_decompress_kernel<<<nh, 128, rsmem, stream>>>(
-      sm, sl, so, w_uv, att, seq_len, d_position, vdim, v_head, qkhd, kChunk, scratch_chunks);
+  const dim3 rgrid(nh, (vdim + 127) / 128);
+  mla_absorbed_reduce_kernel<<<rgrid, 128, 0, stream>>>(sm, sl, so, out_lat, seq_len, d_position,
+                                                        vdim, kChunk, scratch_chunks);
+  const dim3 dgrid(nh, (qkhd + 3) / 4);
+  mla_v_decompress_kernel<<<dgrid, 128, 0, stream>>>(out_lat, w_uv, att, nh, vdim, v_head, qkhd);
 }
 
 }  // namespace engine
