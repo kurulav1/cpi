@@ -492,6 +492,18 @@ private:
   std::vector<float> h_moe_w_seq_;    // host copy of the [T*top_k] weights
   std::vector<int> h_moe_off_;        // [E+1] grouped-row offset per expert (cached gate_up->down)
   std::vector<int> h_moe_perm_;       // [P] source token id per grouped row (cached gate_up->down)
+  // Reused per-call scratch for the MoE grouped path, so each prefill layer refills rather than
+  // reallocates (assign/clear keep capacity after the first call).
+  std::vector<int> h_moe_cursor_;     // [E] per-expert fill cursor while bucketing
+  std::vector<float> h_moe_rweight_;  // [P] routing weight per grouped row
+  std::vector<int> gg_ng_;            // [G] tokens per group for grouped_gemm_ex
+  std::vector<const void*> gg_pa_, gg_pb_;
+  std::vector<void*> gg_pc_;
+  // grouped_gemm_ex scalar-array scratch. transa/transb held as int (cublasOperation_t is int-backed;
+  // cast at the call site) to keep cublas out of this header.
+  std::vector<int> gg_ta_, gg_tb_;
+  std::vector<int> gg_ma_, gg_na_, gg_ka_, gg_lda_, gg_ldb_, gg_ldc_, gg_gs_;
+  std::vector<float> gg_alpha_, gg_beta_;
   int moe_grouped_total_ = 0;         // P for the current chunk (cached gate_up->down)
   // DeepSeek-V2 MLA working set + rope table.
   __half* d_mla_ckv_ = nullptr;      // [kv_lora + qk_rope]  (kv_a_proj output)

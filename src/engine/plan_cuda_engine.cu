@@ -2583,17 +2583,28 @@ bool PlanCudaEngine::grouped_gemm_ex(int m, int k, const std::vector<int>& n_per
   }
   cublasHandle_t h = static_cast<cublasHandle_t>(cublas_);
   cublasSetStream(h, stream_);
-  std::vector<cublasOperation_t> ta(G, CUBLAS_OP_T), tb(G, CUBLAS_OP_N);
-  std::vector<int> ma(G, m), na(n_per_group), ka(G, k), lda(G, k), ldb(G, k), ldc(G, m), gs(G, 1);
-  std::vector<float> alpha(G, 1.0f), beta(G, 0.0f);
+  // Reused member scratch (assign keeps capacity after the first call) so the twice-per-layer prefill
+  // GEMM does not churn the heap.
+  gg_ta_.assign(G, static_cast<int>(CUBLAS_OP_T));
+  gg_tb_.assign(G, static_cast<int>(CUBLAS_OP_N));
+  gg_ma_.assign(G, m);
+  gg_na_.assign(n_per_group.begin(), n_per_group.end());
+  gg_ka_.assign(G, k);
+  gg_lda_.assign(G, k);
+  gg_ldb_.assign(G, k);
+  gg_ldc_.assign(G, m);
+  gg_gs_.assign(G, 1);
+  gg_alpha_.assign(G, 1.0f);
+  gg_beta_.assign(G, 0.0f);
   // The pointer arrays must live in device memory; the scalar arrays stay on host.
   G4_CHECK(cudaMemcpyAsync(d_gg_A_, A.data(), G * sizeof(void*), cudaMemcpyHostToDevice, stream_));
   G4_CHECK(cudaMemcpyAsync(d_gg_B_, B.data(), G * sizeof(void*), cudaMemcpyHostToDevice, stream_));
   G4_CHECK(cudaMemcpyAsync(d_gg_C_, C.data(), G * sizeof(void*), cudaMemcpyHostToDevice, stream_));
   const cublasStatus_t st = cublasGemmGroupedBatchedEx(
-      h, ta.data(), tb.data(), ma.data(), na.data(), ka.data(), alpha.data(), d_gg_A_, CUDA_R_16F,
-      lda.data(), d_gg_B_, CUDA_R_16F, ldb.data(), beta.data(), d_gg_C_, CUDA_R_16F, ldc.data(), G,
-      gs.data(), CUBLAS_COMPUTE_32F);
+      h, reinterpret_cast<cublasOperation_t*>(gg_ta_.data()),
+      reinterpret_cast<cublasOperation_t*>(gg_tb_.data()), gg_ma_.data(), gg_na_.data(), gg_ka_.data(),
+      gg_alpha_.data(), d_gg_A_, CUDA_R_16F, gg_lda_.data(), d_gg_B_, CUDA_R_16F, gg_ldb_.data(),
+      gg_beta_.data(), d_gg_C_, CUDA_R_16F, gg_ldc_.data(), G, gg_gs_.data(), CUBLAS_COMPUTE_32F);
   return st == CUBLAS_STATUS_SUCCESS;
 }
 
@@ -2636,18 +2647,18 @@ bool PlanCudaEngine::moe_grouped_gate_up(const opplan::Op& op, __half* xnorm, in
   for (int i = 0; i < P; ++i) off[h_moe_idx_seq_[i] + 1]++;
   for (int e = 0; e < E; ++e) off[e + 1] += off[e];
   h_moe_perm_.resize(P);
-  std::vector<int> cursor(off.begin(), off.begin() + E);
-  std::vector<float> rweight(P);
+  h_moe_cursor_.assign(off.begin(), off.begin() + E);
+  h_moe_rweight_.resize(P);
   for (int t = 0; t < T; ++t)
     for (int k = 0; k < K; ++k) {
       const int e = h_moe_idx_seq_[t * K + k];
-      const int pos = cursor[e]++;
+      const int pos = h_moe_cursor_[e]++;
       h_moe_perm_[pos] = t;
-      rweight[pos] = h_moe_w_seq_[t * K + k];
+      h_moe_rweight_[pos] = h_moe_w_seq_[t * K + k];
     }
   G4_CHECK(cudaMemcpyAsync(d_moe_perm_, h_moe_perm_.data(), P * sizeof(int), cudaMemcpyHostToDevice,
                            stream_));
-  G4_CHECK(cudaMemcpyAsync(d_moe_rweight_, rweight.data(), P * sizeof(float),
+  G4_CHECK(cudaMemcpyAsync(d_moe_rweight_, h_moe_rweight_.data(), P * sizeof(float),
                            cudaMemcpyHostToDevice, stream_));
   engine::launch_moe_gather_rows(xnorm, d_moe_perm_, d_moe_gather_, H, P, stream_);
 
@@ -2675,13 +2686,14 @@ bool PlanCudaEngine::moe_grouped_gate_up(const opplan::Op& op, __half* xnorm, in
   kernels::launch_dequant_int4_grouped(static_cast<const std::int8_t*>(op.qweight),
                                        static_cast<const float*>(op.qscales), d_moe_dqw_,
                                        E * 2 * MI, H, group, stream_);
-  std::vector<int> ng_list;
-  std::vector<const void*> A, B;
-  std::vector<void*> C;
-  ng_list.reserve(2 * E);
-  A.reserve(2 * E);
-  B.reserve(2 * E);
-  C.reserve(2 * E);
+  std::vector<int>& ng_list = gg_ng_;
+  std::vector<const void*>& A = gg_pa_;
+  std::vector<const void*>& B = gg_pb_;
+  std::vector<void*>& C = gg_pc_;
+  ng_list.clear();
+  A.clear();
+  B.clear();
+  C.clear();
   for (int e = 0; e < E; ++e) {
     const int n_e = off[e + 1] - off[e];
     if (n_e <= 0) continue;
@@ -2727,13 +2739,14 @@ bool PlanCudaEngine::moe_grouped_down(const opplan::Op& op, __half* moe_out, int
     kernels::launch_dequant_int4_grouped(static_cast<const std::int8_t*>(op.qweight),
                                          static_cast<const float*>(op.qscales), d_moe_dqw_, E * H, MI,
                                          group, stream_);
-    std::vector<int> ng_list;
-    std::vector<const void*> A, B;
-    std::vector<void*> C;
-    ng_list.reserve(E);
-    A.reserve(E);
-    B.reserve(E);
-    C.reserve(E);
+    std::vector<int>& ng_list = gg_ng_;
+    std::vector<const void*>& A = gg_pa_;
+    std::vector<const void*>& B = gg_pb_;
+    std::vector<void*>& C = gg_pc_;
+    ng_list.clear();
+    A.clear();
+    B.clear();
+    C.clear();
     for (int e = 0; e < E; ++e) {
       const int n_e = off[e + 1] - off[e];
       if (n_e <= 0) continue;
