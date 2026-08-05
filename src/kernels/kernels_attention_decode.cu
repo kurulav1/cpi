@@ -965,7 +965,7 @@ __global__ void gqa_decode_kernel(const half* __restrict__ q, const half* __rest
       const float score = warp_sum(partial) * scale;
       if (lane == 0) score_sh[warp_id] = score;
     }
-    __syncthreads();  // scores written; K reads done — safe to overwrite kv_sh
+    __syncthreads();  // scores written; K reads done, safe to overwrite kv_sh
 
     // Phase 3: load V[t] into kv_sh (reuse buffer).
     for (int d = tid; d < HeadDim; d += blockDim.x) {
@@ -1079,11 +1079,11 @@ __global__ void gqa_decode_kernel_device_pos(const half* __restrict__ q,
 
 // Sequence length at/below which the GQA-fused decode kernel (num_kv_heads
 // blocks, serial over the sequence) is used. Above it, decode attention routes
-// to the split-K path (parallel over KV chunks) — see launch_attention_step.
+// to the split-K path (parallel over KV chunks); see launch_attention_step.
 constexpr int kGqaFusedMaxSeq = 256;
 
 // ── GQA + split-K decode attention (best of both) ────────────────────────────
-// The per-Q-head split-K kernel reads each K/V token once per QUERY head, so a
+// The per-Q-head split-K kernel reads each K/V token once per query head, so a
 // GQA group of `group_size` query heads re-reads the same KV `group_size` times
 // from HBM. The GQA-fused kernel avoids that but launches only num_kv_heads
 // blocks (poor occupancy at long context). This kernel combines both: grid.x =
@@ -1276,14 +1276,14 @@ void launch_attention_step(const half* q, const half* k_cache, const half* v_cac
     return;
   }
   // GQA fused: one block per KV head, group_size warps share K/V loads.
-  // Gives group_size× KV-bandwidth reduction vs. per-Q-head kernels — but it
+  // Gives group_size× KV-bandwidth reduction vs. per-Q-head kernels, but it
   // launches only num_kv_heads blocks and scans the sequence serially per block,
-  // so it is bandwidth-optimal at SHORT context yet badly under-parallelized at
+  // so it is bandwidth-optimal at short context yet badly under-parallelized at
   // long context (only num_kv_heads blocks, which starves a large GPU at 2k+ tokens).
   // Above this length, fall through to the split-K path (parallel over KV
   // chunks, ~num_heads×ceil(seq/32) blocks).
   // head_dim 64 and 128 both matter: 128 is Llama's, 64 is Qwen2.5's (and plenty of
-  // small models'). Gating these fast paths on 128 ALONE dropped every head_dim-64 model
+  // small models'). Gating these fast paths on 128 alone dropped every head_dim-64 model
   // onto the fallback kernel, which runs one block per head and walks the whole KV inside
   // it; so decode got slower the longer the context grew.
   if (num_kv_heads > 0 && num_heads > num_kv_heads && (num_heads % num_kv_heads) == 0 &&
@@ -1604,7 +1604,7 @@ __device__ __forceinline__ void gqa_split_chunk_stats_batched_core(
 
   // K and V are used in disjoint phases (K for scores, V for the output sum), so
   // they share one tile buffer: stage K, score, then overwrite with V. Peak smem
-  // is a single block_size*HeadDim tile (unchanged by coarsening — the tile is
+  // is a single block_size*HeadDim tile (unchanged by coarsening; the tile is
   // reused across the coarse chunk's sub-blocks), keeping occupancy high while a
   // single grid block now streams blocks_per_chunk*block_size tokens. Fewer,
   // larger blocks hide memory latency far better at long context (batch 1), where
@@ -1644,7 +1644,7 @@ __device__ __forceinline__ void gqa_split_chunk_stats_batched_core(
     const int tile_tokens = min(block_size, seq_len - tok0);
     const int phys_row0 = block_table[pb] * block_size;
 
-    // Phase 1: stage the paged K tile (vectorized int4 — each token's HeadDim
+    // Phase 1: stage the paged K tile (vectorized int4, each token's HeadDim
     // slice is contiguous + 16-byte aligned, so 8 halves move per instruction).
     __syncthreads();  // protect the shared tile from the previous sub-block's V sum
     for (int i8 = tid; i8 < tile_tokens * kHd8; i8 += blockDim.x) {
@@ -1744,7 +1744,7 @@ void launch_attention_step_batched_paged(const half* q, const half* k_pool, cons
   // warps sharing each KV tile, cutting KV traffic by group_size. Requires a real
   // GQA group, block_size <= 32 (lane owns one token), and group_size <= 32 (warps
   // per block). K and V share one shared-memory tile (staged in disjoint phases),
-  // so peak smem is a single block_size*HeadDim tile — small enough that both
+  // so peak smem is a single block_size*HeadDim tile, small enough that both
   // head_dim 128 and 256 keep good occupancy.
   const int kv_hs = (num_kv_heads > 0) ? num_kv_heads : 1;
   const int group_size = num_heads / kv_hs;

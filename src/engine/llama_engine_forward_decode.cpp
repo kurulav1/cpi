@@ -407,16 +407,15 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
       cudaMemcpyAsync(d_token_id_, &token, sizeof(int), cudaMemcpyHostToDevice, compute_stream_));
   kernels::launch_embedding_lookup(static_cast<const __half*>(d_tok_embeddings_), d_token_id_,
                                    static_cast<__half*>(d_x_), 1, hidden, compute_stream_);
-  // Gemma: scale token embeddings by sqrt(hidden). this WAS MISSING here.
+  // Gemma: scale token embeddings by sqrt(hidden). This was missing here.
   //
-  // Prefill applied it (run_batched_chunk) and so did the MoE decode branch above; but the
-  // RESIDENT decode fast path, which is the one that actually runs for a fully-cached model, did
-  // not. Gemma's residual stream therefore entered the layers ~45x too small (sqrt(2048)) on
-  // every decode step, and gemma-2b emitted garbage: prefill produced a sane first token and
-  // decode destroyed everything after it.
+  // Prefill and the MoE decode branch above applied it, but the resident decode fast path (the
+  // one that runs for a fully-cached model) did not, so Gemma's residual stream entered the
+  // layers ~45x too small (sqrt(2048)) every decode step and gemma-2b emitted garbage after a
+  // sane first token.
   //
-  // Three copies of the embedding prologue, and the scale was in two of them. If a model-specific
-  // stage exists, every path that starts a forward pass needs it; grep for all of them.
+  // The embedding prologue has three copies; a model-specific stage must be in every path that
+  // starts a forward pass. Grep for all of them.
   if (cfg.scale_embeddings) {
     kernels::launch_scale_copy(static_cast<__half*>(d_x_), static_cast<const __half*>(d_x_), hidden,
                                std::sqrt(static_cast<float>(hidden)), compute_stream_);

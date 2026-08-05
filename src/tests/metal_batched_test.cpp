@@ -10,7 +10,7 @@
 //   N=1 ; the paged gather, the per-row rope position, the LM-head row offset.
 //   N=2, duplicate rows; the batch dimension itself. A row-indexing bug (reading row 0's
 //        query for row 1, or writing both rows to one logit slice) survives N=1 and dies here.
-//   wrong block table; a NEGATIVE control. Everything above uses the identity table, where
+//   wrong block table; a negative control. Everything above uses the identity table, where
 //        phys == pos, so a kernel ignoring the table entirely would pass. The answer must change.
 //   chunk sweep; paged prefill at several row counts. This is what caught the fp16 GEMM
 //        being dispatched with half the threads it needs: it only misbehaves at
@@ -20,7 +20,7 @@
 //
 // A note on tolerances: comparisons that cross kernels (a GEMM path vs the token-at-a-time
 // GEMV) are held to kCrossKernelTol, because the matrix units accumulate in a different
-// order. Comparisons between two runs of the same kernel are held to EXACT equality; that
+// order. Comparisons between two runs of the same kernel are held to exact equality; that
 // is where batching contamination would show, and there is no excuse for a difference.
 
 #include <chrono>
@@ -183,7 +183,7 @@ int main(int argc, char** argv) {
     }
   }
 
-  // ---- Negative control: the block table must actually be CONSULTED ------
+  // ---- Negative control: the block table must actually be consulted ------
   //
   // Everything above uses the identity table, where phys == pos. That makes the two paths
   // comparable, but it also means a kernel that ignored the block table completely and
@@ -214,12 +214,12 @@ int main(int argc, char** argv) {
     }
   }
 
-  // ---- Paged prefill into SHUFFLED blocks --------------------------------
+  // ---- Paged prefill into shuffled blocks --------------------------------
   //
   // Everything above leaned on the identity table. This lays the same sequence down through
   // a shuffled table; its history is scattered across the pool in an order that has nothing
   // to do with its positions; and then decodes it. It must still reproduce the contiguous
-  // reference exactly. This is the first check that paged PREFILL works at all, and the first
+  // reference exactly. This is the first check that paged prefill works at all, and the first
   // where phys != pos throughout.
   const std::vector<int> blocks_a = {5, 2, 9, 0};
   // Sweep the chunk length. T=1 per call is exact but T=23 in one pass is not, so something
@@ -262,7 +262,7 @@ int main(int argc, char** argv) {
       eng.prefill_paged(std::vector<int>(prompt_b.begin(), prompt_b.end() - 1), 0, blocks_b);
     };
 
-    // Each alone, through the same paged path (so this isolates BATCHING, not paging).
+    // Each alone, through the same paged path (so this isolates batching, not paging).
     prefill_both();
     std::vector<std::vector<float>> solo_a, solo_b;
     eng.decode_step_batched_logits({last_tok}, {last_pos}, blocks_a, 4, solo_a);
@@ -317,9 +317,9 @@ int main(int argc, char** argv) {
     std::vector<int> tbl(static_cast<std::size_t>(blocks));
     for (int i = 0; i < blocks; ++i) tbl[static_cast<std::size_t>(i)] = i;
 
-    // Warm both paths first. The GPU clock ramps, and on this machine the first measurement
-    // of anything reads ~15% slow whichever path happens to go first; that artifact already
-    // produced one wrong conclusion in this backend's history.
+    // Warm both paths first. The GPU clock ramps, and the first measurement of anything reads
+    // ~15% slow whichever path happens to go first; that artifact already produced one wrong
+    // conclusion in this backend's history.
     eng.prefill_paged(longp, 0, tbl);
     eng.inspect_next_logits(longp, 1);
 

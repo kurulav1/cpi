@@ -1,6 +1,6 @@
 // Generic per-layer op-plan CUDA executor. The forward is resolved at load into
-// a data op-plan (include/engine/op_plan.hpp) and the hot loop just executes it —
-// no model-specific control flow. This is the "exotic model" tier: it runs
+// a data op-plan (include/engine/op_plan.hpp) and the hot loop just executes it,
+// with no model-specific control flow. This is the "exotic model" tier: it runs
 // architectures whose per-layer geometry breaks LlamaEngine's uniform-geometry
 // fast path (per-layer head_dim / kv-heads, cross-layer KV sharing, PLE, …).
 //
@@ -9,7 +9,7 @@
 // QK-norm, sandwich norms, KV-cache sharing, per-layer scalar, GeGLU, logit
 // softcap). Adding another exotic model = a new descriptor + plan recipe, not a
 // new engine. The load path still parses the .cpi/Gemma descriptor; that is the
-// model-specific *configuration* (params), which is expected — the goal is no
+// model-specific *configuration* (params), which is expected; the goal is no
 // model-specific *code* in the forward, which is now met.
 // See memory: cpi-gemma4-arch for Gemma's full spec + parity oracle.
 #pragma once
@@ -72,7 +72,7 @@ class PlanCudaEngine : public runtime::SequenceModel {
   // only correct/representative for position < sliding_window (fine for a fixed
   // short position); long-context sliding correctness needs a windowed kernel.
   // `pos_override` > prompt length pads the prefill (repeating the last token) so
-  // the A/B runs at that decode position — use it to exercise the sliding window
+  // the A/B runs at that decode position; use it to exercise the sliding window
   // (pos >= sliding_window), where graph and non-graph must still match.
   void benchmark_graph_decode(const std::vector<int>& prompt, int iters, int pos_override = 0);
 
@@ -89,7 +89,7 @@ class PlanCudaEngine : public runtime::SequenceModel {
   std::vector<float>& logits() override { return last_logits_; }
   // Device-argmax greedy fast path: for greedy decode the final softcap is
   // monotonic (argmax(softcap(x)) == argmax(x)), so we argmax d_logits_ on device
-  // and copy back one int — skipping the 262K-vocab D2H + host softcap that
+  // and copy back one int, skipping the 262K-vocab D2H + host softcap that
   // otherwise dominate E2B decode. Non-greedy falls back to the host sampler.
   int sample(const runtime::DecodeParams& params, const std::vector<int>& history) override;
   // Batched prompt ingestion via the sequence-prefill path (the multimodal machinery,
@@ -127,9 +127,9 @@ class PlanCudaEngine : public runtime::SequenceModel {
   // existing `cfg_.<field>` and `Family::Gemma4` in this engine compiling unchanged; the field
   // names in the shared struct are deliberately identical for that reason.
   //
-  // The EXECUTOR, sampler, quantizer, decode graph and KV/state machinery are shared; only the
+  // The executor, sampler, quantizer, decode graph and KV/state machinery are shared; only the
   // config parse, weight load and plan recipe differ; so a "new model" is a recipe, not an
-  // engine, and a new BACKEND for an existing model should be a routing change, not a fork.
+  // engine, and a new backend for an existing model should be a routing change, not a fork.
   using Family = engine::PlanFamily;
   using Config = engine::PlanModelConfig;
 
@@ -275,7 +275,7 @@ private:
   __half* upload(const std::string& name, int rows = 0, int cols = 0);
   // Loads a weight and quantizes it to int4 on the GPU, freeing the fp16 copy
   // immediately. Done per tensor during load: uploading the whole model in fp16
-  // first and quantizing afterwards would peak at the fp16 footprint — exactly the
+  // first and quantizing afterwards would peak at the fp16 footprint, exactly the
   // OOM this exists to avoid (Gemma 12B is ~24 GB fp16). Peak here is one tensor.
   void upload_int4(const std::string& name, int rows = 0, int cols = 0);
   std::pair<int, int> shape_of(const std::string& name) const;
@@ -291,7 +291,7 @@ private:
   // the owning layer for cache-indexed ops (KvStore/Attention); pass -1 for the
   // prologue/epilogue, which contain none.
   // Execution context. Decode runs one token against a KV cache; a vision encoder
-  // runs a whole SEQUENCE of patches with no cache and no causal mask. Both drive the
+  // runs a whole sequence of patches with no cache and no causal mask. Both drive the
   // same op list through the same executor; only the context differs.
   //
   // INVARIANT: at tokens == 1 every op takes the identical kernel + arguments it took
@@ -326,7 +326,7 @@ private:
   // Process one token at `position` (reusing the KV cache from prior positions).
   // When compute_logits, fills last_logits_ with softcapped logits. When
   // per_layer_rms != nullptr, appends each layer's output RMS (and dumps the
-  // hidden to $G4_DUMP_DIR if set) — the oracle parity path.
+  // hidden to $G4_DUMP_DIR if set); the oracle parity path.
   void forward_one(int token, int position, bool compute_logits,
                    std::vector<float>* per_layer_rms = nullptr);
   void publish_host_logits();  // d_logits_ -> last_logits_ (softcapped)
@@ -383,7 +383,7 @@ private:
   __half* d_lin_att_ = nullptr;
 
   // int4 weight-only quantization (--weight-quant int4). Gemma 12B is ~24 GB in
-  // fp16 and OOMs on a 32 GB card alongside the desktop; int4 on the per-layer
+  // fp16 and can exceed available VRAM; int4 on the per-layer
   // projections takes the transformer from ~22 GB to ~5.5 GB. Embeddings stay fp16
   // (the token lookup and the tied LM head both need them).
   struct QuantWeight {
@@ -396,7 +396,7 @@ private:
     // one extra int8 copy. nullptr = use the dequant-to-fp16 fallback.
     std::int8_t* pf_i8 = nullptr;
     float* pf_scales = nullptr;
-    bool host = false;  // true = packed/scales live on HOST (expert streaming); stage_moe H2D's them
+    bool host = false;  // true = packed/scales live on host (expert streaming); stage_moe H2D's them
   };
   std::unordered_map<std::string, QuantWeight> qdev_;  // name -> quantized weight
   int weight_quant_bits_ = 0;                          // 0 = fp16, 4 = int4, 8 = int8
@@ -432,14 +432,14 @@ private:
 
   // Per-layer state for linear-attention ("delta-net") layers: a rolling causal
   // conv window and the recurrent state. The analogue of the KV cache for that op
-  // family — allocated only when the plan actually emits those ops.
+  // family, allocated only when the plan actually emits those ops.
   float* d_lin_conv_state_ = nullptr;
   float* d_lin_recurrent_state_ = nullptr;
   int lin_conv_state_stride_ = 0;
   int lin_recurrent_state_stride_ = 0;
 
   // scratch
-  __half* d_x_ = nullptr;        // [hidden] — also holds the residual (adds are in-place)
+  __half* d_x_ = nullptr;        // [hidden], also holds the residual (adds are in-place)
   __half* d_x_norm_ = nullptr;   // [hidden]
   __half* d_tmp_ = nullptr;      // [hidden]
   __half* d_q_ = nullptr;        // [num_heads * max_head_dim]
@@ -454,7 +454,7 @@ private:
   __half* d_ple_gate_ = nullptr; // [ple_dim]
 
   // ── Mixture-of-Experts working set ──
-  // The expert selection lives on the DEVICE: the router writes d_moe_idx_/d_moe_w_
+  // The expert selection lives on the device: the router writes d_moe_idx_/d_moe_w_
   // and the expert kernels read them there. Nothing round-trips to the host between
   // the router and the experts (a sync per layer per token would cost more than the
   // experts themselves, and would make the decode graph uncapturable).
@@ -480,7 +480,7 @@ private:
   std::int8_t* d_moe_actq_ = nullptr; // [P, H] int8-quantized grouped activations (int4-direct path)
   float* d_moe_acts_ = nullptr;       // [P, H/32] per-32-group activation scales (int4-direct path)
   int* d_moe_off_dev_ = nullptr;      // [E+1] device copy of per-expert offsets (int4-direct grid.z)
-  // cublasGemmGroupedBatchedEx wants the A/B/C pointer arrays in DEVICE memory (scalar arrays stay
+  // cublasGemmGroupedBatchedEx wants the A/B/C pointer arrays in device memory (scalar arrays stay
   // host). Sized 2*E groups (gate_up's worst case). Verified in isolation.
   const void** d_gg_A_ = nullptr;
   const void** d_gg_B_ = nullptr;
@@ -511,7 +511,7 @@ private:
   __half* d_mla_kvb_ = nullptr;      // [nh*(qk_nope+v_head)] (kv_b_proj output)
   float* d_inv_freq_ = nullptr;      // [qk_rope/2]          (YARN inverse frequencies)
   float mla_attn_scaling_ = 1.0f;    // YARN mscale (1.0 for V2-Lite)
-  // Expert STREAMING (CPI_MOE_STREAM): stage only the top_k selected experts into K contiguous
+  // Expert streaming (CPI_MOE_STREAM): stage only the top_k selected experts into K contiguous
   // slots and feed the kernels an identity index [0..K-1] (so slot k == the k-th selected expert).
   // Step 1 stages from the resident matrix (D2D) to verify the remap is token-identical; Step 2
   // will source experts from host (H2D) so a >VRAM MoE (K3-scale) can run. The router still writes
@@ -568,7 +568,7 @@ private:
   bool load_tuning();
   void save_tuning() const;
 
-  // Device top-k sampling (temperature>0 — the real chat path, since greedy only
+  // Device top-k sampling (temperature>0, the real chat path, since greedy only
   // covers temp<=0). Selects the candidate set on the GPU so the host never sees
   // the full vocab-sized logit vector; only the ~k candidates come back.
   static constexpr int kMaxDeviceTopK = 256;
@@ -602,7 +602,7 @@ private:
   std::int8_t* d_seq_x8_ = nullptr;
   float* d_seq_xs_ = nullptr;
   int* d_seq_i32_ = nullptr;
-  // cuBLAS, for the SEQUENCE-mode GEMMs only (precedent: llama4 engine + bert embedder);
+  // cuBLAS, for the sequence-mode GEMMs only (precedent: llama4 engine + bert embedder);
   // the hand-rolled GEMM cannot reach tensor-core rates. Decode never touches this.
   // CPI_CUDA_NO_CUBLAS=1 restores the fallback.
   void* cublas_ = nullptr;  // cublasHandle_t, kept as void* to keep cublas out of the header

@@ -13,19 +13,19 @@
 // token. The op-plan resolves it once at load: the builder walks the model
 // descriptor and emits a `std::vector<Op>` per layer with every conditional
 // already decided and every weight pointer already bound. The hot loop then
-// just iterates ops — branch-free over identity, and a fixed sequence that a
+// just iterates ops: branch-free over identity, and a fixed sequence that a
 // CUDA graph can capture.
 //
 // This is the seam that lets Gemma 4 (per-layer varying geometry, KV sharing,
 // PLE) run on a shared executor instead of a fork engine, while a uniform-
 // geometry model can still take its specialized fast path (tiering by
-// capability, chosen on the built plan — never by model name).
+// capability, chosen on the built plan, never by model name).
 namespace engine {
 namespace opplan {
 
 // Named intermediate buffers the executor owns (the residual stream + scratch).
 // Ops read/write these slots; the executor maps a slot to its device pointer.
-// Kept small and explicit — this is the whole working set of a decode step.
+// Kept small and explicit: this is the whole working set of a decode step.
 enum class Slot : std::uint8_t {
   X,      // residual stream (persists across ops/layers)
   XNorm,  // normalized input to a projection
@@ -91,19 +91,19 @@ enum class OpKind : std::uint8_t {
   LmHead,           // logits[vocab] (float) = W[vocab×in_dim] · in   (writes the executor's logits)
 
   // ── extensions for gated / linear-attention ("delta-net") architectures ──
-  // These are general OPS, not a model: any architecture that needs them declares
+  // These are general ops, not a model: any architecture that needs them declares
   // them in its plan. The kernels already exist in the shared kernel library.
   SiluMul,              // out = silu(a) * b   (SwiGLU; the SiLU sibling of GeluMul)
   SplitHeadHalves,      // fused q|gate -> out (Q) + out2 (QGate), interleaved per head
   SigmoidGate,          // in-place: out *= sigmoid(aux slot)   (gated attention output)
   LinearConv1d,         // short causal depthwise conv + SiLU over the fused qkv mixture;
-                        // reads/writes this layer's rolling CONV STATE
+                        // reads/writes this layer's rolling conv state
   RepeatLinearHeads,    // expand the fused mixture into per-head q/k/v (GQA-style repeat)
   LinearAttentionStep,  // gated delta-net recurrence; reads/writes this layer's
-                        // RECURRENT STATE. The linear-attention analogue of Attention.
+                        // recurrent state. The linear-attention analogue of Attention.
 
   // ── extensions for Mixture-of-Experts ──
-  // Also general ops. The selected experts stay on the DEVICE end to end: the
+  // Also general ops. The selected experts stay on the device end to end: the
   // router writes indices/weights to device buffers and the expert ops read them
   // there, so a token never round-trips to the host mid-layer and the decode graph
   // remains capturable.
@@ -139,7 +139,7 @@ enum class OpKind : std::uint8_t {
 
 // One resolved op. Fields are a union-by-convention keyed on `kind`; only the
 // members relevant to `kind` are set (kept as a flat struct for cache-friendly
-// iteration and trivial copyability — no virtuals in the hot loop).
+// iteration and trivial copyability; no virtuals in the hot loop).
 struct Op {
   OpKind kind;
   Slot in = Slot::X;
@@ -169,8 +169,8 @@ struct Op {
   // two-per-byte). qgroup picks the scale granularity: 0 = one scale per row,
   // >0 = one scale per that many contiguous input features (a power of two), with
   // `qscales` laid out [out_dim, quant_group_count(in_dim, qgroup)] row-major.
-  // Resolved at LOAD like everything else, so the hot loop stays branch-free over
-  // model identity — the op just carries a different weight encoding.
+  // Resolved at load like everything else, so the hot loop stays branch-free over
+  // model identity; the op just carries a different weight encoding.
   // Opaque, for the same reason `weight` is: on Metal a quantized weight is an
   // MTLBuffer object, not an address, so the IR cannot name its element type.
   const void* qweight = nullptr;  // packed int4 (two per byte) or int8
@@ -213,14 +213,14 @@ struct Op {
   int key_head_dim = 0;
   int value_head_dim = 0;
   int conv_kernel = 0;  // LinearConv1d: causal kernel width
-  // Offset into the aux SLOT (not a raw pointer): the per-layer-input gate reads layer
+  // Offset into the aux slot (not a raw pointer): the per-layer-input gate reads layer
   // L's window of the wide PLE tensor. A baked raw pointer works at one token and reads
   // the wrong rows over a sequence, so the slot + offset is the addressable form.
   int aux_offset = 0;
   float eps = 1e-6f;  // RmsNorm / LinearAttentionStep epsilon
   // Clipped projections (Gemma 4 E2B's vision tower ships per-projection activation
-  // bounds and CLAMPS both the input and the output of every linear). Infinite by
-  // default, so every other model's Gemv is untouched. The INPUT clamp is the one
+  // bounds and clamps both the input and the output of every linear). Infinite by
+  // default, so every other model's Gemv is untouched. The input clamp is the one
   // that matters numerically; it changes the dot product, not just its range.
   float clip_in_min = -std::numeric_limits<float>::infinity();
   float clip_in_max = std::numeric_limits<float>::infinity();
@@ -230,7 +230,7 @@ struct Op {
   const float* auxf_b = nullptr;  // delta-net A_log (float)
 };
 
-// The forward as data: one op list per layer (conditionals already resolved —
+// The forward as data: one op list per layer (conditionals already resolved:
 // shared layers simply omit the KV-compute ops, non-PLE models omit PLE ops).
 struct LayerPlan {
   std::vector<Op> ops;
@@ -238,7 +238,7 @@ struct LayerPlan {
 };
 
 struct ModelPlan {
-  // Index into `prologue` at which the token embeddings are FINAL; i.e. straight after
+  // Index into `prologue` at which the token embeddings are final; i.e. straight after
   // the embedding lookup and its scale, and before anything that reads them. Multimodal
   // prefill splices image embeddings in here. It matters: Gemma E2B projects its
   // per-layer inputs from the embeddings, so splicing after the prologue would compute

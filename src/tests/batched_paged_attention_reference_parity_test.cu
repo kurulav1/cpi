@@ -1,14 +1,14 @@
 // Reference-oracle parity for batched paged decode attention (Phase 0 safety
 // net, serving path).
 //
-// paged_batched_attention_parity_test checks batched == per-sequence-single — a
+// paged_batched_attention_parity_test checks batched == per-sequence-single, a
 // self-consistency test that passes even when both paths share a bug. This test
-// compares launch_attention_step_batched_paged against an INDEPENDENT naive
+// compares launch_attention_step_batched_paged against an independent naive
 // float reference (per sequence, reading K/V from the shared pool through the
 // block table), swept over head_dim ∈ {128,256} and GQA shapes. It catches the
 // head_dim > blockDim scalar-accumulator class of bug in the batched split-K
-// reduce kernel, which — unlike the non-batched split-K path (gated to
-// head_dim==128) — runs at any head_dim and so silently corrupts head_dim=256
+// reduce kernel, which, unlike the non-batched split-K path (gated to
+// head_dim==128), runs at any head_dim and so silently corrupts head_dim=256
 // (Qwen3.5) under batched serving.
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

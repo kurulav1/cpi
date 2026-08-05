@@ -347,8 +347,8 @@ __global__ void rope_inplace_partial_table_kernel(half* q, half* k, int num_head
 // (graphs-on vs CPI_PLAN_NO_GRAPH streams must be token-identical) is what catches
 // drift between them.
 // ---------------------------------------------------------------------------
-// Decode fusions (the kernel-count tax). At T=1 on this GPU every kernel costs ~11-14 us
-// REGARDLESS of size, a 3 KB residual add prices the same as a 1 MB GEMV, so Gemma 4's
+// Decode fusions (the kernel-count tax). At T=1 every kernel costs ~11-14 us
+// regardless of size, a 3 KB residual add prices the same as a 1 MB GEMV, so Gemma 4's
 // ~870-op token spent more time entering kernels than running them. These fuse the two
 // highest-count patterns; the executor's peepholes decide when they apply.
 
@@ -500,7 +500,7 @@ __global__ void rope_inplace_device_pos_kernel(half* q, half* k, int num_heads_q
 }
 
 // Per-position RoPE (P2): like rope_inplace_batched_kernel but each of the
-// num_tokens rows is rotated at its OWN position positions[token] (one token per
+// num_tokens rows is rotated at its own position positions[token] (one token per
 // sequence in a batched decode step), rather than a contiguous start_position+token.
 __global__ void rope_inplace_perpos_kernel(half* q, half* k, int num_tokens, int num_heads_q,
                                            int num_heads_k, int head_dim,
@@ -530,7 +530,7 @@ __global__ void rope_inplace_perpos_kernel(half* q, half* k, int num_tokens, int
   }
 }
 
-// q_row_stride / k_row_stride let this rotate Q and K IN PLACE inside the fused QKV buffer,
+// q_row_stride / k_row_stride let this rotate Q and K in place inside the fused QKV buffer,
 // rather than requiring them to be copied out into contiguous [tokens, heads*head_dim] buffers
 // first. Prefill is host-bound and those copies were 3 of the 7 cudaMemcpy2DAsync per layer.
 // Passing the natural strides (num_heads * head_dim) reproduces the old behaviour exactly.
@@ -599,7 +599,7 @@ __global__ void attention_prefill_kernel_fallback(const half* q, const half* k_c
   const int group_size = ((num_heads / kv_heads_safe) > 0) ? (num_heads / kv_heads_safe) : 1;
   const int kv_head =
       ((head / group_size) < kv_heads_safe) ? (head / group_size) : (kv_heads_safe - 1);
-  // Each thread owns head_dim/blockDim OUTPUT channels. A SCALAR accumulator silently
+  // Each thread owns head_dim/blockDim output channels. A scalar accumulator silently
   // drops every channel past blockDim; with Gemma's head_dim=512 full layers on 128
   // threads that is 3/4 of the head, computed and written as if it did not exist. The
   // decode kernel was fixed for exactly this; the prefill fallback never was, because
@@ -738,7 +738,7 @@ __global__ void attention_prefill_kernel_tiled(const half* q, const half* k_cach
   __syncthreads();
 
   // Each thread owns head_dim/blockDim output channels (2 at head_dim=256 with
-  // 128 threads), so the accumulator must be an array — a scalar conflates the
+  // 128 threads), so the accumulator must be an array; a scalar conflates the
   // strided output dims into one, corrupting head_dim > blockDim (256).
   constexpr int kOutPerThread = (256 + WarpsPerBlock * 32 - 1) / (WarpsPerBlock * 32);
   float acc[kOutPerThread];
@@ -805,7 +805,7 @@ __global__ void attention_prefill_kernel_tiled(const half* q, const half* k_cach
 
 // Paged prefill attention (P3 phase 2d): identical to attention_prefill_kernel_tiled
 // but each key position t is read through the block table (block_size tokens per
-// block) — phys(t) = block_table[t/block_size]*block_size + t%block_size — into a
+// block), phys(t) = block_table[t/block_size]*block_size + t%block_size, into a
 // block pool, so KV need not be contiguous. Same causal online-softmax math.
 template <int WarpsPerBlock>
 __global__ void attention_prefill_kernel_tiled_paged(const half* q, const half* k_pool,
@@ -851,7 +851,7 @@ __global__ void attention_prefill_kernel_tiled_paged(const half* q, const half* 
   __syncthreads();
 
   // Per-thread output array (2 channels at head_dim=256 with 128 threads); a
-  // scalar would conflate the strided output dims — see the non-paged variant.
+  // scalar would conflate the strided output dims; see the non-paged variant.
   constexpr int kOutPerThread = (256 + WarpsPerBlock * 32 - 1) / (WarpsPerBlock * 32);
   float acc[kOutPerThread];
 #pragma unroll
@@ -1031,9 +1031,9 @@ __global__ void rmsnorm_fast_kernel(const half* __restrict__ x, const half* __re
   }
 }
 
-// Batched RMSNorm over T rows with SEPARATE in/out row strides -- for DeepSeek's kv_a_layernorm,
+// Batched RMSNorm over T rows with separate in/out row strides, for DeepSeek's kv_a_layernorm,
 // which normalizes only the [kv_lora] prefix of the wider MlaCkv=[latent|k_pe] row (in_stride=kva)
-// into a contiguous MlaLatent (out_stride=kv_lora). One block per token in ONE launch: the seq path
+// into a contiguous MlaLatent (out_stride=kv_lora). One block per token in one launch: the seq path
 // was looping the T==1 norm per token (~16.5k host launches). cols % 8 == 0.
 template <int Threads>
 __global__ void rmsnorm_seq_strided_kernel(const half* __restrict__ x, const half* __restrict__ w,
@@ -1094,7 +1094,7 @@ __global__ void rmsnorm_seq_strided_kernel(const half* __restrict__ x, const hal
 
 // rmsnorm_fast + perm8 int8 activation quantization in one kernel, for the rows=1 norms
 // whose output feeds dp4a int4 projections (XNorm sites). The normed row never leaves
-// registers: fp16 y is written as usual, then the fp16-ROUNDED values are quantized
+// registers: fp16 y is written as usual, then the fp16-rounded values are quantized
 // exactly what the separate quantize kernel would read back; so the fused path is
 // bit-identical to [rmsnorm_fast; quantize_fp16_to_int8_perm8]. cols <= Threads * 8.
 template <int Threads>
@@ -1202,7 +1202,7 @@ __global__ void softmax_causal_rows_kernel(half* s, int chunk_stride, int keys, 
                                            int window) {
   const int i = blockIdx.x;  // query within the chunk
   const int h = blockIdx.y;  // head
-  // chunk_stride is the ALLOCATED rows per head (kChunk), not the rows in flight: the GEMM
+  // chunk_stride is the allocated rows per head (kChunk), not the rows in flight: the GEMM
   // writes its per-head slice at h * kChunk * keys, so the stride must match that even when
   // the final chunk is short. grid.x carries the rows actually written.
   half* row = s + (static_cast<std::size_t>(h) * chunk_stride + i) * keys;
@@ -1235,11 +1235,8 @@ __global__ void softmax_causal_rows_kernel(half* s, int chunk_stride, int keys, 
   const float mx = sh_max;
 
   // Sum without writing: the scores stay in fp16-from-the-GEMM until the single final store.
-  //
-  // The first version wrote exp() back into the row here and then multiplied by 1/sum in a
-  // second pass; rounding every probability to fp16 twice. The old kernel keeps them in fp32
-  // throughout, so that doubled the precision loss for no reason. One rounding is unavoidable
-  // (the second GEMM consumes P as fp16); two is just sloppy.
+  // Keeping them in fp32 through the sum avoids a second fp16 rounding of every probability;
+  // only the final store to P (consumed by the next GEMM as fp16) must round.
   float sum = 0.0f;
   for (int j = lo + tid; j < valid; j += blockDim.x) {
     sum += __expf(__half2float(row[j]) - mx);
@@ -1268,7 +1265,7 @@ __global__ void softmax_causal_rows_kernel(half* s, int chunk_stride, int keys, 
   }
 }
 
-// Builds the pointer arrays for the tensor-core prefill attention's batched GEMMs, ON DEVICE.
+// Builds the pointer arrays for the tensor-core prefill attention's batched GEMMs, on device.
 //
 // Building them in a kernel on the compute stream makes the ordering structural, so the pointers
 // cannot be written late or early relative to the GEMMs that consume them. A host build into a

@@ -6,17 +6,17 @@
 // vector is never read by a human; it goes straight into a cosine ranking. So "it produced
 // numbers" is worth nothing here and this compares against a reference.
 //
-// what this GATE CAN and cannot SEE, both established by deliberately breaking the encoder:
+// what this gate can and cannot see, both established by deliberately breaking the encoder:
 //
 //   * Wrong attention row_stride (passing the vision tower's fused-qkv 3*hidden where BERT has
-//     separate q/k/v buffers): per-sentence cosine collapses to 0.17-0.68. CAUGHT, decisively.
+//     separate q/k/v buffers): per-sentence cosine collapses to 0.17-0.68. Caught, decisively.
 //   * Tanh GELU instead of the exact erf form: cosine stays 1.00000 and max_abs moves from
-//     ~1.9e-4 to ~3.7e-4. not CAUGHT. That difference is ~4e-4 per element and six layers is not
+//     ~1.9e-4 to ~3.7e-4. not caught. That difference is ~4e-4 per element and six layers is not
 //     enough depth for it to surface above fp16 noise. The erf choice is therefore asserted from
 //     bert_embedder.cu and the model's hidden_act, not proven here; do not read a pass as
 //     evidence about the activation.
 //
-// The tolerance is on the COSINE, because that is what an embedding is for: a port can differ
+// The tolerance is on the cosine, because that is what an embedding is for: a port can differ
 // element-wise and still rank identically, or match element-wise and rank wrongly.
 
 #include <cmath>

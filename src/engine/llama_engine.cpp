@@ -175,7 +175,7 @@ bool linear_rowmajor_weight_lt(cublasLtHandle_t handle, std::vector<LtMatmulPlan
     }
   }
 
-  // alpha/beta must match the SCALE TYPE, not the data type: with CUDA_R_16F they are read as
+  // alpha/beta must match the scale type, not the data type: with CUDA_R_16F they are read as
   // __half, and handing cuBLAS a float* there reinterprets the bits as garbage.
   const __half alpha_h = __float2half(1.0f);
   const __half beta_h = __float2half(0.0f);
@@ -1202,16 +1202,11 @@ void LlamaEngine::initialize(const EngineOptions& options) {
   }
 
   CUDA_CHECK(cudaSetDevice(0));
-  // Prefill chunk = tokens per batched prefill pass.
-  //
-  // With attention on the tensor cores, prefill is limited by host-side CUDA API calls rather
-  // than by GPU work, so every doubling of the chunk roughly halves the number of passes and
-  // the API traffic with it. Bigger is substantially better.
-  //
-  // Chunking is exact: output is unchanged whatever the size.
-  //
-  // The cost is VRAM, every prefill activation buffer scales with the chunk, so size it from
-  // a memory budget rather than a fixed constant, which would hurt small-VRAM GPUs.
+  // Prefill chunk = tokens per batched prefill pass. With attention on the tensor cores, prefill
+  // is host-API-call bound, not GPU-bound, so doubling the chunk halves the passes and API traffic;
+  // bigger is better. Chunking is exact (output unchanged for any size). Cost is VRAM: every prefill
+  // activation buffer scales with the chunk, so size it from a memory budget, not a fixed constant
+  // that would hurt small-VRAM GPUs.
   int prefill_chunk_target = env_int_or_default("CPI_PREFILL_CHUNK_SIZE", 0);
   if (prefill_chunk_target <= 0) {
     const int kv_dim = cfg.num_kv_heads * (cfg.hidden_size / std::max(1, cfg.num_heads));

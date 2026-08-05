@@ -237,7 +237,7 @@ void Llama4CudaEngine::load_resident_weights() {
 
   // Determine how many layers' shared expert weights fit in remaining VRAM.
   // We must reserve VRAM for all attention weights first (they must stay resident).
-  // Attention per layer: wq(hiddenÃ—hidden) + wk+wv(2Ã—kv_dimÃ—hidden) + wo(hiddenÃ—hidden)
+  // Attention per layer: wq(hidden x hidden) + wk+wv(2 x kv_dim x hidden) + wo(hidden x hidden)
   //                    + q_norm + k_norm + norm_att + norm_ffn (tiny)
   std::size_t free_vram = 0, total_vram = 0;
   CUDA_CHECK(cudaMemGetInfo(&free_vram, &total_vram));

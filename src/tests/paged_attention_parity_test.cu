@@ -119,7 +119,7 @@ int main() {
   // The paged kernel does the same online-softmax math on the same values, so it
   // matches to fp16 precision. Tiny (~1 ULP) diffs on a few elements come from
   // FMA-contraction/codegen differences between the two kernel instantiations,
-  // not addressing — a wrong-block read would be off by O(1), not 1e-5. Greedy
+  // not addressing; a wrong-block read would be off by O(1), not 1e-5. Greedy
   // decoding (argmax over logits) is robust to this, so the tolerance is fp16-scale.
   const double tol = 1e-3;
   const bool pass = max_abs < tol;

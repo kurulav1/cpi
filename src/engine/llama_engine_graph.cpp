@@ -16,19 +16,19 @@ bool LlamaEngine::can_use_greedy_decode_graph() const {
   // Greedy decode CUDA graph. Verified byte-identical to the non-graph path for
   // fp16, int8 and int4 once the RMSNorm eps was sourced from the model config
   // (it had been hardcoded to 1e-5, which corrupted models like Qwen2.5 that use
-  // 1e-6 — the corruption compounded badly through int8/int4 quantization).
+  // 1e-6; the corruption compounded badly through int8/int4 quantization).
   // Requires: all layers resident, full attention, standard attention dims, and
   // no biases / LayerNorm / paged-KV / int4-KV / MoE / TQ3 (TQ3 untested in the
   // graph and unused here).
   const auto& cfg = weights_.config();
-  // The graph's device-position split-K attention launches a FIXED grid sized to
+  // The graph's device-position split-K attention launches a fixed grid sized to
   // the full max_context (scratch_chunks = ceil(max_context/32)) every step,
   // since the grid can't depend on the runtime seq_len once captured. For large
   // max_context that fixed grid dwarfs the per-step launch savings and makes
   // decode scale with the *allocated* context rather than the *filled* one (e.g.
   // Qwen2.5-7B: ~82 tok/s at 128K but ~26 at 256K on an 8-token prompt). Above
   // this threshold, skip the graph so decode uses the host-launched path whose
-  // grid is min(scratch_chunks, ceil(seq_len/32)) — i.e. scales with filled tokens.
+  // grid is min(scratch_chunks, ceil(seq_len/32)), i.e. scales with filled tokens.
   constexpr int kGreedyGraphMaxContext = 32768;
   return cached_layer_count_ == cfg.num_layers && !options_.paged_kv_cache &&
          options_.max_context <= kGreedyGraphMaxContext &&
@@ -118,7 +118,7 @@ void LlamaEngine::init_greedy_decode_graph() {
             tq.w13, d_tq3_codebook_, tq.s_w13, static_cast<const __half*>(d_x_tq3_),
             static_cast<__half*>(d_ff1_), 2 * inter, hidden, compute_stream_);
       }
-      // Warm w2 (fp16, always) using resident_projection_half — always graph-capturable.
+      // Warm w2 (fp16, always) using resident_projection_half; always graph-capturable.
       resident_projection_half(lw.w2, d_ff2_, d_ff3_, hidden, inter, resident_wo_warps_,
                                resident_wo_tile_pairs_, resident_wo_rows_per_warp_);
     } else if (!cached_int8_proj_enabled_) {
@@ -310,7 +310,7 @@ void LlamaEngine::init_greedy_decode_graph() {
             resident_int8_wo_warps_per_row_);
       }
     } else if (resident_custom_wo_) {
-      // Residual add folded into this projection's EPILOGUE, so the shared add_inplace
+      // Residual add folded into this projection's epilogue, so the shared add_inplace
       // below is skipped. At batch 1 a kernel costs a fixed ~1.7 us whatever it does.
       resident_projection_half_residual(lw->wo, d_att_, d_x_, hidden, hidden, resident_wo_warps_,
                                         resident_wo_tile_pairs_, resident_wo_rows_per_warp_);
@@ -396,7 +396,7 @@ void LlamaEngine::init_greedy_decode_graph() {
 
     if (tq) {
       // w2 stays fp16 for TQ3 (intermediate_size is not power-of-2).
-      // Use resident_projection_half — always graph-capturable, consistent with logits graph.
+      // Use resident_projection_half; always graph-capturable, consistent with logits graph.
       resident_projection_half(lw->w2, d_ff2_, d_ff3_, hidden, inter, resident_wo_warps_,
                                resident_wo_tile_pairs_, resident_wo_rows_per_warp_);
     } else if (lw_i8 && lw_i8->w1 && lw_i8->w2 && lw_i8->w3 && can_use_dp4a_decode) {
@@ -463,7 +463,7 @@ void LlamaEngine::init_greedy_decode_graph() {
 }
 
 // Same transformer body as init_greedy_decode_graph but without argmax/copy/increment
-// at the end — outputs to d_logits_ so the sampling path can read them back to CPU.
+// at the end; outputs to d_logits_ so the sampling path can read them back to CPU.
 void LlamaEngine::init_logits_decode_graph() {
   if (logits_decode_graph_ready_) {
     return;
@@ -513,7 +513,7 @@ void LlamaEngine::init_logits_decode_graph() {
             tq.w13, d_tq3_codebook_, tq.s_w13, static_cast<const __half*>(d_x_tq3_),
             static_cast<__half*>(d_ff1_), 2 * inter, hidden, compute_stream_);
       }
-      // Warm w2 (fp16, always) using resident_projection_half — always graph-capturable.
+      // Warm w2 (fp16, always) using resident_projection_half; always graph-capturable.
       resident_projection_half(lw.w2, d_ff2_, d_ff3_, hidden, inter, resident_wo_warps_,
                                resident_wo_tile_pairs_, resident_wo_rows_per_warp_);
     } else if (!cached_int8_proj_enabled_) {
@@ -699,7 +699,7 @@ void LlamaEngine::init_logits_decode_graph() {
             resident_int8_wo_warps_per_row_);
       }
     } else if (resident_custom_wo_) {
-      // Residual add folded into this projection's EPILOGUE, so the shared add_inplace
+      // Residual add folded into this projection's epilogue, so the shared add_inplace
       // below is skipped. At batch 1 a kernel costs a fixed ~1.7 us whatever it does.
       resident_projection_half_residual(lw->wo, d_att_, d_x_, hidden, hidden, resident_wo_warps_,
                                         resident_wo_tile_pairs_, resident_wo_rows_per_warp_);
@@ -795,9 +795,9 @@ void LlamaEngine::init_logits_decode_graph() {
 
   kernels::launch_rmsnorm(static_cast<const __half*>(d_x_), static_cast<const __half*>(d_norm_out_),
                           static_cast<__half*>(d_x_norm_), 1, hidden, norm_eps, compute_stream_);
-  // Always use custom kernel in graph capture — same reason as greedy graph.
+  // Always use custom kernel in graph capture; same reason as greedy graph.
   project_lm_head_logits(static_cast<const __half*>(d_x_norm_), static_cast<float*>(d_logits_));
-  // Note: no argmax/copy_int/increment_int — caller reads d_logits_ for sampling.
+  // Note: no argmax/copy_int/increment_int; caller reads d_logits_ for sampling.
 
   CUDA_CHECK(cudaStreamEndCapture(compute_stream_, &logits_decode_graph_));
   CUDA_CHECK(

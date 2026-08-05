@@ -117,7 +117,7 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
 
   // Split-K scratch for the batched attention: [batch*heads*chunks] stats and
   // [batch*heads*chunks*head_dim] partial outputs. Chunks bounded by max_seq.
-  // Persistent (grown on demand) — allocating/freeing per step would stall the
+  // Persistent (grown on demand); allocating/freeing per step would stall the
   // pipeline with synchronizing cudaMalloc/cudaFree on every decode step.
   const int chunks = (max_seq + bs - 1) / bs;
   const std::size_t stat_elems = static_cast<std::size_t>(batch) * cfg.num_heads * chunks;
@@ -294,7 +294,7 @@ void LlamaEngine::decode_step_batched_logits(const std::vector<int>& tokens,
   }
   const auto t1 = std::chrono::steady_clock::now();
   // One batched GEMM, then one coalesced D2H copy of the whole [batch][vocab] block into a
-  // persistent PINNED buffer; pinned dst copies at ~full PCIe bandwidth (a pageable dst
+  // persistent pinned buffer; pinned dst copies at ~full PCIe bandwidth (a pageable dst
   // stages through a driver bounce buffer at ~half) and the copy can be issued async, so the
   // single stream sync covers both the GEMM and the transfer. The buffer is reused across
   // steps rather than freshly allocating ~batch*vocab floats every decode.
@@ -479,12 +479,12 @@ bool LlamaEngine::decode_step_batched_topk(
                      got.size(), ref.size());
       }
 
-      // Closure over the id-set check: run the ACTUAL shared sampler
+      // Closure over the id-set check: run the actual shared sampler
       // (dispatch_sample_from_candidates; the exact code the scheduler uses to turn candidates
       // into a token) on both the device candidate set and the host reference set, seeded
       // identically, and compare the drawn token. Because both go through the same traversal, an
       // agreeing token proves the sets and their values agree; the id-set check above ignores the
-      // candidate VALUES, so this catches a penalty/sanitize value bug that leaves the ids intact.
+      // candidate values, so this catches a penalty/sanitize value bug that leaves the ids intact.
       // We deliberately do not compare against the full sample_from_logits path: it walks the vocab
       // in index order while the candidate path walks in probability order, so the two map the same
       // RNG draw to different tokens by construction (distributionally equal, not token-identical).
@@ -989,7 +989,7 @@ void LlamaEngine::ensure_batch_state_buffers(int batch, int max_blocks) {
     batch_buffers_max_seqs_ = batch;
   }
   // The block table is batch*max_blocks ints. Both factors vary independently and
-  // the batch can regrow after shrinking, so size against the real capacity — the
+  // the batch can regrow after shrinking, so size against the real capacity: the
   // previous product of high-watermarks over-reported it and let a larger request
   // overflow the buffer (device-side memcpy past the end).
   const std::size_t need = static_cast<std::size_t>(batch) * static_cast<std::size_t>(max_blocks);

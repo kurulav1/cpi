@@ -6,12 +6,12 @@
 //
 // Read the numbers with two caveats:
 //
-//   * TIME KERNELS IN A CUDA GRAPH, not back-to-back on a stream. A stream launch carries
+//   * Time kernels in a CUDA graph, not back-to-back on a stream. A stream launch carries
 //     several microseconds of driver submission overhead, which is what you end up timing
 //     it makes unrelated kernels of different sizes all look like they cost the same. Decode
 //     runs inside a graph anyway. bench_graph() below does this; bench() is kept for contrast.
 //
-//   * A LOOP over one MATRIX measures L2, not HBM. Everything but the LM head fits in cache
+//   * A loop over one matrix measures L2, not HBM. Everything but the LM head fits in cache
 //     here, so those figures are best-case. Real decode streams each weight from HBM once.
 //
 // Neither caveat is academic: both will happily report a starved kernel as a fast one.

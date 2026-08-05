@@ -479,7 +479,7 @@ std::vector<int> LlamaEngine::generate_stream(const std::vector<int>& prompt_tok
   // Bounds guard: the KV cache and position tables are allocated for exactly
   // options_.max_context positions (see llama_engine_lifecycle.cpp). A prompt
   // that meets or exceeds the window would prefill KV out of bounds, corrupting
-  // memory — observed as garbage output on some builds and a 0xC0000409
+  // memory; observed as garbage output on some builds and a 0xC0000409
   // stack-buffer-overrun on others. Reject with a clear error before touching
   // any buffer, leaving at least one slot for a generated token.
   if (static_cast<int>(prompt_tokens.size()) >= options_.max_context) {
@@ -543,16 +543,16 @@ std::vector<int> LlamaEngine::generate_stream(const std::vector<int>& prompt_tok
 
   // P3 phase 2a: mirror this sequence's positions in the paged block table so the
   // allocator is exercised against real sequence lengths (allocation + pool
-  // sizing + no-exhaustion + release across requests). Bookkeeping only in 2a —
+  // sizing + no-exhaustion + release across requests). Bookkeeping only in 2a;
   // the KV hot path still uses the flat cache, so output stays byte-identical.
   // Physical block ids are intentionally not contiguous/identity (the free-list
-  // hands blocks back LIFO across requests) — that permutation is exactly what
+  // hands blocks back LIFO across requests); that permutation is exactly what
   // paging enables, and is consumed by the phase-2b gather kernel that will read
   // KV through this table instead of a flat offset.
   if (seq_blocks_) {
     // Phase 2d: allocate this sequence's blocks and publish its block table
     // (host + device). The allocator's free-list is LIFO, so requests after the
-    // first get non-contiguous physical blocks — exercising real paging. Prefill
+    // first get non-contiguous physical blocks, exercising real paging. Prefill
     // + decode KV writes and both attention reads all go through this table, so
     // byte-identical output proves non-contiguous paging works.
     seq_blocks_->clear();
@@ -748,7 +748,7 @@ void LlamaEngine::verify_tokens(const std::vector<int>& tokens, int start_pos,
   launch_norm(d_x_, d_norm_out_, d_norm_out_bias_, d_x_norm_, K, hidden);
 
   // Batched LM head: one GEMM projects all K normed rows in d_x_norm_ through the
-  // lm_head, reading its ~1 GB weight once — the per-position loop re-read it K
+  // lm_head, reading its ~1 GB weight once; the per-position loop re-read it K
   // times (K x the lm_head bandwidth per verify). Consistent with the verify's
   // layer projections, which already run through the batched cuBLAS path. Then a
   // per-row device argmax (only K ints cross the bus).

@@ -15,9 +15,9 @@
 #endif
 
 // Implements the top-level Tokenizer facade that supports two backends:
-//   1. HfBpeTokenizer  — a built-in BPE implementation that reads HuggingFace
+//   1. HfBpeTokenizer  : a built-in BPE implementation that reads HuggingFace
 //      tokenizer.json files directly, requiring no external tools at runtime.
-//   2. SentencePiece   — the reference libsentencepiece library (optional; gated
+//   2. SentencePiece   : the reference libsentencepiece library (optional; gated
 //      by CPI_HAS_SENTENCEPIECE), or, when the library is absent, a
 //      subprocess-based fallback that first tries the bundled Python helper and
 //      then shells out to spm_encode/spm_decode command-line programs.
@@ -121,7 +121,7 @@ std::string read_text_file(const std::filesystem::path& p) {
   std::ifstream in(p, std::ios::binary);
   if (!in) {
     // The file may have been deleted between the existence check and the open,
-    // or permissions may have changed — surface a clear error either way.
+    // or permissions may have changed; surface a clear error either way.
     throw std::runtime_error("failed reading file: " + p.string());
   }
   std::ostringstream ss;
@@ -456,7 +456,7 @@ std::string Tokenizer::decode(const std::vector<int>& ids,
 
 // Returns the per-token byte table for grammar-constrained decoding. Only the
 // HfBpe backend supplies it; the SentencePiece backends return an empty vector
-// (the grammar targets — Qwen2.5 / Llama-3.1 — use HfBpe tokenizer.json files).
+// (the grammar targets, Qwen2.5 / Llama-3.1, use HfBpe tokenizer.json files).
 const std::vector<std::string>& Tokenizer::token_pieces() const {
   if (!tokenizer_json_path_.empty()) {
     auto* tok = reinterpret_cast<const HfBpeTokenizer*>(hf_bpe_);

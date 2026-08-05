@@ -294,7 +294,7 @@ ModelPlan build_llama_plan(const LlamaGeometry& g, const WeightSource& w) {
     o.in_dim = g.hidden;
 
     // The LM head is the single biggest read of a decode step (vocab x hidden), so it
-    // is the most valuable thing to quantize; tied or not. A tied head shares weights
+    // is the most valuable thing to quantize, tied or not. A tied head shares weights
     // with the embedding table, not storage: WeightSource::quant packs a separate copy,
     // and the EmbeddingLookup op keeps its own fp16 handle, so the lookup is untouched.
     // (This used to skip tied heads, which left Qwen2.5 and Gemma paying a full fp16
@@ -607,7 +607,7 @@ ModelPlan build_gemma4_plan(const Gemma4Geometry& g, const WeightSource& w) {
     pro.push_back(embed(WP + "embed_tokens.weight", Slot::X, H));
     pro.push_back(scale(Slot::X, H, std::sqrt(static_cast<float>(H))));
     // Image embeddings splice in here, before anything reads X; and the per-layer-input
-    // projection below DOES read X, which is why this marker is before it and not after the
+    // projection below does read X, which is why this marker is before it and not after the
     // prologue (HF projects the per-layer inputs from the post-scatter embeddings).
     plan.embed_ready = pro.size();
     if (g.has_ple()) {
@@ -643,7 +643,7 @@ ModelPlan build_gemma4_plan(const Gemma4Geometry& g, const WeightSource& w) {
     lp.layer_index = L;
     std::vector<Op>& ops = lp.ops;
     // Gemma 4's two RoPE configurations. rope_table names which for backends that precompute
-    // tables (CUDA); scale and rotary_dim carry the same choice as VALUES, for backends that
+    // tables (CUDA); scale and rotary_dim carry the same choice as values, for backends that
     // compute the angles in-shader (Metal, which does not look at rope_table at all). Both are set
     // because the plan is one description shared by both executors; setting only the enum leaves
     // Metal on Op::scale's default theta of 1.0, i.e. every lane at the same frequency.
@@ -694,7 +694,7 @@ ModelPlan build_gemma4_plan(const Gemma4Geometry& g, const WeightSource& w) {
       ops.push_back(norm(Slot::V, Slot::V, nullptr, nkv, hd));  // weightless v-norm (ones)
       // Every field matters here, and CUDA's own Gemma builder sets only `cols`; its executor
       // reads the K and V slots by hardcoded name, so the rest is implied. The Metal executor
-      // takes them from the OP (slot(op.in), slot(op.in2), op.kv_heads, op.head_dim), so an
+      // takes them from the op (slot(op.in), slot(op.in2), op.kv_heads, op.head_dim), so an
       // under-specified KvStore writes nothing, the cache stays zero, and attention then
       // correctly returns zero over an empty cache. That is the same mistake as leaving
       // Op::scale unset on the Rope ops: a plan is one description read by two executors, so it
@@ -718,7 +718,7 @@ ModelPlan build_gemma4_plan(const Gemma4Geometry& g, const WeightSource& w) {
       a.head_dim = hd;
       a.full_attention = full;
       a.sliding_window = g.sliding_window;
-      // Gemma 4 specifies a NET attention scale of 1.0, and the Metal executor applies
+      // Gemma 4 specifies a net attention scale of 1.0, and the Metal executor applies
       // op.scale directly; so state 1.0 here rather than pre-scaling Q by sqrt(head_dim)
       // with a ScaleCopy and cancelling it against 1/sqrt(head_dim). The old pair cost a
       // dispatch per layer and an extra fp16 rounding of Q. (CUDA's own Gemma builder keeps
@@ -735,7 +735,7 @@ ModelPlan build_gemma4_plan(const Gemma4Geometry& g, const WeightSource& w) {
     ops.push_back(norm(Slot::X, Slot::XNorm, w.fp16(p + "pre_feedforward_layernorm.weight"), 1, H));
     ops.push_back(gemv(Slot::XNorm, Slot::Gate, w, p + "mlp.gate_proj.weight", inter, H));
     ops.push_back(gemv(Slot::XNorm, Slot::Up, w, p + "mlp.up_proj.weight", inter, H));
-    // NOTE: no fp16 headroom scaling here, deliberately. The GeGLU product DID overflow fp16
+    // NOTE: no fp16 headroom scaling here, deliberately. The GeGLU product did overflow fp16
     // while attention was returning zero; an unattenuated residual made the pre-FFN norm huge
     // but that was a consequence of the under-specified KvStore, not a property of the model.
     // With attention working, this product peaks around 45 against a 65504 ceiling. A scale op per

@@ -2,8 +2,8 @@
 // stack and verifies the whole forward on-device against a host oracle. This is the "wire MLA toward a
 // DeepSeek-arch config" step: structurally a real DeepSeek decoder; pre-norm layers of
 //   h += MLA(RMSNorm(h));  h += SwiGLU-MLP(RMSNorm(h))
-//; on a small SYNTHETIC config with random weights (a native-MLA checkpoint like DeepSeek-V2-Lite
-// doesn't reside on this box). It proves the MLA op composes correctly across residual layers with
+//; on a small synthetic config with random weights (a native-MLA checkpoint like DeepSeek-V2-Lite
+// isn't available locally). It proves the MLA op composes correctly across residual layers with
 // norms and MLP; everything except the real weights, which is the only remaining end-to-end gate.
 #include <cuda_runtime.h>
 

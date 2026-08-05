@@ -9,9 +9,8 @@
 // Node layer can multiplex several SSE streams onto one worker.
 //
 // Requires a tokenizer + --paged-blocks. Takes the scheduler, not an engine: the worker only
-// ever needed admit/step/cancel/active, and engine::BatchScheduler is backend-free, so this
-// whole file no longer knows or cares which GPU is underneath it. That is what took the
-// #if CPI_HAS_CUDA off it.
+// needs admit/step/cancel/active, and engine::BatchScheduler is backend-free, so this file is
+// GPU-agnostic (no #if CPI_HAS_CUDA needed).
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -81,7 +80,7 @@ void run_interactive_batch(engine::BatchScheduler& sched, model::Tokenizer& toke
       if (line.empty()) continue;
       const std::string id = json_get_string(line, "id");
       if (json_get_bool(line, "shutdown", false)) break;
-      // Cancel command: {"cancel":"<id>"} — reclaim a disconnected request.
+      // Cancel command {"cancel":"<id>"}: reclaim a disconnected request.
       const std::string cancel_id = json_get_string(line, "cancel");
       if (!cancel_id.empty()) {
         {
@@ -156,7 +155,7 @@ void run_interactive_batch(engine::BatchScheduler& sched, model::Tokenizer& toke
   // Requeue-and-resume for preempted requests. When the engine preempts a
   // request under KV pressure it emits a "preempted" event; instead of closing
   // the client stream we pause it here (keeping its detok/grammar state) and
-  // re-admit it — re-prefilling prompt+generated-so-far — once a running request
+  // re-admit it (re-prefilling prompt+generated-so-far) once a running request
   // finishes and frees blocks. Since the pool is always >= max_context, any one
   // request fits alone, so a preempted request always resumes eventually.
   struct ResumeInfo {
@@ -328,7 +327,7 @@ void run_interactive_batch(engine::BatchScheduler& sched, model::Tokenizer& toke
         detok.erase(it);
         grammars.erase(e.id);
         resume.erase(e.id);
-        slot_freed = true;  // a slot opened — a waiting request can resume next cycle
+        slot_freed = true;  // a slot opened; a waiting request can resume next cycle
       }
     }
   }

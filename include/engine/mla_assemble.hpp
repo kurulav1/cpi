@@ -6,12 +6,12 @@
 // attention, o_proj) reuses existing ops. Verified fp16-vs-oracle in deepseek_mla_assemble_test.
 //
 // One token at absolute `position`. Layouts (fp16 slots, per head h):
-//   Q   [nh*qkhd]  in/out : [q_nope(qk_nope) | q_pe(qk_rope)]; q_pe is roped IN PLACE.
+//   Q   [nh*qkhd]  in/out : [q_nope(qk_nope) | q_pe(qk_rope)]; q_pe is roped in place.
 //   kvb [nh*kvh]   in     : [k_nope(qk_nope) | v(v_head)]   (kv_b up-projection output)
 //   ckv [kv_lora+qk_rope] in : the k_pe (shared) lives at [kv_lora, kv_lora+qk_rope)
 //   K   [nh*qkhd]  out    : [k_nope | k_pe_roped]   (k_pe shared across heads, roped)
 //   V   [nh*qkhd]  out    : [v | zeros]             (V padded to qkhd so one head_dim serves Q/K/V)
-// qkhd = qk_nope+qk_rope, kvh = qk_nope+v_head. Rope is INTERLEAVED: pair (2p,2p+1) rotates by
+// qkhd = qk_nope+qk_rope, kvh = qk_nope+v_head. Rope is interleaved: pair (2p,2p+1) rotates by
 // position*inv_freq[p], then scales by attn_scaling (the yarn mscale).
 
 #include <cuda_fp16.h>
@@ -61,10 +61,10 @@ __global__ inline void mla_assemble_rope_kernel(__half* Q, const __half* kvb, co
   for (int b = v_head; b < qkhd; ++b) v[b] = __float2half(0.0f);
 }
 
-// High-occupancy variant: ONE block per head (blockDim threads) instead of one thread per head. The
+// High-occupancy variant: one block per head (blockDim threads) instead of one thread per head. The
 // original kernel put all of a head's work (128 sin/cos transcendentals + 320 copies) on a single
-// thread and launched only nh(=16) threads total -- one warp on one SM. Here each head's block computes
-// the per-pair cos/sin ONCE into shared memory (q_pe and k_pe rope share the same angles) and spreads
+// thread and launched only nh(=16) threads total (one warp on one SM). Here each head's block computes
+// the per-pair cos/sin once into shared memory (q_pe and k_pe rope share the same angles) and spreads
 // the copies/rotations across its threads. Same math as the T==1 kernel above (verified vs the oracle).
 __global__ inline void mla_assemble_rope_fast_kernel(__half* Q, const __half* kvb, const __half* ckv,
                                                      __half* K, __half* V, const float* inv_freq, int nh,
@@ -79,7 +79,7 @@ __global__ inline void mla_assemble_rope_fast_kernel(__half* Q, const __half* kv
   const int kvh = qk_nope + v_head;
   const int half = qk_rope / 2;
 
-  extern __shared__ float2 cs[];  // [half] (cos, sin) per rope pair -- shared by q_pe and k_pe
+  extern __shared__ float2 cs[];  // [half] (cos, sin) per rope pair, shared by q_pe and k_pe
   for (int p = tid; p < half; p += blockDim.x) {
     const float ang = position * inv_freq[p];
     cs[p] = make_float2(cosf(ang), sinf(ang));

@@ -324,14 +324,14 @@ bool is_byte_token(const std::string& piece, unsigned char* value) {
 // Loads a HuggingFace tokenizer.json file and populates all internal tables.
 //
 // The function parses four top-level sections of the JSON:
-//   "added_tokens"  — special tokens (BOS, EOS, etc.) with their ids.
-//   "normalizer"    — identifies the word-boundary marker string (default
+//   "added_tokens"  : special tokens (BOS, EOS, etc.) with their ids.
+//   "normalizer"    : identifies the word-boundary marker string (default
 //                     U+2581 LOWER one EIGHTH BLOCK, "▁", used by SentencePiece
 //                     and many HF models) so spaces can be reconstructed on
 //                     decode.
-//   "decoder"       — determines whether a leading space should be stripped
+//   "decoder"       : determines whether a leading space should be stripped
 //                     from the decoded output (strip_leading_space_).
-//   "model"         — the core BPE vocabulary ("vocab") and ordered merge rules
+//   "model"         : the core BPE vocabulary ("vocab") and ordered merge rules
 //                     ("merges").
 //
 // After parsing, added_tokens_ is sorted by descending content length so that
@@ -394,7 +394,7 @@ void HfBpeTokenizer::load(const std::string& path) {
             //
             // Canonical names (<bos>/<eos>) win outright; the legacy
             // SentencePiece names (<s>/</s>) only fill a gap. Gemma's vocab
-            // carries both — its real BOS is <bos> (id 2) while <s> (id 204) is
+            // carries both, its real BOS is <bos> (id 2) while <s> (id 204) is
             // an inert leftover, so matching <s> there would prepend the wrong
             // BOS and produce fluent-looking garbage.
             if (content == "<bos>" || content == "<|begin_of_text|>") {
@@ -876,7 +876,7 @@ std::vector<int> HfBpeTokenizer::encode_segment(const std::string& text,
   std::string normalized;
   if (byte_level_) {
     // ByteLevel BPE: map each byte to its GPT-2 unicode character.
-    // No word_boundary_ prepend — the space byte (0x20) becomes Ġ (U+0120) which
+    // No word_boundary_ prepend; the space byte (0x20) becomes Ġ (U+0120) which
     // the BPE merges treat as a word-boundary marker naturally.
     normalized.reserve(text.size() * 2);
     for (unsigned char b : text) {
@@ -898,8 +898,8 @@ std::vector<int> HfBpeTokenizer::encode_segment(const std::string& text,
 
   std::vector<std::string> pieces = split_utf8_pieces(normalized);
   // Apply greedy lowest-rank BPE merges. This is the exact same algorithm as a
-  // naive "rescan every pair, merge the global minimum, repeat" loop — same
-  // merges, same order (lowest rank wins; leftmost breaks ties) — but driven by
+  // naive "rescan every pair, merge the global minimum, repeat" loop; same
+  // merges, same order (lowest rank wins; leftmost breaks ties), but driven by
   // a min-heap over a doubly-linked list so it runs in O(n log n) instead of
   // O(n^2). The old O(n^2) form made a single ~23k-char segment (e.g. a large
   // system prompt with no special tokens inside) cost seconds to tokenise.

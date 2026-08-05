@@ -1,4 +1,4 @@
-// Unit test for HfBpeTokenizer::token_pieces() — the per-token byte table used
+// Unit test for HfBpeTokenizer::token_pieces(): the per-token byte table used
 // by grammar-constrained decoding. Writes a minimal SentencePiece-style
 // tokenizer.json fixture at runtime, loads it, and asserts the byte mapping for
 // a leading-space token, a digit token, a special token (empty), and a

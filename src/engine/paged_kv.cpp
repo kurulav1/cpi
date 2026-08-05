@@ -106,7 +106,7 @@ bool SequenceBlockTable::share_prefix_from(const SequenceBlockTable& other, int 
 
 void SequenceBlockTable::clear() {
   // Release every block we hold a reference to (shared prefix blocks were
-  // add_ref'd, exclusive blocks were allocate'd — both are released here).
+  // add_ref'd, exclusive blocks were allocate'd; both are released here).
   for (int b : blocks_) {
     alloc_->release(b);
   }

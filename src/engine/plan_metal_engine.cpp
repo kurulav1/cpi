@@ -70,7 +70,7 @@ struct AttnParams {
   // construction keeps the contiguous meaning.
   std::uint32_t paged = 0, block_size = 0;
   // Per-token key limits (multimodal prefill's bidirectional image span). When set, the
-  // prefill-capable kernels read chunk-local limits[t] as token t's EXCLUSIVE key bound instead
+  // prefill-capable kernels read chunk-local limits[t] as token t's exclusive key bound instead
   // of the causal pos+1, and a sliding window is measured back from that bound; the same
   // semantics as CUDA's attention_prefill limits argument. Defaulted 0 = causal, every
   // existing construction unchanged.
@@ -111,7 +111,7 @@ struct EmbedQuantParams {
 //
 // not in a namespace called `detail`: engine::detail is the shared sampler's namespace,
 // and clang rightly calls the lookup ambiguous (MSVC silently picked one).
-// The engine only ever read fp16 before this; the image splice has to WRITE it.
+// The engine only ever read fp16 before this; the image splice has to write it.
 // These were local copies that truncated the mantissa and flushed subnormals to zero. The old
 // comment here read "denormals flush to zero; they are far below any quantization level"; true
 // of their magnitude, but they are not below the level at which a systematic, one-directional
@@ -152,7 +152,7 @@ constexpr int kGemmSplitK = 4;  // must match GEMM_SPLITK in the shader
 //   down_proj 896x4864   28 groups   0.867 -> 0.417 ms   (2.1x)
 //   q_proj     896x896   28 groups   0.141 -> 0.076 ms
 //   o_proj     896x896   28 groups   0.097 -> 0.051 ms
-//   gate_proj 4864x896  152 groups   0.415 -> 0.452 ms   (LOSS; already wide)
+//   gate_proj 4864x896  152 groups   0.415 -> 0.452 ms   (loss; already wide)
 // By T=256 every one of these shapes is past the threshold and the split is off again, which
 // is what the measurements say should happen: at T=256 splitting q/o/gate all lose.
 constexpr std::size_t kGemmSplitKMaxGroups = 64;
@@ -163,7 +163,7 @@ constexpr std::size_t kGemmSplitKMaxGroups = 64;
 // per-shape measurements actually cover.
 constexpr int kGemmSplitKMaxTokens = 128;
 // One simdgroup per 32x32 sub-tile of the FBM x BN output tile: at 64x64 that is 2 x 2 = 4
-// simdgroups, 128 threads. DERIVED from the tile, never restated; this line used to read
+// simdgroups, 128 threads. Derived from the tile, never restated; this line used to read
 // `32 * (64 / 32) * (kGemmBN / 32)`, and when the row tile went 64 -> 128 the literal 64 stayed.
 // The kernel takes its row block from GEMM_FBM itself, so it then ran half the simdgroups it
 // needed and wrote only rows row0..row0+63 of every 128-row tile; the rest kept whatever was in
@@ -173,7 +173,7 @@ constexpr int kGemmSplitKMaxTokens = 128;
 // must match GEMM_RF / GEMM_CF in the shader: fragments of 8x8 per simdgroup.
 constexpr int kGemmRF = 4;
 constexpr int kGemmCF = 4;
-// One simdgroup per (8*RF rows x 8*CF tokens) sub-tile of the FBM x BN output tile. DERIVED,
+// One simdgroup per (8*RF rows x 8*CF tokens) sub-tile of the FBM x BN output tile. Derived,
 // never restated; the literal that used to live here is what wrote half the rows.
 constexpr int kGemmTG = 32 * (kGemmFBM / (8 * kGemmRF)) * (kGemmBN / (8 * kGemmCF));
 // The quantized GEMM reads activations from device, not a staged tile, so a wider token tile
@@ -242,13 +242,13 @@ inline bool simdgroup_layout_matches(runtime::MetalContext& ctx) {
 // second pass to merge them, which is why it is not worth it on a short context: below this
 // many keys the single-threadgroup kernel already wins.
 // Split from the second key block onward. This was 256 on the assumption that the merge pass
-// costs more than it saves below that depth; measured on an M4 the opposite holds; the
+// costs more than it saves below that depth; measured, the opposite holds; the
 // single-threadgroup-per-head kernel leaves a 10-core GPU running `heads` threadgroups, and
 // splitting from 64 keys up was +15% whole-model decode on a 0.5B at depth ~100 (+5% fp16).
 // Below 64 keys the block rounding yields one chunk and the split path degenerates to the
 // plain kernel's shape anyway.
 constexpr int kAttnSplitMinKeys = 64;
-// must match DEC_KEY_BLOCK / DEC_TG in cpi_kernels.metal. The decode split kernel runs a NARROW
+// must match DEC_KEY_BLOCK / DEC_TG in cpi_kernels.metal. The decode split kernel runs a narrow
 // threadgroup; one thread per key, so the width has to match the keys in flight, not the 256
 // the rest of the file uses.
 constexpr int kDecKeyBlock = 64;
@@ -363,7 +363,7 @@ std::size_t groups_for_rows(std::size_t rows) {
 // The obvious loop, take max_chunk until the tokens run out, leaves the remainder as the
 // final chunk, and a small chunk is far more expensive than its token count suggests. A GEMM's
 // cost follows its tile count and how much of the GPU its grid fills, and a narrow chunk fills
-// almost none of it: on an M4 a 28-token chunk of Qwen2.5-0.5B runs its projections at 0.69
+// almost none of it: a 28-token chunk of Qwen2.5-0.5B runs its projections at 0.69
 // TFLOP/s where a 512-token chunk reaches 2.96. Greedy chunking therefore spends 19% of a
 // 540-token prefill on the 5% of tokens that spill past the slot, and crossing 512 by two
 // tokens costs 19 ms.
@@ -446,7 +446,7 @@ inline bool dep_sets(const engine::opplan::Op& op, std::uint64_t& rd, std::uint6
 // Resolves a tensor name to its MTLBuffer handle. The plan carries these as opaque
 // void*, and execute_ops passes them straight back to Metal as buffer bindings
 // they are never dereferenced as pointers.
-// Templated on the LOADER, not written twice. model::WeightLoader (.ll2c) and
+// Templated on the loader, not written twice. model::WeightLoader (.ll2c) and
 // model::SafetensorsLoader (.cpi / HF dir) expose the same has_tensor / tensor_bytes /
 // tensor_data surface, so the upload logic, including the MoE expert fusion below, is
 // identical for both container formats and cannot drift between them.
@@ -523,7 +523,7 @@ public:
     return h;
   }
 
-  // Quantizes on the HOST at load. CUDA quantizes on the GPU, but that is only worth
+  // Quantizes on the host at load. CUDA quantizes on the GPU, but that is only worth
   // two extra kernels when you already have them; this runs once per tensor at startup.
   //
   // The format must match kernels_weight_only_matvec.cu exactly, or the model produces
@@ -651,7 +651,7 @@ public:
       // Scales are stored fp16, not fp32: for group-32 int4 the scale is one value per 32
       // weights (16 packed bytes), so an fp32 scale added 1 bit/weight of decode bandwidth
       //; 5.0 bits/weight vs llama.cpp Q4_0's 4.5. fp16 halves that overhead. The weight is
-      // quantized against the fp16-ROUNDED scale the kernel will actually read, so decode
+      // quantized against the fp16-rounded scale the kernel will actually read, so decode
       // stays self-consistent (same discipline as the byte-identical fp16 rounding rule).
       std::vector<std::uint16_t> scales(static_cast<std::size_t>(out_dim) * groups, 0);
 
@@ -824,7 +824,7 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
     throw std::runtime_error("could not load the shader library: " + ctx_.last_error());
   }
 
-  // Route by container. A `.cpi` file (or a HuggingFace safetensors DIRECTORY) is safetensors
+  // Route by container. A `.cpi` file (or a HuggingFace safetensors directory) is safetensors
   // layout with its config in the JSON __metadata__; anything else is a .ll2c with a typed binary
   // header. Same tensor names either way, a .cpi repacked by ll2c_to_cpi preserves them, so
   // the plan and every kernel are untouched by this choice.
@@ -837,12 +837,12 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
   }
   if (from_safetensors_) {
     st_.open(weights_path);
-    // Gemma 4 ships as a HuggingFace DIRECTORY: config.json beside the weights, and no
+    // Gemma 4 ships as a HuggingFace directory: config.json beside the weights, and no
     // __metadata__ block at all. Its config therefore has to come from config.json, parsed by the
     // one Gemma 4 parser (engine::parse_gemma4_text_config) rather than a second copy here.
     //
     // Checking config.json before __metadata__ is deliberate: a `.cpi` written by
-    // convert_gemma4.py does carry a metadata block, but in GEMMA's own schema (family / hidden /
+    // convert_gemma4.py does carry a metadata block, but in Gemma's own schema (family / hidden /
     // vocab), which model::config_from_json does not read; it would hand back a fully defaulted
     // config and the model would load at the wrong shape. That is the same trap probe_model fell
     // into, and a defaulted parse is indistinguishable from a successful one.
@@ -899,7 +899,7 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
   // projection's actual shape; assuming hidden/heads builds a wrong model silently.
   //
   // Two Qwen3.5 wrinkles, both of which convert cleanly into a wrong model rather than an error:
-  //   - layer 0 is usually a DELTA-NET layer and has no attention.wq at all, so the probe has to
+  //   - layer 0 is usually a delta-net layer and has no attention.wq at all, so the probe has to
   //     find the first full-attention layer instead of assuming layer 0 is one;
   //   - on that family wq projects [q | gate] per head, so its row count is 2*q_dim. Halving it
   //     is what attn_output_gate is recorded in the container for.
@@ -907,9 +907,9 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
   int head_dim = 0;
   int kv_dim = 0;
   if (is_gemma4) {
-    // Gemma 4 states head_dim in its config, per layer TYPE, and its tensors use HuggingFace
+    // Gemma 4 states head_dim in its config, per layer type, and its tensors use HuggingFace
     // names; so there is no "layers.N.attention.wq" to measure and nothing to derive. The slots
-    // below are sized for the WIDER of the two types, because one buffer serves both.
+    // below are sized for the wider of the two types, because one buffer serves both.
     head_dim = std::max(cfg_.head_dim_sliding, cfg_.head_dim_full);
     q_dim = cfg_.num_heads * head_dim;
     kv_dim = std::max(cfg_.num_kv_heads_sliding * cfg_.head_dim_sliding,
@@ -1041,7 +1041,7 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
       gg.layer_full[static_cast<std::size_t>(L)] =
           cfg_.attention_kind_for_layer(L) == model::AttentionKind::Full ? 1 : 0;
     }
-    // The per-layer output gain is a NUMBER the plan multiplies in, not a weight the GPU reads, so
+    // The per-layer output gain is a number the plan multiplies in, not a weight the GPU reads, so
     // it has to be pulled host-side. wsrc_->fp16() would hand back an opaque Metal buffer here
     // dereferencing one is a SIGBUS, then silent NaN. It is bf16 in the checkpoint, and a model
     // without the tensor means a no-op gain of 1.0.
@@ -1061,7 +1061,7 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
   } else {
     plan_ = opplan::build_llama_plan(g, *wsrc_);
   }
-  // Read off the PLAN rather than the config: the plan is what the encoder walks, so a model that
+  // Read off the plan rather than the config: the plan is what the encoder walks, so a model that
   // gained or lost a recurrent op cannot disagree with this flag.
   for (const auto& lp : plan_.layers) {
     for (const auto& op : lp.ops) {
@@ -1069,7 +1069,7 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
           op.kind == opplan::OpKind::LinearAttentionStep) {
         has_recurrent_ops_ = true;
       }
-      // Ops that read a WINDOW of another slot (Gemma 4's per-layer-input injection: layer L
+      // Ops that read a window of another slot (Gemma 4's per-layer-input injection: layer L
       // multiplies by per_layer_inputs[L], at aux_offset = L*ple) batch like everything else:
       // the PLE gate is stride-aware (ElemParams.row_len / in2_stride / in2_offset) and the
       // prefill attention kernels cover every head_dim (cpi_attention_prefill_wide). Batched
@@ -1124,7 +1124,7 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
         return static_cast<std::size_t>(q_dim) * 2u;
       case opplan::Slot::QGate:
         return static_cast<std::size_t>(q_dim);
-      // Delta-net. LinQ/LinK are per VALUE head (RepeatLinearHeads fans the shared key heads
+      // Delta-net. LinQ/LinK are per value head (RepeatLinearHeads fans the shared key heads
       // out), so they are num_value_heads * key_head_dim, not num_key_heads * key_head_dim.
       case opplan::Slot::LinMix:
         return static_cast<std::size_t>(lin_conv_dim);
@@ -1176,7 +1176,7 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
     }
   };
   // How many tokens a prefill chunk may hold; the biggest lever on prefill speed, since GEMM
-  // efficiency climbs with token count (M4, this model's projections: 0.69 TFLOP/s over 28 tokens,
+  // efficiency climbs with token count (this model's projections: 0.69 TFLOP/s over 28 tokens,
   // 2.96 over 512), so a short remainder chunk is paid for twice. Bigger is better (a 635-token
   // chunk beats 512+123 by 10%); the slots are the only limit, so the budget is bounded here
   // rather than at a round token count.
@@ -1193,11 +1193,11 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
   max_prefill_ = std::max(1, std::min({kPrefillMaxTokens, max_context, budget_tokens}));
 
   if (cfg_.is_moe()) {
-    // The router's selection crosses ops in DEVICE buffers, so a token never round-trips to the
+    // The router's selection crosses ops in device buffers, so a token never round-trips to the
     // host mid-layer.
     //
-    // SIZED [max_prefill][top_k], not [top_k]. The router, the expert FFN and the accumulate
-    // are separate OPS, so execute_ops runs the router's whole token loop before the expert
+    // Sized [max_prefill][top_k], not [top_k]. The router, the expert FFN and the accumulate
+    // are separate ops, so execute_ops runs the router's whole token loop before the expert
     // loop starts. One shared slot would therefore hold the last token's experts by the time
     // the FFN reads it, and every token in the chunk would run the last token's experts. That
     // produces confident wrong tokens rather than a crash, and it is exactly what the
@@ -1226,7 +1226,7 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
   k_cache_.resize(static_cast<std::size_t>(cfg_.num_layers));
   v_cache_.resize(static_cast<std::size_t>(cfg_.num_layers));
   // Who owns whose cache. Identity everywhere except Gemma 4's shared tail, which reads the cache
-  // of the last non-shared layer OF the same TYPE (kv_source, derived once in
+  // of the last non-shared layer of the same type (kv_source, derived once in
   // parse_gemma4_text_config). A shared layer allocates nothing; it emits no KvStore either, so
   // an own cache would be read-but-never-written, which is precisely the uninitialised memory that
   // made the first Gemma-4-on-Metal run return NaN.
@@ -1253,7 +1253,7 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
   }
   for (int L = 0; L < cfg_.num_layers; ++L) {
     if (kv_owner_[static_cast<std::size_t>(L)] != L) continue;  // reads someone else's
-    // Sized per layer TYPE. Gemma 4's sliding and full layers differ in both head_dim and kv-head
+    // Sized per layer type. Gemma 4's sliding and full layers differ in both head_dim and kv-head
     // count (E2B: 256x2 vs 512x1), so one kv_dim for the whole tower is wrong for one of them
     // too small is an out-of-bounds read, too large silently wastes hundreds of MB.
     std::size_t layer_kv_dim = static_cast<std::size_t>(kv_dim);
@@ -1293,7 +1293,7 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
   using G = runtime::MetalContext::Grid;
 
   // CPI_METAL_PROFILE serialises the pass, one commit per op, and accumulates GPU time
-  // by op kind. It makes the pass slower, so it reports SHARE, not speed. Two GEMM inner-loop
+  // by op kind. It makes the pass slower, so it reports share, not speed. Two GEMM inner-loop
   // optimizations in a row bought nothing, which is what a wrong bottleneck feels like; the
   // only cure is to measure which op actually owns the seconds.
   static const bool profile = std::getenv("CPI_METAL_PROFILE") != nullptr;
@@ -1347,7 +1347,7 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
   for (std::size_t oi = 0; oi < ops.size(); ++oi) {
     const opplan::Op& op = ops[oi];
 
-    // CPI_METAL_ABLATE=<kind>[,<kind>] SKIPS those ops entirely. The output becomes garbage
+    // CPI_METAL_ABLATE=<kind>[,<kind>] skips those ops entirely. The output becomes garbage
     // that is the point: it answers "what does this op cost?" by removing it, which no profiler
     // distortion can confuse. CPI_METAL_PROFILE cannot answer it, because serialising the pass
     // gives every tiny dispatch its own command buffer and inflates exactly the small ops you
@@ -1355,14 +1355,14 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
     // Never set this outside an experiment.
     if (!ablate_.empty() && ablate_.count(op_kind_name(static_cast<int>(op.kind))) != 0) continue;
 
-    // CONCURRENT-DISPATCH OVERLAP, generalised from the old same-input-Gemv-pair rule. The
+    // Concurrent-dispatch overlap, generalised from the old same-input-Gemv-pair rule. The
     // compute encoder is concurrent and every dispatch barriers first by default
     // (serial-equivalent). For a T=1 decode, each op's slot reads/writes are statically known,
     // so the barrier is dropped whenever the op conflicts with nothing dispatched since the
     // last barrier (no raw, WAR or WAW on slots, the KV cache, the token/position buffers or
     // the logits). Two things pay for this: grid-starved neighbours overlap (the 128-row k/v
     // projections never fill the machine alone), and, the reason it was generalised, every
-    // avoided barrier avoids a pipeline DRAIN, which measured ~9 us per dispatch on Gemma 4's
+    // avoided barrier avoids a pipeline drain, which measured ~9 us per dispatch on Gemma 4's
     // ~700-op token and was a third of its decode.
     //
     // Ops whose dependencies are not modelled (MoE, delta-net, vision, the fused paths below)
@@ -1392,7 +1392,7 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
       }
     }
 
-    // PEEPHOLE FUSION: `X += delta` (AddInplace) immediately followed by `XNorm = rmsnorm(X)`
+    // Peephole fusion: `X += delta` (AddInplace) immediately followed by `XNorm = rmsnorm(X)`
     // is one fused pass; the residual is read and written once instead of twice. The two ops
     // are adjacent within a layer (post-attention: the residual add and the ffn_norm). Done
     // here rather than in the shared plan builder so the CUDA path is untouched.
@@ -1417,7 +1417,7 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
       continue;
     }
 
-    // PEEPHOLE FUSION: consecutive quantized GEMVs that share an input become one dispatch.
+    // Peephole fusion: consecutive quantized GEMVs that share an input become one dispatch.
     // Decode fires Q/K/V (all reading XNorm) and gate/up (both reading XNorm) as separate tiny
     // GEMVs, each launch/latency-bound. Only in the GEMV regime (small T / decode); prefill
     // uses the blocked GEMM per op. The fused kernel routes each output row to its matrix.
@@ -1545,7 +1545,7 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
                         nullptr, 4, &qp, sizeof(qp));
           break;
         }
-        // which buffer the CALLER STAGED into, not how many tokens there are. These are not the
+        // which buffer the caller staged into, not how many tokens there are. These are not the
         // same question: a recurrent model prefills in chunks of exactly one token, which still
         // arrive in the sequence buffer. Keying this off `T > 1` made such a chunk read tok_buf_,
         // a buffer prefill never writes; so every prefill position re-embedded whatever decode
@@ -1573,7 +1573,7 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
       }
       case OpKind::Gemv: {
         // The in_proj_qkv gemv is the first consumer of the delta-net block's normalised input,
-        // so dumping its INPUT here pins whether a wrong lin_mix came from the norm or the
+        // so dumping its input here pins whether a wrong lin_mix came from the norm or the
         // projection. Identified by its output slot; no other gemv writes LinMix.
         if (op.out == opplan::Slot::LinMix) {
           dump_named_slot("lin_xnorm", layer, position, op.in, cfg_.hidden_size);
@@ -1596,7 +1596,7 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
 
           // The 8B's prefill is quantized, and that is where the whole prefill gap lives:
           // an fp16-only GEMM does nothing for it. Send the full 32-token tiles to the
-          // QUANTIZED blocked GEMM, which dequantizes each weight once into threadgroup
+          // quantized blocked GEMM, which dequantizes each weight once into threadgroup
           // memory and then reuses it across all 32 tokens.
           // The GEMM takes all the tokens, not just the whole tiles: its store already
           // guards tok >= tokens, so a partial tail tile just masks off.
@@ -1651,10 +1651,10 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
           }
           break;
         }
-        // Clipped projections (Gemma 4 E2B's vision tower): clamp the INPUT into a staging
+        // Clipped projections (Gemma 4 E2B's vision tower): clamp the input into a staging
         // buffer rather than in place; XNorm feeds q/k/v projections whose bounds differ, so
         // mutating the slot would leak one projection's clamp into the next. The output clamp
-        // IS in place; nothing else reads the slot between the GEMM and the clamp.
+        // is in place; nothing else reads the slot between the GEMM and the clamp.
         const void* in_h = slot(op.in);
         const bool clip_in = std::isfinite(op.clip_in_min) || std::isfinite(op.clip_in_max);
         const bool clip_out = std::isfinite(op.clip_out_min) || std::isfinite(op.clip_out_max);
@@ -1676,11 +1676,11 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
         const std::size_t offs[] = {
             0, 0, 0, static_cast<std::size_t>(op.bias_offset) * sizeof(std::uint16_t)};
 
-        // A prefill is a MATMUL. Send the full 8-token tiles to the simdgroup-matrix GEMM
+        // A prefill is a matmul. Send the full 8-token tiles to the simdgroup-matrix GEMM
         // (Metal's matrix units) and let the GEMV mop up the remainder. Decode is T=1 and
         // stays entirely on the GEMV; a matrix unit cannot help when one operand is a
         // vector.
-        // BLOCKED GEMM for prefill. It stages a K-block of both operands into threadgroup
+        // Blocked GEMM for prefill. It stages a K-block of both operands into threadgroup
         // memory, so each weight byte loaded from device is reused by all 32 tokens in the
         // tile. The two earlier attempts streamed operands from device on every K-step and
         // lost to the GEMV; the matrix units were never the bottleneck, the traffic
@@ -1765,7 +1765,7 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
         const std::size_t head_tg = head_nr4 ? 64 : kTG;
         // Batched decode needs logits for every row; each row is a different sequence's
         // next token. One vocab GEMV per row: the rows are independent, so this is a GEMM's
-        // worth of work either way. A paged PREFILL takes the last-row path below instead
+        // worth of work either way. A paged prefill takes the last-row path below instead
         // (logits_last_only), exactly as a contiguous prefill does.
         if (batch_ != nullptr && !batch_->logits_last_only) {
           for (int b = 0; b < batch_->batch; ++b) {
@@ -1892,7 +1892,7 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
         const void* bufs[] = {slot(op.in), use_mrope ? mrope_pos_buf_.handle()
                                                      : (batch_ != nullptr ? batch_pos_buf_.handle()
                                                                           : pos_buf_.handle())};
-        // Threads cover the ROTATED lanes only. Launching head_dim/2 per head was not just
+        // Threads cover the rotated lanes only. Launching head_dim/2 per head was not just
         // wasteful, it was wrong: those extra threads rotated lanes that must pass through.
         const int rot = op.rotary_dim > 0 ? op.rotary_dim : op.head_dim;
         const std::size_t total = static_cast<std::size_t>(op.heads) *
@@ -1930,7 +1930,7 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
         break;
       }
       case OpKind::Attention: {
-        // Vision pass: bidirectional and CACHELESS; the K/V slots are the keys, there is no
+        // Vision pass: bidirectional and cacheless; the K/V slots are the keys, there is no
         // KvStore and no position. Mirrors CUDA's `ctx.causal == false` branch. The kernel takes
         // one row stride for q/k/v; Gemma 4's tower has kv_heads == heads so they agree, and a
         // future GQA tower must extend the kernel rather than silently mis-stride.
@@ -1953,7 +1953,7 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
                         nullptr, 4, &p, sizeof(p));
           break;
         }
-        // A paged PREFILL is one sequence's consecutive tokens sharing one block table, so it
+        // A paged prefill is one sequence's consecutive tokens sharing one block table, so it
         // can use the query-block matrix kernel instead of the decode kernel; which matters:
         // the decode kernel makes every query re-walk the whole history, measured at 2.81x the
         // contiguous path's time on a 480-token prompt.
@@ -1982,7 +1982,7 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
           // just the table, and row 0 sits at offset 0, so it reads the right thing.
           const void* mmbufs[] = {slot(op.in),  kbuf(layer).handle(), vbuf(layer).handle(),
                                   slot(op.out), pos_buf_.handle(),    batch_bt_buf_.handle()};
-          // Blocked by the kernel's OWN query block. This used to use kQBlock, which is half
+          // Blocked by the kernel's own query block. This used to use kQBlock, which is half
           // kQMMBlock, so every query was covered twice and half the threadgroups launched only to
           // find t0 >= tokens and return. Harmless, and invisible in the output, which is why it
           // survived: the kernel bounds-checks correctly, it was just dispatched twice over.
@@ -1994,7 +1994,7 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
           break;
         }
         if (batch_ != nullptr) {
-          // Every row is one query attending over its OWN length, gathered through its own
+          // Every row is one query attending over its own length, gathered through its own
           // block table; the ragged batch the scheduler hands us.
           AttnPagedParams p{static_cast<std::uint32_t>(op.heads),
                             static_cast<std::uint32_t>(op.kv_heads),
@@ -2034,8 +2034,8 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
         const void* bufs[] = {slot(op.in),  kbuf(layer).handle(), vbuf(layer).handle(),
                               slot(op.out), pos_buf_.handle(),    limits_h};
         // A prefill's threadgroups each walk the whole KV cache, so per-token attention is
-        // O(T^2) in DEVICE traffic and was 23% of the 8B's prefill. The prefill kernel gives
-        // one threadgroup a BLOCK of queries, so a key block it pulls in serves kQBlock of
+        // O(T^2) in device traffic and was 23% of the 8B's prefill. The prefill kernel gives
+        // one threadgroup a block of queries, so a key block it pulls in serves kQBlock of
         // them. Decode is a single query and has nothing to block over; it keeps the
         // per-token kernel.
         if (T >= kQBlock) {
@@ -2124,7 +2124,7 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
           const int chunks = attn_split_chunks(op, position);
           // Whole key blocks per chunk: the kernel's scoring loop is one thread per key, so a
           // chunk that is not a multiple of the block runs a short final pass with idle threads.
-          // Rounding UP can leave the last chunks empty, which they handle (-INF max, zero sum,
+          // Rounding up can leave the last chunks empty, which they handle (-INF max, zero sum,
           // and the merge skips them).
           int chunk_size = ((seq - start) + chunks - 1) / chunks;
           chunk_size = ((chunk_size + kDecKeyBlock - 1) / kDecKeyBlock) * kDecKeyBlock;
@@ -2169,7 +2169,7 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
       }
       // ---- Mixture of Experts ------------------------------------------------
       //
-      // one TOKEN AT A TIME, deliberately: routing is a per-token decision, so each token
+      // one token at a time, deliberately: routing is a per-token decision, so each token
       // selects its own experts and there is no batched form to share. Every other op in this
       // plan is row-independent and runs T rows at once; these cannot, because moe_idx_buf_
       // holds one token's selection. A prefill chunk therefore walks these T times.
@@ -2243,9 +2243,9 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
         // the plan multiplies the same power-of-two back after the down-projection. 0 = no scaling,
         // which is every model that is not Gemma 4.
         ElemParams p{static_cast<std::uint32_t>(n), op.scale};
-        // aux_offset selects a WINDOW of in2 rather than its start; Gemma 4's per-layer-input
+        // aux_offset selects a window of in2 rather than its start; Gemma 4's per-layer-input
         // injection multiplies by per_layer_inputs[L], layer L's slice of one packed
-        // [num_layers][ple] table. Described as a STRIDE here rather than a flat buffer offset,
+        // [num_layers][ple] table. Described as a stride here rather than a flat buffer offset,
         // because in2's row is num_layers*ple wide while this op's is ple: a single displacement
         // is only right for one token, which is what used to force these plans to prefill one
         // token at a time. With the stride the kernel indexes correctly for a whole chunk.
@@ -2264,7 +2264,7 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
       }
       // ---- linear attention (delta-net) and gated attention -----------------
       //
-      // These run one TOKEN AT A TIME. The delta-net kernels carry state across steps and have no
+      // These run one token at a time. The delta-net kernels carry state across steps and have no
       // token dimension; CUDA and the CPU reference both drive this family through
       // forward_one(token, position) for the same reason. Metal's batched prefill chunk does not
       // apply here, so every case below refuses T > 1 rather than quietly walking off the end of a
@@ -2357,7 +2357,7 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
         break;
       }
 
-      // GEMMA 4's tower (80_vision.metal); Qwen3.5's is a different architecture (3-D conv
+      // Gemma 4's tower (80_vision.metal); Qwen3.5's is a different architecture (3-D conv
       // patch embed, learned absolute positions, LayerNorm, spatial merge) and stays in
       // plan_metal_vision.cpp. Pixels, patch positions and the 2-D RoPE tables are engine
       // buffers, staged by encode_image before the pass; these ops only run under vision_pass_.
@@ -2409,7 +2409,7 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
             "Metal: AvgPoolPatches is dispatched by encode_image, not from a plan");
 
       case OpKind::AddInplace: {
-        // width COMES from the OP. It used to be hardcoded to hidden_size, which is right for
+        // width comes from the op. It used to be hardcoded to hidden_size, which is right for
         // every residual add; and every AddInplace in the Llama and Qwen3.5 plans is one, so
         // nothing ever noticed. Gemma 4's prologue adds the two halves of its per-layer-embedding
         // table, which is [num_layers][ple] = 8960 wide on E2B, not 1536: the hardcoded width
@@ -2446,7 +2446,7 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
 
 // Commits what is encoded, waits, and charges the elapsed time to `name`. Only ever called
 // under CPI_METAL_PROFILE; it serialises the pass.
-// ⚠ this measures A COMMAND-buffer ROUND TRIP, not the OP. Read dump_profile()'s banner before
+// ⚠ this measures a command-buffer round trip, not the op. Read dump_profile()'s banner before
 // believing a number from here.
 void PlanMetalEngine::profile_tick(const char* name) {
   ctx_.commit_and_wait();
@@ -2487,7 +2487,7 @@ void PlanMetalEngine::dump_profile() const {
   double total = 0.0;
   for (const auto& kv : profile_ms_) total += kv.second;
   if (total <= 0.0) return;
-  // The banner is not decoration. These numbers are shares OF A DISTORTED TOTAL, and taking
+  // The banner is not decoration. These numbers are shares of a distorted total, and taking
   // them at face value has already cost this project real time.
   std::fprintf(
       stderr,
@@ -2519,10 +2519,10 @@ void PlanMetalEngine::dump_profile() const {
 void PlanMetalEngine::encode_forward(int token, int position, int cache_position) {
   if (cache_position < 0) cache_position = position;
 
-  // Unified memory: writing the token and the position IS the H2D transfer.
+  // Unified memory: writing the token and the position is the H2D transfer.
   //
-  // pos_buf_ holds the CACHE position; where K/V land and how far attention reaches (KvParams
-  // and AttnParams both read it). The ROTARY position is `position`, which differs from the
+  // pos_buf_ holds the cache position; where K/V land and how far attention reaches (KvParams
+  // and AttnParams both read it). The rotary position is `position`, which differs from the
   // cache position only under M-RoPE and is fed to the rope kernel separately, below.
   tokens_in_seq_buf_ = false;
   *static_cast<std::int32_t*>(tok_buf_.contents()) = static_cast<std::int32_t>(token);
@@ -2548,7 +2548,7 @@ void PlanMetalEngine::encode_forward(int token, int position, int cache_position
   encode_forward_body(position);
 }
 
-// The chained-decode variant: the step's token was written into tok_buf_ by the PREVIOUS
+// The chained-decode variant: the step's token was written into tok_buf_ by the previous
 // step's cpi_chain_token dispatch and its position is set by a cpi_set_i32 dispatch here
 // the host must not touch tok_buf_/pos_buf_ while earlier steps are still executing on the
 // GPU, which is the whole point of the chain (see generate_greedy).
@@ -2566,7 +2566,7 @@ void PlanMetalEngine::encode_forward_chained(int position) {
 }
 
 void PlanMetalEngine::encode_forward_body(int position) {
-  // CPI_METAL_LAYERS=N runs only the first N layers. A NaN has to start SOMEWHERE, and
+  // CPI_METAL_LAYERS=N runs only the first N layers. A NaN has to start somewhere, and
   // bisecting on the layer count finds where far faster than reasoning about which op
   // could overflow.
   static const int layer_limit = [] {
@@ -2576,7 +2576,7 @@ void PlanMetalEngine::encode_forward_body(int position) {
 
   // CPI_METAL_DEBUG prints max|X| after every layer. Unified memory makes this almost
   // free to do: the residual stream is host-addressable, so an explosion can simply be
-  // WATCHED rather than deduced.
+  // watched rather than deduced.
   static const bool dbg = std::getenv("CPI_METAL_DEBUG") != nullptr;
   auto peek = [&](const char* what) {
     if (!dbg) return;
@@ -2606,7 +2606,7 @@ void PlanMetalEngine::encode_forward_body(int position) {
     }
     std::fprintf(stderr, "  [dbg]   %-8s max=%.1f%s\n", what, m, nan ? "  <-- NaN" : "");
 
-    // On the first NaN, print the index and the two INPUTS at that index. A NaN out of
+    // On the first NaN, print the index and the two inputs at that index. A NaN out of
     // finite inputs is impossible, so this says which assumption is wrong.
     if (nan && sl == opplan::Slot::Inter) {
       const auto* ga = static_cast<const std::uint16_t*>(
@@ -2695,13 +2695,13 @@ void PlanMetalEngine::encode_forward_body(int position) {
 // Every op already knows its token count, so nothing here is prefill-specific except
 // staging the ids and the count; which is the point of having the op-plan.
 //
-// The win is not arithmetic (a batched GEMV still touches every weight) but TRAFFIC:
+// The win is not arithmetic (a batched GEMV still touches every weight) but traffic:
 // one pass over the weights serves T tokens instead of one, so a 12-token prompt reads
 // the model once rather than twelve times. On a bandwidth-bound machine that is the
 // whole game.
 int PlanMetalEngine::attn_split_chunks(const opplan::Op& op, int position) const {
   // CPI_METAL_ATTN_SPLIT_MIN overrides the key count at which splitting starts, and it exists
-  // to make the split path TESTABLE rather than to tune it. The split is a pure optimization
+  // to make the split path testable rather than to tune it. The split is a pure optimization
   // it must produce the same tokens as the single-threadgroup kernel; but every golden is
   // short enough that no decode ever reaches the default threshold, so a green gate would say
   // nothing about these kernels. Setting it to 1 forces the split on at any depth, which points
@@ -2890,7 +2890,7 @@ void PlanMetalEngine::encode_prefill(const std::vector<int>& tokens, int start_p
   // Image soft tokens go in at plan_.embed_ready: after the embedding lookup and its scale,
   // before anything that reads the embeddings. Gemma 4's prologue projects the per-layer
   // inputs from the embeddings, so splicing after the whole prologue would compute them from
-  // the placeholder token instead of the image. Rows are used AS-IS (no sqrt(hidden) scale),
+  // the placeholder token instead of the image. Rows are used as-is (no sqrt(hidden) scale),
   // matching the CUDA path.
   // embed_ready == 0 means the builder never set it; treat that as "after the whole prologue"
   // rather than "before the lookup", where the lookup would overwrite every spliced row; a
@@ -2916,7 +2916,7 @@ void PlanMetalEngine::encode_prefill(const std::vector<int>& tokens, int start_p
   if (T == 1) dump_layer_state(0, start_position);
   for (const opplan::LayerPlan& lp : plan_.layers) {
     execute_ops(lp.ops, lp.layer_index, start_position, T);
-    // Only when the chunk IS one token: with T > 1 slot X holds T states and "the state at
+    // Only when the chunk is one token: with T > 1 slot X holds T states and "the state at
     // start_position" is not what the first hidden_size values are.
     if (T == 1) dump_layer_state(lp.layer_index + 1, start_position);
   }
@@ -3015,7 +3015,7 @@ void PlanMetalEngine::prefill_paged(const std::vector<int>& tokens, int start_po
   for (int t = 0; t < T; ++t) {
     ids[t] = static_cast<std::int32_t>(tokens[static_cast<std::size_t>(t)]);
     ps[t] = static_cast<std::int32_t>(start_position + t);
-    // Row t's length is its own position + 1, which IS the causal mask: token t sees
+    // Row t's length is its own position + 1, which is the causal mask: token t sees
     // 0..start+t and nothing later, including the chunk-mates stored beside it.
     sl[t] = static_cast<std::int32_t>(start_position + t + 1);
     // Every row is the same sequence, so every row gets the same table. Replicating it costs
@@ -3085,7 +3085,7 @@ void PlanMetalEngine::decode_step_batched_logits(const std::vector<int>& tokens,
     batch_bt_elems_ = bt_elems;
   }
 
-  // Unified memory: writing these IS the upload.
+  // Unified memory: writing these is the upload.
   tokens_in_seq_buf_ = true;
   auto* ids = static_cast<std::int32_t*>(seq_tok_buf_.contents());
   auto* ps = static_cast<std::int32_t*>(batch_pos_buf_.contents());
@@ -3094,7 +3094,7 @@ void PlanMetalEngine::decode_step_batched_logits(const std::vector<int>& tokens,
   for (int b = 0; b < B; ++b) {
     ids[b] = static_cast<std::int32_t>(tokens[static_cast<std::size_t>(b)]);
     ps[b] = static_cast<std::int32_t>(positions[static_cast<std::size_t>(b)]);
-    // The attention kernel takes a LENGTH, so it is the new token's position plus one.
+    // The attention kernel takes a length, so it is the new token's position plus one.
     sl[b] = static_cast<std::int32_t>(positions[static_cast<std::size_t>(b)] + 1);
   }
   for (int i = 0; i < bt_elems; ++i) {
@@ -3147,7 +3147,7 @@ void PlanMetalEngine::reset_kv_cache() {
 }
 
 void PlanMetalEngine::prefill_prompt(const std::vector<int>& prompt_tokens, int start_pos) {
-  // Process every token EXCEPT the last, so the last is consumed by the first decode/verify step
+  // Process every token except the last, so the last is consumed by the first decode/verify step
   // at position P-1; matching LlamaEngine and generate_stream. Chunked at max_prefill_.
   const int P = static_cast<int>(prompt_tokens.size());
   if (P <= 1) return;
@@ -3332,7 +3332,7 @@ std::vector<int> PlanMetalEngine::generate_stream(const std::vector<int>& prompt
 
   const int n_pre = static_cast<int>(prompt.size()) - 1;
 
-  // shared-PREFIX REUSE. If this prompt extends the last sequence this engine ran (a multi-turn
+  // shared-prefix reuse. If this prompt extends the last sequence this engine ran (a multi-turn
   // chat, or many requests behind one system prompt), the KV cache still holds the common prefix
   //, same tokens at the same positions, so re-prefill only the new suffix. This is the Metal
   // sibling of the CUDA serving's prefix reuse; it cuts time-to-first-token on repeated prefixes.
@@ -3420,7 +3420,7 @@ std::vector<std::pair<int, float>> PlanMetalEngine::inspect_next_logits(
 }
 
 // Prompt-lookup draft: the most recent earlier occurrence of the last `ng` tokens predicts the
-// tokens that followed it. No draft model; the context IS the draft source, which is why this
+// tokens that followed it. No draft model; the context is the draft source, which is why this
 // wins on structured/repetitive output (code, JSON, quoting) and is neutral on free prose.
 static int metal_lookup_draft(const std::vector<int>& hist, int ng, int k, int* out) {
   const int n = static_cast<int>(hist.size());
@@ -3471,10 +3471,10 @@ std::vector<int> PlanMetalEngine::generate_spec_lookup(const std::vector<int>& p
     return true;
   };
 
-  // ADAPTIVE SPECULATION. A verify costs ~5x a decode step, so it only pays when most of the
+  // Adaptive speculation. A verify costs ~5x a decode step, so it only pays when most of the
   // drafted tokens are accepted. Prompt-lookup acceptance is a property of the model and the
   // text, not just the text: on the same repetitive prompt Qwen2.5 accepts 100% (7.2x) while
-  // Gemma 4 breaks the loop and accepts 15%; which made blind speculation a 35% REGRESSION.
+  // Gemma 4 breaks the loop and accepts 15%; which made blind speculation a 35% regression.
   // Track acceptance and back off when drafting stops paying, re-probing periodically so a
   // stretch of structured output still gets picked up.
   float acc_ewma = 1.0f;
@@ -3576,13 +3576,13 @@ std::vector<int> PlanMetalEngine::generate_greedy(const std::vector<int>& prompt
   prefill_ms_ = std::chrono::duration<double, std::milli>(pre1 - pre0).count();
   prefill_tokens_ = n_pre;
 
-  // CHAINED decode: the step's argmax feeds the next step's token buffer ON the GPU
+  // Chained decode: the step's argmax feeds the next step's token buffer on the GPU
   // (cpi_chain_token), so the host never waits per token; it encodes step k+1 while the GPU
   // executes step k (commit_async), and reads a whole block of tokens back at once. This is
   // what turned 62% GPU-busy into ~full: the per-token commit/wait/read/write round-trip was
   // a third of every decode token on Gemma 4's 700-dispatch plan.
   //
-  // The loop guard and the context bound are checked per BLOCK, so up to kChainBlock-1 tokens
+  // The loop guard and the context bound are checked per block, so up to kChainBlock-1 tokens
   // past a degenerate tail are generated and discarded; wasted work, not wrong output.
   constexpr int kChainBlock = 8;
   if (chain_ring_.size() < kChainBlock * sizeof(std::int32_t)) {

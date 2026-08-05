@@ -1,8 +1,8 @@
 // Reference-oracle parity for decode attention (Phase 0 safety net).
 //
-// Unlike paged_attention_parity_test (which checks paged == contiguous — a
+// Unlike paged_attention_parity_test (which checks paged == contiguous, a
 // self-consistency test that passes even when both paths are wrong the same
-// way), this test compares launch_attention_step against an INDEPENDENT naive
+// way), this test compares launch_attention_step against an independent naive
 // float reference computed on the host. It sweeps head_dim ∈ {64,128,256} and a
 // range of GQA ratios so a kernel that assumes head_dim <= blockDim (the class
 // of bug that corrupted Qwen3.5's head_dim=256 attention) is caught: at 256 the
@@ -10,7 +10,7 @@
 //
 // Exercises all four host decode-attention launches against the reference: the
 // tiled and split-K paths, plus their device-position variants (the CUDA-graph
-// decode path used by the daily driver, where seq_len is read from device
+// decode path, where seq_len is read from device
 // memory). All must match the same reference.
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -148,8 +148,8 @@ int main() {
       CK(cudaMemcpy(dpos, &pos_val, sizeof(int), cudaMemcpyHostToDevice));
 
       // Paths: host tiled / host split-K / device-pos tiled / device-pos split-K.
-      // The device-pos launches (the CUDA-graph decode path used by the daily
-      // driver) forward to the same cores; covering them here guards that path
+      // The device-pos launches (the CUDA-graph decode path) forward to the same
+      // cores; covering them here guards that path
       // directly rather than only by construction.
       const char* labels[4] = {"tiled", "split-K", "dpos-tiled", "dpos-splitK"};
       for (int path = 0; path < 4; ++path) {

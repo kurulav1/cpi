@@ -477,7 +477,7 @@ std::string build_chat_prompt(const std::string& chat_template, const std::strin
     return build_llama3_style_prompt(prompt_text);
   }
   if (chat_template == "gemma") {
-    // Gemma 4 turn format: sot=<|turn> (105), eot=<turn|> (106). No system role —
+    // Gemma 4 turn format: sot=<|turn> (105), eot=<turn|> (106). No system role;
     // the tokenizer prepends <bos>. (Gemma 1/2/3 used <start_of_turn>; Gemma 4
     // renamed the markers.)
     return "<|turn>user\n" + prompt_text + "<turn|>\n<|turn>model\n";
@@ -740,7 +740,7 @@ std::string normalize_final_response_text(const std::string& text) {
 
   // Healthy output: keep the model's own formatting intact (newlines,
   // indentation, code blocks). The aggressive repetition pipeline below is a
-  // salvage path for degenerate loops only — it collapses all whitespace and
+  // salvage path for degenerate loops only; it collapses all whitespace and
   // would corrupt well-formed responses.
   if (!looks_degenerate_repetition(cleaned)) {
     return trim_outer_whitespace(std::move(cleaned));
@@ -851,19 +851,19 @@ ModelProbe probe_model(const std::string& model_path) {
   p.is_safetensors_dir = !p.is_cpi && is_safetensors_model_dir(model_path);
   p.safetensors_family = p.is_cpi ? "" : infer_safetensors_model_family(model_path);
   if (p.is_cpi) {
-    // A `.cpi` is a CONTAINER FORMAT, not a model family. It meant "Gemma 4" only because Gemma 4
+    // A `.cpi` is a container format, not a model family. It meant "Gemma 4" only because Gemma 4
     // was the first thing to ship in it; ll2c_to_cpi now repacks any model this way. So look
-    // INSIDE: our containers carry the whole LlamaConfig in the safetensors __metadata__ block,
+    // inside: our containers carry the whole LlamaConfig in the safetensors __metadata__ block,
     // and its model_family says what this actually is. Only a .cpi with no metadata (i.e. the
     // Gemma 4 converter's output, which predates config_to_json) still defaults to Gemma 4.
     p.kind = ModelFamilyKind::Gemma4;
     try {
       model::SafetensorsLoader probe;
       probe.open(model_path);
-      // A `__metadata__` block is not proof the block is OURS. Gemma 4's converter writes one too,
+      // A `__metadata__` block is not proof the block is ours. Gemma 4's converter writes one too,
       // in its own schema (`family`, `hidden`, `vocab`), and none of those keys are the ones
-      // config_from_json reads; so it hands back a fully DEFAULTED LlamaConfig. Identify the
-      // schema by a key `config_to_json` always emits, and never by a parsed VALUE: the old test
+      // config_from_json reads; so it hands back a fully defaulted LlamaConfig. Identify the
+      // schema by a key `config_to_json` always emits, and never by a parsed value: the old test
       // here was `c.hidden_size > 0`, and hidden_size defaults to 4096, so it was true for every
       // container that had any metadata at all. That silently routed Gemma 4 `.cpi` files to
       // LlamaEngine, which reads `.ll2c` only; a shipped, working path broken by a probe that
@@ -916,7 +916,7 @@ EngineChoice resolve_engine(const ModelProbe& probe, bool cuda_available, bool m
     case ModelFamilyKind::Gemma4:
       // Gemma 4 on Metal is on by default, same shape as Qwen3.5 below. Batched and
       // token-by-token prefill produce the same token stream (CPI_METAL_SEQ_AUX bisects), and
-      // text, quant and the vision tower are all verified on an M4 against the CUDA backend.
+      // text, quant and the vision tower are all verified on Apple Silicon against the CUDA backend.
       if (use_gpu) return EngineChoice::PlanCuda;
       if (use_metal) return EngineChoice::Gemma4Metal;
       throw std::runtime_error(
@@ -924,11 +924,11 @@ EngineChoice resolve_engine(const ModelProbe& probe, bool cuda_available, bool m
     case ModelFamilyKind::Qwen35:
       // Metal runs Qwen3.5 as a shared op plan, verified token-identical to the CPU reference.
       // This branch has to exist for the probe fix above to be safe: teaching the probe to
-      // recognise a Qwen3.5 CONTAINER without it would route Macs to Qwen35Cpu, which reads a
+      // recognise a Qwen3.5 container without it would route Macs to Qwen35Cpu, which reads a
       // HuggingFace directory and cannot open a .ll2c at all. The two changes are one change.
       if (use_gpu) return EngineChoice::Qwen35Cuda;
       if (use_metal) return EngineChoice::Qwen35Metal;
-      // The Qwen3.5 CPU reference reads a HuggingFace DIRECTORY (config.json + safetensors), not
+      // The Qwen3.5 CPU reference reads a HuggingFace directory (config.json + safetensors), not
       // a .ll2c container. Routing a container here would fail deep inside its loader complaining
       // that <container>/config.json does not exist, which describes the symptom and not the
       // cause. Say what is actually wrong instead.

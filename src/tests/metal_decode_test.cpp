@@ -1,11 +1,11 @@
 // Metal decode, checked on real weights.
 //
-// two ORACLES:
+// two oracles:
 //
 //   1. The CPU engine (fp32 end to end) on the first forward; argmax and top-5.
 //   2. A golden token stream from the CUDA backend for the whole greedy sequence.
 //
-// A CAUTIONARY NOTE, because it nearly cost us a real bug. When Metal first diverged
+// A cautionary note, because it nearly cost a real bug. When Metal first diverged
 // from the CPU engine at token 11 with a 0.55 logit gap, that was diagnosed as "the
 // fp16/fp32 activation gap; expected". It was not. The CPU engine had rope_theta
 // hardcoded to 10000 and was rotating every Q and K by the wrong angle for every
@@ -83,7 +83,7 @@ int main(int argc, char** argv) {
   int n_new = (argc > 2) ? std::atoi(argv[2]) : 8;
 
   // CPI_METAL_QUANT=4|8 runs the same checks on a quantized model. The CPU engine
-  // still uses the fp16 weights, so it is the RIGHT oracle: it says what the model
+  // still uses the fp16 weights, so it is the right oracle: it says what the model
   // should do, and quantization error is measured AGAINST that rather than hidden.
   const char* qenv = std::getenv("CPI_METAL_QUANT");
   const int quant = qenv != nullptr ? std::atoi(qenv) : 0;
@@ -132,7 +132,7 @@ int main(int argc, char** argv) {
   std::printf("\n  CPU  top-5:");
   for (const auto& p : cpu_top) std::printf("  %d(%.3f)", p.first, p.second);
 
-  // Metal's own top-5, so the RANKING can be compared; not just the winner. An
+  // Metal's own top-5, so the ranking can be compared; not just the winner. An
   // argmax can agree by luck on an easy token while the distribution underneath is
   // quietly wrong; the ordering of the runners-up is far more sensitive.
   std::vector<int> idx(mlogits.size());
@@ -159,7 +159,7 @@ int main(int argc, char** argv) {
   std::printf("  argmax agreement: %s\n", argmax_ok ? "PASS" : "FAIL");
 
   // A quantized model legitimately deviates from the fp16 oracle, so the bound is
-  // looser; but it is still a BOUND, not an exemption. These are set from measured
+  // looser; but it is still a bound, not an exemption. These are set from measured
   // behaviour, an order of magnitude above the observed error and far below what a
   // structural break produces (a bad kernel yields hundreds, or NaN):
   //
@@ -185,14 +185,14 @@ int main(int argc, char** argv) {
 
   // ---- the gate: does Metal reproduce CUDA's greedy stream? ----------------
   //
-  // Exact token equality is ALMOST the right gate, but not quite: the GEMV sums fp32
+  // Exact token equality is almost the right gate, but not quite: the GEMV sums fp32
   // in a different order than CUDA does, and reordering an fp32 sum changes its
   // rounding by ~5e-3. Greedy decoding turns that into a discrete choice, so on a
   // near-tie the two backends can legitimately pick different tokens while both being
   // correct; and they rejoin immediately after.
   //
   // So a divergence is only forgiven when it happens at a genuine tie: the top-2
-  // logits within the noise floor. A divergence at a CONFIDENT token is a real bug and
+  // logits within the noise floor. A divergence at a confident token is a real bug and
   // still fails. This keeps the gate honest instead of merely lenient.
   constexpr double kTieTol = 0.05;  // ~4x the observed fp16 noise floor
 
@@ -247,7 +247,7 @@ int main(int argc, char** argv) {
       // deliberately broken merge kernel forked at a tie, collapsed into repeated EOS for the
       // next hundred tokens, agreed with the CPU engine on 21 of 128; and the gate went green.
       //
-      // So teacher-force the GOLDEN prefix and judge every position on its own: at each step
+      // So teacher-force the golden prefix and judge every position on its own: at each step
       // Metal sees the reference's tokens, not its own, and has to predict the reference's next
       // one. A tie then excuses only the position it happens at, and a confident disagreement
       // anywhere is a failure no later luck can hide.

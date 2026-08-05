@@ -203,7 +203,7 @@ bool LlamaEngine::prefill_attention_tensorcore(const void* q, const void* k_laye
   for (int c0 = 0; c0 < rows; c0 += kChunk) {
     const int chunk = std::min(kChunk, rows - c0);
 
-    // Pointer arrays are built ON DEVICE, on this stream. Staging them from the host into a
+    // Pointer arrays are built on device, on this stream. Staging them from the host into a
     // reused pinned buffer was a race; this function runs once per layer, so the next layer
     // overwrote the buffer while the previous async copy was still in flight, and the GEMMs
     // could read the wrong layer's K/V. It gave different logits on every run.
@@ -223,7 +223,7 @@ bool LlamaEngine::prefill_attention_tensorcore(const void* q, const void* k_laye
     // K is row-major [keys, D] with row stride kv_stride, which cuBLAS reads column-major as
     // [D, keys] with ld=kv_stride; so OP_T gives [keys, D]. Q is row-major [chunk, D] with row
     // stride q_stride, read column-major as [D, chunk]; OP_N. The column-major result
-    // [keys, chunk] with ld=keys IS the row-major [chunk, keys] the softmax wants.
+    // [keys, chunk] with ld=keys is the row-major [chunk, keys] the softmax wants.
     // 1/sqrt(head_dim) rides in as alpha, so no separate scaling pass.
     CUBLAS_CHECK(cublasGemmBatchedEx(cublas_, CUBLAS_OP_T, CUBLAS_OP_N, keys, chunk, head_dim,
                                      &scale, A1, CUDA_R_16F, kv_stride, B1, CUDA_R_16F, q_stride,

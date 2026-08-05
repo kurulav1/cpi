@@ -109,7 +109,7 @@ public:
   bool accept_bytes(const std::string& piece);
 
   // True when the grammar has matched a complete value here (an accepting stack
-  // is present and no partial UTF-8 sequence is pending) — a legal stop point.
+  // is present and no partial UTF-8 sequence is pending), a legal stop point.
   bool can_terminate() const;
 
   // Would accepting `piece` keep the grammar alive? Does not mutate the state.

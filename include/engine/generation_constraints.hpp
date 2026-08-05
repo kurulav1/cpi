@@ -2,7 +2,7 @@
 
 // Per-request decoding constraints threaded into the engines' generate_stream.
 // Kept as a lightweight header (GrammarSampler is only forward-declared) so the
-// engine headers — including the CUDA ones — stay cheap to include. Engines that
+// engine headers (including the CUDA ones) stay cheap to include. Engines that
 // actually apply the grammar include "grammar/grammar_sampler.hpp" in their .cpp.
 
 namespace grammar {
@@ -24,7 +24,7 @@ struct GenerationConstraints {
 
   // Minimum number of tokens to generate before EOS may be sampled. While fewer
   // than this many tokens have been produced, the EOS logit is masked to -inf so
-  // greedy (temperature 0) decoding cannot terminate early — it fixes the
+  // greedy (temperature 0) decoding cannot terminate early; it fixes the
   // failure where the model emits EOS the moment its distribution collapses on a
   // repeated/round-number run (e.g. "revenue":4000000) and truncates the output.
   // 0 disables (default).

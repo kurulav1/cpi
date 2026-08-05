@@ -87,7 +87,7 @@ void run_with_image(engine::PlanCudaEngine& eng, const app::main_cli::ParsedArgs
 }
 
 // Binds the multimodal generator when the engine actually has a vision tower. The
-// overload for every other engine type returns null, so this is resolved by TYPE rather
+// overload for every other engine type returns null, so this is resolved by type rather
 // than by a runtime model-name check.
 app::main_modes::GenerateMultimodalFn make_multimodal_fn(engine::PlanCudaEngine& eng) {
   return [&eng](const std::vector<int>& base, const std::string& image_path, int max_new,
@@ -125,7 +125,7 @@ std::vector<int> generate_multimodal_metal(engine::PlanMetalEngine& meng,
                                            const std::string& image_path, int max_new, int eos,
                                            const std::function<bool(int)>& on_token,
                                            std::ostream* info_out) {
-  // GEMMA 4's tower first: the same expand + generate_multimodal pair the CUDA path runs
+  // Gemma 4's tower first: the same expand + generate_multimodal pair the CUDA path runs
   // the splice layout lives in one templated header, and the engines carry the same surface.
   // (meng.has_vision() is the Gemma tower; config().has_vision_tower() is Qwen3.5's, carried
   // by container v7. A model has one or the other, never both.)
@@ -173,7 +173,7 @@ std::vector<int> generate_multimodal_metal(engine::PlanMetalEngine& meng,
   // 3. Build the prompt: <vision_start> + n_soft image placeholders + <vision_end> + the
   //    question. embeds[i] holds a soft token for each placeholder position, empty elsewhere; the
   //    engine splices the soft tokens over the placeholders' embeddings.
-  // The image span goes at the FRONT, before the caller's tokens. If the prompt already carries a
+  // The image span goes at the front, before the caller's tokens. If the prompt already carries a
   // single <|image_pad|> placeholder the span replaces it in place instead, so a chat template
   // that positions the image inside the user turn keeps that position.
   std::vector<int> toks;
@@ -214,7 +214,7 @@ std::vector<int> generate_multimodal_metal(engine::PlanMetalEngine& meng,
   }
 
   // 4. M-RoPE positions, prefill all but the last token, then decode with the rotary and cache
-  //    positions kept apart (an image span advances the rotary counter by its MERGED extent).
+  //    positions kept apart (an image span advances the rotary counter by its merged extent).
   const std::vector<std::int32_t> mpos = engine::build_mrope_positions(toks, kImageToken, mh, mw);
   const int n_tok = static_cast<int>(toks.size());
   const std::vector<int> head(toks.begin(), toks.end() - 1);
@@ -465,8 +465,8 @@ int main(int argc, char** argv) {
 #else
     const int cuda_device_count = 0;
 #endif
-    // Resolve the whole dispatch decision — model family (probe) + device
-    // situation — into a single engine choice, replacing the former is_X/use_X
+    // Resolve the whole dispatch decision (model family from the probe + device
+    // situation) into a single engine choice, replacing the former is_X/use_X
     // boolean tangle. (Gemma 4 without CUDA throws here, as before.)
 #if CPI_HAS_CUDA
     const bool cuda_available = cuda_device_count > 0;
@@ -506,7 +506,7 @@ int main(int argc, char** argv) {
           break;
         case EngineChoice::Llama4Cpu:
           std::cout << "[info] Detected a safetensors model. Using the Llama4 CPU engine.\n";
-          // SAY that the GPU is being skipped. On a Mac this path is reached with a perfectly
+          // Say that the GPU is being skipped. On a Mac this path is reached with a perfectly
           // good Metal device present; Llama4 has its own engine (llama4_cuda_engine) with no
           // Metal counterpart, so resolve_engine falls back to CPU. That fallback used to be
           // silent, which reads as "CPI is slow on this model" rather than "CPI is not using
@@ -537,7 +537,7 @@ int main(int argc, char** argv) {
           std::cout << "[info] No CUDA device found. Using the Metal GPU engine (Apple Silicon).\n";
           break;
         case EngineChoice::LlamaCuda:
-          break;  // default fast path — no banner
+          break;  // default fast path, no banner
       }
     }
 
@@ -562,7 +562,7 @@ int main(int argc, char** argv) {
 #if CPI_HAS_CUDA
       if constexpr (std::is_same_v<std::decay_t<decltype(eng)>, engine::LlamaEngine>) {
         if (cli.parity_check) {
-          // Pure gate: run the check and exit 0 (pass) / 1 (FAIL) so a script/CI
+          // Pure gate: run the check and exit 0 (pass) / 1 (fail) so a script/CI
           // can verify a forward-path change preserved correctness.
           const bool ok = eng.run_parity_check(prompt_tokens);
           std::cout.flush();
@@ -589,7 +589,7 @@ int main(int argc, char** argv) {
               cli.temp, cli.opts.top_k, cli.opts.top_p, cli.opts.repetition_penalty,
               cli.opts.no_repeat_ngram_size);
           // Plain `return`: this block is inside a lambda, not main(). The Metal branch's
-          // identical-looking `return 0` IS in main(). Getting these the same way round breaks
+          // identical-looking `return 0` is in main(). Getting these the same way round breaks
           // one compiler or the other, and each hides the other's error; this one is behind
           // #if CPI_HAS_CUDA, so a Mac build never sees it.
           return;
@@ -655,7 +655,7 @@ int main(int argc, char** argv) {
       case EngineChoice::LlamaMetal: {
         // Apple Silicon GPU path for the main binary; the same PlanMetalEngine the metal_infer
         // tool uses, wired into the standard serving modes so the REST/web bridge runs on a Mac.
-        // What actually works here, verified on an M4 rather than assumed; the comment this
+        // What actually works here, verified by running rather than assumed; the comment this
         // replaces claimed "fp16 for now; grammar-constrained decode and a Metal vision tower are
         // not yet wired", and two thirds of that was stale:
         //
@@ -671,7 +671,7 @@ int main(int argc, char** argv) {
         if (!cli.image_path.empty() && !use_tokenizer) {
           throw std::runtime_error("--image requires --tokenizer");
         }
-        // Speculative decoding: a small DRAFT proposes K tokens, this model (the TARGET) checks
+        // Speculative decoding: a small draft proposes K tokens, this model (the target) checks
         // them in one parallel verify pass, and only its own argmax is ever emitted; so the
         // output is identical to plain greedy decoding of the target, just faster when the draft
         // guesses well. Two PlanMetalEngine instances; unified memory means each just holds its
@@ -851,7 +851,7 @@ int main(int argc, char** argv) {
           engine::EngineOptions draft_opts = cli.opts;
           draft_opts.model_path = cli.draft_model_path;
           // Quantize the (fp16) draft to int8 at load so it fits fully in the VRAM
-          // left after the int4 target — a partially-cached, layer-streamed draft
+          // left after the int4 target; a partially-cached, layer-streamed draft
           // is far too slow to be a useful speculator. int8 is near-lossless for a
           // small model, so acceptance is essentially unchanged.
           draft_opts.int8_streaming = true;

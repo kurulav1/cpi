@@ -72,8 +72,8 @@ struct LtMatmulPlan {
 class LlamaEngine {
   // Speculative decoding drives a draft + target engine pair through their
   // internal decode/prefill/verify methods.
-  // SpeculativeDecoder is a TEMPLATE now (one algorithm over both engines), so the friend
-  // declaration has to be too. `friend class SpeculativeDecoder;` also implicitly DECLARED it as
+  // SpeculativeDecoder is a template now (one algorithm over both engines), so the friend
+  // declaration has to be too. `friend class SpeculativeDecoder;` also implicitly declared it as
   // a non-template here, which then collided with the real definition; MSVC: "class template
   // has already been declared as a non-class template". Metal never saw this because it does not
   // include llama_engine.hpp.
@@ -109,7 +109,7 @@ public:
   // Runs a numerical parity check of the GPU decode forward against an
   // independent CPU-reference forward for prompt_tokens, printing max_abs_diff and
   // the top-token match. Returns true when the GPU and CPU argmax agree and the
-  // max logit diff is within tolerance — i.e. a pass/fail gate for verifying that
+  // max logit diff is within tolerance, i.e. a pass/fail gate for verifying that
   // a forward-path change (e.g. kernel fusion) preserved correctness.
   bool run_parity_check(const std::vector<int>& prompt_tokens);
 
@@ -315,7 +315,7 @@ private:
 
   // Device-side top-k sampling. The host-logits path copies the whole vocab to the host
   // every token, 608 KB for Qwen2.5's 151936 logits, and then sorts it there. Measured
-  // at 0.73 ms/token, which is 45% of a 0.5B decode step and DWARFS every kernel in it.
+  // at 0.73 ms/token, which is 45% of a 0.5B decode step and dwarfs every kernel in it.
   // Greedy (temp<=0) already argmaxes on-device and avoids this; temperature>0 is the path
   // real chat actually takes, and it was paying full price.
   //
@@ -578,7 +578,7 @@ private:
   int attn_q_hidden_ = 0;        // Query projection width (rows in attention.wq).
   int attn_head_dim_ = 0;        // Per-head attention width (attn_q_hidden_ / num_heads).
   int attn_kv_hidden_ = 0;       // Key/value projection width (num_kv_heads * attn_head_dim_).
-  // Physical per-layer KV token capacity — the stride of one layer's K/V region
+  // Physical per-layer KV token capacity: the stride of one layer's K/V region
   // and thus the paged block pool size (num_blocks = kv_capacity_tokens_/bs).
   // Equals max_context normally; with --paged-blocks it is sized up to available
   // VRAM so continuous batching can hold many concurrent sequences (each still
@@ -600,7 +600,7 @@ private:
   void* d_norm_out_bias_ = nullptr;   // Optional final norm bias [hidden].
   void* d_lm_head_ = nullptr;         // LM-head projection weight matrix on device.
   // int8 LM head (weight-only). An 8B's LM head is 1.05 GB in fp16; 22% of everything an
-  // int4 8B reads per token. Built only when weight quantization is on. The fp16 copy is KEPT:
+  // int4 8B reads per token. Built only when weight quantization is on. The fp16 copy is kept:
   // the batched-decode path drives the LM head through cuBLAS and still needs it.
   std::int8_t* d_lm_head_i8_ = nullptr;
   float* d_lm_head_i8_scales_ = nullptr;

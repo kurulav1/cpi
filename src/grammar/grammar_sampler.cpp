@@ -125,7 +125,7 @@ void GrammarSampler::apply_mask(std::vector<float>& logits) const {
       continue;
     }
 
-    // Fast path: simple (whole-codepoint) token and no pending partial UTF-8 —
+    // Fast path: simple (whole-codepoint) token and no pending partial UTF-8;
     // walk its codepoints through the memoized transitions.
     if (!partial_pending && token_simple_[t] && !token_cps_[t].empty()) {
       int s = start;

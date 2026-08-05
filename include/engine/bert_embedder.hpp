@@ -2,7 +2,7 @@
 
 // CUDA BERT-family sentence-embedding encoder (the embedding "core"). Loads a
 // HuggingFace BERT encoder (bge / gte / e5 / ...) from safetensors, runs a
-// bidirectional forward pass, pools (CLS or mean), and L2-normalizes — producing
+// bidirectional forward pass, pools (CLS or mean), and L2-normalizes, producing
 // a retrieval embedding. Architecture and behaviour are driven entirely by
 // EmbeddingConfig, so new models are served by config, not code.
 

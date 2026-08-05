@@ -56,7 +56,7 @@ public:
     return {};
   }
 
-  // May the builder quantize embedding TABLES, not just projections? Needs a backend that can
+  // May the builder quantize embedding tables, not just projections? Needs a backend that can
   // gather from a packed row; one whose EmbeddingLookup reads fp16 unconditionally would be
   // handed a packed table and produce garbage. Default no.
   virtual bool quantize_embeddings() const {
@@ -69,7 +69,7 @@ public:
     return quant(name, rows, cols);
   }
 
-  // HOST value of a one-element tensor. The vision builder needs the clip BOUNDS as numbers
+  // Host value of a one-element tensor. The vision builder needs the clip bounds as numbers
   // (they go into Op::clip_*, not into a buffer binding), and only the backend knows how to
   // read bytes out of its container. Default throws: a builder that needs scalars on a backend
   // that cannot supply them is a wiring error, not a silent 0.
@@ -127,7 +127,7 @@ struct LlamaGeometry {
   // MLP block for router -> top-k -> per-expert FFN -> routing-weighted sum. Same attention,
   // same norms, same everything else: MoE is a capability of this geometry, not a fork.
   //
-  // NOTE this is MIXTRAL's MoE. Gemma 4's is a different animal (a weightless router norm, a
+  // NOTE this is Mixtral's MoE. Gemma 4's is a different animal (a weightless router norm, a
   // learned per-expert gain, fused gate_up in the checkpoint) and keeps its own builder inside
   // PlanCudaEngine. Sharing them would mean pretending two different models are one.
   int num_experts = 0;
@@ -152,7 +152,7 @@ struct LlamaGeometry {
 // those eleven can run this plan.
 ModelPlan build_llama_plan(const LlamaGeometry& g, const WeightSource& w);
 
-// Geometry of a Qwen3.5-style MIXED-attention decoder: most layers are gated delta-net (a linear
+// Geometry of a Qwen3.5-style mixed-attention decoder: most layers are gated delta-net (a linear
 // recurrence), a few are full attention whose q projection emits [q | gate] per head. Which is
 // which comes from `layer_is_linear`, per layer, because it is not derivable from anything else.
 //
@@ -204,17 +204,17 @@ ModelPlan build_qwen35_plan(const Qwen35Geometry& g, const WeightSource& w);
 struct Gemma4Geometry {
   int num_layers = 0;
   int hidden = 0;
-  int inter = 0;  // MLP intermediate, DOUBLED on shared layers when use_double_wide_mlp
+  int inter = 0;  // MLP intermediate, doubled on shared layers when use_double_wide_mlp
   int vocab = 0;
   int heads = 0;
   float rms_eps = 1e-6f;
   int sliding_window = 0;
 
-  // Per layer TYPE, because one head_dim cannot describe this model.
+  // Per layer type, because one head_dim cannot describe this model.
   int head_dim_sliding = 0, head_dim_full = 0;
   int kv_heads_sliding = 0, kv_heads_full = 0;
 
-  // ...and a different RoPE base per layer type, with PARTIAL rotary on the full layers only.
+  // ...and a different RoPE base per layer type, with partial rotary on the full layers only.
   // These must be set: Op::scale carries theta on backends that compute RoPE in-shader rather
   // than from a table, and it defaults to 1.0f; a theta of 1.0 makes every lane rotate at the
   // same frequency, which is a wrong model rather than an error.
@@ -235,8 +235,8 @@ struct Gemma4Geometry {
   // prologue and per-layer injection drop out.
   int ple = 0;
 
-  // Per-layer output gain. HOST floats, not weight handles: the value is multiplied into a
-  // ScaleCopy op, so the builder needs the NUMBER, and only a backend knows how to read bytes out
+  // Per-layer output gain. Host floats, not weight handles: the value is multiplied into a
+  // ScaleCopy op, so the builder needs the number, and only a backend knows how to read bytes out
   // of its container. Empty means "all 1.0", which is what a checkpoint without layer_scalar means.
   std::vector<float> layer_scalar;
 
@@ -268,7 +268,7 @@ struct Gemma4Geometry {
 // about layer 2. So no op below sets norm_offset.
 ModelPlan build_gemma4_plan(const Gemma4Geometry& g, const WeightSource& w);
 
-// Geometry of Gemma 4's VISION tower (`vision_config` in the checkpoint). The tower is a
+// Geometry of Gemma 4's vision tower (`vision_config` in the checkpoint). The tower is a
 // text-shaped sandwich-norm encoder with three differences, each already an op: positions are
 // 2-D (Rope2D), the input is pixels (PatchEmbed), and attention is bidirectional (the executor's
 // cacheless mode). Pooling and projection into text space are not in the plan; pooling changes
@@ -288,7 +288,7 @@ struct Gemma4VisionGeometry {
   float rms_eps = 1e-6f;
   float rope_theta = 100.0f;
   bool standardize = false;
-  // E2B ships per-projection activation bounds and HF CLAMPS with them; the 26B sets this false
+  // E2B ships per-projection activation bounds and HF clamps with them; the 26B sets this false
   // and ships none. Skipping them does not crash; it silently changes the numbers.
   bool clipped_linears = false;
 };

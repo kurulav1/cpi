@@ -97,7 +97,7 @@ __global__ void tq3_gemv_f16_kernel(const uint32_t* __restrict__ w_packed,
   // Pad words_per_row to the next multiple of warpSize so every lane executes
   // the same number of outer-loop iterations.  This keeps all lanes in lockstep
   // for __shfl_sync, which requires all mask bits (0xFFFFFFFF) to execute the
-  // instruction together — a requirement enforced by Independent Thread
+  // instruction together, a requirement enforced by Independent Thread
   // Scheduling on Ampere/Ada (SM 8.0+). Without padding, lanes 26-31 exit the
   // loop one iteration earlier than lane 25 and proceed to warp_sum while lane
   // 25 is still calling __shfl_sync, creating a deadlock.
@@ -106,7 +106,7 @@ __global__ void tq3_gemv_f16_kernel(const uint32_t* __restrict__ w_packed,
   // Each lane processes a strided subset of the packed words.
   for (int wi = lane; wi < words_padded; wi += warpSize) {
     // For dummy (padding) iterations beyond words_per_row, use 0 so all 3-bit
-    // indices are 0 — the __shfl_sync still executes but j >= in_features
+    // indices are 0: the __shfl_sync still executes but j >= in_features
     // guards prevent any accumulation.
     const uint32_t packed = (wi < words_per_row) ? row_w[wi] : 0u;
     const int base_j = wi * 10;

@@ -41,7 +41,7 @@
 #include "common.hpp"
 #include "grammar/grammar_sampler.hpp"
 
-// SIMD headers — included unconditionally; individual code paths are
+// SIMD headers, included unconditionally; individual code paths are
 // guarded by feature macros set by the compiler when AVX2 / F16C are enabled.
 // The x86 intrinsic headers do not exist on other ISAs (Apple Silicon / ARM),
 // so the include itself must be gated, not just the code paths below. Every
@@ -137,7 +137,7 @@ inline float hsum256(__m256 v) {
 #define CPU_ENGINE_HAVE_F16C 1
 #endif
 
-// gemv_fp16_impl — y[0..M) = W[M×N] * x[N]
+// gemv_fp16_impl: y[0..M) = W[M×N] * x[N]
 //
 // W  : row-major FP16 weight matrix, [M rows × N cols]
 // x  : FP32 input vector, length N
@@ -178,7 +178,7 @@ static void gemv_fp16_impl(const uint16_t* CPI_RESTRICT W, const float* CPI_REST
 
       // Load 8×FP16 per row, convert to FP32, fused-multiply-add.
       // _mm256_cvtph_ps takes a 128-bit register of 8 fp16 and returns
-      // a 256-bit register of 8 fp32 — one instruction, no precision loss.
+      // a 256-bit register of 8 fp32: one instruction, no precision loss.
       acc0 = _mm256_fmadd_ps(
           _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(r0 + j))), xv, acc0);
       acc1 = _mm256_fmadd_ps(
@@ -261,7 +261,7 @@ static void gemv_fp16_impl(const uint16_t* CPI_RESTRICT W, const float* CPI_REST
 #endif
 }
 
-// gemv_fp32_impl — same blocking/prefetch structure as gemv_fp16_impl but for
+// gemv_fp32_impl: same blocking/prefetch structure as gemv_fp16_impl but for
 // weights already stored as FP32 (e.g. dequantised INT8 MLP weights).
 static void gemv_fp32_impl(const float* CPI_RESTRICT W, const float* CPI_RESTRICT x,
                            float* CPI_RESTRICT y, int M, int N) {
@@ -324,7 +324,7 @@ static void gemv_fp32_impl(const float* CPI_RESTRICT W, const float* CPI_RESTRIC
 }  // namespace
 
 // ============================================================
-// CpuLlamaEngine — public API
+// CpuLlamaEngine: public API
 // ============================================================
 
 // FP32-weight GEMV (used for dequantised INT8 MLP weights).
@@ -564,10 +564,9 @@ void CpuLlamaEngine::mlp(int layer) {
 
   // Gated activation: ff1[i] = act(ff1[i]) * ff3[i].
   //
-  // Gemma uses GeGLU (tanh-GELU), everything else SwiGLU. This engine had no mlp_gelu
-  // branch at all, so it silently ran Gemma with SiLU; a different model. Written in
-  // the sigmoid form, which is what the Metal kernel uses too: 0.5*(1+tanh(z)) IS
-  // sigmoid(2z), and sigmoid does not overflow at either end.
+  // Gemma uses GeGLU (tanh-GELU), everything else SwiGLU. Without an mlp_gelu
+  // branch this ran Gemma with SiLU, a different model. Sigmoid form, matching
+  // the Metal kernel: 0.5*(1+tanh(z)) is sigmoid(2z), which does not overflow.
   if (cfg_.mlp_gelu) {
     for (int i = 0; i < I; ++i) {
       const float g = ff1_[i];
@@ -690,9 +689,8 @@ void CpuLlamaEngine::forward_token(int token, int pos) {
 
   // 1. Token embedding lookup: x = embed[token]
   //
-  // Gemma scales the embeddings by sqrt(hidden). This engine did not, so it ran a
-  // completely different model for every Gemma checkpoint; no crash, just wrong. It
-  // went unnoticed because nothing cross-checked the CPU engine against CUDA on Gemma.
+  // Gemma scales the embeddings by sqrt(hidden); omitting it silently runs a
+  // different model (no crash, just wrong).
   const uint16_t* emb_row = tok_embeddings_ + static_cast<std::ptrdiff_t>(token) * H;
   const float emb_scale = cfg_.scale_embeddings ? std::sqrt(static_cast<float>(H)) : 1.0f;
   for (int i = 0; i < H; ++i) {
@@ -1091,11 +1089,9 @@ void CpuLlamaEngine::initialize(const EngineOptions& options) {
   // --- Precompute RoPE tables ---
   // cos[pos][d] = cos(pos / theta^(2d/head_dim))
   //
-  // The base is the model'S rope_theta, not 10000. It was hardcoded to 10000 here,
-  // which is right for Llama 2 and wrong for most things since: Qwen2.5 and Qwen3 use
-  // 1e6, Llama 3 uses 5e5. A wrong base does not crash and does not produce obvious
-  // garbage; it rotates every query and key by the wrong angle, which degrades the
-  // model in a way that looks like ordinary numerical drift.
+  // Base is the model's rope_theta, not a hardcoded 10000 (right only for Llama 2;
+  // Qwen2.5/Qwen3 use 1e6, Llama 3 uses 5e5). A wrong base does not crash; it
+  // rotates q/k by the wrong angle, degrading the model like numerical drift.
   const float rope_theta = cfg_.effective_rope_theta();
   const int half_hd = head_dim_ / 2;
   rope_cos_.resize(static_cast<std::size_t>(max_ctx) * static_cast<std::size_t>(half_hd));
@@ -1150,7 +1146,7 @@ std::vector<int> CpuLlamaEngine::generate_stream(const std::vector<int>& prompt_
 
   // --- Prefill ---
   // Process every prompt token to fill the KV cache.  The last forward_token
-  // call leaves logits_ primed to predict the first new token — no extra
+  // call leaves logits_ primed to predict the first new token, no extra
   // forward pass is needed before the first sample.
   const auto prefill_start = std::chrono::steady_clock::now();
   int pos = 0;

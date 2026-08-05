@@ -43,13 +43,13 @@ namespace engine {
 std::vector<std::int32_t> build_mrope_positions(const std::vector<int>& tokens, int image_token_id,
                                                 int merged_h, int merged_w);
 
-// The position the first GENERATED token takes. Differs from tokens.size() whenever the prompt
+// The position the first generated token takes. Differs from tokens.size() whenever the prompt
 // contains an image, because an image span advances the counter by its merged extent rather
 // than by its token count.
 int mrope_next_position(const std::vector<int>& tokens, int image_token_id, int merged_h,
                         int merged_w);
 
-struct GenerationConstraints;  // fwd (generation_constraints.hpp) — grammar-constrained decode
+struct GenerationConstraints;  // fwd (generation_constraints.hpp): grammar-constrained decode
 
 class PlanMetalEngine {
 public:
@@ -82,10 +82,10 @@ public:
   std::vector<float> encode_image(const std::vector<float>& patches, int grid_h, int grid_w);
 
   // Prefills a prompt containing image tokens. `embeds` is indexed by absolute position; an
-  // empty row leaves that token's own embedding in place. Rows are spliced AS-IS.
+  // empty row leaves that token's own embedding in place. Rows are spliced as-is.
   // `mrope_positions` is the [3][tokens] array from build_mrope_positions(); empty keeps the
   // plain 1-D rope path. After this returns, generation continues on 1-D positions; generated
-  // tokens are text, so their axes are equal; but the caller must pass the M-ROPE counter,
+  // tokens are text, so their axes are equal; but the caller must pass the M-RoPE counter,
   // not the token index, which build_mrope_positions reports via mrope_next_position().
   void prefill_multimodal(const std::vector<int>& tokens,
                           const std::vector<std::vector<float>>& embeds,
@@ -125,7 +125,7 @@ public:
     return quant_bits_;
   }
 
-  // Bytes of GPU-resident WEIGHT buffers. This, not RSS, is the number that says
+  // Bytes of GPU-resident weight buffers. This, not RSS, is the number that says
   // whether a model fits: the mmap'd fp16 file stays resident because the quantizer
   // reads it, but those pages are clean and file-backed, so they are evictable.
   std::size_t weight_bytes() const;
@@ -140,7 +140,7 @@ public:
   // much history attention covers. They are the same number for plain text and -1 means "same",
   // which is every caller that is not multimodal.
   //
-  // They diverge under M-RoPE: an image span advances the rotary counter by its MERGED extent,
+  // They diverge under M-RoPE: an image span advances the rotary counter by its merged extent,
   // so a 16-token image advances it by 4 and every later token sits 12 behind its sequence
   // index. Passing one value for both wrote K/V on top of an image token and truncated
   // attention to the rotary position; 11 of 21 prompt tokens silently dropped.
@@ -157,7 +157,7 @@ public:
   // cache itself needs no clearing; it is addressed by absolute position and overwritten.
   void reset_kv_cache();
 
-  // Fills the cache with the prompt EXCEPT its last token, at positions [0, P-2]. The last token
+  // Fills the cache with the prompt except its last token, at positions [0, P-2]. The last token
   // is consumed by the first decode/verify step at position P-1, matching generate_stream and the
   // CUDA path. Chunked at max_prefill_.
   void prefill_prompt(const std::vector<int>& prompt_tokens, int start_pos = 0);
@@ -182,7 +182,7 @@ public:
 
   // Capture a .gputrace of whatever runs between these, for Xcode's Metal Debugger.
   //
-  // metal_gemm_bench can already capture ITS dispatches; but a bench is not a prefill, and
+  // metal_gemm_bench can already capture its dispatches; but a bench is not a prefill, and
   // reading a limiter off one and calling it the kernel's was a real mistake here: the bench's
   // own per-shape times predict 137 ms of GEMM for a 541-token prefill that actually spends
   // ~207 ms. Same kernels, same shapes, 1.5x apart, and cache/shape-mix/chunking are all
@@ -199,7 +199,7 @@ public:
 
   // ---- Batched paged decode (continuous batching) --------------------------
   //
-  // Sizes the KV as one paged POOL per layer; num_blocks blocks of block_size tokens,
+  // Sizes the KV as one paged pool per layer; num_blocks blocks of block_size tokens,
   // shared by every sequence; rather than a contiguous max_context run. A contiguous cache
   // cannot serve concurrent sequences without reserving max_context per slot; paging lets
   // them grow independently, and lets two sequences share an identical prompt prefix by
@@ -364,7 +364,7 @@ private:
   bool from_safetensors_ = false;
 
   // Raw tensor bytes from whichever loader is live. Used by the few places that read weight bytes
-  // on the HOST (the vision position table, the head-dim probe) rather than uploading them.
+  // on the host (the vision position table, the head-dim probe) rather than uploading them.
   [[nodiscard]] bool raw_has(const std::string& name) const {
     return from_safetensors_ ? st_.has_tensor(name) : weights_.has_tensor(name);
   }
@@ -481,13 +481,13 @@ private:
 
   // Per-token key limits for multimodal prefill (the bidirectional image span). Armed only for
   // the duration of generate_multimodal's prefill; attention reads it when limits_active_.
-  runtime::MetalBuffer seq_limits_buf_;  // int32[max_prefill]; this CHUNK's limits
+  runtime::MetalBuffer seq_limits_buf_;  // int32[max_prefill]; this chunk's limits
   bool limits_active_ = false;
   // From the Gemma config.json at open(); LlamaConfig deliberately has no eos field.
   int eos_token_id_ = -1;
 
   // Armed only for the duration of a multimodal prefill. The rope kernel reads the axis
-  // positions for the CURRENT chunk from here; decode goes back to the scalar path.
+  // positions for the current chunk from here; decode goes back to the scalar path.
   bool mrope_active_ = false;
   runtime::MetalBuffer mrope_pos_buf_;
   int mrope_section_[3] = {11, 11, 10};

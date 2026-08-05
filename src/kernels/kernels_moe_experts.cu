@@ -7,7 +7,7 @@
 // existing quantiser and its group-wise scales apply unchanged, and the expert
 // weights (which are ~90% of an MoE model) get quantised like any other matrix.
 //
-// The selected expert indices live on the DEVICE (the router wrote them there).
+// The selected expert indices live on the device (the router wrote them there).
 // Nothing is read back to the host between the router and the experts: a
 // host round-trip would cost a sync per layer per token and would make the decode
 // graph uncapturable. Each block reads its own expert index from device memory.
@@ -74,7 +74,7 @@ struct Weight {
 };
 
 // inter[k, r] = act(gate) * up, where gate and up are rows r and (inter + r) of the selected expert's
-// fused gate_up matrix. one WARP per output element (grid.x groups warps_per_block rows; grid.y =
+// fused gate_up matrix. one warp per output element (grid.x groups warps_per_block rows; grid.y =
 // top_k); far more output rows in flight per SM than the old block-per-row form, and no shared-memory
 // block reduction (just a warp shuffle). Memory-bound int4/int8 matvec, so occupancy is what matters.
 template <int BITS>
@@ -106,7 +106,7 @@ __global__ void moe_gate_up_geglu_kernel(Weight<BITS> w, const half* x, const in
   }
 }
 
-// y[r] = sum_k topk_weight[k] * dot(down[expert_k].row(r), inter[k]). one WARP per output row: the warp
+// y[r] = sum_k topk_weight[k] * dot(down[expert_k].row(r), inter[k]). one warp per output row: the warp
 // walks all top_k experts (weighted sum, no atomics), reducing each expert's dot with a warp shuffle
 // no shared memory, no __syncthreads. grid.x groups warps_per_block output rows.
 template <int BITS>
@@ -377,10 +377,10 @@ void launch_mul_vec(const half* in, const half* vec, half* out, int n, float sca
   mul_vec_kernel<<<blocks, kThreads, 0, stream>>>(in, vec, out, n, scale);
 }
 
-// int4-DIRECT grouped MoE GEMM on int8 tensor cores (m16n8k32.s8). Reads the int4 expert weights
-// DIRECTLY (nibble^8-8, per-128-group scales) against int8 activations (natural per-32-group scales) --
+// int4-direct grouped MoE GEMM on int8 tensor cores (m16n8k32.s8). Reads the int4 expert weights
+// directly (nibble^8-8, per-128-group scales) against int8 activations (natural per-32-group scales),
 // no dequant-to-fp16, no fp16 re-read. This is the MMQ-style path that skips the ~28ms dequant-all +
-// the 4x fp16 weight read that dominate SHORT-prompt DeepSeek MoE prefill (the fp16-dequant + cuBLAS
+// the 4x fp16 weight read that dominate short-prompt DeepSeek MoE prefill (the fp16-dequant + cuBLAS
 // grouped path still wins at long prompts, where that fixed cost amortizes). grid.z = expert e; each
 // expert e's weight rows start at e*N, its gathered tokens at off[e]. The fused gate_up output is split
 // at column `split` into out_lo (gate) / out_hi (up); down passes split=N, out_hi=nullptr. Fragment
@@ -481,7 +481,7 @@ __global__ void moe_int4_grouped_mma_kernel(const std::int8_t* __restrict__ xq,
   }
 }
 
-// off[] is DEVICE-resident (grid.z indexes it). max_ne = max tokens routed to any one expert (bounds
+// off[] is device-resident (grid.z indexes it). max_ne = max tokens routed to any one expert (bounds
 // grid.y). group = weight quant group (128); wratio = group/32. split/out_hi implement the fused
 // gate_up split (down: split=N, out_hi=nullptr).
 void launch_moe_int4_grouped_mma(const std::int8_t* xq, const float* as, const std::int8_t* wpacked,

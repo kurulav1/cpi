@@ -119,7 +119,7 @@ int main(int argc, char** argv) {
     ++failures;
   }
   const double mean_abs = sum / static_cast<double>(ref.size());
-  // Tolerance on the MAX. The normalise and patchify are exact integer/affine ops, so the only
+  // Tolerance on the max. The normalise and patchify are exact integer/affine ops, so the only
   // source of error is the bicubic resample vs PIL's. 0.02 on a [-1,1] tensor is ~1%; tight
   // enough to catch a wrong filter or a transposed axis, loose enough for last-bit resample
   // differences. Both controls (wrong patch order, wrong normalise) blow past it.

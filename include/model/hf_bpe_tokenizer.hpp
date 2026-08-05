@@ -36,7 +36,7 @@ public:
   // Decodes a sequence of token IDs back into a UTF-8 string.
   // Byte-fallback tokens are collapsed back into their original bytes. Non-
   // special added tokens (e.g. "</think>") are emitted as their literal text;
-  // special tokens (BOS/EOS/…) are dropped — except any listed in keep_special,
+  // special tokens (BOS/EOS/…) are dropped, except any listed in keep_special,
   // which are emitted as their literal text (reasoning delimiters like Gemma's
   // "<|channel>", which are `special` but must survive for the stream splitter).
   std::string decode(const std::vector<int>& ids,

@@ -58,7 +58,7 @@ public:
   MetalContext(const MetalContext&) = delete;
   MetalContext& operator=(const MetalContext&) = delete;
 
-  // True when a real GPU was found. This is false on GitHub's macOS runners
+  // True when a real GPU was found. This is false on GitHub's macOS runners:
   // they are VMs with no GPU, so MTLCreateSystemDefaultDevice() returns nil.
   // Callers must check; do not assume a Mac has a usable Metal device.
   bool available() const {
@@ -106,7 +106,7 @@ public:
     next_barrier_ = on;
   }
 
-  // Specializes the NEXT dispatch's kernel on compile-time values, one per [[function_constant(i)]]
+  // Specializes the next dispatch's kernel on compile-time values, one per [[function_constant(i)]]
   // the kernel declares. One-shot, like set_next_barrier: consumed by the next dispatch and
   // cleared, so it cannot leak into an unrelated kernel.
   //
@@ -119,7 +119,7 @@ public:
   // kernel name and these values, so each distinct shape compiles once and is then reused; a model
   // has one shape, so this is a handful of pipelines for the process lifetime.
   //
-  // Unlike a silently-defaulted binding, getting this wrong is LOUD: a kernel that declares a
+  // Unlike a silently-defaulted binding, getting this wrong is loud: a kernel that declares a
   // function constant no caller supplies fails pipeline creation, with the driver's message.
   static constexpr int kMaxSpecConstants = 8;
   void set_next_specialization(const std::uint32_t* values, int count);
@@ -128,10 +128,10 @@ public:
   //
   // True GPU nanoseconds per kernel, from the device's timestamp counter set. This is what the
   // host-timed CPI_METAL_PROFILE could never be: that one wraps every op in commit-and-wait and
-  // measures WALL time, so each op carries a command-buffer round trip it does not pay in a real
+  // measures wall time, so each op carries a command-buffer round trip it does not pay in a real
   // pass; roughly 3x, concentrated in the cheap ops, which are exactly the ones being weighed.
   //
-  // The M4 exposes one counter set ("timestamp", one counter) and supports sampling only at
+  // Apple Silicon exposes one counter set ("timestamp", one counter) and supports sampling only at
   // stage boundaries; there is no dispatch-boundary sampling and no ALU/limiter counter
   // reachable from the Metal API at all. Those live only in Xcode's GPU debugger. Timing is what
   // a CLI can have, so timing is what this gives.

@@ -1,4 +1,4 @@
-// Shared decode driver — the prefill + autoregressive-decode + sample + stop
+// Shared decode driver: the prefill + autoregressive-decode + sample + stop
 // loop, extracted so fork engines (Gemma4, and future exotic architectures)
 // don't each re-implement generate/generate_stream. An engine provides only a
 // minimal SequenceModel (its forward + a few scalars); it gets the loop, the

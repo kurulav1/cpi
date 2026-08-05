@@ -104,7 +104,7 @@ int main(int argc, char** argv) {
                 g.num_patches - g.grid_w * g.grid_h);
     if (!geom_ok) ++failures;
 
-    // Channel must be the INNERMOST axis of a patch vector.
+    // Channel must be the innermost axis of a patch vector.
     bool layout_ok = true;
     const int patch_dim = 3 * 16 * 16;
     for (int p = 0; p < g.grid_w * g.grid_h && layout_ok; ++p) {

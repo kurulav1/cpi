@@ -67,7 +67,7 @@ std::string read_text(const std::string& path) {
 
 // Was a local truncating copy. That mattered here specifically: this harness is the reference
 // the engine is compared against, and the container it is compared to was packed by pack_ll2c.py
-// with numpy's IEEE rounding. Truncating made END_TO_END look BETTER than it was; 0.00257
+// with numpy's IEEE rounding. Truncating made END_TO_END look better than it was; 0.00257
 // against 0.00383 with a correct converter; and that flattering 1.49x was half the apparent
 // engine-vs-harness gap. See include/runtime/fp16.hpp.
 inline std::uint16_t f32_to_f16(float f) { return cpi::f32_to_f16(f); }
@@ -82,7 +82,7 @@ void check(const char* name, const std::vector<float>& got, const std::vector<fl
     ++failures;
     return;
   }
-  // NaN must be caught EXPLICITLY. std::max(x, NaN) returns x; every comparison with NaN is
+  // NaN must be caught explicitly. std::max(x, NaN) returns x; every comparison with NaN is
   // false; so an all-NaN result accumulates a max of 0 and passes every tolerance in this
   // file. That is not hypothetical: the engine path returned NaN and this reported pass.
   std::size_t nans = 0;
@@ -129,7 +129,7 @@ constexpr int kGemmTG = 32 * (kGemmFBM / (8 * kGemmRF)) * (kGemmBN / (8 * kGemmC
 //
 // Two things here are easy to get wrong and neither announces itself:
 //
-//   1. The sample positions are linspace(0, side-1, n); endpoint INCLUSIVE. Using n even
+//   1. The sample positions are linspace(0, side-1, n); endpoint inclusive. Using n even
 //      steps (i * side / n) instead of n - 1 (i * (side-1) / (n-1)) shifts every sample and
 //      still produces a smooth, plausible table.
 //
@@ -214,7 +214,7 @@ std::vector<std::uint16_t> to_f16(const std::vector<float>& v) {
 // One Qwen3_5VisionBlock:
 //   x += proj(attn(rope(qkv(LN1(x)))));  x += fc2(gelu(fc1(LN2(x))))
 //
-// Pre-norm on both halves, and the residual is the UNNORMALISED x; writing the norm back into
+// Pre-norm on both halves, and the residual is the unnormalised x; writing the norm back into
 // x instead would still train-shaped-run and be wrong.
 struct BlockDebug {
   // qkv_preroped is captured before the rotation, because that is what the reference's hook on
@@ -491,7 +491,7 @@ int main(int argc, char** argv) {
   }
   // Without this every dispatch below is a silent no-op: the buffers keep whatever they were
   // uploaded with, and the comparison fails with numbers that look like a wrong kernel rather
-  // than a missing library. Cost me a debugging round; hence the explicit failure here.
+  // than a missing library; hence the explicit failure here.
   if (!ctx.load_library()) {
     std::printf("[metal_vision] FAIL: %s\n", ctx.last_error().c_str());
     return 1;
@@ -509,7 +509,7 @@ int main(int argc, char** argv) {
   std::vector<float> our_sum;
 
   // ---- stage 1: patch embed ----
-  // Conv3d with stride == kernel_size over an input reshaped so each sample IS one patch, so
+  // Conv3d with stride == kernel_size over an input reshaped so each sample is one patch, so
   // it reduces to Linear(patch_dim -> hidden). The [768,3,2,16,16] weight is already contiguous
   // in exactly that order, so it needs no rearrangement; only reinterpretation.
   {
@@ -561,7 +561,7 @@ int main(int argc, char** argv) {
     const auto* o = static_cast<const std::uint16_t*>(ba.contents());
     std::vector<float> got(ha.size());
     for (std::size_t i = 0; i < got.size(); ++i) got[i] = f16_to_f32(o[i]);
-    // Fed the ORACLE's patch embed, not ours, so this isolates the add and the position table
+    // Fed the oracle's patch embed, not ours, so this isolates the add and the position table
     // from any error already measured in stage 1.
     check("pos_embed_added", got, want_sum, 0.02f);
     // Our own sum, from our own patch embed; the stage check above deliberately used the
@@ -572,7 +572,7 @@ int main(int argc, char** argv) {
 
   // ---- stage 4: one full transformer block ----
   //
-  // Fed the ORACLE's stage 3, so this measures the block alone rather than accumulating the
+  // Fed the oracle's stage 3, so this measures the block alone rather than accumulating the
   // front end's error. If it matches, the same code runs 12 times for the rest of the tower.
   {
     const int heads = engine::mini::json_get_int(geo, "num_heads");
@@ -622,7 +622,7 @@ int main(int argc, char** argv) {
                             read_f32(p2 + "mlp_linear_fc2_weight.f32"),
                             read_f32(p2 + "mlp_linear_fc2_bias.f32")};
       cur = run_vision_block(ctx, cur, bl, cosb, sinb, tokens, hidden, heads, head_dim, inter);
-      // Per-block RELATIVE error, reported not gated. Smooth growth is fp16 accumulation; a
+      // Per-block relative error, reported not gated. Smooth growth is fp16 accumulation; a
       // jump at one block is a bug in that block. Absolute error alone cannot tell them apart
       // once the activations span three orders of magnitude across the stack.
       const std::vector<float> ref = read_f32(dir + "/stage_" +
@@ -636,12 +636,12 @@ int main(int argc, char** argv) {
       std::printf("      block %02d: max_abs=%9.4f  |ref|max=%9.4f  rel=%.5f\n", L, mx, ref_mx,
                   mx / (ref_mx + 1e-9f));
     }
-    // Gated on RELATIVE error, not absolute. The stack's activations span 8 -> 1657 across
+    // Gated on relative error, not absolute. The stack's activations span 8 -> 1657 across
     // blocks, so one absolute tolerance is either meaningless early or unenforceable late.
     //
     // The threshold is derived, not chosen to pass. Rounding the reference to fp16 and back
     // representation error with no arithmetic at all; costs max_abs 0.48 on this tensor. The
-    // port lands at 10.06, which is 21x that floor, and the MEAN ratio is 24x. Those agreeing
+    // port lands at 10.06, which is 21x that floor, and the mean ratio is 24x. Those agreeing
     // is the signal: a real bug puts a few elements far out, giving a high max ratio against a
     // low mean one. The per-block curve above says the same thing; relative error is flat at
     // ~0.0005 for blocks 1-10 and only moves when block 11's activations jump 34x.
@@ -667,7 +667,7 @@ int main(int argc, char** argv) {
 
   // ---- the merger: 2x2 patches -> one soft token ----
   //
-  // Fed the ORACLE's block_11 so this measures the merger alone rather than inheriting the
+  // Fed the oracle's block_11 so this measures the merger alone rather than inheriting the
   // stack's accumulated error.
   //
   // The 2x2 fold needs no data movement. The norm is applied per patch over hidden, and the
@@ -684,9 +684,9 @@ int main(int argc, char** argv) {
     check("merger", got, want, 0.05f);
   }
 
-  // ---- END TO END: pixels -> soft tokens, entirely on our own outputs ----
+  // ---- end to end: pixels -> soft tokens, entirely on our own outputs ----
   //
-  // Every check above feeds a stage the ORACLE's input, which isolates that stage but says
+  // Every check above feeds a stage the oracle's input, which isolates that stage but says
   // nothing about whether the errors compound. This runs the whole tower on its own output and
   // is the only number that describes what the port actually produces.
   {
@@ -733,7 +733,7 @@ int main(int argc, char** argv) {
     if (!ok) ++failures;
   }
 
-  // ---- the same tower, weights from a .ll2c CONTAINER ----
+  // ---- the same tower, weights from a .ll2c container ----
   //
   // Everything above reads the oracle's own fp32 weight dumps, so it gates the arithmetic while
   // assuming the plumbing. This re-runs it against the container the converter produces, which
@@ -824,7 +824,7 @@ int main(int argc, char** argv) {
                   bad == 0 ? "PASS" : "FAIL");
       if (bad != 0) ++failures;
 
-      // And the ENGINE's own path, end to end: open the container, hand it the same pixels,
+      // And the engine's own path, end to end: open the container, hand it the same pixels,
       // compare its soft tokens to the oracle's. Everything above this exercises the test's
       // reimplementation of the tower; this exercises the code that will actually ship, through
       // the real weight loader. Without it the two can drift and every check above stays green.
@@ -864,9 +864,9 @@ int main(int argc, char** argv) {
   // ---- the splice: soft tokens standing in for placeholder tokens ----
   //
   // There is no oracle past this point, the reference dump stops at soft tokens, so this
-  // gates the two things that CAN be checked without one: that the spliced rows are the ones
+  // gates the two things that can be checked without one: that the spliced rows are the ones
   // that reach the residual stream, and that a prompt containing them generates without
-  // diverging into NaN. It does not check that the model's ANSWER is right; that needs a full
+  // diverging into NaN. It does not check that the model's answer is right; that needs a full
   // multimodal comparison against HuggingFace, which is a heavier harness than this.
   if (argc >= 3) {
     engine::PlanMetalEngine eng;
@@ -976,9 +976,9 @@ int main(int argc, char** argv) {
     }
   }
 
-  // ---- the END: Metal's token stream vs the reference's ----
+  // ---- the end: Metal's token stream vs the reference's ----
   //
-  // Everything else in this file compares activations. This compares ANSWERS, which is the only
+  // Everything else in this file compares activations. This compares answers, which is the only
   // check that covers the tower, the splice, M-RoPE and the text stack at once; and the only
   // one that can tell a wrong-but-finite result from a right one.
   //
@@ -994,7 +994,7 @@ int main(int argc, char** argv) {
     const int mh = grid_h / merge, mw = grid_w / merge;
 
     const std::vector<float> want_soft = read_f32(dir + "/stage_16_merger.f32");
-    // CPI_MM_ORACLE_SOFT=1 splices the ORACLE's soft tokens instead of our tower's. That splits
+    // CPI_MM_ORACLE_SOFT=1 splices the oracle's soft tokens instead of our tower's. That splits
     // the multimodal drift in two: whatever remains with the oracle's inputs belongs to the
     // splice, M-RoPE and the text stack, and whatever the swap removes was the tower's own fp16
     // error propagating. Without this the two are indistinguishable, and 16 of the 22 positions
@@ -1021,7 +1021,7 @@ int main(int argc, char** argv) {
 
     const std::vector<std::int32_t> mpos = engine::build_mrope_positions(toks, IMG, mh, mw);
 
-    // Prefill everything EXCEPT the last token, then push that one through forward_token.
+    // Prefill everything except the last token, then push that one through forward_token.
     //
     // prefill_multimodal consumes every token it is handed; prefill_chunks(n) covers all n
     // and there is no accessor for the logits it leaves behind. So prefilling all of `toks` and
@@ -1044,9 +1044,9 @@ int main(int argc, char** argv) {
     }
     eng.prefill_multimodal(head, head_embeds, head_mpos);
 
-    // Two counters, because M-RoPE makes them diverge. The ROTARY position continues the merged
+    // Two counters, because M-RoPE makes them diverge. The rotary position continues the merged
     // counter: mrope_next_position reports where the next token goes, so the last prompt token
-    // is one before it, and generated tokens step up by one from there. The CACHE position is the
+    // is one before it, and generated tokens step up by one from there. The cache position is the
     // real sequence index; head.size() tokens were prefilled, so the last prompt token occupies
     // slot head.size()-1 and the first generated token lands at head.size(). Passing the rotary
     // position for both is the bug this file used to carry: K/V written into an image slot and
@@ -1058,7 +1058,7 @@ int main(int argc, char** argv) {
     for (int i = 0; i < 8; ++i) {
       const std::vector<float>& lg = eng.forward_token(next, rope_pos + i, cache_pos + i);
 
-      // ---- step 0 against the oracle's DENSE logits ----
+      // ---- step 0 against the oracle's dense logits ----
       //
       // MULTIMODAL_stream compares eight argmax decisions. That is 8 bits of evidence about a
       // 248320-wide vector, and it cannot tell "our logits are slightly off" from "our logits
@@ -1106,7 +1106,7 @@ int main(int argc, char** argv) {
             const float r35 = ref[3160] - ref[3878];
             std::printf("      argmax ours=%d oracle=%d | logit(3160)-logit(3878): ours=%+.4f "
                         "oracle=%+.4f  drift=%+.4f\n", arg_g, arg_r, g35, r35, g35 - r35);
-            // Tolerance 0.30 on the MEAN. The behavioural gate is MULTIMODAL_stream below, which
+            // Tolerance 0.30 on the mean. The behavioural gate is MULTIMODAL_stream below, which
             // is token-identical to the fp32 reference over 8 steps; this is the drift tripwire
             // on top of it. It is set above the text-only control's 0.12 on purpose: this prompt
             // carries fp16 TOWER output at 16 of its 22 positions and a 3-D M-RoPE rotary, where

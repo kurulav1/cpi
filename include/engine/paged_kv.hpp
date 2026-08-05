@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <vector>
 
-// Paged KV cache foundation (P3, Phase 1) — pure host-side bookkeeping, no CUDA.
+// Paged KV cache foundation (P3, Phase 1): pure host-side bookkeeping, no CUDA.
 //
 // vLLM-style block paging: the KV cache is one device pool carved into fixed-size
 // blocks of `block_size` tokens. Each sequence owns a *block table* mapping its

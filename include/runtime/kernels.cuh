@@ -182,7 +182,7 @@ struct PersistOp {
   float* so = nullptr;
   half* kcache = nullptr;
   half* vcache = nullptr;
-  // Set by the compiler when the NEXT op reads only same-grid-stride elements of this op's
+  // Set by the compiler when the next op reads only same-grid-stride elements of this op's
   // output (a pure elementwise chain): the grid.sync after this op is skipped, because block
   // b's writes are exactly what block b reads next.
   int no_sync = 0;
@@ -201,7 +201,7 @@ bool launch_persistent_decode(const PersistOp* ops, int n_ops, const int* tok, c
 // Split-K decode attention for any even head_dim <= kTiledMaxHeadDim, sliding-window aware.
 // Grid is (num_heads, scratch_chunks) with per-chunk seq/window guards, so it is graph-safe
 // and fills the GPU where the single-block-per-head tiled path cannot (Gemma 4: 8 heads on a
-// 170-SM card). The reduce merges chunk softmax stats exactly (log-sum-exp).
+// large GPU). The reduce merges chunk softmax stats exactly (log-sum-exp).
 void launch_attention_split_any(const half* q, const half* k_cache, const half* v_cache, half* out,
                                 int seq_len, int window, int num_heads, int num_kv_heads,
                                 int head_dim, float* scratch_m, float* scratch_l, float* scratch_o,
@@ -283,7 +283,7 @@ void launch_rope_inplace_device_pos(half* q, half* k, int num_heads_q, int num_h
 // Grid: (max(num_heads_q, num_heads_k), num_tokens), head_dim/2 threads.
 // launch_rope_inplace_batched_strided
 //
-// Batched RoPE where Q and K rows carry an explicit stride, so they can be rotated IN PLACE
+// Batched RoPE where Q and K rows carry an explicit stride, so they can be rotated in place
 // inside the fused QKV buffer instead of being copied out to contiguous buffers first. Prefill
 // is host-bound and those copies were 3 of the 7 cudaMemcpy2DAsync per layer.
 // launch_rope_inplace_batched is this with the natural strides; bit-identical.
@@ -437,7 +437,7 @@ void launch_increment_int(int* value, cudaStream_t stream);
 //   causal       - true (default): each token attends only to its own prefix.
 //                  false: every token attends to the whole sequence; the
 //                  bidirectional self-attention a vision encoder needs.
-//   limits       - optional DEVICE array [num_tokens]: the exclusive key limit for each
+//   limits       - optional device array [num_tokens]: the exclusive key limit for each
 //                  token, overriding `causal`. This is what makes an image span
 //                  bidirectional (every token in the span sees the whole span) while the
 //                  surrounding text stays causal.
@@ -447,8 +447,8 @@ void launch_increment_int(int* value, cudaStream_t stream);
 //                  was silently wrong here.
 // launch_build_attention_ptrs
 //
-// Builds the cublasGemmBatchedEx pointer arrays for the tensor-core prefill attention ON the
-// DEVICE. Doing this from the host into a reused pinned buffer is a race; the function runs
+// Builds the cublasGemmBatchedEx pointer arrays for the tensor-core prefill attention on the
+// device. Doing this from the host into a reused pinned buffer is a race; the function runs
 // once per layer, so the next layer overwrites the staging buffer while the previous async copy
 // is still in flight. Building them on the compute stream makes the ordering structural.
 void launch_build_attention_ptrs(const half* k_layer, const half* v_layer, const half* q,
@@ -633,7 +633,7 @@ void launch_moe_router_topk_softmax_seq(const half* logits, int experts, int top
 
 // launch_moe_router_sigmoid_topk
 //
-// Kimi-K3-style router: SIGMOID gate per expert (independent, not softmax), optional grouped
+// Kimi-K3-style router: sigmoid gate per expert (independent, not softmax), optional grouped
 // node-limited selection, top-k, then normalise the selected gates to sum 1. Supports top_k up to
 // 32 (K3 uses 16, above the softmax router's hard cap of 8). Groundwork for K3; not yet wired to
 // a model (its 896/top-16 MoE needs this router + expert streaming + MXFP4); gated in isolation by
@@ -648,7 +648,7 @@ void launch_moe_router_sigmoid_topk(const half* logits, int experts, int top_k, 
 
 // launch_moe_gate_up_geglu / launch_moe_down_accum
 //
-// The expert feed-forward, with the selected experts read from DEVICE memory
+// The expert feed-forward, with the selected experts read from device memory
 // (topk_idx, written by the router); no host round-trip, so the decode graph
 // stays capturable.
 //
@@ -766,7 +766,7 @@ void launch_quantize_rowwise_fp16_to_int8(const half* src, std::int8_t* dst, flo
 //
 // `group` must be a positive power of two and <= cols. Scales are [rows,
 // n_groups] row-major with n_groups = ceil(cols / group); use
-// quant_group_count() to size the buffer. This is the LOAD-time weight path --
+// quant_group_count() to size the buffer. This is the load-time weight path;
 // activation quantisation stays per-row (launch_quantize_rowwise_fp16_to_int8).
 void launch_quantize_groupwise_fp16_to_int8(const half* src, std::int8_t* dst, float* scales,
                                             int rows, int cols, int group, cudaStream_t stream,
@@ -805,7 +805,7 @@ void launch_pack_rowwise_int8_to_int4(const std::int8_t* src, std::int8_t* dst, 
 //   stream       - CUDA stream
 // launch_weight_only_int8_gemv_f32
 //
-// int8 weight-only GEMV with fp16 activations and FLOAT output: the LM head.
+// int8 weight-only GEMV with fp16 activations and float output: the LM head.
 //   y[row] = scales[row] * sum_k w[row, k] * x[k]
 // Only the weights are quantized; x stays fp16 and the dot accumulates in fp32. The dp4a
 // kernels quantize the activation too, which is the wrong trade in the one layer that decides
@@ -1049,10 +1049,10 @@ void launch_gelu_mul_strided(const half* a, const half* b, half* out, int n, int
 
 // launch_gemv_splitk_f16
 //
-// GEMV with one BLOCK per output row and 8 warps splitting the input dimension.
-// The default GEMV gives one WARP per row, so its parallelism is the row count; ample for
+// GEMV with one block per output row and 8 warps splitting the input dimension.
+// The default GEMV gives one warp per row, so its parallelism is the row count; ample for
 // a 151936-row LM head, and only ~10% of the GPU for a 896-row o_proj, which then runs 8x
-// off peak because memory latency is never hidden. Use this for SHORT-and-wide GEMVs.
+// off peak because memory latency is never hidden. Use this for short-and-wide GEMVs.
 // Reduction order differs from the one-warp kernel, so results are equal to fp32 rounding
 // but not bit-identical; opt in per call site.
 void launch_gemv_splitk_f16(const half* w, const half* x, half* y, int out_features,
@@ -1062,7 +1062,7 @@ void launch_gemv_splitk_f16(const half* w, const half* x, half* y, int out_featu
 //
 // Fused SwiGLU projection: out[i] = silu(dot(w_gate[i], x)) * dot(w_up[i], x).
 // Replaces gate-GEMV + up-GEMV + silu_mul (3 kernels -> 1). At batch 1 each kernel costs
-// a fixed ~2.7us of scheduling regardless of its size, and that tax; not bandwidth --
+// a fixed ~2.7us of scheduling regardless of its size, and that tax, not bandwidth,
 // is what separates a small model from the roofline.
 // g and u are rounded to fp16 before the multiply, exactly as the unfused path does when
 // it stores them between kernels, so the result is byte-identical.
@@ -1098,7 +1098,7 @@ void launch_rowmajor_half_gemm_f16(const half* w, const half* x, half* y, int ou
                                    float in_min = -INFINITY, float in_max = INFINITY,
                                    float out_min = -INFINITY, float out_max = INFINITY);
 
-//   residual (optional): fuses the residual add into the epilogue --
+//   residual (optional): fuses the residual add into the epilogue:
 //     residual[row] = __hadd(residual[row], (half)dot)   and `y` is left untouched.
 //   Saves a whole add_inplace launch. byte-identical: the dot is rounded to fp16 first
 //   (what the unfused store does) and combined with __hadd (what add_inplace does).
@@ -1278,7 +1278,7 @@ void launch_rowmajor_half_gemv_f32(const half* w, const half* x, float* y, int o
 // warp 0) within a single block of 256 threads.
 // Two-phase when part_val/part_idx scratch is supplied (sized argmax_partition_count(n)),
 // otherwise a single block scans the whole vector. Supply the scratch: the single-block form
-// launches <<<1,256>>> over the entire vocab, one SM out of 170, and measured 149.6 us on
+// launches <<<1,256>>> over the entire vocab, one SM of many, and measured 149.6 us on
 // Qwen2.5's 151936-wide head, 12% of all GPU time, to read 608 KB.
 constexpr int kArgmaxMaxParts = 1024;
 int argmax_partition_count(int n);
@@ -1300,7 +1300,7 @@ void launch_argmax_float(const float* logits, int n, int* out_index, cudaStream_
 // launch_gather_ge_threshold: appends every finite logit >= *threshold to
 // out_idx/out_val and writes the count to out_count (capped at `capacity`).
 // Taking the threshold from out_val[k-1] reproduces the host sampler exactly,
-// INCLUDING ties at the k-th value (which can yield more than k candidates).
+// including ties at the k-th value (which can yield more than k candidates).
 // out_count must be zeroed before launch. If the count exceeds capacity the
 // caller should fall back to the host path.
 int topk_partition_count(int n);

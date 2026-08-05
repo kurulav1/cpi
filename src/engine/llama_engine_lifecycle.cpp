@@ -357,7 +357,7 @@ void LlamaEngine::allocate_runtime_buffers() {
       // Auto-size the pool to free VRAM so continuous batching can hold many
       // concurrent sequences. This runs before the resident weight cache is
       // built (cache-copy phase), so cudaMemGetInfo still counts that VRAM as
-      // free — subtract a conservative full-fp16 layer-cache reserve plus fixed
+      // free; subtract a conservative full-fp16 layer-cache reserve plus fixed
       // headroom (streaming staging, activations, cuBLAS, fragmentation). The
       // reserve is an upper bound (quantized caches are smaller), so we only
       // ever under-size the pool, never OOM the later weight load.

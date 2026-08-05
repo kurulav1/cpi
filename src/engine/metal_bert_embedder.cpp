@@ -44,7 +44,7 @@ struct BertPoolParams {
 };
 
 // Must match plan_metal_engine.cpp and the shader. Restated here rather than shared because the
-// shader owns them; if they drift, the GEMM covers the wrong rows silently; which is why the
+// shader owns them; if they drift, the GEMM covers the wrong rows silently, which is why the
 // out_dim check below refuses instead of trusting.
 constexpr int kGemmBN = 32;
 constexpr int kGemmFBM = 64;
@@ -88,7 +88,7 @@ void MetalBertEmbedder::layernorm_residual(runtime::MetalBuffer& src, runtime::M
                                            const runtime::MetalBuffer& b, runtime::MetalBuffer& out,
                                            int rows, int cols) {
   const std::size_t n = static_cast<std::size_t>(rows) * cols;
-  // cpi_add_inplace is (in, out) and writes buffer 1, so the ACCUMULATOR is second: this makes
+  // cpi_add_inplace is (in, out) and writes buffer 1, so the accumulator is second: this makes
   // src += residual, leaving the sum in src. The CUDA kernel fuses the add into layernorm; doing
   // it in two dispatches is the same arithmetic because the add is exact in fp32 either way.
   {
@@ -230,7 +230,7 @@ std::vector<float> MetalBertEmbedder::embed(const std::vector<int>& token_ids) {
 
     linear(w.inter_w, w.inter_b, x_, inter_, I, H, L);
     {
-      // EXACT erf GELU, not the tanh approximation. BERT's hidden_act is "gelu", which in
+      // Exact erf GELU, not the tanh approximation. BERT's hidden_act is "gelu", which in
       // transformers is the erf form; cpi_gelu is the tanh one and the two differ by ~4e-4.
       ElemParams p{static_cast<std::uint32_t>(L) * static_cast<std::uint32_t>(I), 1.0f};
       const void* bufs[] = {inter_.handle()};
@@ -249,9 +249,9 @@ std::vector<float> MetalBertEmbedder::embed(const std::vector<int>& token_ids) {
     // one threadgroup of 256: the kernel's tree reduction halves from nthr and assumes a power
     // of two, and the whole output vector must be visible to the normalising pass.
     //
-    // The buffer count is 2 and must equal the array length. It said 3 here, which read one
-    // element past `bufs` and bound whatever that garbage pointer was; a SIGBUS on the first
-    // embed() call, after initialize() had already reported success.
+    // The buffer count is 2 and must equal the array length. A 3 here reads one element past
+    // `bufs` and binds a garbage pointer: a SIGBUS on the first embed() call, after initialize()
+    // had already reported success.
     ctx_.dispatch("cpi_bert_pool_normalize", runtime::MetalContext::Grid::Groups, 1, 256, bufs,
                   nullptr, 2, &p, sizeof(p));
   }

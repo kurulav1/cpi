@@ -89,7 +89,7 @@ int main(int argc, char** argv) {
   // and no M-RoPE array means the plain 1-D rope path, which is what makes this a clean control
   // rather than a different code path that happens to also do text.
   //
-  // Prefill everything EXCEPT the last token, then run that one through forward_token to get the
+  // Prefill everything except the last token, then run that one through forward_token to get the
   // logits. prefill_multimodal consumes every token it is given (prefill_chunks(n) covers all n)
   // and there is no accessor for the logits it leaves behind, so prefilling all n and then
   // calling forward_token(tokens.back()) would feed the final token twice; once at n-1 and
@@ -139,9 +139,9 @@ int main(int argc, char** argv) {
   }
 
   // Tolerance 0.15, and the reasoning matters because a number picked to make the run green is
-  // worthless. The BEHAVIOURAL gate here is TEXT_stream below, which is token-identical to the
+  // worthless. The behavioural gate here is TEXT_stream below, which is token-identical to the
   // fp32 reference over 8 tokens; that is what says the text stack is right. This check is a
-  // regression tripwire on top of it, anchored just above the measured 0.12 so that drift GROWTH
+  // regression tripwire on top of it, anchored just above the measured 0.12 so that drift growth
   // trips it. Logits here run 15-24 in magnitude, so 0.12 is roughly half a percent, which is
   // what fp16 weights against an fp32 reference cost over 24 layers.
   //

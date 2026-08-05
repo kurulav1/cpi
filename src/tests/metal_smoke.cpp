@@ -6,7 +6,7 @@
 // links", never "the kernels are correct". Only a real GPU can say that.
 //
 // Tolerances are loose on purpose: the shaders accumulate in fp32 but read/write
-// fp16, and the accumulation ORDER differs from the CPU reference, so exact
+// fp16, and the accumulation order differs from the CPU reference, so exact
 // equality is not the bar. What we are checking is that each kernel computes the
 // right function; a transposed index or a bad stride blows past these bounds by
 // orders of magnitude.
@@ -328,10 +328,10 @@ int main() {
 
   // ---- Quantized GEMV (int4 and int8) ------------------------------------
   // Quantize a known matrix on the host exactly as PlanMetalEngine does, run the
-  // Metal kernel, and compare against a CPU dot product of the DEQUANTIZED weights.
+  // Metal kernel, and compare against a CPU dot product of the dequantized weights.
   // That separates two questions the end-to-end test conflates: is the kernel right,
   // and is the quantization format right. Comparing against the dequantized weights
-  // (not the originals) means quantization ERROR cannot mask a kernel BUG.
+  // (not the originals) means quantization error cannot mask a kernel bug.
   for (int bits : {8, 4}) {
     const std::uint32_t out_dim = 64, in_dim = 256, group = 64;
     const std::uint32_t groups = in_dim / group;
@@ -543,7 +543,7 @@ int main() {
                    nullptr, 5, &p, sizeof(p));
       ctx.commit_and_wait();
 
-      // Against the DEQUANTIZED weights, so quantization error cannot mask a kernel bug.
+      // Against the dequantized weights, so quantization error cannot mask a kernel bug.
       std::vector<float> want(static_cast<std::size_t>(T) * out_dim), got(want.size());
       for (std::uint32_t t = 0; t < T; ++t) {
         for (std::uint32_t r = 0; r < out_dim; ++r) {
@@ -571,7 +571,7 @@ int main() {
   // (heads != kv_heads, so several queries share a KV head) and the sliding window.
   //
   // The reference is a plain three-loop attention in fp32: scores, softmax, weighted V. The
-  // kernels compute it with an ONLINE softmax over key blocks, which is a different order of
+  // kernels compute it with an online softmax over key blocks, which is a different order of
   // operations, so agreement here is meaningful rather than tautological.
   {
     struct AP {  // must match AttnParams in cpi_kernels.metal
@@ -733,7 +733,7 @@ int main() {
   // ---- linear attention (delta-net) family --------------------------------
   //
   // These six have no end-to-end golden on this backend yet; the Qwen3.5 checkpoint that
-  // exercises them is not converted here; so a CPU reference IS the gate. Two of them carry
+  // exercises them is not converted here; so a CPU reference is the gate. Two of them carry
   // state across steps (the conv window and the recurrent matrix), and the reference reproduces
   // that state update too, which is the part a shape-only check would miss.
   {
@@ -967,7 +967,7 @@ int main() {
   // ---- vision tower ------------------------------------------------------
   //
   // No Gemma 4 checkpoint is converted here either, so the CPU reference is the gate. Every one
-  // of these includes PADDING PATCHES (a negative position), because that is the case that fails
+  // of these includes padding patches (a negative position), because that is the case that fails
   // silently: padding mixed into a real cell is a plausible-looking number, not a crash.
   {
     const std::uint32_t tok = 7, hid = 24, pdim = 12, pts = 8;
@@ -1208,8 +1208,8 @@ int main() {
   {
     // M-RoPE, gated two ways.
     //
-    // (1) STRICT GENERALISATION: with t == h == w == position, M-RoPE must reproduce plain 1-D
-    //     rope BIT FOR BIT. That is the property that makes it safe to enable for a whole
+    // (1) strict generalisation: with t == h == w == position, M-RoPE must reproduce plain 1-D
+    //     rope bit for bit. That is the property that makes it safe to enable for a whole
     //     sequence rather than switching per token, and it is checked against the kernel's own
     //     1-D path rather than a reimplementation of it.
     // (2) It actually splits axes: with three different axis positions the result must differ

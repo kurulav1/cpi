@@ -162,7 +162,7 @@ int main(int argc, char** argv) {
         ++cnt;
       }
       const double mean_nll = cnt > 0 ? nll / cnt : 0.0;
-      // Median and tail: if the median NLL is flat across configs while the MEAN (hence PPL)
+      // Median and tail: if the median NLL is flat across configs while the mean (hence PPL)
       // diverges, the difference is driven by a few confident-wrong outliers, not a broad shift.
       double median_nll = 0.0, p90_nll = 0.0, max_nll = 0.0;
       if (!nlls.empty()) {

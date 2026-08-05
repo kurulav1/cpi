@@ -1,15 +1,15 @@
 // Objective-C++ bridge to Metal. The only file in the engine that knows Metal's
 // types exist; everything above it sees opaque void* handles (metal_context.hpp).
 //
-// Deliberately compiled WITHOUT ARC, so a Metal object can be stored as a plain
+// Deliberately compiled without ARC, so a Metal object can be stored as a plain
 // void* and released by hand. Under ARC the same handles would need __bridge
 // casts everywhere and the header would have to leak Objective-C.
 //
 // Unified memory is the thing that makes this simpler than the CUDA path: a
 // MTLBuffer allocated with MTLResourceStorageModeShared is addressable by both
 // CPU and GPU, so there is no upload, no download, and no staging buffer. What
-// the CUDA backend spends cudaMemcpyAsync on, this backend does with memcpy --
-// or, often, with nothing at all.
+// the CUDA backend spends cudaMemcpyAsync on, this backend does with memcpy,
+// or often with nothing at all.
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -66,8 +66,8 @@ void* MetalBuffer::contents() const {
 MetalContext::MetalContext() {
   id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
   if (dev == nil) {
-    // No GPU. This is the normal outcome inside a VM -- notably GitHub's macOS
-    // runners -- so it must be reported, not asserted away.
+    // No GPU. This is the normal outcome inside a VM, notably GitHub's macOS
+    // runners, so it must be reported, not asserted away.
     last_error_ = "MTLCreateSystemDefaultDevice() returned nil (no Metal GPU available)";
     return;
   }
@@ -80,9 +80,9 @@ MetalContext::MetalContext() {
   }
   queue_ = (void*)q;  // already +1
 
-  // The pipeline cache lives behind the existing void* so the HEADER LAYOUT IS UNCHANGED.
-  // MetalContext is embedded BY VALUE in PlanMetalEngine, so growing it breaks any translation
-  // unit still compiled against the old layout -- which a first attempt at this did: the engine
+  // The pipeline cache lives behind the existing void* so the header layout is unchanged.
+  // MetalContext is embedded by value in PlanMetalEngine, so growing it breaks any translation
+  // unit still compiled against the old layout, which a first attempt at this did: the engine
   // read its config through a shifted `this` and reported layers=7, vocab=397.
   pipelines_ = (void*)new std::unordered_map<std::string, void*>();
 }
@@ -128,7 +128,7 @@ bool MetalContext::load_library(const std::string& path_hint) {
     NSString* p = [NSString stringWithUTF8String:path.c_str()];
     lib = [dev newLibraryWithURL:[NSURL fileURLWithPath:p] error:&err];
   } else {
-    // newDefaultLibrary only finds a metallib embedded in a BUNDLE, so a plain CLI binary
+    // newDefaultLibrary only finds a metallib embedded in a bundle, so a plain CLI binary
     // gets nil even with cpi_kernels.metallib in the same directory. Search there first.
     char exe[4096];
     std::uint32_t exe_len = sizeof(exe);
@@ -155,11 +155,11 @@ bool MetalContext::load_library(const std::string& path_hint) {
 
   if (lib == nil) {
     // No prebuilt library. Fall back to compiling the MSL source at runtime, which
-    // needs only the Metal framework -- so a Mac with no Xcode still works.
+    // needs only the Metal framework, so a Mac with no Xcode still works.
     const char* srcpath = std::getenv("CPI_METAL_SOURCE");
     if (srcpath != nullptr) {
       if (load_library_from_source(srcpath)) return true;
-      // KEEP the compiler's message. Overwriting it with a generic "failed to load"
+      // Keep the compiler's message. Overwriting it with a generic "failed to load"
       // hides the one thing that says what is actually wrong with the shader.
       return false;
     }
@@ -184,8 +184,8 @@ bool MetalContext::load_library_from_source(const std::string& metal_source_path
   NSFileManager* fm = [NSFileManager defaultManager];
 
   // The shaders live as several family files (00_common, 10_dense, ...). The runtime compiler
-  // takes ONE source string and does not resolve #include from a source string, so a directory
-  // is concatenated here in filename order -- the numeric prefixes make that order the dependency
+  // takes one source string and does not resolve #include from a source string, so a directory
+  // is concatenated here in filename order; the numeric prefixes make that order the dependency
   // order (common first). The offline CMake path cats the same files in the same order. A plain
   // file path still works, for a prebuilt single-file blob or a caller that points straight at one.
   NSString* src = nil;
@@ -220,15 +220,15 @@ bool MetalContext::load_library_from_source(const std::string& metal_source_path
   }
 
   MTLCompileOptions* opts = [[MTLCompileOptions alloc] init];
-  // Metal enables FAST MATH by default, which lowers the precision of exactly the
+  // Metal enables fast math by default, which lowers the precision of exactly the
   // functions this engine leans on: sin/cos in RoPE, exp in the attention softmax,
-  // rsqrt in RMSNorm. Left on, logits drift ~0.5 against the fp32 CPU reference --
-  // an order of magnitude worse than the CUDA backend's 0.06 -- which is enough for
+  // rsqrt in RMSNorm. Left on, logits drift ~0.5 against the fp32 CPU reference,
+  // an order of magnitude worse than the CUDA backend's 0.06, which is enough for
   // a greedy stream to flip a token after a few steps. Correctness first.
   // MTLCompileOptions.mathMode / MTLMathModeSafe are macOS 15 SDK symbols. Guard on the SDK
-  // version at COMPILE time (a runtime @available alone still needs the symbol to exist in the
+  // version at compile time (a runtime @available alone still needs the symbol to exist in the
   // headers, so it fails to build against Xcode 15). Older SDKs use the deprecated-but-equivalent
-  // fastMathEnabled = NO -- both simply disable fast math.
+  // fastMathEnabled = NO, both simply disable fast math.
 #if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
   if (@available(macOS 15.0, iOS 18.0, *)) {
     opts.mathMode = MTLMathModeSafe;
@@ -242,7 +242,7 @@ bool MetalContext::load_library_from_source(const std::string& metal_source_path
   [opts release];
 
   if (lib == nil) {
-    // A compile error here is a real shader bug -- surface the driver's message
+    // A compile error here is a real shader bug; surface the driver's message
     // verbatim rather than a generic failure.
     last_error_ = "runtime shader compilation failed";
     if (err != nil) {
@@ -295,7 +295,7 @@ void MetalContext::enable_gpu_profile(bool on) {
   }
 
   // Two samples per dispatch. The driver caps a sample buffer at 32768 B = 4096 timestamps, so
-  // 2048 dispatches is the ceiling -- a 24-layer prefill issues ~750, comfortably inside it.
+  // 2048 dispatches is the ceiling; a 24-layer prefill issues ~750, comfortably inside it.
   // Recording stops past the cap rather than reallocating mid-pass.
   sample_slots_ = 4096;
   MTLCounterSampleBufferDescriptor* d = [[MTLCounterSampleBufferDescriptor alloc] init];
@@ -372,8 +372,8 @@ void MetalContext::dispatch(const std::string& name, Grid grid, std::size_t tota
   for (int i = 0; i < spec_n; ++i) spec[i] = next_spec_[i];
   next_spec_n_ = 0;
 
-  // Key built as a std::string. The unspecialized case -- which is every dispatch in a decode
-  // step -- does no allocation at all: the lookup hashes `name` in place. Only the rare
+  // Key built as a std::string. The unspecialized case, which is every dispatch in a decode
+  // step, does no allocation at all: the lookup hashes `name` in place. Only the rare
   // specialized dispatch builds a string, and only the first time does any of this touch ObjC.
   const std::string* keyp = &name;
   std::string spec_key;
@@ -438,21 +438,21 @@ void MetalContext::dispatch(const std::string& name, Grid grid, std::size_t tota
   }
   id<MTLCommandBuffer> cb = (id<MTLCommandBuffer>)cmdbuf_;
 
-  // ONE compute encoder is reused across every dispatch in the command buffer, closed only at
+  // One compute encoder is reused across every dispatch in the command buffer, closed only at
   // commit. A decode step issues a few hundred dispatches; a fresh encoder per dispatch (the
   // previous design) paid the driver's encoder setup and an implicit full barrier every time,
-  // which is a large fixed per-token cost -- and that overhead is a much bigger fraction of a
+  // which is a large fixed per-token cost, and that overhead is a much bigger fraction of a
   // bandwidth-light int4 decode than of a bandwidth-heavy fp16 one. Ordering between dependent
   // dispatches is kept by an explicit memory barrier (below), which is far cheaper than an
   // encoder boundary.
   if (encoder_ == nullptr) {
-    // CONCURRENT dispatch, not the default serial. The slot/weight buffers are Shared and
-    // hazard-TRACKED (no Untracked flag on alloc), so Metal inserts a dependency barrier
-    // automatically wherever a dispatch reads what an earlier one wrote -- and ONLY there. Under a
+    // Concurrent dispatch, not the default serial. The slot/weight buffers are Shared and
+    // hazard-tracked (no Untracked flag on alloc), so Metal inserts a dependency barrier
+    // automatically wherever a dispatch reads what an earlier one wrote, and only there. Under a
     // serial encoder that automatic tracking is moot: serial orders every dispatch regardless, so
     // the independent ops in a layer (the three Q/K/V projections, gate/up) are force-serialised
-    // and each pays a pipeline drain. Concurrent lets those overlap -- the small grid-starved k/v
-    // projections in particular, which never fill the GPU alone -- while the tracker still
+    // and each pays a pipeline drain. Concurrent lets those overlap, the small grid-starved k/v
+    // projections in particular, which never fill the GPU alone, while the tracker still
     // serialises the real dependency chain (norm -> qkv -> rope -> attention -> o -> ...). This is
     // the correct-by-construction version of an earlier attempt that tracked hazards by hand and
     // reset the state per layer, missing cross-layer dependencies; Metal's tracking spans the whole
@@ -461,7 +461,7 @@ void MetalContext::dispatch(const std::string& name, Grid grid, std::size_t tota
         (void*)[[cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent] retain];
   }
   // Profiling brackets each dispatch with its own encoder, because the timestamp counter samples
-  // at ENCODER boundaries -- the device does not support dispatch-boundary sampling. That
+  // at encoder boundaries, the device does not support dispatch-boundary sampling. That
   // serialises work the concurrent encoder would overlap, which is the price of per-kernel numbers.
   if (gpu_profile_ && sample_buf_ != nullptr && sample_next_ + 2 <= sample_slots_) {
     if (encoder_ != nullptr) {
@@ -480,8 +480,8 @@ void MetalContext::dispatch(const std::string& name, Grid grid, std::size_t tota
   }
 
   id<MTLComputeCommandEncoder> enc = (id<MTLComputeCommandEncoder>)encoder_;
-  // The encoder is concurrent, so a dispatch runs as soon as its inputs are ready UNLESS a barrier
-  // orders it. By default every dispatch barriers first -- correctness-equivalent to a serial
+  // The encoder is concurrent, so a dispatch runs as soon as its inputs are ready unless a barrier
+  // orders it. By default every dispatch barriers first, correctness-equivalent to a serial
   // encoder. The caller drops the barrier (set_next_barrier(false)) only for a dispatch it has
   // proven independent of everything since the last barrier, which lets the small grid-starved
   // projections (q/k/v, gate/up) overlap. The flag is one-shot: it resets to true here so an
@@ -519,7 +519,7 @@ bool MetalContext::begin_gputrace(const std::string& path) {
     return false;
   }
   MTLCaptureManager* mgr = [MTLCaptureManager sharedCaptureManager];
-  // A .gputrace DOCUMENT is the point -- the default destination is the Xcode UI over a live
+  // A .gputrace document is the point; the default destination is the Xcode UI over a live
   // debug session, which is useless from a headless SSH run.
   if (![mgr supportsDestination:MTLCaptureDestinationGPUTraceDocument]) {
     last_error_ =
@@ -533,7 +533,7 @@ bool MetalContext::begin_gputrace(const std::string& path) {
   [[NSFileManager defaultManager] removeItemAtPath:p error:nil];
 
   MTLCaptureDescriptor* d = [[MTLCaptureDescriptor alloc] init];
-  // Capture the QUEUE, not the device: the device scope records every queue in the process,
+  // Capture the queue, not the device: the device scope records every queue in the process,
   // and this one only ever uses one.
   d.captureObject = (id<MTLCommandQueue>)queue_;
   d.destination = MTLCaptureDestinationGPUTraceDocument;
@@ -574,7 +574,7 @@ void MetalContext::commit_async() {
 
 void MetalContext::wait_pending() {
   if (in_flight_.empty()) return;
-  // The queue is serial, so completion of the LAST buffer implies all earlier ones -- but each
+  // The queue is serial, so completion of the last buffer implies all earlier ones, but each
   // is waited (cheap once complete) so its GPU-busy time and error status are collected.
   for (void* p : in_flight_) {
     id<MTLCommandBuffer> cb = (id<MTLCommandBuffer>)p;
@@ -596,7 +596,7 @@ void MetalContext::wait_pending() {
 
 void MetalContext::commit_and_wait() {
   // Anything committed asynchronously belongs to the same stream of work; a caller asking for
-  // a full sync means ALL of it.
+  // a full sync means all of it.
   wait_pending();
   if (cmdbuf_ == nullptr) return;
   id<MTLCommandBuffer> cb = (id<MTLCommandBuffer>)cmdbuf_;

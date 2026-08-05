@@ -8,7 +8,7 @@
 //
 // every check here is paired with a control: the previous hand-rolled converter; which
 // truncated the mantissa and flushed subnormals to zero; is compiled in as `legacy_*` and must
-// FAIL the same check. Four checks in this project's history passed while measuring nothing, so
+// fail the same check. Four checks in this project's history passed while measuring nothing, so
 // a check that cannot be seen failing is not evidence. If a control ever stops failing, the check
 // it guards has gone blind and the test says so.
 
@@ -158,7 +158,7 @@ int main(int argc, char** argv) {
   // The point of the change: truncation always moves toward zero, so it shrinks magnitudes
   // systematically. Rounding's error should average out.
   //
-  // Sampled POSITIVE-only on purpose. Over data symmetric about zero, truncation's bias cancels
+  // Sampled positive-only on purpose. Over data symmetric about zero, truncation's bias cancels
   //, it pulls positives down and negatives up in equal measure, and this check would read as
   // "unbiased" for both converters while measuring nothing. (It did, on the first draft: legacy
   // scored +1.4e-06 against rounding's -1.0e-06.) Real tensors are not symmetric, which is why

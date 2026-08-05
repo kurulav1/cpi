@@ -60,7 +60,7 @@ enum class ModelFamilyKind { Llama, Gemma4, Qwen35, Llama4, DeepSeekV2 };
 
 // Centralized model-identity classification: the single place that inspects a
 // model path and reports its engine family + the raw facts dispatch keys off.
-// This is the capability seam — as the engines converge onto one config-driven
+// This is the capability seam: as the engines converge onto one config-driven
 // executor, this grows into a full capability descriptor and the caller stops
 // switching on identity. For now it just de-scatters the detection.
 struct ModelProbe {
@@ -80,7 +80,7 @@ enum class EngineChoice {
   LlamaCuda,   // default fast path (.ll2c and anything not otherwise classified)
   LlamaMetal,  // PlanMetalEngine on Apple Silicon (no CUDA, Metal GPU present)
   LlamaCpu,    // CpuLlamaEngine (force_cpu / no CUDA device / no-CUDA build)
-  PlanCuda,    // generic per-layer op-plan executor (Gemma 4 .cpi today) — CUDA only
+  PlanCuda,    // generic per-layer op-plan executor (Gemma 4 .cpi today); CUDA only
   Qwen35Cuda,
   Qwen35Metal,  // PlanMetalEngine running the shared Qwen3.5 op plan (Apple Silicon, no CUDA)
   Qwen35Cpu,
@@ -90,7 +90,7 @@ enum class EngineChoice {
 };
 
 // Resolves the model family (from a probe) plus the runtime device situation into
-// a single engine choice — the whole dispatch decision in one place. Throws if the
+// a single engine choice: the whole dispatch decision in one place. Throws if the
 // model cannot run on the available device (Gemma 4 currently requires CUDA).
 EngineChoice resolve_engine(const ModelProbe& probe, bool cuda_available, bool metal_available,
                             bool force_cpu);

@@ -2,7 +2,7 @@
 //
 // Runs everywhere; no CUDA, no Metal, no GPU, no weights. The WeightSource is a
 // stub that hands back a distinct fake handle per tensor name, so the test can also
-// assert that each op got bound to the RIGHT tensor, not merely to something.
+// assert that each op got bound to the right tensor, not merely to something.
 //
 // This is what stops a backend bring-up from chasing a kernel bug that is really a
 // plan bug.
@@ -245,7 +245,7 @@ int main() {
   expect(plan.epilogue[1].weight == w.handle_for("output.weight"),
          "untied head uses output.weight");
 
-  // ---- a TIED head must fall back to the embedding table -------------------
+  // ---- a tied head must fall back to the embedding table -------------------
   {
     FakeWeights tied;  // never add("output.weight")
     const ModelPlan p2 = build_llama_plan(g, tied);
@@ -330,7 +330,7 @@ int main() {
     expect(att0 && !att0->full_attention, "gemma4: layer 0 is sliding");
     expect(att2 && att2->full_attention, "gemma4: layer 2 is full");
 
-    // the trap that PROMPTED this TEST: the CUDA executor reads a global rms_eps and would run
+    // the trap that prompted this test: the CUDA executor reads a global rms_eps and would run
     // fine with op.eps unset; the Metal executor reads op.eps. A plan missing it normalises with
     // no epsilon on one backend only.
     int norms = 0, norms_with_eps = 0, offset_norms = 0;
@@ -350,7 +350,7 @@ int main() {
     // compounds and overflows fp16 around layer 2.
     expect(offset_norms == 0, "gemma4: no RmsNorm uses the (1+w) offset form");
 
-    // RoPE carries its configuration as VALUES, not just as the rope_table enum. A backend that
+    // RoPE carries its configuration as values, not just as the rope_table enum. A backend that
     // computes angles in-shader (Metal) never reads rope_table, and Op::scale defaults to 1.0f
     // a theta of 1.0 rotates every lane at the same frequency and is a wrong model, not an error.
     auto rope_of = [&](int L) {
@@ -410,12 +410,12 @@ int main() {
              "gemma4: no sharing => every layer stores KV");
   }
 
-  // ---- OP COMPLETENESS, across every builder ------------------------------
+  // ---- op completeness, across every builder ------------------------------
   //
   // The bug class this session kept producing, four times: an op that CUDA's executor can run
-  // because it INFERS the missing fields (it reads K and V from hardcoded slots, applies
+  // because it infers the missing fields (it reads K and V from hardcoded slots, applies
   // 1/sqrt(head_dim) in-kernel, selects a rope table by enum), and that Metal's executor cannot,
-  // because it reads those same things OFF the OP. Symptoms ranged from a wrong rope frequency to
+  // because it reads those same things off the op. Symptoms ranged from a wrong rope frequency to
   // KvStore writing nothing at all; and none of them failed at build time, on any machine.
   //
   // A plan is one description read by two executors, so "complete" is the requirement, not

@@ -2,10 +2,10 @@
 
 // Minimal, dependency-free WordPiece tokenizer for BERT-family embedding models
 // (bge, gte, e5, ...). Mirrors HuggingFace's BertTokenizer pipeline:
-//   1. BertNormalizer  — clean control chars, normalize whitespace, (optionally)
+//   1. BertNormalizer: clean control chars, normalize whitespace, (optionally)
 //      lowercase + strip accents, isolate CJK characters.
-//   2. BertPreTokenizer — split on whitespace and isolate punctuation.
-//   3. WordPiece        — greedy longest-match subwording with a "##"
+//   2. BertPreTokenizer: split on whitespace and isolate punctuation.
+//   3. WordPiece: greedy longest-match subwording with a "##"
 //      continuation prefix; unmatched words map to [UNK].
 //
 // Loaded from a HuggingFace model directory's `vocab.txt` (one token per line,

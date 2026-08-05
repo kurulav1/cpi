@@ -127,7 +127,7 @@ __global__ void attention_step_chunk_stats_int4_kernel(
   for (int tile_base = chunk_start; tile_base < chunk_end; tile_base += WarpsPerBlock) {
     const int tile_tokens = min(WarpsPerBlock, chunk_end - tile_base);
 
-    // Phase 1a: INT4 K dot-product — each warp handles one tile token.
+    // Phase 1a: INT4 K dot-product; each warp handles one tile token.
     {
       const int t = tile_base + warp_id;
       float score = neg_inf<float>();
@@ -365,7 +365,7 @@ __global__ void attention_step_kernel_int4(const half* q, const int8_t* k_cache_
       }
     }
 
-    // Phase 1b: stage V tile — decode INT4 packed bytes to fp16 in shared mem.
+    // Phase 1b: stage V tile: decode INT4 packed bytes to fp16 in shared mem.
     {
       for (int i = 0; i < tile_tokens; ++i) {
         const int t = tile_base + i;
@@ -468,7 +468,7 @@ void launch_attention_step_int4(const half* q, const int8_t* k_cache_i4, const i
     attention_step_chunk_stats_int4_kernel<warps><<<grid, threads, smem, stream>>>(
         q, k_cache_i4, v_cache_i4, k_scales, v_scales, scratch_m, scratch_l, scratch_o, seq_len,
         num_heads, num_kv_heads, head_dim, split_chunk_size, scratch_chunks);
-    // Reuse the FP16 reduce kernel — it only operates on float scratch, not the cache format.
+    // Reuse the FP16 reduce kernel: it only operates on float scratch, not the cache format.
     attention_step_chunk_reduce_kernel<<<num_heads, threads, 0, stream>>>(
         scratch_m, scratch_l, scratch_o, out, seq_len, num_heads, head_dim, split_chunk_size,
         scratch_chunks);

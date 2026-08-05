@@ -1,6 +1,6 @@
 // Decode-attention bandwidth bench (harness-first: locate the roofline before
 // optimizing). Decode attention has seq_q=1 attending over a long KV cache, so
-// it is memory-bound reading K/V (~0.5 flop/byte) — tensor cores can't help a
+// it is memory-bound reading K/V (~0.5 flop/byte), tensor cores can't help a
 // single-token query. The lever is bytes read, so the metric that matters is
 // achieved KV-read bandwidth vs the ~1.79 TB/s peak, not FLOPs.
 //

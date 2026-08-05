@@ -1,7 +1,7 @@
 #pragma once
 
 // Shard-fit / memory planner: given a model's dimensions, a weight/KV quantisation, and a 3D
-// parallelism split (tensor x pipeline x expert), compute the EXACT per-rank VRAM footprint and scan
+// parallelism split (tensor x pipeline x expert), compute the exact per-rank VRAM footprint and scan
 // for the minimum world size that fits a target GPU. Pure host arithmetic, no GPU, no cluster, so
 // it runs anywhere and is verifiable by reproducing the known single-GPU footprints at world=1.
 //
@@ -11,7 +11,7 @@
 // is a structural estimate of weights + KV; a coarse activation working-set is reported separately and
 // labelled, since it is workload-dependent, not a fixed allocation.
 //
-// The `weight_quant` here is applied UNIFORMLY to every weight; the engine actually runs MIXED
+// The `weight_quant` here is applied uniformly to every weight; the engine actually runs mixed
 // precision (MLP at this quant, projections int8, embedding/head fp16 on CUDA). The int4-MLP dominates
 // so the total still lands on the real footprint; validated against the known world=1 numbers:
 // Llama-8B fp16 = 8.03B*2 exactly, Qwen-32B int4 @32k ctx ~= 24.9 GB, Gemma-4 26B-A4B int4 experts
@@ -117,7 +117,7 @@ inline int ceil_div(int n, int parts) { return parts > 0 ? (n + parts - 1) / par
 
 // Per-rank footprint for the heaviest rank under `pc`. Weights that TP splits are charged at their
 // sharded size; the embedding/head are charged on their single pp stage (vocab split tp ways); experts
-// are split ep ways; the KV cache is charged for this rank's layers and its tp-share of KV heads.
+// are split ep ways; the KV cache is charged for this rank's layers and its tp share of KV heads.
 inline Footprint estimate_footprint(const ModelDims& d, const PlanConfig& pc) {
   using detail::ceil_div;
   using detail::matrix_bytes;

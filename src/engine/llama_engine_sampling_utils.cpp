@@ -5,7 +5,7 @@
 #include <unordered_set>
 #include <vector>
 
-#include "engine/sampling.hpp"  // shared decls — compile-time check the sampler signatures match
+#include "engine/sampling.hpp"  // shared decls; compile-time check the sampler signatures match
 namespace engine {
 namespace {
 
@@ -17,12 +17,12 @@ std::mt19937& sampler_rng() {
   return rng;
 }
 
-// The single sampling traversal. Every temperature > 0 path; the fast top-k path below, the
-// full sample_from_logits path, and the device top-k path; turns its logits into a candidate set
+// The single sampling traversal. Every temperature > 0 path (the fast top-k path below, the
+// full sample_from_logits path, and the device top-k path) turns its logits into a candidate set
 // and draws through here: softmax over the candidates, top_p nucleus, one uniform draw walked in
 // probability order. Having exactly one traversal is what makes those paths agree token-for-token
-// (not merely in distribution) for a given seed, so which route a request takes; host vs device,
-// fast vs full; never changes the sampled token. The candidate set is O(top_k), so this also
+// (not merely in distribution) for a given seed, so which route a request takes (host vs device,
+// fast vs full) never changes the sampled token. The candidate set is O(top_k), so this also
 // avoids the O(vocab log vocab) full-vocabulary sort the sampler once did on every decoded token.
 int sample_from_candidates(std::vector<engine::detail::SampleCandidate>& cand, float temperature,
                            float top_p) {
@@ -31,7 +31,7 @@ int sample_from_candidates(std::vector<engine::detail::SampleCandidate>& cand, f
     return 0;
   }
   // Same [-80, 80] clamp the full path uses, to keep exp() well-behaved. Applied
-  // to the VALUES only — candidate selection already happened on the raw logits.
+  // to the values only; candidate selection already happened on the raw logits.
   for (Candidate& c : cand) {
     if (c.value > 80.0f)
       c.value = 80.0f;
@@ -105,7 +105,7 @@ int sample_from_logits_topk(const std::vector<float>& logits, float temperature,
                    std::greater<float>());
   const float kth = partitioned[static_cast<std::size_t>(top_k - 1)];
 
-  // Every finite logit at or above the threshold — ties at kth included, which is
+  // Every finite logit at or above the threshold; ties at kth included, which is
   // why this can yield more than top_k candidates (the device path mirrors this).
   std::vector<engine::detail::SampleCandidate> cand;
   cand.reserve(static_cast<std::size_t>(top_k) + 8);
@@ -215,16 +215,16 @@ int sample_from_logits(std::vector<float>& logits, float temperature, int top_k,
     return static_cast<int>(std::max_element(logits.begin(), logits.end()) - logits.begin());
   }
 
-  // Build the same top_k candidate set sample_from_logits_topk does; but on THESE (sanitized,
-  // penalized, n-gram-banned) logits; and delegate the softmax / nucleus / draw to the shared
-  // sample_from_candidates. A single traversal in the codebase is the point: the device top-k path
-  // already samples through sample_from_candidates, so with an identical candidate set and seed
-  // this fallback now returns the identical TOKEN, not merely the same distribution. This path used
-  // to walk the vocab in INDEX order while the candidate path walks in PROBABILITY order, so which
-  // route a request took; decided by whether the whole batch was fast-path eligible, i.e. by
-  // other clients' concurrent requests; changed the sampled token for a fixed seed, and made
-  // CPI_BATCH_TOPK=0 an unreliable A/B for penalty rows. top_k selects the same set on the unscaled
-  // logits (inv_temp is a positive, order-preserving scale), matching the fast path's threshold.
+  // Build the same top_k candidate set sample_from_logits_topk does, but on these (sanitized,
+  // penalized, n-gram-banned) logits, and delegate the softmax / nucleus / draw to the shared
+  // sample_from_candidates. A single traversal is the point: the device top-k path already samples
+  // through sample_from_candidates, so with an identical candidate set and seed this fallback
+  // returns the identical token, not merely the same distribution. This path used to walk the
+  // vocab in index order while the candidate path walks in probability order, so which route a
+  // request took (decided by whether the whole batch was fast-path eligible, i.e. by other clients'
+  // concurrent requests) changed the sampled token for a fixed seed, and made CPI_BATCH_TOPK=0 an
+  // unreliable A/B for penalty rows. top_k selects the same set on the unscaled logits (inv_temp is
+  // a positive, order-preserving scale), matching the fast path's threshold.
   std::vector<engine::detail::SampleCandidate> cand;
   if (top_k > 0 && top_k < static_cast<int>(logits.size())) {
     std::vector<float> part(logits);

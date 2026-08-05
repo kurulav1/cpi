@@ -66,7 +66,7 @@ constexpr int kGemmTG = 32 * (kGemmFBM / (8 * kGemmRF)) * (kGemmBN / (8 * kGemmC
 
 // Bilinear resample of the learned position table onto the patch grid, then a reorder into
 // merge-unit-major order. Both details are load-bearing and neither announces itself if wrong:
-// the samples are linspace(0, side-1, n) with the endpoint INCLUDED, and patch (i, j) does not
+// the samples are linspace(0, side-1, n) with the endpoint included, and patch (i, j) does not
 // land at row i*w + j; the blocks see patches grouped by the 2x2 unit the merger later folds.
 //
 // Host-side on purpose: O(patches * hidden) once per image against twelve blocks at
@@ -161,7 +161,7 @@ void build_rope_tables(int h, int w, int head_dim, int merge, float theta,
 //
 //   - a text token takes t = h = w = next, and advances next by 1;
 //   - an image span takes base = next and assigns t = base, h = base + row, w = base + col over
-//     its MERGED grid, then advances next by max(merged_h, merged_w).
+//     its merged grid, then advances next by max(merged_h, merged_w).
 //
 // That last step is the one that matters and the one a reimplementation gets wrong. An image of
 // 16 tokens advances the counter by 4, not 16, so every text token after an image sits four
@@ -313,7 +313,7 @@ std::vector<float> PlanMetalEngine::encode_image(const std::vector<float>& patch
 
   // ---- + interpolated position table ----
   {
-    // From the LOADER, not the WeightSource. WeightSource::fp16 hands back an opaque Metal
+    // From the loader, not the WeightSource. WeightSource::fp16 hands back an opaque Metal
     // buffer handle, its own comment says these are never dereferenced as pointers, and
     // reading one as fp16 data is how this first went wrong: a SIGBUS, then, once the layout
     // shifted, 16384 NaNs that the test happily reported as pass.
@@ -331,7 +331,7 @@ std::vector<float> PlanMetalEngine::encode_image(const std::vector<float>& patch
     //
     // The interpolated table is not the stored one: bilinear blending of four bf16 rows with
     // fractional weights produces values with full f32 mantissa content, so rounding it before
-    // the add throws away bits the add would otherwise keep. Measured on the M4, this halves the
+    // the add throws away bits the add would otherwise keep. Measured, this halves the
     // tower's error, ENGINE_encode_image rel 0.01010 -> 0.00508, and it is what the
     // reference (and metal_vision_test's END_TO_END path) does.
     //
@@ -411,7 +411,7 @@ std::vector<float> PlanMetalEngine::encode_image(const std::vector<float>& patch
     }
     gemm(W(B + "mlp.fc1.weight"), bnorm, binter, W(B + "mlp.fc1.bias"), inter, hidden, tokens);
     {
-      // tanh GELU here: the BLOCKS specify hidden_act = "gelu_pytorch_tanh". The merger below
+      // tanh GELU here: the blocks specify hidden_act = "gelu_pytorch_tanh". The merger below
       // uses the exact erf form instead; they are different functions and the tower uses both.
       ElemParams p{static_cast<std::uint32_t>(tokens) * static_cast<std::uint32_t>(inter), 1.0f};
       const void* bufs[] = {binter.handle()};
@@ -480,7 +480,7 @@ std::vector<float> PlanMetalEngine::encode_image(const std::vector<float>& patch
 }
 
 // ---------------------------------------------------------------------------
-// Gemma 4's vision tower. Unlike Qwen3.5's hand-rolled sequence above, this one is a PLAN
+// Gemma 4's vision tower. Unlike Qwen3.5's hand-rolled sequence above, this one is a plan
 // (build_gemma4_vision_plan, the same description PlanCudaEngine constructs) walked by the
 // engine's own execute_ops with the slot resolver pointed at vision-sized buffers.
 
@@ -498,7 +498,7 @@ void PlanMetalEngine::init_gemma_vision(const std::string& model_dir) {
     throw std::runtime_error("Gemma 4 vision tower with kv_heads != heads is not supported");
   }
 
-  // cos/sin over the SPATIAL half-dim, exactly PlanCudaEngine::build_vision_rope_tables:
+  // cos/sin over the spatial half-dim, exactly PlanCudaEngine::build_vision_rope_tables:
   // inv_freq = theta^(-2j/spatial_dim) with spatial_dim = head_dim/2, head_dim/4 entries per
   // position, both axes sharing the table.
   {
@@ -617,7 +617,7 @@ std::vector<float> PlanMetalEngine::encode_image(const std::vector<float>& pixel
                     static_cast<std::size_t>(out_tokens) * static_cast<std::size_t>(H), 256, bufs,
                     nullptr, 4, &p, sizeof(p));
     }
-    // Projector: weightless RMS norm (ONES weight, mirroring CUDA's launch_rmsnorm with
+    // Projector: weightless RMS norm (ones weight, mirroring CUDA's launch_rmsnorm with
     // d_ones_) -> linear into the text hidden size.
     {
       struct NormParams {
@@ -684,7 +684,7 @@ std::vector<int> PlanMetalEngine::generate_multimodal(const std::vector<int>& to
         auto* dst = static_cast<std::int32_t*>(seq_limits_buf_.contents());
         for (int t = 0; t < chunk; ++t) {
           const int lim = limits[static_cast<std::size_t>(pos + t)];
-          // A span token's keys must all be WRITTEN when its chunk's attention runs; a span
+          // A span token's keys must all be written when its chunk's attention runs; a span
           // straddling a chunk boundary would attend over unwritten cache. Prompts are far
           // below one chunk today; splitting chunks at span edges is the fix if that changes.
           if (lim > pos + chunk) {
