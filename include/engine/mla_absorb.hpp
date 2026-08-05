@@ -106,82 +106,61 @@ __global__ inline void mla_absorbed_attn_stats_kernel(const __half* q_abs, const
   const int chunk_end = min(chunk_start + chunk_size, seq_len);
 
   extern __shared__ float smem[];
-  float* q_sh = smem;              // [kdim]
-  float* warp_m = q_sh + kdim;     // [4]
-  float* warp_l = warp_m + 4;      // [4]
-  float* warp_o = warp_l + 4;      // [4][vdim]
+  float* q_sh = smem;                // [kdim] (read as float2 pairs when scoring)
+  float* score_sh = q_sh + kdim;     // [chunk_size]
 
   const int tid = threadIdx.x;
   const int warp_id = tid / 32;
   const int lane = tid & 31;
+  const int warps = blockDim.x / 32;
 
   for (int d = tid; d < kdim; d += blockDim.x) {
     q_sh[d] = __half2float(q_abs[static_cast<size_t>(h) * kdim + d]);
   }
   __syncthreads();
 
-  // Per-warp online softmax over this warp's tokens (chunk_start+warp, +4, ...).
-  constexpr int kAccPer = 16;  // vdim <= 512 = 32 lanes * 16
-  float acc[kAccPer];
-#pragma unroll
-  for (int i = 0; i < kAccPer; ++i) acc[i] = 0.0f;
-  float rm = -3.4e38f, rl = 0.0f;
-  for (int t = chunk_start + warp_id; t < chunk_end; t += 4) {
-    const __half* row = cache + static_cast<size_t>(t) * kdim;
-    const __half2* row2 = reinterpret_cast<const __half2*>(row);
+  // Phase 1: score every token in the chunk into shared (one warp per token,
+  // striding). float2 q reads keep shared accesses conflict-free.
+  const float2* q2 = reinterpret_cast<const float2*>(q_sh);
+  for (int t = chunk_start + warp_id; t < chunk_end; t += warps) {
+    const __half2* row2 = reinterpret_cast<const __half2*>(cache + static_cast<size_t>(t) * kdim);
     float partial = 0.0f;
     for (int p = lane; p < kdim / 2; p += 32) {
+      const float2 qv = q2[p];
       const float2 v = __half22float2(row2[p]);
-      partial += q_sh[2 * p] * v.x + q_sh[2 * p + 1] * v.y;
+      partial += qv.x * v.x + qv.y * v.y;
     }
     for (int off = 16; off > 0; off >>= 1)
-      partial += __shfl_xor_sync(0xffffffffu, partial, off);
-    const float s = partial * scale;
-    const float nm = fmaxf(rm, s);
-    const float corr = (rl == 0.0f) ? 0.0f : expf(rm - nm);
-    const float w = expf(s - nm);
-    rl = rl * corr + w;
-    rm = nm;
-#pragma unroll
-    for (int i = 0; i < kAccPer; ++i) {
-      const int d = lane + 32 * i;
-      const float vv = (d < vdim) ? __half2float(row[d]) : 0.0f;
-      acc[i] = acc[i] * corr + w * vv;
-    }
-  }
-
-  // Stage warp partials and merge (contribution of warp w at global max M is
-  // acc_w * exp(m_w - M); l merges the same way).
-  if (lane == 0) {
-    warp_m[warp_id] = rm;
-    warp_l[warp_id] = rl;
-  }
-#pragma unroll
-  for (int i = 0; i < kAccPer; ++i) {
-    const int d = lane + 32 * i;
-    if (d < vdim) warp_o[warp_id * vdim + d] = acc[i];
+      partial += __shfl_down_sync(0xffffffffu, partial, off);
+    if (lane == 0) score_sh[t - chunk_start] = partial * scale;
   }
   __syncthreads();
 
+  // Phase 2: chunk max + weights recomputed redundantly per thread in registers
+  // (no serial section, no per-token accumulator rescale), then a fixed-weight
+  // V pass with two accumulators per thread (256 threads x 2 = 512 dims).
+  const int n = chunk_end - chunk_start;
+  float cm = -3.4e38f;
+  for (int i = 0; i < n; ++i) cm = fmaxf(cm, score_sh[i]);
+  float cl = 0.0f;
+  for (int i = 0; i < n; ++i) cl += expf(score_sh[i] - cm);
+
   const int ci = h * scratch_chunks + chunk;
-  float gm = -3.4e38f;
-  for (int w = 0; w < 4; ++w) gm = fmaxf(gm, warp_m[w]);
   if (tid == 0) {
-    float gl = 0.0f;
-    for (int w = 0; w < 4; ++w) {
-      gl += (warp_l[w] == 0.0f) ? 0.0f : warp_l[w] * expf(warp_m[w] - gm);
-    }
-    chunk_m[ci] = gm;
-    chunk_l[ci] = gl;
+    chunk_m[ci] = cm;
+    chunk_l[ci] = cl;
   }
-  for (int d = tid; d < vdim; d += blockDim.x) {
-    float o = 0.0f;
-    for (int w = 0; w < 4; ++w) {
-      const float f = (warp_l[w] == 0.0f) ? 0.0f : expf(warp_m[w] - gm);
-      o += warp_o[w * vdim + d] * f;
-    }
-    chunk_o[static_cast<size_t>(ci) * vdim + d] = o;
+  float acc0 = 0.0f, acc1 = 0.0f;
+  const int d0 = tid;
+  const int d1 = tid + blockDim.x;
+  for (int i = 0; i < n; ++i) {
+    const float w = expf(score_sh[i] - cm);
+    const __half* row = cache + static_cast<size_t>(chunk_start + i) * kdim;
+    if (d0 < vdim) acc0 += w * __half2float(row[d0]);
+    if (d1 < vdim) acc1 += w * __half2float(row[d1]);
   }
+  if (d0 < vdim) chunk_o[static_cast<size_t>(ci) * vdim + d0] = acc0;
+  if (d1 < vdim) chunk_o[static_cast<size_t>(ci) * vdim + d1] = acc1;
 }
 
 // Split-K pass 2, fused with the V decompression: merge a head's chunk
@@ -193,37 +172,33 @@ __global__ inline void mla_absorbed_reduce_decompress_kernel(
     __half* att, int seq_len, const int* d_position, int vdim, int v_head, int qkhd,
     int chunk_size, int scratch_chunks) {
   if (d_position) seq_len = *d_position + 1;
-  extern __shared__ float rsm[];  // [vdim] merged latent + [3] scale broadcast
+  extern __shared__ float rsm[];  // [vdim] merged latent
   float* lat_sh = rsm;
-  float* sc = rsm + vdim;
   const int h = blockIdx.x;
   const int tid = threadIdx.x;
   const int chunk_count = min(scratch_chunks, (seq_len + chunk_size - 1) / chunk_size);
-  float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-  float rm = -3.4e38f, rl = 0.0f;
+
+  // Two-pass barrier-free merge (every thread scans the tiny m/l arrays
+  // redundantly in registers; the loads are same-address broadcasts): pass 1
+  // global max, pass 2 independent exp-weighted sums.
+  float gm = -3.4e38f;
   for (int c = 0; c < chunk_count; ++c) {
-    if (tid == 0) {
-      const int idx = h * scratch_chunks + c;
-      const float cm = chunk_m[idx], cl = chunk_l[idx];
-      const float nm = fmaxf(rm, cm);
-      const float alpha = (rl == 0.0f) ? 0.0f : expf(rm - nm);
-      const float beta = (cl == 0.0f) ? 0.0f : expf(cm - nm);
-      rl = rl * alpha + cl * beta;
-      rm = nm;
-      sc[0] = alpha;
-      sc[1] = beta;
-      sc[2] = rl;
-    }
-    __syncthreads();
-    const float alpha = sc[0], beta = sc[1];
+    gm = fmaxf(gm, chunk_m[h * scratch_chunks + c]);
+  }
+  float gl = 0.0f;
+  float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  for (int c = 0; c < chunk_count; ++c) {
+    const int idx = h * scratch_chunks + c;
+    const float cl = chunk_l[idx];
+    const float w = (cl == 0.0f) ? 0.0f : expf(chunk_m[idx] - gm);
+    gl += cl * w;
     const size_t base = (static_cast<size_t>(h) * scratch_chunks + c) * vdim;
     int j = 0;
     for (int d = tid; d < vdim; d += blockDim.x, ++j) {
-      acc[j] = acc[j] * alpha + chunk_o[base + d] * beta;
+      acc[j] += chunk_o[base + d] * w;
     }
-    __syncthreads();
   }
-  const float inv_l = 1.0f / fmaxf(sc[2], 1e-8f);
+  const float inv_l = 1.0f / fmaxf(gl, 1e-8f);
   int j = 0;
   for (int d = tid; d < vdim; d += blockDim.x, ++j) {
     lat_sh[d] = acc[j] * inv_l;
@@ -260,10 +235,10 @@ inline void launch_mla_absorbed_attention(const __half* q_abs, const __half* cac
       fixed_grid ? scratch_chunks
                  : min(scratch_chunks, (seq_len + kChunk - 1) / kChunk);
   const dim3 grid(nh, chunks > 0 ? chunks : 1);
-  const size_t smem = (static_cast<size_t>(kdim) + 8 + 4 * static_cast<size_t>(vdim)) * sizeof(float);
-  mla_absorbed_attn_stats_kernel<<<grid, 128, smem, stream>>>(
+  const size_t smem = (static_cast<size_t>(kdim) + kChunk) * sizeof(float);
+  mla_absorbed_attn_stats_kernel<<<grid, 256, smem, stream>>>(
       q_abs, cache, sm, sl, so, seq_len, d_position, kdim, vdim, scale, kChunk, scratch_chunks);
-  const size_t rsmem = (static_cast<size_t>(vdim) + 3) * sizeof(float);
+  const size_t rsmem = static_cast<size_t>(vdim) * sizeof(float);
   mla_absorbed_reduce_decompress_kernel<<<nh, 128, rsmem, stream>>>(
       sm, sl, so, w_uv, att, seq_len, d_position, vdim, v_head, qkhd, kChunk, scratch_chunks);
 }
