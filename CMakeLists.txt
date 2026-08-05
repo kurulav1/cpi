@@ -893,6 +893,20 @@ if(CPI_ENABLE_CUDA)
   add_test(NAME int4_attention_reference_parity_test
            COMMAND int4_attention_reference_parity_test)
 
+  # Generalized quantized-KV parity: store kernel (incl. R3 Hadamard) + decode
+  # attention across (k_bits, v_bits, rotate) combinations vs host reference.
+  add_executable(kv_quant_parity_test
+    src/tests/kv_quant_parity_test.cu
+  )
+  target_include_directories(kv_quant_parity_test PRIVATE include)
+  target_link_libraries(kv_quant_parity_test PRIVATE cpi_engine)
+  set_target_properties(kv_quant_parity_test PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+  )
+  add_test(NAME kv_quant_parity_test
+           COMMAND kv_quant_parity_test)
+
   # Paged split-K decode attention parity (P3 phase 2b): paged == contiguous.
   add_executable(paged_attention_parity_test
     src/tests/paged_attention_parity_test.cu

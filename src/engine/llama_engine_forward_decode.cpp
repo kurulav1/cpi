@@ -73,32 +73,28 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
   if (position >= options_.max_context) {
     CPI_THROW("context length exceeded max_context");
   }
-  // Helper: compute INT4 layer-local pointers and dispatch KV store + attention.
+  // Helper: compute quantized-KV layer-local pointers and dispatch store + attention.
   // Captures layer, position, kv_hidden, head_dim, cfg from the surrounding scope.
   const auto do_kv_int4 = [&](int layer) {
     const auto [attn_start, attn_seq_len] = attention_bounds(layer, position);
-    const int packed_per_head = head_dim / 2;
-    const std::size_t i4_stride = static_cast<std::size_t>(options_.max_context) *
-                                  static_cast<std::size_t>(cfg.num_kv_heads) *
-                                  static_cast<std::size_t>(packed_per_head);
-    const std::size_t sc_stride =
-        static_cast<std::size_t>(options_.max_context) * static_cast<std::size_t>(cfg.num_kv_heads);
-    auto* ki4 = d_k_cache_i4_ + static_cast<std::size_t>(layer) * i4_stride;
-    auto* vi4 = d_v_cache_i4_ + static_cast<std::size_t>(layer) * i4_stride;
-    auto* ks = d_k_scales_ + static_cast<std::size_t>(layer) * sc_stride;
-    auto* vs = d_v_scales_ + static_cast<std::size_t>(layer) * sc_stride;
-    kernels::launch_store_kv_int4(
-        static_cast<const __half*>(d_k_), static_cast<const __half*>(d_v_), ki4, vi4, ks, vs,
-        position, cfg.num_kv_heads, head_dim, options_.max_context, compute_stream_);
-    kernels::launch_attention_step_int4(
-        static_cast<const __half*>(d_q_),
-        ki4 + static_cast<std::size_t>(attn_start) * static_cast<std::size_t>(cfg.num_kv_heads) *
-                  static_cast<std::size_t>(packed_per_head),
-        vi4 + static_cast<std::size_t>(attn_start) * static_cast<std::size_t>(cfg.num_kv_heads) *
-                  static_cast<std::size_t>(packed_per_head),
-        ks + static_cast<std::size_t>(attn_start) * static_cast<std::size_t>(cfg.num_kv_heads),
-        vs + static_cast<std::size_t>(attn_start) * static_cast<std::size_t>(cfg.num_kv_heads),
-        static_cast<__half*>(d_att_), attn_seq_len, cfg.num_heads, cfg.num_kv_heads, head_dim,
+    const std::size_t k_row = static_cast<std::size_t>(head_dim * kv_quant_kbits_ / 8);
+    const std::size_t v_row = static_cast<std::size_t>(head_dim * kv_quant_vbits_ / 8);
+    const std::size_t token_heads = static_cast<std::size_t>(options_.max_context) *
+                                    static_cast<std::size_t>(cfg.num_kv_heads);
+    auto* kq = d_k_cache_i4_ + static_cast<std::size_t>(layer) * token_heads * k_row;
+    auto* vq = d_v_cache_i4_ + static_cast<std::size_t>(layer) * token_heads * v_row;
+    auto* ks = d_k_scales_ + static_cast<std::size_t>(layer) * token_heads;
+    auto* vs = d_v_scales_ + static_cast<std::size_t>(layer) * token_heads;
+    kernels::launch_store_kv_quant(
+        static_cast<const __half*>(d_k_), static_cast<const __half*>(d_v_), kq, vq, ks, vs,
+        position, cfg.num_kv_heads, head_dim, options_.max_context, kv_quant_kbits_,
+        kv_quant_vbits_, kv_quant_rot_, compute_stream_);
+    const std::size_t head_off =
+        static_cast<std::size_t>(attn_start) * static_cast<std::size_t>(cfg.num_kv_heads);
+    kernels::launch_attention_step_quant(
+        static_cast<const __half*>(d_q_), kq + head_off * k_row, vq + head_off * v_row,
+        ks + head_off, vs + head_off, static_cast<__half*>(d_att_), attn_seq_len, cfg.num_heads,
+        cfg.num_kv_heads, head_dim, kv_quant_kbits_, kv_quant_vbits_, kv_quant_rot_,
         compute_stream_, d_attn_chunk_m_, d_attn_chunk_l_, d_attn_chunk_o_, attn_chunk_capacity_,
         !options_.disable_split_attention);
   };

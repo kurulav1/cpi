@@ -1392,6 +1392,35 @@ void launch_attention_step_int4(const half* q, const int8_t* k_cache_i4, const i
                                 float* scratch_o = nullptr, int scratch_chunks = 0,
                                 bool allow_split = false);
 
+// launch_store_kv_quant / launch_attention_step_quant
+//
+// Generalized quantized-KV store and decode attention. K and V are stored per
+// (token, kv_head) with one fp16 absmax scale each, at k_bits / v_bits per
+// element (4 = packed signed nibbles as in the int4 path, 8 = signed bytes).
+// Supported (k_bits, v_bits) combinations: (4,4), (8,4), (8,8).
+//
+// rotate_k applies a head_dim Walsh-Hadamard transform to K before quantizing
+// (QuaRot R3); the attention launcher then applies the same transform to Q at
+// read time so scores are computed in the rotated basis. Requires
+// head_dim == 128 and is only meaningful with k_bits == 4; other combinations
+// ignore the flag. The rotation is unrandomized (no sign vector), matching the
+// validated quality-harness recipe.
+//
+// Cache row strides: K = head_dim * k_bits / 8 bytes, V = head_dim * v_bits / 8
+// bytes per (token, kv_head). Scale tables are [max_context, num_kv_heads] fp16.
+void launch_store_kv_quant(const half* k, const half* v, int8_t* k_cache, int8_t* v_cache,
+                           half* k_scales, half* v_scales, int position, int num_kv_heads,
+                           int head_dim, int max_context, int k_bits, int v_bits, bool rotate_k,
+                           cudaStream_t stream);
+
+void launch_attention_step_quant(const half* q, const int8_t* k_cache, const int8_t* v_cache,
+                                 const half* k_scales, const half* v_scales, half* out,
+                                 int seq_len, int num_heads, int num_kv_heads, int head_dim,
+                                 int k_bits, int v_bits, bool rotate_k, cudaStream_t stream,
+                                 float* scratch_m = nullptr, float* scratch_l = nullptr,
+                                 float* scratch_o = nullptr, int scratch_chunks = 0,
+                                 bool allow_split = false);
+
 // ── TurboQuant 3-bit (TQ3) kernels ───────────────────────────────────────────
 
 // launch_hadamard_rotate_fp16

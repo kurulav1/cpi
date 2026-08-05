@@ -272,10 +272,31 @@ void LlamaEngine::allocate_runtime_buffers() {
                                : inter;
   const int ffn_inter = (expert_inter > inter) ? expert_inter : inter;
   kv_int4_enabled_ = options_.kv_cache_int4;
+  kv_quant_kbits_ = 4;
+  kv_quant_vbits_ = 4;
+  kv_quant_rot_ = false;
+  if (const char* env = std::getenv("CPI_KV_QUANT")) {
+    const std::string mode(env);
+    if (mode == "4" || mode == "44") {
+      kv_quant_kbits_ = 4; kv_quant_vbits_ = 4; kv_quant_rot_ = true; kv_int4_enabled_ = true;
+    } else if (mode == "4nr") {
+      kv_quant_kbits_ = 4; kv_quant_vbits_ = 4; kv_quant_rot_ = false; kv_int4_enabled_ = true;
+    } else if (mode == "84") {
+      kv_quant_kbits_ = 8; kv_quant_vbits_ = 4; kv_int4_enabled_ = true;
+    } else if (mode == "8" || mode == "88") {
+      kv_quant_kbits_ = 8; kv_quant_vbits_ = 8; kv_int4_enabled_ = true;
+    } else if (mode != "0" && mode != "off") {
+      CPI_THROW("CPI_KV_QUANT must be one of 4, 4nr, 84, 8, off");
+    }
+  }
   if (kv_int4_enabled_ && options_.paged_kv_cache) {
-    CPI_THROW("kv_cache_int4 and paged_kv_cache are mutually exclusive");
+    CPI_THROW("quantized KV cache and paged_kv_cache are mutually exclusive");
   }
   const int head_dim = attn_head_dim_ > 0 ? attn_head_dim_ : (cfg.hidden_size / cfg.num_heads);
+  if (kv_quant_rot_ && head_dim != 128) {
+    // The R3 rotation kernels assume head_dim 128; fall back to unrotated K.
+    kv_quant_rot_ = false;
+  }
   const int kv_hidden = attn_kv_hidden_ > 0 ? attn_kv_hidden_ : (cfg.num_kv_heads * head_dim);
   const int rows = prefill_chunk_size_;
   int max_lowbit_cols = (hidden > inter) ? hidden : inter;
@@ -490,25 +511,25 @@ void LlamaEngine::allocate_runtime_buffers() {
                                static_cast<std::size_t>(kv_capacity_tokens_) *
                                static_cast<std::size_t>(kv_hidden) * sizeof(__half);
   if (kv_int4_enabled_) {
-    // INT4 KV: packed nibbles + per-head fp16 scales; FP16 KV buffers not allocated.
-    const int packed_per_head = head_dim / 2;
-    const std::size_t i4_bytes =
-        static_cast<std::size_t>(cfg.num_layers) * static_cast<std::size_t>(options_.max_context) *
-        static_cast<std::size_t>(cfg.num_kv_heads) * static_cast<std::size_t>(packed_per_head);
-    const std::size_t sc_bytes = static_cast<std::size_t>(cfg.num_layers) *
-                                 static_cast<std::size_t>(options_.max_context) *
-                                 static_cast<std::size_t>(cfg.num_kv_heads) * sizeof(__half);
-    CUDA_CHECK(cudaMalloc(&d_k_cache_i4_, i4_bytes));
-    CUDA_CHECK(cudaMalloc(&d_v_cache_i4_, i4_bytes));
+    // Quantized KV: 4- or 8-bit rows + per-head fp16 scales; fp16 KV buffers not allocated.
+    const std::size_t rows = static_cast<std::size_t>(cfg.num_layers) *
+                             static_cast<std::size_t>(options_.max_context) *
+                             static_cast<std::size_t>(cfg.num_kv_heads);
+    const std::size_t k_bytes = rows * static_cast<std::size_t>(head_dim * kv_quant_kbits_ / 8);
+    const std::size_t v_bytes = rows * static_cast<std::size_t>(head_dim * kv_quant_vbits_ / 8);
+    const std::size_t sc_bytes = rows * sizeof(__half);
+    CUDA_CHECK(cudaMalloc(&d_k_cache_i4_, k_bytes));
+    CUDA_CHECK(cudaMalloc(&d_v_cache_i4_, v_bytes));
     CUDA_CHECK(cudaMalloc(&d_k_scales_, sc_bytes));
     CUDA_CHECK(cudaMalloc(&d_v_scales_, sc_bytes));
-    CUDA_CHECK(cudaMemset(d_k_cache_i4_, 0, i4_bytes));
-    CUDA_CHECK(cudaMemset(d_v_cache_i4_, 0, i4_bytes));
+    CUDA_CHECK(cudaMemset(d_k_cache_i4_, 0, k_bytes));
+    CUDA_CHECK(cudaMemset(d_v_cache_i4_, 0, v_bytes));
     CUDA_CHECK(cudaMemset(d_k_scales_, 0, sc_bytes));
     CUDA_CHECK(cudaMemset(d_v_scales_, 0, sc_bytes));
     if (options_.verbose) {
-      std::cout << "[engine] kv_cache_int4=on  KV VRAM: "
-                << (i4_bytes * 2 + sc_bytes * 2) / (1024 * 1024) << " MiB"
+      std::cout << "[engine] kv_quant=K" << kv_quant_kbits_ << "V" << kv_quant_vbits_
+                << (kv_quant_rot_ ? "+rot" : "") << "  KV VRAM: "
+                << (k_bytes + v_bytes + sc_bytes * 2) / (1024 * 1024) << " MiB"
                 << " (vs " << (kv_bytes * 2) / (1024 * 1024) << " MiB fp16)\n";
     }
   } else if (options_.paged_kv_cache) {
@@ -578,15 +599,14 @@ void LlamaEngine::reset_kv_cache() {
                                static_cast<std::size_t>(kv_capacity_tokens_) *
                                static_cast<std::size_t>(kv_hidden) * sizeof(__half);
   if (kv_int4_enabled_) {
-    const int packed_per_head = head_dim / 2;
-    const std::size_t i4_bytes =
-        static_cast<std::size_t>(cfg.num_layers) * static_cast<std::size_t>(options_.max_context) *
-        static_cast<std::size_t>(cfg.num_kv_heads) * static_cast<std::size_t>(packed_per_head);
-    const std::size_t sc_bytes = static_cast<std::size_t>(cfg.num_layers) *
-                                 static_cast<std::size_t>(options_.max_context) *
-                                 static_cast<std::size_t>(cfg.num_kv_heads) * sizeof(__half);
-    CUDA_CHECK(cudaMemset(d_k_cache_i4_, 0, i4_bytes));
-    CUDA_CHECK(cudaMemset(d_v_cache_i4_, 0, i4_bytes));
+    const std::size_t rows = static_cast<std::size_t>(cfg.num_layers) *
+                             static_cast<std::size_t>(options_.max_context) *
+                             static_cast<std::size_t>(cfg.num_kv_heads);
+    const std::size_t k_bytes = rows * static_cast<std::size_t>(head_dim * kv_quant_kbits_ / 8);
+    const std::size_t v_bytes = rows * static_cast<std::size_t>(head_dim * kv_quant_vbits_ / 8);
+    const std::size_t sc_bytes = rows * sizeof(__half);
+    CUDA_CHECK(cudaMemset(d_k_cache_i4_, 0, k_bytes));
+    CUDA_CHECK(cudaMemset(d_v_cache_i4_, 0, v_bytes));
     CUDA_CHECK(cudaMemset(d_k_scales_, 0, sc_bytes));
     CUDA_CHECK(cudaMemset(d_v_scales_, 0, sc_bytes));
     return;

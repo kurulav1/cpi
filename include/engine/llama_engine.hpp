@@ -680,11 +680,17 @@ private:
   void* h_k_cache_ = nullptr;  // Host-pinned mirror of d_k_cache_ for paged eviction.
   void* h_v_cache_ = nullptr;  // Host-pinned mirror of d_v_cache_ for paged eviction.
 
-  // INT4-compressed KV cache (active when options_.kv_cache_int4 is set).
+  // Quantized KV cache (active when options_.kv_cache_int4 or CPI_KV_QUANT is set).
   // Replaces the fp16 buffers above; d_k_cache_ / d_v_cache_ are not allocated.
-  bool kv_int4_enabled_ = false;         // True when INT4 KV cache is active.
-  std::int8_t* d_k_cache_i4_ = nullptr;  // Packed INT4 K cache [layers, ctx, kv_heads, head_dim/2].
-  std::int8_t* d_v_cache_i4_ = nullptr;  // Packed INT4 V cache [layers, ctx, kv_heads, head_dim/2].
+  // K and V each store head_dim * bits/8 bytes per (token, kv_head) plus one
+  // fp16 absmax scale. kv_quant_rot_ stores K Hadamard-rotated (QuaRot R3);
+  // the attention kernels rotate Q to match.
+  bool kv_int4_enabled_ = false;         // True when the quantized KV cache is active.
+  int kv_quant_kbits_ = 4;               // Bits per K element (4 or 8).
+  int kv_quant_vbits_ = 4;               // Bits per V element (4 or 8).
+  bool kv_quant_rot_ = false;            // Hadamard-rotate K before quantizing.
+  std::int8_t* d_k_cache_i4_ = nullptr;  // Quantized K cache [layers, ctx, kv_heads, row_bytes].
+  std::int8_t* d_v_cache_i4_ = nullptr;  // Quantized V cache [layers, ctx, kv_heads, row_bytes].
   __half* d_k_scales_ = nullptr;         // Per-head K dequant scales [layers, ctx, kv_heads].
   __half* d_v_scales_ = nullptr;         // Per-head V dequant scales [layers, ctx, kv_heads].
 
