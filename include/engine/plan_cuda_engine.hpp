@@ -146,6 +146,9 @@ class PlanCudaEngine : public runtime::SequenceModel {
   // false to fall back to the per-token loop (routing not built, or no cuBLAS).
   bool moe_grouped_gate_up(const opplan::Op& op, __half* xnorm, int T);
   bool moe_grouped_down(const opplan::Op& op, __half* moe_out, int T);
+  // Short-prompt MoE uses the int4-direct grouped GEMM (no dequant-all); long prompts keep the
+  // dequant+cuBLAS path. Decision keyed on P = total routings (= T*top_k). See moe_use_int4_direct.
+  bool moe_use_int4_direct(int P) const;
   // One cublasGemmGroupedBatchedEx over all (fp16) expert GEMMs: group g computes C[g] = A[g]^T . B[g]
   // with A [m,k] row-major (OP_T), B [n_g,k] row-major, C [n_g,m] row-major. Collapses the ~64
   // per-expert calls into one, killing the tiny-GEMM launch-latency floor. false on failure.
@@ -474,6 +477,9 @@ private:
   __half* d_moe_up_g_ = nullptr;      // [P, moe_inter] up GEMM out
   __half* d_moe_outg_ = nullptr;      // [P, hidden]   per-expert down GEMM out
   __half* d_moe_dqw_ = nullptr;       // [E*2*MI, H] all experts dequanted once (reused for down)
+  std::int8_t* d_moe_actq_ = nullptr; // [P, H] int8-quantized grouped activations (int4-direct path)
+  float* d_moe_acts_ = nullptr;       // [P, H/32] per-32-group activation scales (int4-direct path)
+  int* d_moe_off_dev_ = nullptr;      // [E+1] device copy of per-expert offsets (int4-direct grid.z)
   // cublasGemmGroupedBatchedEx wants the A/B/C pointer arrays in DEVICE memory (scalar arrays stay
   // host). Sized 2*E groups (gate_up's worst case). Verified in isolation.
   const void** d_gg_A_ = nullptr;

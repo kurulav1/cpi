@@ -377,4 +377,123 @@ void launch_mul_vec(const half* in, const half* vec, half* out, int n, float sca
   mul_vec_kernel<<<blocks, kThreads, 0, stream>>>(in, vec, out, n, scale);
 }
 
+// int4-DIRECT grouped MoE GEMM on int8 tensor cores (m16n8k32.s8). Reads the int4 expert weights
+// DIRECTLY (nibble^8-8, per-128-group scales) against int8 activations (natural per-32-group scales) --
+// no dequant-to-fp16, no fp16 re-read. This is the MMQ-style path that skips the ~28ms dequant-all +
+// the 4x fp16 weight read that dominate SHORT-prompt DeepSeek MoE prefill (the fp16-dequant + cuBLAS
+// grouped path still wins at long prompts, where that fixed cost amortizes). grid.z = expert e; each
+// expert e's weight rows start at e*N, its gathered tokens at off[e]. The fused gate_up output is split
+// at column `split` into out_lo (gate) / out_hi (up); down passes split=N, out_hi=nullptr. Fragment
+// layout empirically verified (scratchpad/mma_probe) + cross-checked vs llama.cpp mma.cuh + PTX ISA.
+namespace {
+constexpr int kMoeMmaBM = 64, kMoeMmaBN = 64;
+}  // namespace
+
+__global__ void moe_int4_grouped_mma_kernel(const std::int8_t* __restrict__ xq,
+                                            const float* __restrict__ as,
+                                            const std::int8_t* __restrict__ wpacked,
+                                            const float* __restrict__ ws, const int* __restrict__ off,
+                                            half* __restrict__ out_lo, half* __restrict__ out_hi, int N,
+                                            int K, int wsg_stride, int wratio, int split, int lo_width,
+                                            int hi_width) {
+  const int e = blockIdx.z;
+  const int m_start = off[e], n_e = off[e + 1] - off[e];
+  const int by = blockIdx.y;
+  if (by * kMoeMmaBM >= n_e) return;
+  __shared__ __align__(16) std::int8_t As[kMoeMmaBM][32];
+  __shared__ __align__(16) std::int8_t Bs[kMoeMmaBN][32];
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int g = lane >> 2, t = lane & 3, mt = warp & 3, nhalf = warp >> 2;
+  const int blockM = m_start + by * kMoeMmaBM;
+  const int wrowbase = e * N;
+  const int pstride = (K + 1) / 2, Kg = K / 32;
+  float facc[4][4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i)
+    for (int j = 0; j < 4; ++j) facc[i][j] = 0.0f;
+  const int blockNrow = blockIdx.x * kMoeMmaBN;
+
+  for (int kg = 0; kg < Kg; ++kg) {
+    const int k0 = kg * 32;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int idx = tid + i * 256, r = idx >> 5, c = idx & 31, col = k0 + c;
+      const int tok = blockM + r;
+      As[r][c] = (by * kMoeMmaBM + r < n_e) ? xq[static_cast<std::size_t>(tok) * K + col] : 0;
+      const int wrow = wrowbase + blockNrow + r;
+      std::int8_t wv = 0;
+      if (blockNrow + r < N) {
+        const std::uint8_t byte =
+            static_cast<std::uint8_t>(wpacked[static_cast<std::size_t>(wrow) * pstride + (col >> 1)]);
+        const std::uint8_t nib = (col & 1) ? (byte >> 4) : (byte & 0x0F);
+        wv = static_cast<std::int8_t>(static_cast<int>(nib ^ 0x8) - 8);
+      }
+      Bs[r][c] = wv;
+    }
+    __syncthreads();
+    const int arow = 16 * mt;
+    const bool m0 = (by * kMoeMmaBM + arow + g) < n_e, m8 = (by * kMoeMmaBM + arow + g + 8) < n_e;
+    const int a0 = *reinterpret_cast<int*>(&As[arow + g][t * 4]);
+    const int a1 = *reinterpret_cast<int*>(&As[arow + g + 8][t * 4]);
+    const int a2 = *reinterpret_cast<int*>(&As[arow + g][16 + t * 4]);
+    const int a3 = *reinterpret_cast<int*>(&As[arow + g + 8][16 + t * 4]);
+    const float as_g = m0 ? as[static_cast<std::size_t>(blockM + arow + g) * Kg + kg] : 0.0f;
+    const float as_g8 = m8 ? as[static_cast<std::size_t>(blockM + arow + g + 8) * Kg + kg] : 0.0f;
+    const int wsg = kg / wratio;
+#pragma unroll
+    for (int nt = 0; nt < 4; ++nt) {
+      const int nbase = nhalf * 32 + nt * 8;
+      const int b0 = *reinterpret_cast<int*>(&Bs[nbase + g][t * 4]);
+      const int b1 = *reinterpret_cast<int*>(&Bs[nbase + g][16 + t * 4]);
+      int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+      asm volatile(
+          "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+          "{%0,%1,%2,%3};\n"
+          : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
+          : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+      const int nra = blockNrow + nbase + 2 * t, nrb = blockNrow + nbase + 2 * t + 1;
+      const float ws_a =
+          (nra < N) ? ws[static_cast<std::size_t>(wrowbase + nra) * wsg_stride + wsg] : 0.0f;
+      const float ws_b =
+          (nrb < N) ? ws[static_cast<std::size_t>(wrowbase + nrb) * wsg_stride + wsg] : 0.0f;
+      facc[nt][0] += static_cast<float>(c0) * as_g * ws_a;
+      facc[nt][1] += static_cast<float>(c1) * as_g * ws_b;
+      facc[nt][2] += static_cast<float>(c2) * as_g8 * ws_a;
+      facc[nt][3] += static_cast<float>(c3) * as_g8 * ws_b;
+    }
+    __syncthreads();
+  }
+#pragma unroll
+  for (int nt = 0; nt < 4; ++nt) {
+    const int nbase = nhalf * 32 + nt * 8;
+    const int rows[4] = {g, g, g + 8, g + 8}, cols[4] = {2 * t, 2 * t + 1, 2 * t, 2 * t + 1};
+#pragma unroll
+    for (int en = 0; en < 4; ++en) {
+      const int lm = by * kMoeMmaBM + 16 * mt + rows[en], gn = blockNrow + nbase + cols[en];
+      if (lm < n_e && gn < N) {
+        const std::size_t grow = static_cast<std::size_t>(m_start + lm);
+        if (gn < split)
+          out_lo[grow * lo_width + gn] = __float2half(facc[nt][en]);
+        else if (out_hi)
+          out_hi[grow * hi_width + (gn - split)] = __float2half(facc[nt][en]);
+      }
+    }
+  }
+}
+
+// off[] is DEVICE-resident (grid.z indexes it). max_ne = max tokens routed to any one expert (bounds
+// grid.y). group = weight quant group (128); wratio = group/32. split/out_hi implement the fused
+// gate_up split (down: split=N, out_hi=nullptr).
+void launch_moe_int4_grouped_mma(const std::int8_t* xq, const float* as, const std::int8_t* wpacked,
+                                 const float* ws, const int* off, half* out_lo, half* out_hi, int E,
+                                 int N, int K, int max_ne, int group, int split, int lo_width,
+                                 int hi_width, cudaStream_t stream) {
+  if (max_ne <= 0) return;
+  const int wsg_stride = (K + 127) / 128;
+  const int wratio = group / 32;
+  dim3 grid((N + kMoeMmaBN - 1) / kMoeMmaBN, (max_ne + kMoeMmaBM - 1) / kMoeMmaBM, E);
+  moe_int4_grouped_mma_kernel<<<grid, 256, 0, stream>>>(xq, as, wpacked, ws, off, out_lo, out_hi, N, K,
+                                                        wsg_stride, wratio, split, lo_width, hi_width);
+}
+
 }  // namespace kernels

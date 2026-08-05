@@ -685,6 +685,15 @@ void launch_moe_down_accum(const void* w, const float* scales, int qbits, int gr
                            const half* inter_in, const int* topk_idx, const float* topk_weight,
                            half* y, int hidden, int inter, int top_k, cudaStream_t stream);
 
+// int4-direct grouped MoE GEMM on int8 tensor cores: reads int4 expert weights directly (no dequant),
+// int8 activations (natural per-32-group scales). off[] is device-resident (grid.z = expert). The
+// fused gate_up output splits at column `split` into out_lo (gate) / out_hi (up); down passes split=N
+// and out_hi=nullptr. Skips the dequant-all fixed cost that dominates short-prompt MoE prefill.
+void launch_moe_int4_grouped_mma(const std::int8_t* xq, const float* as, const std::int8_t* wpacked,
+                                 const float* ws, const int* off, half* out_lo, half* out_hi, int E,
+                                 int N, int K, int max_ne, int group, int split, int lo_width,
+                                 int hi_width, cudaStream_t stream);
+
 // launch_mul_vec
 //
 // out[i] = in[i] * vec[i] * scale. Elementwise gain by a learned vector plus a
