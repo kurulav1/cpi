@@ -134,7 +134,8 @@ __global__ void attention_step_gqa_batched_paged_quant_kernel(
   half* q_sh = reinterpret_cast<half*>(smem_bytes);                        // group_size*HeadDim
   half* kv_tile = q_sh + group_size * HeadDim;                             // block_size*HeadDim
   float* w_sh = reinterpret_cast<float*>(kv_tile + block_size * HeadDim);  // group_size*block_size
-  float* rot_buf = w_sh + group_size * block_size;                         // HeadDim (RotK only)
+  float* sc_sh = w_sh + group_size * block_size;                           // block_size (scales)
+  float* rot_buf = sc_sh + block_size;                                     // HeadDim (RotK only)
 
   const int tid = threadIdx.x;
   const int warp_id = tid / 32;
@@ -166,13 +167,39 @@ __global__ void attention_step_gqa_batched_paged_quant_kernel(
   const int tile_tokens = min(block_size, seq_len - tok0);
   const int phys_row0 = block_table[pb] * block_size;
 
-  // Phase 1: dequantize the K tile into shared memory.
-  for (int i = tid; i < tile_tokens * HeadDim; i += blockDim.x) {
-    const int t = i / HeadDim;
-    const int d = i - t * HeadDim;
-    const std::size_t sh = static_cast<std::size_t>(phys_row0 + t) * num_kv_heads + kv_head;
-    kv_tile[t * HeadDim + d] =
-        __float2half(kvq::kv_load<KBits>(k_pool + sh * k_row_b, d, __half2float(k_scales[sh])));
+  // Phase 1: dequantize the K tile into shared memory. Scales are hoisted to
+  // shared once per tile; rows load as 16-byte segments (32 nibbles / 16
+  // bytes) instead of per-element.
+  if (tid < tile_tokens) {
+    sc_sh[tid] = __half2float(
+        k_scales[static_cast<std::size_t>(phys_row0 + tid) * num_kv_heads + kv_head]);
+  }
+  __syncthreads();
+  {
+    const int segs = k_row_b / 16;
+    const int elems = (KBits == 4) ? 32 : 16;
+    for (int idx = tid; idx < tile_tokens * segs; idx += blockDim.x) {
+      const int t = idx / segs;
+      const int s = idx - t * segs;
+      const std::size_t sh = static_cast<std::size_t>(phys_row0 + t) * num_kv_heads + kv_head;
+      const uint4 w = reinterpret_cast<const uint4*>(k_pool + sh * k_row_b)[s];
+      const int8_t* b = reinterpret_cast<const int8_t*>(&w);
+      const float sc = sc_sh[t];
+      half* dst = kv_tile + t * HeadDim + s * elems;
+      if (KBits == 4) {
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+          const int bb = b[j];
+          dst[2 * j] = __float2half(static_cast<float>((bb << 28) >> 28) * sc);
+          dst[2 * j + 1] = __float2half(static_cast<float>(bb >> 4) * sc);
+        }
+      } else {
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+          dst[j] = __float2half(static_cast<float>(b[j]) * sc);
+        }
+      }
+    }
   }
   __syncthreads();
 
@@ -200,13 +227,37 @@ __global__ void attention_step_gqa_batched_paged_quant_kernel(
   if (warp_id < group_size) w_sh[warp_id * block_size + lane] = weight;
   __syncthreads();  // all warps done with K; safe to overwrite the tile with V
 
-  // Phase 2: dequantize the V tile, then weighted sum per query head.
-  for (int i = tid; i < tile_tokens * HeadDim; i += blockDim.x) {
-    const int t = i / HeadDim;
-    const int d = i - t * HeadDim;
-    const std::size_t sh = static_cast<std::size_t>(phys_row0 + t) * num_kv_heads + kv_head;
-    kv_tile[t * HeadDim + d] =
-        __float2half(kvq::kv_load<VBits>(v_pool + sh * v_row_b, d, __half2float(v_scales[sh])));
+  // Phase 2: dequantize the V tile the same way, then weighted sum per head.
+  if (tid < tile_tokens) {
+    sc_sh[tid] = __half2float(
+        v_scales[static_cast<std::size_t>(phys_row0 + tid) * num_kv_heads + kv_head]);
+  }
+  __syncthreads();
+  {
+    const int segs = v_row_b / 16;
+    const int elems = (VBits == 4) ? 32 : 16;
+    for (int idx = tid; idx < tile_tokens * segs; idx += blockDim.x) {
+      const int t = idx / segs;
+      const int s = idx - t * segs;
+      const std::size_t sh = static_cast<std::size_t>(phys_row0 + t) * num_kv_heads + kv_head;
+      const uint4 w = reinterpret_cast<const uint4*>(v_pool + sh * v_row_b)[s];
+      const int8_t* b = reinterpret_cast<const int8_t*>(&w);
+      const float sc = sc_sh[t];
+      half* dst = kv_tile + t * HeadDim + s * elems;
+      if (VBits == 4) {
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+          const int bb = b[j];
+          dst[2 * j] = __float2half(static_cast<float>((bb << 28) >> 28) * sc);
+          dst[2 * j + 1] = __float2half(static_cast<float>(bb >> 4) * sc);
+        }
+      } else {
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+          dst[j] = __float2half(static_cast<float>(b[j]) * sc);
+        }
+      }
+    }
   }
   __syncthreads();
 
@@ -514,7 +565,8 @@ void launch_attention_step_batched_paged_quant(
   std::size_t smem = (static_cast<std::size_t>(group_size) * head_dim +
                       static_cast<std::size_t>(block_size) * head_dim) *
                          sizeof(half) +
-                     static_cast<std::size_t>(group_size) * block_size * sizeof(float);
+                     (static_cast<std::size_t>(group_size) * block_size + block_size) *
+                         sizeof(float);
   if (rot) smem += static_cast<std::size_t>(head_dim) * sizeof(float);
   const dim3 grid(num_kv_heads, total_blocks, batch);
 
