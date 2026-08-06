@@ -455,10 +455,35 @@ void LlamaEngine::allocate_runtime_buffers() {
     }
   }
 
+  // llama3 rope scaling (CPI_ROPE_SCALING=llama3, params overridable via
+  // CPI_ROPE_SCALING_PARAMS="factor,low,high,orig_max"): Llama-3.1 trains at
+  // 8192 and reaches its long context through frequency-banded scaling of the
+  // inverse frequencies. Without it the model degrades beyond ~16k (needle
+  // retrieval: 16k OK, 30k fails). Opt-in because the model file does not say
+  // whether a checkpoint uses it (Llama-3.0 shares theta 500000 and does not).
+  const char* rs_env = std::getenv("CPI_ROPE_SCALING");
+  const bool llama3_scaling = rs_env && std::string(rs_env) == "llama3";
+  float rs_factor = 8.0f, rs_low = 1.0f, rs_high = 4.0f, rs_orig = 8192.0f;
+  if (const char* p = std::getenv("CPI_ROPE_SCALING_PARAMS")) {
+    std::sscanf(p, "%f,%f,%f,%f", &rs_factor, &rs_low, &rs_high, &rs_orig);
+  }
+  if (options_.verbose && llama3_scaling) {
+    std::cout << "[engine] rope_scaling=llama3 factor=" << rs_factor << " low=" << rs_low
+              << " high=" << rs_high << " orig_max=" << rs_orig << "\n";
+  }
   for (int pos = 0; pos < options_.max_context; ++pos) {
     for (int pair = 0; pair < half_dim; ++pair) {
-      const float theta =
+      float theta =
           std::pow(eff_rope_theta, -2.0f * static_cast<float>(pair) / static_cast<float>(head_dim));
+      if (llama3_scaling) {
+        const float wavelen = 2.0f * 3.14159265358979323846f / theta;
+        if (wavelen > rs_orig / rs_low) {
+          theta /= rs_factor;
+        } else if (wavelen >= rs_orig / rs_high) {
+          const float smooth = (rs_orig / wavelen - rs_low) / (rs_high - rs_low);
+          theta = (1.0f - smooth) * theta / rs_factor + smooth * theta;
+        }
+      }
       const float angle = static_cast<float>(pos) * theta;
       rope_cos[static_cast<std::size_t>(pos) * static_cast<std::size_t>(half_dim) +
                static_cast<std::size_t>(pair)] = std::cos(angle);

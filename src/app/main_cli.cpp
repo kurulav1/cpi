@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <iterator>
 #include <ostream>
 #include <sstream>
 #include <stdexcept>
@@ -256,6 +257,13 @@ ParsedArgs parse_args(int argc, char** argv) {
     }
     if (arg == "--prompt") {
       args.prompt_text = need_val("--prompt");
+    } else if (arg == "--prompt-file") {
+      // Long prompts (long-context evals) exceed OS command-line limits.
+      const std::string path = need_val("--prompt-file");
+      std::ifstream pf(path, std::ios::binary);
+      if (!pf) throw std::runtime_error("--prompt-file: cannot open " + path);
+      args.prompt_text.assign(std::istreambuf_iterator<char>(pf),
+                              std::istreambuf_iterator<char>());
     } else if (arg == "--tokenizer") {
       args.tokenizer_path = need_val("--tokenizer");
       args.tokenizer_set = true;
