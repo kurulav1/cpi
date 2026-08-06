@@ -39,16 +39,45 @@ The core engine is a C++ library compiled with CMake. The build system detects
 CUDA availability and compiles either a CUDA-enabled binary or a CPU-only
 binary; both expose the same interface to the application layer.
 
-**Engine families:**
+**Engine inventory and roles.** There are two executor tiers plus a set of
+deliberately independent reference engines; each class earns its existence in a
+specific way, and the asymmetries between them are stated here rather than
+discovered by reading 10k lines.
 
-| Engine class | Architecture | Compute | Weight format |
-|---|---|---|---|
-| `CpuLlamaEngine` | Llama 2/3, TinyLlama, Mistral, Phi-3 | CPU | `.ll2c` |
-| `Llama4CpuEngine` | Llama 4 Scout/Maverick | CPU | safetensors |
-| `Llama4CudaEngine` | Llama 4 Scout/Maverick | CUDA | safetensors |
-| `Qwen35CpuEngine` | Qwen 3.5 (dense + MoE) | CPU | safetensors |
-| `Qwen35CudaEngine` | Qwen 3.5 (dense + MoE) | CUDA | safetensors |
-| `LlamaEngine` | Llama 2/3, Mistral, Phi-3 MoE | CUDA | `.ll2c` |
+| Engine class | Role | Architecture | Compute | Weight format |
+|---|---|---|---|---|
+| `PlanCudaEngine` | op-plan executor (the extensibility core) | Gemma / Gemma 4 (+MoE), Qwen3.5 (dense, MoE, vision), DeepSeek-V2 (MLA + MoE) | CUDA | `.ll2c`, safetensors |
+| `PlanMetalEngine` | op-plan executor, same plans as CUDA | same families, gated token-identical vs CUDA | Metal | `.ll2c`, safetensors |
+| `LlamaEngine` | uniform-geometry serving fast path | Llama 2/3/3.1, Mistral, Qwen2/2.5/3-dense, Phi-3 MoE | CUDA | `.ll2c` |
+| `Llama4CudaEngine` | expert-streaming for larger-than-VRAM MoE | Llama 4 Scout/Maverick | CUDA | safetensors |
+| `CpuLlamaEngine` | fp32 reference oracle | Llama-family | CPU | `.ll2c` |
+| `Llama4CpuEngine` / `Qwen35CpuEngine` | per-family reference oracles | Llama 4 / Qwen 3.5 | CPU | safetensors |
+
+Why the split, honestly:
+
+- **The op-plan IR is where new model families land.** Gemma 4, Qwen3.5 and
+  DeepSeek-V2 were added as capability flags and plan stages, not forks; both
+  GPU backends execute the same plans and are gated token-identical.
+- **`LlamaEngine` is a deliberate second core, and that is real debt.** It
+  predates the IR and holds every serving-critical capability: CUDA graphs,
+  continuous batching with the paged KV pool, KV-cache quantization,
+  speculative decoding, EAGLE. Models that run on the plan executor get none
+  of those today. Porting the serving stack onto the plan executor is the
+  known large item; until then CPI has one fast serving core and one general
+  executor, and pretending otherwise would be spin.
+- **The CPU engines are oracles, not products.** They are simple, independently
+  derived implementations used to gate the GPU paths. Folding them into the IR
+  would make them share the executor's bugs, which defeats their purpose — a
+  parity oracle that inherits the engine's mistake once made a real GPU fix
+  look like a regression here.
+- **`Llama4CudaEngine` predates op-plan MoE** and exists for per-layer expert
+  streaming of models larger than VRAM. Now that the plan executor runs MoE
+  (DeepSeek, Gemma 4), it is a port-and-retire candidate, not a design
+  statement.
+- Known type-level asymmetry: `PlanCudaEngine` implements
+  `runtime::SequenceModel` (the shared decode driver); `PlanMetalEngine` does
+  not yet, so the backends are interchangeable at the gate level but not at
+  the interface level.
 
 The main binary auto-detects the model format (`.ll2c` vs. a safetensors
 directory) and the model family (via `config.json` or header inspection), then
