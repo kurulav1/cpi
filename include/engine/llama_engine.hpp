@@ -711,14 +711,17 @@ private:
   __half* d_eagle_feats_ = nullptr;   // [max verify rows, hidden] true features from verify
   float* d_eagle_logits_ = nullptr;   // [vocab]
   int* d_eagle_tok_ = nullptr;        // [1]
+  int* d_eagle_dtoks_ = nullptr;      // [16] device-side chained draft tokens
   bool eagle_tried_ = false;          // lazy one-shot load attempt
   bool eagle_load();                  // returns false (and disables) on any mismatch
   void eagle_free();
   // Runs one (feature, token) pair through the draft layer at pair row
-  // `pair_idx`; returns the drafted next token (device argmax of the shared
-  // lm_head over the raw draft hidden), or -1 when want_token is false. The
-  // output feature stays in d_eagle_x_.
-  int eagle_step(const __half* feature, int token, int pair_idx, bool want_token = true);
+  // `pair_idx`. The input token comes from token_dev (device int, chained
+  // drafts) when non-null, else from token_host. With want_token the shared
+  // lm_head argmax is written to dtok_out (device) without any host sync.
+  // The output feature stays in d_eagle_x_.
+  void eagle_step(const __half* feature, const int* token_dev, int token_host, int pair_idx,
+                  bool want_token, int* dtok_out);
   std::vector<int> eagle_generate(const std::vector<int>& prompt_tokens, int max_new_tokens,
                                   const std::function<bool(int)>& on_token);
   void eagle_prefill_pairs(const int* tokens, int count, int chunk_start);

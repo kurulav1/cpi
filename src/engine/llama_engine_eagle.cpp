@@ -117,6 +117,7 @@ bool LlamaEngine::eagle_load() {
   CUDA_CHECK(cudaMalloc(&d_eagle_logits_,
                         static_cast<std::size_t>(cfg.vocab_size) * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_eagle_tok_, sizeof(int)));
+  CUDA_CHECK(cudaMalloc(&d_eagle_dtoks_, 16 * sizeof(int)));
   eagle_enabled_ = true;
   if (options_.verbose) {
     std::cout << "[engine] eagle=on k=" << eagle_k_ << " dir=" << dir << "\n";
@@ -148,6 +149,7 @@ void LlamaEngine::eagle_free() {
   freep(d_eagle_feats_);
   freep(d_eagle_logits_);
   freep(d_eagle_tok_);
+  freep(d_eagle_dtoks_);
   eagle_enabled_ = false;
 }
 
@@ -155,7 +157,8 @@ void LlamaEngine::eagle_free() {
 // (rope position pair_idx + 1). want_token=false skips the lm_head/argmax
 // (used when healing accepted rows with true features). The output feature is
 // left in d_eagle_x_.
-int LlamaEngine::eagle_step(const __half* feature, int token, int pair_idx, bool want_token) {
+void LlamaEngine::eagle_step(const __half* feature, const int* token_dev, int token_host,
+                             int pair_idx, bool want_token, int* dtok_out) {
   const auto& cfg = weights_.config();
   const int H = cfg.hidden_size;
   const int head_dim = attn_head_dim_ > 0 ? attn_head_dim_ : (H / cfg.num_heads);
@@ -164,8 +167,12 @@ int LlamaEngine::eagle_step(const __half* feature, int token, int pair_idx, bool
   const int inter = cfg.intermediate_size;
   auto s = compute_stream_;
 
-  CUDA_CHECK(cudaMemcpyAsync(d_eagle_tok_, &token, sizeof(int), cudaMemcpyHostToDevice, s));
-  kernels::launch_embedding_lookup(static_cast<const __half*>(d_tok_embeddings_), d_eagle_tok_,
+  const int* tok_ptr = token_dev;
+  if (tok_ptr == nullptr) {
+    CUDA_CHECK(cudaMemcpyAsync(d_eagle_tok_, &token_host, sizeof(int), cudaMemcpyHostToDevice, s));
+    tok_ptr = d_eagle_tok_;
+  }
+  kernels::launch_embedding_lookup(static_cast<const __half*>(d_tok_embeddings_), tok_ptr,
                                    d_eagle_cat_, 1, H, s);
   CUDA_CHECK(cudaMemcpyAsync(d_eagle_cat_ + H, feature, static_cast<std::size_t>(H) * sizeof(__half),
                              cudaMemcpyDeviceToDevice, s));
@@ -205,15 +212,13 @@ int LlamaEngine::eagle_step(const __half* feature, int token, int pair_idx, bool
                                   d_eagle_tmp_, H, inter, s);
   kernels::launch_add_inplace(d_eagle_x_, d_eagle_tmp_, H, s);
 
-  if (!want_token) return -1;
-  // Shared lm_head over the RAW draft hidden, then device argmax.
+  if (!want_token) return;
+  // Shared lm_head over the RAW draft hidden, then partitioned device argmax
+  // straight into the chained-token slot; no host sync.
   kernels::launch_rowmajor_half_gemv_f32(static_cast<const __half*>(d_lm_head_), d_eagle_x_,
                                          d_eagle_logits_, cfg.vocab_size, H, s);
-  kernels::launch_argmax_float(d_eagle_logits_, cfg.vocab_size, d_argmax_, s);
-  int tok = -1;
-  CUDA_CHECK(cudaMemcpyAsync(&tok, d_argmax_, sizeof(int), cudaMemcpyDeviceToHost, s));
-  CUDA_CHECK(cudaStreamSynchronize(s));
-  return tok;
+  kernels::launch_argmax_float(d_eagle_logits_, cfg.vocab_size, dtok_out, s, d_argmax_part_val_,
+                               d_argmax_part_idx_, argmax_parts_);
 }
 
 // Feed a prefill chunk's (feature, token) pairs into the draft cache. Features
@@ -222,10 +227,8 @@ int LlamaEngine::eagle_step(const __half* feature, int token, int pair_idx, bool
 void LlamaEngine::eagle_prefill_pairs(const int* tokens, int count, int chunk_start) {
   const int H = weights_.config().hidden_size;
   for (int r = 0; r < count; ++r) {
-    // d_x_norm_ rows are consumed in order; copy the row out first since
-    // eagle_step's kernels do not touch d_x_norm_.
     const __half* feat = static_cast<const __half*>(d_x_norm_) + static_cast<std::size_t>(r) * H;
-    eagle_step(feat, tokens[r], chunk_start + r, /*want_token=*/false);
+    eagle_step(feat, nullptr, tokens[r], chunk_start + r, /*want_token=*/false, nullptr);
   }
 }
 
@@ -266,18 +269,25 @@ std::vector<int> LlamaEngine::eagle_generate(const std::vector<int>& prompt_toke
     // catch-up pair for cur (which yields the first draft).
     const int base = pos - 1 - heal_count;  // pair index of the first heal row
     for (int j = 0; j < heal_count; ++j) {
-      eagle_step(d_eagle_feats_ + static_cast<std::size_t>(j) * H, heal_tokens[j], base + j,
-                 /*want_token=*/false);
+      eagle_step(d_eagle_feats_ + static_cast<std::size_t>(j) * H, nullptr, heal_tokens[j],
+                 base + j, /*want_token=*/false, nullptr);
     }
-    int drafts[16];
-    drafts[0] = eagle_step(d_eagle_feats_ + static_cast<std::size_t>(cur_feat_row) * H, cur,
-                           pos - 1, /*want_token=*/true);
+    // Chain entirely on the device: each step's argmax lands in a
+    // d_eagle_dtoks_ slot which feeds the next step's embedding lookup; the
+    // drafts cross to the host once, after the chain.
+    eagle_step(d_eagle_feats_ + static_cast<std::size_t>(cur_feat_row) * H, nullptr, cur, pos - 1,
+               /*want_token=*/true, d_eagle_dtoks_);
     int nd = 1;
     const int room = max_ctx - pos - 2;
     while (nd < eagle_k_ && nd < room) {
-      drafts[nd] = eagle_step(d_eagle_x_, drafts[nd - 1], pos - 1 + nd, /*want_token=*/true);
+      eagle_step(d_eagle_x_, d_eagle_dtoks_ + (nd - 1), 0, pos - 1 + nd, /*want_token=*/true,
+                 d_eagle_dtoks_ + nd);
       ++nd;
     }
+    int drafts[16];
+    CUDA_CHECK(cudaMemcpyAsync(drafts, d_eagle_dtoks_, static_cast<std::size_t>(nd) * sizeof(int),
+                               cudaMemcpyDeviceToHost, s));
+    CUDA_CHECK(cudaStreamSynchronize(s));
     drafted += nd;
 
     std::vector<int> batch(static_cast<std::size_t>(nd) + 1);

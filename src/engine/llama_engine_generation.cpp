@@ -812,7 +812,8 @@ void LlamaEngine::verify_tokens(const std::vector<int>& tokens, int start_pos,
   for (int i = 0; i < K; ++i) {
     kernels::launch_argmax_float(
         d_batch_logits_ + static_cast<std::size_t>(i) * static_cast<std::size_t>(cfg.vocab_size),
-        cfg.vocab_size, d_argmax_, compute_stream_);
+        cfg.vocab_size, d_argmax_, compute_stream_, d_argmax_part_val_, d_argmax_part_idx_,
+        argmax_parts_);
     CUDA_CHECK(cudaMemcpyAsync(out_argmax.data() + i, d_argmax_, sizeof(int),
                                cudaMemcpyDeviceToHost, compute_stream_));
   }
