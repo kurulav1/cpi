@@ -82,13 +82,25 @@ function tokenMatches(presented, expected) {
   return timingSafeEqual(a, b);
 }
 app.use((req, res, next) => {
-  if (!ADMIN_PATHS.some((re) => re.test(req.path))) return next();
   const cfg = getRuntimeConfig();
+  const isAdmin = ADMIN_PATHS.some((re) => re.test(req.path));
+  // authScope "all" additionally guards inference: every /api and /v1 route
+  // except /api/health (frontend/probe polling). /healthz/* and /metrics sit
+  // outside those prefixes and stay open for orchestrators and scrapers.
+  const scopeAll =
+    cfg.authScope === "all" &&
+    (req.path.startsWith("/api") || req.path.startsWith("/v1")) &&
+    req.path !== "/api/health";
+  if (!isAdmin && !scopeAll) return next();
   if (cfg.adminToken) {
     const header = req.get("authorization") || "";
     const presented = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
     if (presented && tokenMatches(presented, cfg.adminToken)) return next();
-    return res.status(401).json({ error: "Admin endpoints require Authorization: Bearer <adminToken>." });
+    return res.status(401).json({
+      error: isAdmin
+        ? "Admin endpoints require Authorization: Bearer <adminToken>."
+        : "authScope is 'all': this endpoint requires Authorization: Bearer <adminToken>."
+    });
   }
   // Deny-only forwarded check: a local proxy that appends the real peer (the
   // vite dev proxy with xfwd on) reveals a remote client behind a loopback
@@ -3949,6 +3961,14 @@ app.get("/api/hub/jobs", (_req, res) => {
 // â”€â”€ static UI â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 const runtimeConfig = getRuntimeConfig();
+if (runtimeConfig.authScope === "all" && !runtimeConfig.adminToken) {
+  // Fail fast: an auth mode that silently degrades to "open" is worse than not starting.
+  console.error(
+    "[cpi] authScope is 'all' but no adminToken is configured. Set adminToken in web/config.json " +
+      "or CPI_ADMIN_TOKEN, or drop authScope back to 'admin'."
+  );
+  process.exit(1);
+}
 const distDir = path.resolve(runtimeConfig.webRoot, "dist");
 const indexFile = path.resolve(distDir, "index.html");
 

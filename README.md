@@ -461,9 +461,18 @@ There are two namespaces: **`/api/*`** (CPI-native, error envelope `{ "error": "
 additionally refuses any non-localhost client unless you set a bearer token (`adminToken` /
 `CPI_ADMIN_TOKEN`) and send `Authorization: Bearer <token>`; when a token is set it is required
 from localhost too. So exposing the server (`host: 0.0.0.0`, or `npm run dev:lan` for the dev UI)
-shares inference only, never disk access, unless you deliberately configure a token. Inference
-routes carry no auth — put them behind your own gateway if you expose them beyond a trusted
-network. `demoMode` additionally disables the admin surface for everyone and rate-limits
+shares inference only, never disk access, unless you deliberately configure a token.
+
+In **Docker** this bites by design: the image sets `CPI_HOST=0.0.0.0` (the port mapping needs it),
+and even your own browser on the host reaches the container through the docker bridge — a
+non-loopback peer — so the hub/quant/picker UI returns 403 until you set `CPI_ADMIN_TOKEN`
+(the `start_docker` scripts pass it through if exported). Inference works without it.
+
+By default inference routes carry no auth (`authScope: "admin"`), so a non-loopback bind still
+exposes unauthenticated compute. Set `authScope: "all"` (`CPI_AUTH_SCOPE=all`) to require the
+bearer token on every `/api` and `/v1` route except `/api/health`; `/healthz/*` and `/metrics`
+stay open for orchestrator probes and scrapers, and the server refuses to start in this mode
+without a token. `demoMode` additionally disables the admin surface for everyone and rate-limits
 generation per IP.
 
 | Group | Endpoints |

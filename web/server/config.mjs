@@ -140,6 +140,11 @@ const DEFAULT_RUNTIME = Object.freeze({
   // Bearer token for the admin endpoints. Empty = admin is loopback-peers-only;
   // non-empty = required on every admin request (loopback included).
   adminToken: "",
+  // "admin" (default): the token guards only the admin surface; inference is
+  // open. "all": the token is required on every /api and /v1 route except
+  // /api/health -- for exposing the server where unauthenticated compute is
+  // not acceptable. "all" requires adminToken to be set (enforced at startup).
+  authScope: "admin",
   template: "tinyllama",
   systemPrompt: "You are a helpful assistant.",
   forceCpu: false,
@@ -1712,6 +1717,12 @@ export function getRuntimeConfig() {
     port: readIntSetting("PORT", "port", DEFAULT_RUNTIME.port, 1, 65535),
     host: String(pick("CPI_HOST", "host", DEFAULT_RUNTIME.host)).trim() || DEFAULT_RUNTIME.host,
     adminToken: String(pick("CPI_ADMIN_TOKEN", "adminToken", DEFAULT_RUNTIME.adminToken)).trim(),
+    authScope: (() => {
+      const v = String(pick("CPI_AUTH_SCOPE", "authScope", DEFAULT_RUNTIME.authScope))
+        .trim()
+        .toLowerCase();
+      return v === "all" ? "all" : "admin";
+    })(),
     repoRoot,
     webRoot,
     inferBin,

@@ -9,6 +9,9 @@
   "adminToken": "",
   "_adminToken_note": "Bearer token for the admin endpoints (send Authorization: Bearer <token>). Empty = admin works from localhost only. Required for remote admin use; also honored from CPI_ADMIN_TOKEN.",
 
+  "authScope": "admin",
+  "_authScope_note": "'admin' (default): the token guards only downloads/quant/filesystem routes; inference is open. 'all': the token is required on every /api and /v1 route except /api/health -- use when exposing the server where unauthenticated compute is not acceptable. 'all' refuses to start without adminToken. /healthz/* and /metrics always stay open for probes.",
+
   "inferBin": "",
   "_inferBin_note": "Leave empty to auto-detect: build/Release/cpi.exe on Windows, build/cpi on Linux/macOS. Set explicitly if the binary is elsewhere.",
 
