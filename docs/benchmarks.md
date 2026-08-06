@@ -35,6 +35,29 @@ All outputs land in `docs/results/`. The report command updates the
 
 ---
 
+## Cross-Engine Comparison Rules
+
+Every CPI-vs-llama.cpp ratio in this repo follows these rules; a number that
+doesn't is not comparable and should not be quoted.
+
+1. **Interleave the runs.** The GPU throttles over a session (boost clocks
+   drift ±6% within minutes on the reference box). Run A, B, A, B in one
+   sitting — never compare numbers taken in different sessions.
+2. **Mind the timer scope.** `llama-bench` excludes sampling from its tok/s;
+   CPI's `--benchmark` includes it. Reported ratios leave this in (it slightly
+   flatters llama.cpp on decode); if you need it out, measure the sampler
+   separately rather than adjusting by guess.
+3. **Warm first, and defeat the prefix cache.** First-run prefill includes
+   one-time costs (3.3x observed on cold DeepSeek). For CPI prefill timing,
+   `--no-prefix-reuse` is mandatory: a repeated prompt otherwise skips prefill
+   entirely, and `prefill_ms=0.00` means *not measured*, not fast.
+4. **Same weights, stated build.** llama.cpp gets a GGUF converted from the
+   identical checkpoint (`tools/ll2c_to_hf_safetensors.py` + llama.cpp's
+   `convert_hf_to_gguf.py`), and the llama.cpp build hash is recorded next to
+   the numbers.
+
+---
+
 ## Metrics
 
 ### Throughput

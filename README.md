@@ -3,7 +3,11 @@
 CPI is a local LLM inference engine with a CLI, REST API, and web UI. It runs on CPU everywhere,
 on NVIDIA GPUs through CUDA, and on Apple Silicon through Metal. The two GPU backends execute
 the same model plans and are held to token-identical output by cross-backend gates. No external
-runtime dependencies: every kernel, tokenizer, and container reader is in this repo.
+runtime dependencies beyond the vendor toolkits: every decode kernel, attention kernel, quant
+format, tokenizer, and container reader is in this repo. The one exception worth naming is that
+large prefill/batch GEMMs on CUDA go through cuBLAS/cuBLASLt (part of the CUDA toolkit the build
+already requires) — hand-rolling a competitive fp16 tensor-core GEMM buys no user-visible win.
+Everything decode-side, and everything on Metal, is hand-rolled.
 
 ## Benchmarks
 
@@ -34,6 +38,14 @@ omitted: its int4 weights dequantize past the 32 GB of system RAM (out-of-memory
 Same fp16 weights on both sides (llama.cpp gets a GGUF converted from the identical checkpoint),
 same GPU, greedy, and the two engines are run **interleaved**: the GPU throttles over a long
 session, so numbers taken minutes apart are not comparable.
+
+Provenance: all numbers are self-reported from the single reference machine above; each table
+states when its rows were measured and any row carried from an earlier pass says so. Timer scopes
+differ between the tools — `llama-bench` excludes sampling, CPI's `--benchmark` includes it — which
+flatters llama.cpp by a small margin on decode; the ratios below leave that in rather than adjust
+for it. A fresh 2026-08-05 re-run against llama.cpp build `1269cb1` (`-fa 1`, warm, interleaved)
+put the 8B at decode **99%** (82.2 vs 83.2 tok/s), prefill@512 **133%**, prefill@2048 **106%** —
+consistent with the table's earlier rows.
 
 | Model | Test | llama.cpp | CPI | CPI / llama.cpp |
 | ----- | ---- | --------- | --- | --------------- |
