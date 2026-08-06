@@ -680,6 +680,49 @@ private:
   void* h_k_cache_ = nullptr;  // Host-pinned mirror of d_k_cache_ for paged eviction.
   void* h_v_cache_ = nullptr;  // Host-pinned mirror of d_v_cache_ for paged eviction.
 
+  // ── EAGLE speculative decoding (CPI_EAGLE=k; draft head from CPI_EAGLE_DIR) ──
+  // One llama-style draft layer over [embed(token) | target post-norm feature]
+  // pairs, sharing the target's embeddings and lm_head. Chain drafting; the
+  // existing verify_tokens batched verify accepts/rejects.
+  bool eagle_enabled_ = false;
+  int eagle_k_ = 4;
+  void* d_eagle_fc_ = nullptr;        // [hidden, 2*hidden]
+  void* d_eagle_wq_ = nullptr;        // [q_hidden, hidden]
+  void* d_eagle_wk_ = nullptr;        // [kv_hidden, hidden]
+  void* d_eagle_wv_ = nullptr;
+  void* d_eagle_wo_ = nullptr;        // [hidden, q_hidden]
+  void* d_eagle_w1_ = nullptr;        // [inter, hidden]
+  void* d_eagle_w3_ = nullptr;
+  void* d_eagle_w2_ = nullptr;        // [hidden, inter]
+  void* d_eagle_pnorm_ = nullptr;     // [hidden]
+  __half* d_eagle_kcache_ = nullptr;  // draft KV [max_ctx pairs, kv_hidden]
+  __half* d_eagle_vcache_ = nullptr;
+  float* d_eagle_cos_ = nullptr;      // plain-theta rope tables (draft head has no rope scaling)
+  float* d_eagle_sin_ = nullptr;
+  __half* d_eagle_cat_ = nullptr;     // [2*hidden] fc input
+  __half* d_eagle_x_ = nullptr;       // [hidden] draft hidden / residual / output feature
+  __half* d_eagle_tmp_ = nullptr;     // [hidden]
+  __half* d_eagle_norm_ = nullptr;    // [hidden]
+  __half* d_eagle_q_ = nullptr;       // [q_hidden]
+  __half* d_eagle_kv_ = nullptr;      // [2*kv_hidden] (k then v)
+  __half* d_eagle_att_ = nullptr;     // [q_hidden]
+  __half* d_eagle_gate_ = nullptr;    // [inter]
+  __half* d_eagle_up_ = nullptr;      // [inter]
+  __half* d_eagle_feats_ = nullptr;   // [max verify rows, hidden] true features from verify
+  float* d_eagle_logits_ = nullptr;   // [vocab]
+  int* d_eagle_tok_ = nullptr;        // [1]
+  bool eagle_tried_ = false;          // lazy one-shot load attempt
+  bool eagle_load();                  // returns false (and disables) on any mismatch
+  void eagle_free();
+  // Runs one (feature, token) pair through the draft layer at pair row
+  // `pair_idx`; returns the drafted next token (device argmax of the shared
+  // lm_head over the raw draft hidden), or -1 when want_token is false. The
+  // output feature stays in d_eagle_x_.
+  int eagle_step(const __half* feature, int token, int pair_idx, bool want_token = true);
+  std::vector<int> eagle_generate(const std::vector<int>& prompt_tokens, int max_new_tokens,
+                                  const std::function<bool(int)>& on_token);
+  void eagle_prefill_pairs(const int* tokens, int count, int chunk_start);
+
   // Quantized KV cache (active when options_.kv_cache_int4 or CPI_KV_QUANT is set).
   // Replaces the fp16 buffers above; d_k_cache_ / d_v_cache_ are not allocated.
   // K and V each store head_dim * bits/8 bytes per (token, kv_head) plus one

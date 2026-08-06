@@ -184,6 +184,7 @@ if(CPI_ENABLE_CUDA)
     src/engine/llama_engine_forward.cpp
     src/engine/llama_engine_forward_decode.cpp
     src/engine/llama_engine_generation.cpp
+    src/engine/llama_engine_eagle.cpp
     src/engine/llama_engine_batched_decode.cpp
     src/engine/llama_engine_sampling.cpp
     src/engine/llama_engine_parity.cpp

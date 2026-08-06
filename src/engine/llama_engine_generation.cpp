@@ -69,6 +69,13 @@ void LlamaEngine::prefill_prompt(const std::vector<int>& prompt_tokens, int star
                                static_cast<std::size_t>(rows) * sizeof(int), cudaMemcpyHostToDevice,
                                compute_stream_));
     run_batched_chunk(rows, chunk_start);
+    if (eagle_enabled_) {
+      // Feed this chunk's (post-norm feature, next token) pairs into the draft
+      // cache: pair p consumes the token at position p+1, so the last prompt
+      // token pairs with the final chunk's last feature row.
+      launch_norm(d_x_, d_norm_out_, d_norm_out_bias_, d_x_norm_, rows, cfg.hidden_size);
+      eagle_prefill_pairs(prompt_tokens.data() + chunk_start + 1, rows, chunk_start);
+    }
   }
   if (!all_layers_cached) {
     CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
@@ -540,12 +547,18 @@ std::vector<int> LlamaEngine::generate_stream(const std::vector<int>& prompt_tok
   // (causal attention + position-based RoPE), so the output is unchanged. Only
   // the simple contiguous fp16 KV layout is eligible; paged / int4-KV / TQ3 /
   // MoE / sliding-window configs take a full reset + prefill.
+  // Lazy one-shot EAGLE head load (CPI_EAGLE=k); all target buffers exist here.
+  if (!eagle_tried_) {
+    eagle_tried_ = true;
+    eagle_load();
+  }
+  // EAGLE needs the draft cache fed during prefill, which prefix reuse skips.
   const bool prefix_cacheable =
       !options_.disable_prefix_reuse &&                      // benchmarking wants a real prefill
       !options_.paged_kv_cache && !options_.paged_blocks &&  // paged: each request gets its own
       !kv_int4_enabled_ && !tq3_enabled_ &&             // block table, so prior KV isn't at the
-      !cfg.is_moe() && !cfg.uses_non_full_attention();  // same physical blocks (paged shared-prefix
-                                                        // is a later phase)
+      !cfg.is_moe() && !cfg.uses_non_full_attention() &&  // same physical blocks (paged
+      !eagle_enabled_;                                    // shared-prefix is a later phase)
   int reuse = 0;
   if (prefix_cacheable && !resident_prefix_.empty()) {
     // Cap at prompt size - 1 so at least one token remains to seed decode.
@@ -626,6 +639,27 @@ std::vector<int> LlamaEngine::generate_stream(const std::vector<int>& prompt_tok
       std::chrono::duration<double, std::milli>(prefill_end - prefill_start).count();
   if (options_.verbose) {
     std::cout << "[engine] prefill_done ms=" << last_benchmark_stats_.prefill_ms << "\n";
+  }
+
+  // EAGLE chain-speculative decode: greedy only, no grammar/min-tokens, and the
+  // same batched-path eligibility verify_tokens needs. The draft cache was fed
+  // during prefill (see prefill_prompt); the loop verifies chains of k drafts.
+  const bool eagle_eligible =
+      eagle_enabled_ && temperature <= 0.0f && active_grammar_ == nullptr &&
+      min_new_tokens == 0 && !options_.paged_kv_cache && prefill_chunk_size_ > 1 &&
+      !(cached_int8_proj_enabled_ && cached_layer_count_ != cfg.num_layers) &&
+      !kv_int4_enabled_ && !tq3_enabled_ && !cfg.is_moe() && !cfg.uses_non_full_attention() &&
+      eagle_k_ + 1 <= prefill_chunk_size_ && reuse == 0;
+  if (eagle_eligible) {
+    const auto eagle_decode_start = std::chrono::steady_clock::now();
+    const std::vector<int> gen = eagle_generate(prompt_tokens, max_new_tokens, on_token);
+    out.insert(out.end(), gen.begin(), gen.end());
+    CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
+    last_benchmark_stats_.decode_ms = std::chrono::duration<double, std::milli>(
+                                          std::chrono::steady_clock::now() - eagle_decode_start)
+                                          .count();
+    last_benchmark_stats_.generated_tokens = static_cast<int>(gen.size());
+    return out;
   }
 
   int current = prompt_tokens.back();
