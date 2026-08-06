@@ -292,6 +292,14 @@ void launch_rope_inplace_batched_strided(half* q, half* k, int num_tokens, int n
                                          const float* cos_table, const float* sin_table,
                                          int q_row_stride, int k_row_stride, cudaStream_t stream);
 
+// Device-position twin (graph-capturable fixed-shape batched forwards).
+void launch_rope_inplace_batched_strided_device_pos(half* q, half* k, int num_tokens,
+                                                    int num_heads_q, int num_heads_k, int head_dim,
+                                                    const int* start_position,
+                                                    const float* cos_table, const float* sin_table,
+                                                    int q_row_stride, int k_row_stride,
+                                                    cudaStream_t stream);
+
 void launch_rope_inplace_batched(half* q, half* k, int num_tokens, int num_heads_q, int num_heads_k,
                                  int head_dim, int start_position, const float* cos_table,
                                  const float* sin_table, cudaStream_t stream);

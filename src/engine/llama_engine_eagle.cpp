@@ -118,6 +118,17 @@ bool LlamaEngine::eagle_load() {
                         static_cast<std::size_t>(cfg.vocab_size) * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_eagle_tok_, sizeof(int)));
   CUDA_CHECK(cudaMalloc(&d_eagle_dtoks_, 16 * sizeof(int)));
+  CUDA_CHECK(cudaMalloc(&d_eagle_pos_, sizeof(int)));
+  CUDA_CHECK(cudaMalloc(&d_eagle_verdict_, 17 * sizeof(int)));
+  // mt split-K verify scratch: fixed max-context chunk grid with per-chunk
+  // guards (the graph-capturable attention the plan engine's spec verify uses).
+  eagle_mt_chunks_ = std::max(1, (options_.max_context + 31) / 32);
+  {
+    const std::size_t cells = static_cast<std::size_t>(17) * cfg.num_heads * eagle_mt_chunks_;
+    CUDA_CHECK(cudaMalloc(&d_eagle_mt_m_, cells * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_eagle_mt_l_, cells * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_eagle_mt_o_, cells * head_dim * sizeof(float)));
+  }
   eagle_enabled_ = true;
   if (options_.verbose) {
     std::cout << "[engine] eagle=on k=" << eagle_k_ << " dir=" << dir << "\n";
@@ -150,6 +161,20 @@ void LlamaEngine::eagle_free() {
   freep(d_eagle_logits_);
   freep(d_eagle_tok_);
   freep(d_eagle_dtoks_);
+  freep(d_eagle_pos_);
+  freep(d_eagle_verdict_);
+  freep(d_eagle_mt_m_);
+  freep(d_eagle_mt_l_);
+  freep(d_eagle_mt_o_);
+  if (eagle_vgraph_exec_) {
+    cudaGraphExecDestroy(eagle_vgraph_exec_);
+    eagle_vgraph_exec_ = nullptr;
+  }
+  if (eagle_vgraph_) {
+    cudaGraphDestroy(eagle_vgraph_);
+    eagle_vgraph_ = nullptr;
+  }
+  eagle_vgraph_k_ = 0;
   eagle_enabled_ = false;
 }
 
@@ -232,6 +257,142 @@ void LlamaEngine::eagle_prefill_pairs(const int* tokens, int count, int chunk_st
   }
 }
 
+// Graph-safe verify body: K token rows (already in d_token_id_) forwarded at
+// device base position d_eagle_pos_. Fixed shapes throughout: fp16-resident
+// GEMMs (fixed M=K), device-position rope/store, and the mt split-K attention
+// whose fixed max-context chunk grid guards off dead chunks. Leaves verdicts
+// in d_eagle_verdict_[0..K) and the post-norm features in d_eagle_feats_.
+void LlamaEngine::eagle_verify_forward(int K) {
+  const auto& cfg = weights_.config();
+  const int hidden = cfg.hidden_size;
+  const int head_dim = attn_head_dim_ > 0 ? attn_head_dim_ : (hidden / cfg.num_heads);
+  const int q_hidden = attn_q_hidden_ > 0 ? attn_q_hidden_ : hidden;
+  const int kv_hidden = attn_kv_hidden_ > 0 ? attn_kv_hidden_ : (cfg.num_kv_heads * head_dim);
+  const int inter = cfg.intermediate_size;
+  auto s = compute_stream_;
+  const std::size_t layer_stride =
+      static_cast<std::size_t>(kv_capacity_tokens_) * static_cast<std::size_t>(kv_hidden);
+  const std::size_t q_row_bytes = static_cast<std::size_t>(q_hidden) * sizeof(__half);
+  const std::size_t kv_row_bytes = static_cast<std::size_t>(kv_hidden) * sizeof(__half);
+  const std::size_t qkv_stride_bytes =
+      static_cast<std::size_t>(q_hidden + 2 * kv_hidden) * sizeof(__half);
+  const std::size_t ff_row_bytes = static_cast<std::size_t>(inter) * sizeof(__half);
+  const std::size_t ff13_stride_bytes = static_cast<std::size_t>(2 * inter) * sizeof(__half);
+  auto* qkv_base = static_cast<const __half*>(d_qkv_);
+  auto* ff13_base = static_cast<const __half*>(d_ff13_);
+
+  kernels::launch_embedding_lookup(static_cast<const __half*>(d_tok_embeddings_), d_token_id_,
+                                   static_cast<__half*>(d_x_), K, hidden, s);
+  for (int layer = 0; layer < cfg.num_layers; ++layer) {
+    const LayerDeviceWeights* lw = &layer_cache_[static_cast<std::size_t>(layer)];
+    launch_norm(d_x_, lw->norm_att, lw->norm_att_bias, d_x_norm_, K, hidden);
+    detail::dispatch_linear_rowmajor_weight(
+        cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, s, lw->wqkv,
+        d_x_norm_, d_qkv_, q_hidden + 2 * kv_hidden, hidden, K, CUDA_R_16F);
+    CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_q_, q_row_bytes, qkv_base, qkv_stride_bytes,
+                                 q_row_bytes, K, cudaMemcpyDeviceToDevice, s));
+    CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_k_, kv_row_bytes, qkv_base + q_hidden,
+                                 qkv_stride_bytes, kv_row_bytes, K, cudaMemcpyDeviceToDevice, s));
+    CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_v_, kv_row_bytes, qkv_base + q_hidden + kv_hidden,
+                                 qkv_stride_bytes, kv_row_bytes, K, cudaMemcpyDeviceToDevice, s));
+    kernels::launch_rope_inplace_batched_strided_device_pos(
+        static_cast<__half*>(d_prefill_q_), static_cast<__half*>(d_prefill_k_), K, cfg.num_heads,
+        cfg.num_kv_heads, head_dim, d_eagle_pos_, d_rope_cos_, d_rope_sin_, q_hidden, kv_hidden,
+        s);
+    auto* k_layer =
+        static_cast<__half*>(d_k_cache_) + static_cast<std::size_t>(layer) * layer_stride;
+    auto* v_layer =
+        static_cast<__half*>(d_v_cache_) + static_cast<std::size_t>(layer) * layer_stride;
+    kernels::launch_store_kv_seq_device_pos(static_cast<const __half*>(d_prefill_k_),
+                                            static_cast<const __half*>(d_prefill_v_), k_layer,
+                                            v_layer, d_eagle_pos_, kv_hidden, K,
+                                            kv_capacity_tokens_, s);
+    kernels::launch_attention_split_any_mt_device_pos(
+        static_cast<const __half*>(d_prefill_q_), k_layer, v_layer, static_cast<__half*>(d_att_),
+        d_eagle_pos_, K, /*window=*/0, cfg.num_heads, cfg.num_kv_heads, head_dim, d_eagle_mt_m_,
+        d_eagle_mt_l_, d_eagle_mt_o_, 32, eagle_mt_chunks_, s);
+    detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
+                                            lt_workspace_bytes_, s, lw->wo, d_att_, d_ff3_, hidden,
+                                            q_hidden, K, CUDA_R_16F);
+    kernels::launch_add_inplace(static_cast<__half*>(d_x_), static_cast<const __half*>(d_ff3_),
+                                K * hidden, s);
+    launch_norm(d_x_, lw->norm_ffn, lw->norm_ffn_bias, d_x_norm_, K, hidden);
+    detail::dispatch_linear_rowmajor_weight(
+        cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, s, lw->w13,
+        d_x_norm_, d_ff13_, 2 * inter, hidden, K, CUDA_R_16F);
+    CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_ff1_, ff_row_bytes, ff13_base, ff13_stride_bytes,
+                                 ff_row_bytes, K, cudaMemcpyDeviceToDevice, s));
+    CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_ff2_, ff_row_bytes, ff13_base + inter,
+                                 ff13_stride_bytes, ff_row_bytes, K, cudaMemcpyDeviceToDevice, s));
+    detail::launch_gated_glu(cfg.mlp_gelu, static_cast<const __half*>(d_prefill_ff1_),
+                             static_cast<const __half*>(d_prefill_ff2_),
+                             static_cast<__half*>(d_prefill_ff2_), K * inter, s);
+    detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
+                                            lt_workspace_bytes_, s, lw->w2, d_prefill_ff2_, d_ff3_,
+                                            hidden, inter, K, CUDA_R_16F);
+    kernels::launch_add_inplace(static_cast<__half*>(d_x_), static_cast<const __half*>(d_ff3_),
+                                K * hidden, s);
+  }
+  launch_norm(d_x_, d_norm_out_, d_norm_out_bias_, d_x_norm_, K, hidden);
+  CUDA_CHECK(cudaMemcpyAsync(d_eagle_feats_, d_x_norm_,
+                             static_cast<std::size_t>(K) * hidden * sizeof(__half),
+                             cudaMemcpyDeviceToDevice, s));
+  batched_lm_head(K, hidden, cfg.vocab_size);
+  for (int i = 0; i < K; ++i) {
+    kernels::launch_argmax_float(
+        d_batch_logits_ + static_cast<std::size_t>(i) * static_cast<std::size_t>(cfg.vocab_size),
+        cfg.vocab_size, d_eagle_verdict_ + i, s, d_argmax_part_val_, d_argmax_part_idx_,
+        argmax_parts_);
+  }
+}
+
+// Capture-once, replay-per-round wrapper. Returns false when the graphed path
+// is unavailable (caller falls back to eager verify_tokens).
+bool LlamaEngine::eagle_verify_graphed(const std::vector<int>& batch, int start_pos,
+                                       std::vector<int>& out_argmax) {
+  const auto& cfg = weights_.config();
+  const int K = static_cast<int>(batch.size());
+  // Graph eligibility: pure fp16-resident weights, no qkv bias / qk-norm
+  // stages (the forward above omits them), contiguous fp16 KV.
+  if (cached_layer_count_ != cfg.num_layers || cached_int8_proj_enabled_ || kv_int4_enabled_ ||
+      layer_cache_.empty() || layer_cache_[0].bqkv != nullptr || layer_cache_[0].q_norm != nullptr) {
+    return false;
+  }
+  auto s = compute_stream_;
+  CUDA_CHECK(cudaMemcpyAsync(d_token_id_, batch.data(), static_cast<std::size_t>(K) * sizeof(int),
+                             cudaMemcpyHostToDevice, s));
+  CUDA_CHECK(
+      cudaMemcpyAsync(d_eagle_pos_, &start_pos, sizeof(int), cudaMemcpyHostToDevice, s));
+  if (eagle_vgraph_k_ != K) {
+    if (eagle_vgraph_exec_) {
+      cudaGraphExecDestroy(eagle_vgraph_exec_);
+      eagle_vgraph_exec_ = nullptr;
+    }
+    if (eagle_vgraph_) {
+      cudaGraphDestroy(eagle_vgraph_);
+      eagle_vgraph_ = nullptr;
+    }
+    // Warm run (also warms the cublasLt plan cache), then capture.
+    eagle_verify_forward(K);
+    CUDA_CHECK(cudaStreamSynchronize(s));
+    CUDA_CHECK(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));
+    eagle_verify_forward(K);
+    CUDA_CHECK(cudaStreamEndCapture(s, &eagle_vgraph_));
+    CUDA_CHECK(cudaGraphInstantiate(&eagle_vgraph_exec_, eagle_vgraph_, nullptr, nullptr, 0));
+    eagle_vgraph_k_ = K;
+    if (options_.verbose) {
+      std::cout << "[eagle] verify graph captured (K=" << K << ")\n";
+    }
+  }
+  CUDA_CHECK(cudaGraphLaunch(eagle_vgraph_exec_, s));
+  out_argmax.resize(static_cast<std::size_t>(K));
+  CUDA_CHECK(cudaMemcpyAsync(out_argmax.data(), d_eagle_verdict_,
+                             static_cast<std::size_t>(K) * sizeof(int), cudaMemcpyDeviceToHost,
+                             s));
+  CUDA_CHECK(cudaStreamSynchronize(s));
+  return true;
+}
+
 std::vector<int> LlamaEngine::eagle_generate(const std::vector<int>& prompt_tokens,
                                              int max_new_tokens,
                                              const std::function<bool(int)>& on_token) {
@@ -294,12 +455,15 @@ std::vector<int> LlamaEngine::eagle_generate(const std::vector<int>& prompt_toke
     batch[0] = cur;
     for (int i = 0; i < nd; ++i) batch[static_cast<std::size_t>(i) + 1] = drafts[i];
     std::vector<int> verdict;
-    verify_tokens(batch, pos, verdict);
+    if (!eagle_verify_graphed(batch, pos, verdict)) {
+      verify_tokens(batch, pos, verdict);
+      // True features for all verified rows (the graphed path copies them
+      // inside the graph; the eager path leaves them in d_x_norm_).
+      CUDA_CHECK(cudaMemcpyAsync(d_eagle_feats_, d_x_norm_,
+                                 static_cast<std::size_t>(nd + 1) * H * sizeof(__half),
+                                 cudaMemcpyDeviceToDevice, s));
+    }
     ++verifies;
-    // True features for all verified rows (before anything clobbers d_x_norm_).
-    CUDA_CHECK(cudaMemcpyAsync(d_eagle_feats_, d_x_norm_,
-                               static_cast<std::size_t>(nd + 1) * H * sizeof(__half),
-                               cudaMemcpyDeviceToDevice, s));
 
     int acc = 0;
     while (acc < nd && verdict[static_cast<std::size_t>(acc)] == drafts[acc]) ++acc;

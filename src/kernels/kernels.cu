@@ -566,6 +566,43 @@ __global__ void rope_inplace_batched_kernel(half* q, half* k, int num_tokens, in
   }
 }
 
+// Device-position twin: the base position is read on the device, which makes a
+// fixed-shape batched forward (the EAGLE graphed verify) graph-capturable.
+__global__ void rope_inplace_batched_device_pos_kernel(half* q, half* k, int num_tokens,
+                                                       int num_heads_q, int num_heads_k,
+                                                       int head_dim,
+                                                       const int* __restrict__ start_position,
+                                                       const float* cos_table,
+                                                       const float* sin_table, int q_row_stride,
+                                                       int k_row_stride) {
+  const int head = blockIdx.x;
+  const int token = blockIdx.y;
+  const int pair = threadIdx.x;
+  const int half_dim = head_dim / 2;
+  if (token >= num_tokens || pair >= half_dim) {
+    return;
+  }
+
+  const int table_idx = (start_position[0] + token) * half_dim + pair;
+  const float c = cos_table[table_idx];
+  const float s = sin_table[table_idx];
+
+  if (head < num_heads_q) {
+    const int base = token * q_row_stride + head * head_dim;
+    const float q0 = __half2float(q[base + pair]);
+    const float q1 = __half2float(q[base + pair + half_dim]);
+    q[base + pair] = __float2half(q0 * c - q1 * s);
+    q[base + pair + half_dim] = __float2half(q1 * c + q0 * s);
+  }
+  if (head < num_heads_k) {
+    const int base = token * k_row_stride + head * head_dim;
+    const float k0 = __half2float(k[base + pair]);
+    const float k1 = __half2float(k[base + pair + half_dim]);
+    k[base + pair] = __float2half(k0 * c - k1 * s);
+    k[base + pair + half_dim] = __float2half(k1 * c + k0 * s);
+  }
+}
+
 // Decode-time attention helpers and kernels.
 // Flatten [time, head, dim] coordinates into the packed KV-cache layout.
 __device__ __forceinline__ int cache_index(int t, int head, int d, int num_heads, int head_dim) {
@@ -1422,6 +1459,20 @@ void launch_rope_inplace_batched_strided(half* q, half* k, int num_tokens, int n
   const int blocks = (num_heads_q > num_heads_k) ? num_heads_q : num_heads_k;
   const dim3 grid(blocks, num_tokens);
   rope_inplace_batched_kernel<<<grid, threads, 0, stream>>>(
+      q, k, num_tokens, num_heads_q, num_heads_k, head_dim, start_position, cos_table, sin_table,
+      q_row_stride, k_row_stride);
+}
+
+void launch_rope_inplace_batched_strided_device_pos(half* q, half* k, int num_tokens,
+                                                    int num_heads_q, int num_heads_k, int head_dim,
+                                                    const int* start_position,
+                                                    const float* cos_table, const float* sin_table,
+                                                    int q_row_stride, int k_row_stride,
+                                                    cudaStream_t stream) {
+  const int threads = head_dim / 2;
+  const int blocks = (num_heads_q > num_heads_k) ? num_heads_q : num_heads_k;
+  const dim3 grid(blocks, num_tokens);
+  rope_inplace_batched_device_pos_kernel<<<grid, threads, 0, stream>>>(
       q, k, num_tokens, num_heads_q, num_heads_k, head_dim, start_position, cos_table, sin_table,
       q_row_stride, k_row_stride);
 }

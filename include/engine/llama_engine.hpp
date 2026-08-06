@@ -712,6 +712,21 @@ private:
   float* d_eagle_logits_ = nullptr;   // [vocab]
   int* d_eagle_tok_ = nullptr;        // [1]
   int* d_eagle_dtoks_ = nullptr;      // [16] device-side chained draft tokens
+  // Graphed verify: a fixed-K, device-position replica of the verify forward
+  // captured once and replayed per round (the eager verify's ~700 small
+  // launches cost ~2ms/round).
+  int* d_eagle_pos_ = nullptr;        // [1] device base position for the verify
+  int* d_eagle_verdict_ = nullptr;    // [17] per-row argmax outputs
+  float* d_eagle_mt_m_ = nullptr;     // mt split-K scratch [K, heads, chunks]
+  float* d_eagle_mt_l_ = nullptr;
+  float* d_eagle_mt_o_ = nullptr;     // [K, heads, chunks, head_dim]
+  int eagle_mt_chunks_ = 0;
+  cudaGraph_t eagle_vgraph_ = nullptr;
+  cudaGraphExec_t eagle_vgraph_exec_ = nullptr;
+  int eagle_vgraph_k_ = 0;            // K the graph was captured for (0 = none)
+  void eagle_verify_forward(int K);   // graph-safe verify body (device pos)
+  bool eagle_verify_graphed(const std::vector<int>& batch, int start_pos,
+                            std::vector<int>& out_argmax);
   bool eagle_tried_ = false;          // lazy one-shot load attempt
   bool eagle_load();                  // returns false (and disables) on any mismatch
   void eagle_free();
