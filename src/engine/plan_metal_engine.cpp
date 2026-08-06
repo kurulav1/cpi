@@ -2936,7 +2936,10 @@ public:
   explicit BatchAdapter(PlanMetalEngine* e) : e_(e) {}
 
   void prefill_suffix(const std::vector<int>& prompt_tokens, int shared_tokens,
-                      const std::vector<int>& block_table) override {
+                      const std::vector<int>& block_table, int kv_slot) override {
+    // kv_slot identifies per-sequence backend side state (CUDA's quant sink/window
+    // buffers); Metal has none, so it is unused here.
+    (void)kv_slot;
     // [0, shared) is already in the pool through adopted blocks. Chunk the rest to the slot
     // size; each chunk lands at its own absolute position, so a chunk boundary is not a
     // sequence boundary. prefill_paged commits and waits, which is the contract.
@@ -2951,7 +2954,9 @@ public:
 
   void decode_batched_logits(const std::vector<int>& tokens, const std::vector<int>& positions,
                              const std::vector<int>& block_tables_flat, int max_blocks,
+                             const std::vector<int>& kv_slots,
                              std::vector<std::vector<float>>& out_logits) override {
+    (void)kv_slots;  // no per-sequence side state on Metal
     e_->decode_step_batched_logits(tokens, positions, block_tables_flat, max_blocks, out_logits);
   }
 

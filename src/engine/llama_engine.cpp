@@ -831,6 +831,10 @@ LlamaEngine::~LlamaEngine() {
     cudaFree(d_batch_block_tables_);
     d_batch_block_tables_ = nullptr;
   }
+  if (d_batch_kv_slots_) {
+    cudaFree(d_batch_kv_slots_);
+    d_batch_kv_slots_ = nullptr;
+  }
   if (d_batch_logits_) {
     cudaFree(d_batch_logits_);
     d_batch_logits_ = nullptr;

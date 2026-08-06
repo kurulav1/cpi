@@ -411,8 +411,18 @@ private:
   int* d_batch_positions_ = nullptr;
   int* d_batch_seq_lens_ = nullptr;
   int* d_batch_block_tables_ = nullptr;
+  int* d_batch_kv_slots_ = nullptr;  // [batch] stable quality-slot ids (quant sink/window tier)
   int batch_buffers_max_seqs_ = 0;
   int batch_buffers_max_blocks_ = 0;
+  // Quality-slot capacity of the fp16 sink/ring side buffers (d_kv_sink_/d_kv_ring_,
+  // layout [layers, slots, sink_n | win_n, kv_heads, head_dim]). The contiguous
+  // single-sequence cache uses exactly slot 0; the batched paged tier grows this on
+  // demand as the scheduler hands out higher slot ids.
+  int kv_quality_slots_ = 1;
+  void ensure_kv_quality_slots(int min_slots);
+  // Quality slot the next paged quant PREFILL writes into (set by the batch adapter
+  // around prefill_suffix; 0 for the single-sequence path).
+  int prefill_kv_slot_ = 0;
   // Actual element capacity of d_batch_block_tables_ (batch*max_blocks ints). The
   // batch size can shrink then regrow (e.g. a preempted request resuming), so this
   // must track the real allocation, not the product of independent high-watermarks.
@@ -424,15 +434,20 @@ public:
   // current token at positions[b]; block_tables_flat is [batch][max_blocks]
   // (logical chunk -> physical block). Returns each sequence's next (greedy) token.
   // fp16 resident (--gpu-cache-all), full-attention path only.
+  // kv_slots (all decode_step_batched* methods): per-row stable quality-slot ids for
+  // the quant sink/window tier; empty means "all rows slot 0" (single-sequence and
+  // duplicate-row check callers). Ignored when the tier is off.
   std::vector<int> decode_step_batched(const std::vector<int>& tokens,
                                        const std::vector<int>& positions,
-                                       const std::vector<int>& block_tables_flat, int max_blocks);
+                                       const std::vector<int>& block_tables_flat, int max_blocks,
+                                       const std::vector<int>& kv_slots = std::vector<int>());
 
   // Same forward as decode_step_batched but returns per-row logits [batch][vocab]
   // so each sequence can be sampled with its own params/grammar (streaming batcher).
   void decode_step_batched_logits(const std::vector<int>& tokens, const std::vector<int>& positions,
                                   const std::vector<int>& block_tables_flat, int max_blocks,
-                                  std::vector<std::vector<float>>& out_logits);
+                                  std::vector<std::vector<float>>& out_logits,
+                                  const std::vector<int>& kv_slots = std::vector<int>());
 
   // Device top-k fast path for the streaming batcher: same forward as decode_step_batched_logits,
   // then a per-row device top-k + gather so only each row's ~k candidates cross to the host (not
@@ -442,14 +457,16 @@ public:
   bool decode_step_batched_topk(const std::vector<int>& tokens, const std::vector<int>& positions,
                                 const std::vector<int>& block_tables_flat, int max_blocks,
                                 const BatchTopkParams& sp,
-                                std::vector<std::vector<detail::SampleCandidate>>& out_cand);
+                                std::vector<std::vector<detail::SampleCandidate>>& out_cand,
+                                const std::vector<int>& kv_slots = std::vector<int>());
 
   // Greedy device argmax over a batched decode step: returns each row's winner id in out_ids
   // (resized to batch) via a device reduction, sanitizing + applying repetition penalty on-device
   // so the winners match the host greedy path. Returns false only if the batch is empty.
   bool decode_step_batched_argmax(const std::vector<int>& tokens, const std::vector<int>& positions,
                                   const std::vector<int>& block_tables_flat, int max_blocks,
-                                  const BatchArgmaxParams& ap, std::vector<int>& out_ids);
+                                  const BatchArgmaxParams& ap, std::vector<int>& out_ids,
+                                  const std::vector<int>& kv_slots = std::vector<int>());
 
   // Parity gate for decode_step_batched: prefill `prompt_tokens`, then for
   // `num_steps` decode steps compare the batched path (N=1 and N=2 duplicate
@@ -526,7 +543,8 @@ private:
   // Shared batched-decode forward (embed -> layers -> final norm); leaves per-row
   // final hidden states in d_x_norm_. Returns batch size.
   int decode_step_batched_forward(const std::vector<int>& tokens, const std::vector<int>& positions,
-                                  const std::vector<int>& block_tables_flat, int max_blocks);
+                                  const std::vector<int>& block_tables_flat, int max_blocks,
+                                  const std::vector<int>& kv_slots);
   // Throws with a clear message if the current model/mode isn't supported by the
   // batched decode path (only plain fp16 full-attention resident is).
   void require_batched_supported() const;

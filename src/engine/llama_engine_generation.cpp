@@ -244,14 +244,32 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
         auto* vq = d_v_cache_i4_ + static_cast<std::size_t>(layer) * token_heads * v_row;
         auto* ks = d_k_scales_ + static_cast<std::size_t>(layer) * token_heads;
         auto* vs = d_v_scales_ + static_cast<std::size_t>(layer) * token_heads;
+        // Slot-resolved fp16 sink/ring bases for this sequence's quality slot
+        // (prefill_kv_slot_; 0 for the single-sequence path). Side-buffer layout
+        // is [layers, slots, n, kv_heads, head_dim].
+        const std::size_t sink_n_elems = static_cast<std::size_t>(kv_quant_sink_) * kv_hidden;
+        const std::size_t ring_n_elems = static_cast<std::size_t>(kv_quant_win_) * kv_hidden;
+        const std::size_t sink_off =
+            (static_cast<std::size_t>(layer) * kv_quality_slots_ + prefill_kv_slot_) *
+            sink_n_elems;
+        const std::size_t ring_off =
+            (static_cast<std::size_t>(layer) * kv_quality_slots_ + prefill_kv_slot_) *
+            ring_n_elems;
+        auto* sink_k = d_kv_sink_k_ ? d_kv_sink_k_ + sink_off : nullptr;
+        auto* sink_v = d_kv_sink_v_ ? d_kv_sink_v_ + sink_off : nullptr;
+        auto* ring_k = d_kv_ring_k_ ? d_kv_ring_k_ + ring_off : nullptr;
+        auto* ring_v = d_kv_ring_v_ ? d_kv_ring_v_ + ring_off : nullptr;
         kernels::launch_store_kv_paged_quant(
             static_cast<const __half*>(d_prefill_k_), static_cast<const __half*>(d_prefill_v_),
             kv_hidden, kq, vq, ks, vs, d_block_table_, base_pos, rows, cfg.num_kv_heads, head_dim,
-            bs, kv_quant_kbits_, kv_quant_vbits_, kv_quant_rot_, compute_stream_);
+            bs, kv_quant_kbits_, kv_quant_vbits_, kv_quant_rot_, compute_stream_, sink_k, sink_v,
+            ring_k, ring_v, kv_quant_sink_, kv_quant_win_);
         kernels::launch_attention_prefill_paged_quant(
             static_cast<const __half*>(d_prefill_q_), kq, vq, ks, vs, d_block_table_,
             static_cast<__half*>(d_att_), rows, base_pos, cfg.num_heads, cfg.num_kv_heads,
-            head_dim, bs, kv_quant_kbits_, kv_quant_vbits_, kv_quant_rot_, compute_stream_);
+            head_dim, bs, kv_quant_kbits_, kv_quant_vbits_, kv_quant_rot_, compute_stream_,
+            static_cast<const __half*>(d_prefill_k_), static_cast<const __half*>(d_prefill_v_),
+            kv_hidden, sink_k, sink_v, kv_quant_sink_);
       } else {
         kernels::launch_store_kv_paged(k_layer, v_layer, static_cast<const __half*>(d_prefill_k_),
                                        static_cast<const __half*>(d_prefill_v_), d_block_table_,

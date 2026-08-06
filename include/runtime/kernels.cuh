@@ -1450,6 +1450,17 @@ void launch_attention_step_quant(const half* q, const int8_t* k_cache, const int
 // quantized cache; rotate_k stores K Hadamard-rotated and the attention
 // launcher rotates Q to match.
 
+// fp16 sink/window quality tier for the paged pool: per-sequence stable
+// quality slots in side buffers [slots, sink_n | win_n, kv_heads, head_dim]
+// (one set per layer; the caller passes layer-resolved bases). The store
+// kernels dual-write (rotated) fp16 K and raw fp16 V for sink positions
+// (< sink_n) and into ring slot position % win_n; the batched decode
+// attention reads those instead of the quantized pool for sink and
+// recent-window tokens. slot_ids is a device array [batch]; the
+// single-sequence prefill store takes slot-resolved pointers directly and
+// only ring-writes each launch's tail win_n positions (residue-race rule).
+// Pass nulls / zeros to disable.
+
 // Scatter + quantize `rows` contiguous KV rows at positions
 // base_pos..base_pos+rows-1 through `block_table`. src_stride is in halves
 // (pass kv_hidden, or the fused-QKV row stride to read K/V in place).
@@ -1457,7 +1468,9 @@ void launch_store_kv_paged_quant(const half* k_src, const half* v_src, int src_s
                                  int8_t* k_pool, int8_t* v_pool, half* k_scales, half* v_scales,
                                  const int* block_table, int base_pos, int rows, int num_kv_heads,
                                  int head_dim, int block_size, int k_bits, int v_bits,
-                                 bool rotate_k, cudaStream_t stream);
+                                 bool rotate_k, cudaStream_t stream, half* k_sink = nullptr,
+                                 half* v_sink = nullptr, half* k_ring = nullptr,
+                                 half* v_ring = nullptr, int sink_n = 0, int win_n = 0);
 
 // Batched decode scatter: one token per sequence via per-sequence block tables
 // and positions (device arrays, [batch] and [batch * max_blocks]).
@@ -1466,17 +1479,26 @@ void launch_store_kv_batched_paged_quant(const half* k_src, const half* v_src, i
                                          const int* block_tables, const int* positions,
                                          int max_blocks, int batch, int num_kv_heads,
                                          int head_dim, int block_size, int k_bits, int v_bits,
-                                         bool rotate_k, cudaStream_t stream);
+                                         bool rotate_k, cudaStream_t stream,
+                                         const int* slot_ids = nullptr, half* k_sink = nullptr,
+                                         half* v_sink = nullptr, half* k_ring = nullptr,
+                                         half* v_ring = nullptr, int sink_n = 0, int win_n = 0);
 
 // Chunked prefill attention over the quantized paged pool (causal, gather via
 // the block table); the quant sibling of launch_attention_prefill_paged.
+// k_src/v_src (the chunk's own fp16 K/V, row stride src_stride halves) and
+// the slot-resolved fp16 sink buffers enable exact reads for this chunk's
+// positions and the sink; pass nulls for pure quantized reads.
 void launch_attention_prefill_paged_quant(const half* q, const int8_t* k_pool,
                                           const int8_t* v_pool, const half* k_scales,
                                           const half* v_scales, const int* block_table,
                                           half* out, int num_tokens, int start_position,
                                           int num_heads, int num_kv_heads, int head_dim,
                                           int block_size, int k_bits, int v_bits, bool rotate_k,
-                                          cudaStream_t stream);
+                                          cudaStream_t stream, const half* k_src = nullptr,
+                                          const half* v_src = nullptr, int src_stride = 0,
+                                          const half* k_sink = nullptr,
+                                          const half* v_sink = nullptr, int sink_n = 0);
 
 // Eligibility for the quantized batched paged attention (GQA-shared tier is
 // the only implementation): head_dim 128, real GQA group, block_size <= 32,
@@ -1492,7 +1514,9 @@ void launch_attention_step_batched_paged_quant(
     const half* v_scales, const int* block_tables, const int* seq_lens, int max_blocks,
     int max_seq_len, half* out, int batch, int num_heads, int num_kv_heads, int head_dim,
     int block_size, int k_bits, int v_bits, bool rotate_k, cudaStream_t stream, float* scratch_m,
-    float* scratch_l, float* scratch_o, int scratch_chunks);
+    float* scratch_l, float* scratch_o, int scratch_chunks, const int* slot_ids = nullptr,
+    const half* k_sink = nullptr, const half* v_sink = nullptr, const half* k_ring = nullptr,
+    const half* v_ring = nullptr, int sink_n = 0, int win_n = 0);
 
 // ── TurboQuant 3-bit (TQ3) kernels ───────────────────────────────────────────
 

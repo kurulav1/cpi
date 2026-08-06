@@ -70,7 +70,8 @@ void LlamaEngine::require_batched_supported() const {
 int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
                                              const std::vector<int>& positions,
                                              const std::vector<int>& block_tables_flat,
-                                             int max_blocks) {
+                                             int max_blocks,
+                                             const std::vector<int>& kv_slots) {
   const auto& cfg = weights_.config();
   const int batch = static_cast<int>(tokens.size());
   if (batch == 0) return 0;
@@ -78,7 +79,21 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
       static_cast<int>(block_tables_flat.size()) != batch * max_blocks) {
     throw std::runtime_error("decode_step_batched: ragged tokens/positions/block_tables");
   }
+  if (!kv_slots.empty() && static_cast<int>(kv_slots.size()) != batch) {
+    throw std::runtime_error("decode_step_batched: kv_slots must be empty or [batch]");
+  }
   require_batched_supported();
+  // Quality-slot ids for the quant sink/window tier: empty means all rows use
+  // slot 0 (single-sequence and duplicate-row check callers). Grow the side
+  // buffers before any kernel touches them; safe here, the previous step's
+  // work was synced before its call returned.
+  const bool kv_quality = kv_int4_enabled_ && (kv_quant_sink_ > 0 || kv_quant_win_ > 0) &&
+                          (d_kv_sink_k_ != nullptr || d_kv_ring_k_ != nullptr);
+  if (kv_quality) {
+    int max_slot = 0;
+    for (int s : kv_slots) max_slot = std::max(max_slot, s);
+    ensure_kv_quality_slots(max_slot + 1);
+  }
 
   const int hidden = cfg.hidden_size;
   const int inter = cfg.intermediate_size;
@@ -118,6 +133,14 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
   CUDA_CHECK(cudaMemcpyAsync(d_batch_block_tables_, block_tables_flat.data(),
                              static_cast<std::size_t>(batch) * max_blocks * sizeof(int),
                              cudaMemcpyHostToDevice, compute_stream_));
+  if (kv_quality) {
+    if (kv_slots.empty()) {
+      CUDA_CHECK(cudaMemsetAsync(d_batch_kv_slots_, 0, batch * sizeof(int), compute_stream_));
+    } else {
+      CUDA_CHECK(cudaMemcpyAsync(d_batch_kv_slots_, kv_slots.data(), batch * sizeof(int),
+                                 cudaMemcpyHostToDevice, compute_stream_));
+    }
+  }
 
   // Split-K scratch for the batched attention: [batch*heads*chunks] stats and
   // [batch*heads*chunks*head_dim] partial outputs. Chunks bounded by max_seq.
@@ -200,16 +223,29 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
       auto* vq = d_v_cache_i4_ + static_cast<std::size_t>(layer) * token_heads * v_row;
       auto* ksc = d_k_scales_ + static_cast<std::size_t>(layer) * token_heads;
       auto* vsc = d_v_scales_ + static_cast<std::size_t>(layer) * token_heads;
+      // Layer bases of the per-slot fp16 sink/ring quality buffers (kernels add
+      // each row's slot offset from d_batch_kv_slots_).
+      const std::size_t sink_lstride = static_cast<std::size_t>(kv_quality_slots_) *
+                                       kv_quant_sink_ * cfg.num_kv_heads * head_dim;
+      const std::size_t ring_lstride = static_cast<std::size_t>(kv_quality_slots_) *
+                                       kv_quant_win_ * cfg.num_kv_heads * head_dim;
+      auto* sink_k = (kv_quality && d_kv_sink_k_) ? d_kv_sink_k_ + layer * sink_lstride : nullptr;
+      auto* sink_v = (kv_quality && d_kv_sink_v_) ? d_kv_sink_v_ + layer * sink_lstride : nullptr;
+      auto* ring_k = (kv_quality && d_kv_ring_k_) ? d_kv_ring_k_ + layer * ring_lstride : nullptr;
+      auto* ring_v = (kv_quality && d_kv_ring_v_) ? d_kv_ring_v_ + layer * ring_lstride : nullptr;
+      const int* slot_ids = kv_quality ? d_batch_kv_slots_ : nullptr;
       kernels::launch_store_kv_batched_paged_quant(
           static_cast<const __half*>(d_prefill_k_), static_cast<const __half*>(d_prefill_v_), kq,
           vq, ksc, vsc, d_batch_block_tables_, d_batch_positions_, max_blocks, batch,
           cfg.num_kv_heads, head_dim, bs, kv_quant_kbits_, kv_quant_vbits_, kv_quant_rot_,
-          compute_stream_);
+          compute_stream_, slot_ids, sink_k, sink_v, ring_k, ring_v, kv_quant_sink_,
+          kv_quant_win_);
       kernels::launch_attention_step_batched_paged_quant(
           static_cast<const __half*>(d_prefill_q_), kq, vq, ksc, vsc, d_batch_block_tables_,
           d_batch_seq_lens_, max_blocks, max_seq, static_cast<__half*>(d_att_), batch,
           cfg.num_heads, cfg.num_kv_heads, head_dim, bs, kv_quant_kbits_, kv_quant_vbits_,
-          kv_quant_rot_, compute_stream_, scratch_m, scratch_l, scratch_o, chunks);
+          kv_quant_rot_, compute_stream_, scratch_m, scratch_l, scratch_o, chunks, slot_ids,
+          sink_k, sink_v, ring_k, ring_v, kv_quant_sink_, kv_quant_win_);
     } else {
       auto* k_pool =
           static_cast<__half*>(d_k_cache_) + static_cast<std::size_t>(layer) * layer_stride;
@@ -283,8 +319,10 @@ void LlamaEngine::batched_lm_head(int batch, int hidden, int vocab) {
 std::vector<int> LlamaEngine::decode_step_batched(const std::vector<int>& tokens,
                                                   const std::vector<int>& positions,
                                                   const std::vector<int>& block_tables_flat,
-                                                  int max_blocks) {
-  const int batch = decode_step_batched_forward(tokens, positions, block_tables_flat, max_blocks);
+                                                  int max_blocks,
+                                                  const std::vector<int>& kv_slots) {
+  const int batch =
+      decode_step_batched_forward(tokens, positions, block_tables_flat, max_blocks, kv_slots);
   if (batch == 0) return {};
   const int hidden = weights_.config().hidden_size;
   const int vocab = weights_.config().vocab_size;
@@ -304,10 +342,12 @@ void LlamaEngine::decode_step_batched_logits(const std::vector<int>& tokens,
                                              const std::vector<int>& positions,
                                              const std::vector<int>& block_tables_flat,
                                              int max_blocks,
-                                             std::vector<std::vector<float>>& out_logits) {
+                                             std::vector<std::vector<float>>& out_logits,
+                                             const std::vector<int>& kv_slots) {
   static const bool prof = std::getenv("CPI_BATCH_PROFILE") != nullptr;
   const auto t0 = std::chrono::steady_clock::now();
-  const int batch = decode_step_batched_forward(tokens, positions, block_tables_flat, max_blocks);
+  const int batch =
+      decode_step_batched_forward(tokens, positions, block_tables_flat, max_blocks, kv_slots);
   // resize (not assign) so rows kept from a previous step retain their vocab-sized capacity;
   // the copy loop below reuses it instead of reallocating every row every step.
   out_logits.resize(static_cast<std::size_t>(batch));
@@ -349,7 +389,8 @@ void LlamaEngine::decode_step_batched_logits(const std::vector<int>& tokens,
 bool LlamaEngine::decode_step_batched_topk(
     const std::vector<int>& tokens, const std::vector<int>& positions,
     const std::vector<int>& block_tables_flat, int max_blocks, const BatchTopkParams& sp,
-    std::vector<std::vector<detail::SampleCandidate>>& out_cand) {
+    std::vector<std::vector<detail::SampleCandidate>>& out_cand,
+    const std::vector<int>& kv_slots) {
   // must match llama_engine_graph.cpp: the shared d_topk_/d_cand_ buffers are sized to these.
   constexpr int kMaxDeviceTopK = 1024;
   constexpr int kCandCapacity = 4096;
@@ -359,7 +400,8 @@ bool LlamaEngine::decode_step_batched_topk(
   for (int kb : sp.k)
     if (kb <= 0 || kb > kMaxDeviceTopK || kb >= vocab) return false;
 
-  const int batch = decode_step_batched_forward(tokens, positions, block_tables_flat, max_blocks);
+  const int batch =
+      decode_step_batched_forward(tokens, positions, block_tables_flat, max_blocks, kv_slots);
   if (static_cast<int>(sp.k.size()) != batch) return false;
   out_cand.resize(static_cast<std::size_t>(batch));
   if (batch == 0) return true;
@@ -539,9 +581,11 @@ bool LlamaEngine::decode_step_batched_argmax(const std::vector<int>& tokens,
                                              const std::vector<int>& positions,
                                              const std::vector<int>& block_tables_flat,
                                              int max_blocks, const BatchArgmaxParams& ap,
-                                             std::vector<int>& out_ids) {
+                                             std::vector<int>& out_ids,
+                                             const std::vector<int>& kv_slots) {
   const int vocab = weights_.config().vocab_size;
-  const int batch = decode_step_batched_forward(tokens, positions, block_tables_flat, max_blocks);
+  const int batch =
+      decode_step_batched_forward(tokens, positions, block_tables_flat, max_blocks, kv_slots);
   out_ids.resize(static_cast<std::size_t>(batch));
   if (batch == 0) return false;
   if (static_cast<int>(ap.penalty.size()) != batch ||
@@ -777,7 +821,7 @@ public:
   explicit BatchAdapter(LlamaEngine* e) : e_(e) {}
 
   void prefill_suffix(const std::vector<int>& prompt_tokens, int shared_tokens,
-                      const std::vector<int>& block_table) override {
+                      const std::vector<int>& block_table, int kv_slot) override {
     // d_block_table_ is shared engine state and a fully-cached prefill runs async on
     // compute_stream_, so this must be settled before returning: a later admit or the decode
     // loop would otherwise clobber it. That is the BatchBackend contract, not an internal
@@ -785,29 +829,38 @@ public:
     e_->block_table_host_ = block_table;
     CUDA_CHECK(cudaMemcpy(e_->d_block_table_, block_table.data(), block_table.size() * sizeof(int),
                           cudaMemcpyHostToDevice));
+    // Route the prefill's paged quant KV stores into this sequence's quality slot
+    // (sink + recent-window fp16 side buffers). Restored to the single-sequence
+    // default before returning, per the "settled on return" contract above.
+    e_->ensure_kv_quality_slots(kv_slot + 1);
+    e_->prefill_kv_slot_ = kv_slot;
     e_->prefill_prompt(prompt_tokens, shared_tokens);
     CUDA_CHECK(cudaStreamSynchronize(e_->compute_stream_));
+    e_->prefill_kv_slot_ = 0;
   }
 
   void decode_batched_logits(const std::vector<int>& tokens, const std::vector<int>& positions,
                              const std::vector<int>& block_tables_flat, int max_blocks,
+                             const std::vector<int>& kv_slots,
                              std::vector<std::vector<float>>& out_logits) override {
-    e_->decode_step_batched_logits(tokens, positions, block_tables_flat, max_blocks, out_logits);
+    e_->decode_step_batched_logits(tokens, positions, block_tables_flat, max_blocks, out_logits,
+                                   kv_slots);
   }
 
   bool decode_batched_topk(const std::vector<int>& tokens, const std::vector<int>& positions,
                            const std::vector<int>& block_tables_flat, int max_blocks,
-                           const BatchTopkParams& sp,
+                           const std::vector<int>& kv_slots, const BatchTopkParams& sp,
                            std::vector<std::vector<detail::SampleCandidate>>& out_cand) override {
     return e_->decode_step_batched_topk(tokens, positions, block_tables_flat, max_blocks, sp,
-                                        out_cand);
+                                        out_cand, kv_slots);
   }
 
   bool decode_batched_argmax(const std::vector<int>& tokens, const std::vector<int>& positions,
                              const std::vector<int>& block_tables_flat, int max_blocks,
-                             const BatchArgmaxParams& ap, std::vector<int>& out_ids) override {
+                             const std::vector<int>& kv_slots, const BatchArgmaxParams& ap,
+                             std::vector<int>& out_ids) override {
     return e_->decode_step_batched_argmax(tokens, positions, block_tables_flat, max_blocks, ap,
-                                          out_ids);
+                                          out_ids, kv_slots);
   }
 
 private:
@@ -824,6 +877,18 @@ BatchScheduler& LlamaEngine::ensure_scheduler() {
     o.max_context = options_.max_context;
     o.eos_token_id = options_.eos_token_id;
     o.verbose = options_.verbose;
+    // The quant sink/window quality tier keeps per-sequence fp16 side buffers that only
+    // this sequence's own prefill + decode write. An adopted shared prefix would leave
+    // holes in them (its positions were prefilled by another sequence into another
+    // slot), so prefix reuse is off under this tier. Backfill-on-adopt is a possible
+    // follow-up.
+    o.disable_prefix_reuse = kv_int4_enabled_ && (kv_quant_sink_ > 0 || kv_quant_win_ > 0);
+    // Pre-size the quality-slot pool for a full batch up front: growing it
+    // mid-serving means GB-scale cudaMallocs in the admission path (measured
+    // as a multi-second stall the first time a batch crossed 32 concurrent
+    // sequences). 64 slots ~= 1.2GB for the 8B; beyond that the on-demand
+    // growth still works, it is just no longer the common case.
+    if (o.disable_prefix_reuse) ensure_kv_quality_slots(64);
     scheduler_ = std::make_unique<BatchScheduler>(batch_adapter_.get(), block_alloc_.get(), o);
   }
   return *scheduler_;
@@ -1010,8 +1075,10 @@ void LlamaEngine::ensure_batch_state_buffers(int batch, int max_blocks) {
   if (batch > batch_buffers_max_seqs_) {
     if (d_batch_positions_) cudaFree(d_batch_positions_);
     if (d_batch_seq_lens_) cudaFree(d_batch_seq_lens_);
+    if (d_batch_kv_slots_) cudaFree(d_batch_kv_slots_);
     CUDA_CHECK(cudaMalloc(&d_batch_positions_, static_cast<std::size_t>(batch) * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_batch_seq_lens_, static_cast<std::size_t>(batch) * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_batch_kv_slots_, static_cast<std::size_t>(batch) * sizeof(int)));
     batch_buffers_max_seqs_ = batch;
   }
   // The block table is batch*max_blocks ints. Both factors vary independently and
@@ -1025,6 +1092,52 @@ void LlamaEngine::ensure_batch_state_buffers(int batch, int max_blocks) {
     batch_buffers_block_table_cap_ = need;
     if (max_blocks > batch_buffers_max_blocks_) batch_buffers_max_blocks_ = max_blocks;
   }
+}
+
+// Grow the fp16 sink/ring quality-slot side buffers to at least `min_slots`
+// per-sequence slots, preserving live slots' contents. Layout is
+// [layers][slots][sink_n | win_n][kv_heads][head_dim], so growth is a per-layer
+// strided copy (old slots block is a prefix of each layer's new region). Only
+// ever called between settled steps (the previous decode/prefill synced before
+// returning), so no in-flight kernel can hold the old pointers.
+void LlamaEngine::ensure_kv_quality_slots(int min_slots) {
+  if (min_slots <= kv_quality_slots_) return;
+  if (!kv_int4_enabled_ || (d_kv_sink_k_ == nullptr && d_kv_ring_k_ == nullptr)) return;
+  const auto& cfg = weights_.config();
+  const int head_dim = attn_head_dim_ > 0 ? attn_head_dim_ : (cfg.hidden_size / cfg.num_heads);
+  const std::size_t kv_hidden =
+      static_cast<std::size_t>(cfg.num_kv_heads) * static_cast<std::size_t>(head_dim);
+  int new_slots = kv_quality_slots_;
+  while (new_slots < min_slots) new_slots *= 2;
+
+  const auto grow = [&](__half*& buf, int n_tokens) {
+    if (buf == nullptr || n_tokens <= 0) return;
+    const std::size_t slot_elems = static_cast<std::size_t>(n_tokens) * kv_hidden;
+    const std::size_t old_layer = static_cast<std::size_t>(kv_quality_slots_) * slot_elems;
+    const std::size_t new_layer = static_cast<std::size_t>(new_slots) * slot_elems;
+    __half* nb = nullptr;
+    CUDA_CHECK(cudaMalloc(&nb, static_cast<std::size_t>(cfg.num_layers) * new_layer *
+                                   sizeof(__half)));
+    // No memset of the new region: reads never touch a slot position the owning
+    // sequence didn't itself write (see the reset_kv_cache note in lifecycle.cpp).
+    for (int l = 0; l < cfg.num_layers; ++l) {
+      CUDA_CHECK(cudaMemcpy(nb + l * new_layer, buf + l * old_layer, old_layer * sizeof(__half),
+                            cudaMemcpyDeviceToDevice));
+    }
+    cudaFree(buf);
+    buf = nb;
+  };
+  grow(d_kv_sink_k_, kv_quant_sink_);
+  grow(d_kv_sink_v_, kv_quant_sink_);
+  grow(d_kv_ring_k_, kv_quant_win_);
+  grow(d_kv_ring_v_, kv_quant_win_);
+  if (options_.verbose) {
+    std::printf("[engine] kv quality slots %d -> %d (%.1f MB)\n", kv_quality_slots_, new_slots,
+                static_cast<double>(cfg.num_layers) * new_slots *
+                    (kv_quant_sink_ + kv_quant_win_) * kv_hidden * 2 * sizeof(__half) /
+                    (1024.0 * 1024.0));
+  }
+  kv_quality_slots_ = new_slots;
 }
 
 }  // namespace engine

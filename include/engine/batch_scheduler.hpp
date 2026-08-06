@@ -98,17 +98,24 @@ public:
   // [0, shared) is already in the pool via adopted (refcounted) blocks, so it must not be
   // recomputed; and must not be assumed contiguous with the suffix.
   //
+  // kv_slot (here and per-row as kv_slots in the decode calls) is the sequence's stable
+  // quality-slot id: assigned by the scheduler at admission, constant for the sequence's
+  // lifetime, and reused only after the sequence retires. Backends with per-sequence side
+  // state keyed off the sequence (CUDA's quant sink/window fp16 buffers) key it here;
+  // backends without simply ignore it.
+  //
   // Must be complete before returning: the scheduler may reuse shared engine state (a block
   // table upload, a scratch buffer) on the very next call.
   virtual void prefill_suffix(const std::vector<int>& prompt_tokens, int shared_tokens,
-                              const std::vector<int>& block_table) = 0;
+                              const std::vector<int>& block_table, int kv_slot) = 0;
 
   // One decode step for N sequences. tokens[b]/positions[b] are sequence b's newest token and
-  // its position; block_tables_flat is [N][max_blocks] row-major. out_logits is resized to N
-  // rows of vocab.
+  // its position; block_tables_flat is [N][max_blocks] row-major; kv_slots[b] is sequence b's
+  // stable quality-slot id (see prefill_suffix). out_logits is resized to N rows of vocab.
   virtual void decode_batched_logits(const std::vector<int>& tokens,
                                      const std::vector<int>& positions,
                                      const std::vector<int>& block_tables_flat, int max_blocks,
+                                     const std::vector<int>& kv_slots,
                                      std::vector<std::vector<float>>& out_logits) = 0;
 
   // Optional fast path: one decode step returning each row's top-k candidate set via a DEVICE
@@ -120,12 +127,13 @@ public:
   virtual bool decode_batched_topk(const std::vector<int>& tokens,
                                    const std::vector<int>& positions,
                                    const std::vector<int>& block_tables_flat, int max_blocks,
-                                   const BatchTopkParams& sp,
+                                   const std::vector<int>& kv_slots, const BatchTopkParams& sp,
                                    std::vector<std::vector<detail::SampleCandidate>>& out_cand) {
     (void)tokens;
     (void)positions;
     (void)block_tables_flat;
     (void)max_blocks;
+    (void)kv_slots;
     (void)sp;
     (void)out_cand;
     return false;
@@ -139,11 +147,13 @@ public:
   virtual bool decode_batched_argmax(const std::vector<int>& tokens,
                                      const std::vector<int>& positions,
                                      const std::vector<int>& block_tables_flat, int max_blocks,
-                                     const BatchArgmaxParams& ap, std::vector<int>& out_ids) {
+                                     const std::vector<int>& kv_slots, const BatchArgmaxParams& ap,
+                                     std::vector<int>& out_ids) {
     (void)tokens;
     (void)positions;
     (void)block_tables_flat;
     (void)max_blocks;
+    (void)kv_slots;
     (void)ap;
     (void)out_ids;
     return false;
@@ -157,6 +167,10 @@ struct BatchSchedulerOptions {
   int max_context = 2048;
   int eos_token_id = -1;
   bool verbose = false;
+  // Skip shared-prefix adoption (and cache insertion). Set by backends whose per-sequence
+  // side state cannot survive adoption: an adopted prefix was prefilled by another sequence,
+  // so this sequence's quality-slot buffers (quant sink/window) would have holes for it.
+  bool disable_prefix_reuse = false;
 };
 
 class BatchScheduler {
@@ -196,6 +210,7 @@ private:
     int pos = 0;
     int last_token = 0;
     int generated = 0;
+    int kv_slot = 0;  // stable quality-slot id (see BatchBackend::prefill_suffix)
     StreamParams params;
   };
 
@@ -210,6 +225,9 @@ private:
   };
 
   void grow_table(StreamSeq& s, int upto_pos);
+  // Stable quality-slot allocation: smallest-free-first so backend side buffers stay dense.
+  int acquire_kv_slot();
+  void release_kv_slot(int slot);
 
   BatchBackend* backend_;
   BlockAllocator* alloc_;
@@ -226,6 +244,8 @@ private:
   std::vector<CachedPrefix> prefix_cache_;
   std::uint64_t prefix_cache_tick_ = 0;
   static constexpr std::size_t kPrefixCacheEntries = 32;
+  std::vector<int> free_kv_slots_;  // released slot ids, reused smallest-first
+  int next_kv_slot_ = 0;            // high-watermark of slots ever handed out
 };
 
 }  // namespace engine

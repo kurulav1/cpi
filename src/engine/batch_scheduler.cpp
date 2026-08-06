@@ -26,6 +26,21 @@ int BatchScheduler::active() const {
   return static_cast<int>(seqs_.size());
 }
 
+int BatchScheduler::acquire_kv_slot() {
+  if (!free_kv_slots_.empty()) {
+    // Smallest-first keeps the backend's per-slot side buffers dense.
+    const auto it = std::min_element(free_kv_slots_.begin(), free_kv_slots_.end());
+    const int slot = *it;
+    free_kv_slots_.erase(it);
+    return slot;
+  }
+  return next_kv_slot_++;
+}
+
+void BatchScheduler::release_kv_slot(int slot) {
+  free_kv_slots_.push_back(slot);
+}
+
 void BatchScheduler::grow_table(StreamSeq& s, int upto_pos) {
   const int bs = opts_.paged_block_size > 0 ? opts_.paged_block_size : 32;
   if (!s.blocks->ensure_position(upto_pos)) {
@@ -68,8 +83,10 @@ void BatchScheduler::admit(const std::string& id, const std::vector<int>& prompt
   // Shared-prefix reuse: adopt the cached prefix's KV blocks for the longest whole-BLOCK
   // common prefix, so only the suffix is prefilled. Capped below the prompt length so the
   // final block is always (re)prefilled to seed decode. Must run before grow_table allocates.
+  // Skipped entirely when the backend's per-sequence side state cannot survive adoption
+  // (opts_.disable_prefix_reuse; see BatchSchedulerOptions).
   int shared_tokens = 0;
-  {
+  if (!opts_.disable_prefix_reuse) {
     const int cap = static_cast<int>(prompt_tokens.size()) - 1;
     CachedPrefix* best = nullptr;
     int best_whole = 0;
@@ -94,16 +111,25 @@ void BatchScheduler::admit(const std::string& id, const std::vector<int>& prompt
 
   grow_table(s, s.pos);
 
+  // Slot assigned only after grow_table can no longer throw (pool exhaustion rejects the
+  // admit before any slot is consumed); released again if the prefill itself throws.
+  s.kv_slot = acquire_kv_slot();
+
   // The backend contract says this is complete on return, so shared engine state (a block
   // table upload, scratch buffers) is free for the next call.
-  backend_->prefill_suffix(prompt_tokens, shared_tokens, s.table);
+  try {
+    backend_->prefill_suffix(prompt_tokens, shared_tokens, s.table, s.kv_slot);
+  } catch (...) {
+    release_kv_slot(s.kv_slot);
+    throw;
+  }
 
   // Refresh the cache with this sequence's block-aligned prefix (a fresh table that refcounts
   // the blocks so they outlive this sequence). If this request exactly extends the entry it
   // reused, update that entry in place so a growing chat stays one slot; otherwise insert and
   // LRU-evict to the cap.
   const int cache_tokens = (static_cast<int>(prompt_tokens.size()) / bs) * bs;
-  if (cache_tokens >= bs) {
+  if (!opts_.disable_prefix_reuse && cache_tokens >= bs) {
     auto next_table = std::make_unique<SequenceBlockTable>(alloc_, bs);
     if (next_table->share_prefix_from(*s.blocks, cache_tokens)) {
       CachedPrefix* slot = nullptr;
@@ -157,6 +183,7 @@ bool BatchScheduler::step(std::vector<StreamEvent>& events) {
       std::fprintf(stderr, "[stream] preempted %s: paged KV pool exhausted (%d running)\n",
                    seqs_[b].id.c_str(), static_cast<int>(seqs_.size()));
       events.push_back(StreamEvent{seqs_[b].id, -1, true, "preempted"});
+      release_kv_slot(seqs_[b].kv_slot);
       seqs_.erase(seqs_.begin() + static_cast<std::ptrdiff_t>(b));
     }
   }
@@ -169,10 +196,12 @@ bool BatchScheduler::step(std::vector<StreamEvent>& events) {
     max_blocks = std::max(max_blocks, static_cast<int>(s.table.size()));
   }
   std::vector<int> toks(static_cast<std::size_t>(B)), poss(static_cast<std::size_t>(B));
+  std::vector<int> slots(static_cast<std::size_t>(B));
   std::vector<int> flat(static_cast<std::size_t>(B) * static_cast<std::size_t>(max_blocks), 0);
   for (int b = 0; b < B; ++b) {
     toks[static_cast<std::size_t>(b)] = seqs_[static_cast<std::size_t>(b)].last_token;
     poss[static_cast<std::size_t>(b)] = seqs_[static_cast<std::size_t>(b)].pos;
+    slots[static_cast<std::size_t>(b)] = seqs_[static_cast<std::size_t>(b)].kv_slot;
     const auto& t = seqs_[static_cast<std::size_t>(b)].table;
     for (std::size_t c = 0; c < t.size(); ++c) {
       flat[static_cast<std::size_t>(b) * static_cast<std::size_t>(max_blocks) + c] = t[c];
@@ -221,7 +250,7 @@ bool BatchScheduler::step(std::vector<StreamEvent>& events) {
     }
     if (eligible) {
       used_topk =
-          backend_->decode_batched_topk(toks, poss, flat, max_blocks, sp, batch_cand_scratch_);
+          backend_->decode_batched_topk(toks, poss, flat, max_blocks, slots, sp, batch_cand_scratch_);
     }
   }
 
@@ -266,7 +295,7 @@ bool BatchScheduler::step(std::vector<StreamEvent>& events) {
     }
     if (eligible) {
       used_argmax =
-          backend_->decode_batched_argmax(toks, poss, flat, max_blocks, ap, batch_argmax_out_);
+          backend_->decode_batched_argmax(toks, poss, flat, max_blocks, slots, ap, batch_argmax_out_);
     }
   }
 
@@ -317,7 +346,7 @@ bool BatchScheduler::step(std::vector<StreamEvent>& events) {
     }
   } else {
     std::vector<std::vector<float>>& logits = batch_logits_scratch_;
-    backend_->decode_batched_logits(toks, poss, flat, max_blocks, logits);
+    backend_->decode_batched_logits(toks, poss, flat, max_blocks, slots, logits);
     for (int b = 0; b < B; ++b) {
       StreamSeq& s = seqs_[static_cast<std::size_t>(b)];
       std::vector<float>& lg = logits[static_cast<std::size_t>(b)];
@@ -336,6 +365,7 @@ bool BatchScheduler::step(std::vector<StreamEvent>& events) {
   // Free finished requests' blocks and remove them (iterate high->low to keep indices valid).
   // RAII on the unique_ptr releases blocks to the pool.
   for (auto it = finished.rbegin(); it != finished.rend(); ++it) {
+    release_kv_slot(seqs_[static_cast<std::size_t>(*it)].kv_slot);
     seqs_.erase(seqs_.begin() + *it);
   }
   return true;
@@ -348,6 +378,7 @@ void BatchScheduler::clear_prefix_cache() {
 bool BatchScheduler::cancel(const std::string& id) {
   for (std::size_t i = 0; i < seqs_.size(); ++i) {
     if (seqs_[i].id == id) {
+      release_kv_slot(seqs_[i].kv_slot);
       seqs_.erase(seqs_.begin() + static_cast<std::ptrdiff_t>(i));
       return true;
     }

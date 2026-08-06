@@ -679,20 +679,13 @@ void LlamaEngine::reset_kv_cache() {
     CUDA_CHECK(cudaMemset(d_v_cache_i4_, 0, v_bytes));
     CUDA_CHECK(cudaMemset(d_k_scales_, 0, sc_bytes));
     CUDA_CHECK(cudaMemset(d_v_scales_, 0, sc_bytes));
-    const std::size_t sink_bytes = static_cast<std::size_t>(cfg.num_layers) *
-                                   static_cast<std::size_t>(kv_quant_sink_) *
-                                   static_cast<std::size_t>(kv_hidden) * sizeof(__half);
-    const std::size_t ring_bytes = static_cast<std::size_t>(cfg.num_layers) *
-                                   static_cast<std::size_t>(kv_quant_win_) *
-                                   static_cast<std::size_t>(kv_hidden) * sizeof(__half);
-    if (d_kv_sink_k_) {
-      CUDA_CHECK(cudaMemset(d_kv_sink_k_, 0, sink_bytes));
-      CUDA_CHECK(cudaMemset(d_kv_sink_v_, 0, sink_bytes));
-    }
-    if (d_kv_ring_k_) {
-      CUDA_CHECK(cudaMemset(d_kv_ring_k_, 0, ring_bytes));
-      CUDA_CHECK(cudaMemset(d_kv_ring_v_, 0, ring_bytes));
-    }
+    // The fp16 sink/ring quality buffers are deliberately NOT cleared: the attention
+    // only ever reads sink positions t < min(sink_n, seq_len) and ring positions
+    // >= seq_len - win_n of the owning sequence's slot, all of which that sequence's
+    // own prefill + decode freshly wrote (prefix adoption is disabled under this
+    // tier). At batched slot counts these buffers are ~GB-scale, and this reset runs
+    // per generation on the single-sequence path -- clearing them was measured at
+    // ~180ms/reset (the B=48/64 batch-bench collapse).
     return;
   }
   if (options_.paged_kv_cache) {
