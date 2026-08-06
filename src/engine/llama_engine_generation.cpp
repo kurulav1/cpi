@@ -46,9 +46,12 @@ void LlamaEngine::prefill_prompt(const std::vector<int>& prompt_tokens, int star
   // fp16 wqkv/wo copies after quantisation) and through fp16 cuBLAS GEMMs
   // otherwise. Streamed layers may not have their projections resident in
   // either form, so quant + streaming falls back to sequential prefill.
+  // Quantized KV can batched-prefill through the paged pool (store + attention
+  // quant kernels); the contiguous quantized cache still prefills sequentially.
+  const bool kv_quant_needs_sequential = kv_int4_enabled_ && !options_.paged_blocks;
   if (options_.paged_kv_cache || prefill_chunk_size_ <= 1 ||
-      (cached_int8_proj_enabled_ && !all_layers_cached) || kv_int4_enabled_ || tq3_enabled_ ||
-      cfg.is_moe() || cfg.uses_non_full_attention()) {
+      (cached_int8_proj_enabled_ && !all_layers_cached) || kv_quant_needs_sequential ||
+      tq3_enabled_ || cfg.is_moe() || cfg.uses_non_full_attention()) {
     prefill_prompt_sequential(prompt_tokens, start_pos);
     return;
   }
@@ -225,13 +228,32 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
       // P3 phase 2d: scatter this chunk's KV into the block pool via the block
       // table, and run paged prefill attention (gather via the same table).
       const int bs = options_.paged_block_size > 0 ? options_.paged_block_size : 32;
-      kernels::launch_store_kv_paged(k_layer, v_layer, static_cast<const __half*>(d_prefill_k_),
-                                     static_cast<const __half*>(d_prefill_v_), d_block_table_,
-                                     base_pos, rows, kv_hidden, bs, compute_stream_);
-      kernels::launch_attention_prefill_paged(static_cast<const __half*>(d_prefill_q_), k_layer,
-                                              v_layer, d_block_table_, static_cast<__half*>(d_att_),
-                                              rows, base_pos, cfg.num_heads, cfg.num_kv_heads,
-                                              head_dim, bs, compute_stream_);
+      if (kv_int4_enabled_) {
+        const std::size_t k_row = static_cast<std::size_t>(head_dim * kv_quant_kbits_ / 8);
+        const std::size_t v_row = static_cast<std::size_t>(head_dim * kv_quant_vbits_ / 8);
+        const std::size_t token_heads = static_cast<std::size_t>(kv_capacity_tokens_) *
+                                        static_cast<std::size_t>(cfg.num_kv_heads);
+        auto* kq = d_k_cache_i4_ + static_cast<std::size_t>(layer) * token_heads * k_row;
+        auto* vq = d_v_cache_i4_ + static_cast<std::size_t>(layer) * token_heads * v_row;
+        auto* ks = d_k_scales_ + static_cast<std::size_t>(layer) * token_heads;
+        auto* vs = d_v_scales_ + static_cast<std::size_t>(layer) * token_heads;
+        kernels::launch_store_kv_paged_quant(
+            static_cast<const __half*>(d_prefill_k_), static_cast<const __half*>(d_prefill_v_),
+            kv_hidden, kq, vq, ks, vs, d_block_table_, base_pos, rows, cfg.num_kv_heads, head_dim,
+            bs, kv_quant_kbits_, kv_quant_vbits_, kv_quant_rot_, compute_stream_);
+        kernels::launch_attention_prefill_paged_quant(
+            static_cast<const __half*>(d_prefill_q_), kq, vq, ks, vs, d_block_table_,
+            static_cast<__half*>(d_att_), rows, base_pos, cfg.num_heads, cfg.num_kv_heads,
+            head_dim, bs, kv_quant_kbits_, kv_quant_vbits_, kv_quant_rot_, compute_stream_);
+      } else {
+        kernels::launch_store_kv_paged(k_layer, v_layer, static_cast<const __half*>(d_prefill_k_),
+                                       static_cast<const __half*>(d_prefill_v_), d_block_table_,
+                                       base_pos, rows, kv_hidden, bs, compute_stream_);
+        kernels::launch_attention_prefill_paged(
+            static_cast<const __half*>(d_prefill_q_), k_layer, v_layer, d_block_table_,
+            static_cast<__half*>(d_att_), rows, base_pos, cfg.num_heads, cfg.num_kv_heads,
+            head_dim, bs, compute_stream_);
+      }
     } else {
       // Store K/V into the cache. On the in-place path these read straight out of the fused QKV
       // buffer (source pitch = the whole QKV row) instead of from the split copies; same bytes,

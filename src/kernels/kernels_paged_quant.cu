@@ -228,6 +228,137 @@ __global__ void attention_step_gqa_batched_paged_quant_kernel(
   }
 }
 
+// Paged prefill attention over the quantized pool: same causal online-softmax
+// structure as attention_prefill_kernel_tiled_paged, with dequantizing K/V
+// reads through the block table and (for the R3 format) an in-place Q
+// rotation to match the rotated K basis. Grid: (num_heads, num_tokens);
+// block: 4 warps.
+template <int WarpsPerBlock, int KBits, int VBits, bool RotK>
+__global__ void attention_prefill_paged_quant_kernel(
+    const half* q, const int8_t* k_pool, const int8_t* v_pool, const half* k_scales,
+    const half* v_scales, const int* __restrict__ block_table, half* out, int num_tokens,
+    int start_position, int num_heads, int num_kv_heads, int head_dim, int block_size) {
+  extern __shared__ unsigned char smem_bytes[];
+  half* q_shared = reinterpret_cast<half*>(smem_bytes);
+  float* score_shared = reinterpret_cast<float*>(q_shared + head_dim);
+  float* alpha_shared = score_shared + WarpsPerBlock;
+  float* beta_shared = alpha_shared + WarpsPerBlock;
+  float* stats_shared = beta_shared + WarpsPerBlock;
+  float* rot_buf = stats_shared + 2;  // [head_dim] (RotK only)
+
+  const int head = blockIdx.x;
+  const int token = blockIdx.y;
+  const int tid = threadIdx.x;
+  const int warp_id = tid / warpSize;
+  const int lane = tid % warpSize;
+  if (token >= num_tokens) return;
+
+  const int hidden = num_heads * head_dim;
+  const int q_base = token * hidden + head * head_dim;
+  const float scale = rsqrtf(static_cast<float>(head_dim));
+  const int kv_heads_safe = (num_kv_heads > 0) ? num_kv_heads : 1;
+  const int group_size = ((num_heads / kv_heads_safe) > 0) ? (num_heads / kv_heads_safe) : 1;
+  const int kv_head =
+      ((head / group_size) < kv_heads_safe) ? (head / group_size) : (kv_heads_safe - 1);
+  const int k_row = head_dim * KBits / 8;
+  const int v_row = head_dim * VBits / 8;
+  const int limit = start_position + token + 1;
+
+  for (int d = tid; d < head_dim; d += blockDim.x) {
+    q_shared[d] = q[q_base + d];
+  }
+  if (tid == 0) {
+    stats_shared[0] = -1.0e30f;
+    stats_shared[1] = 0.0f;
+  }
+  __syncthreads();
+  if (RotK) {
+    for (int d = tid; d < head_dim; d += blockDim.x) rot_buf[d] = __half2float(q_shared[d]);
+    __syncthreads();
+    kvq::fwht_shared(rot_buf, tid, head_dim);
+    const float rn = rsqrtf(static_cast<float>(head_dim));
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+      q_shared[d] = __float2half(rot_buf[d] * rn);
+    }
+    __syncthreads();
+  }
+
+  constexpr int kOutPerThread = (256 + WarpsPerBlock * 32 - 1) / (WarpsPerBlock * 32);
+  float acc[kOutPerThread];
+#pragma unroll
+  for (int j = 0; j < kOutPerThread; ++j) acc[j] = 0.0f;
+  for (int tile_base = 0; tile_base < limit; tile_base += WarpsPerBlock) {
+    const int t = tile_base + warp_id;
+    float score = -1.0e30f;
+    if (warp_id < WarpsPerBlock && t < limit) {
+      const int phys = block_table[t / block_size] * block_size + (t % block_size);
+      const std::size_t sh = static_cast<std::size_t>(phys) * num_kv_heads + kv_head;
+      const float kscale = __half2float(k_scales[sh]);
+      const int8_t* krow = k_pool + sh * k_row;
+      float partial = 0.0f;
+      if (KBits == 4) {
+        for (int i = lane; i < head_dim / 2; i += warpSize) {
+          const int8_t b = krow[i];
+          const float k0 = static_cast<float>(((int)b << 28) >> 28) * kscale;
+          const float k1 = static_cast<float>((int)b >> 4) * kscale;
+          partial += __half2float(q_shared[2 * i]) * k0;
+          partial += __half2float(q_shared[2 * i + 1]) * k1;
+        }
+      } else {
+        for (int i = lane; i < head_dim; i += warpSize) {
+          partial += __half2float(q_shared[i]) * static_cast<float>(krow[i]) * kscale;
+        }
+      }
+      score = pq_warp_sum(partial) * scale;
+    }
+    if (lane == 0 && warp_id < WarpsPerBlock) {
+      score_shared[warp_id] = score;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+      float running_m = stats_shared[0];
+      float running_l = stats_shared[1];
+      const int tile_tokens = min(WarpsPerBlock, limit - tile_base);
+      for (int i = 0; i < tile_tokens; ++i) {
+        const float token_score = score_shared[i];
+        const float new_m = fmaxf(running_m, token_score);
+        const float alpha = (running_l == 0.0f) ? 0.0f : expf(running_m - new_m);
+        const float beta = expf(token_score - new_m);
+        running_l = running_l * alpha + beta;
+        running_m = new_m;
+        alpha_shared[i] = alpha;
+        beta_shared[i] = beta;
+      }
+      stats_shared[0] = running_m;
+      stats_shared[1] = running_l;
+    }
+    __syncthreads();
+
+    int j = 0;
+    for (int d = tid; d < head_dim; d += blockDim.x, ++j) {
+      float acc_local = acc[j];
+      const int tile_tokens = min(WarpsPerBlock, limit - tile_base);
+      for (int i = 0; i < tile_tokens; ++i) {
+        const int tt = tile_base + i;
+        const int phys = block_table[tt / block_size] * block_size + (tt % block_size);
+        const std::size_t sh = static_cast<std::size_t>(phys) * num_kv_heads + kv_head;
+        const float vv =
+            kvq::kv_load<VBits>(v_pool + sh * v_row, d, __half2float(v_scales[sh]));
+        acc_local = acc_local * alpha_shared[i] + beta_shared[i] * vv;
+      }
+      acc[j] = acc_local;
+    }
+    __syncthreads();
+  }
+
+  const float inv_l = 1.0f / fmaxf(stats_shared[1], 1e-8f);
+  int j = 0;
+  for (int d = tid; d < head_dim; d += blockDim.x, ++j) {
+    out[q_base + d] = __float2half(acc[j] * inv_l);
+  }
+}
+
 // Pass-2 reduce across a sequence's chunks (local clone of the fp16 batched
 // reduce; float scratch only, format-independent).
 __global__ void pq_chunk_reduce_batched_kernel(const float* chunk_m, const float* chunk_l,
@@ -330,6 +461,36 @@ void launch_store_kv_batched_paged_quant(const half* k_src, const half* v_src, i
     CPI_PQ_BSTORE(8, 8, false);
   }
 #undef CPI_PQ_BSTORE
+}
+
+void launch_attention_prefill_paged_quant(const half* q, const int8_t* k_pool,
+                                          const int8_t* v_pool, const half* k_scales,
+                                          const half* v_scales, const int* block_table,
+                                          half* out, int num_tokens, int start_position,
+                                          int num_heads, int num_kv_heads, int head_dim,
+                                          int block_size, int k_bits, int v_bits, bool rotate_k,
+                                          cudaStream_t stream) {
+  constexpr int warps = 4;
+  constexpr int threads = warps * 32;
+  const bool rot = rotate_k && head_dim == threads;
+  std::size_t smem = static_cast<std::size_t>(head_dim) * sizeof(half) +
+                     static_cast<std::size_t>(3 * warps + 2) * sizeof(float);
+  if (rot) smem += static_cast<std::size_t>(head_dim) * sizeof(float);
+  const dim3 grid(num_heads, num_tokens);
+#define CPI_PQ_PREFILL(KB, VB, RK)                                                            \
+  attention_prefill_paged_quant_kernel<warps, KB, VB, RK><<<grid, threads, smem, stream>>>(   \
+      q, k_pool, v_pool, k_scales, v_scales, block_table, out, num_tokens, start_position,    \
+      num_heads, num_kv_heads, head_dim, block_size)
+  if (k_bits == 4 && v_bits == 4 && rot) {
+    CPI_PQ_PREFILL(4, 4, true);
+  } else if (k_bits == 4 && v_bits == 4) {
+    CPI_PQ_PREFILL(4, 4, false);
+  } else if (k_bits == 8 && v_bits == 4) {
+    CPI_PQ_PREFILL(8, 4, false);
+  } else {
+    CPI_PQ_PREFILL(8, 8, false);
+  }
+#undef CPI_PQ_PREFILL
 }
 
 bool paged_quant_attention_supported(int num_heads, int num_kv_heads, int head_dim,

@@ -1460,6 +1460,16 @@ void launch_store_kv_batched_paged_quant(const half* k_src, const half* v_src, i
                                          int head_dim, int block_size, int k_bits, int v_bits,
                                          bool rotate_k, cudaStream_t stream);
 
+// Chunked prefill attention over the quantized paged pool (causal, gather via
+// the block table); the quant sibling of launch_attention_prefill_paged.
+void launch_attention_prefill_paged_quant(const half* q, const int8_t* k_pool,
+                                          const int8_t* v_pool, const half* k_scales,
+                                          const half* v_scales, const int* block_table,
+                                          half* out, int num_tokens, int start_position,
+                                          int num_heads, int num_kv_heads, int head_dim,
+                                          int block_size, int k_bits, int v_bits, bool rotate_k,
+                                          cudaStream_t stream);
+
 // Eligibility for the quantized batched paged attention (GQA-shared tier is
 // the only implementation): head_dim 128, real GQA group, block_size <= 32,
 // group_size * 32 >= head_dim (Q rotation needs one thread per element).
