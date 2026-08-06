@@ -133,6 +133,13 @@ function pickRaw(envKey, fileKey) {
 
 const DEFAULT_RUNTIME = Object.freeze({
   port: 3001,
+  // Interface the API binds to. Loopback by default: the admin surface (model
+  // downloads, quant jobs, filesystem pickers) is a local tool, not a service.
+  // Set host to "0.0.0.0" (and an adminToken) to expose it deliberately.
+  host: "127.0.0.1",
+  // Bearer token for the admin endpoints. Empty = admin is loopback-peers-only;
+  // non-empty = required on every admin request (loopback included).
+  adminToken: "",
   template: "tinyllama",
   systemPrompt: "You are a helpful assistant.",
   forceCpu: false,
@@ -1703,6 +1710,8 @@ export function getRuntimeConfig() {
 
   const baseConfig = {
     port: readIntSetting("PORT", "port", DEFAULT_RUNTIME.port, 1, 65535),
+    host: String(pick("CPI_HOST", "host", DEFAULT_RUNTIME.host)).trim() || DEFAULT_RUNTIME.host,
+    adminToken: String(pick("CPI_ADMIN_TOKEN", "adminToken", DEFAULT_RUNTIME.adminToken)).trim(),
     repoRoot,
     webRoot,
     inferBin,

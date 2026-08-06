@@ -5,7 +5,7 @@ import path from "node:path";
 import os from "node:os";
 import { spawn, execFileSync } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash, timingSafeEqual } from "node:crypto";
 
 import { getRuntimeConfig, publicRuntimeSummary, setPreferredModelDir, profileBatchable, isMetalBackend } from "./config.mjs";
 import { createBatchWorker, toBatchArgs } from "./batch_worker.mjs";
@@ -56,15 +56,61 @@ app.get("/metrics", (_req, res) => {
   res.send(obsMetrics.render());
 });
 
-// -- public-demo hardening (only when getRuntimeConfig().demoMode is on) --
-// The admin surface (model downloads, quant jobs, filesystem pickers) is unauthenticated, so
-// demo mode refuses it and rate-limits generation per IP. Generation size is clamped at the
-// handlers, since it is a request field not a route.
-const DEMO_BLOCKED = [
+// -- admin-surface auth --
+// The admin surface can download models to arbitrary dirs, launch quant jobs and
+// walk the host filesystem, so it is never served to a non-local client without
+// auth. Three layers: the server binds loopback by default (config.host); these
+// routes refuse non-loopback TCP peers unless a bearer token is configured and
+// presented; and demo mode (below) refuses them outright. The peer check is on
+// the raw socket address, NOT trust-proxy-derived req.ip: anything that proxies
+// for remote clients (the vite dev server's /api proxy included) makes them look
+// local, which is exactly why a proxied deployment must set adminToken.
+const ADMIN_PATHS = [
   /^\/api\/hub(\/|$)/, // model downloads: arbitrary repo -> arbitrary dir -> full disk
   /^\/api\/quant\/(convert|select|jobs|status)(\/|$)/, // compute-heavy conversions
   /^\/api\/system\// // pick-folder / model-dir: walks the host filesystem
 ];
+function isLoopbackAddress(addr) {
+  if (!addr) return false;
+  const a = addr.startsWith("::ffff:") ? addr.slice(7) : addr;
+  return a === "::1" || a === "127.0.0.1" || a.startsWith("127.");
+}
+function tokenMatches(presented, expected) {
+  // Compare digests so length differences don't shortcut the comparison.
+  const a = createHash("sha256").update(presented).digest();
+  const b = createHash("sha256").update(expected).digest();
+  return timingSafeEqual(a, b);
+}
+app.use((req, res, next) => {
+  if (!ADMIN_PATHS.some((re) => re.test(req.path))) return next();
+  const cfg = getRuntimeConfig();
+  if (cfg.adminToken) {
+    const header = req.get("authorization") || "";
+    const presented = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
+    if (presented && tokenMatches(presented, cfg.adminToken)) return next();
+    return res.status(401).json({ error: "Admin endpoints require Authorization: Bearer <adminToken>." });
+  }
+  // Deny-only forwarded check: a local proxy that appends the real peer (the
+  // vite dev proxy with xfwd on) reveals a remote client behind a loopback
+  // socket. The header can only hurt the sender (a forged loopback entry is
+  // ignored unless the socket itself is loopback AND the last hop says remote),
+  // so it is safe to consult without trust-proxy.
+  const xff = String(req.headers["x-forwarded-for"] || "");
+  const lastHop = xff ? xff.split(",").pop().trim() : "";
+  const remoteViaProxy = lastHop !== "" && lastHop !== "localhost" && !isLoopbackAddress(lastHop);
+  if (isLoopbackAddress(req.socket?.remoteAddress) && !remoteViaProxy) return next();
+  return res.status(403).json({
+    error:
+      "Admin endpoints are limited to localhost. To use them remotely, set adminToken " +
+      "(config.json) or CPI_ADMIN_TOKEN and send Authorization: Bearer <token>."
+  });
+});
+
+// -- public-demo hardening (only when getRuntimeConfig().demoMode is on) --
+// Demo mode refuses the admin surface for everyone (token or not) and
+// rate-limits generation per IP. Generation size is clamped at the handlers,
+// since it is a request field not a route.
+const DEMO_BLOCKED = ADMIN_PATHS;
 // The paths that pin the single GPU. Health/models stay unlimited for frontend polling.
 const DEMO_RATE_PATHS = [
   /^\/api\/chat\/stream$/,
@@ -3911,14 +3957,26 @@ if (fs.existsSync(indexFile)) {
   app.get(/^(?!\/api|\/v1).*/, (_req, res) => res.sendFile(indexFile));
 }
 
-app.listen(runtimeConfig.port, () => {
+app.listen(runtimeConfig.port, runtimeConfig.host, () => {
   const s = publicRuntimeSummary(runtimeConfig);
   const modelInfo = s.selectedProfile
     ? `model=${s.selectedProfile.label} template=${s.selectedProfile.template}`
     : "no model configured";
   console.log(
-    `[cpi] http://localhost:${runtimeConfig.port}  ready=${s.ready}  ${modelInfo}`
+    `[cpi] http://${runtimeConfig.host}:${runtimeConfig.port}  ready=${s.ready}  ${modelInfo}`
   );
+  const hostIsLocal = runtimeConfig.host === "localhost" || isLoopbackAddress(runtimeConfig.host);
+  if (!hostIsLocal) {
+    if (runtimeConfig.adminToken) {
+      console.log("[cpi] non-loopback bind: admin endpoints require the configured bearer token");
+    } else {
+      console.warn(
+        "[cpi] WARNING: bound to a non-loopback interface with no adminToken -- the inference " +
+          "API is reachable from the network; admin endpoints will refuse non-local clients. " +
+          "Set CPI_ADMIN_TOKEN to use them remotely, or bind host=127.0.0.1."
+      );
+    }
+  }
   if (!s.ready) {
     console.log(
       "[cpi] Set modelPath and tokenizerPath in web/config.json (or CPI_MODEL_PATH / CPI_TOKENIZER_PATH)."

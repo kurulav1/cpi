@@ -442,8 +442,17 @@ document at [`docs/openapi.yaml`](docs/openapi.yaml), also served live at
 `GET /openapi.yaml` — point any OpenAPI viewer or client generator at it.
 
 There are two namespaces: **`/api/*`** (CPI-native, error envelope `{ "error": "..." }`) and
-**`/v1/*`** (OpenAI-compatible, so existing OpenAI clients work by changing the base URL). No auth
-or CORS is applied — put it behind your own gateway if you expose it beyond localhost.
+**`/v1/*`** (OpenAI-compatible, so existing OpenAI clients work by changing the base URL).
+
+**Exposure model.** The server binds `127.0.0.1` by default (`host` in `web/config.json` or
+`CPI_HOST`). The admin surface — model hub downloads, quant jobs, and the filesystem pickers —
+additionally refuses any non-localhost client unless you set a bearer token (`adminToken` /
+`CPI_ADMIN_TOKEN`) and send `Authorization: Bearer <token>`; when a token is set it is required
+from localhost too. So exposing the server (`host: 0.0.0.0`, or `npm run dev:lan` for the dev UI)
+shares inference only, never disk access, unless you deliberately configure a token. Inference
+routes carry no auth — put them behind your own gateway if you expose them beyond a trusted
+network. `demoMode` additionally disables the admin surface for everyone and rate-limits
+generation per IP.
 
 | Group | Endpoints |
 | ----- | --------- |

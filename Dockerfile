@@ -59,7 +59,11 @@ COPY web/.env.example ./.env.example
 COPY --from=web-build /app/web/dist ./dist
 COPY --from=engine-build /app/build/cpi /app/bin/cpi
 
+# CPI_HOST=0.0.0.0: inside a container the server must bind all interfaces for
+# the port mapping to reach it; the host's -p flag decides actual exposure. The
+# admin surface still refuses non-localhost clients unless CPI_ADMIN_TOKEN is set.
 ENV PORT=3001 \
+    CPI_HOST=0.0.0.0 \
     CPI_BIN=/app/bin/cpi \
     LLAMA_MODEL_DIRS=/models \
     LLAMA_MODEL_PATH=/models/model.ll2c \

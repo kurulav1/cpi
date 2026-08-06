@@ -29,8 +29,11 @@ export default defineConfig(({ mode }) => {
     server: {
       port: devPort,
       proxy: {
-        "/api": apiOrigin,
-        "/v1": apiOrigin
+        // xfwd appends the real client address so the API's admin-surface
+        // guard can tell remote clients from local ones even though the proxy
+        // itself connects from loopback (matters for `npm run dev:lan`).
+        "/api": { target: apiOrigin, xfwd: true },
+        "/v1": { target: apiOrigin, xfwd: true }
       }
     }
   };
