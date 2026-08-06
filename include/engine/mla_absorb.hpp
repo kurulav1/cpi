@@ -49,6 +49,67 @@ inline void launch_mla_lat_store(const __half* lat, const __half* K, __half* cac
                                               T, position, d_position, max_ctx);
 }
 
+// Latent-only decode front end: replaces kv_b GEMV + assemble + materialized
+// KvStore for a single decode token. Ropes q_pe in place per head and the
+// shared k_pe from the kv_a output, then writes the latent cache row
+// [normed latent | roped k_pe]. Rope arithmetic matches
+// mla_assemble_rope_fast_kernel exactly (interleaved pairs, attn_scaling
+// folded into both roped operands) so the absorbed scores are unchanged.
+// Grid: nh+1 blocks (block h ropes head h's q_pe; block nh handles k_pe and
+// the cache row).
+__global__ inline void mla_rope_q_store_lat_kernel(__half* Q, const __half* ckv,
+                                                   const __half* lat, __half* cache,
+                                                   const float* inv_freq, int nh, int qk_nope,
+                                                   int qk_rope, int qkhd, int kv_lora,
+                                                   int position, const int* d_position,
+                                                   int max_ctx, float attn_scaling) {
+  const int h = blockIdx.x;
+  const int tid = threadIdx.x;
+  if (d_position) position = *d_position;
+  if (position < 0 || position >= max_ctx) return;
+  const int half = qk_rope / 2;
+
+  extern __shared__ float2 cs2[];  // [half] (cos, sin) per rope pair
+  for (int p = tid; p < half; p += blockDim.x) {
+    const float ang = position * inv_freq[p];
+    cs2[p] = make_float2(cosf(ang), sinf(ang));
+  }
+  __syncthreads();
+
+  if (h < nh) {
+    __half* q = Q + static_cast<size_t>(h) * qkhd + qk_nope;
+    for (int p = tid; p < half; p += blockDim.x) {
+      const float2 sc = cs2[p];
+      const float x0 = __half2float(q[2 * p]), x1 = __half2float(q[2 * p + 1]);
+      q[2 * p] = __float2half(attn_scaling * (x0 * sc.x - x1 * sc.y));
+      q[2 * p + 1] = __float2half(attn_scaling * (x0 * sc.y + x1 * sc.x));
+    }
+    return;
+  }
+  // Block nh: latent copy + roped k_pe into the cache row.
+  const int width = kv_lora + qk_rope;
+  __half* row = cache + static_cast<size_t>(position) * width;
+  for (int j = tid; j < kv_lora; j += blockDim.x) row[j] = lat[j];
+  const __half* kpe = ckv + kv_lora;
+  for (int p = tid; p < half; p += blockDim.x) {
+    const float2 sc = cs2[p];
+    const float x0 = __half2float(kpe[2 * p]), x1 = __half2float(kpe[2 * p + 1]);
+    row[kv_lora + 2 * p] = __float2half(attn_scaling * (x0 * sc.x - x1 * sc.y));
+    row[kv_lora + 2 * p + 1] = __float2half(attn_scaling * (x0 * sc.y + x1 * sc.x));
+  }
+}
+
+inline void launch_mla_rope_q_store_lat(__half* Q, const __half* ckv, const __half* lat,
+                                        __half* cache, const float* inv_freq, int nh,
+                                        int qk_nope, int qk_rope, int qkhd, int kv_lora,
+                                        int position, const int* d_position, int max_ctx,
+                                        float attn_scaling, cudaStream_t stream) {
+  const size_t smem = static_cast<size_t>(qk_rope / 2) * sizeof(float2);
+  mla_rope_q_store_lat_kernel<<<nh + 1, 64, smem, stream>>>(
+      Q, ckv, lat, cache, inv_freq, nh, qk_nope, qk_rope, qkhd, kv_lora, position, d_position,
+      max_ctx, attn_scaling);
+}
+
 // Absorbed query: MlaQAbs[i] = [W_UK[i]^T q_nope[i] (kv_lora) | q_pe[i] (qk_rope)].
 // Q rows are [nh][qkhd] with q_pe already roped+scaled in place; w_uk_t is
 // [nh][kv_lora][qk_nope] (output-major so each warp's dot reads a contiguous row).

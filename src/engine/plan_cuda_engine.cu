@@ -1361,7 +1361,17 @@ void PlanCudaEngine::build_deepseek_plan() {
     gemv(Slot::XNorm, Slot::Q, "self_attn.q_proj.weight", nh * qkhd, H);
     gemv(Slot::XNorm, Slot::MlaCkv, "self_attn.kv_a_proj_with_mqa.weight", kva, H);
     rms(Slot::MlaCkv, Slot::MlaLatent, "self_attn.kv_a_layernorm.weight", 1, cfg_.kv_lora_rank);
+    // Latent-only decode: with absorbed attention, decode never reads the
+    // materialized per-head cache (prefill always restarts from position 0, so
+    // no later prefill reads decode-written rows either). kv_b, assemble, and
+    // the materialized store then only need to run in seq mode; a fused
+    // rope-q + store-latent kernel replaces them per decode token. Spec decode
+    // is the one seq path that attends over decode-written materialized rows,
+    // so it keeps the dual-write decode.
+    const bool latent_only = mla_absorb_ && std::getenv("CPI_CUDA_SPEC") == nullptr &&
+                             std::getenv("CPI_DS_NO_LATENT_ONLY") == nullptr;
     gemv(Slot::MlaLatent, Slot::MlaKvb, "self_attn.kv_b_proj.weight", kvb, cfg_.kv_lora_rank);
+    ops.back().decode_skip = latent_only;
     {
       Op o;
       o.kind = OpKind::MlaAssembleRope;
@@ -1373,12 +1383,14 @@ void PlanCudaEngine::build_deepseek_plan() {
       o.in_dim = cfg_.kv_lora_rank;
       o.scale = mla_attn_scaling_;
       o.aux_ptr = d_inv_freq_;
+      o.decode_skip = latent_only;
       ops.push_back(o);
     }
     {
       Op o;
       o.kind = OpKind::KvStore;
       o.cols = kvw;
+      o.decode_skip = latent_only;
       ops.push_back(o);
     }
     if (mla_absorb_) {
@@ -1389,6 +1401,12 @@ void PlanCudaEngine::build_deepseek_plan() {
       o.key_head_dim = cfg_.qk_nope_head_dim;
       o.rotary_dim = cfg_.qk_rope_head_dim;
       o.in_dim = cfg_.kv_lora_rank;
+      if (latent_only) {
+        // Arms the fused decode path: rope q_pe/k_pe here (assemble is skipped)
+        // and write the latent row straight from the kv_a outputs.
+        o.aux_ptr = d_inv_freq_;
+        o.scale = mla_attn_scaling_;
+      }
       ops.push_back(o);
     }
     {
@@ -3096,6 +3114,10 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
       }
     }
 
+    // Ops marked decode_skip run only in sequence mode (absorbed-MLA decode
+    // replaces the materialized attention ops at T==1).
+    if (!seq && op.decode_skip) goto op_done;
+
     // Op-class ablation levers, graph-safe (they change what gets captured). Output is
     // garbage by design; like CPI_CUDA_ABLATE_ATTENTION they price an op class under
     // graph replay, which no profiler can do. Never set outside an experiment.
@@ -3473,11 +3495,20 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
         }
         break;
       case OpKind::MlaLatStore: {
-        // Append [latent | roped k_pe] rows to the latent cache; runs in every
-        // mode (decode single, graph device-pos, seq prefill, spec seq).
-        const int rows = seq ? T : 1;
         const int* dpos =
             (device_pos_mode_ || spec_seq_device_pos_) ? d_position_ : nullptr;
+        if (!seq && op.aux_ptr != nullptr) {
+          // Latent-only decode: assemble was skipped, so rope q_pe/k_pe here
+          // and write the latent row straight from the kv_a outputs.
+          engine::launch_mla_rope_q_store_lat(
+              S(Slot::Q), S(Slot::MlaCkv), S(Slot::MlaLatent), caches_lat_[layer],
+              static_cast<const float*>(op.aux_ptr), op.heads, op.key_head_dim, op.rotary_dim,
+              op.head_dim, op.in_dim, position, dpos, max_ctx_, op.scale, stream_);
+          break;
+        }
+        // Append [latent | roped k_pe] rows to the latent cache (k_pe gathered
+        // from the assembled K); seq prefill, spec seq, and dual-write decode.
+        const int rows = seq ? T : 1;
         engine::launch_mla_lat_store(S(Slot::MlaLatent), S(Slot::K), caches_lat_[layer],
                                      op.in_dim, op.key_head_dim, op.rotary_dim, op.head_dim,
                                      op.heads, rows, position, dpos, max_ctx_, stream_);
@@ -3598,7 +3629,6 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
         break;
       }
       case OpKind::Attention: {
-        if (!seq && op.decode_skip) break;  // absorbed-MLA decode replaces this op
         if (seq && ctx.cached) {
           // text prefill: K/V were appended to this layer's cache by KvStore, so attend
           // over the cache (it also holds any earlier context). Full-attention layers with
