@@ -237,6 +237,18 @@ void launch_attention_tree_masked(const half* q, const half* k_cache, const half
                                   int num_heads, int num_kv_heads, int head_dim, int q_row_stride,
                                   cudaStream_t stream);
 
+// Split-K form of the tree-verify attention (the one-block-per-(row,head) form above is
+// latency-bound at depth): cache chunks go through the guarded fixed-grid stats core at
+// constant per-row length *cache_len, the masked in-batch columns become one virtual
+// chunk at slot ceil(cache_len/chunk_size), and the reduce merges both. scratch_chunks
+// must include the +1 spare slot for the virtual chunk.
+void launch_attention_tree_split(const half* q, const half* k_cache, const half* v_cache,
+                                 const half* k_scratch, const half* v_scratch, half* out,
+                                 const int* cache_len, const unsigned int* anc_mask, int rows,
+                                 int num_heads, int num_kv_heads, int head_dim, float* scratch_m,
+                                 float* scratch_l, float* scratch_o, int chunk_size,
+                                 int scratch_chunks, cudaStream_t stream);
+
 // launch_rmsnorm_add_scale
 //
 // Decode fusion: x = (x + rmsnorm_w(tmp)) * alpha over one row. Replaces the
@@ -324,6 +336,13 @@ void launch_rope_inplace_batched_offsets_device_pos(half* q, half* k, int num_to
 // logits[*index] = -inf (device-read index): chains argmax -> mask -> argmax for
 // device-side top-k extraction with no host sync; graph-capturable.
 void launch_mask_logit(float* logits, const int* index, cudaStream_t stream);
+
+// EAGLE tree scatter: copy accepted verify rows' K/V (indices rows_idx[0..n)) from the
+// per-layer [scr_rows, kv_hidden] scratch into every layer's cache at base..base+n-1.
+void launch_eagle_tree_scatter(const half* k_scr, const half* v_scr, half* k_cache, half* v_cache,
+                               const int* rows_idx, int n, int base, int kv_hidden, int scr_rows,
+                               int num_layers, std::size_t cache_layer_stride,
+                               cudaStream_t stream);
 
 void launch_rope_inplace_batched(half* q, half* k, int num_tokens, int num_heads_q, int num_heads_k,
                                  int head_dim, int start_position, const float* cos_table,

@@ -129,10 +129,11 @@ void LlamaEngine::eagle_tree_verify_forward(int K) {
         static_cast<const __half*>(d_k_cache_) + static_cast<std::size_t>(layer) * layer_stride;
     auto* v_layer =
         static_cast<const __half*>(d_v_cache_) + static_cast<std::size_t>(layer) * layer_stride;
-    kernels::launch_attention_tree_masked(
+    kernels::launch_attention_tree_split(
         static_cast<const __half*>(d_prefill_q_), k_layer, v_layer, k_scr, v_scr,
         static_cast<__half*>(d_att_), d_eagle_pos_, d_eagle_anc_mask_, K, cfg.num_heads,
-        cfg.num_kv_heads, head_dim, q_hidden, s);
+        cfg.num_kv_heads, head_dim, d_eagle_mt_m_, d_eagle_mt_l_, d_eagle_mt_o_, 32,
+        eagle_mt_chunks_, s);
     detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
                                             lt_workspace_bytes_, s, lw->wo, d_att_, d_ff3_, hidden,
                                             q_hidden, K, CUDA_R_16F);
@@ -220,6 +221,7 @@ std::vector<int> LlamaEngine::eagle_tree_generate(const std::vector<int>& prompt
   int heal_tokens[8];
   int heal_feat_rows[8];  // verify row whose feature produced each healed pair
   int cur_feat_row = 0;
+  int scatter_rows[8];    // function-scope: async H2D source must outlive the copy
 
   // Room guard: the round writes draft-cache pairs up to (pos-1)+4 and cache
   // slots up to pos+5 (acc <= 5 plus bonus).
@@ -328,30 +330,20 @@ std::vector<int> LlamaEngine::eagle_tree_generate(const std::vector<int>& prompt
     }
     accepted += acc;
 
-    // Scatter the accepted rows' K/V into the real cache at base..base+acc.
+    // Scatter the accepted rows' K/V into the real cache at base..base+acc
+    // (one launch across all layers).
     {
+      scatter_rows[0] = 0;
+      for (int j = 0; j < acc; ++j) scatter_rows[j + 1] = path[j];
+      CUDA_CHECK(cudaMemcpyAsync(d_eagle_scatter_, scatter_rows,
+                                 static_cast<std::size_t>(acc + 1) * sizeof(int),
+                                 cudaMemcpyHostToDevice, s));
       const std::size_t layer_stride =
           static_cast<std::size_t>(kv_capacity_tokens_) * static_cast<std::size_t>(kv_hidden);
-      const std::size_t scratch_layer =
-          static_cast<std::size_t>(kRows) * static_cast<std::size_t>(kv_hidden);
-      const std::size_t row_bytes = static_cast<std::size_t>(kv_hidden) * sizeof(__half);
-      for (int layer = 0; layer < cfg.num_layers; ++layer) {
-        auto* k_layer =
-            static_cast<__half*>(d_k_cache_) + static_cast<std::size_t>(layer) * layer_stride;
-        auto* v_layer =
-            static_cast<__half*>(d_v_cache_) + static_cast<std::size_t>(layer) * layer_stride;
-        const __half* k_scr = d_eagle_tree_k_ + static_cast<std::size_t>(layer) * scratch_layer;
-        const __half* v_scr = d_eagle_tree_v_ + static_cast<std::size_t>(layer) * scratch_layer;
-        for (int j = 0; j <= acc; ++j) {
-          const int src = (j == 0) ? 0 : path[j - 1];
-          CUDA_CHECK(cudaMemcpyAsync(k_layer + static_cast<std::size_t>(pos + j) * kv_hidden,
-                                     k_scr + static_cast<std::size_t>(src) * kv_hidden, row_bytes,
-                                     cudaMemcpyDeviceToDevice, s));
-          CUDA_CHECK(cudaMemcpyAsync(v_layer + static_cast<std::size_t>(pos + j) * kv_hidden,
-                                     v_scr + static_cast<std::size_t>(src) * kv_hidden, row_bytes,
-                                     cudaMemcpyDeviceToDevice, s));
-        }
-      }
+      kernels::launch_eagle_tree_scatter(
+          d_eagle_tree_k_, d_eagle_tree_v_, static_cast<__half*>(d_k_cache_),
+          static_cast<__half*>(d_v_cache_), d_eagle_scatter_, acc + 1, pos, kv_hidden, kRows,
+          cfg.num_layers, layer_stride, s);
     }
     if (prof) {
       CUDA_CHECK(cudaStreamSynchronize(s));

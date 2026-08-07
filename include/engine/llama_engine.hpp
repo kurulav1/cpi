@@ -757,6 +757,7 @@ private:
   __half* d_eagle_tree_v_ = nullptr;   // [num_layers, rows, kv_hidden] verify V scratch
   int* d_eagle_row_off_ = nullptr;     // [rows] per-row depth (device, constant)
   unsigned int* d_eagle_anc_mask_ = nullptr;  // [rows] ancestor bitmasks (device, constant)
+  int* d_eagle_scatter_ = nullptr;     // [8] accepted-row indices for the KV scatter
   void eagle_tree_verify_forward(int K);
   std::vector<int> eagle_tree_generate(const std::vector<int>& prompt_tokens, int max_new_tokens,
                                        const std::function<bool(int)>& on_token);

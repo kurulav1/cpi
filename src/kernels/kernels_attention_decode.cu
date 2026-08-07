@@ -644,6 +644,130 @@ __global__ void attention_step_chunk_reduce_any_mt_device_pos_kernel(
                                        k_start);
 }
 
+// Tree-verify split-K twins: like the mt twins above, but every row's CACHE
+// length is exactly *position (the committed prefix -- in-batch causality is
+// an ancestor bitmask, not position order), and the in-batch scratch columns
+// form one extra virtual chunk at index ceil(cache_len/chunk_size), merged by
+// the tree reduce below. Restores the split-K parallelism the one-block-per-
+// (row,head) tree kernel gives up (latency-bound at depth -- the decode
+// attention coarsening trap, again).
+template <int WarpsPerBlock>
+__global__ void attention_tree_chunk_stats_kernel(const half* q, const half* k_cache,
+                                                  const half* v_cache, float* chunk_m,
+                                                  float* chunk_l, float* chunk_o,
+                                                  const int* position_ptr, int num_heads,
+                                                  int num_kv_heads, int head_dim, int chunk_size,
+                                                  int scratch_chunks) {
+  const int t = blockIdx.z;
+  const int seq_len = position_ptr[0];
+  const std::size_t scr = static_cast<std::size_t>(t) * num_heads * scratch_chunks;
+  attention_step_chunk_stats_core<WarpsPerBlock>(
+      q + static_cast<std::size_t>(t) * num_heads * head_dim, k_cache, v_cache, chunk_m + scr,
+      chunk_l + scr, chunk_o + scr * head_dim, seq_len, num_heads, num_kv_heads, head_dim,
+      chunk_size, scratch_chunks, /*k_start=*/0);
+}
+
+// One block per (head, row): softmax stats over the <= 32 in-batch scratch
+// columns the row's ancestor bitmask admits, written to the virtual chunk
+// slot after the last cache chunk.
+__global__ void attention_tree_inbatch_stats_kernel(const half* q, const half* k_scratch,
+                                                    const half* v_scratch, float* chunk_m,
+                                                    float* chunk_l, float* chunk_o,
+                                                    const int* position_ptr,
+                                                    const unsigned int* anc_mask, int rows,
+                                                    int num_heads, int num_kv_heads, int head_dim,
+                                                    int chunk_size, int scratch_chunks) {
+  const int head = blockIdx.x;
+  const int row = blockIdx.y;
+  const int tid = threadIdx.x;
+  const int lane = tid % warpSize;
+  const int warp_id = tid / warpSize;
+  const float scale = rsqrtf(static_cast<float>(head_dim));
+  const int kv_heads_safe = (num_kv_heads > 0) ? num_kv_heads : 1;
+  const int group_size = ((num_heads / kv_heads_safe) > 0) ? (num_heads / kv_heads_safe) : 1;
+  const int kv_head =
+      ((head / group_size) < kv_heads_safe) ? (head / group_size) : (kv_heads_safe - 1);
+  const int head_pairs = head_dim / 2;
+  const unsigned int mask = anc_mask[row];
+  const int cache_len = position_ptr[0];
+  const int slot = (cache_len + chunk_size - 1) / chunk_size;
+
+  extern __shared__ float smem[];
+  float* q_shared = smem;                    // [head_dim]
+  float* score_shared = q_shared + head_dim; // [rows]
+
+  for (int d = tid; d < head_dim; d += blockDim.x) {
+    q_shared[d] = __half2float(q[(static_cast<std::size_t>(row) * num_heads + head) * head_dim + d]);
+  }
+  __syncthreads();
+
+  // One warp per admitted column (rows <= 32 so one pass of warps covers all
+  // columns for blockDim >= 32 * ceil(rows/warps) -- loop to be safe).
+  for (int j = warp_id; j < rows; j += blockDim.x / warpSize) {
+    float score = neg_inf<float>();
+    if ((mask >> j) & 1u) {
+      const half2* k2 = reinterpret_cast<const half2*>(
+          k_scratch + (static_cast<std::size_t>(j) * kv_heads_safe + kv_head) * head_dim);
+      float partial = 0.0f;
+      for (int pair = lane; pair < head_pairs; pair += warpSize) {
+        const float2 qv = make_float2(q_shared[2 * pair], q_shared[2 * pair + 1]);
+        const float2 kv = __half22float2(k2[pair]);
+        partial += qv.x * kv.x + qv.y * kv.y;
+      }
+      score = warp_sum(partial) * scale;
+    }
+    if (lane == 0) score_shared[j] = score;
+  }
+  __syncthreads();
+
+  // Serial softmax stats over <= rows entries, then a parallel V combine.
+  float m = neg_inf<float>();
+  for (int j = 0; j < rows; ++j) m = fmaxf(m, score_shared[j]);
+  float l = 0.0f;
+  for (int j = 0; j < rows; ++j) {
+    const float b = ((mask >> j) & 1u) ? expf(score_shared[j] - m) : 0.0f;
+    score_shared[j] = ((mask >> j) & 1u) ? b : 0.0f;
+    l += b;
+  }
+  __syncthreads();
+  const std::size_t scr =
+      (static_cast<std::size_t>(row) * num_heads + head) * static_cast<std::size_t>(scratch_chunks);
+  for (int d = tid; d < head_dim; d += blockDim.x) {
+    float o = 0.0f;
+    for (int j = 0; j < rows; ++j) {
+      if ((mask >> j) & 1u) {
+        o += score_shared[j] *
+             __half2float(v_scratch[(static_cast<std::size_t>(j) * kv_heads_safe + kv_head) *
+                                        head_dim +
+                                    d]);
+      }
+    }
+    chunk_o[(scr + slot) * head_dim + d] = o;
+  }
+  if (tid == 0) {
+    chunk_m[scr + slot] = m;
+    chunk_l[scr + slot] = l;
+  }
+}
+
+__global__ void attention_tree_chunk_reduce_kernel(const float* chunk_m, const float* chunk_l,
+                                                   const float* chunk_o, half* out,
+                                                   const int* position_ptr, int num_heads,
+                                                   int head_dim, int chunk_size,
+                                                   int scratch_chunks) {
+  const int t = blockIdx.y;
+  const int cache_len = position_ptr[0];
+  // Cache chunks plus the in-batch virtual chunk: reduce_any_core iterates
+  // chunk_count = ceil(seq_len/chunk_size), so a synthetic seq_len one chunk
+  // past the cache covers slot ceil(cache_len/chunk_size) exactly.
+  const int seq_len = ((cache_len + chunk_size - 1) / chunk_size + 1) * chunk_size;
+  const std::size_t scr = static_cast<std::size_t>(t) * num_heads * scratch_chunks;
+  attention_step_chunk_reduce_any_core(chunk_m + scr, chunk_l + scr, chunk_o + scr * head_dim,
+                                       out + static_cast<std::size_t>(t) * num_heads * head_dim,
+                                       seq_len, num_heads, head_dim, chunk_size, scratch_chunks,
+                                       /*k_start=*/0);
+}
+
 // Split-K decode pass-1, PAGED (P3 phase 2b): identical math to
 // attention_step_chunk_stats_kernel, but K/V for logical chunk `chunk` live in
 // physical block `block_table[chunk]` of a block pool (block_size == chunk_size).
@@ -2203,6 +2327,35 @@ __global__ void attention_tree_masked_kernel(
   for (int d = tid; d < head_dim; d += blockDim.x, ++j) {
     out[row * q_row_stride + head * head_dim + d] = __float2half(acc[j] * inv_l);
   }
+}
+
+void launch_attention_tree_split(const half* q, const half* k_cache, const half* v_cache,
+                                 const half* k_scratch, const half* v_scratch, half* out,
+                                 const int* cache_len, const unsigned int* anc_mask, int rows,
+                                 int num_heads, int num_kv_heads, int head_dim, float* scratch_m,
+                                 float* scratch_l, float* scratch_o, int chunk_size,
+                                 int scratch_chunks, cudaStream_t stream) {
+  constexpr int warps = 4;
+  constexpr int threads = 256;
+  const std::size_t smem = static_cast<std::size_t>(head_dim) * sizeof(half) +
+                           static_cast<std::size_t>(2 * warps + 4) * sizeof(float) +
+                           static_cast<std::size_t>(warps * head_dim) * sizeof(half);
+  // Cache chunks (fixed grid, per-chunk guards; the virtual in-batch chunk
+  // needs one spare slot, so pass scratch_chunks - 1 as the cache grid).
+  const dim3 grid(num_heads, scratch_chunks - 1, rows);
+  attention_tree_chunk_stats_kernel<warps><<<grid, threads, smem, stream>>>(
+      q, k_cache, v_cache, scratch_m, scratch_l, scratch_o, cache_len, num_heads, num_kv_heads,
+      head_dim, chunk_size, scratch_chunks);
+  const dim3 bgrid(num_heads, rows);
+  const std::size_t bsmem =
+      static_cast<std::size_t>(head_dim) * sizeof(float) + rows * sizeof(float);
+  attention_tree_inbatch_stats_kernel<<<bgrid, 128, bsmem, stream>>>(
+      q, k_scratch, v_scratch, scratch_m, scratch_l, scratch_o, cache_len, anc_mask, rows,
+      num_heads, num_kv_heads, head_dim, chunk_size, scratch_chunks);
+  const dim3 rgrid(num_heads, rows);
+  attention_tree_chunk_reduce_kernel<<<rgrid, threads, 0, stream>>>(
+      scratch_m, scratch_l, scratch_o, out, cache_len, num_heads, head_dim, chunk_size,
+      scratch_chunks);
 }
 
 void launch_attention_tree_masked(const half* q, const half* k_cache, const half* v_cache,

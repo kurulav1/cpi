@@ -123,7 +123,9 @@ bool LlamaEngine::eagle_load() {
   CUDA_CHECK(cudaMalloc(&d_eagle_verdict_, 17 * sizeof(int)));
   // mt split-K verify scratch: fixed max-context chunk grid with per-chunk
   // guards (the graph-capturable attention the plan engine's spec verify uses).
-  eagle_mt_chunks_ = std::max(1, (options_.max_context + 31) / 32);
+  // +1: the tree verify parks its masked in-batch columns in a virtual chunk
+  // slot after the last cache chunk (launch_attention_tree_split).
+  eagle_mt_chunks_ = std::max(1, (options_.max_context + 31) / 32) + 1;
   {
     const std::size_t cells = static_cast<std::size_t>(17) * cfg.num_heads * eagle_mt_chunks_;
     CUDA_CHECK(cudaMalloc(&d_eagle_mt_m_, cells * sizeof(float)));
@@ -142,6 +144,7 @@ bool LlamaEngine::eagle_load() {
     CUDA_CHECK(cudaMalloc(&d_eagle_tree_v_, scratch));
     CUDA_CHECK(cudaMalloc(&d_eagle_row_off_, kRows * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_eagle_anc_mask_, kRows * sizeof(unsigned int)));
+    CUDA_CHECK(cudaMalloc(&d_eagle_scatter_, 8 * sizeof(int)));
   }
   eagle_enabled_ = true;
   if (options_.verbose) {
@@ -186,6 +189,7 @@ void LlamaEngine::eagle_free() {
   freep(d_eagle_tree_v_);
   freep(d_eagle_row_off_);
   freep(d_eagle_anc_mask_);
+  freep(d_eagle_scatter_);
   if (eagle_vgraph_exec_) {
     cudaGraphExecDestroy(eagle_vgraph_exec_);
     eagle_vgraph_exec_ = nullptr;

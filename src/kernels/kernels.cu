@@ -646,6 +646,27 @@ __global__ void mask_logit_kernel(float* logits, const int* __restrict__ index) 
   logits[index[0]] = -3.0e38f;
 }
 
+// EAGLE tree scatter: after the verdict walk, copy the accepted rows' K/V from
+// the per-layer verify scratch into the real cache at base..base+n-1, all
+// layers in one launch (replaces a per-(layer,row) async-memcpy storm).
+__global__ void eagle_tree_scatter_kernel(const half* __restrict__ k_scr,
+                                          const half* __restrict__ v_scr, half* k_cache,
+                                          half* v_cache, const int* __restrict__ rows_idx, int n,
+                                          int base, int kv_hidden, int scr_rows,
+                                          std::size_t cache_layer_stride) {
+  const int layer = blockIdx.x;
+  const int j = blockIdx.y;
+  if (j >= n) return;
+  const std::size_t src =
+      (static_cast<std::size_t>(layer) * scr_rows + rows_idx[j]) * static_cast<std::size_t>(kv_hidden);
+  const std::size_t dst = static_cast<std::size_t>(layer) * cache_layer_stride +
+                          static_cast<std::size_t>(base + j) * static_cast<std::size_t>(kv_hidden);
+  for (int d = threadIdx.x; d < kv_hidden; d += blockDim.x) {
+    k_cache[dst + d] = k_scr[src + d];
+    v_cache[dst + d] = v_scr[src + d];
+  }
+}
+
 // Decode-time attention helpers and kernels.
 // Flatten [time, head, dim] coordinates into the packed KV-cache layout.
 __device__ __forceinline__ int cache_index(int t, int head, int d, int num_heads, int head_dim) {
@@ -1536,6 +1557,16 @@ void launch_rope_inplace_batched_offsets_device_pos(half* q, half* k, int num_to
 
 void launch_mask_logit(float* logits, const int* index, cudaStream_t stream) {
   mask_logit_kernel<<<1, 1, 0, stream>>>(logits, index);
+}
+
+void launch_eagle_tree_scatter(const half* k_scr, const half* v_scr, half* k_cache, half* v_cache,
+                               const int* rows_idx, int n, int base, int kv_hidden, int scr_rows,
+                               int num_layers, std::size_t cache_layer_stride,
+                               cudaStream_t stream) {
+  const dim3 grid(num_layers, n);
+  eagle_tree_scatter_kernel<<<grid, 256, 0, stream>>>(k_scr, v_scr, k_cache, v_cache, rows_idx, n,
+                                                      base, kv_hidden, scr_rows,
+                                                      cache_layer_stride);
 }
 
 void launch_rope_inplace_batched(half* q, half* k, int num_tokens, int num_heads_q, int num_heads_k,
