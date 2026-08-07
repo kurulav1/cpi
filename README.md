@@ -36,7 +36,9 @@ omitted: its int4 weights dequantize past the 32 GB of system RAM (out-of-memory
 CPU prefill is batched (chunked cache-blocked GEMM — weights stream from RAM once per 256-token
 chunk instead of once per token, with an AVX-512 tier behind a runtime CPUID check): ~92 tok/s on
 the 8B and ~1180 tok/s on the 0.5B at a ~640-token prompt, a ~30× win over the old token-by-token
-prefill. Against llama.cpp's CPU backend on the same box and weights, CPI CPU decode is within
+prefill. Against llama.cpp's CPU backend (build `b4aa7dd47`, zen4 kernels, GPU hidden — note
+`-ngl 0` alone is not a CPU benchmark: with a CUDA build present, llama.cpp still runs prompt
+processing on the GPU) on the same box and weights, CPI CPU decode is within
 ~90% (3.15 vs 3.49 tok/s, both bandwidth-bound) and CPU prefill reaches ~50% (llama.cpp's mature
 fp16 GEMM kernels keep the rest); the CPU engine's first job is being the verification oracle,
 and `CPI_CPU_PREFILL_TOKENWISE=1` restores the legacy path (`CPI_CPU_PREFILL_CHUNK` tunes the
@@ -244,7 +246,7 @@ GPU-architecture and driver specific) — build it from source per [Build Modes]
 | CMake | ≥ 3.24 | build system |
 | Python | ≥ 3.10 + pip | model download/conversion (`tools/`) |
 | Node.js | ≥ 18 + npm | web UI + REST API (`web/`) |
-| CUDA Toolkit | ≥ 12 (optional) | GPU acceleration; auto-detected; CPU-only build otherwise |
+| CUDA Toolkit | ≥ 12.5 (optional) | GPU acceleration; auto-detected; CPU-only build otherwise. 12.5 is a hard floor: the MoE grouped-expert path calls `cublasGemmGroupedBatchedEx`, which older toolkits don't have (found the hard way when the Docker image pinned 12.4) |
 
 No CUDA GPU is required: without a CUDA toolkit CMake falls back to a CPU-only
 build automatically (see [Build Modes](#build-modes)). GitHub-hosted CI builds
