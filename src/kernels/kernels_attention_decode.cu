@@ -2057,4 +2057,168 @@ void launch_store_kv_seq_device_pos(const half* k, const half* v, half* k_cache,
                                                                  kv_hidden, max_context);
 }
 
+// Tree-verify attention: K draft-tree rows attend the committed cache
+// [0, *cache_len) plus the in-batch scratch rows their ancestor bitmask admits
+// (bit j of anc_mask[row] = scratch row j visible; a row's own bit is set).
+// Draft siblings share a position, so in-batch K/V cannot go through the
+// sequential cache-store path -- they live in a [rows, kv_hidden] scratch and
+// causality is the mask, not position order. One block per (head, row): with
+// rows x heads blocks (e.g. 11 x 32) the grid fills the GPU without the
+// split-K machinery, and the tiled main loop matches attention_step_kernel's.
+// cache_len is read from the device so the fixed-shape launch is
+// graph-capturable.
+template <int WarpsPerBlock>
+__global__ void attention_tree_masked_kernel(
+    const half* __restrict__ q, const half* __restrict__ k_cache, const half* __restrict__ v_cache,
+    const half* __restrict__ k_scratch, const half* __restrict__ v_scratch, half* __restrict__ out,
+    const int* __restrict__ cache_len_ptr, const unsigned int* __restrict__ anc_mask, int rows,
+    int num_heads, int num_kv_heads, int head_dim, int q_row_stride) {
+  extern __shared__ float smem[];
+  float* q_shared = smem;                              // [head_dim]
+  float* score_shared = q_shared + head_dim;           // [WarpsPerBlock]
+  float* beta_shared = score_shared + WarpsPerBlock;   // [WarpsPerBlock]
+  float* stats_shared = beta_shared + WarpsPerBlock;   // [running_m, running_l, tile_m, tile_l]
+  half* v_tile = reinterpret_cast<half*>(stats_shared + 4);  // [WarpsPerBlock, head_dim]
+
+  const int head = blockIdx.x;
+  const int row = blockIdx.y;
+  const int tid = threadIdx.x;
+  const int warp_id = tid / warpSize;
+  const int lane = tid % warpSize;
+  const float scale = rsqrtf(static_cast<float>(head_dim));
+  const int kv_heads_safe = (num_kv_heads > 0) ? num_kv_heads : 1;
+  const int group_size = ((num_heads / kv_heads_safe) > 0) ? (num_heads / kv_heads_safe) : 1;
+  const int kv_head =
+      ((head / group_size) < kv_heads_safe) ? (head / group_size) : (kv_heads_safe - 1);
+  const int head_pairs = head_dim / 2;
+  const int cache_len = cache_len_ptr[0];
+  const unsigned int mask = anc_mask[row];
+
+  for (int d = tid; d < head_dim; d += blockDim.x) {
+    q_shared[d] = __half2float(q[row * q_row_stride + head * head_dim + d]);
+  }
+  if (tid == 0) {
+    stats_shared[0] = -1.0e30f;  // running_m
+    stats_shared[1] = 0.0f;      // running_l
+  }
+  __syncthreads();
+
+  float acc[2];  // head_dim <= 2 * blockDim elements per thread
+  acc[0] = 0.0f;
+  acc[1] = 0.0f;
+  // total_cols: cache columns then the rows in-batch scratch columns; scratch
+  // column j is dead unless the mask admits it.
+  const int total_cols = cache_len + rows;
+  for (int tile_base = 0; tile_base < total_cols; tile_base += WarpsPerBlock) {
+    const int tile_tokens = min(WarpsPerBlock, total_cols - tile_base);
+
+    // Phase 1a: one warp scores one column of the tile.
+    {
+      const int t = tile_base + warp_id;
+      float score = -1.0e30f;
+      if (warp_id < tile_tokens) {
+        const half* k_src = nullptr;
+        if (t < cache_len) {
+          k_src = k_cache + cache_index(t, kv_head, 0, num_kv_heads, head_dim);
+        } else if ((mask >> (t - cache_len)) & 1u) {
+          k_src = k_scratch + cache_index(t - cache_len, kv_head, 0, num_kv_heads, head_dim);
+        }
+        if (k_src != nullptr) {
+          const half2* k2 = reinterpret_cast<const half2*>(k_src);
+          float partial = 0.0f;
+          for (int pair = lane; pair < head_pairs; pair += warpSize) {
+            const float2 qv = make_float2(q_shared[2 * pair], q_shared[2 * pair + 1]);
+            const float2 kv = __half22float2(k2[pair]);
+            partial += qv.x * kv.x + qv.y * kv.y;
+          }
+          score = warp_sum(partial) * scale;
+        }
+      }
+      if (lane == 0 && warp_id < tile_tokens) {
+        score_shared[warp_id] = score;
+      }
+    }
+
+    // Phase 1b: stage the tile's V rows (masked-out columns stage zeros; their
+    // softmax weight underflows to 0 through the -1e30 score anyway).
+    for (int i = 0; i < tile_tokens; ++i) {
+      const int t = tile_base + i;
+      const half* v_src = nullptr;
+      if (t < cache_len) {
+        v_src = v_cache + cache_index(t, kv_head, 0, num_kv_heads, head_dim);
+      } else if ((mask >> (t - cache_len)) & 1u) {
+        v_src = v_scratch + cache_index(t - cache_len, kv_head, 0, num_kv_heads, head_dim);
+      }
+      for (int d = tid; d < head_dim; d += blockDim.x) {
+        v_tile[i * head_dim + d] = (v_src != nullptr) ? v_src[d] : __float2half(0.0f);
+      }
+    }
+    __syncthreads();
+
+    // Phase 2: tile softmax stats (serial over <= WarpsPerBlock entries).
+    if (tid == 0) {
+      float tile_m = -1.0e30f;
+      for (int i = 0; i < tile_tokens; ++i) {
+        tile_m = fmaxf(tile_m, score_shared[i]);
+      }
+      float tile_l = 0.0f;
+      for (int i = 0; i < tile_tokens; ++i) {
+        const float b = expf(score_shared[i] - tile_m);
+        beta_shared[i] = b;
+        tile_l += b;
+      }
+      stats_shared[2] = tile_m;
+      stats_shared[3] = tile_l;
+    }
+    __syncthreads();
+
+    // Phase 3: merge the tile into the running accumulator.
+    {
+      const float tile_m = stats_shared[2];
+      const float tile_l = stats_shared[3];
+      const float running_m = stats_shared[0];
+      const float running_l = stats_shared[1];
+      const float new_m = fmaxf(running_m, tile_m);
+      const float c_prev = (running_l == 0.0f) ? 0.0f : expf(running_m - new_m);
+      const float c_tile = expf(tile_m - new_m);
+
+      int j = 0;
+      for (int d = tid; d < head_dim; d += blockDim.x, ++j) {
+        float tile_o = 0.0f;
+        for (int i = 0; i < tile_tokens; ++i) {
+          tile_o += beta_shared[i] * __half2float(v_tile[i * head_dim + d]);
+        }
+        acc[j] = acc[j] * c_prev + tile_o * c_tile;
+      }
+      if (tid == 0) {
+        stats_shared[0] = new_m;
+        stats_shared[1] = running_l * c_prev + tile_l * c_tile;
+      }
+    }
+    __syncthreads();
+  }
+
+  const float inv_l = 1.0f / fmaxf(stats_shared[1], 1e-8f);
+  int j = 0;
+  for (int d = tid; d < head_dim; d += blockDim.x, ++j) {
+    out[row * q_row_stride + head * head_dim + d] = __float2half(acc[j] * inv_l);
+  }
+}
+
+void launch_attention_tree_masked(const half* q, const half* k_cache, const half* v_cache,
+                                  const half* k_scratch, const half* v_scratch, half* out,
+                                  const int* cache_len, const unsigned int* anc_mask, int rows,
+                                  int num_heads, int num_kv_heads, int head_dim, int q_row_stride,
+                                  cudaStream_t stream) {
+  constexpr int kWarps = 4;
+  const dim3 grid(num_heads, rows);
+  const int threads = kWarps * 32;
+  const std::size_t smem_bytes = static_cast<std::size_t>(head_dim) * sizeof(float) +
+                                 (2 * kWarps + 4) * sizeof(float) +
+                                 static_cast<std::size_t>(kWarps) * head_dim * sizeof(half);
+  attention_tree_masked_kernel<kWarps><<<grid, threads, smem_bytes, stream>>>(
+      q, k_cache, v_cache, k_scratch, v_scratch, out, cache_len, anc_mask, rows, num_heads,
+      num_kv_heads, head_dim, q_row_stride);
+}
+
 }  // namespace kernels

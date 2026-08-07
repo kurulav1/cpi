@@ -226,6 +226,17 @@ void launch_store_kv_seq_device_pos(const half* k, const half* v, half* k_cache,
                                     const int* position, int kv_hidden, int rows, int max_context,
                                     cudaStream_t stream);
 
+// Tree-verify attention (EAGLE tree rounds): `rows` draft-tree rows attend the committed
+// cache [0, *cache_len) plus in-batch scratch rows admitted by their ancestor bitmask
+// (bit j of anc_mask[row]; a row's own bit is set). Sibling rows share positions, so
+// their K/V live in [rows, kv_hidden] scratch, not the cache; causality is the mask.
+// Fixed shape + device cache_len = graph-capturable. rows <= 32 (bitmask width).
+void launch_attention_tree_masked(const half* q, const half* k_cache, const half* v_cache,
+                                  const half* k_scratch, const half* v_scratch, half* out,
+                                  const int* cache_len, const unsigned int* anc_mask, int rows,
+                                  int num_heads, int num_kv_heads, int head_dim, int q_row_stride,
+                                  cudaStream_t stream);
+
 // launch_rmsnorm_add_scale
 //
 // Decode fusion: x = (x + rmsnorm_w(tmp)) * alpha over one row. Replaces the
@@ -299,6 +310,20 @@ void launch_rope_inplace_batched_strided_device_pos(half* q, half* k, int num_to
                                                     const float* cos_table, const float* sin_table,
                                                     int q_row_stride, int k_row_stride,
                                                     cudaStream_t stream);
+
+// Tree twin: row i is roped at *start_position + row_off[i] (its tree depth; device
+// buffer, constant per static tree shape). Sibling rows share a depth, which the
+// sequential device-pos twin cannot express.
+void launch_rope_inplace_batched_offsets_device_pos(half* q, half* k, int num_tokens,
+                                                    int num_heads_q, int num_heads_k, int head_dim,
+                                                    const int* start_position, const int* row_off,
+                                                    const float* cos_table, const float* sin_table,
+                                                    int q_row_stride, int k_row_stride,
+                                                    cudaStream_t stream);
+
+// logits[*index] = -inf (device-read index): chains argmax -> mask -> argmax for
+// device-side top-k extraction with no host sync; graph-capturable.
+void launch_mask_logit(float* logits, const int* index, cudaStream_t stream);
 
 void launch_rope_inplace_batched(half* q, half* k, int num_tokens, int num_heads_q, int num_heads_k,
                                  int head_dim, int start_position, const float* cos_table,

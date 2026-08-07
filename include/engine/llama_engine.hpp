@@ -745,6 +745,21 @@ private:
   void eagle_verify_forward(int K);   // graph-safe verify body (device pos)
   bool eagle_verify_graphed(const std::vector<int>& batch, int start_pos,
                             std::vector<int>& out_argmax);
+  // ── EAGLE tree drafting (CPI_EAGLE_TREE=1, on top of CPI_EAGLE) ──
+  // Static draft tree instead of a single chain: siblings rescue the round when
+  // the top-1 draft misses (chain tokens/round is capped ~2.2 by the 69/43%
+  // acceptance decay). Sibling verify rows share positions, so their K/V go to
+  // per-layer scratch and attention uses ancestor bitmasks; the accepted path's
+  // rows are scattered into the real cache after the verdict walk.
+  bool eagle_tree_ = false;
+  __half* d_eagle_tree_h_ = nullptr;   // [1 + nodes, hidden] stashed draft hiddens (DFS)
+  __half* d_eagle_tree_k_ = nullptr;   // [num_layers, rows, kv_hidden] verify K scratch
+  __half* d_eagle_tree_v_ = nullptr;   // [num_layers, rows, kv_hidden] verify V scratch
+  int* d_eagle_row_off_ = nullptr;     // [rows] per-row depth (device, constant)
+  unsigned int* d_eagle_anc_mask_ = nullptr;  // [rows] ancestor bitmasks (device, constant)
+  void eagle_tree_verify_forward(int K);
+  std::vector<int> eagle_tree_generate(const std::vector<int>& prompt_tokens, int max_new_tokens,
+                                       const std::function<bool(int)>& on_token);
   bool eagle_tried_ = false;          // lazy one-shot load attempt
   bool eagle_load();                  // returns false (and disables) on any mismatch
   void eagle_free();

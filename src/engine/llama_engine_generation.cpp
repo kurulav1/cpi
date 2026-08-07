@@ -670,7 +670,9 @@ std::vector<int> LlamaEngine::generate_stream(const std::vector<int>& prompt_tok
       eagle_k_ + 1 <= prefill_chunk_size_ && reuse == 0;
   if (eagle_eligible) {
     const auto eagle_decode_start = std::chrono::steady_clock::now();
-    const std::vector<int> gen = eagle_generate(prompt_tokens, max_new_tokens, on_token);
+    const std::vector<int> gen = eagle_tree_
+                                     ? eagle_tree_generate(prompt_tokens, max_new_tokens, on_token)
+                                     : eagle_generate(prompt_tokens, max_new_tokens, on_token);
     out.insert(out.end(), gen.begin(), gen.end());
     CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
     last_benchmark_stats_.decode_ms = std::chrono::duration<double, std::milli>(

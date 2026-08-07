@@ -130,9 +130,23 @@ bool LlamaEngine::eagle_load() {
     CUDA_CHECK(cudaMalloc(&d_eagle_mt_l_, cells * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_eagle_mt_o_, cells * head_dim * sizeof(float)));
   }
+  eagle_tree_ = std::getenv("CPI_EAGLE_TREE") != nullptr;
+  if (eagle_tree_) {
+    // Static tree: 10 nodes, 11 verify rows (see llama_engine_eagle_tree.cpp).
+    constexpr int kRows = 11;
+    CUDA_CHECK(cudaMalloc(&d_eagle_tree_h_,
+                          static_cast<std::size_t>(1 + kRows - 1) * H * sizeof(__half)));
+    const std::size_t scratch =
+        static_cast<std::size_t>(cfg.num_layers) * kRows * kv_hidden * sizeof(__half);
+    CUDA_CHECK(cudaMalloc(&d_eagle_tree_k_, scratch));
+    CUDA_CHECK(cudaMalloc(&d_eagle_tree_v_, scratch));
+    CUDA_CHECK(cudaMalloc(&d_eagle_row_off_, kRows * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_eagle_anc_mask_, kRows * sizeof(unsigned int)));
+  }
   eagle_enabled_ = true;
   if (options_.verbose) {
-    std::cout << "[engine] eagle=on k=" << eagle_k_ << " dir=" << dir << "\n";
+    std::cout << "[engine] eagle=on k=" << eagle_k_ << (eagle_tree_ ? " tree" : " chain")
+              << " dir=" << dir << "\n";
   }
   return true;
 }
@@ -167,6 +181,11 @@ void LlamaEngine::eagle_free() {
   freep(d_eagle_mt_m_);
   freep(d_eagle_mt_l_);
   freep(d_eagle_mt_o_);
+  freep(d_eagle_tree_h_);
+  freep(d_eagle_tree_k_);
+  freep(d_eagle_tree_v_);
+  freep(d_eagle_row_off_);
+  freep(d_eagle_anc_mask_);
   if (eagle_vgraph_exec_) {
     cudaGraphExecDestroy(eagle_vgraph_exec_);
     eagle_vgraph_exec_ = nullptr;
