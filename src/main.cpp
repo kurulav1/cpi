@@ -373,11 +373,15 @@ int main(int argc, char** argv) {
           cli.chat_template = "gemma";
           info_out << "[info] defaulting to --chat-template gemma for the configured Gemma 4 "
                       "safetensors model directory.\n";
-        } else {
+        } else if (safetensors_family == "llama4") {
           cli.chat_template = "llama4";
           info_out << "[info] defaulting to --chat-template llama4 for the configured safetensors "
                       "model directory.\n";
         }
+        // Any other family (e.g. deepseek_v2): no default template. Rendering a
+        // foreign family's chat markup tokenizes as literal text when the
+        // markers are not in the model's token set, which degenerates
+        // generation far worse than plain completion does.
       }
       if (!cli.interactive_mode && cli.stop_texts.empty()) {
         cli.stop_texts = default_stop_texts_for_template(cli.chat_template);

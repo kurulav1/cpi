@@ -397,12 +397,21 @@ void HfBpeTokenizer::load(const std::string& path) {
             // carries both, its real BOS is <bos> (id 2) while <s> (id 204) is
             // an inert leftover, so matching <s> there would prepend the wrong
             // BOS and produce fluent-looking garbage.
-            if (content == "<bos>" || content == "<|begin_of_text|>") {
+            // DeepSeek writes its sentence markers with fullwidth vertical bars
+            // (U+FF5C) and lower-one-eighth blocks (U+2581); spelled here as
+            // escaped UTF-8 so the source stays ASCII.
+            if (content == "<bos>" || content == "<|begin_of_text|>" ||
+                content ==
+                    "<\xEF\xBD\x9C"
+                    "begin\xE2\x96\x81of\xE2\x96\x81sentence\xEF\xBD\x9C>") {
               bos_id_ = id;
             } else if (content == "<s>") {
               if (bos_id_ < 0) bos_id_ = id;
             } else if (content == "<eos>" || content == "<|end_of_text|>" ||
-                       content == "<|eot|>") {
+                       content == "<|eot|>" ||
+                       content ==
+                           "<\xEF\xBD\x9C"
+                           "end\xE2\x96\x81of\xE2\x96\x81sentence\xEF\xBD\x9C>") {
               eos_id_ = id;
             } else if (content == "</s>") {
               if (eos_id_ < 0) eos_id_ = id;
