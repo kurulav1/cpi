@@ -74,6 +74,11 @@ private:
 
   void gemv_fp16(const uint16_t* W, const float* x, float* y, int M, int N);
   void gemv_fp32(const float* W, const float* x, float* y, int M, int N);
+  // Batched projection for prefill: Y[B][M] = X[B][N] * W^T, W row-major fp16.
+  // Cache-blocked so each weight row block is read from DRAM once per call
+  // (not once per token), which is the entire difference between prefill at
+  // decode speed and prefill at compute speed on CPU.
+  void gemm_fp16(const uint16_t* W, const float* X, float* Y, int M, int N, int B);
 
   void rope(float* q, float* k, int pos, int n_heads, int n_kv_heads, int head_dim);
   void attention(int pos, int layer);
@@ -81,6 +86,20 @@ private:
   void mlp(int layer);
   void mlp_moe(int layer);
   void forward_token(int token, int pos);
+  // Final RMSNorm + LM head from the current residual x_ into logits_
+  // (the tail of forward_token, shared with the chunked prefill).
+  void compute_logits_from_x();
+  // Batched prefill: run `count` prompt tokens starting at absolute position
+  // base_pos through all layers (no LM head), leaving the last token's
+  // residual in x_. Full-attention / sliding-window dense fp16 models only;
+  // callers gate on batched_prefill_supported().
+  void forward_prompt_chunk(const int* tokens, int base_pos, int count);
+  bool batched_prefill_supported() const;
+  // Prefill dispatch shared by generate_stream and inspect_next_logits:
+  // chunked when supported (CPI_CPU_PREFILL_TOKENWISE=1 forces the legacy
+  // token-by-token path), token-wise otherwise. Returns the next position and
+  // leaves logits_ primed from the last prompt token.
+  int prefill_prompt(const std::vector<int>& prompt_tokens);
 
   int sample_token(float temperature, int top_k, const std::vector<int>& history,
                    float rep_penalty);
@@ -117,6 +136,17 @@ private:
 
   std::vector<float> k_cache_;
   std::vector<float> v_cache_;
+
+  // Batched-prefill scratch, [chunk][dim] row-major (sized on first use).
+  std::vector<float> xb_;
+  std::vector<float> xnormb_;
+  std::vector<float> qb_;
+  std::vector<float> kb_;
+  std::vector<float> vb_;
+  std::vector<float> attb_;
+  std::vector<float> ff1b_;
+  std::vector<float> ff3b_;
+  std::vector<float> ff2b_;
 
   std::vector<float> rope_cos_;
   std::vector<float> rope_sin_;

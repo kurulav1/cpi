@@ -394,6 +394,105 @@ void CpuLlamaEngine::gemv_fp16(const uint16_t* W, const float* x, float* y, int 
   std::copy(tmp_y.begin(), tmp_y.begin() + M, y);
 }
 
+// gemm_fp16: Y[B][M] = X[B][N] * W^T with W row-major fp16, X/Y row-major fp32.
+//
+// The point of this kernel is weight-traffic amortization, not FLOPs: the
+// per-token GEMV reads the whole weight matrix from DRAM for every token, so
+// prefill runs at decode speed (~bandwidth / model bytes). Here the outer
+// parallel loop hands each thread a 2-row weight block (2 x N fp16 = 16 KB at
+// N=4096, comfortably L1-resident) and the inner loops sweep 4-token tiles of
+// X against it, so each weight row is read from DRAM once per CALL and from
+// L1 thereafter. X (a [chunk x N] fp32 panel, ~512 KB at chunk 32) re-streams
+// from L2 once per row block. Register budget: 8 accumulators + 2 weight + 4
+// input vectors = 14 of 16 ymm.
+//
+// Requires M % 2 == 0 and N % 8 == 0 (the wrapper falls back to per-token
+// GEMV otherwise). B is arbitrary; the token tail runs 1 token at a time.
+static void gemm_fp16_impl(const uint16_t* CPI_RESTRICT W, const float* CPI_RESTRICT X,
+                           float* CPI_RESTRICT Y, int M, int N, int B) {
+#if defined(__AVX2__) && defined(CPU_ENGINE_HAVE_F16C)
+#pragma omp parallel for schedule(dynamic, 8)
+  for (int i = 0; i < M; i += 2) {
+    const uint16_t* r0 = W + static_cast<std::ptrdiff_t>(i + 0) * N;
+    const uint16_t* r1 = W + static_cast<std::ptrdiff_t>(i + 1) * N;
+    int b = 0;
+    for (; b + 4 <= B; b += 4) {
+      const float* x0 = X + static_cast<std::ptrdiff_t>(b + 0) * N;
+      const float* x1 = X + static_cast<std::ptrdiff_t>(b + 1) * N;
+      const float* x2 = X + static_cast<std::ptrdiff_t>(b + 2) * N;
+      const float* x3 = X + static_cast<std::ptrdiff_t>(b + 3) * N;
+      __m256 a00 = _mm256_setzero_ps(), a01 = _mm256_setzero_ps();
+      __m256 a02 = _mm256_setzero_ps(), a03 = _mm256_setzero_ps();
+      __m256 a10 = _mm256_setzero_ps(), a11 = _mm256_setzero_ps();
+      __m256 a12 = _mm256_setzero_ps(), a13 = _mm256_setzero_ps();
+      for (int j = 0; j < N; j += 8) {
+        const __m256 w0 =
+            _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(r0 + j)));
+        const __m256 w1 =
+            _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(r1 + j)));
+        const __m256 v0 = _mm256_loadu_ps(x0 + j);
+        const __m256 v1 = _mm256_loadu_ps(x1 + j);
+        const __m256 v2 = _mm256_loadu_ps(x2 + j);
+        const __m256 v3 = _mm256_loadu_ps(x3 + j);
+        a00 = _mm256_fmadd_ps(w0, v0, a00);
+        a01 = _mm256_fmadd_ps(w0, v1, a01);
+        a02 = _mm256_fmadd_ps(w0, v2, a02);
+        a03 = _mm256_fmadd_ps(w0, v3, a03);
+        a10 = _mm256_fmadd_ps(w1, v0, a10);
+        a11 = _mm256_fmadd_ps(w1, v1, a11);
+        a12 = _mm256_fmadd_ps(w1, v2, a12);
+        a13 = _mm256_fmadd_ps(w1, v3, a13);
+      }
+      Y[static_cast<std::ptrdiff_t>(b + 0) * M + i + 0] = hsum256(a00);
+      Y[static_cast<std::ptrdiff_t>(b + 1) * M + i + 0] = hsum256(a01);
+      Y[static_cast<std::ptrdiff_t>(b + 2) * M + i + 0] = hsum256(a02);
+      Y[static_cast<std::ptrdiff_t>(b + 3) * M + i + 0] = hsum256(a03);
+      Y[static_cast<std::ptrdiff_t>(b + 0) * M + i + 1] = hsum256(a10);
+      Y[static_cast<std::ptrdiff_t>(b + 1) * M + i + 1] = hsum256(a11);
+      Y[static_cast<std::ptrdiff_t>(b + 2) * M + i + 1] = hsum256(a12);
+      Y[static_cast<std::ptrdiff_t>(b + 3) * M + i + 1] = hsum256(a13);
+    }
+    for (; b < B; ++b) {
+      const float* xb = X + static_cast<std::ptrdiff_t>(b) * N;
+      __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+      for (int j = 0; j < N; j += 8) {
+        const __m256 xv = _mm256_loadu_ps(xb + j);
+        a0 = _mm256_fmadd_ps(
+            _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(r0 + j))), xv, a0);
+        a1 = _mm256_fmadd_ps(
+            _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(r1 + j))), xv, a1);
+      }
+      Y[static_cast<std::ptrdiff_t>(b) * M + i + 0] = hsum256(a0);
+      Y[static_cast<std::ptrdiff_t>(b) * M + i + 1] = hsum256(a1);
+    }
+  }
+#else
+  // Portable fallback: per-token scalar rows (no batching win, but correct).
+#pragma omp parallel for schedule(dynamic, 8)
+  for (int i = 0; i < M; ++i) {
+    const uint16_t* row = W + static_cast<std::ptrdiff_t>(i) * N;
+    for (int b = 0; b < B; ++b) {
+      const float* xb = X + static_cast<std::ptrdiff_t>(b) * N;
+      float acc = 0.f;
+      for (int j = 0; j < N; ++j) acc += fp16_to_fp32(row[j]) * xb[j];
+      Y[static_cast<std::ptrdiff_t>(b) * M + i] = acc;
+    }
+  }
+#endif
+}
+
+void CpuLlamaEngine::gemm_fp16(const uint16_t* W, const float* X, float* Y, int M, int N, int B) {
+  if ((M & 1) == 0 && (N & 7) == 0) {
+    gemm_fp16_impl(W, X, Y, M, N, B);
+    return;
+  }
+  // Odd geometry: fall back to the padded per-token GEMV (correctness path).
+  for (int b = 0; b < B; ++b) {
+    gemv_fp16(W, X + static_cast<std::ptrdiff_t>(b) * N,
+              Y + static_cast<std::ptrdiff_t>(b) * M, M, N);
+  }
+}
+
 void CpuLlamaEngine::normalize(const float* x, const uint16_t* w, const uint16_t* b, float* out,
                                int n) {
   const float eps = cfg_.norm_eps > 0.0f ? cfg_.norm_eps : 1e-5f;
@@ -756,6 +855,12 @@ void CpuLlamaEngine::forward_token(int token, int pos) {
   }
 
   // 3. Final RMSNorm + LM head
+  compute_logits_from_x();
+}
+
+void CpuLlamaEngine::compute_logits_from_x() {
+  const int H = cfg_.hidden_size;
+  const int V = cfg_.vocab_size;
   normalize(x_.data(), norm_out_, norm_out_bias_, x_norm_.data(), H);
   gemv_fp16(lm_head_, x_norm_.data(), logits_.data(), V, H);
   if (lm_head_bias_) {
@@ -764,6 +869,213 @@ void CpuLlamaEngine::forward_token(int token, int pos) {
           fp16_to_fp32(lm_head_bias_[static_cast<std::size_t>(i)]);
     }
   }
+}
+
+// Batched prefill eligibility: dense fp16 MLP weights and softmax attention
+// only. MoE routes per token, the fp32-MLP case is the dequantized-int8 load
+// path, and linear-attention layers have no batched CPU implementation; all
+// of those keep the token-by-token path.
+bool CpuLlamaEngine::batched_prefill_supported() const {
+  if (cfg_.is_moe()) return false;
+  for (int l = 0; l < cfg_.num_layers; ++l) {
+    if (cfg_.attention_kind_for_layer(l) == model::AttentionKind::Linear) return false;
+    const auto& lw = layers_[static_cast<std::size_t>(l)];
+    if (lw.w1_fp32 || lw.w2_fp32 || lw.w3_fp32) return false;
+    if (!lw.w1_fp16 || !lw.w2_fp16 || !lw.w3_fp16) return false;
+  }
+  return true;
+}
+
+// Run `count` prompt tokens (absolute positions base_pos..base_pos+count-1)
+// through every layer with batched projections. Same math as forward_token,
+// re-ordered per chunk; causality inside the chunk is enforced by each
+// query's own attention length (the chunk's K/V are all in the cache before
+// the attention loop, and query b only reads up to its own position). Leaves
+// the LAST token's residual in x_ so the caller can prime logits once,
+// instead of paying the [vocab x hidden] LM head for every prompt token the
+// way the token-wise path does.
+void CpuLlamaEngine::forward_prompt_chunk(const int* tokens, int base_pos, int count) {
+  const int H = cfg_.hidden_size;
+  const int I = cfg_.intermediate_size;
+  const int NL = cfg_.num_layers;
+  const int NH = cfg_.num_heads;
+  const int NKV = cfg_.num_kv_heads;
+  const int kv_mul = NH / NKV;
+  const int max_ctx = options_.max_context;
+  const int B = count;
+  const float scale = 1.f / std::sqrt(static_cast<float>(head_dim_));
+
+  xb_.resize(static_cast<std::size_t>(B) * H);
+  xnormb_.resize(static_cast<std::size_t>(B) * H);
+  qb_.resize(static_cast<std::size_t>(B) * q_dim_);
+  kb_.resize(static_cast<std::size_t>(B) * kv_dim_);
+  vb_.resize(static_cast<std::size_t>(B) * kv_dim_);
+  attb_.resize(static_cast<std::size_t>(B) * q_dim_);
+  ff1b_.resize(static_cast<std::size_t>(B) * I);
+  ff3b_.resize(static_cast<std::size_t>(B) * I);
+  ff2b_.resize(static_cast<std::size_t>(B) * H);
+
+  const float emb_scale = cfg_.scale_embeddings ? std::sqrt(static_cast<float>(H)) : 1.0f;
+  for (int b = 0; b < B; ++b) {
+    const uint16_t* emb_row =
+        tok_embeddings_ + static_cast<std::ptrdiff_t>(tokens[b]) * H;
+    float* xr = xb_.data() + static_cast<std::ptrdiff_t>(b) * H;
+    for (int i = 0; i < H; ++i) xr[i] = fp16_to_fp32(emb_row[i]) * emb_scale;
+  }
+
+  const std::ptrdiff_t kv_cache_stride = static_cast<std::ptrdiff_t>(max_ctx) * kv_dim_;
+  for (int l = 0; l < NL; ++l) {
+    const auto& lw = layers_[static_cast<std::size_t>(l)];
+
+    // --- Attention sub-block ---
+#pragma omp parallel for schedule(static)
+    for (int b = 0; b < B; ++b) {
+      normalize(xb_.data() + static_cast<std::ptrdiff_t>(b) * H, lw.norm_att, lw.norm_att_bias,
+                xnormb_.data() + static_cast<std::ptrdiff_t>(b) * H, H);
+    }
+    gemm_fp16(lw.wq, xnormb_.data(), qb_.data(), q_dim_, H, B);
+    gemm_fp16(lw.wk, xnormb_.data(), kb_.data(), kv_dim_, H, B);
+    gemm_fp16(lw.wv, xnormb_.data(), vb_.data(), kv_dim_, H, B);
+
+#pragma omp parallel for schedule(static)
+    for (int b = 0; b < B; ++b) {
+      float* qr = qb_.data() + static_cast<std::ptrdiff_t>(b) * q_dim_;
+      float* kr = kb_.data() + static_cast<std::ptrdiff_t>(b) * kv_dim_;
+      float* vr = vb_.data() + static_cast<std::ptrdiff_t>(b) * kv_dim_;
+      if (lw.bqkv) {
+        for (int i = 0; i < q_dim_; ++i) qr[i] += fp16_to_fp32(lw.bqkv[i]);
+        for (int i = 0; i < kv_dim_; ++i) {
+          kr[i] += fp16_to_fp32(lw.bqkv[q_dim_ + i]);
+          vr[i] += fp16_to_fp32(lw.bqkv[q_dim_ + kv_dim_ + i]);
+        }
+      }
+      if (lw.q_norm) qk_norm_heads(qr, lw.q_norm, NH, head_dim_);
+      if (lw.k_norm) qk_norm_heads(kr, lw.k_norm, NKV, head_dim_);
+      rope(qr, kr, base_pos + b, NH, NKV, head_dim_);
+      // Store this token's K/V before the batched attention below.
+      float* kc = k_cache_.data() + static_cast<std::ptrdiff_t>(l) * kv_cache_stride +
+                  static_cast<std::ptrdiff_t>(base_pos + b) * kv_dim_;
+      float* vc = v_cache_.data() + static_cast<std::ptrdiff_t>(l) * kv_cache_stride +
+                  static_cast<std::ptrdiff_t>(base_pos + b) * kv_dim_;
+      std::copy(kr, kr + kv_dim_, kc);
+      std::copy(vr, vr + kv_dim_, vc);
+    }
+
+    // Causal (window-aware) attention over all (token, head) pairs; matches
+    // attention()'s per-query semantics exactly.
+    const int window = cfg_.attention_window_for_layer(l);
+    const float* kbase = k_cache_.data() + static_cast<std::ptrdiff_t>(l) * kv_cache_stride;
+    const float* vbase = v_cache_.data() + static_cast<std::ptrdiff_t>(l) * kv_cache_stride;
+#pragma omp parallel for schedule(dynamic, 2)
+    for (int bh = 0; bh < B * NH; ++bh) {
+      const int b = bh / NH;
+      const int h = bh - b * NH;
+      const int h_kv = h / kv_mul;
+      const int full_seq_len = base_pos + b + 1;
+      const int attn_seq_len = (window > 0) ? std::min(window, full_seq_len) : full_seq_len;
+      const int attn_start = full_seq_len - attn_seq_len;
+      const float* q_h =
+          qb_.data() + static_cast<std::ptrdiff_t>(b) * q_dim_ +
+          static_cast<std::ptrdiff_t>(h) * head_dim_;
+
+      thread_local std::vector<float> sc;
+      sc.resize(static_cast<std::size_t>(attn_seq_len));
+      for (int t = 0; t < attn_seq_len; ++t) {
+        const float* k_t = kbase + static_cast<std::ptrdiff_t>(attn_start + t) * kv_dim_ +
+                           static_cast<std::ptrdiff_t>(h_kv) * head_dim_;
+        float dot = 0.f;
+        for (int d = 0; d < head_dim_; ++d) dot += q_h[d] * k_t[d];
+        sc[static_cast<std::size_t>(t)] = dot * scale;
+      }
+      float max_s = sc[0];
+      for (int t = 1; t < attn_seq_len; ++t) max_s = std::max(max_s, sc[static_cast<std::size_t>(t)]);
+      float sum_exp = 0.f;
+      for (int t = 0; t < attn_seq_len; ++t) {
+        sc[static_cast<std::size_t>(t)] = std::exp(sc[static_cast<std::size_t>(t)] - max_s);
+        sum_exp += sc[static_cast<std::size_t>(t)];
+      }
+      const float inv_sum = 1.f / sum_exp;
+      float* out_h = attb_.data() + static_cast<std::ptrdiff_t>(b) * q_dim_ +
+                     static_cast<std::ptrdiff_t>(h) * head_dim_;
+      std::fill(out_h, out_h + head_dim_, 0.f);
+      for (int t = 0; t < attn_seq_len; ++t) {
+        const float* v_t = vbase + static_cast<std::ptrdiff_t>(attn_start + t) * kv_dim_ +
+                           static_cast<std::ptrdiff_t>(h_kv) * head_dim_;
+        const float alpha = sc[static_cast<std::size_t>(t)] * inv_sum;
+        for (int d = 0; d < head_dim_; ++d) out_h[d] += alpha * v_t[d];
+      }
+    }
+
+    gemm_fp16(lw.wo, attb_.data(), ff2b_.data(), H, q_dim_, B);
+#pragma omp parallel for schedule(static)
+    for (int b = 0; b < B; ++b) {
+      float* xr = xb_.data() + static_cast<std::ptrdiff_t>(b) * H;
+      const float* fr = ff2b_.data() + static_cast<std::ptrdiff_t>(b) * H;
+      if (lw.bo) {
+        for (int i = 0; i < H; ++i) xr[i] += fr[i] + fp16_to_fp32(lw.bo[i]);
+      } else {
+        for (int i = 0; i < H; ++i) xr[i] += fr[i];
+      }
+    }
+
+    // --- FFN sub-block (dense SwiGLU/GeGLU; MoE is gated out by the caller) ---
+#pragma omp parallel for schedule(static)
+    for (int b = 0; b < B; ++b) {
+      normalize(xb_.data() + static_cast<std::ptrdiff_t>(b) * H, lw.norm_ffn, lw.norm_ffn_bias,
+                xnormb_.data() + static_cast<std::ptrdiff_t>(b) * H, H);
+    }
+    gemm_fp16(lw.w1_fp16, xnormb_.data(), ff1b_.data(), I, H, B);
+    gemm_fp16(lw.w3_fp16, xnormb_.data(), ff3b_.data(), I, H, B);
+    // The gated activation is ~half a million exp() calls per layer at chunk
+    // 32; serial it was a measurable Amdahl slice of the whole prefill.
+    const std::ptrdiff_t act_n = static_cast<std::ptrdiff_t>(B) * I;
+    if (cfg_.mlp_gelu) {
+#pragma omp parallel for schedule(static)
+      for (std::ptrdiff_t i = 0; i < act_n; ++i) {
+        const float g = ff1b_[static_cast<std::size_t>(i)];
+        const float inner = 0.7978845608028654f * (g + 0.044715f * g * g * g);
+        ff1b_[static_cast<std::size_t>(i)] =
+            (g / (1.f + std::exp(-2.f * inner))) * ff3b_[static_cast<std::size_t>(i)];
+      }
+    } else {
+#pragma omp parallel for schedule(static)
+      for (std::ptrdiff_t i = 0; i < act_n; ++i) {
+        const float g = ff1b_[static_cast<std::size_t>(i)];
+        ff1b_[static_cast<std::size_t>(i)] =
+            (g / (1.f + std::exp(-g))) * ff3b_[static_cast<std::size_t>(i)];
+      }
+    }
+    gemm_fp16(lw.w2_fp16, ff1b_.data(), ff2b_.data(), H, I, B);
+    const std::ptrdiff_t res_n = static_cast<std::ptrdiff_t>(B) * H;
+#pragma omp parallel for schedule(static)
+    for (std::ptrdiff_t i = 0; i < res_n; ++i) {
+      xb_[static_cast<std::size_t>(i)] += ff2b_[static_cast<std::size_t>(i)];
+    }
+  }
+
+  // Hand the last token's residual to the single-token machinery (LM head,
+  // decode continuation).
+  const float* last = xb_.data() + static_cast<std::ptrdiff_t>(B - 1) * H;
+  std::copy(last, last + H, x_.begin());
+}
+
+int CpuLlamaEngine::prefill_prompt(const std::vector<int>& prompt_tokens) {
+  const int max_ctx = options_.max_context;
+  const int n = std::min<int>(static_cast<int>(prompt_tokens.size()), max_ctx);
+  static const bool force_tokenwise = std::getenv("CPI_CPU_PREFILL_TOKENWISE") != nullptr;
+  if (n > 1 && !force_tokenwise && batched_prefill_supported()) {
+    constexpr int kChunk = 32;  // X panel ~512 KB at hidden 4096: L2-resident
+    for (int i = 0; i < n; i += kChunk) {
+      const int c = std::min(kChunk, n - i);
+      forward_prompt_chunk(prompt_tokens.data() + i, i, c);
+    }
+    compute_logits_from_x();
+    return n;
+  }
+  for (int i = 0; i < n; ++i) {
+    forward_token(prompt_tokens[static_cast<std::size_t>(i)], i);
+  }
+  return n;
 }
 
 // Temperature + top-k sampling with repetition penalty.
@@ -1155,11 +1467,7 @@ std::vector<int> CpuLlamaEngine::generate_stream(const std::vector<int>& prompt_
     forward_token(1 /*BOS*/, 0);
     pos = 1;
   } else {
-    for (int i = 0; i < static_cast<int>(prompt_tokens.size()); ++i) {
-      if (i >= max_ctx) break;
-      forward_token(prompt_tokens[static_cast<std::size_t>(i)], i);
-      pos = i + 1;
-    }
+    pos = prefill_prompt(prompt_tokens);
   }
   const auto prefill_end = std::chrono::steady_clock::now();
   last_benchmark_stats_.prefill_ms =
@@ -1199,10 +1507,7 @@ std::vector<int> CpuLlamaEngine::generate_stream(const std::vector<int>& prompt_
 // ============================================================
 std::vector<std::pair<int, float>> CpuLlamaEngine::inspect_next_logits(
     const std::vector<int>& prompt_tokens, int top_k) {
-  for (int i = 0; i < static_cast<int>(prompt_tokens.size()); ++i) {
-    if (i >= options_.max_context) break;
-    forward_token(prompt_tokens[static_cast<std::size_t>(i)], i);
-  }
+  prefill_prompt(prompt_tokens);
 
   const int V = cfg_.vocab_size;
   const int k = std::min(top_k, V);

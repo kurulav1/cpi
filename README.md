@@ -33,6 +33,13 @@ Peak VRAM is total GPU memory during the run (includes ~1 GB desktop compositor)
 omitted: its int4 weights dequantize past the 32 GB of system RAM (out-of-memory). See
 [docs/benchmarks.md](docs/benchmarks.md) for methodology and the full context × quant sweep.
 
+CPU prefill is batched (chunked cache-blocked GEMM, so weights stream from RAM once per 32-token
+chunk instead of once per token): ~41 tok/s on the 8B and ~700 tok/s on the 0.5B, a ~13× win over
+the old token-by-token prefill. Against llama.cpp's CPU backend on the same box and weights, CPI
+CPU decode is within ~90% (3.15 vs 3.49 tok/s, both bandwidth-bound) and CPU prefill reaches
+~20–25% (llama.cpp's mature AVX-512 fp16 GEMMs keep the rest); the CPU engine's first job is
+being the verification oracle, and `CPI_CPU_PREFILL_TOKENWISE=1` restores the legacy path.
+
 ### vs llama.cpp
 
 Same fp16 weights on both sides (llama.cpp gets a GGUF converted from the identical checkpoint),
