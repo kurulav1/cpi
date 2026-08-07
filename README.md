@@ -507,7 +507,12 @@ shares inference only, never disk access, unless you deliberately configure a to
 In **Docker** this bites by design: the image sets `CPI_HOST=0.0.0.0` (the port mapping needs it),
 and even your own browser on the host reaches the container through the docker bridge — a
 non-loopback peer — so the hub/quant/picker UI returns 403 until you set `CPI_ADMIN_TOKEN`
-(the `start_docker` scripts pass it through if exported). Inference works without it.
+(the `start_docker` scripts pass it through if exported). Inference works without it. All of this
+is verified by running the container: health open, admin 403 bare / 401 wrong-token / 200 with
+the token, and OpenAI-compatible chat served end-to-end. The same image runs CPU-only on hosts
+without a GPU (automatic fallback — but note Docker Desktop's WSL2 backend injects the GPU even
+without `--gpus`; force CPU with `-e CUDA_VISIBLE_DEVICES=-1`, and set `OMP_NUM_THREADS` to the
+physical core count, since SMT oversubscription under WSL2 measured 2.4× slower).
 
 By default inference routes carry no auth (`authScope: "admin"`), so a non-loopback bind still
 exposes unauthenticated compute. Set `authScope: "all"` (`CPI_AUTH_SCOPE=all`) to require the

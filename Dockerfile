@@ -32,10 +32,12 @@ COPY src ./src
 # The build host has no GPU, so the CMakeLists default of CMAKE_CUDA_ARCHITECTURES=native
 # can't probe a device and falls back to a low arch lacking __dp4a (needs sm_61+). Pin a
 # real arch list (Turing..Hopper) plus 90-virtual PTX for forward-compat on newer GPUs.
-# Newer-than-Hopper GPUs (e.g. sm_120 Blackwell) run via the 90-virtual PTX, which means
-# the driver JIT-compiles the whole engine on first launch -- several minutes, and --rm
-# containers lose the JIT cache every run. To serve such GPUs routinely, bump the base
-# images to a CUDA that can target them (12.8+ for Blackwell) and add the -real arch here.
+# Newer-than-Hopper GPUs (e.g. sm_120 Blackwell) run via the 90-virtual PTX: the driver
+# JIT-compiles kernels lazily on first launch (measured ~13 s folded into the first
+# forward for a 0.5B on an RTX 5090; larger models touch more kernels), and --rm
+# containers discard the JIT cache every run. To serve such GPUs without the first-run
+# cost, bump the base images to a CUDA that can target them (12.8+ for Blackwell) and
+# add the -real arch here.
 ARG CUDA_ARCHS="75-real;80-real;86-real;89-real;90-real;90-virtual"
 RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
@@ -66,6 +68,14 @@ COPY --from=engine-build /app/build/cpi /app/bin/cpi
 # CPI_HOST=0.0.0.0: inside a container the server must bind all interfaces for
 # the port mapping to reach it; the host's -p flag decides actual exposure. The
 # admin surface still refuses non-localhost clients unless CPI_ADMIN_TOKEN is set.
+#
+# CPU-in-container notes (verified by running, Docker Desktop / WSL2):
+# - Without a GPU the engine falls back to the CPU path automatically; no
+#   separate CPU image. Docker Desktop's WSL2 backend hands the GPU to
+#   containers even WITHOUT --gpus; force CPU with -e CUDA_VISIBLE_DEVICES=-1.
+# - Set OMP_NUM_THREADS to the host's PHYSICAL core count for CPU inference:
+#   the default (all logical CPUs) oversubscribes SMT under the WSL2 scheduler
+#   and measured 2.4x slower on both prefill and decode.
 ENV PORT=3001 \
     CPI_HOST=0.0.0.0 \
     CPI_BIN=/app/bin/cpi \
