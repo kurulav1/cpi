@@ -154,6 +154,7 @@ set(CPI_ENGINE_SOURCES
   src/grammar/json_schema_to_grammar.cpp
   src/grammar/grammar_sampler.cpp
   src/engine/cpu_engine.cpp
+  src/engine/cpu_gemm_avx512.cpp
   src/engine/llama4_cpu_engine.cpp
   src/engine/qwen35_cpu_engine.cpp
 )
@@ -315,6 +316,11 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|X86_64|amd64|AMD64|i386|i686)$")
       COMPILE_OPTIONS "/arch:AVX2")
     set_source_files_properties(src/engine/qwen35_cpu_engine.cpp PROPERTIES
       COMPILE_OPTIONS "/arch:AVX2")
+    # The AVX-512 GEMM tier lives in exactly one TU; it is dispatched behind a
+    # runtime CPUID check in cpu_engine.cpp, so these flags must never spread
+    # to files whose code runs unconditionally.
+    set_source_files_properties(src/engine/cpu_gemm_avx512.cpp PROPERTIES
+      COMPILE_OPTIONS "/arch:AVX512")
   else()
     set_source_files_properties(src/engine/cpu_engine.cpp PROPERTIES
       COMPILE_OPTIONS "-mavx2;-mf16c;-mfma")
@@ -322,6 +328,8 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|X86_64|amd64|AMD64|i386|i686)$")
       COMPILE_OPTIONS "-mavx2;-mfma")
     set_source_files_properties(src/engine/qwen35_cpu_engine.cpp PROPERTIES
       COMPILE_OPTIONS "-mavx2;-mfma")
+    set_source_files_properties(src/engine/cpu_gemm_avx512.cpp PROPERTIES
+      COMPILE_OPTIONS "-mavx512f;-mf16c;-mfma")
   endif()
 else()
   message(STATUS "CPU engines: non-x86 target (${CMAKE_SYSTEM_PROCESSOR}); using scalar fallbacks")

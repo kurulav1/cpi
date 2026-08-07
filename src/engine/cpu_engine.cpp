@@ -25,6 +25,8 @@
 
 #include "engine/cpu_engine.hpp"
 
+#include "engine/cpu_gemm_avx512.hpp"
+
 #include <algorithm>
 #include <cassert>
 #include <chrono>
@@ -481,7 +483,36 @@ static void gemm_fp16_impl(const uint16_t* CPI_RESTRICT W, const float* CPI_REST
 #endif
 }
 
+// Runtime AVX-512 probe. Lives HERE (an AVX2-flagged TU), never in
+// cpu_gemm_avx512.cpp: everything in that file may be compiled to AVX-512
+// instructions, so it must not execute before this check passes. Requires the
+// OS to have enabled ZMM/opmask state (XCR0), not just the CPU feature bit.
+static bool cpu_supports_avx512() {
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+  int i1[4];
+  __cpuid(i1, 1);
+  if ((i1[2] & (1 << 27)) == 0) return false;  // OSXSAVE
+  int i7[4];
+  __cpuidex(i7, 7, 0);
+  if ((i7[1] & (1 << 16)) == 0) return false;  // AVX512F
+  const unsigned long long xcr0 = _xgetbv(0);
+  return (xcr0 & 0xE6) == 0xE6;  // SSE+AVX+opmask+ZMM state enabled by the OS
+#elif defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+  return __builtin_cpu_supports("avx512f");
+#else
+  return false;
+#endif
+}
+
 void CpuLlamaEngine::gemm_fp16(const uint16_t* W, const float* X, float* Y, int M, int N, int B) {
+  // Widest eligible tier first. CPI_CPU_NO_AVX512=1 pins the AVX2 kernel
+  // (A/B lever); geometry gates mirror each kernel's alignment contract.
+  static const bool avx512 = detail::gemm_fp16_avx512_compiled() && cpu_supports_avx512() &&
+                             std::getenv("CPI_CPU_NO_AVX512") == nullptr;
+  if (avx512 && (M & 3) == 0 && (N & 15) == 0) {
+    detail::gemm_fp16_avx512(W, X, Y, M, N, B);
+    return;
+  }
   if ((M & 1) == 0 && (N & 7) == 0) {
     gemm_fp16_impl(W, X, Y, M, N, B);
     return;
@@ -1064,7 +1095,19 @@ int CpuLlamaEngine::prefill_prompt(const std::vector<int>& prompt_tokens) {
   const int n = std::min<int>(static_cast<int>(prompt_tokens.size()), max_ctx);
   static const bool force_tokenwise = std::getenv("CPI_CPU_PREFILL_TOKENWISE") != nullptr;
   if (n > 1 && !force_tokenwise && batched_prefill_supported()) {
-    constexpr int kChunk = 32;  // X panel ~512 KB at hidden 4096: L2-resident
+    // Chunk size sets the weight-traffic amortization AND how the fixed
+    // per-chunk cost (~0.3 s of parallel-region and cache-warm overhead on
+    // the reference box) is spread; measured on the 8B it climbs 42 -> 93
+    // tok/s from chunk 32 to 256 and only ~4% more at 512. 256 keeps the
+    // largest activation panel (~14 MB at inter 14336) inside typical L3;
+    // larger values only pay off on big-L3 parts (CPI_CPU_PREFILL_CHUNK
+    // overrides). Short prompts are unaffected: a chunk never exceeds the
+    // remaining prompt.
+    static const int kChunk = [] {
+      const char* e = std::getenv("CPI_CPU_PREFILL_CHUNK");
+      const int v = e ? std::atoi(e) : 0;
+      return v > 0 ? v : 256;
+    }();
     for (int i = 0; i < n; i += kChunk) {
       const int c = std::min(kChunk, n - i);
       forward_prompt_chunk(prompt_tokens.data() + i, i, c);
