@@ -80,7 +80,13 @@ int run_case(const std::string& model, const char* label, int prompt_len) {
       static_cast<int>(std::max_element(logits_seq.begin(), logits_seq.end()) - logits_seq.begin());
   const double cos = cosine(logits_tbt, logits_seq);
   const bool same_cont = cont_tbt == cont_seq;
-  const bool ok = argmax_tbt == argmax_seq && cos > 0.9999 && same_cont;
+  // The cosine is a proxy gate and its threshold accounts for the tensor-core
+  // prefill attention (CPI_CUDA_NO_TC_PREFILL=1 disables it), whose fp16 GEMM
+  // accumulation legitimately differs from the token-by-token path's: measured
+  // 0.999857 at len=200 with TC, 0.999962 without, argmax and continuation
+  // identical either way. Wiring bugs (positions, windows, cache offsets) land
+  // orders of magnitude below this, and the exact gates stay exact.
+  const bool ok = argmax_tbt == argmax_seq && cos > 0.9995 && same_cont;
 
   std::printf("  [%s] %-18s len=%-5d argmax %d vs %d | logit cosine %.6f | continuation %s\n",
               ok ? "ok" : "FAIL", label, prompt_len, argmax_tbt, argmax_seq, cos,
