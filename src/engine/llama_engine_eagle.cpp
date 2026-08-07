@@ -21,6 +21,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -409,6 +410,16 @@ std::vector<int> LlamaEngine::eagle_generate(const std::vector<int>& prompt_toke
   int verifies = 0, drafted = 0, accepted = 0;
   int pos_try[16] = {0}, pos_ok[16] = {0};  // per-chain-position accept stats
 
+  // CPI_EAGLE_PROF=1: wall-clock the round's phases (each phase boundary gets a
+  // stream sync while profiling, so the numbers are attribution, not exact
+  // production timings -- the perturbation is a few syncs/round).
+  static const bool prof = std::getenv("CPI_EAGLE_PROF") != nullptr;
+  double t_heal = 0.0, t_draft = 0.0, t_verify = 0.0, t_round = 0.0;
+  using pclock = std::chrono::steady_clock;
+  const auto psec = [](pclock::time_point a, pclock::time_point b) {
+    return std::chrono::duration<double, std::milli>(b - a).count();
+  };
+
   // First token through the normal single-token path; its feature (the post-
   // final-norm hidden of position pos) lands in d_x_norm_.
   int next = decode_next_token(cur, pos, 0.0f, dummy_hist);
@@ -426,12 +437,19 @@ std::vector<int> LlamaEngine::eagle_generate(const std::vector<int>& prompt_toke
   int cur_feat_row = 0;         // d_eagle_feats_ row holding cur's producing feature
 
   while (!stop && static_cast<int>(out.size()) < max_new_tokens && pos < max_ctx - 1) {
+    const auto tr0 = pclock::now();
     // Heal previously accepted pairs with their true features, then the
     // catch-up pair for cur (which yields the first draft).
     const int base = pos - 1 - heal_count;  // pair index of the first heal row
     for (int j = 0; j < heal_count; ++j) {
       eagle_step(d_eagle_feats_ + static_cast<std::size_t>(j) * H, nullptr, heal_tokens[j],
                  base + j, /*want_token=*/false, nullptr);
+    }
+    auto tp = pclock::now();
+    if (prof) {
+      CUDA_CHECK(cudaStreamSynchronize(s));
+      tp = pclock::now();
+      t_heal += psec(tr0, tp);
     }
     // Chain entirely on the device: each step's argmax lands in a
     // d_eagle_dtoks_ slot which feeds the next step's embedding lookup; the
@@ -450,6 +468,8 @@ std::vector<int> LlamaEngine::eagle_generate(const std::vector<int>& prompt_toke
                                cudaMemcpyDeviceToHost, s));
     CUDA_CHECK(cudaStreamSynchronize(s));
     drafted += nd;
+    auto td = pclock::now();
+    if (prof) t_draft += psec(tp, td);
 
     std::vector<int> batch(static_cast<std::size_t>(nd) + 1);
     batch[0] = cur;
@@ -464,6 +484,12 @@ std::vector<int> LlamaEngine::eagle_generate(const std::vector<int>& prompt_toke
                                  cudaMemcpyDeviceToDevice, s));
     }
     ++verifies;
+    if (prof) {
+      CUDA_CHECK(cudaStreamSynchronize(s));
+      const auto tv = pclock::now();
+      t_verify += psec(td, tv);
+      t_round += psec(tr0, tv);  // host tail after verify is negligible; counted next round
+    }
 
     int acc = 0;
     while (acc < nd && verdict[static_cast<std::size_t>(acc)] == drafts[acc]) ++acc;
@@ -491,6 +517,14 @@ std::vector<int> LlamaEngine::eagle_generate(const std::vector<int>& prompt_toke
     cur_feat_row = acc;
     cur = bonus;
     pos += acc + 1;
+  }
+  if (prof && verifies > 0) {
+    const double n = static_cast<double>(verifies);
+    std::fprintf(stderr,
+                 "[eagle-prof] rounds=%d avg_ms: heal=%.2f draft=%.2f verify=%.2f round=%.2f "
+                 "(tokens/round=%.2f -> %.1f tok/s in-loop)\n",
+                 verifies, t_heal / n, t_draft / n, t_verify / n, t_round / n,
+                 (accepted + verifies) / n, 1000.0 * (accepted + verifies) / t_round);
   }
   if (std::getenv("CPI_EAGLE_STATS")) {
     std::fprintf(stderr, "[eagle] verifies=%d drafted=%d accepted=%d (%.1f%%) tokens=%zu\n",
