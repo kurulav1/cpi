@@ -1159,10 +1159,15 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
     }
   } else {
     int uncached_index = 0;
-    copy_layer_weights_to_device(
-        cached_layer_count_, &streaming_layer_weights_[0],
-        options_.int8_streaming ? &streaming_layer_weights_i8_[0] : nullptr, transfer_stream_);
-    CUDA_CHECK(cudaEventRecord(streaming_ready_[0], transfer_stream_));
+    // Fully-cached but routed here anyway (paged KV forces the streaming-shaped
+    // path): there is no first uncached layer to pre-stream, and asking for
+    // layers[num_layers] throws on a missing tensor.
+    if (cached_layer_count_ < cfg.num_layers) {
+      copy_layer_weights_to_device(
+          cached_layer_count_, &streaming_layer_weights_[0],
+          options_.int8_streaming ? &streaming_layer_weights_i8_[0] : nullptr, transfer_stream_);
+      CUDA_CHECK(cudaEventRecord(streaming_ready_[0], transfer_stream_));
+    }
 
     for (int layer = 0; layer < cfg.num_layers; ++layer) {
       const LayerDeviceWeights* lw = nullptr;

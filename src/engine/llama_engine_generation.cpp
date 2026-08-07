@@ -469,11 +469,15 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
     }
   } else {
     int uncached_index = 0;
-    CUDA_CHECK(cudaStreamWaitEvent(transfer_stream_, streaming_consumed_[0], 0));
-    copy_layer_weights_to_device(
-        cached_layer_count_, &streaming_layer_weights_[0],
-        options_.int8_streaming ? &streaming_layer_weights_i8_[0] : nullptr, transfer_stream_);
-    CUDA_CHECK(cudaEventRecord(streaming_ready_[0], transfer_stream_));
+    // Same guard as the decode twin: fully-cached configs can still route here
+    // (paged KV), and layers[num_layers] does not exist to pre-stream.
+    if (cached_layer_count_ < cfg.num_layers) {
+      CUDA_CHECK(cudaStreamWaitEvent(transfer_stream_, streaming_consumed_[0], 0));
+      copy_layer_weights_to_device(
+          cached_layer_count_, &streaming_layer_weights_[0],
+          options_.int8_streaming ? &streaming_layer_weights_i8_[0] : nullptr, transfer_stream_);
+      CUDA_CHECK(cudaEventRecord(streaming_ready_[0], transfer_stream_));
+    }
 
     for (int layer = 0; layer < cfg.num_layers; ++layer) {
       const LayerDeviceWeights* lw = nullptr;
