@@ -124,6 +124,12 @@ Notes:
   window, so how many sequences run concurrently scales with the card. Under genuine over-subscription
   the newest sequences are preempted (and the client told) as a safety net, rather than the server
   crashing. Override the pool size with `CPI_KV_POOL_TOKENS`.
+- **Quantized KV pool** (`CPI_KV_QUANT=84` conservative, `=4` aggressive): the same paged pool holds
+  2.61× / 3.88× more tokens in the same VRAM budget (measured on the 8B: 97k → 254k / 377k pool
+  tokens), with an fp16 sink + recent-window tier keeping retrieval quality (needle-exact at 8k and
+  30k). Throughput matches fp16 batching at shallow depth and passes it where aggregate KV reads
+  dominate (measured crossover: 1024-deep sequences at batch 64). Prefix reuse is disabled under
+  the quality tier — each sequence's fp16 window is its own.
 - **Default on the web server** for supported models (opt out with `CPI_BATCH_WORKER=0`); requires
   fp16-resident weights (`--gpu-cache-all`) + paged KV (`--paged-blocks`) and full-attention models.
   Quantized / MoE / streaming models (e.g. the 32B int4) fall back to single-request serving.
@@ -150,20 +156,32 @@ decode (Llama-3.1-8B at 32K: ~30 → ~49 tok/s, ~34% → ~52% of the weight+KV b
 before/after binary, `CPI_ATTN_BPC=1` vs default). Llama-3.1-8B still falls off fastest: it
 has 8 KV heads to Qwen2.5-7B's 4, so ~2× the KV to scan per token and a smaller (4× vs 7×) query group
 to amortize it over. (Contexts past ~4K need
-`--tokens-file`, since a token list that long exceeds the OS command-line limit.)
+`--tokens-file` or `--prompt-file`, since a token list that long exceeds the OS command-line limit.)
+
+Correctness note for long contexts: Llama-3.1's usable window past its 8192 base relies on
+llama3-style rope scaling, which is **opt-in**: set `CPI_ROPE_SCALING=llama3` (parameters
+overridable via `CPI_ROPE_SCALING_PARAMS=factor,low,high,orig_max`). Without it, retrieval
+degrades beyond ~8K even though decode runs fine — the throughput rows above are unaffected,
+but quality at 16K/32K needs the flag.
 
 ## Highlights
 
 - Three backends (CPU, CUDA, Metal) executing one shared op-plan IR; the GPU backends are gated
   token-identical against each other
-- Model families: Llama 2/3, Mistral, Mixtral, Qwen2/2.5/3, Qwen3.5 (linear attention),
-  Gemma, Gemma 4 (per-layer geometry, per-layer embeddings, KV sharing), plus BERT-style
+- Model families: Llama 2/3/3.1, Mistral, Mixtral, Qwen2/2.5/3, Qwen3.5 (linear attention),
+  Gemma, Gemma 4 (per-layer geometry, per-layer embeddings, KV sharing; the 26B-A4B MoE runs
+  int4-resident), DeepSeek-V2 (native MLA attention + fine-grained MoE; CUDA), plus BERT-style
   embedding models
 - Multimodal: image input (`--image` and web upload) for Qwen3.5 and Gemma 4, on both GPU
   backends, gated against HuggingFace and cross-backend references
 - Continuous batching with a paged KV cache for concurrent multi-user serving (default;
   VRAM-sized pool, shared-prefix reuse)
-- Speculative decoding (`--draft-model`), lossless with respect to the target's own output
+- KV-cache quantization (`CPI_KV_QUANT`): K8V4 conservative or KV4 with a QuaRot-style
+  rotation, both with an fp16 sink + recent-window quality tier — 2.6–3.9× more KV pool in the
+  same VRAM, needle-retrieval-gated at 8k–30k context, and at/above fp16 throughput in the
+  deep-and-concurrent regime it exists for
+- Speculative decoding (`--draft-model`), lossless with respect to the target's own output;
+  prompt-lookup speculation needs no draft model at all (`CPI_CUDA_SPEC` / `CPI_METAL_SPEC`)
 - Streaming weights for models larger than VRAM; runtime int8/int4 quantization on load
 - Grammar and JSON-schema constrained decoding
 - OpenAI-compatible API, embeddings endpoint, React web UI, Node API bridge in `web/`
@@ -323,10 +341,11 @@ something next to the token count that produced them.
 | Llama-3.1-8B | int8 | 8.8 | token-identical to the CUDA fp16 reference |
 | Llama-3.1-8B | int4 | 13.7 | |
 
-Prefill sits at 72-77% of llama.cpp on the small models. That gap is understood and bounded:
-the GEMM is at its measured hardware ceiling, the remaining difference is attention work
-decomposition and scheduling, and the full investigation (including the dead ends and the
-retractions) is in [docs/metal-optimization-log.md](docs/metal-optimization-log.md).
+Prefill at 2048-token prompts is at parity with llama.cpp (93–108% across the gated models,
+2026-07-22 sweep); short prompts remain behind (down to ~50% at ~130 tokens), because the GEMM
+carries a fixed per-pass weight-read cost that long prompts amortize and short ones don't. The
+GEMM itself measures at its hardware ceiling; the full investigation (including the dead ends
+and the retractions) is in [docs/metal-optimization-log.md](docs/metal-optimization-log.md).
 
 ### Build and run
 
@@ -403,6 +422,19 @@ That preset builds for:
 - `90` - Hopper H100
 
 For local machine-specific builds, the default CUDA path still uses `CMAKE_CUDA_ARCHITECTURES=native`.
+
+### Binary footprint
+
+The engine itself is small; the deployment weight of the CUDA build is almost entirely the vendor
+GEMM library it links (the one stated exception to hand-rolled kernels):
+
+| Build | Binary | Runtime dependencies |
+| ----- | ------ | -------------------- |
+| CUDA (single-arch `native`) | `cpi.exe` ≈ 7.9 MB | `cublasLt64_13.dll` ≈ 432 MB + `cublas64_13.dll` ≈ 49 MB (CUDA toolkit), NVIDIA driver, MSVC runtime |
+| CPU-only | < 1 MB | MSVC / libstdc++ runtime only |
+
+A multi-architecture fatbin build (`cuda-distributable-release`) grows the binary with each added
+`sm_*` target but leaves the dependency picture unchanged.
 
 ## Web Configuration
 
