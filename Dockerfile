@@ -9,7 +9,7 @@ FROM web-deps AS web-build
 COPY web/ ./
 RUN npm run build
 
-FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS engine-build
+FROM nvidia/cuda:12.6.3-devel-ubuntu22.04 AS engine-build
 ARG DEBIAN_FRONTEND=noninteractive
 WORKDIR /app
 
@@ -32,6 +32,10 @@ COPY src ./src
 # The build host has no GPU, so the CMakeLists default of CMAKE_CUDA_ARCHITECTURES=native
 # can't probe a device and falls back to a low arch lacking __dp4a (needs sm_61+). Pin a
 # real arch list (Turing..Hopper) plus 90-virtual PTX for forward-compat on newer GPUs.
+# Newer-than-Hopper GPUs (e.g. sm_120 Blackwell) run via the 90-virtual PTX, which means
+# the driver JIT-compiles the whole engine on first launch -- several minutes, and --rm
+# containers lose the JIT cache every run. To serve such GPUs routinely, bump the base
+# images to a CUDA that can target them (12.8+ for Blackwell) and add the -real arch here.
 ARG CUDA_ARCHS="75-real;80-real;86-real;89-real;90-real;90-virtual"
 RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
@@ -39,7 +43,7 @@ RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
 
 FROM node:22-bullseye-slim AS node-runtime
 
-FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04 AS runtime
+FROM nvidia/cuda:12.6.3-runtime-ubuntu22.04 AS runtime
 ARG DEBIAN_FRONTEND=noninteractive
 ENV NODE_ENV=production
 WORKDIR /app/web

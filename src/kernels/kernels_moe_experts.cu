@@ -396,6 +396,13 @@ __global__ void moe_int4_grouped_mma_kernel(const std::int8_t* __restrict__ xq,
                                             half* __restrict__ out_lo, half* __restrict__ out_hi, int N,
                                             int K, int wsg_stride, int wratio, int split, int lo_width,
                                             int hi_width) {
+// mma.m16n8k32.s8 needs sm_80+. For older targets in a fatbin (sm_75) compile
+// an empty body so ptxas can assemble the arch; the engine never launches this
+// kernel there (moe_use_int4_direct checks compute capability at runtime).
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800)
+  (void)xq; (void)as; (void)wpacked; (void)ws; (void)off; (void)out_lo; (void)out_hi;
+  (void)N; (void)K; (void)wsg_stride; (void)wratio; (void)split; (void)lo_width; (void)hi_width;
+#else
   const int e = blockIdx.z;
   const int m_start = off[e], n_e = off[e + 1] - off[e];
   const int by = blockIdx.y;
@@ -479,6 +486,7 @@ __global__ void moe_int4_grouped_mma_kernel(const std::int8_t* __restrict__ xq,
       }
     }
   }
+#endif  // __CUDA_ARCH__ >= 800
 }
 
 // off[] is device-resident (grid.z indexes it). max_ne = max tokens routed to any one expert (bounds

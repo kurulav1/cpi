@@ -2742,6 +2742,16 @@ bool PlanCudaEngine::grouped_gemm_ex(int m, int k, const std::vector<int>& n_per
 // dequant amortizes and cuBLAS's fp16 tensor-core GEMM wins, so we cross over on P (= T*top_k).
 // CPI_DS_MOE_INT4=1 forces on, =0 forces off (A/B); CPI_DS_MOE_INT4_MAX_P overrides the threshold.
 bool PlanCudaEngine::moe_use_int4_direct(int P) const {
+  // The int4-direct path runs on int8 tensor cores (mma.m16n8k32.s8, sm_80+);
+  // pre-Ampere devices take the fp16-dequant grouped path unconditionally.
+  static const bool mma_ok = [] {
+    int dev = 0, major = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return false;
+    if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess)
+      return false;
+    return major >= 8;
+  }();
+  if (!mma_ok) return false;
   static const int forced = [] {
     const char* f = std::getenv("CPI_DS_MOE_INT4");
     return f ? (std::atoi(f) != 0 ? 1 : -1) : 0;
