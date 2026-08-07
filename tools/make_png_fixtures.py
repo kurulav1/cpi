@@ -82,7 +82,7 @@ def write_png(name, width, height, color_type, raw_rows, expect_rgb, palette=Non
 
 
 def main():
-    # 1. RGB gradient — compresses well, dynamic Huffman
+    # 1. RGB gradient -- compresses well, dynamic Huffman
     w, h = 64, 48
     rows, rgb = [], bytearray()
     for y in range(h):
@@ -94,7 +94,7 @@ def main():
         rows.append(bytes(row))
     write_png("rgb_gradient", w, h, 2, rows, rgb)
 
-    # 2. RGBA pseudo-random noise at level 0 — incompressible, forces STORED blocks
+    # 2. RGBA pseudo-random noise at level 0 -- incompressible, forces STORED blocks
     w, h = 32, 32
     rows, rgb = [], bytearray()
     state = 12345
@@ -110,7 +110,7 @@ def main():
         rows.append(bytes(row))
     write_png("rgba_noise", w, h, 6, rows, rgb, level=0)
 
-    # 3. Greyscale with long runs — overlapping LZ77 back-references
+    # 3. Greyscale with long runs -- overlapping LZ77 back-references
     w, h = 40, 20
     rows, rgb = [], bytearray()
     for y in range(h):

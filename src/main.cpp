@@ -655,9 +655,7 @@ int main(int argc, char** argv) {
       case EngineChoice::LlamaMetal: {
         // Apple Silicon GPU path for the main binary; the same PlanMetalEngine the metal_infer
         // tool uses, wired into the standard serving modes so the REST/web bridge runs on a Mac.
-        // What actually works here, verified by running rather than assumed; the comment this
-        // replaces claimed "fp16 for now; grammar-constrained decode and a Metal vision tower are
-        // not yet wired", and two thirds of that was stale:
+        // Capabilities on this path (each verified by running, not assumed):
         //
         //   int4/int8 weight-quant  yes (--weight-quant, below)
         //   continuous batching     yes (--interactive-batch, two concurrent streams interleaved)

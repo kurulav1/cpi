@@ -215,7 +215,7 @@ def cmd_download(args):
                 Path(stale).unlink()
                 log(f"Removed stale: {Path(stale).name}")
             except OSError:
-                pass  # still locked by another process — will fail on download
+                pass  # still locked by another process -- will fail on download
 
     total_files = len(files_to_get)
 

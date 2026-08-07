@@ -457,7 +457,7 @@ function formatQwen35(turns, systemPrompt, thinking = false) {
   return blocks.join("\n");
 }
 
-// Gemma 4 turn format. No system role — the system prompt (if any) is folded
+// Gemma 4 turn format. No system role -- the system prompt (if any) is folded
 // into the first user turn. The tokenizer prepends <bos> (addBos). sot=<|turn>,
 // eot=<turn|>; a pending turn ends with "<|turn>model\n" for the model to answer.
 function formatGemma(turns, systemPrompt) {
@@ -523,10 +523,10 @@ function formatPlain(turns, systemPrompt) {
   return lines.join("\n\n").trim();
 }
 
-// ── Chat template as DATA ────────────────────────────────────────────────────
+// ── Chat template as data ────────────────────────────────────────────────────
 // A model's chat format is a descriptor it ships, not a function in the core.
-// Every modern template is the same shape — per-role prefix/suffix, a generation
-// prompt for the pending turn, and a join — so one generic renderer covers them:
+// Every modern template is the same shape -- per-role prefix/suffix, a generation
+// prompt for the pending turn, and a join -- so one generic renderer covers them:
 //
 //   { join, trim, bosLiteral,
 //     system: { mode: "block"|"fold"|"prepend"|"none", prefix, suffix,
@@ -536,14 +536,14 @@ function formatPlain(turns, systemPrompt) {
 //     generationPrompt, stop: [...] }
 //
 // system.mode captures the only real structural variation:
-//   block   — its own turn (ChatML, Llama3, Phi-3)
-//   fold    — folded into the first user turn (Gemma, Mistral)
-//   prepend — emitted raw before the turns (DeepSeek-R1)
+//   block   -- its own turn (ChatML, Llama3, Phi-3)
+//   fold    -- folded into the first user turn (Gemma, Mistral)
+//   prepend -- emitted raw before the turns (DeepSeek-R1)
 // `prime` is appended to the generation prompt (a reasoning model's <think> open);
 // it comes from the reasoning descriptor, so reasoning stays out of the template.
 //
-// NOTE: llama2/tinyllama are deliberately NOT expressible here — they aren't chat
-// templates, they're bespoke prompt STRATEGIES (history compaction, injected
+// NOTE: llama2/tinyllama are deliberately NOT expressible here -- they aren't chat
+// templates, they're bespoke prompt strategies (history compaction, injected
 // instructions). Those stay as code; see formatLlama2.
 export function renderChat(turns, systemPrompt, chat, prime = "") {
   const sys = systemPrompt || "";
@@ -563,7 +563,7 @@ export function renderChat(turns, systemPrompt, chat, prime = "") {
       blocks.push(`${chat.assistant?.prefix ?? ""}${turn.assistant}${chat.assistant?.suffix ?? ""}`);
     } else {
       // Pending turn: the generation prompt (+ any reasoning prime). Some templates
-      // (Mistral) have none — the user suffix itself is the cue — so emit nothing.
+      // (Mistral) have none -- the user suffix itself is the cue -- so emit nothing.
       const gen = `${chat.generationPrompt ?? ""}${prime}`;
       if (gen) blocks.push(gen);
     }
@@ -611,7 +611,7 @@ export function buildPromptPackage(messages, options = {}) {
     const prime = options.thinking
       ? (options.reasoning?.primeOn ?? "")
       : (options.reasoning?.primeOff ?? "");
-    // system.source "explicit" = forward ONLY a caller-supplied system prompt, not
+    // system.source "explicit" = forward only a caller-supplied system prompt, not
     // system messages merged from the conversation (DeepSeek-R1 recommends none).
     const sys = options.chat.system?.source === "explicit"
       ? (hasExplicitSystemPrompt ? systemPrompt : "")

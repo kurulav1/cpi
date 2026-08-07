@@ -4,7 +4,7 @@
 // engine::BertEmbedder, which is CUDA (cublas + six __global__ kernels) and therefore left
 // embeddings, RAG and folder-search dead on a Mac.
 //
-// The interface deliberately MIRRORS BertEmbedder rather than generalising it: same
+// The interface deliberately mirrors BertEmbedder rather than generalising it: same
 // initialize/embed/dim/max_tokens/config surface, so cpi_embed picks one at compile time and the
 // serving protocol above it does not change. A shared abstract base would buy nothing here
 // there are exactly two implementations and they share no state.

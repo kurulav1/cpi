@@ -210,11 +210,11 @@ function modelDisplay(profile) {
 // are streamed from disk/RAM layer-by-layer during inference. Lets you run huge
 // models (e.g. 32B) at the cost of speed.
 const STREAMING_HELP =
-  "Streaming model: too large to fit in VRAM, so its weights are streamed from disk during inference — runs big models, but slower.";
+  "Streaming model: too large to fit in VRAM, so its weights are streamed from disk during inference -- runs big models, but slower.";
 
 // Group ready profiles by base model name and collapse each model's precision
-// options — runtime FP16/INT8/INT4 on the full-precision file, plus any pre-packed
-// streaming builds — into a single ordered variant list. So the UI can offer one
+// options -- runtime FP16/INT8/INT4 on the full-precision file, plus any pre-packed
+// streaming builds -- into a single ordered variant list. So the UI can offer one
 // model picker + one variant picker instead of scattering formats across names,
 // tags and a separate quant menu. Each variant maps to a (profileId, quantMode).
 function buildModelGroups(profiles) {
@@ -251,14 +251,14 @@ function buildModelGroups(profiles) {
     const seen = new Set();
     g.variants = g.variants.filter((v) => (seen.has(v.key) ? false : seen.add(v.key)));
     // "Streaming" is a fit-necessity, not a user choice: if a full-precision build
-    // exists (order < 10), hide the pre-packed streaming builds — the engine keeps
+    // exists (order < 10), hide the pre-packed streaming builds -- the engine keeps
     // what fits VRAM resident and streams any overflow automatically. Streaming
-    // only stays visible when it's the ONLY way to run the model (e.g. a 32B with
+    // only stays visible when it's the only way to run the model (e.g. a 32B with
     // no fp16 build). Runtime INT8/INT4 remain as a genuine quality/speed choice.
     const hasFullPrecision = g.variants.some((v) => v.order < 10);
     if (hasFullPrecision) g.variants = g.variants.filter((v) => v.order < 10);
     g.variants.sort((a, b) => a.order - b.order);
-    // Capabilities are a property of the MODEL, so take them from its full-precision
+    // Capabilities are a property of the model, so take them from its full-precision
     // profile when there is one (a pre-packed streaming build reports no batching, which
     // would misrepresent the model itself).
     const primary = g.profiles.find((p) => !modelDisplay(p).pinned) ?? g.profiles[0];
@@ -269,7 +269,7 @@ function buildModelGroups(profiles) {
   return groups;
 }
 
-// Compact capability chips, shown for EVERY model in the picker so you can compare
+// Compact capability chips, shown for every model in the picker so you can compare
 // before selecting instead of choosing blind and finding out afterwards.
 function CapsInline({ caps, compact = false }) {
   if (!caps) return null;
@@ -286,7 +286,7 @@ function CapsInline({ caps, compact = false }) {
       t: caps.reasoning === "always" ? "Always reasons before answering." : "Reasoning can be switched on per request.",
     });
   if (caps.batching) on.push({ k: "Batching", t: "Continuous batching: many requests share one worker." });
-  if (caps.moe) on.push({ k: "MoE", t: "Mixture of experts — only a few experts run per token." });
+  if (caps.moe) on.push({ k: "MoE", t: "Mixture of experts -- only a few experts run per token." });
   if (caps.streamingWeights) on.push({ k: "Streamed", t: "Weights stream from disk; runs models larger than VRAM." });
   return (
     <span className={`capsline ${compact ? "capsline-compact" : ""}`}>
@@ -305,7 +305,7 @@ function CapsInline({ caps, compact = false }) {
 }
 
 // Model picker. A dropdown of bare names makes you choose blind; this shows what each
-// model can DO before you pick it, and lets you land directly on a precision variant.
+// model can do before you pick it, and lets you land directly on a precision variant.
 function ModelPicker({ open, groups, currentProfileId, currentKey, onPick, onClose }) {
   const [q, setQ] = useState("");
   const boxRef = useRef(null);
@@ -378,7 +378,7 @@ function ModelPicker({ open, groups, currentProfileId, currentKey, onPick, onClo
                       title={
                         v.quantMode === "none"
                           ? "Full precision"
-                          : `Quantized at load (${v.quantMode}) — smaller and faster, slight quality cost`
+                          : `Quantized at load (${v.quantMode}) -- smaller and faster, slight quality cost`
                       }
                       onClick={() => { onPick(v); onClose(); }}
                     >
@@ -404,7 +404,7 @@ function ModelPicker({ open, groups, currentProfileId, currentKey, onPick, onClo
 function friendlyEngineError(msg) {
   const m = String(msg || "");
   if (/gpu-cache-all|fully resident|not supported by the batched|INT8\/INT4-quantized/i.test(m)) {
-    return "This model can't run with fast batching — it's a streaming/quantized model that doesn't fit fully in VRAM. Pick a full-precision (FP16) model, or turn batching off.";
+    return "This model can't run with fast batching -- it's a streaming/quantized model that doesn't fit fully in VRAM. Pick a full-precision (FP16) model, or turn batching off.";
   }
   if (/pool exhausted|max_context budget/i.test(m)) {
     return "Ran out of KV-cache space for this many concurrent requests. Lower the context size or reduce concurrency.";
@@ -434,7 +434,7 @@ function defaultQuantForProfile(profile) {
 }
 
 // Recursively flatten React children (incl. rehype-highlight's nested token
-// spans) back to plain text — used for the copy-to-clipboard button.
+// spans) back to plain text -- used for the copy-to-clipboard button.
 function nodeText(node) {
   if (node == null || node === false) return "";
   if (typeof node === "string" || typeof node === "number") return String(node);
@@ -454,7 +454,7 @@ function CodeBlock({ language, children }) {
       setCopied(true);
       setTimeout(() => setCopied(false), 1200);
     } catch {
-      // clipboard blocked (insecure context / permissions) — ignore
+      // clipboard blocked (insecure context / permissions) -- ignore
     }
   };
   return (
@@ -473,7 +473,7 @@ function CodeBlock({ language, children }) {
 }
 
 // What the selected model can and cannot do. The server computes this
-// (profileCapabilities in config.mjs) from what the MODEL declares -- its config.json,
+// (profileCapabilities in config.mjs) from what the model declares -- its config.json,
 // its shipped chat/reasoning descriptors -- so the UI just renders it and no capability
 // rule is duplicated here.
 function CapabilityBar({ profile }) {
@@ -491,7 +491,7 @@ function CapabilityBar({ profile }) {
       on: caps.vision,
       title: caps.vision
         ? "Attach a PNG in the composer (or paste one). The vision tower encodes it into soft tokens."
-        : "This model has no vision tower — it cannot take images.",
+        : "This model has no vision tower -- it cannot take images.",
     },
     {
       label: caps.reasoning === "always" ? "Thinking (always)" : "Thinking",
@@ -520,7 +520,7 @@ function CapabilityBar({ profile }) {
   ];
   if (caps.moe) chips.push({ label: "MoE", on: true, title: "Mixture of experts: only a few experts run per token." });
   if (caps.streamingWeights)
-    chips.push({ label: "Streamed weights", on: true, title: "Weights stream from disk — runs models larger than VRAM." });
+    chips.push({ label: "Streamed weights", on: true, title: "Weights stream from disk -- runs models larger than VRAM." });
 
   const ctx = fmtCtx(caps.maxContext);
 
@@ -681,11 +681,11 @@ function formatModelMarkdown(text) {
     .replace(/\\\[([\s\S]+?)\\\]/g, (_m, body) => `$$${body}$$`)
     .replace(/\\\(([\s\S]+?)\\\)/g, (_m, body) => `$${body}$`);
 
-  // A dollar sign is usually MONEY. "It costs $5 and the other is $7" otherwise pairs up
+  // A dollar sign is usually money. "It costs $5 and the other is $7" otherwise pairs up
   // into inline math and renders as garbage. Deciding by pairing is hopeless (a line can
   // hold both money and math), so target the thing that is actually recognisable: a $
-  // directly followed by a number that ENDS at a word boundary. That escapes "$5" and
-  // "$1,000.50" while leaving "$2x + 1$" alone — there the digits run into the maths.
+  // directly followed by a number that ends at a word boundary. That escapes "$5" and
+  // "$1,000.50" while leaving "$2x + 1$" alone -- there the digits run into the maths.
   clean = clean.replace(
     /(^|[\s(])\$(\d[\d,]*(?:\.\d+)?)(?=$|[\s.,;:!?)])/gm,
     (_m, pre, num) => `${pre}\\$${num}`
@@ -1354,7 +1354,7 @@ export default function App() {
     profiles.find((p) => p.id === settings.profileId) ||
     health.config?.selectedProfile || null;
   const selDisplay   = selProfile ? modelDisplay(selProfile) : { base:"", tag:"", isStreaming:false, fmt:"", pinned:false };
-  // The MODEL declares whether it can take images (config.json's vision_config), the
+  // The model declares whether it can take images (config.json's vision_config), the
   // same way it declares its reasoning and chat formats. No name matching here.
   const visionOK     = Boolean(selProfile?.vision?.supported);
   const reasoningMode = selProfile?.reasoning?.mode ?? "none";  // none | optional | always
@@ -1546,7 +1546,7 @@ export default function App() {
     if (!profileId || !selProfile?.ready || streaming) return;
     // Streaming models load slowly and lazily (weights stream from disk, often
     // gigabytes). A blocking pre-warm just times out and looks like a failure, so
-    // skip it — they load on the first message instead.
+    // skip it -- they load on the first message instead.
     if (selDisplay.isStreaming) { setWarmup({ state:"lazy", workerKey: selectedWorkerKey, error:"" }); return; }
     const workerKey = selectedWorkerKey;
 
@@ -1871,13 +1871,13 @@ export default function App() {
         <span className="topbar-brand">CPI</span>
         <span className="topbar-sep" />
 
-        {/* Model selector — opens a picker that shows each model's capabilities. */}
+        {/* Model selector -- opens a picker that shows each model's capabilities. */}
         <button
           type="button"
           className="topbar-model"
           disabled={streaming || modelGroups.length === 0}
           onClick={() => setModelPickerOpen(true)}
-          title="Choose a model — see what each one supports"
+          title="Choose a model -- see what each one supports"
         >
           {/* Name + caret only. The capability chips live in the strip below and in the
               picker itself -- crowding them in here made the topbar overflow. */}
@@ -1893,7 +1893,7 @@ export default function App() {
           value={selectedVariant?.key || ""}
           disabled={streaming || !selectedGroup || (selectedGroup.variants.length <= 1)}
           onChange={(e) => applyVariant(selectedGroup?.variants.find((v) => v.key === e.target.value))}
-          title="Precision / variant — FP16: full quality. INT8 / INT4: smaller & faster (slight quality trade-off). 'streaming' builds run models too large for VRAM by streaming weights from disk."
+          title="Precision / variant -- FP16: full quality. INT8 / INT4: smaller & faster (slight quality trade-off). 'streaming' builds run models too large for VRAM by streaming weights from disk."
         >
           {(selectedGroup?.variants ?? []).map((v) => (
             <option key={v.key} value={v.key}>{v.label}</option>
@@ -1910,7 +1910,7 @@ export default function App() {
           {health?.system?.gpu ? (
             <span
               className="badge badge-blue"
-              title={`${health.system.gpu.name} — ${health.system.gpu.utilPercent}% util, ${(health.system.gpu.memUsedMB / 1024).toFixed(1)}/${(health.system.gpu.memTotalMB / 1024).toFixed(0)} GB VRAM\nCPU: ${health.system.cpu.model} (${health.system.cpu.cores} cores)\nRAM: ${(health.system.ram.totalMB / 1000).toFixed(0)} GB`}
+              title={`${health.system.gpu.name} -- ${health.system.gpu.utilPercent}% util, ${(health.system.gpu.memUsedMB / 1024).toFixed(1)}/${(health.system.gpu.memTotalMB / 1024).toFixed(0)} GB VRAM\nCPU: ${health.system.cpu.model} (${health.system.cpu.cores} cores)\nRAM: ${(health.system.ram.totalMB / 1000).toFixed(0)} GB`}
             >
               {health.system.gpu.name.replace(/NVIDIA GeForce /i, "")} · {(health.system.gpu.memUsedMB / 1024).toFixed(1)}/{(health.system.gpu.memTotalMB / 1024).toFixed(0)} GB
             </span>
@@ -2130,7 +2130,7 @@ export default function App() {
                   <div className="composer-foot">
                     <span className="composer-hint">Enter to send - Shift+Enter for newline</span>
                     <div className="composer-acts">
-                      {/* Reasoning is a per-MESSAGE decision ("think hard about this one"),
+                      {/* Reasoning is a per-message decision ("think hard about this one"),
                           not a preference, so it belongs next to Send rather than buried in
                           settings. Shown only when the model declares it. */}
                       {reasoningMode === "optional" && (
@@ -2141,8 +2141,8 @@ export default function App() {
                           aria-pressed={Boolean(settings.thinking)}
                           title={
                             settings.thinking
-                              ? "Thinking ON — the model reasons first; its chain of thought streams above the answer. Slower, better on math and multi-step questions."
-                              : "Thinking OFF — the model answers directly. Turn on for math and multi-step questions."
+                              ? "Thinking ON -- the model reasons first; its chain of thought streams above the answer. Slower, better on math and multi-step questions."
+                              : "Thinking OFF -- the model answers directly. Turn on for math and multi-step questions."
                           }
                           onClick={() => setSettings((c) => ({ ...c, thinking: !c.thinking }))}
                         >
@@ -2195,7 +2195,7 @@ export default function App() {
         )}
 
         {/*  Settings drawer  */}
-        {/* Rendered at the ROOT, not inside <header>: the topbar sets backdrop-filter,
+        {/* Rendered at the root, not inside <header>: the topbar sets backdrop-filter,
             which makes it the containing block for position:fixed children -- a modal
             nested in there is laid out inside the topbar's box instead of the viewport,
             so its backdrop never covers the page and the chat shows through. */}
@@ -2362,7 +2362,7 @@ export default function App() {
                   )}
                   <p className="field-help" style={{ marginTop:"0.5rem" }}>
                     <strong>Quant</strong> = weight precision: FP16 (full quality) vs INT8/INT4 (smaller &amp; faster,
-                    slight quality loss). It only applies to full-precision models — models whose name already lists a
+                    slight quality loss). It only applies to full-precision models -- models whose name already lists a
                     format (e.g. <em>int4</em>) are pre-packed and fixed. <strong>Streaming</strong> models are too big for
                     VRAM, so their weights stream from disk (runs huge models, but slower).
                   </p>

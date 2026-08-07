@@ -35,7 +35,7 @@ struct SpeculativeStats {
 // repetition penalty) decoding of the target: the target's argmax is always the
 // emitted token, the draft only proposes candidates the target then confirms.
 //
-// A TEMPLATE over the engine type rather than a class bound to one engine: the algorithm is
+// A template over the engine type rather than a class bound to one engine: the algorithm is
 // backend-free, and both LlamaEngine (CUDA) and PlanMetalEngine expose the same five methods it
 // needs; reset_kv_cache, prefill_prompt, decode_next_token, decode_next_token2, verify_tokens.
 // Class template argument deduction makes `SpeculativeDecoder spec(draft, target, k)` pick the

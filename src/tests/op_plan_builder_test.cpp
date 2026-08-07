@@ -412,7 +412,7 @@ int main() {
 
   // ---- op completeness, across every builder ------------------------------
   //
-  // The bug class this session kept producing, four times: an op that CUDA's executor can run
+  // A recurring bug class (hit four times before this test): an op that CUDA's executor can run
   // because it infers the missing fields (it reads K and V from hardcoded slots, applies
   // 1/sqrt(head_dim) in-kernel, selects a rope table by enum), and that Metal's executor cannot,
   // because it reads those same things off the op. Symptoms ranged from a wrong rope frequency to

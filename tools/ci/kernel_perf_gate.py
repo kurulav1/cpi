@@ -11,13 +11,13 @@ per-kernel perf regression check.
   python tools/ci/kernel_perf_gate.py               # gate against the baseline
 
 Notes:
-- Run with the GPU otherwise idle (stop the web server) — a co-resident model
+- Run with the GPU otherwise idle (stop the web server) -- a co-resident model
   adds contention/clock noise (~8-10%) that inflates false positives.
 - The metric is GB/s (higher is better); the gate flags drops below baseline.
 - Each shape is measured best-of-N (--repeat, default 3): the max over runs is
   the least clock/thermal/contention-perturbed estimate, so it is reproducible
   run-to-run. Single-shot benching swings 40%+ on the high-batch/long-context
-  attention shapes — best-of-N is what makes the tolerance meaningful.
+  attention shapes -- best-of-N is what makes the tolerance meaningful.
 """
 from __future__ import annotations
 
@@ -34,17 +34,17 @@ BASELINE = Path(__file__).resolve().parent / "kernel_perf_baseline.json"
 # Per-bench regression tolerance (max fractional GB/s drop before failing).
 #
 # int4_gemv is rock-stable run-to-run on this box (never false-flagged across four
-# independent best-of-3 windows), so it gets a tight, meaningful gate — it is also
+# independent best-of-3 windows), so it gets a tight, meaningful gate -- it is also
 # the load-bearing decode signal (weight-streaming GEMVs dominate decode time).
 #
 # attention_decode is different: its high-batch/long-context shapes have a ~40-45%
 # run-to-run NOISE FLOOR here (one shape swung -32/-39/-41/-45% across windows that
-# changed nothing). The cause is cross-window thermal/clock drift — best-of-N absorbs
+# changed nothing). The cause is cross-window thermal/clock drift -- best-of-N absorbs
 # drift within a window but not the temperature difference between a baseline capture
 # and a gate run minutes later. On a consumer WDDM GPU that floor is irreducible for a
 # wall-clock-throttled microbench, so the attention gate is deliberately coarse: it
 # only catches GROSS regressions (fallback kernel / wrong head_dim path / disabled
-# coarsening — all 2-10x cliffs), not subtle ones. For a tight attention signal, run
+# coarsening -- all 2-10x cliffs), not subtle ones. For a tight attention signal, run
 # the microbench standalone on an idle, thermally-steady GPU and eyeball %-of-roofline.
 DEFAULT_TOL = {"int4_gemv": 0.12, "attention_decode": 0.50}
 
@@ -94,7 +94,7 @@ def measure(repeat: int) -> dict[str, dict[str, float]]:
                 if cur is None or gbs > cur:
                     best[bench][key] = gbs
     if not best["int4_gemv"] or not best["attention_decode"]:
-        sys.exit("[kernel_perf_gate] parsed no rows — bench output format changed?")
+        sys.exit("[kernel_perf_gate] parsed no rows -- bench output format changed?")
     return best
 
 
@@ -114,7 +114,7 @@ def main() -> int:
         return 0
 
     if not BASELINE.exists():
-        sys.exit(f"[kernel_perf_gate] no baseline at {BASELINE} — run with --update first")
+        sys.exit(f"[kernel_perf_gate] no baseline at {BASELINE} -- run with --update first")
     base = json.loads(BASELINE.read_text(encoding="utf-8"))
 
     regressions = []

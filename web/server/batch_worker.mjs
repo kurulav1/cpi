@@ -35,7 +35,7 @@ export function createBatchWorker({ bin, args, env, cwd, onReadyError }) {
   const child = spawn(bin, args, { stdio: ["pipe", "pipe", "pipe"], env: env ?? process.env, cwd });
   const pending = new Map(); // id -> { onStart, onDelta, onDone, onError, text }
   const decoder = new StringDecoder("utf8");
-  // Surface worker stderr — otherwise a worker-side error/crash is invisible and
+  // Surface worker stderr -- otherwise a worker-side error/crash is invisible and
   // the request just hangs.
   child.stderr?.on("data", (d) => { try { process.stderr.write(`[batch-worker] ${d}`); } catch { /* ignore */ } });
   let stdoutBuffer = "";
@@ -97,7 +97,7 @@ export function createBatchWorker({ bin, args, env, cwd, onReadyError }) {
     pending.clear();
   };
   // Resolves once the child process has fully exited (its single-instance mutex
-  // and GPU memory are released) — used to serialize teardown before respawning.
+  // and GPU memory are released) -- used to serialize teardown before respawning.
   let markExited;
   const exited = new Promise((resolve) => { markExited = resolve; });
   child.on("exit", (code) => { failAll(new Error(`batch worker exited (code ${code})`)); markExited(); });
@@ -137,7 +137,7 @@ export function createBatchWorker({ bin, args, env, cwd, onReadyError }) {
     try {
       child.stdin.write(`${JSON.stringify({ cancel: id })}\n`);
     } catch {
-      // ignore — a dead worker frees everything on exit anyway
+      // ignore -- a dead worker frees everything on exit anyway
     }
   };
 

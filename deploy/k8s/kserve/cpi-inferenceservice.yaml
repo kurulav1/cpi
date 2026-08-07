@@ -1,4 +1,4 @@
-# InferenceService — the user-facing KServe object. It asks for a model of format
+# InferenceService -- the user-facing KServe object. It asks for a model of format
 # "ll2c"; KServe matches it to the cpi-llama ServingRuntime and builds the
 # Deployment + Service + (optional) route + HPA in RawDeployment mode.
 #

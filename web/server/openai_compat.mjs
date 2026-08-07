@@ -137,7 +137,7 @@ function responseFormatInstruction(responseFormat) {
 // This engine has no native tool-calling, so we emulate the OpenAI protocol:
 // when a tool is forced we inject its JSON schema as an instruction, let the model
 // generate, then present the model's JSON output as a `tool_calls` response. The
-// quality of that JSON is entirely the model's job — pair with constrained decoding
+// quality of that JSON is entirely the model's job -- pair with constrained decoding
 // and a capable model for reliable results.
 
 export function resolveForcedTool(body) {

@@ -26,7 +26,7 @@ using namespace metal;
 // a time, so this is the barrier-amortisation factor.
 #define KEY_BLOCK 32
 
-// The matrix-unit prefill attention kernel uses a WIDER key block than the scalar/decode paths:
+// The matrix-unit prefill attention kernel uses a wider key block than the scalar/decode paths:
 // its per-block cost (three barriers + the softmax reductions) is amortised over the keys in the
 // block, and attention is the prefill bottleneck (measured ~3x llama.cpp), so a 64-key block halves
 // the iteration count. The softmax then covers 64 keys with 32 lanes (two keys per lane). Separate
@@ -99,20 +99,20 @@ struct RopeParams {
   float theta;
   uint use_position_buffer;  // read the position from a device buffer instead
   uint row_stride;           // elements between consecutive tokens in the slot
-  // Batched decode: every row is a DIFFERENT sequence, so row t takes positions[t] rather
+  // Batched decode: every row is a different sequence, so row t takes positions[t] rather
   // than base+t. The default (0) keeps the prefill meaning, where the rows are consecutive
   // tokens of one sequence.
   uint per_row_positions;
   // Lanes actually rotated, from the head's start. 0 means "all of head_dim", which is what
   // every model without a partial_rotary_factor wants and what this kernel did unconditionally
   // before. Qwen3.5 rotates 25% of a 256-wide head; rotating all of it is wrong in a way that
-  // is INVISIBLE at position 0, because the angle is zero there.
+  // is invisible at position 0, because the angle is zero there.
   uint rotary_dim;
   // M-RoPE: the rotary lanes are split between three position axes (t, h, w), with
   // mrope_section giving how many lanes each takes -- [11, 11, 10] on Qwen3.5, summing to
   // rotary_dim/2. Zero means plain 1-D rope, where every lane reads the same scalar position.
   //
-  // For pure TEXT tokens t == h == w, so M-RoPE reduces exactly to 1-D rope. That is what makes
+  // For pure text tokens t == h == w, so M-RoPE reduces exactly to 1-D rope. That is what makes
   // this safe to switch on for a whole sequence rather than per token.
   uint mrope_t;
   uint mrope_h;
@@ -122,7 +122,7 @@ struct RopeParams {
 struct ElemParams {
   uint n;       // total elements
   float scale;
-  // Strided second operand, for an op whose in2 is a WINDOW of a wider per-token row than its own
+  // Strided second operand, for an op whose in2 is a window of a wider per-token row than its own
   // (Gemma 4's per-layer-input gate: out/in are [token][ple], in2 is [token][num_layers*ple] and
   // this layer wants its own slice). row_len == 0 means "in2 is laid out exactly like in", which
   // is every other op and every other model.
@@ -134,7 +134,7 @@ struct ElemParams {
 struct KvParams {
   uint kv_heads;
   uint head_dim;
-  uint position;  // position of the FIRST token in the batch
+  uint position;  // position of the first token in the batch
   uint max_context;
   uint use_position_buffer;
   uint tokens;  // T: 1 for decode, N for a prefill chunk
@@ -144,17 +144,17 @@ struct AttnParams {
   uint heads;
   uint kv_heads;
   uint head_dim;
-  uint position;  // position of the FIRST query token (0-based)
+  uint position;  // position of the first query token (0-based)
   uint max_context;
   uint window;  // 0 = full causal; else sliding window length
   float scale;  // usually 1/sqrt(head_dim)
   uint use_position_buffer;
   uint tokens;  // T: 1 for decode, N for a prefill chunk
   // Paged prefill (cpi_attention_prefill_mm only; the others ignore these). 0 = the KV is one
-  // contiguous run and a key's row IS its position.
+  // contiguous run and a key's row is its position.
   uint paged;
   uint block_size;  // tokens per KV block; only meaningful when paged != 0
-  // Multimodal prefill: chunk-local per-token EXCLUSIVE key bounds replace the causal pos+1
+  // Multimodal prefill: chunk-local per-token exclusive key bounds replace the causal pos+1
   // (a bidirectional image span gives every token in the span the span's end). A sliding
   // window is measured back from the bound. 0 = causal; the limits binding is a dummy then.
   uint use_limits;

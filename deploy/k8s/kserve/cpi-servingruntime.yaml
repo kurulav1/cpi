@@ -2,7 +2,7 @@
 # non-standard engine into KServe's control plane: declare a model format the
 # runtime serves (here "ll2c") and the container that serves it. KServe then
 # builds the Deployment/Service/HPA/route for any InferenceService that asks for
-# this format/runtime — you keep your engine, KServe owns the serving lifecycle.
+# this format/runtime -- you keep your engine, KServe owns the serving lifecycle.
 #
 # GPU here uses the same WSL2/Docker-Desktop bind-mount trick as the plain pod
 # (privileged + /dev/dxg + /usr/lib/wsl, ldconfig before start). On a real cluster
@@ -41,7 +41,7 @@ spec:
         - { name: LLAMA_MODEL_DIRS, value: /models }   # scanned recursively -> all models
         - { name: LLAMA_MODEL_PATH, value: /models/Qwen2.5-Coder-3B-Instruct/Qwen2.5-Coder-3B-Instruct.ll2c }
         - { name: LLAMA_TOKENIZER_PATH, value: /models/Qwen2.5-Coder-3B-Instruct/tokenizer.json }
-        - { name: LLAMA_CHAT_TEMPLATE, value: qwen2 }   # ChatML — matches Qwen2.5
+        - { name: LLAMA_CHAT_TEMPLATE, value: qwen2 }   # ChatML -- matches Qwen2.5
         - { name: LLAMA_WARM_ON_START, value: "1" }   # load the model at boot
         - { name: LLAMA_MAX_CPU_PERCENT, value: "100" }
         - { name: LLAMA_MAX_MEMORY_PERCENT, value: "100" }

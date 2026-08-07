@@ -1,4 +1,4 @@
-// Isolated fp16 GEMM benchmark; that CHECKS what IT TIMES.
+// Isolated fp16 GEMM benchmark; one that checks what it times.
 //
 // This exists because of what happened to this kernel. It was tuned for two sessions against
 // end-to-end wall-clock, a change raised its row tile without raising its thread count, and it
@@ -7,7 +7,7 @@
 // GEMM only runs at T >= kGemmMinTokens and every golden prompt was shorter than that.
 //
 // So: every configuration this benchmark reports a number for is spot-checked against a CPU
-// reference in the same run, and a FAILED configuration prints no tok/s at all. A number here
+// reference in the same run, and a failed configuration prints no tok/s at all. A number here
 // means the kernel computed the right answer while achieving it. That property is the point of
 // the file; do not "optimize" it away.
 //
@@ -31,7 +31,7 @@
 
 namespace {
 
-// Shared with the engine. This one is a BENCH, so its accuracy column was never load-bearing
+// Shared with the engine. This one is a bench, so its accuracy column was never load-bearing
 // which is exactly why a private, differently-rounding copy could sit here unnoticed.
 inline std::uint16_t f32_to_f16(float f) { return cpi::f32_to_f16(f); }
 inline float f16_to_f32(std::uint16_t h) { return cpi::f16_to_f32(h); }
@@ -39,7 +39,7 @@ inline float f16_to_f32(std::uint16_t h) { return cpi::f16_to_f32(h); }
 // must match the shader / engine. The whole bug was a copy of these drifting, so they are
 // stated once and everything below derives from them.
 //
-// And "everything" has to mean everything: this file previously derived the GRID from kFBM but
+// And "everything" has to mean everything: this file previously derived the grid from kFBM but
 // still computed the thread count as 32 * (kFBM/32) * (kBN/32); a formula that silently
 // assumed 32x32 per simdgroup. The moment the per-simdgroup tile became a variable, that line
 // handed the kernel twice the threads it wanted and the bench reported wrong. The bench caught
@@ -74,7 +74,7 @@ int main(int argc, char** argv) {
               kFBM, kBN);
 
   // Qwen2.5-0.5B's projections. qkv is fused in the plan but the shapes are what matter.
-  // Qwen2.5-0.5B's SEVEN real projections per layer, not three. The k/v pair matters far more
+  // Qwen2.5-0.5B's seven real projections per layer, not three. The k/v pair matters far more
   // than its 1.5% of the FLOPs suggests: out_dim 128 gives a grid of (128/64) * tiles = 18
   // threadgroups on a 10-core GPU, so it is launch/occupancy-bound rather than ALU-bound and
   // its cost does not scale with its arithmetic. Leaving it out is how a bench reports 2.85
@@ -106,7 +106,7 @@ int main(int argc, char** argv) {
   int failures = 0;
 
   for (const Shape& s : shapes) {
-    // CPI_METAL_GEMM_ROTATE=<n> allocates n DISTINCT weight matrices and cycles through them,
+    // CPI_METAL_GEMM_ROTATE=<n> allocates n distinct weight matrices and cycles through them,
     // instead of hammering one. This exists because the single-matrix default does not
     // reproduce a prefill: a real pass walks 24 layers x 7 matrices (~716 MB) once each, while
     // one matrix reused 20x sits in cache. The default reports 2.85 TFLOP/s where a real
@@ -143,7 +143,7 @@ int main(int argc, char** argv) {
     const std::size_t threads = 32 * (kFBM / (8 * kRF)) * (kBN / (8 * kCF));
     const void* bufs[] = {bW.handle(), bA.handle(), bo.handle(), bW.handle()};
 
-    // WARM UP UNTIL the CLOCK STOPS RAMPING, not for a fixed few dispatches. Three was not
+    // Warm up until the clock stops ramping, not for a fixed few dispatches. Three was not
     // enough and it cost a wrong conclusion: an A/B of GEMM_FBK 32 vs 64 read as +15% for 64,
     // and interleaving the runs showed it was the first measurement in each process that was
     // slow, whichever config it happened to be. The GPU ramps over ~100 ms; anything measured
@@ -158,7 +158,7 @@ int main(int argc, char** argv) {
       ctx.commit_and_wait();
     }
 
-    // BEST of several timed batches, not the mean. The mean folds in whatever else the OS
+    // Best of several timed batches, not the mean. The mean folds in whatever else the OS
     // decided to do; the best run is the one where the kernel got the machine to itself, and
     // it is what a kernel comparison wants.
     double ms = 1e30;
@@ -208,7 +208,7 @@ int main(int argc, char** argv) {
       ctx.commit_and_wait();
     }
 
-    // CHECK what WE TIMED. A spot check, not the full product: 128 random (token,row) dot
+    // Check what we timed. A spot check, not the full product: 128 random (token,row) dot
     // products on the host. A kernel writing half its rows fails this immediately, which is
     // the entire reason the benchmark refuses to report a number without it.
     const auto* o = static_cast<const std::uint16_t*>(bo.contents());

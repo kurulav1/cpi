@@ -1,4 +1,4 @@
-# CPI on Kubernetes — the serving half of the train + serve platform
+# CPI on Kubernetes -- the serving half of the train + serve platform
 
 This directory holds the **inference plane**. Its sibling, the **training plane**, lives
 in the CPT repo under `deploy/k8s/` (the Indexed data-parallel Job). Together they form a
@@ -20,7 +20,7 @@ comprehensive setup: **CPT trains, CPI serves, and they meet on a shared model s
 ```
 
 The two planes are **decoupled**: serving replicas never talk to the training Job and never
-talk to each other — they only read the artifact. That is what lets training be a batch Job
+talk to each other -- they only read the artifact. That is what lets training be a batch Job
 and serving be an always-on autoscaled service.
 
 ## Why the shapes differ
@@ -35,10 +35,10 @@ and serving be an always-on autoscaled service.
 
 ## Files
 
-- **`inference-deployment.yaml`** — production variant: namespace, RWX `models` PVC,
+- **`inference-deployment.yaml`** -- production variant: namespace, RWX `models` PVC,
   Deployment (1 GPU/replica, rolling updates, liveness/readiness probes), Service,
   Ingress, HPA. Edit the `storageClassName`, Ingress host, and HPA metric for your cluster.
-- **`kind-inference-deployment.yaml`** — local single-node (kind) variant: CPU-only, no GPU
+- **`kind-inference-deployment.yaml`** -- local single-node (kind) variant: CPU-only, no GPU
   plugin, NodePort, `hostPath` model store. Mirrors the CPT `kind-data-parallel-job.yaml`.
 
 ## Local end-to-end loop (kind)
@@ -65,7 +65,7 @@ curl localhost:3001/v1/models            # OpenAI-compatible model list
 
 `kind-inference-gpu.yaml` is hardened for real serving; the gaps it closes:
 
-- **Persistent multi-model store** — a `hostPath` on the node's **`/var` (ext4)**,
+- **Persistent multi-model store** -- a `hostPath` on the node's **`/var` (ext4)**,
   `/var/cpi-models`, with **one subdir per model** (`<name>/<name>.ll2c` + its
   `tokenizer.json`). This replaces the old `hostPath /tmp/cpt-models`: kind's `/tmp` is
   **tmpfs (RAM)**, so every restart wiped the model; `/var` persists. CPI scans the dir
@@ -80,27 +80,27 @@ curl localhost:3001/v1/models            # OpenAI-compatible model list
   ```
   (`model-pvc.yaml` remains as the single-model PVC example; real clusters use a sized
   RWX PVC or object store instead of hostPath.)
-- **No cold start** — `LLAMA_WARM_ON_START=1` loads the model into the GPU **at boot**,
+- **No cold start** -- `LLAMA_WARM_ON_START=1` loads the model into the GPU **at boot**,
   and readiness is gated on the model actually being warm. The first real request is
   generation-time only (~2 s), never a ~60 s lazy load.
-- **Model-aware probes** — the server exposes dedicated endpoints (don't gate liveness
+- **Model-aware probes** -- the server exposes dedicated endpoints (don't gate liveness
   on the model, so a slow load can't trigger a restart loop):
   - `GET /healthz/live` → 200 once the process is up (**liveness**)
   - `GET /healthz/ready` → 200 only when the model is warm, else 503 (**readiness** +
     **startupProbe**, with a generous `failureThreshold` for the load window)
-- **Zero-downtime + graceful** — `maxUnavailable: 0` rollout, a `preStop` drain, and
+- **Zero-downtime + graceful** -- `maxUnavailable: 0` rollout, a `preStop` drain, and
   `terminationGracePeriodSeconds` so rollouts/scale-down don't drop in-flight requests.
-- **Right-sized resources** — requests are small (the model is in GPU VRAM, not host
+- **Right-sized resources** -- requests are small (the model is in GPU VRAM, not host
   RAM), so replicas and the alternative KServe path co-schedule on the node.
 
 Verified: after a full Docker Desktop restart the model stays in the PVC (no re-seed),
-the pod auto-warms, and the first request is ~2.5 s — not a cold load.
+the pod auto-warms, and the first request is ~2.5 s -- not a cold load.
 
 ## Probes (legacy note)
 
 `/api/health` still returns **200 whenever the server is listening** with model state in
-the body — fine as a simple liveness check. The `/healthz/*` endpoints above are the
-production probes (status-code based, so plain `httpGet` works — no body-grep needed).
+the body -- fine as a simple liveness check. The `/healthz/*` endpoints above are the
+production probes (status-code based, so plain `httpGet` works -- no body-grep needed).
 
 ## GPU on kind (WSL2 / Docker Desktop)
 
@@ -115,7 +115,7 @@ PTX JITs to Blackwell at load time).
    { "default-runtime": "nvidia",
      "runtimes": { "nvidia": { "path": "nvidia-container-runtime" } } }
    ```
-2. **Build a GPU-enabled kind node image** (`gpu-node.Dockerfile`) — it just sets
+2. **Build a GPU-enabled kind node image** (`gpu-node.Dockerfile`) -- it just sets
    `NVIDIA_VISIBLE_DEVICES=all`, which makes the runtime inject `/dev/dxg` + the WSL driver libs
    (`libcuda.so.1`, `libnvidia-ptxjitcompiler.so.1`) into the node, exactly like `docker run --gpus all`:
    ```bash
@@ -132,12 +132,12 @@ PTX JITs to Blackwell at load time).
    ```
    A `/v1/completions` call then returns coherent output GPU-accelerated (~12 s vs ~54 s on CPU).
 
-On a real cluster none of this applies — use the NVIDIA device plugin and `nvidia.com/gpu` resource
+On a real cluster none of this applies -- use the NVIDIA device plugin and `nvidia.com/gpu` resource
 requests (`inference-deployment.yaml`); the WSL dance is a Docker-Desktop-only workaround.
 
 ## The real integration gap
 
-The orchestration here is plumbing. The substance is the **artifact round-trip** — a CPT-trained
+The orchestration here is plumbing. The substance is the **artifact round-trip** -- a CPT-trained
 checkpoint actually loading in `cpi`:
 
 - ✅ Export path exists: CPT `export_cpt_to_hf.py` → CPI `convert_hf_to_bins.py` (HF → `.ll2c`).

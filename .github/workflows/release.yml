@@ -140,7 +140,7 @@ jobs:
             ### macOS (Metal)
             The macOS asset is attached only when the hosted CI runner could build it; its Xcode
             can lag real Apple Silicon. If it is missing, build from source (it compiles cleanly on
-            current Apple Silicon) — see [Build Modes](https://github.com/kurulav1/cpi#build-modes).
+            current Apple Silicon) -- see [Build Modes](https://github.com/kurulav1/cpi#build-modes).
 
             The Metal backend compiles its shaders at runtime, so the archive bundles the
             `.metal` sources next to the binary. Use the included launcher:
@@ -150,7 +150,7 @@ jobs:
             ```
 
             (or run `cpi` directly with `CPI_METAL_SOURCE=./metal` set). First launch
-            may prompt Gatekeeper on an unsigned binary — allow it in System Settings › Privacy.
+            may prompt Gatekeeper on an unsigned binary -- allow it in System Settings › Privacy.
 
             ### GPU (CUDA) builds
             CUDA binaries are GPU-architecture and driver specific, so they are not

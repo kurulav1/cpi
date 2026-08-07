@@ -233,7 +233,7 @@ private:
   // Executes the INT8 w2 (down) MLP projection for a resident layer.
   void resident_int8_mlp_w2(const LayerDeviceInt8Weights& lw_i8, int hidden, int inter);
 
-  // Group-wise int4 MLP matvec over `rows` tokens against a PRE-QUANTIZED perm8-g32 activation
+  // Group-wise int4 MLP matvec over `rows` tokens against a pre-quantized perm8-g32 activation
   // (xq + x_scales). rows==1 -> single-token grouped_dp4a; rows>1 -> grouped_dp4a_mt looped in
   // batches of 8 (its per-launch token cap), weights streamed once per batch. Same dp4a speed as
   // the per-row path, with the group-wise weight-scale quality.
@@ -308,7 +308,7 @@ private:
   // then declined mid-loop, there would be no contiguous Q left to fall back to.
   bool prefill_tc_prepare(int rows, int base_pos, int num_heads, int num_kv_heads, int head_dim);
 
-  // Runs the logits decode graph and LEAVES the logits on the device. Returns false if the
+  // Runs the logits decode graph and leaves the logits on the device. Returns false if the
   // graph is unavailable (caller must fall back). This is the half of
   // decode_next_token_logits_graph that does not pay for the D2H copy.
   bool run_logits_decode_graph(int token, int position);
@@ -420,7 +420,7 @@ private:
   // demand as the scheduler hands out higher slot ids.
   int kv_quality_slots_ = 1;
   void ensure_kv_quality_slots(int min_slots);
-  // Quality slot the next paged quant PREFILL writes into (set by the batch adapter
+  // Quality slot the next paged quant prefill writes into (set by the batch adapter
   // around prefill_suffix; 0 for the single-sequence path).
   int prefill_kv_slot_ = 0;
   // Actual element capacity of d_batch_block_tables_ (batch*max_blocks ints). The
@@ -553,7 +553,7 @@ private:
   void batched_lm_head(int batch, int hidden, int vocab);
   float* d_batch_logits_ = nullptr;  // [max_batch * vocab] float LM-head output
   int d_batch_logits_cap_ = 0;       // capacity in rows
-  // Persistent PINNED host mirror for the [batch][vocab] D2H copy. Pinned so the copy
+  // Persistent pinned host mirror for the [batch][vocab] D2H copy. Pinned so the copy
   // runs at full PCIe bandwidth and can be async; reused so no ~batch*vocab alloc per
   // decode step. Grown on demand alongside d_batch_logits_.
   float* h_batch_logits_ = nullptr;
@@ -582,7 +582,7 @@ private:
   // A running request in the streaming batch scheduler.
   // The backend half of continuous batching: the two operations BatchScheduler needs from a
   // GPU. Defined in llama_engine_batched_decode.cpp, where the CUDA state it touches lives.
-  // Held as the BASE pointer: BatchBackend is complete here and has a virtual destructor, so
+  // Held as the base pointer: BatchBackend is complete here and has a virtual destructor, so
   // ~LlamaEngine (compiled where BatchAdapter is only forward-declared) can destroy it.
   class BatchAdapter;
   std::unique_ptr<BatchBackend> batch_adapter_;

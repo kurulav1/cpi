@@ -34,7 +34,7 @@ namespace engine {
 // header to do so.
 struct StreamParams {
   int max_new_tokens = 16;
-  // Suppress EOS until this many tokens are generated. IGNORED when `grammar` is set: a grammar
+  // Suppress EOS until this many tokens are generated. Ignored when `grammar` is set: a grammar
   // drives its own termination, so the scheduler does not also floor the length (see step()).
   int min_new_tokens = 0;
   float temperature = 0.0f;
@@ -54,8 +54,8 @@ struct StreamParams {
 
 // One token for one request.
 //
-// finish_reason is "eos" | "stop" | "length" | "preempted". PREEMPTED IS PART OF the
-// CONTRACT, not an error: it arrives with token == -1 and means the KV pool ran out and this
+// finish_reason is "eos" | "stop" | "length" | "preempted". "Preempted" is part of the
+// contract, not an error: it arrives with token == -1 and means the KV pool ran out and this
 // request's blocks were reclaimed so older ones could finish. The caller is expected to
 // re-admit it with (prompt + generated-so-far) and a decremented budget; the scheduler
 // deliberately does not do that itself, because only the caller knows the request's remaining
@@ -68,7 +68,7 @@ struct StreamEvent {
 };
 
 // Per-row inputs to the device top-k fast path. penalty[b] <= 1 means "no repetition penalty for
-// row b". penalty_ids / penalty_rows are the flattened UNIQUE seen token ids for the penalty rows
+// row b". penalty_ids / penalty_rows are the flattened unique seen token ids for the penalty rows
 // (penalty_ids[i] belongs to row penalty_rows[i]); the backend applies the penalty on-device
 // before the top-k, so the candidate set still matches the host sampler's slow path.
 struct BatchTopkParams {
@@ -118,7 +118,7 @@ public:
                                      const std::vector<int>& kv_slots,
                                      std::vector<std::vector<float>>& out_logits) = 0;
 
-  // Optional fast path: one decode step returning each row's top-k candidate set via a DEVICE
+  // Optional fast path: one decode step returning each row's top-k candidate set via a device
   // top-k reduction, so only ~k candidates per row cross to the host instead of the full
   // [batch][vocab] logits. Returns false when the backend has no device top-k or k is unusable
   // (the caller then falls back to decode_batched_logits). The caller guarantees the batch needs
@@ -139,8 +139,8 @@ public:
     return false;
   }
 
-  // Optional fast path for GREEDY rows (temperature <= 0): one decode step returning each row's
-  // argmax token via a DEVICE reduction, so only B ints cross to the host instead of the full
+  // Optional fast path for greedy rows (temperature <= 0): one decode step returning each row's
+  // argmax token via a device reduction, so only B ints cross to the host instead of the full
   // [batch][vocab] logits. Returns false when the backend has no device argmax. The caller
   // guarantees the batch needs no full-vocabulary host feature (n-gram blocking, grammar) and that
   // every row is greedy; repetition penalty is applied on-device before the argmax.
@@ -196,7 +196,7 @@ public:
 
   // Drop the shared-prefix cache. The caller must do this whenever the KV cache is wiped
   // underneath the scheduler (reset_kv_cache): the cached entries hold refcounted blocks whose
-  // CONTENTS the wipe invalidates, and nothing about the block ids themselves would reveal
+  // contents the wipe invalidates, and nothing about the block ids themselves would reveal
   // that; a later admit would happily adopt them and prefill garbage. Running sequences are
   // deliberately left alone, matching the behaviour this replaced.
   void clear_prefix_cache();

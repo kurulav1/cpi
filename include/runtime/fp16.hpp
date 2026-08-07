@@ -2,13 +2,13 @@
 
 // IEEE 754 binary16 <-> binary32, in one place.
 //
-// This exists because there were FIVE hand-rolled copies of these two functions (plan_metal_
+// This exists because there were five hand-rolled copies of these two functions (plan_metal_
 // engine.cpp, plan_metal_vision.cpp, metal_vision_test.cpp, metal_smoke.cpp, metal_gemm_bench.cpp)
 // and every one of them was wrong in the same two ways:
 //
-//   * f32 -> f16 TRUNCATED the mantissa (`man >> 13`) instead of rounding to nearest even, so
+//   * f32 -> f16 truncated the mantissa (`man >> 13`) instead of rounding to nearest even, so
 //     every conversion of a value that is not exactly representable was biased toward zero.
-//   * both directions FLUSHED fp16 subnormals to zero (`if (exp <= 0) return sign`), discarding
+//   * both directions flushed fp16 subnormals to zero (`if (exp <= 0) return sign`), discarding
 //     the entire range below 2^-14 that fp16 in fact represents down to 2^-24.
 //
 // Metal's own `half()` does neither, so host and device disagreed on 0.39% of a bf16 checkpoint's

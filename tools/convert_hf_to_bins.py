@@ -140,7 +140,7 @@ def unsupported_reason(cfg: dict) -> str:
         return ""
 
     # Linear attention is supported for qwen3_5 (handled above, which returns "" for it). Any
-    # OTHER family arriving here with linear-attention layers has a block shape this converter has
+    # other family arriving here with linear-attention layers has a block shape this converter has
     # not been taught, so it is still refused rather than mapped by guesswork.
     if has_linear_attention:
         return ("This model uses linear-attention layers, which the native CPI "
@@ -168,7 +168,7 @@ def load_index(hf_dir: Path) -> dict:
 
     single_path = hf_dir / "model.safetensors"
     if not single_path.exists():
-        # Some repos ship a single shard under the sharded NAME (Qwen3.5-0.8B is
+        # Some repos ship a single shard under the sharded name (Qwen3.5-0.8B is
         # "model.safetensors-00001-of-00001.safetensors") and then omit the index, since there is
         # nothing to index. Accept exactly one such file; refuse several, because picking one of
         # a real multi-shard set would silently convert a fraction of the model.
@@ -239,8 +239,8 @@ def read_safetensor_blob(safetensor_path: Path, tensor_name: str):
 # Config extraction
 # ---------------------------------------------------------------------------
 
-# NOTE on the lookups below: Python evaluates a .get() default EAGERLY, so
-# `text_cfg.get(k, hf_cfg[k])` raises KeyError whenever k is absent from the TOP level; even
+# NOTE on the lookups below: Python evaluates a .get() default eagerly, so
+# `text_cfg.get(k, hf_cfg[k])` raises KeyError whenever k is absent from the top level; even
 # when text_config supplies it. That is every nested-config model (Qwen3.5 keeps everything under
 # text_config), and it read as "this model has no attention heads" rather than as a lookup bug.
 # hf_cfg.get() keeps the fallback lazy.
@@ -251,7 +251,7 @@ def extract_model_config(hf_cfg: dict, family: str) -> dict:
     num_kv_heads = int(text_cfg.get("num_key_value_heads", hf_cfg.get("num_key_value_heads", num_heads)))
 
     # Newer HF configs (Qwen3.5 and later) nest every rope knob under "rope_parameters" instead of
-    # leaving them at the top level. Reading only the flat key silently yields the FAMILY DEFAULT
+    # leaving them at the top level. Reading only the flat key silently yields the family default
     # theta and a full-rotary factor; a model that loads, runs, and is wrong.
     def rope_param(key, default):
         for scope in (text_cfg, hf_cfg):
@@ -468,8 +468,8 @@ def build_qwen35_mapping(num_layers: int, layer_types: list, has_qk_norm: bool,
             (f"{P}layers.{i}.mlp.up_proj.weight", f"layers.{i}.feed_forward.w3", True),
         ])
         if "linear" in kind:
-            # Delta-net. linear_attn.norm is the OUTPUT norm inside the block (value_head_dim
-            # wide, gated by z); it is in ADDITION to the input_layernorm emitted above.
+            # Delta-net. linear_attn.norm is the output norm inside the block (value_head_dim
+            # wide, gated by z); it is in addition to the input_layernorm emitted above.
             items.extend([
                 (f"{P}layers.{i}.linear_attn.in_proj_qkv.weight",
                  f"layers.{i}.linear_attn.in_proj_qkv", True),

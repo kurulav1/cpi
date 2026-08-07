@@ -1,11 +1,11 @@
 #define Q_BLOCK 8
-// The largest head_dim the SCALAR attention kernels can hold in threadgroup memory. Was a bare
-// 256 repeated in six places, which is exactly the head_dim of Qwen3.5 and Gemma 4's SLIDING
-// layers -- so it fit every model anyone had run. Gemma 4 E2B's FULL layers are head_dim 512 and
+// The largest head_dim the scalar attention kernels can hold in threadgroup memory. Was a bare
+// 256 repeated in six places, which is exactly the head_dim of Qwen3.5 and Gemma 4's sliding
+// layers -- so it fit every model anyone had run. Gemma 4 E2B's full layers are head_dim 512 and
 // wrote straight past these arrays, which is where its NaN logits came from.
 //
 // Cost is 2 arrays * ATTN_MAX_HEAD_DIM floats per threadgroup: 4 KB at 512, up from 2 KB. Well
-// inside the 32 KB budget, but it is OCCUPANCY that pays -- so this is measured, not assumed.
+// inside the 32 KB budget, but it is occupancy that pays -- so this is measured, not assumed.
 #define ATTN_MAX_HEAD_DIM 512
 // Query-block size of cpi_attention_prefill_wide, the head_dim > 256 variant of the scalar
 // prefill kernel. The main kernel's q_sh/acc are Q_BLOCK * 256 floats and cannot be raised to
@@ -29,7 +29,7 @@
 #define QMM_BLOCK 16
 
 // The scoring and P.V loops hold a QMM_QT x QMM_KT register tile, so they walk query fragments in
-// groups of QMM_QT and round the count UP. A block that is not a whole number of those groups
+// groups of QMM_QT and round the count up. A block that is not a whole number of those groups
 // therefore reads query fragments past its own rows -- q_sh and acc are sized QMM_BLOCK rows, so
 // that is off the end of the array, not merely zero padding, and the kernel silently computes
 // wrong attention. QMM_BLOCK 8 did exactly that (the golden failed while every benchmark looked
@@ -63,7 +63,7 @@ constant uint FC_kv_dim [[function_constant(1)]];
 constant uint FC_q_dim [[function_constant(2)]];
 
 // ---------------------------------------------------------------------------
-// Prefill attention on the MATRIX UNITS (head_dim <= 128). The scalar kernel below scores
+// Prefill attention on the matrix units (head_dim <= 128). The scalar kernel below scores
 // QK^T and does P.V with per-thread dot products -- the matrix units sit idle through the
 // whole of attention, which the RCA put at ~21% of prefill. This computes both products with
 // simdgroup_matrix (fp32 accumulate, the fast path), keeping the same per-query online softmax.
@@ -109,7 +109,7 @@ static void attn_prefill_mm_body(device const half* q, device const half* k_cach
   const uint lane = lid % 32u;
   const uint n_simd = nthr / 32u;
 
-  // Zero the FULL QB rows, not just nq: the matrix ops load 8-row fragments, so the
+  // Zero the full QB rows, not just nq: the matrix ops load 8-row fragments, so the
   // padding rows must be defined (0) rather than garbage that could turn into NaN.
   for (uint c = lid; c < QB * hd; c += nthr) {
     const uint qi = c / hd, i = c % hd;
@@ -134,7 +134,7 @@ static void attn_prefill_mm_body(device const half* q, device const half* k_cach
     const uint nk = min((uint)MM_KEY_BLOCK, last_pos - kb + 1u);
     const uint n_kg = (nk + 7u) / 8u;  // 8-key groups this block
 
-    // Where this key block physically lives. ONE lookup per block, not per key: the caller
+    // Where this key block physically lives. One lookup per block, not per key: the caller
     // guarantees block_size % MM_KEY_BLOCK == 0 and no sliding window (so start == 0 and every kb
     // is MM_KEY_BLOCK-aligned), which together mean the whole run [kb, kb+MM_KEY_BLOCK) sits inside a
     // single physical block and stays contiguous -- so the simdgroup_loads below keep working
@@ -144,8 +144,8 @@ static void attn_prefill_mm_body(device const half* q, device const half* k_cach
                            ? uint(block_tables[kb / p.block_size]) * p.block_size + (kb % p.block_size)
                            : kb;
 
-    // --- Scoring: each simdgroup computes a QT x KT TILE of S[8q x 8k] fragments. ---
-    // REGISTER TILING, the same trick that makes the GEMM fast. One output fragment per work item
+    // --- Scoring: each simdgroup computes a QT x KT tile of S[8q x 8k] fragments. ---
+    // Register tiling, the same trick that makes the GEMM fast. One output fragment per work item
     // means loading a Qf and a Kf for every single matrix op -- two loads per MAC, an arithmetic
     // intensity of 0.5, against the GEMM's 2.0. That is why attention runs at a few percent of the
     // GEMM's FLOP rate: it is starved on fragment loads, not short of matrix throughput. Holding a
@@ -153,8 +153,8 @@ static void attn_prefill_mm_body(device const half* q, device const half* k_cach
     // 4 loads feed 4 MACs (intensity 1.0), and with qfs=2 and n_kg up to 16 the tile count still
     // fills all 8 simdgroups.
     //
-    // Query fragments past qfs are safe to compute BECAUSE QB is a whole number of QT-sized
-    // groups (the static_assert above): q_sh is zeroed over the FULL QB rows, so they
+    // Query fragments past qfs are safe to compute because QB is a whole number of QT-sized
+    // groups (the static_assert above): q_sh is zeroed over the full QB rows, so they
     // contribute zeros that the softmax's nq bound ignores. Key groups past n_kg are NOT safe
     // to read (they can run off the end of the KV cache), so their load is clamped and their store
     // suppressed.
@@ -174,7 +174,7 @@ static void attn_prefill_mm_body(device const half* q, device const half* k_cach
           simdgroup_load(Qf[a], q_sh + (qt * QT + a) * 8u * hd + df * 8u, hd);  // [8q x 8d]
         for (uint b = 0u; b < KT; ++b) {
           const uint kg = min(kt * KT + b, n_kg - 1u);  // clamped: out-of-range reads are discarded
-          // K is [key][d]; load the [8k x 8d] tile TRANSPOSED to get [8d x 8k].
+          // K is [key][d]; load the [8k x 8d] tile transposed to get [8d x 8k].
           simdgroup_load(Kf[b],
                          k_cache + (ulong)(kphys + kg * 8u) * (ulong)kv_dim + kv_head * hd + df * 8u,
                          kv_dim, ulong2(0, 0), true);
@@ -259,7 +259,7 @@ static void attn_prefill_mm_body(device const half* q, device const half* k_cach
 
     // --- P.V: O[8q x 8d] += P[8q x 8k] @ V[8k x 8d], accumulated into the fp32 acc. ---
     // Tiled over QT query fragments for the same reason as the scoring above: one output fragment
-    // per work item meant loading a Pf AND a Vf for every MAC (intensity 0.5). Holding QT of them
+    // per work item meant loading a Pf and a Vf for every MAC (intensity 0.5). Holding QT of them
     // reuses each Vf across the query fragments -- 3 loads feed 2 MACs (0.67) -- while dt_n = dfs
     // keeps all 8 simdgroups busy. The accumulator load/store is hoisted out of the key loop, so it
     // amortises over all n_kg groups.
@@ -298,7 +298,7 @@ kernel void cpi_attention_prefill_mm(device const half* q [[buffer(0)]],
                                      device const half* v_cache [[buffer(2)]],
                                      device half* out [[buffer(3)]],
                                      device const int* positions [[buffer(4)]],
-                                     // ONE sequence's logical->physical block map, used only when
+                                     // One sequence's logical->physical block map, used only when
                                      // p.paged != 0. Bound to a dummy otherwise (the params block
                                      // must stay last, so the slot cannot simply be absent).
                                      device const int* block_tables [[buffer(5)]],
@@ -364,7 +364,7 @@ kernel void cpi_attention_prefill_mm_wide(device const half* q [[buffer(0)]],
 // not a 32-lane simd_max), and a lane holds the same row of every fragment, so each lane tracks one
 // query's running max and sum in registers.
 //
-// STATUS: correct (goldens pass) but RESEARCH-ONLY, and slower by enough to retire the idea.
+// STATUS: correct (goldens pass) but research-only, and slower by enough to retire the idea.
 // Attention ~283 ms vs the phase kernel's ~117 at T=2041; CPI_METAL_ATTN_FA=1 makes prefill ~774 ms
 // against 612. Per phase (FA_RCA above):
 //
@@ -397,7 +397,7 @@ kernel void cpi_attention_prefill_mm_wide(device const half* q [[buffer(0)]],
 // eliminated and the wall-clock delta is that phase.
 //   1 = scoring matmul skipped (S keeps its zero fill, so the softmax still consumes it)
 //   4 = P.V matmul skipped (O keeps its zero fill, so the output loop still consumes it)
-// A stub whose result goes UNREAD lets the compiler delete the phase outright and then prices
+// A stub whose result goes unread lets the compiler delete the phase outright and then prices
 // nothing. That is not hypothetical: a first attempt here filled P directly and left S written but
 // unused, the scoring matmul vanished, and the softmax looked like it cost 28 ms when it costs 63.
 #define FA_RCA 0
@@ -481,7 +481,7 @@ kernel void cpi_attention_prefill_fa(device const half* q [[buffer(0)]],
   simdgroup_float8x8 O[16];
   for (uint df = 0u; df < dfs; ++df) O[df] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
 
-  // The running max and sum of THIS lane's query, in registers, replicated across the four lanes
+  // The running max and sum of this lane's query, in registers, replicated across the four lanes
   // of the row by the butterfly reductions.
   float m_run = -INFINITY;
   float l_run = 0.0f;
@@ -585,17 +585,17 @@ kernel void cpi_attention_prefill_fa(device const half* q [[buffer(0)]],
 }
 
 // ---------------------------------------------------------------------------
-// QUERY-PARTITIONED prefill attention -- the research rewrite.
+// Query-partitioned prefill attention -- the research rewrite.
 //
-// The kernel above is PHASE-partitioned: all 8 simdgroups cooperate on all QMM_BLOCK queries and
+// The kernel above is phase-partitioned: all 8 simdgroups cooperate on all QMM_BLOCK queries and
 // re-partition between scoring / softmax / P.V, so every phase boundary pushes the intermediate
 // state through threadgroup memory behind a threadgroup_barrier. Measured, that structure costs
 // exactly what llama.cpp's flash-attention-OFF path costs (116 vs 117 ms at T=2048) -- it is the
 // unfused algorithm in a fused kernel's clothing, and no amount of tiling, block-size or occupancy
 // tuning moved it (all measured neutral).
 //
-// This one is QUERY-partitioned, which is what actually makes flash attention fast: each simdgroup
-// owns QP_QPS queries OUTRIGHT and carries them through scoring, softmax and accumulation itself.
+// This one is query-partitioned, which is what actually makes flash attention fast: each simdgroup
+// owns QP_QPS queries outright and carries them through scoring, softmax and accumulation itself.
 // Nothing it writes is read by any other simdgroup, so every scratch array is a per-simdgroup slice
 // and every barrier drops from threadgroup_barrier to simdgroup_barrier -- ordering within one
 // simdgroup, which is nearly free. There is no cross-simdgroup synchronisation in the key loop at
@@ -652,7 +652,7 @@ kernel void cpi_attention_prefill_qp(device const half* q [[buffer(0)]],
   const uint hd = p.head_dim;
   const uint dfs = hd / 8u;
 
-  // This simdgroup's OWN queries. Nothing below is shared with another simdgroup.
+  // This simdgroup's own queries. Nothing below is shared with another simdgroup.
   const uint q0 = t0 + sg * QP_QPS;
   const uint nq = (q0 < p.tokens) ? min((uint)QP_QPS, p.tokens - q0) : 0u;
 
@@ -663,7 +663,7 @@ kernel void cpi_attention_prefill_qp(device const half* q [[buffer(0)]],
   threadgroup float m_sh[QP_NSG][QP_QPS];
   threadgroup float l_sh[QP_NSG][QP_QPS];
 
-  // Zero the FULL QP_QPS rows: the matrix ops load 8-row fragments, so padding rows must be
+  // Zero the full QP_QPS rows: the matrix ops load 8-row fragments, so padding rows must be
   // defined rather than garbage that could become NaN.
   for (uint c = lane; c < QP_QPS * hd; c += 32u) {
     const uint qi = c / hd, i = c % hd;
@@ -692,8 +692,8 @@ kernel void cpi_attention_prefill_qp(device const half* q [[buffer(0)]],
             ? uint(block_tables[kb / p.block_size]) * p.block_size + (kb % p.block_size)
             : kb;
 
-    // Scoring: this simdgroup's 8 queries against each key group. The query fragments are the SAME
-    // for every key group, so they are loaded ONCE into registers and reused across all of them --
+    // Scoring: this simdgroup's 8 queries against each key group. The query fragments are the same
+    // for every key group, so they are loaded once into registers and reused across all of them --
     // dfs + n_kg*dfs loads for n_kg*dfs MACs, rather than reloading Qf per key group (which would
     // be two loads per MAC, the 0.5 intensity that starved the phase-partitioned kernel).
     simdgroup_half8x8 Qf[16];  // dfs <= 128/8
@@ -785,7 +785,7 @@ kernel void cpi_attention_prefill(device const half* q [[buffer(0)]],
 
   // 256 is a hard head_dim ceiling, NOT ATTN_MAX_HEAD_DIM: at Q_BLOCK 8 the 512-wide pair alone
   // is the whole 32 KB threadgroup budget. The executor routes head_dim > 256 to
-  // cpi_attention_prefill_wide below; dispatching THIS kernel wider silently smashes acc and the
+  // cpi_attention_prefill_wide below; dispatching this kernel wider silently smashes acc and the
   // softmax scratch.
   threadgroup float q_sh[Q_BLOCK * 256];
   threadgroup float acc[Q_BLOCK * 256];
@@ -808,7 +808,7 @@ kernel void cpi_attention_prefill(device const half* q [[buffer(0)]],
 
   // The block's queries span positions [base+t0, base+t0+nq-1]; the last one reaches
   // furthest, and the first one's window (if any) starts earliest. Per-token limits widen
-  // that: a bidirectional span token's bound can sit PAST its causal position (its span's
+  // that: a bidirectional span token's bound can sit past its causal position (its span's
   // keys are all written -- KvStore appends the whole chunk before attention runs).
   const uint last_pos = base + t0 + nq - 1u;
   const uint first_pos = base + t0;
@@ -824,7 +824,7 @@ kernel void cpi_attention_prefill(device const half* q [[buffer(0)]],
   for (uint kb = start; kb < end_total; kb += KEY_BLOCK) {
     const uint nk = min((uint)KEY_BLOCK, end_total - kb);
 
-    // Score every (query, key) pair: ONE THREAD per pair, a full dot product with no
+    // Score every (query, key) pair: one thread per pair, a full dot product with no
     // cross-lane reduction. The previous version gave each pair a whole simdgroup and summed
     // across 32 lanes -- five shuffle steps of reduction overhead for ~two useful multiplies
     // per lane. nq*nk <= Q_BLOCK*KEY_BLOCK == nthr, so this is a single pass at full occupancy.
@@ -848,7 +848,7 @@ kernel void cpi_attention_prefill(device const half* q [[buffer(0)]],
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Fold the block into each query's own online softmax. ONE SIMDGROUP per query, so all
+    // Fold the block into each query's own online softmax. One simdgroup per query, so all
     // 256 threads work -- the old thread-per-query version left 8 threads busy and 248 idle at
     // the barrier below. KEY_BLOCK == 32 == simd width, so lane j owns key j and the max/sum are
     // lane-parallel reductions.
@@ -1037,10 +1037,10 @@ kernel void cpi_attention_decode(
   // One threadgroup per (query token, head). Decode is just T = 1, so prefill and decode
   // share this kernel instead of duplicating the softmax and the GQA maths.
   //
-  // KEYS ARE PROCESSED IN BLOCKS. The first version walked the cache ONE KEY AT A TIME,
+  // Keys are processed in blocks. The first version walked the cache one key at a time,
   // with two threadgroup barriers per key -- about 1100 barriers per (token, head) on a
   // 551-token prompt, which made prefill attention O(T^2) in barriers as well as in work.
-  // Scoring a block of 32 keys and folding it into the online softmax ONCE cuts the
+  // Scoring a block of 32 keys and folding it into the online softmax once cuts the
   // barrier count ~20x and lets the score dot-products run across all simdgroups at once.
   const uint total = p.heads * p.tokens;
   if (gid >= total) return;
@@ -1104,7 +1104,7 @@ kernel void cpi_attention_decode(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Online softmax, folded in ONCE for the block rather than once per key.
+    // Online softmax, folded in once for the block rather than once per key.
     float bmax = -INFINITY;
     for (uint j = 0u; j < nk; ++j) bmax = max(bmax, sc_sh[j]);
 
@@ -1152,16 +1152,16 @@ kernel void cpi_attention_decode(
 // Split-KV decode attention.
 //
 // cpi_attention_decode above gives one threadgroup to each (token, head) and walks the whole
-// cache inside it. For a PREFILL that is fine: T tokens x heads is thousands of threadgroups.
-// At DECODE T is 1, so the grid is just `heads` -- 14 threadgroups for Qwen2.5-0.5B, on a GPU
+// cache inside it. For a prefill that is fine: T tokens x heads is thousands of threadgroups.
+// At decode T is 1, so the grid is just `heads` -- 14 threadgroups for Qwen2.5-0.5B, on a GPU
 // that wants hundreds. The cache walk becomes a serial loop in a nearly empty machine, so
 // decode slows down with context for a reason that has nothing to do with bandwidth: at 2048
 // keys the KV cache is ~25 MB against 1.17 GB of weights, 2% of the traffic for a 2.6x
 // slowdown (88 -> 34 tok/s, where llama.cpp holds 96 -> 89).
 //
-// So split the keys. Pass 1 gives each (head, chunk) its own threadgroup and an INDEPENDENT
+// So split the keys. Pass 1 gives each (head, chunk) its own threadgroup and an independent
 // online softmax over its slice, writing that slice's running max, running sum and an
-// UNNORMALIZED accumulator. Pass 2 merges the slices per head.
+// unnormalized accumulator. Pass 2 merges the slices per head.
 //
 // The merge is exact, not an approximation: softmax combines under the standard log-sum-exp
 // rule, so rescaling each slice by exp(m_c - m) and summing reproduces the single-threadgroup
@@ -1171,11 +1171,11 @@ kernel void cpi_attention_decode(
 // ---------------------------------------------------------------------------
 
 // Keys per pass of the decode scoring loop, and the threadgroup width that serves it. They are
-// the same number ON PURPOSE: the loop gives each THREAD one whole key, so the 64-element dot
+// the same number on purpose: the loop gives each thread one whole key, so the 64-element dot
 // product stays in one thread and there is no cross-lane reduction at all.
 //
 // The kernel this replaced split each key's dot product across a simdgroup -- 32 lanes doing 2
-// MACs each, then a 5-step shuffle reduction, PER KEY. That is two MACs of work per reduction and
+// MACs each, then a 5-step shuffle reduction, per key. That is two MACs of work per reduction and
 // it ran the per-key term at ~23 GFLOP/s, 0.5% of peak. One key per lane needs as many keys in
 // flight as threads, which is why this threadgroup is 64 wide and not the 256 the rest of the file
 // uses: a decode chunk is only ~56 keys once the chunks are sized to fill the GPU, so 256 threads
@@ -1263,7 +1263,7 @@ kernel void cpi_attention_decode_split(
   // V-accumulate work split. Sweeping dims alone leaves most threads idle whenever
   // head_dim/4 < nthr -- 16 of 64 for head_dim 64, so 75% of the threadgroup sat out the V pass
   // while it walked every key serially. When the dims fit the threadgroup, give each thread a
-  // (dim, key-group) pair and keep its partial in a REGISTER: every thread works, reads stay
+  // (dim, key-group) pair and keep its partial in a register: every thread works, reads stay
   // contiguous within each key, and the key-group partials are combined once at the end instead
   // of round-tripping tg_acc every block. Wider heads keep the original sweep.
   const uint hd4v = p.head_dim >> 2u;
@@ -1278,7 +1278,7 @@ kernel void cpi_attention_decode_split(
   for (uint kb = c0; kb < c1; kb += DEC_KEY_BLOCK) {
     const uint nk = min((uint)DEC_KEY_BLOCK, c1 - kb);
 
-    // Score: ONE KEY PER THREAD, half4 K loads + float4 dots. head_dim % 4 == 0 on
+    // Score: one key per thread, half4 K loads + float4 dots. head_dim % 4 == 0 on
     // every model here.
     {
       threadgroup const float4* q4 = (threadgroup const float4*)q_sh;
@@ -1372,7 +1372,7 @@ kernel void cpi_attention_decode_split(
   }
 }
 
-// GQA-shared split decode: one threadgroup per KEY CHUNK, one simdgroup per q-head, the
+// GQA-shared split decode: one threadgroup per key chunk, one simdgroup per q-head, the
 // K and V blocks staged in threadgroup memory once for all heads (the per-(head,chunk)
 // kernel re-reads the shared kv_head per q-head). Opt-in: the staging barriers measured
 // costlier than the traffic they save. Per-head softmax state lives in simd registers:
@@ -1560,7 +1560,7 @@ kernel void cpi_attention_decode_merge(
 // ---------------------------------------------------------------------------
 // Batched paged decode -- the kernels continuous batching needs.
 //
-// The kernels above serve ONE sequence, whose KV is contiguous: the key at logical
+// The kernels above serve one sequence, whose KV is contiguous: the key at logical
 // position p lives at p * kv_dim. Continuous batching cannot use that layout, because the
 // sequences in a batch start, grow and finish independently -- a contiguous per-sequence
 // cache would have to reserve max_context for every slot. Instead the cache is one pool per
@@ -1622,8 +1622,8 @@ struct AttnPagedParams {
   uint batch;
 };
 
-// One threadgroup per (sequence, head). Each sequence attends over its OWN length, gathered
-// through its OWN block table -- the ragged batch the scheduler hands us. Structurally this
+// One threadgroup per (sequence, head). Each sequence attends over its own length, gathered
+// through its own block table -- the ragged batch the scheduler hands us. Structurally this
 // is cpi_attention_decode with the contiguous key address replaced by a paged gather; the
 // online softmax is unchanged, so the two agree key-for-key when a block table happens to be
 // identity (which is what the parity gate checks).
@@ -1633,7 +1633,7 @@ kernel void cpi_attention_decode_batched_paged(
     device const half*  v_pool       [[buffer(2)]],
     device half*        out          [[buffer(3)]],  // [batch][heads*head_dim]
     device const int*   block_tables [[buffer(4)]],  // [batch][max_blocks]
-    device const int*   seq_lens     [[buffer(5)]],  // [batch] -- length INCLUDING the new token
+    device const int*   seq_lens     [[buffer(5)]],  // [batch] -- length including the new token
     constant AttnPagedParams& p      [[buffer(6)]],
     uint gid  [[threadgroup_position_in_grid]],
     uint lid  [[thread_position_in_threadgroup]],
@@ -1752,7 +1752,7 @@ kernel void cpi_attention_decode_batched_paged(
 //   x [hidden]              --GateUpGeglu-> inter[k][einter]    (per selected expert)
 //   inter                   --DownAccum---> y [hidden]          (routing-weighted sum)
 //
-// The selection crosses ops in DEVICE buffers, so a token never round-trips to the host
+// The selection crosses ops in device buffers, so a token never round-trips to the host
 // mid-layer. These mirror PlanCudaEngine's kernels; the gate is reproducing the CUDA token
 // stream on tiny-mixtral, so a deviation here is a bug even where it looks like an
 // improvement.
@@ -1762,7 +1762,7 @@ kernel void cpi_attention_decode_batched_paged(
 // ---------------------------------------------------------------------------
 // Bidirectional (non-causal) attention, for a vision tower.
 //
-// A SEPARATE kernel rather than a mask mode on the causal ones above. Those four are tuned
+// A separate kernel rather than a mask mode on the causal ones above. Those four are tuned
 // against a measured roofline and are on the path of every text model; threading a
 // "bidirectional" branch through them would put a vision feature's regressions into the text
 // engine. The shapes differ too: no KV cache, no paging, no sliding window, no GQA, and a
@@ -1794,7 +1794,7 @@ kernel void cpi_attention_bidirectional(
   // offset. Assuming the packed stride reads q's row t from wherever k's row t/3 happens to be
   // -- plausible numbers, wrong attention.
   const uint dim  = (p.row_stride != 0u) ? p.row_stride : (p.heads * p.head_dim);
-  // The OUTPUT is its own packed [tokens][heads*head_dim] buffer, so it never carries the
+  // The output is its own packed [tokens][heads*head_dim] buffer, so it never carries the
   // fused stride. Using `dim` for both -- which is the natural way to write this -- scatters
   // each token's result three rows apart and leaves two thirds of the buffer untouched.
   const uint out_dim = p.heads * p.head_dim;
@@ -1805,7 +1805,7 @@ kernel void cpi_attention_bidirectional(
   threadgroup float sc[BIATTN_CHUNK];
   threadgroup float red[BIATTN_CHUNK / 32];
   threadgroup float acc[BIATTN_MAXDIM];   // running unnormalised output
-  // [2] holds the max from BEFORE this chunk: the rescale is exp(prev_max - run_max), and reading
+  // [2] holds the max from before this chunk: the rescale is exp(prev_max - run_max), and reading
   // an already-updated stats[0] makes that exp(0) == 1, dropping the correction when the max grows.
   threadgroup float stats[3];             // [0] running max, [1] running sum, [2] previous max
 

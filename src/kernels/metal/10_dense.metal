@@ -102,9 +102,9 @@ kernel void cpi_add_rmsnorm(
 // GEMV: out[out_dim] = W[out_dim x in_dim] . in[in_dim], row-major, fp16.
 // One simdgroup per output row; each lane strides the row, fp32 accumulate.
 //
-// The weights are read 128 BITS AT A TIME (uint4 = 8 halves), not one half at a
+// The weights are read 128 bits at a time (uint4 = 8 halves), not one half at a
 // time. A decode GEMV is pure bandwidth -- it touches every weight exactly once and
-// never reuses one -- so the load width IS the kernel. Reading 16-bit scalars leaves
+// never reuses one -- so the load width is the kernel. Reading 16-bit scalars leaves
 // most of each memory transaction unused and cannot keep enough requests in flight to
 // cover DRAM latency. The same mistake, and the same fix, as the CUDA backend.
 //
@@ -138,18 +138,18 @@ kernel void cpi_gemv_f16(
   const uint simd_id      = lid / 32u;
   const uint lane         = lid % 32u;
 
-  // TOKEN TILING. A prefill pushes T tokens through the same weights, so the weight
-  // row is loaded ONCE and reused across a tile of tokens. Without this, a "batched"
+  // Token tiling. A prefill pushes T tokens through the same weights, so the weight
+  // row is loaded once and reused across a tile of tokens. Without this, a "batched"
   // GEMV is really T separate GEMVs: it re-streams the entire weight matrix per token
   // and saves nothing on a bandwidth-bound machine. With it, a tile of TILE tokens
   // reads the weights once, so prefill traffic drops by up to TILE-fold.
   //
   // Decode is TILE=1 and behaves exactly as before.
-  // Four-rows-per-simdgroup DECODE path: one simdgroup owns four consecutive rows and the
+  // Four-rows-per-simdgroup decode path: one simdgroup owns four consecutive rows and the
   // activation is loaded once for all of them. An fp16 square GEMV is half activation
   // re-reads by traffic on the one-row shape (row = in_dim halfs, activation = in_dim halfs),
   // so this cuts total traffic up to 1.6x. The executor passes 64-thread threadgroups under
-  // the SAME predicate (tokens == 1, in_dim % 8 == 0) -- keep them in lockstep.
+  // the same predicate (tokens == 1, in_dim % 8 == 0) -- keep them in lockstep.
   if (p.tokens == 1u && (p.in_dim & 7u) == 0u) {
     const uint r0 = (gid * simds_per_tg + simd_id) * 4u;
     if (r0 >= p.out_dim) return;
@@ -275,12 +275,12 @@ kernel void cpi_lm_head(
 // ---------------------------------------------------------------------------
 // True LayerNorm: (x - mean) / sqrt(var + eps) * weight + bias.
 //
-// The fp32 accumulators are LOAD-BEARING and measured to be so. The Qwen3.5 vision tower's
+// The fp32 accumulators are load-bearing and measured to be so. The Qwen3.5 vision tower's
 // last block holds outliers around 1657 (its rows are otherwise ~unit scale), and 1657^2 is
 // 2.7e6 -- past fp16's 65504. Swapping the variance accumulator to half makes metal_smoke's
 // layernorm case go from max_abs 0.0005 to 1.21, so that test genuinely pins this.
 //
-// The two passes are DEFENSIVE, not required by this model. The one-pass identity
+// The two passes are defensive, not required by this model. The one-pass identity
 // var = E[x^2] - E[x]^2 cancels catastrophically only when |mean| >> stddev, and these
 // activations are near zero-mean (max |mean|/stddev across the tower is 0.5), so both forms
 // agree here -- verified by patching the kernel to the one-pass form and seeing the test

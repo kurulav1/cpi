@@ -1,8 +1,8 @@
 // Parity gate for device-side top-k sampling.
 //
-// Drives cpi --interactive twice with the SAME seed and sampling knobs —
+// Drives cpi --interactive twice with the SAME seed and sampling knobs --
 // once with the GPU candidate selection (default) and once forced onto the host
-// path (CPI_PLAN_NO_DEVICE_TOPK=1) — and requires an IDENTICAL token
+// path (CPI_PLAN_NO_DEVICE_TOPK=1) -- and requires an IDENTICAL token
 // sequence. Both paths feed the same shared candidate math and the same RNG, so
 // a seeded run must agree exactly; any divergence means the GPU selected a
 // different candidate set (a silent distribution bug).
@@ -49,6 +49,6 @@ console.log("device top-k:", JSON.stringify(dev));
 console.log("host   top-k:", JSON.stringify(host));
 const ok = Boolean(dev) && dev === host;
 console.log(ok
-  ? "\nPARITY OK — seeded sampled generation is identical on the device and host paths"
-  : "\nPARITY FAILED — the GPU selected a different candidate set");
+  ? "\nPARITY OK -- seeded sampled generation is identical on the device and host paths"
+  : "\nPARITY FAILED -- the GPU selected a different candidate set");
 process.exit(ok ? 0 : 1);

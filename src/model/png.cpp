@@ -1,7 +1,7 @@
 // Hand-rolled PNG decoder: DEFLATE (RFC 1951) + PNG filters (RFC 2083).
 //
 // The DEFLATE side is a straight canonical-Huffman inflater. The only subtlety worth
-// calling out is that DEFLATE packs bits LSB-first within a byte, but Huffman CODES are
+// calling out is that DEFLATE packs bits LSB-first within a byte, but Huffman codes are
 // read MSB-first; a bit reader that gets that backwards decodes the fixed-Huffman
 // blocks fine and then falls apart on dynamic ones, which is a miserable bug to chase.
 // Here, read_bits() is LSB-first and decode_symbol() walks the code bit by bit,

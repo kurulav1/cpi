@@ -1,9 +1,9 @@
-# CPI inference plane — the SERVING half of the CPT(train) + CPI(serve) platform.
+# CPI inference plane -- the SERVING half of the CPT(train) + CPI(serve) platform.
 #
 # Shape: a long-running Deployment (not a Job). N stateless replicas of the CPI
 # image (Node web server on :3001 that shells out to the cpi CUDA binary),
 # load-balanced by a Service, fronted by an Ingress, autoscaled by an HPA. Each
-# replica mounts the shared model store read-only at /models — this is the "seam"
+# replica mounts the shared model store read-only at /models -- this is the "seam"
 # the training plane writes to (CPT checkpoint -> export -> .ll2c -> /models).
 #
 # Replicas never talk to each other and never talk to the training Job; they only

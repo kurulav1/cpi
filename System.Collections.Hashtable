@@ -1,0 +1,318 @@
+﻿| 1 | unit/argmax_tiebreak_test | TIMEOUT | 180s |
+| 2 | unit/attention_reference_parity_test | TIMEOUT | 180s |
+| 3 | unit/int4_attention_reference_parity_test | TIMEOUT | 180s |
+| 4 | unit/batched_paged_attention_reference_parity_test | TIMEOUT | 180s |
+| 5 | unit/paged_attention_parity_test | TIMEOUT | 180s |
+| 6 | unit/paged_batched_attention_parity_test | TIMEOUT | 180s |
+| 7 | unit/paged_batched_primitives_test | TIMEOUT | 180s |
+| 8 | unit/paged_kv_test | TIMEOUT | 180s |
+| 9 | unit/prefill_parity_test | TIMEOUT | 180s |
+| 10 | unit/seq_prefill_test | TIMEOUT | 180s |
+| 11 | unit/gemm_parity_test | TIMEOUT | 180s |
+| 12 | unit/kv_quant_parity_test | TIMEOUT | 180s |
+| 13 | unit/grammar_test | TIMEOUT | 180s |
+| 14 | unit/tokenizer_pieces_test | TIMEOUT | 180s |
+| 15 | unit/wordpiece_test | TIMEOUT | 180s |
+| 16 | unit/config_json_test | TIMEOUT | 180s |
+| 17 | unit/op_plan_builder_test | TIMEOUT | 180s |
+| 18 | unit/moe_kernel_parity_test | TIMEOUT | 180s |
+| 19 | unit/moe_router_sigmoid_test | TIMEOUT | 180s |
+| 20 | unit/mxfp4_dequant_test | TIMEOUT | 180s |
+| 21 | unit/deepseek_rope_test | TIMEOUT | 180s |
+| 22 | unit/deepseek_mla_assemble_test | TIMEOUT | 180s |
+| 23 | unit/mla_attention_test | TIMEOUT | 180s |
+| 24 | unit/kda_attention_test | TIMEOUT | 180s |
+| 25 | unit/tensor_parallel_test | TIMEOUT | 180s |
+| 26 | unit/row_parallel_test | TIMEOUT | 180s |
+| 27 | unit/expert_parallel_test | TIMEOUT | 180s |
+| 28 | unit/shard_plan_test | TIMEOUT | 180s |
+| 29 | unit/image_preprocess_test | TIMEOUT | 180s |
+| 30 | unit/png_test | TIMEOUT | 180s |
+| 31 | unit/qwen2vl_preproc_test | TIMEOUT | 180s |
+| 32 | unit/pipeline_parallel_test | TIMEOUT | 180s |
+| 33 | unit/probe_model_test | TIMEOUT | 180s |
+| 34 | unit/metal_fp16_test | TIMEOUT | 180s |
+| 35 | unit/collective_test | TIMEOUT | 180s |
+| 36 | unit/socket_ring_allreduce_test | TIMEOUT | 180s |
+| 37 | 8B fp16 | TIMEOUT | no exit in 240s |
+| 38 | 8B int8 | TIMEOUT | no exit in 300s |
+| 39 | 8B int4 | TIMEOUT | no exit in 300s |
+| 40 | 8B int4 g128 | TIMEOUT | no exit in 300s |
+| 41 | 8B kv-quant4 | TIMEOUT | no exit in 240s |
+| 42 | 8B kv-int4 flag | TIMEOUT | no exit in 240s |
+| 43 | 8B paged-kv | TIMEOUT | no exit in 240s |
+| 44 | 8B stream 4GB | TIMEOUT | no exit in 400s |
+| 45 | 8B streaming-int4 ll2c | TIMEOUT | no exit in 400s |
+| 46 | 8B tq-cached | TIMEOUT | no exit in 400s |
+| 47 | R1-distill-8B fp16 | TIMEOUT | no exit in 300s |
+| 48 | 0.5B fp16 | TIMEOUT | no exit in 180s |
+| 49 | 0.5B int4 | TIMEOUT | no exit in 180s |
+| 50 | 0.5B CPU | TIMEOUT | no exit in 300s |
+| 51 | Qwen3-0.6B (qk-norm) | TIMEOUT | no exit in 180s |
+| 52 | Qwen2.5-7B int4 | TIMEOUT | no exit in 400s |
+| 53 | Coder-3B fp16 | TIMEOUT | no exit in 300s |
+| 54 | gemma-2b | TIMEOUT | no exit in 300s |
+| 55 | Gemma4-E2B text (hf dir) | TIMEOUT | no exit in 400s |
+| 56 | Gemma4-E2B vision | TIMEOUT | no exit in 400s |
+| 57 | Gemma4-12B (hf dir) | TIMEOUT | no exit in 600s |
+| 58 | Gemma4-26B MoE int4 | TIMEOUT | no exit in 900s |
+| 59 | Qwen3.5-9B (hf dir) | TIMEOUT | no exit in 600s |
+| 60 | Qwen3.5-9B vision | TIMEOUT | no exit in 600s |
+| 61 | DeepSeek-V2-Lite (hf dir) | TIMEOUT | no exit in 600s |
+| 62 | llava-1.5-7b (probe) | TIMEOUT | no exit in 400s |
+| 63 | Coder-32B int4 | TIMEOUT | no exit in 900s |
+| 64 | spec prompt-lookup 8B | TIMEOUT | no exit in 300s |
+| 65 | eagle chain 8B | TIMEOUT | no exit in 300s |
+| 66 | eagle tree 8B | TIMEOUT | no exit in 300s |
+| 67 | 0.5B deep decode 400 | TIMEOUT | no exit in 300s |
+| 68 | 8B autotune | TIMEOUT | no exit in 600s |
+| 69 | embed bge-small | FAIL | exit=1 The system cannot find the path specified. |
+
+Sweep sections U/M/F done 2026-08-07T13:10:57. Web section runs separately.
+
+| 1 | unit/argmax_tiebreak_test | FAIL | exit=:  |
+| 2 | unit/attention_reference_parity_test | FAIL | exit=:  |
+| 3 | unit/int4_attention_reference_parity_test | FAIL | exit=:  |
+| 4 | unit/batched_paged_attention_reference_parity_test | FAIL | exit=:  |
+| 5 | unit/paged_attention_parity_test | FAIL | exit=:  |
+| 6 | unit/paged_batched_attention_parity_test | FAIL | exit=:  |
+| 7 | unit/paged_batched_primitives_test | FAIL | exit=: paged_batched_primitives: PASS (0 failures)  |
+| 8 | unit/paged_kv_test | FAIL | exit=: paged_kv_test: PASS (0 failures)  |
+| 9 | unit/prefill_parity_test | TIMEOUT | 180s |
+| 10 | unit/seq_prefill_test | FAIL | exit=:   [FAIL] medium             len=200   argmax 8363 vs 8363 / logit cosine 0.999857 / continuation identical  |
+| 11 | unit/gemm_parity_test | FAIL | exit=:  |
+| 12 | unit/kv_quant_parity_test | FAIL | exit=:  |
+| 13 | unit/grammar_test | FAIL | exit=:  |
+| 14 | unit/tokenizer_pieces_test | FAIL | exit=:  |
+| 15 | unit/wordpiece_test | FAIL | exit=:  |
+| 16 | unit/config_json_test | FAIL | exit=:  |
+| 17 | unit/op_plan_builder_test | FAIL | exit=:  |
+| 18 | unit/moe_kernel_parity_test | FAIL | exit=:  |
+| 19 | unit/moe_router_sigmoid_test | FAIL | exit=:  |
+| 20 | unit/mxfp4_dequant_test | FAIL | exit=:  |
+| 21 | unit/deepseek_rope_test | FAIL | exit=:  |
+| 22 | unit/deepseek_mla_assemble_test | FAIL | exit=:  |
+| 23 | unit/mla_attention_test | FAIL | exit=:  |
+| 24 | unit/kda_attention_test | FAIL | exit=:  |
+| 25 | unit/tensor_parallel_test | FAIL | exit=:  |
+| 26 | unit/row_parallel_test | FAIL | exit=:  |
+| 27 | unit/expert_parallel_test | FAIL | exit=:  |
+| 28 | unit/shard_plan_test | FAIL | exit=:  |
+| 29 | unit/image_preprocess_test | FAIL | exit=:  |
+| 30 | unit/png_test | FAIL | exit=:  |
+| 31 | unit/qwen2vl_preproc_test | SKIP | needs args |
+| 32 | unit/pipeline_parallel_test | FAIL | exit=:  |
+| 33 | unit/probe_model_test | FAIL | exit=:  |
+| 34 | unit/metal_fp16_test | FAIL | exit=:     control: legacy differs    PASS  legacy fails 9 of them, as it must  |
+| 35 | unit/collective_test | FAIL | exit=:  |
+| 36 | unit/socket_ring_allreduce_test | FAIL | exit=:  |
+
+| 37 | 8B fp16 | FAIL | exit=:  |
+| 38 | 8B int8 | FAIL | exit=:  |
+| 39 | 8B int4 | FAIL | exit=:  |
+| 40 | 8B int4 g128 | FAIL | exit=:  |
+| 41 | 8B kv-quant4 env | FAIL | exit=:  |
+| 42 | 8B kv-int4 flag | FAIL | exit=:  |
+| 43 | 8B paged-kv | FAIL | exit=:  |
+| 1 | unit/argmax_tiebreak_test | FAIL | exit=:  |
+| 2 | unit/attention_reference_parity_test | FAIL | exit=:  |
+| 3 | unit/int4_attention_reference_parity_test | FAIL | exit=:  |
+| 4 | unit/batched_paged_attention_reference_parity_test | FAIL | exit=:  |
+| 5 | unit/paged_attention_parity_test | FAIL | exit=:  |
+| 6 | unit/paged_batched_attention_parity_test | FAIL | exit=:  |
+| 7 | unit/paged_batched_primitives_test | FAIL | exit=: paged_batched_primitives: PASS (0 failures)  |
+| 8 | unit/paged_kv_test | FAIL | exit=: paged_kv_test: PASS (0 failures)  |
+| 1 | unit/argmax_tiebreak_test | FAIL | exit=:  |
+| 2 | unit/attention_reference_parity_test | FAIL | exit=:  |
+| 3 | unit/int4_attention_reference_parity_test | FAIL | exit=:  |
+| 4 | unit/batched_paged_attention_reference_parity_test | FAIL | exit=:  |
+| 5 | unit/paged_attention_parity_test | FAIL | exit=:  |
+| 6 | unit/paged_batched_attention_parity_test | FAIL | exit=:  |
+| 7 | unit/paged_batched_primitives_test | FAIL | exit=: paged_batched_primitives: PASS (0 failures)  |
+| 8 | unit/paged_kv_test | FAIL | exit=: paged_kv_test: PASS (0 failures)  |
+| 9 | unit/prefill_parity_test | FAIL | exit=:  |
+| 10 | unit/seq_prefill_test | FAIL | exit=:   [FAIL] medium             len=200   argmax 8363 vs 8363 / logit cosine 0.999857 / continuation identical  |
+| 11 | unit/gemm_parity_test | FAIL | exit=:  |
+| 12 | unit/kv_quant_parity_test | FAIL | exit=:  |
+| 13 | unit/grammar_test | FAIL | exit=:  |
+| 14 | unit/tokenizer_pieces_test | FAIL | exit=:  |
+| 15 | unit/wordpiece_test | FAIL | exit=:  |
+| 16 | unit/config_json_test | FAIL | exit=:  |
+| 17 | unit/op_plan_builder_test | FAIL | exit=:  |
+| 18 | unit/moe_kernel_parity_test | FAIL | exit=:  |
+| 19 | unit/moe_router_sigmoid_test | FAIL | exit=:  |
+| 20 | unit/mxfp4_dequant_test | FAIL | exit=:  |
+| 21 | unit/deepseek_rope_test | FAIL | exit=:  |
+| 22 | unit/deepseek_mla_assemble_test | FAIL | exit=:  |
+| 23 | unit/mla_attention_test | FAIL | exit=:  |
+| 24 | unit/kda_attention_test | FAIL | exit=:  |
+| 25 | unit/tensor_parallel_test | FAIL | exit=:  |
+| 26 | unit/row_parallel_test | FAIL | exit=:  |
+| 27 | unit/expert_parallel_test | FAIL | exit=:  |
+| 28 | unit/shard_plan_test | FAIL | exit=:  |
+| 29 | unit/image_preprocess_test | FAIL | exit=:  |
+| 30 | unit/png_test | FAIL | exit=:  |
+| 31 | unit/qwen2vl_preproc_test | SKIP | needs args |
+| 32 | unit/pipeline_parallel_test | FAIL | exit=:  |
+| 33 | unit/probe_model_test | FAIL | exit=:  |
+| 34 | unit/metal_fp16_test | FAIL | exit=:     control: legacy differs    PASS  legacy fails 9 of them, as it must  |
+| 35 | unit/collective_test | FAIL | exit=:  |
+| 36 | unit/socket_ring_allreduce_test | FAIL | exit=:  |
+
+| 37 | 8B fp16 | FAIL | exit=:  |
+| 38 | 8B int8 | FAIL | exit=:  |
+| 39 | 8B int4 | FAIL | exit=:  |
+| 40 | 8B int4 g128 | FAIL | exit=:  |
+| 41 | 8B kv-quant4 env | FAIL | exit=:  |
+| 42 | 8B kv-int4 flag | FAIL | exit=:  |
+| 43 | 8B paged-kv | FAIL | exit=:  |
+| 44 | 8B stream 4GB | FAIL | exit=:  |
+| 45 | 8B streaming-int4 ll2c | FAIL | exit=:  |
+| 46 | 8B tq-cached | FAIL | exit=:  |
+| 47 | R1-distill-8B fp16 | FAIL | exit=:  |
+| 48 | 0.5B fp16 | FAIL | exit=:  |
+| 49 | 0.5B int4 | FAIL | exit=:  |
+| 50 | 0.5B CPU | FAIL | exit=:  |
+| 51 | Qwen3-0.6B qk-norm | FAIL | exit=:  |
+| 52 | Qwen2.5-7B int4 | FAIL | exit=:  |
+| 53 | Coder-3B fp16 | FAIL | exit=:  |
+| 54 | gemma-2b | FAIL | exit=:  |
+| 55 | Gemma4-E2B text hf-dir | FAIL | exit=:  |
+| 56 | Gemma4-E2B vision | FAIL | exit=:  |
+| 57 | Gemma4-12B int4 hf-dir | FAIL | exit=:  |
+| 58 | Gemma4-26B MoE int4 | FAIL | exit=:  |
+| 59 | Qwen3.5-9B hf-dir | FAIL | exit=:  |
+| 60 | Qwen3.5-9B vision | FAIL | exit=:  |
+| 61 | DeepSeek-V2-Lite hf-dir | FAIL | exit=:  |
+| 62 | llava-1.5-7b probe | FAIL | exit=:  |
+| 63 | Coder-32B int4 stream | FAIL | exit=:  |
+
+| 64 | spec prompt-lookup 8B | FAIL | exit=:  |
+| 65 | eagle chain 8B | FAIL | exit=:  |
+| 66 | eagle tree 8B | FAIL | exit=:  |
+| 67 | 0.5B deep decode 400 | FAIL | exit=:  |
+| 68 | 8B autotune | FAIL | exit=:  |
+| 69 | embed bge-small | PASS | vector emitted |
+
+Sections U/M/F done 2026-08-07T14:29:34. Web section separate.
+
+| 1 | unit/argmax_tiebreak_test | FAIL | exit=:  |
+| 2 | unit/config_json_test | FAIL | exit=:  |
+
+| 1 | unit/argmax_tiebreak_test | FAIL | exit=-997:  |
+| 2 | unit/attention_reference_parity_test | FAIL | exit=-997:  |
+| 3 | unit/int4_attention_reference_parity_test | FAIL | exit=-997:  |
+| 4 | unit/batched_paged_attention_reference_parity_test | FAIL | exit=-997:  |
+| 5 | unit/paged_attention_parity_test | FAIL | exit=-997:  |
+| 6 | unit/paged_batched_attention_parity_test | FAIL | exit=-997:  |
+| 7 | unit/paged_batched_primitives_test | FAIL | exit=-997: paged_batched_primitives: PASS (0 failures)  |
+| 8 | unit/paged_kv_test | FAIL | exit=-997: paged_kv_test: PASS (0 failures)  |
+| 9 | unit/prefill_parity_test | FAIL | exit=-997:  |
+| 10 | unit/seq_prefill_test | FAIL | exit=-997:   [FAIL] medium             len=200   argmax 8363 vs 8363 / logit cosine 0.999857 / continuation identical  |
+| 11 | unit/gemm_parity_test | FAIL | exit=-997:  |
+| 12 | unit/kv_quant_parity_test | FAIL | exit=-997:  |
+| 13 | unit/grammar_test | FAIL | exit=-997:  |
+| 14 | unit/tokenizer_pieces_test | FAIL | exit=-997:  |
+| 15 | unit/wordpiece_test | FAIL | exit=-997:  |
+| 16 | unit/config_json_test | FAIL | exit=-997:  |
+| 17 | unit/op_plan_builder_test | FAIL | exit=-997:  |
+| 18 | unit/moe_kernel_parity_test | FAIL | exit=-997:  |
+| 19 | unit/moe_router_sigmoid_test | FAIL | exit=-997:  |
+| 20 | unit/mxfp4_dequant_test | FAIL | exit=-997:  |
+| 21 | unit/deepseek_rope_test | FAIL | exit=-997:  |
+| 22 | unit/deepseek_mla_assemble_test | FAIL | exit=-997:  |
+| 23 | unit/mla_attention_test | FAIL | exit=-997:  |
+| 24 | unit/kda_attention_test | FAIL | exit=-997:  |
+| 25 | unit/tensor_parallel_test | FAIL | exit=-997:  |
+| 26 | unit/row_parallel_test | FAIL | exit=-997:  |
+| 27 | unit/expert_parallel_test | FAIL | exit=-997:  |
+| 28 | unit/shard_plan_test | FAIL | exit=-997:  |
+| 29 | unit/image_preprocess_test | FAIL | exit=-997:  |
+| 30 | unit/png_test | FAIL | exit=-997:  |
+| 31 | unit/qwen2vl_preproc_test | SKIP | needs args |
+| 32 | unit/pipeline_parallel_test | FAIL | exit=-997:  |
+| 33 | unit/probe_model_test | FAIL | exit=-997:  |
+| 34 | unit/metal_fp16_test | FAIL | exit=-997:     control: legacy differs    PASS  legacy fails 9 of them, as it must  |
+| 35 | unit/collective_test | FAIL | exit=-997:  |
+| 36 | unit/socket_ring_allreduce_test | FAIL | exit=-997:  |
+
+| 37 | 8B fp16 | FAIL | exit=-997:  |
+| 38 | 8B int8 | FAIL | exit=-997:  |
+| 39 | 8B int4 | FAIL | exit=-997:  |
+| 40 | 8B int4 g128 | FAIL | exit=-997:  |
+| 41 | 8B kv-quant4 env | FAIL | exit=-997:  |
+| 42 | 8B kv-int4 flag | FAIL | exit=-997:  |
+| 43 | 8B paged-kv | FAIL | exit=-997:  |
+| 44 | 8B stream 4GB | FAIL | exit=-997:  |
+| 45 | 8B streaming-int4 ll2c | FAIL | exit=-997:  |
+| 46 | 8B tq-cached | FAIL | exit=-997:  |
+| 47 | R1-distill-8B fp16 | FAIL | exit=-997:  |
+| 48 | 0.5B fp16 | FAIL | exit=-997:  |
+| 49 | 0.5B int4 | FAIL | exit=-997:  |
+| 50 | 0.5B CPU | FAIL | exit=-997:  |
+| 51 | Qwen3-0.6B qk-norm | FAIL | exit=-997:  |
+| unit/argmax_tiebreak_test | PASS | row 0: got 5 expected 5  OK  |
+| unit/attention_reference_parity_test | PASS | MHA hd64         1      tiled        1.00000    0.00e+00   PASS  |
+| unit/int4_attention_reference_parity_test | PASS | Qwen2.5 hd128      1      fallback  1.00000    4.76e-04   PASS  |
+| unit/batched_paged_attention_reference_parity_test | PASS | Qwen2.5 hd128    1.0000(40) 1.0000(100) 1.0000(200) 1.0000(600) 1.0000(2050)   1.00000    1.15e-04   PASS  |
+| unit/paged_attention_parity_test | PASS | PASS (numerically identical to contiguous) (tol=1e-03)  |
+| unit/paged_batched_attention_parity_test | PASS | PASS (batched == per-sequence single, no cross-seq interference)  |
+| unit/paged_batched_primitives_test | PASS | ok    per-pos RoPE == contiguous batched (max_diff=0.000e+00)  |
+| unit/paged_kv_test | PASS | ok    pool bytes per block  |
+| unit/prefill_parity_test | PASS | PASS fp16/short: argmax 2063, max /logit diff/ 0.0518  |
+| unit/seq_prefill_test | FAIL | exit=1:   [FAIL] medium             len=200   argmax 8363 vs 8363 / logit cosine 0.999857 / continuation identical  |
+| unit/gemm_parity_test | PASS |   [ok] tokens=1    out=64    in=64    / vs CPU ref: 0.00046 / vs GEMV: 0.00000  |
+| unit/kv_quant_parity_test | PASS | K4V4       1      store     0.0000     5.01e-01   PASS  |
+| unit/grammar_test | PASS | grammar_test: 48/48 checks passed  |
+| unit/tokenizer_pieces_test | PASS | tokenizer_pieces_test: 6/6 checks passed  |
+| unit/wordpiece_test | PASS | wordpiece_test: 6/6 passed  |
+| unit/config_json_test | PASS | [config_json] ALL PASS  |
+| unit/op_plan_builder_test | PASS | op_plan_builder_test: PASS  |
+| unit/moe_kernel_parity_test | PASS | [moe-kernel-test] PASS  |
+| unit/moe_router_sigmoid_test | PASS | PASS[flat-top16]: E=256 k=16 n_group=1 topk_group=0  |
+| unit/mxfp4_dequant_test | PASS | PASS: MXFP4 dequant (device==host, LUT+representable exact, round-trip 14.19%)  |
+| unit/deepseek_rope_test | PASS | PASS[DeepSeek YARN rope]: inv_freq vs HF max rel 0.00e+00, attention_scaling 1.0000  |
+| unit/deepseek_mla_assemble_test | PASS | PASS[MLA assemble+rope]: K/V/Q device vs fp32 oracle, max rel 1.05e-04  |
+| unit/mla_attention_test | PASS | PASS[MLA prefill]: device vs fp32 oracle, T=5 heads=4 qk=16(+8 rope) v=16, max rel 1.87e-07  |
+| unit/kda_attention_test | PASS | PASS[KDA]: per-channel gated delta-rule, device vs oracle, T=6 heads=3 kdim=8 vdim=8, max rel 9.85e-08  |
+| unit/tensor_parallel_test | PASS | PASS[world=2 batch=1]: 512/512 bit-exact vs unsharded, max rel diff 0.00e+00  |
+| unit/row_parallel_test | PASS | PASS[world=2]: row-parallel all-reduce vs unsharded, max rel diff 3.75e-04  |
+| unit/expert_parallel_test | PASS | PASS[world=2]: expert-parallel MoE vs all-local, max rel diff 3.40e-04  |
+| unit/shard_plan_test | PASS | PASS tp=2 halves the dense MLP weights  |
+| unit/image_preprocess_test | PASS |   [ok] down_big     200x150 -> 96x48   mean abs err 0.000, worst 0 (of 255)  |
+| unit/png_test | PASS |   [ok]   rgb_gradient   64x48  (RGB, dynamic Huffman, gradient (exercises all filters))  |
+| unit/qwen2vl_preproc_test | SKIP | needs args |
+| unit/pipeline_parallel_test | PASS | PASS[world=2]: pipeline vs unsharded max rel diff 0.00e+00, owner-map consistent  |
+| unit/probe_model_test | PASS | gemma4 .cpi (foreign metadata schema) -> Gemma4            PASS  |
+| unit/metal_fp16_test | PASS |   f32_to_f16 structured        PASS  0/22 wrong  |
+| unit/collective_test | PASS | PASS[world=1]: all_reduce_sum -> 1 on every rank (0 wrong)  |
+| unit/socket_ring_allreduce_test | PASS | PASS[world=1 count=1000]: socket ring all-reduce, 1/1 ranks correct (0 mismatched elems)  |
+| 8B fp16 | PASS | perf=True |
+| 8B int8 | PASS | perf=True |
+| 8B int4 | PASS | perf=True |
+| 8B int4 g128 | WEAK | ran ok but output lacks 'Paris' |
+| 8B kv-quant4 env | PASS | perf=True |
+| 8B kv-int4 flag | PASS | perf=True |
+| 8B paged-kv | FAIL | exit=2:  |
+| 8B stream 4GB | PASS | perf=True |
+| 8B streaming-int4 ll2c | PASS | perf=True |
+| 8B tq-cached | PASS | perf=True |
+| R1-distill-8B fp16 | PASS | perf=True |
+| 0.5B fp16 | PASS | perf=True |
+| 0.5B int4 | PASS | perf=True |
+| 0.5B CPU | PASS | perf=True |
+| Qwen3-0.6B qk-norm | PASS | perf=True |
+| Coder-3B fp16 | PASS | perf=True |
+| gemma-2b | PASS | perf=True |
+| Qwen2.5-7B int4 | PASS | perf=True |
+| Gemma4-E2B text hf-dir | FAIL | exit=2:  |
+| Gemma4-E2B vision | FAIL | exit=2:  |
+| Qwen3.5-9B hf-dir | FAIL | exit=2:  |
+| Qwen3.5-9B vision | FAIL | exit=2:  |
+| DeepSeek-V2-Lite hf-dir | FAIL | exit=2:  |
+| llava-1.5-7b probe | FAIL | exit=2:  |
+| Gemma4-12B int4 hf-dir | FAIL | exit=2:  |
+| spec prompt-lookup 8B | PASS | perf=True |
+| eagle chain 8B | PASS | perf=True |
+| eagle tree 8B | PASS | perf=True |
+| 0.5B deep decode 400 | PASS | perf=True |

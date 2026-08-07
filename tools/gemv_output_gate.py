@@ -1,4 +1,4 @@
-﻿# Does the wide GEMV change what the models SAY?
+# Does the wide GEMV change what the models SAY?
 #
 # The wide GEMV (int4 loads, one warp per row) accumulates each row in a different order
 # than the tiled kernel, so it is deliberately not bit-identical; fp32 sums are

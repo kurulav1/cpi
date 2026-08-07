@@ -1,4 +1,4 @@
-# Metal kernel correctness on REAL Apple Silicon.
+# Metal kernel correctness on real Apple Silicon.
 #
 # The `metal` job in ci.yml is compile-only: GitHub's macOS runners are GPU-less VMs where
 # MTLCreateSystemDefaultDevice() returns nil, so the kernels there are type-checked and
@@ -9,7 +9,7 @@
 # Tart-based ephemeral runner works and is the recommended setup; a plugged-in Mac mini
 # with the runner agent works too.
 #
-# INERT UNTIL A RUNNER EXISTS. A job that targets a self-hosted label with no matching
+# Inert until a runner exists. A job that targets a self-hosted label with no matching
 # runner does not fail -- it queues forever and hangs every PR. So this is gated on a repo
 # variable: it is skipped entirely until you set HAS_METAL_RUNNER=true
 # (Settings -> Secrets and variables -> Actions -> Variables). Until then this file costs
@@ -45,13 +45,13 @@ on:
 jobs:
   metal-gpu:
     name: Metal kernels on real hardware
-    # TWO conditions, and the second is a security control, not a nicety.
+    # Two conditions, and the second is a security control, not a nicety.
     #
     # HAS_METAL_RUNNER: a job targeting an absent self-hosted label does not fail -- it
     # queues forever and hangs every PR. So this file stays inert until the hardware exists.
     #
-    # THE FORK CHECK: THIS REPOSITORY IS PUBLIC, and a self-hosted runner executes whatever
-    # the workflow says on YOUR machine. Without this, anyone could fork the repo, open a PR
+    # The fork check: this repository is public, and a self-hosted runner executes whatever
+    # the workflow says on your machine. Without this, anyone could fork the repo, open a PR
     # touching CMakeLists.txt (or this file), and run arbitrary code on the Mac -- as the
     # user who owns it, inside your network. GitHub's own guidance is to not put self-hosted
     # runners on public repos for exactly this reason. Restricting to PRs whose head is this

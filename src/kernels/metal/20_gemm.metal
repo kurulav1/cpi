@@ -1,8 +1,8 @@
 #define GEMM_BM 64  // rows per threadgroup
-// Tokens per threadgroup. Like the K-depth, the two GEMMs want DIFFERENT widths, measured on
+// Tokens per threadgroup. Like the K-depth, the two GEMMs want different widths, measured on
 // the 0.5B fp16 prefill and the int4:
 //
-//   fp16  (GEMM_BN 32): narrow is better, and further than first measured. This kernel STAGES
+//   fp16  (GEMM_BN 32): narrow is better, and further than first measured. This kernel stages
 //     the activation tile in threadgroup memory, so a wider tile costs more threadgroup memory
 //     and drops occupancy; 128 measured 2017 -> 1663 tok/s. 32 is better again, because the tile
 //     width also sets how many threadgroups the grid has: out_dim/GEMM_FBM * ceil(T/GEMM_BN), and
@@ -14,7 +14,7 @@
 //     the shader and every gemm_f16 check failed, which made a correct kernel look broken.
 //   quant (GEMM_QBN 128): wide is better. The quant kernel reads activation fragments straight
 //     from device (no As tile), so widening only adds simdgroups and weight reuse -- the staged
-//     weight block now serves 128 tokens -- at the SAME threadgroup memory. 64 -> 128 measured
+//     weight block now serves 128 tokens -- at the same threadgroup memory. 64 -> 128 measured
 //     1527 -> 1649 tok/s.
 #define GEMM_BN 32
 #define GEMM_QBN 128
@@ -22,14 +22,14 @@
 // Fragments of 8x8 each simdgroup owns: GEMM_RF rows x GEMM_CF cols. This sets arithmetic
 // intensity: per 8-deep step a simdgroup issues (RF + CF) simdgroup_loads to do (RF * CF) matrix
 // ops, so 4x4 is 8 loads per 16 ops (2.0) and 8x4 would be 12 per 32 (2.67). Everything else --
-// thread count, simdgroup grid, row offsets -- DERIVES from these two, so the tile can be swept
+// thread count, simdgroup grid, row offsets -- derives from these two, so the tile can be swept
 // without a hardcoded number drifting out of step, which is how this kernel once came to write
 // half its rows.
 //
 // 4x4 is the ceiling, bounded by the register file. Measured with metal_gemm_bench:
 //
 //   RF=4, FBM=64  (32x32/simdgroup, 16 accumulator fragments)   2.90 TFLOP/s
-//   RF=8, FBM=128 (64x32/simdgroup, 32 accumulator fragments)   0.38 TFLOP/s   <- 7.6x SLOWER
+//   RF=8, FBM=128 (64x32/simdgroup, 32 accumulator fragments)   0.38 TFLOP/s   <- 7.6x slower
 //
 // 32 accumulator fragments is 64 float registers per lane before wf/af, and it spills. Holding
 // more of the output per thread to raise intensity trades fewer loads for spill traffic at a
@@ -37,17 +37,17 @@
 #define GEMM_RF 4
 #define GEMM_CF 4
 
-// The fp16 GEMM's ACCUMULATOR type. 0 = fp32 (simdgroup_float8x8), 1 = fp16.
+// The fp16 GEMM's accumulator type. 0 = fp32 (simdgroup_float8x8), 1 = fp16.
 //
-// This WAS the last open perf question, now closed by re-measurement. Xcode's counters show the
+// This was the last open perf question, now closed by re-measurement. Xcode's counters show the
 // kernel F32-limited while the F16 pipe sits at 0.00% -- every MAC issues on F32 because the
 // accumulator is float -- and Apple's F16 ALU pipe is ~2x the F32 rate, so the hope was that half
 // accumulators route there and roughly double the kernel.
 //
 // They do not. Flipped to 1 and benched honestly (spot-checked, warm, current harness): gate/up
-// 3.20 -> 0.81 TFLOP/s, aggregate 2.98 -> 0.74 -- a 4x REGRESSION, which confirms the old note
+// 3.20 -> 0.81 TFLOP/s, aggregate 2.98 -> 0.74 -- a 4x regression, which confirms the old note
 // that had been distrusted for dating from the bad-measurement era. The 0% F16 utilization is not
-// headroom: the matrix unit (simdgroup_multiply_accumulate) accumulates in fp32 NATIVELY, and
+// headroom: the matrix unit (simdgroup_multiply_accumulate) accumulates in fp32 natively, and
 // asking for a half accumulator does not move the MAC onto the F16 pipe -- it emulates fp16
 // accumulation on the F32 unit, which is strictly more work. The F16 pipe is reachable by scalar
 // half math, not by the matrix unit, and a GEMM has to live on the matrix unit. (Precision was
@@ -88,10 +88,10 @@ typedef float gemm_acc_e;
 // ---------------------------------------------------------------------------
 // Blocked fp16 GEMM (prefill). A K-block of both operands is staged in threadgroup memory,
 // so a weight loaded from device is reused by every token in the tile. Two earlier attempts
-// streamed the operands from device on every K-step and LOST to the plain GEMV: the matrix
+// streamed the operands from device on every K-step and lost to the plain GEMV: the matrix
 // units were never the bottleneck, the traffic feeding them was.
 //
-// REGISTER TILING is the second half of that same idea. With one 8x64 strip per simdgroup
+// Register tiling is the second half of that same idea. With one 8x64 strip per simdgroup
 // the inner loop issued nine fragment loads to do eight matrix ops -- starved on
 // threadgroup traffic instead of device traffic. Each simdgroup now owns a 32x32 output
 // tile (4x4 fragments), so the same eight loads feed sixteen matrix ops. The threadgroup is
@@ -143,7 +143,7 @@ kernel void cpi_gemm_f16(device const half* w [[buffer(0)]], device const half* 
 
     for (uint kk = 0u; kk < GEMM_FBK; kk += 8u) {
       simdgroup_half8x8 wf[GEMM_RF], af[GEMM_CF];
-      // W is [rows, cols], so a weight fragment loads TRANSPOSED: [8k x 8rows].
+      // W is [rows, cols], so a weight fragment loads transposed: [8k x 8rows].
       for (uint i = 0u; i < GEMM_RF; ++i)
         simdgroup_load(wf[i], Ws + (sg_row * GEMM_SG_ROWS + i * 8u) * GEMM_FBK + kk, GEMM_FBK,
                        ulong2(0, 0), true);
@@ -177,16 +177,16 @@ kernel void cpi_gemm_f16(device const half* w [[buffer(0)]], device const half* 
 }
 
 // ---------------------------------------------------------------------------
-// SPLIT-K prototype of the fp16 GEMM.
+// Split-K prototype of the fp16 GEMM.
 //
 // At a short prompt the grid is out_dim/GEMM_FBM * ceil(T/GEMM_BN) threadgroups, which for this
 // model's 896-row projections is 28 at T=64 -- on a 10-core GPU. down_proj is the worst of them:
 // same FLOPs and same bytes as gate_proj, but a 14x76 grid instead of 76x14, and it measures 2.2x
-// slower. Shrinking the row tile to make more threadgroups was tried and LOST (GEMM_FBM 32: 0.49
+// slower. Shrinking the row tile to make more threadgroups was tried and lost (GEMM_FBM 32: 0.49
 // -> 0.55 ms), because it also halves how many output rows each staged weight tile serves and so
 // doubles the weight traffic.
 //
-// Splitting the REDUCTION does not have that problem: every threadgroup reads a different slice of
+// Splitting the reduction does not have that problem: every threadgroup reads a different slice of
 // K, so the total weight bytes are unchanged and only the activation tile is re-read. Each
 // threadgroup writes a float partial, and a second pass sums them.
 //
@@ -300,8 +300,8 @@ kernel void cpi_gemm_splitk_reduce(device const float* partial [[buffer(0)]],
 
 // Fills one K-block of the weight tile, dequantizing on the way in.
 //
-// The tile is stored K-MAJOR -- Ws[k][row], not Ws[row][k]. The weights are [out_dim, in_dim]
-// row-major, so a matrix fragment of them is [8k x 8rows]: the TRANSPOSE of how they sit in
+// The tile is stored K-major -- Ws[k][row], not Ws[row][k]. The weights are [out_dim, in_dim]
+// row-major, so a matrix fragment of them is [8k x 8rows]: the transpose of how they sit in
 // memory. Taking that transpose in simdgroup_load costs real time on every K-step. The
 // dequant loop writes scalars anyway, so it can just as easily scatter them into K-major
 // order once, and the fragment load becomes an ordinary one.
@@ -344,7 +344,7 @@ static inline void load_qblock(threadgroup half* Ws, threadgroup float* sc_row,
 // Quantized blocked GEMM. The 8B's prefill is quantized, so an fp16-only GEMM did nothing
 // for it -- this is where the prefill gap against llama.cpp actually lived.
 //
-// Quantization only changes how the weight tile is FILLED. Dequantize a K-block into
+// Quantization only changes how the weight tile is filled. Dequantize a K-block into
 // threadgroup memory once -- every weight unpacked exactly once -- and from there it is an
 // ordinary fp16 matmul, identical to cpi_gemm_f16: the same 4x4 register tile, the same
 // reuse across every token. The quantized GEMV re-unpacked every weight for every token.
@@ -367,9 +367,9 @@ kernel void cpi_gemm_quant(device const uchar* qw [[buffer(0)]],
   const uint tok0 = (tgid / row_blocks) * GEMM_QBN;
   if (tok0 >= p.tokens) return;
 
-  // The ACTIVATIONS are not staged. They could be -- and were -- but this GEMM turned out to
+  // The activations are not staged. They could be -- and were -- but this GEMM turned out to
   // be occupancy-limited rather than barrier-limited (deepening the K-block halves the
-  // barriers and made it 8% SLOWER), so threadgroup memory is the scarce resource. Fragments
+  // barriers and made it 8% slower), so threadgroup memory is the scarce resource. Fragments
   // load straight from device instead: the token block's activations are a few hundred KB and
   // every row-block threadgroup reads the same ones, so they sit in L2. Only the weights,
   // which must be dequantized exactly once, are worth the staging.
@@ -384,7 +384,7 @@ kernel void cpi_gemm_quant(device const uchar* qw [[buffer(0)]],
   const uint packed_row = (p.bits == 4u) ? ((p.in_dim + 1u) / 2u) : p.in_dim;
 
   // A tail tile reads past p.tokens. That stays inside the slot buffer, which is sized for a
-  // whole prefill chunk, and a garbage token only ever corrupts its OWN output row -- which
+  // whole prefill chunk, and a garbage token only ever corrupts its own output row -- which
   // the store below drops. So there is nothing to mask here.
   device const half* atile = in + (ulong)(tok0 + sg_col * 32u) * (ulong)p.in_dim;
 
@@ -429,8 +429,8 @@ kernel void cpi_gemm_quant(device const uchar* qw [[buffer(0)]],
 // ---------------------------------------------------------------------------
 // Weight-only int4 / int8 GEMV.
 //
-// Metal has NO __dp4a, so this does not try to mirror the CUDA kernel's packed
-// integer dot product. It does not need to: an int4 decode is BANDWIDTH-bound, and
+// Metal has no __dp4a, so this does not try to mirror the CUDA kernel's packed
+// integer dot product. It does not need to: an int4 decode is bandwidth-bound, and
 // reading 0.5 bytes per weight instead of 2 is itself the whole win. Dequantise on
 // the fly and multiply in fp32.
 //
@@ -459,7 +459,7 @@ kernel void cpi_gemv_quant(
   const uint gsz0 = (p.group == 0u) ? p.in_dim : p.group;
   // Four-rows-per-simdgroup decode path: one simdgroup owns four consecutive rows and
   // the activation chunk is loaded once for all of them. The executor shrinks the grid
-  // under the SAME predicate -- keep them in lockstep or rows go missing.
+  // under the same predicate -- keep them in lockstep or rows go missing.
   if (p.tokens == 1u && p.bits == 4u && (p.in_dim & 31u) == 0u && (gsz0 & 31u) == 0u &&
       p.has_bias == 0u) {
     const uint r0 = (gid * simds_per_tg + simd_id) * 4u;
@@ -560,10 +560,10 @@ kernel void cpi_gemv_quant(
   for (uint t = 0u; t < GEMV_TILE; ++t) acc[t] = 0.0f;
 
   if (p.bits == 4u) {
-    // 128-BIT loads: a uint4 is 32 packed int4 weights. This used to load a bare `uint`
+    // 128-bit loads: a uint4 is 32 packed int4 weights. This used to load a bare `uint`
     // (8 weights, 32 bits) and it cost ~40% of decode throughput -- the same narrow-load
     // mistake as the fp16 GEMV, made again in a new kernel. On a bandwidth-bound machine
-    // the LOAD WIDTH IS THE KERNEL, whatever the element size.
+    // the load width is the kernel, whatever the element size.
     //
     // A group size that is a multiple of 32 keeps all 32 weights inside one scale group.
     device const uint4* w128 =
@@ -611,7 +611,7 @@ kernel void cpi_gemv_quant(
       }
     }
   } else {
-    // int8, 128 bits at a time: a uint4 is SIXTEEN weights. Loading them one byte at a
+    // int8, 128 bits at a time: a uint4 is sixteen weights. Loading them one byte at a
     // time made int8 slower than fp16 -- which is absurd, since it reads half the bytes
     // -- for exactly the reason the fp16 GEMV needed 128-bit loads. Narrow loads waste
     // the transaction and cannot cover DRAM latency, whatever the element size.
@@ -626,7 +626,7 @@ kernel void cpi_gemv_quant(
       for (uint w = 0u; w < 4u; ++w) {
         const uint word = (w == 0u) ? packed.x : (w == 1u) ? packed.y
                         : (w == 2u) ? packed.z : packed.w;
-        qb[w] = as_type<char4>(word);  // int8 needs no decode; bytes ARE the weights
+        qb[w] = as_type<char4>(word);  // int8 needs no decode; bytes are the weights
       }
       for (uint t = 0u; t < nt; ++t) {
         device const half4* x4 = (device const half4*)(in + (ulong)(t0 + t) * (ulong)p.in_dim + j0);
@@ -657,12 +657,12 @@ kernel void cpi_gemv_quant(
 }
 
 // ---------------------------------------------------------------------------
-// FUSED quantized GEMV over 2 or 3 concatenated weight matrices that share the same input.
+// Fused quantized GEMV over 2 or 3 concatenated weight matrices that share the same input.
 // Decode fires ~7 separate GEMV dispatches per layer; three of them (Q, K, V) read the same
 // normalized input, and two more (gate, up) do too. Each tiny GEMV is launch/latency-bound,
-// not bandwidth-bound, so collapsing the group into ONE dispatch removes that fixed per-token
+// not bandwidth-bound, so collapsing the group into one dispatch removes that fixed per-token
 // cost -- which is the dominant share of a bandwidth-light int4 decode. No weight
-// pre-concatenation: each output row across the [n0 + n1 + n2] space is ROUTED to its matrix.
+// pre-concatenation: each output row across the [n0 + n1 + n2] space is routed to its matrix.
 // ---------------------------------------------------------------------------
 struct QCatParams {
   uint n0, n1, n2;  // rows (out_dim) of each sub-matrix; n2 == 0 for the 2-way (gate/up) case
@@ -671,7 +671,7 @@ struct QCatParams {
   uint bits;
   uint group;
   uint groups;
-  uint has_bias;  // bias is ONE concatenated tensor over the [n0+n1+n2] rows (Qwen's bqkv)
+  uint has_bias;  // bias is one concatenated tensor over the [n0+n1+n2] rows (Qwen's bqkv)
 };
 
 // One output row's quantized dot product against the token tile, written to `out`.
@@ -741,7 +741,7 @@ static inline void qcat_row(device const uchar* qw, device const half* scales,
       for (uint w = 0u; w < 4u; ++w) {
         const uint word =
             (w == 0u) ? packed.x : (w == 1u) ? packed.y : (w == 2u) ? packed.z : packed.w;
-        qb[w] = as_type<char4>(word);  // int8 needs no decode; bytes ARE the weights
+        qb[w] = as_type<char4>(word);  // int8 needs no decode; bytes are the weights
       }
       for (uint t = 0u; t < nt; ++t) {
         device const half4* x4 = (device const half4*)(in + (ulong)(t0 + t) * (ulong)in_dim + j0);
@@ -790,7 +790,7 @@ kernel void cpi_gemv_quant_cat(
   const uint gsz = (p.group == 0u) ? p.in_dim : p.group;
 
   // Four-rows-per-simdgroup decode path (see cpi_gemv_quant); executor shrinks the grid
-  // under the SAME predicate.
+  // under the same predicate.
   if (p.tokens == 1u && p.bits == 4u && (p.in_dim & 31u) == 0u && (gsz & 31u) == 0u &&
       p.has_bias == 0u) {
     const uint r0 = (gid * simds_per_tg + simd_id) * 4u;
@@ -1002,7 +1002,7 @@ kernel void cpi_gemv_quant_glu(
   if (simd_id == 0u && lane < pairs_per_tg) {
     const uint orow = (gid % row_blocks) * pairs_per_tg + lane;
     if (t0 < p.tokens && orow < p.n0) {
-      // EXACTLY cpi_gelu_mul's semantics or the fusion is a numerics change in disguise:
+      // Exactly cpi_gelu_mul's semantics or the fusion is a numerics change in disguise:
       // sigmoid-form gelu (tanh overflows via exp(+large)), the fp16-headroom scale that
       // the plan multiplies back after the down-projection (first version omitted it --
       // activations landed 2^k too large and generation died), and the clamp backstop.
@@ -1036,7 +1036,7 @@ kernel void cpi_lm_head_quant(
   const uint gsz = (p.group == 0u) ? p.in_dim : p.group;
 
   // The head is the biggest single read of a quantized decode step (vocab x hidden), and this
-  // kernel had BOTH known GEMV mistakes at once: 32-bit weight loads with a scalar per-nibble
+  // kernel had both known GEMV mistakes at once: 32-bit weight loads with a scalar per-nibble
   // decode (the "narrow-load mistake" that cost ~40% in cpi_gemv_quant), and one row per
   // simdgroup, re-reading the activation once per vocab row. This is the wide-load + four-rows
   // shape from cpi_gemv_quant with fp32 outputs; the executor passes 64-thread threadgroups
@@ -1147,7 +1147,7 @@ kernel void cpi_lm_head_quant(
 // In-place over `heads` heads of `head_dim`.
 // ---------------------------------------------------------------------------
 
-// NOTE the buffer order: the params block is ALWAYS the last binding, in every
+// NOTE the buffer order: the params block is always the last binding, in every
 // kernel here. MetalContext::dispatch() binds it at index n_buffers, so a kernel
 // that puts it anywhere else would have its params written over another buffer --
 // which compiles cleanly and only misbehaves on real hardware.

@@ -8,7 +8,7 @@ file carries how it got there.
 ## Apple Silicon (Metal)
 
 CPI has a second GPU backend. Both execute the same op-plan IR (`include/engine/op_plan.hpp`)
-and the same plan built by `build_llama_plan()` — Metal is a backend, not a fork. Adding Qwen3
+and the same plan built by `build_llama_plan()` -- Metal is a backend, not a fork. Adding Qwen3
 (per-head QK-norm) and Gemma (GeGLU, embedding scale) needed **zero new kernels**: they are
 capability flags on the geometry, not forks.
 
@@ -21,7 +21,7 @@ export CPI_METAL_SOURCE=$PWD/src/kernels/metal/cpi_kernels.metal
 ```
 
 **No Xcode required.** The offline `metal` compiler ships with Xcode, not with the Command
-Line Tools, so CPI compiles its shaders at runtime via `newLibraryWithSource` — that needs only
+Line Tools, so CPI compiles its shaders at runtime via `newLibraryWithSource` -- that needs only
 the Metal framework, which every Mac has. A stock Mac with the CLT is enough. If Xcode *is*
 present, CMake precompiles a `.metallib` and skips the runtime step.
 
@@ -29,8 +29,8 @@ present, CMake precompiles a `.metallib` and skips the runtime step.
 Mistral, Qwen2.5, Qwen3, Gemma), batched prefill, single-token decode, and the full sampler
 (temperature, top-k, top-p, repetition penalty, n-gram blocking) via CPI's shared implementation.
 
-**Single-request serving runs on Metal.** The main `cpi` binary — which the REST/web bridge spawns
-— dispatches to the Metal engine on Apple Silicon (it used to fall back to the scalar CPU engine).
+**Single-request serving runs on Metal.** The main `cpi` binary -- which the REST/web bridge spawns
+-- dispatches to the Metal engine on Apple Silicon (it used to fall back to the scalar CPU engine).
 The interactive JSON streaming protocol the web UI uses works end to end (token deltas, temperature
 sampling, metrics), and `--weight-quant int4/int8` serves a quantized model, so a large model fits
 on a small Mac. On an M4, Qwen2.5-0.5B streams at ~54 tok/s (fp16) / ~87 tok/s (int4), versus
@@ -46,7 +46,7 @@ the three dimensions the state buffers need, and the shared plan builder does no
 all. Kernels done, wiring not -- which is the honest split, rather than a half-integration nothing
 can execute.
 
-Continuous batching now runs on Metal — `--interactive-batch`, the same flag and the same
+Continuous batching now runs on Metal -- `--interactive-batch`, the same flag and the same
 multi-user worker the CUDA server uses. Verified on an M4 with two concurrent requests: the
 second is admitted while the first is mid-generation, both then advance one token per step
 interleaved, and the first retires without disturbing the second.
@@ -55,15 +55,15 @@ It is the *same scheduler*, not a Metal port of one. `engine::BatchScheduler` ow
 newest-first preemption, block growth and the shared-prefix LRU; a backend supplies only the two
 operations that need a GPU (a suffix prefill and a batched decode step). Metal cannot drift from
 CUDA's serving policy because it never states one. That scheduler used to live inside
-`LlamaEngine`, which is the only reason batching was ever CUDA-only — of its ~200 lines, two
+`LlamaEngine`, which is the only reason batching was ever CUDA-only -- of its ~200 lines, two
 touched a GPU.
 
 **Verifying it.** Every kernel family has a CPU-reference check (`metal_smoke`, 52 checks),
 plus golden token streams that must reproduce the CUDA backend exactly. `tools/metal_verify.sh`
 runs the lot in one command on any Mac. This is not ceremony: GitHub's macOS runners have no
-GPU, so CI can only compile Metal, never execute it — and a kernel that no gate executed was
+GPU, so CI can only compile Metal, never execute it -- and a kernel that no gate executed was
 silently corrupting every fp16 prompt of >=16 tokens for weeks (see the GEMM note below).
-To make that check automatic you need an Apple Silicon runner —
+To make that check automatic you need an Apple Silicon runner --
 [docs/metal-ci-runner.md](docs/metal-ci-runner.md) is the recipe.
 
 **Measured** (Apple M4, 10-core GPU, 16 GB):
@@ -72,7 +72,7 @@ To make that check automatic you need an Apple Silicon runner —
 | --- | --- | --- | --- | --- | --- |
 | Qwen2.5-0.5B | fp16 | 1.17 GB | 90.7 tok/s | 83.7 tok/s | 3343 tok/s |
 | Qwen2.5-0.5B | int4 | 0.51 GB | 176.2 tok/s | 154.6 tok/s | 3002 tok/s |
-| **Llama-3.1-8B** | **int4** | **4.91 GB** | **20.5 tok/s** | — | **161 tok/s** |
+| **Llama-3.1-8B** | **int4** | **4.91 GB** | **20.5 tok/s** | -- | **161 tok/s** |
 
 Prefill is a ~540-token prompt; decode is `--max-new N` from a short one. Decode is quoted at two
 lengths on purpose: it falls as the KV cache grows, so a single figure only means something next to
@@ -84,19 +84,19 @@ is carried from an earlier machine and was not re-measured here.
 >
 > `cpi_gemm_f16` gives each simdgroup a 32×32 sub-tile, so its thread count has to follow its
 > row tile. When that tile was raised 64 → 128, the shader changed and the host's thread count
-> did not — so it ran 4 simdgroups against a 128-row tile and **wrote only half the rows of
+> did not -- so it ran 4 simdgroups against a 128-row tile and **wrote only half the rows of
 > each one**. Every fp16 prompt of ≥16 tokens (where the GEMM replaces the GEMV) decoded from a
 > corrupted prefill.
 >
 > It survived because **a kernel that skips half its writes is not slower, it is faster**. The
 > benchmark rewarded it: re-running the same measurement on the broken kernel still reproduces
-> 3563–3720 tok/s, which is where 3730 came from. And no correctness gate ever executed it —
+> 3563–3720 tok/s, which is where 3730 came from. And no correctness gate ever executed it --
 > `metal_smoke` did not cover the GEMM at all, and every golden prompt is 10–12 tokens, below
 > the threshold. The engine's fastest fp16 path was benchmarked every session and verified
 > never.
 >
 > Two things fell out once it was fixed. The "+37% from a taller tile over 8 simdgroups" was
-> **the entire bug** — with the geometry consistent, 128 rows over 8 simdgroups is ~3% *slower*
+> **the entire bug** -- with the geometry consistent, 128 rows over 8 simdgroups is ~3% *slower*
 > than 64 over 4, so the tile is back to 64 and its rationale (more simdgroups hide fragment-load
 > latency) is unsupported. And the int4 GEMM, whose row tile really is 64, was never affected:
 > int4 prefill was long thought to lag fp16 badly, and a long hunt for the missing speed found
@@ -104,7 +104,7 @@ is carried from an earlier machine and was not re-measured here.
 > exist.
 
 The 8B is the point of quantization: at fp16 its weights are ~15 GB and it does **not** fit in a
-16 GB Mac — attempting it drives the machine into swap. At int4 it runs in 4.91 GB with zero
+16 GB Mac -- attempting it drives the machine into swap. At int4 it runs in 4.91 GB with zero
 swaps. (The 3.05x saving beats Qwen2.5's 2.3x because the 8B's LM head is untied and gets
 quantized too; Qwen2.5 ties its head to the embedding table, which must stay fp16 for the lookup.)
 
@@ -126,35 +126,35 @@ Not parity, and worth being precise about where the remaining gap is rather than
 off. Both figures above are from `llama-bench -p 512 -n 64` and CPI's `--benchmark` on the same
 machine, same weights, minutes apart.
 
-Prefill is 75% one kernel — the quantized blocked GEMM — and it runs at **~3.5 TFLOP/s, about
+Prefill is 75% one kernel -- the quantized blocked GEMM -- and it runs at **~3.5 TFLOP/s, about
 85% of this chip's rated 4.26 TFLOPS FP32 peak.** llama.cpp sustains ~3.9 TFLOP/s across its
 *whole* prefill, so its GEMM is faster than the FP32 peak: it is reaching fp16 rate somewhere we
-are not. Where, we don't know yet — and the honest version of that sentence is more useful than a
+are not. Where, we don't know yet -- and the honest version of that sentence is more useful than a
 guess.
 
 What is known, because it was measured and not assumed:
 
 | tried | result |
 | --- | --- |
-| double-buffered K-blocks | +1 tok/s — reverted |
+| double-buffered K-blocks | +1 tok/s -- reverted |
 | 4×4 register tiling (16 matrix ops per 8 loads, was 8 per 9) | +4 |
 | widened the token tile 64 → 128 (halves weight traffic) | 0 |
 | K-major weight tile, dropping the transposed fragment load | +1 |
 | deepening the K-block 32 → 64 | **−13** (costs occupancy) |
 | activation fragments straight from device (frees threadgroup memory) | **−7** |
 | padding the tile stride to break 8-way bank conflicts | **−4** |
-| **half accumulators** (the only path past the FP32 peak) | **−107** — Apple's matrix units have no fast half-accumulate path |
+| **half accumulators** (the only path past the FP32 peak) | **−107** -- Apple's matrix units have no fast half-accumulate path |
 
 Eight attempts at that inner loop, none worth more than 5%, and the two that *should* have been
 free both lost. That is what a kernel sitting on a hardware wall looks like. The wins that did
 land came from structure, not from the loop:
 
 - **The token tail was falling to the scalar GEMV.** A 551-token prompt chunks into 512 + 39, and
-  the 39-token tail could not fill a GEMM tile, so it went to the GEMV — which re-streams the
+  the 39-token tail could not fill a GEMM tile, so it went to the GEMV -- which re-streams the
   whole model once per 8-token tile. Those 39 tokens swept 4.9 GB of weights five times and cost
   **a third of the prefill**. Letting the GEMM take the tail as a masked tile: **104 → 142 tok/s**.
 - **Prefill attention was O(T²) in device traffic.** Each (token, head) threadgroup walked the
-  whole KV cache alone — ~80 GB at ~73 GB/s. Blocking over 8 queries, so a key block serves eight
+  whole KV cache alone -- ~80 GB at ~73 GB/s. Blocking over 8 queries, so a key block serves eight
   of them: **142 → 161**.
 
 Both were found by per-kernel profiling (`CPI_METAL_PROFILE=1`), in one shot, after four
@@ -278,7 +278,7 @@ the check fails when it should.
 
 A counter (`MetalContext::gpu_busy_ms()`, GPU wall-clock via command-buffer timestamps) settled
 the first question: prefill is **97% GPU-busy**, so the gap is kernel efficiency, not dispatch
-overhead. From a starting point of ~47%, three kernel wins closed most of the gap — all transfer
+overhead. From a starting point of ~47%, three kernel wins closed most of the gap -- all transfer
 to the 8B:
 
 - **Flash attention on the matrix units** (biggest win). Attention scored QK^T and did P·V with
@@ -290,11 +290,11 @@ to the 8B:
   barrier; `KEY_BLOCK == 32 == simd width`, so one simdgroup per query does the max/weight/sum as
   lane-parallel reductions: **fp16 2022 → 2156**.
 - **Attention scored QK^T with a 32-lane reduction** (superseded by the flash kernel, but it was
-  the first step): one thread per pair, full dot product, no reduction — **1745 → 2023**.
+  the first step): one thread per pair, full dot product, no reduction -- **1745 → 2023**.
 - **The two GEMMs want different token-tile widths.** The quantized GEMM reads activation fragments
   from device, so a wider tile (128) adds weight reuse at no threadgroup-memory cost: **int4
   1527 → 1903**. The fp16 GEMM stages its activations, so the same widening drops occupancy and
-  loses — it keeps 64.
+  loses -- it keeps 64.
 - **THE fp16 GEMM IS F32-ALU BOUND AT ~91% OF ITS LIMITER. It is finished.** Xcode's Metal
   Debugger, on a `.gputrace` from `metal_gemm_bench` (`CPI_METAL_GPUTRACE=<path>`):
 
@@ -307,11 +307,11 @@ to the 8B:
 
   **F16 utilization is exactly zero**: the inputs are half, but every multiply-accumulate issues
   on the F32 pipe, because the kernel accumulates into `simdgroup_float8x8`. That pipe is the
-  limiter. The kernel is not stalling — it is saturating the unit it runs on, and there is no
+  limiter. The kernel is not stalling -- it is saturating the unit it runs on, and there is no
   headroom in this design.
 
   This also corrects the number quoted here for a long time. **"53% of peak" was measured against
-  the wrong peak** — a theoretical fp16 rate the matrix unit does not deliver when accumulating in
+  the wrong peak** -- a theoretical fp16 rate the matrix unit does not deliver when accumulating in
   fp32. Against the F32 matrix rate it is ~91%, and the kernel was never leaving 20% on the table.
 
   It retro-explains the entire lever sweep below: K-depth flat, taller tile slower, more
@@ -520,12 +520,12 @@ to the 8B:
   Eliminated by measurement, not argument: cache residency (rotating 24 distinct weight
   matrices: 2.85 TFLOP/s, flat), shape mix (all 7 real projections: 2.83; k/v are half-rate at
   1.38 but far too small to matter), GPU clock (Maximum throughout the timed loops), fp16
-  accumulators (4.4x slower — the F16 pipe is emulated), and serial dispatch (a concurrent
+  accumulators (4.4x slower -- the F16 pipe is emulated), and serial dispatch (a concurrent
   encoder bought ~3%).
 
   Xcode's counters on a real prefill say **nothing is saturated**: F32 limiter 39.95%, ALU
   utilization 24.59%, occupancy target 100%, MMU 4%, LLC 6%, launch 8%. Threads are resident
-  and waiting. On the *bench* the same kernel reads F32 90.86% — which is why a limiter read
+  and waiting. On the *bench* the same kernel reads F32 90.86% -- which is why a limiter read
   off a bench cannot be quoted as the kernel's.
 
   > **Two entries were struck from that list because the experiments behind them never ran.**
@@ -543,18 +543,18 @@ to the 8B:
   > obsolete. A 481-token prompt was one chunk against a 512-wide slot, so "one chunk vs chunked"
   > compared 481-in-one against 541-as-512+28 and read the tail's cost as noise.
 
-- **Prefill attention costs 30 ms of a 193 ms prefill (15.5%) and runs at 0.42 TFLOP/s — a
+- **Prefill attention costs 30 ms of a 193 ms prefill (15.5%) and runs at 0.42 TFLOP/s -- a
   SEVENTH of our own GEMM's 2.86.** It is the largest identified lever left, and the mechanism is
   known: `cpi_attention_prefill_mm` blocks 8 queries per threadgroup, so each head re-reads the
-  whole K/V cache once per 8 queries — 68 passes at T=541. Widening the block to 16 measured
-  **193 → 177 ms with attention's share falling 30 → 12 ms** — and produced WRONG TOKENS. The
+  whole K/V cache once per 8 queries -- 68 passes at T=541. Widening the block to 16 measured
+  **193 → 177 ms with attention's share falling 30 → 12 ms** -- and produced WRONG TOKENS. The
   fragment plan scored exactly one `simdgroup_float8x8` from row 0, so the second half of a
   16-query block was never written: the fp16 GEMM's bug precisely, a tile widened past the threads
   that serve it, and **the 9% "win" was just doing half the work.** Third time in one day that a
   speedup turned out to be a correctness bug.
 
   Making the matrix ops loop over `QMM_BLOCK/8` fragments fixes the correctness, and then the win
-  is real but not for the reason it was tried. It is **not** cutting K/V re-reads — those are
+  is real but not for the reason it was tried. It is **not** cutting K/V re-reads -- those are
   cache-served (a layer's K+V is ~277 KB at T=541, held in the LLC without trying), and the "3 GB
   of redundant traffic" that motivated it was DRAM-naive arithmetic. What 16 does is fill the
   scoring matmul: it runs `qfs·n_kg` simdgroup work items, and with 4 key groups one query fragment
@@ -564,7 +564,7 @@ to the 8B:
   This first read as a dead end because it was measured at 541 tokens, where attention is 15% of
   prefill and 9% of that is under the run-to-run noise. Both measurements were right; the
   conclusion was drawn at the length where the effect is smallest. **Measure a small term where it
-  is small and you will call it zero** — the same mistake, in the same session, as testing the
+  is small and you will call it zero** -- the same mistake, in the same session, as testing the
   decode split before a prompt was deep enough to need it. `QMM_BLOCK` is 16 (its own constant: the
   scalar kernel's `Q_BLOCK` is stuck at 8 by Gemma's head_dim 256, whose golden *skips* without a
   checkpoint, so a shared bump would have broken it invisibly).
@@ -667,7 +667,7 @@ something specific to the quantized GEMM. And it is the GEMM: **every other op i
 ~3.5% combined**, measured by deleting them (`CPI_METAL_ABLATE`) rather than by profiling them.
 
 That number matters because the profiler says otherwise. `CPI_METAL_PROFILE` reported the
-non-GEMM ops at ~34%, which made fusing them look like the obvious next move — but it serialises
+non-GEMM ops at ~34%, which made fusing them look like the obvious next move -- but it serialises
 the pass, giving every tiny dispatch its own command buffer, so it inflates precisely the small
 ops one is asking about (it charges 551 ms of GPU work to a pass that really takes ~190). Removing
 each op and re-timing puts SiluMul, KvStore and attention at ~0 apiece and all of them together
@@ -678,7 +678,7 @@ overhead either.
 token stream exactly on an Apple M4 (`src/tests/golden/`). `metal_decode_test` gates on two
 oracles: the fp32 CPU engine for the first forward (argmax + a bounded logit diff), and a CUDA
 golden for the whole stream. Quantized runs keep the CPU-oracle bound (looser, but still a bound)
-and skip the golden — a quantized model is a *different* model and cannot reproduce an fp16 stream.
+and skip the golden -- a quantized model is a *different* model and cannot reproduce an fp16 stream.
 
 **Two traps worth knowing, both found the hard way:**
 
@@ -687,7 +687,7 @@ and skip the golden — a quantized model is a *different* model and cannot repr
   activations, so the GeGLU produced NaN on real inputs. Use the sigmoid form:
   `0.5*(1+tanh(z))` **is** `sigmoid(2z)`, which is safe at both ends.
 - **When a new backend disagrees with a reference, the reference is a suspect too.** Bringing this
-  backend up surfaced three long-standing bugs in `CpuLlamaEngine` — a hardcoded `rope_theta`,
-  missing QK-norm, and no Gemma support at all — each producing a fluent, plausible, *wrong* model.
+  backend up surfaced three long-standing bugs in `CpuLlamaEngine` -- a hardcoded `rope_theta`,
+  missing QK-norm, and no Gemma support at all -- each producing a fluent, plausible, *wrong* model.
   All three were briefly mistaken for "expected numerical drift" in the new backend. That
   explanation is exactly what makes a real bug invisible.

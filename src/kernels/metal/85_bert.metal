@@ -26,7 +26,7 @@ struct BertPoolParams {
 
 // out[t][d] = word[token[t]][d] + pos[t][d] + type[type_id][d]
 //
-// Position embeddings are ABSOLUTE and looked up by index, not rotary -- BERT's
+// Position embeddings are absolute and looked up by index, not rotary -- BERT's
 // position_embedding_type is "absolute" and the table is a learned [max_pos][H]. Feeding a rotary
 // path here would be silently wrong rather than an error.
 //
@@ -50,7 +50,7 @@ kernel void cpi_bert_embed(device const half* word_emb [[buffer(0)]],
   out[gid] = half(v);
 }
 
-// Pool [L][H] -> [H], then optionally L2-normalise. ONE threadgroup: the output is a single
+// Pool [L][H] -> [H], then optionally L2-normalise. One threadgroup: the output is a single
 // vector, and the normalisation needs every element before it can scale any of them.
 //
 // Output is f32, not half. This is the value that leaves the GPU and gets compared for cosine

@@ -23,7 +23,7 @@ let lastError = null;
 // user configured (build-run, build-cuda, …), never the plain CPU build/. We
 // can't assume a single location, so try, in order: an explicit override, the
 // dir holding the resolved cpi (they're built together), then every
-// known build dir — returning the first that exists. Returns a path that may
+// known build dir -- returning the first that exists. Returns a path that may
 // not exist (the best guess) only when nothing is found, so the caller's
 // existence check produces a clear "set EMBED_BIN" error.
 function embedBinCandidates(config) {

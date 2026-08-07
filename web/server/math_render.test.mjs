@@ -1,4 +1,4 @@
-// Does the markdown pipeline render LaTeX — without eating money?
+// Does the markdown pipeline render LaTeX -- without eating money?
 // Runs the SAME plugin chain and the SAME normalisation the app uses.
 import { unified } from "unified";
 import remarkParse from "remark-parse";
@@ -57,5 +57,5 @@ for (const [name, src, wantMath] of cases) {
     console.log(`THREW ${name}: ${e.message}`);
   }
 }
-console.log(bad === 0 ? "\nMATH OK — renders LaTeX, leaves money alone, survives half-streamed formulas"
+console.log(bad === 0 ? "\nMATH OK -- renders LaTeX, leaves money alone, survives half-streamed formulas"
                       : `\n${bad} case(s) FAILED`);

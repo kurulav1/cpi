@@ -6,10 +6,10 @@
 // comparison are all generated from the one CPI_CONFIG_FIELDS list, so:
 //
 //   - a field added to the list is written, read and checked at once;
-//   - a field LEFT OUT of the list fails this test, because it is filled with a distinct value
+//   - a field left out of the list fails this test, because it is filled with a distinct value
 //     below and comes back as its default.
 //
-// Every scalar gets a DISTINCT value. Filling them with 1s would let a writer that emits the
+// Every scalar gets a distinct value. Filling them with 1s would let a writer that emits the
 // wrong field pass, since every wrong answer would still be 1.
 
 #include <cstdio>
@@ -97,15 +97,15 @@ int main() {
             std::to_string(in.kv_source.size()));
   checked += 4;
 
-  // the RESIDUAL HOLE, and why this count is pinned.
+  // The residual hole, and why this count is pinned.
   //
   // The X-macro guarantees the writer and the reader agree; a field in the list is in both. It
   // does not guarantee the list covers LlamaConfig: add a member to the struct and forget this
   // file, and everything above still passes while the new field silently rides its default. That
   // is the v7 whitelist bug wearing a different hat.
   //
-  // Pinning the count is the cheap half of the guard: REMOVING a field from the list trips it
-  // immediately. For ADDING one, LlamaConfig's declaration carries a pointer back here; a
+  // Pinning the count is the cheap half of the guard: removing a field from the list trips it
+  // immediately. For adding one, LlamaConfig's declaration carries a pointer back here; a
   // sizeof() static_assert would be stronger but is not portable, because std::string/std::vector
   // differ in size between MSVC and libc++ and the number would be wrong on one of them.
   check("field count (update when CPI_CONFIG_FIELDS changes)", checked == 55,

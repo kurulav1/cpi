@@ -6,7 +6,7 @@ the same model plans and are held to token-identical output by cross-backend gat
 runtime dependencies beyond the vendor toolkits: every decode kernel, attention kernel, quant
 format, tokenizer, and container reader is in this repo. The one exception worth naming is that
 large prefill/batch GEMMs on CUDA go through cuBLAS/cuBLASLt (part of the CUDA toolkit the build
-already requires) — hand-rolling a competitive fp16 tensor-core GEMM buys no user-visible win.
+already requires) -- hand-rolling a competitive fp16 tensor-core GEMM buys no user-visible win.
 Everything decode-side, and everything on Metal, is hand-rolled.
 
 ## Benchmarks
@@ -33,10 +33,10 @@ Peak VRAM is total GPU memory during the run (includes ~1 GB desktop compositor)
 omitted: its int4 weights dequantize past the 32 GB of system RAM (out-of-memory). See
 [docs/benchmarks.md](docs/benchmarks.md) for methodology and the full context × quant sweep.
 
-CPU prefill is batched (chunked cache-blocked GEMM — weights stream from RAM once per 256-token
+CPU prefill is batched (chunked cache-blocked GEMM -- weights stream from RAM once per 256-token
 chunk instead of once per token, with an AVX-512 tier behind a runtime CPUID check): ~92 tok/s on
 the 8B and ~1180 tok/s on the 0.5B at a ~640-token prompt, a ~30× win over the old token-by-token
-prefill. Against llama.cpp's CPU backend (build `b4aa7dd47`, zen4 kernels, GPU hidden — note
+prefill. Against llama.cpp's CPU backend (build `b4aa7dd47`, zen4 kernels, GPU hidden -- note
 `-ngl 0` alone is not a CPU benchmark: with a CUDA build present, llama.cpp still runs prompt
 processing on the GPU) on the same box and weights, CPI CPU decode is within
 ~90% (3.15 vs 3.49 tok/s, both bandwidth-bound) and CPU prefill reaches ~50% (llama.cpp's mature
@@ -52,10 +52,10 @@ session, so numbers taken minutes apart are not comparable.
 
 Provenance: all numbers are self-reported from the single reference machine above; each table
 states when its rows were measured and any row carried from an earlier pass says so. Timer scopes
-differ between the tools — `llama-bench` excludes sampling, CPI's `--benchmark` includes it — which
+differ between the tools -- `llama-bench` excludes sampling, CPI's `--benchmark` includes it -- which
 flatters llama.cpp by a small margin on decode; the ratios below leave that in rather than adjust
 for it. A fresh 2026-08-05 re-run against llama.cpp build `1269cb1` (`-fa 1`, warm, interleaved)
-put the 8B at decode **99%** (82.2 vs 83.2 tok/s), prefill@512 **133%**, prefill@2048 **106%** —
+put the 8B at decode **99%** (82.2 vs 83.2 tok/s), prefill@512 **133%**, prefill@2048 **106%** --
 consistent with the table's earlier rows.
 
 | Model | Test | llama.cpp | CPI | CPI / llama.cpp |
@@ -94,7 +94,7 @@ same RTX 5090. The "1 req" column is the identical engine at batch 1.
 The 8B row is re-measured on the current **device-argmax** greedy path (the default). Before the
 device argmax, the same greedy path shipped the full logit block and reached 1795 tok/s at batch 64
 (still selectable with `CPI_BATCH_ARGMAX=0`); the older 1457 predates the v2 pinned-staging + scratch
-reuse. The other rows predate the device-argmax path and were not re-measured on this pass — they
+reuse. The other rows predate the device-argmax path and were not re-measured on this pass -- they
 would rise similarly.
 
 Notes:
@@ -112,7 +112,7 @@ Notes:
   instead of the full `[batch × vocab]` block. Two baselines at Llama-3.1-8B batch 64 (top-k 40),
   because the honest comparison depends on whether the host still has its own fast path:
   - **vs the host's own top-k shortcut** (no penalty): 815 → 1918 tok/s, **2.35×**.
-  - **at repetition penalty 1.05** (the served default): 453 → 1973 tok/s, **4.36×** — but part of
+  - **at repetition penalty 1.05** (the served default): 453 → 1973 tok/s, **4.36×** -- but part of
     that ratio is the host *losing* its shortcut, not the device winning: `sample_from_logits`
     disables its top-k fast path for penalty > 1 and falls back to a full-vocabulary softmax + sort,
     while the device applies the penalty *before* the top-k and keeps the fast path.
@@ -123,8 +123,8 @@ Notes:
 - **Greedy (temperature ≤ 0) also decides on device.** A batched argmax returns one winner id per
   row (B ints) instead of the full logit block; the repetition penalty and the min-tokens EOS
   suppression are applied on the GPU first, so the winner matches the host token-for-token. This is
-  a smaller win than sampling — greedy's host work was already a single argmax scan, so only the
-  bus transfer is saved — but still lifts Llama-3.1-8B batch 64 from **1795 to 2469 tok/s** (1.38×).
+  a smaller win than sampling -- greedy's host work was already a single argmax scan, so only the
+  bus transfer is saved -- but still lifts Llama-3.1-8B batch 64 from **1795 to 2469 tok/s** (1.38×).
   Selectable with `CPI_BATCH_ARGMAX=0`.
 - **Shared-prefix reuse**: concurrent requests that share a leading prefix (a common system prompt, a
   multi-turn chat) adopt each other's cached KV blocks instead of re-prefilling. A small per-worker LRU
@@ -140,7 +140,7 @@ Notes:
   tokens), with an fp16 sink + recent-window tier keeping retrieval quality (needle-exact at 8k and
   30k). Throughput matches fp16 batching at shallow depth and passes it where aggregate KV reads
   dominate (measured crossover: 1024-deep sequences at batch 64). Prefix reuse is disabled under
-  the quality tier — each sequence's fp16 window is its own.
+  the quality tier -- each sequence's fp16 window is its own.
 - **Default on the web server** for supported models (opt out with `CPI_BATCH_WORKER=0`); requires
   fp16-resident weights (`--gpu-cache-all`) + paged KV (`--paged-blocks`) and full-attention models.
   Quantized / MoE / streaming models (e.g. the 32B int4) fall back to single-request serving.
@@ -172,7 +172,7 @@ to amortize it over. (Contexts past ~4K need
 Correctness note for long contexts: Llama-3.1's usable window past its 8192 base relies on
 llama3-style rope scaling, which is **opt-in**: set `CPI_ROPE_SCALING=llama3` (parameters
 overridable via `CPI_ROPE_SCALING_PARAMS=factor,low,high,orig_max`). Without it, retrieval
-degrades beyond ~8K even though decode runs fine — the throughput rows above are unaffected,
+degrades beyond ~8K even though decode runs fine -- the throughput rows above are unaffected,
 but quality at 16K/32K needs the flag.
 
 ## Highlights
@@ -188,7 +188,7 @@ but quality at 16K/32K needs the flag.
 - Continuous batching with a paged KV cache for concurrent multi-user serving (default;
   VRAM-sized pool, shared-prefix reuse)
 - KV-cache quantization (`CPI_KV_QUANT`): K8V4 conservative or KV4 with a QuaRot-style
-  rotation, both with an fp16 sink + recent-window quality tier — 2.6–3.9× more KV pool in the
+  rotation, both with an fp16 sink + recent-window quality tier -- 2.6–3.9× more KV pool in the
   same VRAM, needle-retrieval-gated at 8k–30k context, and at/above fp16 throughput in the
   deep-and-concurrent regime it exists for
 - Speculative decoding (`--draft-model`), lossless with respect to the target's own output;
@@ -236,7 +236,7 @@ Tagged releases attach prebuilt `cpi` binaries (see the repository's Releases pa
 Unpack and check the build with `cpi --version`. The macOS archive bundles the Metal
 shader sources next to the binary; launch it with the included `./run.sh` (which sets
 `CPI_METAL_SOURCE` for you) or set that variable by hand. CUDA is not shipped as a binary (it is
-GPU-architecture and driver specific) — build it from source per [Build Modes](#build-modes).
+GPU-architecture and driver specific) -- build it from source per [Build Modes](#build-modes).
 
 ### Prerequisites
 
@@ -494,25 +494,25 @@ All repo-managed Node install paths use `npm ci`.
 
 The server runs on port `3001` by default. The full contract is defined in an **OpenAPI 3.1**
 document at [`docs/openapi.yaml`](docs/openapi.yaml), also served live at
-`GET /openapi.yaml` — point any OpenAPI viewer or client generator at it.
+`GET /openapi.yaml` -- point any OpenAPI viewer or client generator at it.
 
 There are two namespaces: **`/api/*`** (CPI-native, error envelope `{ "error": "..." }`) and
 **`/v1/*`** (OpenAI-compatible, so existing OpenAI clients work by changing the base URL).
 
 **Exposure model.** The server binds `127.0.0.1` by default (`host` in `web/config.json` or
-`CPI_HOST`). The admin surface — model hub downloads, quant jobs, and the filesystem pickers —
+`CPI_HOST`). The admin surface -- model hub downloads, quant jobs, and the filesystem pickers --
 additionally refuses any non-localhost client unless you set a bearer token (`adminToken` /
 `CPI_ADMIN_TOKEN`) and send `Authorization: Bearer <token>`; when a token is set it is required
 from localhost too. So exposing the server (`host: 0.0.0.0`, or `npm run dev:lan` for the dev UI)
 shares inference only, never disk access, unless you deliberately configure a token.
 
 In **Docker** this bites by design: the image sets `CPI_HOST=0.0.0.0` (the port mapping needs it),
-and even your own browser on the host reaches the container through the docker bridge — a
-non-loopback peer — so the hub/quant/picker UI returns 403 until you set `CPI_ADMIN_TOKEN`
+and even your own browser on the host reaches the container through the docker bridge -- a
+non-loopback peer -- so the hub/quant/picker UI returns 403 until you set `CPI_ADMIN_TOKEN`
 (the `start_docker` scripts pass it through if exported). Inference works without it. All of this
 is verified by running the container: health open, admin 403 bare / 401 wrong-token / 200 with
 the token, and OpenAI-compatible chat served end-to-end. The same image runs CPU-only on hosts
-without a GPU (automatic fallback — but note Docker Desktop's WSL2 backend injects the GPU even
+without a GPU (automatic fallback -- but note Docker Desktop's WSL2 backend injects the GPU even
 without `--gpus`; force CPU with `-e CUDA_VISIBLE_DEVICES=-1`, and set `OMP_NUM_THREADS` to the
 physical core count, since SMT oversubscription under WSL2 measured 2.4× slower).
 
@@ -543,7 +543,7 @@ curl -X POST http://localhost:3001/api/generate \
   -d '{"messages":[{"role":"user","content":"What is CUDA?"}]}'
 ```
 
-OpenAI-compatible chat (drop-in for OpenAI SDKs — set the base URL to `http://localhost:3001/v1`):
+OpenAI-compatible chat (drop-in for OpenAI SDKs -- set the base URL to `http://localhost:3001/v1`):
 
 ```bash
 curl -X POST http://localhost:3001/v1/chat/completions \
@@ -552,7 +552,7 @@ curl -X POST http://localhost:3001/v1/chat/completions \
 ```
 
 Download and convert a model over the API (the same pipeline as `tools/hf_download.py`, async with
-a job id — poll progress on `GET /api/hub/status/{jobId}`):
+a job id -- poll progress on `GET /api/hub/status/{jobId}`):
 
 ```bash
 curl -X POST http://localhost:3001/api/hub/download \

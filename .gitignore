@@ -122,3 +122,10 @@ RELEASE_CHECKLIST.md
 /build-cuda-ninja.bat
 /nsys*.bat
 /ncu*.bat
+
+# IDE state
+.vscode/
+.idea/
+
+# any stray node_modules
+node_modules/

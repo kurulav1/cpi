@@ -1,6 +1,6 @@
 # Grafana with the VictoriaMetrics datasource and a CPI dashboard, both provisioned
 # from ConfigMaps (no manual clicking). Anonymous admin is enabled for the local
-# demo — do NOT do that on a real cluster.
+# demo -- do NOT do that on a real cluster.
 apiVersion: v1
 kind: ConfigMap
 metadata:

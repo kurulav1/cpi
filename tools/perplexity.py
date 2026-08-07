@@ -41,8 +41,8 @@ import importlib
 import importlib.util
 import json
 import math
+import os
 import platform
-import socket
 import sys
 import time
 from pathlib import Path
@@ -54,7 +54,7 @@ RESULTS_DIR = REPO_ROOT / "docs" / "results"
 
 def _rel(p) -> str:
     """Repo-root-relative path (forward slashes) for portable, non-leaky result
-    metadata — avoids baking an absolute C:\\Users\\<name>\\... path into committed
+    metadata -- avoids baking an absolute C:\\Users\\<name>\\... path into committed
     JSON. Falls back to the absolute string if the path is outside the repo."""
     try:
         return str(Path(p).resolve().relative_to(REPO_ROOT)).replace("\\", "/")
@@ -342,7 +342,7 @@ def main() -> int:
     report = {
         "schema": "cpi-ppl-v1",
         "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
-        "host": socket.gethostname(),
+        "host": os.environ.get("CPI_BENCH_HOST", "redacted"),
         "platform": platform.platform(),
         "cpu": _cpu_info(),
         "gpu": _gpu_info(),

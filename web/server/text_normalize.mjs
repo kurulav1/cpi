@@ -3,7 +3,7 @@
 //
 // The key invariant (regression-guarded): healthy output is returned intact.
 // The lossy "drop trailing incomplete tail" salvage runs ONLY on degenerate
-// (repetition-loop) output — unconditionally cutting at the last '.'/'?'/'!'
+// (repetition-loop) output -- unconditionally cutting at the last '.'/'?'/'!'
 // truncated all code/DSL/structured text (ternaries, quoted ".", decimals,
 // URLs). Mirrors the C++ gating in src/app/main_helpers.cpp
 // (trim_incomplete_trailing_tail behind looks_degenerate_repetition).
@@ -73,7 +73,7 @@ export function normalizeGeneratedChatText(text, template) {
     );
   }
 
-  // Salvage tiny-model drift ONLY for degenerate output — see module header.
+  // Salvage tiny-model drift ONLY for degenerate output -- see module header.
   // Healthy output keeps its full content.
   if (looksDegenerateRepetition(cleaned)) {
     const lastTerminal = Math.max(

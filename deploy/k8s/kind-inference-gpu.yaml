@@ -1,9 +1,9 @@
 # Production-grade GPU serving pod for kind on WSL2/Docker Desktop.
 #
 # Hardening vs a naive Deployment:
-#  - Model on a PERSISTENT PVC (model-pvc.yaml), not tmpfs — survives restarts, no re-seed.
+#  - Model on a PERSISTENT PVC (model-pvc.yaml), not tmpfs -- survives restarts, no re-seed.
 #  - Model is WARMED on boot (LLAMA_WARM_ON_START) and readiness is gated on the model
-#    actually being loaded (/healthz/ready 503s until warm) — so the Service never routes
+#    actually being loaded (/healthz/ready 503s until warm) -- so the Service never routes
 #    to a cold pod: no first-request cold-start latency, no 503s during scale-up/rollout.
 #  - startupProbe gives the ~60s GPU model load room without the livenessProbe killing it.
 #  - resource requests/limits (Burstable QoS), graceful drain (preStop + grace period),
@@ -78,7 +78,7 @@ spec:
             - { name: LLAMA_MODEL_DIRS, value: /models }   # scanned recursively -> lists all models
             - { name: LLAMA_MODEL_PATH, value: /models/Qwen2.5-Coder-3B-Instruct/Qwen2.5-Coder-3B-Instruct.ll2c }
             - { name: LLAMA_TOKENIZER_PATH, value: /models/Qwen2.5-Coder-3B-Instruct/tokenizer.json }
-            - { name: LLAMA_CHAT_TEMPLATE, value: qwen2 }   # ChatML — both served models are Qwen2.5
+            - { name: LLAMA_CHAT_TEMPLATE, value: qwen2 }   # ChatML -- both served models are Qwen2.5
             - { name: LLAMA_WARM_ON_START, value: "1" }
             - { name: LLAMA_MAX_CPU_PERCENT, value: "100" }
             - { name: LLAMA_MAX_MEMORY_PERCENT, value: "100" }

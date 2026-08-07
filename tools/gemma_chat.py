@@ -30,7 +30,7 @@ def main():
     if not infer.is_absolute():
         infer = (Path.cwd() / infer).resolve()
     if not infer.exists():
-        sys.exit(f"[gemma_chat] cpi not found at {infer} — pass --infer-bin or run from the repo root")
+        sys.exit(f"[gemma_chat] cpi not found at {infer} -- pass --infer-bin or run from the repo root")
 
     proc = subprocess.Popen(
         [str(infer), args.model, "--tokenizer", args.tokenizer, "--interactive",

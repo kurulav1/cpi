@@ -803,7 +803,7 @@ void launch_quantize_rowwise_fp16_to_int8(const half* src, std::int8_t* dst, flo
 
 // launch_quantize_groupwise_fp16_to_int8
 //
-// Weight quantisation with one scale per GROUP of `group` contiguous columns
+// Weight quantisation with one scale per group of `group` contiguous columns
 // instead of one scale per row:
 //   g              = col >> log2(group)
 //   scales[row, g] = max(abs(src[row, g*group : (g+1)*group])) / max_q
@@ -973,7 +973,7 @@ void launch_weight_only_int4_matvec(const std::int8_t* w_packed, const float* sc
 
 // launch_weight_only_int{4,8}_matvec_grouped
 //
-// As above, but the weight scales are per GROUP of `group` contiguous input
+// As above, but the weight scales are per group of `group` contiguous input
 // features rather than per row (see launch_quantize_groupwise_fp16_to_int8).
 // The scale can no longer be hoisted out of the dot product, so it is applied
 // per element: y[row] = sum_col q[row,col] * scales[row, col>>shift] * x[col].
@@ -1054,7 +1054,7 @@ void launch_weight_only_int4_matvec_dual_dp4a(
 // 2-D RoPE over a sequence of patches. A head's channels split into two halves: the
 // first rotates by the patch's x coordinate, the second by its y. Within each half the
 // rotation is rotate_half (channel j pairs with j + half/2); the same convention the
-// 1-D table kernel uses, so cos/sin tables are built identically (here over the SPATIAL
+// 1-D table kernel uses, so cos/sin tables are built identically (here over the spatial
 // half-dim: head_dim/4 entries per position).
 //
 //   x        - q or k, fp16 [tokens, num_heads, head_dim]; modified in place
@@ -1144,7 +1144,7 @@ void launch_rope_seq_table_device_pos(half* x, int num_heads, int head_dim, cons
 // A tiled GEMM sums K in a different order than the GEMV, so the two do not agree
 // bit-for-bit; single-token work must keep using the GEMV or decode output shifts.
 // in_min/in_max/out_min/out_max: clipped projections (Gemma 4 E2B's vision tower)
-// clamp the activation on the way IN and the result on the way OUT. +-inf = no clamp.
+// clamp the activation on the way in and the result on the way out. +-inf = no clamp.
 void launch_rowmajor_half_gemm_f16(const half* w, const half* x, half* y, int out_features,
                                    int in_features, int tokens, cudaStream_t stream,
                                    float in_min = -INFINITY, float in_max = INFINITY,
@@ -1192,7 +1192,7 @@ void launch_weight_only_int4_matvec_grouped_dp4a(const std::int8_t* w_packed, co
 //
 // rows=1 rmsnorm fused with perm8 int8 activation quantization (XNorm sites feeding dp4a
 // projections). Bit-identical to [launch_rmsnorm; launch_quantize_fp16_to_int8_perm8]:
-// the quantizer reads the fp16-ROUNDED normed values. cols % 8 == 0 and cols <= 2048.
+// the quantizer reads the fp16-rounded normed values. cols % 8 == 0 and cols <= 2048.
 void launch_rmsnorm_quant_perm8(const half* x, const half* w, half* y, std::int8_t* xq,
                                 float* xscale, int cols, float eps, cudaStream_t stream);
 
@@ -1364,7 +1364,7 @@ void launch_gather_ge_threshold(const float* logits, int n, const float* thresho
 // Repetition penalty for the batched device top-k path, applied to [batch][vocab] logits before
 // the top-k so the candidate set matches the host sampler's slow path. Both touch only rows whose
 // penalties[b] > 1. Call sanitize first (non-finite -> -inf, clamp [+-80]), then the penalty over
-// each row's UNIQUE seen token ids (seen_ids[i] in row seen_rows[i]); seen ids are unique per row
+// each row's unique seen token ids (seen_ids[i] in row seen_rows[i]); seen ids are unique per row
 // so the penalty writes never collide.
 void launch_sanitize_penalty_rows(float* logits, int vocab, const float* penalties, int batch,
                                   cudaStream_t stream);

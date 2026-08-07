@@ -1,7 +1,7 @@
 {
   "schema": "cpi-sweep-v1",
   "timestamp": "20260524T200838Z",
-  "host": "DESKTOP-31S0GEM",
+  "host": "redacted",
   "platform": "Windows-11-10.0.26200-SP0",
   "cpu": "AMD64 Family 26 Model 68 Stepping 0, AuthenticAMD",
   "gpu": "NVIDIA GeForce RTX 5090",

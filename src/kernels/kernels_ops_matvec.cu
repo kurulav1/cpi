@@ -1,4 +1,4 @@
-﻿// kernels_ops_matvec.cu
+// kernels_ops_matvec.cu
 //
 // CUDA kernels and host launch wrappers for pointwise ops, quant/dequant,
 // weight-only matvec, projection GEMV, and argmax helpers.
@@ -45,7 +45,7 @@ __device__ __forceinline__ void warp_argmax(float& value, int& index) {
   for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
     const float other_value = __shfl_down_sync(0xffffffffu, value, offset);
     const int other_index = __shfl_down_sync(0xffffffffu, index, offset);
-    // Ties resolve to the LOWEST index, matching the host's std::max_element (first maximum). A
+    // Ties resolve to the lowest index, matching the host's std::max_element (first maximum). A
     // plain `>` would keep the lower lane, but the strided per-thread scan means the lower lane
     // does not hold the lower index; and the sanitize clamp to +/-80 manufactures exact ties out
     // of distinct raw logits, so this is a case the greedy path actively hits, not a float-equality
@@ -488,7 +488,7 @@ __global__ void moe_router_topk_softmax_kernel(const half* logits, int experts, 
   moe_route_token(logits, experts, top_k, topk_idx, topk_prob, per_expert_scale, renorm, probs);
 }
 
-// Sequence prefill: route all T tokens in ONE launch (one block per token) instead of T single-block
+// Sequence prefill: route all T tokens in one launch (one block per token) instead of T single-block
 // launches. The per-token loop was ~16.5k tiny latency-bound launches = the top prefill cost.
 __global__ void moe_router_topk_softmax_seq_kernel(const half* logits, int experts, int top_k,
                                                    int* topk_idx, float* topk_prob,
@@ -501,9 +501,9 @@ __global__ void moe_router_topk_softmax_seq_kernel(const half* logits, int exper
                   topk_prob + static_cast<std::size_t>(t) * top_k, per_expert_scale, renorm, probs);
 }
 
-// Kimi-K3-style router: SIGMOID gates (independent per expert, not softmax-normalised), optional
+// Kimi-K3-style router: sigmoid gates (independent per expert, not softmax-normalised), optional
 // grouped node-limited selection (top-2-per-group score -> top `topk_group` groups -> top-k within
-// the selected groups, DeepSeek-V3 style), then normalise the SELECTED gates to sum 1. n_group<=1
+// the selected groups, DeepSeek-V3 style), then normalise the selected gates to sum 1. n_group<=1
 // (or a degenerate grouping) falls back to a flat top-k. Single-thread for an exact lowest-index
 // tie-break, matching moe_router_topk_softmax_kernel. top_k up to 32 (K3 uses 16, > the softmax
 // router's hard cap of 8). NOTE: not yet wired to a model; isolation-gated groundwork.
@@ -891,7 +891,7 @@ __global__ void rowmajor_half_gemv_kernel(const half* w, const half* x, OutT* y,
 //
 // Tie-break: `>` (strictly greater) everywhere, exactly as the single-block kernel, so a
 // duplicated maximum resolves the same way it always did within a slice. Across slices the
-// decomposition differs, so an EXACT tie between two equal maxima in different blocks could
+// decomposition differs, so an exact tie between two equal maxima in different blocks could
 // resolve differently; the greedy 6-model gate is what proves this does not bite.
 __global__ void argmax_partial_kernel(const float* __restrict__ logits, int n,
                                       float* __restrict__ part_val, int* __restrict__ part_idx) {
@@ -1537,7 +1537,7 @@ void launch_rowmajor_half_gemv_f16(const half* w, const half* x, half* y, int ou
                             rows_per_warp, residual);
 }
 
-// Rowwise int8 activation quantization with a PERMUTED byte layout for the grouped-dp4a
+// Rowwise int8 activation quantization with a permuted byte layout for the grouped-dp4a
 // int4 matvec: within each 8-column window the even columns land in bytes 0-3 and the odd
 // columns in bytes 4-7. The int4 packing stores column pairs (2j, 2j+1) as a byte's
 // (lo, hi) nibbles, so `word & 0x0F0F0F0F` yields four even columns; this layout lets
@@ -2005,7 +2005,7 @@ void launch_convert_bf16_to_fp16(const std::uint16_t* src, half* dst, int n, cud
 }
 
 // Repetition-penalty support for the batched device top-k path. The host slow path (see
-// sample_from_logits) SANITIZES logits (non-finite -> -inf, clamp to [+-80]) and then divides a
+// sample_from_logits) sanitizes logits (non-finite -> -inf, clamp to [+-80]) and then divides a
 // seen token's logit by the penalty (or multiplies, if negative); both before building the
 // top-k candidate set. Doing it on-device keeps the full vocab off the host bus. Both kernels
 // touch only rows whose penalty > 1: a non-penalty row in the same batch must keep the exact

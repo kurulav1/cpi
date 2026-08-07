@@ -2,8 +2,8 @@
 
 // Expert parallelism (EP) dispatch for MoE: the experts are sharded across ranks (rank r owns a
 // contiguous expert range), so a token's top-k selections may land on several ranks. Each rank runs
-// the STANDARD MoE kernels on its own expert sub-matrix, with the selections REMAPPED to local expert
-// indices and the off-rank selections' weights MASKED to zero; the per-rank outputs then SUM to the
+// the standard MoE kernels on its own expert sub-matrix, with the selections remapped to local expert
+// indices and the off-rank selections' weights masked to zero; the per-rank outputs then sum to the
 // full MoE result (each global expert contributes exactly once, on its owner). That sum is the
 // all_to_all-combine seam; for real multi-GPU it becomes a collective; on one GPU it is a local add,
 // which is what makes the dispatch/combine logic verifiable here (expert_parallel_test).
@@ -34,8 +34,8 @@ inline void expert_parallel_range(int experts, int world_size, int rank, int* lo
   }
 }
 
-// For one token's top-k selections (global expert ids + weights), fill this rank's LOCAL expert
-// indices and MASKED weights: on-rank selection -> (global - lo, weight); off-rank -> (0, 0). The
+// For one token's top-k selections (global expert ids + weights), fill this rank's local expert
+// indices and masked weights: on-rank selection -> (global - lo, weight); off-rank -> (0, 0). The
 // zero weight makes the standard down-accum kernel drop the off-rank term, so running the kernels on
 // rank r's [lo,hi) expert sub-matrix yields exactly r's partial of the full weighted sum.
 inline void expert_parallel_dispatch(int experts, int world_size, int rank, const int* topk_idx,

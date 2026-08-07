@@ -1,4 +1,4 @@
-﻿import dotenv from "dotenv";
+import dotenv from "dotenv";
 import express from "express";
 import fs from "node:fs";
 import path from "node:path";
@@ -105,7 +105,7 @@ app.use((req, res, next) => {
   // Deny-only forwarded check: a local proxy that appends the real peer (the
   // vite dev proxy with xfwd on) reveals a remote client behind a loopback
   // socket. The header can only hurt the sender (a forged loopback entry is
-  // ignored unless the socket itself is loopback AND the last hop says remote),
+  // ignored unless the socket itself is loopback and the last hop says remote),
   // so it is safe to consult without trust-proxy.
   const xff = String(req.headers["x-forwarded-for"] || "");
   const lastHop = xff ? xff.split(",").pop().trim() : "";
@@ -181,10 +181,10 @@ app.get("/openapi.yaml", (_req, res) => {
 
 // Kubernetes probes. Registered before the SPA catch-all so they aren't shadowed.
 // Liveness: the process is up and serving HTTP (do NOT gate on the model, so a slow
-// model load never triggers a liveness kill — the startupProbe covers that window).
+// model load never triggers a liveness kill -- the startupProbe covers that window).
 app.get("/healthz/live", (_req, res) => res.status(200).send("ok"));
 // Readiness: the model is actually loaded/warmed into the worker. Gating traffic on
-// this is what makes serving production-grade — the Service never routes to a cold
+// this is what makes serving production-grade -- the Service never routes to a cold
 // pod, so clients never see cold-start latency or 503s during scale-up / rollouts.
 app.get("/healthz/ready", (_req, res) => {
   const warm = Boolean(interactiveWorker && interactiveWorker.ready) && getRuntimeConfig().ready;
@@ -963,7 +963,7 @@ function buildCliArgs(config, body) {
   const longFormMode = isTruthyFlag(body.longFormMode);
   // Reasoning ("thinking") mode: the model emits a reasoning block before its
   // answer, which the stream splitter separates out. Driven by the descriptor the
-  // MODEL ships (profile.reasoning, read from its manifest / cpi.json sidecar) —
+  // model ships (profile.reasoning, read from its manifest / cpi.json sidecar) --
   // "always" reasons unconditionally, "optional" honours the request flag, "none"
   // never reasons. Reasoning is a property of the model, not of the template.
   const reasoningCap = selectedProfile?.reasoning ?? {
@@ -975,7 +975,7 @@ function buildCliArgs(config, body) {
   const promptBudget = computePromptBudget(maxContext, performanceMode);
 
   // --- image (optional) ---
-  // The model DECLARES whether it can take one (profile.vision, read from its
+  // The model declares whether it can take one (profile.vision, read from its
   // config.json). The placeholder goes into the last user turn, so the ordinary chat
   // renderer needs no image-awareness: it just leaves a marker where the picture goes.
   const visionCap = selectedProfile?.vision ?? null;
@@ -1024,7 +1024,7 @@ ${msgs[last].content ?? ""}` };
 
   // An explicit client max_tokens (the OpenAI contract) is authoritative and
   // caps generation. The autoMaxTokens keyword heuristic only applies when the
-  // client supplied NO budget. Previously auto (default on) ignored max_tokens
+  // client supplied no budget. Previously auto (default on) ignored max_tokens
   // and could pick a tiny budget (~96 tokens), silently truncating output
   // mid-generation with finish_reason:"stop" for any client that relies on
   // max_tokens.
@@ -1667,9 +1667,9 @@ function batchWorkerEnabled() {
 // This used to say the batched path "only supports plain fp16 fully-resident full-attention
 // models" and that "--interactive-batch is LlamaEngine-only". Both were stale. main.cpp wires
 // --interactive-batch for PlanMetalEngine too (engine::BatchScheduler is backend-free), and on
-// an M4 two concurrent streams interleave correctly at fp16, int8 AND int4.
+// an M4 two concurrent streams interleave correctly at fp16, int8 and int4.
 //
-// The surviving rule is per-FAMILY, not per-engine: a recurrent/delta-net model (qwen3_5) carries
+// The surviving rule is per-family, not per-engine: a recurrent/delta-net model (qwen3_5) carries
 // per-sequence state the batched scheduler does not multiplex, and MoE/streamed-weight profiles
 // have their own reasons. That lives in NON_BATCH_FAMILIES/profileBatchable in config.mjs, which
 // is what actually enforces it -- a NON_CPI_ENGINE_FAMILIES alias sat here unused.
@@ -1677,13 +1677,13 @@ function batchWorkerEnabled() {
 function isBatchCompatible(cliConfig) {
   const p = cliConfig.profile || {};
   // Profile-level rules (separate engine, MoE, streamed weights, pre-packed quant,
-  // SentencePiece tokenizer) live in config.mjs so the UI can SHOW them as capabilities
+  // SentencePiece tokenizer) live in config.mjs so the UI can show them as capabilities
   // without re-deriving them here. What is left is request-level.
   if (!profileBatchable({ ...p, template: p.template ?? cliConfig.meta?.template })) return false;
   if (cliConfig.imagePath) return false;                                   // images: single-flight only
   if (cliConfig.meta?.thinking) return false;                              // reasoning split needs the single-flight splitter
-  // Runtime quantization forces single-flight on CUDA. It does NOT on Metal: PlanMetalEngine
-  // runs --interactive-batch with --weight-quant int8 AND int4, measured on an M4 (two
+  // Runtime quantization forces single-flight on CUDA. It does not on Metal: PlanMetalEngine
+  // runs --interactive-batch with --weight-quant int8 and int4, measured on an M4 (two
   // concurrent streams, correctly interleaved, coherent output at both widths).
   //
   // This mattered more than it looks. Quantization is precisely how a large model fits in a
@@ -1748,9 +1748,9 @@ async function getBatchWorker(config, cliConfig) {
     return batchWorker;
   }
   // Respawning (profile change, or a dead worker): force-kill the old process and
-  // wait for it to fully exit BEFORE launching the new one, so its single-instance
+  // wait for it to fully exit before launching the new one, so its single-instance
   // mutex + GPU memory are released (otherwise the new worker dies with exit
-  // code 3 — "another instance is already running").
+  // code 3 -- "another instance is already running").
   if (batchWorker) {
     const old = batchWorker;
     batchWorker = null;
@@ -1761,7 +1761,7 @@ async function getBatchWorker(config, cliConfig) {
   // The batched path is always fully GPU-resident (--gpu-cache-all), so the host
   // RAM it "uses" is mostly the reclaimable mmap of the weights. The host
   // memory/CPU throttle would otherwise fire (weights push system RAM past the
-  // 85% default) and sleep between decode steps — a ~10x decode slowdown for no
+  // 85% default) and sleep between decode steps -- a ~10x decode slowdown for no
   // real benefit. Lift host resource limits for the batch worker.
   const args = toBatchArgs(buildInteractiveLaunchArgs(config, { ...cliConfig, noResourceLimits: true }));
   batchWorker = createBatchWorker({
@@ -1831,8 +1831,8 @@ async function warmupProfileWorker(config, profileId, options = {}) {
   return profile;
 }
 
-// Startup warm for the default (batch) path. Warms the BATCH worker rather than
-// the single-flight engine so only ONE copy of the model resides in VRAM — both
+// Startup warm for the default (batch) path. Warms the batch worker rather than
+// the single-flight engine so only one copy of the model resides in VRAM -- both
 // would be ~2x and OOM large models. Non-batchable default profiles (qwen3_5,
 // quantized, MoE, grammar-only, …) fall back to warming single-flight. Uses the
 // same buildWorkerCliConfig as the single-flight warm so the worker key matches
@@ -2229,7 +2229,7 @@ function guardReady(config, res) {
 
 // Map a worker error message to an OpenAI-style status/type/code. A prompt that
 // exceeds the model context window is a client error (400 context_length_exceeded),
-// not a server fault — the engine now rejects it with a clear message instead of
+// not a server fault -- the engine now rejects it with a clear message instead of
 // crashing (see llama_engine generate_stream bounds guard). Over-capacity is 503.
 function classifyWorkerError(msg) {
   const m = String(msg || "");
@@ -2244,9 +2244,9 @@ function classifyWorkerError(msg) {
 
 // ── Single-flight engine gate ────────────────────────────────────────────────
 // The interactive worker, `activeRequest`, and `worker.pending` are all single-
-// slot, so at most ONE generation may run at a time. Every generation funnels
+// slot, so at most one generation may run at a time. Every generation funnels
 // through runGeneration, which acquires a slot here; concurrent requests queue
-// FIFO and run serially (correct — latency stacks) instead of racing into the
+// FIFO and run serially (correct -- latency stacks) instead of racing into the
 // worker and clobbering each other's response slot (the old check-then-act
 // guardOpenAiIdle let two idle-arriving requests both pass). Bounded depth gives
 // backpressure: past the cap, acquisition rejects and the route returns 503.
@@ -2355,7 +2355,7 @@ async function guardOpenAiIdle(
   // Serialization + backpressure now live in the single-flight engine queue
   // (acquireEngineSlot in runGeneration): concurrent requests queue FIFO and run
   // one at a time; past the depth cap, acquisition rejects and the route returns
-  // 503. So there is no idle-wait / engine_busy 409 here — admit and let the
+  // 503. So there is no idle-wait / engine_busy 409 here -- admit and let the
   // queue order it. (waitForIdleMs is retained in the signature but unused.)
   void waitForIdleMs;
   return true;
@@ -2689,7 +2689,7 @@ app.post("/api/generate", async (req, res) => {
 // Request body: same as /api/generate
 // Generic reasoning stream splitter, driven by the model's reasoning descriptor:
 //   - openTag "" (primed, e.g. Qwen): the prompt opens the block, so the stream
-//     STARTS inside reasoning; split at closeTag.
+//     starts inside reasoning; split at closeTag.
 //   - openTag set (e.g. Gemma "<|channel>"): stream starts in the answer, enters
 //     reasoning at openTag, exits at closeTag.
 // Buffers a short tail so a marker split across token boundaries is still found.
@@ -3287,7 +3287,7 @@ app.post("/v1/embeddings", async (req, res) => {
     sendOpenAiError(
       res,
       503,
-      `embeddings unavailable — cpi_embed not found at ${status.binary}. ` +
+      `embeddings unavailable -- cpi_embed not found at ${status.binary}. ` +
         "Build CPI's CUDA target or set EMBED_BIN; the embed worker must be started.",
       { type: "server_error", code: "embeddings_unavailable" }
     );
@@ -4011,7 +4011,7 @@ app.listen(runtimeConfig.port, runtimeConfig.host, () => {
       ? warmupBatchWorker(runtimeConfig, { maxContext: runtimeConfig.maxContext })
       : warmupProfileWorker(runtimeConfig);
     warmStart
-      .then(() => console.log("[cpi] model warm — readiness will pass"))
+      .then(() => console.log("[cpi] model warm -- readiness will pass"))
       .catch((err) => console.warn(`[cpi] startup warm failed: ${err?.message || String(err)}`));
   }
   const emb = embedStatus(runtimeConfig);
@@ -4019,7 +4019,7 @@ app.listen(runtimeConfig.port, runtimeConfig.host, () => {
     console.log(`[cpi] embeddings: enabled (bge-small) bin=${emb.binary}`);
   } else {
     console.log(
-      `[cpi] embeddings: DISABLED (cpi_embed not found at ${emb.binary}) — RAG/folder-search will 503. ` +
+      `[cpi] embeddings: DISABLED (cpi_embed not found at ${emb.binary}) -- RAG/folder-search will 503. ` +
         "Build the CUDA target or set EMBED_BIN."
     );
   }

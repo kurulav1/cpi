@@ -3,7 +3,7 @@
 CPI runs in the local kind cluster and is published to the host by small proxy
 containers (`deploy/k8s/expose-host.sh`), so it's reachable at a stable URL with no
 `kubectl port-forward` to keep alive (the proxies use `--restart unless-stopped`, so
-they come back after a Docker/host restart — and the model is persistent + warmed, so
+they come back after a Docker/host restart -- and the model is persistent + warmed, so
 the API is ready without a re-seed or cold start).
 
 | What | URL |
@@ -15,7 +15,7 @@ the API is ready without a re-seed or cold start).
 
 > Same machine → use `localhost`. Another machine on the LAN → the proxies bind
 > `0.0.0.0`, so use `http://<this-host-ip>:3001` (open the firewall for 3001).
-> Note: **no auth** — keep it on trusted networks / behind a proxy if exposed.
+> Note: **no auth** -- keep it on trusted networks / behind a proxy if exposed.
 
 ## Available models
 
@@ -23,8 +23,8 @@ the API is ready without a re-seed or cold start).
 
 | model id (use in the `model` field) | notes |
 |---|---|
-| `Qwen2.5-Coder-3B-Instruct` | **default**, warm at all times — code-tuned, fast |
-| `Qwen2.5-7B-Instruct` | larger general chat — first request after switching reloads the GPU (~30 s), then fast |
+| `Qwen2.5-Coder-3B-Instruct` | **default**, warm at all times -- code-tuned, fast |
+| `Qwen2.5-7B-Instruct` | larger general chat -- first request after switching reloads the GPU (~30 s), then fast |
 
 Single GPU → one model is resident at a time; **switching models reloads** (the default
 3B stays warm, others load on first use). Pick a model per request via the `model` field.

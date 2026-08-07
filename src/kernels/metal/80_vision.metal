@@ -5,7 +5,7 @@
 // operands are fp32 (the pixels and the RoPE tables) and which are half, so the two backends can
 // be compared directly rather than approximately.
 //
-// PADDING PATCHES are the thread running through all of these: a patch whose position is negative
+// Padding patches are the thread running through all of these: a patch whose position is negative
 // is padding, and it must contribute nothing. PatchEmbed zeroes it, AvgPoolPatches skips it in the
 // average. Getting that wrong does not crash -- it quietly mixes padding into real cells.
 
@@ -45,7 +45,7 @@ struct VisStdParams {
 // out[t] = proj . (2*(pixels[t] - 0.5)) + pos_table[0][x] + pos_table[1][y]
 //
 // The position table is [2, pos_table_size, hidden]: the x coordinate indexes plane 0, y plane 1,
-// and the two are SUMMED. (HF one-hots the coordinates into the table and sums; a gather is the
+// and the two are summed. (HF one-hots the coordinates into the table and sums; a gather is the
 // same thing without materialising the one-hot.) Gemma applies no mean/std normalisation here --
 // it rescales [0,1] to [-1,1] inline, which is the 2*(p-0.5).
 kernel void cpi_patch_embed(device const half* proj [[buffer(0)]],
@@ -118,7 +118,7 @@ kernel void cpi_rope_2d_inplace(device half* x [[buffer(0)]], device const int* 
 // number of patches actually found -- padding patches are skipped but do not shrink the divisor,
 // which is what makes a partially-filled edge cell scale correctly.
 //
-// The cell index is computed in SIGNED arithmetic, matching the CUDA kernel. That is deliberate
+// The cell index is computed in signed arithmetic, matching the CUDA kernel. That is deliberate
 // and it is what makes the padding guard load-bearing: in signed division -1/k is 0, so an
 // unguarded padding patch lands in cell 0 and quietly corrupts it. Casting to unsigned first would
 // send it to a cell index no real cell can equal, which hides the bug AND makes the guard
@@ -162,7 +162,7 @@ struct ClampParams {
 
 // out = clamp(in, lo, hi). Gemma 4 E2B's clipped linears (Gemma4ClippableLinear): HF clamps both
 // the input and the output of every vision projection with per-projection bounds. in == out is
-// allowed (the output clamp runs in place); the INPUT clamp must go through a staging buffer
+// allowed (the output clamp runs in place); the input clamp must go through a staging buffer
 // instead, because one normalised activation feeds several projections with different bounds.
 kernel void cpi_clamp(device const half* in [[buffer(0)]], device half* out [[buffer(1)]],
                       constant ClampParams& p [[buffer(2)]],

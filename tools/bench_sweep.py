@@ -42,10 +42,10 @@ import argparse
 import datetime
 import json
 import math
+import os
 import platform
 import re
 import shutil
-import socket
 import subprocess
 import sys
 import threading
@@ -549,7 +549,7 @@ def main() -> int:
     report = {
         "schema": "cpi-sweep-v1",
         "timestamp": timestamp,
-        "host": socket.gethostname(),
+        "host": os.environ.get("CPI_BENCH_HOST", "redacted"),
         "platform": platform.platform(),
         "cpu": _cpu_info(),
         "gpu": _gpu_name(),
@@ -578,7 +578,7 @@ def main() -> int:
         f"# CPI Benchmark Sweep — {model_name}",
         "",
         f"**Date:** {timestamp}  ",
-        f"**Host:** {socket.gethostname()}  ",
+        f"**Host:** {os.environ.get('CPI_BENCH_HOST', 'redacted')}  ",
         f"**GPU:** {_gpu_name()}  ",
         f"**CPU:** {_cpu_info()}  ",
         f"**Prompt:** _{args.prompt}_  ",

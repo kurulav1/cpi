@@ -1312,10 +1312,9 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
       }
     }
     // A name matching no op ablates nothing while still printing ABLATION ACTIVE below, which is
-    // far worse than not ablating: the run looks like the experiment you asked for and is the
-    // experiment you did not. "Attn" for "Attention" is how a prefill got profiled with all of
-    // its attention still in it, and the conclusions drawn off that trace were wrong for a week.
-    // So refuse to run rather than quietly measure the wrong thing.
+    // worse than not ablating: the run looks like the requested experiment but measures the
+    // unmodified pipeline (a misspelled "Attn" once profiled a prefill with all of its attention
+    // still in it). Refuse to run rather than quietly measure the wrong thing.
     for (const std::string& n : out) {
       bool known = false;
       for (const char* k : kAblatableKinds) {

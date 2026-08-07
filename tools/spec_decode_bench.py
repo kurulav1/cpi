@@ -22,11 +22,11 @@ Measured baseline 2026-07-05 (Qwen2.5 7B target + 0.5B draft, 5090, code prompt)
   spec K=4  101 tok/s (1.10x)  accept 0.72  3.28 tok/round
   spec K=5  103 tok/s (1.11x)  accept 0.67  3.77 tok/round
 Round cost attributed (K=5): ~19 ms draft + ~18 ms verify. Acceptance is already
-good (3.6 tok/round would be ~3.6x if free) — the wall is overhead, split two
+good (3.6 tok/round would be ~3.6x if free) -- the wall is overhead, split two
 ways with different causes:
   - Draft (5 x 3.75 ms): the 0.5B draft IS graphed (greedy_decode_graph enabled),
     so launches are amortized. 3.75 ms is genuine execution of ~900 tiny kernels
-    (each a few us even under graph replay) — ~5.6x off the ~0.67 ms weight
+    (each a few us even under graph replay) -- ~5.6x off the ~0.67 ms weight
     roofline. Lever: reduce kernel count (forward-path fusion). Large effort.
   - Verify (~18 ms): run_batched_chunk (~37 kernel launches) is not graphed, so
     it pays full per-round launch overhead. Lever: capture it in a fixed-K CUDA
@@ -46,7 +46,7 @@ SPEC = re.compile(r"accept_rate=([0-9.]+) tokens_per_round=([0-9.]+)")
 
 def run(bin_path, args, mutex):
     env = dict(os.environ, CPI_INSTANCE_MUTEX=mutex)
-    # Resolve the binary to an absolute path — a relative path is not reliably
+    # Resolve the binary to an absolute path -- a relative path is not reliably
     # found by subprocess on Windows.
     bin_path = os.path.abspath(bin_path)
     p = subprocess.run([bin_path, *args], env=env, capture_output=True, text=True, timeout=400)
@@ -73,7 +73,7 @@ def main():
 
     base_tps, _ = run(a.bin, [a.target, *common], mutex)
     if not base_tps:
-        print("baseline produced no tok/s — check the binary/model paths", file=sys.stderr)
+        print("baseline produced no tok/s -- check the binary/model paths", file=sys.stderr)
         sys.exit(1)
     print(f"{'config':16} {'tok/s':>8} {'speedup':>8} {'accept':>7} {'tok/round':>9}")
     print("-" * 54)

@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 # The Metal correctness gate for Apple Silicon.
 #
-# WHY THIS EXISTS AS A SCRIPT AND NOT JUST CI: GitHub's macOS runners are GPU-less VMs, so
+# Why this exists as a script and not just CI: GitHub's macOS runners are GPU-less VMs, so
 # MTLCreateSystemDefaultDevice() returns nil and every Metal test SKIPs there. The `metal`
-# CI job is compile-only BY DESIGN -- a green job means the shaders type-check, the
+# CI job is compile-only by design -- a green job means the shaders type-check, the
 # Objective-C++ bridge compiles and links. It does NOT mean a single kernel is correct.
 # Kernel correctness needs real Apple Silicon, and without this script that check lives
 # only in whoever last ran the commands by hand.
 #
 # Run it on actual Apple Silicon: a dev Mac, or a self-hosted / Tart-based runner (Tart VMs
-# DO expose a paravirtual MTLDevice, unlike GitHub's). See .github/workflows/metal-gpu.yml.
+# do expose a paravirtual MTLDevice, unlike GitHub's). See .github/workflows/metal-gpu.yml.
 #
 #   tools/metal_verify.sh [--build DIR] [--models DIR]
 #
-# Checkpoints are optional: every golden it cannot find is skipped LOUDLY rather than
+# Checkpoints are optional: every golden it cannot find is skipped loudly rather than
 # silently passing, so a bare checkout still gets the synthetic kernel smoke and the
 # summary tells you how much was actually covered.
 #
@@ -83,7 +83,7 @@ fi
 echo
 
 # ---------------------------------------------------------------------------
-# 2. Golden token streams. fp16 must reproduce the CUDA reference stream EXACTLY; a
+# 2. Golden token streams. fp16 must reproduce the CUDA reference stream exactly; a
 #    quantized run is a different model, so it is held to the CPU-oracle logit bound
 #    instead (looser, but still a bound).
 # ---------------------------------------------------------------------------
@@ -120,12 +120,12 @@ else
   run_golden qwen2.5-0.5b-sky-128.txt 128 ""  qwen.ll2c Qwen2.5-0.5B-Instruct.ll2c
   run_golden qwen2.5-0.5b-sky-128.txt 128 "4" qwen.ll2c Qwen2.5-0.5B-Instruct.ll2c
   run_golden qwen2.5-0.5b-sky-128.txt 128 "8" qwen.ll2c Qwen2.5-0.5B-Instruct.ll2c
-  # The ONLY golden whose prompt (86 tokens) exceeds kGemmMinTokens, so the only one that
+  # The only golden whose prompt (86 tokens) exceeds kGemmMinTokens, so the only one that
   # executes cpi_gemm_f16 at all. Every other prompt here prefills via the GEMV. Verified to
-  # catch the real thing: with the GEMM's thread count mismatched again, this FAILS and the
+  # catch the real thing: with the GEMM's thread count mismatched again, this fails and the
   # 12-token goldens still pass.
   #
-  # fp16 ONLY, deliberately. There is no int4 row because the quantized gate compares against
+  # fp16 only, deliberately. There is no int4 row because the quantized gate compares against
   # the fp32 CPU engine, and across an 86-token prompt int4 legitimately picks a different
   # (equally good) first token -- fp16 opens "Leaves are green because...", int4 opens with a
   # numbered list. Both are correct; an fp32 oracle simply cannot adjudicate an int4 stream at
@@ -133,7 +133,7 @@ else
   # CPU reference over T = 1..200 -- which is a stronger check than this would have been.
   run_golden qwen2.5-0.5b-longprompt-86x64.txt 64 ""  qwen.ll2c Qwen2.5-0.5B-Instruct.ll2c
 
-  # Split-KV decode attention, forced on. It normally waits for 256 keys, which NO golden here
+  # Split-KV decode attention, forced on. It normally waits for 256 keys, which no golden here
   # ever reaches -- the longest tops out around 150 -- so without this the split kernels ship
   # with the gate green and nothing having run them. CPI_METAL_ATTN_SPLIT_MIN=1 splits at any
   # depth, so these re-runs point the same CUDA-referenced streams at pass 1 and the merge. The
@@ -148,7 +148,7 @@ else
   run_golden qwen3-0.6b-sky-64.txt 64 "" Qwen3-0.6B.ll2c
   # Gemma: GeGLU, sliding window, head_dim 256 -- the scalar attention path.
   run_golden gemma-2b-capital-32.txt 32 "" gemma-2b.ll2c
-  # Mixtral MoE: router + top-k + per-expert FFN. The ONLY golden whose plan is not a dense
+  # Mixtral MoE: router + top-k + per-expert FFN. The only golden whose plan is not a dense
   # MLP, and the only one that can catch a routing bug.
   run_golden tiny-mixtral-moe-24.txt 24 "" tiny-mixtral.ll2c
   # The 8B at int4: the only model that exercises a real quantized prefill.

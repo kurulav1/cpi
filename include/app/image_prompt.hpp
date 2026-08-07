@@ -3,11 +3,11 @@
 // The chat text carries a single `<|image|>` placeholder token; exactly how HF's
 // processor does it; and this expands that one token into
 //   <boi> <image> x N <eoi>
-// where the N image tokens' EMBEDDINGS are the vision tower's soft tokens. Doing it this
+// where the N image tokens' embeddings are the vision tower's soft tokens. Doing it this
 // way means the ordinary chat-template rendering (CLI or web) needs no image-awareness
 // at all: it just leaves a placeholder where the picture goes.
 //
-// A TEMPLATE over the engine, not a PlanCudaEngine function: PlanMetalEngine now carries the
+// A template over the engine, not a PlanCudaEngine function: PlanMetalEngine now carries the
 // same four-method surface (has_vision / can_sequence_prefill / vision_config / encode_image),
 // and this file is the one place the splice layout lives; a per-backend copy is how the two
 // would drift. Header-only so a CUDA-free build never sees a CUDA type.

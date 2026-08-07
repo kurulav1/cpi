@@ -1,4 +1,4 @@
-// Reference chat descriptors — the DATA that ships with each model.
+// Reference chat descriptors -- the DATA that ships with each model.
 // Kept side-effect free so tooling can import them to author model descriptors.
 // chat_spec_parity.test.mjs proves these render byte-identically to the legacy
 // hand-written formatters.

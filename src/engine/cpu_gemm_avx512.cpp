@@ -8,7 +8,7 @@
 // else that executes unconditionally OUT of this file.
 //
 // Why a separate width tier at all: Zen 4 double-pumps 512-bit ops, so raw
-// FMA throughput matches AVX2 — the wins are the 32-register file (a 4-row x
+// FMA throughput matches AVX2 -- the wins are the 32-register file (a 4-row x
 // 4-token tile with 16 zmm accumulators + 4 weight + 4 input vectors = 24
 // live registers, which AVX2's 16 ymm cannot hold without spilling) and
 // half the instruction count per element (16-wide FMA and 16-wide fp16
@@ -138,7 +138,7 @@ void gemm_fp16_avx512(const std::uint16_t* W, const float* X, float* Y, int M, i
 }  // namespace detail
 }  // namespace engine
 
-#else  // !__AVX512F__ — this build has no AVX-512 kernel; the dispatch never calls it.
+#else  // !__AVX512F__ -- this build has no AVX-512 kernel; the dispatch never calls it.
 
 namespace engine {
 namespace detail {

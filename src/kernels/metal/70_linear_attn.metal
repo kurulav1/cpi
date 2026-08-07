@@ -5,7 +5,7 @@
 // mirrors kernels_ops_matvec.cu exactly, including where it accumulates in fp32 and where it
 // rounds to half, so the two backends can be compared token-for-token rather than approximately.
 //
-// Two of them carry PERSISTENT STATE across decode steps, which nothing else in this backend
+// Two of them carry persistent state across decode steps, which nothing else in this backend
 // does: the conv1d keeps the last kernel_size-1 inputs per channel, and the attention step keeps
 // a [key_head_dim x value_head_dim] matrix per head. Both are fp32 and both are read-modify-write
 // within a single step, so neither can be replayed and neither may run twice on the same token.
@@ -94,7 +94,7 @@ kernel void cpi_mul_vec(device const half* in [[buffer(0)]], device const half* 
 //
 // conv_state is [channels][kernel_size-1] fp32 and holds this channel's previous inputs oldest
 // first. One thread per channel: the whole window is that thread's own, so the shift is a private
-// read-modify-write and needs no barrier -- but it also means this kernel must run EXACTLY ONCE
+// read-modify-write and needs no barrier -- but it also means this kernel must run exactly once
 // per token, since replaying it would advance the history twice.
 kernel void cpi_linear_conv1d_silu(device const half* conv_weight [[buffer(0)]],
                                    device float* conv_state [[buffer(1)]],
@@ -148,7 +148,7 @@ kernel void cpi_repeat_linear_heads(device const half* qkv_mix [[buffer(0)]],
   }
 }
 
-// One decode step of gated delta-net linear attention. One THREADGROUP per head.
+// One decode step of gated delta-net linear attention. One threadgroup per head.
 //
 //   q, k        L2-normalised (q additionally scaled by 1/sqrt(key_head_dim))
 //   state      *= decay, where decay = exp(-exp(a_log) * softplus(a + dt_bias))
