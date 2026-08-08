@@ -604,6 +604,51 @@ bool GgufLoader::fill_device_fp16(const std::string& cpi_name, void* dst, void* 
 #endif
 }
 
+GgufLoader::PackedTensor GgufLoader::packed_kquant(const std::string& cpi_name) const {
+  PackedTensor out;
+  const auto it = cpi_to_gguf_.find(cpi_name);
+  if (it == cpi_to_gguf_.end()) return out;
+  const TensorInfo& info = tensors_.at(it->second);
+  std::size_t block_bytes = 0;
+  switch (info.type) {
+    case GgmlType::Q4_K:
+      out.kind = 0;
+      block_bytes = kquant::kQ4KBlockBytes;
+      break;
+    case GgmlType::Q5_K:
+      out.kind = 1;
+      block_bytes = kquant::kQ5KBlockBytes;
+      break;
+    case GgmlType::Q6_K:
+      out.kind = 2;
+      block_bytes = kquant::kQ6KBlockBytes;
+      break;
+    default:
+      return out;  // not a k-quant: no packed route
+  }
+  if (info.elements % kquant::kSuperBlock != 0) {
+    out.kind = -1;
+    return out;
+  }
+  // Q and K carry the converter's RoPE permutation, which is undone on the host
+  // while unpacking. A packed consumer would need it applied to the blocks
+  // themselves, so they are withheld rather than silently served unpermuted.
+  if (permute_heads_.find(cpi_name) != permute_heads_.end()) {
+    out.kind = -1;
+    return out;
+  }
+  out.bytes = (info.elements / kquant::kSuperBlock) * block_bytes;
+  if (info.offset + out.bytes > data_bytes_) {
+    out.kind = -1;
+    return out;
+  }
+  out.data = data_base_ + info.offset;
+  // ggml stores dims fastest-axis-first: dims[0] is the input width.
+  out.cols = info.dims.size() > 0 ? static_cast<int>(info.dims[0]) : 0;
+  out.rows = info.dims.size() > 1 ? static_cast<int>(info.dims[1]) : 1;
+  return out;
+}
+
 const std::byte* GgufLoader::raw_tensor_bytes(const std::string& gguf_name) const {
   const auto it = tensors_.find(gguf_name);
   if (it == tensors_.end() || data_base_ == nullptr) return nullptr;

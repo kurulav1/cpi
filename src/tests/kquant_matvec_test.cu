@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "model/gguf_kquant.hpp"
+#include "model/gguf_loader.hpp"
 #include "runtime/kernels.cuh"
 
 namespace {
@@ -130,7 +131,76 @@ void run_case(const Case& c, int rows, int cols) {
 
 }  // namespace
 
-int main() {
+// Real weights: the same projection multiplied two ways -- once from the packed
+// blocks by the kernel, once from the fp16 the loader produces. This is the last
+// unknown before residency: synthetic blocks prove the arithmetic, only a real
+// tensor proves the layout assumptions (row/col order, block-per-row stride)
+// against a file a quantizer actually wrote.
+void run_real(const std::string& gguf_path) {
+  model::GgufLoader g;
+  try {
+    g.open(gguf_path);
+  } catch (const std::exception& e) {
+    std::printf("  [FAIL] open threw: %s\n", e.what());
+    ++failures;
+    return;
+  }
+  int checked = 0;
+  for (const auto& name : g.tensor_names()) {
+    const auto pk = g.packed_kquant(name);
+    if (!pk.valid() || pk.rows < 2 || pk.cols % 256 != 0) continue;
+
+    const int rows = std::min(pk.rows, 32);  // a slice is enough; rows are independent
+    const std::size_t row_bytes = pk.bytes / static_cast<std::size_t>(pk.rows);
+    std::vector<__half> x(pk.cols);
+    std::mt19937 rng(4242);
+    std::uniform_real_distribution<float> xd(-1.0f, 1.0f);
+    for (int i = 0; i < pk.cols; ++i) x[i] = __float2half(xd(rng));
+
+    // Reference from the loader's fp16 expansion of the same tensor.
+    const auto* fp16 = reinterpret_cast<const std::uint16_t*>(g.tensor_data(name));
+    std::vector<float> ref(rows, 0.0f);
+    for (int r = 0; r < rows; ++r) {
+      double acc = 0.0;
+      for (int i = 0; i < pk.cols; ++i) {
+        acc += static_cast<double>(h2f(fp16[static_cast<std::size_t>(r) * pk.cols + i])) *
+               __half2float(x[i]);
+      }
+      ref[r] = static_cast<float>(acc);
+    }
+
+    std::uint8_t* d_w = nullptr;
+    __half* d_x = nullptr;
+    __half* d_y = nullptr;
+    cudaMalloc(&d_w, row_bytes * rows);
+    cudaMalloc(&d_x, x.size() * sizeof(__half));
+    cudaMalloc(&d_y, static_cast<std::size_t>(rows) * sizeof(__half));
+    cudaMemcpy(d_w, pk.data, row_bytes * rows, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_x, x.data(), x.size() * sizeof(__half), cudaMemcpyHostToDevice);
+    kernels::launch_kquant_matvec(d_w, static_cast<kernels::KQuantType>(pk.kind), d_x, d_y, rows,
+                                  pk.cols, nullptr);
+    cudaDeviceSynchronize();
+    std::vector<__half> y(rows);
+    cudaMemcpy(y.data(), d_y, y.size() * sizeof(__half), cudaMemcpyDeviceToHost);
+    cudaFree(d_w);
+    cudaFree(d_x);
+    cudaFree(d_y);
+
+    double scale = 0.0;
+    for (int r = 0; r < rows; ++r) scale = std::max(scale, std::abs(static_cast<double>(ref[r])));
+    double worst = 0.0;
+    for (int r = 0; r < rows; ++r) {
+      worst = std::max(worst, std::abs(__half2float(y[r]) - ref[r]) / (scale > 0.0 ? scale : 1.0));
+    }
+    std::printf("  %-28s kind=%d rows=%-5d cols=%-5d worst_rel=%.5f\n", name.c_str(), pk.kind,
+                pk.rows, pk.cols, worst);
+    check(worst < 0.01, name + ": packed matvec matches the fp16 expansion");
+    if (++checked >= 4) break;
+  }
+  check(checked > 0, "found packed k-quant tensors to check");
+}
+
+int main(int argc, char** argv) {
   int devices = 0;
   if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
     std::printf("kquant_matvec_test: no CUDA device; skipping\n");
@@ -148,6 +218,10 @@ int main() {
   for (const Case& c : cases) {
     run_case(c, 8, 512);      // several rows, two super-blocks each
     run_case(c, 64, 4096);    // a realistic projection shape
+  }
+  if (argc > 1) {
+    std::printf("kquant_matvec_test: real weights from %s\n", argv[1]);
+    run_real(argv[1]);
   }
   std::printf("%s\n", failures == 0 ? "KQUANT MATVEC: PASS" : "KQUANT MATVEC: FAIL");
   return failures == 0 ? 0 : 1;

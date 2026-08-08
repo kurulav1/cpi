@@ -105,6 +105,23 @@ public:
   [[nodiscard]] bool fill_device_fp16(const std::string& cpi_name, void* dst,
                                       void* stream) const;
 
+  // A tensor still in its packed k-quant form, for the paths that consume blocks
+  // directly instead of an fp16 expansion (that is the point of keeping a
+  // quantized model quantized). `kind` is 0 Q4_K, 1 Q5_K, 2 Q6_K, matching
+  // kernels::KQuantType. Absent when the tensor is not a k-quant, is not a whole
+  // number of super-blocks, or needs the host-side RoPE un-permute.
+  struct PackedTensor {
+    const std::byte* data = nullptr;
+    std::size_t bytes = 0;
+    int kind = -1;
+    int rows = 0;  // out_features
+    int cols = 0;  // in_features
+    [[nodiscard]] bool valid() const {
+      return data != nullptr && kind >= 0;
+    }
+  };
+  [[nodiscard]] PackedTensor packed_kquant(const std::string& cpi_name) const;
+
   // Non-empty when the file's architecture has no trustworthy CPI mapping. The
   // file still reads (inspection, dequant checks); it is running it that is
   // refused, at the engine boundary. See build_config for the reasoning.
