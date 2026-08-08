@@ -88,6 +88,10 @@ public:
   };
   [[nodiscard]] std::vector<RawTensor> raw_tensors() const;
 
+  // The tensor's bytes exactly as stored (still quantized), for code that
+  // consumes the packed form rather than the fp16 expansion. Null if unknown.
+  [[nodiscard]] const std::byte* raw_tensor_bytes(const std::string& gguf_name) const;
+
   // Non-empty when the file's architecture has no trustworthy CPI mapping. The
   // file still reads (inspection, dequant checks); it is running it that is
   // refused, at the engine boundary. See build_config for the reasoning.

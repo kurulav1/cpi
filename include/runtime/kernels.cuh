@@ -1246,6 +1246,16 @@ void launch_weight_only_int8_matvec_glu(const std::int8_t* wg, const float* sg,
 void launch_half_gemv_glu(const half* wg, const half* wu, const half* x, half* y, int out_features,
                           int in_features, cudaStream_t stream);
 
+// launch_dequant_kquant
+//
+// Device-side ggml k-quant dequantization: `blocks` 256-weight super-blocks in, fp16
+// out. The packed blocks are uploaded as-is, so the host never materializes the fp16
+// copy. Gated against the host reference by kquant_dequant_test -- a mistake in this
+// arithmetic reads as slightly-wrong weights, not as a failure.
+enum class KQuantType { Q4_K, Q5_K, Q6_K };
+void launch_dequant_kquant(const std::uint8_t* blocks_in, KQuantType type, std::size_t blocks,
+                           half* out, cudaStream_t stream);
+
 // launch_dequant_weight_rowwise_to_fp16
 //
 // Dequant in LlamaEngine's cached low-bit layout (row-wise scales; int4 packed as

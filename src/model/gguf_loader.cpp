@@ -166,6 +166,10 @@ std::uint16_t float_to_half(float f) {
   return engine::mini::float_to_half_bits(f);
 }
 
+}  // namespace
+
+namespace kquant {
+
 // ---- k-quant super-blocks -------------------------------------------------
 //
 // The k-quants pack 256 weights per super-block and quantize the per-sub-block
@@ -373,7 +377,7 @@ void dequant_q3_k(const std::uint8_t* base, std::size_t blocks, std::uint16_t* o
   }
 }
 
-}  // namespace
+}  // namespace kquant
 
 bool is_gguf_file(const std::string& path) {
   std::ifstream f(path, std::ios::binary);
@@ -499,6 +503,13 @@ std::vector<GgufLoader::RawTensor> GgufLoader::raw_tensors() const {
   std::sort(out.begin(), out.end(),
             [](const RawTensor& a, const RawTensor& b) { return a.name < b.name; });
   return out;
+}
+
+const std::byte* GgufLoader::raw_tensor_bytes(const std::string& gguf_name) const {
+  const auto it = tensors_.find(gguf_name);
+  if (it == tensors_.end() || data_base_ == nullptr) return nullptr;
+  if (it->second.offset > data_bytes_) return nullptr;
+  return data_base_ + it->second.offset;
 }
 
 std::string GgufLoader::metadata_string(const std::string& key) const {
@@ -706,7 +717,7 @@ const std::byte* GgufLoader::materialize(const std::string& cpi_name,
     case GgmlType::Q4_K:
     case GgmlType::Q5_K:
     case GgmlType::Q6_K:
-      if (n % kSuperBlock != 0) {
+      if (n % kquant::kSuperBlock != 0) {
         throw std::runtime_error("gguf: tensor '" + info.gguf_name +
                                  "' uses a k-quant type but its element count " +
                                  std::to_string(n) + " is not a multiple of 256");
@@ -842,19 +853,19 @@ const std::byte* GgufLoader::materialize(const std::string& cpi_name,
       break;
     }
     case GgmlType::Q4_K:
-      dequant_q4_k(reinterpret_cast<const std::uint8_t*>(src), n / kSuperBlock, half.data());
+      kquant::dequant_q4_k(reinterpret_cast<const std::uint8_t*>(src), n / kquant::kSuperBlock, half.data());
       break;
     case GgmlType::Q5_K:
-      dequant_q5_k(reinterpret_cast<const std::uint8_t*>(src), n / kSuperBlock, half.data());
+      kquant::dequant_q5_k(reinterpret_cast<const std::uint8_t*>(src), n / kquant::kSuperBlock, half.data());
       break;
     case GgmlType::Q6_K:
-      dequant_q6_k(reinterpret_cast<const std::uint8_t*>(src), n / kSuperBlock, half.data());
+      kquant::dequant_q6_k(reinterpret_cast<const std::uint8_t*>(src), n / kquant::kSuperBlock, half.data());
       break;
     case GgmlType::Q2_K:
-      dequant_q2_k(reinterpret_cast<const std::uint8_t*>(src), n / kSuperBlock, half.data());
+      kquant::dequant_q2_k(reinterpret_cast<const std::uint8_t*>(src), n / kquant::kSuperBlock, half.data());
       break;
     case GgmlType::Q3_K:
-      dequant_q3_k(reinterpret_cast<const std::uint8_t*>(src), n / kSuperBlock, half.data());
+      kquant::dequant_q3_k(reinterpret_cast<const std::uint8_t*>(src), n / kquant::kSuperBlock, half.data());
       break;
     default:
       throw std::runtime_error("gguf: unsupported tensor type at materialize time");

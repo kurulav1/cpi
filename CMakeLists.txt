@@ -175,6 +175,7 @@ if(CPI_ENABLE_CUDA)
     src/kernels/kernels_vision.cu
     src/kernels/kernels_weight_only_matvec.cu
     src/kernels/kernels_turboquant.cu
+    src/kernels/kernels_kquant.cu
     src/engine/tensor_parallel.cpp
     src/engine/llama_engine.cpp
     src/engine/llama_engine_lowbit_utils.cpp
@@ -452,6 +453,13 @@ target_link_libraries(ll2c_to_cpi PRIVATE cpi_engine)
 # GGUF reader. Takes a .gguf path (and optionally a .ll2c of the same model as an
 # oracle), so it is not registered with add_test: there is no checked-in fixture
 # big enough to be a real model.
+# Device k-quant dequant vs the host reference. Needs CUDA; takes an optional
+# .gguf so it can run on real blocks rather than only synthetic ones.
+add_executable(kquant_dequant_test src/tests/kquant_dequant_test.cu)
+target_include_directories(kquant_dequant_test PRIVATE include)
+target_link_libraries(kquant_dequant_test PRIVATE cpi_engine)
+add_test(NAME kquant_dequant_test COMMAND kquant_dequant_test)
+
 add_executable(gguf_loader_test src/tests/gguf_loader_test.cpp)
 target_include_directories(gguf_loader_test PRIVATE include)
 target_link_libraries(gguf_loader_test PRIVATE cpi_engine)
