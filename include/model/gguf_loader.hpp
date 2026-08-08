@@ -39,6 +39,10 @@ namespace model {
 
 class GgufLoader {
 public:
+  GgufLoader() = default;
+  ~GgufLoader();
+  GgufLoader(const GgufLoader&) = delete;
+  GgufLoader& operator=(const GgufLoader&) = delete;
   // Maps the file and parses the header, metadata and tensor table. Throws with
   // a specific message on a bad magic, an unsupported version, or a tensor type
   // this build cannot dequantize.
@@ -91,6 +95,15 @@ public:
   // The tensor's bytes exactly as stored (still quantized), for code that
   // consumes the packed form rather than the fp16 expansion. Null if unknown.
   [[nodiscard]] const std::byte* raw_tensor_bytes(const std::string& gguf_name) const;
+
+  // Fills `dst` (device, fp16, tensor_bytes(name) long) directly from the packed
+  // blocks: the quantized bytes go to the GPU and are unpacked there, so the
+  // host never materializes the fp16 copy. Returns false when this tensor has no
+  // device route (fp16 already, or a type without a device kernel), leaving the
+  // caller on the host path. `stream` is a cudaStream_t, opaque here so the
+  // header stays CUDA-free for the CPU and Metal builds.
+  [[nodiscard]] bool fill_device_fp16(const std::string& cpi_name, void* dst,
+                                      void* stream) const;
 
   // Non-empty when the file's architecture has no trustworthy CPI mapping. The
   // file still reads (inspection, dequant checks); it is running it that is
@@ -156,6 +169,11 @@ private:
   // Dequantized (or un-permuted) tensors, owned. mutable because materializing
   // is a caching detail of a const read.
   mutable std::unordered_map<std::string, std::vector<std::byte>> cache_;
+  // Device staging for fill_device_fp16: holds one tensor's packed blocks,
+  // grown to the largest seen and reused. Owned here so the lifetime matches
+  // the mapping it stages from.
+  mutable void* device_packed_ = nullptr;
+  mutable std::size_t device_packed_bytes_ = 0;
 };
 
 }  // namespace model

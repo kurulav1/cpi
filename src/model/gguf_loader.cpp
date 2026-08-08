@@ -1,6 +1,8 @@
 // GGUF reader. See gguf_loader.hpp for scope and the two caveats.
 #include "model/gguf_loader.hpp"
 
+#include "model/gguf_kquant.hpp"
+
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -9,6 +11,13 @@
 #include <stdexcept>
 
 #include "model/json_mini.hpp"
+
+#if CPI_HAS_CUDA
+#  include <cuda_fp16.h>
+#  include <cuda_runtime.h>
+
+#  include "runtime/kernels.cuh"
+#endif
 
 namespace model {
 namespace {
@@ -177,7 +186,6 @@ namespace kquant {
 // same bit width. The layouts below follow ggml's block structs exactly; they
 // are a wire format, so the field order and the bit packing are the spec, and
 // deviating anywhere produces plausible-looking weights that are simply wrong.
-constexpr std::size_t kSuperBlock = 256;  // ggml's QK_K
 
 // Q4_K/Q5_K scales: 8 sub-blocks x (6-bit scale, 6-bit min) packed into 12 bytes.
 void get_scale_min_k4(int j, const std::uint8_t* q, std::uint8_t* d, std::uint8_t* m) {
@@ -387,6 +395,14 @@ bool is_gguf_file(const std::string& path) {
   return f.gcount() == static_cast<std::streamsize>(sizeof(magic)) && magic == kGgufMagic;
 }
 
+GgufLoader::~GgufLoader() {
+#if CPI_HAS_CUDA
+  if (device_packed_ != nullptr) cudaFree(device_packed_);
+#endif
+  device_packed_ = nullptr;
+  device_packed_bytes_ = 0;
+}
+
 void GgufLoader::open(const std::string& path) {
   parse(path);
   build_config();
@@ -503,6 +519,89 @@ std::vector<GgufLoader::RawTensor> GgufLoader::raw_tensors() const {
   std::sort(out.begin(), out.end(),
             [](const RawTensor& a, const RawTensor& b) { return a.name < b.name; });
   return out;
+}
+
+bool GgufLoader::fill_device_fp16(const std::string& cpi_name, void* dst, void* stream) const {
+#if CPI_HAS_CUDA
+  if (dst == nullptr) return false;
+  // Kill switch, and the A/B lever the device path was verified with: the host
+  // route must produce the same weights, so both must be runnable.
+  static const bool disabled = []() {
+    const char* env = std::getenv("CPI_GGUF_DEVICE_DEQUANT");
+    return env != nullptr && env[0] == '0';
+  }();
+  if (disabled) return false;
+  const auto it = cpi_to_gguf_.find(cpi_name);
+  if (it == cpi_to_gguf_.end()) return false;
+  const TensorInfo& info = tensors_.at(it->second);
+  // Only the k-quants have a device kernel today. fp16 is already served
+  // zero-copy from the mapping, and the flat quants are cheap enough on the
+  // host that they are not worth a second path until measured.
+  kernels::KQuantType kt;
+  switch (info.type) {
+    case GgmlType::Q4_K:
+      kt = kernels::KQuantType::Q4_K;
+      break;
+    case GgmlType::Q5_K:
+      kt = kernels::KQuantType::Q5_K;
+      break;
+    case GgmlType::Q6_K:
+      kt = kernels::KQuantType::Q6_K;
+      break;
+    default:
+      return false;
+  }
+  if (info.elements % kquant::kSuperBlock != 0) return false;
+  if (permute_heads_.find(cpi_name) != permute_heads_.end()) {
+    // Q/K need the RoPE un-permute, which lives on the host path for now.
+    return false;
+  }
+  const std::size_t blocks = info.elements / kquant::kSuperBlock;
+  std::size_t block_bytes = 0;
+  switch (info.type) {
+    case GgmlType::Q4_K:
+      block_bytes = kquant::kQ4KBlockBytes;
+      break;
+    case GgmlType::Q5_K:
+      block_bytes = kquant::kQ5KBlockBytes;
+      break;
+    default:
+      block_bytes = kquant::kQ6KBlockBytes;
+      break;
+  }
+  const std::size_t packed_bytes = blocks * block_bytes;
+  if (info.offset + packed_bytes > data_bytes_) return false;
+
+  auto* cuda_stream = static_cast<cudaStream_t>(stream);
+  // A staging buffer sized to the largest tensor seen so far, reused across
+  // layers: the packed bytes are a fraction of the fp16 they expand to, so this
+  // is small next to what the old path allocated on the host.
+  if (packed_bytes > device_packed_bytes_) {
+    if (device_packed_ != nullptr) {
+      cudaStreamSynchronize(cuda_stream);
+      cudaFree(device_packed_);
+      device_packed_ = nullptr;
+      device_packed_bytes_ = 0;
+    }
+    if (cudaMalloc(&device_packed_, packed_bytes) != cudaSuccess) {
+      device_packed_ = nullptr;
+      return false;  // fall back to the host path rather than fail the load
+    }
+    device_packed_bytes_ = packed_bytes;
+  }
+  if (cudaMemcpyAsync(device_packed_, data_base_ + info.offset, packed_bytes,
+                      cudaMemcpyHostToDevice, cuda_stream) != cudaSuccess) {
+    return false;
+  }
+  kernels::launch_dequant_kquant(static_cast<const std::uint8_t*>(device_packed_), kt, blocks,
+                                 static_cast<__half*>(dst), cuda_stream);
+  return true;
+#else
+  (void)cpi_name;
+  (void)dst;
+  (void)stream;
+  return false;
+#endif
 }
 
 const std::byte* GgufLoader::raw_tensor_bytes(const std::string& gguf_name) const {

@@ -720,6 +720,12 @@ void LlamaEngine::init_layer_cache() {
       if (!weights_.has_tensor(name)) {
         CPI_THROW("missing tensor: " + name);
       }
+      // A container that can unpack on the device does so: the quantized bytes
+      // cross the bus and expand in VRAM, instead of expanding to fp16 in host
+      // RAM first. Anything else falls through to the plain copy.
+      if (weights_.fill_device_fp16(name, dst, transfer_stream_)) {
+        return;
+      }
       CUDA_CHECK(cudaMemcpyAsync(dst, weights_.tensor_data(name), bytes, cudaMemcpyHostToDevice,
                                  transfer_stream_));
     };
