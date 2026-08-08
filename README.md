@@ -58,6 +58,26 @@ for it. A fresh 2026-08-05 re-run against llama.cpp build `1269cb1` (`-fa 1`, wa
 put the 8B at decode **99%** (82.2 vs 83.2 tok/s), prefill@512 **133%**, prefill@2048 **106%** --
 consistent with the table's earlier rows.
 
+**Same file, both engines.** Since CPI reads GGUF directly, the two engines can now be pointed at
+the byte-identical file rather than at two conversions of one checkpoint. Llama-3.1-8B, same RTX
+5090, interleaved, decode of 128 tokens after a 133-token prompt (`llama-bench -n 128` against
+CPI's `[bench] decode_tok_per_s`, both decode-only):
+
+| File | llama.cpp | CPI | CPI / llama.cpp |
+| ---- | --------- | --- | --------------- |
+| `llama31-8b-F16.gguf` | 94.3 tok/s | 94.3 tok/s | **100%** |
+| `llama31-8b-Q4_K_M.gguf` | 248.3 tok/s | 210.3 tok/s | **85%** |
+
+The F16 row is the honest apples-to-apples case: identical bytes, identical arithmetic, parity. The
+Q4_K_M row is not like-for-like -- llama.cpp runs k-quant blocks natively, while CPI dequantizes and
+re-packs into its own int4 (`--weight-quant int4`), which costs a second quantization and leaves it
+at 4.6 GB on disk but 12.5 GB resident. Loading those blocks natively is the open work; the gap is
+the size of the prize.
+
+One weakness the same measurement exposes: CPI's **int4 prefill is much slower than its fp16
+prefill** (375 vs 2145 tok/s on a 133-token prompt), so quantized runs pay at prompt ingestion what
+they win at decode. Long-prompt workloads should measure both phases before choosing.
+
 | Model | Test | llama.cpp | CPI | CPI / llama.cpp |
 | ----- | ---- | --------- | --- | --------------- |
 | Qwen2.5-0.5B | decode 256 | 820 tok/s | 851 tok/s | **104%** |
