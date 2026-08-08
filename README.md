@@ -289,6 +289,14 @@ Tensor types: F32, F16, BF16, the flat quants (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0) and the
 starts as fast as CPI's own container and decodes at the same speed (measured 91 tok/s either way on
 an 8B, with generation **token-identical** to the same checkpoint's `.ll2c`).
 
+One caveat worth knowing before you point a quantized file at it: CPI currently **dequantizes to
+fp16 at load**, so a 4.6 GB Q4_K_M uses the same VRAM as the 15 GB F16 of the same model. You get
+the smaller download and disk footprint, not a smaller resident model. Dequantization is
+multi-threaded (an 8B Q4_K_M starts in ~13 s against ~7 s for F16, and decodes at the same speed),
+and mapping the quantized blocks onto CPI's own packed int4/int8 -- which would keep the memory
+win -- is the next step on this path. `--weight-quant int4` re-quantizes on load if you need the
+VRAM back today.
+
 Architectures are mapped conservatively: `llama` (verified against a `.ll2c` of the same checkpoint,
 bit-exact weights and identical output) and `qwen2`. Anything else is **refused with an
 explanation** rather than loaded under the wrong conventions -- an unmapped architecture still has

@@ -185,8 +185,10 @@ void get_scale_min_k4(int j, const std::uint8_t* q, std::uint8_t* d, std::uint8_
   }
 }
 
-void dequant_q4_k(const std::uint8_t* p, std::size_t blocks, std::uint16_t* out) {
-  for (std::size_t b = 0; b < blocks; ++b) {
+void dequant_q4_k(const std::uint8_t* base, std::size_t blocks, std::uint16_t* out) {
+#pragma omp parallel for schedule(static)
+  for (std::ptrdiff_t b = 0; b < static_cast<std::ptrdiff_t>(blocks); ++b) {
+    const std::uint8_t* p = base + static_cast<std::size_t>(b) * 144;
     std::uint16_t dh = 0;
     std::uint16_t mh = 0;
     std::memcpy(&dh, p, 2);
@@ -195,7 +197,7 @@ void dequant_q4_k(const std::uint8_t* p, std::size_t blocks, std::uint16_t* out)
     const float dmin = half_to_float(mh);
     const std::uint8_t* scales = p + 4;
     const std::uint8_t* q = p + 4 + 12;
-    std::uint16_t* y = out + b * kSuperBlock;
+    std::uint16_t* y = out + static_cast<std::size_t>(b) * kSuperBlock;
     int is = 0;
     for (std::size_t j = 0; j < kSuperBlock; j += 64) {
       std::uint8_t sc = 0;
@@ -211,12 +213,13 @@ void dequant_q4_k(const std::uint8_t* p, std::size_t blocks, std::uint16_t* out)
       q += 32;
       is += 2;
     }
-    p += 144;  // 2 + 2 + 12 + 128
   }
 }
 
-void dequant_q5_k(const std::uint8_t* p, std::size_t blocks, std::uint16_t* out) {
-  for (std::size_t b = 0; b < blocks; ++b) {
+void dequant_q5_k(const std::uint8_t* base, std::size_t blocks, std::uint16_t* out) {
+#pragma omp parallel for schedule(static)
+  for (std::ptrdiff_t b = 0; b < static_cast<std::ptrdiff_t>(blocks); ++b) {
+    const std::uint8_t* p = base + static_cast<std::size_t>(b) * 176;
     std::uint16_t dh = 0;
     std::uint16_t mh = 0;
     std::memcpy(&dh, p, 2);
@@ -226,7 +229,7 @@ void dequant_q5_k(const std::uint8_t* p, std::size_t blocks, std::uint16_t* out)
     const std::uint8_t* scales = p + 4;
     const std::uint8_t* qh = p + 4 + 12;
     const std::uint8_t* ql = p + 4 + 12 + 32;
-    std::uint16_t* y = out + b * kSuperBlock;
+    std::uint16_t* y = out + static_cast<std::size_t>(b) * kSuperBlock;
     int is = 0;
     std::uint8_t u1 = 1;
     std::uint8_t u2 = 2;
@@ -252,19 +255,20 @@ void dequant_q5_k(const std::uint8_t* p, std::size_t blocks, std::uint16_t* out)
       u1 = static_cast<std::uint8_t>(u1 << 2);
       u2 = static_cast<std::uint8_t>(u2 << 2);
     }
-    p += 176;  // 2 + 2 + 12 + 32 + 128
   }
 }
 
-void dequant_q6_k(const std::uint8_t* p, std::size_t blocks, std::uint16_t* out) {
-  for (std::size_t b = 0; b < blocks; ++b) {
+void dequant_q6_k(const std::uint8_t* base, std::size_t blocks, std::uint16_t* out) {
+#pragma omp parallel for schedule(static)
+  for (std::ptrdiff_t b = 0; b < static_cast<std::ptrdiff_t>(blocks); ++b) {
+    const std::uint8_t* p = base + static_cast<std::size_t>(b) * 210;
     const std::uint8_t* ql = p;
     const std::uint8_t* qh = p + 128;
     const auto* sc = reinterpret_cast<const std::int8_t*>(p + 128 + 64);
     std::uint16_t dh = 0;
     std::memcpy(&dh, p + 128 + 64 + 16, 2);
     const float d = half_to_float(dh);
-    std::uint16_t* y = out + b * kSuperBlock;
+    std::uint16_t* y = out + static_cast<std::size_t>(b) * kSuperBlock;
     for (std::size_t n = 0; n < kSuperBlock; n += 128) {
       for (int l = 0; l < 32; ++l) {
         const int is = l / 16;
@@ -282,12 +286,13 @@ void dequant_q6_k(const std::uint8_t* p, std::size_t blocks, std::uint16_t* out)
       qh += 32;
       sc += 8;
     }
-    p += 210;  // 128 + 64 + 16 + 2
   }
 }
 
-void dequant_q2_k(const std::uint8_t* p, std::size_t blocks, std::uint16_t* out) {
-  for (std::size_t b = 0; b < blocks; ++b) {
+void dequant_q2_k(const std::uint8_t* base, std::size_t blocks, std::uint16_t* out) {
+#pragma omp parallel for schedule(static)
+  for (std::ptrdiff_t b = 0; b < static_cast<std::ptrdiff_t>(blocks); ++b) {
+    const std::uint8_t* p = base + static_cast<std::size_t>(b) * 84;
     const std::uint8_t* scales = p;
     const std::uint8_t* q = p + 16;
     std::uint16_t dh = 0;
@@ -296,7 +301,7 @@ void dequant_q2_k(const std::uint8_t* p, std::size_t blocks, std::uint16_t* out)
     std::memcpy(&mh, p + 16 + 64 + 2, 2);
     const float d = half_to_float(dh);
     const float dmin = half_to_float(mh);
-    std::uint16_t* y = out + b * kSuperBlock;
+    std::uint16_t* y = out + static_cast<std::size_t>(b) * kSuperBlock;
     int is = 0;
     for (std::size_t n = 0; n < kSuperBlock; n += 128) {
       int shift = 0;
@@ -317,14 +322,15 @@ void dequant_q2_k(const std::uint8_t* p, std::size_t blocks, std::uint16_t* out)
       }
       q += 32;
     }
-    p += 84;  // 16 + 64 + 4
   }
 }
 
-void dequant_q3_k(const std::uint8_t* p, std::size_t blocks, std::uint16_t* out) {
+void dequant_q3_k(const std::uint8_t* base, std::size_t blocks, std::uint16_t* out) {
   constexpr std::uint32_t kmask1 = 0x03030303u;
   constexpr std::uint32_t kmask2 = 0x0f0f0f0fu;
-  for (std::size_t b = 0; b < blocks; ++b) {
+#pragma omp parallel for schedule(static)
+  for (std::ptrdiff_t b = 0; b < static_cast<std::ptrdiff_t>(blocks); ++b) {
+    const std::uint8_t* p = base + static_cast<std::size_t>(b) * 110;
     const std::uint8_t* hm = p;
     const std::uint8_t* q = p + 32;
     std::uint16_t dh = 0;
@@ -342,7 +348,7 @@ void dequant_q3_k(const std::uint8_t* p, std::size_t blocks, std::uint16_t* out)
     aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
     const auto* scales = reinterpret_cast<const std::int8_t*>(aux);
 
-    std::uint16_t* y = out + b * kSuperBlock;
+    std::uint16_t* y = out + static_cast<std::size_t>(b) * kSuperBlock;
     std::uint8_t m = 1;
     int is = 0;
     for (std::size_t n = 0; n < kSuperBlock; n += 128) {
@@ -363,7 +369,6 @@ void dequant_q3_k(const std::uint8_t* p, std::size_t blocks, std::uint16_t* out)
       }
       q += 32;
     }
-    p += 110;  // 32 + 64 + 12 + 2
   }
 }
 
@@ -702,28 +707,35 @@ const std::byte* GgufLoader::materialize(const std::string& cpi_name,
     }
     case GgmlType::BF16: {
       const auto* bf = reinterpret_cast<const std::uint16_t*>(src);
-      for (std::size_t i = 0; i < n; ++i) half[i] = float_to_half(engine::mini::bf16_to_float(bf[i]));
+#pragma omp parallel for schedule(static)
+      for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(n); ++i) {
+        half[i] = float_to_half(engine::mini::bf16_to_float(bf[i]));
+      }
       break;
     }
     case GgmlType::F32: {
       const auto* f = reinterpret_cast<const float*>(src);
-      for (std::size_t i = 0; i < n; ++i) half[i] = float_to_half(f[i]);
+#pragma omp parallel for schedule(static)
+      for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(n); ++i) {
+        half[i] = float_to_half(f[i]);
+      }
       break;
     }
     case GgmlType::Q8_0: {
       // block: fp16 scale, then 32 int8 quants. value = d * q
       constexpr std::size_t kBlock = 32;
       const std::size_t blocks = n / kBlock;
-      const auto* p = reinterpret_cast<const std::uint8_t*>(src);
-      for (std::size_t b = 0; b < blocks; ++b) {
+      const auto* base = reinterpret_cast<const std::uint8_t*>(src);
+#pragma omp parallel for schedule(static)
+      for (std::ptrdiff_t b = 0; b < static_cast<std::ptrdiff_t>(blocks); ++b) {
+        const std::uint8_t* p = base + static_cast<std::size_t>(b) * (2 + kBlock);
         std::uint16_t dh = 0;
         std::memcpy(&dh, p, sizeof(dh));
         const float d = half_to_float(dh);
         const auto* q = reinterpret_cast<const std::int8_t*>(p + 2);
         for (std::size_t i = 0; i < kBlock; ++i) {
-          half[b * kBlock + i] = float_to_half(d * static_cast<float>(q[i]));
+          half[static_cast<std::size_t>(b) * kBlock + i] = float_to_half(d * static_cast<float>(q[i]));
         }
-        p += 2 + kBlock;
       }
       break;
     }
@@ -732,8 +744,11 @@ const std::byte* GgufLoader::materialize(const std::string& cpi_name,
       // Nibble order is ggml's: low nibbles hold the first half of the block.
       constexpr std::size_t kBlock = 32;
       const std::size_t blocks = n / kBlock;
-      const auto* p = reinterpret_cast<const std::uint8_t*>(src);
-      for (std::size_t b = 0; b < blocks; ++b) {
+      const auto* base = reinterpret_cast<const std::uint8_t*>(src);
+#pragma omp parallel for schedule(static)
+      for (std::ptrdiff_t b = 0; b < static_cast<std::ptrdiff_t>(blocks); ++b) {
+        const std::uint8_t* p = base + static_cast<std::size_t>(b) * (2 + kBlock / 2);
+        const std::size_t o = static_cast<std::size_t>(b) * kBlock;
         std::uint16_t dh = 0;
         std::memcpy(&dh, p, sizeof(dh));
         const float d = half_to_float(dh);
@@ -741,10 +756,9 @@ const std::byte* GgufLoader::materialize(const std::string& cpi_name,
         for (std::size_t i = 0; i < kBlock / 2; ++i) {
           const int lo = (q[i] & 0x0F) - 8;
           const int hi = (q[i] >> 4) - 8;
-          half[b * kBlock + i] = float_to_half(d * static_cast<float>(lo));
-          half[b * kBlock + kBlock / 2 + i] = float_to_half(d * static_cast<float>(hi));
+          half[o + i] = float_to_half(d * static_cast<float>(lo));
+          half[o + kBlock / 2 + i] = float_to_half(d * static_cast<float>(hi));
         }
-        p += 2 + kBlock / 2;
       }
       break;
     }
