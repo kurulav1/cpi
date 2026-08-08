@@ -26,6 +26,9 @@ struct ParsedArgs {
   int batched_check = 0;           // >0: run decode_step_batched parity gate for this many steps
   int scheduler_check = 0;         // >0: run the batch-scheduler parity gate with this max_new
   bool interactive_batch = false;  // multiplexed continuous-batching interactive worker
+  bool serve_http = false;         // --serve: in-binary OpenAI-compatible HTTP server
+  int serve_port = 8080;           // --port
+  std::string serve_host = "127.0.0.1";  // --host (0.0.0.0 to expose beyond loopback)
   int batch_bench = 0;             // >0: run the batch throughput benchmark with this max_new
   bool dump_tokenizer_meta = false;
   bool dump_prompt_tokens = false;

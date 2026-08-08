@@ -361,6 +361,10 @@ add_executable(cpi
   src/app/main_cli.cpp
   src/app/main_modes.cpp
   src/app/main_interactive_batch.cpp
+  # The batching loop and the HTTP transport that shares it with the stdin worker.
+  src/app/batch_worker.cpp
+  src/app/main_http_serve.cpp
+  src/net/http_server.cpp
 )
 target_link_libraries(cpi PRIVATE cpi_engine)
 

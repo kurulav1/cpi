@@ -415,6 +415,18 @@ ParsedArgs parse_args(int argc, char** argv) {
       args.interactive_batch = true;
       args.interactive_mode = true;  // reuse interactive setup (tokenizer required)
       args.web_mode = true;
+    } else if (arg == "--serve") {
+      // Same setup path as the batch worker (tokenizer + paged blocks); only the
+      // transport differs, so it rides the interactive flags rather than a
+      // parallel branch.
+      args.serve_http = true;
+      args.interactive_batch = true;
+      args.interactive_mode = true;
+      args.web_mode = true;
+    } else if (arg == "--port") {
+      args.serve_port = std::stoi(need_val("--port"));
+    } else if (arg == "--host") {
+      args.serve_host = need_val("--host");
     } else if (arg == "--simple") {
       args.simple_mode = true;
     } else if (arg == "--draft-model") {

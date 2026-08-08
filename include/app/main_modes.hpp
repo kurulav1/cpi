@@ -70,4 +70,26 @@ void run_interactive_batch(engine::BatchScheduler& sched, model::Tokenizer& toke
                            float default_top_p, float default_repeat_penalty,
                            int default_no_repeat);
 
+// Settings for the in-binary OpenAI-compatible HTTP server (--serve).
+struct HttpServeOptions {
+  std::string host = "127.0.0.1";
+  int port = 8080;
+  std::string model_name = "cpi";
+  std::string chat_template;  // applied to /v1/chat/completions turns
+  std::vector<std::string> stop_texts;
+  bool add_bos = true;
+  int max_new = 128;
+  float temp = 0.0f;
+  int top_k = 0;
+  float top_p = 0.0f;
+  float repeat_penalty = 1.0f;
+  int no_repeat_ngram = 0;
+};
+
+// Serves HTTP until the process is stopped, driving the same BatchWorker (and
+// therefore the same continuous batching) as the stdin transport above.
+// See main_http_serve.cpp.
+void run_http_server(engine::BatchScheduler& sched, model::Tokenizer& tokenizer,
+                     const HttpServeOptions& opts);
+
 }  // namespace app::main_modes

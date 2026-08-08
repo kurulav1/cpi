@@ -588,6 +588,23 @@ int main(int argc, char** argv) {
           if (!use_tokenizer) {
             throw std::runtime_error("--interactive-batch requires --tokenizer");
           }
+          if (cli.serve_http) {
+            app::main_modes::HttpServeOptions so;
+            so.host = cli.serve_host;
+            so.port = cli.serve_port;
+            so.model_name = std::filesystem::path(cli.opts.model_path).filename().string();
+            so.chat_template = cli.chat_template;
+            so.stop_texts = cli.stop_texts;
+            so.add_bos = !cli.force_no_bos;
+            so.max_new = cli.max_new;
+            so.temp = cli.temp;
+            so.top_k = cli.opts.top_k;
+            so.top_p = cli.opts.top_p;
+            so.repeat_penalty = cli.opts.repetition_penalty;
+            so.no_repeat_ngram = cli.opts.no_repeat_ngram_size;
+            app::main_modes::run_http_server(eng.batch_scheduler(), tokenizer, so);
+            return;
+          }
           app::main_modes::run_interactive_batch(
               eng.batch_scheduler(), tokenizer, cli.stop_texts, !cli.force_no_bos, cli.max_new,
               cli.temp, cli.opts.top_k, cli.opts.top_p, cli.opts.repetition_penalty,
@@ -783,6 +800,23 @@ int main(int argc, char** argv) {
           bo.max_context = cli.opts.max_context;
           bo.eos_token_id = cli.opts.eos_token_id;
           bo.verbose = cli.opts.verbose;
+          if (cli.serve_http) {
+            app::main_modes::HttpServeOptions so;
+            so.host = cli.serve_host;
+            so.port = cli.serve_port;
+            so.model_name = std::filesystem::path(cli.opts.model_path).filename().string();
+            so.chat_template = cli.chat_template;
+            so.stop_texts = cli.stop_texts;
+            so.add_bos = !cli.force_no_bos;
+            so.max_new = cli.max_new;
+            so.temp = cli.temp;
+            so.top_k = cli.opts.top_k;
+            so.top_p = cli.opts.top_p;
+            so.repeat_penalty = cli.opts.repetition_penalty;
+            so.no_repeat_ngram = cli.opts.no_repeat_ngram_size;
+            app::main_modes::run_http_server(meng.batch_scheduler(bo), tokenizer, so);
+            return 0;
+          }
           app::main_modes::run_interactive_batch(
               meng.batch_scheduler(bo), tokenizer, cli.stop_texts, !cli.force_no_bos, cli.max_new,
               cli.temp, cli.opts.top_k, cli.opts.top_p, cli.opts.repetition_penalty,
