@@ -126,6 +126,7 @@ set(CPI_ENGINE_SOURCES
   src/platform/mmap_file.cpp
   src/model/weight_loader.cpp
   src/model/safetensors_loader.cpp
+  src/model/gguf_loader.cpp
   src/model/hf_bpe_tokenizer.cpp
   src/model/tokenizer.cpp
   src/model/png.cpp
@@ -448,6 +449,13 @@ target_include_directories(ll2c_to_cpi PRIVATE include)
 target_link_libraries(ll2c_to_cpi PRIVATE cpi_engine)
 
 # LlamaConfig <-> .cpi __metadata__ round trip. Header-only and CPU-only, so it runs everywhere.
+# GGUF reader. Takes a .gguf path (and optionally a .ll2c of the same model as an
+# oracle), so it is not registered with add_test: there is no checked-in fixture
+# big enough to be a real model.
+add_executable(gguf_loader_test src/tests/gguf_loader_test.cpp)
+target_include_directories(gguf_loader_test PRIVATE include)
+target_link_libraries(gguf_loader_test PRIVATE cpi_engine)
+
 add_executable(config_json_test src/tests/config_json_test.cpp)
 target_include_directories(config_json_test PRIVATE include)
 add_test(NAME config_json_test COMMAND config_json_test)
