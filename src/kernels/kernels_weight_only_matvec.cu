@@ -2007,13 +2007,16 @@ void launch_weight_only_int4_matvec_dual_dp4a(const int8_t* w_a_packed, const fl
 __global__ void dequant_rowwise_int4_to_fp16_kernel(const std::int8_t* __restrict__ packed,
                                                     const float* __restrict__ scales,
                                                     half* __restrict__ out, int rows, int cols,
-                                                    int packed_cols) {
+                                                    int packed_cols, int group, int groups) {
   const int row = blockIdx.x;
   if (row >= rows) return;
-  const float scale = scales[row];
   const std::int8_t* src = packed + static_cast<std::size_t>(row) * packed_cols;
   half* dst = out + static_cast<std::size_t>(row) * cols;
+  const float* row_scales = scales + static_cast<std::size_t>(row) * groups;
   for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    // group <= 0 is the one-scale-per-row layout; otherwise each scale covers
+    // `group` consecutive input columns (quantize_groupwise_to_int8).
+    const float scale = row_scales[group > 0 ? (col / group) : 0];
     const std::uint8_t byte = static_cast<std::uint8_t>(src[col >> 1]);
     const std::uint8_t nibble = (col & 1) == 0 ? (byte & 0x0Fu) : ((byte >> 4) & 0x0Fu);
     const int q = (nibble >= 8) ? static_cast<int>(nibble) - 16 : static_cast<int>(nibble);
@@ -2035,11 +2038,13 @@ __global__ void dequant_rowwise_int8_to_fp16_kernel(const std::int8_t* __restric
 }
 
 void launch_dequant_weight_rowwise_to_fp16(const std::int8_t* w, const float* scales, half* out,
-                                           int rows, int cols, bool int4, cudaStream_t stream) {
+                                           int rows, int cols, bool int4, int group,
+                                           cudaStream_t stream) {
   constexpr int kThreads = 256;
   if (int4) {
-    dequant_rowwise_int4_to_fp16_kernel<<<rows, kThreads, 0, stream>>>(w, scales, out, rows, cols,
-                                                                      (cols + 1) / 2);
+    const int groups = quant_group_count(cols, group);
+    dequant_rowwise_int4_to_fp16_kernel<<<rows, kThreads, 0, stream>>>(
+        w, scales, out, rows, cols, (cols + 1) / 2, groups > 1 ? group : 0, groups);
   } else {
     dequant_rowwise_int8_to_fp16_kernel<<<rows, kThreads, 0, stream>>>(w, scales, out, rows, cols);
   }

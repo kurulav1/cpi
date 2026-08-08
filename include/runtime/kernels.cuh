@@ -1252,8 +1252,12 @@ void launch_half_gemv_glu(const half* wg, const half* wu, const half* x, half* y
 // sequential column pairs, low nibble first). Prefill uses it to reach the tensor-core
 // GEMM. Not interchangeable with launch_dequant_int4_grouped below: that reads the
 // op-plan engine's packing.
+// `group` <= 0 selects the one-scale-per-row layout; > 0 means each scale covers that
+// many consecutive input columns (grouped int4), with quant_group_count(cols, group)
+// scales per row. int8 is always row-wise.
 void launch_dequant_weight_rowwise_to_fp16(const std::int8_t* w, const float* scales, half* out,
-                                           int rows, int cols, bool int4, cudaStream_t stream);
+                                           int rows, int cols, bool int4, int group,
+                                           cudaStream_t stream);
 
 // launch_dequant_int4_grouped / launch_dequant_int8_rowwise
 //

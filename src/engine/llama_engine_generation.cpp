@@ -40,7 +40,7 @@ constexpr int kQuantPrefillGemmMinRows = 16;
 // llama_engine_lowbit_utils.cpp packs (row-wise scales; int4 as sequential column
 // pairs). Returns null when the scratch cannot be sized, so the caller falls back.
 const void* LlamaEngine::dequant_weight_for_gemm(const std::int8_t* w, const float* scales,
-                                                 bool int4, int rows, int cols) {
+                                                 bool int4, int rows, int cols, int group) {
   if (w == nullptr || scales == nullptr || rows <= 0 || cols <= 0) return nullptr;
   const std::size_t need =
       static_cast<std::size_t>(rows) * static_cast<std::size_t>(cols) * sizeof(__half);
@@ -57,7 +57,7 @@ const void* LlamaEngine::dequant_weight_for_gemm(const std::int8_t* w, const flo
     d_prefill_wdq_bytes_ = need;
   }
   kernels::launch_dequant_weight_rowwise_to_fp16(w, scales, static_cast<__half*>(d_prefill_wdq_),
-                                                 rows, cols, int4, compute_stream_);
+                                                 rows, cols, int4, group, compute_stream_);
   return d_prefill_wdq_;
 }
 
@@ -173,8 +173,10 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
     // the row-wise scale layout (grouped int4 scales are per column group).
     const int wgemm_mask = quant_prefill_gemm_mask();
     const bool wgemm_rows_ok = rows >= kQuantPrefillGemmMinRows;
-    const bool lowbit_mlp_rowwise =
-        lw_i8 && lw_i8->w1 && lw_i8->w2 && lw_i8->w3 && lw_i8->mlp_group <= 0;
+    // Grouped int4 is included now: the packing is identical (see
+    // load_cached_lowbit) and only the scale indexing differs, which the dequant
+    // kernel takes as a parameter.
+    const bool lowbit_mlp = lw_i8 && lw_i8->w1 && lw_i8->w2 && lw_i8->w3;
     bool fused_glu = false;  // fp16 path reads gate/up in place; quant paths still need the split
 
     launch_norm(d_x_, lw->norm_att, lw->norm_att_bias, d_x_norm_, rows, hidden);
@@ -182,7 +184,7 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
     const void* wqkv_dq =
         (lowbit_proj && wgemm_rows_ok && (wgemm_mask & 1))
             ? dequant_weight_for_gemm(lw_i8->wqkv, lw_i8->s_wqkv, lw_i8->proj_int4,
-                                      q_hidden + 2 * kv_hidden, hidden)
+                                      q_hidden + 2 * kv_hidden, hidden, 0)
             : nullptr;
     if (wqkv_dq != nullptr) {
       detail::dispatch_linear_rowmajor_weight(
@@ -375,7 +377,7 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
 
     const void* wo_dq = (lowbit_proj && wgemm_rows_ok && (wgemm_mask & 2))
                             ? dequant_weight_for_gemm(lw_i8->wo, lw_i8->s_wo, lw_i8->proj_int4,
-                                                      hidden, q_hidden)
+                                                      hidden, q_hidden, 0)
                             : nullptr;
     if (wo_dq != nullptr) {
       detail::dispatch_linear_rowmajor_weight(
@@ -415,16 +417,16 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
 
     launch_norm(d_x_, lw->norm_ffn, lw->norm_ffn_bias, d_x_norm_, rows, hidden);
 
-    const bool gate_gemm = lowbit_mlp_rowwise && wgemm_rows_ok && (wgemm_mask & 4);
-    if (gate_gemm &&
-        dequant_weight_for_gemm(lw_i8->w1, lw_i8->s_w1, lw_i8->mlp_int4, inter, hidden) !=
-            nullptr) {
+    const bool gate_gemm = lowbit_mlp && wgemm_rows_ok && (wgemm_mask & 4);
+    if (gate_gemm && dequant_weight_for_gemm(lw_i8->w1, lw_i8->s_w1, lw_i8->mlp_int4, inter, hidden,
+                                             lw_i8->mlp_group) != nullptr) {
       // The scratch holds one matrix at a time, so each is dequantized right
       // before its own GEMM.
       detail::dispatch_linear_rowmajor_weight(
           cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,
           d_prefill_wdq_, d_x_norm_, d_prefill_ff1_, inter, hidden, rows, CUDA_R_16F);
-      dequant_weight_for_gemm(lw_i8->w3, lw_i8->s_w3, lw_i8->mlp_int4, inter, hidden);
+      dequant_weight_for_gemm(lw_i8->w3, lw_i8->s_w3, lw_i8->mlp_int4, inter, hidden,
+                              lw_i8->mlp_group);
       detail::dispatch_linear_rowmajor_weight(
           cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,
           d_prefill_wdq_, d_x_norm_, d_prefill_ff2_, inter, hidden, rows, CUDA_R_16F);
@@ -497,9 +499,9 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
           rows * inter, compute_stream_);
     }
 
-    const void* w2_dq = (lowbit_mlp_rowwise && wgemm_rows_ok && (wgemm_mask & 8))
+    const void* w2_dq = (lowbit_mlp && wgemm_rows_ok && (wgemm_mask & 8))
                             ? dequant_weight_for_gemm(lw_i8->w2, lw_i8->s_w2, lw_i8->mlp_int4,
-                                                      hidden, inter)
+                                                      hidden, inter, lw_i8->mlp_group)
                             : nullptr;
     if (w2_dq != nullptr) {
       detail::dispatch_linear_rowmajor_weight(
