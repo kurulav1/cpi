@@ -77,6 +77,17 @@ public:
   // The raw metadata, for diagnostics and for fields the config does not model.
   [[nodiscard]] std::string metadata_string(const std::string& key) const;
 
+  // Every tensor as the file declares it (ggml name, ggml type id, dims), for
+  // diagnostics. Reading a container you did not write means being able to see
+  // what it actually says rather than what it was expected to say.
+  struct RawTensor {
+    std::string name;
+    std::uint32_t type = 0;
+    std::vector<std::uint64_t> dims;
+    std::size_t elements = 0;
+  };
+  [[nodiscard]] std::vector<RawTensor> raw_tensors() const;
+
 private:
   // ggml tensor types this reader understands. The numbering is ggml's.
   enum class GgmlType : std::uint32_t {
@@ -88,6 +99,15 @@ private:
     Q5_1 = 7,
     Q8_0 = 8,
     Q8_1 = 9,
+    // "k-quants": 256-element super-blocks carrying quantized per-sub-block
+    // scales. Not optional in practice -- even a file named Q4_0 ships k-quant
+    // tensors for its embedding and output matrices.
+    Q2_K = 10,
+    Q3_K = 11,
+    Q4_K = 12,
+    Q5_K = 13,
+    Q6_K = 14,
+    Q8_K = 15,
     BF16 = 30,
   };
 

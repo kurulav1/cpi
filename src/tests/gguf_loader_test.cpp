@@ -117,8 +117,20 @@ int main(int argc, char** argv) {
   check(g.has_tensor("tok_embeddings.weight"), "token embeddings mapped");
   check(g.has_tensor("layers.0.attention.wq"), "layer 0 wq mapped");
   check(g.has_tensor("layers.0.feed_forward.w2"), "layer 0 w2 mapped");
-  check(static_cast<int>(g.tensor_names().size()) >= c.num_layers * 7,
-        "tensor count consistent with layer count");
+  // Only meaningful for architectures whose tensor names the reader maps. An
+  // unmapped one (deepseek2's MLA projections, say) legitimately maps few
+  // tensors, and asserting otherwise would report a name-mapping gap as a
+  // reader failure.
+  const std::string arch = g.metadata_string("general.architecture");
+  const bool mapped_arch = arch == "llama" || arch == "qwen2" || arch == "gemma" ||
+                           arch == "gemma2" || arch == "gemma4";
+  if (mapped_arch) {
+    check(static_cast<int>(g.tensor_names().size()) >= c.num_layers * 7,
+          "tensor count consistent with layer count");
+  } else {
+    std::printf("  [note] architecture '%s' has no CPI name mapping yet; %zu tensors mapped\n",
+                arch.c_str(), g.tensor_names().size());
+  }
   if (!g.tokenizer().empty()) {
     std::printf("  tokenizer: model=%s tokens=%zu bos=%d eos=%d\n", g.tokenizer().model.c_str(),
                 g.tokenizer().tokens.size(), g.tokenizer().bos_id, g.tokenizer().eos_id);

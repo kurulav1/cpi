@@ -165,6 +165,208 @@ std::uint16_t float_to_half(float f) {
   return engine::mini::float_to_half_bits(f);
 }
 
+// ---- k-quant super-blocks -------------------------------------------------
+//
+// The k-quants pack 256 weights per super-block and quantize the per-sub-block
+// scales themselves, which is why they beat the flat Q4_0/Q8_0 formats at the
+// same bit width. The layouts below follow ggml's block structs exactly; they
+// are a wire format, so the field order and the bit packing are the spec, and
+// deviating anywhere produces plausible-looking weights that are simply wrong.
+constexpr std::size_t kSuperBlock = 256;  // ggml's QK_K
+
+// Q4_K/Q5_K scales: 8 sub-blocks x (6-bit scale, 6-bit min) packed into 12 bytes.
+void get_scale_min_k4(int j, const std::uint8_t* q, std::uint8_t* d, std::uint8_t* m) {
+  if (j < 4) {
+    *d = q[j] & 63;
+    *m = q[j + 4] & 63;
+  } else {
+    *d = static_cast<std::uint8_t>((q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4));
+    *m = static_cast<std::uint8_t>((q[j + 4] >> 4) | ((q[j] >> 6) << 4));
+  }
+}
+
+void dequant_q4_k(const std::uint8_t* p, std::size_t blocks, std::uint16_t* out) {
+  for (std::size_t b = 0; b < blocks; ++b) {
+    std::uint16_t dh = 0;
+    std::uint16_t mh = 0;
+    std::memcpy(&dh, p, 2);
+    std::memcpy(&mh, p + 2, 2);
+    const float d = half_to_float(dh);
+    const float dmin = half_to_float(mh);
+    const std::uint8_t* scales = p + 4;
+    const std::uint8_t* q = p + 4 + 12;
+    std::uint16_t* y = out + b * kSuperBlock;
+    int is = 0;
+    for (std::size_t j = 0; j < kSuperBlock; j += 64) {
+      std::uint8_t sc = 0;
+      std::uint8_t m = 0;
+      get_scale_min_k4(is + 0, scales, &sc, &m);
+      const float d1 = d * sc;
+      const float m1 = dmin * m;
+      get_scale_min_k4(is + 1, scales, &sc, &m);
+      const float d2 = d * sc;
+      const float m2 = dmin * m;
+      for (int l = 0; l < 32; ++l) *y++ = float_to_half(d1 * (q[l] & 0x0F) - m1);
+      for (int l = 0; l < 32; ++l) *y++ = float_to_half(d2 * (q[l] >> 4) - m2);
+      q += 32;
+      is += 2;
+    }
+    p += 144;  // 2 + 2 + 12 + 128
+  }
+}
+
+void dequant_q5_k(const std::uint8_t* p, std::size_t blocks, std::uint16_t* out) {
+  for (std::size_t b = 0; b < blocks; ++b) {
+    std::uint16_t dh = 0;
+    std::uint16_t mh = 0;
+    std::memcpy(&dh, p, 2);
+    std::memcpy(&mh, p + 2, 2);
+    const float d = half_to_float(dh);
+    const float dmin = half_to_float(mh);
+    const std::uint8_t* scales = p + 4;
+    const std::uint8_t* qh = p + 4 + 12;
+    const std::uint8_t* ql = p + 4 + 12 + 32;
+    std::uint16_t* y = out + b * kSuperBlock;
+    int is = 0;
+    std::uint8_t u1 = 1;
+    std::uint8_t u2 = 2;
+    for (std::size_t j = 0; j < kSuperBlock; j += 64) {
+      std::uint8_t sc = 0;
+      std::uint8_t m = 0;
+      get_scale_min_k4(is + 0, scales, &sc, &m);
+      const float d1 = d * sc;
+      const float m1 = dmin * m;
+      get_scale_min_k4(is + 1, scales, &sc, &m);
+      const float d2 = d * sc;
+      const float m2 = dmin * m;
+      for (int l = 0; l < 32; ++l) {
+        const float v = d1 * ((ql[l] & 0x0F) + ((qh[l] & u1) ? 16 : 0)) - m1;
+        *y++ = float_to_half(v);
+      }
+      for (int l = 0; l < 32; ++l) {
+        const float v = d2 * ((ql[l] >> 4) + ((qh[l] & u2) ? 16 : 0)) - m2;
+        *y++ = float_to_half(v);
+      }
+      ql += 32;
+      is += 2;
+      u1 = static_cast<std::uint8_t>(u1 << 2);
+      u2 = static_cast<std::uint8_t>(u2 << 2);
+    }
+    p += 176;  // 2 + 2 + 12 + 32 + 128
+  }
+}
+
+void dequant_q6_k(const std::uint8_t* p, std::size_t blocks, std::uint16_t* out) {
+  for (std::size_t b = 0; b < blocks; ++b) {
+    const std::uint8_t* ql = p;
+    const std::uint8_t* qh = p + 128;
+    const auto* sc = reinterpret_cast<const std::int8_t*>(p + 128 + 64);
+    std::uint16_t dh = 0;
+    std::memcpy(&dh, p + 128 + 64 + 16, 2);
+    const float d = half_to_float(dh);
+    std::uint16_t* y = out + b * kSuperBlock;
+    for (std::size_t n = 0; n < kSuperBlock; n += 128) {
+      for (int l = 0; l < 32; ++l) {
+        const int is = l / 16;
+        const int q1 = static_cast<int>((ql[l] & 0x0F) | (((qh[l] >> 0) & 3) << 4)) - 32;
+        const int q2 = static_cast<int>((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4)) - 32;
+        const int q3 = static_cast<int>((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+        const int q4 = static_cast<int>((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+        y[l + 0] = float_to_half(d * sc[is + 0] * static_cast<float>(q1));
+        y[l + 32] = float_to_half(d * sc[is + 2] * static_cast<float>(q2));
+        y[l + 64] = float_to_half(d * sc[is + 4] * static_cast<float>(q3));
+        y[l + 96] = float_to_half(d * sc[is + 6] * static_cast<float>(q4));
+      }
+      y += 128;
+      ql += 64;
+      qh += 32;
+      sc += 8;
+    }
+    p += 210;  // 128 + 64 + 16 + 2
+  }
+}
+
+void dequant_q2_k(const std::uint8_t* p, std::size_t blocks, std::uint16_t* out) {
+  for (std::size_t b = 0; b < blocks; ++b) {
+    const std::uint8_t* scales = p;
+    const std::uint8_t* q = p + 16;
+    std::uint16_t dh = 0;
+    std::uint16_t mh = 0;
+    std::memcpy(&dh, p + 16 + 64, 2);
+    std::memcpy(&mh, p + 16 + 64 + 2, 2);
+    const float d = half_to_float(dh);
+    const float dmin = half_to_float(mh);
+    std::uint16_t* y = out + b * kSuperBlock;
+    int is = 0;
+    for (std::size_t n = 0; n < kSuperBlock; n += 128) {
+      int shift = 0;
+      for (int j = 0; j < 4; ++j) {
+        std::uint8_t sc = scales[is++];
+        float dl = d * (sc & 0x0F);
+        float ml = dmin * (sc >> 4);
+        for (int l = 0; l < 16; ++l) {
+          *y++ = float_to_half(dl * static_cast<float>((q[l] >> shift) & 3) - ml);
+        }
+        sc = scales[is++];
+        dl = d * (sc & 0x0F);
+        ml = dmin * (sc >> 4);
+        for (int l = 0; l < 16; ++l) {
+          *y++ = float_to_half(dl * static_cast<float>((q[l + 16] >> shift) & 3) - ml);
+        }
+        shift += 2;
+      }
+      q += 32;
+    }
+    p += 84;  // 16 + 64 + 4
+  }
+}
+
+void dequant_q3_k(const std::uint8_t* p, std::size_t blocks, std::uint16_t* out) {
+  constexpr std::uint32_t kmask1 = 0x03030303u;
+  constexpr std::uint32_t kmask2 = 0x0f0f0f0fu;
+  for (std::size_t b = 0; b < blocks; ++b) {
+    const std::uint8_t* hm = p;
+    const std::uint8_t* q = p + 32;
+    std::uint16_t dh = 0;
+    std::memcpy(&dh, p + 32 + 64 + 12, 2);
+    const float d_all = half_to_float(dh);
+
+    // The 6-bit scales are stored across 12 bytes in a packed layout; ggml
+    // rebuilds them into 16 signed values through this shuffle.
+    std::uint32_t aux[4];
+    std::memcpy(aux, p + 32 + 64, 12);
+    const std::uint32_t tmp = aux[2];
+    aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+    aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+    aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+    aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+    const auto* scales = reinterpret_cast<const std::int8_t*>(aux);
+
+    std::uint16_t* y = out + b * kSuperBlock;
+    std::uint8_t m = 1;
+    int is = 0;
+    for (std::size_t n = 0; n < kSuperBlock; n += 128) {
+      int shift = 0;
+      for (int j = 0; j < 4; ++j) {
+        float dl = d_all * static_cast<float>(scales[is++] - 32);
+        for (int l = 0; l < 16; ++l) {
+          const int base = static_cast<int>((q[l] >> shift) & 3);
+          *y++ = float_to_half(dl * static_cast<float>(base - ((hm[l] & m) ? 0 : 4)));
+        }
+        dl = d_all * static_cast<float>(scales[is++] - 32);
+        for (int l = 0; l < 16; ++l) {
+          const int base = static_cast<int>((q[l + 16] >> shift) & 3);
+          *y++ = float_to_half(dl * static_cast<float>(base - ((hm[l + 16] & m) ? 0 : 4)));
+        }
+        shift += 2;
+        m = static_cast<std::uint8_t>(m << 1);
+      }
+      q += 32;
+    }
+    p += 110;  // 32 + 64 + 12 + 2
+  }
+}
+
 }  // namespace
 
 bool is_gguf_file(const std::string& path) {
@@ -243,23 +445,11 @@ void GgufLoader::parse(const std::string& path) {
     info.type = static_cast<GgmlType>(cur.read<std::uint32_t>());
     info.offset = cur.read<std::uint64_t>();
     info.fp16_bytes = info.elements * sizeof(std::uint16_t);
-    switch (info.type) {
-      case GgmlType::F32:
-      case GgmlType::F16:
-      case GgmlType::BF16:
-      case GgmlType::Q8_0:
-      case GgmlType::Q4_0:
-      case GgmlType::Q4_1:
-      case GgmlType::Q5_0:
-      case GgmlType::Q5_1:
-        break;
-      default:
-        throw std::runtime_error(
-            "gguf: tensor '" + info.gguf_name + "' uses ggml type " +
-            std::to_string(static_cast<std::uint32_t>(info.type)) +
-            ", which this reader does not dequantize yet (F32/F16/BF16/Q8_0/Q4_0/Q4_1/Q5_0/Q5_1 "
-            "are supported; k-quants are not)");
-    }
+    // Deliberately no type check here. A container may carry tensors this
+    // engine never reads (per-layer scales, an architecture's extra
+    // projections), and refusing to open the whole file because one of them
+    // uses a type we cannot dequantize would reject files that work fine. The
+    // check happens where it matters: when a tensor is actually requested.
     tensors_[info.gguf_name] = std::move(info);
   }
 
@@ -267,6 +457,22 @@ void GgufLoader::parse(const std::string& path) {
   if (cur.pos() > size) throw std::runtime_error("gguf: tensor data starts past end of file");
   data_base_ = base + cur.pos();
   data_bytes_ = size - cur.pos();
+}
+
+std::vector<GgufLoader::RawTensor> GgufLoader::raw_tensors() const {
+  std::vector<RawTensor> out;
+  out.reserve(tensors_.size());
+  for (const auto& [name, info] : tensors_) {
+    RawTensor r;
+    r.name = name;
+    r.type = static_cast<std::uint32_t>(info.type);
+    r.dims = info.dims;
+    r.elements = info.elements;
+    out.push_back(std::move(r));
+  }
+  std::sort(out.begin(), out.end(),
+            [](const RawTensor& a, const RawTensor& b) { return a.name < b.name; });
+  return out;
 }
 
 std::string GgufLoader::metadata_string(const std::string& key) const {
@@ -438,6 +644,38 @@ const std::byte* GgufLoader::materialize(const std::string& cpi_name,
   const std::byte* src = data_base_ + info.offset;
   const std::size_t n = info.elements;
 
+  // Access-time type gate (see parse): say precisely what is unsupported, and
+  // for the k-quants also that the tensor is not a whole number of 256-element
+  // super-blocks, which would otherwise read past the block table.
+  switch (info.type) {
+    case GgmlType::F32:
+    case GgmlType::F16:
+    case GgmlType::BF16:
+    case GgmlType::Q8_0:
+    case GgmlType::Q4_0:
+    case GgmlType::Q4_1:
+    case GgmlType::Q5_0:
+    case GgmlType::Q5_1:
+      break;
+    case GgmlType::Q2_K:
+    case GgmlType::Q3_K:
+    case GgmlType::Q4_K:
+    case GgmlType::Q5_K:
+    case GgmlType::Q6_K:
+      if (n % kSuperBlock != 0) {
+        throw std::runtime_error("gguf: tensor '" + info.gguf_name +
+                                 "' uses a k-quant type but its element count " +
+                                 std::to_string(n) + " is not a multiple of 256");
+      }
+      break;
+    default:
+      throw std::runtime_error(
+          "gguf: tensor '" + info.gguf_name + "' uses ggml type " +
+          std::to_string(static_cast<std::uint32_t>(info.type)) +
+          ", which this reader does not dequantize (supported: F32/F16/BF16, "
+          "Q4_0/Q4_1/Q5_0/Q5_1/Q8_0, and the k-quants Q2_K/Q3_K/Q4_K/Q5_K/Q6_K)");
+  }
+
   std::vector<std::uint16_t> half(n);
   switch (info.type) {
     case GgmlType::F16: {
@@ -550,6 +788,21 @@ const std::byte* GgufLoader::materialize(const std::string& cpi_name,
       }
       break;
     }
+    case GgmlType::Q4_K:
+      dequant_q4_k(reinterpret_cast<const std::uint8_t*>(src), n / kSuperBlock, half.data());
+      break;
+    case GgmlType::Q5_K:
+      dequant_q5_k(reinterpret_cast<const std::uint8_t*>(src), n / kSuperBlock, half.data());
+      break;
+    case GgmlType::Q6_K:
+      dequant_q6_k(reinterpret_cast<const std::uint8_t*>(src), n / kSuperBlock, half.data());
+      break;
+    case GgmlType::Q2_K:
+      dequant_q2_k(reinterpret_cast<const std::uint8_t*>(src), n / kSuperBlock, half.data());
+      break;
+    case GgmlType::Q3_K:
+      dequant_q3_k(reinterpret_cast<const std::uint8_t*>(src), n / kSuperBlock, half.data());
+      break;
     default:
       throw std::runtime_error("gguf: unsupported tensor type at materialize time");
   }
