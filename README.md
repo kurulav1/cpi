@@ -195,7 +195,9 @@ but quality at 16K/32K needs the flag.
   prompt-lookup speculation needs no draft model at all (`CPI_CUDA_SPEC` / `CPI_METAL_SPEC`)
 - Streaming weights for models larger than VRAM; runtime int8/int4 quantization on load
 - Grammar and JSON-schema constrained decoding
-- OpenAI-compatible API, embeddings endpoint, React web UI, Node API bridge in `web/`
+- OpenAI-compatible API served **from the binary itself** (`--serve`: hand-rolled HTTP + SSE, no
+  interpreter and no third-party dependency), driving the same batching scheduler as the web stack;
+  plus the embeddings endpoint, React web UI, and Node API bridge in `web/`
 - Native `tokenizer.json` and SentencePiece tokenizer support
 - Model auto-discovery, one-command Hugging Face download + `.ll2c` conversion
 
@@ -273,6 +275,30 @@ These scripts:
 - create `web/.env` from `web/.env.example` if needed
 - create `web/config.json` from `web/config.example.json` if needed
 - build `cpi` if it is missing
+
+### Serve an OpenAI-compatible API (no Node, no dependencies)
+
+The binary is its own HTTP server, so headless serving needs nothing but `cpi`:
+
+```bash
+cpi model.ll2c --tokenizer tokenizer.json --serve --port 8080 --paged-blocks --chat-template qwen2
+```
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"Hello"}],"max_tokens":64,"stream":true}'
+```
+
+Endpoints: `POST /v1/chat/completions`, `POST /v1/completions` (both support `"stream": true`
+for SSE), `GET /v1/models`, `GET /health`. Requests are served through the same continuous-batching
+scheduler as the web stack, so concurrent clients interleave rather than queue (4 concurrent chats
+measured at 2.23x the serial time on a 0.5B). `response_format` with a `json_schema` compiles to the
+grammar sampler, and a client that disconnects mid-stream has its KV blocks reclaimed immediately.
+
+It binds loopback by default; `--host 0.0.0.0` exposes it. There is no auth on this surface, so put
+it behind something that has one before exposing it. The Node stack below remains the way to get the
+web UI, the model hub, and the admin routes.
 
 ### Run the packaged local app
 
