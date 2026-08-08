@@ -427,6 +427,10 @@ ParsedArgs parse_args(int argc, char** argv) {
       args.serve_port = std::stoi(need_val("--port"));
     } else if (arg == "--host") {
       args.serve_host = need_val("--host");
+    } else if (arg == "--api-key") {
+      args.serve_api_key = need_val("--api-key");
+    } else if (arg == "--embed-model") {
+      args.serve_embed_model = need_val("--embed-model");
     } else if (arg == "--simple") {
       args.simple_mode = true;
     } else if (arg == "--draft-model") {

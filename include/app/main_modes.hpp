@@ -84,6 +84,12 @@ struct HttpServeOptions {
   float top_p = 0.0f;
   float repeat_penalty = 1.0f;
   int no_repeat_ngram = 0;
+  // Bearer token required on /v1/*. Empty disables the check, which is only
+  // safe on loopback; binding 0.0.0.0 without one is refused at startup.
+  std::string api_key;
+  // BERT-family embedding model directory. Empty means /v1/embeddings answers
+  // 503 instead of pretending the route does not exist.
+  std::string embed_model_dir;
 };
 
 // Serves HTTP until the process is stopped, driving the same BatchWorker (and

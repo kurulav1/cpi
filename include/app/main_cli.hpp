@@ -29,6 +29,8 @@ struct ParsedArgs {
   bool serve_http = false;         // --serve: in-binary OpenAI-compatible HTTP server
   int serve_port = 8080;           // --port
   std::string serve_host = "127.0.0.1";  // --host (0.0.0.0 to expose beyond loopback)
+  std::string serve_api_key;             // --api-key / CPI_API_KEY: bearer token for /v1/*
+  std::string serve_embed_model;         // --embed-model <dir>: enables /v1/embeddings
   int batch_bench = 0;             // >0: run the batch throughput benchmark with this max_new
   bool dump_tokenizer_meta = false;
   bool dump_prompt_tokens = false;

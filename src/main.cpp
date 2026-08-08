@@ -602,6 +602,11 @@ int main(int argc, char** argv) {
             so.top_p = cli.opts.top_p;
             so.repeat_penalty = cli.opts.repetition_penalty;
             so.no_repeat_ngram = cli.opts.no_repeat_ngram_size;
+            so.api_key = cli.serve_api_key;
+            if (so.api_key.empty()) {
+              if (const char* env_key = std::getenv("CPI_API_KEY")) so.api_key = env_key;
+            }
+            so.embed_model_dir = cli.serve_embed_model;
             app::main_modes::run_http_server(eng.batch_scheduler(), tokenizer, so);
             return;
           }
@@ -814,6 +819,11 @@ int main(int argc, char** argv) {
             so.top_p = cli.opts.top_p;
             so.repeat_penalty = cli.opts.repetition_penalty;
             so.no_repeat_ngram = cli.opts.no_repeat_ngram_size;
+            so.api_key = cli.serve_api_key;
+            if (so.api_key.empty()) {
+              if (const char* env_key = std::getenv("CPI_API_KEY")) so.api_key = env_key;
+            }
+            so.embed_model_dir = cli.serve_embed_model;
             app::main_modes::run_http_server(meng.batch_scheduler(bo), tokenizer, so);
             return 0;
           }

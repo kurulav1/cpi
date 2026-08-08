@@ -22,7 +22,21 @@
 #include "app/main_modes.hpp"
 #include "engine/batch_scheduler.hpp"
 #include "model/tokenizer.hpp"
+#include "model/wordpiece_tokenizer.hpp"
 #include "net/http_server.hpp"
+
+// The embedding backend, chosen the same way cpi_embed chooses it: CUDA when
+// present, else Metal. Without either, /v1/embeddings reports unavailable
+// rather than failing the build (a CPU-only cpi still serves chat).
+#if CPI_HAS_CUDA
+#  include "engine/bert_embedder.hpp"
+#  define CPI_SERVE_HAS_EMBEDDER 1
+using ServeEmbedder = engine::BertEmbedder;
+#elif defined(CPI_ENABLE_METAL)
+#  include "engine/metal_bert_embedder.hpp"
+#  define CPI_SERVE_HAS_EMBEDDER 1
+using ServeEmbedder = engine::MetalBertEmbedder;
+#endif
 
 namespace app::main_modes {
 
@@ -137,10 +151,44 @@ std::string error_json(const std::string& message, const std::string& type) {
   return "{\"error\":{\"message\":\"" + json_escape(message) + "\",\"type\":\"" + type + "\"}}";
 }
 
+// Constant-time-ish comparison so a wrong key cannot be recovered byte by byte
+// from response timing. Lengths differing is already public (and unavoidable).
+bool token_matches(const std::string& a, const std::string& b) {
+  if (a.size() != b.size()) return false;
+  unsigned char diff = 0;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    diff |= static_cast<unsigned char>(a[i] ^ b[i]);
+  }
+  return diff == 0;
+}
+
+// "Authorization: Bearer <token>", tolerating the header's usual whitespace.
+std::string bearer_token(const net::HttpRequest& req) {
+  std::string h = req.header("authorization");
+  const std::string prefix = "Bearer ";
+  if (h.size() > prefix.size() &&
+      std::equal(prefix.begin(), prefix.end(), h.begin(),
+                 [](char x, char y) { return std::tolower(static_cast<unsigned char>(x)) ==
+                                             std::tolower(static_cast<unsigned char>(y)); })) {
+    return h.substr(prefix.size());
+  }
+  return std::string();
+}
+
 }  // namespace
 
 void run_http_server(engine::BatchScheduler& sched, model::Tokenizer& tokenizer,
                      const HttpServeOptions& opts) {
+  // Refuse the combination that silently publishes an unauthenticated model to
+  // the network. Loopback without a key stays fine (that is the dev default),
+  // and an explicit key makes any bind address the operator's choice.
+  if (opts.api_key.empty() && opts.host != "127.0.0.1" && opts.host != "localhost") {
+    throw std::runtime_error(
+        "[serve] refusing to bind " + opts.host +
+        " without --api-key: that would expose an unauthenticated API to the network. "
+        "Pass --api-key <token> (or CPI_API_KEY), or keep the default --host 127.0.0.1.");
+  }
+
   BatchDefaults defaults;
   defaults.stop_texts = opts.stop_texts;
   defaults.add_bos = opts.add_bos;
@@ -343,14 +391,115 @@ void run_http_server(engine::BatchScheduler& sched, model::Tokenizer& tokenizer,
     res.send(200, "application/json", payload);
   };
 
+  // Embedding model (optional). Loaded once here so /v1/embeddings does not pay
+  // a per-request init, and guarded by its own mutex because the batching worker
+  // owns the generation engine on another thread.
+  std::mutex embed_mu;
+  bool embed_ready = false;
+  std::string embed_error;
+#if defined(CPI_SERVE_HAS_EMBEDDER)
+  ServeEmbedder embedder;
+  model::WordPieceTokenizer embed_tokenizer;
+  if (!opts.embed_model_dir.empty()) {
+    try {
+      embedder.initialize(opts.embed_model_dir);
+      const auto& ecfg = embedder.config();
+      embed_tokenizer.load(opts.embed_model_dir, ecfg.lowercase, ecfg.strip_accents);
+      embed_ready = true;
+      std::fprintf(stderr, "[serve] embeddings ready dim=%d model=%s\n", embedder.dim(),
+                   opts.embed_model_dir.c_str());
+    } catch (const std::exception& e) {
+      embed_error = e.what();
+      std::fprintf(stderr, "[serve] embedding model failed to load: %s\n", embed_error.c_str());
+    }
+  }
+#else
+  if (!opts.embed_model_dir.empty()) {
+    embed_error = "this build has no GPU backend for embeddings";
+  }
+#endif
+
+  const auto handle_embeddings = [&](const net::HttpRequest& req, net::HttpResponder& res) {
+    if (!embed_ready) {
+      const std::string why =
+          embed_error.empty()
+              ? std::string("no embedding model loaded (pass --embed-model <dir>)")
+              : embed_error;
+      res.send(503, "application/json", error_json(why, "server_error"));
+      return;
+    }
+#if defined(CPI_SERVE_HAS_EMBEDDER)
+    std::vector<std::string> inputs = json_get_string_array(req.body, "input");
+    if (inputs.empty()) {
+      const std::string one = json_get_string(req.body, "input");
+      if (!one.empty()) inputs.push_back(one);
+    }
+    if (inputs.empty()) {
+      res.send(400, "application/json",
+               error_json("'input' must be a string or array of strings", "invalid_request_error"));
+      return;
+    }
+    const std::string input_type = json_get_string(req.body, "input_type");
+    std::ostringstream data;
+    int total_tokens = 0;
+    int dim = 0;
+    try {
+      std::lock_guard<std::mutex> lk(embed_mu);
+      const auto& ecfg = embedder.config();
+      const std::string prefix = (input_type == "query") ? ecfg.query_prefix : ecfg.doc_prefix;
+      dim = embedder.dim();
+      for (std::size_t i = 0; i < inputs.size(); ++i) {
+        const std::vector<int> ids =
+            embed_tokenizer.encode(prefix + inputs[i], embedder.max_tokens());
+        const std::vector<float> v = embedder.embed(ids);
+        total_tokens += static_cast<int>(ids.size());
+        if (i) data << ",";
+        data << "{\"object\":\"embedding\",\"index\":" << i << ",\"embedding\":[";
+        for (std::size_t d = 0; d < v.size(); ++d) {
+          if (d) data << ",";
+          char buf[24];
+          std::snprintf(buf, sizeof(buf), "%.7g", v[d]);
+          data << buf;
+        }
+        data << "]}";
+      }
+    } catch (const std::exception& e) {
+      res.send(500, "application/json", error_json(e.what(), "server_error"));
+      return;
+    }
+    std::ostringstream out;
+    out << "{\"object\":\"list\",\"data\":[" << data.str() << "],\"model\":\""
+        << json_escape(opts.embed_model_dir) << "\",\"usage\":{\"prompt_tokens\":" << total_tokens
+        << ",\"total_tokens\":" << total_tokens << "},\"dim\":" << dim << "}";
+    res.send(200, "application/json", out.str());
+#endif
+  };
+
   net::HttpServer server;
   std::string start_error;
   const bool ok = server.start(
       opts.host, opts.port,
       [&](const net::HttpRequest& req, net::HttpResponder& res) {
+        // /health stays open so a load balancer needs no credential; everything
+        // under /v1 requires the bearer token when one is configured.
         if (req.path == "/health" || req.path == "/api/health") {
           res.send(200, "application/json",
                    "{\"status\":\"ok\",\"model\":\"" + json_escape(model_name) + "\"}");
+          return;
+        }
+        if (!opts.api_key.empty() && !token_matches(bearer_token(req), opts.api_key)) {
+          res.send(401, "application/json",
+                   error_json("missing or invalid Authorization bearer token",
+                              "invalid_request_error"),
+                   "WWW-Authenticate: Bearer\r\n");
+          return;
+        }
+        if (req.path == "/v1/embeddings") {
+          if (req.method != "POST") {
+            res.send(405, "application/json", error_json("use POST", "invalid_request_error"));
+            return;
+          }
+          handle_embeddings(req, res);
           return;
         }
         if (req.path == "/v1/models") {
@@ -375,8 +524,8 @@ void run_http_server(engine::BatchScheduler& sched, model::Tokenizer& tokenizer,
   if (!ok) {
     throw std::runtime_error("[serve] " + start_error);
   }
-  std::fprintf(stderr, "[serve] listening on http://%s:%d (model=%s)\n", opts.host.c_str(),
-               server.port(), model_name.c_str());
+  std::fprintf(stderr, "[serve] listening on http://%s:%d (model=%s, auth=%s)\n", opts.host.c_str(),
+               server.port(), model_name.c_str(), opts.api_key.empty() ? "off" : "bearer");
   std::fprintf(stderr,
                "[serve] POST /v1/chat/completions, POST /v1/completions, GET /v1/models, "
                "GET /health\n");
