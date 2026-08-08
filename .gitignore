@@ -129,3 +129,7 @@ RELEASE_CHECKLIST.md
 
 # any stray node_modules
 node_modules/
+
+# A PowerShell hashtable interpolated into a redirect target lands here as a
+# literal filename. It has been committed by accident once; never again.
+System.Collections.Hashtable
