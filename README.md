@@ -291,14 +291,35 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 ```
 
 Endpoints: `POST /v1/chat/completions`, `POST /v1/completions` (both support `"stream": true`
-for SSE), `GET /v1/models`, `GET /health`. Requests are served through the same continuous-batching
-scheduler as the web stack, so concurrent clients interleave rather than queue (4 concurrent chats
-measured at 2.23x the serial time on a 0.5B). `response_format` with a `json_schema` compiles to the
-grammar sampler, and a client that disconnects mid-stream has its KV blocks reclaimed immediately.
+for SSE), `POST /v1/embeddings`, `GET /v1/models`, `GET /health`. `response_format` with a
+`json_schema` compiles to the grammar sampler, and a client that disconnects mid-stream has its KV
+blocks reclaimed immediately.
 
-It binds loopback by default; `--host 0.0.0.0` exposes it. There is no auth on this surface, so put
-it behind something that has one before exposing it. The Node stack below remains the way to get the
-web UI, the model hub, and the admin routes.
+**Vision** works over the API too, in the OpenAI content-array shape (a `data:` URL is decoded
+in-process):
+
+```json
+{"messages":[{"role":"user","content":[
+  {"type":"text","text":"What is in this image?"},
+  {"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0..."}}]}]}
+```
+
+**Embeddings** need a BERT-family model: add `--embed-model <dir>`. Without one the route answers
+503 with the reason. The vectors are identical to the standalone `cpi_embed` worker's.
+
+**Auth and exposure.** `--api-key <token>` (or `CPI_API_KEY`) requires a bearer token on every
+`/v1/*` route; `/health` stays open for load balancers. The server binds `127.0.0.1` by default and
+**refuses to start** on a non-loopback `--host` without a key, rather than silently publishing an
+unauthenticated model to the network.
+
+**Two serving modes**, reported in the startup line. Models on the LlamaEngine (Llama, Qwen2.5,
+Mistral, ...) and everything on Metal serve `mode=batched`: the same continuous-batching scheduler
+as the web stack, so concurrent clients interleave rather than queue (4 concurrent chats measured at
+2.23x the serial time on a 0.5B). Models on the op-plan CUDA engine (Gemma 4, Qwen3.5, DeepSeek-V2)
+serve `mode=serial`: that engine has no batch scheduler yet, so requests queue behind one lock. They
+are still fully served, vision included; they just do not batch.
+
+The Node stack below remains the way to get the web UI, the model hub, and the admin routes.
 
 ### Run the packaged local app
 
