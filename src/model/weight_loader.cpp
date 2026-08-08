@@ -171,6 +171,17 @@ constexpr const char kMagic[] = "LL2CUDA";
 // the offset lives in one place, the struct, and stays correct if the format grows again.
 // model_family_id has been at a fixed offset since v4, so a v4 file reads correctly too.
 ModelFamily peek_container_family(const std::string& path) {
+  // GGUF carries its architecture in metadata, not a fixed header field, so the
+  // cheap peek opens it through the reader (metadata only; no tensor is touched).
+  if (is_gguf_file(path)) {
+    try {
+      GgufLoader g;
+      g.open(path);
+      return g.config().model_family;
+    } catch (const std::exception&) {
+      return ModelFamily::Unknown;
+    }
+  }
   std::ifstream f(path, std::ios::binary);
   if (!f) return ModelFamily::Unknown;
   HeaderV5 h{};
@@ -182,6 +193,15 @@ ModelFamily peek_container_family(const std::string& path) {
 }
 
 void WeightLoader::open(const std::string& path) {
+  // A GGUF is a different container with the same job. Detect it here so every
+  // consumer of WeightLoader (engines, converters, tools) reads one without
+  // knowing there are two formats.
+  if (is_gguf_file(path)) {
+    gguf_ = std::make_unique<GgufLoader>();
+    gguf_->open(path);
+    config_ = gguf_->config();
+    return;
+  }
   mmap_.open(path);
   // Hint the OS to prefetch the file into the page cache immediately after mapping,
   // so subsequent tensor accesses don't stall on page faults during GPU loading.
@@ -190,6 +210,7 @@ void WeightLoader::open(const std::string& path) {
 }
 
 const std::byte* WeightLoader::tensor_data(const std::string& name) const {
+  if (gguf_) return gguf_->tensor_data(name);
   const auto it = tensors_.find(name);
   if (it == tensors_.end()) {
     CPI_THROW("tensor not found: " + name);
@@ -198,6 +219,7 @@ const std::byte* WeightLoader::tensor_data(const std::string& name) const {
 }
 
 std::size_t WeightLoader::tensor_bytes(const std::string& name) const {
+  if (gguf_) return gguf_->tensor_bytes(name);
   const auto it = tensors_.find(name);
   if (it == tensors_.end()) {
     CPI_THROW("tensor not found: " + name);
@@ -206,10 +228,12 @@ std::size_t WeightLoader::tensor_bytes(const std::string& name) const {
 }
 
 bool WeightLoader::has_tensor(const std::string& name) const {
+  if (gguf_) return gguf_->has_tensor(name);
   return tensors_.find(name) != tensors_.end();
 }
 
 std::vector<std::string> WeightLoader::tensor_names() const {
+  if (gguf_) return gguf_->tensor_names();
   std::vector<std::string> names;
   names.reserve(tensors_.size());
   for (const auto& kv : tensors_) names.push_back(kv.first);

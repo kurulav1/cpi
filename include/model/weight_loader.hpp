@@ -15,6 +15,9 @@
 #include <unordered_map>
 #include <vector>
 
+#include <memory>
+
+#include "model/gguf_loader.hpp"
 #include "model/llama_config.hpp"
 #include "platform/mmap_file.hpp"
 
@@ -61,7 +64,17 @@ public:
   // at packing time; so this is a constant here, and the answer is what lets an uploader convert
   // BF16 from a HuggingFace checkpoint without special-casing which container it came from.
   [[nodiscard]] std::string tensor_dtype(const std::string& name) const {
+    if (gguf_) return gguf_->tensor_dtype(name);
     return has_tensor(name) ? std::string("F16") : std::string();
+  }
+
+  // True when this loader is backed by a GGUF rather than a .ll2c container.
+  // Callers that need the embedded tokenizer ask through here.
+  [[nodiscard]] bool is_gguf() const {
+    return gguf_ != nullptr;
+  }
+  [[nodiscard]] const GgufLoader* gguf() const {
+    return gguf_.get();
   }
 
   // Every tensor name in the container, sorted. Needed to REPACK a .ll2c into another container
@@ -78,6 +91,11 @@ private:
   // Reads the header and populates config_ and tensors_ from the mapped file.
   void parse_manifest();
 
+  // A GGUF is read by GgufLoader and delegated to, rather than reimplemented:
+  // open() sniffs the magic, and every accessor below forwards when this is set.
+  // Doing it here instead of at each of the engines' ~200 call sites is what
+  // makes GGUF work everywhere a .ll2c does, including the tools.
+  std::unique_ptr<GgufLoader> gguf_;
   platform::MMapFile mmap_;  // Memory-mapped handle to the weight file.
   LlamaConfig config_{};     // Model config decoded from the file header.
   std::unordered_map<std::string, TensorSlice> tensors_;  // Name-to-slice index for all tensors.
