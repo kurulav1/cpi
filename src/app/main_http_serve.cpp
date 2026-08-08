@@ -10,6 +10,8 @@
 // POST /v1/chat/completions (both with "stream": true for SSE).
 #include <atomic>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <condition_variable>
 #include <cstdio>
 #include <mutex>
@@ -63,11 +65,133 @@ struct Pending {
   bool done = false;
 };
 
-// Extracts message contents from an OpenAI "messages" array. Hand-rolled because
-// the shared JSON helpers are scalar-only, and a chat body is the one place the
-// server must walk an array of objects. Returns role/content pairs in order.
-std::vector<std::pair<std::string, std::string>> parse_messages(const std::string& body) {
-  std::vector<std::pair<std::string, std::string>> out;
+// Base64 decoder for data: image URLs. Hand-rolled, per policy; skips
+// whitespace, stops at padding, and returns false on any other stray byte
+// rather than quietly producing a corrupt image.
+bool base64_decode(const std::string& in, std::string* out) {
+  auto value = [](unsigned char c) -> int {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+  };
+  out->clear();
+  out->reserve(in.size() * 3 / 4);
+  int acc = 0;
+  int bits = 0;
+  for (const char ch : in) {
+    const unsigned char c = static_cast<unsigned char>(ch);
+    if (c == '\n' || c == '\r' || c == ' ' || c == '\t') continue;
+    if (c == '=') break;
+    const int v = value(c);
+    if (v < 0) return false;
+    acc = (acc << 6) | v;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      out->push_back(static_cast<char>((acc >> bits) & 0xFF));
+    }
+  }
+  return true;
+}
+
+// One image found in an OpenAI-style message: either an inline data: URL or a
+// local path (the latter is a convenience for same-host clients).
+struct ImageRef {
+  std::string data;  // decoded bytes when inline
+  std::string path;  // filesystem path when not
+  bool inline_data = false;
+};
+
+// Pulls image_url entries out of a message's content array. OpenAI vision bodies
+// carry content as [{"type":"text",...},{"type":"image_url","image_url":{"url":...}}];
+// a plain string content has no images and returns nothing.
+std::vector<ImageRef> parse_images(const std::string& message_object) {
+  std::vector<ImageRef> out;
+  std::size_t pos = 0;
+  const std::string key = "\"url\"";
+  while ((pos = message_object.find(key, pos)) != std::string::npos) {
+    const std::size_t colon = message_object.find(':', pos + key.size());
+    if (colon == std::string::npos) break;
+    std::size_t q = message_object.find('"', colon);
+    if (q == std::string::npos) break;
+    std::size_t end = q + 1;
+    std::string url;
+    while (end < message_object.size()) {
+      if (message_object[end] == '\\' && end + 1 < message_object.size()) {
+        url.push_back(message_object[end + 1]);
+        end += 2;
+        continue;
+      }
+      if (message_object[end] == '"') break;
+      url.push_back(message_object[end]);
+      ++end;
+    }
+    pos = end + 1;
+
+    ImageRef ref;
+    const std::string data_prefix = "data:";
+    if (url.rfind(data_prefix, 0) == 0) {
+      const std::size_t comma = url.find(',');
+      if (comma == std::string::npos) continue;
+      if (url.find(";base64", 0) == std::string::npos) continue;
+      if (!base64_decode(url.substr(comma + 1), &ref.data)) continue;
+      ref.inline_data = true;
+    } else {
+      ref.path = url;
+    }
+    out.push_back(std::move(ref));
+  }
+  return out;
+}
+
+// Extracts the text of a message whose content is either a plain string or an
+// OpenAI content array (in which case the "text" parts are concatenated).
+std::string message_text(const std::string& message_object) {
+  const std::string raw = json_get_raw_value(message_object, "content");
+  if (raw.empty() || raw.front() != '[') return json_get_string(message_object, "content");
+  std::string text;
+  std::size_t pos = 0;
+  const std::string key = "\"text\"";
+  while ((pos = message_object.find(key, pos)) != std::string::npos) {
+    const std::size_t colon = message_object.find(':', pos + key.size());
+    if (colon == std::string::npos) break;
+    const std::size_t q = message_object.find('"', colon);
+    if (q == std::string::npos) break;
+    std::size_t end = q + 1;
+    std::string part;
+    while (end < message_object.size()) {
+      if (message_object[end] == '\\' && end + 1 < message_object.size()) {
+        // Keep the escape intact; json_get_string-style unescaping happens later.
+        part.push_back(message_object[end]);
+        part.push_back(message_object[end + 1]);
+        end += 2;
+        continue;
+      }
+      if (message_object[end] == '"') break;
+      part.push_back(message_object[end]);
+      ++end;
+    }
+    pos = end + 1;
+    if (!text.empty()) text += "\n";
+    text += part;
+  }
+  return text;
+}
+
+struct ChatMessage {
+  std::string role;
+  std::string content;
+  std::string raw;  // the message object, so images can be pulled from it
+};
+
+// Extracts messages from an OpenAI "messages" array. Hand-rolled because the
+// shared JSON helpers are scalar-only, and a chat body is the one place the
+// server must walk an array of objects. Order is preserved.
+std::vector<ChatMessage> parse_messages(const std::string& body) {
+  std::vector<ChatMessage> out;
   const std::string arr = json_get_raw_value(body, "messages");
   if (arr.empty() || arr.front() != '[') return out;
 
@@ -98,7 +222,11 @@ std::vector<std::pair<std::string, std::string>> parse_messages(const std::strin
       --depth;
       if (depth == 0 && obj_start != std::string::npos) {
         const std::string obj = arr.substr(obj_start, i - obj_start + 1);
-        out.emplace_back(json_get_string(obj, "role"), json_get_string(obj, "content"));
+        ChatMessage m;
+        m.role = json_get_string(obj, "role");
+        m.content = message_text(obj);
+        m.raw = obj;
+        out.push_back(std::move(m));
         obj_start = std::string::npos;
       }
     } else if (c == ']' && depth == 0) {
@@ -112,15 +240,14 @@ std::vector<std::pair<std::string, std::string>> parse_messages(const std::strin
 // templates take one user turn, so a multi-turn history is flattened with role
 // labels ahead of the templated final turn: enough for the common
 // system + alternating turns case without inventing a second template engine.
-std::string chat_prompt_from_messages(
-    const std::vector<std::pair<std::string, std::string>>& messages,
-    const std::string& chat_template) {
+std::string chat_prompt_from_messages(const std::vector<ChatMessage>& messages,
+                                      const std::string& chat_template, bool with_image) {
   std::string system_text;
   std::string history;
   std::string last_user;
   for (std::size_t i = 0; i < messages.size(); ++i) {
-    const std::string& role = messages[i].first;
-    const std::string& content = messages[i].second;
+    const std::string& role = messages[i].role;
+    const std::string& content = messages[i].content;
     if (content.empty()) continue;
     if (role == "system") {
       if (!system_text.empty()) system_text += "\n";
@@ -133,9 +260,12 @@ std::string chat_prompt_from_messages(
       history += "Assistant: " + content + "\n";
     }
   }
-  if (last_user.empty() && !messages.empty()) last_user = messages.back().second;
+  if (last_user.empty() && !messages.empty()) last_user = messages.back().content;
 
   std::string turn;
+  // The vision splice looks for this placeholder in the templated prompt; without
+  // it image_prompt::expand refuses (rather than silently dropping the picture).
+  if (with_image) turn += "<|image|>\n";
   if (!system_text.empty()) turn += system_text + "\n\n";
   if (!history.empty()) turn += history + "\n";
   turn += last_user;
@@ -175,13 +305,16 @@ std::string bearer_token(const net::HttpRequest& req) {
   return std::string();
 }
 
-}  // namespace
+// Auth, routing, the refuse-to-expose gate and startup logging, shared by both
+// serving backends. Only generation differs between them (continuous batching
+// when the engine has a scheduler, serialized when it does not), so everything
+// security-relevant lives here once rather than in two copies that can drift.
+using CompletionFn = std::function<void(const net::HttpRequest&, net::HttpResponder&, bool chat)>;
+using EmbeddingFn = std::function<void(const net::HttpRequest&, net::HttpResponder&)>;
 
-void run_http_server(engine::BatchScheduler& sched, model::Tokenizer& tokenizer,
-                     const HttpServeOptions& opts) {
-  // Refuse the combination that silently publishes an unauthenticated model to
-  // the network. Loopback without a key stays fine (that is the dev default),
-  // and an explicit key makes any bind address the operator's choice.
+void serve_routes(const HttpServeOptions& opts, const std::string& model_name, const char* mode,
+                  const CompletionFn& completion, const EmbeddingFn& embeddings,
+                  const std::function<void()>& run_forever) {
   if (opts.api_key.empty() && opts.host != "127.0.0.1" && opts.host != "localhost") {
     throw std::runtime_error(
         "[serve] refusing to bind " + opts.host +
@@ -189,6 +322,67 @@ void run_http_server(engine::BatchScheduler& sched, model::Tokenizer& tokenizer,
         "Pass --api-key <token> (or CPI_API_KEY), or keep the default --host 127.0.0.1.");
   }
 
+  net::HttpServer server;
+  std::string start_error;
+  const bool ok = server.start(
+      opts.host, opts.port,
+      [&](const net::HttpRequest& req, net::HttpResponder& res) {
+        // /health stays open so a load balancer needs no credential; everything
+        // under /v1 requires the bearer token when one is configured.
+        if (req.path == "/health" || req.path == "/api/health") {
+          res.send(200, "application/json",
+                   "{\"status\":\"ok\",\"model\":\"" + json_escape(model_name) + "\"}");
+          return;
+        }
+        if (!opts.api_key.empty() && !token_matches(bearer_token(req), opts.api_key)) {
+          res.send(401, "application/json",
+                   error_json("missing or invalid Authorization bearer token",
+                              "invalid_request_error"),
+                   "WWW-Authenticate: Bearer\r\n");
+          return;
+        }
+        if (req.path == "/v1/embeddings") {
+          if (req.method != "POST") {
+            res.send(405, "application/json", error_json("use POST", "invalid_request_error"));
+            return;
+          }
+          embeddings(req, res);
+          return;
+        }
+        if (req.path == "/v1/models") {
+          res.send(200, "application/json",
+                   "{\"object\":\"list\",\"data\":[{\"id\":\"" + json_escape(model_name) +
+                       "\",\"object\":\"model\",\"owned_by\":\"cpi\"}]}");
+          return;
+        }
+        if (req.path == "/v1/chat/completions" || req.path == "/v1/completions") {
+          if (req.method != "POST") {
+            res.send(405, "application/json", error_json("use POST", "invalid_request_error"));
+            return;
+          }
+          completion(req, res, req.path == "/v1/chat/completions");
+          return;
+        }
+        res.send(404, "application/json",
+                 error_json("unknown route: " + req.path, "invalid_request_error"));
+      },
+      &start_error);
+
+  if (!ok) throw std::runtime_error("[serve] " + start_error);
+  std::fprintf(stderr, "[serve] listening on http://%s:%d (model=%s, auth=%s, mode=%s)\n",
+               opts.host.c_str(), server.port(), model_name.c_str(),
+               opts.api_key.empty() ? "off" : "bearer", mode);
+  std::fprintf(stderr,
+               "[serve] POST /v1/chat/completions, POST /v1/completions, GET /v1/models, "
+               "GET /v1/embeddings, GET /health\n");
+  run_forever();
+  server.stop();
+}
+
+}  // namespace
+
+void run_http_server(engine::BatchScheduler& sched, model::Tokenizer& tokenizer,
+                     const HttpServeOptions& opts) {
   BatchDefaults defaults;
   defaults.stop_texts = opts.stop_texts;
   defaults.add_bos = opts.add_bos;
@@ -242,6 +436,7 @@ void run_http_server(engine::BatchScheduler& sched, model::Tokenizer& tokenizer,
                                      bool chat) {
     const std::string& body = req.body;
     std::string prompt;
+    std::vector<ImageRef> images;
     if (chat) {
       const auto messages = parse_messages(body);
       if (messages.empty()) {
@@ -249,7 +444,11 @@ void run_http_server(engine::BatchScheduler& sched, model::Tokenizer& tokenizer,
                  error_json("'messages' must be a non-empty array", "invalid_request_error"));
         return;
       }
-      prompt = chat_prompt_from_messages(messages, opts.chat_template);
+      for (const auto& m : messages) {
+        auto found = parse_images(m.raw);
+        images.insert(images.end(), found.begin(), found.end());
+      }
+      prompt = chat_prompt_from_messages(messages, opts.chat_template, !images.empty());
     } else {
       prompt = json_get_string(body, "prompt");
       if (prompt.empty()) {
@@ -280,6 +479,83 @@ void run_http_server(engine::BatchScheduler& sched, model::Tokenizer& tokenizer,
     const bool stream = json_get_bool(body, "stream", false);
     const std::string id =
         (chat ? "chatcmpl-" : "cmpl-") + std::to_string(next_id.fetch_add(1));
+
+    // Vision requests take a different engine entry point than the batch
+    // scheduler, so they run as an exclusive task on the worker thread. Only the
+    // first image is used: the towers this serves splice one image span.
+    if (!images.empty()) {
+      if (!opts.multimodal) {
+        res.send(400, "application/json",
+                 error_json("this model has no vision tower; remove the image or load a "
+                            "multimodal model",
+                            "invalid_request_error"));
+        return;
+      }
+      std::string image_path = images.front().path;
+      std::string temp_path;
+      if (images.front().inline_data) {
+        // The image pipeline reads a file (the PNG decoder is path-based), so an
+        // inline data: URL is staged to a temp file and removed afterwards.
+        std::error_code ec;
+        const auto dir = std::filesystem::temp_directory_path(ec);
+        temp_path = (dir / ("cpi_serve_" + id + ".png")).string();
+        std::ofstream f(temp_path, std::ios::binary);
+        f.write(images.front().data.data(),
+                static_cast<std::streamsize>(images.front().data.size()));
+        f.close();
+        image_path = temp_path;
+      }
+      if (image_path.empty()) {
+        res.send(400, "application/json",
+                 error_json("could not read the supplied image", "invalid_request_error"));
+        return;
+      }
+
+      const int max_new = ov.max_new >= 0 ? ov.max_new : defaults.max_new;
+      const float temp = ov.temp >= 0.0f ? ov.temp : defaults.temp;
+      std::string text;
+      std::string vision_error;
+      const std::vector<int> base = tokenizer.encode(prompt, defaults.add_bos);
+      worker.run_exclusive([&]() {
+        try {
+          const std::vector<int> outs =
+              opts.multimodal(base, image_path, max_new, temp, nullptr);
+          text = app::main_helpers::sanitize_stream_text(tokenizer.decode(outs));
+        } catch (const std::exception& e) {
+          vision_error = e.what();
+        }
+      });
+      if (!temp_path.empty()) {
+        std::error_code ec;
+        std::filesystem::remove(temp_path, ec);
+      }
+      if (!vision_error.empty()) {
+        res.send(500, "application/json", error_json(vision_error, "server_error"));
+        return;
+      }
+      const std::string created_v = iso_created();
+      if (stream) {
+        // Vision generation is not streamed by the engine, so the whole answer
+        // arrives as one content chunk followed by the terminator.
+        res.begin_sse();
+        res.sse("{\"id\":\"" + id + "\",\"object\":\"chat.completion.chunk\",\"created\":" +
+                created_v + ",\"model\":\"" + json_escape(model_name) +
+                "\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"" +
+                json_escape(text) + "\"},\"finish_reason\":null}]}");
+        res.sse("{\"id\":\"" + id + "\",\"object\":\"chat.completion.chunk\",\"created\":" +
+                created_v + ",\"model\":\"" + json_escape(model_name) +
+                "\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}");
+        res.sse("[DONE]");
+        return;
+      }
+      res.send(200, "application/json",
+               "{\"id\":\"" + id + "\",\"object\":\"chat.completion\",\"created\":" + created_v +
+                   ",\"model\":\"" + json_escape(model_name) +
+                   "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\","
+                   "\"content\":\"" +
+                   json_escape(text) + "\"},\"finish_reason\":\"stop\"}]}");
+      return;
+    }
     auto pending = std::make_shared<Pending>();
     {
       std::lock_guard<std::mutex> lk(reg_mu);
@@ -475,65 +751,201 @@ void run_http_server(engine::BatchScheduler& sched, model::Tokenizer& tokenizer,
 #endif
   };
 
-  net::HttpServer server;
-  std::string start_error;
-  const bool ok = server.start(
-      opts.host, opts.port,
-      [&](const net::HttpRequest& req, net::HttpResponder& res) {
-        // /health stays open so a load balancer needs no credential; everything
-        // under /v1 requires the bearer token when one is configured.
-        if (req.path == "/health" || req.path == "/api/health") {
-          res.send(200, "application/json",
-                   "{\"status\":\"ok\",\"model\":\"" + json_escape(model_name) + "\"}");
-          return;
-        }
-        if (!opts.api_key.empty() && !token_matches(bearer_token(req), opts.api_key)) {
-          res.send(401, "application/json",
-                   error_json("missing or invalid Authorization bearer token",
-                              "invalid_request_error"),
-                   "WWW-Authenticate: Bearer\r\n");
-          return;
-        }
-        if (req.path == "/v1/embeddings") {
-          if (req.method != "POST") {
-            res.send(405, "application/json", error_json("use POST", "invalid_request_error"));
-            return;
-          }
-          handle_embeddings(req, res);
-          return;
-        }
-        if (req.path == "/v1/models") {
-          res.send(200, "application/json",
-                   "{\"object\":\"list\",\"data\":[{\"id\":\"" + json_escape(model_name) +
-                       "\",\"object\":\"model\",\"owned_by\":\"cpi\"}]}");
-          return;
-        }
-        if (req.path == "/v1/chat/completions" || req.path == "/v1/completions") {
-          if (req.method != "POST") {
-            res.send(405, "application/json", error_json("use POST", "invalid_request_error"));
-            return;
-          }
-          handle_completion(req, res, req.path == "/v1/chat/completions");
-          return;
-        }
-        res.send(404, "application/json",
-                 error_json("unknown route: " + req.path, "invalid_request_error"));
-      },
-      &start_error);
+  serve_routes(opts, model_name, "batched", handle_completion, handle_embeddings, [&]() {
+    // The worker owns the engine and runs on this thread until the process is
+    // stopped; HTTP threads only enqueue work.
+    worker.run();
+  });
+}
 
-  if (!ok) {
-    throw std::runtime_error("[serve] " + start_error);
-  }
-  std::fprintf(stderr, "[serve] listening on http://%s:%d (model=%s, auth=%s)\n", opts.host.c_str(),
-               server.port(), model_name.c_str(), opts.api_key.empty() ? "off" : "bearer");
-  std::fprintf(stderr,
-               "[serve] POST /v1/chat/completions, POST /v1/completions, GET /v1/models, "
-               "GET /health\n");
+void run_http_server_serial(GenerateStreamFn generate, model::Tokenizer& tokenizer,
+                            const HttpServeOptions& opts) {
+  const std::string model_name = opts.model_name;
+  // One request at a time: these engines have no paged pool to interleave with,
+  // so concurrency is queueing rather than batching. Stated in the startup log
+  // so nobody benchmarks this expecting the batched path's numbers.
+  std::mutex engine_mu;
 
-  // The worker owns the engine and runs on this thread until the process is
-  // stopped; HTTP threads only enqueue work.
-  worker.run();
-  server.stop();
+  const auto handle_completion = [&](const net::HttpRequest& req, net::HttpResponder& res,
+                                     bool chat) {
+    const std::string& body = req.body;
+    std::string prompt;
+    std::vector<ImageRef> images;
+    if (chat) {
+      const auto messages = parse_messages(body);
+      if (messages.empty()) {
+        res.send(400, "application/json",
+                 error_json("'messages' must be a non-empty array", "invalid_request_error"));
+        return;
+      }
+      for (const auto& m : messages) {
+        auto found = parse_images(m.raw);
+        images.insert(images.end(), found.begin(), found.end());
+      }
+      prompt = chat_prompt_from_messages(messages, opts.chat_template, !images.empty());
+    } else {
+      prompt = json_get_string(body, "prompt");
+      if (prompt.empty()) {
+        res.send(400, "application/json",
+                 error_json("'prompt' is required", "invalid_request_error"));
+        return;
+      }
+    }
+
+    const int max_new =
+        std::max(1, json_get_int(body, "max_tokens", json_get_int(body, "max_new", opts.max_new)));
+    const float temp = std::max(0.0f, json_get_float(body, "temperature", opts.temp));
+    const bool stream = json_get_bool(body, "stream", false);
+    const std::string id = (chat ? "chatcmpl-" : "cmpl-") + std::to_string(
+                               std::chrono::steady_clock::now().time_since_epoch().count() % 100000);
+    const std::string created = iso_created();
+
+    std::string image_path;
+    std::string temp_path;
+    if (!images.empty()) {
+      if (!opts.multimodal) {
+        res.send(400, "application/json",
+                 error_json("this model has no vision tower; remove the image or load a "
+                            "multimodal model",
+                            "invalid_request_error"));
+        return;
+      }
+      image_path = images.front().path;
+      if (images.front().inline_data) {
+        std::error_code ec;
+        const auto dir = std::filesystem::temp_directory_path(ec);
+        temp_path = (dir / ("cpi_serve_" + id + ".png")).string();
+        std::ofstream f(temp_path, std::ios::binary);
+        f.write(images.front().data.data(),
+                static_cast<std::streamsize>(images.front().data.size()));
+        f.close();
+        image_path = temp_path;
+      }
+      if (image_path.empty()) {
+        res.send(400, "application/json",
+                 error_json("could not read the supplied image", "invalid_request_error"));
+        return;
+      }
+    }
+
+    if (stream) res.begin_sse();
+    if (stream && chat) {
+      res.sse("{\"id\":\"" + id + "\",\"object\":\"chat.completion.chunk\",\"created\":" + created +
+              ",\"model\":\"" + json_escape(model_name) +
+              "\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},"
+              "\"finish_reason\":null}]}");
+    }
+
+    // Incremental detokenization, matching the batched path: decode the whole
+    // history each step and emit the difference, so multi-byte pieces are never
+    // split mid-character.
+    std::vector<int> ids;
+    std::string prev_text;
+    std::string full_text;
+    bool client_gone = false;
+    const auto emit_delta = [&](const std::string& delta) {
+      if (delta.empty()) return true;
+      full_text += delta;
+      if (!stream) return true;
+      const std::string payload =
+          chat ? ("{\"id\":\"" + id + "\",\"object\":\"chat.completion.chunk\",\"created\":" +
+                  created + ",\"model\":\"" + json_escape(model_name) +
+                  "\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"" + json_escape(delta) +
+                  "\"},\"finish_reason\":null}]}")
+               : ("{\"id\":\"" + id + "\",\"object\":\"text_completion\",\"created\":" + created +
+                  ",\"model\":\"" + json_escape(model_name) +
+                  "\",\"choices\":[{\"index\":0,\"text\":\"" + json_escape(delta) +
+                  "\",\"finish_reason\":null}]}");
+      return res.sse(payload);
+    };
+
+    std::string error;
+    {
+      std::lock_guard<std::mutex> lk(engine_mu);
+      try {
+        const std::vector<int> base = tokenizer.encode(prompt, opts.add_bos);
+        if (!image_path.empty()) {
+          // Vision generation is not incremental in these engines; one answer.
+          const std::vector<int> outs = opts.multimodal(base, image_path, max_new, temp, nullptr);
+          emit_delta(app::main_helpers::sanitize_stream_text(tokenizer.decode(outs)));
+        } else {
+          generate(base, max_new, temp, [&](int token) {
+            ids.push_back(token);
+            const std::string decoded =
+                app::main_helpers::sanitize_stream_text(tokenizer.decode(ids));
+            if (decoded.size() > prev_text.size()) {
+              const std::string delta = decoded.substr(prev_text.size());
+              prev_text = decoded;
+              if (!emit_delta(delta)) {
+                client_gone = true;
+                return false;  // stop generating for a client that hung up
+              }
+            }
+            return true;
+          }, /*constraints=*/nullptr);
+        }
+      } catch (const std::exception& e) {
+        error = e.what();
+      }
+    }
+    if (!temp_path.empty()) {
+      std::error_code ec;
+      std::filesystem::remove(temp_path, ec);
+    }
+    if (client_gone) return;
+
+    if (!error.empty()) {
+      if (stream) {
+        res.sse(error_json(error, "server_error"));
+        res.sse("[DONE]");
+      } else {
+        res.send(500, "application/json", error_json(error, "server_error"));
+      }
+      return;
+    }
+    const std::string reason = static_cast<int>(ids.size()) >= max_new ? "length" : "stop";
+    if (stream) {
+      res.sse(chat ? ("{\"id\":\"" + id +
+                      "\",\"object\":\"chat.completion.chunk\",\"created\":" + created +
+                      ",\"model\":\"" + json_escape(model_name) +
+                      "\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"" + reason +
+                      "\"}]}")
+                   : ("{\"id\":\"" + id + "\",\"object\":\"text_completion\",\"created\":" +
+                      created + ",\"model\":\"" + json_escape(model_name) +
+                      "\",\"choices\":[{\"index\":0,\"text\":\"\",\"finish_reason\":\"" + reason +
+                      "\"}]}"));
+      res.sse("[DONE]");
+      return;
+    }
+    res.send(200, "application/json",
+             chat ? ("{\"id\":\"" + id + "\",\"object\":\"chat.completion\",\"created\":" +
+                     created + ",\"model\":\"" + json_escape(model_name) +
+                     "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\","
+                     "\"content\":\"" +
+                     json_escape(full_text) + "\"},\"finish_reason\":\"" + reason + "\"}]}")
+                  : ("{\"id\":\"" + id + "\",\"object\":\"text_completion\",\"created\":" +
+                     created + ",\"model\":\"" + json_escape(model_name) +
+                     "\",\"choices\":[{\"index\":0,\"text\":\"" + json_escape(full_text) +
+                     "\",\"finish_reason\":\"" + reason + "\"}]}"));
+  };
+
+  // No embedder on this path (it would need its own model load); the route
+  // reports why rather than 404ing.
+  const auto handle_embeddings = [&](const net::HttpRequest&, net::HttpResponder& res) {
+    res.send(503, "application/json",
+             error_json("embeddings are served by the batched backend; this model runs on the "
+                        "op-plan engine",
+                        "server_error"));
+  };
+
+  std::mutex done_mu;
+  std::condition_variable done_cv;
+  serve_routes(opts, model_name, "serial", handle_completion, handle_embeddings, [&]() {
+    // Nothing to pump: requests run on their own connection threads under
+    // engine_mu. Park until the process is stopped.
+    std::unique_lock<std::mutex> lk(done_mu);
+    done_cv.wait(lk, []() { return false; });
+  });
 }
 
 }  // namespace app::main_modes

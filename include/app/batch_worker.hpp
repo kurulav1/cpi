@@ -92,6 +92,14 @@ class BatchWorker {
   // Safe for ids that are queued, running, or already gone.
   void cancel(const std::string& id);
 
+  // Runs `task` on the worker thread with the engine to itself, then returns.
+  // Multimodal generation goes through a different engine entry point than the
+  // scheduler (image embeddings, not just tokens), and the engine is not
+  // thread-safe, so an HTTP thread cannot simply call it while decode steps are
+  // in flight. The task runs between steps; in-flight text requests pause for
+  // its duration rather than racing it. Blocks until the task has run.
+  void run_exclusive(const std::function<void()>& task);
+
   // Asks run() to return once the queue drains and no request is active.
   void stop();
 
@@ -116,10 +124,17 @@ class BatchWorker {
   BatchDefaults defaults_;
   Sink sink_;
 
+  struct ExclusiveTask {
+    const std::function<void()>* fn = nullptr;
+    bool done = false;
+  };
+
   std::mutex mu_;
   std::condition_variable cv_;
+  std::condition_variable exclusive_cv_;
   std::deque<Incoming> queue_;
   std::deque<std::string> cancels_;
+  std::deque<ExclusiveTask*> exclusive_;
   bool stopping_ = false;
 };
 

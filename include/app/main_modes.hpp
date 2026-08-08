@@ -90,6 +90,11 @@ struct HttpServeOptions {
   // BERT-family embedding model directory. Empty means /v1/embeddings answers
   // 503 instead of pretending the route does not exist.
   std::string embed_model_dir;
+  // Vision generation, bound only when the loaded model has a tower. Null means
+  // an image-bearing request is refused with a clear message rather than having
+  // its image silently dropped. Runs on the worker thread (see run_exclusive).
+  GenerateMultimodalFn multimodal;
+  int eos_token_id = -1;
 };
 
 // Serves HTTP until the process is stopped, driving the same BatchWorker (and
@@ -97,5 +102,13 @@ struct HttpServeOptions {
 // See main_http_serve.cpp.
 void run_http_server(engine::BatchScheduler& sched, model::Tokenizer& tokenizer,
                      const HttpServeOptions& opts);
+
+// The same HTTP surface for an engine without continuous batching: the op-plan
+// CUDA engine (Gemma 4, Qwen3.5, DeepSeek-V2) has no BatchScheduler, so its
+// requests are serialized behind one lock instead of interleaved. Everything
+// security-relevant (auth, the refuse-to-expose gate, routing) is the shared
+// code path; only generation differs. Vision requests go through opts.multimodal.
+void run_http_server_serial(GenerateStreamFn generate, model::Tokenizer& tokenizer,
+                            const HttpServeOptions& opts);
 
 }  // namespace app::main_modes

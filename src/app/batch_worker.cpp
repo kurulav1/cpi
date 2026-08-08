@@ -104,6 +104,18 @@ void BatchWorker::cancel(const std::string& id) {
   cv_.notify_all();
 }
 
+void BatchWorker::run_exclusive(const std::function<void()>& task) {
+  ExclusiveTask slot;
+  slot.fn = &task;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    exclusive_.push_back(&slot);
+  }
+  cv_.notify_all();
+  std::unique_lock<std::mutex> lk(mu_);
+  exclusive_cv_.wait(lk, [&]() { return slot.done; });
+}
+
 void BatchWorker::stop() {
   {
     std::lock_guard<std::mutex> lk(mu_);
@@ -141,13 +153,38 @@ void BatchWorker::run() {
   constexpr int kMaxResumeRetries = 16;
 
   while (true) {
+    // Exclusive tasks first: they need the engine to themselves, and running
+    // them at the top of the iteration means no decode step is in flight.
+    while (true) {
+      ExclusiveTask* task = nullptr;
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (exclusive_.empty()) break;
+        task = exclusive_.front();
+        exclusive_.pop_front();
+      }
+      try {
+        (*task->fn)();
+      } catch (const std::exception& e) {
+        std::cerr << "[batch] exclusive task threw: " << e.what() << "\n";
+      }
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        task->done = true;
+      }
+      exclusive_cv_.notify_all();
+    }
+
     std::vector<Incoming> admits;
     std::vector<std::string> cancel_ids;
     {
       std::unique_lock<std::mutex> lk(mu_);
-      if (queue_.empty() && cancels_.empty() && waiting.empty() && sched_.active() == 0) {
+      if (queue_.empty() && cancels_.empty() && exclusive_.empty() && waiting.empty() &&
+          sched_.active() == 0) {
         if (stopping_) break;
-        cv_.wait(lk, [&]() { return !queue_.empty() || !cancels_.empty() || stopping_; });
+        cv_.wait(lk, [&]() {
+          return !queue_.empty() || !cancels_.empty() || !exclusive_.empty() || stopping_;
+        });
       }
       while (!cancels_.empty()) {
         cancel_ids.push_back(std::move(cancels_.front()));
@@ -240,7 +277,7 @@ void BatchWorker::run() {
 
     if (sched_.active() == 0) {
       std::lock_guard<std::mutex> lk(mu_);
-      if (stopping_ && queue_.empty() && cancels_.empty()) break;
+      if (stopping_ && queue_.empty() && cancels_.empty() && exclusive_.empty()) break;
       continue;
     }
 

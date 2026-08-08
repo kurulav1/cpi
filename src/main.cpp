@@ -607,6 +607,11 @@ int main(int argc, char** argv) {
               if (const char* env_key = std::getenv("CPI_API_KEY")) so.api_key = env_key;
             }
             so.embed_model_dir = cli.serve_embed_model;
+            so.eos_token_id = cli.opts.eos_token_id;
+            // Bound only when this engine actually has a tower; the overload
+            // returns null otherwise, which is what makes an image request fail
+            // loudly instead of silently dropping the picture.
+            so.multimodal = make_multimodal_fn(eng);
             app::main_modes::run_http_server(eng.batch_scheduler(), tokenizer, so);
             return;
           }
@@ -651,6 +656,38 @@ int main(int argc, char** argv) {
         engine::PlanCudaEngine plan_eng;
         if (!cli.image_path.empty()) {
           run_with_image(plan_eng, cli, tokenizer, info_out);
+          break;
+        }
+        // --serve on the op-plan engine. It has no BatchScheduler (continuous
+        // batching lives in LlamaEngine and PlanMetalEngine), so requests are
+        // serialized rather than interleaved; that is still a served model
+        // instead of no server at all, and it is what makes the vision models
+        // (Gemma 4, Qwen3.5) reachable over HTTP on CUDA.
+        if (cli.serve_http) {
+          if (!use_tokenizer) throw std::runtime_error("--serve requires --tokenizer");
+          plan_eng.open(cli.opts.model_path, cli.opts.max_context);
+          app::main_modes::HttpServeOptions so;
+          so.host = cli.serve_host;
+          so.port = cli.serve_port;
+          so.model_name = std::filesystem::path(cli.opts.model_path).filename().string();
+          so.chat_template = cli.chat_template;
+          so.stop_texts = cli.stop_texts;
+          so.add_bos = !cli.force_no_bos;
+          so.max_new = cli.max_new;
+          so.temp = cli.temp;
+          so.api_key = cli.serve_api_key;
+          if (so.api_key.empty()) {
+            if (const char* env_key = std::getenv("CPI_API_KEY")) so.api_key = env_key;
+          }
+          so.eos_token_id = cli.opts.eos_token_id;
+          so.multimodal = make_multimodal_fn(plan_eng);
+          app::main_modes::run_http_server_serial(
+              [&plan_eng](const std::vector<int>& prompt, int max_new, float temp,
+                          const std::function<bool(int)>& on_token,
+                          const engine::GenerationConstraints*) {
+                return plan_eng.generate_stream(prompt, max_new, temp, on_token);
+              },
+              tokenizer, so);
           break;
         }
         run_with_engine(plan_eng);
@@ -824,6 +861,11 @@ int main(int argc, char** argv) {
               if (const char* env_key = std::getenv("CPI_API_KEY")) so.api_key = env_key;
             }
             so.embed_model_dir = cli.serve_embed_model;
+            so.eos_token_id = cli.opts.eos_token_id;
+            // Bound only when this engine actually has a tower; the overload
+            // returns null otherwise, which is what makes an image request fail
+            // loudly instead of silently dropping the picture.
+            so.multimodal = make_multimodal_fn(meng);
             app::main_modes::run_http_server(meng.batch_scheduler(bo), tokenizer, so);
             return 0;
           }
