@@ -524,17 +524,35 @@ void GgufLoader::build_config() {
     config_.vocab_size = static_cast<std::int32_t>(tokenizer_.tokens.size());
   }
 
+  // Architecture mapping, and the refusal that matters more than the mapping.
+  //
+  // An architecture CPI has not been taught still has blk.N.attn_q-style tensors,
+  // so a wrong mapping does not fail to load: it loads and answers nonsense.
+  // Anything not known good is therefore refused by name. The cost of being wrong
+  // in the other direction (a supported model rejected) is an error message; the
+  // cost here is a user believing an answer.
   if (architecture_ == "llama") {
+    // Verified: bit-exact against a .ll2c of the same checkpoint, and generation
+    // is token-identical. Q/K are un-permuted (see map_names).
     config_.model_family = ModelFamily::LLaMA3;
   } else if (architecture_ == "qwen2") {
+    // Same layout as llama minus the Q/K permutation (llama.cpp gives Qwen2 the
+    // NeoX rope convention, which is already CPI's), plus QKV biases.
+    // Implemented from the format, not yet verified against a Qwen2 GGUF.
     config_.model_family = ModelFamily::Qwen2;
-    config_.has_qkv_bias = true;  // Qwen2 carries QKV biases
-  } else if (architecture_ == "gemma" || architecture_ == "gemma2") {
-    config_.model_family = ModelFamily::Gemma;
-    config_.mlp_gelu = true;
-    config_.scale_embeddings = true;
+    config_.has_qkv_bias = true;
   } else {
-    config_.model_family = ModelFamily::LLaMA3;
+    // Recorded rather than thrown: reading an unmapped file is still useful
+    // (inspecting it, checking a dequant), and the diagnostics depend on it.
+    // The refusal happens at the engine boundary, in WeightLoader::open.
+    config_.model_family = ModelFamily::Unknown;
+    unsupported_reason_ =
+        "gguf: architecture '" + architecture_ +
+        "' is not mapped yet. Its tensors would load under the wrong conventions and produce "
+        "confident nonsense rather than an error, so it is refused instead. Supported today: "
+        "llama (verified), qwen2. Gemma/Gemma 4 and DeepSeek-V2 need their config and norm "
+        "conventions mapped (Gemma's (1+w) norms, Gemma 4's per-layer embeddings, DeepSeek's MLA "
+        "projections) before their GGUFs can be trusted; convert those to .ll2c/.cpi meanwhile.";
   }
 
   // Tied embeddings: no separate output tensor means the head shares the table.

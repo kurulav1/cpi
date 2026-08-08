@@ -199,6 +199,13 @@ void WeightLoader::open(const std::string& path) {
   if (is_gguf_file(path)) {
     gguf_ = std::make_unique<GgufLoader>();
     gguf_->open(path);
+    // The engine boundary: an architecture whose conventions CPI has not been
+    // taught would load and answer nonsense rather than fail, so it stops here.
+    if (!gguf_->unsupported_reason().empty()) {
+      const std::string reason = gguf_->unsupported_reason();
+      gguf_.reset();
+      CPI_THROW(reason);
+    }
     config_ = gguf_->config();
     return;
   }

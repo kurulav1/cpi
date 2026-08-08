@@ -158,14 +158,33 @@ int main(int argc, char** argv) {
   // Q/K un-permutation, which no self-consistent check can catch.
   if (!compare_path.empty()) {
     std::printf("comparing against %s\n", compare_path.c_str());
+    // The oracle may be a .ll2c or another GGUF of the same model. A second
+    // GGUF is the stronger check for quantized files -- the same weights at two
+    // bit widths -- so it is read through GgufLoader directly rather than
+    // through WeightLoader, which refuses unmapped architectures by design.
     model::WeightLoader w;
+    model::GgufLoader wg;
+    const bool oracle_is_gguf = model::is_gguf_file(compare_path);
     try {
-      w.open(compare_path);
+      if (oracle_is_gguf) {
+        wg.open(compare_path);
+      } else {
+        w.open(compare_path);
+      }
     } catch (const std::exception& e) {
       std::printf("  [FAIL] oracle open threw: %s\n", e.what());
       return 1;
     }
-    const model::LlamaConfig& oc = w.config();
+    const auto oracle_has = [&](const std::string& n) {
+      return oracle_is_gguf ? wg.has_tensor(n) : w.has_tensor(n);
+    };
+    const auto oracle_bytes = [&](const std::string& n) {
+      return oracle_is_gguf ? wg.tensor_bytes(n) : w.tensor_bytes(n);
+    };
+    const auto oracle_data = [&](const std::string& n) {
+      return oracle_is_gguf ? wg.tensor_data(n) : w.tensor_data(n);
+    };
+    const model::LlamaConfig& oc = oracle_is_gguf ? wg.config() : w.config();
     check(oc.num_layers == c.num_layers && oc.hidden_size == c.hidden_size &&
               oc.num_heads == c.num_heads && oc.num_kv_heads == c.num_kv_heads,
           "geometry matches the .ll2c oracle");
@@ -176,15 +195,15 @@ int main(int argc, char** argv) {
                              "layers.0.attention.wv", "layers.0.attention.wo",
                              "layers.0.feed_forward.w1", "layers.0.feed_forward.w2",
                              "layers.1.attention.wq", "norm.weight"}) {
-      if (!g.has_tensor(name) || !w.has_tensor(name)) continue;
+      if (!g.has_tensor(name) || !oracle_has(name)) continue;
       const std::size_t gb = g.tensor_bytes(name);
-      const std::size_t wb = w.tensor_bytes(name);
+      const std::size_t wb = oracle_bytes(name);
       if (gb != wb) {
         check(false, std::string(name) + ": size mismatch vs oracle");
         continue;
       }
       const auto* a = reinterpret_cast<const std::uint16_t*>(g.tensor_data(name));
-      const auto* b = reinterpret_cast<const std::uint16_t*>(w.tensor_data(name));
+      const auto* b = reinterpret_cast<const std::uint16_t*>(oracle_data(name));
       const std::size_t n = gb / sizeof(std::uint16_t);
       double max_abs = 0.0;
       double sum_abs = 0.0;

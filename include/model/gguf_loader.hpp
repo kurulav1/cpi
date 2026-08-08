@@ -88,6 +88,13 @@ public:
   };
   [[nodiscard]] std::vector<RawTensor> raw_tensors() const;
 
+  // Non-empty when the file's architecture has no trustworthy CPI mapping. The
+  // file still reads (inspection, dequant checks); it is running it that is
+  // refused, at the engine boundary. See build_config for the reasoning.
+  [[nodiscard]] const std::string& unsupported_reason() const {
+    return unsupported_reason_;
+  }
+
 private:
   // ggml tensor types this reader understands. The numbering is ggml's.
   enum class GgmlType : std::uint32_t {
@@ -132,6 +139,7 @@ private:
   LlamaConfig config_{};
   TokenizerData tokenizer_;
   std::string architecture_;
+  std::string unsupported_reason_;
 
   // Metadata values, kept as strings (numbers formatted) for a uniform lookup.
   std::unordered_map<std::string, std::string> meta_;
