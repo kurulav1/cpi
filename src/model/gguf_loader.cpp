@@ -183,6 +183,9 @@ void GgufLoader::open(const std::string& path) {
 
 void GgufLoader::parse(const std::string& path) {
   mmap_.open(path);
+  // Same reasoning as the .ll2c loader: pull the file into the page cache up
+  // front so the upload does not stall on faults tensor by tensor.
+  mmap_.prefetch();
   const auto* base = static_cast<const std::byte*>(mmap_.data());
   const std::size_t size = mmap_.size();
   Cursor cur(base, size);
@@ -414,6 +417,16 @@ const std::byte* GgufLoader::tensor_data(const std::string& name) const {
   const auto it = cpi_to_gguf_.find(name);
   if (it == cpi_to_gguf_.end()) throw std::out_of_range("gguf: no tensor named " + name);
   const TensorInfo& info = tensors_.at(it->second);
+  // An fp16 tensor that needs no un-permutation is already in the layout CPI
+  // wants, so hand out the mapped bytes instead of copying them. That is nearly
+  // every tensor of an F16 file: copying them all cost ~15 s of extra startup on
+  // an 8B and a second full-size copy in RAM, for nothing.
+  if (info.type == GgmlType::F16 && permute_heads_.find(name) == permute_heads_.end()) {
+    if (info.offset + info.fp16_bytes > data_bytes_) {
+      throw std::runtime_error("gguf: tensor '" + name + "' extends past the data region");
+    }
+    return data_base_ + info.offset;
+  }
   const auto cached = cache_.find(name);
   if (cached != cache_.end()) return cached->second.data();
   return materialize(name, info);
