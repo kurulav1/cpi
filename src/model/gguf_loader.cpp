@@ -2,6 +2,7 @@
 #include "model/gguf_loader.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -386,6 +387,26 @@ void GgufLoader::open(const std::string& path) {
   parse(path);
   build_config();
   map_names();
+
+  // A quantized file that silently costs fp16 residency is a surprise worth
+  // spending one line on: the download is small, the resident model is not,
+  // and the flag that fixes it also makes decode faster (fewer weight bytes
+  // per token). Only printed when the file actually carries quantized weights.
+  bool quantized = false;
+  for (const auto& [cpi_name, gguf_name] : cpi_to_gguf_) {
+    (void)cpi_name;
+    const GgmlType t = tensors_.at(gguf_name).type;
+    if (t != GgmlType::F32 && t != GgmlType::F16 && t != GgmlType::BF16) {
+      quantized = true;
+      break;
+    }
+  }
+  if (quantized) {
+    std::fprintf(stderr,
+                 "[gguf] quantized weights are dequantized to fp16 at load, so this model is "
+                 "resident at its fp16 size. Pass --weight-quant int4 (or int8) to keep it packed "
+                 "on the GPU: less VRAM, and faster decode.\n");
+  }
 }
 
 void GgufLoader::parse(const std::string& path) {

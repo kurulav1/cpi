@@ -289,13 +289,22 @@ Tensor types: F32, F16, BF16, the flat quants (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0) and the
 starts as fast as CPI's own container and decodes at the same speed (measured 91 tok/s either way on
 an 8B, with generation **token-identical** to the same checkpoint's `.ll2c`).
 
-One caveat worth knowing before you point a quantized file at it: CPI currently **dequantizes to
-fp16 at load**, so a 4.6 GB Q4_K_M uses the same VRAM as the 15 GB F16 of the same model. You get
-the smaller download and disk footprint, not a smaller resident model. Dequantization is
-multi-threaded (an 8B Q4_K_M starts in ~13 s against ~7 s for F16, and decodes at the same speed),
-and mapping the quantized blocks onto CPI's own packed int4/int8 -- which would keep the memory
-win -- is the next step on this path. `--weight-quant int4` re-quantizes on load if you need the
-VRAM back today.
+One thing to know before pointing a quantized file at it: CPI **dequantizes to fp16 at load**, so
+by default a 4.6 GB Q4_K_M is resident at the fp16 footprint -- the download shrinks, the model in
+VRAM does not. Adding `--weight-quant int4` re-packs it on the GPU and is worth it on both axes,
+measured on an 8B Q4_K_M:
+
+| | peak VRAM | decode |
+| --- | --- | --- |
+| default (fp16 resident) | 20.7 GB | 74 tok/s |
+| `--weight-quant int4` | 12.5 GB | **134 tok/s** |
+
+The speedup is the same reason quantization helps anywhere: decode is bandwidth-bound, so fewer
+weight bytes per token is directly faster. The cost is a second quantization on top of the file's
+own (output stays coherent, but it is not the GGUF's exact numerics). Loading the file's blocks
+straight into CPI's packed format -- no fp16 round trip, no double quantization -- is the next step
+on this path. Dequantization is multi-threaded meanwhile: an 8B Q4_K_M starts in ~13 s against
+~7 s for F16.
 
 Architectures are mapped conservatively: `llama` (verified against a `.ll2c` of the same checkpoint,
 bit-exact weights and identical output) and `qwen2`. Anything else is **refused with an
