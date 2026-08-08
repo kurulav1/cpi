@@ -140,6 +140,107 @@ __global__ void dequant_q6_k_kernel(const std::uint8_t* __restrict__ base, __hal
 
 }  // namespace
 
+// Per-thread unpack of one k-quant super-block element. Shared by the dequant
+// kernels above and the matvec below, so the two cannot drift: the matvec is
+// only trustworthy because this arithmetic is the arithmetic kquant_dequant_test
+// gates bit-for-bit.
+__device__ __forceinline__ float kquant_value(const std::uint8_t* p, KQuantType type, int i) {
+  if (type == KQuantType::Q4_K) {
+    std::uint16_t dh, mh;
+    memcpy(&dh, p, 2);
+    memcpy(&mh, p + 2, 2);
+    const float d = half_bits_to_float(dh);
+    const float dmin = half_bits_to_float(mh);
+    const std::uint8_t* scales = p + 4;
+    const std::uint8_t* qs = p + 16;
+    const int j = i / 64;
+    const int rem = i % 64;
+    const int l = rem % 32;
+    std::uint8_t sc, m;
+    get_scale_min_k4(2 * j + (rem / 32), scales, &sc, &m);
+    const std::uint8_t byte = qs[j * 32 + l];
+    const int q = (rem < 32) ? (byte & 0x0F) : (byte >> 4);
+    return d * sc * static_cast<float>(q) - dmin * m;
+  }
+  if (type == KQuantType::Q5_K) {
+    std::uint16_t dh, mh;
+    memcpy(&dh, p, 2);
+    memcpy(&mh, p + 2, 2);
+    const float d = half_bits_to_float(dh);
+    const float dmin = half_bits_to_float(mh);
+    const std::uint8_t* scales = p + 4;
+    const std::uint8_t* qh = p + 16;
+    const std::uint8_t* ql = p + 48;
+    const int j = i / 64;
+    const int rem = i % 64;
+    const int l = rem % 32;
+    std::uint8_t sc, m;
+    get_scale_min_k4(2 * j + (rem / 32), scales, &sc, &m);
+    const std::uint8_t byte = ql[j * 32 + l];
+    const std::uint8_t hbit = static_cast<std::uint8_t>(1u << (2 * j + (rem / 32)));
+    const int q = ((rem < 32) ? (byte & 0x0F) : (byte >> 4)) + ((qh[l] & hbit) ? 16 : 0);
+    return d * sc * static_cast<float>(q) - dmin * m;
+  }
+  // Q6_K
+  const std::uint8_t* ql = p;
+  const std::uint8_t* qh = p + 128;
+  const auto* sc = reinterpret_cast<const std::int8_t*>(p + 192);
+  std::uint16_t dh;
+  memcpy(&dh, p + 208, 2);
+  const float d = half_bits_to_float(dh);
+  const int n = i / 128;
+  const int rem = i % 128;
+  const int quarter = rem / 32;
+  const int l = rem % 32;
+  const std::uint8_t* qln = ql + n * 64;
+  const std::uint8_t* qhn = qh + n * 32;
+  const std::int8_t* scn = sc + n * 8;
+  const int half_off = (quarter & 1) * 32;
+  const int q =
+      static_cast<int>((quarter >> 1) ? (qln[l + half_off] >> 4) : (qln[l + half_off] & 0x0F)) |
+      (((qhn[l] >> (2 * quarter)) & 3) << 4);
+  return d * static_cast<float>(scn[quarter * 2 + (l / 16)]) * static_cast<float>(q - 32);
+}
+
+// y = W x with W still packed: one row per thread block, the row's super-blocks
+// unpacked on the fly and multiplied into x. This is the point of the whole
+// exercise -- the weight never exists as fp16 anywhere, so a Q4_K_M model is
+// resident at its file size instead of ~3x it.
+__global__ void kquant_matvec_kernel(const std::uint8_t* __restrict__ w, KQuantType type,
+                                     std::size_t block_bytes, const __half* __restrict__ x,
+                                     __half* __restrict__ y, int rows, int cols) {
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const int blocks_per_row = cols / static_cast<int>(kSuperBlock);
+  const std::uint8_t* row_base =
+      w + static_cast<std::size_t>(row) * blocks_per_row * block_bytes;
+
+  float acc = 0.0f;
+  for (int b = 0; b < blocks_per_row; ++b) {
+    const std::uint8_t* p = row_base + static_cast<std::size_t>(b) * block_bytes;
+    const int col0 = b * static_cast<int>(kSuperBlock);
+    for (int i = threadIdx.x; i < static_cast<int>(kSuperBlock); i += blockDim.x) {
+      acc += kquant_value(p, type, i) * __half2float(x[col0 + i]);
+    }
+  }
+
+  // Block reduction: warp shuffles then one value per warp through shared memory.
+  __shared__ float warp_sums[32];
+  const int lane = threadIdx.x % warpSize;
+  const int warp = threadIdx.x / warpSize;
+  for (int off = warpSize / 2; off > 0; off >>= 1) {
+    acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+  }
+  if (lane == 0) warp_sums[warp] = acc;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float total = 0.0f;
+    const int warps = (blockDim.x + warpSize - 1) / warpSize;
+    for (int i = 0; i < warps; ++i) total += warp_sums[i];
+    y[row] = __float2half(total);
+  }
+}
+
 void launch_dequant_kquant(const std::uint8_t* blocks_in, KQuantType type, std::size_t blocks,
                            __half* out, cudaStream_t stream) {
   constexpr int kThreads = 128;
@@ -155,6 +256,15 @@ void launch_dequant_kquant(const std::uint8_t* blocks_in, KQuantType type, std::
       dequant_q6_k_kernel<<<grid, kThreads, 0, stream>>>(blocks_in, out, blocks);
       break;
   }
+}
+
+void launch_kquant_matvec(const std::uint8_t* w, KQuantType type, const half* x, half* y, int rows,
+                          int cols, cudaStream_t stream) {
+  std::size_t block_bytes = model::kquant::kQ6KBlockBytes;
+  if (type == KQuantType::Q4_K) block_bytes = model::kquant::kQ4KBlockBytes;
+  if (type == KQuantType::Q5_K) block_bytes = model::kquant::kQ5KBlockBytes;
+  constexpr int kThreads = 256;
+  kquant_matvec_kernel<<<rows, kThreads, 0, stream>>>(w, type, block_bytes, x, y, rows, cols);
 }
 
 }  // namespace kernels

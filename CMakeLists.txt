@@ -460,6 +460,11 @@ target_include_directories(kquant_dequant_test PRIVATE include)
 target_link_libraries(kquant_dequant_test PRIVATE cpi_engine)
 add_test(NAME kquant_dequant_test COMMAND kquant_dequant_test)
 
+add_executable(kquant_matvec_test src/tests/kquant_matvec_test.cu)
+target_include_directories(kquant_matvec_test PRIVATE include)
+target_link_libraries(kquant_matvec_test PRIVATE cpi_engine)
+add_test(NAME kquant_matvec_test COMMAND kquant_matvec_test)
+
 add_executable(gguf_loader_test src/tests/gguf_loader_test.cpp)
 target_include_directories(gguf_loader_test PRIVATE include)
 target_link_libraries(gguf_loader_test PRIVATE cpi_engine)

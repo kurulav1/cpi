@@ -1256,6 +1256,15 @@ enum class KQuantType { Q4_K, Q5_K, Q6_K };
 void launch_dequant_kquant(const std::uint8_t* blocks_in, KQuantType type, std::size_t blocks,
                            half* out, cudaStream_t stream);
 
+// launch_kquant_matvec
+//
+// y[rows] = W[rows, cols] * x[cols] with W left PACKED: the super-blocks are unpacked
+// inside the kernel, so the weight never exists as fp16 and a quantized model stays
+// resident at its file size. cols must be a multiple of 256. Gated by
+// kquant_matvec_test against a host dequant + fp32 dot.
+void launch_kquant_matvec(const std::uint8_t* w, KQuantType type, const half* x, half* y, int rows,
+                          int cols, cudaStream_t stream);
+
 // launch_dequant_weight_rowwise_to_fp16
 //
 // Dequant in LlamaEngine's cached low-bit layout (row-wise scales; int4 packed as
