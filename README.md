@@ -276,6 +276,26 @@ These scripts:
 - create `web/config.json` from `web/config.example.json` if needed
 - build `cpi` if it is missing
 
+### Run a GGUF
+
+GGUF files load directly, no conversion step:
+
+```bash
+cpi model.gguf --tokenizer tokenizer.json --prompt "Hello" --gpu-cache-all
+```
+
+Tensor types: F32, F16, BF16, the flat quants (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0) and the k-quants
+(Q2_K/Q3_K/Q4_K/Q5_K/Q6_K). fp16 tensors are served straight from the mapping, so an F16 GGUF
+starts as fast as CPI's own container and decodes at the same speed (measured 91 tok/s either way on
+an 8B, with generation **token-identical** to the same checkpoint's `.ll2c`).
+
+Architectures are mapped conservatively: `llama` (verified against a `.ll2c` of the same checkpoint,
+bit-exact weights and identical output) and `qwen2`. Anything else is **refused with an
+explanation** rather than loaded under the wrong conventions -- an unmapped architecture still has
+recognisable tensor names, so the failure mode being avoided is confident nonsense, not a crash.
+Gemma, Gemma 4 and DeepSeek-V2 GGUFs need their norm and config conventions mapped first; convert
+those to `.ll2c`/`.cpi` meanwhile.
+
 ### Serve an OpenAI-compatible API (no Node, no dependencies)
 
 The binary is its own HTTP server, so headless serving needs nothing but `cpi`:
