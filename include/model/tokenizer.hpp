@@ -32,6 +32,12 @@ public:
   // Throws on missing or malformed tokenizer files.
   void load(const std::string& path);
 
+  // Loads the tokenizer a GGUF carries in its own metadata, so `cpi model.gguf`
+  // needs no separate --tokenizer. Returns false when the file has no usable
+  // vocabulary (the caller then asks for one), rather than throwing: a missing
+  // embedded tokenizer is a normal property of some containers.
+  bool load_from_gguf(const std::string& gguf_path);
+
   // Encodes text into a sequence of token IDs.
   // If add_bos is true, the BOS token ID is prepended to the result.
   std::vector<int> encode(const std::string& text, bool add_bos) const;

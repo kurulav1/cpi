@@ -29,6 +29,17 @@ public:
   // file at path.  Throws on missing file or JSON parse errors.
   void load(const std::string& path);
 
+  // Builds the same tables from a vocabulary already in memory, which is how a
+  // GGUF's embedded tokenizer (tokenizer.ggml.*) is used: the container carries
+  // the vocab and merges, so a separate tokenizer.json should not be required to
+  // run the file. `model` is GGUF's tokenizer.ggml.model ("gpt2" => byte-level
+  // BPE, "llama"/"spm" => SentencePiece-style word-boundary pieces).
+  // `token_types` uses ggml's numbering, where 3 marks a control token; empty
+  // means "not supplied".
+  void load_from_vocab(const std::string& model, const std::vector<std::string>& tokens,
+                       const std::vector<std::string>& merges,
+                       const std::vector<std::int32_t>& token_types, int bos, int eos, int unk);
+
   // Encodes text into a sequence of BPE token IDs.
   // If add_bos is true, the BOS token ID is prepended to the result.
   std::vector<int> encode(const std::string& text, bool add_bos) const;
@@ -75,6 +86,10 @@ public:
   }
 
 private:
+  // Shared tail of load()/load_from_vocab(): byte-level tables and the per-token
+  // byte pieces the grammar sampler masks against.
+  void finalize_tables();
+
   // Resolves a single token's vocabulary piece to the raw bytes it emits,
   // mirroring decode() for one token but without the leading-space strip.
   std::string piece_to_bytes(const std::string& piece) const;

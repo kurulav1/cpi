@@ -673,6 +673,10 @@ void HfBpeTokenizer::load(const std::string& path) {
     }
   }
 
+  finalize_tables();
+}
+
+void HfBpeTokenizer::finalize_tables() {
   // Build GPT-2 byte-to-unicode tables when byte_level_ is active.
   // The mapping follows the standard GPT-2 bytes_to_unicode() function:
   //   bytes 33-126, 161-172, 174-255 → same code point (Latin-1 printable)
@@ -708,6 +712,64 @@ void HfBpeTokenizer::load(const std::string& path) {
       token_pieces_[static_cast<std::size_t>(sid)].clear();
     }
   }
+}
+
+void HfBpeTokenizer::load_from_vocab(const std::string& model,
+                                     const std::vector<std::string>& tokens,
+                                     const std::vector<std::string>& merges,
+                                     const std::vector<std::int32_t>& token_types, int bos, int eos,
+                                     int unk) {
+  vocab_.clear();
+  id_to_piece_.clear();
+  merge_ranks_.clear();
+  added_tokens_.clear();
+  special_ids_.clear();
+  token_pieces_.clear();
+  unicode_to_byte_.clear();
+
+  // "gpt2" is GGUF's name for byte-level BPE; the SentencePiece families keep the
+  // U+2581 word-boundary marker and byte fallback instead.
+  byte_level_ = (model == "gpt2");
+  byte_fallback_ = !byte_level_;
+  strip_leading_space_ = !byte_level_;
+
+  id_to_piece_.reserve(tokens.size());
+  for (std::size_t i = 0; i < tokens.size(); ++i) {
+    id_to_piece_.push_back(tokens[i]);
+    // First writer wins, matching tokenizer.json order: a duplicate piece later
+    // in the vocabulary must not steal the canonical id.
+    vocab_.emplace(tokens[i], static_cast<int>(i));
+  }
+
+  for (std::size_t r = 0; r < merges.size(); ++r) {
+    const std::string& m = merges[r];
+    const std::size_t sp = m.find(' ');
+    if (sp == std::string::npos) continue;
+    merge_ranks_[merge_key(m.substr(0, sp), m.substr(sp + 1))] = static_cast<int>(r);
+  }
+
+  // ggml token type 3 is CONTROL; those are the specials the decoder drops.
+  for (std::size_t i = 0; i < token_types.size() && i < tokens.size(); ++i) {
+    if (token_types[i] == 3) {
+      special_ids_.push_back(static_cast<int>(i));
+      added_tokens_.emplace_back(tokens[i], static_cast<int>(i));
+    }
+  }
+
+  bos_id_ = bos;
+  eos_id_ = eos;
+  unk_id_ = unk;
+  const auto known = [&](int id) {
+    return id >= 0 && static_cast<std::size_t>(id) < id_to_piece_.size();
+  };
+  for (const int id : {bos_id_, eos_id_, unk_id_}) {
+    if (known(id) && std::find(special_ids_.begin(), special_ids_.end(), id) == special_ids_.end()) {
+      special_ids_.push_back(id);
+      added_tokens_.emplace_back(id_to_piece_[static_cast<std::size_t>(id)], id);
+    }
+  }
+
+  finalize_tables();
 }
 
 // Resolves a single token's vocabulary piece to the raw bytes it emits. This

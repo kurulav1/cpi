@@ -37,6 +37,7 @@
 #include "model/image_preprocess.hpp"
 #include "runtime/metal_context.hpp"
 #endif
+#include "model/gguf_loader.hpp"
 #include "model/tokenizer.hpp"
 
 #ifdef _WIN32
@@ -352,7 +353,16 @@ int main(int argc, char** argv) {
 
     // --- Tokenizer setup ---
     if (use_tokenizer) {
-      if (cli.tokenizer_path.empty()) {
+      // A GGUF carries its own vocabulary, so --tokenizer is optional for one.
+      bool tokenizer_from_gguf = false;
+      if (cli.tokenizer_path.empty() && model::is_gguf_file(cli.opts.model_path)) {
+        tokenizer_from_gguf = tokenizer.load_from_gguf(cli.opts.model_path);
+        if (tokenizer_from_gguf) {
+          if (tokenizer.eos_id() >= 0) cli.opts.eos_token_id = tokenizer.eos_id();
+          info_out << "[info] using the tokenizer embedded in the GGUF (no --tokenizer needed).\n";
+        }
+      }
+      if (cli.tokenizer_path.empty() && !tokenizer_from_gguf) {
         if (cli.simple_mode) {
           cli.tokenizer_path = auto_detect_tokenizer_path(cli.opts.model_path);
           if (cli.tokenizer_path.empty()) {
@@ -386,7 +396,9 @@ int main(int argc, char** argv) {
       if (!cli.interactive_mode && cli.stop_texts.empty()) {
         cli.stop_texts = default_stop_texts_for_template(cli.chat_template);
       }
-      tokenizer.load(cli.tokenizer_path);
+      if (!tokenizer_from_gguf) {
+        tokenizer.load(cli.tokenizer_path);
+      }
       if (tokenizer.eos_id() >= 0) {
         cli.opts.eos_token_id = tokenizer.eos_id();
       }

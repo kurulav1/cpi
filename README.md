@@ -301,8 +301,11 @@ These scripts:
 GGUF files load directly, no conversion step:
 
 ```bash
-cpi model.gguf --tokenizer tokenizer.json --prompt "Hello" --gpu-cache-all
+cpi model.gguf --prompt "Hello" --gpu-cache-all
 ```
+
+`--tokenizer` is optional for a GGUF: the container carries its own vocabulary and merges, and CPI
+uses them (verified token-identical to the matching `tokenizer.json`). Pass one anyway to override.
 
 Tensor types: F32, F16, BF16, the flat quants (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0) and the k-quants
 (Q2_K/Q3_K/Q4_K/Q5_K/Q6_K). fp16 tensors are served straight from the mapping, so an F16 GGUF

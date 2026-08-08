@@ -1,5 +1,7 @@
 #include "model/tokenizer.hpp"
 
+#include "model/gguf_loader.hpp"
+
 #include <algorithm>
 #include <cstdlib>
 #include <filesystem>
@@ -161,6 +163,34 @@ Tokenizer::~Tokenizer() {
 //
 // This function resets all prior state so it is safe to call multiple times
 // on the same Tokenizer instance (e.g. to hot-reload a model).
+bool Tokenizer::load_from_gguf(const std::string& gguf_path) {
+  if (!is_gguf_file(gguf_path)) return false;
+  GgufLoader g;
+  try {
+    g.open(gguf_path);
+  } catch (const std::exception&) {
+    return false;  // unreadable or unmapped: the caller's own error is better
+  }
+  const GgufLoader::TokenizerData& td = g.tokenizer();
+  if (td.tokens.empty()) return false;
+
+  model_path_ = gguf_path;
+  // encode()/decode() select the HF-BPE backend on this being non-empty, so it
+  // names the container the vocabulary came from rather than a tokenizer.json.
+  tokenizer_json_path_ = gguf_path;
+  spm_python_cmd_.clear();
+  delete reinterpret_cast<HfBpeTokenizer*>(hf_bpe_);
+  hf_bpe_ = new HfBpeTokenizer();
+  auto* tok = reinterpret_cast<HfBpeTokenizer*>(hf_bpe_);
+  tok->load_from_vocab(td.model, td.tokens, td.merges, td.token_types, td.bos_id, td.eos_id,
+                       td.unk_id);
+  bos_id_ = tok->bos_id();
+  eos_id_ = tok->eos_id();
+  unk_id_ = tok->unk_id();
+  special_ids_ = tok->special_ids();
+  return true;
+}
+
 void Tokenizer::load(const std::string& path) {
   model_path_ = path;
   tokenizer_json_path_.clear();
