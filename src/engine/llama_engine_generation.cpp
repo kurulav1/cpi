@@ -16,6 +16,51 @@
 
 namespace engine {
 
+namespace {
+// Which quantized prefill matrices go through dequantize + tensor-core GEMM
+// instead of the batched matvec kernels. A bitmask rather than one switch so
+// each matrix can be enabled and its output read on its own: the two earlier
+// attempts at this both measured a convincing speedup while producing nonsense,
+// and an all-or-nothing flag cannot tell you which matrix lied.
+//   bit 0 (1) wqkv, bit 1 (2) wo, bit 2 (4) w1/w3, bit 3 (8) w2
+// All four are on by default; CPI_QUANT_PREFILL_GEMM=<mask> overrides, and 0
+// restores the pure matvec path.
+int quant_prefill_gemm_mask() {
+  static const int value = []() {
+    const char* env = std::getenv("CPI_QUANT_PREFILL_GEMM");
+    return env ? std::max(0, std::atoi(env)) : 15;
+  }();
+  return value;
+}
+// Row count below which the matvec kernels still win (they are built for decode).
+constexpr int kQuantPrefillGemmMinRows = 16;
+}  // namespace
+
+// Dequantizes one cached low-bit weight into the prefill scratch, in the layout
+// llama_engine_lowbit_utils.cpp packs (row-wise scales; int4 as sequential column
+// pairs). Returns null when the scratch cannot be sized, so the caller falls back.
+const void* LlamaEngine::dequant_weight_for_gemm(const std::int8_t* w, const float* scales,
+                                                 bool int4, int rows, int cols) {
+  if (w == nullptr || scales == nullptr || rows <= 0 || cols <= 0) return nullptr;
+  const std::size_t need =
+      static_cast<std::size_t>(rows) * static_cast<std::size_t>(cols) * sizeof(__half);
+  if (need > d_prefill_wdq_bytes_) {
+    // Queued GEMMs may still be reading the old buffer.
+    CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
+    if (d_prefill_wdq_ != nullptr) cudaFree(d_prefill_wdq_);
+    d_prefill_wdq_ = nullptr;
+    d_prefill_wdq_bytes_ = 0;
+    if (cudaMalloc(&d_prefill_wdq_, need) != cudaSuccess) {
+      d_prefill_wdq_ = nullptr;
+      return nullptr;
+    }
+    d_prefill_wdq_bytes_ = need;
+  }
+  kernels::launch_dequant_weight_rowwise_to_fp16(w, scales, static_cast<__half*>(d_prefill_wdq_),
+                                                 rows, cols, int4, compute_stream_);
+  return d_prefill_wdq_;
+}
+
 std::vector<int> LlamaEngine::generate(const std::vector<int>& prompt_tokens, int max_new_tokens,
                                        float temperature) {
   return generate_stream(prompt_tokens, max_new_tokens, temperature, {});
@@ -124,11 +169,27 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
     // projection weights (fp16 wqkv/wo are freed after quantisation), so the
     // projections go through the batched low-bit kernels, mirroring the MLP.
     const bool lowbit_proj = cached_int8_proj_enabled_ && lw_i8 && lw_i8->wqkv && lw_i8->wo;
+    // Dequantize-then-GEMM is only worth it at prompt row counts, and only for
+    // the row-wise scale layout (grouped int4 scales are per column group).
+    const int wgemm_mask = quant_prefill_gemm_mask();
+    const bool wgemm_rows_ok = rows >= kQuantPrefillGemmMinRows;
+    const bool lowbit_mlp_rowwise =
+        lw_i8 && lw_i8->w1 && lw_i8->w2 && lw_i8->w3 && lw_i8->mlp_group <= 0;
     bool fused_glu = false;  // fp16 path reads gate/up in place; quant paths still need the split
 
     launch_norm(d_x_, lw->norm_att, lw->norm_att_bias, d_x_norm_, rows, hidden);
 
-    if (lowbit_proj && can_use_dp4a_proj) {
+    const void* wqkv_dq =
+        (lowbit_proj && wgemm_rows_ok && (wgemm_mask & 1))
+            ? dequant_weight_for_gemm(lw_i8->wqkv, lw_i8->s_wqkv, lw_i8->proj_int4,
+                                      q_hidden + 2 * kv_hidden, hidden)
+            : nullptr;
+    if (wqkv_dq != nullptr) {
+      detail::dispatch_linear_rowmajor_weight(
+          cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,
+          const_cast<void*>(wqkv_dq), d_x_norm_, d_qkv_, q_hidden + 2 * kv_hidden, hidden, rows,
+          CUDA_R_16F);
+    } else if (lowbit_proj && can_use_dp4a_proj) {
       kernels::launch_quantize_rowwise_fp16_to_int8(static_cast<const __half*>(d_x_norm_),
                                                     d_prefill_i8_, d_prefill_i8_scales_, rows,
                                                     hidden, compute_stream_);
@@ -312,7 +373,15 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
       }
     }
 
-    if (lowbit_proj && can_use_dp4a_proj) {
+    const void* wo_dq = (lowbit_proj && wgemm_rows_ok && (wgemm_mask & 2))
+                            ? dequant_weight_for_gemm(lw_i8->wo, lw_i8->s_wo, lw_i8->proj_int4,
+                                                      hidden, q_hidden)
+                            : nullptr;
+    if (wo_dq != nullptr) {
+      detail::dispatch_linear_rowmajor_weight(
+          cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,
+          const_cast<void*>(wo_dq), d_att_, d_ff3_, hidden, q_hidden, rows, CUDA_R_16F);
+    } else if (lowbit_proj && can_use_dp4a_proj) {
       kernels::launch_quantize_rowwise_fp16_to_int8(static_cast<const __half*>(d_att_),
                                                     d_prefill_i8_, d_prefill_i8_scales_, rows,
                                                     q_hidden, compute_stream_);
@@ -346,7 +415,20 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
 
     launch_norm(d_x_, lw->norm_ffn, lw->norm_ffn_bias, d_x_norm_, rows, hidden);
 
-    if (lw_i8 && lw_i8->w1 && lw_i8->w2 && lw_i8->w3 && lw_i8->mlp_group > 0) {
+    const bool gate_gemm = lowbit_mlp_rowwise && wgemm_rows_ok && (wgemm_mask & 4);
+    if (gate_gemm &&
+        dequant_weight_for_gemm(lw_i8->w1, lw_i8->s_w1, lw_i8->mlp_int4, inter, hidden) !=
+            nullptr) {
+      // The scratch holds one matrix at a time, so each is dequantized right
+      // before its own GEMM.
+      detail::dispatch_linear_rowmajor_weight(
+          cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,
+          d_prefill_wdq_, d_x_norm_, d_prefill_ff1_, inter, hidden, rows, CUDA_R_16F);
+      dequant_weight_for_gemm(lw_i8->w3, lw_i8->s_w3, lw_i8->mlp_int4, inter, hidden);
+      detail::dispatch_linear_rowmajor_weight(
+          cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,
+          d_prefill_wdq_, d_x_norm_, d_prefill_ff2_, inter, hidden, rows, CUDA_R_16F);
+    } else if (lw_i8 && lw_i8->w1 && lw_i8->w2 && lw_i8->w3 && lw_i8->mlp_group > 0) {
       // Group-wise int4 MLP (w1/w3) via perm8 dp4a. Must match the grouped weight scales; a per-row
       // batched kernel here would misread them. w1/w3 share the one perm8 activation.
       kernels::launch_quantize_fp16_to_int8_perm8_g32_mt(
@@ -415,7 +497,15 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
           rows * inter, compute_stream_);
     }
 
-    if (lw_i8 && lw_i8->w1 && lw_i8->w2 && lw_i8->w3 && lw_i8->mlp_group > 0) {
+    const void* w2_dq = (lowbit_mlp_rowwise && wgemm_rows_ok && (wgemm_mask & 8))
+                            ? dequant_weight_for_gemm(lw_i8->w2, lw_i8->s_w2, lw_i8->mlp_int4,
+                                                      hidden, inter)
+                            : nullptr;
+    if (w2_dq != nullptr) {
+      detail::dispatch_linear_rowmajor_weight(
+          cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,
+          const_cast<void*>(w2_dq), d_prefill_ff2_, d_ff3_, hidden, inter, rows, CUDA_R_16F);
+    } else if (lw_i8 && lw_i8->w1 && lw_i8->w2 && lw_i8->w3 && lw_i8->mlp_group > 0) {
       // Group-wise int4 MLP (w2) via perm8 dp4a: post-GLU activation (d_prefill_ff2_).
       kernels::launch_quantize_fp16_to_int8_perm8_g32_mt(
           static_cast<const __half*>(d_prefill_ff2_), static_cast<std::int8_t*>(d_prefill_i8_),

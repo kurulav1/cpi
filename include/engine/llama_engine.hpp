@@ -642,6 +642,13 @@ private:
   void* d_ff2_ = nullptr;        // Post-down-projection MLP output buffer.
   void* d_prefill_ff1_ = nullptr;         // Prefill-sized gate activation buffer.
   void* d_prefill_ff2_ = nullptr;         // Prefill-sized down-projection output buffer.
+  // Prefill scratch for the dequantize-then-GEMM path: one weight matrix at a
+  // time in fp16, so a prompt chunk reaches the tensor-core GEMM instead of the
+  // batched matvec kernels (decode-shaped, ~20x off at prefill row counts).
+  void* d_prefill_wdq_ = nullptr;
+  std::size_t d_prefill_wdq_bytes_ = 0;
+  const void* dequant_weight_for_gemm(const std::int8_t* w, const float* scales, bool int4,
+                                      int rows, int cols);
   std::int8_t* d_prefill_i8_ = nullptr;   // INT8 quantised activations for prefill INT8 path.
   float* d_prefill_i8_scales_ = nullptr;  // Per-row scales accompanying d_prefill_i8_.
   float* d_prefill_perm8_scales_ = nullptr;  // Per-group(32) scales for the perm8-g32 activation

@@ -1246,6 +1246,15 @@ void launch_weight_only_int8_matvec_glu(const std::int8_t* wg, const float* sg,
 void launch_half_gemv_glu(const half* wg, const half* wu, const half* x, half* y, int out_features,
                           int in_features, cudaStream_t stream);
 
+// launch_dequant_weight_rowwise_to_fp16
+//
+// Dequant in LlamaEngine's cached low-bit layout (row-wise scales; int4 packed as
+// sequential column pairs, low nibble first). Prefill uses it to reach the tensor-core
+// GEMM. Not interchangeable with launch_dequant_int4_grouped below: that reads the
+// op-plan engine's packing.
+void launch_dequant_weight_rowwise_to_fp16(const std::int8_t* w, const float* scales, half* out,
+                                           int rows, int cols, bool int4, cudaStream_t stream);
+
 // launch_dequant_int4_grouped / launch_dequant_int8_rowwise
 //
 // Whole-matrix dequant to fp16 (prefill scratch: sequence mode runs the real GEMM over a

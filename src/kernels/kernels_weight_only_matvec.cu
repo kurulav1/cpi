@@ -1994,4 +1994,55 @@ void launch_weight_only_int4_matvec_dual_dp4a(const int8_t* w_a_packed, const fl
   }
 }
 
+
+// Whole-matrix dequant to fp16 in LlamaEngine's cached low-bit layout, so a
+// prefill chunk can run a quantized weight through the tensor-core GEMM instead
+// of the batched matvec kernels (decode-shaped, and an order of magnitude off at
+// prompt row counts).
+//
+// Layout is the one pack_rowwise_int8_to_int4 writes: sequential column pairs,
+// low nibble first, signed two's complement, one scale per row. NOT the op-plan
+// engine's packing -- launch_dequant_int4_grouped reads a different one, and
+// feeding these bytes to it runs fast and produces garbage.
+__global__ void dequant_rowwise_int4_to_fp16_kernel(const std::int8_t* __restrict__ packed,
+                                                    const float* __restrict__ scales,
+                                                    half* __restrict__ out, int rows, int cols,
+                                                    int packed_cols) {
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const float scale = scales[row];
+  const std::int8_t* src = packed + static_cast<std::size_t>(row) * packed_cols;
+  half* dst = out + static_cast<std::size_t>(row) * cols;
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    const std::uint8_t byte = static_cast<std::uint8_t>(src[col >> 1]);
+    const std::uint8_t nibble = (col & 1) == 0 ? (byte & 0x0Fu) : ((byte >> 4) & 0x0Fu);
+    const int q = (nibble >= 8) ? static_cast<int>(nibble) - 16 : static_cast<int>(nibble);
+    dst[col] = __float2half(scale * static_cast<float>(q));
+  }
+}
+
+__global__ void dequant_rowwise_int8_to_fp16_kernel(const std::int8_t* __restrict__ w,
+                                                    const float* __restrict__ scales,
+                                                    half* __restrict__ out, int rows, int cols) {
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const float scale = scales[row];
+  const std::int8_t* src = w + static_cast<std::size_t>(row) * cols;
+  half* dst = out + static_cast<std::size_t>(row) * cols;
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    dst[col] = __float2half(scale * static_cast<float>(src[col]));
+  }
+}
+
+void launch_dequant_weight_rowwise_to_fp16(const std::int8_t* w, const float* scales, half* out,
+                                           int rows, int cols, bool int4, cudaStream_t stream) {
+  constexpr int kThreads = 256;
+  if (int4) {
+    dequant_rowwise_int4_to_fp16_kernel<<<rows, kThreads, 0, stream>>>(w, scales, out, rows, cols,
+                                                                      (cols + 1) / 2);
+  } else {
+    dequant_rowwise_int8_to_fp16_kernel<<<rows, kThreads, 0, stream>>>(w, scales, out, rows, cols);
+  }
+}
+
 }  // namespace kernels
