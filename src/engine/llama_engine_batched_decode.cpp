@@ -1004,6 +1004,12 @@ void LlamaEngine::run_batch_bench(const std::vector<int>& prompt, int max_new) {
   }
 
   std::printf(
+      // The argument to --batch-bench is max_new, not a batch size: the batch
+      // sizes are the fixed sweep below. At a small max_new every row is
+      // dominated by its prefill and the decode numbers are meaningless -- 4
+      // tokens per sequence reports roughly a quarter of what 32 does. Use 32
+      // or more, and mind that B*(prompt+max_new) has to fit max_context or the
+      // larger batches are silently skipped.
       "batch throughput bench: prompt=%zu max_new=%d temp=%.2f (decode tokens/sec, eos disabled)\n",
       prompt.size(), max_new, bench_temp);
   std::printf("  %4s  %14s  %14s  %8s\n", "B", "serial_tok/s", "batched_tok/s", "speedup");

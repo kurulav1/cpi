@@ -312,6 +312,8 @@ ParsedArgs parse_args(int argc, char** argv) {
     } else if (arg == "--scheduler-check") {
       args.scheduler_check = std::stoi(need_val("--scheduler-check"));
     } else if (arg == "--batch-bench") {
+      // Value is max_new per sequence, not a batch size; the batch sizes are a
+      // fixed sweep. Small values are prefill-dominated, so use 32 or more.
       args.batch_bench = std::stoi(need_val("--batch-bench"));
     } else if (arg == "--dump-tokenizer-meta") {
       args.dump_tokenizer_meta = true;
