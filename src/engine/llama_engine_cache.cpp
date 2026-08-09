@@ -1205,6 +1205,26 @@ void LlamaEngine::init_layer_cache() {
               << " sync_wait_ms=" << static_cast<long>(t_sync_ms) << " layers=" << built << "\n";
   }
   cached_layer_count_ = built;
+
+  // Size the prefill scratch now rather than on the first prompt. A packed
+  // weight has no fp16 form for cuBLAS, so prefill expands the largest of them
+  // into this buffer -- and growing it there costs a stream sync plus a
+  // few-hundred-MB cudaMalloc on the very request whose latency matters most.
+  // Steady-state prefill is unaffected; this is purely first-token latency.
+  if (built > 0 && !layer_cache_.empty()) {
+    std::size_t widest = 0;
+    for (const auto& lw : layer_cache_) {
+      for (const PackedWeight* w :
+           {&lw.wqkv_packed, &lw.wq_packed, &lw.wk_packed, &lw.wv_packed, &lw.wo_packed,
+            &lw.w13_packed, &lw.w2_packed}) {
+        if (!w->active()) continue;
+        widest = std::max(widest, static_cast<std::size_t>(w->rows) *
+                                      static_cast<std::size_t>(w->cols) * sizeof(__half));
+      }
+    }
+    if (widest > 0) ensure_prefill_wdq(widest, transfer_stream_);
+  }
+
   cached_int8_proj_enabled_ = !tq3_enabled_ && lowbit_streaming_enabled(options_) && (built > 0);
   layer_cache_.resize(static_cast<std::size_t>(cached_layer_count_));
   layer_cache_i8_.resize(static_cast<std::size_t>(cached_layer_count_));

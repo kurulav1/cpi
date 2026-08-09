@@ -43,99 +43,138 @@ __device__ __forceinline__ void get_scale_min_k4(int j, const std::uint8_t* q, s
   }
 }
 
-// One super-block per thread block; threads split the 256 outputs. Each type
-// reads its own header, so the block pointer is derived from blockIdx rather
-// than walked, which is what makes the whole thing parallel.
-__global__ void dequant_q4_k_kernel(const std::uint8_t* __restrict__ base, __half* __restrict__ out,
-                                    std::size_t blocks) {
-  const std::size_t b = blockIdx.x;
-  if (b >= blocks) return;
-  const std::uint8_t* p = base + b * model::kquant::kQ4KBlockBytes;
-  std::uint16_t dh, mh;
-  memcpy(&dh, p, 2);
-  memcpy(&mh, p + 2, 2);
-  const float d = half_bits_to_float(dh);
-  const float dmin = half_bits_to_float(mh);
-  const std::uint8_t* scales = p + 4;
-  const std::uint8_t* qs = p + 16;
-  __half* y = out + b * kSuperBlock;
+__device__ __forceinline__ std::uint32_t byte_at(std::uint32_t w, int i) {
+  return (w >> (8 * i)) & 0xFFu;
+}
 
-  for (int i = threadIdx.x; i < static_cast<int>(kSuperBlock); i += blockDim.x) {
-    const int j = i / 64;            // which 64-wide half-group
-    const int rem = i % 64;          // position inside it
-    const int is = 2 * j + (rem / 32);  // sub-block index for the scale pair
-    const int l = rem % 32;
-    std::uint8_t sc, m;
-    get_scale_min_k4(is, scales, &sc, &m);
-    const std::uint8_t byte = qs[j * 32 + l];
-    const int q = (rem < 32) ? (byte & 0x0F) : (byte >> 4);
-    y[i] = __float2half(d * sc * static_cast<float>(q) - dmin * m);
+__device__ __forceinline__ void scale_min_from_hdr(int idx, std::uint32_t y, std::uint32_t z,
+                                                   std::uint32_t w32, float* sc, float* m) {
+  if (idx < 4) {
+    *sc = static_cast<float>(byte_at(y, idx) & 63u);
+    *m = static_cast<float>(byte_at(z, idx) & 63u);
+  } else {
+    const std::uint32_t a = byte_at(w32, idx - 4);  // q[idx + 4]
+    const std::uint32_t b = byte_at(y, idx - 4);    // q[idx - 4]
+    const std::uint32_t c = byte_at(z, idx - 4);    // q[idx]
+    *sc = static_cast<float>((a & 0x0Fu) | ((b >> 6) << 4));
+    *m = static_cast<float>((a >> 4) | ((c >> 6) << 4));
   }
 }
 
-__global__ void dequant_q5_k_kernel(const std::uint8_t* __restrict__ base, __half* __restrict__ out,
-                                    std::size_t blocks) {
-  const std::size_t b = blockIdx.x;
+// One warp per super-block, each lane taking a 4-byte slice of the quantized
+// payload -- 8 values, written as two 8-byte stores.
+//
+// This replaced a per-element version that re-decoded the 6-bit scale fields and
+// reloaded d/dmin for every weight, the same cost the matvec used to pay. It
+// matters beyond load time: prefill expands whole weights through this path, and
+// that showed up as a fixed ~80 ms per prefill against a ~14 ms bandwidth
+// budget.
+//
+// Arithmetic per element is unchanged, so the result stays bit-identical to the
+// host reference that kquant_dequant_test gates against.
+template <KQuantType TYPE>
+__global__ void dequant_kquant_vec_kernel(const std::uint8_t* __restrict__ base,
+                                          __half* __restrict__ out, std::size_t blocks) {
+  const int warp = static_cast<int>(threadIdx.x) >> 5;
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const std::size_t b = static_cast<std::size_t>(blockIdx.x) * 8 + warp;
   if (b >= blocks) return;
-  const std::uint8_t* p = base + b * model::kquant::kQ5KBlockBytes;
-  std::uint16_t dh, mh;
-  memcpy(&dh, p, 2);
-  memcpy(&mh, p + 2, 2);
-  const float d = half_bits_to_float(dh);
-  const float dmin = half_bits_to_float(mh);
-  const std::uint8_t* scales = p + 4;
-  const std::uint8_t* qh = p + 16;
-  const std::uint8_t* ql = p + 48;
+
+  std::size_t block_bytes;
+  if (TYPE == KQuantType::Q4_K) {
+    block_bytes = model::kquant::kQ4KBlockBytes;
+  } else if (TYPE == KQuantType::Q5_K) {
+    block_bytes = model::kquant::kQ5KBlockBytes;
+  } else {
+    block_bytes = model::kquant::kQ6KBlockBytes;
+  }
+  const std::uint8_t* p = base + b * block_bytes;
   __half* y = out + b * kSuperBlock;
 
-  for (int i = threadIdx.x; i < static_cast<int>(kSuperBlock); i += blockDim.x) {
-    const int j = i / 64;
-    const int rem = i % 64;
-    const int is = 2 * j + (rem / 32);
-    const int l = rem % 32;
-    std::uint8_t sc, m;
-    get_scale_min_k4(is, scales, &sc, &m);
-    const std::uint8_t byte = ql[j * 32 + l];
-    // The high bit for this position lives in qh, two bits per 64-wide group.
-    const std::uint8_t hbit = static_cast<std::uint8_t>(1u << (2 * j + (rem / 32)));
-    const int base_q = (rem < 32) ? (byte & 0x0F) : (byte >> 4);
-    const int q = base_q + ((qh[l] & hbit) ? 16 : 0);
-    y[i] = __float2half(d * sc * static_cast<float>(q) - dmin * m);
-  }
-}
+  float lo[4];
+  float hi[4];
+  int off_lo;
+  int off_hi;
 
-__global__ void dequant_q6_k_kernel(const std::uint8_t* __restrict__ base, __half* __restrict__ out,
-                                    std::size_t blocks) {
-  const std::size_t b = blockIdx.x;
-  if (b >= blocks) return;
-  const std::uint8_t* p = base + b * model::kquant::kQ6KBlockBytes;
-  const std::uint8_t* ql = p;
-  const std::uint8_t* qh = p + 128;
-  const auto* sc = reinterpret_cast<const std::int8_t*>(p + 192);
-  std::uint16_t dh;
-  memcpy(&dh, p + 208, 2);
-  const float d = half_bits_to_float(dh);
-  __half* y = out + b * kSuperBlock;
-
-  for (int i = threadIdx.x; i < static_cast<int>(kSuperBlock); i += blockDim.x) {
-    const int n = i / 128;      // which 128-wide half
-    const int rem = i % 128;    // position within it
-    const int quarter = rem / 32;
-    const int l = rem % 32;
-    const std::uint8_t* qln = ql + n * 64;
-    const std::uint8_t* qhn = qh + n * 32;
-    const std::int8_t* scn = sc + n * 8;
-    // ggml's order within a 128-group: quarters 0,1 take the low nibbles of
-    // ql[l] and ql[l+32]; quarters 2,3 take their high nibbles. So the nibble
-    // half comes from the high bit of `quarter` and the ql offset from its low
-    // bit -- swapping the two is undetectable until index 32.
-    const int lo_hi = quarter >> 1;      // 0: low nibble, 1: high nibble
-    const int half_off = (quarter & 1) * 32;
-    const int q = static_cast<int>(lo_hi ? (qln[l + half_off] >> 4) : (qln[l + half_off] & 0x0F)) |
-                  (((qhn[l] >> (2 * quarter)) & 3) << 4);
-    y[i] = __float2half(d * static_cast<float>(scn[quarter * 2 + (l / 16)]) *
-                        static_cast<float>(q - 32));
+  if (TYPE == KQuantType::Q6_K) {
+    const int n = lane >> 4;
+    const int rest = (lane << 2) & 63;
+    const int h = rest >> 5;
+    const int l0 = rest & 31;
+    const std::uint8_t* qlp = p + (lane << 2);
+    const std::uint32_t qw =
+        static_cast<std::uint32_t>(*reinterpret_cast<const std::uint16_t*>(qlp)) |
+        (static_cast<std::uint32_t>(*reinterpret_cast<const std::uint16_t*>(qlp + 2)) << 16);
+    const std::uint8_t* qhp = p + 128 + (n << 5) + l0;
+    const std::uint32_t hw =
+        static_cast<std::uint32_t>(*reinterpret_cast<const std::uint16_t*>(qhp)) |
+        (static_cast<std::uint32_t>(*reinterpret_cast<const std::uint16_t*>(qhp + 2)) << 16);
+    const int sbase = 192 + (n << 3) + (l0 >> 4);
+    const float scl =
+        static_cast<float>(*reinterpret_cast<const std::int8_t*>(p + sbase + (h << 1)));
+    const float sch =
+        static_cast<float>(*reinterpret_cast<const std::int8_t*>(p + sbase + ((2 + h) << 1)));
+    std::uint16_t dbits;
+    memcpy(&dbits, p + 208, 2);
+    const float d = half_bits_to_float(dbits);
+    const int sl = 2 * h;
+    const int sh = 4 + 2 * h;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      const std::uint32_t byte = (qw >> (8 * k)) & 0xFFu;
+      const std::uint32_t hb = (hw >> (8 * k)) & 0xFFu;
+      const int qlo = static_cast<int>((byte & 0x0Fu) | (((hb >> sl) & 3u) << 4)) - 32;
+      const int qhi = static_cast<int>((byte >> 4) | (((hb >> sh) & 3u) << 4)) - 32;
+      lo[k] = d * scl * static_cast<float>(qlo);
+      hi[k] = d * sch * static_cast<float>(qhi);
+    }
+    off_lo = (n << 7) + (h << 5) + l0;
+    off_hi = off_lo + 64;
+  } else {
+    const uint4 hdr = *reinterpret_cast<const uint4*>(p);
+    const float d = half_bits_to_float(static_cast<std::uint16_t>(hdr.x & 0xFFFFu));
+    const float dmin = half_bits_to_float(static_cast<std::uint16_t>(hdr.x >> 16));
+    const int j = lane >> 3;
+    const int t = lane & 7;
+    const int qoff = (TYPE == KQuantType::Q4_K) ? 16 : 48;
+    const std::uint32_t qw = *reinterpret_cast<const std::uint32_t*>(p + qoff + (lane << 2));
+    std::uint32_t hw = 0;
+    if (TYPE == KQuantType::Q5_K) {
+      hw = *reinterpret_cast<const std::uint32_t*>(p + 16 + (t << 2));
+    }
+    float sc0, m0, sc1, m1;
+    scale_min_from_hdr(2 * j, hdr.y, hdr.z, hdr.w, &sc0, &m0);
+    scale_min_from_hdr(2 * j + 1, hdr.y, hdr.z, hdr.w, &sc1, &m1);
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      const std::uint32_t byte = (qw >> (8 * k)) & 0xFFu;
+      std::uint32_t qlo = byte & 0x0Fu;
+      std::uint32_t qhi = byte >> 4;
+      if (TYPE == KQuantType::Q5_K) {
+        const std::uint32_t hb = (hw >> (8 * k)) & 0xFFu;
+        qlo |= ((hb >> (2 * j)) & 1u) << 4;
+        qhi |= ((hb >> (2 * j + 1)) & 1u) << 4;
+      }
+      lo[k] = d * sc0 * static_cast<float>(qlo) - dmin * m0;
+      hi[k] = d * sc1 * static_cast<float>(qhi) - dmin * m1;
+    }
+    off_lo = (j << 6) + (t << 2);
+    off_hi = off_lo + 32;
   }
+
+  // Four halves per store; the offsets are always a multiple of four.
+  const __half2 lo0 = __floats2half2_rn(lo[0], lo[1]);
+  const __half2 lo1 = __floats2half2_rn(lo[2], lo[3]);
+  const __half2 hi0 = __floats2half2_rn(hi[0], hi[1]);
+  const __half2 hi1 = __floats2half2_rn(hi[2], hi[3]);
+  uint2 vlo;
+  uint2 vhi;
+  memcpy(&vlo.x, &lo0, 4);
+  memcpy(&vlo.y, &lo1, 4);
+  memcpy(&vhi.x, &hi0, 4);
+  memcpy(&vhi.y, &hi1, 4);
+  *reinterpret_cast<uint2*>(y + off_lo) = vlo;
+  *reinterpret_cast<uint2*>(y + off_hi) = vhi;
 }
 
 }  // namespace
@@ -210,24 +249,6 @@ __device__ __forceinline__ float kquant_value(const std::uint8_t* p, KQuantType 
 // scale bytes arrive as part of a single 16-byte load, so indexing them through
 // a local array would spill to local memory for a runtime index; shifting the
 // registers keeps it in registers.
-__device__ __forceinline__ std::uint32_t byte_at(std::uint32_t w, int i) {
-  return (w >> (8 * i)) & 0xFFu;
-}
-
-__device__ __forceinline__ void scale_min_from_hdr(int idx, std::uint32_t y, std::uint32_t z,
-                                                   std::uint32_t w32, float* sc, float* m) {
-  if (idx < 4) {
-    *sc = static_cast<float>(byte_at(y, idx) & 63u);
-    *m = static_cast<float>(byte_at(z, idx) & 63u);
-  } else {
-    const std::uint32_t a = byte_at(w32, idx - 4);  // q[idx + 4]
-    const std::uint32_t b = byte_at(y, idx - 4);    // q[idx - 4]
-    const std::uint32_t c = byte_at(z, idx - 4);    // q[idx]
-    *sc = static_cast<float>((a & 0x0Fu) | ((b >> 6) << 4));
-    *m = static_cast<float>((a >> 4) | ((c >> 6) << 4));
-  }
-}
-
 __device__ __forceinline__ float2 load_x4(const __half* p, float2* second) {
   // Four contiguous halves as one 8-byte load. Offsets into x are always a
   // multiple of four halves here, so the 8-byte alignment holds.
@@ -563,17 +584,17 @@ __global__ void kquant_matvec_kernel(const std::uint8_t* __restrict__ w, KQuantT
 
 void launch_dequant_kquant(const std::uint8_t* blocks_in, KQuantType type, std::size_t blocks,
                            __half* out, cudaStream_t stream) {
-  constexpr int kThreads = 128;
-  const dim3 grid(static_cast<unsigned>(blocks));
+  constexpr int kThreads = 256;  // 8 warps, one super-block each
+  const unsigned grid = static_cast<unsigned>((blocks + 7) / 8);
   switch (type) {
     case KQuantType::Q4_K:
-      dequant_q4_k_kernel<<<grid, kThreads, 0, stream>>>(blocks_in, out, blocks);
+      dequant_kquant_vec_kernel<KQuantType::Q4_K><<<grid, kThreads, 0, stream>>>(blocks_in, out, blocks);
       break;
     case KQuantType::Q5_K:
-      dequant_q5_k_kernel<<<grid, kThreads, 0, stream>>>(blocks_in, out, blocks);
+      dequant_kquant_vec_kernel<KQuantType::Q5_K><<<grid, kThreads, 0, stream>>>(blocks_in, out, blocks);
       break;
     case KQuantType::Q6_K:
-      dequant_q6_k_kernel<<<grid, kThreads, 0, stream>>>(blocks_in, out, blocks);
+      dequant_kquant_vec_kernel<KQuantType::Q6_K><<<grid, kThreads, 0, stream>>>(blocks_in, out, blocks);
       break;
   }
 }
