@@ -639,6 +639,9 @@ private:
   void* d_norm_out_ = nullptr;        // Final RMSNorm scale vector on device.
   void* d_norm_out_bias_ = nullptr;   // Optional final norm bias [hidden].
   void* d_lm_head_ = nullptr;         // LM-head projection weight matrix on device.
+  // The head in its container's k-quant blocks; when active d_lm_head_ is never
+  // allocated, since the head is read whole on every token.
+  PackedWeight lm_head_packed_;
   // int8 LM head (weight-only). An 8B's LM head is 1.05 GB in fp16; 22% of everything an
   // int4 8B reads per token. Built only when weight quantization is on. The fp16 copy is kept:
   // the batched-decode path drives the LM head through cuBLAS and still needs it.
@@ -672,11 +675,12 @@ private:
   // Uploads a tensor's packed k-quant blocks and records them in `out`. No-op
   // when the container cannot serve this tensor packed, which leaves the fp16
   // path in charge.
-  void stage_packed_weight(const std::string& name, PackedWeight* out);
+  void stage_packed_weight(const std::string& name, PackedWeight* out, int mask_bit);
 
   // Same, for a matrix CPI keeps fused that the container stores as two
   // row-blocks. Declines unless both halves are packed the same way.
-  void stage_packed_pair(const std::string& first, const std::string& second, PackedWeight* out);
+  void stage_packed_pair(const std::string& first, const std::string& second,
+                         PackedWeight* out, int mask_bit);
 
   const void* dequant_packed_for_gemm(const PackedWeight& w, cudaStream_t stream);
 

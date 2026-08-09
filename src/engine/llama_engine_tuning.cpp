@@ -332,6 +332,10 @@ void LlamaEngine::tune_resident_projection_backends() {
     resident_custom_wo_ = wo_custom_ms < wo_cublas_ms * 0.98;
   }
 
+  // A packed head is not served by either candidate here, so there is nothing
+  // to choose between and no fp16 buffer to benchmark against.
+  if (lm_head_packed_.active()) return;
+
   const double lm_cublas_ms = benchmark_cuda_launch(compute_stream_, warmup, iters, [&] {
     detail::dispatch_linear_rowmajor_weight(
         cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,

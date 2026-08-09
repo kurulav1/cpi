@@ -322,9 +322,12 @@ void LlamaEngine::batched_lm_head(int batch, int hidden, int vocab) {
         cudaMalloc(&d_batch_logits_, static_cast<std::size_t>(batch) * vocab * sizeof(float)));
     d_batch_logits_cap_ = batch;
   }
+    const void* head_src = lm_head_packed_.active()
+                               ? dequant_packed_for_gemm(lm_head_packed_, compute_stream_)
+                               : static_cast<const void*>(d_lm_head_);
   detail::dispatch_linear_rowmajor_weight(
       cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,
-      d_lm_head_, d_x_norm_, d_batch_logits_, vocab, hidden, batch, CUDA_R_32F);
+      const_cast<void*>(head_src), d_x_norm_, d_batch_logits_, vocab, hidden, batch, CUDA_R_32F);
   if (d_lm_head_bias_) {
     for (int b = 0; b < batch; ++b) {
       kernels::launch_add_bias_inplace_float_from_half(

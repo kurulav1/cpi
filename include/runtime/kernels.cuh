@@ -1262,6 +1262,10 @@ void launch_dequant_kquant(const std::uint8_t* blocks_in, KQuantType type, std::
 // inside the kernel, so the weight never exists as fp16 and a quantized model stays
 // resident at its file size. cols must be a multiple of 256. Gated by
 // kquant_matvec_test against a host dequant + fp32 dot.
+// Same, writing fp32. The LM head produces logits rather than activations.
+void launch_kquant_matvec_f32(const std::uint8_t* w, KQuantType type, const half* x, float* y,
+                              int rows, int cols, cudaStream_t stream);
+
 void launch_kquant_matvec(const std::uint8_t* w, KQuantType type, const half* x, half* y, int rows,
                           int cols, cudaStream_t stream);
 

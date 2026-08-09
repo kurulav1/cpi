@@ -246,7 +246,13 @@ bool LlamaEngine::prefill_attention_tensorcore(const void* q, const void* k_laye
 
 void LlamaEngine::project_lm_head_logits(const __half* x_norm, float* logits) {
   const auto& cfg = weights_.config();
-  if (lm_head_int8_ && d_lm_head_i8_ != nullptr) {
+  if (lm_head_packed_.active()) {
+    ++packed_matvec_calls_;
+    kernels::launch_kquant_matvec_f32(static_cast<const std::uint8_t*>(lm_head_packed_.data),
+                                      static_cast<kernels::KQuantType>(lm_head_packed_.kind), x_norm,
+                                      logits, lm_head_packed_.rows, lm_head_packed_.cols,
+                                      compute_stream_);
+  } else if (lm_head_int8_ && d_lm_head_i8_ != nullptr) {
     kernels::launch_weight_only_int8_gemv_f32(d_lm_head_i8_, d_lm_head_i8_scales_, x_norm, logits,
                                               cfg.vocab_size, cfg.hidden_size, compute_stream_);
   } else {

@@ -33,10 +33,9 @@ namespace {
 // Whether a tensor will be served packed, answerable before allocation so the
 // fp16 buffer can be skipped rather than allocated and left unread.
 int kquant_packed_mask();
-int kquant_packed_mask_fwd() { return kquant_packed_mask(); }
 
 bool will_pack(const model::WeightLoader& w, const std::string& name, int bit) {
-  if ((kquant_packed_mask_fwd() & bit) == 0 || !w.is_gguf() || w.gguf() == nullptr) return false;
+  if ((kquant_packed_mask() & bit) == 0 || !w.is_gguf() || w.gguf() == nullptr) return false;
   return w.gguf()->packed_kquant(name).valid();
 }
 
@@ -108,7 +107,8 @@ bool LlamaEngine::tq_cached_preflight_layers(int layers, std::string* reason) co
 }
 
 void LlamaEngine::stage_packed_pair(const std::string& first, const std::string& second,
-                                    PackedWeight* out) {
+                                    PackedWeight* out, int mask_bit) {
+  if ((kquant_packed_mask() & mask_bit) == 0) return;
   if (out == nullptr || !weights_.is_gguf() || weights_.gguf() == nullptr) return;
   const auto a = weights_.gguf()->packed_kquant(first);
   const auto b = weights_.gguf()->packed_kquant(second);
@@ -131,7 +131,9 @@ void LlamaEngine::stage_packed_pair(const std::string& first, const std::string&
   out->cols = a.cols;
 }
 
-void LlamaEngine::stage_packed_weight(const std::string& name, PackedWeight* out) {
+void LlamaEngine::stage_packed_weight(const std::string& name, PackedWeight* out,
+                                      int mask_bit) {
+  if ((kquant_packed_mask() & mask_bit) == 0) return;
   if (out == nullptr || !weights_.is_gguf() || weights_.gguf() == nullptr) return;
   const auto pk = weights_.gguf()->packed_kquant(name);
   if (!pk.valid() || pk.rows <= 0 || pk.cols <= 0) return;
@@ -871,15 +873,9 @@ void LlamaEngine::init_layer_cache() {
       // blocks on the device so decode can multiply them directly. Staged
       // alongside the fp16 copy for now -- correctness first; dropping the fp16
       // allocation is the step that actually saves the memory.
-      if (kquant_packed_mask() & 1) {
-        stage_packed_weight(p + ".feed_forward.w2", &lw.w2_packed);
-      }
-      if (kquant_packed_mask() & 2) {
-        stage_packed_weight(p + ".attention.wo", &lw.wo_packed);
-      }
-      if (kquant_packed_mask() & 4) {
-        stage_packed_pair(p + ".feed_forward.w1", p + ".feed_forward.w3", &lw.w13_packed);
-      }
+      stage_packed_weight(p + ".feed_forward.w2", &lw.w2_packed, 1);
+      stage_packed_weight(p + ".attention.wo", &lw.wo_packed, 2);
+      stage_packed_pair(p + ".feed_forward.w1", p + ".feed_forward.w3", &lw.w13_packed, 4);
 
       CUDA_CHECK(cudaStreamSynchronize(transfer_stream_));
       CUDA_CHECK(cudaStreamSynchronize(compute_stream_));

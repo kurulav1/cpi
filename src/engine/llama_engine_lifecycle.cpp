@@ -142,10 +142,16 @@ void LlamaEngine::load_static_weights() {
   }
 
   const std::string out_name = weights_.has_tensor("output.weight") ? "output.weight" : emb_name;
-  const std::size_t out_bytes = weights_.tensor_bytes(out_name);
-  CUDA_CHECK(cudaMalloc(&d_lm_head_, out_bytes));
-  CUDA_CHECK(
-      cudaMemcpy(d_lm_head_, weights_.tensor_data(out_name), out_bytes, cudaMemcpyHostToDevice));
+  // The head is read in full for every token, so leaving it fp16 costs more
+  // bandwidth than any single layer matrix. It carries no RoPE permutation, so
+  // it can be served packed as soon as the container offers it.
+  stage_packed_weight(out_name, &lm_head_packed_, 8);
+  if (!lm_head_packed_.active()) {
+    const std::size_t out_bytes = weights_.tensor_bytes(out_name);
+    CUDA_CHECK(cudaMalloc(&d_lm_head_, out_bytes));
+    CUDA_CHECK(
+        cudaMemcpy(d_lm_head_, weights_.tensor_data(out_name), out_bytes, cudaMemcpyHostToDevice));
+  }
 
   // Weight-only int8 LM head, when the user asked for a quantized model.
   //

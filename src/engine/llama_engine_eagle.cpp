@@ -264,7 +264,10 @@ void LlamaEngine::eagle_step(const __half* feature, const int* token_dev, int to
   if (!want_token) return;
   // Shared lm_head over the RAW draft hidden, then partitioned device argmax
   // straight into the chained-token slot; no host sync.
-  kernels::launch_rowmajor_half_gemv_f32(static_cast<const __half*>(d_lm_head_), d_eagle_x_,
+  const void* head_src = lm_head_packed_.active()
+                             ? dequant_packed_for_gemm(lm_head_packed_, s)
+                             : static_cast<const void*>(d_lm_head_);
+  kernels::launch_rowmajor_half_gemv_f32(static_cast<const __half*>(head_src), d_eagle_x_,
                                          d_eagle_logits_, cfg.vocab_size, H, s);
   kernels::launch_argmax_float(d_eagle_logits_, cfg.vocab_size, dtok_out, s, d_argmax_part_val_,
                                d_argmax_part_idx_, argmax_parts_);

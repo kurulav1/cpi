@@ -206,6 +206,198 @@ __device__ __forceinline__ float kquant_value(const std::uint8_t* p, KQuantType 
 // unpacked on the fly and multiplied into x. This is the point of the whole
 // exercise -- the weight never exists as fp16 anywhere, so a Q4_K_M model is
 // resident at its file size instead of ~3x it.
+// Decodes one (scale, min) pair straight out of the header registers. The 12
+// scale bytes arrive as part of a single 16-byte load, so indexing them through
+// a local array would spill to local memory for a runtime index; shifting the
+// registers keeps it in registers.
+__device__ __forceinline__ std::uint32_t byte_at(std::uint32_t w, int i) {
+  return (w >> (8 * i)) & 0xFFu;
+}
+
+__device__ __forceinline__ void scale_min_from_hdr(int idx, std::uint32_t y, std::uint32_t z,
+                                                   std::uint32_t w32, float* sc, float* m) {
+  if (idx < 4) {
+    *sc = static_cast<float>(byte_at(y, idx) & 63u);
+    *m = static_cast<float>(byte_at(z, idx) & 63u);
+  } else {
+    const std::uint32_t a = byte_at(w32, idx - 4);  // q[idx + 4]
+    const std::uint32_t b = byte_at(y, idx - 4);    // q[idx - 4]
+    const std::uint32_t c = byte_at(z, idx - 4);    // q[idx]
+    *sc = static_cast<float>((a & 0x0Fu) | ((b >> 6) << 4));
+    *m = static_cast<float>((a >> 4) | ((c >> 6) << 4));
+  }
+}
+
+__device__ __forceinline__ float2 load_x4(const __half* p, float2* second) {
+  // Four contiguous halves as one 8-byte load. Offsets into x are always a
+  // multiple of four halves here, so the 8-byte alignment holds.
+  const uint2 v = *reinterpret_cast<const uint2*>(p);
+  const float2 a = __half22float2(*reinterpret_cast<const __half2*>(&v.x));
+  *second = __half22float2(*reinterpret_cast<const __half2*>(&v.y));
+  return a;
+}
+
+// One super-block's contribution to one row, given this lane's slice of x
+// already in registers. Splitting it out is what lets a block walk several rows
+// against a single load of x.
+template <KQuantType TYPE>
+__device__ __forceinline__ float kq_block_dot(const std::uint8_t* __restrict__ p, int lane,
+                                              const float* xa, const float* xh) {
+  if (TYPE == KQuantType::Q6_K) {
+    const int n = lane >> 4;
+    const int rest = (lane << 2) & 63;
+    const int h = rest >> 5;
+    const int l0 = rest & 31;
+
+    const std::uint8_t* qlp = p + (lane << 2);
+    const std::uint32_t qw =
+        static_cast<std::uint32_t>(*reinterpret_cast<const std::uint16_t*>(qlp)) |
+        (static_cast<std::uint32_t>(*reinterpret_cast<const std::uint16_t*>(qlp + 2)) << 16);
+    const std::uint8_t* qhp = p + 128 + (n << 5) + l0;
+    const std::uint32_t hw =
+        static_cast<std::uint32_t>(*reinterpret_cast<const std::uint16_t*>(qhp)) |
+        (static_cast<std::uint32_t>(*reinterpret_cast<const std::uint16_t*>(qhp + 2)) << 16);
+
+    const int sbase = 192 + (n << 3) + (l0 >> 4);
+    const float scl = static_cast<float>(*reinterpret_cast<const std::int8_t*>(p + sbase + (h << 1)));
+    const float sch =
+        static_cast<float>(*reinterpret_cast<const std::int8_t*>(p + sbase + ((2 + h) << 1)));
+    std::uint16_t dbits;
+    memcpy(&dbits, p + 208, 2);
+    const float d = half_bits_to_float(dbits);
+
+    const int sl = 2 * h;
+    const int sh = 4 + 2 * h;
+    float sq_lo = 0.0f;
+    float sq_hi = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      const std::uint32_t byte = (qw >> (8 * k)) & 0xFFu;
+      const std::uint32_t hb = (hw >> (8 * k)) & 0xFFu;
+      const int qlo = static_cast<int>((byte & 0x0Fu) | (((hb >> sl) & 3u) << 4)) - 32;
+      const int qhi = static_cast<int>((byte >> 4) | (((hb >> sh) & 3u) << 4)) - 32;
+      sq_lo += static_cast<float>(qlo) * xa[k];
+      sq_hi += static_cast<float>(qhi) * xh[k];
+    }
+    return d * (scl * sq_lo + sch * sq_hi);
+  }
+
+  const uint4 hdr = *reinterpret_cast<const uint4*>(p);
+  const float d = half_bits_to_float(static_cast<std::uint16_t>(hdr.x & 0xFFFFu));
+  const float dmin = half_bits_to_float(static_cast<std::uint16_t>(hdr.x >> 16));
+  const int j = lane >> 3;
+  const int t = lane & 7;
+
+  const int qoff = (TYPE == KQuantType::Q4_K) ? 16 : 48;
+  const std::uint32_t qw = *reinterpret_cast<const std::uint32_t*>(p + qoff + (lane << 2));
+  std::uint32_t hw = 0;
+  if (TYPE == KQuantType::Q5_K) {
+    hw = *reinterpret_cast<const std::uint32_t*>(p + 16 + (t << 2));
+  }
+
+  float sc0, m0, sc1, m1;
+  scale_min_from_hdr(2 * j, hdr.y, hdr.z, hdr.w, &sc0, &m0);
+  scale_min_from_hdr(2 * j + 1, hdr.y, hdr.z, hdr.w, &sc1, &m1);
+
+  float sq0 = 0.0f;
+  float sx0 = 0.0f;
+  float sq1 = 0.0f;
+  float sx1 = 0.0f;
+#pragma unroll
+  for (int k = 0; k < 4; ++k) {
+    const std::uint32_t byte = (qw >> (8 * k)) & 0xFFu;
+    std::uint32_t qlo = byte & 0x0Fu;
+    std::uint32_t qhi = byte >> 4;
+    if (TYPE == KQuantType::Q5_K) {
+      const std::uint32_t hb = (hw >> (8 * k)) & 0xFFu;
+      qlo |= ((hb >> (2 * j)) & 1u) << 4;
+      qhi |= ((hb >> (2 * j + 1)) & 1u) << 4;
+    }
+    sq0 += static_cast<float>(qlo) * xa[k];
+    sx0 += xa[k];
+    sq1 += static_cast<float>(qhi) * xh[k];
+    sx1 += xh[k];
+  }
+  // Scales are uniform across a 32-element group, so applying them to this
+  // lane's partial sums is the same arithmetic as applying them per weight.
+  return d * (sc0 * sq0 + sc1 * sq1) - dmin * (m0 * sx0 + m1 * sx1);
+}
+
+// Vector-load packed matvec. The scalar kernel was bound by load-instruction
+// issue rather than bandwidth: it fetched one byte of qs, one half of x and the
+// scale bytes separately for EVERY weight, roughly four loads per element.
+//
+// A warp owns one super-block and each lane takes a 4-byte slice of its
+// quantized payload, which is 8 weights (4 low nibbles, 4 high nibbles). Those
+// two runs of 4 always fall in exactly two 32-element scale groups, so scales
+// apply once per run rather than once per weight, and the whole 16-byte header
+// (d, dmin and all 12 scale bytes) arrives in one load.
+//
+// ROWS rows share each load of x, which is otherwise re-read once per row and
+// accounts for half the remaining load instructions.
+//
+// Q6_K blocks are 210 bytes, so consecutive blocks are only 2-byte aligned and
+// it uses uint16 pairs where the others use uint32.
+__device__ __forceinline__ void store_out(__half* p, float v) { *p = __float2half(v); }
+__device__ __forceinline__ void store_out(float* p, float v) { *p = v; }
+
+template <KQuantType TYPE, int ROWS, typename OutT>
+__global__ void kquant_matvec_vec_kernel(const std::uint8_t* __restrict__ w,
+                                         const __half* __restrict__ x, OutT* __restrict__ y,
+                                         int rows, int cols) {
+  const int blocks_per_row = cols / static_cast<int>(kSuperBlock);
+
+  std::size_t block_bytes;
+  if (TYPE == KQuantType::Q4_K) {
+    block_bytes = model::kquant::kQ4KBlockBytes;
+  } else if (TYPE == KQuantType::Q5_K) {
+    block_bytes = model::kquant::kQ5KBlockBytes;
+  } else {
+    block_bytes = model::kquant::kQ6KBlockBytes;
+  }
+  const std::size_t row_bytes = static_cast<std::size_t>(blocks_per_row) * block_bytes;
+
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int warp = static_cast<int>(threadIdx.x) >> 5;
+  // A warp owns a whole row and walks every super-block in it. Splitting one
+  // row across the block instead would need a __syncthreads and a shared-memory
+  // reduction per row, which costs more than it saves on the shallow matrices
+  // (wo walks only 16 super-blocks, against 56 for w2).
+  const int row = blockIdx.x * ROWS + warp;
+  if (row >= rows) return;
+
+  // This lane's two runs of four weights sit at fixed offsets inside every
+  // super-block, so the x offsets are loop-invariant.
+  int xo;
+  int xstride;
+  if (TYPE == KQuantType::Q6_K) {
+    const int rest = (lane << 2) & 63;
+    xo = ((lane >> 4) << 7) + ((rest >> 5) << 5) + (rest & 31);
+    xstride = 64;
+  } else {
+    xo = ((lane >> 3) << 6) + ((lane & 7) << 2);
+    xstride = 32;
+  }
+
+  const std::uint8_t* p = w + static_cast<std::size_t>(row) * row_bytes;
+  float acc = 0.0f;
+  for (int b = 0; b < blocks_per_row; ++b) {
+    const __half* xb = x + b * static_cast<int>(kSuperBlock);
+    float2 a1;
+    float2 h1;
+    const float2 a0 = load_x4(xb + xo, &a1);
+    const float2 h0 = load_x4(xb + xo + xstride, &h1);
+    const float xa[4] = {a0.x, a0.y, a1.x, a1.y};
+    const float xh[4] = {h0.x, h0.y, h1.x, h1.y};
+    acc += kq_block_dot<TYPE>(p, lane, xa, xh);
+    p += block_bytes;
+  }
+
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+  if (lane == 0) store_out(y + row, acc);
+}
+
 // Per-type packed matvec. The generic kernel above re-derives everything for
 // every weight: it branches on the runtime type, reloads d/dmin, and re-decodes
 // the packed 6-bit scale nibbles once per element. Since the block is exactly
@@ -361,24 +553,36 @@ void launch_dequant_kquant(const std::uint8_t* blocks_in, KQuantType type, std::
   }
 }
 
-void launch_kquant_matvec(const std::uint8_t* w, KQuantType type, const half* x, half* y, int rows,
-                          int cols, cudaStream_t stream) {
-  std::size_t block_bytes = model::kquant::kQ6KBlockBytes;
-  if (type == KQuantType::Q4_K) block_bytes = model::kquant::kQ4KBlockBytes;
-  if (type == KQuantType::Q5_K) block_bytes = model::kquant::kQ5KBlockBytes;
-  constexpr int kThreads = 256;  // one super-block wide, so a thread's slot is fixed
+template <typename OutT>
+static void launch_kquant_matvec_impl(const std::uint8_t* w, KQuantType type, const half* x, OutT* y,
+                                      int rows, int cols, cudaStream_t stream) {
+  constexpr int kThreads = 256;                 // 8 warps, one row each
+  constexpr int kRowsPerBlock = kThreads / 32;  // one row per warp
+  const int grid = (rows + kRowsPerBlock - 1) / kRowsPerBlock;
   switch (type) {
     case KQuantType::Q4_K:
-      kquant_matvec_fast_kernel<KQuantType::Q4_K><<<rows, kThreads, 0, stream>>>(w, x, y, rows, cols);
+      kquant_matvec_vec_kernel<KQuantType::Q4_K, kRowsPerBlock, OutT>
+          <<<grid, kThreads, 0, stream>>>(w, x, y, rows, cols);
       return;
     case KQuantType::Q5_K:
-      kquant_matvec_fast_kernel<KQuantType::Q5_K><<<rows, kThreads, 0, stream>>>(w, x, y, rows, cols);
+      kquant_matvec_vec_kernel<KQuantType::Q5_K, kRowsPerBlock, OutT>
+          <<<grid, kThreads, 0, stream>>>(w, x, y, rows, cols);
       return;
     case KQuantType::Q6_K:
-      kquant_matvec_fast_kernel<KQuantType::Q6_K><<<rows, kThreads, 0, stream>>>(w, x, y, rows, cols);
+      kquant_matvec_vec_kernel<KQuantType::Q6_K, kRowsPerBlock, OutT>
+          <<<grid, kThreads, 0, stream>>>(w, x, y, rows, cols);
       return;
   }
-  kquant_matvec_kernel<<<rows, kThreads, 0, stream>>>(w, type, block_bytes, x, y, rows, cols);
+}
+
+void launch_kquant_matvec(const std::uint8_t* w, KQuantType type, const half* x, half* y, int rows,
+                          int cols, cudaStream_t stream) {
+  launch_kquant_matvec_impl(w, type, x, y, rows, cols, stream);
+}
+
+void launch_kquant_matvec_f32(const std::uint8_t* w, KQuantType type, const half* x, float* y,
+                              int rows, int cols, cudaStream_t stream) {
+  launch_kquant_matvec_impl(w, type, x, y, rows, cols, stream);
 }
 
 }  // namespace kernels
