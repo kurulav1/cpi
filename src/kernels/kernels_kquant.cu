@@ -72,27 +72,14 @@ __device__ __forceinline__ void scale_min_from_hdr(int idx, std::uint32_t y, std
 //
 // Arithmetic per element is unchanged, so the result stays bit-identical to the
 // host reference that kquant_dequant_test gates against.
+// This lane's eight weights from one super-block, as values, plus where they sit
+// inside the block. Shared by the dequant kernel and the batched matmul so the
+// two cannot drift -- the matmul is trustworthy because this is the arithmetic
+// kquant_dequant_test gates bit-for-bit against the host.
 template <KQuantType TYPE>
-__global__ void dequant_kquant_vec_kernel(const std::uint8_t* __restrict__ base,
-                                          __half* __restrict__ out, std::size_t blocks) {
-  const int warp = static_cast<int>(threadIdx.x) >> 5;
-  const int lane = static_cast<int>(threadIdx.x) & 31;
-  const std::size_t b = static_cast<std::size_t>(blockIdx.x) * 8 + warp;
-  if (b >= blocks) return;
-
-  std::size_t block_bytes;
-  if (TYPE == KQuantType::Q4_K) {
-    block_bytes = model::kquant::kQ4KBlockBytes;
-  } else if (TYPE == KQuantType::Q5_K) {
-    block_bytes = model::kquant::kQ5KBlockBytes;
-  } else {
-    block_bytes = model::kquant::kQ6KBlockBytes;
-  }
-  const std::uint8_t* p = base + b * block_bytes;
-  __half* y = out + b * kSuperBlock;
-
-  float lo[4];
-  float hi[4];
+__device__ __forceinline__ void kq_block_values(const std::uint8_t* __restrict__ p, int lane,
+                                                float* lo, float* hi, int* out_off_lo,
+                                                int* out_off_hi) {
   int off_lo;
   int off_hi;
 
@@ -161,6 +148,33 @@ __global__ void dequant_kquant_vec_kernel(const std::uint8_t* __restrict__ base,
     off_lo = (j << 6) + (t << 2);
     off_hi = off_lo + 32;
   }
+  *out_off_lo = off_lo;
+  *out_off_hi = off_hi;
+}
+
+template <KQuantType TYPE>
+__global__ void dequant_kquant_vec_kernel(const std::uint8_t* __restrict__ base,
+                                          __half* __restrict__ out, std::size_t blocks) {
+  const int warp = static_cast<int>(threadIdx.x) >> 5;
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const std::size_t b = static_cast<std::size_t>(blockIdx.x) * 8 + warp;
+  if (b >= blocks) return;
+
+  std::size_t block_bytes;
+  if (TYPE == KQuantType::Q4_K) {
+    block_bytes = model::kquant::kQ4KBlockBytes;
+  } else if (TYPE == KQuantType::Q5_K) {
+    block_bytes = model::kquant::kQ5KBlockBytes;
+  } else {
+    block_bytes = model::kquant::kQ6KBlockBytes;
+  }
+  __half* y = out + b * kSuperBlock;
+
+  float lo[4];
+  float hi[4];
+  int off_lo;
+  int off_hi;
+  kq_block_values<TYPE>(base + b * block_bytes, lane, lo, hi, &off_lo, &off_hi);
 
   // Four halves per store; the offsets are always a multiple of four.
   const __half2 lo0 = __floats2half2_rn(lo[0], lo[1]);
@@ -597,6 +611,121 @@ void launch_dequant_kquant(const std::uint8_t* blocks_in, KQuantType type, std::
       dequant_kquant_vec_kernel<KQuantType::Q6_K><<<grid, kThreads, 0, stream>>>(blocks_in, out, blocks);
       break;
   }
+}
+
+// Batched packed matmul: y[b, n] = sum_k x[b, k] * W[n, k], with W left in its
+// k-quant blocks.
+//
+// The alternative is what prefill and batched decode did before: expand the
+// whole weight to fp16 and hand it to cuBLAS. That reads the packed weight once
+// but writes and then re-reads its fp16 form, roughly eight times the packed
+// bytes, which is why batch-64 decode ran at 137 tok/s against 323 for fp16.
+//
+// Here one block owns an output row and its eight warps split the row's
+// super-blocks. Each lane unpacks its eight weights once and reuses them across
+// a tile of BMAX batch elements, so the weight is read ceil(batch/BMAX) times
+// rather than once per element. That beats the expand-and-GEMM traffic while
+// ceil(batch/BMAX) stays under about eight; past that cuBLAS on the expanded
+// weight wins, and tensor cores widen the gap, so the launcher hands large
+// batches back to the caller.
+template <KQuantType TYPE, int BMAX>
+__global__ void kquant_matmul_kernel(const std::uint8_t* __restrict__ w,
+                                     const __half* __restrict__ x, __half* __restrict__ y, int rows,
+                                     int cols, int batch, int ldy) {
+  constexpr int kWarps = 8;
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int warp = static_cast<int>(threadIdx.x) >> 5;
+  const int blocks_per_row = cols / static_cast<int>(kSuperBlock);
+
+  std::size_t block_bytes;
+  if (TYPE == KQuantType::Q4_K) {
+    block_bytes = model::kquant::kQ4KBlockBytes;
+  } else if (TYPE == KQuantType::Q5_K) {
+    block_bytes = model::kquant::kQ5KBlockBytes;
+  } else {
+    block_bytes = model::kquant::kQ6KBlockBytes;
+  }
+  const std::uint8_t* rowp =
+      w + static_cast<std::size_t>(row) * static_cast<std::size_t>(blocks_per_row) * block_bytes;
+
+  __shared__ float parts[kWarps][BMAX];
+
+  for (int b0 = 0; b0 < batch; b0 += BMAX) {
+    const int bn = min(BMAX, batch - b0);
+    float acc[BMAX];
+#pragma unroll
+    for (int t = 0; t < BMAX; ++t) acc[t] = 0.0f;
+
+    const std::uint8_t* p = rowp + static_cast<std::size_t>(warp) * block_bytes;
+    for (int sb = warp; sb < blocks_per_row; sb += kWarps) {
+      float wlo[4];
+      float whi[4];
+      int off_lo;
+      int off_hi;
+      kq_block_values<TYPE>(p, lane, wlo, whi, &off_lo, &off_hi);
+      const int xbase = sb * static_cast<int>(kSuperBlock);
+      for (int t = 0; t < bn; ++t) {
+        const __half* xb = x + static_cast<std::size_t>(b0 + t) * static_cast<std::size_t>(cols) +
+                           xbase;
+        float2 a1;
+        float2 h1;
+        const float2 a0 = load_x4(xb + off_lo, &a1);
+        const float2 h0 = load_x4(xb + off_hi, &h1);
+        acc[t] += wlo[0] * a0.x + wlo[1] * a0.y + wlo[2] * a1.x + wlo[3] * a1.y + whi[0] * h0.x +
+                  whi[1] * h0.y + whi[2] * h1.x + whi[3] * h1.y;
+      }
+      p += block_bytes * kWarps;
+    }
+
+    for (int t = 0; t < bn; ++t) {
+      float v = acc[t];
+#pragma unroll
+      for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xFFFFFFFFu, v, off);
+      if (lane == 0) parts[warp][t] = v;
+    }
+    __syncthreads();
+    if (static_cast<int>(threadIdx.x) < bn) {
+      const int t = static_cast<int>(threadIdx.x);
+      float total = 0.0f;
+#pragma unroll
+      for (int k = 0; k < kWarps; ++k) total += parts[k][t];
+      // ldy, not rows: a split QKV writes into a row range of the fused output.
+      y[static_cast<std::size_t>(b0 + t) * static_cast<std::size_t>(ldy) + row] =
+          __float2half(total);
+    }
+    __syncthreads();
+  }
+}
+
+bool launch_kquant_matmul(const std::uint8_t* w, KQuantType type, const half* x, half* y, int rows,
+                          int cols, int batch, int ldy, cudaStream_t stream) {
+  // Above this the expanded-weight GEMM is cheaper, and it has tensor cores.
+  if (batch < 2 || batch > 64) return false;
+  constexpr int kThreads = 256;
+#define CPI_KQ_MM(BM)                                                             \
+  switch (type) {                                                                 \
+    case KQuantType::Q4_K:                                                        \
+      kquant_matmul_kernel<KQuantType::Q4_K, BM>                                  \
+          <<<rows, kThreads, 0, stream>>>(w, x, y, rows, cols, batch, ldy);            \
+      return true;                                                                \
+    case KQuantType::Q5_K:                                                        \
+      kquant_matmul_kernel<KQuantType::Q5_K, BM>                                  \
+          <<<rows, kThreads, 0, stream>>>(w, x, y, rows, cols, batch, ldy);            \
+      return true;                                                                \
+    case KQuantType::Q6_K:                                                        \
+      kquant_matmul_kernel<KQuantType::Q6_K, BM>                                  \
+          <<<rows, kThreads, 0, stream>>>(w, x, y, rows, cols, batch, ldy);            \
+      return true;                                                                \
+  }
+  if (batch <= 4) {
+    CPI_KQ_MM(4)
+  } else {
+    CPI_KQ_MM(16)
+  }
+#undef CPI_KQ_MM
+  return false;
 }
 
 template <typename OutT>

@@ -244,6 +244,32 @@ bool LlamaEngine::prefill_attention_tensorcore(const void* q, const void* k_laye
   return true;
 }
 
+bool LlamaEngine::packed_matmul(const PackedWeight& w, const void* x, void* y, int batch, int ldy,
+                                int row0, cudaStream_t stream) {
+  if (!w.active()) return false;
+  return kernels::launch_kquant_matmul(
+      static_cast<const std::uint8_t*>(w.data), static_cast<kernels::KQuantType>(w.kind),
+      static_cast<const __half*>(x), static_cast<__half*>(y) + row0, w.rows, w.cols, batch, ldy,
+      stream);
+}
+
+// Batched QKV off the packed blocks, in whichever shape this layer has. All or
+// nothing: a partial success would leave some row ranges unwritten.
+bool LlamaEngine::packed_qkv_matmul(const LayerDeviceWeights& lw, const void* x, void* y, int batch,
+                                    int ldy, cudaStream_t stream) {
+  if (lw.wqkv_packed.active()) {
+    return packed_matmul(lw.wqkv_packed, x, y, batch, ldy, 0, stream);
+  }
+  if (!lw.wq_packed.active() || !lw.wv_packed.active()) return false;
+  const int rows_q = lw.wq_packed.rows;
+  const int rows_k = lw.wk_packed.active() ? lw.wk_packed.rows : 0;
+  // Probe the first part before committing: the launcher declines batches it is
+  // not worth doing, and it must decline all three or none.
+  if (!packed_matmul(lw.wq_packed, x, y, batch, ldy, 0, stream)) return false;
+  if (rows_k > 0 && !packed_matmul(lw.wk_packed, x, y, batch, ldy, rows_q, stream)) return false;
+  return packed_matmul(lw.wv_packed, x, y, batch, ldy, rows_q + rows_k, stream);
+}
+
 bool LlamaEngine::packed_qkv_matvec(const LayerDeviceWeights& lw, const void* x_norm, void* qkv,
                                     cudaStream_t stream) {
   const auto run = [&](const PackedWeight& w, int row_offset) {

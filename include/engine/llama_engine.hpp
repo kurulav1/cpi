@@ -699,6 +699,14 @@ private:
   bool packed_qkv_matvec(const LayerDeviceWeights& lw, const void* x_norm, void* qkv,
                          cudaStream_t stream);
 
+  // Batched forms. False means the batch is outside what the packed kernel is
+  // worth doing for, and the caller should expand the weight and use cuBLAS.
+  bool packed_matmul(const PackedWeight& w, const void* x, void* y, int batch, int ldy, int row0,
+                     cudaStream_t stream);
+
+  bool packed_qkv_matmul(const LayerDeviceWeights& lw, const void* x, void* y, int batch, int ldy,
+                         cudaStream_t stream);
+
   const void* dequant_packed_for_gemm(const PackedWeight& w, cudaStream_t stream);
 
   bool ensure_prefill_wdq(std::size_t need, cudaStream_t stream);

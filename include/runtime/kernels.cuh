@@ -1262,6 +1262,13 @@ void launch_dequant_kquant(const std::uint8_t* blocks_in, KQuantType type, std::
 // inside the kernel, so the weight never exists as fp16 and a quantized model stays
 // resident at its file size. cols must be a multiple of 256. Gated by
 // kquant_matvec_test against a host dequant + fp32 dot.
+// Batched form: y[b, n] = sum_k x[b, k] * W[n, k], W left packed. x is
+// [batch, cols] and y is [batch, rows], both row-major -- the layout the fp16
+// GEMM path already produces. Returns false when the batch is outside the range
+// this is worth doing for, which is the caller's cue to expand and use cuBLAS.
+bool launch_kquant_matmul(const std::uint8_t* w, KQuantType type, const half* x, half* y, int rows,
+                          int cols, int batch, int ldy, cudaStream_t stream);
+
 // Same, writing fp32. The LM head produces logits rather than activations.
 void launch_kquant_matvec_f32(const std::uint8_t* w, KQuantType type, const half* x, float* y,
                               int rows, int cols, cudaStream_t stream);

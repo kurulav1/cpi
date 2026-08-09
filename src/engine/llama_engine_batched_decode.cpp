@@ -174,12 +174,17 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
     // --- Attention block ---
     launch_norm(d_x_, lw->norm_att, lw->norm_att_bias, d_x_norm_, batch, hidden);
 
-    const void* qkv_src = dequant_packed_qkv_for_gemm(*lw, compute_stream_);
-    if (qkv_src == nullptr) qkv_src = lw->wqkv;
-    detail::dispatch_linear_rowmajor_weight(
-        cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,
-        const_cast<void*>(qkv_src), d_x_norm_, d_qkv_, q_hidden + 2 * kv_hidden, hidden, batch,
-        CUDA_R_16F);
+    // Straight off the packed blocks when the batch is small enough to be worth
+    // it; otherwise expand once and let cuBLAS have it.
+    if (!packed_qkv_matmul(*lw, d_x_norm_, d_qkv_, batch, q_hidden + 2 * kv_hidden,
+                           compute_stream_)) {
+      const void* qkv_src = dequant_packed_qkv_for_gemm(*lw, compute_stream_);
+      if (qkv_src == nullptr) qkv_src = lw->wqkv;
+      detail::dispatch_linear_rowmajor_weight(
+          cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,
+          const_cast<void*>(qkv_src), d_x_norm_, d_qkv_, q_hidden + 2 * kv_hidden, hidden, batch,
+          CUDA_R_16F);
+    }
 
     CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_q_, q_row_bytes, qkv_base, qkv_stride_bytes, q_row_bytes,
                                  batch, cudaMemcpyDeviceToDevice, compute_stream_));
@@ -269,12 +274,14 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
     // A packed k-quant weight has no fp16 copy for cuBLAS; expand it into the
     // shared prefill scratch. Same stream as the GEMM, so the expansion is
     // ordered before the read and before the next weight overwrites it.
-    const void* wo_src = lw->wo_packed.active()
-                              ? dequant_packed_for_gemm(lw->wo_packed, compute_stream_)
-                              : static_cast<const void*>(lw->wo);
-    detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
-                                            lt_workspace_bytes_, compute_stream_, const_cast<void*>(wo_src), d_att_,
-                                            d_ff3_, hidden, q_hidden, batch, CUDA_R_16F);
+    if (!packed_matmul(lw->wo_packed, d_att_, d_ff3_, batch, hidden, 0, compute_stream_)) {
+      const void* wo_src = lw->wo_packed.active()
+                               ? dequant_packed_for_gemm(lw->wo_packed, compute_stream_)
+                               : static_cast<const void*>(lw->wo);
+      detail::dispatch_linear_rowmajor_weight(
+          cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,
+          const_cast<void*>(wo_src), d_att_, d_ff3_, hidden, q_hidden, batch, CUDA_R_16F);
+    }
     maybe_add_half_bias(d_ff3_, lw->bo, batch, hidden);
     kernels::launch_add_inplace(static_cast<__half*>(d_x_), static_cast<const __half*>(d_ff3_),
                                 batch * hidden, compute_stream_);
@@ -285,12 +292,14 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
     // A packed k-quant weight has no fp16 copy for cuBLAS; expand it into the
     // shared prefill scratch. Same stream as the GEMM, so the expansion is
     // ordered before the read and before the next weight overwrites it.
-    const void* w13_src = lw->w13_packed.active()
-                              ? dequant_packed_for_gemm(lw->w13_packed, compute_stream_)
-                              : static_cast<const void*>(lw->w13);
-    detail::dispatch_linear_rowmajor_weight(
-        cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,
-        const_cast<void*>(w13_src), d_x_norm_, d_ff13_, 2 * inter, hidden, batch, CUDA_R_16F);
+    if (!packed_matmul(lw->w13_packed, d_x_norm_, d_ff13_, batch, 2 * inter, 0, compute_stream_)) {
+      const void* w13_src = lw->w13_packed.active()
+                                ? dequant_packed_for_gemm(lw->w13_packed, compute_stream_)
+                                : static_cast<const void*>(lw->w13);
+      detail::dispatch_linear_rowmajor_weight(
+          cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,
+          const_cast<void*>(w13_src), d_x_norm_, d_ff13_, 2 * inter, hidden, batch, CUDA_R_16F);
+    }
     CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_ff1_, ff_row_bytes, ff13_base, ff13_stride_bytes,
                                  ff_row_bytes, batch, cudaMemcpyDeviceToDevice, compute_stream_));
     CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_ff2_, ff_row_bytes, ff13_base + inter, ff13_stride_bytes,
@@ -301,12 +310,14 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
     // A packed k-quant weight has no fp16 copy for cuBLAS; expand it into the
     // shared prefill scratch. Same stream as the GEMM, so the expansion is
     // ordered before the read and before the next weight overwrites it.
-    const void* w2_src = lw->w2_packed.active()
-                              ? dequant_packed_for_gemm(lw->w2_packed, compute_stream_)
-                              : static_cast<const void*>(lw->w2);
-    detail::dispatch_linear_rowmajor_weight(
-        cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,
-        const_cast<void*>(w2_src), d_prefill_ff2_, d_ff3_, hidden, inter, batch, CUDA_R_16F);
+    if (!packed_matmul(lw->w2_packed, d_prefill_ff2_, d_ff3_, batch, hidden, 0, compute_stream_)) {
+      const void* w2_src = lw->w2_packed.active()
+                               ? dequant_packed_for_gemm(lw->w2_packed, compute_stream_)
+                               : static_cast<const void*>(lw->w2);
+      detail::dispatch_linear_rowmajor_weight(
+          cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,
+          const_cast<void*>(w2_src), d_prefill_ff2_, d_ff3_, hidden, inter, batch, CUDA_R_16F);
+    }
     kernels::launch_add_inplace(static_cast<__half*>(d_x_), static_cast<const __half*>(d_ff3_),
                                 batch * hidden, compute_stream_);
   }

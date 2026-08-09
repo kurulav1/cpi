@@ -205,6 +205,51 @@ void run_real(const std::string& gguf_path, bool bandwidth) {
     cudaDeviceSynchronize();
     std::vector<__half> y(rows);
     cudaMemcpy(y.data(), d_y, y.size() * sizeof(__half), cudaMemcpyDeviceToHost);
+    // Batched form against the same fp16 reference, at a batch on each side of
+    // the kernel's BMAX tile so both the single-tile and multi-tile paths run.
+    // Batch element 0 reuses x, so its expected answer is `ref` -- a batched
+    // kernel that silently ignored the batch index would still match there,
+    // which is why the other elements get their own activations.
+    for (const int bsz : {4, 20}) {
+      std::vector<__half> xb(static_cast<std::size_t>(bsz) * pk.cols);
+      for (int b = 0; b < bsz; ++b) {
+        for (int i = 0; i < pk.cols; ++i) {
+          xb[static_cast<std::size_t>(b) * pk.cols + i] =
+              (b == 0) ? x[i] : __float2half(__half2float(x[i]) * (0.5f + 0.25f * b));
+        }
+      }
+      __half* d_xb = nullptr;
+      __half* d_yb = nullptr;
+      cudaMalloc(&d_xb, xb.size() * sizeof(__half));
+      cudaMalloc(&d_yb, static_cast<std::size_t>(bsz) * rows * sizeof(__half));
+      cudaMemcpy(d_xb, xb.data(), xb.size() * sizeof(__half), cudaMemcpyHostToDevice);
+      double refmax = 0.0;
+      for (int r = 0; r < rows; ++r) {
+        refmax = std::max(refmax, std::abs(static_cast<double>(ref[r])));
+      }
+      const bool took =
+          kernels::launch_kquant_matmul(d_w, static_cast<kernels::KQuantType>(pk.kind), d_xb, d_yb,
+                                        rows, pk.cols, bsz, /*ldy=*/rows, nullptr);
+      cudaDeviceSynchronize();
+      if (took) {
+        std::vector<__half> yb(static_cast<std::size_t>(bsz) * rows);
+        cudaMemcpy(yb.data(), d_yb, yb.size() * sizeof(__half), cudaMemcpyDeviceToHost);
+        double wb = 0.0;
+        for (int b = 0; b < bsz; ++b) {
+          const float mul = (b == 0) ? 1.0f : (0.5f + 0.25f * b);
+          for (int r = 0; r < rows; ++r) {
+            const double want = static_cast<double>(ref[r]) * mul;
+            const double got = __half2float(yb[static_cast<std::size_t>(b) * rows + r]);
+            wb = std::max(wb, std::abs(got - want) / (refmax * mul > 0.0 ? refmax * mul : 1.0));
+          }
+        }
+        check(wb < 0.02, name + ": batched matmul (batch " + std::to_string(bsz) + ") matches");
+      } else {
+        check(false, name + ": batched matmul declined batch " + std::to_string(bsz));
+      }
+      cudaFree(d_xb);
+      cudaFree(d_yb);
+    }
     // Achieved bandwidth at the real shape. A matvec reads its weight exactly
     // once, so bytes/time is the number to compare against the card's peak --
     // and it says which shape is worth tuning rather than which is biggest.
@@ -252,6 +297,7 @@ void run_real(const std::string& gguf_path, bool bandwidth) {
     for (int r = 0; r < rows; ++r) {
       worst = std::max(worst, std::abs(__half2float(y[r]) - ref[r]) / (scale > 0.0 ? scale : 1.0));
     }
+
     std::printf("  %-28s kind=%d rows=%-5d cols=%-5d worst_rel=%.5f", name.c_str(), pk.kind,
                 pk.rows, pk.cols, worst);
     if (bandwidth) std::printf("  %7.1f GB/s", gbps);
