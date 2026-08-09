@@ -206,6 +206,109 @@ __device__ __forceinline__ float kquant_value(const std::uint8_t* p, KQuantType 
 // unpacked on the fly and multiplied into x. This is the point of the whole
 // exercise -- the weight never exists as fp16 anywhere, so a Q4_K_M model is
 // resident at its file size instead of ~3x it.
+// Per-type packed matvec. The generic kernel above re-derives everything for
+// every weight: it branches on the runtime type, reloads d/dmin, and re-decodes
+// the packed 6-bit scale nibbles once per element. Since the block is exactly
+// one super-block wide, a thread handles the SAME offset inside every
+// super-block down the row, so all of that index math is loop-invariant and
+// hoists out. What remains in the loop is the three loads that actually differ
+// per super-block: the fp16 scale pair, the thread's own scale byte(s), and its
+// quantized byte.
+//
+// A 256-thread block reads exactly the 144/176/210 bytes of one super-block per
+// iteration and nothing else, so no bytes are fetched twice within a block.
+template <KQuantType TYPE>
+__global__ void kquant_matvec_fast_kernel(const std::uint8_t* __restrict__ w,
+                                          const __half* __restrict__ x, __half* __restrict__ y,
+                                          int rows, int cols) {
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const int i = static_cast<int>(threadIdx.x);
+  const int blocks_per_row = cols / static_cast<int>(kSuperBlock);
+
+  std::size_t block_bytes;
+  if (TYPE == KQuantType::Q4_K) {
+    block_bytes = model::kquant::kQ4KBlockBytes;
+  } else if (TYPE == KQuantType::Q5_K) {
+    block_bytes = model::kquant::kQ5KBlockBytes;
+  } else {
+    block_bytes = model::kquant::kQ6KBlockBytes;
+  }
+  const std::uint8_t* p =
+      w + static_cast<std::size_t>(row) * static_cast<std::size_t>(blocks_per_row) * block_bytes;
+
+  // Loop-invariant offsets for this thread's slot in a super-block.
+  int off_a = 0;  // quantized byte
+  int off_b = 0;  // high-bit byte (Q5_K/Q6_K)
+  int scale_idx = 0;
+  bool hi_nibble = false;
+  int shift = 0;
+  if (TYPE == KQuantType::Q4_K || TYPE == KQuantType::Q5_K) {
+    const int j = i / 64;
+    const int rem = i % 64;
+    const int l = rem % 32;
+    scale_idx = 2 * j + (rem / 32);
+    hi_nibble = rem >= 32;
+    if (TYPE == KQuantType::Q4_K) {
+      off_a = 16 + j * 32 + l;
+    } else {
+      off_a = 48 + j * 32 + l;
+      off_b = 16 + l;
+    }
+  } else {
+    const int n = i / 128;
+    const int rem = i % 128;
+    const int quarter = rem / 32;
+    const int l = rem % 32;
+    off_a = n * 64 + l + (quarter & 1) * 32;
+    off_b = 128 + n * 32 + l;
+    scale_idx = 192 + n * 8 + quarter * 2 + (l / 16);
+    hi_nibble = (quarter >> 1) != 0;
+    shift = 2 * quarter;
+  }
+
+  float acc = 0.0f;
+  for (int b = 0; b < blocks_per_row; ++b) {
+    float v;
+    if (TYPE == KQuantType::Q6_K) {
+      std::uint16_t dh;
+      memcpy(&dh, p + 208, 2);
+      const int q = static_cast<int>(hi_nibble ? (__ldg(p + off_a) >> 4) : (__ldg(p + off_a) & 0x0F)) |
+                    (((__ldg(p + off_b) >> shift) & 3) << 4);
+      const auto sc = static_cast<const std::int8_t>(__ldg(p + scale_idx));
+      v = half_bits_to_float(dh) * static_cast<float>(sc) * static_cast<float>(q - 32);
+    } else {
+      std::uint16_t dh, mh;
+      memcpy(&dh, p, 2);
+      memcpy(&mh, p + 2, 2);
+      std::uint8_t sc, m;
+      get_scale_min_k4(scale_idx, p + 4, &sc, &m);
+      const std::uint8_t byte = __ldg(p + off_a);
+      int q = hi_nibble ? (byte >> 4) : (byte & 0x0F);
+      if (TYPE == KQuantType::Q5_K) {
+        q += (__ldg(p + off_b) & static_cast<std::uint8_t>(1u << scale_idx)) ? 16 : 0;
+      }
+      v = half_bits_to_float(dh) * static_cast<float>(sc) * static_cast<float>(q) -
+          half_bits_to_float(mh) * static_cast<float>(m);
+    }
+    acc += v * __half2float(__ldg(x + b * static_cast<int>(kSuperBlock) + i));
+    p += block_bytes;
+  }
+
+  __shared__ float warp_sums[8];
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int warp = static_cast<int>(threadIdx.x) >> 5;
+  for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+  if (lane == 0) warp_sums[warp] = acc;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float total = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) total += warp_sums[k];
+    y[row] = __float2half(total);
+  }
+}
+
 __global__ void kquant_matvec_kernel(const std::uint8_t* __restrict__ w, KQuantType type,
                                      std::size_t block_bytes, const __half* __restrict__ x,
                                      __half* __restrict__ y, int rows, int cols) {
@@ -263,7 +366,18 @@ void launch_kquant_matvec(const std::uint8_t* w, KQuantType type, const half* x,
   std::size_t block_bytes = model::kquant::kQ6KBlockBytes;
   if (type == KQuantType::Q4_K) block_bytes = model::kquant::kQ4KBlockBytes;
   if (type == KQuantType::Q5_K) block_bytes = model::kquant::kQ5KBlockBytes;
-  constexpr int kThreads = 256;
+  constexpr int kThreads = 256;  // one super-block wide, so a thread's slot is fixed
+  switch (type) {
+    case KQuantType::Q4_K:
+      kquant_matvec_fast_kernel<KQuantType::Q4_K><<<rows, kThreads, 0, stream>>>(w, x, y, rows, cols);
+      return;
+    case KQuantType::Q5_K:
+      kquant_matvec_fast_kernel<KQuantType::Q5_K><<<rows, kThreads, 0, stream>>>(w, x, y, rows, cols);
+      return;
+    case KQuantType::Q6_K:
+      kquant_matvec_fast_kernel<KQuantType::Q6_K><<<rows, kThreads, 0, stream>>>(w, x, y, rows, cols);
+      return;
+  }
   kquant_matvec_kernel<<<rows, kThreads, 0, stream>>>(w, type, block_bytes, x, y, rows, cols);
 }
 
