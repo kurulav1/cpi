@@ -244,15 +244,34 @@ bool LlamaEngine::prefill_attention_tensorcore(const void* q, const void* k_laye
   return true;
 }
 
-bool LlamaEngine::packed_qkv_matvec(const PackedWeight& w, const void* x_norm, void* qkv,
+bool LlamaEngine::packed_qkv_matvec(const LayerDeviceWeights& lw, const void* x_norm, void* qkv,
                                     cudaStream_t stream) {
-  if (!w.active()) return false;
-  ++packed_matvec_calls_;
-  kernels::launch_kquant_matvec(static_cast<const std::uint8_t*>(w.data),
-                                static_cast<kernels::KQuantType>(w.kind),
-                                static_cast<const __half*>(x_norm), static_cast<__half*>(qkv),
-                                w.rows, w.cols, stream);
-  return true;
+  const auto run = [&](const PackedWeight& w, int row_offset) {
+    ++packed_matvec_calls_;
+    kernels::launch_kquant_matvec(static_cast<const std::uint8_t*>(w.data),
+                                  static_cast<kernels::KQuantType>(w.kind),
+                                  static_cast<const __half*>(x_norm),
+                                  static_cast<__half*>(qkv) + row_offset, w.rows, w.cols, stream);
+  };
+  if (lw.wqkv_packed.active()) {
+    run(lw.wqkv_packed, 0);
+    return true;
+  }
+  // Separate buffers write into the same row ranges the fused matrix would have
+  // produced, so everything downstream is unchanged. wq_packed may already hold
+  // Q and K together, in which case wk_packed is empty and there are two
+  // launches rather than three.
+  if (lw.wq_packed.active() && lw.wv_packed.active()) {
+    run(lw.wq_packed, 0);
+    int written = lw.wq_packed.rows;
+    if (lw.wk_packed.active()) {
+      run(lw.wk_packed, written);
+      written += lw.wk_packed.rows;
+    }
+    run(lw.wv_packed, written);
+    return true;
+  }
+  return false;
 }
 
 void LlamaEngine::project_lm_head_logits(const __half* x_norm, float* logits) {

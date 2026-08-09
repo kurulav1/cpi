@@ -156,6 +156,11 @@ private:
     // a RoPE permutation undone during host unpacking, and CPI's QKV is fused
     // while GGUF stores it split, so those stay fp16 for now.
     PackedWeight wqkv_packed;
+    // Fallback when Q, K and V disagree on quant type and cannot share one
+    // buffer: three separate matvecs into the fused output's row ranges.
+    PackedWeight wq_packed;
+    PackedWeight wk_packed;
+    PackedWeight wv_packed;
     PackedWeight w2_packed;
     PackedWeight wo_packed;
     // gate and up concatenated; legal only because a k-quant row is a whole
@@ -691,10 +696,14 @@ private:
 
   // Single-token QKV straight off the packed blocks. False when this layer kept
   // its fp16 fused matrix, which is the caller's cue to run the old path.
-  bool packed_qkv_matvec(const PackedWeight& w, const void* x_norm, void* qkv,
+  bool packed_qkv_matvec(const LayerDeviceWeights& lw, const void* x_norm, void* qkv,
                          cudaStream_t stream);
 
   const void* dequant_packed_for_gemm(const PackedWeight& w, cudaStream_t stream);
+
+  bool ensure_prefill_wdq(std::size_t need, cudaStream_t stream);
+
+  const void* dequant_packed_qkv_for_gemm(const LayerDeviceWeights& lw, cudaStream_t stream);
 
   const void* dequant_weight_for_gemm(const std::int8_t* w, const float* scales, bool int4,
                                       int rows, int cols, int group);

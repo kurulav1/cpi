@@ -125,12 +125,12 @@ void LlamaEngine::init_greedy_decode_graph() {
       }
     } else if (!cached_int8_proj_enabled_) {
       if (resident_custom_qkv_) {
-        if (!packed_qkv_matvec(lw.wqkv_packed, d_x_norm_, d_q_, compute_stream_)) {
+        if (!packed_qkv_matvec(lw, d_x_norm_, d_q_, compute_stream_)) {
           resident_projection_half(lw.wqkv, d_x_norm_, d_q_, hidden + 2 * kv_hidden, hidden,
                                    resident_qkv_warps_, resident_qkv_tile_pairs_,
                                    resident_qkv_rows_per_warp_);
         }
-      } else if (!packed_qkv_matvec(lw.wqkv_packed, d_x_norm_, d_q_, compute_stream_)) {
+      } else if (!packed_qkv_matvec(lw, d_x_norm_, d_q_, compute_stream_)) {
         detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
                                                 lt_workspace_bytes_, compute_stream_, lw.wqkv,
                                                 d_x_norm_, d_q_, hidden + 2 * kv_hidden, hidden, 1,
@@ -284,11 +284,11 @@ void LlamaEngine::init_greedy_decode_graph() {
             resident_int8_qkv_tile_packed4_, resident_int8_qkv_warps_per_row_);
       }
     } else if (resident_custom_qkv_) {
-      if (!packed_qkv_matvec(lw->wqkv_packed, d_x_norm_, d_q_, compute_stream_)) {
+      if (!packed_qkv_matvec(*lw, d_x_norm_, d_q_, compute_stream_)) {
         resident_projection_half(lw->wqkv, d_x_norm_, d_q_, hidden + 2 * kv_hidden, hidden,
                                  resident_qkv_warps_, resident_qkv_tile_pairs_);
       }
-    } else if (!packed_qkv_matvec(lw->wqkv_packed, d_x_norm_, d_q_, compute_stream_)) {
+    } else if (!packed_qkv_matvec(*lw, d_x_norm_, d_q_, compute_stream_)) {
       detail::dispatch_linear_rowmajor_weight(
           cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,
           lw->wqkv, d_x_norm_, d_q_, hidden + 2 * kv_hidden, hidden, 1, CUDA_R_16F);
@@ -574,12 +574,12 @@ void LlamaEngine::init_logits_decode_graph() {
       }
     } else if (!cached_int8_proj_enabled_) {
       if (resident_custom_qkv_) {
-        if (!packed_qkv_matvec(lw.wqkv_packed, d_x_norm_, d_q_, compute_stream_)) {
+        if (!packed_qkv_matvec(lw, d_x_norm_, d_q_, compute_stream_)) {
           resident_projection_half(lw.wqkv, d_x_norm_, d_q_, hidden + 2 * kv_hidden, hidden,
                                    resident_qkv_warps_, resident_qkv_tile_pairs_,
                                    resident_qkv_rows_per_warp_);
         }
-      } else if (!packed_qkv_matvec(lw.wqkv_packed, d_x_norm_, d_q_, compute_stream_)) {
+      } else if (!packed_qkv_matvec(lw, d_x_norm_, d_q_, compute_stream_)) {
         detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
                                                 lt_workspace_bytes_, compute_stream_, lw.wqkv,
                                                 d_x_norm_, d_q_, hidden + 2 * kv_hidden, hidden, 1,
@@ -727,11 +727,11 @@ void LlamaEngine::init_logits_decode_graph() {
             resident_int8_qkv_tile_packed4_, resident_int8_qkv_warps_per_row_);
       }
     } else if (resident_custom_qkv_) {
-      if (!packed_qkv_matvec(lw->wqkv_packed, d_x_norm_, d_q_, compute_stream_)) {
+      if (!packed_qkv_matvec(*lw, d_x_norm_, d_q_, compute_stream_)) {
         resident_projection_half(lw->wqkv, d_x_norm_, d_q_, hidden + 2 * kv_hidden, hidden,
                                  resident_qkv_warps_, resident_qkv_tile_pairs_);
       }
-    } else if (!packed_qkv_matvec(lw->wqkv_packed, d_x_norm_, d_q_, compute_stream_)) {
+    } else if (!packed_qkv_matvec(*lw, d_x_norm_, d_q_, compute_stream_)) {
       detail::dispatch_linear_rowmajor_weight(
           cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,
           lw->wqkv, d_x_norm_, d_q_, hidden + 2 * kv_hidden, hidden, 1, CUDA_R_16F);

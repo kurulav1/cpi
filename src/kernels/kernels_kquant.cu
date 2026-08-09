@@ -341,10 +341,18 @@ __device__ __forceinline__ float kq_block_dot(const std::uint8_t* __restrict__ p
 __device__ __forceinline__ void store_out(__half* p, float v) { *p = __float2half(v); }
 __device__ __forceinline__ void store_out(float* p, float v) { *p = v; }
 
-template <KQuantType TYPE, int ROWS, typename OutT>
+// WPR warps cooperate on one row, so a block covers 8/WPR rows.
+//
+// One warp per row suits tall matrices, but the attention projections are short:
+// at 1024 rows that launches 128 blocks onto 170 SMs, leaving most of the GPU
+// idle with nothing to hide memory latency behind. Splitting a row across warps
+// multiplies the grid by WPR and costs one shared-memory reduction.
+template <KQuantType TYPE, int WPR, typename OutT>
 __global__ void kquant_matvec_vec_kernel(const std::uint8_t* __restrict__ w,
                                          const __half* __restrict__ x, OutT* __restrict__ y,
                                          int rows, int cols) {
+  constexpr int kWarps = 8;  // 256 threads
+  constexpr int kRowsPerBlock = kWarps / WPR;
   const int blocks_per_row = cols / static_cast<int>(kSuperBlock);
 
   std::size_t block_bytes;
@@ -359,12 +367,8 @@ __global__ void kquant_matvec_vec_kernel(const std::uint8_t* __restrict__ w,
 
   const int lane = static_cast<int>(threadIdx.x) & 31;
   const int warp = static_cast<int>(threadIdx.x) >> 5;
-  // A warp owns a whole row and walks every super-block in it. Splitting one
-  // row across the block instead would need a __syncthreads and a shared-memory
-  // reduction per row, which costs more than it saves on the shallow matrices
-  // (wo walks only 16 super-blocks, against 56 for w2).
-  const int row = blockIdx.x * ROWS + warp;
-  if (row >= rows) return;
+  const int sub = warp % WPR;  // which slice of this row's super-blocks
+  const int row = blockIdx.x * kRowsPerBlock + warp / WPR;
 
   // This lane's two runs of four weights sit at fixed offsets inside every
   // super-block, so the x offsets are loop-invariant.
@@ -379,23 +383,44 @@ __global__ void kquant_matvec_vec_kernel(const std::uint8_t* __restrict__ w,
     xstride = 32;
   }
 
-  const std::uint8_t* p = w + static_cast<std::size_t>(row) * row_bytes;
   float acc = 0.0f;
-  for (int b = 0; b < blocks_per_row; ++b) {
-    const __half* xb = x + b * static_cast<int>(kSuperBlock);
-    float2 a1;
-    float2 h1;
-    const float2 a0 = load_x4(xb + xo, &a1);
-    const float2 h0 = load_x4(xb + xo + xstride, &h1);
-    const float xa[4] = {a0.x, a0.y, a1.x, a1.y};
-    const float xh[4] = {h0.x, h0.y, h1.x, h1.y};
-    acc += kq_block_dot<TYPE>(p, lane, xa, xh);
-    p += block_bytes;
+  if (row < rows) {
+    const std::uint8_t* p = w + static_cast<std::size_t>(row) * row_bytes +
+                            static_cast<std::size_t>(sub) * block_bytes;
+    // Two super-blocks per iteration so both sets of loads are in flight before
+    // either is consumed. Profiling put 59% of warp stalls on memory scoreboard
+    // dependencies at 90% occupancy and only 48% DRAM utilisation, which is a
+    // shortage of loads in flight rather than of warps.
+#pragma unroll 2
+    for (int b = sub; b < blocks_per_row; b += WPR) {
+      const __half* xb = x + b * static_cast<int>(kSuperBlock);
+      float2 a1;
+      float2 h1;
+      const float2 a0 = load_x4(xb + xo, &a1);
+      const float2 h0 = load_x4(xb + xo + xstride, &h1);
+      const float xa[4] = {a0.x, a0.y, a1.x, a1.y};
+      const float xh[4] = {h0.x, h0.y, h1.x, h1.y};
+      acc += kq_block_dot<TYPE>(p, lane, xa, xh);
+      p += block_bytes * WPR;
+    }
   }
 
 #pragma unroll
   for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
-  if (lane == 0) store_out(y + row, acc);
+
+  if (WPR == 1) {
+    if (lane == 0 && row < rows) store_out(y + row, acc);
+    return;
+  }
+  __shared__ float parts[kWarps];
+  if (lane == 0) parts[warp] = acc;
+  __syncthreads();
+  if (lane == 0 && sub == 0 && row < rows) {
+    float total = 0.0f;
+#pragma unroll
+    for (int k = 0; k < WPR; ++k) total += parts[warp + k];
+    store_out(y + row, total);
+  }
 }
 
 // Per-type packed matvec. The generic kernel above re-derives everything for
@@ -556,23 +581,36 @@ void launch_dequant_kquant(const std::uint8_t* blocks_in, KQuantType type, std::
 template <typename OutT>
 static void launch_kquant_matvec_impl(const std::uint8_t* w, KQuantType type, const half* x, OutT* y,
                                       int rows, int cols, cudaStream_t stream) {
-  constexpr int kThreads = 256;                 // 8 warps, one row each
-  constexpr int kRowsPerBlock = kThreads / 32;  // one row per warp
-  const int grid = (rows + kRowsPerBlock - 1) / kRowsPerBlock;
-  switch (type) {
-    case KQuantType::Q4_K:
-      kquant_matvec_vec_kernel<KQuantType::Q4_K, kRowsPerBlock, OutT>
-          <<<grid, kThreads, 0, stream>>>(w, x, y, rows, cols);
-      return;
-    case KQuantType::Q5_K:
-      kquant_matvec_vec_kernel<KQuantType::Q5_K, kRowsPerBlock, OutT>
-          <<<grid, kThreads, 0, stream>>>(w, x, y, rows, cols);
-      return;
-    case KQuantType::Q6_K:
-      kquant_matvec_vec_kernel<KQuantType::Q6_K, kRowsPerBlock, OutT>
-          <<<grid, kThreads, 0, stream>>>(w, x, y, rows, cols);
-      return;
+  constexpr int kThreads = 256;  // 8 warps
+  // Warps per row. Short matrices need several or the grid cannot fill the GPU;
+  // tall ones do better with one warp per row and no shared reduction.
+  static const int forced = []() {
+    const char* e = std::getenv("CPI_KQUANT_WPR");
+    return e != nullptr ? std::atoi(e) : 0;
+  }();
+  // Flat 8, measured end to end: 222.0 tok/s against 220.5 / 218.7 / 210.9 for
+  // 8 / 4 / 1 in an earlier sweep. Two shape-aware rules were tried and both
+  // lost (205.4 and 216.8) even though isolated per-shape benchmarks favoured
+  // them -- a matvec measured alone owns the whole GPU and a warm L2, which is
+  // nothing like running back to back inside the decode graph. Only end-to-end
+  // numbers decide this.
+  int wpr = forced;
+  if (wpr <= 0) wpr = 8;
+  const int rows_per_block = 8 / wpr;
+  const int grid = (rows + rows_per_block - 1) / rows_per_block;
+
+#define CPI_KQ_DISPATCH(WPRV)                                     switch (type) {                                                   case KQuantType::Q4_K:                                            kquant_matvec_vec_kernel<KQuantType::Q4_K, WPRV, OutT>              <<<grid, kThreads, 0, stream>>>(w, x, y, rows, cols);       return;                                                       case KQuantType::Q5_K:                                            kquant_matvec_vec_kernel<KQuantType::Q5_K, WPRV, OutT>              <<<grid, kThreads, 0, stream>>>(w, x, y, rows, cols);       return;                                                       case KQuantType::Q6_K:                                            kquant_matvec_vec_kernel<KQuantType::Q6_K, WPRV, OutT>              <<<grid, kThreads, 0, stream>>>(w, x, y, rows, cols);       return;                                                     }
+
+  if (wpr >= 8) {
+    CPI_KQ_DISPATCH(8)
+  } else if (wpr >= 4) {
+    CPI_KQ_DISPATCH(4)
+  } else if (wpr >= 2) {
+    CPI_KQ_DISPATCH(2)
+  } else {
+    CPI_KQ_DISPATCH(1)
   }
+#undef CPI_KQ_DISPATCH
 }
 
 void launch_kquant_matvec(const std::uint8_t* w, KQuantType type, const half* x, half* y, int rows,

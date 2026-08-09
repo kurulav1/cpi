@@ -66,6 +66,50 @@ const void* LlamaEngine::dequant_weight_for_gemm(const std::int8_t* w, const flo
 // path can consume it. Same scratch and same same-stream reuse rule as the
 // low-bit sibling above: the GEMM is enqueued before the next dequant overwrites
 // the buffer, and both live on compute_stream_.
+// Grows the shared prefill scratch to `need` bytes. Returns false when it
+// cannot, which leaves callers on whatever path they had.
+bool LlamaEngine::ensure_prefill_wdq(std::size_t need, cudaStream_t stream) {
+  if (need <= d_prefill_wdq_bytes_) return d_prefill_wdq_ != nullptr;
+  CUDA_CHECK(cudaStreamSynchronize(stream));
+  if (d_prefill_wdq_ != nullptr) cudaFree(d_prefill_wdq_);
+  d_prefill_wdq_ = nullptr;
+  d_prefill_wdq_bytes_ = 0;
+  if (cudaMalloc(&d_prefill_wdq_, need) != cudaSuccess) {
+    d_prefill_wdq_ = nullptr;
+    return false;
+  }
+  d_prefill_wdq_bytes_ = need;
+  return true;
+}
+
+// The fused QKV a GEMM wants, from whichever packed shape this layer has. The
+// split trio expands into one contiguous scratch in Q, K, V row order, which is
+// exactly the layout the fused matrix had.
+const void* LlamaEngine::dequant_packed_qkv_for_gemm(const LayerDeviceWeights& lw,
+                                                     cudaStream_t stream) {
+  if (lw.wqkv_packed.active()) return dequant_packed_for_gemm(lw.wqkv_packed, stream);
+  if (!lw.wq_packed.active() || !lw.wv_packed.active()) return nullptr;
+  // wq_packed may already carry K, leaving wk_packed empty.
+  const PackedWeight* parts[3] = {&lw.wq_packed, &lw.wk_packed, &lw.wv_packed};
+  std::size_t elems = 0;
+  for (const auto* w : parts) {
+    if (!w->active()) continue;
+    elems += static_cast<std::size_t>(w->rows) * static_cast<std::size_t>(w->cols);
+  }
+  if (!ensure_prefill_wdq(elems * sizeof(__half), stream)) return nullptr;
+  std::size_t off = 0;
+  for (const auto* w : parts) {
+    if (!w->active()) continue;
+    const std::size_t n = static_cast<std::size_t>(w->rows) * static_cast<std::size_t>(w->cols);
+    kernels::launch_dequant_kquant(static_cast<const std::uint8_t*>(w->data),
+                                   static_cast<kernels::KQuantType>(w->kind),
+                                   n / model::kquant::kSuperBlock,
+                                   static_cast<__half*>(d_prefill_wdq_) + off, stream);
+    off += n;
+  }
+  return d_prefill_wdq_;
+}
+
 const void* LlamaEngine::dequant_packed_for_gemm(const PackedWeight& w,
                                                  cudaStream_t stream) {
   if (!w.active()) return nullptr;
@@ -247,9 +291,8 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
             static_cast<__half*>(d_qkv_), rows, q_hidden + 2 * kv_hidden, hidden, compute_stream_);
       }
     } else {
-      const void* qkv_src = lw->wqkv_packed.active()
-                                ? dequant_packed_for_gemm(lw->wqkv_packed, compute_stream_)
-                                : static_cast<const void*>(lw->wqkv);
+      const void* qkv_src = dequant_packed_qkv_for_gemm(*lw, compute_stream_);
+      if (qkv_src == nullptr) qkv_src = lw->wqkv;
       detail::dispatch_linear_rowmajor_weight(
           cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,
           const_cast<void*>(qkv_src), d_x_norm_, d_qkv_, q_hidden + 2 * kv_hidden, hidden, rows,

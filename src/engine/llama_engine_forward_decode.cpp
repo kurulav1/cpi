@@ -309,7 +309,7 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
 
       launch_norm(d_x_, lw->norm_att, lw->norm_att_bias, d_x_norm_, 1, hidden);
 
-      if (!packed_qkv_matvec(lw->wqkv_packed, d_x_norm_, d_q_, compute_stream_)) {
+      if (!packed_qkv_matvec(*lw, d_x_norm_, d_q_, compute_stream_)) {
         resident_projection_half(lw->wqkv, d_x_norm_, d_q_, q_hidden + 2 * kv_hidden, hidden,
                                  resident_qkv_warps_, resident_qkv_tile_pairs_,
                                  resident_qkv_rows_per_warp_);
@@ -486,7 +486,7 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
             resident_int8_qkv_tile_packed4_, resident_int8_qkv_warps_per_row_);
       }
     } else {
-      if (!packed_qkv_matvec(lw->wqkv_packed, d_x_norm_, d_q_, compute_stream_)) {
+      if (!packed_qkv_matvec(*lw, d_x_norm_, d_q_, compute_stream_)) {
         resident_projection_half(lw->wqkv, d_x_norm_, d_q_, q_hidden + 2 * kv_hidden, hidden,
                                  resident_qkv_warps_, resident_qkv_tile_pairs_,
                                  resident_qkv_rows_per_warp_);
@@ -661,13 +661,13 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
 
     run_profiled(last_benchmark_stats_.decode_qkv_ms, [&] {
       if (resident_custom_qkv_) {
-        if (!packed_qkv_matvec(lw->wqkv_packed, d_x_norm_, d_q_, compute_stream_)) {
+        if (!packed_qkv_matvec(*lw, d_x_norm_, d_q_, compute_stream_)) {
           resident_projection_half(lw->wqkv, d_x_norm_, d_q_, q_hidden + 2 * kv_hidden, hidden,
                                    resident_qkv_warps_, resident_qkv_tile_pairs_,
                                    resident_qkv_rows_per_warp_);
         }
       } else {
-        if (!packed_qkv_matvec(lw->wqkv_packed, d_x_norm_, d_q_, compute_stream_)) {
+        if (!packed_qkv_matvec(*lw, d_x_norm_, d_q_, compute_stream_)) {
           resident_projection_half(lw->wqkv, d_x_norm_, d_q_, q_hidden + 2 * kv_hidden, hidden,
                                    resident_qkv_warps_, resident_qkv_tile_pairs_,
                                    resident_qkv_rows_per_warp_);
@@ -844,12 +844,12 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
               resident_int8_qkv_tile_packed4_, resident_int8_qkv_warps_per_row_);
         }
       } else if (resident_custom_qkv_) {
-        if (!packed_qkv_matvec(lw->wqkv_packed, d_x_norm_, d_q_, compute_stream_)) {
+        if (!packed_qkv_matvec(*lw, d_x_norm_, d_q_, compute_stream_)) {
           resident_projection_half(lw->wqkv, d_x_norm_, d_q_, q_hidden + 2 * kv_hidden, hidden,
                                    resident_qkv_warps_, resident_qkv_tile_pairs_,
                                    resident_qkv_rows_per_warp_);
         }
-      } else if (!packed_qkv_matvec(lw->wqkv_packed, d_x_norm_, d_q_, compute_stream_)) {
+      } else if (!packed_qkv_matvec(*lw, d_x_norm_, d_q_, compute_stream_)) {
         detail::dispatch_linear_rowmajor_weight(cublas_, matmul_lt, &lt_plan_cache_, lt_workspace_,
                                                 lt_workspace_bytes_, compute_stream_, lw->wqkv,
                                                 d_x_norm_, d_q_, q_hidden + 2 * kv_hidden, hidden,
@@ -1079,7 +1079,7 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
         (void)words;
       } else {
         // Fallback: fp16 (wq/wk/wv not quantised in this file).
-        if (!packed_qkv_matvec(lw->wqkv_packed, d_x_norm_, d_q_, compute_stream_)) {
+        if (!packed_qkv_matvec(*lw, d_x_norm_, d_q_, compute_stream_)) {
           resident_projection_half(lw->wqkv, d_x_norm_, d_q_, q_hidden + 2 * kv_hidden, hidden,
                                    resident_qkv_warps_, resident_qkv_tile_pairs_,
                                    resident_qkv_rows_per_warp_);

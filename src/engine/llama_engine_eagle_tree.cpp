@@ -104,9 +104,8 @@ void LlamaEngine::eagle_tree_verify_forward(int K) {
   for (int layer = 0; layer < cfg.num_layers; ++layer) {
     const LayerDeviceWeights* lw = &layer_cache_[static_cast<std::size_t>(layer)];
     launch_norm(d_x_, lw->norm_att, lw->norm_att_bias, d_x_norm_, K, hidden);
-    const void* qkv_src = lw->wqkv_packed.active()
-                              ? dequant_packed_for_gemm(lw->wqkv_packed, s)
-                              : static_cast<const void*>(lw->wqkv);
+    const void* qkv_src = dequant_packed_qkv_for_gemm(*lw, s);
+    if (qkv_src == nullptr) qkv_src = lw->wqkv;
     detail::dispatch_linear_rowmajor_weight(
         cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, s,
         const_cast<void*>(qkv_src),

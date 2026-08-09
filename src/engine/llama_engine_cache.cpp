@@ -687,9 +687,11 @@ void LlamaEngine::init_layer_cache() {
     // buffer needs a shared quant type, and Q4_K_M puts Q6_K in some layers'
     // attn_v. Checking each tensor alone would skip the fp16 allocation for a
     // layer the stager then declines to pack, leaving nothing behind.
-    const bool pack_qkv = will_pack_fused(weights_, {lp + ".attention.wq", lp + ".attention.wk",
-                                                     lp + ".attention.wv"},
-                                          16);
+    // Either shape works now, so the fp16 fused matrix can go whenever all three
+    // parts are packable at all.
+    const bool pack_qkv = will_pack(weights_, lp + ".attention.wq", 16) &&
+                          will_pack(weights_, lp + ".attention.wk", 16) &&
+                          will_pack(weights_, lp + ".attention.wv", 16);
     const cudaError_t a0 =
         (tq3_enabled_ || pack_qkv)
             ? cudaSuccess
@@ -775,6 +777,9 @@ void LlamaEngine::init_layer_cache() {
       if (lw.bo) cudaFree(lw.bo);
       if (lw.w13) cudaFree(lw.w13);
       if (lw.wqkv_packed.data) cudaFree(lw.wqkv_packed.data);
+      if (lw.wq_packed.data) cudaFree(lw.wq_packed.data);
+      if (lw.wk_packed.data) cudaFree(lw.wk_packed.data);
+      if (lw.wv_packed.data) cudaFree(lw.wv_packed.data);
       if (lw.w2_packed.data) cudaFree(lw.w2_packed.data);
       if (lw.wo_packed.data) cudaFree(lw.wo_packed.data);
       if (lw.w13_packed.data) cudaFree(lw.w13_packed.data);
@@ -957,6 +962,18 @@ void LlamaEngine::init_layer_cache() {
       // allocation is the step that actually saves the memory.
       stage_packed_triple(p + ".attention.wq", p + ".attention.wk", p + ".attention.wv",
                           &lw.wqkv_packed, 16);
+      if (!lw.wqkv_packed.active()) {
+        // Q, K and V disagree on quant type here (Q4_K_M puts Q6_K in some
+        // layers' attn_v), so they cannot share one buffer. Fuse as much as
+        // does agree: a 1024-row matvec is far off roofline (250 GB/s against
+        // 900 for a 4096-row one), so folding K into Q is worth a buffer.
+        stage_packed_pair(p + ".attention.wq", p + ".attention.wk", &lw.wq_packed, 16);
+        if (!lw.wq_packed.active()) {
+          stage_packed_weight(p + ".attention.wq", &lw.wq_packed, 16);
+          stage_packed_weight(p + ".attention.wk", &lw.wk_packed, 16);
+        }
+        stage_packed_weight(p + ".attention.wv", &lw.wv_packed, 16);
+      }
       stage_packed_weight(p + ".feed_forward.w2", &lw.w2_packed, 1);
       stage_packed_weight(p + ".attention.wo", &lw.wo_packed, 2);
       stage_packed_pair(p + ".feed_forward.w1", p + ".feed_forward.w3", &lw.w13_packed, 4);

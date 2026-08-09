@@ -136,7 +136,7 @@ void run_case(const Case& c, int rows, int cols) {
 // unknown before residency: synthetic blocks prove the arithmetic, only a real
 // tensor proves the layout assumptions (row/col order, block-per-row stride)
 // against a file a quantizer actually wrote.
-void run_real(const std::string& gguf_path) {
+void run_real(const std::string& gguf_path, bool bandwidth) {
   model::GgufLoader g;
   try {
     g.open(gguf_path);
@@ -152,6 +152,29 @@ void run_real(const std::string& gguf_path) {
 
     const int rows = std::min(pk.rows, 32);  // a slice is enough; rows are independent
     const std::size_t row_bytes = pk.bytes / static_cast<std::size_t>(pk.rows);
+
+    // Q and K are stored with the converter's RoPE row interleave, which the
+    // engine undoes on the packed bytes while staging (upload_packed_rows).
+    // Doing the same here is what makes this a gate for that: if reordering
+    // packed rows were not equivalent to the host un-permute of fp16, this
+    // comparison against the loader's fp16 would fail.
+    std::vector<std::uint8_t> permuted;
+    const auto* packed_src = reinterpret_cast<const std::uint8_t*>(pk.data);
+    if (pk.permute_heads > 0 && pk.rows % pk.permute_heads == 0) {
+      permuted.resize(pk.bytes);
+      const int hd = pk.rows / pk.permute_heads;
+      const int hh = hd / 2;
+      for (int h = 0; h < pk.permute_heads; ++h) {
+        for (int r = 0; r < hd; ++r) {
+          const int src_row = (r < hh) ? (r * 2) : ((r - hh) * 2 + 1);
+          std::memcpy(permuted.data() + static_cast<std::size_t>(h * hd + r) * row_bytes,
+                      packed_src + static_cast<std::size_t>(h * hd + src_row) * row_bytes,
+                      row_bytes);
+        }
+      }
+      packed_src = permuted.data();
+    }
+
     std::vector<__half> x(pk.cols);
     std::mt19937 rng(4242);
     std::uniform_real_distribution<float> xd(-1.0f, 1.0f);
@@ -175,13 +198,50 @@ void run_real(const std::string& gguf_path) {
     cudaMalloc(&d_w, row_bytes * rows);
     cudaMalloc(&d_x, x.size() * sizeof(__half));
     cudaMalloc(&d_y, static_cast<std::size_t>(rows) * sizeof(__half));
-    cudaMemcpy(d_w, pk.data, row_bytes * rows, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_w, packed_src, row_bytes * rows, cudaMemcpyHostToDevice);
     cudaMemcpy(d_x, x.data(), x.size() * sizeof(__half), cudaMemcpyHostToDevice);
     kernels::launch_kquant_matvec(d_w, static_cast<kernels::KQuantType>(pk.kind), d_x, d_y, rows,
                                   pk.cols, nullptr);
     cudaDeviceSynchronize();
     std::vector<__half> y(rows);
     cudaMemcpy(y.data(), d_y, y.size() * sizeof(__half), cudaMemcpyDeviceToHost);
+    // Achieved bandwidth at the real shape. A matvec reads its weight exactly
+    // once, so bytes/time is the number to compare against the card's peak --
+    // and it says which shape is worth tuning rather than which is biggest.
+    // Uses the full tensor, not the 32-row correctness slice.
+    double gbps = 0.0;
+    if (bandwidth) {
+      std::uint8_t* d_full = nullptr;
+      __half* d_yfull = nullptr;
+      if (cudaMalloc(&d_full, pk.bytes) == cudaSuccess &&
+          cudaMalloc(&d_yfull, static_cast<std::size_t>(pk.rows) * sizeof(__half)) == cudaSuccess) {
+        cudaMemcpy(d_full, packed_src, pk.bytes, cudaMemcpyHostToDevice);
+        for (int it = 0; it < 3; ++it) {
+          kernels::launch_kquant_matvec(d_full, static_cast<kernels::KQuantType>(pk.kind), d_x,
+                                        d_yfull, pk.rows, pk.cols, nullptr);
+        }
+        cudaDeviceSynchronize();
+        cudaEvent_t t0, t1;
+        cudaEventCreate(&t0);
+        cudaEventCreate(&t1);
+        constexpr int kIters = 50;
+        cudaEventRecord(t0);
+        for (int it = 0; it < kIters; ++it) {
+          kernels::launch_kquant_matvec(d_full, static_cast<kernels::KQuantType>(pk.kind), d_x,
+                                        d_yfull, pk.rows, pk.cols, nullptr);
+        }
+        cudaEventRecord(t1);
+        cudaEventSynchronize(t1);
+        float ms = 0.0f;
+        cudaEventElapsedTime(&ms, t0, t1);
+        gbps = static_cast<double>(pk.bytes) * kIters / (ms * 1e-3) / 1e9;
+        cudaEventDestroy(t0);
+        cudaEventDestroy(t1);
+      }
+      cudaFree(d_full);
+      cudaFree(d_yfull);
+    }
+
     cudaFree(d_w);
     cudaFree(d_x);
     cudaFree(d_y);
@@ -192,10 +252,12 @@ void run_real(const std::string& gguf_path) {
     for (int r = 0; r < rows; ++r) {
       worst = std::max(worst, std::abs(__half2float(y[r]) - ref[r]) / (scale > 0.0 ? scale : 1.0));
     }
-    std::printf("  %-28s kind=%d rows=%-5d cols=%-5d worst_rel=%.5f\n", name.c_str(), pk.kind,
+    std::printf("  %-28s kind=%d rows=%-5d cols=%-5d worst_rel=%.5f", name.c_str(), pk.kind,
                 pk.rows, pk.cols, worst);
+    if (bandwidth) std::printf("  %7.1f GB/s", gbps);
+    std::printf("\n");
     check(worst < 0.01, name + ": packed matvec matches the fp16 expansion");
-    if (++checked >= 4) break;
+    if (++checked >= 6) break;
   }
   check(checked > 0, "found packed k-quant tensors to check");
 }
@@ -221,7 +283,8 @@ int main(int argc, char** argv) {
   }
   if (argc > 1) {
     std::printf("kquant_matvec_test: real weights from %s\n", argv[1]);
-    run_real(argv[1]);
+    // A second argument turns on the per-shape bandwidth report.
+    run_real(argv[1], argc > 2);
   }
   std::printf("%s\n", failures == 0 ? "KQUANT MATVEC: PASS" : "KQUANT MATVEC: FAIL");
   return failures == 0 ? 0 : 1;

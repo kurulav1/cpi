@@ -174,9 +174,8 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
     // --- Attention block ---
     launch_norm(d_x_, lw->norm_att, lw->norm_att_bias, d_x_norm_, batch, hidden);
 
-    const void* qkv_src = lw->wqkv_packed.active()
-                              ? dequant_packed_for_gemm(lw->wqkv_packed, compute_stream_)
-                              : static_cast<const void*>(lw->wqkv);
+    const void* qkv_src = dequant_packed_qkv_for_gemm(*lw, compute_stream_);
+    if (qkv_src == nullptr) qkv_src = lw->wqkv;
     detail::dispatch_linear_rowmajor_weight(
         cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,
         const_cast<void*>(qkv_src), d_x_norm_, d_qkv_, q_hidden + 2 * kv_hidden, hidden, batch,
