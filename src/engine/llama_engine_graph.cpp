@@ -118,9 +118,11 @@ void LlamaEngine::init_greedy_decode_graph() {
             tq.w13, d_tq3_codebook_, tq.s_w13, static_cast<const __half*>(d_x_tq3_),
             static_cast<__half*>(d_ff1_), 2 * inter, hidden, compute_stream_);
       }
-      // Warm w2 (fp16, always) using resident_projection_half; always graph-capturable.
-      resident_projection_half(lw.w2, d_ff2_, d_ff3_, hidden, inter, resident_wo_warps_,
-                               resident_wo_tile_pairs_, resident_wo_rows_per_warp_);
+      // Warm w2 (fp16 under TQ3) using resident_projection_half; always graph-capturable.
+      if (lw.w2 != nullptr) {
+        resident_projection_half(lw.w2, d_ff2_, d_ff3_, hidden, inter, resident_wo_warps_,
+                                 resident_wo_tile_pairs_, resident_wo_rows_per_warp_);
+      }
     } else if (!cached_int8_proj_enabled_) {
       if (resident_custom_qkv_) {
         resident_projection_half(lw.wqkv, d_x_norm_, d_q_, hidden + 2 * kv_hidden, hidden,
@@ -132,7 +134,15 @@ void LlamaEngine::init_greedy_decode_graph() {
                                                 d_x_norm_, d_q_, hidden + 2 * kv_hidden, hidden, 1,
                                                 CUDA_R_16F);
       }
-      if (resident_custom_wo_) {
+      if (lw.wo_packed.active()) {
+        // Warm what capture will actually record. A packed matrix has no fp16
+        // buffer, so warming the fp16 kernel would hand cuBLAS a null pointer.
+        kernels::launch_kquant_matvec(static_cast<const std::uint8_t*>(lw.wo_packed.data),
+                                      static_cast<kernels::KQuantType>(lw.wo_packed.kind),
+                                      static_cast<const __half*>(d_att_),
+                                      static_cast<__half*>(d_ff3_), lw.wo_packed.rows,
+                                      lw.wo_packed.cols, compute_stream_);
+      } else if (resident_custom_wo_) {
         resident_projection_half(lw.wo, d_att_, d_ff3_, hidden, hidden, resident_wo_warps_,
                                  resident_wo_tile_pairs_, resident_wo_rows_per_warp_);
       } else {
@@ -168,12 +178,28 @@ void LlamaEngine::init_greedy_decode_graph() {
           }
         }
       } else if (!cached_int8_proj_enabled_) {
-        detail::dispatch_linear_rowmajor_weight(
-            cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_,
-            compute_stream_, lw.w13, d_x_norm_, d_ff1_, 2 * inter, hidden, 1, CUDA_R_16F);
-        detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
-                                                lt_workspace_bytes_, compute_stream_, lw.w2, d_ff2_,
-                                                d_ff3_, hidden, inter, 1, CUDA_R_16F);
+        if (lw.w13_packed.active()) {
+          kernels::launch_kquant_matvec(static_cast<const std::uint8_t*>(lw.w13_packed.data),
+                                        static_cast<kernels::KQuantType>(lw.w13_packed.kind),
+                                        static_cast<const __half*>(d_x_norm_),
+                                        static_cast<__half*>(d_ff1_), lw.w13_packed.rows,
+                                        lw.w13_packed.cols, compute_stream_);
+        } else {
+          detail::dispatch_linear_rowmajor_weight(
+              cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_,
+              compute_stream_, lw.w13, d_x_norm_, d_ff1_, 2 * inter, hidden, 1, CUDA_R_16F);
+        }
+        if (lw.w2_packed.active()) {
+          kernels::launch_kquant_matvec(static_cast<const std::uint8_t*>(lw.w2_packed.data),
+                                        static_cast<kernels::KQuantType>(lw.w2_packed.kind),
+                                        static_cast<const __half*>(d_ff2_),
+                                        static_cast<__half*>(d_ff3_), lw.w2_packed.rows,
+                                        lw.w2_packed.cols, compute_stream_);
+        } else {
+          detail::dispatch_linear_rowmajor_weight(
+              cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_,
+              compute_stream_, lw.w2, d_ff2_, d_ff3_, hidden, inter, 1, CUDA_R_16F);
+        }
       } else if (lw.w13) {
         // INT8 proj + FP16 MLP (e.g., TinyLlama): warm resident_projection_half since
         // cuBLASLt may not find a graph-capturable plan for all dimension combinations.
@@ -309,6 +335,14 @@ void LlamaEngine::init_greedy_decode_graph() {
             hidden, compute_stream_, resident_int8_wo_warps_, resident_int8_wo_tile_packed4_,
             resident_int8_wo_warps_per_row_);
       }
+    } else if (lw->wo_packed.active()) {
+      // Packed k-quant: multiply the container's own blocks. Nothing is fused
+      // into this one, so the shared add_inplace below still runs.
+      ++packed_matvec_calls_;
+      kernels::launch_kquant_matvec(static_cast<const std::uint8_t*>(lw->wo_packed.data),
+                                    static_cast<kernels::KQuantType>(lw->wo_packed.kind),
+                                    static_cast<const __half*>(d_att_), static_cast<__half*>(d_ff3_),
+                                    lw->wo_packed.rows, lw->wo_packed.cols, compute_stream_);
     } else if (resident_custom_wo_) {
       // Residual add folded into this projection's epilogue, so the shared add_inplace
       // below is skipped. At batch 1 a kernel costs a fixed ~1.7 us whatever it does.
@@ -367,6 +401,16 @@ void LlamaEngine::init_greedy_decode_graph() {
             static_cast<__half*>(d_ff2_), inter, hidden, compute_stream_);
       }
       fused_glu = false;
+    } else if (lw->w13_packed.active()) {
+      // Gate and up share one packed buffer, so a single matvec covers both row
+      // blocks and the gated activation below finishes the job.
+      ++packed_matvec_calls_;
+      kernels::launch_kquant_matvec(static_cast<const std::uint8_t*>(lw->w13_packed.data),
+                                    static_cast<kernels::KQuantType>(lw->w13_packed.kind),
+                                    static_cast<const __half*>(d_x_norm_),
+                                    static_cast<__half*>(d_ff1_), lw->w13_packed.rows,
+                                    lw->w13_packed.cols, compute_stream_);
+      fused_glu = false;
     } else if (!weights_.config().mlp_gelu) {
       // fused: gate+up GEMV and silu_mul in one kernel. At batch 1 every kernel costs a
       // fixed ~2.7 us of scheduling regardless of how little it does, and that tax; not
@@ -414,6 +458,12 @@ void LlamaEngine::init_greedy_decode_graph() {
             lw_i8->w2, lw_i8->s_w2, static_cast<const __half*>(d_ff2_),
             static_cast<__half*>(d_ff3_), hidden, inter, compute_stream_);
       }
+    } else if (lw->w2_packed.active()) {
+      ++packed_matvec_calls_;
+      kernels::launch_kquant_matvec(static_cast<const std::uint8_t*>(lw->w2_packed.data),
+                                    static_cast<kernels::KQuantType>(lw->w2_packed.kind),
+                                    static_cast<const __half*>(d_ff2_), static_cast<__half*>(d_ff3_),
+                                    lw->w2_packed.rows, lw->w2_packed.cols, compute_stream_);
     } else {
       // Residual add folded into the down-projection's epilogue.
       resident_projection_half_residual(lw->w2, d_ff2_, d_x_, hidden, inter, resident_wo_warps_,
@@ -513,9 +563,11 @@ void LlamaEngine::init_logits_decode_graph() {
             tq.w13, d_tq3_codebook_, tq.s_w13, static_cast<const __half*>(d_x_tq3_),
             static_cast<__half*>(d_ff1_), 2 * inter, hidden, compute_stream_);
       }
-      // Warm w2 (fp16, always) using resident_projection_half; always graph-capturable.
-      resident_projection_half(lw.w2, d_ff2_, d_ff3_, hidden, inter, resident_wo_warps_,
-                               resident_wo_tile_pairs_, resident_wo_rows_per_warp_);
+      // Warm w2 (fp16 under TQ3) using resident_projection_half; always graph-capturable.
+      if (lw.w2 != nullptr) {
+        resident_projection_half(lw.w2, d_ff2_, d_ff3_, hidden, inter, resident_wo_warps_,
+                                 resident_wo_tile_pairs_, resident_wo_rows_per_warp_);
+      }
     } else if (!cached_int8_proj_enabled_) {
       if (resident_custom_qkv_) {
         resident_projection_half(lw.wqkv, d_x_norm_, d_q_, hidden + 2 * kv_hidden, hidden,
@@ -527,7 +579,15 @@ void LlamaEngine::init_logits_decode_graph() {
                                                 d_x_norm_, d_q_, hidden + 2 * kv_hidden, hidden, 1,
                                                 CUDA_R_16F);
       }
-      if (resident_custom_wo_) {
+      if (lw.wo_packed.active()) {
+        // Warm what capture will actually record. A packed matrix has no fp16
+        // buffer, so warming the fp16 kernel would hand cuBLAS a null pointer.
+        kernels::launch_kquant_matvec(static_cast<const std::uint8_t*>(lw.wo_packed.data),
+                                      static_cast<kernels::KQuantType>(lw.wo_packed.kind),
+                                      static_cast<const __half*>(d_att_),
+                                      static_cast<__half*>(d_ff3_), lw.wo_packed.rows,
+                                      lw.wo_packed.cols, compute_stream_);
+      } else if (resident_custom_wo_) {
         resident_projection_half(lw.wo, d_att_, d_ff3_, hidden, hidden, resident_wo_warps_,
                                  resident_wo_tile_pairs_, resident_wo_rows_per_warp_);
       } else {
@@ -563,12 +623,28 @@ void LlamaEngine::init_logits_decode_graph() {
           }
         }
       } else if (!cached_int8_proj_enabled_) {
-        detail::dispatch_linear_rowmajor_weight(
-            cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_,
-            compute_stream_, lw.w13, d_x_norm_, d_ff1_, 2 * inter, hidden, 1, CUDA_R_16F);
-        detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
-                                                lt_workspace_bytes_, compute_stream_, lw.w2, d_ff2_,
-                                                d_ff3_, hidden, inter, 1, CUDA_R_16F);
+        if (lw.w13_packed.active()) {
+          kernels::launch_kquant_matvec(static_cast<const std::uint8_t*>(lw.w13_packed.data),
+                                        static_cast<kernels::KQuantType>(lw.w13_packed.kind),
+                                        static_cast<const __half*>(d_x_norm_),
+                                        static_cast<__half*>(d_ff1_), lw.w13_packed.rows,
+                                        lw.w13_packed.cols, compute_stream_);
+        } else {
+          detail::dispatch_linear_rowmajor_weight(
+              cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_,
+              compute_stream_, lw.w13, d_x_norm_, d_ff1_, 2 * inter, hidden, 1, CUDA_R_16F);
+        }
+        if (lw.w2_packed.active()) {
+          kernels::launch_kquant_matvec(static_cast<const std::uint8_t*>(lw.w2_packed.data),
+                                        static_cast<kernels::KQuantType>(lw.w2_packed.kind),
+                                        static_cast<const __half*>(d_ff2_),
+                                        static_cast<__half*>(d_ff3_), lw.w2_packed.rows,
+                                        lw.w2_packed.cols, compute_stream_);
+        } else {
+          detail::dispatch_linear_rowmajor_weight(
+              cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_,
+              compute_stream_, lw.w2, d_ff2_, d_ff3_, hidden, inter, 1, CUDA_R_16F);
+        }
       } else if (lw.w13) {
         // INT8 proj + FP16 MLP (e.g., TinyLlama): warm resident_projection_half since
         // cuBLASLt may not find a graph-capturable plan for all dimension combinations.
@@ -698,6 +774,14 @@ void LlamaEngine::init_logits_decode_graph() {
             hidden, compute_stream_, resident_int8_wo_warps_, resident_int8_wo_tile_packed4_,
             resident_int8_wo_warps_per_row_);
       }
+    } else if (lw->wo_packed.active()) {
+      // Packed k-quant: multiply the container's own blocks. Nothing is fused
+      // into this one, so the shared add_inplace below still runs.
+      ++packed_matvec_calls_;
+      kernels::launch_kquant_matvec(static_cast<const std::uint8_t*>(lw->wo_packed.data),
+                                    static_cast<kernels::KQuantType>(lw->wo_packed.kind),
+                                    static_cast<const __half*>(d_att_), static_cast<__half*>(d_ff3_),
+                                    lw->wo_packed.rows, lw->wo_packed.cols, compute_stream_);
     } else if (resident_custom_wo_) {
       // Residual add folded into this projection's epilogue, so the shared add_inplace
       // below is skipped. At batch 1 a kernel costs a fixed ~1.7 us whatever it does.
@@ -752,6 +836,13 @@ void LlamaEngine::init_logits_decode_graph() {
             lw_i8->w3, lw_i8->s_w3, static_cast<const __half*>(d_x_norm_),
             static_cast<__half*>(d_ff2_), inter, hidden, compute_stream_);
       }
+    } else if (lw->w13_packed.active()) {
+      ++packed_matvec_calls_;
+      kernels::launch_kquant_matvec(static_cast<const std::uint8_t*>(lw->w13_packed.data),
+                                    static_cast<kernels::KQuantType>(lw->w13_packed.kind),
+                                    static_cast<const __half*>(d_x_norm_),
+                                    static_cast<__half*>(d_ff1_), lw->w13_packed.rows,
+                                    lw->w13_packed.cols, compute_stream_);
     } else {
       // FP16 MLP fallback in graph capture: use resident_projection_half (always graph-capturable).
       resident_projection_half(lw->w13, d_x_norm_, d_ff1_, 2 * inter, hidden, resident_qkv_warps_,
@@ -780,6 +871,12 @@ void LlamaEngine::init_logits_decode_graph() {
             lw_i8->w2, lw_i8->s_w2, static_cast<const __half*>(d_ff2_),
             static_cast<__half*>(d_ff3_), hidden, inter, compute_stream_);
       }
+    } else if (lw->w2_packed.active()) {
+      ++packed_matvec_calls_;
+      kernels::launch_kquant_matvec(static_cast<const std::uint8_t*>(lw->w2_packed.data),
+                                    static_cast<kernels::KQuantType>(lw->w2_packed.kind),
+                                    static_cast<const __half*>(d_ff2_), static_cast<__half*>(d_ff3_),
+                                    lw->w2_packed.rows, lw->w2_packed.cols, compute_stream_);
     } else {
       // Residual add folded into the down-projection's epilogue.
       resident_projection_half_residual(lw->w2, d_ff2_, d_x_, hidden, inter, resident_wo_warps_,

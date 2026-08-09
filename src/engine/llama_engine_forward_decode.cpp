@@ -633,6 +633,7 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
       }
     } else {
       if (lw->w2_packed.active()) {
+        ++packed_matvec_calls_;
         // The weight is still in the container's k-quant blocks; multiply them
         // directly rather than an fp16 expansion that need not exist.
         kernels::launch_kquant_matvec(static_cast<const std::uint8_t*>(lw->w2_packed.data),
@@ -748,6 +749,7 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
 
     run_profiled(last_benchmark_stats_.decode_wo_ms, [&] {
       if (lw->wo_packed.active()) {
+        ++packed_matvec_calls_;
         kernels::launch_kquant_matvec(static_cast<const std::uint8_t*>(lw->wo_packed.data),
                                       static_cast<kernels::KQuantType>(lw->wo_packed.kind),
                                       static_cast<const __half*>(d_att_),
@@ -767,6 +769,7 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
 
     run_profiled(last_benchmark_stats_.decode_mlp_ms, [&] {
       if (lw->w13_packed.active()) {
+        ++packed_matvec_calls_;
         // Gate and up in one packed buffer: one matvec over both row-blocks,
         // then the same gated activation the unfused path uses.
         kernels::launch_kquant_matvec(static_cast<const std::uint8_t*>(lw->w13_packed.data),
@@ -793,6 +796,7 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
       }
 
       if (lw->w2_packed.active()) {
+        ++packed_matvec_calls_;
         kernels::launch_kquant_matvec(static_cast<const std::uint8_t*>(lw->w2_packed.data),
                                       static_cast<kernels::KQuantType>(lw->w2_packed.kind),
                                       static_cast<const __half*>(d_ff2_),

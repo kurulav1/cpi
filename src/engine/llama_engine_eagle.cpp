@@ -335,14 +335,26 @@ void LlamaEngine::eagle_verify_forward(int K) {
         static_cast<const __half*>(d_prefill_q_), k_layer, v_layer, static_cast<__half*>(d_att_),
         d_eagle_pos_, K, /*window=*/0, cfg.num_heads, cfg.num_kv_heads, head_dim, d_eagle_mt_m_,
         d_eagle_mt_l_, d_eagle_mt_o_, 32, eagle_mt_chunks_, s);
+    // A packed k-quant weight has no fp16 copy for cuBLAS; expand it into the
+    // shared prefill scratch. Same stream as the GEMM, so the expansion is
+    // ordered before the read and before the next weight overwrites it.
+    const void* wo_src = lw->wo_packed.active()
+                              ? dequant_packed_for_gemm(lw->wo_packed, s)
+                              : static_cast<const void*>(lw->wo);
     detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
-                                            lt_workspace_bytes_, s, lw->wo, d_att_, d_ff3_, hidden,
+                                            lt_workspace_bytes_, s, const_cast<void*>(wo_src), d_att_, d_ff3_, hidden,
                                             q_hidden, K, CUDA_R_16F);
     kernels::launch_add_inplace(static_cast<__half*>(d_x_), static_cast<const __half*>(d_ff3_),
                                 K * hidden, s);
     launch_norm(d_x_, lw->norm_ffn, lw->norm_ffn_bias, d_x_norm_, K, hidden);
+    // A packed k-quant weight has no fp16 copy for cuBLAS; expand it into the
+    // shared prefill scratch. Same stream as the GEMM, so the expansion is
+    // ordered before the read and before the next weight overwrites it.
+    const void* w13_src = lw->w13_packed.active()
+                              ? dequant_packed_for_gemm(lw->w13_packed, s)
+                              : static_cast<const void*>(lw->w13);
     detail::dispatch_linear_rowmajor_weight(
-        cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, s, lw->w13,
+        cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, s, const_cast<void*>(w13_src),
         d_x_norm_, d_ff13_, 2 * inter, hidden, K, CUDA_R_16F);
     CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_ff1_, ff_row_bytes, ff13_base, ff13_stride_bytes,
                                  ff_row_bytes, K, cudaMemcpyDeviceToDevice, s));
@@ -351,8 +363,14 @@ void LlamaEngine::eagle_verify_forward(int K) {
     detail::launch_gated_glu(cfg.mlp_gelu, static_cast<const __half*>(d_prefill_ff1_),
                              static_cast<const __half*>(d_prefill_ff2_),
                              static_cast<__half*>(d_prefill_ff2_), K * inter, s);
+    // A packed k-quant weight has no fp16 copy for cuBLAS; expand it into the
+    // shared prefill scratch. Same stream as the GEMM, so the expansion is
+    // ordered before the read and before the next weight overwrites it.
+    const void* w2_src = lw->w2_packed.active()
+                              ? dequant_packed_for_gemm(lw->w2_packed, s)
+                              : static_cast<const void*>(lw->w2);
     detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
-                                            lt_workspace_bytes_, s, lw->w2, d_prefill_ff2_, d_ff3_,
+                                            lt_workspace_bytes_, s, const_cast<void*>(w2_src), d_prefill_ff2_, d_ff3_,
                                             hidden, inter, K, CUDA_R_16F);
     kernels::launch_add_inplace(static_cast<__half*>(d_x_), static_cast<const __half*>(d_ff3_),
                                 K * hidden, s);

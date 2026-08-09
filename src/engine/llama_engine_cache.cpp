@@ -30,6 +30,16 @@ namespace {
 // Bit per matrix: 1 = w2, 2 = wo, 4 = w13. One at a time is how the earlier
 // unpacking bugs were caught -- a wrong unpack reads as fluent text, not a
 // crash, so each matrix needs its own A/B against the fp16 path.
+// Whether a tensor will be served packed, answerable before allocation so the
+// fp16 buffer can be skipped rather than allocated and left unread.
+int kquant_packed_mask();
+int kquant_packed_mask_fwd() { return kquant_packed_mask(); }
+
+bool will_pack(const model::WeightLoader& w, const std::string& name, int bit) {
+  if ((kquant_packed_mask_fwd() & bit) == 0 || !w.is_gguf() || w.gguf() == nullptr) return false;
+  return w.gguf()->packed_kquant(name).valid();
+}
+
 int kquant_packed_mask() {
   static const int mask = []() {
     const char* env = std::getenv("CPI_KQUANT_PACKED");
@@ -602,13 +612,24 @@ void LlamaEngine::init_layer_cache() {
     const cudaError_t a0 =
         tq3_enabled_ ? cudaSuccess
                      : cudaMalloc(&lw.wqkv, bytes_for_matrix(q_hidden + 2 * kv_hidden, hidden));
-    const cudaError_t a1 =
-        tq3_enabled_ ? cudaSuccess : cudaMalloc(&lw.wo, bytes_for_matrix(hidden, q_hidden));
-    const cudaError_t a2 = (use_cached_int8 || tq3_enabled_)
+    // A matrix that will live packed gets no fp16 buffer at all; that skipped
+    // allocation is the whole point of packed residency. Every consumer either
+    // multiplies the blocks directly or expands them into the shared prefill
+    // scratch, so nothing reads the pointer that is left null here.
+    const std::string lp = "layers." + std::to_string(layer);
+    const bool pack_wo = will_pack(weights_, lp + ".attention.wo", 2);
+    const bool pack_w13 = will_pack(weights_, lp + ".feed_forward.w1", 4) &&
+                          will_pack(weights_, lp + ".feed_forward.w3", 4);
+    const bool pack_w2 = will_pack(weights_, lp + ".feed_forward.w2", 1);
+    const cudaError_t a1 = (tq3_enabled_ || pack_wo)
+                               ? cudaSuccess
+                               : cudaMalloc(&lw.wo, bytes_for_matrix(hidden, q_hidden));
+    const cudaError_t a2 = (use_cached_int8 || tq3_enabled_ || pack_w13)
                                ? cudaSuccess
                                : cudaMalloc(&lw.w13, bytes_for_matrix(2 * inter, hidden));
-    const cudaError_t a3 =
-        use_cached_int8 ? cudaSuccess : cudaMalloc(&lw.w2, bytes_for_matrix(hidden, inter));
+    const cudaError_t a3 = (use_cached_int8 || pack_w2)
+                               ? cudaSuccess
+                               : cudaMalloc(&lw.w2, bytes_for_matrix(hidden, inter));
     const cudaError_t a4 = cudaMalloc(&lw.norm_att, bytes_for_matrix(1, hidden));
     const cudaError_t a5 = cudaMalloc(&lw.norm_ffn, bytes_for_matrix(1, hidden));
     const cudaError_t a16 = cudaMalloc(&lw.bo, bytes_for_matrix(1, hidden));
@@ -822,7 +843,9 @@ void LlamaEngine::init_layer_cache() {
                        wqkv_base + static_cast<std::size_t>(q_hidden + kv_hidden) *
                                        static_cast<std::size_t>(hidden),
                        bytes_for_matrix(kv_hidden, hidden));
-      copy_fp16_direct(p + ".attention.wo", lw.wo, bytes_for_matrix(hidden, q_hidden));
+      if (lw.wo != nullptr) {
+        copy_fp16_direct(p + ".attention.wo", lw.wo, bytes_for_matrix(hidden, q_hidden));
+      }
       copy_optional_fp16_direct(p + ".attention.bo", lw.bo, bytes_for_matrix(1, hidden));
       if (cfg.has_qkv_bias && weights_.has_tensor(p + ".attention.bqkv")) {
         const std::size_t bias_bytes = bytes_for_matrix(1, q_hidden + 2 * kv_hidden);
@@ -834,12 +857,16 @@ void LlamaEngine::init_layer_cache() {
       copy_fp16_direct(p + ".ffn_norm.weight", lw.norm_ffn, bytes_for_matrix(1, hidden));
       copy_optional_fp16_direct(p + ".ffn_norm.bias", lw.norm_ffn_bias,
                                 bytes_for_matrix(1, hidden));
-      copy_fp16_direct(p + ".feed_forward.w1", w13_base, bytes_for_matrix(inter, hidden));
-      copy_fp16_direct(
-          p + ".feed_forward.w3",
-          w13_base + static_cast<std::size_t>(inter) * static_cast<std::size_t>(hidden),
-          bytes_for_matrix(inter, hidden));
-      copy_fp16_direct(p + ".feed_forward.w2", lw.w2, bytes_for_matrix(hidden, inter));
+      if (w13_base != nullptr) {
+        copy_fp16_direct(p + ".feed_forward.w1", w13_base, bytes_for_matrix(inter, hidden));
+        copy_fp16_direct(
+            p + ".feed_forward.w3",
+            w13_base + static_cast<std::size_t>(inter) * static_cast<std::size_t>(hidden),
+            bytes_for_matrix(inter, hidden));
+      }
+      if (lw.w2 != nullptr) {
+        copy_fp16_direct(p + ".feed_forward.w2", lw.w2, bytes_for_matrix(hidden, inter));
+      }
       // Packed k-quant residency (CPI_KQUANT_PACKED=1): keep the container's own
       // blocks on the device so decode can multiply them directly. Staged
       // alongside the fp16 copy for now -- correctness first; dropping the fp16

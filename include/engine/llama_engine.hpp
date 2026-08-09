@@ -678,6 +678,8 @@ private:
   // row-blocks. Declines unless both halves are packed the same way.
   void stage_packed_pair(const std::string& first, const std::string& second, PackedWeight* out);
 
+  const void* dequant_packed_for_gemm(const PackedWeight& w, cudaStream_t stream);
+
   const void* dequant_weight_for_gemm(const std::int8_t* w, const float* scales, bool int4,
                                       int rows, int cols, int group);
   std::int8_t* d_prefill_i8_ = nullptr;   // INT8 quantised activations for prefill INT8 path.
@@ -868,6 +870,11 @@ private:
   // CUDA graph state for the greedy-decode fast path.
   cudaGraph_t greedy_decode_graph_ = nullptr;           // Captured decode graph object.
   cudaGraphExec_t greedy_decode_graph_exec_ = nullptr;  // Executable instance of the decode graph.
+  // How many packed k-quant matvecs actually launched. There are several layer
+  // bodies (two captured into CUDA graphs, one not), so "the output did not
+  // change" cannot on its own tell you the packed path ran -- it did not, once.
+  std::uint64_t packed_matvec_calls_ = 0;
+
   bool greedy_decode_graph_ready_ = false;  // True once the graph has been captured and compiled.
   bool greedy_decode_graph_state_valid_ =
       false;  // True when cached graph inputs match the current state.

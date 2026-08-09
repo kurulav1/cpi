@@ -9,6 +9,7 @@
 
 #include "common.hpp"
 #include "engine/llama_engine.hpp"
+#include "model/gguf_kquant.hpp"
 #include "grammar/grammar_sampler.hpp"
 #include "llama_engine_internal.hpp"
 #include "runtime/cuda_utils.cuh"
@@ -58,6 +59,37 @@ const void* LlamaEngine::dequant_weight_for_gemm(const std::int8_t* w, const flo
   }
   kernels::launch_dequant_weight_rowwise_to_fp16(w, scales, static_cast<__half*>(d_prefill_wdq_),
                                                  rows, cols, int4, group, compute_stream_);
+  return d_prefill_wdq_;
+}
+
+// Dequantizes a packed k-quant weight into the prefill scratch so the fp16 GEMM
+// path can consume it. Same scratch and same same-stream reuse rule as the
+// low-bit sibling above: the GEMM is enqueued before the next dequant overwrites
+// the buffer, and both live on compute_stream_.
+const void* LlamaEngine::dequant_packed_for_gemm(const PackedWeight& w,
+                                                 cudaStream_t stream) {
+  if (!w.active()) return nullptr;
+  const std::size_t need =
+      static_cast<std::size_t>(w.rows) * static_cast<std::size_t>(w.cols) * sizeof(__half);
+  if (need > d_prefill_wdq_bytes_) {
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (d_prefill_wdq_ != nullptr) cudaFree(d_prefill_wdq_);
+    d_prefill_wdq_ = nullptr;
+    d_prefill_wdq_bytes_ = 0;
+    if (cudaMalloc(&d_prefill_wdq_, need) != cudaSuccess) {
+      d_prefill_wdq_ = nullptr;
+      return nullptr;
+    }
+    d_prefill_wdq_bytes_ = need;
+  }
+  // The kernel counts SUPER-BLOCKS, not elements: one thread block per 256
+  // weights. Passing the element count launches 256x the grid and writes far
+  // past the scratch, which surfaces as an unrelated cuBLAS internal error.
+  kernels::launch_dequant_kquant(static_cast<const std::uint8_t*>(w.data),
+                                 static_cast<kernels::KQuantType>(w.kind),
+                                 (static_cast<std::size_t>(w.rows) *
+                                  static_cast<std::size_t>(w.cols)) / model::kquant::kSuperBlock,
+                                 static_cast<__half*>(d_prefill_wdq_), stream);
   return d_prefill_wdq_;
 }
 
@@ -379,10 +411,14 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
                             ? dequant_weight_for_gemm(lw_i8->wo, lw_i8->s_wo, lw_i8->proj_int4,
                                                       hidden, q_hidden, 0)
                             : nullptr;
-    if (wo_dq != nullptr) {
+    // A packed k-quant weight has no fp16 copy to hand cuBLAS, so it expands
+    // into the same scratch the low-bit path uses. Brick 5 comes out of this:
+    // prefill needs no new GEMM, only a different way to fill the scratch.
+    const void* wo_src = wo_dq != nullptr ? wo_dq : dequant_packed_for_gemm(lw->wo_packed, compute_stream_);
+    if (wo_src != nullptr) {
       detail::dispatch_linear_rowmajor_weight(
           cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,
-          const_cast<void*>(wo_dq), d_att_, d_ff3_, hidden, q_hidden, rows, CUDA_R_16F);
+          const_cast<void*>(wo_src), d_att_, d_ff3_, hidden, q_hidden, rows, CUDA_R_16F);
     } else if (lowbit_proj && can_use_dp4a_proj) {
       kernels::launch_quantize_rowwise_fp16_to_int8(static_cast<const __half*>(d_att_),
                                                     d_prefill_i8_, d_prefill_i8_scales_, rows,
@@ -478,9 +514,11 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
             static_cast<__half*>(d_prefill_ff2_), rows, inter, hidden, compute_stream_);
       }
     } else {
+      const void* w13_src = lw->w13_packed.active() ? dequant_packed_for_gemm(lw->w13_packed, compute_stream_)
+                                                    : static_cast<const void*>(lw->w13);
       detail::dispatch_linear_rowmajor_weight(
           cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,
-          lw->w13, d_x_norm_, d_ff13_, 2 * inter, hidden, rows, CUDA_R_16F);
+          const_cast<void*>(w13_src), d_x_norm_, d_ff13_, 2 * inter, hidden, rows, CUDA_R_16F);
 
       // Read gate/up straight off the fused [rows, 2*inter] w13 output rather than splitting it
       // into two buffers first: those copies only un-interleave data the GLU reads elementwise.
@@ -503,10 +541,11 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
                             ? dequant_weight_for_gemm(lw_i8->w2, lw_i8->s_w2, lw_i8->mlp_int4,
                                                       hidden, inter, lw_i8->mlp_group)
                             : nullptr;
-    if (w2_dq != nullptr) {
+    const void* w2_src = w2_dq != nullptr ? w2_dq : dequant_packed_for_gemm(lw->w2_packed, compute_stream_);
+    if (w2_src != nullptr) {
       detail::dispatch_linear_rowmajor_weight(
           cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,
-          const_cast<void*>(w2_dq), d_prefill_ff2_, d_ff3_, hidden, inter, rows, CUDA_R_16F);
+          const_cast<void*>(w2_src), d_prefill_ff2_, d_ff3_, hidden, inter, rows, CUDA_R_16F);
     } else if (lw_i8 && lw_i8->w1 && lw_i8->w2 && lw_i8->w3 && lw_i8->mlp_group > 0) {
       // Group-wise int4 MLP (w2) via perm8 dp4a: post-GLU activation (d_prefill_ff2_).
       kernels::launch_quantize_fp16_to_int8_perm8_g32_mt(
@@ -738,6 +777,11 @@ std::vector<int> LlamaEngine::generate_stream(const std::vector<int>& prompt_tok
   last_benchmark_stats_.tq3_cached_active = tq3_cached_active ? 1 : 0;
   if (options_.verbose && tq3_enabled_) {
     std::cout << "[engine] tq3_cached_active=" << (tq3_cached_active ? 1 : 0) << "\n";
+  }
+  if (packed_matvec_calls_ > 0) {
+    // Printed unconditionally: this counter exists to answer "did the packed
+    // path run at all", and a silent report would defeat the purpose.
+    std::cout << "[engine] packed_kquant_matvecs=" << packed_matvec_calls_ << "\n";
   }
   benchmark_transfer_active_ = false;
   greedy_decode_graph_state_valid_ = false;
