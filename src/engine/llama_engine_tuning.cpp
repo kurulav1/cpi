@@ -221,6 +221,9 @@ void LlamaEngine::resident_int8_mlp_w2(const LayerDeviceInt8Weights& lw_i8, int 
 
 void LlamaEngine::tune_resident_projection_backends() {
   resident_custom_qkv_ = false;
+  // With the projections packed there is no fp16 buffer to benchmark and no
+  // choice of backend to make; the packed matvec is the only implementation.
+  if (!layer_cache_.empty() && layer_cache_.front().wqkv_packed.active()) return;
   resident_custom_wo_ = false;
   resident_custom_lm_head_ = false;
   resident_qkv_warps_ = 8;

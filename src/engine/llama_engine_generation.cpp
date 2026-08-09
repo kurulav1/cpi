@@ -247,9 +247,13 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
             static_cast<__half*>(d_qkv_), rows, q_hidden + 2 * kv_hidden, hidden, compute_stream_);
       }
     } else {
+      const void* qkv_src = lw->wqkv_packed.active()
+                                ? dequant_packed_for_gemm(lw->wqkv_packed, compute_stream_)
+                                : static_cast<const void*>(lw->wqkv);
       detail::dispatch_linear_rowmajor_weight(
           cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,
-          lw->wqkv, d_x_norm_, d_qkv_, q_hidden + 2 * kv_hidden, hidden, rows, CUDA_R_16F);
+          const_cast<void*>(qkv_src), d_x_norm_, d_qkv_, q_hidden + 2 * kv_hidden, hidden, rows,
+          CUDA_R_16F);
     }
     maybe_add_half_bias(d_ff3_, lw->bo, rows, hidden);
 

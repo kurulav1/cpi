@@ -116,6 +116,11 @@ public:
     int kind = -1;
     int rows = 0;  // out_features
     int cols = 0;  // in_features
+    // Non-zero for Q/K, which the converter stored with its RoPE row
+    // interleave. The un-permute moves whole rows, and a packed row is a
+    // contiguous run of super-blocks, so a consumer can undo it on the packed
+    // bytes -- see WeightLoader users of this field.
+    int permute_heads = 0;
     [[nodiscard]] bool valid() const {
       return data != nullptr && kind >= 0;
     }

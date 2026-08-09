@@ -244,6 +244,17 @@ bool LlamaEngine::prefill_attention_tensorcore(const void* q, const void* k_laye
   return true;
 }
 
+bool LlamaEngine::packed_qkv_matvec(const PackedWeight& w, const void* x_norm, void* qkv,
+                                    cudaStream_t stream) {
+  if (!w.active()) return false;
+  ++packed_matvec_calls_;
+  kernels::launch_kquant_matvec(static_cast<const std::uint8_t*>(w.data),
+                                static_cast<kernels::KQuantType>(w.kind),
+                                static_cast<const __half*>(x_norm), static_cast<__half*>(qkv),
+                                w.rows, w.cols, stream);
+  return true;
+}
+
 void LlamaEngine::project_lm_head_logits(const __half* x_norm, float* logits) {
   const auto& cfg = weights_.config();
   if (lm_head_packed_.active()) {

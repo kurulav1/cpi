@@ -630,12 +630,12 @@ GgufLoader::PackedTensor GgufLoader::packed_kquant(const std::string& cpi_name) 
     out.kind = -1;
     return out;
   }
-  // Q and K carry the converter's RoPE permutation, which is undone on the host
-  // while unpacking. A packed consumer would need it applied to the blocks
-  // themselves, so they are withheld rather than silently served unpermuted.
-  if (permute_heads_.find(cpi_name) != permute_heads_.end()) {
-    out.kind = -1;
-    return out;
+  // Q and K carry the converter's RoPE row interleave. It is reported rather
+  // than applied: the un-permute reorders whole rows, so a packed consumer can
+  // undo it by gathering row-sized byte runs.
+  const auto perm = permute_heads_.find(cpi_name);
+  if (perm != permute_heads_.end()) {
+    out.permute_heads = perm->second;
   }
   out.bytes = (info.elements / kquant::kSuperBlock) * block_bytes;
   if (info.offset + out.bytes > data_bytes_) {

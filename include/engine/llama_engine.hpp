@@ -155,6 +155,7 @@ private:
     // Only the matrices the container can serve packed are populated: Q/K carry
     // a RoPE permutation undone during host unpacking, and CPI's QKV is fused
     // while GGUF stores it split, so those stay fp16 for now.
+    PackedWeight wqkv_packed;
     PackedWeight w2_packed;
     PackedWeight wo_packed;
     // gate and up concatenated; legal only because a k-quant row is a whole
@@ -681,6 +682,17 @@ private:
   // row-blocks. Declines unless both halves are packed the same way.
   void stage_packed_pair(const std::string& first, const std::string& second,
                          PackedWeight* out, int mask_bit);
+
+  // Same for a matrix the container stores as three row-blocks (Q, K, V).
+  void stage_packed_triple(const std::string& a, const std::string& b, const std::string& c,
+                           PackedWeight* out, int mask_bit);
+
+  bool upload_packed_rows(const model::GgufLoader::PackedTensor& pk, void* dst);
+
+  // Single-token QKV straight off the packed blocks. False when this layer kept
+  // its fp16 fused matrix, which is the caller's cue to run the old path.
+  bool packed_qkv_matvec(const PackedWeight& w, const void* x_norm, void* qkv,
+                         cudaStream_t stream);
 
   const void* dequant_packed_for_gemm(const PackedWeight& w, cudaStream_t stream);
 

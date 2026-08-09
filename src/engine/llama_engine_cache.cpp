@@ -27,12 +27,33 @@ namespace {
 // Opt-in while the packed path is being wired matrix by matrix. Reading the
 // generated text at each step is the only thing that catches a wrong unpack,
 // so this stays off until every matrix has been through that.
-// Bit per matrix: 1 = w2, 2 = wo, 4 = w13. One at a time is how the earlier
+// Bit per matrix: 1 = w2, 2 = wo, 4 = w13, 8 = lm head, 16 = fused qkv.
+// One at a time is how the earlier
 // unpacking bugs were caught -- a wrong unpack reads as fluent text, not a
 // crash, so each matrix needs its own A/B against the fp16 path.
 // Whether a tensor will be served packed, answerable before allocation so the
 // fp16 buffer can be skipped rather than allocated and left unread.
 int kquant_packed_mask();
+
+// True when every part is packable AND they agree on quant type and width, the
+// same condition the fused stagers apply. The allocation decision and the
+// staging decision must not be able to disagree.
+bool will_pack_fused(const model::WeightLoader& w, const std::vector<std::string>& names, int bit) {
+  if ((kquant_packed_mask() & bit) == 0 || !w.is_gguf() || w.gguf() == nullptr) return false;
+  int kind = -1;
+  int cols = -1;
+  for (const auto& n : names) {
+    const auto pk = w.gguf()->packed_kquant(n);
+    if (!pk.valid()) return false;
+    if (kind < 0) {
+      kind = pk.kind;
+      cols = pk.cols;
+    } else if (pk.kind != kind || pk.cols != cols) {
+      return false;
+    }
+  }
+  return true;
+}
 
 bool will_pack(const model::WeightLoader& w, const std::string& name, int bit) {
   if ((kquant_packed_mask() & bit) == 0 || !w.is_gguf() || w.gguf() == nullptr) return false;
@@ -106,6 +127,60 @@ bool LlamaEngine::tq_cached_preflight_layers(int layers, std::string* reason) co
   return true;
 }
 
+// Uploads one packed tensor into `dst`, undoing the converter's Q/K row
+// interleave on the way when the container reports one. The un-permute moves
+// whole rows and a packed row is a contiguous run of super-blocks, so it is a
+// gather of row-sized byte runs -- the same reordering the host unpacker does,
+// applied to the blocks instead of to fp16.
+bool LlamaEngine::upload_packed_rows(const model::GgufLoader::PackedTensor& pk, void* dst) {
+  const std::size_t row_bytes = pk.bytes / static_cast<std::size_t>(pk.rows);
+  if (pk.permute_heads <= 0 || pk.rows % pk.permute_heads != 0) {
+    return cudaMemcpyAsync(dst, pk.data, pk.bytes, cudaMemcpyHostToDevice, transfer_stream_) ==
+           cudaSuccess;
+  }
+  const int hd = pk.rows / pk.permute_heads;  // rows per head
+  const int hh = hd / 2;
+  std::vector<std::uint8_t> tmp(pk.bytes);
+  const auto* src = reinterpret_cast<const std::uint8_t*>(pk.data);
+  for (int h = 0; h < pk.permute_heads; ++h) {
+    for (int r = 0; r < hd; ++r) {
+      const int src_row = (r < hh) ? (r * 2) : ((r - hh) * 2 + 1);
+      std::memcpy(tmp.data() + (static_cast<std::size_t>(h * hd + r) * row_bytes),
+                  src + (static_cast<std::size_t>(h * hd + src_row) * row_bytes), row_bytes);
+    }
+  }
+  // Synchronous: tmp is a local buffer and must not outlive the copy.
+  return cudaMemcpy(dst, tmp.data(), pk.bytes, cudaMemcpyHostToDevice) == cudaSuccess;
+}
+
+// CPI fuses Q, K and V into one matrix; a GGUF stores them apart. Concatenating
+// their packed rows is legal whenever the three share a quant type, which
+// Q4_K_M does not always do -- it puts Q6_K in some layers' attn_v. When they
+// disagree the fp16 path keeps the layer.
+void LlamaEngine::stage_packed_triple(const std::string& a, const std::string& b,
+                                      const std::string& c, PackedWeight* out, int mask_bit) {
+  if ((kquant_packed_mask() & mask_bit) == 0) return;
+  if (out == nullptr || !weights_.is_gguf() || weights_.gguf() == nullptr) return;
+  const auto pa = weights_.gguf()->packed_kquant(a);
+  const auto pb = weights_.gguf()->packed_kquant(b);
+  const auto pc = weights_.gguf()->packed_kquant(c);
+  if (!pa.valid() || !pb.valid() || !pc.valid()) return;
+  if (pa.kind != pb.kind || pa.kind != pc.kind) return;
+  if (pa.cols != pb.cols || pa.cols != pc.cols) return;
+  void* dev = nullptr;
+  if (cudaMalloc(&dev, pa.bytes + pb.bytes + pc.bytes) != cudaSuccess) return;
+  auto* base = static_cast<std::uint8_t*>(dev);
+  if (!upload_packed_rows(pa, base) || !upload_packed_rows(pb, base + pa.bytes) ||
+      !upload_packed_rows(pc, base + pa.bytes + pb.bytes)) {
+    cudaFree(dev);
+    return;
+  }
+  out->data = dev;
+  out->kind = pa.kind;
+  out->rows = pa.rows + pb.rows + pc.rows;
+  out->cols = pa.cols;
+}
+
 void LlamaEngine::stage_packed_pair(const std::string& first, const std::string& second,
                                     PackedWeight* out, int mask_bit) {
   if ((kquant_packed_mask() & mask_bit) == 0) return;
@@ -118,10 +193,7 @@ void LlamaEngine::stage_packed_pair(const std::string& first, const std::string&
   void* dev = nullptr;
   if (cudaMalloc(&dev, a.bytes + b.bytes) != cudaSuccess) return;
   auto* base = static_cast<std::uint8_t*>(dev);
-  if (cudaMemcpyAsync(base, a.data, a.bytes, cudaMemcpyHostToDevice, transfer_stream_) !=
-          cudaSuccess ||
-      cudaMemcpyAsync(base + a.bytes, b.data, b.bytes, cudaMemcpyHostToDevice, transfer_stream_) !=
-          cudaSuccess) {
+  if (!upload_packed_rows(a, base) || !upload_packed_rows(b, base + a.bytes)) {
     cudaFree(dev);
     return;
   }
@@ -139,8 +211,7 @@ void LlamaEngine::stage_packed_weight(const std::string& name, PackedWeight* out
   if (!pk.valid() || pk.rows <= 0 || pk.cols <= 0) return;
   void* dev = nullptr;
   if (cudaMalloc(&dev, pk.bytes) != cudaSuccess) return;  // stay on fp16 rather than fail
-  if (cudaMemcpyAsync(dev, pk.data, pk.bytes, cudaMemcpyHostToDevice, transfer_stream_) !=
-      cudaSuccess) {
+  if (!upload_packed_rows(pk, dev)) {
     cudaFree(dev);
     return;
   }
@@ -611,17 +682,25 @@ void LlamaEngine::init_layer_cache() {
         use_cached_int4
             ? static_cast<std::size_t>(inter) * static_cast<std::size_t>((hidden + 1) / 2)
             : static_cast<std::size_t>(inter) * static_cast<std::size_t>(hidden);
+    const std::string lp = "layers." + std::to_string(layer);
+    // Must match stage_packed_triple exactly: fusing three row-blocks into one
+    // buffer needs a shared quant type, and Q4_K_M puts Q6_K in some layers'
+    // attn_v. Checking each tensor alone would skip the fp16 allocation for a
+    // layer the stager then declines to pack, leaving nothing behind.
+    const bool pack_qkv = will_pack_fused(weights_, {lp + ".attention.wq", lp + ".attention.wk",
+                                                     lp + ".attention.wv"},
+                                          16);
     const cudaError_t a0 =
-        tq3_enabled_ ? cudaSuccess
-                     : cudaMalloc(&lw.wqkv, bytes_for_matrix(q_hidden + 2 * kv_hidden, hidden));
+        (tq3_enabled_ || pack_qkv)
+            ? cudaSuccess
+            : cudaMalloc(&lw.wqkv, bytes_for_matrix(q_hidden + 2 * kv_hidden, hidden));
     // A matrix that will live packed gets no fp16 buffer at all; that skipped
     // allocation is the whole point of packed residency. Every consumer either
     // multiplies the blocks directly or expands them into the shared prefill
     // scratch, so nothing reads the pointer that is left null here.
-    const std::string lp = "layers." + std::to_string(layer);
     const bool pack_wo = will_pack(weights_, lp + ".attention.wo", 2);
-    const bool pack_w13 = will_pack(weights_, lp + ".feed_forward.w1", 4) &&
-                          will_pack(weights_, lp + ".feed_forward.w3", 4);
+    const bool pack_w13 =
+        will_pack_fused(weights_, {lp + ".feed_forward.w1", lp + ".feed_forward.w3"}, 4);
     const bool pack_w2 = will_pack(weights_, lp + ".feed_forward.w2", 1);
     const cudaError_t a1 = (tq3_enabled_ || pack_wo)
                                ? cudaSuccess
@@ -695,6 +774,7 @@ void LlamaEngine::init_layer_cache() {
       if (lw.wo) cudaFree(lw.wo);
       if (lw.bo) cudaFree(lw.bo);
       if (lw.w13) cudaFree(lw.w13);
+      if (lw.wqkv_packed.data) cudaFree(lw.wqkv_packed.data);
       if (lw.w2_packed.data) cudaFree(lw.w2_packed.data);
       if (lw.wo_packed.data) cudaFree(lw.wo_packed.data);
       if (lw.w13_packed.data) cudaFree(lw.w13_packed.data);
@@ -836,15 +916,17 @@ void LlamaEngine::init_layer_cache() {
         copy_fp16_direct(p + ".attention.q_norm", lw.q_norm, bytes_for_matrix(1, qkd));
         copy_fp16_direct(p + ".attention.k_norm", lw.k_norm, bytes_for_matrix(1, qkd));
       }
-      copy_fp16_direct(p + ".attention.wq", wqkv_base, bytes_for_matrix(q_hidden, hidden));
-      copy_fp16_direct(
-          p + ".attention.wk",
-          wqkv_base + static_cast<std::size_t>(q_hidden) * static_cast<std::size_t>(hidden),
-          bytes_for_matrix(kv_hidden, hidden));
-      copy_fp16_direct(p + ".attention.wv",
-                       wqkv_base + static_cast<std::size_t>(q_hidden + kv_hidden) *
-                                       static_cast<std::size_t>(hidden),
-                       bytes_for_matrix(kv_hidden, hidden));
+      if (wqkv_base != nullptr) {
+        copy_fp16_direct(p + ".attention.wq", wqkv_base, bytes_for_matrix(q_hidden, hidden));
+        copy_fp16_direct(
+            p + ".attention.wk",
+            wqkv_base + static_cast<std::size_t>(q_hidden) * static_cast<std::size_t>(hidden),
+            bytes_for_matrix(kv_hidden, hidden));
+        copy_fp16_direct(p + ".attention.wv",
+                         wqkv_base + static_cast<std::size_t>(q_hidden + kv_hidden) *
+                                         static_cast<std::size_t>(hidden),
+                         bytes_for_matrix(kv_hidden, hidden));
+      }
       if (lw.wo != nullptr) {
         copy_fp16_direct(p + ".attention.wo", lw.wo, bytes_for_matrix(hidden, q_hidden));
       }
@@ -873,6 +955,8 @@ void LlamaEngine::init_layer_cache() {
       // blocks on the device so decode can multiply them directly. Staged
       // alongside the fp16 copy for now -- correctness first; dropping the fp16
       // allocation is the step that actually saves the memory.
+      stage_packed_triple(p + ".attention.wq", p + ".attention.wk", p + ".attention.wv",
+                          &lw.wqkv_packed, 16);
       stage_packed_weight(p + ".feed_forward.w2", &lw.w2_packed, 1);
       stage_packed_weight(p + ".attention.wo", &lw.wo_packed, 2);
       stage_packed_pair(p + ".feed_forward.w1", p + ".feed_forward.w3", &lw.w13_packed, 4);
