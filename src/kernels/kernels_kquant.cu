@@ -710,8 +710,17 @@ __global__ void kquant_matmul_kernel(const std::uint8_t* __restrict__ w,
 
 bool launch_kquant_matmul(const std::uint8_t* w, KQuantType type, const half* x, half* y, int rows,
                           int cols, int batch, int ldy, cudaStream_t stream) {
-  // Above this the expanded-weight GEMM is cheaper, and it has tensor cores.
-  if (batch < 2 || batch > 64) return false;
+  // This kernel is the mat-vec shape widened by a batch tile: warps split one
+  // row and reduce partial products. llama.cpp uses that shape (MMVQ) only for
+  // small batches and switches to MMQ above -- activations quantized to q8_1,
+  // weight tiles staged in shared memory, int8 tensor cores. CPI has no MMQ
+  // equivalent, so past the crossover the expanded-weight cuBLAS GEMM is the
+  // better answer: it at least gets fp16 tensor cores.
+  static const int max_batch = []() {
+    const char* e = std::getenv("CPI_KQUANT_MM_MAX");
+    return e != nullptr ? std::atoi(e) : 8;
+  }();
+  if (batch < 2 || batch > max_batch) return false;
   constexpr int kThreads = 256;
 #define CPI_KQ_MM(BM)                                                             \
   switch (type) {                                                                 \
