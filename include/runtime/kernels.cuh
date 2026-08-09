@@ -1277,6 +1277,13 @@ bool launch_kquant_matmul_dp4a(const std::uint8_t* w, KQuantType type, const hal
                                int rows, int cols, int batch, int ldy, std::int8_t* xq, float* xs,
                                float* xsum, cudaStream_t stream);
 
+// Q4_K on int8 tensor cores (mma.m16n8k32.s8, sm_80+): the weight stays packed
+// AND the inner product runs on tensor cores, which is what the expand-and-cuBLAS
+// fallback was winning on. Batch must fit one M tile (64). Same scratch as above.
+bool launch_kquant_mmq(const std::uint8_t* w, KQuantType type, const half* x, half* y, int rows,
+                       int cols, int batch, int ldy, std::int8_t* xq, float* xs, float* xsum,
+                       cudaStream_t stream);
+
 // Same, writing fp32. The LM head produces logits rather than activations.
 void launch_kquant_matvec_f32(const std::uint8_t* w, KQuantType type, const half* x, float* y,
                               int rows, int cols, cudaStream_t stream);

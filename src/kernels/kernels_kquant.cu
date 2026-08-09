@@ -857,6 +857,166 @@ __global__ void kquant_matmul_dp4a_kernel(const std::uint8_t* __restrict__ w,
 }
 
 
+// Q4_K matmul on int8 tensor cores -- the MMQ shape, adapted from
+// moe_int4_grouped_mma_kernel.
+//
+// Everything above this in the file multiplies packed weights with scalar FMAs,
+// which is why cuBLAS on an expanded weight kept winning above a batch of about
+// eight: it has tensor cores and they do not. This one keeps the weight packed
+// AND uses them, so it should beat both.
+//
+// Two things make Q4_K fit the MoE kernel's tiling almost unchanged. A 32-column
+// group of one row is a contiguous 32-byte run of qs -- low nibbles when the
+// group index is even, high when odd -- because a super-block's 256 weights are
+// laid out as four 32-byte runs each supplying a low and a high group. And the
+// scale index inside the block is just (group % 8).
+//
+// The one real difference from the MoE version is the minimum term. int4 there
+// is symmetric, so the int32 dot times two scales is the whole answer. A k-quant
+// weight is d*sc*q - dmin*m, so the dot needs a rank-1 correction:
+//   sum_i w_i x_i = d*sc * (sum_i q_i xq_i) * as - dmin*m * (sum_i x_i)
+// The activation group sum is precomputed by quantize_q8_1_groups_kernel, so the
+// correction costs one multiply-add per accumulator per K-group and never
+// touches the tensor cores.
+namespace {
+constexpr int kMmqBM = 64, kMmqBN = 64;
+}  // namespace
+
+__global__ void kquant_mmq_q4k_kernel(const std::uint8_t* __restrict__ w,
+                                      const std::int8_t* __restrict__ xq,
+                                      const float* __restrict__ as, const float* __restrict__ gsum,
+                                      __half* __restrict__ y, int rows, int cols, int batch,
+                                      int ldy) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800)
+  (void)w; (void)xq; (void)as; (void)gsum; (void)y; (void)rows; (void)cols; (void)batch; (void)ldy;
+#else
+  const int tid = static_cast<int>(threadIdx.x);
+  const int warp = tid >> 5, lane = tid & 31;
+  const int g = lane >> 2, t = lane & 3, mt = warp & 3, nhalf = warp >> 2;
+  const int blockNrow = blockIdx.x * kMmqBN;
+  const int Kg = cols >> 5;                 // 32-wide groups per row
+  const int blocks_per_row = cols >> 8;     // 256-wide super-blocks per row
+  const std::size_t row_bytes =
+      static_cast<std::size_t>(blocks_per_row) * model::kquant::kQ4KBlockBytes;
+
+  __shared__ __align__(16) std::int8_t As[kMmqBM][32];
+  __shared__ __align__(16) std::int8_t Bs[kMmqBN][32];
+  __shared__ float Bsc[kMmqBN];  // d * sc for this K-group
+  __shared__ float Bdm[kMmqBN];  // dmin * m for this K-group
+
+  float facc[4][4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i)
+#pragma unroll
+    for (int j = 0; j < 4; ++j) facc[i][j] = 0.0f;
+
+  for (int kg = 0; kg < Kg; ++kg) {
+    const int k0 = kg << 5;
+    const int sb = kg >> 3;          // which super-block
+    const int gin = kg & 7;          // scale index inside it
+    const int qrun = (gin >> 1) * 32;  // the 32-byte run this group lives in
+    const bool hi_nib = (gin & 1) != 0;
+
+    // Stage activations and weights: 8 x 256 threads covers 64 rows x 32 cols.
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int idx = tid + i * 256, r = idx >> 5, c = idx & 31;
+      As[r][c] = (r < batch) ? xq[static_cast<std::size_t>(r) * cols + k0 + c] : 0;
+      std::int8_t wv = 0;
+      const int wrow = blockNrow + r;
+      if (wrow < rows) {
+        const std::uint8_t* p =
+            w + static_cast<std::size_t>(wrow) * row_bytes +
+            static_cast<std::size_t>(sb) * model::kquant::kQ4KBlockBytes;
+        const std::uint8_t byte = p[16 + qrun + c];
+        wv = static_cast<std::int8_t>(hi_nib ? (byte >> 4) : (byte & 0x0F));
+      }
+      Bs[r][c] = wv;
+    }
+    // The two scale factors for this K-group, one pair per output row.
+    if (tid < kMmqBN) {
+      float sc = 0.0f, m = 0.0f, d = 0.0f, dmin = 0.0f;
+      const int wrow = blockNrow + tid;
+      if (wrow < rows) {
+        const std::uint8_t* p =
+            w + static_cast<std::size_t>(wrow) * row_bytes +
+            static_cast<std::size_t>(sb) * model::kquant::kQ4KBlockBytes;
+        const uint4 hdr = *reinterpret_cast<const uint4*>(p);
+        d = half_bits_to_float(static_cast<std::uint16_t>(hdr.x & 0xFFFFu));
+        dmin = half_bits_to_float(static_cast<std::uint16_t>(hdr.x >> 16));
+        scale_min_from_hdr(gin, hdr.y, hdr.z, hdr.w, &sc, &m);
+      }
+      Bsc[tid] = d * sc;
+      Bdm[tid] = dmin * m;
+    }
+    __syncthreads();
+
+    const int arow = 16 * mt;
+    const int m_a = arow + g, m_b = arow + g + 8;
+    const int a0 = *reinterpret_cast<int*>(&As[m_a][t * 4]);
+    const int a1 = *reinterpret_cast<int*>(&As[m_b][t * 4]);
+    const int a2 = *reinterpret_cast<int*>(&As[m_a][16 + t * 4]);
+    const int a3 = *reinterpret_cast<int*>(&As[m_b][16 + t * 4]);
+    const bool ok_a = m_a < batch, ok_b = m_b < batch;
+    const float as_a = ok_a ? as[static_cast<std::size_t>(m_a) * Kg + kg] : 0.0f;
+    const float as_b = ok_b ? as[static_cast<std::size_t>(m_b) * Kg + kg] : 0.0f;
+    const float gs_a = ok_a ? gsum[static_cast<std::size_t>(m_a) * Kg + kg] : 0.0f;
+    const float gs_b = ok_b ? gsum[static_cast<std::size_t>(m_b) * Kg + kg] : 0.0f;
+
+#pragma unroll
+    for (int nt = 0; nt < 4; ++nt) {
+      const int nbase = nhalf * 32 + nt * 8;
+      const int b0 = *reinterpret_cast<int*>(&Bs[nbase + g][t * 4]);
+      const int b1 = *reinterpret_cast<int*>(&Bs[nbase + g][16 + t * 4]);
+      int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+      asm volatile(
+          "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+          "{%0,%1,%2,%3};\n"
+          : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
+          : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+      const int na = nbase + 2 * t, nb = nbase + 2 * t + 1;
+      facc[nt][0] += static_cast<float>(c0) * as_a * Bsc[na] - Bdm[na] * gs_a;
+      facc[nt][1] += static_cast<float>(c1) * as_a * Bsc[nb] - Bdm[nb] * gs_a;
+      facc[nt][2] += static_cast<float>(c2) * as_b * Bsc[na] - Bdm[na] * gs_b;
+      facc[nt][3] += static_cast<float>(c3) * as_b * Bsc[nb] - Bdm[nb] * gs_b;
+    }
+    __syncthreads();
+  }
+
+#pragma unroll
+  for (int nt = 0; nt < 4; ++nt) {
+    const int nbase = nhalf * 32 + nt * 8;
+    const int rr[4] = {g, g, g + 8, g + 8};
+    const int cc[4] = {2 * t, 2 * t + 1, 2 * t, 2 * t + 1};
+#pragma unroll
+    for (int en = 0; en < 4; ++en) {
+      const int lm = 16 * mt + rr[en], gn = blockNrow + nbase + cc[en];
+      if (lm < batch && gn < rows) {
+        y[static_cast<std::size_t>(lm) * static_cast<std::size_t>(ldy) + gn] =
+            __float2half(facc[nt][en]);
+      }
+    }
+  }
+#endif
+}
+
+// Q4_K on int8 tensor cores. Same activation preparation as the dp4a path; the
+// difference is the inner product runs on mma instead of scalar FMAs. sm_80+
+// only -- the caller checks compute capability.
+bool launch_kquant_mmq(const std::uint8_t* w, KQuantType type, const half* x, half* y, int rows,
+                       int cols, int batch, int ldy, std::int8_t* xq, float* xs, float* xsum,
+                       cudaStream_t stream) {
+  if (type != KQuantType::Q4_K) return false;
+  if (batch < 1 || batch > kMmqBM || cols % 256 != 0) return false;
+  const int groups_per_row = cols >> 5;
+  const int total_groups = batch * groups_per_row;
+  quantize_q8_1_groups_kernel<<<(total_groups + 7) / 8, 256, 0, stream>>>(x, xq, xs, xsum, cols,
+                                                                         groups_per_row);
+  const int grid = (rows + kMmqBN - 1) / kMmqBN;
+  kquant_mmq_q4k_kernel<<<grid, 256, 0, stream>>>(w, xq, xs, xsum, y, rows, cols, batch, ldy);
+  return true;
+}
+
 // Quantize activations once per GEMM, then run the dp4a matmul.
 bool launch_kquant_matmul_dp4a(const std::uint8_t* w, KQuantType type, const half* x, half* y,
                                int rows, int cols, int batch, int ldy, std::int8_t* xq, float* xs,

@@ -280,6 +280,32 @@ void run_real(const std::string& gguf_path, bool bandwidth) {
           std::printf("  %-28s dp4a batch %-3d worst_rel=%.5f\n", name.c_str(), bsz, wq);
           check(wq < 0.02, name + ": dp4a matmul (batch " + std::to_string(bsz) + ") matches");
         }
+        // MMQ: same product on int8 tensor cores. Q4_K only, batch must fit one
+        // M tile. A wrong mma fragment mapping shows up here as a large error,
+        // not a crash, which is the whole reason this is checked against the
+        // fp16 reference rather than eyeballed.
+        if (pk.kind == 0 && bsz <= 64 && pk.cols % 256 == 0) {
+          cudaMemset(d_yb, 0, static_cast<std::size_t>(bsz) * rows * sizeof(__half));
+          const bool okm = kernels::launch_kquant_mmq(
+              d_w, static_cast<kernels::KQuantType>(pk.kind), d_xb, d_yb, rows, pk.cols, bsz,
+              /*ldy=*/rows, d_q, d_s, d_sum, nullptr);
+          cudaDeviceSynchronize();
+          if (okm) {
+            std::vector<__half> ym(static_cast<std::size_t>(bsz) * rows);
+            cudaMemcpy(ym.data(), d_yb, ym.size() * sizeof(__half), cudaMemcpyDeviceToHost);
+            double wm = 0.0;
+            for (int b = 0; b < bsz; ++b) {
+              const float mul = (b == 0) ? 1.0f : (0.5f + 0.25f * b);
+              for (int r = 0; r < rows; ++r) {
+                const double want = static_cast<double>(ref[r]) * mul;
+                const double got = __half2float(ym[static_cast<std::size_t>(b) * rows + r]);
+                wm = std::max(wm, std::abs(got - want) / (refmax * mul > 0.0 ? refmax * mul : 1.0));
+              }
+            }
+            std::printf("  %-28s mmq  batch %-3d worst_rel=%.5f\n", name.c_str(), bsz, wm);
+            check(wm < 0.02, name + ": mmq matmul (batch " + std::to_string(bsz) + ") matches");
+          }
+        }
         cudaFree(d_q);
         cudaFree(d_s);
         cudaFree(d_sum);

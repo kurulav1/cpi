@@ -284,6 +284,34 @@ bool LlamaEngine::packed_matmul(const PackedWeight& w, const void* x, void* y, i
                                   static_cast<__half*>(y) + row0, w.rows, w.cols, stream);
     return true;
   }
+  // Int8 tensor cores (CPI_KQUANT_MMQ=1). Correct, gated, and still SLOWER than
+  // expand-and-cuBLAS: 535 against 738 tok/s at B=32. It keeps the weight packed
+  // and does reach the hardware cuBLAS wins on, so the architecture is right --
+  // what is missing is tuning. Two known costs: the M tile is a fixed 64 rows,
+  // so a batch of 2 computes 62 rows of padding, and the staging/occupancy work
+  // llama.cpp carries per-architecture tile configs for is simply absent here.
+  static const bool mmq_on = []() {
+    const char* e = std::getenv("CPI_KQUANT_MMQ");
+    return e != nullptr && e[0] == '1';
+  }();
+  static const bool mma_ok = []() {
+    int dev = 0;
+    cudaDeviceProp prop{};
+    if (cudaGetDevice(&dev) != cudaSuccess) return false;
+    if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess) return false;
+    return prop.major >= 8;  // mma.m16n8k32.s8 is sm_80+
+  }();
+  if (mmq_on && mma_ok && batch >= 2 && batch <= 64 && w.kind == 0 && w.cols % 256 == 0 &&
+      ensure_q8_scratch(batch, w.cols) &&
+      kernels::launch_kquant_mmq(static_cast<const std::uint8_t*>(w.data),
+                                 static_cast<kernels::KQuantType>(w.kind),
+                                 static_cast<const __half*>(x), static_cast<__half*>(y) + row0,
+                                 w.rows, w.cols, batch, ldy, d_q8_x_, d_q8_scale_, d_q8_sum_,
+                                 stream)) {
+    ++packed_matmul_calls_;
+    return true;
+  }
+
   // dp4a form, opt-in (CPI_KQUANT_DP4A=1) and currently NOT profitable.
   //
   // The kernel is correct -- kquant_matvec_test gates it to 0.7% against the
