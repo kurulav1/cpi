@@ -271,6 +271,19 @@ bool LlamaEngine::ensure_q8_scratch(int batch, int cols) {
 bool LlamaEngine::packed_matmul(const PackedWeight& w, const void* x, void* y, int batch, int ldy,
                                 int row0, cudaStream_t stream) {
   if (!w.active()) return false;
+  // A single row is a matvec. Without this the batched path falls through to
+  // expand-and-cuBLAS, which re-expands the whole weight for one token: at B=1
+  // that measured 22 ms per token against 5.3 ms for the same model on the
+  // single-stream path, because a decode step was moving ~28 GB to multiply by
+  // one vector.
+  if (batch == 1) {
+    ++packed_matmul_calls_;
+    kernels::launch_kquant_matvec(static_cast<const std::uint8_t*>(w.data),
+                                  static_cast<kernels::KQuantType>(w.kind),
+                                  static_cast<const __half*>(x),
+                                  static_cast<__half*>(y) + row0, w.rows, w.cols, stream);
+    return true;
+  }
   // dp4a form, opt-in (CPI_KQUANT_DP4A=1) and currently NOT profitable.
   //
   // The kernel is correct -- kquant_matvec_test gates it to 0.7% against the
