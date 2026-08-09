@@ -666,7 +666,14 @@ __global__ void kquant_matmul_kernel(const std::uint8_t* __restrict__ w,
       int off_hi;
       kq_block_values<TYPE>(p, lane, wlo, whi, &off_lo, &off_hi);
       const int xbase = sb * static_cast<int>(kSuperBlock);
-      for (int t = 0; t < bn; ++t) {
+      // The bound is BMAX, a compile-time constant, with the tail masked rather
+      // than shortening the loop. A runtime bound leaves the compiler unable to
+      // prove the index range, so acc[] lands in local memory and every
+      // accumulate becomes a load-modify-store -- which measured as roughly 2%
+      // of fp32 peak.
+#pragma unroll
+      for (int t = 0; t < BMAX; ++t) {
+        if (t >= bn) continue;
         const __half* xb = x + static_cast<std::size_t>(b0 + t) * static_cast<std::size_t>(cols) +
                            xbase;
         float2 a1;
@@ -679,7 +686,9 @@ __global__ void kquant_matmul_kernel(const std::uint8_t* __restrict__ w,
       p += block_bytes * kWarps;
     }
 
-    for (int t = 0; t < bn; ++t) {
+#pragma unroll
+    for (int t = 0; t < BMAX; ++t) {
+      if (t >= bn) continue;
       float v = acc[t];
 #pragma unroll
       for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xFFFFFFFFu, v, off);

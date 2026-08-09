@@ -1040,6 +1040,12 @@ void LlamaEngine::run_batch_bench(const std::vector<int>& prompt, int max_new) {
     }
     std::printf("\n");
   }
+  if (packed_matvec_calls_ > 0 || packed_matmul_calls_ > 0 || packed_matmul_declined_ > 0) {
+    std::printf("  [packed] matvecs=%llu matmuls=%llu matmul_declined=%llu\n",
+                static_cast<unsigned long long>(packed_matvec_calls_),
+                static_cast<unsigned long long>(packed_matmul_calls_),
+                static_cast<unsigned long long>(packed_matmul_declined_));
+  }
 }
 
 void LlamaEngine::run_scheduler_check(const std::vector<int>& base_prompt, int max_new,

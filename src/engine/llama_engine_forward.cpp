@@ -247,10 +247,16 @@ bool LlamaEngine::prefill_attention_tensorcore(const void* q, const void* k_laye
 bool LlamaEngine::packed_matmul(const PackedWeight& w, const void* x, void* y, int batch, int ldy,
                                 int row0, cudaStream_t stream) {
   if (!w.active()) return false;
-  return kernels::launch_kquant_matmul(
+  const bool ok = kernels::launch_kquant_matmul(
       static_cast<const std::uint8_t*>(w.data), static_cast<kernels::KQuantType>(w.kind),
       static_cast<const __half*>(x), static_cast<__half*>(y) + row0, w.rows, w.cols, batch, ldy,
       stream);
+  if (ok) {
+    ++packed_matmul_calls_;
+  } else {
+    ++packed_matmul_declined_;
+  }
+  return ok;
 }
 
 // Batched QKV off the packed blocks, in whichever shape this layer has. All or
