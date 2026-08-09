@@ -704,6 +704,15 @@ private:
   bool packed_matmul(const PackedWeight& w, const void* x, void* y, int batch, int ldy, int row0,
                      cudaStream_t stream);
 
+  // Scratch for the dp4a path's int8 activations, grown on demand.
+  bool ensure_q8_scratch(int batch, int cols);
+
+  std::int8_t* d_q8_x_ = nullptr;
+  float* d_q8_scale_ = nullptr;
+  float* d_q8_sum_ = nullptr;
+  std::size_t q8_x_bytes_ = 0;
+  std::size_t q8_meta_bytes_ = 0;
+
   bool packed_qkv_matmul(const LayerDeviceWeights& lw, const void* x, void* y, int batch, int ldy,
                          cudaStream_t stream);
 

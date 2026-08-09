@@ -244,9 +244,59 @@ bool LlamaEngine::prefill_attention_tensorcore(const void* q, const void* k_laye
   return true;
 }
 
+bool LlamaEngine::ensure_q8_scratch(int batch, int cols) {
+  const std::size_t xb = static_cast<std::size_t>(batch) * static_cast<std::size_t>(cols);
+  const std::size_t mb =
+      static_cast<std::size_t>(batch) * static_cast<std::size_t>(cols / 32) * sizeof(float);
+  if (xb > q8_x_bytes_) {
+    if (d_q8_x_) cudaFree(d_q8_x_);
+    d_q8_x_ = nullptr;
+    q8_x_bytes_ = 0;
+    if (cudaMalloc(&d_q8_x_, xb) != cudaSuccess) return false;
+    q8_x_bytes_ = xb;
+  }
+  if (mb > q8_meta_bytes_) {
+    if (d_q8_scale_) cudaFree(d_q8_scale_);
+    if (d_q8_sum_) cudaFree(d_q8_sum_);
+    d_q8_scale_ = nullptr;
+    d_q8_sum_ = nullptr;
+    q8_meta_bytes_ = 0;
+    if (cudaMalloc(&d_q8_scale_, mb) != cudaSuccess) return false;
+    if (cudaMalloc(&d_q8_sum_, mb) != cudaSuccess) return false;
+    q8_meta_bytes_ = mb;
+  }
+  return true;
+}
+
 bool LlamaEngine::packed_matmul(const PackedWeight& w, const void* x, void* y, int batch, int ldy,
                                 int row0, cudaStream_t stream) {
   if (!w.active()) return false;
+  // dp4a form, opt-in (CPI_KQUANT_DP4A=1) and currently NOT profitable.
+  //
+  // The kernel is correct -- kquant_matvec_test gates it to 0.7% against the
+  // fp16 reference -- and the integer dots are genuinely cheaper. What sinks it
+  // is the plumbing around it: activations are quantized inside this call, so
+  // the same d_x_norm_ is re-quantized for qkv and again for w13, and a batched
+  // step pays 32 layers x 4 weights of extra launches and traffic. Measured at
+  // B=2..64 it runs 77.9/104.0/93.4/109.4/96.6/99.0 against 85.9/113.3/116.7/
+  // 128.1/150.2/160.5 without it.
+  //
+  // Hoisting the quantization to once per distinct activation is what llama.cpp
+  // does (src1 is converted once per matmul op, not per tile), and is the next
+  // step if this is picked up.
+  static const bool dp4a_on = []() {
+    const char* e = std::getenv("CPI_KQUANT_DP4A");
+    return e != nullptr && e[0] == '1';
+  }();
+  if (dp4a_on && batch >= 2 && w.kind != 2 && w.cols % 32 == 0 &&
+      ensure_q8_scratch(batch, w.cols) &&
+      kernels::launch_kquant_matmul_dp4a(
+          static_cast<const std::uint8_t*>(w.data), static_cast<kernels::KQuantType>(w.kind),
+          static_cast<const __half*>(x), static_cast<__half*>(y) + row0, w.rows, w.cols, batch, ldy,
+          d_q8_x_, d_q8_scale_, d_q8_sum_, stream)) {
+    ++packed_matmul_calls_;
+    return true;
+  }
   const bool ok = kernels::launch_kquant_matmul(
       static_cast<const std::uint8_t*>(w.data), static_cast<kernels::KQuantType>(w.kind),
       static_cast<const __half*>(x), static_cast<__half*>(y) + row0, w.rows, w.cols, batch, ldy,

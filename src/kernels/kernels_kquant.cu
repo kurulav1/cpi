@@ -708,6 +708,188 @@ __global__ void kquant_matmul_kernel(const std::uint8_t* __restrict__ w,
   }
 }
 
+// Activations in the form the packed matmul wants: int8 with one scale per
+// 32-element group, plus that group's sum. This is llama.cpp's q8_1 idea.
+//
+// The sum is needed because a k-quant weight is `d*sc*q - dmin*m`: the dot
+// splits into an integer part (sum q*xq, which dp4a does four at a time) and a
+// correction proportional to sum(x) over the group. Precomputing the sum here
+// keeps it out of the inner loop.
+//
+// One warp per group: 32 lanes, one element each.
+__global__ void quantize_q8_1_groups_kernel(const __half* __restrict__ x, std::int8_t* __restrict__ q,
+                                            float* __restrict__ scale, float* __restrict__ gsum,
+                                            int cols, int groups_per_row) {
+  const int warp = static_cast<int>(threadIdx.x) >> 5;
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int g = blockIdx.x * (blockDim.x >> 5) + warp;
+  const int total = gridDim.x * (blockDim.x >> 5);
+  (void)total;
+  const int row = g / groups_per_row;
+  const int gi = g % groups_per_row;
+  const std::size_t base = static_cast<std::size_t>(row) * cols + gi * 32;
+
+  const float v = __half2float(x[base + lane]);
+  float amax = fabsf(v);
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, off));
+  }
+  const float s = amax > 0.0f ? amax / 127.0f : 1.0f;
+  const int qi = __float2int_rn(v / s);
+  q[base + lane] = static_cast<std::int8_t>(max(-127, min(127, qi)));
+
+  float sum = static_cast<float>(qi);
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) sum += __shfl_xor_sync(0xFFFFFFFFu, sum, off);
+  if (lane == 0) {
+    scale[g] = s;
+    // Stored already multiplied by the scale: the inner loop wants sum(x), not
+    // sum(xq).
+    gsum[g] = sum * s;
+  }
+}
+
+// dp4a form of the batched packed matmul, Q4_K/Q5_K only (their scales are per
+// 32 elements, which is what the activation groups are cut to).
+//
+// Per lane per super-block the previous kernel did eight float multiply-adds per
+// batch element. Here the four low nibbles are already four int8 lanes of one
+// word (`qw & 0x0F0F0F0F`), so one dp4a does that whole run, and a second
+// against 0x01010101 gets the group sum the `-dmin*m` term needs.
+template <KQuantType TYPE, int BMAX>
+__global__ void kquant_matmul_dp4a_kernel(const std::uint8_t* __restrict__ w,
+                                          const std::int8_t* __restrict__ xq,
+                                          const float* __restrict__ xs,
+                                          const float* __restrict__ xsum, __half* __restrict__ y,
+                                          int rows, int cols, int batch, int ldy) {
+  constexpr int kWarps = 8;
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int warp = static_cast<int>(threadIdx.x) >> 5;
+  const int blocks_per_row = cols / static_cast<int>(kSuperBlock);
+  const int groups_per_row = cols >> 5;
+
+  const std::size_t block_bytes =
+      TYPE == KQuantType::Q4_K ? model::kquant::kQ4KBlockBytes : model::kquant::kQ5KBlockBytes;
+  const std::uint8_t* rowp =
+      w + static_cast<std::size_t>(row) * static_cast<std::size_t>(blocks_per_row) * block_bytes;
+
+  const int j = lane >> 3;
+  const int t4 = lane & 7;
+  const int off_lo = (j << 6) + (t4 << 2);
+  const int off_hi = off_lo + 32;
+
+  __shared__ float parts[kWarps][BMAX];
+
+  for (int b0 = 0; b0 < batch; b0 += BMAX) {
+    const int bn = min(BMAX, batch - b0);
+    float acc[BMAX];
+#pragma unroll
+    for (int t = 0; t < BMAX; ++t) acc[t] = 0.0f;
+
+    const std::uint8_t* p = rowp + static_cast<std::size_t>(warp) * block_bytes;
+    for (int sb = warp; sb < blocks_per_row; sb += kWarps) {
+      const uint4 hdr = *reinterpret_cast<const uint4*>(p);
+      const float d = half_bits_to_float(static_cast<std::uint16_t>(hdr.x & 0xFFFFu));
+      const float dmin = half_bits_to_float(static_cast<std::uint16_t>(hdr.x >> 16));
+      const int qoff = (TYPE == KQuantType::Q4_K) ? 16 : 48;
+      const std::uint32_t qw = *reinterpret_cast<const std::uint32_t*>(p + qoff + (lane << 2));
+      float sc0, m0, sc1, m1;
+      scale_min_from_hdr(2 * j, hdr.y, hdr.z, hdr.w, &sc0, &m0);
+      scale_min_from_hdr(2 * j + 1, hdr.y, hdr.z, hdr.w, &sc1, &m1);
+
+      int qlo = static_cast<int>(qw & 0x0F0F0F0Fu);
+      int qhi = static_cast<int>((qw >> 4) & 0x0F0F0F0Fu);
+      if (TYPE == KQuantType::Q5_K) {
+        const std::uint32_t hw = *reinterpret_cast<const std::uint32_t*>(p + 16 + (t4 << 2));
+        const std::uint32_t bit_lo = (hw >> (2 * j)) & 0x01010101u;
+        const std::uint32_t bit_hi = (hw >> (2 * j + 1)) & 0x01010101u;
+        qlo |= static_cast<int>(bit_lo << 4);
+        qhi |= static_cast<int>(bit_hi << 4);
+      }
+
+      const int xbase = sb * static_cast<int>(kSuperBlock);
+      const int gbase = sb << 3;  // eight 32-groups per super-block
+#pragma unroll
+      for (int t = 0; t < BMAX; ++t) {
+        if (t >= bn) continue;
+        const std::size_t xrow = static_cast<std::size_t>(b0 + t) * static_cast<std::size_t>(cols);
+        const std::size_t grow =
+            static_cast<std::size_t>(b0 + t) * static_cast<std::size_t>(groups_per_row);
+        const int xl = *reinterpret_cast<const int*>(xq + xrow + xbase + off_lo);
+        const int xh = *reinterpret_cast<const int*>(xq + xrow + xbase + off_hi);
+        const int dot_lo = __dp4a(qlo, xl, 0);
+        const int dot_hi = __dp4a(qhi, xh, 0);
+        const int sum_lo = __dp4a(xl, 0x01010101, 0);
+        const int sum_hi = __dp4a(xh, 0x01010101, 0);
+        const float slo = xs[grow + gbase + 2 * j];
+        const float shi = xs[grow + gbase + 2 * j + 1];
+        acc[t] += slo * (d * sc0 * static_cast<float>(dot_lo) -
+                         dmin * m0 * static_cast<float>(sum_lo)) +
+                  shi * (d * sc1 * static_cast<float>(dot_hi) -
+                         dmin * m1 * static_cast<float>(sum_hi));
+      }
+      p += block_bytes * kWarps;
+    }
+
+#pragma unroll
+    for (int t = 0; t < BMAX; ++t) {
+      if (t >= bn) continue;
+      float v = acc[t];
+#pragma unroll
+      for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xFFFFFFFFu, v, off);
+      if (lane == 0) parts[warp][t] = v;
+    }
+    __syncthreads();
+    if (static_cast<int>(threadIdx.x) < bn) {
+      const int t = static_cast<int>(threadIdx.x);
+      float total = 0.0f;
+#pragma unroll
+      for (int k = 0; k < kWarps; ++k) total += parts[k][t];
+      y[static_cast<std::size_t>(b0 + t) * static_cast<std::size_t>(ldy) + row] =
+          __float2half(total);
+    }
+    __syncthreads();
+  }
+  (void)xsum;
+}
+
+
+// Quantize activations once per GEMM, then run the dp4a matmul.
+bool launch_kquant_matmul_dp4a(const std::uint8_t* w, KQuantType type, const half* x, half* y,
+                               int rows, int cols, int batch, int ldy, std::int8_t* xq, float* xs,
+                               float* xsum, cudaStream_t stream) {
+  if (type == KQuantType::Q6_K) return false;  // per-16 scales, different grouping
+  if (batch < 2 || cols % 32 != 0) return false;
+  const int groups_per_row = cols >> 5;
+  const int total_groups = batch * groups_per_row;
+  constexpr int kQThreads = 256;  // 8 warps, one group each
+  const int qgrid = (total_groups + 7) / 8;
+  quantize_q8_1_groups_kernel<<<qgrid, kQThreads, 0, stream>>>(x, xq, xs, xsum, cols,
+                                                               groups_per_row);
+  constexpr int kThreads = 256;
+  if (batch <= 4) {
+    if (type == KQuantType::Q4_K) {
+      kquant_matmul_dp4a_kernel<KQuantType::Q4_K, 4>
+          <<<rows, kThreads, 0, stream>>>(w, xq, xs, xsum, y, rows, cols, batch, ldy);
+    } else {
+      kquant_matmul_dp4a_kernel<KQuantType::Q5_K, 4>
+          <<<rows, kThreads, 0, stream>>>(w, xq, xs, xsum, y, rows, cols, batch, ldy);
+    }
+  } else {
+    if (type == KQuantType::Q4_K) {
+      kquant_matmul_dp4a_kernel<KQuantType::Q4_K, 16>
+          <<<rows, kThreads, 0, stream>>>(w, xq, xs, xsum, y, rows, cols, batch, ldy);
+    } else {
+      kquant_matmul_dp4a_kernel<KQuantType::Q5_K, 16>
+          <<<rows, kThreads, 0, stream>>>(w, xq, xs, xsum, y, rows, cols, batch, ldy);
+    }
+  }
+  return true;
+}
+
 bool launch_kquant_matmul(const std::uint8_t* w, KQuantType type, const half* x, half* y, int rows,
                           int cols, int batch, int ldy, cudaStream_t stream) {
   // This kernel is the mat-vec shape widened by a batch tile: warps split one

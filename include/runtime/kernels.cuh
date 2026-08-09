@@ -1269,6 +1269,14 @@ void launch_dequant_kquant(const std::uint8_t* blocks_in, KQuantType type, std::
 bool launch_kquant_matmul(const std::uint8_t* w, KQuantType type, const half* x, half* y, int rows,
                           int cols, int batch, int ldy, cudaStream_t stream);
 
+// dp4a form: activations are quantized to int8 with a scale and sum per
+// 32-group (llama.cpp's q8_1 idea) and the inner loop becomes integer dots.
+// Q4_K/Q5_K only -- Q6_K's per-16 scales do not line up with those groups.
+// xq/xs/xsum are caller-owned scratch sized batch*cols, batch*cols/32, same.
+bool launch_kquant_matmul_dp4a(const std::uint8_t* w, KQuantType type, const half* x, half* y,
+                               int rows, int cols, int batch, int ldy, std::int8_t* xq, float* xs,
+                               float* xsum, cudaStream_t stream);
+
 // Same, writing fp32. The LM head produces logits rather than activations.
 void launch_kquant_matvec_f32(const std::uint8_t* w, KQuantType type, const half* x, float* y,
                               int rows, int cols, cudaStream_t stream);

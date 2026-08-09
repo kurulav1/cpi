@@ -720,6 +720,20 @@ LlamaEngine::~LlamaEngine() {
     d_prefill_wdq_ = nullptr;
     d_prefill_wdq_bytes_ = 0;
   }
+  if (d_q8_x_) {
+    cudaFree(d_q8_x_);
+    d_q8_x_ = nullptr;
+    q8_x_bytes_ = 0;
+  }
+  if (d_q8_scale_) {
+    cudaFree(d_q8_scale_);
+    d_q8_scale_ = nullptr;
+  }
+  if (d_q8_sum_) {
+    cudaFree(d_q8_sum_);
+    d_q8_sum_ = nullptr;
+    q8_meta_bytes_ = 0;
+  }
   if (d_prefill_i8_scales_) {
     cudaFree(d_prefill_i8_scales_);
     d_prefill_i8_scales_ = nullptr;
