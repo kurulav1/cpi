@@ -632,8 +632,18 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
             static_cast<__half*>(d_ff3_), hidden, inter, compute_stream_);
       }
     } else {
-      resident_projection_half(lw->w2, d_ff2_, d_ff3_, hidden, inter, resident_wo_warps_,
-                               resident_wo_tile_pairs_, resident_wo_rows_per_warp_);
+      if (lw->w2_packed.active()) {
+        // The weight is still in the container's k-quant blocks; multiply them
+        // directly rather than an fp16 expansion that need not exist.
+        kernels::launch_kquant_matvec(static_cast<const std::uint8_t*>(lw->w2_packed.data),
+                                      static_cast<kernels::KQuantType>(lw->w2_packed.kind),
+                                      static_cast<const __half*>(d_ff2_),
+                                      static_cast<__half*>(d_ff3_), lw->w2_packed.rows,
+                                      lw->w2_packed.cols, compute_stream_);
+      } else {
+        resident_projection_half(lw->w2, d_ff2_, d_ff3_, hidden, inter, resident_wo_warps_,
+                                 resident_wo_tile_pairs_, resident_wo_rows_per_warp_);
+      }
     }
 
     kernels::launch_add_inplace(static_cast<__half*>(d_x_), static_cast<const __half*>(d_ff3_),
@@ -737,9 +747,12 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
     }
 
     run_profiled(last_benchmark_stats_.decode_wo_ms, [&] {
-      if (resident_custom_wo_) {
-        resident_projection_half(lw->wo, d_att_, d_ff3_, hidden, q_hidden, resident_wo_warps_,
-                                 resident_wo_tile_pairs_, resident_wo_rows_per_warp_);
+      if (lw->wo_packed.active()) {
+        kernels::launch_kquant_matvec(static_cast<const std::uint8_t*>(lw->wo_packed.data),
+                                      static_cast<kernels::KQuantType>(lw->wo_packed.kind),
+                                      static_cast<const __half*>(d_att_),
+                                      static_cast<__half*>(d_ff3_), lw->wo_packed.rows,
+                                      lw->wo_packed.cols, compute_stream_);
       } else {
         resident_projection_half(lw->wo, d_att_, d_ff3_, hidden, q_hidden, resident_wo_warps_,
                                  resident_wo_tile_pairs_, resident_wo_rows_per_warp_);
@@ -753,7 +766,18 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
                  [&] { launch_norm(d_x_, lw->norm_ffn, lw->norm_ffn_bias, d_x_norm_, 1, hidden); });
 
     run_profiled(last_benchmark_stats_.decode_mlp_ms, [&] {
-      if (!weights_.config().mlp_gelu) {
+      if (lw->w13_packed.active()) {
+        // Gate and up in one packed buffer: one matvec over both row-blocks,
+        // then the same gated activation the unfused path uses.
+        kernels::launch_kquant_matvec(static_cast<const std::uint8_t*>(lw->w13_packed.data),
+                                      static_cast<kernels::KQuantType>(lw->w13_packed.kind),
+                                      static_cast<const __half*>(d_x_norm_),
+                                      static_cast<__half*>(d_ff1_), lw->w13_packed.rows,
+                                      lw->w13_packed.cols, compute_stream_);
+        detail::launch_gated_glu(weights_.config().mlp_gelu, static_cast<const __half*>(d_ff1_),
+                                 static_cast<const __half*>(d_ff2_), static_cast<__half*>(d_ff2_),
+                                 inter, compute_stream_);
+      } else if (!weights_.config().mlp_gelu) {
         // Fused: gate+up GEMV and silu_mul in one kernel (see launch_swiglu_gemv_f16).
         kernels::launch_swiglu_gemv_f16(
             static_cast<const __half*>(lw->w13),
@@ -768,8 +792,16 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
                                  inter, compute_stream_);
       }
 
-      resident_projection_half(lw->w2, d_ff2_, d_ff3_, hidden, inter, resident_wo_warps_,
-                               resident_wo_tile_pairs_, resident_wo_rows_per_warp_);
+      if (lw->w2_packed.active()) {
+        kernels::launch_kquant_matvec(static_cast<const std::uint8_t*>(lw->w2_packed.data),
+                                      static_cast<kernels::KQuantType>(lw->w2_packed.kind),
+                                      static_cast<const __half*>(d_ff2_),
+                                      static_cast<__half*>(d_ff3_), lw->w2_packed.rows,
+                                      lw->w2_packed.cols, compute_stream_);
+      } else {
+        resident_projection_half(lw->w2, d_ff2_, d_ff3_, hidden, inter, resident_wo_warps_,
+                                 resident_wo_tile_pairs_, resident_wo_rows_per_warp_);
+      }
 
       kernels::launch_add_inplace(static_cast<__half*>(d_x_), static_cast<const __half*>(d_ff3_),
                                   hidden, compute_stream_);

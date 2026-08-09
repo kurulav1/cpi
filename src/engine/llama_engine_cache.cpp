@@ -22,6 +22,24 @@
 #include "runtime/kernels.cuh"
 #include "runtime/system_info.hpp"
 namespace engine {
+
+namespace {
+// Opt-in while the packed path is being wired matrix by matrix. Reading the
+// generated text at each step is the only thing that catches a wrong unpack,
+// so this stays off until every matrix has been through that.
+// Bit per matrix: 1 = w2, 2 = wo, 4 = w13. One at a time is how the earlier
+// unpacking bugs were caught -- a wrong unpack reads as fluent text, not a
+// crash, so each matrix needs its own A/B against the fp16 path.
+int kquant_packed_mask() {
+  static const int mask = []() {
+    const char* env = std::getenv("CPI_KQUANT_PACKED");
+    return env != nullptr ? std::atoi(env) : 0;
+  }();
+  return mask;
+}
+}  // namespace
+
+
 namespace {
 
 std::size_t bytes_for_matrix(int rows, int cols) {
@@ -77,6 +95,47 @@ bool LlamaEngine::tq_cached_preflight_layers(int layers, std::string* reason) co
     }
   }
   return true;
+}
+
+void LlamaEngine::stage_packed_pair(const std::string& first, const std::string& second,
+                                    PackedWeight* out) {
+  if (out == nullptr || !weights_.is_gguf() || weights_.gguf() == nullptr) return;
+  const auto a = weights_.gguf()->packed_kquant(first);
+  const auto b = weights_.gguf()->packed_kquant(second);
+  // Different quant types or widths cannot share one packed buffer; the mixed
+  // k-quant mixes (Q4_K_M puts Q6_K in some layers) make this a real case.
+  if (!a.valid() || !b.valid() || a.kind != b.kind || a.cols != b.cols) return;
+  void* dev = nullptr;
+  if (cudaMalloc(&dev, a.bytes + b.bytes) != cudaSuccess) return;
+  auto* base = static_cast<std::uint8_t*>(dev);
+  if (cudaMemcpyAsync(base, a.data, a.bytes, cudaMemcpyHostToDevice, transfer_stream_) !=
+          cudaSuccess ||
+      cudaMemcpyAsync(base + a.bytes, b.data, b.bytes, cudaMemcpyHostToDevice, transfer_stream_) !=
+          cudaSuccess) {
+    cudaFree(dev);
+    return;
+  }
+  out->data = dev;
+  out->kind = a.kind;
+  out->rows = a.rows + b.rows;
+  out->cols = a.cols;
+}
+
+void LlamaEngine::stage_packed_weight(const std::string& name, PackedWeight* out) {
+  if (out == nullptr || !weights_.is_gguf() || weights_.gguf() == nullptr) return;
+  const auto pk = weights_.gguf()->packed_kquant(name);
+  if (!pk.valid() || pk.rows <= 0 || pk.cols <= 0) return;
+  void* dev = nullptr;
+  if (cudaMalloc(&dev, pk.bytes) != cudaSuccess) return;  // stay on fp16 rather than fail
+  if (cudaMemcpyAsync(dev, pk.data, pk.bytes, cudaMemcpyHostToDevice, transfer_stream_) !=
+      cudaSuccess) {
+    cudaFree(dev);
+    return;
+  }
+  out->data = dev;
+  out->kind = pk.kind;
+  out->rows = pk.rows;
+  out->cols = pk.cols;
 }
 
 void LlamaEngine::init_layer_cache() {
@@ -613,6 +672,9 @@ void LlamaEngine::init_layer_cache() {
       if (lw.wo) cudaFree(lw.wo);
       if (lw.bo) cudaFree(lw.bo);
       if (lw.w13) cudaFree(lw.w13);
+      if (lw.w2_packed.data) cudaFree(lw.w2_packed.data);
+      if (lw.wo_packed.data) cudaFree(lw.wo_packed.data);
+      if (lw.w13_packed.data) cudaFree(lw.w13_packed.data);
       if (lw.w2) cudaFree(lw.w2);
       if (lw.norm_att) cudaFree(lw.norm_att);
       if (lw.norm_ffn) cudaFree(lw.norm_ffn);
@@ -778,6 +840,19 @@ void LlamaEngine::init_layer_cache() {
           w13_base + static_cast<std::size_t>(inter) * static_cast<std::size_t>(hidden),
           bytes_for_matrix(inter, hidden));
       copy_fp16_direct(p + ".feed_forward.w2", lw.w2, bytes_for_matrix(hidden, inter));
+      // Packed k-quant residency (CPI_KQUANT_PACKED=1): keep the container's own
+      // blocks on the device so decode can multiply them directly. Staged
+      // alongside the fp16 copy for now -- correctness first; dropping the fp16
+      // allocation is the step that actually saves the memory.
+      if (kquant_packed_mask() & 1) {
+        stage_packed_weight(p + ".feed_forward.w2", &lw.w2_packed);
+      }
+      if (kquant_packed_mask() & 2) {
+        stage_packed_weight(p + ".attention.wo", &lw.wo_packed);
+      }
+      if (kquant_packed_mask() & 4) {
+        stage_packed_pair(p + ".feed_forward.w1", p + ".feed_forward.w3", &lw.w13_packed);
+      }
 
       CUDA_CHECK(cudaStreamSynchronize(transfer_stream_));
       CUDA_CHECK(cudaStreamSynchronize(compute_stream_));

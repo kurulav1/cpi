@@ -123,6 +123,19 @@ private:
   // Weight pointers for a single transformer layer that are kept resident on
   // the GPU device.  All pointers are untyped (void*) because the concrete
   // element type (fp16 or fp32) depends on the runtime dtype setting.
+  // A weight left in its container's k-quant blocks instead of expanded to fp16.
+  // Populated only when the model came from a GGUF and the packed path is
+  // enabled; `data` null means this matrix is fp16 as before.
+  struct PackedWeight {
+    void* data = nullptr;
+    int kind = -1;  // kernels::KQuantType
+    int rows = 0;
+    int cols = 0;
+    [[nodiscard]] bool active() const {
+      return data != nullptr && kind >= 0;
+    }
+  };
+
   struct LayerDeviceWeights {
     void* wqkv = nullptr;           // Fused QKV projection weight matrix.
     void* wo = nullptr;             // Output (post-attention) projection weight matrix.
@@ -138,6 +151,15 @@ private:
         nullptr;  // Per-head RMSNorm scale for Q [head_dim]; null unless has_qk_norm (Qwen3).
     void* k_norm =
         nullptr;  // Per-head RMSNorm scale for K [head_dim]; null unless has_qk_norm (Qwen3).
+    // Packed k-quant forms, used instead of the fp16 buffer above when active.
+    // Only the matrices the container can serve packed are populated: Q/K carry
+    // a RoPE permutation undone during host unpacking, and CPI's QKV is fused
+    // while GGUF stores it split, so those stay fp16 for now.
+    PackedWeight w2_packed;
+    PackedWeight wo_packed;
+    // gate and up concatenated; legal only because a k-quant row is a whole
+    // number of super-blocks, so fusing rows is a byte append.
+    PackedWeight w13_packed;
   };
 
   // Weight pointers for a single transformer layer stored in host page-locked
@@ -647,6 +669,15 @@ private:
   // batched matvec kernels (decode-shaped, ~20x off at prefill row counts).
   void* d_prefill_wdq_ = nullptr;
   std::size_t d_prefill_wdq_bytes_ = 0;
+  // Uploads a tensor's packed k-quant blocks and records them in `out`. No-op
+  // when the container cannot serve this tensor packed, which leaves the fp16
+  // path in charge.
+  void stage_packed_weight(const std::string& name, PackedWeight* out);
+
+  // Same, for a matrix CPI keeps fused that the container stores as two
+  // row-blocks. Declines unless both halves are packed the same way.
+  void stage_packed_pair(const std::string& first, const std::string& second, PackedWeight* out);
+
   const void* dequant_weight_for_gemm(const std::int8_t* w, const float* scales, bool int4,
                                       int rows, int cols, int group);
   std::int8_t* d_prefill_i8_ = nullptr;   // INT8 quantised activations for prefill INT8 path.
