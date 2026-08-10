@@ -17,6 +17,8 @@
 #include <cstdint>
 #include <cstring>
 
+#include <cuda_pipeline.h>
+
 #include "model/gguf_kquant.hpp"
 #include "runtime/kernels.cuh"
 
@@ -1043,6 +1045,173 @@ __global__ __launch_bounds__(256) void kquant_mmq_q4k_kernel(
 #endif
 }
 
+// Double-buffered Q4_K MMQ: cp.async stages the next K-tile while the current
+// one is being multiplied.
+//
+// The previous version alternated [stage | compute] with a barrier between, so
+// every warp waited out a full tile load before touching the tensor cores. That
+// is why it moved 6.7x fewer bytes than expand-and-cuBLAS and still only matched
+// it: ~190 GB/s effective against the ~590 GB/s the same engine reaches on fp16.
+//
+// cp.async can only copy bytes, which forces the useful change: the nibble
+// unpack moves out of staging and into the fragment build. Shared now holds the
+// RAW super-block -- 128 bytes of qs per row instead of 256 unpacked -- and the
+// b-fragment does `word & 0x0F0F0F0F` on the way to the mma. That halves the
+// weight tile as a side effect, which is what makes double buffering fit in
+// static shared memory.
+//
+// M tile is 32 here, not 64: two tiles in flight double the activation storage,
+// and batches above 32 keep the single-buffered kernel.
+template <int NT>
+__global__ __launch_bounds__(256) void kquant_mmq_q4k_async_kernel(
+    const std::uint8_t* __restrict__ w, const std::int8_t* __restrict__ xq,
+    const float* __restrict__ as, const float* __restrict__ gsum, __half* __restrict__ y, int rows,
+    int cols, int batch, int ldy) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800)
+  (void)w; (void)xq; (void)as; (void)gsum; (void)y; (void)rows; (void)cols; (void)batch; (void)ldy;
+#else
+  constexpr int kBM = 32;
+  constexpr int kBN = 2 * NT * 8;
+  const int tid = static_cast<int>(threadIdx.x);
+  const int warp = tid >> 5, lane = tid & 31;
+  const int g = lane >> 2, t = lane & 3, mt = warp & 3, nhalf = warp >> 2;
+  const int blockNrow = blockIdx.x * kBN;
+  const int Kg = cols >> 5;
+  const int nsb = cols >> 8;
+  const std::size_t row_bytes =
+      static_cast<std::size_t>(nsb) * model::kquant::kQ4KBlockBytes;
+
+  __shared__ __align__(16) std::int8_t As[2][kBM][256];
+  __shared__ __align__(16) std::uint8_t Bq[2][kBN][128];  // raw qs, unpacked at use
+  __shared__ __align__(16) std::uint8_t Hd[2][kBN][16];   // raw header: d, dmin, 12 scale bytes
+
+  // Issue one K-tile's copies into buffer `buf`.
+  const auto stage = [&](int sb, int buf) {
+    // Activations: 32 rows x 256 B = 512 uint4, two per thread.
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      const int u = tid + i * 256;
+      const int r = u >> 4, c = (u & 15) << 4;
+      if (r < batch) {
+        __pipeline_memcpy_async(&As[buf][r][c],
+                                xq + static_cast<std::size_t>(r) * cols + (sb << 8) + c, 16);
+      }
+    }
+    // Weights: 32 rows x 128 B of qs = 256 uint4, one per thread.
+    {
+      const int r = tid >> 3, c = (tid & 7) << 4;
+      const int wrow = blockNrow + r;
+      if (r < kBN && wrow < rows) {
+        const std::uint8_t* p = w + static_cast<std::size_t>(wrow) * row_bytes +
+                                static_cast<std::size_t>(sb) * model::kquant::kQ4KBlockBytes;
+        __pipeline_memcpy_async(&Bq[buf][r][c], p + 16 + c, 16);
+      }
+    }
+    // Headers: 32 rows x 16 B.
+    if (tid < kBN) {
+      const int wrow = blockNrow + tid;
+      if (wrow < rows) {
+        __pipeline_memcpy_async(&Hd[buf][tid][0],
+                                w + static_cast<std::size_t>(wrow) * row_bytes +
+                                    static_cast<std::size_t>(sb) * model::kquant::kQ4KBlockBytes,
+                                16);
+      }
+    }
+    __pipeline_commit();
+  };
+
+  float facc[NT][4];
+#pragma unroll
+  for (int i = 0; i < NT; ++i)
+#pragma unroll
+    for (int j = 0; j < 4; ++j) facc[i][j] = 0.0f;
+
+  stage(0, 0);
+  for (int sb = 0; sb < nsb; ++sb) {
+    const int buf = sb & 1;
+    if (sb + 1 < nsb) stage(sb + 1, buf ^ 1);
+    // Wait only for this tile; the next one keeps flying.
+    __pipeline_wait_prior(sb + 1 < nsb ? 1 : 0);
+    __syncthreads();
+
+    const int arow = 16 * mt;
+    const int m_a = arow + g, m_b = arow + g + 8;
+    const bool ok_a = m_a < batch, ok_b = m_b < batch;
+
+    // Per-row scale pairs for this super-block, decoded from the staged header.
+    float sc_n[NT][2][2];  // [nt][a|b][d*sc, dmin*m] filled per group below
+    (void)sc_n;
+
+#pragma unroll
+    for (int gi = 0; gi < 8; ++gi) {
+      const int kg = (sb << 3) + gi, co = gi << 5;
+      // A fragments: k = co..co+31, split 0..15 / 16..31 across a0a1 / a2a3.
+      const int a0 = ok_a ? *reinterpret_cast<int*>(&As[buf][m_a][co + t * 4]) : 0;
+      const int a1 = ok_b ? *reinterpret_cast<int*>(&As[buf][m_b][co + t * 4]) : 0;
+      const int a2 = ok_a ? *reinterpret_cast<int*>(&As[buf][m_a][co + 16 + t * 4]) : 0;
+      const int a3 = ok_b ? *reinterpret_cast<int*>(&As[buf][m_b][co + 16 + t * 4]) : 0;
+      const float as_a = ok_a ? as[static_cast<std::size_t>(m_a) * Kg + kg] : 0.0f;
+      const float as_b = ok_b ? as[static_cast<std::size_t>(m_b) * Kg + kg] : 0.0f;
+      const float gs_a = ok_a ? gsum[static_cast<std::size_t>(m_a) * Kg + kg] : 0.0f;
+      const float gs_b = ok_b ? gsum[static_cast<std::size_t>(m_b) * Kg + kg] : 0.0f;
+
+      // Column co..co+31 lives in qs[j*32 + l], j = co/64, low nibble when
+      // (co%64) < 32. Four consecutive columns are four consecutive bytes.
+      const int j = co >> 6;
+      const bool hi_nib = ((co >> 5) & 1) != 0;
+      const int qb = (j << 5) + (t << 2);
+
+#pragma unroll
+      for (int nt = 0; nt < NT; ++nt) {
+        const int nbase = nhalf * (NT * 8) + nt * 8;
+        const int nrow = nbase + g;
+        const std::uint32_t w0 = *reinterpret_cast<const std::uint32_t*>(&Bq[buf][nrow][qb]);
+        const std::uint32_t w1 = *reinterpret_cast<const std::uint32_t*>(&Bq[buf][nrow][qb + 16]);
+        const int b0 = static_cast<int>(hi_nib ? ((w0 >> 4) & 0x0F0F0F0Fu) : (w0 & 0x0F0F0F0Fu));
+        const int b1 = static_cast<int>(hi_nib ? ((w1 >> 4) & 0x0F0F0F0Fu) : (w1 & 0x0F0F0F0Fu));
+        int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+        asm volatile(
+            "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, "
+            "{%8,%9}, {%0,%1,%2,%3};\n"
+            : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
+            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+        // Scales for the two output rows this thread accumulates.
+        const int na = nbase + 2 * t, nb = nbase + 2 * t + 1;
+        const uint4 ha = *reinterpret_cast<const uint4*>(&Hd[buf][na][0]);
+        const uint4 hb = *reinterpret_cast<const uint4*>(&Hd[buf][nb][0]);
+        float sca, ma, scb, mb;
+        scale_min_from_hdr(gi, ha.y, ha.z, ha.w, &sca, &ma);
+        scale_min_from_hdr(gi, hb.y, hb.z, hb.w, &scb, &mb);
+        const float da = half_bits_to_float(static_cast<std::uint16_t>(ha.x & 0xFFFFu));
+        const float dmina = half_bits_to_float(static_cast<std::uint16_t>(ha.x >> 16));
+        const float db = half_bits_to_float(static_cast<std::uint16_t>(hb.x & 0xFFFFu));
+        const float dminb = half_bits_to_float(static_cast<std::uint16_t>(hb.x >> 16));
+        facc[nt][0] += static_cast<float>(c0) * as_a * (da * sca) - (dmina * ma) * gs_a;
+        facc[nt][1] += static_cast<float>(c1) * as_a * (db * scb) - (dminb * mb) * gs_a;
+        facc[nt][2] += static_cast<float>(c2) * as_b * (da * sca) - (dmina * ma) * gs_b;
+        facc[nt][3] += static_cast<float>(c3) * as_b * (db * scb) - (dminb * mb) * gs_b;
+      }
+    }
+    __syncthreads();
+  }
+
+#pragma unroll
+  for (int nt = 0; nt < NT; ++nt) {
+    const int nbase = nhalf * (NT * 8) + nt * 8;
+    const int rr[4] = {g, g, g + 8, g + 8};
+    const int cc[4] = {2 * t, 2 * t + 1, 2 * t, 2 * t + 1};
+#pragma unroll
+    for (int en = 0; en < 4; ++en) {
+      const int lm = 16 * mt + rr[en], gn = blockNrow + nbase + cc[en];
+      if (lm < batch && gn < rows) {
+        y[static_cast<std::size_t>(lm) * static_cast<std::size_t>(ldy) + gn] =
+            __float2half(facc[nt][en]);
+      }
+    }
+  }
+#endif
+}
+
 // Q4_K on int8 tensor cores. Same activation preparation as the dp4a path; the
 // difference is the inner product runs on mma instead of scalar FMAs. sm_80+
 // only -- the caller checks compute capability.
@@ -1060,6 +1229,17 @@ bool launch_kquant_mmq(const std::uint8_t* w, KQuantType type, const half* x, ha
     const char* e = std::getenv("CPI_KQUANT_MMQ_NT");
     return e != nullptr ? std::atoi(e) : 2;
   }();
+  // The double-buffered kernel carries two K-tiles of activations, so its M tile
+  // is 32; larger batches use the single-buffered one.
+  static const bool async_on = []() {
+    const char* e = std::getenv("CPI_KQUANT_MMQ_ASYNC");
+    return e == nullptr || e[0] != '0';
+  }();
+  if (async_on && batch <= 32) {
+    kquant_mmq_q4k_async_kernel<2>
+        <<<(rows + 31) / 32, 256, 0, stream>>>(w, xq, xs, xsum, y, rows, cols, batch, ldy);
+    return true;
+  }
   if (nt >= 4) {
     kquant_mmq_q4k_kernel<4><<<(rows + 63) / 64, 256, 0, stream>>>(w, xq, xs, xsum, y, rows, cols,
                                                                    batch, ldy);
