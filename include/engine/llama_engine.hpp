@@ -705,8 +705,10 @@ private:
 
   // Batched forms. False means the batch is outside what the packed kernel is
   // worth doing for, and the caller should expand the weight and use cuBLAS.
+  // reuse_x says the caller has already had this exact activation quantized by
+  // an immediately preceding matvec of the same width, as q/k/v do.
   bool packed_matmul(const PackedWeight& w, const void* x, void* y, int batch, int ldy, int row0,
-                     cudaStream_t stream);
+                     cudaStream_t stream, bool reuse_x = false);
 
   // Scratch for the dp4a path's int8 activations, grown on demand.
   bool ensure_q8_scratch(int batch, int cols);

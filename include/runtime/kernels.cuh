@@ -1284,6 +1284,9 @@ struct KQuantTuning {
   // which excludes it from the 32-wide mma but not from a matvec: an 8-byte
   // slice keeps l0>>4 constant, so one scale pair still covers the run.
   int matvec_dp4a_q6k = 1;
+  // Quantize a shared activation once per group of sharers (q/k/v) rather than
+  // once per projection. Only honoured where the caller asserts x is unchanged.
+  int matvec_share_x = 1;
 };
 void set_kquant_tuning(const KQuantTuning& t);
 KQuantTuning get_kquant_tuning();
@@ -1318,14 +1321,14 @@ bool launch_kquant_mmq(const std::uint8_t* w, KQuantType type, const half* x, ha
 void reserve_kquant_dp4a_scratch(int cols);
 
 void launch_kquant_matvec_residual(const std::uint8_t* w, KQuantType type, const half* x, half* y,
-                                   int rows, int cols, cudaStream_t stream);
+                                   int rows, int cols, cudaStream_t stream, bool reuse_x = false);
 
 // Same, writing fp32. The LM head produces logits rather than activations.
 void launch_kquant_matvec_f32(const std::uint8_t* w, KQuantType type, const half* x, float* y,
                               int rows, int cols, cudaStream_t stream);
 
 void launch_kquant_matvec(const std::uint8_t* w, KQuantType type, const half* x, half* y, int rows,
-                          int cols, cudaStream_t stream);
+                          int cols, cudaStream_t stream, bool reuse_x = false);
 
 // launch_dequant_weight_rowwise_to_fp16
 //

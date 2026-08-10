@@ -347,13 +347,17 @@ void LlamaEngine::init_greedy_decode_graph() {
       // pointer never fuses. What matters is whether the model actually carries
       // attention.bo.
       const bool fuse = !has_any_layer_output_bias_;
-      const auto launch = fuse ? &kernels::launch_kquant_matvec_residual
-                               : &kernels::launch_kquant_matvec;
+      // Both take a trailing reuse_x now, so name the type rather than letting
+      // the ternary deduce it.
+      using MatvecFn = void (*)(const std::uint8_t*, kernels::KQuantType, const __half*, __half*,
+                                int, int, cudaStream_t, bool);
+      const MatvecFn launch = fuse ? &kernels::launch_kquant_matvec_residual
+                                   : &kernels::launch_kquant_matvec;
       launch(static_cast<const std::uint8_t*>(lw->wo_packed.data),
              static_cast<kernels::KQuantType>(lw->wo_packed.kind),
              static_cast<const __half*>(d_att_),
              static_cast<__half*>(fuse ? d_x_ : d_ff3_), lw->wo_packed.rows, lw->wo_packed.cols,
-             compute_stream_);
+             compute_stream_, false);
       fused_residual = fuse;
     } else if (resident_custom_wo_) {
       // Residual add folded into this projection's epilogue, so the shared add_inplace
@@ -802,13 +806,17 @@ void LlamaEngine::init_logits_decode_graph() {
       // pointer never fuses. What matters is whether the model actually carries
       // attention.bo.
       const bool fuse = !has_any_layer_output_bias_;
-      const auto launch = fuse ? &kernels::launch_kquant_matvec_residual
-                               : &kernels::launch_kquant_matvec;
+      // Both take a trailing reuse_x now, so name the type rather than letting
+      // the ternary deduce it.
+      using MatvecFn = void (*)(const std::uint8_t*, kernels::KQuantType, const __half*, __half*,
+                                int, int, cudaStream_t, bool);
+      const MatvecFn launch = fuse ? &kernels::launch_kquant_matvec_residual
+                                   : &kernels::launch_kquant_matvec;
       launch(static_cast<const std::uint8_t*>(lw->wo_packed.data),
              static_cast<kernels::KQuantType>(lw->wo_packed.kind),
              static_cast<const __half*>(d_att_),
              static_cast<__half*>(fuse ? d_x_ : d_ff3_), lw->wo_packed.rows, lw->wo_packed.cols,
-             compute_stream_);
+             compute_stream_, false);
       fused_residual = fuse;
     } else if (resident_custom_wo_) {
       // Residual add folded into this projection's epilogue, so the shared add_inplace

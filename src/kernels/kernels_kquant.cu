@@ -48,6 +48,7 @@ KQuantTuning g_kq_tune = []() {
   t.matvec_dp4a = env_int("CPI_KQUANT_MATVEC_DP4A", t.matvec_dp4a);
   t.matvec_dp4a16 = env_int("CPI_KQUANT_MATVEC_DP4A16", t.matvec_dp4a16);
   t.matvec_dp4a_q6k = env_int("CPI_KQUANT_MATVEC_DP4A_Q6K", t.matvec_dp4a_q6k);
+  t.matvec_share_x = env_int("CPI_KQUANT_MATVEC_SHARE_X", t.matvec_share_x);
   return t;
 }();
 }  // namespace
@@ -1770,6 +1771,9 @@ namespace {
 // module-local so the dp4a path can be switched on without touching every call
 // site; it is a few tens of KB.
 std::int8_t* g_dp4a_xq = nullptr;
+// Width the quantized activation in the scratch currently holds, so a caller
+// that knows x is unchanged can skip re-quantizing it. -1 means nothing valid.
+int g_dp4a_ready_cols = -1;
 float* g_dp4a_xs = nullptr;
 // The quantizer writes a scale AND a group sum. The matvec only needs the
 // scale -- it derives its own partial sums with dp4a -- but the sum still needs
@@ -1792,6 +1796,7 @@ bool ensure_dp4a_scratch(int cols) {
   g_dp4a_sum = nullptr;
   g_dp4a_cols = 0;
   const std::size_t meta = static_cast<std::size_t>(cols / 32) * sizeof(float);
+  g_dp4a_ready_cols = -1;
   if (cudaMalloc(&g_dp4a_xq, static_cast<std::size_t>(cols)) != cudaSuccess) return false;
   if (cudaMalloc(&g_dp4a_xs, meta) != cudaSuccess || cudaMalloc(&g_dp4a_sum, meta) != cudaSuccess) {
     cudaFree(g_dp4a_xq);
@@ -1804,12 +1809,22 @@ bool ensure_dp4a_scratch(int cols) {
 
 template <bool ACC>
 bool try_dp4a_matvec(const std::uint8_t* w, KQuantType type, const half* x, half* y, int rows,
-                     int cols, cudaStream_t stream) {
+                     int cols, cudaStream_t stream, bool reuse) {
   if (g_kq_tune.matvec_dp4a == 0) return false;
   if (cols % 256 != 0 || !ensure_dp4a_scratch(cols)) return false;
   const int groups = cols >> 5;
-  quantize_q8_1_groups_kernel<<<(groups + 7) / 8, 256, 0, stream>>>(x, g_dp4a_xq, g_dp4a_xs,
-                                                                    g_dp4a_sum, cols, groups);
+  // A layer's q, k and v projections read one activation, and this model cannot
+  // fuse them into a packed triple because wv is Q6_K where wq and wk are Q4_K.
+  // Quantizing it once per group of sharers rather than once per projection is
+  // two fewer kernels per layer, 64 fewer per token. The caller is the only
+  // thing that knows x is unchanged, so it has to say so -- keying on the
+  // pointer would silently reuse across layers that share a residual buffer.
+  const bool have_x = g_dp4a_ready_cols == cols && g_kq_tune.matvec_share_x;
+  if (!(reuse && have_x)) {
+    quantize_q8_1_groups_kernel<<<(groups + 7) / 8, 256, 0, stream>>>(x, g_dp4a_xq, g_dp4a_xs,
+                                                                      g_dp4a_sum, cols, groups);
+    g_dp4a_ready_cols = cols;
+  }
   constexpr int kThreads = 256;
   const int wpr = 8;
   const int grid = (rows + (8 / wpr) - 1) / (8 / wpr);
@@ -1885,14 +1900,14 @@ static void launch_kquant_matvec_impl(const std::uint8_t* w, KQuantType type, co
 void reserve_kquant_dp4a_scratch(int cols) { ensure_dp4a_scratch(cols); }
 
 void launch_kquant_matvec(const std::uint8_t* w, KQuantType type, const half* x, half* y, int rows,
-                          int cols, cudaStream_t stream) {
-  if (try_dp4a_matvec<false>(w, type, x, y, rows, cols, stream)) return;
+                          int cols, cudaStream_t stream, bool reuse_x) {
+  if (try_dp4a_matvec<false>(w, type, x, y, rows, cols, stream, reuse_x)) return;
   launch_kquant_matvec_impl<half, false>(w, type, x, y, rows, cols, stream);
 }
 
 void launch_kquant_matvec_residual(const std::uint8_t* w, KQuantType type, const half* x, half* y,
-                                   int rows, int cols, cudaStream_t stream) {
-  if (try_dp4a_matvec<true>(w, type, x, y, rows, cols, stream)) return;
+                                   int rows, int cols, cudaStream_t stream, bool reuse_x) {
+  if (try_dp4a_matvec<true>(w, type, x, y, rows, cols, stream, reuse_x)) return;
   launch_kquant_matvec_impl<half, true>(w, type, x, y, rows, cols, stream);
 }
 

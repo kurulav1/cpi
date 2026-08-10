@@ -269,7 +269,7 @@ bool LlamaEngine::ensure_q8_scratch(int batch, int cols) {
 }
 
 bool LlamaEngine::packed_matmul(const PackedWeight& w, const void* x, void* y, int batch, int ldy,
-                                int row0, cudaStream_t stream) {
+                                int row0, cudaStream_t stream, bool reuse_x) {
   if (!w.active()) return false;
   // A single row is a matvec. Without this the batched path falls through to
   // expand-and-cuBLAS, which re-expands the whole weight for one token: at B=1
@@ -281,7 +281,7 @@ bool LlamaEngine::packed_matmul(const PackedWeight& w, const void* x, void* y, i
     kernels::launch_kquant_matvec(static_cast<const std::uint8_t*>(w.data),
                                   static_cast<kernels::KQuantType>(w.kind),
                                   static_cast<const __half*>(x),
-                                  static_cast<__half*>(y) + row0, w.rows, w.cols, stream);
+                                  static_cast<__half*>(y) + row0, w.rows, w.cols, stream, reuse_x);
     return true;
   }
   // Int8 tensor cores (CPI_KQUANT_MMQ=1). Correct, gated, and still SLOWER than
@@ -362,19 +362,26 @@ bool LlamaEngine::packed_qkv_matmul(const LayerDeviceWeights& lw, const void* x,
   const int rows_k = lw.wk_packed.active() ? lw.wk_packed.rows : 0;
   // Probe the first part before committing: the launcher declines batches it is
   // not worth doing, and it must decline all three or none.
+  // All three read the same activation, so only the first pays to quantize it.
   if (!packed_matmul(lw.wq_packed, x, y, batch, ldy, 0, stream)) return false;
-  if (rows_k > 0 && !packed_matmul(lw.wk_packed, x, y, batch, ldy, rows_q, stream)) return false;
-  return packed_matmul(lw.wv_packed, x, y, batch, ldy, rows_q + rows_k, stream);
+  if (rows_k > 0 && !packed_matmul(lw.wk_packed, x, y, batch, ldy, rows_q, stream, true)) {
+    return false;
+  }
+  return packed_matmul(lw.wv_packed, x, y, batch, ldy, rows_q + rows_k, stream, true);
 }
 
 bool LlamaEngine::packed_qkv_matvec(const LayerDeviceWeights& lw, const void* x_norm, void* qkv,
                                     cudaStream_t stream) {
-  const auto run = [&](const PackedWeight& w, int row_offset) {
+  // reuse says x_norm was already quantized by the preceding projection: all of
+  // q, k and v read the same normed activation, and this model cannot fuse them
+  // into one packed matrix because wv is Q6_K where wq and wk are Q4_K.
+  const auto run = [&](const PackedWeight& w, int row_offset, bool reuse = false) {
     ++packed_matvec_calls_;
     kernels::launch_kquant_matvec(static_cast<const std::uint8_t*>(w.data),
                                   static_cast<kernels::KQuantType>(w.kind),
                                   static_cast<const __half*>(x_norm),
-                                  static_cast<__half*>(qkv) + row_offset, w.rows, w.cols, stream);
+                                  static_cast<__half*>(qkv) + row_offset, w.rows, w.cols, stream,
+                                  reuse);
   };
   if (lw.wqkv_packed.active()) {
     run(lw.wqkv_packed, 0);
@@ -388,10 +395,10 @@ bool LlamaEngine::packed_qkv_matvec(const LayerDeviceWeights& lw, const void* x_
     run(lw.wq_packed, 0);
     int written = lw.wq_packed.rows;
     if (lw.wk_packed.active()) {
-      run(lw.wk_packed, written);
+      run(lw.wk_packed, written, true);
       written += lw.wk_packed.rows;
     }
-    run(lw.wv_packed, written);
+    run(lw.wv_packed, written, true);
     return true;
   }
   return false;
