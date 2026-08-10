@@ -1290,6 +1290,9 @@ struct KQuantTuning {
   // Take the -dmin*m correction's sum(x) from the group sums the quantizer
   // already wrote, instead of half the matvec's dp4a recomputing it per row.
   int matvec_gsum = 1;
+  // Read a lane's sixteen contiguous activation bytes as one int4 rather than
+  // four ints.
+  int matvec_vecx = 1;
 };
 void set_kquant_tuning(const KQuantTuning& t);
 KQuantTuning get_kquant_tuning();
