@@ -1280,6 +1280,10 @@ struct KQuantTuning {
   // covers the whole slice, and scale handling -- not the dot -- was the
   // matvec's limiter: 4 -> 8 -> 16 bytes ran 90.0 -> 94.3 -> 96.4% of llama.cpp.
   int matvec_dp4a16 = 2;
+  // Q6_K on the integer path too. Its scales are per 16 weights rather than 32,
+  // which excludes it from the 32-wide mma but not from a matvec: an 8-byte
+  // slice keeps l0>>4 constant, so one scale pair still covers the run.
+  int matvec_dp4a_q6k = 1;
 };
 void set_kquant_tuning(const KQuantTuning& t);
 KQuantTuning get_kquant_tuning();
