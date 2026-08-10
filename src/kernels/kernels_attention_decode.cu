@@ -1362,8 +1362,30 @@ __global__ void attention_step_chunk_stats_gqa_split_device_pos_kernel(
 // Coarsening factor for the split-K decode attention: each grid block sweeps this
 // many 32-token sub-chunks with a running online softmax. Pick the largest G (<=
 // kMaxBpc) that keeps the grid (lanes*coarse_chunks, lanes = num_kv_heads*batch)
-// above a floor for occupancy, so long context runs on fewer, larger, latency-
-// hiding blocks. Short context stays at G=1. CPI_ATTN_BPC overrides.
+// above a floor for occupancy. CPI_ATTN_BPC overrides.
+//
+// kMaxBpc is 1: measurement says coarsening costs 2% and never pays back.
+//
+// The intent was that short context "stays at G=1", but it cannot. G is fixed
+// when the decode graph is captured, and capture only knows max_context, so
+// scratch_chunks is always large and G always lands at the cap. At a 215-token
+// context that leaves ONE coarse chunk per KV head holding data -- eight blocks
+// on a 170-SM part -- each walking seven sub-chunks serially, every one a
+// dependent global-to-shared load behind a __syncthreads. nsys shows the cost is
+// almost entirely that chain rather than the KV traffic: 8525 ns at a mean
+// context of ~75 against 8838 ns at ~600, so eight times the context costs 3.7%
+// more time.
+//
+// Against llama.cpp on an 8B Q4_K_M, G=1 versus the previous G=8:
+//   max_new  400 -> +2.0%   (241.8 -> 246.8 tok/s)
+//   max_new 1500 -> +0.2%
+//   max_new 3000 -> +0.1%
+//   max_new 8000 -> +0.0%   (238.6 -> 238.7)
+// so the coarsening never paid for itself at any depth reachable here, and the
+// batched paged path is unchanged at B=1..64. The comment it replaces claimed
+// tiny 32-token blocks left decode attention at ~14% of peak; whatever that
+// measured, it is not reproducible on this GPU for this model, so if you
+// reinstate coarsening, do it with numbers at the depth you care about.
 static inline int pick_blocks_per_chunk(int total_blocks, long long lanes) {
   static const int env_bpc = [] {
     const char* s = std::getenv("CPI_ATTN_BPC");
@@ -1371,7 +1393,7 @@ static inline int pick_blocks_per_chunk(int total_blocks, long long lanes) {
   }();
   const int cap = max(1, total_blocks);
   if (env_bpc > 0) return min(env_bpc, cap);
-  constexpr int kMaxBpc = 8;     // <= 256 tokens/block: past this it over-serializes
+  constexpr int kMaxBpc = 1;     // see above: coarsening measured as a 2% loss
   constexpr int kMinGrid = 256;  // floor on total grid blocks for occupancy
   int bpc = min(kMaxBpc, cap);
   while (bpc > 1) {
