@@ -315,6 +315,9 @@ ParsedArgs parse_args(int argc, char** argv) {
       // Value is max_new per sequence, not a batch size; the batch sizes are a
       // fixed sweep. Small values are prefill-dominated, so use 32 or more.
       args.batch_bench = std::stoi(need_val("--batch-bench"));
+    } else if (arg == "--tune-kquant") {
+      // Batch size to tune at; the knobs that matter are batch-dependent.
+      args.tune_kquant = std::stoi(need_val("--tune-kquant"));
     } else if (arg == "--dump-tokenizer-meta") {
       args.dump_tokenizer_meta = true;
     } else if (arg == "--dump-prompt-tokens") {

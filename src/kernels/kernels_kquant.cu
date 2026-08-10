@@ -23,6 +23,35 @@
 #include "runtime/kernels.cuh"
 
 namespace kernels {
+
+// Per-box tuning knobs for the k-quant kernels.
+//
+// These were `static const` reads of one env var each, which meant a value could
+// only be chosen before the process started -- fine for a manual sweep, useless
+// for a tuner that has to re-time an incumbent against a candidate inside one
+// run. Every wrong call in this kernel's history came from comparing numbers
+// taken in different processes, where thermal drift is larger than the effect.
+// Defaults are the hand-measured RTX 5090 values; env still overrides, and
+// set_kquant_tuning lets the autotuner search.
+namespace {
+KQuantTuning g_kq_tune = []() {
+  KQuantTuning t;
+  const auto env_int = [](const char* name, int fallback) {
+    const char* e = std::getenv(name);
+    return e != nullptr ? std::atoi(e) : fallback;
+  };
+  t.mm_max = env_int("CPI_KQUANT_MM_MAX", t.mm_max);
+  t.mmq_nt = env_int("CPI_KQUANT_MMQ_NT", t.mmq_nt);
+  t.mmq_async_nt = env_int("CPI_KQUANT_MMQ_ANT", t.mmq_async_nt);
+  t.mmq_async = env_int("CPI_KQUANT_MMQ_ASYNC", t.mmq_async);
+  t.matvec_wpr = env_int("CPI_KQUANT_WPR", t.matvec_wpr);
+  return t;
+}();
+}  // namespace
+
+void set_kquant_tuning(const KQuantTuning& t) { g_kq_tune = t; }
+KQuantTuning get_kquant_tuning() { return g_kq_tune; }
+
 namespace {
 
 using model::kquant::kSuperBlock;
@@ -1234,16 +1263,10 @@ bool launch_kquant_mmq(const std::uint8_t* w, KQuantType type, const half* x, ha
   quantize_q8_1_groups_kernel<<<(total_groups + 7) / 8, 256, 0, stream>>>(x, xq, xs, xsum, cols,
                                                                          groups_per_row);
   // NT trades output-tile width against registers and grid size.
-  static const int nt = []() {
-    const char* e = std::getenv("CPI_KQUANT_MMQ_NT");
-    return e != nullptr ? std::atoi(e) : 2;
-  }();
+  const int nt = g_kq_tune.mmq_nt;
   // The double-buffered kernel carries two K-tiles of activations, so its M tile
   // is 32; larger batches use the single-buffered one.
-  static const bool async_on = []() {
-    const char* e = std::getenv("CPI_KQUANT_MMQ_ASYNC");
-    return e == nullptr || e[0] != '0';
-  }();
+  const bool async_on = g_kq_tune.mmq_async != 0;
   if (async_on && batch <= 32) {
     // NT=2 (64-wide output tile) measured better than NT=1 at every batch this
     // path serves: 475.2/690.7/938.9 against 429.0/664.6/823.8 at B=8/16/32 in
@@ -1251,10 +1274,7 @@ bool launch_kquant_mmq(const std::uint8_t* w, KQuantType type, const half* x, ha
     // against 170 SMs -- so the extra work per block outweighs filling the GPU,
     // which is the opposite of what the block count suggests. Measure, do not
     // reason from grid size here.
-    static const int ant = []() {
-      const char* e = std::getenv("CPI_KQUANT_MMQ_ANT");
-      return e != nullptr ? std::atoi(e) : 2;
-    }();
+    const int ant = g_kq_tune.mmq_async_nt;
     if (ant >= 2) {
       kquant_mmq_q4k_async_kernel<2>
           <<<(rows + 63) / 64, 256, 0, stream>>>(w, xq, xs, xsum, y, rows, cols, batch, ldy);
@@ -1315,10 +1335,7 @@ bool launch_kquant_matmul(const std::uint8_t* w, KQuantType type, const half* x,
   // weight tiles staged in shared memory, int8 tensor cores. CPI has no MMQ
   // equivalent, so past the crossover the expanded-weight cuBLAS GEMM is the
   // better answer: it at least gets fp16 tensor cores.
-  static const int max_batch = []() {
-    const char* e = std::getenv("CPI_KQUANT_MM_MAX");
-    return e != nullptr ? std::atoi(e) : 8;
-  }();
+  const int max_batch = g_kq_tune.mm_max;
   if (batch < 2 || batch > max_batch) return false;
   constexpr int kThreads = 256;
 #define CPI_KQ_MM(BM)                                                             \

@@ -983,6 +983,84 @@ std::vector<std::vector<int>> LlamaEngine::run_batch(const std::vector<BatchRequ
   return outs;
 }
 
+// Per-box search over the k-quant kernel knobs.
+//
+// Every parameter in these kernels that was chosen by reasoning turned out
+// wrong on measurement -- warps per row, the batched cutoff, the mma tile width,
+// twice. What settled each of them was a paired comparison in one process. This
+// automates exactly that, and the shape is lifted from PlanCudaEngine::autotune,
+// which already learned the same lessons:
+//
+//   - a throwaway run first, because the first timing at a new shape lands on
+//     cold clocks and a cold incumbent loses to any warm candidate;
+//   - the incumbent re-timed in the same pass rather than trusting an earlier
+//     number, because drift between runs is larger than most of these effects;
+//   - hysteresis, so a candidate has to win by more than the noise to displace
+//     a default.
+//
+// Timed on real batched decode, not an isolated kernel benchmark: an isolated
+// per-shape sweep picked the wrong warps-per-row three times running, because a
+// matvec measured alone owns the whole GPU and a warm L2.
+void LlamaEngine::tune_kquant_knobs(int batch, int steps) {
+  if (cached_layer_count_ != weights_.config().num_layers) {
+    std::fprintf(stderr, "[tune] k-quant tuning needs a fully resident model; skipping\n");
+    return;
+  }
+  const std::vector<int> prompt(8, 1);
+  auto time_batch = [&](int reps) {
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int r = 0; r < reps; ++r) {
+      std::vector<BatchRequest> reqs(static_cast<std::size_t>(batch),
+                                     BatchRequest{prompt, steps, -1});
+      run_batch(reqs);
+    }
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  };
+
+  kernels::KQuantTuning t = kernels::get_kquant_tuning();
+  struct Knob {
+    const char* name;
+    int* value;
+    std::vector<int> candidates;
+  };
+  const std::vector<Knob> knobs = {
+      {"mmq_async", &t.mmq_async, {0, 1}},
+      {"mmq_async_nt", &t.mmq_async_nt, {1, 2}},
+      {"mm_max", &t.mm_max, {0, 4, 8, 16}},
+      {"mmq_nt", &t.mmq_nt, {2, 4}},
+  };
+
+  std::fprintf(stderr, "[tune] k-quant knobs at batch %d, %d tokens per sequence\n", batch, steps);
+  kernels::set_kquant_tuning(t);
+  time_batch(1);  // discard: cold clocks
+  for (const auto& k : knobs) {
+    const int incumbent = *k.value;
+    int best = incumbent;
+    // Re-time the incumbent in this pass; an earlier number is a different
+    // thermal state.
+    kernels::set_kquant_tuning(t);
+    double best_s = time_batch(2);
+    for (int cand : k.candidates) {
+      if (cand == incumbent) continue;
+      *k.value = cand;
+      kernels::set_kquant_tuning(t);
+      const double s = time_batch(2);
+      if (s < best_s * 0.98) {  // must beat the incumbent by more than drift
+        best = cand;
+        best_s = s;
+      }
+    }
+    *k.value = best;
+    kernels::set_kquant_tuning(t);
+    std::fprintf(stderr, "[tune]   %-14s %d%s\n", k.name, best,
+                 best == incumbent ? " (kept)" : " (changed)");
+  }
+  std::fprintf(stderr,
+               "[tune] winners: CPI_KQUANT_MMQ_ASYNC=%d CPI_KQUANT_MMQ_ANT=%d "
+               "CPI_KQUANT_MM_MAX=%d CPI_KQUANT_MMQ_NT=%d\n",
+               t.mmq_async, t.mmq_async_nt, t.mm_max, t.mmq_nt);
+}
+
 void LlamaEngine::run_batch_bench(const std::vector<int>& prompt, int max_new) {
   if (!options_.paged_blocks) throw std::runtime_error("batch bench requires --paged-blocks");
   if (cached_layer_count_ != weights_.config().num_layers) {

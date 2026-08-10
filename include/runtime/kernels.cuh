@@ -1262,6 +1262,19 @@ void launch_dequant_kquant(const std::uint8_t* blocks_in, KQuantType type, std::
 // inside the kernel, so the weight never exists as fp16 and a quantized model stays
 // resident at its file size. cols must be a multiple of 256. Gated by
 // kquant_matvec_test against a host dequant + fp32 dot.
+// Per-box tuning knobs for the k-quant kernels. Runtime-settable so a tuner can
+// re-time an incumbent against a candidate inside a single process -- comparing
+// across processes loses the effect in thermal drift.
+struct KQuantTuning {
+  int mm_max = 8;        // largest batch the register-tile matmul takes
+  int mmq_nt = 2;        // n-tiles per warp-half, single-buffered mma kernel
+  int mmq_async_nt = 2;  // same, double-buffered kernel
+  int mmq_async = 1;     // use the cp.async kernel when the batch fits
+  int matvec_wpr = 8;    // warps cooperating on one row in the matvec
+};
+void set_kquant_tuning(const KQuantTuning& t);
+KQuantTuning get_kquant_tuning();
+
 // Batched form: y[b, n] = sum_k x[b, k] * W[n, k], W left packed. x is
 // [batch, cols] and y is [batch, rows], both row-major -- the layout the fp16
 // GEMM path already produces. Returns false when the batch is outside the range

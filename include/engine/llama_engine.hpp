@@ -528,6 +528,10 @@ public:
   // generation against concurrent run_batch (decode tokens/sec + speedup).
   void run_batch_bench(const std::vector<int>& prompt, int max_new);
 
+  // Coordinate descent over the k-quant kernel knobs on this box, timed on real
+  // batched decode. See the definition for why it re-times the incumbent.
+  void tune_kquant_knobs(int batch, int steps);
+
   // ---- Streaming batch scheduler (continuous batching for the server) --------
   //
   // The scheduler itself now lives in engine::BatchScheduler, which has no backend in it:
