@@ -12,6 +12,20 @@
 
 namespace engine {
 
+namespace {
+// rmsnorm that also leaves the q8_1 activation the integer matvec wants, so the
+// consumer can skip its own quantize pass. `allow` is false where the consumer
+// reads something other than the value we just normalised -- the TQ3 path
+// rotates a copy first, so the scratch would describe the wrong vector.
+inline bool norm_maybe_q8(const __half* x, const __half* w, __half* y, int cols, float eps,
+                          cudaStream_t stream, bool allow) {
+  if (allow && kernels::launch_rmsnorm_q8_1(x, w, y, cols, eps, stream)) return true;
+  kernels::launch_rmsnorm(x, w, y, 1, cols, eps, stream);
+  return false;
+}
+}  // namespace
+
+
 bool LlamaEngine::can_use_greedy_decode_graph() const {
   // Greedy decode CUDA graph. Verified byte-identical to the non-graph path for
   // fp16, int8 and int4 once the RMSNorm eps was sourced from the model config
@@ -251,9 +265,9 @@ void LlamaEngine::init_greedy_decode_graph() {
                                                static_cast<std::size_t>(options_.max_context) *
                                                static_cast<std::size_t>(kv_hidden);
 
-    kernels::launch_rmsnorm(static_cast<const __half*>(d_x_),
-                            static_cast<const __half*>(lw->norm_att),
-                            static_cast<__half*>(d_x_norm_), 1, hidden, norm_eps, compute_stream_);
+    const bool xnorm_q8 = norm_maybe_q8(
+        static_cast<const __half*>(d_x_), static_cast<const __half*>(lw->norm_att),
+        static_cast<__half*>(d_x_norm_), hidden, norm_eps, compute_stream_, !(tq && tq->wqkv));
 
     if (tq && tq->wqkv) {
       CUDA_CHECK(cudaMemcpyAsync(d_x_tq3_, d_x_norm_,
@@ -284,11 +298,11 @@ void LlamaEngine::init_greedy_decode_graph() {
             resident_int8_qkv_tile_packed4_, resident_int8_qkv_warps_per_row_);
       }
     } else if (resident_custom_qkv_) {
-      if (!packed_qkv_matvec(*lw, d_x_norm_, d_q_, compute_stream_)) {
+      if (!packed_qkv_matvec(*lw, d_x_norm_, d_q_, compute_stream_, xnorm_q8)) {
         resident_projection_half(lw->wqkv, d_x_norm_, d_q_, hidden + 2 * kv_hidden, hidden,
                                  resident_qkv_warps_, resident_qkv_tile_pairs_);
       }
-    } else if (!packed_qkv_matvec(*lw, d_x_norm_, d_q_, compute_stream_)) {
+    } else if (!packed_qkv_matvec(*lw, d_x_norm_, d_q_, compute_stream_, xnorm_q8)) {
       detail::dispatch_linear_rowmajor_weight(
           cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,
           lw->wqkv, d_x_norm_, d_q_, hidden + 2 * kv_hidden, hidden, 1, CUDA_R_16F);
@@ -377,9 +391,9 @@ void LlamaEngine::init_greedy_decode_graph() {
     }
     fused_residual = false;
 
-    kernels::launch_rmsnorm(static_cast<const __half*>(d_x_),
-                            static_cast<const __half*>(lw->norm_ffn),
-                            static_cast<__half*>(d_x_norm_), 1, hidden, norm_eps, compute_stream_);
+    const bool xnorm_ffn_q8 = norm_maybe_q8(
+        static_cast<const __half*>(d_x_), static_cast<const __half*>(lw->norm_ffn),
+        static_cast<__half*>(d_x_norm_), hidden, norm_eps, compute_stream_, !(tq && tq->w13));
 
     // True when the gate+up GEMV and silu_mul collapsed into one kernel.
     bool fused_glu = false;
@@ -425,7 +439,7 @@ void LlamaEngine::init_greedy_decode_graph() {
                                     static_cast<kernels::KQuantType>(lw->w13_packed.kind),
                                     static_cast<const __half*>(d_x_norm_),
                                     static_cast<__half*>(d_ff1_), lw->w13_packed.rows,
-                                    lw->w13_packed.cols, compute_stream_);
+                                    lw->w13_packed.cols, compute_stream_, xnorm_ffn_q8);
       fused_glu = false;
     } else if (!weights_.config().mlp_gelu) {
       // fused: gate+up GEMV and silu_mul in one kernel. At batch 1 every kernel costs a
@@ -710,9 +724,9 @@ void LlamaEngine::init_logits_decode_graph() {
                                                static_cast<std::size_t>(options_.max_context) *
                                                static_cast<std::size_t>(kv_hidden);
 
-    kernels::launch_rmsnorm(static_cast<const __half*>(d_x_),
-                            static_cast<const __half*>(lw->norm_att),
-                            static_cast<__half*>(d_x_norm_), 1, hidden, norm_eps, compute_stream_);
+    const bool xnorm_q8 = norm_maybe_q8(
+        static_cast<const __half*>(d_x_), static_cast<const __half*>(lw->norm_att),
+        static_cast<__half*>(d_x_norm_), hidden, norm_eps, compute_stream_, !(tq && tq->wqkv));
 
     if (tq && tq->wqkv) {
       CUDA_CHECK(cudaMemcpyAsync(d_x_tq3_, d_x_norm_,
@@ -743,11 +757,11 @@ void LlamaEngine::init_logits_decode_graph() {
             resident_int8_qkv_tile_packed4_, resident_int8_qkv_warps_per_row_);
       }
     } else if (resident_custom_qkv_) {
-      if (!packed_qkv_matvec(*lw, d_x_norm_, d_q_, compute_stream_)) {
+      if (!packed_qkv_matvec(*lw, d_x_norm_, d_q_, compute_stream_, xnorm_q8)) {
         resident_projection_half(lw->wqkv, d_x_norm_, d_q_, hidden + 2 * kv_hidden, hidden,
                                  resident_qkv_warps_, resident_qkv_tile_pairs_);
       }
-    } else if (!packed_qkv_matvec(*lw, d_x_norm_, d_q_, compute_stream_)) {
+    } else if (!packed_qkv_matvec(*lw, d_x_norm_, d_q_, compute_stream_, xnorm_q8)) {
       detail::dispatch_linear_rowmajor_weight(
           cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,
           lw->wqkv, d_x_norm_, d_q_, hidden + 2 * kv_hidden, hidden, 1, CUDA_R_16F);
@@ -836,9 +850,9 @@ void LlamaEngine::init_logits_decode_graph() {
     }
     fused_residual = false;
 
-    kernels::launch_rmsnorm(static_cast<const __half*>(d_x_),
-                            static_cast<const __half*>(lw->norm_ffn),
-                            static_cast<__half*>(d_x_norm_), 1, hidden, norm_eps, compute_stream_);
+    const bool xnorm_ffn_q8 = norm_maybe_q8(
+        static_cast<const __half*>(d_x_), static_cast<const __half*>(lw->norm_ffn),
+        static_cast<__half*>(d_x_norm_), hidden, norm_eps, compute_stream_, !(tq && tq->w13));
 
     if (tq && tq->w13) {
       CUDA_CHECK(cudaMemcpyAsync(d_x_tq3_, d_x_norm_,
@@ -878,7 +892,7 @@ void LlamaEngine::init_logits_decode_graph() {
                                     static_cast<kernels::KQuantType>(lw->w13_packed.kind),
                                     static_cast<const __half*>(d_x_norm_),
                                     static_cast<__half*>(d_ff1_), lw->w13_packed.rows,
-                                    lw->w13_packed.cols, compute_stream_);
+                                    lw->w13_packed.cols, compute_stream_, xnorm_ffn_q8);
     } else {
       // FP16 MLP fallback in graph capture: use resident_projection_half (always graph-capturable).
       resident_projection_half(lw->w13, d_x_norm_, d_ff1_, 2 * inter, hidden, resident_qkv_warps_,

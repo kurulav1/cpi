@@ -700,8 +700,10 @@ private:
 
   // Single-token QKV straight off the packed blocks. False when this layer kept
   // its fp16 fused matrix, which is the caller's cue to run the old path.
+  // x_pre_quantized: the rmsnorm that produced x_norm already wrote its q8_1
+  // form into the shared activation scratch, so no projection needs to redo it.
   bool packed_qkv_matvec(const LayerDeviceWeights& lw, const void* x_norm, void* qkv,
-                         cudaStream_t stream);
+                         cudaStream_t stream, bool x_pre_quantized = false);
 
   // Batched forms. False means the batch is outside what the packed kernel is
   // worth doing for, and the caller should expand the weight and use cuBLAS.

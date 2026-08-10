@@ -1326,6 +1326,17 @@ bool launch_kquant_mmq(const std::uint8_t* w, KQuantType type, const half* x, ha
 // graph is captured: allocating inside a captured stream is rejected.
 void reserve_kquant_dp4a_scratch(int cols);
 
+// Hands out the dp4a activation scratch so a producer kernel can emit the q8_1
+// form directly, and marks it ready so the consuming matvec skips its own
+// quantize pass. False means the integer path is off or the width does not fit,
+// and the caller should do a plain rmsnorm.
+bool acquire_kquant_q8_1_scratch(int cols, std::int8_t** xq, float** xs, float** gsum);
+
+// rmsnorm that also writes the q8_1 activation. Decode only (one row). Returns
+// false if the q8_1 scratch was unavailable and nothing was written.
+bool launch_rmsnorm_q8_1(const half* x, const half* weight, half* y, int cols, float eps,
+                         cudaStream_t stream);
+
 void launch_kquant_matvec_residual(const std::uint8_t* w, KQuantType type, const half* x, half* y,
                                    int rows, int cols, cudaStream_t stream, bool reuse_x = false);
 

@@ -1406,6 +1406,120 @@ void launch_rmsnorm_quant_perm8(const half* x, const half* w, half* y, std::int8
       <<<1, kThreads, 0, stream>>>(x, w, y, xq, xscale, cols, eps, 127);
 }
 
+// rmsnorm that also emits the q8_1 form the integer matvec wants, so the layer
+// stops paying for a separate quantize pass over the same 4096 values.
+//
+// The quantizer is a ~770 ns kernel and there are four per layer, which is about
+// the floor for a kernel this size -- silu_mul next door costs 695 ns for
+// comparable work. Nothing was going to make it cheaper, so the only lever left
+// was not launching it. Two of the four read an rmsnorm output directly.
+//
+// Group layout: 32 values per group, i.e. four int4 vectors, and thread t owns
+// vectors t and t+Threads. Both land on lane groups of four consecutive threads
+// (Threads is a multiple of four), so the group max and sum are two shuffles
+// across lanes rather than anything in shared memory.
+template <int Threads>
+__global__ void rmsnorm_fast_q8_1_kernel(const half* __restrict__ x, const half* __restrict__ w,
+                                         half* __restrict__ y, std::int8_t* __restrict__ xq,
+                                         float* __restrict__ xs, float* __restrict__ gsum,
+                                         int cols, float eps) {
+  constexpr int kMaxVecs = 8;
+  const int tid = threadIdx.x;
+  const int vecs = cols / 8;
+  const int4* x4 = reinterpret_cast<const int4*>(x);
+
+  int4 buf[kMaxVecs];
+  float acc = 0.0f;
+  int n = 0;
+  for (int i = tid; i < vecs; i += Threads, ++n) {
+    buf[n] = x4[i];
+    const half2* h = reinterpret_cast<const half2*>(&buf[n]);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const float2 v = __half22float2(h[j]);
+      acc += v.x * v.x + v.y * v.y;
+    }
+  }
+#pragma unroll
+  for (int off = warpSize / 2; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+  __shared__ float partial[Threads / 32];
+  __shared__ float inv_shared;
+  if ((tid & 31) == 0) partial[tid / 32] = acc;
+  __syncthreads();
+  if (tid == 0) {
+    float total = 0.0f;
+#pragma unroll
+    for (int i = 0; i < Threads / 32; ++i) total += partial[i];
+    inv_shared = rsqrtf(total / static_cast<float>(cols) + eps);
+  }
+  __syncthreads();
+
+  const float inv = inv_shared;
+  const int4* w4 = reinterpret_cast<const int4*>(w);
+  int4* y4 = reinterpret_cast<int4*>(y);
+  n = 0;
+  for (int i = tid; i < vecs; i += Threads, ++n) {
+    const int4 wpack = w4[i];
+    const half2* xh = reinterpret_cast<const half2*>(&buf[n]);
+    const half2* wh = reinterpret_cast<const half2*>(&wpack);
+    float v[8];
+    int4 out;
+    half2* oh = reinterpret_cast<half2*>(&out);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const float2 xv = __half22float2(xh[j]);
+      const float2 wv = __half22float2(wh[j]);
+      v[2 * j] = xv.x * inv * wv.x;
+      v[2 * j + 1] = xv.y * inv * wv.y;
+      oh[j] = __floats2half2_rn(v[2 * j], v[2 * j + 1]);
+    }
+    y4[i] = out;
+
+    // Group amax across the four lanes that share this group's four vectors.
+    float amax = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) amax = fmaxf(amax, fabsf(v[j]));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+    const float scale = amax > 0.0f ? amax / 127.0f : 1.0f;
+    // Multiply by the reciprocal rather than dividing eight times per vector:
+    // each thread owns two vectors, so the divides were sixteen deep and cost
+    // most of what fusing the quantize away had saved.
+    const float qscale = amax > 0.0f ? 127.0f / amax : 1.0f;
+
+    float sum = 0.0f;
+    std::int8_t* q = xq + static_cast<std::size_t>(i) * 8;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const int qi = max(-127, min(127, __float2int_rn(v[j] * qscale)));
+      q[j] = static_cast<std::int8_t>(qi);
+      sum += static_cast<float>(qi);
+    }
+    sum += __shfl_xor_sync(0xffffffffu, sum, 1);
+    sum += __shfl_xor_sync(0xffffffffu, sum, 2);
+    if ((i & 3) == 0) {
+      const int g = i >> 2;
+      xs[g] = scale;
+      // Stored pre-multiplied by the scale: the matvec wants sum(x), not sum(xq).
+      gsum[g] = sum * scale;
+    }
+  }
+}
+
+bool launch_rmsnorm_q8_1(const half* x, const half* weight, half* y, int cols, float eps,
+                         cudaStream_t stream) {
+  constexpr int kThreads = 256;
+  static_assert(kThreads % 4 == 0, "group of four vectors must sit in consecutive lanes");
+  if ((cols % 8) != 0 || (cols / 8) > kThreads * 8) return false;
+  std::int8_t* xq = nullptr;
+  float* xs = nullptr;
+  float* gsum = nullptr;
+  if (!acquire_kquant_q8_1_scratch(cols, &xq, &xs, &gsum)) return false;
+  rmsnorm_fast_q8_1_kernel<kThreads>
+      <<<1, kThreads, 0, stream>>>(x, weight, y, xq, xs, gsum, cols, eps);
+  return true;
+}
+
 void launch_rmsnorm(const half* x, const half* weight, half* y, int rows, int cols, float eps,
                     cudaStream_t stream) {
   // Fast path needs 128-bit alignment (cols % 8) and the row to fit in registers.

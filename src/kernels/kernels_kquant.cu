@@ -1959,6 +1959,17 @@ static void launch_kquant_matvec_impl(const std::uint8_t* w, KQuantType type, co
 
 void reserve_kquant_dp4a_scratch(int cols) { ensure_dp4a_scratch(cols); }
 
+bool acquire_kquant_q8_1_scratch(int cols, std::int8_t** xq, float** xs, float** gsum) {
+  if (g_kq_tune.matvec_dp4a == 0 || cols % 256 != 0 || !ensure_dp4a_scratch(cols)) return false;
+  *xq = g_dp4a_xq;
+  *xs = g_dp4a_xs;
+  *gsum = g_dp4a_sum;
+  // Whoever fills it is standing in for quantize_q8_1_groups_kernel, so the
+  // matvec that follows can be told to reuse it.
+  g_dp4a_ready_cols = cols;
+  return true;
+}
+
 void launch_kquant_matvec(const std::uint8_t* w, KQuantType type, const half* x, half* y, int rows,
                           int cols, cudaStream_t stream, bool reuse_x) {
   if (try_dp4a_matvec<false>(w, type, x, y, rows, cols, stream, reuse_x)) return;

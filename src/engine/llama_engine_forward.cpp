@@ -371,7 +371,7 @@ bool LlamaEngine::packed_qkv_matmul(const LayerDeviceWeights& lw, const void* x,
 }
 
 bool LlamaEngine::packed_qkv_matvec(const LayerDeviceWeights& lw, const void* x_norm, void* qkv,
-                                    cudaStream_t stream) {
+                                    cudaStream_t stream, bool x_pre_quantized) {
   // reuse says x_norm was already quantized by the preceding projection: all of
   // q, k and v read the same normed activation, and this model cannot fuse them
   // into one packed matrix because wv is Q6_K where wq and wk are Q4_K.
@@ -384,7 +384,7 @@ bool LlamaEngine::packed_qkv_matvec(const LayerDeviceWeights& lw, const void* x_
                                   reuse);
   };
   if (lw.wqkv_packed.active()) {
-    run(lw.wqkv_packed, 0);
+    run(lw.wqkv_packed, 0, x_pre_quantized);
     return true;
   }
   // Separate buffers write into the same row ranges the fused matrix would have
@@ -392,7 +392,7 @@ bool LlamaEngine::packed_qkv_matvec(const LayerDeviceWeights& lw, const void* x_
   // Q and K together, in which case wk_packed is empty and there are two
   // launches rather than three.
   if (lw.wq_packed.active() && lw.wv_packed.active()) {
-    run(lw.wq_packed, 0);
+    run(lw.wq_packed, 0, x_pre_quantized);
     int written = lw.wq_packed.rows;
     if (lw.wk_packed.active()) {
       run(lw.wk_packed, written, true);
