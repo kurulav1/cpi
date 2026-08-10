@@ -1713,8 +1713,8 @@ __global__ void kquant_matvec_dp4a32_kernel(const std::uint8_t* __restrict__ w,
 template <int WPR, bool ACC>
 __global__ void kquant_matvec_dp4a_q6k_kernel(const std::uint8_t* __restrict__ w,
                                               const std::int8_t* __restrict__ xq,
-                                              const float* __restrict__ xs, __half* __restrict__ y,
-                                              int rows, int cols) {
+                                              const float* __restrict__ xs,
+                                              __half* __restrict__ y, int rows, int cols) {
   constexpr int kWarps = 8;
   constexpr int kRowsPerBlock = kWarps / WPR;
   const int lane = static_cast<int>(threadIdx.x) & 31;
@@ -1755,6 +1755,10 @@ __global__ void kquant_matvec_dp4a_q6k_kernel(const std::uint8_t* __restrict__ w
         reinterpret_cast<const std::uint16_t*>(p + 128 + (n << 5) + l0);
 
     const int xbase = sb * static_cast<int>(kSuperBlock);
+    // Eight contiguous activation bytes per half, off_lo being a multiple of
+    // eight: one int2 rather than two ints, as in the Q4_K kernel.
+    const int2 xl2 = *reinterpret_cast<const int2*>(xq + xbase + off_lo);
+    const int2 xh2 = *reinterpret_cast<const int2*>(xq + xbase + off_hi);
     int dot_lo = 0, dot_hi = 0, sum_lo = 0, sum_hi = 0;
 #pragma unroll
     for (int k = 0; k < 2; ++k) {
@@ -1766,16 +1770,20 @@ __global__ void kquant_matvec_dp4a_q6k_kernel(const std::uint8_t* __restrict__ w
                                        (((hword >> sl) & 0x03030303u) << 4));
       const int qhi = static_cast<int>(((word >> 4) & 0x0F0F0F0Fu) |
                                        (((hword >> sh) & 0x03030303u) << 4));
-      const int xl = *reinterpret_cast<const int*>(xq + xbase + off_lo + (k << 2));
-      const int xh = *reinterpret_cast<const int*>(xq + xbase + off_hi + (k << 2));
+      const int xl = k == 0 ? xl2.x : xl2.y;
+      const int xh = k == 0 ? xh2.x : xh2.y;
       dot_lo = __dp4a(qlo, xl, dot_lo);
       dot_hi = __dp4a(qhi, xh, dot_hi);
       sum_lo = __dp4a(xl, 0x01010101, sum_lo);
       sum_hi = __dp4a(xh, 0x01010101, sum_hi);
     }
 
-    // off_lo advances inside a 32-aligned run, so each half sits in one
-    // activation group: lo in n*4+h, hi 64 elements later in n*4+h+2.
+    // The group-sum shortcut the Q4_K kernel uses does NOT work here, and the
+    // gate says so loudly (worst_rel 2.8). It needs one weight scale across the
+    // lanes sharing an activation group, and Q6_K carries a scale per 16 weights
+    // where the group is 32: the four lanes covering a group split across two
+    // different scales, so no single lane can carry the whole -32*sum(x) term.
+    // Per-16 sums would fix it, but the quantizer only emits per-32.
     const int glo = (sb << 3) + (n << 2) + h;
     acc += xs[glo] * d * scl * static_cast<float>(dot_lo - 32 * sum_lo) +
            xs[glo + 2] * d * sch * static_cast<float>(dot_hi - 32 * sum_hi);
