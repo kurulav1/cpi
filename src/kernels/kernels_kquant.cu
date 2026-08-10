@@ -1582,6 +1582,17 @@ __global__ void kquant_matvec_dp4a16_kernel(const std::uint8_t* __restrict__ w,
 // warps per row rather than eight -- four warps x four super-blocks is exactly a
 // 4096-wide row. At WPR=8 half the block would find nothing to do. Two rows per
 // block keeps the same warps in flight.
+// Split-K does not apply here, though the shape of the problem invites it. A
+// per-shape microbenchmark showed the narrow projections at a fraction of the
+// MLP matrices' throughput -- wk at 102 GB/s against w1's 1684 -- which reads as
+// a starved GPU wanting more blocks. Two things were wrong with that. The bench
+// launches outside a graph, and on Windows the per-launch cost dominates: every
+// shape came out at 18-26 us regardless of size, so it was measuring launch
+// overhead, not bandwidth. And a 4096-wide row is only 16 super-blocks, which
+// one block already consumes entirely (4 warps x 4 each), so there is no column
+// depth left to split -- chunking it just idles three warps in four. Measured
+// end to end it cost 8.8%: 220.5 against 241.9 tok/s. Use nsys, not that bench,
+// to decide anything about this kernel.
 template <KQuantType TYPE, int WPR, bool ACC, bool GSUM, bool VECX>
 __global__ void kquant_matvec_dp4a32_kernel(const std::uint8_t* __restrict__ w,
                                             const std::int8_t* __restrict__ xq,
@@ -1960,6 +1971,14 @@ void launch_kquant_matvec_residual(const std::uint8_t* w, KQuantType type, const
   launch_kquant_matvec_impl<half, true>(w, type, x, y, rows, cols, stream);
 }
 
+// The LM head stays on fp16 activations deliberately. It is 7.5% of a decode
+// step on its own -- 202 launches of ~296 us for 431 MB of Q6_K -- so it looked
+// like the last easy dp4a win. Wiring it through the integer path (templating
+// the kernels on output type, since this one writes fp32 logits) works and is
+// gate-clean, but nsys put the kernel at 291 us against 296: 1.6% of the kernel,
+// 0.12% of the step, invisible end to end. It was already at 1480 GB/s of a
+// ~1792 GB/s part, i.e. bandwidth-bound, which is the same reason Q6_K gained
+// least from dp4a everywhere else. Not worth changing logit numerics for.
 void launch_kquant_matvec_f32(const std::uint8_t* w, KQuantType type, const half* x, float* y,
                               int rows, int cols, cudaStream_t stream) {
   launch_kquant_matvec_impl<float, false>(w, type, x, y, rows, cols, stream);
