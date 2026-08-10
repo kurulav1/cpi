@@ -86,6 +86,60 @@ __global__ void silu_mul_kernel(const half* gate, const half* up, half* out, int
   out[i] = __float2half(s * u);
 }
 
+// silu_mul that also emits the q8_1 activation the down projection wants, so the
+// layer stops launching a separate ~770 ns quantize over the same values. Same
+// trade as the fused rmsnorm; this is the third of the four per-layer quantize
+// calls.
+//
+// One thread owns one half2, so a 32-value group is exactly sixteen consecutive
+// lanes and the group max and sum are four shuffles inside a warp. The launcher
+// only takes this path when no thread exits early, because a thread that
+// returned cannot answer a __shfl_xor_sync.
+//
+// Quantization reads the values back out of the fp16 result rather than the
+// float it was rounded from, so it sees exactly what a separate pass over `out`
+// would have seen.
+__global__ void silu_mul_half2_q8_1_kernel(const half2* __restrict__ gate,
+                                           const half2* __restrict__ up,
+                                           half2* __restrict__ out, std::int8_t* __restrict__ q,
+                                           float* __restrict__ xs, float* __restrict__ gsum,
+                                           int n2) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  const half2 g2 = gate[i];
+  const half2 u2 = up[i];
+  const float g0 = __half2float(__low2half(g2));
+  const float g1 = __half2float(__high2half(g2));
+  const float u0 = __half2float(__low2half(u2));
+  const float u1 = __half2float(__high2half(u2));
+  const float s0 = g0 / (1.0f + expf(-g0));
+  const float s1 = g1 / (1.0f + expf(-g1));
+  const half2 r = __halves2half2(__float2half(s0 * u0), __float2half(s1 * u1));
+  out[i] = r;
+
+  const float v0 = __half2float(__low2half(r));
+  const float v1 = __half2float(__high2half(r));
+  float amax = fmaxf(fabsf(v0), fabsf(v1));
+#pragma unroll
+  for (int m = 1; m < 16; m <<= 1) {
+    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, m));
+  }
+  const float scale = amax > 0.0f ? amax / 127.0f : 1.0f;
+  const float qscale = amax > 0.0f ? 127.0f / amax : 1.0f;
+  const int q0 = max(-127, min(127, __float2int_rn(v0 * qscale)));
+  const int q1 = max(-127, min(127, __float2int_rn(v1 * qscale)));
+  q[2 * i] = static_cast<std::int8_t>(q0);
+  q[2 * i + 1] = static_cast<std::int8_t>(q1);
+
+  float sum = static_cast<float>(q0 + q1);
+#pragma unroll
+  for (int m = 1; m < 16; m <<= 1) sum += __shfl_xor_sync(0xFFFFFFFFu, sum, m);
+  if ((i & 15) == 0) {
+    const int g = i >> 4;
+    xs[g] = scale;
+    gsum[g] = sum * scale;
+  }
+}
+
 __global__ void silu_mul_half2_kernel(const half2* gate, const half2* up, half2* out, int n2) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n2) {
@@ -1117,6 +1171,28 @@ void launch_gated_glu_interleaved(const half* ff13, half* out, int inter, int to
   const int blocks = (total + kThreads - 1) / kThreads;
   gated_glu_interleaved_kernel<<<blocks, kThreads, 0, stream>>>(ff13, out, inter, tokens,
                                                                 gelu ? 1 : 0);
+}
+
+bool launch_silu_mul_q8_1(const half* gate, const half* up, half* out, int n,
+                          cudaStream_t stream) {
+  constexpr int threads = 256;
+  const bool aligned =
+      ((reinterpret_cast<std::uintptr_t>(gate) | reinterpret_cast<std::uintptr_t>(up) |
+        reinterpret_cast<std::uintptr_t>(out)) &
+       (alignof(half2) - 1)) == 0;
+  if ((n & 1) != 0 || !aligned) return false;
+  const int n2 = n / 2;
+  // Every lane must reach the shuffles, so the grid has to divide exactly, and a
+  // group of 32 values has to be sixteen whole lanes.
+  if ((n2 % threads) != 0 || (n % 32) != 0) return false;
+  std::int8_t* xq = nullptr;
+  float* xs = nullptr;
+  float* gsum = nullptr;
+  if (!acquire_kquant_q8_1_scratch(n, &xq, &xs, &gsum)) return false;
+  silu_mul_half2_q8_1_kernel<<<n2 / threads, threads, 0, stream>>>(
+      reinterpret_cast<const half2*>(gate), reinterpret_cast<const half2*>(up),
+      reinterpret_cast<half2*>(out), xq, xs, gsum, n2);
+  return true;
 }
 
 void launch_silu_mul(const half* gate, const half* up, half* out, int n, cudaStream_t stream) {

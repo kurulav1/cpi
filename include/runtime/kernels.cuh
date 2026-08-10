@@ -1332,6 +1332,11 @@ void reserve_kquant_dp4a_scratch(int cols);
 // and the caller should do a plain rmsnorm.
 bool acquire_kquant_q8_1_scratch(int cols, std::int8_t** xq, float** xs, float** gsum);
 
+// silu_mul that also writes the q8_1 activation for the down projection. False
+// means nothing was written and the caller should run the plain gated GLU.
+bool launch_silu_mul_q8_1(const half* gate, const half* up, half* out, int n,
+                          cudaStream_t stream);
+
 // rmsnorm that also writes the q8_1 activation. Decode only (one row). Returns
 // false if the q8_1 scratch was unavailable and nothing was written.
 bool launch_rmsnorm_q8_1(const half* x, const half* weight, half* y, int cols, float eps,

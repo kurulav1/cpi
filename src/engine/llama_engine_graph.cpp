@@ -462,10 +462,23 @@ void LlamaEngine::init_greedy_decode_graph() {
       fused_glu = false;
     }
 
+    bool ff_q8 = false;
     if (!fused_glu) {
-      detail::launch_gated_glu(weights_.config().mlp_gelu, static_cast<const __half*>(d_ff1_),
-                               static_cast<const __half*>(d_ff2_), static_cast<__half*>(d_ff2_),
-                               inter, compute_stream_);
+      // The gated GLU can leave the q8_1 form behind for the down projection,
+      // the same trade the norm above makes. Only silu (not gelu) has a fused
+      // kernel, and only the packed w2 can consume it.
+      if (!weights_.config().mlp_gelu && !tq && lw->w2_packed.active()) {
+        ff_q8 = kernels::launch_silu_mul_q8_1(static_cast<const __half*>(d_ff1_),
+                                              static_cast<const __half*>(d_ff2_),
+                                              static_cast<__half*>(d_ff2_), inter,
+                                              compute_stream_);
+      }
+      if (!ff_q8) {
+        detail::launch_gated_glu(weights_.config().mlp_gelu,
+                                 static_cast<const __half*>(d_ff1_),
+                                 static_cast<const __half*>(d_ff2_),
+                                 static_cast<__half*>(d_ff2_), inter, compute_stream_);
+      }
     }
 
     if (tq) {
@@ -496,7 +509,7 @@ void LlamaEngine::init_greedy_decode_graph() {
           static_cast<const std::uint8_t*>(lw->w2_packed.data),
           static_cast<kernels::KQuantType>(lw->w2_packed.kind),
           static_cast<const __half*>(d_ff2_), static_cast<__half*>(d_x_), lw->w2_packed.rows,
-          lw->w2_packed.cols, compute_stream_);
+          lw->w2_packed.cols, compute_stream_, ff_q8);
       fused_residual = true;
     } else {
       // Residual add folded into the down-projection's epilogue.
@@ -899,9 +912,24 @@ void LlamaEngine::init_logits_decode_graph() {
                                resident_qkv_tile_pairs_, resident_qkv_rows_per_warp_);
     }
 
-    detail::launch_gated_glu(weights_.config().mlp_gelu, static_cast<const __half*>(d_ff1_),
-                             static_cast<const __half*>(d_ff2_), static_cast<__half*>(d_ff2_),
-                             inter, compute_stream_);
+    bool ff_q8 = false;
+    {
+      // The gated GLU can leave the q8_1 form behind for the down projection,
+      // the same trade the norm above makes. Only silu (not gelu) has a fused
+      // kernel, and only the packed w2 can consume it.
+      if (!weights_.config().mlp_gelu && !tq && lw->w2_packed.active()) {
+        ff_q8 = kernels::launch_silu_mul_q8_1(static_cast<const __half*>(d_ff1_),
+                                              static_cast<const __half*>(d_ff2_),
+                                              static_cast<__half*>(d_ff2_), inter,
+                                              compute_stream_);
+      }
+      if (!ff_q8) {
+        detail::launch_gated_glu(weights_.config().mlp_gelu,
+                                 static_cast<const __half*>(d_ff1_),
+                                 static_cast<const __half*>(d_ff2_),
+                                 static_cast<__half*>(d_ff2_), inter, compute_stream_);
+      }
+    }
 
     if (tq) {
       resident_projection_half(lw->w2, d_ff2_, d_ff3_, hidden, inter, resident_wo_warps_,
@@ -929,7 +957,7 @@ void LlamaEngine::init_logits_decode_graph() {
           static_cast<const std::uint8_t*>(lw->w2_packed.data),
           static_cast<kernels::KQuantType>(lw->w2_packed.kind),
           static_cast<const __half*>(d_ff2_), static_cast<__half*>(d_x_), lw->w2_packed.rows,
-          lw->w2_packed.cols, compute_stream_);
+          lw->w2_packed.cols, compute_stream_, ff_q8);
       fused_residual = true;
     } else {
       // Residual add folded into the down-projection's epilogue.
