@@ -45,6 +45,7 @@ KQuantTuning g_kq_tune = []() {
   t.mmq_async_nt = env_int("CPI_KQUANT_MMQ_ANT", t.mmq_async_nt);
   t.mmq_async = env_int("CPI_KQUANT_MMQ_ASYNC", t.mmq_async);
   t.matvec_wpr = env_int("CPI_KQUANT_WPR", t.matvec_wpr);
+  t.matvec_dp4a = env_int("CPI_KQUANT_MATVEC_DP4A", t.matvec_dp4a);
   return t;
 }();
 }  // namespace
@@ -1369,6 +1370,160 @@ bool launch_kquant_matmul(const std::uint8_t* w, KQuantType type, const half* x,
   return false;
 }
 
+// Integer-dot matvec: activations to int8 once, then dp4a instead of per-weight
+// float unpacking.
+//
+// Profiling the fp16-activation matvec on w13 put compute at 62.8% against DRAM
+// at 56.8% -- it is arithmetic-limited, and the arithmetic is converting each
+// 4-bit weight to float and multiplying. Four low nibbles of a 4-byte slice are
+// already four int8 lanes (`qw & 0x0F0F0F0F`), so one dp4a replaces four
+// convert-and-multiply pairs, and a second against 0x01010101 gives the group
+// sum the `- dmin*m` term needs.
+//
+// A matvec is where this trade is cheapest: the activation is quantized once and
+// reused down every row, so the cost is one pass over `cols` against rows*cols
+// of saved arithmetic. The same idea lost in the batched matmul, where the
+// quantization happened per weight rather than per activation.
+//
+// It does change numerics -- int8 activations are what llama.cpp's MMVQ uses,
+// and it is why decode stops being bit-identical to the fp16 path. Opt-in.
+template <KQuantType TYPE, int WPR, bool ACC>
+__global__ void kquant_matvec_dp4a_kernel(const std::uint8_t* __restrict__ w,
+                                          const std::int8_t* __restrict__ xq,
+                                          const float* __restrict__ xs, __half* __restrict__ y,
+                                          int rows, int cols) {
+  constexpr int kWarps = 8;
+  constexpr int kRowsPerBlock = kWarps / WPR;
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int warpid = static_cast<int>(threadIdx.x) >> 5;
+  const int sub = warpid % WPR;
+  const int row = blockIdx.x * kRowsPerBlock + warpid / WPR;
+  if (row >= rows) return;
+  const int blocks_per_row = cols / static_cast<int>(kSuperBlock);
+  const std::size_t block_bytes =
+      TYPE == KQuantType::Q4_K ? model::kquant::kQ4KBlockBytes : model::kquant::kQ5KBlockBytes;
+  const std::uint8_t* p = w + static_cast<std::size_t>(row) * blocks_per_row * block_bytes +
+                          static_cast<std::size_t>(sub) * block_bytes;
+
+  const int j = lane >> 3;
+  const int t = lane & 7;
+  const int off_lo = (j << 6) + (t << 2);
+  const int off_hi = off_lo + 32;
+
+  float acc = 0.0f;
+#pragma unroll 2
+  for (int b = sub; b < blocks_per_row; b += WPR) {
+    const uint4 hdr = *reinterpret_cast<const uint4*>(p);
+    const float d = half_bits_to_float(static_cast<std::uint16_t>(hdr.x & 0xFFFFu));
+    const float dmin = half_bits_to_float(static_cast<std::uint16_t>(hdr.x >> 16));
+    const int qoff = (TYPE == KQuantType::Q4_K) ? 16 : 48;
+    const std::uint32_t qw = *reinterpret_cast<const std::uint32_t*>(p + qoff + (lane << 2));
+    float sc0, m0, sc1, m1;
+    scale_min_from_hdr(2 * j, hdr.y, hdr.z, hdr.w, &sc0, &m0);
+    scale_min_from_hdr(2 * j + 1, hdr.y, hdr.z, hdr.w, &sc1, &m1);
+
+    int qlo = static_cast<int>(qw & 0x0F0F0F0Fu);
+    int qhi = static_cast<int>((qw >> 4) & 0x0F0F0F0Fu);
+    if (TYPE == KQuantType::Q5_K) {
+      const std::uint32_t hw = *reinterpret_cast<const std::uint32_t*>(p + 16 + (t << 2));
+      qlo |= static_cast<int>(((hw >> (2 * j)) & 0x01010101u) << 4);
+      qhi |= static_cast<int>(((hw >> (2 * j + 1)) & 0x01010101u) << 4);
+    }
+
+    const int xbase = b * static_cast<int>(kSuperBlock);
+    const int gbase = b << 3;  // eight 32-groups per super-block
+    const int xl = *reinterpret_cast<const int*>(xq + xbase + off_lo);
+    const int xh = *reinterpret_cast<const int*>(xq + xbase + off_hi);
+    const int dot_lo = __dp4a(qlo, xl, 0);
+    const int dot_hi = __dp4a(qhi, xh, 0);
+    const int sum_lo = __dp4a(xl, 0x01010101, 0);
+    const int sum_hi = __dp4a(xh, 0x01010101, 0);
+    // Per-lane partial sums: the group scale is uniform across the run, so
+    // applying it here is the same arithmetic as applying it per weight.
+    acc += xs[gbase + 2 * j] * (d * sc0 * static_cast<float>(dot_lo) -
+                                dmin * m0 * static_cast<float>(sum_lo)) +
+           xs[gbase + 2 * j + 1] * (d * sc1 * static_cast<float>(dot_hi) -
+                                    dmin * m1 * static_cast<float>(sum_hi));
+    p += block_bytes * WPR;
+  }
+
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+  if (WPR == 1) {
+    if (lane == 0) y[row] = __float2half(ACC ? acc + __half2float(y[row]) : acc);
+    return;
+  }
+  __shared__ float parts[32];
+  if (lane == 0) parts[warpid] = acc;
+  __syncthreads();
+  if (lane == 0 && sub == 0) {
+    float total = 0.0f;
+#pragma unroll
+    for (int k = 0; k < WPR; ++k) total += parts[warpid + k];
+    y[row] = __float2half(ACC ? total + __half2float(y[row]) : total);
+  }
+}
+
+namespace {
+// Scratch for the int8 activation form, grown to the widest matvec seen. Kept
+// module-local so the dp4a path can be switched on without touching every call
+// site; it is a few tens of KB.
+std::int8_t* g_dp4a_xq = nullptr;
+float* g_dp4a_xs = nullptr;
+// The quantizer writes a scale AND a group sum. The matvec only needs the
+// scale -- it derives its own partial sums with dp4a -- but the sum still needs
+// somewhere to land: aliasing it onto the scale buffer silently overwrote every
+// scale and produced fluent garbage.
+float* g_dp4a_sum = nullptr;
+int g_dp4a_cols = 0;
+
+// Must be reserved BEFORE any capture: cudaMalloc inside a captured stream is
+// rejected, and this scratch is sized from a kernel that the decode graph
+// captures. Reserving lazily crashed capture with "operation failed due to a
+// previous error during capture" -- the same trap the GEMM scratch hit.
+bool ensure_dp4a_scratch(int cols) {
+  if (cols <= g_dp4a_cols) return g_dp4a_xq != nullptr;
+  if (g_dp4a_xq) cudaFree(g_dp4a_xq);
+  if (g_dp4a_xs) cudaFree(g_dp4a_xs);
+  if (g_dp4a_sum) cudaFree(g_dp4a_sum);
+  g_dp4a_xq = nullptr;
+  g_dp4a_xs = nullptr;
+  g_dp4a_sum = nullptr;
+  g_dp4a_cols = 0;
+  const std::size_t meta = static_cast<std::size_t>(cols / 32) * sizeof(float);
+  if (cudaMalloc(&g_dp4a_xq, static_cast<std::size_t>(cols)) != cudaSuccess) return false;
+  if (cudaMalloc(&g_dp4a_xs, meta) != cudaSuccess || cudaMalloc(&g_dp4a_sum, meta) != cudaSuccess) {
+    cudaFree(g_dp4a_xq);
+    g_dp4a_xq = nullptr;
+    return false;
+  }
+  g_dp4a_cols = cols;
+  return true;
+}
+
+template <bool ACC>
+bool try_dp4a_matvec(const std::uint8_t* w, KQuantType type, const half* x, half* y, int rows,
+                     int cols, cudaStream_t stream) {
+  if (g_kq_tune.matvec_dp4a == 0) return false;
+  if (type == KQuantType::Q6_K) return false;  // per-16 scales do not line up
+  if (cols % 256 != 0 || !ensure_dp4a_scratch(cols)) return false;
+  const int groups = cols >> 5;
+  quantize_q8_1_groups_kernel<<<(groups + 7) / 8, 256, 0, stream>>>(x, g_dp4a_xq, g_dp4a_xs,
+                                                                    g_dp4a_sum, cols, groups);
+  constexpr int kThreads = 256;
+  const int wpr = 8;
+  const int grid = (rows + (8 / wpr) - 1) / (8 / wpr);
+  if (type == KQuantType::Q4_K) {
+    kquant_matvec_dp4a_kernel<KQuantType::Q4_K, 8, ACC>
+        <<<grid, kThreads, 0, stream>>>(w, g_dp4a_xq, g_dp4a_xs, y, rows, cols);
+  } else {
+    kquant_matvec_dp4a_kernel<KQuantType::Q5_K, 8, ACC>
+        <<<grid, kThreads, 0, stream>>>(w, g_dp4a_xq, g_dp4a_xs, y, rows, cols);
+  }
+  return true;
+}
+}  // namespace
+
 template <typename OutT, bool ACC>
 static void launch_kquant_matvec_impl(const std::uint8_t* w, KQuantType type, const half* x, OutT* y,
                                       int rows, int cols, cudaStream_t stream) {
@@ -1404,13 +1559,17 @@ static void launch_kquant_matvec_impl(const std::uint8_t* w, KQuantType type, co
 #undef CPI_KQ_DISPATCH
 }
 
+void reserve_kquant_dp4a_scratch(int cols) { ensure_dp4a_scratch(cols); }
+
 void launch_kquant_matvec(const std::uint8_t* w, KQuantType type, const half* x, half* y, int rows,
                           int cols, cudaStream_t stream) {
+  if (try_dp4a_matvec<false>(w, type, x, y, rows, cols, stream)) return;
   launch_kquant_matvec_impl<half, false>(w, type, x, y, rows, cols, stream);
 }
 
 void launch_kquant_matvec_residual(const std::uint8_t* w, KQuantType type, const half* x, half* y,
                                    int rows, int cols, cudaStream_t stream) {
+  if (try_dp4a_matvec<true>(w, type, x, y, rows, cols, stream)) return;
   launch_kquant_matvec_impl<half, true>(w, type, x, y, rows, cols, stream);
 }
 

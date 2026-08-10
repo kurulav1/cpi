@@ -1223,6 +1223,9 @@ void LlamaEngine::init_layer_cache() {
       }
     }
     if (widest > 0) ensure_prefill_wdq(widest, transfer_stream_);
+    // The dp4a matvec quantizes its activation into module scratch, and it runs
+    // inside the decode graph, so the buffer has to exist before capture.
+    kernels::reserve_kquant_dp4a_scratch(std::max(cfg.hidden_size, cfg.intermediate_size));
   }
 
   cached_int8_proj_enabled_ = !tq3_enabled_ && lowbit_streaming_enabled(options_) && (built > 0);

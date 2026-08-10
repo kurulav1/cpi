@@ -1271,6 +1271,7 @@ struct KQuantTuning {
   int mmq_async_nt = 2;  // same, double-buffered kernel
   int mmq_async = 1;     // use the cp.async kernel when the batch fits
   int matvec_wpr = 8;    // warps cooperating on one row in the matvec
+  int matvec_dp4a = 0;   // int8 activations + dp4a in the matvec; changes numerics
 };
 void set_kquant_tuning(const KQuantTuning& t);
 KQuantTuning get_kquant_tuning();
@@ -1300,6 +1301,10 @@ bool launch_kquant_mmq(const std::uint8_t* w, KQuantType type, const half* x, ha
 // Accumulates into y instead of overwriting it, folding a residual add into the
 // projection's epilogue. The fp16 path has always done this; without it the
 // packed path pays an extra kernel per layer for wo and again for w2.
+// Sizes the dp4a matvec's activation scratch. Must be called before the decode
+// graph is captured: allocating inside a captured stream is rejected.
+void reserve_kquant_dp4a_scratch(int cols);
+
 void launch_kquant_matvec_residual(const std::uint8_t* w, KQuantType type, const half* x, half* y,
                                    int rows, int cols, cudaStream_t stream);
 
