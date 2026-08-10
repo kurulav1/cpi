@@ -879,113 +879,156 @@ __global__ void kquant_matmul_dp4a_kernel(const std::uint8_t* __restrict__ w,
 // correction costs one multiply-add per accumulator per K-group and never
 // touches the tensor cores.
 namespace {
-constexpr int kMmqBM = 64, kMmqBN = 64;
+// M tile is fixed by the batch range this path serves. NT is the number of
+// 8-wide n-tiles each warp-half owns, so BN = 2 * NT * 8: NT=4 gives a 64-wide
+// output tile, NT=2 gives 32. NT is the register knob -- each n-tile carries 4
+// accumulators, and at NT=4 the kernel needed 128 registers per thread, which
+// capped it at 2 blocks/SM and 33% theoretical occupancy.
+constexpr int kMmqBM = 64;
 }  // namespace
 
-__global__ void kquant_mmq_q4k_kernel(const std::uint8_t* __restrict__ w,
-                                      const std::int8_t* __restrict__ xq,
-                                      const float* __restrict__ as, const float* __restrict__ gsum,
-                                      __half* __restrict__ y, int rows, int cols, int batch,
-                                      int ldy) {
+// A whole super-block of K per staging round (llama.cpp's MMQ_ITER_K=256).
+//
+// Staging 32 columns at a time cost two __syncthreads per 32 columns: with
+// Kg=128 that is 256 barriers per block to cover one row, against 8 mma
+// instructions each. Widening to 256 amortises it 8x.
+//
+// An earlier attempt at this was slower, because widening the tile is only half
+// the change -- the staging has to stay fully parallel and vectorized. Here every
+// thread moves 16 bytes at a time with uint4 loads and stores:
+//   As: 64 rows x 256 bytes = 1024 uint4 units, 4 per thread.
+//   Bs: each row's 256 weights come from 128 bytes of qs, so 32 rows is 256
+//       uint4 units, 1 per thread, expanding to two 16-byte runs (the low and
+//       high nibbles of a 16-byte chunk land 32 columns apart).
+template <int NT>
+__global__ __launch_bounds__(256) void kquant_mmq_q4k_kernel(
+    const std::uint8_t* __restrict__ w, const std::int8_t* __restrict__ xq,
+    const float* __restrict__ as, const float* __restrict__ gsum, __half* __restrict__ y, int rows,
+    int cols, int batch, int ldy) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800)
   (void)w; (void)xq; (void)as; (void)gsum; (void)y; (void)rows; (void)cols; (void)batch; (void)ldy;
 #else
+  constexpr int kMmqBN = 2 * NT * 8;
   const int tid = static_cast<int>(threadIdx.x);
   const int warp = tid >> 5, lane = tid & 31;
   const int g = lane >> 2, t = lane & 3, mt = warp & 3, nhalf = warp >> 2;
   const int blockNrow = blockIdx.x * kMmqBN;
-  const int Kg = cols >> 5;                 // 32-wide groups per row
-  const int blocks_per_row = cols >> 8;     // 256-wide super-blocks per row
+  const int Kg = cols >> 5;
+  const int blocks_per_row = cols >> 8;
   const std::size_t row_bytes =
       static_cast<std::size_t>(blocks_per_row) * model::kquant::kQ4KBlockBytes;
 
-  __shared__ __align__(16) std::int8_t As[kMmqBM][32];
-  __shared__ __align__(16) std::int8_t Bs[kMmqBN][32];
-  __shared__ float Bsc[kMmqBN];  // d * sc for this K-group
-  __shared__ float Bdm[kMmqBN];  // dmin * m for this K-group
+  __shared__ __align__(16) std::int8_t As[kMmqBM][256];
+  __shared__ __align__(16) std::int8_t Bs[kMmqBN][256];
+  __shared__ float Bsc[kMmqBN][8];
+  __shared__ float Bdm[kMmqBN][8];
 
-  float facc[4][4];
+  float facc[NT][4];
 #pragma unroll
-  for (int i = 0; i < 4; ++i)
+  for (int i = 0; i < NT; ++i)
 #pragma unroll
     for (int j = 0; j < 4; ++j) facc[i][j] = 0.0f;
 
-  for (int kg = 0; kg < Kg; ++kg) {
-    const int k0 = kg << 5;
-    const int sb = kg >> 3;          // which super-block
-    const int gin = kg & 7;          // scale index inside it
-    const int qrun = (gin >> 1) * 32;  // the 32-byte run this group lives in
-    const bool hi_nib = (gin & 1) != 0;
+  for (int sb = 0; sb < blocks_per_row; ++sb) {
+    const int k0 = sb << 8;
 
-    // Stage activations and weights: 8 x 256 threads covers 64 rows x 32 cols.
+    // Activations: 16 uint4 per row, 4 units per thread.
 #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-      const int idx = tid + i * 256, r = idx >> 5, c = idx & 31;
-      As[r][c] = (r < batch) ? xq[static_cast<std::size_t>(r) * cols + k0 + c] : 0;
-      std::int8_t wv = 0;
-      const int wrow = blockNrow + r;
-      if (wrow < rows) {
-        const std::uint8_t* p =
-            w + static_cast<std::size_t>(wrow) * row_bytes +
-            static_cast<std::size_t>(sb) * model::kquant::kQ4KBlockBytes;
-        const std::uint8_t byte = p[16 + qrun + c];
-        wv = static_cast<std::int8_t>(hi_nib ? (byte >> 4) : (byte & 0x0F));
-      }
-      Bs[r][c] = wv;
+    for (int i = 0; i < (kMmqBM * 16) / 256; ++i) {
+      const int u = tid + i * 256;
+      const int r = u >> 4, c = (u & 15) << 4;
+      uint4 v = make_uint4(0, 0, 0, 0);
+      if (r < batch) v = *reinterpret_cast<const uint4*>(xq + static_cast<std::size_t>(r) * cols + k0 + c);
+      *reinterpret_cast<uint4*>(&As[r][c]) = v;
     }
-    // The two scale factors for this K-group, one pair per output row.
+
+    // Weights: one uint4 of qs per thread expands to two 16-byte runs of Bs.
+    {
+      const int r = tid >> 3, chunk = (tid & 7) << 4;  // 8 chunks of 16 bytes = 128
+      if (r < kMmqBN) {
+        const int wrow = blockNrow + r;
+        uint4 q = make_uint4(0, 0, 0, 0);
+        if (wrow < rows) {
+          const std::uint8_t* p = w + static_cast<std::size_t>(wrow) * row_bytes +
+                                  static_cast<std::size_t>(sb) * model::kquant::kQ4KBlockBytes;
+          q = *reinterpret_cast<const uint4*>(p + 16 + chunk);
+        }
+        const int j = chunk >> 5, l0 = chunk & 31;
+        const int lo_col = (j << 6) + l0, hi_col = lo_col + 32;
+        uint4 lo, hi;
+        const std::uint32_t* qw = &q.x;
+        std::uint32_t* lw = &lo.x;
+        std::uint32_t* hw = &hi.x;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+          lw[k] = qw[k] & 0x0F0F0F0Fu;
+          hw[k] = (qw[k] >> 4) & 0x0F0F0F0Fu;
+        }
+        *reinterpret_cast<uint4*>(&Bs[r][lo_col]) = lo;
+        *reinterpret_cast<uint4*>(&Bs[r][hi_col]) = hi;
+      }
+    }
+
+    // Scales: one thread per output row decodes all eight groups from one header.
     if (tid < kMmqBN) {
-      float sc = 0.0f, m = 0.0f, d = 0.0f, dmin = 0.0f;
       const int wrow = blockNrow + tid;
+      float d = 0.0f, dmin = 0.0f;
+      uint4 hdr = make_uint4(0, 0, 0, 0);
       if (wrow < rows) {
-        const std::uint8_t* p =
-            w + static_cast<std::size_t>(wrow) * row_bytes +
-            static_cast<std::size_t>(sb) * model::kquant::kQ4KBlockBytes;
-        const uint4 hdr = *reinterpret_cast<const uint4*>(p);
+        hdr = *reinterpret_cast<const uint4*>(w + static_cast<std::size_t>(wrow) * row_bytes +
+                                              static_cast<std::size_t>(sb) *
+                                                  model::kquant::kQ4KBlockBytes);
         d = half_bits_to_float(static_cast<std::uint16_t>(hdr.x & 0xFFFFu));
         dmin = half_bits_to_float(static_cast<std::uint16_t>(hdr.x >> 16));
-        scale_min_from_hdr(gin, hdr.y, hdr.z, hdr.w, &sc, &m);
       }
-      Bsc[tid] = d * sc;
-      Bdm[tid] = dmin * m;
+#pragma unroll
+      for (int gi = 0; gi < 8; ++gi) {
+        float sc = 0.0f, m = 0.0f;
+        scale_min_from_hdr(gi, hdr.y, hdr.z, hdr.w, &sc, &m);
+        Bsc[tid][gi] = d * sc;
+        Bdm[tid][gi] = dmin * m;
+      }
     }
     __syncthreads();
 
     const int arow = 16 * mt;
     const int m_a = arow + g, m_b = arow + g + 8;
-    const int a0 = *reinterpret_cast<int*>(&As[m_a][t * 4]);
-    const int a1 = *reinterpret_cast<int*>(&As[m_b][t * 4]);
-    const int a2 = *reinterpret_cast<int*>(&As[m_a][16 + t * 4]);
-    const int a3 = *reinterpret_cast<int*>(&As[m_b][16 + t * 4]);
     const bool ok_a = m_a < batch, ok_b = m_b < batch;
-    const float as_a = ok_a ? as[static_cast<std::size_t>(m_a) * Kg + kg] : 0.0f;
-    const float as_b = ok_b ? as[static_cast<std::size_t>(m_b) * Kg + kg] : 0.0f;
-    const float gs_a = ok_a ? gsum[static_cast<std::size_t>(m_a) * Kg + kg] : 0.0f;
-    const float gs_b = ok_b ? gsum[static_cast<std::size_t>(m_b) * Kg + kg] : 0.0f;
-
 #pragma unroll
-    for (int nt = 0; nt < 4; ++nt) {
-      const int nbase = nhalf * 32 + nt * 8;
-      const int b0 = *reinterpret_cast<int*>(&Bs[nbase + g][t * 4]);
-      const int b1 = *reinterpret_cast<int*>(&Bs[nbase + g][16 + t * 4]);
-      int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
-      asm volatile(
-          "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
-          "{%0,%1,%2,%3};\n"
-          : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
-          : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
-      const int na = nbase + 2 * t, nb = nbase + 2 * t + 1;
-      facc[nt][0] += static_cast<float>(c0) * as_a * Bsc[na] - Bdm[na] * gs_a;
-      facc[nt][1] += static_cast<float>(c1) * as_a * Bsc[nb] - Bdm[nb] * gs_a;
-      facc[nt][2] += static_cast<float>(c2) * as_b * Bsc[na] - Bdm[na] * gs_b;
-      facc[nt][3] += static_cast<float>(c3) * as_b * Bsc[nb] - Bdm[nb] * gs_b;
+    for (int gi = 0; gi < 8; ++gi) {
+      const int kg = (sb << 3) + gi, co = gi << 5;
+      const int a0 = *reinterpret_cast<int*>(&As[m_a][co + t * 4]);
+      const int a1 = *reinterpret_cast<int*>(&As[m_b][co + t * 4]);
+      const int a2 = *reinterpret_cast<int*>(&As[m_a][co + 16 + t * 4]);
+      const int a3 = *reinterpret_cast<int*>(&As[m_b][co + 16 + t * 4]);
+      const float as_a = ok_a ? as[static_cast<std::size_t>(m_a) * Kg + kg] : 0.0f;
+      const float as_b = ok_b ? as[static_cast<std::size_t>(m_b) * Kg + kg] : 0.0f;
+      const float gs_a = ok_a ? gsum[static_cast<std::size_t>(m_a) * Kg + kg] : 0.0f;
+      const float gs_b = ok_b ? gsum[static_cast<std::size_t>(m_b) * Kg + kg] : 0.0f;
+#pragma unroll
+      for (int nt = 0; nt < NT; ++nt) {
+        const int nbase = nhalf * (NT * 8) + nt * 8;
+        const int b0 = *reinterpret_cast<int*>(&Bs[nbase + g][co + t * 4]);
+        const int b1 = *reinterpret_cast<int*>(&Bs[nbase + g][co + 16 + t * 4]);
+        int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+        asm volatile(
+            "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, "
+            "{%8,%9}, {%0,%1,%2,%3};\n"
+            : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
+            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+        const int na = nbase + 2 * t, nb = nbase + 2 * t + 1;
+        facc[nt][0] += static_cast<float>(c0) * as_a * Bsc[na][gi] - Bdm[na][gi] * gs_a;
+        facc[nt][1] += static_cast<float>(c1) * as_a * Bsc[nb][gi] - Bdm[nb][gi] * gs_a;
+        facc[nt][2] += static_cast<float>(c2) * as_b * Bsc[na][gi] - Bdm[na][gi] * gs_b;
+        facc[nt][3] += static_cast<float>(c3) * as_b * Bsc[nb][gi] - Bdm[nb][gi] * gs_b;
+      }
     }
     __syncthreads();
   }
 
 #pragma unroll
-  for (int nt = 0; nt < 4; ++nt) {
-    const int nbase = nhalf * 32 + nt * 8;
+  for (int nt = 0; nt < NT; ++nt) {
+    const int nbase = nhalf * (NT * 8) + nt * 8;
     const int rr[4] = {g, g, g + 8, g + 8};
     const int cc[4] = {2 * t, 2 * t + 1, 2 * t, 2 * t + 1};
 #pragma unroll
@@ -1012,8 +1055,18 @@ bool launch_kquant_mmq(const std::uint8_t* w, KQuantType type, const half* x, ha
   const int total_groups = batch * groups_per_row;
   quantize_q8_1_groups_kernel<<<(total_groups + 7) / 8, 256, 0, stream>>>(x, xq, xs, xsum, cols,
                                                                          groups_per_row);
-  const int grid = (rows + kMmqBN - 1) / kMmqBN;
-  kquant_mmq_q4k_kernel<<<grid, 256, 0, stream>>>(w, xq, xs, xsum, y, rows, cols, batch, ldy);
+  // NT trades output-tile width against registers and grid size.
+  static const int nt = []() {
+    const char* e = std::getenv("CPI_KQUANT_MMQ_NT");
+    return e != nullptr ? std::atoi(e) : 2;
+  }();
+  if (nt >= 4) {
+    kquant_mmq_q4k_kernel<4><<<(rows + 63) / 64, 256, 0, stream>>>(w, xq, xs, xsum, y, rows, cols,
+                                                                   batch, ldy);
+  } else {
+    kquant_mmq_q4k_kernel<2><<<(rows + 31) / 32, 256, 0, stream>>>(w, xq, xs, xsum, y, rows, cols,
+                                                                   batch, ldy);
+  }
   return true;
 }
 
