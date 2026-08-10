@@ -907,50 +907,77 @@ __global__ void attention_step_chunk_stats_paged_kernel(
   }
 }
 
+// Block reduction into a shared scalar. SUM picks addition, otherwise maximum.
+template <bool SUM>
+__device__ __forceinline__ void block_reduce_into(float v, float* red, int tid, float* out) {
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    const float o = __shfl_down_sync(0xFFFFFFFFu, v, off);
+    v = SUM ? v + o : fmaxf(v, o);
+  }
+  if (lane == 0) red[warp] = v;
+  __syncthreads();
+  if (tid == 0) {
+    const int warps = (blockDim.x + 31) >> 5;
+    float t = red[0];
+    for (int i = 1; i < warps; ++i) t = SUM ? t + red[i] : fmaxf(t, red[i]);
+    *out = t;
+  }
+}
+
 __global__ void attention_step_chunk_reduce_device_pos_kernel(
     const float* chunk_m, const float* chunk_l, const float* chunk_o, half* out,
     const int* position_ptr, int num_heads, int head_dim, int chunk_size, int scratch_chunks) {
   const int seq_len = position_ptr[0] + 1;
-  __shared__ float scale_shared[3];
   const int head = blockIdx.x;
   const int tid = threadIdx.x;
   const int chunk_count = (seq_len + chunk_size - 1) / chunk_size;
+  const std::size_t head_base = static_cast<std::size_t>(head) *
+                                static_cast<std::size_t>(scratch_chunks);
+
+  // Merge the per-chunk softmax stats in two parallel reductions rather than by
+  // walking chunks in an online loop. The online form made thread 0 do a
+  // dependent global load per chunk with two __syncthreads around it, so the
+  // kernel cost a latency chain as deep as the chunk count -- 2643 ns for seven
+  // chunks. Taking the global max first turns the rest into independent work:
+  // every weight is exp(m_c - m) <= 1, which is the same stability the online
+  // rescaling was buying.
+  __shared__ float red[32];
+  __shared__ float m_shared;
+  __shared__ float l_shared;
+
+  float local_m = neg_inf<float>();
+  for (int c = tid; c < chunk_count; c += blockDim.x) {
+    local_m = fmaxf(local_m, chunk_m[head_base + c]);
+  }
+  block_reduce_into<false>(local_m, red, tid, &m_shared);
+  __syncthreads();
+  const float m = m_shared;
+
+  float local_l = 0.0f;
+  if (m > neg_inf<float>()) {
+    for (int c = tid; c < chunk_count; c += blockDim.x) {
+      local_l += chunk_l[head_base + c] * __expf(chunk_m[head_base + c] - m);
+    }
+  }
+  block_reduce_into<true>(local_l, red, tid, &l_shared);
+  __syncthreads();
+
+  if (tid >= head_dim) return;
+  if (m <= neg_inf<float>()) {
+    out[head * head_dim + tid] = __float2half(0.0f);
+    return;
+  }
+
+  // No barrier in here: the weight is a broadcast read of one float per chunk.
   float acc = 0.0f;
-  float running_m = neg_inf<float>();
-  float running_l = 0.0f;
-
-  for (int chunk = 0; chunk < chunk_count; ++chunk) {
-    if (tid == 0) {
-      const int idx = head * scratch_chunks + chunk;
-      const float chunk_m_value = chunk_m[idx];
-      const float chunk_l_value = chunk_l[idx];
-      const float new_m = fmaxf(running_m, chunk_m_value);
-      const float alpha = (running_l == 0.0f) ? 0.0f : expf(running_m - new_m);
-      const float beta = (chunk_l_value == 0.0f) ? 0.0f : expf(chunk_m_value - new_m);
-      running_l = running_l * alpha + chunk_l_value * beta;
-      running_m = new_m;
-      scale_shared[0] = alpha;
-      scale_shared[1] = beta;
-      scale_shared[2] = running_l;
-    }
-    __syncthreads();
-
-    const float alpha = scale_shared[0];
-    const float beta = scale_shared[1];
-    const std::size_t base =
-        (static_cast<std::size_t>(head) * static_cast<std::size_t>(scratch_chunks) +
-         static_cast<std::size_t>(chunk)) *
-        static_cast<std::size_t>(head_dim);
-    for (int d = tid; d < head_dim; d += blockDim.x) {
-      acc = acc * alpha + chunk_o[base + static_cast<std::size_t>(d)] * beta;
-    }
-    __syncthreads();
+  for (int c = 0; c < chunk_count; ++c) {
+    const float w = __expf(chunk_m[head_base + c] - m);
+    acc += chunk_o[(head_base + c) * static_cast<std::size_t>(head_dim) + tid] * w;
   }
-
-  const float inv_l = 1.0f / fmaxf(scale_shared[2], 1e-8f);
-  for (int d = tid; d < head_dim; d += blockDim.x) {
-    out[head * head_dim + d] = __float2half(acc * inv_l);
-  }
+  out[head * head_dim + tid] = __float2half(acc / fmaxf(l_shared, 1e-8f));
 }
 
 // CUDA Graph-friendly helper kernels for KV-cache writes and device-side
