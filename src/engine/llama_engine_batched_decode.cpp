@@ -1007,12 +1007,20 @@ void LlamaEngine::tune_kquant_knobs(int batch, int steps) {
     return;
   }
   const std::vector<int> prompt(8, 1);
+  // batch==1 tunes the single-stream path, which goes through the matvec and the
+  // decode graph rather than run_batch -- the batched harness never touches the
+  // matvec, so tuning its warps-per-row through it would measure nothing.
+  const bool single = batch <= 1;
   auto time_batch = [&](int reps) {
     const auto t0 = std::chrono::steady_clock::now();
     for (int r = 0; r < reps; ++r) {
-      std::vector<BatchRequest> reqs(static_cast<std::size_t>(batch),
-                                     BatchRequest{prompt, steps, -1});
-      run_batch(reqs);
+      if (single) {
+        greedy_generate_single(prompt, steps, -1);
+      } else {
+        std::vector<BatchRequest> reqs(static_cast<std::size_t>(batch),
+                                       BatchRequest{prompt, steps, -1});
+        run_batch(reqs);
+      }
     }
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   };
@@ -1023,14 +1031,20 @@ void LlamaEngine::tune_kquant_knobs(int batch, int steps) {
     int* value;
     std::vector<int> candidates;
   };
-  const std::vector<Knob> knobs = {
+  const std::vector<Knob> batched_knobs = {
       {"mmq_async", &t.mmq_async, {0, 1}},
       {"mmq_async_nt", &t.mmq_async_nt, {1, 2}},
       {"mm_max", &t.mm_max, {0, 4, 8, 16}},
       {"mmq_nt", &t.mmq_nt, {2, 4}},
   };
+  // Warps cooperating on one row only matters to the matvec, i.e. single-stream.
+  const std::vector<Knob> single_knobs = {
+      {"matvec_wpr", &t.matvec_wpr, {1, 2, 4, 8}},
+  };
+  const std::vector<Knob>& knobs = single ? single_knobs : batched_knobs;
 
-  std::fprintf(stderr, "[tune] k-quant knobs at batch %d, %d tokens per sequence\n", batch, steps);
+  std::fprintf(stderr, "[tune] k-quant knobs, %s, %d tokens per sequence\n",
+               single ? "single stream" : "batched", steps);
   kernels::set_kquant_tuning(t);
   time_batch(1);  // discard: cold clocks
   for (const auto& k : knobs) {
@@ -1057,8 +1071,8 @@ void LlamaEngine::tune_kquant_knobs(int batch, int steps) {
   }
   std::fprintf(stderr,
                "[tune] winners: CPI_KQUANT_MMQ_ASYNC=%d CPI_KQUANT_MMQ_ANT=%d "
-               "CPI_KQUANT_MM_MAX=%d CPI_KQUANT_MMQ_NT=%d\n",
-               t.mmq_async, t.mmq_async_nt, t.mm_max, t.mmq_nt);
+               "CPI_KQUANT_MM_MAX=%d CPI_KQUANT_MMQ_NT=%d CPI_KQUANT_WPR=%d\n",
+               t.mmq_async, t.mmq_async_nt, t.mm_max, t.mmq_nt, t.matvec_wpr);
 }
 
 void LlamaEngine::run_batch_bench(const std::vector<int>& prompt, int max_new) {
