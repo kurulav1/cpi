@@ -49,6 +49,7 @@ KQuantTuning g_kq_tune = []() {
   t.matvec_dp4a16 = env_int("CPI_KQUANT_MATVEC_DP4A16", t.matvec_dp4a16);
   t.matvec_dp4a_q6k = env_int("CPI_KQUANT_MATVEC_DP4A_Q6K", t.matvec_dp4a_q6k);
   t.matvec_share_x = env_int("CPI_KQUANT_MATVEC_SHARE_X", t.matvec_share_x);
+  t.matvec_gsum = env_int("CPI_KQUANT_MATVEC_GSUM", t.matvec_gsum);
   return t;
 }();
 }  // namespace
@@ -1580,10 +1581,11 @@ __global__ void kquant_matvec_dp4a16_kernel(const std::uint8_t* __restrict__ w,
 // warps per row rather than eight -- four warps x four super-blocks is exactly a
 // 4096-wide row. At WPR=8 half the block would find nothing to do. Two rows per
 // block keeps the same warps in flight.
-template <KQuantType TYPE, int WPR, bool ACC>
+template <KQuantType TYPE, int WPR, bool ACC, bool GSUM>
 __global__ void kquant_matvec_dp4a32_kernel(const std::uint8_t* __restrict__ w,
                                             const std::int8_t* __restrict__ xq,
-                                            const float* __restrict__ xs, __half* __restrict__ y,
+                                            const float* __restrict__ xs,
+                                            const float* __restrict__ gsum, __half* __restrict__ y,
                                             int rows, int cols) {
   constexpr int kWarps = 8;
   constexpr int kRowsPerBlock = kWarps / WPR;
@@ -1639,15 +1641,31 @@ __global__ void kquant_matvec_dp4a32_kernel(const std::uint8_t* __restrict__ w,
       const int xh = *reinterpret_cast<const int*>(xq + xbase + off_hi + (k << 2));
       dot_lo = __dp4a(qlo, xl, dot_lo);
       dot_hi = __dp4a(qhi, xh, dot_hi);
-      sum_lo = __dp4a(xl, 0x01010101, sum_lo);
-      sum_hi = __dp4a(xh, 0x01010101, sum_hi);
+      if (!GSUM) {
+        sum_lo = __dp4a(xl, 0x01010101, sum_lo);
+        sum_hi = __dp4a(xh, 0x01010101, sum_hi);
+      }
     }
 
+    // The -dmin*m term wants sum(x) over the whole group, not over this lane's
+    // half of it, and the quantizer already wrote exactly that per group. Half
+    // the dp4a here used to recompute it against 0x01010101 -- once per row, for
+    // a quantity that does not depend on the row. The two lanes sharing a run
+    // split the group between them, so letting t == 0 carry the entire
+    // correction sums to the same value.
     const int gbase = sb << 3;
-    acc += xs[gbase + 2 * j] * (d * sc0 * static_cast<float>(dot_lo) -
-                                dmin * m0 * static_cast<float>(sum_lo)) +
-           xs[gbase + 2 * j + 1] * (d * sc1 * static_cast<float>(dot_hi) -
-                                    dmin * m1 * static_cast<float>(sum_hi));
+    if (GSUM) {
+      acc += xs[gbase + 2 * j] * d * sc0 * static_cast<float>(dot_lo) +
+             xs[gbase + 2 * j + 1] * d * sc1 * static_cast<float>(dot_hi);
+      if (t == 0) {
+        acc -= dmin * (m0 * gsum[gbase + 2 * j] + m1 * gsum[gbase + 2 * j + 1]);
+      }
+    } else {
+      acc += xs[gbase + 2 * j] * (d * sc0 * static_cast<float>(dot_lo) -
+                                  dmin * m0 * static_cast<float>(sum_lo)) +
+             xs[gbase + 2 * j + 1] * (d * sc1 * static_cast<float>(dot_hi) -
+                                      dmin * m1 * static_cast<float>(sum_hi));
+    }
   }
 
 #pragma unroll
@@ -1836,13 +1854,21 @@ bool try_dp4a_matvec(const std::uint8_t* w, KQuantType type, const half* x, half
     // Four warps per row: four warps x four super-blocks covers a 4096-wide row
     // exactly, so widening the slice does not idle half the block.
     const dim3 grid32(static_cast<unsigned>((rows + 1) / 2));
+#define CPI_KQ_MV32(T, G)                                                                   kquant_matvec_dp4a32_kernel<T, 4, ACC, G>                                                     <<<grid32, kThreads, 0, stream>>>(w, g_dp4a_xq, g_dp4a_xs, g_dp4a_sum, y, rows, cols)
     if (type == KQuantType::Q4_K) {
-      kquant_matvec_dp4a32_kernel<KQuantType::Q4_K, 4, ACC>
-          <<<grid32, kThreads, 0, stream>>>(w, g_dp4a_xq, g_dp4a_xs, y, rows, cols);
+      if (g_kq_tune.matvec_gsum) {
+        CPI_KQ_MV32(KQuantType::Q4_K, true);
+      } else {
+        CPI_KQ_MV32(KQuantType::Q4_K, false);
+      }
     } else {
-      kquant_matvec_dp4a32_kernel<KQuantType::Q5_K, 4, ACC>
-          <<<grid32, kThreads, 0, stream>>>(w, g_dp4a_xq, g_dp4a_xs, y, rows, cols);
+      if (g_kq_tune.matvec_gsum) {
+        CPI_KQ_MV32(KQuantType::Q5_K, true);
+      } else {
+        CPI_KQ_MV32(KQuantType::Q5_K, false);
+      }
     }
+#undef CPI_KQ_MV32
   } else if (g_kq_tune.matvec_dp4a16) {
     if (type == KQuantType::Q4_K) {
       kquant_matvec_dp4a16_kernel<KQuantType::Q4_K, 8, ACC>

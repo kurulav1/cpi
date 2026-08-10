@@ -1287,6 +1287,9 @@ struct KQuantTuning {
   // Quantize a shared activation once per group of sharers (q/k/v) rather than
   // once per projection. Only honoured where the caller asserts x is unchanged.
   int matvec_share_x = 1;
+  // Take the -dmin*m correction's sum(x) from the group sums the quantizer
+  // already wrote, instead of half the matvec's dp4a recomputing it per row.
+  int matvec_gsum = 1;
 };
 void set_kquant_tuning(const KQuantTuning& t);
 KQuantTuning get_kquant_tuning();
