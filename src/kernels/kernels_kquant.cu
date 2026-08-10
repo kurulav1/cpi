@@ -1410,6 +1410,11 @@ __global__ void kquant_matvec_dp4a_kernel(const std::uint8_t* __restrict__ w,
   const int off_lo = (j << 6) + (t << 2);
   const int off_hi = off_lo + 32;
 
+  // The activation scales are NOT staged in shared. Tried it: one per 32 inputs
+  // is 512 B for a 4096-wide matvec, so every block already finds them in L1,
+  // and with eight warps per row a block covers a single output row -- the
+  // staging pass and its __syncthreads are then paid per row to save loads that
+  // were already free. Cost 3 points against llama.cpp.
   float acc = 0.0f;
 #pragma unroll 2
   for (int b = sub; b < blocks_per_row; b += WPR) {
