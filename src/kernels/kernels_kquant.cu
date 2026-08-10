@@ -1071,10 +1071,17 @@ __global__ __launch_bounds__(256) void kquant_mmq_q4k_async_kernel(
   (void)w; (void)xq; (void)as; (void)gsum; (void)y; (void)rows; (void)cols; (void)batch; (void)ldy;
 #else
   constexpr int kBM = 32;
-  constexpr int kBN = 2 * NT * 8;
+  // Warps split across the M and N tiles, and the split has to follow kBM: with
+  // 16 rows per m-tile, kBM=32 leaves only two m-tiles, so the other warps must
+  // go to N. Keeping the 64-row mapping here left warps 4..7 with every row out
+  // of range -- half the block computing nothing, which is exactly the factor
+  // between this kernel's 33% theoretical and 17% achieved occupancy.
+  constexpr int kMT = kBM / 16;   // m-tiles per block
+  constexpr int kNH = 8 / kMT;    // warps left for the n dimension
+  constexpr int kBN = kNH * NT * 8;
   const int tid = static_cast<int>(threadIdx.x);
   const int warp = tid >> 5, lane = tid & 31;
-  const int g = lane >> 2, t = lane & 3, mt = warp & 3, nhalf = warp >> 2;
+  const int g = lane >> 2, t = lane & 3, mt = warp % kMT, nhalf = warp / kMT;
   const int blockNrow = blockIdx.x * kBN;
   const int Kg = cols >> 5;
   const int nsb = cols >> 8;
@@ -1097,9 +1104,11 @@ __global__ __launch_bounds__(256) void kquant_mmq_q4k_async_kernel(
                                 xq + static_cast<std::size_t>(r) * cols + (sb << 8) + c, 16);
       }
     }
-    // Weights: 32 rows x 128 B of qs = 256 uint4, one per thread.
-    {
-      const int r = tid >> 3, c = (tid & 7) << 4;
+    // Weights: kBN rows x 128 B of qs, 8 uint4 per row.
+#pragma unroll
+    for (int i = 0; i < (kBN + 31) / 32; ++i) {
+      const int u = tid + i * 256;
+      const int r = u >> 3, c = (u & 7) << 4;
       const int wrow = blockNrow + r;
       if (r < kBN && wrow < rows) {
         const std::uint8_t* p = w + static_cast<std::size_t>(wrow) * row_bytes +
@@ -1107,7 +1116,7 @@ __global__ __launch_bounds__(256) void kquant_mmq_q4k_async_kernel(
         __pipeline_memcpy_async(&Bq[buf][r][c], p + 16 + c, 16);
       }
     }
-    // Headers: 32 rows x 16 B.
+    // Headers: kBN rows x 16 B.
     if (tid < kBN) {
       const int wrow = blockNrow + tid;
       if (wrow < rows) {
@@ -1236,8 +1245,23 @@ bool launch_kquant_mmq(const std::uint8_t* w, KQuantType type, const half* x, ha
     return e == nullptr || e[0] != '0';
   }();
   if (async_on && batch <= 32) {
-    kquant_mmq_q4k_async_kernel<2>
-        <<<(rows + 31) / 32, 256, 0, stream>>>(w, xq, xs, xsum, y, rows, cols, batch, ldy);
+    // NT=2 (64-wide output tile) measured better than NT=1 at every batch this
+    // path serves: 475.2/690.7/938.9 against 429.0/664.6/823.8 at B=8/16/32 in
+    // one run. It halves the grid, and for a 4096-row matrix that is 64 blocks
+    // against 170 SMs -- so the extra work per block outweighs filling the GPU,
+    // which is the opposite of what the block count suggests. Measure, do not
+    // reason from grid size here.
+    static const int ant = []() {
+      const char* e = std::getenv("CPI_KQUANT_MMQ_ANT");
+      return e != nullptr ? std::atoi(e) : 2;
+    }();
+    if (ant >= 2) {
+      kquant_mmq_q4k_async_kernel<2>
+          <<<(rows + 63) / 64, 256, 0, stream>>>(w, xq, xs, xsum, y, rows, cols, batch, ldy);
+    } else {
+      kquant_mmq_q4k_async_kernel<1>
+          <<<(rows + 31) / 32, 256, 0, stream>>>(w, xq, xs, xsum, y, rows, cols, batch, ldy);
+    }
     return true;
   }
   if (nt >= 4) {
