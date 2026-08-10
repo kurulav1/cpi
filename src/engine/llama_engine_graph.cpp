@@ -340,13 +340,21 @@ void LlamaEngine::init_greedy_decode_graph() {
             resident_int8_wo_warps_per_row_);
       }
     } else if (lw->wo_packed.active()) {
-      // Packed k-quant: multiply the container's own blocks. Nothing is fused
-      // into this one, so the shared add_inplace below still runs.
+      // Residual folded into the epilogue when no bias sits between them, which
+      // is what the fp16 path does; otherwise the bias needs its own buffer.
       ++packed_matvec_calls_;
-      kernels::launch_kquant_matvec(static_cast<const std::uint8_t*>(lw->wo_packed.data),
-                                    static_cast<kernels::KQuantType>(lw->wo_packed.kind),
-                                    static_cast<const __half*>(d_att_), static_cast<__half*>(d_ff3_),
-                                    lw->wo_packed.rows, lw->wo_packed.cols, compute_stream_);
+      // The bias BUFFER is always allocated and zero-filled, so testing the
+      // pointer never fuses. What matters is whether the model actually carries
+      // attention.bo.
+      const bool fuse = !has_any_layer_output_bias_;
+      const auto launch = fuse ? &kernels::launch_kquant_matvec_residual
+                               : &kernels::launch_kquant_matvec;
+      launch(static_cast<const std::uint8_t*>(lw->wo_packed.data),
+             static_cast<kernels::KQuantType>(lw->wo_packed.kind),
+             static_cast<const __half*>(d_att_),
+             static_cast<__half*>(fuse ? d_x_ : d_ff3_), lw->wo_packed.rows, lw->wo_packed.cols,
+             compute_stream_);
+      fused_residual = fuse;
     } else if (resident_custom_wo_) {
       // Residual add folded into this projection's epilogue, so the shared add_inplace
       // below is skipped. At batch 1 a kernel costs a fixed ~1.7 us whatever it does.
@@ -463,11 +471,15 @@ void LlamaEngine::init_greedy_decode_graph() {
             static_cast<__half*>(d_ff3_), hidden, inter, compute_stream_);
       }
     } else if (lw->w2_packed.active()) {
+      // Same fusion for the down projection; nothing sits between it and the
+      // residual add.
       ++packed_matvec_calls_;
-      kernels::launch_kquant_matvec(static_cast<const std::uint8_t*>(lw->w2_packed.data),
-                                    static_cast<kernels::KQuantType>(lw->w2_packed.kind),
-                                    static_cast<const __half*>(d_ff2_), static_cast<__half*>(d_ff3_),
-                                    lw->w2_packed.rows, lw->w2_packed.cols, compute_stream_);
+      kernels::launch_kquant_matvec_residual(
+          static_cast<const std::uint8_t*>(lw->w2_packed.data),
+          static_cast<kernels::KQuantType>(lw->w2_packed.kind),
+          static_cast<const __half*>(d_ff2_), static_cast<__half*>(d_x_), lw->w2_packed.rows,
+          lw->w2_packed.cols, compute_stream_);
+      fused_residual = true;
     } else {
       // Residual add folded into the down-projection's epilogue.
       resident_projection_half_residual(lw->w2, d_ff2_, d_x_, hidden, inter, resident_wo_warps_,
@@ -783,13 +795,21 @@ void LlamaEngine::init_logits_decode_graph() {
             resident_int8_wo_warps_per_row_);
       }
     } else if (lw->wo_packed.active()) {
-      // Packed k-quant: multiply the container's own blocks. Nothing is fused
-      // into this one, so the shared add_inplace below still runs.
+      // Residual folded into the epilogue when no bias sits between them, which
+      // is what the fp16 path does; otherwise the bias needs its own buffer.
       ++packed_matvec_calls_;
-      kernels::launch_kquant_matvec(static_cast<const std::uint8_t*>(lw->wo_packed.data),
-                                    static_cast<kernels::KQuantType>(lw->wo_packed.kind),
-                                    static_cast<const __half*>(d_att_), static_cast<__half*>(d_ff3_),
-                                    lw->wo_packed.rows, lw->wo_packed.cols, compute_stream_);
+      // The bias BUFFER is always allocated and zero-filled, so testing the
+      // pointer never fuses. What matters is whether the model actually carries
+      // attention.bo.
+      const bool fuse = !has_any_layer_output_bias_;
+      const auto launch = fuse ? &kernels::launch_kquant_matvec_residual
+                               : &kernels::launch_kquant_matvec;
+      launch(static_cast<const std::uint8_t*>(lw->wo_packed.data),
+             static_cast<kernels::KQuantType>(lw->wo_packed.kind),
+             static_cast<const __half*>(d_att_),
+             static_cast<__half*>(fuse ? d_x_ : d_ff3_), lw->wo_packed.rows, lw->wo_packed.cols,
+             compute_stream_);
+      fused_residual = fuse;
     } else if (resident_custom_wo_) {
       // Residual add folded into this projection's epilogue, so the shared add_inplace
       // below is skipped. At batch 1 a kernel costs a fixed ~1.7 us whatever it does.
@@ -880,11 +900,15 @@ void LlamaEngine::init_logits_decode_graph() {
             static_cast<__half*>(d_ff3_), hidden, inter, compute_stream_);
       }
     } else if (lw->w2_packed.active()) {
+      // Same fusion for the down projection; nothing sits between it and the
+      // residual add.
       ++packed_matvec_calls_;
-      kernels::launch_kquant_matvec(static_cast<const std::uint8_t*>(lw->w2_packed.data),
-                                    static_cast<kernels::KQuantType>(lw->w2_packed.kind),
-                                    static_cast<const __half*>(d_ff2_), static_cast<__half*>(d_ff3_),
-                                    lw->w2_packed.rows, lw->w2_packed.cols, compute_stream_);
+      kernels::launch_kquant_matvec_residual(
+          static_cast<const std::uint8_t*>(lw->w2_packed.data),
+          static_cast<kernels::KQuantType>(lw->w2_packed.kind),
+          static_cast<const __half*>(d_ff2_), static_cast<__half*>(d_x_), lw->w2_packed.rows,
+          lw->w2_packed.cols, compute_stream_);
+      fused_residual = true;
     } else {
       // Residual add folded into the down-projection's epilogue.
       resident_projection_half_residual(lw->w2, d_ff2_, d_x_, hidden, inter, resident_wo_warps_,

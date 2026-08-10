@@ -405,6 +405,8 @@ __device__ __forceinline__ float kq_block_dot(const std::uint8_t* __restrict__ p
 // Q6_K blocks are 210 bytes, so consecutive blocks are only 2-byte aligned and
 // it uses uint16 pairs where the others use uint32.
 __device__ __forceinline__ void store_out(__half* p, float v) { *p = __float2half(v); }
+__device__ __forceinline__ float load_out(const __half* p) { return __half2float(*p); }
+__device__ __forceinline__ float load_out(const float* p) { return *p; }
 __device__ __forceinline__ void store_out(float* p, float v) { *p = v; }
 
 // WPR warps cooperate on one row, so a block covers 8/WPR rows.
@@ -413,7 +415,7 @@ __device__ __forceinline__ void store_out(float* p, float v) { *p = v; }
 // at 1024 rows that launches 128 blocks onto 170 SMs, leaving most of the GPU
 // idle with nothing to hide memory latency behind. Splitting a row across warps
 // multiplies the grid by WPR and costs one shared-memory reduction.
-template <KQuantType TYPE, int WPR, typename OutT>
+template <KQuantType TYPE, int WPR, typename OutT, bool ACC>
 __global__ void kquant_matvec_vec_kernel(const std::uint8_t* __restrict__ w,
                                          const __half* __restrict__ x, OutT* __restrict__ y,
                                          int rows, int cols) {
@@ -475,7 +477,12 @@ __global__ void kquant_matvec_vec_kernel(const std::uint8_t* __restrict__ w,
   for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
 
   if (WPR == 1) {
-    if (lane == 0 && row < rows) store_out(y + row, acc);
+    if (lane == 0 && row < rows) {
+      // ACC folds the residual add into this store: the fp16 path has always
+      // done it in the projection epilogue, and the packed path was paying a
+      // whole extra kernel per layer for it.
+      store_out(y + row, ACC ? acc + load_out(y + row) : acc);
+    }
     return;
   }
   __shared__ float parts[kWarps];
@@ -485,7 +492,7 @@ __global__ void kquant_matvec_vec_kernel(const std::uint8_t* __restrict__ w,
     float total = 0.0f;
 #pragma unroll
     for (int k = 0; k < WPR; ++k) total += parts[warp + k];
-    store_out(y + row, total);
+    store_out(y + row, ACC ? total + load_out(y + row) : total);
   }
 }
 
@@ -1362,7 +1369,7 @@ bool launch_kquant_matmul(const std::uint8_t* w, KQuantType type, const half* x,
   return false;
 }
 
-template <typename OutT>
+template <typename OutT, bool ACC>
 static void launch_kquant_matvec_impl(const std::uint8_t* w, KQuantType type, const half* x, OutT* y,
                                       int rows, int cols, cudaStream_t stream) {
   constexpr int kThreads = 256;  // 8 warps
@@ -1383,7 +1390,7 @@ static void launch_kquant_matvec_impl(const std::uint8_t* w, KQuantType type, co
   const int rows_per_block = 8 / wpr;
   const int grid = (rows + rows_per_block - 1) / rows_per_block;
 
-#define CPI_KQ_DISPATCH(WPRV)                                     switch (type) {                                                   case KQuantType::Q4_K:                                            kquant_matvec_vec_kernel<KQuantType::Q4_K, WPRV, OutT>              <<<grid, kThreads, 0, stream>>>(w, x, y, rows, cols);       return;                                                       case KQuantType::Q5_K:                                            kquant_matvec_vec_kernel<KQuantType::Q5_K, WPRV, OutT>              <<<grid, kThreads, 0, stream>>>(w, x, y, rows, cols);       return;                                                       case KQuantType::Q6_K:                                            kquant_matvec_vec_kernel<KQuantType::Q6_K, WPRV, OutT>              <<<grid, kThreads, 0, stream>>>(w, x, y, rows, cols);       return;                                                     }
+#define CPI_KQ_DISPATCH(WPRV)                                     switch (type) {                                                   case KQuantType::Q4_K:                                            kquant_matvec_vec_kernel<KQuantType::Q4_K, WPRV, OutT, ACC>              <<<grid, kThreads, 0, stream>>>(w, x, y, rows, cols);       return;                                                       case KQuantType::Q5_K:                                            kquant_matvec_vec_kernel<KQuantType::Q5_K, WPRV, OutT, ACC>              <<<grid, kThreads, 0, stream>>>(w, x, y, rows, cols);       return;                                                       case KQuantType::Q6_K:                                            kquant_matvec_vec_kernel<KQuantType::Q6_K, WPRV, OutT, ACC>              <<<grid, kThreads, 0, stream>>>(w, x, y, rows, cols);       return;                                                     }
 
   if (wpr >= 8) {
     CPI_KQ_DISPATCH(8)
@@ -1399,12 +1406,17 @@ static void launch_kquant_matvec_impl(const std::uint8_t* w, KQuantType type, co
 
 void launch_kquant_matvec(const std::uint8_t* w, KQuantType type, const half* x, half* y, int rows,
                           int cols, cudaStream_t stream) {
-  launch_kquant_matvec_impl(w, type, x, y, rows, cols, stream);
+  launch_kquant_matvec_impl<half, false>(w, type, x, y, rows, cols, stream);
+}
+
+void launch_kquant_matvec_residual(const std::uint8_t* w, KQuantType type, const half* x, half* y,
+                                   int rows, int cols, cudaStream_t stream) {
+  launch_kquant_matvec_impl<half, true>(w, type, x, y, rows, cols, stream);
 }
 
 void launch_kquant_matvec_f32(const std::uint8_t* w, KQuantType type, const half* x, float* y,
                               int rows, int cols, cudaStream_t stream) {
-  launch_kquant_matvec_impl(w, type, x, y, rows, cols, stream);
+  launch_kquant_matvec_impl<float, false>(w, type, x, y, rows, cols, stream);
 }
 
 }  // namespace kernels

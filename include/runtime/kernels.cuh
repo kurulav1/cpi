@@ -1297,6 +1297,12 @@ bool launch_kquant_mmq(const std::uint8_t* w, KQuantType type, const half* x, ha
                        int cols, int batch, int ldy, std::int8_t* xq, float* xs, float* xsum,
                        cudaStream_t stream);
 
+// Accumulates into y instead of overwriting it, folding a residual add into the
+// projection's epilogue. The fp16 path has always done this; without it the
+// packed path pays an extra kernel per layer for wo and again for w2.
+void launch_kquant_matvec_residual(const std::uint8_t* w, KQuantType type, const half* x, half* y,
+                                   int rows, int cols, cudaStream_t stream);
+
 // Same, writing fp32. The LM head produces logits rather than activations.
 void launch_kquant_matvec_f32(const std::uint8_t* w, KQuantType type, const half* x, float* y,
                               int rows, int cols, cudaStream_t stream);
