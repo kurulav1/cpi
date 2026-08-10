@@ -1271,7 +1271,15 @@ struct KQuantTuning {
   int mmq_async_nt = 2;  // same, double-buffered kernel
   int mmq_async = 1;     // use the cp.async kernel when the batch fits
   int matvec_wpr = 8;    // warps cooperating on one row in the matvec
-  int matvec_dp4a = 0;   // int8 activations + dp4a in the matvec; changes numerics
+  // int8 activations + dp4a in the matvec. Changes numerics -- this is the same
+  // trade llama.cpp's MMVQ makes by default -- but greedy decoding stayed
+  // token-identical to the fp16-activation path over 267 tokens of code
+  // generation, and it is worth ~7% (222 -> 238 tok/s on an 8B Q4_K_M).
+  int matvec_dp4a = 1;
+  // Bytes of qs each lane takes, as 0 = 4, 1 = 8, 2 = 16. One scale decode
+  // covers the whole slice, and scale handling -- not the dot -- was the
+  // matvec's limiter: 4 -> 8 -> 16 bytes ran 90.0 -> 94.3 -> 96.4% of llama.cpp.
+  int matvec_dp4a16 = 2;
 };
 void set_kquant_tuning(const KQuantTuning& t);
 KQuantTuning get_kquant_tuning();

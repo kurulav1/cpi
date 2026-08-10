@@ -46,6 +46,7 @@ KQuantTuning g_kq_tune = []() {
   t.mmq_async = env_int("CPI_KQUANT_MMQ_ASYNC", t.mmq_async);
   t.matvec_wpr = env_int("CPI_KQUANT_WPR", t.matvec_wpr);
   t.matvec_dp4a = env_int("CPI_KQUANT_MATVEC_DP4A", t.matvec_dp4a);
+  t.matvec_dp4a16 = env_int("CPI_KQUANT_MATVEC_DP4A16", t.matvec_dp4a16);
   return t;
 }();
 }  // namespace
@@ -1469,6 +1470,199 @@ __global__ void kquant_matvec_dp4a_kernel(const std::uint8_t* __restrict__ w,
   }
 }
 
+// Same integer dot as above, but each lane takes an 8-byte slice of qs instead
+// of 4, so one scale decode covers sixteen weights instead of eight.
+//
+// The dot was never the cost. Per super-block a lane ran two
+// scale_min_from_hdr decodes (~12 bit ops) and ~13 float ops to apply them,
+// against four dp4a -- the scale handling is roughly six times the dot. Both
+// halves of an 8-byte slice land in the same pair of 32-groups, so their dots
+// can be summed as integers first and scaled once, which halves the scale work
+// and the qs load instructions for identical bytes moved.
+//
+// Sixteen lanes now cover one super-block, so a warp covers two per iteration.
+template <KQuantType TYPE, int WPR, bool ACC>
+__global__ void kquant_matvec_dp4a16_kernel(const std::uint8_t* __restrict__ w,
+                                            const std::int8_t* __restrict__ xq,
+                                            const float* __restrict__ xs, __half* __restrict__ y,
+                                            int rows, int cols) {
+  constexpr int kWarps = 8;
+  constexpr int kRowsPerBlock = kWarps / WPR;
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int warpid = static_cast<int>(threadIdx.x) >> 5;
+  const int sub = warpid % WPR;
+  const int row = blockIdx.x * kRowsPerBlock + warpid / WPR;
+  if (row >= rows) return;
+  const int blocks_per_row = cols / static_cast<int>(kSuperBlock);
+  const std::size_t block_bytes =
+      TYPE == KQuantType::Q4_K ? model::kquant::kQ4KBlockBytes : model::kquant::kQ5KBlockBytes;
+
+  const int sb_off = lane >> 4;   // which of the warp's two super-blocks
+  const int r = lane & 15;        // which 8-byte slice of the 128-byte qs
+  const int j = r >> 2;           // 32-byte run, i.e. scale-group pair (2j, 2j+1)
+  const int t = r & 3;            // slice within the run
+  const int off_lo = (j << 6) + (t << 3);
+  const int off_hi = off_lo + 32;
+  const int qoff = (TYPE == KQuantType::Q4_K) ? 16 : 48;
+
+  const std::uint8_t* base = w + static_cast<std::size_t>(row) * blocks_per_row * block_bytes;
+
+  float acc = 0.0f;
+  for (int b = sub * 2; b < blocks_per_row; b += WPR * 2) {
+    const int sb = b + sb_off;
+    if (sb >= blocks_per_row) break;
+    const std::uint8_t* p = base + static_cast<std::size_t>(sb) * block_bytes;
+
+    const uint4 hdr = *reinterpret_cast<const uint4*>(p);
+    const float d = half_bits_to_float(static_cast<std::uint16_t>(hdr.x & 0xFFFFu));
+    const float dmin = half_bits_to_float(static_cast<std::uint16_t>(hdr.x >> 16));
+    float sc0, m0, sc1, m1;
+    scale_min_from_hdr(2 * j, hdr.y, hdr.z, hdr.w, &sc0, &m0);
+    scale_min_from_hdr(2 * j + 1, hdr.y, hdr.z, hdr.w, &sc1, &m1);
+
+    const uint2 qw = *reinterpret_cast<const uint2*>(p + qoff + (r << 3));
+    uint2 hw;
+    if (TYPE == KQuantType::Q5_K) hw = *reinterpret_cast<const uint2*>(p + 16 + (t << 3));
+
+    const int xbase = sb * static_cast<int>(kSuperBlock);
+    int dot_lo = 0, dot_hi = 0, sum_lo = 0, sum_hi = 0;
+#pragma unroll
+    for (int k = 0; k < 2; ++k) {
+      const std::uint32_t word = k == 0 ? qw.x : qw.y;
+      int qlo = static_cast<int>(word & 0x0F0F0F0Fu);
+      int qhi = static_cast<int>((word >> 4) & 0x0F0F0F0Fu);
+      if (TYPE == KQuantType::Q5_K) {
+        const std::uint32_t h = k == 0 ? hw.x : hw.y;
+        qlo |= static_cast<int>(((h >> (2 * j)) & 0x01010101u) << 4);
+        qhi |= static_cast<int>(((h >> (2 * j + 1)) & 0x01010101u) << 4);
+      }
+      const int xl = *reinterpret_cast<const int*>(xq + xbase + off_lo + (k << 2));
+      const int xh = *reinterpret_cast<const int*>(xq + xbase + off_hi + (k << 2));
+      dot_lo = __dp4a(qlo, xl, dot_lo);
+      dot_hi = __dp4a(qhi, xh, dot_hi);
+      sum_lo = __dp4a(xl, 0x01010101, sum_lo);
+      sum_hi = __dp4a(xh, 0x01010101, sum_hi);
+    }
+
+    // Both slices sit in the same two groups, so the scales apply once to the
+    // summed integer dots rather than once per four weights.
+    const int gbase = sb << 3;
+    acc += xs[gbase + 2 * j] * (d * sc0 * static_cast<float>(dot_lo) -
+                                dmin * m0 * static_cast<float>(sum_lo)) +
+           xs[gbase + 2 * j + 1] * (d * sc1 * static_cast<float>(dot_hi) -
+                                    dmin * m1 * static_cast<float>(sum_hi));
+  }
+
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+  if (WPR == 1) {
+    if (lane == 0) y[row] = __float2half(ACC ? acc + __half2float(y[row]) : acc);
+    return;
+  }
+  __shared__ float parts[32];
+  if (lane == 0) parts[warpid] = acc;
+  __syncthreads();
+  if (lane == 0 && sub == 0) {
+    float total = 0.0f;
+#pragma unroll
+    for (int k = 0; k < WPR; ++k) total += parts[warpid + k];
+    y[row] = __float2half(ACC ? total + __half2float(y[row]) : total);
+  }
+}
+
+// The same trade taken one step further: a 16-byte slice of qs per lane, so one
+// scale decode covers thirty-two weights. Widening 4 -> 8 bytes was worth 5.3%,
+// which said the scale work really was the limiter; this halves what is left.
+//
+// Eight lanes now cover a super-block and a warp covers four, so this wants four
+// warps per row rather than eight -- four warps x four super-blocks is exactly a
+// 4096-wide row. At WPR=8 half the block would find nothing to do. Two rows per
+// block keeps the same warps in flight.
+template <KQuantType TYPE, int WPR, bool ACC>
+__global__ void kquant_matvec_dp4a32_kernel(const std::uint8_t* __restrict__ w,
+                                            const std::int8_t* __restrict__ xq,
+                                            const float* __restrict__ xs, __half* __restrict__ y,
+                                            int rows, int cols) {
+  constexpr int kWarps = 8;
+  constexpr int kRowsPerBlock = kWarps / WPR;
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int warpid = static_cast<int>(threadIdx.x) >> 5;
+  const int sub = warpid % WPR;
+  const int row = blockIdx.x * kRowsPerBlock + warpid / WPR;
+  if (row >= rows) return;
+  const int blocks_per_row = cols / static_cast<int>(kSuperBlock);
+  const std::size_t block_bytes =
+      TYPE == KQuantType::Q4_K ? model::kquant::kQ4KBlockBytes : model::kquant::kQ5KBlockBytes;
+
+  const int sb_off = lane >> 3;  // which of the warp's four super-blocks
+  const int r = lane & 7;        // which 16-byte slice of the 128-byte qs
+  const int j = r >> 1;          // 32-byte run, i.e. scale-group pair (2j, 2j+1)
+  const int t = r & 1;           // half of the run
+  const int off_lo = (j << 6) + (t << 4);
+  const int off_hi = off_lo + 32;
+  const int qoff = (TYPE == KQuantType::Q4_K) ? 16 : 48;
+
+  const std::uint8_t* base = w + static_cast<std::size_t>(row) * blocks_per_row * block_bytes;
+
+  float acc = 0.0f;
+  for (int b = sub * 4; b < blocks_per_row; b += WPR * 4) {
+    const int sb = b + sb_off;
+    if (sb >= blocks_per_row) break;
+    const std::uint8_t* p = base + static_cast<std::size_t>(sb) * block_bytes;
+
+    const uint4 hdr = *reinterpret_cast<const uint4*>(p);
+    const float d = half_bits_to_float(static_cast<std::uint16_t>(hdr.x & 0xFFFFu));
+    const float dmin = half_bits_to_float(static_cast<std::uint16_t>(hdr.x >> 16));
+    float sc0, m0, sc1, m1;
+    scale_min_from_hdr(2 * j, hdr.y, hdr.z, hdr.w, &sc0, &m0);
+    scale_min_from_hdr(2 * j + 1, hdr.y, hdr.z, hdr.w, &sc1, &m1);
+
+    const uint4 qw = *reinterpret_cast<const uint4*>(p + qoff + (r << 4));
+    uint4 hw;
+    if (TYPE == KQuantType::Q5_K) hw = *reinterpret_cast<const uint4*>(p + 16 + (t << 4));
+
+    const int xbase = sb * static_cast<int>(kSuperBlock);
+    int dot_lo = 0, dot_hi = 0, sum_lo = 0, sum_hi = 0;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      const std::uint32_t word = k == 0 ? qw.x : (k == 1 ? qw.y : (k == 2 ? qw.z : qw.w));
+      int qlo = static_cast<int>(word & 0x0F0F0F0Fu);
+      int qhi = static_cast<int>((word >> 4) & 0x0F0F0F0Fu);
+      if (TYPE == KQuantType::Q5_K) {
+        const std::uint32_t h = k == 0 ? hw.x : (k == 1 ? hw.y : (k == 2 ? hw.z : hw.w));
+        qlo |= static_cast<int>(((h >> (2 * j)) & 0x01010101u) << 4);
+        qhi |= static_cast<int>(((h >> (2 * j + 1)) & 0x01010101u) << 4);
+      }
+      const int xl = *reinterpret_cast<const int*>(xq + xbase + off_lo + (k << 2));
+      const int xh = *reinterpret_cast<const int*>(xq + xbase + off_hi + (k << 2));
+      dot_lo = __dp4a(qlo, xl, dot_lo);
+      dot_hi = __dp4a(qhi, xh, dot_hi);
+      sum_lo = __dp4a(xl, 0x01010101, sum_lo);
+      sum_hi = __dp4a(xh, 0x01010101, sum_hi);
+    }
+
+    const int gbase = sb << 3;
+    acc += xs[gbase + 2 * j] * (d * sc0 * static_cast<float>(dot_lo) -
+                                dmin * m0 * static_cast<float>(sum_lo)) +
+           xs[gbase + 2 * j + 1] * (d * sc1 * static_cast<float>(dot_hi) -
+                                    dmin * m1 * static_cast<float>(sum_hi));
+  }
+
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+  __shared__ float parts[32];
+  if (lane == 0) parts[warpid] = acc;
+  __syncthreads();
+  if (lane == 0 && sub == 0) {
+    float total = 0.0f;
+#pragma unroll
+    for (int k = 0; k < WPR; ++k) total += parts[warpid + k];
+    y[row] = __float2half(ACC ? total + __half2float(y[row]) : total);
+  }
+}
+
+
+
 namespace {
 // Scratch for the int8 activation form, grown to the widest matvec seen. Kept
 // module-local so the dp4a path can be switched on without touching every call
@@ -1518,7 +1712,26 @@ bool try_dp4a_matvec(const std::uint8_t* w, KQuantType type, const half* x, half
   constexpr int kThreads = 256;
   const int wpr = 8;
   const int grid = (rows + (8 / wpr) - 1) / (8 / wpr);
-  if (type == KQuantType::Q4_K) {
+  if (g_kq_tune.matvec_dp4a16 == 2) {
+    // Four warps per row: four warps x four super-blocks covers a 4096-wide row
+    // exactly, so widening the slice does not idle half the block.
+    const dim3 grid32(static_cast<unsigned>((rows + 1) / 2));
+    if (type == KQuantType::Q4_K) {
+      kquant_matvec_dp4a32_kernel<KQuantType::Q4_K, 4, ACC>
+          <<<grid32, kThreads, 0, stream>>>(w, g_dp4a_xq, g_dp4a_xs, y, rows, cols);
+    } else {
+      kquant_matvec_dp4a32_kernel<KQuantType::Q5_K, 4, ACC>
+          <<<grid32, kThreads, 0, stream>>>(w, g_dp4a_xq, g_dp4a_xs, y, rows, cols);
+    }
+  } else if (g_kq_tune.matvec_dp4a16) {
+    if (type == KQuantType::Q4_K) {
+      kquant_matvec_dp4a16_kernel<KQuantType::Q4_K, 8, ACC>
+          <<<grid, kThreads, 0, stream>>>(w, g_dp4a_xq, g_dp4a_xs, y, rows, cols);
+    } else {
+      kquant_matvec_dp4a16_kernel<KQuantType::Q5_K, 8, ACC>
+          <<<grid, kThreads, 0, stream>>>(w, g_dp4a_xq, g_dp4a_xs, y, rows, cols);
+    }
+  } else if (type == KQuantType::Q4_K) {
     kquant_matvec_dp4a_kernel<KQuantType::Q4_K, 8, ACC>
         <<<grid, kThreads, 0, stream>>>(w, g_dp4a_xq, g_dp4a_xs, y, rows, cols);
   } else {
