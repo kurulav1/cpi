@@ -1938,7 +1938,33 @@ void launch_attention_step_batched_paged(const half* q, const half* k_pool, cons
                                          float* scratch_l, float* scratch_o, int scratch_chunks) {
   constexpr int warps = 4;
   constexpr int threads = warps * 32;
-  const int total_blocks = min(scratch_chunks, (max_seq_len + block_size - 1) / block_size);
+  // Sizing the grid from a host-side max_seq_len is the ONE thing keeping this
+  // path out of a CUDA graph: capture freezes grid dimensions, so a grid that
+  // depends on runtime length cannot be captured. Everything else here is
+  // already device-side -- seq_lens and block_tables are device pointers, the
+  // kernel reads seq_lens[b] itself and guards `chunk_start >= seq_len`, and the
+  // reduce derives its per-sequence chunk count from seq_lens too.
+  //
+  // The fixed grid is available but OFF by default, because unlike the
+  // single-stream case it is NOT free here. This grid is heads x chunks x batch,
+  // so max-sizing it multiplies by the batch as well: at B=32 with a short
+  // context that is ~65k blocks, nearly all of which exist only to hit the guard
+  // and return. Measured against the length-dependent grid at B=1/8/32/64:
+  // +7.6 / -0.4 / -9.3 / +3.2%, medians of three -- noisy, but the loss at 32 has
+  // a mechanism behind it and the wins do not.
+  //
+  // So one always-max graph is the wrong shape for this path. What fits is
+  // bucketed capture: a small set of graphs for length ranges, each with a grid
+  // fixed to its bucket's ceiling, re-captured when a sequence outgrows it. That
+  // keeps the grid honest AND capturable. CPI_ATTN_FIXED_GRID=1 turns on the
+  // always-max form for anyone building that.
+  static const bool fixed_grid = [] {
+    const char* e = std::getenv("CPI_ATTN_FIXED_GRID");
+    return e && *e == '1';
+  }();
+  const int total_blocks =
+      fixed_grid ? scratch_chunks
+                 : min(scratch_chunks, (max_seq_len + block_size - 1) / block_size);
 
   // GQA-shared path: one block per (KV head, chunk, sequence) with group_size
   // warps sharing each KV tile, cutting KV traffic by group_size. Requires a real
