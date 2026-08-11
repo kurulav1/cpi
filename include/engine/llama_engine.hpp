@@ -712,6 +712,16 @@ private:
   bool packed_matmul(const PackedWeight& w, const void* x, void* y, int batch, int ldy, int row0,
                      cudaStream_t stream, bool reuse_x = false);
 
+  // A captured batched decode step. The graph is only valid for the shapes that
+  // fixed its grids, so it is keyed on them and re-captured when any changes --
+  // batch size above all, which moves every grid in the step. Held as void* so
+  // the header does not need the CUDA graph types.
+  void* batch_graph_exec_ = nullptr;
+  int batch_graph_batch_ = -1;
+  int batch_graph_blocks_ = -1;
+  int batch_graph_bucket_ = -1;
+  void reset_batch_graph();
+
   // Scratch for the dp4a path's int8 activations, grown on demand.
   bool ensure_q8_scratch(int batch, int cols);
 

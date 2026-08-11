@@ -146,7 +146,15 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
   // [batch*heads*chunks*head_dim] partial outputs. Chunks bounded by max_seq.
   // Persistent (grown on demand); allocating/freeing per step would stall the
   // pipeline with synchronizing cudaMalloc/cudaFree on every decode step.
-  const int chunks = (max_seq + bs - 1) / bs;
+  // Round the length up to a bucket. Every grid dimension and scratch size below
+  // derives from this rather than from the true max_seq, which is what lets a
+  // captured graph stay valid as sequences grow: within a bucket the shapes do
+  // not move, and the kernels already guard per sequence off the device-side
+  // seq_lens. Crossing a bucket boundary re-captures.
+  const int kSeqBucket = 512;
+  const int bucket_seq =
+      std::min(options_.max_context, ((max_seq + kSeqBucket - 1) / kSeqBucket) * kSeqBucket);
+  const int chunks = (bucket_seq + bs - 1) / bs;
   const std::size_t stat_elems = static_cast<std::size_t>(batch) * cfg.num_heads * chunks;
   if (stat_elems > d_bs_stat_cap_) {
     if (d_bs_scratch_m_) cudaFree(d_bs_scratch_m_);
@@ -160,6 +168,12 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
   float* scratch_m = d_bs_scratch_m_;
   float* scratch_l = d_bs_scratch_l_;
   float* scratch_o = d_bs_scratch_o_;
+
+  // Everything above this point either touches the host or can allocate, so it
+  // stays outside the graph: the uploads read from caller-owned vectors whose
+  // addresses capture would bake in, and the scratch grows on demand. Everything
+  // below is pure device work on stable pointers.
+  const auto run_compute = [&]() {
 
   kernels::launch_embedding_lookup(static_cast<const __half*>(d_tok_embeddings_), d_token_id_,
                                    static_cast<__half*>(d_x_), batch, hidden, compute_stream_);
@@ -250,7 +264,7 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
           kv_quant_win_);
       kernels::launch_attention_step_batched_paged_quant(
           static_cast<const __half*>(d_prefill_q_), kq, vq, ksc, vsc, d_batch_block_tables_,
-          d_batch_seq_lens_, max_blocks, max_seq, static_cast<__half*>(d_att_), batch,
+          d_batch_seq_lens_, max_blocks, bucket_seq, static_cast<__half*>(d_att_), batch,
           cfg.num_heads, cfg.num_kv_heads, head_dim, bs, kv_quant_kbits_, kv_quant_vbits_,
           kv_quant_rot_, compute_stream_, scratch_m, scratch_l, scratch_o, chunks, slot_ids,
           sink_k, sink_v, ring_k, ring_v, kv_quant_sink_, kv_quant_win_);
@@ -266,7 +280,7 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
 
       kernels::launch_attention_step_batched_paged(
           static_cast<const __half*>(d_prefill_q_), k_pool, v_pool, d_batch_block_tables_,
-          d_batch_seq_lens_, max_blocks, max_seq, static_cast<__half*>(d_att_), batch,
+          d_batch_seq_lens_, max_blocks, bucket_seq, static_cast<__half*>(d_att_), batch,
           cfg.num_heads, cfg.num_kv_heads, head_dim, bs, compute_stream_, scratch_m, scratch_l,
           scratch_o, chunks);
     }
@@ -323,7 +337,53 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
   }
 
   launch_norm(d_x_, d_norm_out_, d_norm_out_bias_, d_x_norm_, batch, hidden);
+  };  // run_compute
+
+  // CPI_BATCH_GRAPH=0 disables. The batched path has no graph today and nsys says
+  // it costs: at B=32 the GPU kernel sum is 18.7 ms a step against 23.0 ms of
+  // wall, so about 4.3 ms -- 19% -- is host-side gap between roughly 400 launches.
+  static const bool graph_on = [] {
+    const char* e = std::getenv("CPI_BATCH_GRAPH");
+    return !(e && *e == '0');
+  }();
+  if (!graph_on) {
+    run_compute();
+    return batch;
+  }
+
+  if (batch_graph_exec_ == nullptr || batch_graph_batch_ != batch ||
+      batch_graph_blocks_ != max_blocks || batch_graph_bucket_ != bucket_seq) {
+    reset_batch_graph();
+    // Warm once outside capture: first touch of a lazily loaded kernel module
+    // inside a capture is one of the ways this fails opaquely.
+    run_compute();
+    CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
+    kernels::set_capture_active(true);
+    CUDA_CHECK(cudaStreamBeginCapture(compute_stream_, cudaStreamCaptureModeThreadLocal));
+    run_compute();
+    cudaGraph_t graph = nullptr;
+    kernels::set_capture_active(false);
+    CUDA_CHECK(cudaStreamEndCapture(compute_stream_, &graph));
+    cudaGraphExec_t exec = nullptr;
+    CUDA_CHECK(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+    CUDA_CHECK(cudaGraphDestroy(graph));
+    batch_graph_exec_ = static_cast<void*>(exec);
+    batch_graph_batch_ = batch;
+    batch_graph_blocks_ = max_blocks;
+    batch_graph_bucket_ = bucket_seq;
+  }
+  CUDA_CHECK(cudaGraphLaunch(static_cast<cudaGraphExec_t>(batch_graph_exec_), compute_stream_));
   return batch;
+}
+
+void LlamaEngine::reset_batch_graph() {
+  if (batch_graph_exec_ != nullptr) {
+    cudaGraphExecDestroy(static_cast<cudaGraphExec_t>(batch_graph_exec_));
+    batch_graph_exec_ = nullptr;
+  }
+  batch_graph_batch_ = -1;
+  batch_graph_blocks_ = -1;
+  batch_graph_bucket_ = -1;
 }
 
 // Project all `batch` rows of d_x_norm_ through the LM head into d_batch_logits_
