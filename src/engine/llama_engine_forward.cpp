@@ -290,10 +290,32 @@ bool LlamaEngine::packed_matmul(const PackedWeight& w, const void* x, void* y, i
   // what is missing is tuning. Two known costs: the M tile is a fixed 64 rows,
   // so a batch of 2 computes 62 rows of padding, and the staging/occupancy work
   // llama.cpp carries per-architecture tile configs for is simply absent here.
-  static const bool mmq_on = []() {
+  // MMQ is on by default now, but only across the batch range where it actually
+  // wins. It keeps the weight packed, so it avoids expanding the whole matrix to
+  // fp16 every step -- w13 alone is 235 MB of fp16 per layer per step -- but its
+  // fixed 64-row M tile means small batches compute mostly padding, and at large
+  // batches cuBLAS's tiling pulls ahead again. Measured against expand-and-cuBLAS
+  // on an 8B Q4_K_M, batched decode tok/s:
+  //     B:      1     2     4     8    16    32    48    64
+  //   cuBLAS: 93.1 165.6 267.2 286.7 387.1 597.4 701.0 765.5
+  //   MMQ:    89.7 151.1 262.4 387.6 514.9 680.5 680.3 739.0
+  //           -4%   -9%   -2%  +35%  +33%  +14%   -3%   -3%
+  // so the band is [8, 40]. CPI_KQUANT_MMQ=1 forces it everywhere and =0 disables
+  // it, for re-measuring the edges.
+  static const int mmq_force = []() {
     const char* e = std::getenv("CPI_KQUANT_MMQ");
-    return e != nullptr && e[0] == '1';
+    return e == nullptr ? -1 : (e[0] == '1' ? 1 : 0);
   }();
+  static const int mmq_lo = []() {
+    const char* e = std::getenv("CPI_KQUANT_MMQ_MIN_BATCH");
+    return e ? atoi(e) : 8;
+  }();
+  static const int mmq_hi = []() {
+    const char* e = std::getenv("CPI_KQUANT_MMQ_MAX_BATCH");
+    return e ? atoi(e) : 40;
+  }();
+  const bool mmq_on =
+      mmq_force == 1 || (mmq_force != 0 && batch >= mmq_lo && batch <= mmq_hi);
   static const bool mma_ok = []() {
     int dev = 0;
     cudaDeviceProp prop{};
