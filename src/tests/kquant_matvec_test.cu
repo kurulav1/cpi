@@ -252,7 +252,7 @@ void run_real(const std::string& gguf_path, bool bandwidth) {
       // dp4a form of the same product. Activations go through int8, so this is
       // checked to a percent rather than to fp16 rounding -- the point is that
       // the integer path computes the same thing, not that it is bit-equal.
-      if (pk.kind != 2 && pk.cols % 32 == 0) {
+      if (pk.cols % 32 == 0) {  // Q6_K enters for the MMQ check below; dp4a is skipped
         std::int8_t* d_q = nullptr;
         float* d_s = nullptr;
         float* d_sum = nullptr;
@@ -261,7 +261,7 @@ void run_real(const std::string& gguf_path, bool bandwidth) {
         cudaMalloc(&d_s, static_cast<std::size_t>(bsz) * groups * sizeof(float));
         cudaMalloc(&d_sum, static_cast<std::size_t>(bsz) * groups * sizeof(float));
         cudaMemset(d_yb, 0, static_cast<std::size_t>(bsz) * rows * sizeof(__half));
-        const bool ok = kernels::launch_kquant_matmul_dp4a(
+        const bool ok = pk.kind != 2 && kernels::launch_kquant_matmul_dp4a(
             d_w, static_cast<kernels::KQuantType>(pk.kind), d_xb, d_yb, rows, pk.cols, bsz,
             /*ldy=*/rows, d_q, d_s, d_sum, nullptr);
         cudaDeviceSynchronize();
@@ -284,7 +284,7 @@ void run_real(const std::string& gguf_path, bool bandwidth) {
         // M tile. A wrong mma fragment mapping shows up here as a large error,
         // not a crash, which is the whole reason this is checked against the
         // fp16 reference rather than eyeballed.
-        if (pk.kind == 0 && bsz <= 64 && pk.cols % 256 == 0) {
+        if ((pk.kind == 0 || pk.kind == 2) && bsz <= 64 && pk.cols % 256 == 0) {
           cudaMemset(d_yb, 0, static_cast<std::size_t>(bsz) * rows * sizeof(__half));
           const bool okm = kernels::launch_kquant_mmq(
               d_w, static_cast<kernels::KQuantType>(pk.kind), d_xb, d_yb, rows, pk.cols, bsz,

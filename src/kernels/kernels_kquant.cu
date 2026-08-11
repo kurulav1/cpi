@@ -50,6 +50,7 @@ KQuantTuning g_kq_tune = []() {
   t.matvec_dp4a_q6k = env_int("CPI_KQUANT_MATVEC_DP4A_Q6K", t.matvec_dp4a_q6k);
   t.matvec_share_x = env_int("CPI_KQUANT_MATVEC_SHARE_X", t.matvec_share_x);
   t.matvec_gsum = env_int("CPI_KQUANT_MATVEC_GSUM", t.matvec_gsum);
+  t.mmq_q6k = env_int("CPI_KQUANT_MMQ_Q6K", t.mmq_q6k);
   t.matvec_vecx = env_int("CPI_KQUANT_MATVEC_VECX", t.matvec_vecx);
   return t;
 }();
@@ -1266,15 +1267,207 @@ __global__ __launch_bounds__(256) void kquant_mmq_q4k_async_kernel(
 // Q4_K on int8 tensor cores. Same activation preparation as the dp4a path; the
 // difference is the inner product runs on mma instead of scalar FMAs. sm_80+
 // only -- the caller checks compute capability.
+// Q6_K on the tensor cores. OFF BY DEFAULT: it is correct and gated but it
+// LOSES to dequant-and-cuBLAS -- -14.4/-6.3/-6.7/-3.8/-2.1% at B=8/16/32/48/64,
+// medians of three. Removing the dequant was not enough to pay for how this
+// kernel gets its bytes. Two suspects, in order: the staging below does 32
+// single-byte global loads per thread because a 210-byte Q6_K block leaves p
+// only 2-byte aligned, where the Q4_K kernel stages with uint4; and each 32-k
+// step issues two mma instead of one. The first is worth fixing before the
+// second -- uint16 pairs would halve the load count -- and neither has been
+// tried. CPI_KQUANT_MMQ_Q6K=1 turns it on.
+//
+// Q6_K is a quarter of a Q4_K_M by bytes -- ffn_down
+// for most layers plus wv -- and it was the reason a batched step still expanded
+// weights to fp16: with no MMQ path it fell to dequant-and-cuBLAS, which nsys put
+// at 15.3% of batched time even with MMQ forced on everywhere else.
+//
+// Two things make this simpler than the Q4_K kernel rather than harder:
+//
+//   - Q6_K values are q-32 with q in 0..63, so they land in -32..31 and fit int8
+//     directly. There is no -dmin*m term, so no group sums and no correction --
+//     the mma result is the dot product already.
+//   - The scale for element e is exactly scales[e>>4], once the layout is worked
+//     through: the per-16 index the reference unpack builds from n, h and l0
+//     equals e>>4 for the low half and e>>4 for the high half too, since off_hi
+//     is off_lo + 64.
+//
+// The one real obstacle is that a scale per 16 does not line up with
+// mma.m16n8k32, which accumulates 32 k at once. So each 32-k step issues two
+// mma, one per 16-k half, with the other half of the b fragment zeroed. That
+// doubles the mma count at unchanged memory traffic -- an acceptable trade for a
+// kernel measured at ~426 GB/s, i.e. bound by the weight read rather than the
+// tensor cores.
+template <int NT>
+__global__ __launch_bounds__(256) void kquant_mmq_q6k_kernel(
+    const std::uint8_t* __restrict__ w, const std::int8_t* __restrict__ xq,
+    const float* __restrict__ as, __half* __restrict__ y, int rows, int cols, int batch, int ldy) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800)
+  (void)w; (void)xq; (void)as; (void)y; (void)rows; (void)cols; (void)batch; (void)ldy;
+#else
+  constexpr int kMmqBN = 2 * NT * 8;
+  const int tid = static_cast<int>(threadIdx.x);
+  const int warp = tid >> 5, lane = tid & 31;
+  const int g = lane >> 2, t = lane & 3, mt = warp & 3, nhalf = warp >> 2;
+  const int blockNrow = blockIdx.x * kMmqBN;
+  const int Kg = cols >> 5;
+  const int blocks_per_row = cols >> 8;
+  const std::size_t row_bytes =
+      static_cast<std::size_t>(blocks_per_row) * model::kquant::kQ6KBlockBytes;
+
+  __shared__ __align__(16) std::int8_t As[kMmqBM][256];
+  __shared__ __align__(16) std::int8_t Bs[kMmqBN][256];
+  __shared__ float Bsc[kMmqBN][16];  // d*scale per 16 weights
+
+  float facc[NT][4];
+#pragma unroll
+  for (int i = 0; i < NT; ++i)
+#pragma unroll
+    for (int j = 0; j < 4; ++j) facc[i][j] = 0.0f;
+
+  for (int sb = 0; sb < blocks_per_row; ++sb) {
+    const int k0 = sb << 8;
+
+#pragma unroll
+    for (int i = 0; i < (kMmqBM * 16) / 256; ++i) {
+      const int u = tid + i * 256;
+      const int r = u >> 4, c = (u & 15) << 4;
+      uint4 v = make_uint4(0, 0, 0, 0);
+      if (r < batch) {
+        v = *reinterpret_cast<const uint4*>(xq + static_cast<std::size_t>(r) * cols + k0 + c);
+      }
+      *reinterpret_cast<uint4*>(&As[r][c]) = v;
+    }
+
+    // Weights: eight threads a row, each unpacking a 16-byte run of ql into
+    // sixteen low and sixteen high values. A 16-byte run never crosses the
+    // 32-byte or 64-byte boundaries that move l0, h and n, so those are constant
+    // across the run and the matching qh bytes are contiguous too.
+    {
+      const int r = tid >> 3, c = (tid & 7) << 4;
+      if (r < kMmqBN) {
+        const int wrow = blockNrow + r;
+        const std::uint8_t* p =
+            (wrow < rows) ? w + static_cast<std::size_t>(wrow) * row_bytes +
+                                static_cast<std::size_t>(sb) * model::kquant::kQ6KBlockBytes
+                          : nullptr;
+        const int n = c >> 6, h = (c >> 5) & 1, l0 = c & 31;
+        const int off_lo = (n << 7) + (h << 5) + l0;
+        const int sl = 2 * h, sh = 4 + 2 * h;
+        for (int i = 0; i < 16; ++i) {
+          int vlo = 0, vhi = 0;
+          if (p != nullptr) {
+            const std::uint32_t byte = p[c + i];
+            const std::uint32_t hb = p[128 + (n << 5) + l0 + i];
+            vlo = static_cast<int>((byte & 0x0Fu) | (((hb >> sl) & 3u) << 4)) - 32;
+            vhi = static_cast<int>((byte >> 4) | (((hb >> sh) & 3u) << 4)) - 32;
+          }
+          Bs[r][off_lo + i] = static_cast<std::int8_t>(vlo);
+          Bs[r][off_lo + 64 + i] = static_cast<std::int8_t>(vhi);
+        }
+        // Two of the sixteen scale groups per thread.
+        float d = 0.0f;
+        if (p != nullptr) {
+          std::uint16_t dbits;
+          memcpy(&dbits, p + 208, 2);
+          d = half_bits_to_float(dbits);
+        }
+        const int j0 = (tid & 7) << 1;
+        for (int j = j0; j < j0 + 2; ++j) {
+          Bsc[r][j] =
+              (p != nullptr)
+                  ? d * static_cast<float>(*reinterpret_cast<const std::int8_t*>(p + 192 + j))
+                  : 0.0f;
+        }
+      }
+    }
+    __syncthreads();
+
+    const int arow = 16 * mt;
+    const int m_a = arow + g, m_b = arow + g + 8;
+    const bool ok_a = m_a < batch, ok_b = m_b < batch;
+#pragma unroll
+    for (int gi = 0; gi < 8; ++gi) {
+      const int kg = (sb << 3) + gi, co = gi << 5;
+      const int a0 = *reinterpret_cast<int*>(&As[m_a][co + t * 4]);
+      const int a1 = *reinterpret_cast<int*>(&As[m_b][co + t * 4]);
+      const int a2 = *reinterpret_cast<int*>(&As[m_a][co + 16 + t * 4]);
+      const int a3 = *reinterpret_cast<int*>(&As[m_b][co + 16 + t * 4]);
+      const float as_a = ok_a ? as[static_cast<std::size_t>(m_a) * Kg + kg] : 0.0f;
+      const float as_b = ok_b ? as[static_cast<std::size_t>(m_b) * Kg + kg] : 0.0f;
+#pragma unroll
+      for (int nt = 0; nt < NT; ++nt) {
+        const int nbase = nhalf * (NT * 8) + nt * 8;
+        const int b0 = *reinterpret_cast<int*>(&Bs[nbase + g][co + t * 4]);
+        const int b1 = *reinterpret_cast<int*>(&Bs[nbase + g][co + 16 + t * 4]);
+        // Halves of the 32-k step carry different weight scales, so they cannot
+        // share an accumulator. Zeroing the other half of b is what splits them.
+        int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+        asm volatile(
+            "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, "
+            "{%8,%9}, {%0,%1,%2,%3};\n"
+            : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
+            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(0));
+        int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+        asm volatile(
+            "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, "
+            "{%8,%9}, {%0,%1,%2,%3};\n"
+            : "+r"(d0), "+r"(d1), "+r"(d2), "+r"(d3)
+            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(0), "r"(b1));
+        const int na = nbase + 2 * t, nb = nbase + 2 * t + 1;
+        const int jl = gi << 1, jh = jl + 1;
+        facc[nt][0] += as_a * (static_cast<float>(c0) * Bsc[na][jl] +
+                               static_cast<float>(d0) * Bsc[na][jh]);
+        facc[nt][1] += as_a * (static_cast<float>(c1) * Bsc[nb][jl] +
+                               static_cast<float>(d1) * Bsc[nb][jh]);
+        facc[nt][2] += as_b * (static_cast<float>(c2) * Bsc[na][jl] +
+                               static_cast<float>(d2) * Bsc[na][jh]);
+        facc[nt][3] += as_b * (static_cast<float>(c3) * Bsc[nb][jl] +
+                               static_cast<float>(d3) * Bsc[nb][jh]);
+      }
+    }
+    __syncthreads();
+  }
+
+#pragma unroll
+  for (int nt = 0; nt < NT; ++nt) {
+    const int nbase = nhalf * (NT * 8) + nt * 8;
+    const int rr[4] = {g, g, g + 8, g + 8};
+    const int cc[4] = {2 * t, 2 * t + 1, 2 * t, 2 * t + 1};
+#pragma unroll
+    for (int en = 0; en < 4; ++en) {
+      const int lm = 16 * mt + rr[en], gn = blockNrow + nbase + cc[en];
+      if (lm < batch && gn < rows) {
+        y[static_cast<std::size_t>(lm) * static_cast<std::size_t>(ldy) + gn] =
+            __float2half(facc[nt][en]);
+      }
+    }
+  }
+#endif
+}
+
 bool launch_kquant_mmq(const std::uint8_t* w, KQuantType type, const half* x, half* y, int rows,
                        int cols, int batch, int ldy, std::int8_t* xq, float* xs, float* xsum,
                        cudaStream_t stream) {
-  if (type != KQuantType::Q4_K) return false;
+  if (type != KQuantType::Q4_K && type != KQuantType::Q6_K) return false;
+  if (type == KQuantType::Q6_K && g_kq_tune.mmq_q6k == 0) return false;
   if (batch < 1 || batch > kMmqBM || cols % 256 != 0) return false;
   const int groups_per_row = cols >> 5;
   const int total_groups = batch * groups_per_row;
   quantize_q8_1_groups_kernel<<<(total_groups + 7) / 8, 256, 0, stream>>>(x, xq, xs, xsum, cols,
                                                                          groups_per_row);
+  if (type == KQuantType::Q6_K) {
+    // Q6_K needs no group sums: its values are (q-32), which is already signed,
+    // so the mma result is the dot product with no correction term.
+    if (g_kq_tune.mmq_nt >= 4) {
+      kquant_mmq_q6k_kernel<4>
+          <<<(rows + 63) / 64, 256, 0, stream>>>(w, xq, xs, y, rows, cols, batch, ldy);
+    } else {
+      kquant_mmq_q6k_kernel<2>
+          <<<(rows + 31) / 32, 256, 0, stream>>>(w, xq, xs, y, rows, cols, batch, ldy);
+    }
+    return true;
+  }
   // NT trades output-tile width against registers and grid size.
   const int nt = g_kq_tune.mmq_nt;
   // The double-buffered kernel carries two K-tiles of activations, so its M tile

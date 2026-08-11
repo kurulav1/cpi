@@ -323,7 +323,10 @@ bool LlamaEngine::packed_matmul(const PackedWeight& w, const void* x, void* y, i
     if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess) return false;
     return prop.major >= 8;  // mma.m16n8k32.s8 is sm_80+
   }();
-  if (mmq_on && mma_ok && batch >= 2 && batch <= 64 && w.kind == 0 && w.cols % 256 == 0 &&
+  // kind 0 is Q4_K, kind 2 is Q6_K; both have an MMQ path now, which is what
+  // stops ffn_down and wv falling back to expand-and-cuBLAS.
+  if (mmq_on && mma_ok && batch >= 2 && batch <= 64 && (w.kind == 0 || w.kind == 2) &&
+      w.cols % 256 == 0 &&
       ensure_q8_scratch(batch, w.cols) &&
       kernels::launch_kquant_mmq(static_cast<const std::uint8_t*>(w.data),
                                  static_cast<kernels::KQuantType>(w.kind),
