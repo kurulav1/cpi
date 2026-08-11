@@ -30,6 +30,26 @@ constexpr std::size_t kQ4KBlockBytes = 144;  // d,dmin + scales[12] + qs[128]
 constexpr std::size_t kQ5KBlockBytes = 176;  // d,dmin + scales[12] + qh[32] + qs[128]
 constexpr std::size_t kQ6KBlockBytes = 210;  // ql[128] + qh[64] + scales[16] + d
 
+// Stride between Q6_K super-blocks once RESIDENT on the GPU, as distinct from the
+// 210 bytes the file format packs them at. They are the same today.
+//
+// They should not stay the same. 210 is not a multiple of 4, so a resident block
+// pointer changes alignment from one block to the next, which makes cp.async
+// illegal -- and cp.async staging is what makes the Q4_K MMQ kernel fast (forcing
+// it onto scalar staging costs 22.8%). Q6_K is stuck without it: it runs ~138
+// GB/s against Q4_K MMQ's ~495, which is why Q6_K matmuls are about 55% of a
+// batched step for 25% of the weights, and why dequant-and-cuBLAS still beats
+// MMQ there despite moving 5.9x the traffic.
+//
+// Raising this to 224 (14*16) fixes the alignment for +6.7% VRAM on Q6_K alone.
+// Doing so needs, in one pass: this constant, the allocation size, a strided
+// upload (cudaMemcpy2D, spitch 210 -> dpitch 224, including the row-permute
+// path), and the tests that stage their own buffers. The kernels already read
+// through this constant, which is the point of separating it. A stride change
+// that lands in some places and not others corrupts silently rather than
+// failing, so it is all or nothing.
+constexpr std::size_t kQ6KResidentBytes = kQ6KBlockBytes;
+
 // Host dequantization: `blocks` super-blocks at `p` become blocks * kSuperBlock
 // fp16 values at `out`. These are the reference implementations.
 void dequant_q2_k(const std::uint8_t* p, std::size_t blocks, std::uint16_t* out);

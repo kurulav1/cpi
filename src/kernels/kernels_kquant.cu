@@ -207,7 +207,7 @@ __global__ void dequant_kquant_vec_kernel(const std::uint8_t* __restrict__ base,
   } else if (TYPE == KQuantType::Q5_K) {
     block_bytes = model::kquant::kQ5KBlockBytes;
   } else {
-    block_bytes = model::kquant::kQ6KBlockBytes;
+    block_bytes = model::kquant::kQ6KResidentBytes;
   }
   __half* y = out + b * kSuperBlock;
 
@@ -439,7 +439,7 @@ __global__ void kquant_matvec_vec_kernel(const std::uint8_t* __restrict__ w,
   } else if (TYPE == KQuantType::Q5_K) {
     block_bytes = model::kquant::kQ5KBlockBytes;
   } else {
-    block_bytes = model::kquant::kQ6KBlockBytes;
+    block_bytes = model::kquant::kQ6KResidentBytes;
   }
   const std::size_t row_bytes = static_cast<std::size_t>(blocks_per_row) * block_bytes;
 
@@ -532,7 +532,7 @@ __global__ void kquant_matvec_fast_kernel(const std::uint8_t* __restrict__ w,
   } else if (TYPE == KQuantType::Q5_K) {
     block_bytes = model::kquant::kQ5KBlockBytes;
   } else {
-    block_bytes = model::kquant::kQ6KBlockBytes;
+    block_bytes = model::kquant::kQ6KResidentBytes;
   }
   const std::uint8_t* p =
       w + static_cast<std::size_t>(row) * static_cast<std::size_t>(blocks_per_row) * block_bytes;
@@ -693,7 +693,7 @@ __global__ void kquant_matmul_kernel(const std::uint8_t* __restrict__ w,
   } else if (TYPE == KQuantType::Q5_K) {
     block_bytes = model::kquant::kQ5KBlockBytes;
   } else {
-    block_bytes = model::kquant::kQ6KBlockBytes;
+    block_bytes = model::kquant::kQ6KResidentBytes;
   }
   const std::uint8_t* rowp =
       w + static_cast<std::size_t>(row) * static_cast<std::size_t>(blocks_per_row) * block_bytes;
@@ -1372,7 +1372,7 @@ __global__ __launch_bounds__(256) void kquant_mmq_q6k_kernel(
   const int Kg = cols >> 5;
   const int blocks_per_row = cols >> 8;
   const std::size_t row_bytes =
-      static_cast<std::size_t>(blocks_per_row) * model::kquant::kQ6KBlockBytes;
+      static_cast<std::size_t>(blocks_per_row) * model::kquant::kQ6KResidentBytes;
 
   __shared__ __align__(16) std::int8_t As[kMmqBM][256];
   __shared__ __align__(16) std::int8_t Bs[kMmqBN][256];
@@ -1417,7 +1417,7 @@ __global__ __launch_bounds__(256) void kquant_mmq_q6k_kernel(
         const int wrow = blockNrow + r;
         const std::uint8_t* p =
             (wrow < rows) ? w + static_cast<std::size_t>(wrow) * row_bytes +
-                                static_cast<std::size_t>(sb) * model::kquant::kQ6KBlockBytes
+                                static_cast<std::size_t>(sb) * model::kquant::kQ6KResidentBytes
                           : nullptr;
         const int n = c >> 6, h = (c >> 5) & 1, l0 = c & 31;
         const int off_lo = (n << 7) + (h << 5) + l0;
@@ -2066,7 +2066,7 @@ __global__ void kquant_matvec_dp4a_q6k_kernel(const std::uint8_t* __restrict__ w
   const int row = blockIdx.x * kRowsPerBlock + warpid / WPR;
   if (row >= rows) return;
   const int blocks_per_row = cols / static_cast<int>(kSuperBlock);
-  constexpr std::size_t block_bytes = model::kquant::kQ6KBlockBytes;
+  constexpr std::size_t block_bytes = model::kquant::kQ6KResidentBytes;
 
   const int sb_off = lane >> 4;  // which of the warp's two super-blocks
   const int b0 = (lane & 15) << 3;  // 8-byte slice of the 128-byte ql

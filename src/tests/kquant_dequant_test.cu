@@ -108,7 +108,7 @@ int main(int argc, char** argv) {
        &model::kquant::dequant_q4_k},
       {"Q5_K", kernels::KQuantType::Q5_K, model::kquant::kQ5KBlockBytes,
        &model::kquant::dequant_q5_k},
-      {"Q6_K", kernels::KQuantType::Q6_K, model::kquant::kQ6KBlockBytes,
+      {"Q6_K", kernels::KQuantType::Q6_K, model::kquant::kQ6KResidentBytes,
        &model::kquant::dequant_q6_k},
   };
 
