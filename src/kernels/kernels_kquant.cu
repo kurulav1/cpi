@@ -1335,13 +1335,24 @@ __global__ void kquant_mmq_finalize_kernel(float* __restrict__ partial, __half* 
 // cache-resident, but ~138 GB/s against its ~495 in the engine. llama.cpp's
 // equivalent runs ~33.9 us a call where this one runs ~102.7.
 //
-// The fix is not a wider load -- alignment forbids it -- but a different
-// assignment: let consecutive lanes read consecutive uint16 (lane j takes u = j,
-// j+8, j+16, ...) so each instruction covers a contiguous span. That means the
-// lane no longer holds the bytes it needs to unpack, so the unpack has to move
-// out of staging and into the fragment build, staging raw bytes into shared
-// instead. That is the same shape as the Q4_K async kernel, minus cp.async, and
-// it is where the ~3x is.
+// FALSIFIED as well. Staging the raw block into shared first with consecutive
+// lanes on consecutive halfwords -- perfectly coalesced global reads, unpack
+// moved to a second pass off shared -- is numerically identical and SLOWER:
+// defaults 1507 -> 1497 tok/s and Q6_K-MMQ 1462 -> 1427 at B=32.
+//
+// The reason is that the strided pattern was never costing DRAM bandwidth. At
+// step k the warp touches 16*t + 2*k, and the sectors it pulls are the same ones
+// steps k+1..k+7 need, so L1 absorbs the reuse and total DRAM traffic is
+// unchanged. Only the instruction count differs, and the extra shared buffer plus
+// its __syncthreads cost more than that. Strided-within-a-warp is a bandwidth
+// problem only when the lines are not revisited.
+//
+// So the ~3x against llama.cpp's Q6_K MMQ (33.9 us a call against ~102.7) is
+// still unexplained, with alignment, mma decomposition and coalescing all ruled
+// out by measurement. What has NOT been tried: llama.cpp's stream-K
+// decomposition with its separate fixup kernel, and its tile shapes -- it uses a
+// different M/N tiling than the 64-row/32-col one here, which changes both
+// occupancy and how much of each block a warp re-reads.
 //
 // Q6_K CANNOT USE THE ASYNC STAGING
 // STYLE THAT MAKES THE Q4_K MMQ FAST. cp.async requires natural 4/8/16-byte
