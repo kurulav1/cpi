@@ -1473,9 +1473,16 @@ bool launch_kquant_mmq(const std::uint8_t* w, KQuantType type, const half* x, ha
   if (type == KQuantType::Q6_K) {
     // Q6_K needs no group sums: its values are (q-32), which is already signed,
     // so the mma result is the dot product with no correction term.
+    // NT sets rows per block (2*NT*8), so it sets the grid. The Q6_K weight this
+    // path serves is wv at 1024 rows: at NT=2 that is 32 blocks on a 170-SM part,
+    // which is why the kernel measured 139 us a call against the Q4_K MMQ's 78
+    // for roughly a seventh of the bytes. NT=1 quadruples the grid.
     if (g_kq_tune.mmq_nt >= 4) {
       kquant_mmq_q6k_kernel<4>
           <<<(rows + 63) / 64, 256, 0, stream>>>(w, xq, xs, y, rows, cols, batch, ldy);
+    } else if (g_kq_tune.mmq_nt == 1) {
+      kquant_mmq_q6k_kernel<1>
+          <<<(rows + 15) / 16, 256, 0, stream>>>(w, xq, xs, y, rows, cols, batch, ldy);
     } else {
       kquant_mmq_q6k_kernel<2>
           <<<(rows + 31) / 32, 256, 0, stream>>>(w, xq, xs, y, rows, cols, batch, ldy);
