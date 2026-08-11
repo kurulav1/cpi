@@ -1627,15 +1627,18 @@ bool launch_kquant_mmq(const std::uint8_t* w, KQuantType type, const half* x, ha
     }
     const bool us6 = sp6 > 1 && ensure_mmq_partial(static_cast<std::size_t>(batch) * rows);
     const dim3 g6(static_cast<unsigned>(bb6), us6 ? static_cast<unsigned>(sp6) : 1u);
-    if (us6) {
-      kquant_mmq_q6k_kernel<2, true>
-          <<<g6, 256, 0, stream>>>(w, xq, xs, y, g_mmq_partial, rows, cols, batch, ldy);
-      kquant_mmq_finalize_kernel<<<(rows + 255) / 256, 256, 0, stream>>>(g_mmq_partial, y, rows,
-                                                                        batch, ldy);
+    // NT sets the N tile (2*NT*8 columns a block) and so the grid. llama.cpp's
+    // MMQ uses different M/N tiling than the 64x32 here, and tile shape is one of
+    // two things its profile shows it doing differently that has not been tried.
+#define CPI_MMQ_Q6K(N)                                                                         do {                                                                                           const dim3 gg(static_cast<unsigned>((rows + (2 * (N) * 8) - 1) / (2 * (N) * 8)),                            us6 ? static_cast<unsigned>(sp6) : 1u);                                        if (us6) {                                                                                     kquant_mmq_q6k_kernel<N, true>                                                                    <<<gg, 256, 0, stream>>>(w, xq, xs, y, g_mmq_partial, rows, cols, batch, ldy);            kquant_mmq_finalize_kernel<<<(rows + 255) / 256, 256, 0, stream>>>(g_mmq_partial, y,                                                                             rows, batch, ldy);        } else {                                                                                        kquant_mmq_q6k_kernel<N, false>                                                                    <<<gg, 256, 0, stream>>>(w, xq, xs, y, nullptr, rows, cols, batch, ldy);                }                                                                                           } while (0)
+    if (g_kq_tune.mmq_nt >= 4) {
+      CPI_MMQ_Q6K(4);
+    } else if (g_kq_tune.mmq_nt <= 1) {
+      CPI_MMQ_Q6K(1);
     } else {
-      kquant_mmq_q6k_kernel<2, false>
-          <<<g6, 256, 0, stream>>>(w, xq, xs, y, nullptr, rows, cols, batch, ldy);
+      CPI_MMQ_Q6K(2);
     }
+#undef CPI_MMQ_Q6K
     return true;
   }
   // NT trades output-tile width against registers and grid size.
