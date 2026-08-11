@@ -1240,6 +1240,19 @@ void LlamaEngine::initialize(const EngineOptions& options) {
     std::cout << "\n";
   }
 
+  // A batched decode step ends in a stream sync to read the sampled tokens back,
+  // and the next step cannot start until the host has them. On Windows that wake
+  // is a WDDM scheduling event, and its latency lands squarely in the gap that
+  // nsys shows between steps -- about 4.3 ms a step at B=32, most of which the
+  // CUDA graph did not recover because it is not launch overhead. Spinning
+  // instead of blocking trades a busy core for a faster wake.
+  //
+  // Must precede context creation, so it sits above cudaSetDevice. Off by
+  // default: it burns a core, which is the wrong trade for a machine doing
+  // anything else. CPI_CUDA_SPIN=1 enables.
+  if (const char* spin = std::getenv("CPI_CUDA_SPIN"); spin != nullptr && *spin == '1') {
+    cudaSetDeviceFlags(cudaDeviceScheduleSpin);
+  }
   CUDA_CHECK(cudaSetDevice(0));
   // Prefill chunk = tokens per batched prefill pass. With attention on the tensor cores, prefill
   // is host-API-call bound, not GPU-bound, so doubling the chunk halves the passes and API traffic;
