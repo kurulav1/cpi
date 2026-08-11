@@ -1307,7 +1307,31 @@ __global__ void kquant_mmq_finalize_kernel(float* __restrict__ partial, __half* 
 // Q4_K on int8 tensor cores. Same activation preparation as the dp4a path; the
 // difference is the inner product runs on mma instead of scalar FMAs. sm_80+
 // only -- the caller checks compute capability.
-// FALSIFIED, and the reason is structural: Q6_K CANNOT USE THE ASYNC STAGING
+// FALSIFIED TWICE MORE, and the second one closes off the compute theories.
+//
+// (a) llama.cpp does NOT use cp.async for Q6_K either. Its load_tiles_q6_K uses
+// plain loads and unpacks 6-bit into int8 in shared at staging time -- the same
+// shape as the kernel below, down to the __vsubss4(x, 0x20202020) centering. So
+// the 210-byte alignment wall is not what separates the two, and the aligned
+// repack is not the lever it looked like.
+//
+// (b) The mma decomposition is not the bottleneck either. llama.cpp issues its
+// two mma over DISJOINT k-ranges with full b fragments and scales each
+// accumulator afterwards, where this kernel issues two over the same range with
+// half of b zeroed -- nominally a 2x waste. Rewriting it to two m16n8k16 over
+// disjoint ranges is numerically exact and bought NOTHING: w2 34.0 -> 34.5 us,
+// wv 28.3 -> 35.9, i.e. worse. Halving the tensor-core work changed nothing, so
+// this kernel is not mma-bound. Reverted.
+//
+// What that leaves: the harness (L2-resident) says this kernel is fine -- w2 runs
+// 0.72 us/MB against the Q4_K MMQ's 0.85 -- while the engine (DRAM) says Q6_K
+// MMQ manages ~138 GB/s against Q4_K MMQ's ~495. A kernel that looks good from
+// cache and bad from memory has a DRAM ACCESS PATTERN problem, not a compute one.
+// The obvious suspect is that a Q6_K block scatters across three disjoint regions
+// (ql at 0, qh at 128, scales at 192) inside 210 bytes, where Q4_K touches two
+// inside 144. Measure that before writing more of this kernel.
+//
+// Q6_K CANNOT USE THE ASYNC STAGING
 // STYLE THAT MAKES THE Q4_K MMQ FAST. cp.async requires natural 4/8/16-byte
 // alignment on its source, and a Q6_K block is 210 bytes -- not a multiple of 4,
 // let alone 16 -- so p shifts alignment every block. Q4_K's 144-byte blocks are a
