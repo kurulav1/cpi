@@ -1323,13 +1323,25 @@ __global__ void kquant_mmq_finalize_kernel(float* __restrict__ partial, __half* 
 // wv 28.3 -> 35.9, i.e. worse. Halving the tensor-core work changed nothing, so
 // this kernel is not mma-bound. Reverted.
 //
-// What that leaves: the harness (L2-resident) says this kernel is fine -- w2 runs
-// 0.72 us/MB against the Q4_K MMQ's 0.85 -- while the engine (DRAM) says Q6_K
-// MMQ manages ~138 GB/s against Q4_K MMQ's ~495. A kernel that looks good from
-// cache and bad from memory has a DRAM ACCESS PATTERN problem, not a compute one.
-// The obvious suspect is that a Q6_K block scatters across three disjoint regions
-// (ql at 0, qh at 128, scales at 192) inside 210 bytes, where Q4_K touches two
-// inside 144. Measure that before writing more of this kernel.
+// What that leaves is the DRAM access pattern, and the staging below is the
+// suspect. Each thread takes a contiguous 16-byte chunk at offset 16*t and reads
+// it as eight uint16 -- two-byte loads are forced, because a 210-byte block
+// stride leaves p only 2-byte aligned. At any one instruction the warp is then
+// reading 16*t + 2*k: two bytes per thread at a sixteen-byte stride, so a 32-byte
+// sector serves two lanes and roughly seven eighths of every fetch is discarded.
+//
+// That is invisible from L2 and ruinous from DRAM, which is exactly the signature
+// measured: 0.72 us/MB here against the Q4_K MMQ's 0.85 when the weight is
+// cache-resident, but ~138 GB/s against its ~495 in the engine. llama.cpp's
+// equivalent runs ~33.9 us a call where this one runs ~102.7.
+//
+// The fix is not a wider load -- alignment forbids it -- but a different
+// assignment: let consecutive lanes read consecutive uint16 (lane j takes u = j,
+// j+8, j+16, ...) so each instruction covers a contiguous span. That means the
+// lane no longer holds the bytes it needs to unpack, so the unpack has to move
+// out of staging and into the fragment build, staging raw bytes into shared
+// instead. That is the same shape as the Q4_K async kernel, minus cp.async, and
+// it is where the ~3x is.
 //
 // Q6_K CANNOT USE THE ASYNC STAGING
 // STYLE THAT MAKES THE Q4_K MMQ FAST. cp.async requires natural 4/8/16-byte
