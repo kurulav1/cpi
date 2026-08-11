@@ -245,6 +245,9 @@ bool LlamaEngine::prefill_attention_tensorcore(const void* q, const void* k_laye
 }
 
 bool LlamaEngine::ensure_q8_scratch(int batch, int cols) {
+  // Same hazard as the kquant scratch: growing this inside a captured stream
+  // poisons the capture and the error names something else entirely.
+  kernels::capture_guard("engine q8 activation scratch");
   const std::size_t xb = static_cast<std::size_t>(batch) * static_cast<std::size_t>(cols);
   const std::size_t mb =
       static_cast<std::size_t>(batch) * static_cast<std::size_t>(cols / 32) * sizeof(float);

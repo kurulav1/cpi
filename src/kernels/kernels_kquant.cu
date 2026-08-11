@@ -15,6 +15,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 
 #include <cuda_pipeline.h>
@@ -2042,8 +2043,11 @@ int g_dp4a_cols = 0;
 // rejected, and this scratch is sized from a kernel that the decode graph
 // captures. Reserving lazily crashed capture with "operation failed due to a
 // previous error during capture" -- the same trap the GEMM scratch hit.
+bool g_capture_active = false;
+
 bool ensure_dp4a_scratch(int cols) {
   if (cols <= g_dp4a_cols) return g_dp4a_xq != nullptr;
+  capture_guard("kquant dp4a activation scratch");
   if (g_dp4a_xq) cudaFree(g_dp4a_xq);
   if (g_dp4a_xs) cudaFree(g_dp4a_xs);
   if (g_dp4a_sum) cudaFree(g_dp4a_sum);
@@ -2161,6 +2165,22 @@ static void launch_kquant_matvec_impl(const std::uint8_t* w, KQuantType type, co
     CPI_KQ_DISPATCH(1)
   }
 #undef CPI_KQ_DISPATCH
+}
+
+void set_capture_active(bool active) { g_capture_active = active; }
+bool capture_active() { return g_capture_active; }
+
+bool capture_guard(const char* what) {
+  if (!g_capture_active) return false;
+  static const bool strict = [] {
+    const char* e = std::getenv("CPI_CAPTURE_STRICT");
+    return e && *e == '1';
+  }();
+  std::fprintf(stderr, "[capture] ALLOCATION DURING GRAPH CAPTURE: %s\n", what);
+  std::fprintf(stderr, "[capture]   capture fails later at cudaStreamEndCapture naming nothing;\n");
+  std::fprintf(stderr, "[capture]   reserve this before capture (see the reserve_* helpers).\n");
+  if (strict) std::abort();
+  return true;
 }
 
 void reserve_kquant_dp4a_scratch(int cols) { ensure_dp4a_scratch(cols); }

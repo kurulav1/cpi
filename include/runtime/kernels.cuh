@@ -1328,6 +1328,23 @@ bool launch_kquant_mmq(const std::uint8_t* w, KQuantType type, const half* x, ha
 // Accumulates into y instead of overwriting it, folding a residual add into the
 // projection's epilogue. The fp16 path has always done this; without it the
 // packed path pays an extra kernel per layer for wo and again for w2.
+// ── Graph-capture safety ─────────────────────────────────────────────────────
+//
+// Allocating inside a captured stream is rejected, but CUDA reports it as
+// "operation failed due to a previous error during capture" at the END of
+// capture, naming nothing. That turns a one-line bug into an afternoon, and it
+// has cost this codebase two of them.
+//
+// The engine marks the capture region and anything that might allocate calls
+// capture_guard() with a label first, so the failure names itself at the moment
+// it happens instead of surfacing anonymously later. Set CPI_CAPTURE_STRICT=1 to
+// abort on the spot rather than warn, which is what you want while bringing a
+// new path under capture.
+void set_capture_active(bool active);
+bool capture_active();
+// Returns true if a capture is in progress (i.e. this call is a problem).
+bool capture_guard(const char* what);
+
 // Sizes the dp4a matvec's activation scratch. Must be called before the decode
 // graph is captured: allocating inside a captured stream is rejected.
 void reserve_kquant_dp4a_scratch(int cols);

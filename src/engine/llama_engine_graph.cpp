@@ -246,6 +246,13 @@ void LlamaEngine::init_greedy_decode_graph() {
 
   destroy_greedy_decode_graph();
   CUDA_CHECK(cudaStreamBeginCapture(compute_stream_, cudaStreamCaptureModeGlobal));
+  kernels::set_capture_active(true);
+  // A detector that never fires is indistinguishable from one that does not
+  // work, which is the failure mode this whole guard exists to avoid. This
+  // proves it on demand: CPI_CAPTURE_SELFTEST=1 should print the warning.
+  if (std::getenv("CPI_CAPTURE_SELFTEST") != nullptr) {
+    kernels::capture_guard("self-test, expected during capture");
+  }
 
   kernels::launch_embedding_lookup(static_cast<const __half*>(d_tok_embeddings_), d_token_id_,
                                    static_cast<__half*>(d_x_), 1, hidden, compute_stream_);
@@ -553,6 +560,7 @@ void LlamaEngine::init_greedy_decode_graph() {
   kernels::launch_copy_int(d_argmax_, d_token_id_, compute_stream_);
   kernels::launch_increment_int(d_decode_position_, compute_stream_);
 
+  kernels::set_capture_active(false);
   CUDA_CHECK(cudaStreamEndCapture(compute_stream_, &greedy_decode_graph_));
   if (options_.verbose) {
     std::cout << "[engine] init_greedy_decode_graph: captured, instantiating\n";
@@ -727,6 +735,13 @@ void LlamaEngine::init_logits_decode_graph() {
 
   destroy_logits_decode_graph();
   CUDA_CHECK(cudaStreamBeginCapture(compute_stream_, cudaStreamCaptureModeGlobal));
+  kernels::set_capture_active(true);
+  // A detector that never fires is indistinguishable from one that does not
+  // work, which is the failure mode this whole guard exists to avoid. This
+  // proves it on demand: CPI_CAPTURE_SELFTEST=1 should print the warning.
+  if (std::getenv("CPI_CAPTURE_SELFTEST") != nullptr) {
+    kernels::capture_guard("self-test, expected during capture");
+  }
 
   kernels::launch_embedding_lookup(static_cast<const __half*>(d_tok_embeddings_), d_token_id_,
                                    static_cast<__half*>(d_x_), 1, hidden, compute_stream_);
@@ -1001,6 +1016,7 @@ void LlamaEngine::init_logits_decode_graph() {
   project_lm_head_logits(static_cast<const __half*>(d_x_norm_), static_cast<float*>(d_logits_));
   // Note: no argmax/copy_int/increment_int; caller reads d_logits_ for sampling.
 
+  kernels::set_capture_active(false);
   CUDA_CHECK(cudaStreamEndCapture(compute_stream_, &logits_decode_graph_));
   CUDA_CHECK(
       cudaGraphInstantiate(&logits_decode_graph_exec_, logits_decode_graph_, nullptr, nullptr, 0));
