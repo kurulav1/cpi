@@ -137,6 +137,9 @@ void run_case(const Case& c, int rows, int cols) {
 // tensor proves the layout assumptions (row/col order, block-per-row stride)
 // against a file a quantizer actually wrote.
 void run_real(const std::string& gguf_path, bool bandwidth) {
+  // CPI_MMQ_BENCH=N times the batched tensor-core path at batch N per shape.
+  const char* mb = std::getenv("CPI_MMQ_BENCH");
+  const int mmq_batch = mb ? atoi(mb) : 0;
   model::GgufLoader g;
   try {
     g.open(gguf_path);
@@ -345,6 +348,69 @@ void run_real(const std::string& gguf_path, bool bandwidth) {
         gbps = static_cast<double>(pk.bytes) * kIters / (ms * 1e-3) / 1e9;
         cudaEventDestroy(t0);
         cudaEventDestroy(t1);
+      }
+
+      // Same for the batched tensor-core path. The matvec bench above is
+      // launch-overhead bound and cannot be used to tune anything -- every shape
+      // came out at 18-26 us regardless of size. MMQ is not: at a real shape it
+      // runs 80-140 us a call, so launch cost is a few percent and bytes/time is
+      // a signal you can iterate a kernel against. That matters because the
+      // end-to-end batched delta for one of these kernels is ~1% of a step,
+      // which is too coarse to tune with.
+      if (mmq_batch > 0 && (pk.kind == 0 || pk.kind == 2) && pk.cols % 256 == 0) {
+        const int B = mmq_batch;
+        std::int8_t* mq = nullptr;
+        float* ms = nullptr;
+        float* msum = nullptr;
+        __half* mx = nullptr;
+        __half* my = nullptr;
+        const int mg = pk.cols / 32;
+        if (cudaMalloc(&mq, static_cast<std::size_t>(B) * pk.cols) == cudaSuccess &&
+            cudaMalloc(&ms, static_cast<std::size_t>(B) * mg * sizeof(float)) == cudaSuccess &&
+            cudaMalloc(&msum, static_cast<std::size_t>(B) * mg * sizeof(float)) == cudaSuccess &&
+            cudaMalloc(&mx, static_cast<std::size_t>(B) * pk.cols * sizeof(__half)) ==
+                cudaSuccess &&
+            cudaMalloc(&my, static_cast<std::size_t>(B) * rows * sizeof(__half)) == cudaSuccess) {
+          std::vector<__half> hx(static_cast<std::size_t>(B) * pk.cols);
+          for (std::size_t i = 0; i < hx.size(); ++i) {
+            hx[i] = __float2half(0.02f * static_cast<float>((i % 61) - 30));
+          }
+          cudaMemcpy(mx, hx.data(), hx.size() * sizeof(__half), cudaMemcpyHostToDevice);
+          bool ok_mmq = true;
+          for (int it = 0; it < 3; ++it) {
+            ok_mmq = kernels::launch_kquant_mmq(d_full, static_cast<kernels::KQuantType>(pk.kind),
+                                                mx, my, rows, pk.cols, B, rows, mq, ms, msum,
+                                                nullptr);
+          }
+          cudaDeviceSynchronize();
+          if (ok_mmq) {
+            cudaEvent_t m0, m1;
+            cudaEventCreate(&m0);
+            cudaEventCreate(&m1);
+            constexpr int kMmqIters = 30;
+            cudaEventRecord(m0);
+            for (int it = 0; it < kMmqIters; ++it) {
+              kernels::launch_kquant_mmq(d_full, static_cast<kernels::KQuantType>(pk.kind), mx, my,
+                                         rows, pk.cols, B, rows, mq, ms, msum, nullptr);
+            }
+            cudaEventRecord(m1);
+            cudaEventSynchronize(m1);
+            float mms = 0.0f;
+            cudaEventElapsedTime(&mms, m0, m1);
+            const double us = mms * 1e3 / kMmqIters;
+            std::printf("  %-28s MMQ B=%-3d %8.1f us  %7.1f GB/s\n", name.c_str(), B, us,
+                        static_cast<double>(pk.bytes) / (us * 1e-6) / 1e9);
+            cudaEventDestroy(m0);
+            cudaEventDestroy(m1);
+          } else {
+            std::printf("  %-28s MMQ B=%-3d declined\n", name.c_str(), B);
+          }
+        }
+        cudaFree(mq);
+        cudaFree(ms);
+        cudaFree(msum);
+        cudaFree(mx);
+        cudaFree(my);
       }
       cudaFree(d_full);
       cudaFree(d_yfull);
