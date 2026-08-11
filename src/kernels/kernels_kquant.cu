@@ -1267,15 +1267,17 @@ __global__ __launch_bounds__(256) void kquant_mmq_q4k_async_kernel(
 // Q4_K on int8 tensor cores. Same activation preparation as the dp4a path; the
 // difference is the inner product runs on mma instead of scalar FMAs. sm_80+
 // only -- the caller checks compute capability.
-// Q6_K on the tensor cores. OFF BY DEFAULT: it is correct and gated but it
-// LOSES to dequant-and-cuBLAS -- -14.4/-6.3/-6.7/-3.8/-2.1% at B=8/16/32/48/64,
-// medians of three. Removing the dequant was not enough to pay for how this
-// kernel gets its bytes. Two suspects, in order: the staging below does 32
-// single-byte global loads per thread because a 210-byte Q6_K block leaves p
-// only 2-byte aligned, where the Q4_K kernel stages with uint4; and each 32-k
-// step issues two mma instead of one. The first is worth fixing before the
-// second -- uint16 pairs would halve the load count -- and neither has been
-// tried. CPI_KQUANT_MMQ_Q6K=1 turns it on.
+// Q6_K on the tensor cores. OFF BY DEFAULT: correct and gated, but it does not
+// beat dequant-and-cuBLAS. Against it, at B=8/16/32/48/64, medians of three:
+//   byte-at-a-time staging: -14.4 / -6.3 / -6.7 / -3.8 / -2.1%
+//   uint16-pair staging:     -9.5 / -1.0 / -2.8 / +0.2 / +0.2%
+// so halving the load count recovered about half the deficit and the kernel now
+// breaks even at large batch, but still loses where MMQ matters most. What is
+// left is most likely the mma count: a scale per 16 weights does not line up
+// with mma.m16n8k32, so each 32-k step issues two mma with the other half of the
+// b fragment zeroed, and that is structural to the format rather than something
+// tuning fixes. Anyone picking this up should look there, or at giving the
+// staging a layout that permits 4-byte loads. CPI_KQUANT_MMQ_Q6K=1 turns it on.
 //
 // Q6_K is a quarter of a Q4_K_M by bytes -- ffn_down
 // for most layers plus wv -- and it was the reason a batched step still expanded
@@ -1354,16 +1356,27 @@ __global__ __launch_bounds__(256) void kquant_mmq_q6k_kernel(
         const int n = c >> 6, h = (c >> 5) & 1, l0 = c & 31;
         const int off_lo = (n << 7) + (h << 5) + l0;
         const int sl = 2 * h, sh = 4 + 2 * h;
-        for (int i = 0; i < 16; ++i) {
-          int vlo = 0, vhi = 0;
-          if (p != nullptr) {
-            const std::uint32_t byte = p[c + i];
-            const std::uint32_t hb = p[128 + (n << 5) + l0 + i];
-            vlo = static_cast<int>((byte & 0x0Fu) | (((hb >> sl) & 3u) << 4)) - 32;
-            vhi = static_cast<int>((byte >> 4) | (((hb >> sh) & 3u) << 4)) - 32;
+        // Read the run as uint16 pairs, not byte at a time. A 210-byte block
+        // leaves p only 2-byte aligned so uint4 is out -- 210 % 4 == 2, so even
+        // 4-byte alignment alternates between super-blocks -- but 16-bit loads
+        // are always safe and halve the count from 32 per thread to 16.
+        const std::uint16_t* qlp = reinterpret_cast<const std::uint16_t*>(p + c);
+        const std::uint16_t* qhp =
+            reinterpret_cast<const std::uint16_t*>(p + 128 + (n << 5) + l0);
+#pragma unroll
+        for (int i2 = 0; i2 < 8; ++i2) {
+          const std::uint32_t qw = (p != nullptr) ? qlp[i2] : 0u;
+          const std::uint32_t hw = (p != nullptr) ? qhp[i2] : 0u;
+#pragma unroll
+          for (int k = 0; k < 2; ++k) {
+            const int i = 2 * i2 + k;
+            const std::uint32_t byte = (qw >> (8 * k)) & 0xFFu;
+            const std::uint32_t hb = (hw >> (8 * k)) & 0xFFu;
+            const int vlo = static_cast<int>((byte & 0x0Fu) | (((hb >> sl) & 3u) << 4)) - 32;
+            const int vhi = static_cast<int>((byte >> 4) | (((hb >> sh) & 3u) << 4)) - 32;
+            Bs[r][off_lo + i] = static_cast<std::int8_t>(vlo);
+            Bs[r][off_lo + 64 + i] = static_cast<std::int8_t>(vhi);
           }
-          Bs[r][off_lo + i] = static_cast<std::int8_t>(vlo);
-          Bs[r][off_lo + 64 + i] = static_cast<std::int8_t>(vhi);
         }
         // Two of the sixteen scale groups per thread.
         float d = 0.0f;
