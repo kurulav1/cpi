@@ -335,7 +335,7 @@ bool LlamaEngine::packed_matmul(const PackedWeight& w, const void* x, void* y, i
                                  static_cast<kernels::KQuantType>(w.kind),
                                  static_cast<const __half*>(x), static_cast<__half*>(y) + row0,
                                  w.rows, w.cols, batch, ldy, d_q8_x_, d_q8_scale_, d_q8_sum_,
-                                 stream)) {
+                                 stream, reuse_x)) {
     ++packed_matmul_calls_;
     return true;
   }

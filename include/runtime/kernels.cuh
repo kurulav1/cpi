@@ -1321,9 +1321,11 @@ bool launch_kquant_matmul_dp4a(const std::uint8_t* w, KQuantType type, const hal
 // Q4_K on int8 tensor cores (mma.m16n8k32.s8, sm_80+): the weight stays packed
 // AND the inner product runs on tensor cores, which is what the expand-and-cuBLAS
 // fallback was winning on. Batch must fit one M tile (64). Same scratch as above.
+// reuse_x: the caller has already had this exact activation quantized into
+// xq/xs/xsum by an immediately preceding call of the same width, as q/k/v do.
 bool launch_kquant_mmq(const std::uint8_t* w, KQuantType type, const half* x, half* y, int rows,
                        int cols, int batch, int ldy, std::int8_t* xq, float* xs, float* xsum,
-                       cudaStream_t stream);
+                       cudaStream_t stream, bool reuse_x = false);
 
 // Accumulates into y instead of overwriting it, folding a residual add into the
 // projection's epilogue. The fp16 path has always done this; without it the

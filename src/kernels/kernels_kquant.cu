@@ -1462,14 +1462,22 @@ __global__ __launch_bounds__(256) void kquant_mmq_q6k_kernel(
 
 bool launch_kquant_mmq(const std::uint8_t* w, KQuantType type, const half* x, half* y, int rows,
                        int cols, int batch, int ldy, std::int8_t* xq, float* xs, float* xsum,
-                       cudaStream_t stream) {
+                       cudaStream_t stream, bool reuse_x) {
   if (type != KQuantType::Q4_K && type != KQuantType::Q6_K) return false;
   if (type == KQuantType::Q6_K && g_kq_tune.mmq_q6k == 0) return false;
   if (batch < 1 || batch > kMmqBM || cols % 256 != 0) return false;
   const int groups_per_row = cols >> 5;
   const int total_groups = batch * groups_per_row;
-  quantize_q8_1_groups_kernel<<<(total_groups + 7) / 8, 256, 0, stream>>>(x, xq, xs, xsum, cols,
-                                                                         groups_per_row);
+  // The activation is quantized per call, and at batch the q, k and v
+  // projections all read the same one -- so it was being done three times a
+  // layer. The microbenchmark shows why that matters: Q4_K MMQ takes about the
+  // same 41 us for 2.4 MB as for 9.4, i.e. a large per-call fixed cost, and this
+  // is a big part of it. Same redundancy the single-stream path had; the caller
+  // is the only thing that knows x is unchanged, so it has to say so.
+  if (!reuse_x) {
+    quantize_q8_1_groups_kernel<<<(total_groups + 7) / 8, 256, 0, stream>>>(x, xq, xs, xsum, cols,
+                                                                           groups_per_row);
+  }
   if (type == KQuantType::Q6_K) {
     // Q6_K needs no group sums: its values are (q-32), which is already signed,
     // so the mma result is the dot product with no correction term.
