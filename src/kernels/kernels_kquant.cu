@@ -52,6 +52,8 @@ KQuantTuning g_kq_tune = []() {
   t.matvec_share_x = env_int("CPI_KQUANT_MATVEC_SHARE_X", t.matvec_share_x);
   t.matvec_gsum = env_int("CPI_KQUANT_MATVEC_GSUM", t.matvec_gsum);
   t.mmq_q6k = env_int("CPI_KQUANT_MMQ_Q6K", t.mmq_q6k);
+  t.mmq_splitk = env_int("CPI_KQUANT_MMQ_SPLITK", t.mmq_splitk);
+  t.mmq_split_target = env_int("CPI_KQUANT_MMQ_SPLIT_TARGET", t.mmq_split_target);
   t.matvec_vecx = env_int("CPI_KQUANT_MATVEC_VECX", t.matvec_vecx);
   return t;
 }();
@@ -1106,11 +1108,24 @@ __global__ __launch_bounds__(256) void kquant_mmq_q4k_kernel(
 //
 // M tile is 32 here, not 64: two tiles in flight double the activation storage,
 // and batches above 32 keep the single-buffered kernel.
-template <int NT>
+// SPLITK divides the super-block loop across gridDim.y. The loop is the whole
+// cost: a block walks every super-block serially, each stage a
+// __pipeline_wait_prior and a __syncthreads, and the microbenchmark shows the
+// kernel does not care how many bytes it reads -- w13 has 3.5x wq's weight and
+// takes the same time, both at nsb=16, i.e. ~1.8 us per iteration at B=8. More
+// blocks does not help either (w13's 448 are no faster per call than wk's 16),
+// because the chain is inside a block. So shorten the chain and multiply the
+// blocks. Partials go to a float scratch via atomicAdd and a finalize pass folds
+// them into y.
+//
+// Note this is NOT the split-K that failed for the matvec: there a 4096-wide row
+// was 16 super-blocks and one block already consumed all 16 across its warps, so
+// chunking only idled warps. Here one block walks all 16 in sequence.
+template <int NT, bool SPLITK>
 __global__ __launch_bounds__(256) void kquant_mmq_q4k_async_kernel(
     const std::uint8_t* __restrict__ w, const std::int8_t* __restrict__ xq,
-    const float* __restrict__ as, const float* __restrict__ gsum, __half* __restrict__ y, int rows,
-    int cols, int batch, int ldy) {
+    const float* __restrict__ as, const float* __restrict__ gsum, __half* __restrict__ y,
+    float* __restrict__ partial, int rows, int cols, int batch, int ldy) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800)
   (void)w; (void)xq; (void)as; (void)gsum; (void)y; (void)rows; (void)cols; (void)batch; (void)ldy;
 #else
@@ -1179,12 +1194,20 @@ __global__ __launch_bounds__(256) void kquant_mmq_q4k_async_kernel(
 #pragma unroll
     for (int j = 0; j < 4; ++j) facc[i][j] = 0.0f;
 
-  stage(0, 0);
-  for (int sb = 0; sb < nsb; ++sb) {
-    const int buf = sb & 1;
-    if (sb + 1 < nsb) stage(sb + 1, buf ^ 1);
+  int sb_lo = 0, sb_hi = nsb;
+  if (SPLITK) {
+    const int chunk = (nsb + static_cast<int>(gridDim.y) - 1) / static_cast<int>(gridDim.y);
+    sb_lo = static_cast<int>(blockIdx.y) * chunk;
+    sb_hi = min(sb_lo + chunk, nsb);
+    if (sb_lo >= sb_hi) return;
+  }
+
+  stage(sb_lo, 0);
+  for (int sb = sb_lo; sb < sb_hi; ++sb) {
+    const int buf = (sb - sb_lo) & 1;
+    if (sb + 1 < sb_hi) stage(sb + 1, buf ^ 1);
     // Wait only for this tile; the next one keeps flying.
-    __pipeline_wait_prior(sb + 1 < nsb ? 1 : 0);
+    __pipeline_wait_prior(sb + 1 < sb_hi ? 1 : 0);
     __syncthreads();
 
     const int arow = 16 * mt;
@@ -1257,12 +1280,28 @@ __global__ __launch_bounds__(256) void kquant_mmq_q4k_async_kernel(
     for (int en = 0; en < 4; ++en) {
       const int lm = 16 * mt + rr[en], gn = blockNrow + nbase + cc[en];
       if (lm < batch && gn < rows) {
-        y[static_cast<std::size_t>(lm) * static_cast<std::size_t>(ldy) + gn] =
-            __float2half(facc[nt][en]);
+        if (SPLITK) {
+          atomicAdd(&partial[static_cast<std::size_t>(lm) * rows + gn], facc[nt][en]);
+        } else {
+          y[static_cast<std::size_t>(lm) * static_cast<std::size_t>(ldy) + gn] =
+              __float2half(facc[nt][en]);
+        }
       }
     }
   }
 #endif
+}
+
+// Folds split-K partials into y and leaves the scratch zeroed for the next call.
+__global__ void kquant_mmq_finalize_kernel(float* __restrict__ partial, __half* __restrict__ y,
+                                           int rows, int batch, int ldy) {
+  const int n = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (n >= rows) return;
+  for (int m = 0; m < batch; ++m) {
+    const std::size_t i = static_cast<std::size_t>(m) * rows + n;
+    y[static_cast<std::size_t>(m) * static_cast<std::size_t>(ldy) + n] = __float2half(partial[i]);
+    partial[i] = 0.0f;
+  }
 }
 
 // Q4_K on int8 tensor cores. Same activation preparation as the dp4a path; the
@@ -1460,6 +1499,21 @@ __global__ __launch_bounds__(256) void kquant_mmq_q6k_kernel(
 #endif
 }
 
+float* g_mmq_partial = nullptr;
+std::size_t g_mmq_partial_elems = 0;
+
+bool ensure_mmq_partial(std::size_t elems) {
+  if (elems <= g_mmq_partial_elems) return g_mmq_partial != nullptr;
+  capture_guard("kquant MMQ split-K partials");
+  if (g_mmq_partial) cudaFree(g_mmq_partial);
+  g_mmq_partial = nullptr;
+  g_mmq_partial_elems = 0;
+  if (cudaMalloc(&g_mmq_partial, elems * sizeof(float)) != cudaSuccess) return false;
+  cudaMemset(g_mmq_partial, 0, elems * sizeof(float));
+  g_mmq_partial_elems = elems;
+  return true;
+}
+
 bool launch_kquant_mmq(const std::uint8_t* w, KQuantType type, const half* x, half* y, int rows,
                        int cols, int batch, int ldy, std::int8_t* xq, float* xs, float* xsum,
                        cudaStream_t stream, bool reuse_x) {
@@ -1510,12 +1564,28 @@ bool launch_kquant_mmq(const std::uint8_t* w, KQuantType type, const half* x, ha
     // which is the opposite of what the block count suggests. Measure, do not
     // reason from grid size here.
     const int ant = g_kq_tune.mmq_async_nt;
+    const int base_blocks = ant >= 2 ? (rows + 63) / 64 : (rows + 31) / 32;
+    const int nsb = cols >> 8;
+    // Enough blocks to cover the SMs, but never so few super-blocks per block
+    // that the pipeline has nothing to overlap.
+    int split = 1;
+    if (g_kq_tune.mmq_splitk > 0 && base_blocks < g_kq_tune.mmq_split_target) {
+      split = (g_kq_tune.mmq_split_target + base_blocks - 1) / base_blocks;
+      split = min(split, max(1, nsb / 2));
+    }
+    const bool use_split =
+        split > 1 && ensure_mmq_partial(static_cast<std::size_t>(batch) * rows);
+    const dim3 grid(static_cast<unsigned>(base_blocks), use_split ? static_cast<unsigned>(split) : 1u);
+#define CPI_MMQ_ASYNC(N, S)                                                                    kquant_mmq_q4k_async_kernel<N, S>                                                                <<<grid, 256, 0, stream>>>(w, xq, xs, xsum, y, g_mmq_partial, rows, cols, batch, ldy)
     if (ant >= 2) {
-      kquant_mmq_q4k_async_kernel<2>
-          <<<(rows + 63) / 64, 256, 0, stream>>>(w, xq, xs, xsum, y, rows, cols, batch, ldy);
+      if (use_split) { CPI_MMQ_ASYNC(2, true); } else { CPI_MMQ_ASYNC(2, false); }
     } else {
-      kquant_mmq_q4k_async_kernel<1>
-          <<<(rows + 31) / 32, 256, 0, stream>>>(w, xq, xs, xsum, y, rows, cols, batch, ldy);
+      if (use_split) { CPI_MMQ_ASYNC(1, true); } else { CPI_MMQ_ASYNC(1, false); }
+    }
+#undef CPI_MMQ_ASYNC
+    if (use_split) {
+      kquant_mmq_finalize_kernel<<<(rows + 255) / 256, 256, 0, stream>>>(g_mmq_partial, y, rows,
+                                                                        batch, ldy);
     }
     return true;
   }

@@ -1275,7 +1275,12 @@ struct KQuantTuning {
   int mmq_nt = 2;        // n-tiles per warp-half, single-buffered mma kernel
   int mmq_async_nt = 2;  // same, double-buffered kernel
   int mmq_async = 1;
-  int mmq_q6k = 0;      // Q6_K on the tensor cores: correct, gated, and LOSES. See below.     // use the cp.async kernel when the batch fits
+  int mmq_q6k = 0;      // Q6_K on the tensor cores: correct, gated, and LOSES. See below.
+  // Split the MMQ super-block loop across blocks. That loop is the kernel's
+  // cost -- w13 has 3.5x wq's weight bytes and takes the same time -- so
+  // shortening the per-block chain is the lever, not more rows per block.
+  int mmq_splitk = 1;
+  int mmq_split_target = 340;  // ~2 blocks per SM on this part     // use the cp.async kernel when the batch fits
   int matvec_wpr = 8;    // warps cooperating on one row in the matvec
   // int8 activations + dp4a in the matvec. Changes numerics -- this is the same
   // trade llama.cpp's MMVQ makes by default -- but greedy decoding stayed
