@@ -1307,6 +1307,22 @@ __global__ void kquant_mmq_finalize_kernel(float* __restrict__ partial, __half* 
 // Q4_K on int8 tensor cores. Same activation preparation as the dp4a path; the
 // difference is the inner product runs on mma instead of scalar FMAs. sm_80+
 // only -- the caller checks compute capability.
+// FALSIFIED, and the reason is structural: Q6_K CANNOT USE THE ASYNC STAGING
+// STYLE THAT MAKES THE Q4_K MMQ FAST. cp.async requires natural 4/8/16-byte
+// alignment on its source, and a Q6_K block is 210 bytes -- not a multiple of 4,
+// let alone 16 -- so p shifts alignment every block. Q4_K's 144-byte blocks are a
+// multiple of 16, which is exactly why its async kernel works. Writing the async
+// version anyway produced worst_rel 1.0 and out-of-bounds writes that corrupted
+// unrelated Q4_K results; the same alignment wall forced uint16 loads in the
+// staging below.
+//
+// That matters because async staging is worth 22.8% on Q4_K (forcing it to the
+// scalar-staging kernel costs 1259 -> 972 tok/s), and it is the largest known
+// term in Q6_K MMQ being ~2.5x Q4_K per byte. So closing that gap needs Q6_K
+// REPACKED to an aligned stride (224 or 256 bytes a block), which is a converter
+// change, not a kernel one -- and note the reason is alignment, not the per-16
+// scale grouping that an earlier note blamed.
+//
 // Q6_K on the tensor cores. OFF BY DEFAULT: correct and gated, but it does not
 // beat dequant-and-cuBLAS. Against it, at B=8/16/32/48/64, medians of three:
 //   byte-at-a-time staging: -14.4 / -6.3 / -6.7 / -3.8 / -2.1%
