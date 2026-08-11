@@ -350,6 +350,18 @@ void run_real(const std::string& gguf_path, bool bandwidth) {
         cudaEventDestroy(t1);
       }
 
+      // WARNING: the GB/s reported here is an L2 number for anything that fits
+      // in cache, which on this part is everything in this model. The 5090 has
+      // roughly 96-128 MB of L2; w2 is 48 MB and w13 is 33, so thirty
+      // back-to-back iterations over one weight are served from L2 and never
+      // touch DRAM. That is why times look flat across weight sizes and why w2
+      // read "1416 GB/s" here while the same kernel averages 102.7 us in the
+      // engine, where each weight is read once per step from memory.
+      //
+      // Use this to compare KERNEL VARIANTS on one shape -- that comparison is
+      // still fair, both variants get the same cache -- and never to conclude
+      // anything about achieved bandwidth or to compare across shapes.
+      //
       // Same for the batched tensor-core path. The matvec bench above is
       // launch-overhead bound and cannot be used to tune anything -- every shape
       // came out at 18-26 us regardless of size. MMQ is not: at a real shape it
