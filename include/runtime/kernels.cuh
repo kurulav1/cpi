@@ -433,7 +433,12 @@ void launch_attention_step_device_pos(const half* q, const half* k_cache, const 
                                       int num_kv_heads, int head_dim, cudaStream_t stream,
                                       float* scratch_m = nullptr, float* scratch_l = nullptr,
                                       float* scratch_o = nullptr, int scratch_chunks = 0,
-                                      bool allow_split = true, int window = 0);
+                                      bool allow_split = true, int window = 0,
+                                      // Set true when the split path also wrote the q8_1
+                                      // form of `out` into the shared activation scratch,
+                                      // so the output projection can skip its own
+                                      // quantize pass.
+                                      bool* emitted_q8 = nullptr);
 
 // launch_store_kv_device_pos
 //

@@ -929,7 +929,8 @@ __device__ __forceinline__ void block_reduce_into(float v, float* red, int tid, 
 
 __global__ void attention_step_chunk_reduce_device_pos_kernel(
     const float* chunk_m, const float* chunk_l, const float* chunk_o, half* out,
-    const int* position_ptr, int num_heads, int head_dim, int chunk_size, int scratch_chunks) {
+    const int* position_ptr, int num_heads, int head_dim, int chunk_size, int scratch_chunks,
+    std::int8_t* q8, float* q8_scale, float* q8_sum) {
   const int seq_len = position_ptr[0] + 1;
   const int head = blockIdx.x;
   const int tid = threadIdx.x;
@@ -966,18 +967,44 @@ __global__ void attention_step_chunk_reduce_device_pos_kernel(
   __syncthreads();
 
   if (tid >= head_dim) return;
-  if (m <= neg_inf<float>()) {
-    out[head * head_dim + tid] = __float2half(0.0f);
-    return;
-  }
 
-  // No barrier in here: the weight is a broadcast read of one float per chunk.
   float acc = 0.0f;
-  for (int c = 0; c < chunk_count; ++c) {
-    const float w = __expf(chunk_m[head_base + c] - m);
-    acc += chunk_o[(head_base + c) * static_cast<std::size_t>(head_dim) + tid] * w;
+  if (m > neg_inf<float>()) {
+    // No barrier in here: the weight is a broadcast read of one float per chunk.
+    for (int c = 0; c < chunk_count; ++c) {
+      const float w = __expf(chunk_m[head_base + c] - m);
+      acc += chunk_o[(head_base + c) * static_cast<std::size_t>(head_dim) + tid] * w;
+    }
+    acc /= fmaxf(l_shared, 1e-8f);
   }
-  out[head * head_dim + tid] = __float2half(acc / fmaxf(l_shared, 1e-8f));
+  const half r = __float2half(acc);
+  out[head * head_dim + tid] = r;
+
+  // Also emit the q8_1 form the output projection wants, so the layer does not
+  // launch a separate quantize over what was just written. This is the last of
+  // the four per-layer quantize calls. head_dim is a multiple of 32 and tid maps
+  // one-to-one onto the head's elements, so a 32-value group is exactly one warp
+  // -- the cleanest of the three producers. Threads that dropped out above did so
+  // in whole warps, for the same reason, so the shuffles below are safe.
+  if (q8 == nullptr) return;
+  const float v = __half2float(r);
+  float amax = fabsf(v);
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, off));
+  }
+  const float scale = amax > 0.0f ? amax / 127.0f : 1.0f;
+  const float qscale = amax > 0.0f ? 127.0f / amax : 1.0f;
+  const int qi = max(-127, min(127, __float2int_rn(v * qscale)));
+  const int idx = head * head_dim + tid;
+  q8[idx] = static_cast<std::int8_t>(qi);
+  float sum = static_cast<float>(qi);
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) sum += __shfl_xor_sync(0xFFFFFFFFu, sum, off);
+  if ((tid & 31) == 0) {
+    q8_scale[idx >> 5] = scale;
+    q8_sum[idx >> 5] = sum * scale;
+  }
 }
 
 // CUDA Graph-friendly helper kernels for KV-cache writes and device-side
@@ -1981,7 +2008,7 @@ void launch_attention_step_device_pos(const half* q, const half* k_cache, const 
                                       half* out, const int* position, int num_heads,
                                       int num_kv_heads, int head_dim, cudaStream_t stream,
                                       float* scratch_m, float* scratch_l, float* scratch_o,
-                                      int scratch_chunks, bool allow_split, int window) {
+                                      int scratch_chunks, bool allow_split, int window, bool* emitted_q8) {
   // Cached once: getenv on every launch (per layer, per token) is needless work and, more to the
   // point, is not required to be thread-safe against a concurrent setenv in a threaded server.
   static const bool force_fallback = [] {
@@ -2080,9 +2107,19 @@ void launch_attention_step_device_pos(const half* q, const half* k_cache, const 
           q, k_cache, v_cache, scratch_m, scratch_l, scratch_o, position, num_heads, num_kv_heads,
           head_dim, split_chunk_size, scratch_chunks);
     }
+    // The reduce produces the output projection's activation, so it can leave the
+    // q8_1 form behind and save the layer a quantize launch. Only when the caller
+    // asked, since it claims the shared activation scratch.
+    std::int8_t* q8 = nullptr;
+    float* q8_scale = nullptr;
+    float* q8_sum = nullptr;
+    if (emitted_q8 != nullptr && (head_dim % 32) == 0 &&
+        acquire_kquant_q8_1_scratch(num_heads * head_dim, &q8, &q8_scale, &q8_sum)) {
+      *emitted_q8 = true;
+    }
     attention_step_chunk_reduce_device_pos_kernel<<<num_heads, threads, 0, stream>>>(
         scratch_m, scratch_l, scratch_o, out, position, num_heads, head_dim, reduce_chunk_size,
-        scratch_chunks);
+        scratch_chunks, q8, q8_scale, q8_sum);
     return;
   }
 

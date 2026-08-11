@@ -12,6 +12,19 @@
 
 namespace engine {
 
+namespace detail {
+// Whether the attention reduce emits the q8_1 form for wo. Present so the fusion
+// can be A/B'd back to back in one session; comparing ratios across sessions is
+// worth up to 2.6 points of drift and cannot resolve a change this small.
+inline bool fuse_att_q8() {
+  static const bool on = [] {
+    const char* e = std::getenv("CPI_FUSE_ATT_Q8");
+    return !(e && *e == '0');
+  }();
+  return on;
+}
+}  // namespace detail
+
 namespace {
 // rmsnorm that also leaves the q8_1 activation the integer matvec wants, so the
 // consumer can skip its own quantize pass. `allow` is false where the consumer
@@ -319,11 +332,16 @@ void LlamaEngine::init_greedy_decode_graph() {
     kernels::launch_store_kv_device_pos(
         static_cast<const __half*>(d_k_), static_cast<const __half*>(d_v_), k_layer, v_layer,
         d_decode_position_, kv_hidden, options_.max_context, compute_stream_);
+    // The split reduce can leave the q8_1 form of the attention output behind for
+    // wo, the last of the four per-layer quantize calls. Declined for TQ3, which
+    // rotates a copy of this before the projection reads it.
+    bool att_q8 = false;
     kernels::launch_attention_step_device_pos(
         static_cast<const __half*>(d_q_), k_layer, v_layer, static_cast<__half*>(d_att_),
         d_decode_position_, cfg.num_heads, cfg.num_kv_heads, head_dim, compute_stream_,
         d_attn_chunk_m_, d_attn_chunk_l_, d_attn_chunk_o_, attn_chunk_capacity_,
-        !options_.disable_split_attention);
+        !options_.disable_split_attention, 0,
+        (!detail::fuse_att_q8() || (tq && tq->wo) || !lw->wo_packed.active()) ? nullptr : &att_q8);
 
     if (tq && tq->wo) {
       CUDA_CHECK(cudaMemcpyAsync(d_x_tq3_, d_att_,
@@ -371,7 +389,7 @@ void LlamaEngine::init_greedy_decode_graph() {
              static_cast<kernels::KQuantType>(lw->wo_packed.kind),
              static_cast<const __half*>(d_att_),
              static_cast<__half*>(fuse ? d_x_ : d_ff3_), lw->wo_packed.rows, lw->wo_packed.cols,
-             compute_stream_, false);
+             compute_stream_, att_q8);
       fused_residual = fuse;
     } else if (resident_custom_wo_) {
       // Residual add folded into this projection's epilogue, so the shared add_inplace
@@ -791,11 +809,16 @@ void LlamaEngine::init_logits_decode_graph() {
     kernels::launch_store_kv_device_pos(
         static_cast<const __half*>(d_k_), static_cast<const __half*>(d_v_), k_layer, v_layer,
         d_decode_position_, kv_hidden, options_.max_context, compute_stream_);
+    // The split reduce can leave the q8_1 form of the attention output behind for
+    // wo, the last of the four per-layer quantize calls. Declined for TQ3, which
+    // rotates a copy of this before the projection reads it.
+    bool att_q8 = false;
     kernels::launch_attention_step_device_pos(
         static_cast<const __half*>(d_q_), k_layer, v_layer, static_cast<__half*>(d_att_),
         d_decode_position_, cfg.num_heads, cfg.num_kv_heads, head_dim, compute_stream_,
         d_attn_chunk_m_, d_attn_chunk_l_, d_attn_chunk_o_, attn_chunk_capacity_,
-        !options_.disable_split_attention);
+        !options_.disable_split_attention, 0,
+        (!detail::fuse_att_q8() || (tq && tq->wo) || !lw->wo_packed.active()) ? nullptr : &att_q8);
 
     if (tq && tq->wo) {
       CUDA_CHECK(cudaMemcpyAsync(d_x_tq3_, d_att_,
@@ -843,7 +866,7 @@ void LlamaEngine::init_logits_decode_graph() {
              static_cast<kernels::KQuantType>(lw->wo_packed.kind),
              static_cast<const __half*>(d_att_),
              static_cast<__half*>(fuse ? d_x_ : d_ff3_), lw->wo_packed.rows, lw->wo_packed.cols,
-             compute_stream_, false);
+             compute_stream_, att_q8);
       fused_residual = fuse;
     } else if (resident_custom_wo_) {
       // Residual add folded into this projection's epilogue, so the shared add_inplace
