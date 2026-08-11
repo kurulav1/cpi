@@ -1546,9 +1546,12 @@ bool ensure_mmq_partial(std::size_t elems) {
 
 bool launch_kquant_mmq(const std::uint8_t* w, KQuantType type, const half* x, half* y, int rows,
                        int cols, int batch, int ldy, std::int8_t* xq, float* xs, float* xsum,
-                       cudaStream_t stream, bool reuse_x) {
+                       cudaStream_t stream, bool reuse_x, bool force_q6k) {
   if (type != KQuantType::Q4_K && type != KQuantType::Q6_K) return false;
-  if (type == KQuantType::Q6_K && g_kq_tune.mmq_q6k == 0) return false;
+  // force_q6k is for callers whose alternative is dequant-and-cuBLAS rather than
+  // a good kernel -- the LM head. For layer weights Q6_K MMQ still loses, which
+  // is what mmq_q6k gates.
+  if (type == KQuantType::Q6_K && g_kq_tune.mmq_q6k == 0 && !force_q6k) return false;
   if (batch < 1 || batch > kMmqBM || cols % 256 != 0) return false;
   const int groups_per_row = cols >> 5;
   const int total_groups = batch * groups_per_row;

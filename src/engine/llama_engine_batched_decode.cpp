@@ -389,6 +389,24 @@ void LlamaEngine::reset_batch_graph() {
 // Project all `batch` rows of d_x_norm_ through the LM head into d_batch_logits_
 // ([batch][vocab] float) with a single GEMM (half in, float out via cublasGemmEx),
 // replacing a per-row loop of GEMV + sync + big D2H copy.
+bool LlamaEngine::lm_head_mmq_enabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("CPI_LM_HEAD_MMQ");
+    return !(e && *e == '0');
+  }();
+  return on;
+}
+
+bool LlamaEngine::ensure_batch_logits_half(std::size_t elems) {
+  if (elems <= d_batch_logits_h_cap_) return d_batch_logits_h_ != nullptr;
+  if (d_batch_logits_h_) cudaFree(d_batch_logits_h_);
+  d_batch_logits_h_ = nullptr;
+  d_batch_logits_h_cap_ = 0;
+  if (cudaMalloc(&d_batch_logits_h_, elems * sizeof(__half)) != cudaSuccess) return false;
+  d_batch_logits_h_cap_ = elems;
+  return true;
+}
+
 void LlamaEngine::batched_lm_head(int batch, int hidden, int vocab) {
   if (batch > d_batch_logits_cap_) {
     if (d_batch_logits_) cudaFree(d_batch_logits_);
@@ -396,12 +414,40 @@ void LlamaEngine::batched_lm_head(int batch, int hidden, int vocab) {
         cudaMalloc(&d_batch_logits_, static_cast<std::size_t>(batch) * vocab * sizeof(float)));
     d_batch_logits_cap_ = batch;
   }
+  // The LM head is the one packed weight that never attempted the tensor-core
+  // path: it went straight to dequant-and-cuBLAS, expanding 431 MB of Q6_K into
+  // ~1.05 GB of fp16 that cuBLAS then reads back -- over 2 GB of traffic a step
+  // for a weight MMQ reads once. nsys had that expansion at ~1.8 ms of a 14.6 ms
+  // step at B=32, and the layer weights stopped using this path once MMQ took
+  // them (matmul_declined is 0).
+  //
+  // MMQ writes fp16 and the sampler wants fp32, so it lands in a scratch and a
+  // convert pass follows: 8 MB written and read against the 2 GB it avoids.
+  bool head_done = false;
+  if (lm_head_packed_.active() && lm_head_mmq_enabled()) {
+    const int vrows = lm_head_packed_.rows;
+    if (ensure_batch_logits_half(static_cast<std::size_t>(batch) * vrows) &&
+        ensure_q8_scratch(batch, lm_head_packed_.cols) &&
+        kernels::launch_kquant_mmq(static_cast<const std::uint8_t*>(lm_head_packed_.data),
+                                   static_cast<kernels::KQuantType>(lm_head_packed_.kind),
+                                   static_cast<const __half*>(d_x_norm_),
+                                   static_cast<__half*>(d_batch_logits_h_), vrows,
+                                   lm_head_packed_.cols, batch, vrows, d_q8_x_, d_q8_scale_,
+                                   d_q8_sum_, compute_stream_, /*reuse_x=*/false,
+                                   /*force_q6k=*/true)) {
+      kernels::launch_convert_half_to_float(static_cast<const __half*>(d_batch_logits_h_),
+                                            d_batch_logits_, batch * vrows, compute_stream_);
+      head_done = true;
+    }
+  }
+  if (!head_done) {
     const void* head_src = lm_head_packed_.active()
                                ? dequant_packed_for_gemm(lm_head_packed_, compute_stream_)
                                : static_cast<const void*>(d_lm_head_);
   detail::dispatch_linear_rowmajor_weight(
       cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,
       const_cast<void*>(head_src), d_x_norm_, d_batch_logits_, vocab, hidden, batch, CUDA_R_32F);
+  }
   if (d_lm_head_bias_) {
     for (int b = 0; b < batch; ++b) {
       kernels::launch_add_bias_inplace_float_from_half(

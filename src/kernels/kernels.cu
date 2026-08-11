@@ -1506,6 +1506,16 @@ __global__ void rmsnorm_fast_q8_1_kernel(const half* __restrict__ x, const half*
   }
 }
 
+__global__ void convert_half_to_float_kernel(const __half* __restrict__ src,
+                                             float* __restrict__ dst, int n) {
+  const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (i < n) dst[i] = __half2float(src[i]);
+}
+
+void launch_convert_half_to_float(const half* src, float* dst, int n, cudaStream_t stream) {
+  convert_half_to_float_kernel<<<(n + 255) / 256, 256, 0, stream>>>(src, dst, n);
+}
+
 bool launch_rmsnorm_q8_1(const half* x, const half* weight, half* y, int cols, float eps,
                          cudaStream_t stream) {
   constexpr int kThreads = 256;

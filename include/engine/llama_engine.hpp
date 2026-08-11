@@ -722,6 +722,14 @@ private:
   int batch_graph_bucket_ = -1;
   void reset_batch_graph();
 
+  // fp16 logits scratch for the tensor-core LM head, plus its gate. Enabled by
+  // default: unlike the layer weights, the path it replaces is dequant-and-cuBLAS
+  // rather than a good kernel. CPI_LM_HEAD_MMQ=0 disables.
+  void* d_batch_logits_h_ = nullptr;
+  std::size_t d_batch_logits_h_cap_ = 0;
+  bool ensure_batch_logits_half(std::size_t elems);
+  static bool lm_head_mmq_enabled();
+
   // Scratch for the dp4a path's int8 activations, grown on demand.
   bool ensure_q8_scratch(int batch, int cols);
 

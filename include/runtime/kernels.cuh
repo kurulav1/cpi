@@ -1330,7 +1330,7 @@ bool launch_kquant_matmul_dp4a(const std::uint8_t* w, KQuantType type, const hal
 // xq/xs/xsum by an immediately preceding call of the same width, as q/k/v do.
 bool launch_kquant_mmq(const std::uint8_t* w, KQuantType type, const half* x, half* y, int rows,
                        int cols, int batch, int ldy, std::int8_t* xq, float* xs, float* xsum,
-                       cudaStream_t stream, bool reuse_x = false);
+                       cudaStream_t stream, bool reuse_x = false, bool force_q6k = false);
 
 // Accumulates into y instead of overwriting it, folding a residual add into the
 // projection's epilogue. The fp16 path has always done this; without it the
@@ -1538,6 +1538,9 @@ void launch_batched_argmax(const float* logits, int vocab, const int* blocked, i
 //   n      - number of elements
 //   stream - CUDA stream
 void launch_convert_bf16_to_fp16(const std::uint16_t* src, half* dst, int n, cudaStream_t stream);
+
+// Logits come out of the tensor-core path in fp16 and the sampler wants fp32.
+void launch_convert_half_to_float(const half* src, float* dst, int n, cudaStream_t stream);
 
 // launch_store_kv_int4
 //
