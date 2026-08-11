@@ -1105,17 +1105,32 @@ void LlamaEngine::run_batch_bench(const std::vector<int>& prompt, int max_new) {
       "batch throughput bench: prompt=%zu max_new=%d temp=%.2f (decode tokens/sec, eos disabled)\n",
       prompt.size(), max_new, bench_temp);
   std::printf("  %4s  %14s  %14s  %8s\n", "B", "serial_tok/s", "batched_tok/s", "speedup");
+  // CPI_BATCH_ONLY=N runs one batch size and skips the serial baseline. That
+  // baseline is B independent single-sequence generations, so it dominates any
+  // profile of this bench: a trace of the default sweep spends 40% in the
+  // batch-1 matvec and 10.9% in the single-sequence paged attention, and the
+  // batched kernels do not reach the top ten. Anything measuring the batched
+  // step -- nsys, ncu, a debugger -- wants this on, or it is measuring the
+  // baseline instead.
+  static const int only_b = [] {
+    const char* e = std::getenv("CPI_BATCH_ONLY");
+    return e ? atoi(e) : 0;
+  }();
   for (int B : sizes) {
     if (static_cast<long long>(B) * per_seq > options_.max_context) continue;
+    if (only_b > 0 && B != only_b) continue;
 
     // Serial baseline: B independent single-sequence generations, back to back.
-    const auto s0 = clock::now();
+    double serial_s = 0.0;
     long long serial_tokens = 0;
-    for (int i = 0; i < B; ++i) {
-      const auto out = greedy_generate_single(prompt, max_new, -1);
-      serial_tokens += static_cast<long long>(out.size());
+    if (only_b <= 0) {
+      const auto s0 = clock::now();
+      for (int i = 0; i < B; ++i) {
+        const auto out = greedy_generate_single(prompt, max_new, -1);
+        serial_tokens += static_cast<long long>(out.size());
+      }
+      serial_s = secs(clock::now() - s0);
     }
-    const double serial_s = secs(clock::now() - s0);
 
     // Batched: all B sequences concurrently through the scheduler.
     std::vector<BatchRequest> reqs(B, BatchRequest{prompt, max_new, -1, bench_temp});
