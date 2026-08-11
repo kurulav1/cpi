@@ -1356,10 +1356,11 @@ __global__ void kquant_mmq_finalize_kernel(float* __restrict__ partial, __half* 
 // doubles the mma count at unchanged memory traffic -- an acceptable trade for a
 // kernel measured at ~426 GB/s, i.e. bound by the weight read rather than the
 // tensor cores.
-template <int NT>
+template <int NT, bool SPLITK>
 __global__ __launch_bounds__(256) void kquant_mmq_q6k_kernel(
     const std::uint8_t* __restrict__ w, const std::int8_t* __restrict__ xq,
-    const float* __restrict__ as, __half* __restrict__ y, int rows, int cols, int batch, int ldy) {
+    const float* __restrict__ as, __half* __restrict__ y, float* __restrict__ partial, int rows,
+    int cols, int batch, int ldy) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800)
   (void)w; (void)xq; (void)as; (void)y; (void)rows; (void)cols; (void)batch; (void)ldy;
 #else
@@ -1383,7 +1384,16 @@ __global__ __launch_bounds__(256) void kquant_mmq_q6k_kernel(
 #pragma unroll
     for (int j = 0; j < 4; ++j) facc[i][j] = 0.0f;
 
-  for (int sb = 0; sb < blocks_per_row; ++sb) {
+  int sb_lo = 0, sb_hi = blocks_per_row;
+  if (SPLITK) {
+    // Same lever that took 26% off the Q4_K kernel: the super-block loop is
+    // serial per block and there are too few blocks to hide it.
+    const int chunk = (blocks_per_row + static_cast<int>(gridDim.y) - 1) / static_cast<int>(gridDim.y);
+    sb_lo = static_cast<int>(blockIdx.y) * chunk;
+    sb_hi = min(sb_lo + chunk, blocks_per_row);
+    if (sb_lo >= sb_hi) return;
+  }
+  for (int sb = sb_lo; sb < sb_hi; ++sb) {
     const int k0 = sb << 8;
 
 #pragma unroll
@@ -1507,8 +1517,12 @@ __global__ __launch_bounds__(256) void kquant_mmq_q6k_kernel(
     for (int en = 0; en < 4; ++en) {
       const int lm = 16 * mt + rr[en], gn = blockNrow + nbase + cc[en];
       if (lm < batch && gn < rows) {
-        y[static_cast<std::size_t>(lm) * static_cast<std::size_t>(ldy) + gn] =
-            __float2half(facc[nt][en]);
+        if (SPLITK) {
+          atomicAdd(&partial[static_cast<std::size_t>(lm) * rows + gn], facc[nt][en]);
+        } else {
+          y[static_cast<std::size_t>(lm) * static_cast<std::size_t>(ldy) + gn] =
+              __float2half(facc[nt][en]);
+        }
       }
     }
   }
@@ -1555,15 +1569,22 @@ bool launch_kquant_mmq(const std::uint8_t* w, KQuantType type, const half* x, ha
     // path serves is wv at 1024 rows: at NT=2 that is 32 blocks on a 170-SM part,
     // which is why the kernel measured 139 us a call against the Q4_K MMQ's 78
     // for roughly a seventh of the bytes. NT=1 quadruples the grid.
-    if (g_kq_tune.mmq_nt >= 4) {
-      kquant_mmq_q6k_kernel<4>
-          <<<(rows + 63) / 64, 256, 0, stream>>>(w, xq, xs, y, rows, cols, batch, ldy);
-    } else if (g_kq_tune.mmq_nt == 1) {
-      kquant_mmq_q6k_kernel<1>
-          <<<(rows + 15) / 16, 256, 0, stream>>>(w, xq, xs, y, rows, cols, batch, ldy);
+    const int bb6 = (rows + 31) / 32;
+    int sp6 = 1;
+    if (g_kq_tune.mmq_splitk > 0 && bb6 < g_kq_tune.mmq_split_target) {
+      sp6 = (g_kq_tune.mmq_split_target + bb6 - 1) / bb6;
+      sp6 = min(sp6, max(1, (cols >> 8) / 2));
+    }
+    const bool us6 = sp6 > 1 && ensure_mmq_partial(static_cast<std::size_t>(batch) * rows);
+    const dim3 g6(static_cast<unsigned>(bb6), us6 ? static_cast<unsigned>(sp6) : 1u);
+    if (us6) {
+      kquant_mmq_q6k_kernel<2, true>
+          <<<g6, 256, 0, stream>>>(w, xq, xs, y, g_mmq_partial, rows, cols, batch, ldy);
+      kquant_mmq_finalize_kernel<<<(rows + 255) / 256, 256, 0, stream>>>(g_mmq_partial, y, rows,
+                                                                        batch, ldy);
     } else {
-      kquant_mmq_q6k_kernel<2>
-          <<<(rows + 31) / 32, 256, 0, stream>>>(w, xq, xs, y, rows, cols, batch, ldy);
+      kquant_mmq_q6k_kernel<2, false>
+          <<<g6, 256, 0, stream>>>(w, xq, xs, y, nullptr, rows, cols, batch, ldy);
     }
     return true;
   }
