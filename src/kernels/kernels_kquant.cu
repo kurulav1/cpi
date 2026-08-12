@@ -1964,9 +1964,9 @@ int q6k_streamk_grid(int nt_sel, int bm) {
       nsm = 128;
     }
   }
-  // The 64x128 dynamic-shared shape is occupancy 1 by construction (56 KB of
-  // a 100 KB SM): one wave is exactly the SM count.
-  if (bm > 32) return nsm;
+  // The dynamic-shared shapes (64x128 at 56 KB, 32x256 at 88 KB) are
+  // occupancy 1 by construction: one wave is exactly the SM count.
+  if (bm > 32 || nt_sel >= 8) return nsm;
   const int i = nt_sel >= 4 ? 2 : (nt_sel <= 1 ? 0 : 1);
   const int j = bm <= 32 ? 0 : 1;
   if (occ[i][j] == 0) {
@@ -1999,8 +1999,14 @@ void launch_kquant_mmq_q6k_streamk(const std::uint8_t* w, const std::int8_t* xq,
   // larger batches take 64x128 in 56 KB of dynamic shared at occupancy 1 --
   // the N width is what divides activation restaging, so it stays 128.
   const int bm = batch <= 32 ? 32 : 64;
+  // NT=8 at BM=32 is the 32x256 tile in 88 KB of dynamic shared (occupancy 1)
+  // -- the next step on the width/occupancy frontier, opt-in via
+  // CPI_KQUANT_MMQ_Q6K_NT=8.
   const int nt_sel =
-      bm == 64 ? 8 : (g_kq_tune.mmq_q6k_nt >= 4 ? 4 : (g_kq_tune.mmq_q6k_nt <= 1 ? 1 : 2));
+      bm == 64 ? 8
+               : (g_kq_tune.mmq_q6k_nt >= 8
+                      ? 8
+                      : (g_kq_tune.mmq_q6k_nt >= 4 ? 4 : (g_kq_tune.mmq_q6k_nt <= 1 ? 1 : 2)));
   const int bn = (128 / bm) * nt_sel * 8;
   const int nty = (rows + bn - 1) / bn;
   const int nsb = cols >> 8;
@@ -2045,7 +2051,9 @@ void launch_kquant_mmq_q6k_streamk(const std::uint8_t* w, const std::int8_t* xq,
     }                                                                                            \
   } while (0)
   if (bm == 32) {
-    if (nt_sel == 4) {
+    if (nt_sel == 8) {
+      CPI_MMQ_Q6K_SK(8, 32);
+    } else if (nt_sel == 4) {
       CPI_MMQ_Q6K_SK(4, 32);
     } else if (nt_sel == 1) {
       CPI_MMQ_Q6K_SK(1, 32);
