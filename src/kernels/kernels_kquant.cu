@@ -962,6 +962,37 @@ __device__ __forceinline__ void ldsm_x2(int& r0, int& r1, const void* p) {
                : "=r"(r0), "=r"(r1)
                : "r"(a));
 }
+
+// Tile-set layout for the Q6_K stream-K kernel, host-visible so the launcher
+// can size the dynamic-shared launch. The 64-batch x 128-row shape is 56 KB --
+// past the 48 KB static limit -- which is exactly why Q6_K used to decline
+// batches above 32 and fall back to dequant+cuBLAS.
+template <int NT, int BM>
+struct Q6kSmemLayout {
+  std::int8_t As[BM][256];
+  std::int8_t Bs[(128 / BM) * NT * 8][256];
+  float Bsc[(128 / BM) * NT * 8][16];
+};
+
+// Static shared when the layout fits 48 KB, dynamic (opted in via
+// cudaFuncSetAttribute at launch) when it does not. A __shared__ variable
+// inside the member function still has kernel lifetime.
+template <bool DYN, typename T>
+struct MmqSmem;
+template <typename T>
+struct MmqSmem<false, T> {
+  __device__ __forceinline__ T* get() {
+    __shared__ __align__(16) T s;
+    return &s;
+  }
+};
+template <typename T>
+struct MmqSmem<true, T> {
+  __device__ __forceinline__ T* get() {
+    extern __shared__ __align__(16) char mmq_dyn_smem[];
+    return reinterpret_cast<T*>(mmq_dyn_smem);
+  }
+};
 }  // namespace
 
 // A whole super-block of K per staging round (llama.cpp's MMQ_ITER_K=256).
@@ -1776,9 +1807,12 @@ __global__ __launch_bounds__(256) void kquant_mmq_q6k_streamk_kernel(
   (void)w; (void)xq; (void)as; (void)y; (void)tmp; (void)rows; (void)cols; (void)batch; (void)ldy;
 #else
   constexpr int kMmqBN = (128 / BM) * NT * 8;
-  __shared__ __align__(16) std::int8_t As[BM][256];
-  __shared__ __align__(16) std::int8_t Bs[kMmqBN][256];
-  __shared__ float Bsc[kMmqBN][16];  // d*scale per 16 weights
+  using Smem = Q6kSmemLayout<NT, BM>;
+  constexpr bool kDyn = sizeof(Smem) > 48 * 1024;
+  Smem* sm = MmqSmem<kDyn, Smem>().get();
+  auto& As = sm->As;
+  auto& Bs = sm->Bs;
+  auto& Bsc = sm->Bsc;  // d*scale per 16 weights
 
   const int nsb = cols >> 8;
   const int nty = (rows + kMmqBN - 1) / kMmqBN;
@@ -1922,6 +1956,9 @@ int q6k_streamk_grid(int nt_sel, int bm) {
       nsm = 128;
     }
   }
+  // The 64x128 dynamic-shared shape is occupancy 1 by construction (56 KB of
+  // a 100 KB SM): one wave is exactly the SM count.
+  if (bm > 32) return nsm;
   const int i = nt_sel >= 4 ? 2 : (nt_sel <= 1 ? 0 : 1);
   const int j = bm <= 32 ? 0 : 1;
   if (occ[i][j] == 0) {
@@ -1950,10 +1987,12 @@ int q6k_streamk_grid(int nt_sel, int bm) {
 void launch_kquant_mmq_q6k_streamk(const std::uint8_t* w, const std::int8_t* xq, const float* xs,
                                    half* y, int rows, int cols, int batch, int ldy,
                                    cudaStream_t stream) {
-  const int nt_sel = g_kq_tune.mmq_q6k_nt >= 4 ? 4 : (g_kq_tune.mmq_q6k_nt <= 1 ? 1 : 2);
-  // Batches that fit half the M tile take the 32x(4*NT*8) shape: same shared
-  // budget, double the N width, half the activation restaging per weight byte.
+  // Batches that fit half the M tile take the 32x128 shape in static shared;
+  // larger batches take 64x128 in 56 KB of dynamic shared at occupancy 1 --
+  // the N width is what divides activation restaging, so it stays 128.
   const int bm = batch <= 32 ? 32 : 64;
+  const int nt_sel =
+      bm == 64 ? 8 : (g_kq_tune.mmq_q6k_nt >= 4 ? 4 : (g_kq_tune.mmq_q6k_nt <= 1 ? 1 : 2));
   const int bn = (128 / bm) * nt_sel * 8;
   const int nty = (rows + bn - 1) / bn;
   const int nsb = cols >> 8;
@@ -1976,8 +2015,21 @@ void launch_kquant_mmq_q6k_streamk(const std::uint8_t* w, const std::int8_t* xq,
   }
 #define CPI_MMQ_Q6K_SK(N, M)                                                                     \
   do {                                                                                           \
-    kquant_mmq_q6k_streamk_kernel<N, M><<<static_cast<unsigned>(nblocks), 256, 0, stream>>>(     \
-        w, xq, xs, y, g_mmq_fixup, rows, cols, batch, ldy);                                      \
+    constexpr unsigned kSmemB = sizeof(Q6kSmemLayout<N, M>) > 48u * 1024u                        \
+                                    ? static_cast<unsigned>(sizeof(Q6kSmemLayout<N, M>))         \
+                                    : 0u;                                                        \
+    if (kSmemB > 0) {                                                                            \
+      static const bool attr_once = []() {                                                       \
+        return cudaFuncSetAttribute(kquant_mmq_q6k_streamk_kernel<N, M>,                         \
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize,                 \
+                                    static_cast<int>(sizeof(Q6kSmemLayout<N, M>))) ==            \
+               cudaSuccess;                                                                      \
+      }();                                                                                       \
+      (void)attr_once;                                                                           \
+    }                                                                                            \
+    kquant_mmq_q6k_streamk_kernel<N, M>                                                          \
+        <<<static_cast<unsigned>(nblocks), 256, kSmemB, stream>>>(w, xq, xs, y, g_mmq_fixup,     \
+                                                                  rows, cols, batch, ldy);       \
     if (fixup) {                                                                                 \
       kquant_mmq_q6k_streamk_fixup_kernel<N, M>                                                  \
           <<<static_cast<unsigned>(nblocks), 256, 0, stream>>>(y, g_mmq_fixup, rows, cols,       \
@@ -1993,13 +2045,8 @@ void launch_kquant_mmq_q6k_streamk(const std::uint8_t* w, const std::int8_t* xq,
       CPI_MMQ_Q6K_SK(2, 32);
     }
   } else {
-    if (nt_sel == 4) {
-      CPI_MMQ_Q6K_SK(4, 64);
-    } else if (nt_sel == 1) {
-      CPI_MMQ_Q6K_SK(1, 64);
-    } else {
-      CPI_MMQ_Q6K_SK(2, 64);
-    }
+    // One shape above batch 32: 64x128 in dynamic shared, occupancy 1.
+    CPI_MMQ_Q6K_SK(8, 64);
   }
 #undef CPI_MMQ_Q6K_SK
 }
@@ -2011,11 +2058,9 @@ void launch_kquant_mmq_q6k_streamk(const std::uint8_t* w, const std::int8_t* xq,
 bool kquant_mmq_accepts(KQuantType type, int batch, int cols, bool force_q6k) {
   if (type != KQuantType::Q4_K && type != KQuantType::Q6_K) return false;
   if (type == KQuantType::Q6_K && g_kq_tune.mmq_q6k == 0 && !force_q6k) return false;
-  // Q6_K's profitable shape is the 32x128 tile, which only exists for batches
-  // that fit half the M tile; above that it would run 64x64, whose activation
-  // restaging loses to dequant+cuBLAS (measured -1.8% at B=64). The LM head
-  // stays on MMQ via force_q6k -- its alternative is a 1 GB fp16 expansion.
-  if (type == KQuantType::Q6_K && batch > 32 && !force_q6k) return false;
+  // Above batch 32 Q6_K runs the 64x128 dynamic-shared shape. (The 64x64
+  // static shape it briefly had there measured -1.8% against dequant+cuBLAS;
+  // the width, not the M tile, was what mattered.)
   if (batch < 1 || batch > kMmqBM || cols % 256 != 0) return false;
   return true;
 }
