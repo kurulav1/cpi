@@ -1540,9 +1540,14 @@ __global__ __launch_bounds__(256) void kquant_mmq_q4k_streamk_kernel(
 // staging stayed cp.async raw -- pure added latency at the tile boundary.
 // Here the fold rides the unpack pass that must exist anyway, and the unpack
 // pass replaces (not augments) the cp.async staging.
-template <int NT>
+// M2 doubles the activation panel to 64 rows (two 32-row batch halves) while
+// the weight tile stays 4*NT*8 rows: the mma loop replays each staged weight
+// fragment against both halves, so batch 33..64 reads the weights ONCE -- the
+// ROUND 2 dual-half pattern on the unpacked body. At NT=2 the M2 tile set is
+// 36 KB static (As 16K + Bs 16K + Bsdm 4K), leaving room for 2 blocks/SM.
+template <int NT, bool M2 = false>
 struct Q4kSmemLayout {
-  std::int8_t As[32][256];
+  std::int8_t As[M2 ? 64 : 32][256];
   std::int8_t Bs[4 * NT * 8][256];   // raw nibble values 0..15
   float2 Bsdm[4 * NT * 8][8];        // (d*sc, dmin*m) per 32-group
 };
@@ -1554,14 +1559,16 @@ struct Q4kSmemLayout {
 // pair of rows keeps one index.
 __device__ __forceinline__ int mmq_swz_dm(int r, int j) { return j ^ ((r >> 1) & 3); }
 
-template <int NT, int MODE>
+template <int NT, bool M2, int MODE>
 __device__ __forceinline__ void kquant_mmq_q4k_process_tile_unpacked(
-    Q4kSmemLayout<NT>* sm, const std::uint8_t* __restrict__ w,
+    Q4kSmemLayout<NT, M2>* sm, const std::uint8_t* __restrict__ w,
     const std::int8_t* __restrict__ xq, const float* __restrict__ as,
     const float* __restrict__ gsum, __half* __restrict__ y, float* __restrict__ aux, int rows,
     int cols, int batch, int ldy, int tile_it, int kb0_start, int kb0_stop) {
   constexpr int kBN = 4 * NT * 8;
   constexpr int kWIter = NT;  // weight staging passes: kBN * 8 / 256
+  constexpr int kMH = M2 ? 2 : 1;  // batch halves per pass
+  constexpr int kBMT = 32 * kMH;   // activation rows staged
   auto& As = sm->As;
   auto& Bs = sm->Bs;
   auto& Bsdm = sm->Bsdm;
@@ -1574,11 +1581,13 @@ __device__ __forceinline__ void kquant_mmq_q4k_process_tile_unpacked(
   const std::size_t row_bytes =
       static_cast<std::size_t>(nsb) * model::kquant::kQ4KBlockBytes;
 
-  float facc[NT][4];
+  float facc[kMH][NT][4];
 #pragma unroll
-  for (int i = 0; i < NT; ++i)
+  for (int m = 0; m < kMH; ++m)
 #pragma unroll
-    for (int j = 0; j < 4; ++j) facc[i][j] = 0.0f;
+    for (int i = 0; i < NT; ++i)
+#pragma unroll
+      for (int j = 0; j < 4; ++j) facc[m][i][j] = 0.0f;
 
   // Raw super-block prefetch, in REGISTERS: the synchronous unpack-at-staging
   // variant of this kernel exposed the global load latency the async kernel
@@ -1646,7 +1655,7 @@ __device__ __forceinline__ void kquant_mmq_q4k_process_tile_unpacked(
     // same way and measured long_scoreboard 1.6 -- it is the small, L2-hot
     // side.
 #pragma unroll
-    for (int i = 0; i < 2; ++i) {
+    for (int i = 0; i < kBMT / 16; ++i) {
       const int u = tid + i * 256;
       const int r = u >> 4, c = (u & 15) << 4;
       uint4 v = make_uint4(0, 0, 0, 0);
@@ -1661,23 +1670,30 @@ __device__ __forceinline__ void kquant_mmq_q4k_process_tile_unpacked(
     if (sb + 1 < kb0_stop) prefetch(sb + 1);
 
     const int arow = 16 * mt;
-    const int m_a = arow + g, m_b = arow + g + 8;
-    const bool ok_a = m_a < batch, ok_b = m_b < batch;
 #pragma unroll
     for (int gi = 0; gi < 8; ++gi) {
       const int kg = (sb << 3) + gi, co = gi << 5;
+      // A fragments per batch half, loaded up front so the nt loop can replay
+      // each staged weight fragment against both halves without touching
+      // shared again (the M2 pattern: weights read once).
       // Unguarded ldmatrix: rows past the batch hold zeros, and either way the
       // products below are zeroed by as/gs = 0 -- an int8 mma cannot NaN.
-      int a0, a1, a2, a3;
-      {
-        const int ar = arow + (lane & 15);
-        const int ac = co + ((lane >> 4) << 4);
-        ldsm_x4(a0, a1, a2, a3, &As[ar][mmq_swz(ar, ac)]);
+      int a0[kMH], a1[kMH], a2[kMH], a3[kMH];
+      float as_a[kMH], as_b[kMH], gs_a[kMH], gs_b[kMH];
+#pragma unroll
+      for (int mh = 0; mh < kMH; ++mh) {
+        const int m_a = 32 * mh + arow + g, m_b = 32 * mh + arow + g + 8;
+        const bool ok_a = m_a < batch, ok_b = m_b < batch;
+        {
+          const int ar = 32 * mh + arow + (lane & 15);
+          const int ac = co + ((lane >> 4) << 4);
+          ldsm_x4(a0[mh], a1[mh], a2[mh], a3[mh], &As[ar][mmq_swz(ar, ac)]);
+        }
+        as_a[mh] = ok_a ? as[static_cast<std::size_t>(m_a) * Kg + kg] : 0.0f;
+        as_b[mh] = ok_b ? as[static_cast<std::size_t>(m_b) * Kg + kg] : 0.0f;
+        gs_a[mh] = ok_a ? gsum[static_cast<std::size_t>(m_a) * Kg + kg] : 0.0f;
+        gs_b[mh] = ok_b ? gsum[static_cast<std::size_t>(m_b) * Kg + kg] : 0.0f;
       }
-      const float as_a = ok_a ? as[static_cast<std::size_t>(m_a) * Kg + kg] : 0.0f;
-      const float as_b = ok_b ? as[static_cast<std::size_t>(m_b) * Kg + kg] : 0.0f;
-      const float gs_a = ok_a ? gsum[static_cast<std::size_t>(m_a) * Kg + kg] : 0.0f;
-      const float gs_b = ok_b ? gsum[static_cast<std::size_t>(m_b) * Kg + kg] : 0.0f;
       // All B fragments and scales for this k-group load BEFORE any mma: with
       // the in-loop unpack gone there are no spare instructions to hide the
       // ldsm latency behind (short_scoreboard 3.2 on the synchronous variant),
@@ -1710,36 +1726,42 @@ __device__ __forceinline__ void kquant_mmq_q4k_process_tile_unpacked(
       }
 #pragma unroll
       for (int nt = 0; nt < NT; ++nt) {
-        int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
-        asm volatile(
-            "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, "
-            "{%8,%9}, {%0,%1,%2,%3};\n"
-            : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
-            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0[nt]), "r"(b1[nt]));
-        facc[nt][0] += static_cast<float>(c0) * as_a * sa[nt].x - sa[nt].y * gs_a;
-        facc[nt][1] += static_cast<float>(c1) * as_a * sn[nt].x - sn[nt].y * gs_a;
-        facc[nt][2] += static_cast<float>(c2) * as_b * sa[nt].x - sa[nt].y * gs_b;
-        facc[nt][3] += static_cast<float>(c3) * as_b * sn[nt].x - sn[nt].y * gs_b;
+#pragma unroll
+        for (int mh = 0; mh < kMH; ++mh) {
+          int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+          asm volatile(
+              "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, "
+              "{%8,%9}, {%0,%1,%2,%3};\n"
+              : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
+              : "r"(a0[mh]), "r"(a1[mh]), "r"(a2[mh]), "r"(a3[mh]), "r"(b0[nt]), "r"(b1[nt]));
+          facc[mh][nt][0] += static_cast<float>(c0) * as_a[mh] * sa[nt].x - sa[nt].y * gs_a[mh];
+          facc[mh][nt][1] += static_cast<float>(c1) * as_a[mh] * sn[nt].x - sn[nt].y * gs_a[mh];
+          facc[mh][nt][2] += static_cast<float>(c2) * as_b[mh] * sa[nt].x - sa[nt].y * gs_b[mh];
+          facc[mh][nt][3] += static_cast<float>(c3) * as_b[mh] * sn[nt].x - sn[nt].y * gs_b[mh];
+        }
       }
     }
     __syncthreads();
   }
 
 #pragma unroll
-  for (int nt = 0; nt < NT; ++nt) {
-    const int nbase = nhalf * (NT * 8) + nt * 8;
-    const int rr[4] = {g, g, g + 8, g + 8};
-    const int cc[4] = {2 * t, 2 * t + 1, 2 * t, 2 * t + 1};
+  for (int mh = 0; mh < kMH; ++mh) {
 #pragma unroll
-    for (int en = 0; en < 4; ++en) {
-      const int lm = 16 * mt + rr[en], gn = blockNrow + nbase + cc[en];
-      if (lm < batch && gn < rows) {
-        if (MODE == 2) {
-          aux[static_cast<std::size_t>(blockIdx.x) * (kBN * 32) +
-              static_cast<std::size_t>(lm) * kBN + (nbase + cc[en])] = facc[nt][en];
-        } else {
-          y[static_cast<std::size_t>(lm) * static_cast<std::size_t>(ldy) + gn] =
-              __float2half(facc[nt][en]);
+    for (int nt = 0; nt < NT; ++nt) {
+      const int nbase = nhalf * (NT * 8) + nt * 8;
+      const int rr[4] = {g, g, g + 8, g + 8};
+      const int cc[4] = {2 * t, 2 * t + 1, 2 * t, 2 * t + 1};
+#pragma unroll
+      for (int en = 0; en < 4; ++en) {
+        const int lm = 32 * mh + 16 * mt + rr[en], gn = blockNrow + nbase + cc[en];
+        if (lm < batch && gn < rows) {
+          if (MODE == 2) {
+            aux[static_cast<std::size_t>(blockIdx.x) * (kBN * kBMT) +
+                static_cast<std::size_t>(lm) * kBN + (nbase + cc[en])] = facc[mh][nt][en];
+          } else {
+            y[static_cast<std::size_t>(lm) * static_cast<std::size_t>(ldy) + gn] =
+                __float2half(facc[mh][nt][en]);
+          }
         }
       }
     }
@@ -1756,7 +1778,7 @@ __device__ __forceinline__ void kquant_mmq_q4k_process_tile_unpacked(
 // occupancy-1 by shared memory anyway, so it keeps the relaxed bound.
 // (minBlocks 2 at NT=4 as well was tried: 1890.7 vs 1907.1 base at B=32 --
 // the 128-register cap costs more than the second block buys at a 48 KB tile.)
-template <int NT>
+template <int NT, bool M2 = false>
 __global__ __launch_bounds__(256, NT <= 2 ? 2 : 1) void kquant_mmq_q4k_streamk_unpacked_kernel(
     const std::uint8_t* __restrict__ w, const std::int8_t* __restrict__ xq,
     const float* __restrict__ as, const float* __restrict__ gsum, __half* __restrict__ y,
@@ -1766,7 +1788,7 @@ __global__ __launch_bounds__(256, NT <= 2 ? 2 : 1) void kquant_mmq_q4k_streamk_u
   (void)batch; (void)ldy;
 #else
   constexpr int kBN = 4 * NT * 8;
-  using Smem = Q4kSmemLayout<NT>;
+  using Smem = Q4kSmemLayout<NT, M2>;
   constexpr bool kDyn = sizeof(Smem) > 48 * 1024;
   Smem* sm = MmqSmem<kDyn, Smem>().get();
 
@@ -1780,18 +1802,18 @@ __global__ __launch_bounds__(256, NT <= 2 ? 2 : 1) void kquant_mmq_q4k_streamk_u
   std::int64_t want = kb0_start + (kbc_stop - kbc);
   int kb0_stop = want < nsb ? static_cast<int>(want) : nsb;
   while (kbc < kbc_stop && kb0_stop == nsb) {
-    kquant_mmq_q4k_process_tile_unpacked<NT, 0>(sm, w, xq, as, gsum, y, tmp, rows, cols, batch,
-                                                ldy, static_cast<int>(kbc / nsb), kb0_start,
-                                                kb0_stop);
+    kquant_mmq_q4k_process_tile_unpacked<NT, M2, 0>(sm, w, xq, as, gsum, y, tmp, rows, cols,
+                                                    batch, ldy, static_cast<int>(kbc / nsb),
+                                                    kb0_start, kb0_stop);
     kbc += nsb - kb0_start;
     kb0_start = 0;
     want = kbc_stop - kbc;
     kb0_stop = want < nsb ? static_cast<int>(want) : nsb;
   }
   if (kbc >= kbc_stop) return;
-  kquant_mmq_q4k_process_tile_unpacked<NT, 2>(sm, w, xq, as, gsum, y, tmp, rows, cols, batch,
-                                              ldy, static_cast<int>(kbc / nsb), kb0_start,
-                                              kb0_stop);
+  kquant_mmq_q4k_process_tile_unpacked<NT, M2, 2>(sm, w, xq, as, gsum, y, tmp, rows, cols, batch,
+                                                  ldy, static_cast<int>(kbc / nsb), kb0_start,
+                                                  kb0_stop);
 #endif
 }
 
@@ -2483,9 +2505,9 @@ void launch_kquant_mmq_q6k_streamk(const std::uint8_t* w, const std::int8_t* xq,
 // One-wave grid for the stream-K Q4_K async MMQ, same shape as
 // q6k_streamk_grid. All Q4_K shapes are static shared, so only the occupancy
 // query differs per NT.
-int q4k_streamk_grid(int nt_sel, bool unpack) {
+int q4k_streamk_grid(int nt_sel, bool unpack, bool m2 = false) {
   static int nsm = 0;
-  static int occ[2][3] = {{0, 0, 0}, {0, 0, 0}};  // [unpack][NT 1,2,4]
+  static int occ[3][3] = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}};  // [plain/unpack/m2][NT 1,2,4]
   if (nsm == 0) {
     int dev = 0;
     cudaGetDevice(&dev);
@@ -2494,7 +2516,7 @@ int q4k_streamk_grid(int nt_sel, bool unpack) {
       nsm = 128;
     }
   }
-  const int u = unpack ? 1 : 0;
+  const int u = m2 ? 2 : (unpack ? 1 : 0);
   const int i = nt_sel >= 4 ? 2 : (nt_sel <= 1 ? 0 : 1);
   if (occ[u][i] == 0) {
     int o = 0;
@@ -2502,7 +2524,9 @@ int q4k_streamk_grid(int nt_sel, bool unpack) {
     const auto query = [&](auto kern) {
       err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&o, kern, 256, 0);
     };
-    if (unpack) {
+    if (m2) {
+      query(kquant_mmq_q4k_streamk_unpacked_kernel<2, true>);  // the one M2 shape
+    } else if (unpack) {
       if (i == 2) query(kquant_mmq_q4k_streamk_unpacked_kernel<4>);
       else if (i == 0) query(kquant_mmq_q4k_streamk_unpacked_kernel<1>);
       else query(kquant_mmq_q4k_streamk_unpacked_kernel<2>);
@@ -2525,19 +2549,23 @@ int q4k_streamk_grid(int nt_sel, bool unpack) {
 // the reconciliation arithmetic is identical.
 void launch_kquant_mmq_q4k_streamk(const std::uint8_t* w, const std::int8_t* xq, const float* xs,
                                    const float* xsum, half* y, int rows, int cols, int batch,
-                                   int ldy, int nt_sel, cudaStream_t stream) {
+                                   int ldy, int nt_sel, bool m2, cudaStream_t stream) {
   const int bn = 4 * nt_sel * 8;
   // The unpacked body ships in the wide-tile shape only (auto-ANT picks NT=4
   // above batch 16): at B=8 it measured -1.7% against the async kernel at BOTH
   // NT (804 vs 818 tok/s interleaved, occupancy already fixed to 2 blocks/SM)
   // -- the async kernel is memory-healthy there (54% DRAM, 917 GB/s, ROUND 10)
-  // and the staging trade only pays where the mma loop dominates.
-  const bool unpack = g_kq_tune.mmq_unpack != 0 && nt_sel >= 4;
+  // and the staging trade only pays where the mma loop dominates. The M2
+  // dual-half shape (batch 33..64, NT=2, unpacked body only -- the caller
+  // routes CPI_KQUANT_MMQ_UNPACK=0 to the split-K async kernel) is where the
+  // mma loop dominates MOST: every staged fragment replays against two batch
+  // halves.
+  const bool unpack = m2 || (g_kq_tune.mmq_unpack != 0 && nt_sel >= 4);
   const int nty = (rows + bn - 1) / bn;
   const int nsb = cols >> 8;
   const std::int64_t total = static_cast<std::int64_t>(nty) * nsb;
   int nblocks =
-      g_kq_tune.mmq_streamk > 1 ? g_kq_tune.mmq_streamk : q4k_streamk_grid(nt_sel, unpack);
+      g_kq_tune.mmq_streamk > 1 ? g_kq_tune.mmq_streamk : q4k_streamk_grid(nt_sel, unpack, m2);
   const int waves = (nty + nblocks - 1) / nblocks;
   if (100 * nty >= 90 * nblocks * waves) {
     nblocks = nty;
@@ -2547,9 +2575,22 @@ void launch_kquant_mmq_q4k_streamk(const std::uint8_t* w, const std::int8_t* xq,
     nblocks = static_cast<int>(total / 2 > nty ? total / 2 : nty);
   }
   bool fixup = (nty % nblocks) != 0;
-  if (fixup && !ensure_mmq_fixup(static_cast<std::size_t>(nblocks) * bn * 32)) {
+  if (fixup && !ensure_mmq_fixup(static_cast<std::size_t>(nblocks) * bn * (m2 ? 64 : 32))) {
     nblocks = nty;  // no scratch: block boundaries land on tile boundaries
     fixup = false;
+  }
+  if (m2) {
+    // Fixup: Q6_K's at (NT=4, BM=64) is the exact [bidx][64][64] layout the M2
+    // MODE-2 epilogue stores -- kMmqBN = (128/64)*4*8 = 64 = this kernel's kBN.
+    kquant_mmq_q4k_streamk_unpacked_kernel<2, true>
+        <<<static_cast<unsigned>(nblocks), 256, 0, stream>>>(w, xq, xs, xsum, y, g_mmq_fixup,
+                                                             rows, cols, batch, ldy);
+    if (fixup) {
+      kquant_mmq_q6k_streamk_fixup_kernel<4, 64>
+          <<<static_cast<unsigned>(nblocks), 256, 0, stream>>>(y, g_mmq_fixup, rows, cols, batch,
+                                                               ldy);
+    }
+    return;
   }
 #define CPI_MMQ_Q4K_SK(N)                                                                        \
   do {                                                                                           \
@@ -2660,12 +2701,13 @@ bool launch_kquant_mmq(const std::uint8_t* w, KQuantType type, const half* x, ha
     const bool m2 = batch > 32;
     const int ant =
         m2 ? 2 : (g_kq_tune.mmq_async_nt > 0 ? g_kq_tune.mmq_async_nt : (batch > 16 ? 4 : 2));
-    // Stream-K replaces the atomicAdd split-K + finalize for batch <= 32 (the
-    // M2 dual-half shape stays on split-K). Same knob as the Q6_K path:
-    // CPI_KQUANT_MMQ_STREAMK=0 restores the split.
-    if (!m2 && g_kq_tune.mmq_streamk != 0) {
+    // Stream-K replaces the atomicAdd split-K + finalize. Batch 33..64 takes
+    // the M2 dual-half UNPACKED stream-K kernel (ROUND 12); with
+    // CPI_KQUANT_MMQ_UNPACK=0 it falls back to the split-K async M2 body
+    // below, and CPI_KQUANT_MMQ_STREAMK=0 restores the split everywhere.
+    if (g_kq_tune.mmq_streamk != 0 && (!m2 || g_kq_tune.mmq_unpack != 0)) {
       launch_kquant_mmq_q4k_streamk(w, xq, xs, xsum, y, rows, cols, batch, ldy,
-                                    ant >= 4 ? 4 : (ant <= 1 ? 1 : 2), stream);
+                                    ant >= 4 ? 4 : (ant <= 1 ? 1 : 2), m2, stream);
       return true;
     }
     const int base_blocks = ant >= 4 ? (rows + 127) / 128
