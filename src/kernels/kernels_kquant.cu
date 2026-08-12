@@ -2613,7 +2613,20 @@ void launch_kquant_mmq_q6k_streamk(const std::uint8_t* w, const std::int8_t* xq,
     }                                                                                            \
   } while (0)
   if (bm == 32) {
-    if (nt_sel == 8) {
+    // ROUND 13: the PF register-prefetch staging extended to the BM=32 shapes
+    // (ROUND 12 shipped it BM=64-only). The body is BM-generic; the same
+    // CPI_KQUANT_MMQ_Q6K_PF knob selects it here.
+    if (g_kq_tune.mmq_q6k_pf != 0) {
+      if (nt_sel == 8) {
+        CPI_MMQ_Q6K_SK(8, 32, true);
+      } else if (nt_sel == 4) {
+        CPI_MMQ_Q6K_SK(4, 32, true);
+      } else if (nt_sel == 1) {
+        CPI_MMQ_Q6K_SK(1, 32, true);
+      } else {
+        CPI_MMQ_Q6K_SK(2, 32, true);
+      }
+    } else if (nt_sel == 8) {
       CPI_MMQ_Q6K_SK(8, 32, false);
     } else if (nt_sel == 4) {
       CPI_MMQ_Q6K_SK(4, 32, false);
