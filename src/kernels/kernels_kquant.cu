@@ -1123,7 +1123,23 @@ __global__ __launch_bounds__(256) void kquant_mmq_q4k_kernel(
 // Note this is NOT the split-K that failed for the matvec: there a 4096-wide row
 // was 16 super-blocks and one block already consumed all 16 across its warps, so
 // chunking only idled warps. Here one block walks all 16 in sequence.
-template <int NT, bool SPLITK>
+//
+// M2 serves batch 33..64 in ONE pass over the staged weights: two 32-row batch
+// halves share every Bq fragment (the mma loop keeps the weight fragment in
+// registers and issues it against both halves), so the weight is read once
+// where the pre-M2 alternative was re-dequantizing the entire model to fp16
+// every step -- the audit's 11.1 ms/step of dequant at B=64. M2 forces the
+// single-buffered activation panel (both halves staged = 16 KB) and NT=2.
+//
+// FALSIFIED HERE (2026-08-12, #6 for this kernel family): folding the 6-bit
+// scale headers into a pre-decoded float2 (d*sc, dmin*m) shared tile at stage
+// time, llama.cpp-style, replacing the per-(group, n-tile) in-loop decode.
+// Bit-identical, gated, and SLOWER: 1508.6 -> 1426.9 tok/s at B=32 and 621.6
+// -> 539.7 at B=8, interleaved same-binary-pair medians. The in-loop decode
+// pipelines behind the mma for free; a synchronous fold serializes at the
+// tile boundary. Same verdict as the earlier decode-into-shared attempt --
+// scale handling is NOT this kernel's bottleneck, stop trying to hoist it.
+template <int NT, bool SPLITK, bool M2 = false>
 __global__ __launch_bounds__(256) void kquant_mmq_q4k_async_kernel(
     const std::uint8_t* __restrict__ w, const std::int8_t* __restrict__ xq,
     const float* __restrict__ as, const float* __restrict__ gsum, __half* __restrict__ y,
@@ -1132,6 +1148,8 @@ __global__ __launch_bounds__(256) void kquant_mmq_q4k_async_kernel(
   (void)w; (void)xq; (void)as; (void)gsum; (void)y; (void)rows; (void)cols; (void)batch; (void)ldy;
 #else
   constexpr int kBM = 32;
+  constexpr int kMH = M2 ? 2 : 1;    // batch halves per pass
+  constexpr int kBMT = 32 * kMH;     // activation rows staged
   // Warps split across the M and N tiles, and the split has to follow kBM: with
   // 16 rows per m-tile, kBM=32 leaves only two m-tiles, so the other warps must
   // go to N. Keeping the 64-row mapping here left warps 4..7 with every row out
@@ -1155,8 +1173,8 @@ __global__ __launch_bounds__(256) void kquant_mmq_q4k_async_kernel(
   // a tile against Bq's 16), and the whole point of the wide tile is that this
   // panel is re-read less often per weight byte. Weights and headers keep the
   // cp.async double buffer either way.
-  constexpr int kAsBufs = NT >= 4 ? 1 : 2;
-  __shared__ __align__(16) std::int8_t As[kAsBufs][kBM][256];
+  constexpr int kAsBufs = (NT >= 4 || M2) ? 1 : 2;
+  __shared__ __align__(16) std::int8_t As[kAsBufs][kBMT][256];
   __shared__ __align__(16) std::uint8_t Bq[2][kBN][128];  // raw qs, unpacked at use
   __shared__ __align__(16) std::uint8_t Hd[2][kBN][16];   // raw header: d, dmin, 12 scale bytes
 
@@ -1165,7 +1183,7 @@ __global__ __launch_bounds__(256) void kquant_mmq_q4k_async_kernel(
   // warp is done computing from As[0] before any warp overwrites it.
   const auto stage_a_sync = [&](int sb) {
 #pragma unroll
-    for (int i = 0; i < 2; ++i) {
+    for (int i = 0; i < (kBMT * 16) / 256; ++i) {
       const int u = tid + i * 256;
       const int r = u >> 4, c = (u & 15) << 4;
       uint4 v = make_uint4(0, 0, 0, 0);
@@ -1216,11 +1234,13 @@ __global__ __launch_bounds__(256) void kquant_mmq_q4k_async_kernel(
     __pipeline_commit();
   };
 
-  float facc[NT][4];
+  float facc[kMH][NT][4];
 #pragma unroll
-  for (int i = 0; i < NT; ++i)
+  for (int m = 0; m < kMH; ++m)
 #pragma unroll
-    for (int j = 0; j < 4; ++j) facc[i][j] = 0.0f;
+    for (int i = 0; i < NT; ++i)
+#pragma unroll
+      for (int j = 0; j < 4; ++j) facc[m][i][j] = 0.0f;
 
   int sb_lo = 0, sb_hi = nsb;
   if (SPLITK) {
@@ -1241,25 +1261,28 @@ __global__ __launch_bounds__(256) void kquant_mmq_q4k_async_kernel(
     const int abuf = kAsBufs == 1 ? 0 : buf;
 
     const int arow = 16 * mt;
-    const int m_a = arow + g, m_b = arow + g + 8;
-    const bool ok_a = m_a < batch, ok_b = m_b < batch;
-
-    // Per-row scale pairs for this super-block, decoded from the staged header.
-    float sc_n[NT][2][2];  // [nt][a|b][d*sc, dmin*m] filled per group below
-    (void)sc_n;
 
 #pragma unroll
     for (int gi = 0; gi < 8; ++gi) {
       const int kg = (sb << 3) + gi, co = gi << 5;
-      // A fragments: k = co..co+31, split 0..15 / 16..31 across a0a1 / a2a3.
-      const int a0 = ok_a ? *reinterpret_cast<int*>(&As[abuf][m_a][co + t * 4]) : 0;
-      const int a1 = ok_b ? *reinterpret_cast<int*>(&As[abuf][m_b][co + t * 4]) : 0;
-      const int a2 = ok_a ? *reinterpret_cast<int*>(&As[abuf][m_a][co + 16 + t * 4]) : 0;
-      const int a3 = ok_b ? *reinterpret_cast<int*>(&As[abuf][m_b][co + 16 + t * 4]) : 0;
-      const float as_a = ok_a ? as[static_cast<std::size_t>(m_a) * Kg + kg] : 0.0f;
-      const float as_b = ok_b ? as[static_cast<std::size_t>(m_b) * Kg + kg] : 0.0f;
-      const float gs_a = ok_a ? gsum[static_cast<std::size_t>(m_a) * Kg + kg] : 0.0f;
-      const float gs_b = ok_b ? gsum[static_cast<std::size_t>(m_b) * Kg + kg] : 0.0f;
+      // A fragments per batch half: k = co..co+31, split 0..15 / 16..31 across
+      // a0a1 / a2a3. Loaded up front so the nt loop can replay each staged
+      // weight fragment against both halves without touching shared again.
+      int a0[kMH], a1[kMH], a2[kMH], a3[kMH];
+      float as_a[kMH], as_b[kMH], gs_a[kMH], gs_b[kMH];
+#pragma unroll
+      for (int mh = 0; mh < kMH; ++mh) {
+        const int m_a = 32 * mh + arow + g, m_b = 32 * mh + arow + g + 8;
+        const bool ok_a = m_a < batch, ok_b = m_b < batch;
+        a0[mh] = ok_a ? *reinterpret_cast<int*>(&As[abuf][m_a][co + t * 4]) : 0;
+        a1[mh] = ok_b ? *reinterpret_cast<int*>(&As[abuf][m_b][co + t * 4]) : 0;
+        a2[mh] = ok_a ? *reinterpret_cast<int*>(&As[abuf][m_a][co + 16 + t * 4]) : 0;
+        a3[mh] = ok_b ? *reinterpret_cast<int*>(&As[abuf][m_b][co + 16 + t * 4]) : 0;
+        as_a[mh] = ok_a ? as[static_cast<std::size_t>(m_a) * Kg + kg] : 0.0f;
+        as_b[mh] = ok_b ? as[static_cast<std::size_t>(m_b) * Kg + kg] : 0.0f;
+        gs_a[mh] = ok_a ? gsum[static_cast<std::size_t>(m_a) * Kg + kg] : 0.0f;
+        gs_b[mh] = ok_b ? gsum[static_cast<std::size_t>(m_b) * Kg + kg] : 0.0f;
+      }
 
       // Column co..co+31 lives in qs[j*32 + l], j = co/64, low nibble when
       // (co%64) < 32. Four consecutive columns are four consecutive bytes.
@@ -1275,13 +1298,8 @@ __global__ __launch_bounds__(256) void kquant_mmq_q4k_async_kernel(
         const std::uint32_t w1 = *reinterpret_cast<const std::uint32_t*>(&Bq[buf][nrow][qb + 16]);
         const int b0 = static_cast<int>(hi_nib ? ((w0 >> 4) & 0x0F0F0F0Fu) : (w0 & 0x0F0F0F0Fu));
         const int b1 = static_cast<int>(hi_nib ? ((w1 >> 4) & 0x0F0F0F0Fu) : (w1 & 0x0F0F0F0Fu));
-        int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
-        asm volatile(
-            "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, "
-            "{%8,%9}, {%0,%1,%2,%3};\n"
-            : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
-            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
-        // Scales for the two output rows this thread accumulates.
+        // Scales for the two output rows this thread accumulates -- shared by
+        // both batch halves, so decoded once per n-tile.
         const int na = nbase + 2 * t, nb = nbase + 2 * t + 1;
         const uint4 ha = *reinterpret_cast<const uint4*>(&Hd[buf][na][0]);
         const uint4 hb = *reinterpret_cast<const uint4*>(&Hd[buf][nb][0]);
@@ -1292,29 +1310,41 @@ __global__ __launch_bounds__(256) void kquant_mmq_q4k_async_kernel(
         const float dmina = half_bits_to_float(static_cast<std::uint16_t>(ha.x >> 16));
         const float db = half_bits_to_float(static_cast<std::uint16_t>(hb.x & 0xFFFFu));
         const float dminb = half_bits_to_float(static_cast<std::uint16_t>(hb.x >> 16));
-        facc[nt][0] += static_cast<float>(c0) * as_a * (da * sca) - (dmina * ma) * gs_a;
-        facc[nt][1] += static_cast<float>(c1) * as_a * (db * scb) - (dminb * mb) * gs_a;
-        facc[nt][2] += static_cast<float>(c2) * as_b * (da * sca) - (dmina * ma) * gs_b;
-        facc[nt][3] += static_cast<float>(c3) * as_b * (db * scb) - (dminb * mb) * gs_b;
+#pragma unroll
+        for (int mh = 0; mh < kMH; ++mh) {
+          int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+          asm volatile(
+              "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, "
+              "{%8,%9}, {%0,%1,%2,%3};\n"
+              : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
+              : "r"(a0[mh]), "r"(a1[mh]), "r"(a2[mh]), "r"(a3[mh]), "r"(b0), "r"(b1));
+          facc[mh][nt][0] += static_cast<float>(c0) * as_a[mh] * (da * sca) - (dmina * ma) * gs_a[mh];
+          facc[mh][nt][1] += static_cast<float>(c1) * as_a[mh] * (db * scb) - (dminb * mb) * gs_a[mh];
+          facc[mh][nt][2] += static_cast<float>(c2) * as_b[mh] * (da * sca) - (dmina * ma) * gs_b[mh];
+          facc[mh][nt][3] += static_cast<float>(c3) * as_b[mh] * (db * scb) - (dminb * mb) * gs_b[mh];
+        }
       }
     }
     __syncthreads();
   }
 
 #pragma unroll
-  for (int nt = 0; nt < NT; ++nt) {
-    const int nbase = nhalf * (NT * 8) + nt * 8;
-    const int rr[4] = {g, g, g + 8, g + 8};
-    const int cc[4] = {2 * t, 2 * t + 1, 2 * t, 2 * t + 1};
+  for (int mh = 0; mh < kMH; ++mh) {
 #pragma unroll
-    for (int en = 0; en < 4; ++en) {
-      const int lm = 16 * mt + rr[en], gn = blockNrow + nbase + cc[en];
-      if (lm < batch && gn < rows) {
-        if (SPLITK) {
-          atomicAdd(&partial[static_cast<std::size_t>(lm) * rows + gn], facc[nt][en]);
-        } else {
-          y[static_cast<std::size_t>(lm) * static_cast<std::size_t>(ldy) + gn] =
-              __float2half(facc[nt][en]);
+    for (int nt = 0; nt < NT; ++nt) {
+      const int nbase = nhalf * (NT * 8) + nt * 8;
+      const int rr[4] = {g, g, g + 8, g + 8};
+      const int cc[4] = {2 * t, 2 * t + 1, 2 * t, 2 * t + 1};
+#pragma unroll
+      for (int en = 0; en < 4; ++en) {
+        const int lm = 32 * mh + 16 * mt + rr[en], gn = blockNrow + nbase + cc[en];
+        if (lm < batch && gn < rows) {
+          if (SPLITK) {
+            atomicAdd(&partial[static_cast<std::size_t>(lm) * rows + gn], facc[mh][nt][en]);
+          } else {
+            y[static_cast<std::size_t>(lm) * static_cast<std::size_t>(ldy) + gn] =
+                __float2half(facc[mh][nt][en]);
+          }
         }
       }
     }
@@ -1935,6 +1965,11 @@ void launch_kquant_mmq_q6k_streamk(const std::uint8_t* w, const std::int8_t* xq,
 bool kquant_mmq_accepts(KQuantType type, int batch, int cols, bool force_q6k) {
   if (type != KQuantType::Q4_K && type != KQuantType::Q6_K) return false;
   if (type == KQuantType::Q6_K && g_kq_tune.mmq_q6k == 0 && !force_q6k) return false;
+  // Q6_K's profitable shape is the 32x128 tile, which only exists for batches
+  // that fit half the M tile; above that it would run 64x64, whose activation
+  // restaging loses to dequant+cuBLAS (measured -1.8% at B=64). The LM head
+  // stays on MMQ via force_q6k -- its alternative is a 1 GB fp16 expansion.
+  if (type == KQuantType::Q6_K && batch > 32 && !force_q6k) return false;
   if (batch < 1 || batch > kMmqBM || cols % 256 != 0) return false;
   return true;
 }
@@ -1995,15 +2030,19 @@ bool launch_kquant_mmq(const std::uint8_t* w, KQuantType type, const half* x, ha
   // The double-buffered kernel carries two K-tiles of activations, so its M tile
   // is 32; larger batches use the single-buffered one.
   const bool async_on = g_kq_tune.mmq_async != 0;
-  if (async_on && batch <= 32) {
+  if (async_on && batch <= 64) {
     // NT=2 (64-wide output tile) measured better than NT=1 at every batch this
     // path serves: 475.2/690.7/938.9 against 429.0/664.6/823.8 at B=8/16/32 in
     // one run. It halves the grid, and for a 4096-row matrix that is 64 blocks
     // against 170 SMs -- so the extra work per block outweighs filling the GPU,
     // which is the opposite of what the block count suggests. Measure, do not
     // reason from grid size here.
+    // Batch 33..64 takes the dual-half M2 shape: NT=2 (the wide-N tile's shared
+    // budget goes to the 64-row activation panel instead), weights staged once
+    // and replayed against both batch halves.
+    const bool m2 = batch > 32;
     const int ant =
-        g_kq_tune.mmq_async_nt > 0 ? g_kq_tune.mmq_async_nt : (batch > 16 ? 4 : 2);
+        m2 ? 2 : (g_kq_tune.mmq_async_nt > 0 ? g_kq_tune.mmq_async_nt : (batch > 16 ? 4 : 2));
     const int base_blocks = ant >= 4 ? (rows + 127) / 128
                                      : (ant >= 2 ? (rows + 63) / 64 : (rows + 31) / 32);
     const int nsb = cols >> 8;
@@ -2017,13 +2056,15 @@ bool launch_kquant_mmq(const std::uint8_t* w, KQuantType type, const half* x, ha
     const bool use_split =
         split > 1 && ensure_mmq_partial(static_cast<std::size_t>(batch) * rows);
     const dim3 grid(static_cast<unsigned>(base_blocks), use_split ? static_cast<unsigned>(split) : 1u);
-#define CPI_MMQ_ASYNC(N, S)                                                                    kquant_mmq_q4k_async_kernel<N, S>                                                                <<<grid, 256, 0, stream>>>(w, xq, xs, xsum, y, g_mmq_partial, rows, cols, batch, ldy)
-    if (ant >= 4) {
-      if (use_split) { CPI_MMQ_ASYNC(4, true); } else { CPI_MMQ_ASYNC(4, false); }
+#define CPI_MMQ_ASYNC(N, S, M)                                                                 kquant_mmq_q4k_async_kernel<N, S, M>                                                             <<<grid, 256, 0, stream>>>(w, xq, xs, xsum, y, g_mmq_partial, rows, cols, batch, ldy)
+    if (m2) {
+      if (use_split) { CPI_MMQ_ASYNC(2, true, true); } else { CPI_MMQ_ASYNC(2, false, true); }
+    } else if (ant >= 4) {
+      if (use_split) { CPI_MMQ_ASYNC(4, true, false); } else { CPI_MMQ_ASYNC(4, false, false); }
     } else if (ant >= 2) {
-      if (use_split) { CPI_MMQ_ASYNC(2, true); } else { CPI_MMQ_ASYNC(2, false); }
+      if (use_split) { CPI_MMQ_ASYNC(2, true, false); } else { CPI_MMQ_ASYNC(2, false, false); }
     } else {
-      if (use_split) { CPI_MMQ_ASYNC(1, true); } else { CPI_MMQ_ASYNC(1, false); }
+      if (use_split) { CPI_MMQ_ASYNC(1, true, false); } else { CPI_MMQ_ASYNC(1, false, false); }
     }
 #undef CPI_MMQ_ASYNC
     if (use_split) {

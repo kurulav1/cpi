@@ -273,12 +273,15 @@ bool LlamaEngine::ensure_q8_scratch(int batch, int cols) {
 
 namespace detail_mmq {
 // MMQ batch-band routing, hoisted so packed_qkv_matmul can ask "would this
-// succeed" without launching. The band stays [8, 40]: extending it to 64 was
-// re-measured 2026-08-12 (post stream-K, post staging fixes) and LOST -- 1451
-// vs 1560 tok/s at B=64, interleaved -- because batches above 32 leave the
-// double-buffered kernel for the single-buffered one, which is weaker than
-// even the 3x-traffic dequant+cuBLAS path. The B=64 fix is a kernel that is
-// good at M=64, not this routing constant. CPI_KQUANT_MMQ_MAX_BATCH re-pins.
+// succeed" without launching. The band runs to 64 since the M2 dual-half
+// kernel: batch 33..64 stages each weight tile once and replays it against
+// both 32-row batch halves, which beat the re-dequantize-everything fallback
+// by 9.9% at B=64 (1727 vs 1571 tok/s, interleaved). The extension attempt
+// BEFORE that kernel existed lost 7% -- above batch 32 the only MMQ was the
+// single-buffered kernel, weaker than even 3x-traffic dequant -- so if this
+// band moves again, re-measure both edges. Q6_K caps itself at batch 32
+// inside kquant_mmq_accepts (its wide tile does not fit shared above that).
+// CPI_KQUANT_MMQ_MAX_BATCH re-pins.
 inline bool band_allows(int batch) {
   static const int mmq_force = []() {
     const char* e = std::getenv("CPI_KQUANT_MMQ");
@@ -290,7 +293,7 @@ inline bool band_allows(int batch) {
   }();
   static const int mmq_hi = []() {
     const char* e = std::getenv("CPI_KQUANT_MMQ_MAX_BATCH");
-    return e ? atoi(e) : 40;
+    return e ? atoi(e) : 64;
   }();
   return mmq_force == 1 || (mmq_force != 0 && batch >= mmq_lo && batch <= mmq_hi);
 }
