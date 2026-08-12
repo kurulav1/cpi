@@ -2544,11 +2544,27 @@ void launch_kquant_mmq_q6k_streamk(const std::uint8_t* w, const std::int8_t* xq,
   // NT=8 at BM=32 is the 32x256 tile in 88 KB of dynamic shared (occupancy 1)
   // -- the next step on the width/occupancy frontier, opt-in via
   // CPI_KQUANT_MMQ_Q6K_NT=8.
-  const int nt_sel =
+  int nt_sel =
       bm == 64 ? 8
                : (g_kq_tune.mmq_q6k_nt >= 8
                       ? 8
                       : (g_kq_tune.mmq_q6k_nt >= 4 ? 4 : (g_kq_tune.mmq_q6k_nt <= 1 ? 1 : 2)));
+  // Small-grid starvation fix (ROUND 13): wv (1024x4096) at NT=4 is 8 tiles x
+  // 16 super-blocks = 128 work units, and the two-units-per-block floor caps
+  // the grid at 64 blocks on a 170-SM part -- ncu at B=8 read 196 GB/s with
+  // top stall no_instruction 4.35 cyc/issue, i.e. block starvation (ROUND 10).
+  // Narrowing the tile multiplies the units: drop NT while even two-unit
+  // blocks cannot fill one wave. Shapes with enough units (w2, the LM head)
+  // break immediately and keep their measured NT.
+  if (bm == 32) {
+    while (nt_sel > 1) {
+      const int bnq = 4 * nt_sel * 8;
+      const std::int64_t tq =
+          static_cast<std::int64_t>((rows + bnq - 1) / bnq) * (cols >> 8);
+      if (tq / 2 >= q6k_streamk_grid(nt_sel, bm)) break;
+      nt_sel >>= 1;
+    }
+  }
   const int bn = (128 / bm) * nt_sel * 8;
   const int nty = (rows + bn - 1) / bn;
   const int nsb = cols >> 8;
