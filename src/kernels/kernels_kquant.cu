@@ -946,6 +946,13 @@ constexpr int kMmqBM = 64;
 // Bits 0..3 are untouched, so 4- and 16-byte alignment survive.
 __device__ __forceinline__ int mmq_swz(int r, int c) { return c ^ ((r & 7) << 4); }
 
+// Same idea for the Q6_K scale tile, whose rows are 64 B = 16 words: the four
+// Bsc loads in the mma epilogue come from rows nbase + 2t (+1), i.e. a 32-word
+// stride across the thread quad -- same bank four ways. XOR-ing the float
+// index with row bits 1..2 spreads the quad across four bank groups; rows na
+// (even) and na+1 share an offset, so a thread's own pair stays adjacent.
+__device__ __forceinline__ int mmq_swz_sc(int r, int j) { return j ^ (((r >> 1) & 3) << 2); }
+
 // ldmatrix fragment loads: one instruction replaces four (x4) or two (x2)
 // address computations + ld.shared, with the PTX-defined per-thread fragment
 // distribution (thread = row lane>>2, bytes (lane&3)*4) exactly matching what
@@ -1665,7 +1672,7 @@ __device__ __forceinline__ void kquant_mmq_q6k_process_tile(
         }
         const int j0 = (u & 7) << 1;
         for (int j = j0; j < j0 + 2; ++j) {
-          Bsc[r][j] =
+          Bsc[r][mmq_swz_sc(r, j)] =
               (p != nullptr)
                   ? d * static_cast<float>(*reinterpret_cast<const std::int8_t*>(p + 192 + j))
                   : 0.0f;
@@ -1715,7 +1722,8 @@ __device__ __forceinline__ void kquant_mmq_q6k_process_tile(
             : "+r"(d0), "+r"(d1), "+r"(d2), "+r"(d3)
             : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(0), "r"(b1));
         const int na = nbase + 2 * t, nb = nbase + 2 * t + 1;
-        const int jl = gi << 1, jh = jl + 1;
+        // na is even and nb = na + 1, so both share one swizzle offset.
+        const int jl = mmq_swz_sc(na, gi << 1), jh = jl + 1;
         facc[nt][0] += as_a * (static_cast<float>(c0) * Bsc[na][jl] +
                                static_cast<float>(d0) * Bsc[na][jh]);
         facc[nt][1] += as_a * (static_cast<float>(c1) * Bsc[nb][jl] +
