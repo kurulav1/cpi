@@ -271,6 +271,63 @@ bool LlamaEngine::ensure_q8_scratch(int batch, int cols) {
   return true;
 }
 
+namespace detail_mmq {
+// MMQ batch-band routing, hoisted so packed_qkv_matmul can ask "would this
+// succeed" without launching. The band stays [8, 40]: extending it to 64 was
+// re-measured 2026-08-12 (post stream-K, post staging fixes) and LOST -- 1451
+// vs 1560 tok/s at B=64, interleaved -- because batches above 32 leave the
+// double-buffered kernel for the single-buffered one, which is weaker than
+// even the 3x-traffic dequant+cuBLAS path. The B=64 fix is a kernel that is
+// good at M=64, not this routing constant. CPI_KQUANT_MMQ_MAX_BATCH re-pins.
+inline bool band_allows(int batch) {
+  static const int mmq_force = []() {
+    const char* e = std::getenv("CPI_KQUANT_MMQ");
+    return e == nullptr ? -1 : (e[0] == '1' ? 1 : 0);
+  }();
+  static const int mmq_lo = []() {
+    const char* e = std::getenv("CPI_KQUANT_MMQ_MIN_BATCH");
+    return e ? atoi(e) : 8;
+  }();
+  static const int mmq_hi = []() {
+    const char* e = std::getenv("CPI_KQUANT_MMQ_MAX_BATCH");
+    return e ? atoi(e) : 40;
+  }();
+  return mmq_force == 1 || (mmq_force != 0 && batch >= mmq_lo && batch <= mmq_hi);
+}
+inline bool mma_ok() {
+  static const bool ok = []() {
+    int dev = 0;
+    cudaDeviceProp prop{};
+    if (cudaGetDevice(&dev) != cudaSuccess) return false;
+    if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess) return false;
+    return prop.major >= 8;  // mma.m16n8k32.s8 is sm_80+
+  }();
+  return ok;
+}
+inline bool dp4a_on() {
+  static const bool on = []() {
+    const char* e = std::getenv("CPI_KQUANT_DP4A");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+// Mirrors packed_matmul's routing without launching: would SOME packed path
+// take this (weight, batch)? Used by the all-or-nothing QKV so a layer whose
+// wv must decline never pays for a wq+wk launch it is about to discard.
+inline bool would_accept(bool active, int kind, int cols, int batch) {
+  if (!active) return false;
+  if (batch == 1) return true;  // matvec takes anything
+  if (band_allows(batch) && mma_ok() && batch >= 2 && batch <= 64 && (kind == 0 || kind == 2) &&
+      cols % 256 == 0 &&
+      kernels::kquant_mmq_accepts(static_cast<kernels::KQuantType>(kind), batch, cols)) {
+    return true;
+  }
+  if (dp4a_on() && batch >= 2 && kind != 2 && cols % 32 == 0) return true;
+  // The register-tile matmul's own gate (launch_kquant_matmul).
+  return batch >= 2 && batch <= kernels::get_kquant_tuning().mm_max;
+}
+}  // namespace detail_mmq
+
 bool LlamaEngine::packed_matmul(const PackedWeight& w, const void* x, void* y, int batch, int ldy,
                                 int row0, cudaStream_t stream, bool reuse_x) {
   if (!w.active()) return false;
@@ -305,31 +362,11 @@ bool LlamaEngine::packed_matmul(const PackedWeight& w, const void* x, void* y, i
   //           -4%   -9%   -2%  +35%  +33%  +14%   -3%   -3%
   // so the band is [8, 40]. CPI_KQUANT_MMQ=1 forces it everywhere and =0 disables
   // it, for re-measuring the edges.
-  static const int mmq_force = []() {
-    const char* e = std::getenv("CPI_KQUANT_MMQ");
-    return e == nullptr ? -1 : (e[0] == '1' ? 1 : 0);
-  }();
-  static const int mmq_lo = []() {
-    const char* e = std::getenv("CPI_KQUANT_MMQ_MIN_BATCH");
-    return e ? atoi(e) : 8;
-  }();
-  static const int mmq_hi = []() {
-    const char* e = std::getenv("CPI_KQUANT_MMQ_MAX_BATCH");
-    return e ? atoi(e) : 40;
-  }();
-  const bool mmq_on =
-      mmq_force == 1 || (mmq_force != 0 && batch >= mmq_lo && batch <= mmq_hi);
-  static const bool mma_ok = []() {
-    int dev = 0;
-    cudaDeviceProp prop{};
-    if (cudaGetDevice(&dev) != cudaSuccess) return false;
-    if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess) return false;
-    return prop.major >= 8;  // mma.m16n8k32.s8 is sm_80+
-  }();
+  const bool mmq_on = detail_mmq::band_allows(batch);
   // kind 0 is Q4_K, kind 2 is Q6_K; both have an MMQ path now, which is what
   // stops ffn_down and wv falling back to expand-and-cuBLAS.
-  if (mmq_on && mma_ok && batch >= 2 && batch <= 64 && (w.kind == 0 || w.kind == 2) &&
-      w.cols % 256 == 0 &&
+  if (mmq_on && detail_mmq::mma_ok() && batch >= 2 && batch <= 64 &&
+      (w.kind == 0 || w.kind == 2) && w.cols % 256 == 0 &&
       ensure_q8_scratch(batch, w.cols) &&
       kernels::launch_kquant_mmq(static_cast<const std::uint8_t*>(w.data),
                                  static_cast<kernels::KQuantType>(w.kind),
@@ -388,8 +425,15 @@ bool LlamaEngine::packed_qkv_matmul(const LayerDeviceWeights& lw, const void* x,
   if (!lw.wq_packed.active() || !lw.wv_packed.active()) return false;
   const int rows_q = lw.wq_packed.rows;
   const int rows_k = lw.wk_packed.active() ? lw.wk_packed.rows : 0;
-  // Probe the first part before committing: the launcher declines batches it is
-  // not worth doing, and it must decline all three or none.
+  // Decline BEFORE launching anything. Probing by launching cost ~430 us/step
+  // at B=32: wq+wk (Q4_K) ran its MMQ, then wv (Q6_K, gated off) declined, the
+  // whole projection fell back to dequant+cuBLAS, and the finished MMQ output
+  // was overwritten -- every split-QKV layer, every step (2026-08-12 audit).
+  if (!detail_mmq::would_accept(true, lw.wq_packed.kind, lw.wq_packed.cols, batch) ||
+      (rows_k > 0 && !detail_mmq::would_accept(true, lw.wk_packed.kind, lw.wk_packed.cols, batch)) ||
+      !detail_mmq::would_accept(true, lw.wv_packed.kind, lw.wv_packed.cols, batch)) {
+    return false;
+  }
   // All three read the same activation, so only the first pays to quantize it.
   if (!packed_matmul(lw.wq_packed, x, y, batch, ldy, 0, stream)) return false;
   if (rows_k > 0 && !packed_matmul(lw.wk_packed, x, y, batch, ldy, rows_q, stream, true)) {

@@ -213,7 +213,10 @@ void run_real(const std::string& gguf_path, bool bandwidth) {
     // Batch element 0 reuses x, so its expected answer is `ref` -- a batched
     // kernel that silently ignored the batch index would still match there,
     // which is why the other elements get their own activations.
-    for (const int bsz : {4, 20}) {
+    // 64 = the MMQ M-tile edge: the engine's batch band now runs to 64, and a
+    // kernel bug in the upper half of the tile is invisible at batch <= 32
+    // (all m-tiles beyond the batch are masked by the lm < batch guard).
+    for (const int bsz : {4, 20, 64}) {
       std::vector<__half> xb(static_cast<std::size_t>(bsz) * pk.cols);
       for (int b = 0; b < bsz; ++b) {
         for (int i = 0; i < pk.cols; ++i) {

@@ -1273,9 +1273,17 @@ void launch_dequant_kquant(const std::uint8_t* blocks_in, KQuantType type, std::
 struct KQuantTuning {
   int mm_max = 8;        // largest batch the register-tile matmul takes
   int mmq_nt = 2;        // n-tiles per warp-half, single-buffered mma kernel
-  int mmq_async_nt = 2;  // same, double-buffered kernel
+  // Double-buffered Q4_K kernel's n-tile. 0 = auto: the 32x128 tile (ANT=4,
+  // activation panel single-buffered to fit shared) wins +2-4% at B=32 by
+  // halving panel restaging, but loses ~3% at B=8 where the grid shrink bites;
+  // B=16 is a wash. Auto picks 4 above batch 16, 2 at or below.
+  int mmq_async_nt = 0;
   int mmq_async = 1;
-  int mmq_q6k = 0;      // Q6_K on the tensor cores: correct, gated, and LOSES. See below.
+  // Q6_K on the tensor cores. ON since the 32x128 stream-K tile: interleaved
+  // medians vs the dequant+cuBLAS fallback, 2026-08-12 evening session:
+  // B=8 +2.6% (621 vs 606), B=32 +0.9% (1449 vs 1435). The flip from LOSES to
+  // WINS was activation-restaging (tile width), not staging instruction shape.
+  int mmq_q6k = 1;
   // Split the MMQ super-block loop across blocks. That loop is the kernel's
   // cost -- w13 has 3.5x wq's weight bytes and takes the same time -- so
   // shortening the per-block chain is the lever, not more rows per block.
@@ -1346,6 +1354,10 @@ bool launch_kquant_matmul_dp4a(const std::uint8_t* w, KQuantType type, const hal
 bool launch_kquant_mmq(const std::uint8_t* w, KQuantType type, const half* x, half* y, int rows,
                        int cols, int batch, int ldy, std::int8_t* xq, float* xs, float* xsum,
                        cudaStream_t stream, bool reuse_x = false, bool force_q6k = false);
+// Whether launch_kquant_mmq would take this shape, without launching anything.
+// Lets an all-or-nothing caller (packed_qkv_matmul) decline BEFORE paying for
+// the parts that would succeed.
+bool kquant_mmq_accepts(KQuantType type, int batch, int cols, bool force_q6k = false);
 
 // Accumulates into y instead of overwriting it, folding a residual add into the
 // projection's epilogue. The fp16 path has always done this; without it the

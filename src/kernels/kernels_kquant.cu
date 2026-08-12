@@ -1149,20 +1149,46 @@ __global__ __launch_bounds__(256) void kquant_mmq_q4k_async_kernel(
   const std::size_t row_bytes =
       static_cast<std::size_t>(nsb) * model::kquant::kQ4KBlockBytes;
 
-  __shared__ __align__(16) std::int8_t As[2][kBM][256];
+  // At NT>=4 (kBN=128, the audit's restaging fix) the double-buffered tile set
+  // no longer fits 48 KB static shared, so the ACTIVATION panel drops to a
+  // single buffer staged with plain loads: it is the small, L2-hot side (8 KB
+  // a tile against Bq's 16), and the whole point of the wide tile is that this
+  // panel is re-read less often per weight byte. Weights and headers keep the
+  // cp.async double buffer either way.
+  constexpr int kAsBufs = NT >= 4 ? 1 : 2;
+  __shared__ __align__(16) std::int8_t As[kAsBufs][kBM][256];
   __shared__ __align__(16) std::uint8_t Bq[2][kBN][128];  // raw qs, unpacked at use
   __shared__ __align__(16) std::uint8_t Hd[2][kBN][16];   // raw header: d, dmin, 12 scale bytes
 
-  // Issue one K-tile's copies into buffer `buf`.
-  const auto stage = [&](int sb, int buf) {
-    // Activations: 32 rows x 256 B = 512 uint4, two per thread.
+  // Synchronous activation stage for the single-buffer shape. Safe without an
+  // extra barrier: the previous iteration's trailing __syncthreads means every
+  // warp is done computing from As[0] before any warp overwrites it.
+  const auto stage_a_sync = [&](int sb) {
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
       const int u = tid + i * 256;
       const int r = u >> 4, c = (u & 15) << 4;
+      uint4 v = make_uint4(0, 0, 0, 0);
       if (r < batch) {
-        __pipeline_memcpy_async(&As[buf][r][c],
-                                xq + static_cast<std::size_t>(r) * cols + (sb << 8) + c, 16);
+        v = *reinterpret_cast<const uint4*>(xq + static_cast<std::size_t>(r) * cols + (sb << 8) +
+                                            c);
+      }
+      *reinterpret_cast<uint4*>(&As[0][r][c]) = v;
+    }
+  };
+
+  // Issue one K-tile's copies into buffer `buf`.
+  const auto stage = [&](int sb, int buf) {
+    // Activations: 32 rows x 256 B = 512 uint4, two per thread.
+    if (kAsBufs == 2) {
+#pragma unroll
+      for (int i = 0; i < 2; ++i) {
+        const int u = tid + i * 256;
+        const int r = u >> 4, c = (u & 15) << 4;
+        if (r < batch) {
+          __pipeline_memcpy_async(&As[buf % kAsBufs][r][c],
+                                  xq + static_cast<std::size_t>(r) * cols + (sb << 8) + c, 16);
+        }
       }
     }
     // Weights: kBN rows x 128 B of qs, 8 uint4 per row.
@@ -1208,9 +1234,11 @@ __global__ __launch_bounds__(256) void kquant_mmq_q4k_async_kernel(
   for (int sb = sb_lo; sb < sb_hi; ++sb) {
     const int buf = (sb - sb_lo) & 1;
     if (sb + 1 < sb_hi) stage(sb + 1, buf ^ 1);
+    if (kAsBufs == 1) stage_a_sync(sb);
     // Wait only for this tile; the next one keeps flying.
     __pipeline_wait_prior(sb + 1 < sb_hi ? 1 : 0);
     __syncthreads();
+    const int abuf = kAsBufs == 1 ? 0 : buf;
 
     const int arow = 16 * mt;
     const int m_a = arow + g, m_b = arow + g + 8;
@@ -1224,10 +1252,10 @@ __global__ __launch_bounds__(256) void kquant_mmq_q4k_async_kernel(
     for (int gi = 0; gi < 8; ++gi) {
       const int kg = (sb << 3) + gi, co = gi << 5;
       // A fragments: k = co..co+31, split 0..15 / 16..31 across a0a1 / a2a3.
-      const int a0 = ok_a ? *reinterpret_cast<int*>(&As[buf][m_a][co + t * 4]) : 0;
-      const int a1 = ok_b ? *reinterpret_cast<int*>(&As[buf][m_b][co + t * 4]) : 0;
-      const int a2 = ok_a ? *reinterpret_cast<int*>(&As[buf][m_a][co + 16 + t * 4]) : 0;
-      const int a3 = ok_b ? *reinterpret_cast<int*>(&As[buf][m_b][co + 16 + t * 4]) : 0;
+      const int a0 = ok_a ? *reinterpret_cast<int*>(&As[abuf][m_a][co + t * 4]) : 0;
+      const int a1 = ok_b ? *reinterpret_cast<int*>(&As[abuf][m_b][co + t * 4]) : 0;
+      const int a2 = ok_a ? *reinterpret_cast<int*>(&As[abuf][m_a][co + 16 + t * 4]) : 0;
+      const int a3 = ok_b ? *reinterpret_cast<int*>(&As[abuf][m_b][co + 16 + t * 4]) : 0;
       const float as_a = ok_a ? as[static_cast<std::size_t>(m_a) * Kg + kg] : 0.0f;
       const float as_b = ok_b ? as[static_cast<std::size_t>(m_b) * Kg + kg] : 0.0f;
       const float gs_a = ok_a ? gsum[static_cast<std::size_t>(m_a) * Kg + kg] : 0.0f;
@@ -1426,17 +1454,27 @@ __global__ void kquant_mmq_finalize_kernel(float* __restrict__ partial, __half* 
 //      split-K, kept for CPI_KQUANT_MMQ_STREAMK=0).
 //   2  store raw float partials to this block's slot of the stream-K fixup
 //      buffer: aux[blockIdx.x][m][n_local].
-template <int NT, int MODE>
+//
+// BM is the M (batch) tile: 16 rows per m-tile warp group, so BM=64 splits the
+// 8 warps 4x2 over MxN and BM=32 splits them 2x4. The BM=32 shape exists
+// because the audit's dominant matmul cost was ACTIVATION RESTAGING: every
+// block re-stages the whole batch panel, so tile-N width is the divisor on
+// that traffic, and shrinking the M tile to what a batch<=32 call actually
+// uses buys the shared memory to double N: BM=32/NT=4 is a 32x128 tile in the
+// same 48 KB that BM=64/NT=4 spends on 64x64.
+template <int NT, int BM, int MODE>
 __device__ __forceinline__ void kquant_mmq_q6k_process_tile(
-    std::int8_t (&As)[kMmqBM][256], std::int8_t (&Bs)[2 * NT * 8][256],
-    float (&Bsc)[2 * NT * 8][16], const std::uint8_t* __restrict__ w,
+    std::int8_t (&As)[BM][256], std::int8_t (&Bs)[(128 / BM) * NT * 8][256],
+    float (&Bsc)[(128 / BM) * NT * 8][16], const std::uint8_t* __restrict__ w,
     const std::int8_t* __restrict__ xq, const float* __restrict__ as, __half* __restrict__ y,
     float* __restrict__ aux, int rows, int cols, int batch, int ldy, int tile_it, int kb0_start,
     int kb0_stop) {
-  constexpr int kMmqBN = 2 * NT * 8;
+  constexpr int kMT = BM / 16;      // m-tiles, one warp group each
+  constexpr int kNH = 8 / kMT;      // warp groups across N
+  constexpr int kMmqBN = kNH * NT * 8;
   const int tid = static_cast<int>(threadIdx.x);
   const int warp = tid >> 5, lane = tid & 31;
-  const int g = lane >> 2, t = lane & 3, mt = warp & 3, nhalf = warp >> 2;
+  const int g = lane >> 2, t = lane & 3, mt = warp % kMT, nhalf = warp / kMT;
   const int blockNrow = tile_it * kMmqBN;
   const int Kg = cols >> 5;
   const int blocks_per_row = cols >> 8;
@@ -1453,7 +1491,7 @@ __device__ __forceinline__ void kquant_mmq_q6k_process_tile(
     const int k0 = sb << 8;
 
 #pragma unroll
-    for (int i = 0; i < (kMmqBM * 16) / 256; ++i) {
+    for (int i = 0; i < (BM * 16) / 256; ++i) {
       const int u = tid + i * 256;
       const int r = u >> 4, c = (u & 15) << 4;
       uint4 v = make_uint4(0, 0, 0, 0);
@@ -1486,27 +1524,39 @@ __device__ __forceinline__ void kquant_mmq_q6k_process_tile(
         const int n = c >> 6, h = (c >> 5) & 1, l0 = c & 31;
         const int off_lo = (n << 7) + (h << 5) + l0;
         const int sl = 2 * h, sh = 4 + 2 * h;
-        // Read the run as uint16 pairs, not byte at a time. A 210-byte block
-        // leaves p only 2-byte aligned so uint4 is out -- 210 % 4 == 2, so even
-        // 4-byte alignment alternates between super-blocks -- but 16-bit loads
-        // are always safe and halve the count from 32 per thread to 16.
+        // Read the run as uint16 pairs -- a 210-byte block leaves p only 2-byte
+        // aligned so wider loads are out (llama.cpp pays the same get_int_b2
+        // tax) -- but UNPACK IN WORDS, NOT BYTES. The old loop computed each
+        // value separately and issued a byte-wide shared store per weight: 32
+        // st.b8 and ~96 per-byte ALU ops per 16-byte run. The audit's head A/B
+        // put this kernel at 379 GB/s against llama.cpp's 1317 on identical
+        // bytes with staging as the only untested difference; their
+        // load_tiles_q6_K assembles four recentered values per int in
+        // registers (__vsubss4) and stores words. Same here: the whole-word
+        // shifts keep each byte lane's 2 qh bits and 4 ql bits in place (the
+        // cross-byte spill of >> lands above the per-lane mask), so this is
+        // arithmetic-identical to the byte loop, at 8 st.b32 and ~16 word ops.
         const std::uint16_t* qlp = reinterpret_cast<const std::uint16_t*>(p + c);
         const std::uint16_t* qhp =
             reinterpret_cast<const std::uint16_t*>(p + 128 + (n << 5) + l0);
 #pragma unroll
-        for (int i2 = 0; i2 < 8; ++i2) {
-          const std::uint32_t qw = (p != nullptr) ? qlp[i2] : 0u;
-          const std::uint32_t hw = (p != nullptr) ? qhp[i2] : 0u;
-#pragma unroll
-          for (int k = 0; k < 2; ++k) {
-            const int i = 2 * i2 + k;
-            const std::uint32_t byte = (qw >> (8 * k)) & 0xFFu;
-            const std::uint32_t hb = (hw >> (8 * k)) & 0xFFu;
-            const int vlo = static_cast<int>((byte & 0x0Fu) | (((hb >> sl) & 3u) << 4)) - 32;
-            const int vhi = static_cast<int>((byte >> 4) | (((hb >> sh) & 3u) << 4)) - 32;
-            Bs[r][off_lo + i] = static_cast<std::int8_t>(vlo);
-            Bs[r][off_lo + 64 + i] = static_cast<std::int8_t>(vhi);
+        for (int g2 = 0; g2 < 4; ++g2) {
+          std::uint32_t ql32 = 0u;
+          std::uint32_t qh32 = 0u;
+          if (p != nullptr) {
+            ql32 = static_cast<std::uint32_t>(qlp[2 * g2]) |
+                   (static_cast<std::uint32_t>(qlp[2 * g2 + 1]) << 16);
+            qh32 = static_cast<std::uint32_t>(qhp[2 * g2]) |
+                   (static_cast<std::uint32_t>(qhp[2 * g2 + 1]) << 16);
           }
+          const std::uint32_t lo_u =
+              (ql32 & 0x0F0F0F0Fu) | (((qh32 >> sl) & 0x03030303u) << 4);
+          const std::uint32_t hi_u =
+              ((ql32 >> 4) & 0x0F0F0F0Fu) | (((qh32 >> sh) & 0x03030303u) << 4);
+          const int lo = __vsubss4(static_cast<int>(lo_u), 0x20202020);
+          const int hi = __vsubss4(static_cast<int>(hi_u), 0x20202020);
+          *reinterpret_cast<int*>(&Bs[r][off_lo + 4 * g2]) = lo;
+          *reinterpret_cast<int*>(&Bs[r][off_lo + 64 + 4 * g2]) = hi;
         }
         // Two of the sixteen scale groups per pass.
         float d = 0.0f;
@@ -1584,7 +1634,7 @@ __device__ __forceinline__ void kquant_mmq_q6k_process_tile(
         if (MODE == 1) {
           atomicAdd(&aux[static_cast<std::size_t>(lm) * rows + gn], facc[nt][en]);
         } else if (MODE == 2) {
-          aux[static_cast<std::size_t>(blockIdx.x) * (kMmqBN * kMmqBM) +
+          aux[static_cast<std::size_t>(blockIdx.x) * (kMmqBN * BM) +
               static_cast<std::size_t>(lm) * kMmqBN + (nbase + cc[en])] = facc[nt][en];
         } else {
           y[static_cast<std::size_t>(lm) * static_cast<std::size_t>(ldy) + gn] =
@@ -1622,9 +1672,10 @@ __global__ __launch_bounds__(256) void kquant_mmq_q6k_kernel(
     sb_hi = min(sb_lo + chunk, blocks_per_row);
     if (sb_lo >= sb_hi) return;
   }
-  kquant_mmq_q6k_process_tile<NT, SPLITK ? 1 : 0>(As, Bs, Bsc, w, xq, as, y, partial, rows, cols,
-                                                  batch, ldy, static_cast<int>(blockIdx.x), sb_lo,
-                                                  sb_hi);
+  kquant_mmq_q6k_process_tile<NT, kMmqBM, SPLITK ? 1 : 0>(As, Bs, Bsc, w, xq, as, y, partial, rows,
+                                                          cols, batch, ldy,
+                                                          static_cast<int>(blockIdx.x), sb_lo,
+                                                          sb_hi);
 #endif
 }
 
@@ -1640,7 +1691,7 @@ __global__ __launch_bounds__(256) void kquant_mmq_q6k_kernel(
 // to its tmp slot, and kquant_mmq_q6k_streamk_fixup_kernel folds those into y.
 // Unlike the atomicAdd split, the result is deterministic: the fixup adds
 // partials in a fixed order.
-template <int NT>
+template <int NT, int BM>
 __global__ __launch_bounds__(256) void kquant_mmq_q6k_streamk_kernel(
     const std::uint8_t* __restrict__ w, const std::int8_t* __restrict__ xq,
     const float* __restrict__ as, __half* __restrict__ y, float* __restrict__ tmp, int rows,
@@ -1648,8 +1699,8 @@ __global__ __launch_bounds__(256) void kquant_mmq_q6k_streamk_kernel(
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800)
   (void)w; (void)xq; (void)as; (void)y; (void)tmp; (void)rows; (void)cols; (void)batch; (void)ldy;
 #else
-  constexpr int kMmqBN = 2 * NT * 8;
-  __shared__ __align__(16) std::int8_t As[kMmqBM][256];
+  constexpr int kMmqBN = (128 / BM) * NT * 8;
+  __shared__ __align__(16) std::int8_t As[BM][256];
   __shared__ __align__(16) std::int8_t Bs[kMmqBN][256];
   __shared__ float Bsc[kMmqBN][16];  // d*scale per 16 weights
 
@@ -1665,8 +1716,8 @@ __global__ __launch_bounds__(256) void kquant_mmq_q6k_streamk_kernel(
   std::int64_t want = kb0_start + (kbc_stop - kbc);
   int kb0_stop = want < nsb ? static_cast<int>(want) : nsb;
   while (kbc < kbc_stop && kb0_stop == nsb) {
-    kquant_mmq_q6k_process_tile<NT, 0>(As, Bs, Bsc, w, xq, as, y, tmp, rows, cols, batch, ldy,
-                                       static_cast<int>(kbc / nsb), kb0_start, kb0_stop);
+    kquant_mmq_q6k_process_tile<NT, BM, 0>(As, Bs, Bsc, w, xq, as, y, tmp, rows, cols, batch, ldy,
+                                           static_cast<int>(kbc / nsb), kb0_start, kb0_stop);
     kbc += nsb - kb0_start;  // advance to the next tile boundary
     kb0_start = 0;
     want = kbc_stop - kbc;
@@ -1675,8 +1726,8 @@ __global__ __launch_bounds__(256) void kquant_mmq_q6k_streamk_kernel(
   if (kbc >= kbc_stop) return;
   // Trailing piece that ends mid-tile: park it in the fixup buffer. Writing y
   // here would race with the block that owns this tile's k-end.
-  kquant_mmq_q6k_process_tile<NT, 2>(As, Bs, Bsc, w, xq, as, y, tmp, rows, cols, batch, ldy,
-                                     static_cast<int>(kbc / nsb), kb0_start, kb0_stop);
+  kquant_mmq_q6k_process_tile<NT, BM, 2>(As, Bs, Bsc, w, xq, as, y, tmp, rows, cols, batch, ldy,
+                                         static_cast<int>(kbc / nsb), kb0_start, kb0_stop);
 #endif
 }
 
@@ -1688,12 +1739,12 @@ __global__ __launch_bounds__(256) void kquant_mmq_q6k_streamk_kernel(
 // to reconcile exit in a few instructions. Must be launched with the SAME grid
 // size as the stream-K kernel -- the kbc arithmetic has to reproduce its
 // partitioning exactly.
-template <int NT>
+template <int NT, int BM>
 __global__ void kquant_mmq_q6k_streamk_fixup_kernel(__half* __restrict__ y,
                                                     const float* __restrict__ tmp, int rows,
                                                     int cols, int batch, int ldy) {
-  constexpr int kMmqBN = 2 * NT * 8;
-  constexpr int kElems = (kMmqBN * kMmqBM) / 256;  // tile outputs per thread
+  constexpr int kMmqBN = (128 / BM) * NT * 8;
+  constexpr int kElems = (kMmqBN * BM) / 256;  // tile outputs per thread
   const int nsb = cols >> 8;
   const int nty = (rows + kMmqBN - 1) / kMmqBN;
   const std::int64_t total = static_cast<std::int64_t>(nty) * nsb;
@@ -1722,7 +1773,7 @@ __global__ void kquant_mmq_q6k_streamk_fixup_kernel(__half* __restrict__ y,
     }
     // Non-empty predecessor: its range ends at kbc_stop_w, mid-tile `it`, so
     // its trailing piece is a partial of this tile.
-    const float* src = tmp + static_cast<std::size_t>(bidx) * (kMmqBN * kMmqBM);
+    const float* src = tmp + static_cast<std::size_t>(bidx) * (kMmqBN * BM);
 #pragma unroll
     for (int e = 0; e < kElems; ++e) {
       sum[e] += src[static_cast<int>(threadIdx.x) + e * 256];
@@ -1784,9 +1835,9 @@ bool ensure_mmq_fixup(std::size_t elems) {
 // measured occupancy -- so all blocks run concurrently and the kbc ranges
 // partition the work exactly once. Cached after the first call; the queries
 // are device-attribute reads, not stream work, so they are capture-safe.
-int q6k_streamk_grid(int nt_sel) {
+int q6k_streamk_grid(int nt_sel, int bm) {
   static int nsm = 0;
-  static int occ[3] = {0, 0, 0};  // NT = 1, 2, 4
+  static int occ[3][2] = {{0, 0}, {0, 0}, {0, 0}};  // [NT 1,2,4][BM 32,64]
   if (nsm == 0) {
     int dev = 0;
     cudaGetDevice(&dev);
@@ -1796,22 +1847,25 @@ int q6k_streamk_grid(int nt_sel) {
     }
   }
   const int i = nt_sel >= 4 ? 2 : (nt_sel <= 1 ? 0 : 1);
-  if (occ[i] == 0) {
+  const int j = bm <= 32 ? 0 : 1;
+  if (occ[i][j] == 0) {
     int o = 0;
     cudaError_t err = cudaErrorUnknown;
-    if (i == 2) {
-      err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&o, kquant_mmq_q6k_streamk_kernel<4>,
-                                                          256, 0);
-    } else if (i == 0) {
-      err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&o, kquant_mmq_q6k_streamk_kernel<1>,
-                                                          256, 0);
+    const auto query = [&](auto kern) {
+      err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&o, kern, 256, 0);
+    };
+    if (j == 0) {
+      if (i == 2) query(kquant_mmq_q6k_streamk_kernel<4, 32>);
+      else if (i == 0) query(kquant_mmq_q6k_streamk_kernel<1, 32>);
+      else query(kquant_mmq_q6k_streamk_kernel<2, 32>);
     } else {
-      err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&o, kquant_mmq_q6k_streamk_kernel<2>,
-                                                          256, 0);
+      if (i == 2) query(kquant_mmq_q6k_streamk_kernel<4, 64>);
+      else if (i == 0) query(kquant_mmq_q6k_streamk_kernel<1, 64>);
+      else query(kquant_mmq_q6k_streamk_kernel<2, 64>);
     }
-    occ[i] = (err == cudaSuccess && o > 0) ? o : 1;
+    occ[i][j] = (err == cudaSuccess && o > 0) ? o : 1;
   }
-  return nsm * occ[i];
+  return nsm * occ[i][j];
 }
 
 // Stream-K launch for the Q6_K MMQ. Returns false only when the fixup scratch
@@ -1821,14 +1875,17 @@ void launch_kquant_mmq_q6k_streamk(const std::uint8_t* w, const std::int8_t* xq,
                                    half* y, int rows, int cols, int batch, int ldy,
                                    cudaStream_t stream) {
   const int nt_sel = g_kq_tune.mmq_q6k_nt >= 4 ? 4 : (g_kq_tune.mmq_q6k_nt <= 1 ? 1 : 2);
-  const int bn = 2 * nt_sel * 8;
+  // Batches that fit half the M tile take the 32x(4*NT*8) shape: same shared
+  // budget, double the N width, half the activation restaging per weight byte.
+  const int bm = batch <= 32 ? 32 : 64;
+  const int bn = (128 / bm) * nt_sel * 8;
   const int nty = (rows + bn - 1) / bn;
   const int nsb = cols >> 8;
   const std::int64_t total = static_cast<std::int64_t>(nty) * nsb;
   int nblocks =
-      g_kq_tune.mmq_streamk > 1 ? g_kq_tune.mmq_streamk : q6k_streamk_grid(nt_sel);
+      g_kq_tune.mmq_streamk > 1 ? g_kq_tune.mmq_streamk : q6k_streamk_grid(nt_sel, bm);
   // llama.cpp's shortcut: when whole tiles already fill the waves >=90%
-  // (the LM head's 4008 tiles, for instance), plain one-tile-per-block is the
+  // (the LM head's tiles, for instance), plain one-tile-per-block is the
   // same work with no fixup pass.
   const int waves = (nty + nblocks - 1) / nblocks;
   if (100 * nty >= 90 * nblocks * waves) {
@@ -1837,39 +1894,57 @@ void launch_kquant_mmq_q6k_streamk(const std::uint8_t* w, const std::int8_t* xq,
     nblocks = static_cast<int>(total);
   }
   bool fixup = (nty % nblocks) != 0;
-  if (fixup &&
-      !ensure_mmq_fixup(static_cast<std::size_t>(nblocks) * bn * kMmqBM)) {
+  if (fixup && !ensure_mmq_fixup(static_cast<std::size_t>(nblocks) * bn * bm)) {
     nblocks = nty;  // no scratch: block boundaries land on tile boundaries
     fixup = false;
   }
-#define CPI_MMQ_Q6K_SK(N)                                                                        \
+#define CPI_MMQ_Q6K_SK(N, M)                                                                     \
   do {                                                                                           \
-    kquant_mmq_q6k_streamk_kernel<N><<<static_cast<unsigned>(nblocks), 256, 0, stream>>>(        \
+    kquant_mmq_q6k_streamk_kernel<N, M><<<static_cast<unsigned>(nblocks), 256, 0, stream>>>(     \
         w, xq, xs, y, g_mmq_fixup, rows, cols, batch, ldy);                                      \
     if (fixup) {                                                                                 \
-      kquant_mmq_q6k_streamk_fixup_kernel<N><<<static_cast<unsigned>(nblocks), 256, 0, stream>>>( \
-          y, g_mmq_fixup, rows, cols, batch, ldy);                                               \
+      kquant_mmq_q6k_streamk_fixup_kernel<N, M>                                                  \
+          <<<static_cast<unsigned>(nblocks), 256, 0, stream>>>(y, g_mmq_fixup, rows, cols,       \
+                                                               batch, ldy);                      \
     }                                                                                            \
   } while (0)
-  if (nt_sel == 4) {
-    CPI_MMQ_Q6K_SK(4);
-  } else if (nt_sel == 1) {
-    CPI_MMQ_Q6K_SK(1);
+  if (bm == 32) {
+    if (nt_sel == 4) {
+      CPI_MMQ_Q6K_SK(4, 32);
+    } else if (nt_sel == 1) {
+      CPI_MMQ_Q6K_SK(1, 32);
+    } else {
+      CPI_MMQ_Q6K_SK(2, 32);
+    }
   } else {
-    CPI_MMQ_Q6K_SK(2);
+    if (nt_sel == 4) {
+      CPI_MMQ_Q6K_SK(4, 64);
+    } else if (nt_sel == 1) {
+      CPI_MMQ_Q6K_SK(1, 64);
+    } else {
+      CPI_MMQ_Q6K_SK(2, 64);
+    }
   }
 #undef CPI_MMQ_Q6K_SK
+}
+
+// The decline conditions of launch_kquant_mmq, checkable WITHOUT launching.
+// packed_qkv_matmul is all-or-nothing across q/k/v: probing by launching meant
+// a layer whose wv declines had already run -- and then discarded -- the fused
+// wq+wk MMQ, every layer, every step (~430 us/step at B=32 in the audit).
+bool kquant_mmq_accepts(KQuantType type, int batch, int cols, bool force_q6k) {
+  if (type != KQuantType::Q4_K && type != KQuantType::Q6_K) return false;
+  if (type == KQuantType::Q6_K && g_kq_tune.mmq_q6k == 0 && !force_q6k) return false;
+  if (batch < 1 || batch > kMmqBM || cols % 256 != 0) return false;
+  return true;
 }
 
 bool launch_kquant_mmq(const std::uint8_t* w, KQuantType type, const half* x, half* y, int rows,
                        int cols, int batch, int ldy, std::int8_t* xq, float* xs, float* xsum,
                        cudaStream_t stream, bool reuse_x, bool force_q6k) {
-  if (type != KQuantType::Q4_K && type != KQuantType::Q6_K) return false;
   // force_q6k is for callers whose alternative is dequant-and-cuBLAS rather than
-  // a good kernel -- the LM head. For layer weights Q6_K MMQ still loses, which
-  // is what mmq_q6k gates.
-  if (type == KQuantType::Q6_K && g_kq_tune.mmq_q6k == 0 && !force_q6k) return false;
-  if (batch < 1 || batch > kMmqBM || cols % 256 != 0) return false;
+  // a good kernel -- the LM head. For layer weights Q6_K MMQ is gated by mmq_q6k.
+  if (!kquant_mmq_accepts(type, batch, cols, force_q6k)) return false;
   const int groups_per_row = cols >> 5;
   const int total_groups = batch * groups_per_row;
   // The activation is quantized per call, and at batch the q, k and v
@@ -1927,8 +2002,10 @@ bool launch_kquant_mmq(const std::uint8_t* w, KQuantType type, const half* x, ha
     // against 170 SMs -- so the extra work per block outweighs filling the GPU,
     // which is the opposite of what the block count suggests. Measure, do not
     // reason from grid size here.
-    const int ant = g_kq_tune.mmq_async_nt;
-    const int base_blocks = ant >= 2 ? (rows + 63) / 64 : (rows + 31) / 32;
+    const int ant =
+        g_kq_tune.mmq_async_nt > 0 ? g_kq_tune.mmq_async_nt : (batch > 16 ? 4 : 2);
+    const int base_blocks = ant >= 4 ? (rows + 127) / 128
+                                     : (ant >= 2 ? (rows + 63) / 64 : (rows + 31) / 32);
     const int nsb = cols >> 8;
     // Enough blocks to cover the SMs, but never so few super-blocks per block
     // that the pipeline has nothing to overlap.
@@ -1941,7 +2018,9 @@ bool launch_kquant_mmq(const std::uint8_t* w, KQuantType type, const half* x, ha
         split > 1 && ensure_mmq_partial(static_cast<std::size_t>(batch) * rows);
     const dim3 grid(static_cast<unsigned>(base_blocks), use_split ? static_cast<unsigned>(split) : 1u);
 #define CPI_MMQ_ASYNC(N, S)                                                                    kquant_mmq_q4k_async_kernel<N, S>                                                                <<<grid, 256, 0, stream>>>(w, xq, xs, xsum, y, g_mmq_partial, rows, cols, batch, ldy)
-    if (ant >= 2) {
+    if (ant >= 4) {
+      if (use_split) { CPI_MMQ_ASYNC(4, true); } else { CPI_MMQ_ASYNC(4, false); }
+    } else if (ant >= 2) {
       if (use_split) { CPI_MMQ_ASYNC(2, true); } else { CPI_MMQ_ASYNC(2, false); }
     } else {
       if (use_split) { CPI_MMQ_ASYNC(1, true); } else { CPI_MMQ_ASYNC(1, false); }
