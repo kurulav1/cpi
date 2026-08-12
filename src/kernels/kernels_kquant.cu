@@ -1598,7 +1598,16 @@ __device__ __forceinline__ void kquant_mmq_q4k_process_tile_unpacked(
   // retire behind it. Eight threads a row: one 16-byte qs chunk and, since a
   // row has exactly eight 32-wide scale groups, one header copy each (8x
   // redundant per row, L1 broadcasts it).
-  uint4 pq[kWIter], ph[kWIter];
+  // NT=8's register budget cannot hold both prefetch arrays: pq[8]+ph[8] is 64
+  // registers and the natural allocation spills (255 regs, 251k spill-loads on
+  // the w13 launch, +7% instructions over NT=4 for LESS memory work). The
+  // header line is provably L1/L2-resident by unpack time -- the pq prefetch
+  // for the same super-block touched its sectors one full mma loop earlier
+  // (chunk 0's load shares the header's 128B line, or the previous
+  // super-block's qs covered the straddled sector) -- so at NT>=8 the header
+  // is re-loaded synchronously in unpack_store instead of prefetched.
+  constexpr bool kPfHdr = NT < 8;
+  uint4 pq[kWIter], ph[kPfHdr ? kWIter : 1];
   const auto prefetch = [&](int sb) {
 #pragma unroll
     for (int i = 0; i < kWIter; ++i) {
@@ -1609,10 +1618,10 @@ __device__ __forceinline__ void kquant_mmq_q4k_process_tile_unpacked(
         const std::uint8_t* p = w + static_cast<std::size_t>(wrow) * row_bytes +
                                 static_cast<std::size_t>(sb) * model::kquant::kQ4KBlockBytes;
         pq[i] = *reinterpret_cast<const uint4*>(p + 16 + chunk);
-        ph[i] = *reinterpret_cast<const uint4*>(p);
+        if (kPfHdr) ph[i] = *reinterpret_cast<const uint4*>(p);
       } else {
         pq[i] = make_uint4(0, 0, 0, 0);
-        ph[i] = make_uint4(0, 0, 0, 0);
+        if (kPfHdr) ph[i] = make_uint4(0, 0, 0, 0);
       }
     }
   };
@@ -1620,7 +1629,7 @@ __device__ __forceinline__ void kquant_mmq_q4k_process_tile_unpacked(
   // that used to run per (fragment, n-tile, warp) in the mma loop runs ONCE
   // per byte here, in words; the header decode that used to run per
   // (group, n-tile, warp) runs once per (row, group).
-  const auto unpack_store = [&]() {
+  const auto unpack_store = [&](int sb) {
 #pragma unroll
     for (int i = 0; i < kWIter; ++i) {
       const int u = tid + i * 256;
@@ -1639,11 +1648,23 @@ __device__ __forceinline__ void kquant_mmq_q4k_process_tile_unpacked(
       *reinterpret_cast<uint4*>(&Bs[r][mmq_swz(r, lo_col)]) = lo;
       *reinterpret_cast<uint4*>(&Bs[r][mmq_swz(r, hi_col)]) = hi;
       const int gi = u & 7;
+      uint4 h;
+      if (kPfHdr) {
+        h = ph[i];
+      } else {
+        const int wrow = blockNrow + r;
+        h = make_uint4(0, 0, 0, 0);
+        if (wrow < rows) {
+          h = *reinterpret_cast<const uint4*>(
+              w + static_cast<std::size_t>(wrow) * row_bytes +
+              static_cast<std::size_t>(sb) * model::kquant::kQ4KBlockBytes);
+        }
+      }
       float sc, m;
-      scale_min_from_hdr(gi, ph[i].y, ph[i].z, ph[i].w, &sc, &m);
+      scale_min_from_hdr(gi, h.y, h.z, h.w, &sc, &m);
       float2 sdm;
-      sdm.x = half_bits_to_float(static_cast<std::uint16_t>(ph[i].x & 0xFFFFu)) * sc;
-      sdm.y = half_bits_to_float(static_cast<std::uint16_t>(ph[i].x >> 16)) * m;
+      sdm.x = half_bits_to_float(static_cast<std::uint16_t>(h.x & 0xFFFFu)) * sc;
+      sdm.y = half_bits_to_float(static_cast<std::uint16_t>(h.x >> 16)) * m;
       Bsdm[r][mmq_swz_dm(r, gi)] = sdm;
     }
   };
@@ -1667,7 +1688,7 @@ __device__ __forceinline__ void kquant_mmq_q4k_process_tile_unpacked(
       }
       *reinterpret_cast<uint4*>(&As[r][mmq_swz(r, c)]) = v;
     }
-    unpack_store();
+    unpack_store(sb);
     __syncthreads();
     if (sb + 1 < kb0_stop) prefetch(sb + 1);
 
@@ -2623,6 +2644,7 @@ int q4k_streamk_grid(int nt_sel, bool unpack, bool m2 = false) {
       if (i == 2) return nsm;  // 64x128 dynamic-shared: occupancy 1 by construction
       query(kquant_mmq_q4k_streamk_unpacked_kernel<2, true>);
     } else if (unpack) {
+      if (nt_sel >= 8) return nsm;  // 32x256 dynamic-shared: occupancy 1 by construction
       if (i == 2) query(kquant_mmq_q4k_streamk_unpacked_kernel<4>);
       else if (i == 0) query(kquant_mmq_q4k_streamk_unpacked_kernel<1>);
       else query(kquant_mmq_q4k_streamk_unpacked_kernel<2>);
@@ -2646,6 +2668,8 @@ int q4k_streamk_grid(int nt_sel, bool unpack, bool m2 = false) {
 void launch_kquant_mmq_q4k_streamk(const std::uint8_t* w, const std::int8_t* xq, const float* xs,
                                    const float* xsum, half* y, int rows, int cols, int batch,
                                    int ldy, int nt_sel, bool m2, cudaStream_t stream) {
+  // NT=8 (32x256, 88 KB dynamic shared) exists only in the unpacked body.
+  if (nt_sel >= 8 && (m2 || g_kq_tune.mmq_unpack == 0)) nt_sel = 4;
   const int bn = 4 * nt_sel * 8;
   // The unpacked body ships in the wide-tile shape only (auto-ANT picks NT=4
   // above batch 16): at B=8 it measured -1.7% against the async kernel at BOTH
@@ -2656,7 +2680,10 @@ void launch_kquant_mmq_q4k_streamk(const std::uint8_t* w, const std::int8_t* xq,
   // routes CPI_KQUANT_MMQ_UNPACK=0 to the split-K async kernel) is where the
   // mma loop dominates MOST: every staged fragment replays against two batch
   // halves.
-  const bool unpack = m2 || (g_kq_tune.mmq_unpack != 0 && nt_sel >= 4);
+  // CPI_KQUANT_MMQ_UNPACK=2 forces the unpacked body at every NT (the default
+  // gates it to the wide tile, where the mma loop dominates).
+  const bool unpack =
+      m2 || (g_kq_tune.mmq_unpack != 0 && (nt_sel >= 4 || g_kq_tune.mmq_unpack >= 2));
   const int nty = (rows + bn - 1) / bn;
   const int nsb = cols >> 8;
   const std::int64_t total = static_cast<std::int64_t>(nty) * nsb;
@@ -2702,6 +2729,42 @@ void launch_kquant_mmq_q4k_streamk(const std::uint8_t* w, const std::int8_t* xq,
                                                              rows, cols, batch, ldy);
     if (fixup) {
       kquant_mmq_q6k_streamk_fixup_kernel<4, 64>
+          <<<static_cast<unsigned>(nblocks), 256, 0, stream>>>(y, g_mmq_fixup, rows, cols, batch,
+                                                               ldy);
+    }
+    return;
+  }
+  if (nt_sel >= 8) {
+    // 32x256 unpacked tile in 88 KB dynamic shared, occupancy 1
+    // (CPI_KQUANT_MMQ_ANT=8, kept opt-in for reproducibility).
+    // FALSIFIED at B=32 (ROUND 13): the ROUND 12 occupancy-1 reversal does NOT
+    // extend to BM=32 -- widening N scales the REGISTER state (prefetch
+    // buffers + fragments + scales are all per-NT) where the M2 win widened M,
+    // which only scales facc. Interleaved config medians vs the NT=4 default:
+    //   - full prefetch (pq[8]+ph[8]): 1805.6 vs 2007.0 tok/s (-10.0%); ncu
+    //     w13: 255 regs, 251k spill-loads, +7% instructions (3.39e7 vs 3.17e7)
+    //     for LESS memory work (gloads -40%, ldsm -17%), lg_throttle appears.
+    //   - header-slimmed prefetch (kPfHdr=false, below): 1871.9 vs 2017.9
+    //     (-7.2%); instructions back to parity (3.19e7) but still 255 regs +
+    //     150k spill-loads, short_scoreboard 1.19 vs 0.73 -- equal instructions
+    //     at worse per-issue latency on the same 2-warps/scheduler floor.
+    // The symmetric occupancy test also FALSIFIED: NT=2 unpacked at B=32
+    // (28 KB tile, minBlocks=2, occupancy 2+ WITH prefetch, via ANT=2 +
+    // UNPACK=2): 1912.3 vs 1999.9 (-4.4%) -- doubled As restaging costs more
+    // than the extra blocks hide. B=32's 32x128 occ-1 shape is a measured
+    // optimum among {64-wide occ-2, 128-wide occ-1, 256-wide occ-1}.
+    using Smem = Q4kSmemLayout<8, false>;
+    static const bool attr_once = []() {
+      return cudaFuncSetAttribute(kquant_mmq_q4k_streamk_unpacked_kernel<8>,
+                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                  static_cast<int>(sizeof(Smem))) == cudaSuccess;
+    }();
+    (void)attr_once;
+    kquant_mmq_q4k_streamk_unpacked_kernel<8>
+        <<<static_cast<unsigned>(nblocks), 256, static_cast<unsigned>(sizeof(Smem)), stream>>>(
+            w, xq, xs, xsum, y, g_mmq_fixup, rows, cols, batch, ldy);
+    if (fixup) {
+      kquant_mmq_q6k_streamk_fixup_kernel<8, 32>
           <<<static_cast<unsigned>(nblocks), 256, 0, stream>>>(y, g_mmq_fixup, rows, cols, batch,
                                                                ldy);
     }
@@ -2822,7 +2885,7 @@ bool launch_kquant_mmq(const std::uint8_t* w, KQuantType type, const half* x, ha
     // below, and CPI_KQUANT_MMQ_STREAMK=0 restores the split everywhere.
     if (g_kq_tune.mmq_streamk != 0 && (!m2 || g_kq_tune.mmq_unpack != 0)) {
       const int sk_nt = m2 ? (g_kq_tune.mmq_m2_nt >= 4 ? 4 : 2)
-                           : (ant >= 4 ? 4 : (ant <= 1 ? 1 : 2));
+                           : (ant >= 8 ? 8 : (ant >= 4 ? 4 : (ant <= 1 ? 1 : 2)));
       launch_kquant_mmq_q4k_streamk(w, xq, xs, xsum, y, rows, cols, batch, ldy, sk_nt, m2,
                                     stream);
       return true;
