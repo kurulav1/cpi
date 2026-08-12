@@ -935,6 +935,33 @@ namespace {
 // accumulators, and at NT=4 the kernel needed 128 registers per thread, which
 // capped it at 2 blocks/SM and 33% theoretical occupancy.
 constexpr int kMmqBM = 64;
+
+// 16-byte-granular XOR swizzle for the MMQ shared tiles. Tile rows are 256 B =
+// exactly 64 banks x 4 B, so unswizzled, the 8 rows a fragment load touches
+// all start on the SAME bank and every ld.shared serializes ~8-way -- the cost
+// no prior falsification touched (stores are fewer, mma count was ruled out,
+// and it is invisible to DRAM counters). XOR-ing bits 4..6 of the column with
+// the low row bits rotates each row's chunks across banks at zero memory cost
+// (llama.cpp buys the same property by padding its sram stride to %8==4).
+// Bits 0..3 are untouched, so 4- and 16-byte alignment survive.
+__device__ __forceinline__ int mmq_swz(int r, int c) { return c ^ ((r & 7) << 4); }
+
+// ldmatrix fragment loads: one instruction replaces four (x4) or two (x2)
+// address computations + ld.shared, with the PTX-defined per-thread fragment
+// distribution (thread = row lane>>2, bytes (lane&3)*4) exactly matching what
+// the manual loads produced for mma.m16n8k32.
+__device__ __forceinline__ void ldsm_x4(int& r0, int& r1, int& r2, int& r3, const void* p) {
+  const unsigned a = static_cast<unsigned>(__cvta_generic_to_shared(p));
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+               : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+               : "r"(a));
+}
+__device__ __forceinline__ void ldsm_x2(int& r0, int& r1, const void* p) {
+  const unsigned a = static_cast<unsigned>(__cvta_generic_to_shared(p));
+  asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+               : "=r"(r0), "=r"(r1)
+               : "r"(a));
+}
 }  // namespace
 
 // A whole super-block of K per staging round (llama.cpp's MMQ_ITER_K=256).
@@ -1191,7 +1218,7 @@ __global__ __launch_bounds__(256) void kquant_mmq_q4k_async_kernel(
         v = *reinterpret_cast<const uint4*>(xq + static_cast<std::size_t>(r) * cols + (sb << 8) +
                                             c);
       }
-      *reinterpret_cast<uint4*>(&As[0][r][c]) = v;
+      *reinterpret_cast<uint4*>(&As[0][r][mmq_swz(r, c)]) = v;
     }
   };
 
@@ -1204,12 +1231,14 @@ __global__ __launch_bounds__(256) void kquant_mmq_q4k_async_kernel(
         const int u = tid + i * 256;
         const int r = u >> 4, c = (u & 15) << 4;
         if (r < batch) {
-          __pipeline_memcpy_async(&As[buf % kAsBufs][r][c],
+          __pipeline_memcpy_async(&As[buf % kAsBufs][r][mmq_swz(r, c)],
                                   xq + static_cast<std::size_t>(r) * cols + (sb << 8) + c, 16);
         }
       }
     }
-    // Weights: kBN rows x 128 B of qs, 8 uint4 per row.
+    // Weights: kBN rows x 128 B of qs, 8 uint4 per row. Swizzled like As --
+    // Bq rows are 128 B (exactly one bank wrap), so unswizzled fragment loads
+    // serialize the same way.
 #pragma unroll
     for (int i = 0; i < (kBN + 31) / 32; ++i) {
       const int u = tid + i * 256;
@@ -1218,7 +1247,7 @@ __global__ __launch_bounds__(256) void kquant_mmq_q4k_async_kernel(
       if (r < kBN && wrow < rows) {
         const std::uint8_t* p = w + static_cast<std::size_t>(wrow) * row_bytes +
                                 static_cast<std::size_t>(sb) * model::kquant::kQ4KBlockBytes;
-        __pipeline_memcpy_async(&Bq[buf][r][c], p + 16 + c, 16);
+        __pipeline_memcpy_async(&Bq[buf][r][mmq_swz(r, c)], p + 16 + c, 16);
       }
     }
     // Headers: kBN rows x 16 B.
@@ -1274,10 +1303,14 @@ __global__ __launch_bounds__(256) void kquant_mmq_q4k_async_kernel(
       for (int mh = 0; mh < kMH; ++mh) {
         const int m_a = 32 * mh + arow + g, m_b = 32 * mh + arow + g + 8;
         const bool ok_a = m_a < batch, ok_b = m_b < batch;
-        a0[mh] = ok_a ? *reinterpret_cast<int*>(&As[abuf][m_a][co + t * 4]) : 0;
-        a1[mh] = ok_b ? *reinterpret_cast<int*>(&As[abuf][m_b][co + t * 4]) : 0;
-        a2[mh] = ok_a ? *reinterpret_cast<int*>(&As[abuf][m_a][co + 16 + t * 4]) : 0;
-        a3[mh] = ok_b ? *reinterpret_cast<int*>(&As[abuf][m_b][co + 16 + t * 4]) : 0;
+        // Unguarded ldmatrix: rows past the batch hold zeros (sync staging) or
+        // stale bytes (cp.async staging), and either way the products below
+        // are zeroed by as/gs = 0 -- an int8 mma cannot produce NaN.
+        {
+          const int ar = 32 * mh + arow + (lane & 15);
+          const int ac = co + ((lane >> 4) << 4);
+          ldsm_x4(a0[mh], a1[mh], a2[mh], a3[mh], &As[abuf][ar][mmq_swz(ar, ac)]);
+        }
         as_a[mh] = ok_a ? as[static_cast<std::size_t>(m_a) * Kg + kg] : 0.0f;
         as_b[mh] = ok_b ? as[static_cast<std::size_t>(m_b) * Kg + kg] : 0.0f;
         gs_a[mh] = ok_a ? gsum[static_cast<std::size_t>(m_a) * Kg + kg] : 0.0f;
@@ -1288,14 +1321,18 @@ __global__ __launch_bounds__(256) void kquant_mmq_q4k_async_kernel(
       // (co%64) < 32. Four consecutive columns are four consecutive bytes.
       const int j = co >> 6;
       const bool hi_nib = ((co >> 5) & 1) != 0;
-      const int qb = (j << 5) + (t << 2);
 
 #pragma unroll
       for (int nt = 0; nt < NT; ++nt) {
         const int nbase = nhalf * (NT * 8) + nt * 8;
-        const int nrow = nbase + g;
-        const std::uint32_t w0 = *reinterpret_cast<const std::uint32_t*>(&Bq[buf][nrow][qb]);
-        const std::uint32_t w1 = *reinterpret_cast<const std::uint32_t*>(&Bq[buf][nrow][qb + 16]);
+        int wi0, wi1;
+        {
+          const int br = nbase + (lane & 7);
+          const int bc = (j << 5) + ((lane & 8) << 1);
+          ldsm_x2(wi0, wi1, &Bq[buf][br][mmq_swz(br, bc)]);
+        }
+        const std::uint32_t w0 = static_cast<std::uint32_t>(wi0);
+        const std::uint32_t w1 = static_cast<std::uint32_t>(wi1);
         const int b0 = static_cast<int>(hi_nib ? ((w0 >> 4) & 0x0F0F0F0Fu) : (w0 & 0x0F0F0F0Fu));
         const int b1 = static_cast<int>(hi_nib ? ((w1 >> 4) & 0x0F0F0F0Fu) : (w1 & 0x0F0F0F0Fu));
         // Scales for the two output rows this thread accumulates -- shared by
@@ -1528,7 +1565,7 @@ __device__ __forceinline__ void kquant_mmq_q6k_process_tile(
       if (r < batch) {
         v = *reinterpret_cast<const uint4*>(xq + static_cast<std::size_t>(r) * cols + k0 + c);
       }
-      *reinterpret_cast<uint4*>(&As[r][c]) = v;
+      *reinterpret_cast<uint4*>(&As[r][mmq_swz(r, c)]) = v;
     }
 
     // Weights: eight threads a row, each unpacking a 16-byte run of ql into
@@ -1585,8 +1622,8 @@ __device__ __forceinline__ void kquant_mmq_q6k_process_tile(
               ((ql32 >> 4) & 0x0F0F0F0Fu) | (((qh32 >> sh) & 0x03030303u) << 4);
           const int lo = __vsubss4(static_cast<int>(lo_u), 0x20202020);
           const int hi = __vsubss4(static_cast<int>(hi_u), 0x20202020);
-          *reinterpret_cast<int*>(&Bs[r][off_lo + 4 * g2]) = lo;
-          *reinterpret_cast<int*>(&Bs[r][off_lo + 64 + 4 * g2]) = hi;
+          *reinterpret_cast<int*>(&Bs[r][mmq_swz(r, off_lo + 4 * g2)]) = lo;
+          *reinterpret_cast<int*>(&Bs[r][mmq_swz(r, off_lo + 64 + 4 * g2)]) = hi;
         }
         // Two of the sixteen scale groups per pass.
         float d = 0.0f;
@@ -1612,17 +1649,26 @@ __device__ __forceinline__ void kquant_mmq_q6k_process_tile(
 #pragma unroll
     for (int gi = 0; gi < 8; ++gi) {
       const int kg = (sb << 3) + gi, co = gi << 5;
-      const int a0 = *reinterpret_cast<int*>(&As[m_a][co + t * 4]);
-      const int a1 = *reinterpret_cast<int*>(&As[m_b][co + t * 4]);
-      const int a2 = *reinterpret_cast<int*>(&As[m_a][co + 16 + t * 4]);
-      const int a3 = *reinterpret_cast<int*>(&As[m_b][co + 16 + t * 4]);
+      // One ldmatrix.x4 replaces the four a-fragment loads: lanes 0-15 address
+      // rows arow..arow+15 at k-chunk co, lanes 16-31 the same rows at co+16;
+      // the returned per-thread fragments are exactly the old a0..a3.
+      int a0, a1, a2, a3;
+      {
+        const int ar = arow + (lane & 15);
+        const int ac = co + ((lane >> 4) << 4);
+        ldsm_x4(a0, a1, a2, a3, &As[ar][mmq_swz(ar, ac)]);
+      }
       const float as_a = ok_a ? as[static_cast<std::size_t>(m_a) * Kg + kg] : 0.0f;
       const float as_b = ok_b ? as[static_cast<std::size_t>(m_b) * Kg + kg] : 0.0f;
 #pragma unroll
       for (int nt = 0; nt < NT; ++nt) {
         const int nbase = nhalf * (NT * 8) + nt * 8;
-        const int b0 = *reinterpret_cast<int*>(&Bs[nbase + g][co + t * 4]);
-        const int b1 = *reinterpret_cast<int*>(&Bs[nbase + g][co + 16 + t * 4]);
+        int b0, b1;
+        {
+          const int br = nbase + (lane & 7);
+          const int bc = co + ((lane & 8) << 1);
+          ldsm_x2(b0, b1, &Bs[br][mmq_swz(br, bc)]);
+        }
         // Halves of the 32-k step carry different weight scales, so they cannot
         // share an accumulator. Zeroing the other half of b is what splits them.
         int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
