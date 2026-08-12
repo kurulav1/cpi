@@ -58,6 +58,21 @@ for it. A fresh 2026-08-05 re-run against llama.cpp build `1269cb1` (`-fa 1`, wa
 put the 8B at decode **99%** (82.2 vs 83.2 tok/s), prefill@512 **133%**, prefill@2048 **106%** --
 consistent with the table's earlier rows.
 
+**Where the comparison lives.** The llama.cpp side is not vendored: binaries and GGUFs sit under
+`artifacts/llamacpp/`, which is gitignored, so none of the numbers here reproduce until you put them
+there. `artifacts/llamacpp/bin/` holds an upstream CUDA build -- `llama-bench`,
+`llama-batched-bench`, `ggml-cuda.dll` and friends, currently build `b4aa7dd47` (10085) -- and the
+weights sit alongside it, e.g. `artifacts/llamacpp/llama31-8b-Q4_K_M.gguf` at 4.58 GB.
+
+**Batched decode needs more care than single-stream**, because the two tools do not measure the same
+thing. CPI's `--batch-bench` includes the batch prefill where `llama-batched-bench`'s `S_TG` column
+is decode-only, and CPI's bench prompt is 3 tokens, so comparing it against llama.cpp at its usual
+`-npp 64` flatters CPI by roughly twofold on context depth. To compare like with like: run CPI at two
+step counts (`--batch-bench 24` and `96`, with `CPI_BATCH_ONLY=<B>` and `--max-context 32768`) and
+solve `total = prefill + n*step` for the slope -- the intercept is not prefill, it also absorbs
+first-step graph capture; run llama.cpp at matched depth (`-npp 8 -ntg 96 -npl <B>`); and take
+medians of three, since that bench carries about 10% run-to-run noise.
+
 **Same file, both engines.** Since CPI reads GGUF directly, the two engines can now be pointed at
 the byte-identical file rather than at two conversions of one checkpoint. Llama-3.1-8B, same RTX
 5090, interleaved, decode of 128 tokens after a 133-token prompt (`llama-bench -n 128` against
