@@ -57,6 +57,7 @@ KQuantTuning g_kq_tune = []() {
   t.mmq_streamk = env_int("CPI_KQUANT_MMQ_STREAMK", t.mmq_streamk);
   t.mmq_q6k_nt = env_int("CPI_KQUANT_MMQ_Q6K_NT", t.mmq_q6k_nt);
   t.mmq_unpack = env_int("CPI_KQUANT_MMQ_UNPACK", t.mmq_unpack);
+  t.mmq_m2_nt = env_int("CPI_KQUANT_MMQ_M2NT", t.mmq_m2_nt);
   t.matvec_vecx = env_int("CPI_KQUANT_MATVEC_VECX", t.matvec_vecx);
   return t;
 }();
@@ -2525,7 +2526,8 @@ int q4k_streamk_grid(int nt_sel, bool unpack, bool m2 = false) {
       err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&o, kern, 256, 0);
     };
     if (m2) {
-      query(kquant_mmq_q4k_streamk_unpacked_kernel<2, true>);  // the one M2 shape
+      if (i == 2) return nsm;  // 64x128 dynamic-shared: occupancy 1 by construction
+      query(kquant_mmq_q4k_streamk_unpacked_kernel<2, true>);
     } else if (unpack) {
       if (i == 2) query(kquant_mmq_q4k_streamk_unpacked_kernel<4>);
       else if (i == 0) query(kquant_mmq_q4k_streamk_unpacked_kernel<1>);
@@ -2580,6 +2582,25 @@ void launch_kquant_mmq_q4k_streamk(const std::uint8_t* w, const std::int8_t* xq,
     fixup = false;
   }
   if (m2) {
+    if (nt_sel >= 4) {
+      // 64x128 in 56 KB dynamic shared, occupancy 1 (CPI_KQUANT_MMQ_M2NT=4).
+      using Smem = Q4kSmemLayout<4, true>;
+      static const bool attr_once = []() {
+        return cudaFuncSetAttribute(kquant_mmq_q4k_streamk_unpacked_kernel<4, true>,
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    static_cast<int>(sizeof(Smem))) == cudaSuccess;
+      }();
+      (void)attr_once;
+      kquant_mmq_q4k_streamk_unpacked_kernel<4, true>
+          <<<static_cast<unsigned>(nblocks), 256, static_cast<unsigned>(sizeof(Smem)), stream>>>(
+              w, xq, xs, xsum, y, g_mmq_fixup, rows, cols, batch, ldy);
+      if (fixup) {
+        kquant_mmq_q6k_streamk_fixup_kernel<8, 64>
+            <<<static_cast<unsigned>(nblocks), 256, 0, stream>>>(y, g_mmq_fixup, rows, cols,
+                                                                 batch, ldy);
+      }
+      return;
+    }
     // Fixup: Q6_K's at (NT=4, BM=64) is the exact [bidx][64][64] layout the M2
     // MODE-2 epilogue stores -- kMmqBN = (128/64)*4*8 = 64 = this kernel's kBN.
     kquant_mmq_q4k_streamk_unpacked_kernel<2, true>
@@ -2706,8 +2727,10 @@ bool launch_kquant_mmq(const std::uint8_t* w, KQuantType type, const half* x, ha
     // CPI_KQUANT_MMQ_UNPACK=0 it falls back to the split-K async M2 body
     // below, and CPI_KQUANT_MMQ_STREAMK=0 restores the split everywhere.
     if (g_kq_tune.mmq_streamk != 0 && (!m2 || g_kq_tune.mmq_unpack != 0)) {
-      launch_kquant_mmq_q4k_streamk(w, xq, xs, xsum, y, rows, cols, batch, ldy,
-                                    ant >= 4 ? 4 : (ant <= 1 ? 1 : 2), m2, stream);
+      const int sk_nt = m2 ? (g_kq_tune.mmq_m2_nt >= 4 ? 4 : 2)
+                           : (ant >= 4 ? 4 : (ant <= 1 ? 1 : 2));
+      launch_kquant_mmq_q4k_streamk(w, xq, xs, xsum, y, rows, cols, batch, ldy, sk_nt, m2,
+                                    stream);
       return true;
     }
     const int base_blocks = ant >= 4 ? (rows + 127) / 128

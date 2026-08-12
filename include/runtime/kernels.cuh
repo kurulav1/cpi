@@ -1311,6 +1311,14 @@ struct KQuantTuning {
   // header decode that made the async kernel execute 2.34x llama's
   // instructions per byte. 0 restores the cp.async raw-staging kernel.
   int mmq_unpack = 1;
+  // N tile for the M2 (batch 33..64) unpacked stream-K shape: 2 = 64x64 tile,
+  // 36 KB static shared at occupancy 2; 4 = 64x128 in 56 KB dynamic shared at
+  // occupancy 1 (halves activation restaging, loses the co-resident block).
+  // 4 wins: 2455.8 vs 2302.9 tok/s at B=64 (+6.6%) and 2187 vs 2091 at B=48
+  // (+4.6%), interleaved same-binary config medians -- the register-prefetch
+  // hides staging latency well enough that occupancy 1 stops mattering, the
+  // opposite of the unpipelined ROUND 4/6 verdicts.
+  int mmq_m2_nt = 4;
   int matvec_wpr = 8;    // warps cooperating on one row in the matvec
   // int8 activations + dp4a in the matvec. Changes numerics -- this is the same
   // trade llama.cpp's MMVQ makes by default -- but greedy decoding stayed
