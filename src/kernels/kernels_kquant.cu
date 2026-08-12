@@ -2019,8 +2019,12 @@ void launch_kquant_mmq_q6k_streamk(const std::uint8_t* w, const std::int8_t* xq,
   const int waves = (nty + nblocks - 1) / nblocks;
   if (100 * nty >= 90 * nblocks * waves) {
     nblocks = nty;
-  } else if (static_cast<std::int64_t>(nblocks) > total) {
-    nblocks = static_cast<int>(total);
+  } else if (static_cast<std::int64_t>(nblocks) * 2 > total) {
+    // Tiny shapes (wv: 8 tiles x 16 super-blocks): one unit per block split
+    // every tile ~16 ways and the fixup cost more than the matmul (11.3 vs
+    // 9.9 us in the 2026-08-12 audit). Keep at least two units per block, so
+    // the walk halves and the tmp traffic halves, at worst half a wave idle.
+    nblocks = static_cast<int>(total / 2 > nty ? total / 2 : nty);
   }
   bool fixup = (nty % nblocks) != 0;
   if (fixup && !ensure_mmq_fixup(static_cast<std::size_t>(nblocks) * bn * bm)) {
