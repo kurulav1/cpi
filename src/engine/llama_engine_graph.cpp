@@ -1113,6 +1113,14 @@ bool LlamaEngine::decode_next_token_device_topk(int token, int position, float t
                                       d_topk_val_ + (k - 1), d_cand_idx_, d_cand_val_,
                                       d_cand_count_, kCandCapacity, compute_stream_);
   CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
+  // FALSIFIED (2026-08-12): replacing the three blocking cudaMemcpy readbacks below
+  // with cudaMemcpyAsync into pinned buffers queued before ONE sync measured SLOWER,
+  // not faster: interleaved single-stream pairs -0.9/-2.9/-3.5% (242.8 -> 236.5
+  // median decode tok/s), and nsys showed the sampler-tail GPU idle GREW (gather->D2H
+  // gap 39 -> 54us, last-D2H -> next-H2D 80 -> 96us; idle 283 -> 332us/step). On this
+  // WDDM box a tiny blocking D2H evidently takes a cheap immediate-readback path,
+  // while a queued DMA + sync pays scheduler latency per hop. Do not retry the
+  // pinned-async pattern here (or for the 4-byte greedy argmax readback).
 
   int count = 0;
   CUDA_CHECK(cudaMemcpy(&count, d_cand_count_, sizeof(int), cudaMemcpyDeviceToHost));
