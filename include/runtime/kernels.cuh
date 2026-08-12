@@ -1281,6 +1281,21 @@ struct KQuantTuning {
   // shortening the per-block chain is the lever, not more rows per block.
   int mmq_splitk = 1;
   int mmq_split_target = 340;  // ~2 blocks per SM on this part     // use the cp.async kernel when the batch fits
+  // llama.cpp's stream-K decomposition for the Q6_K MMQ: a fixed grid walks a
+  // contiguous range of (row-tile, super-block) work units, pieces that reach a
+  // tile's k-end write y directly, each block's trailing partial piece goes to a
+  // per-block buffer, and a fixup kernel folds those into y. Replaces the
+  // atomicAdd split-K (mmq_splitk) for Q6_K when set. 1 = auto grid
+  // (SMs x occupancy); >1 = explicit block count; 0 = off.
+  int mmq_streamk = 1;
+  // N tile for the Q6_K MMQ kernels (2*NT*8 output rows a block), separate from
+  // mmq_nt because the right default flipped when stream-K landed: under the
+  // one-tile-per-block launch NT=2 measured best (ebbe5f2), but with stream-K
+  // NT=4 takes w2 from ~142 to ~119 us a call and the force_q6k LM head from
+  // 1246 to 956 us -- the wider tile halves the activation re-staging per
+  // output byte, and stream-K's balanced kbc ranges remove the grid-shrink
+  // penalty that used to make wide tiles lose.
+  int mmq_q6k_nt = 4;
   int matvec_wpr = 8;    // warps cooperating on one row in the matvec
   // int8 activations + dp4a in the matvec. Changes numerics -- this is the same
   // trade llama.cpp's MMVQ makes by default -- but greedy decoding stayed
