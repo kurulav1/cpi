@@ -1304,6 +1304,13 @@ struct KQuantTuning {
   // output byte, and stream-K's balanced kbc ranges remove the grid-shrink
   // penalty that used to make wide tiles lose.
   int mmq_q6k_nt = 4;
+  // Unpack-at-staging body for the Q4_K stream-K MMQ (ROUND 11): nibbles
+  // expanded to an int8 tile and (d*sc, dmin*m) folded to a float2 tile in the
+  // staging pass, so the mma loop is ldsm + mma + a 64-bit scale load per
+  // fragment -- llama.cpp's structure, replacing the per-fragment unpack +
+  // header decode that made the async kernel execute 2.34x llama's
+  // instructions per byte. 0 restores the cp.async raw-staging kernel.
+  int mmq_unpack = 1;
   int matvec_wpr = 8;    // warps cooperating on one row in the matvec
   // int8 activations + dp4a in the matvec. Changes numerics -- this is the same
   // trade llama.cpp's MMVQ makes by default -- but greedy decoding stayed
