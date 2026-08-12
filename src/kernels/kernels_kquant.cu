@@ -1636,6 +1636,27 @@ __global__ void kquant_mmq_finalize_kernel(float* __restrict__ partial, __half* 
 // doubles the mma count at unchanged memory traffic -- an acceptable trade for a
 // kernel measured at ~426 GB/s, i.e. bound by the weight read rather than the
 // tensor cores.
+// FALSIFIED (2026-08-12, round 8, the last named structural difference vs
+// llama.cpp's Q6_K MMQ): the register-resident int8-scale epilogue. Bsc
+// restaged as RAW packed scales (int Bsc_i[BN][4], four int8 per int, plus
+// float Bd[BN] for the super-block d), mma loop restructured nt-OUTER so a row
+// pair's 8 packed-scale ints + 2 d floats load once per (nt, super-block) and
+// the epilogue becomes facc += as * (d * float(c0*sc_lo + d0*sc_hi)) --
+// integer multiply-adds against register scales replacing the four
+// conflicted-ish Bsc float loads and two float multiplies per mma pair, with
+// the a-fragment ldmatrix.x4 moving inside the nt loop (NT x more ldsm) as
+// the trade. Numerics held exactly (worst_rel identical to all printed
+// digits, both gates PASS) and registers went DOWN (152 -> 142 on the NT=4
+// BM=32 workhorse, no spills, the tile back under 48 KB static) -- and it is
+// SLOWER: 1710.5 -> 1653.0 tok/s at B=32 (-3.4%) and 740.4 -> 726.6 at B=8
+// (-1.9%), interleaved binary-pair medians. Third confirmation (after the
+// pre-folded float2 tile, #6, and the neutral Bsc swizzle) that scale
+// handling pipelines behind the mma for free here and is NOT the bottleneck;
+// the NT x extra a-fragment ldsm traffic costs real time. With the k16-mma
+// decomposition and staging shape also falsified above, llama.cpp's remaining
+// Q6_K edge is NOT explained by any single named kernel-body difference we
+// can port; PDL launch overlap is the one structural item left untried.
+//
 // One (row-tile, k-range) piece of the Q6_K MMQ: stages the activation and
 // weight tiles for super-blocks [kb0_start, kb0_stop) of row tile `tile_it`
 // and runs them through the mma. Factored out of the kernel so the stream-K
