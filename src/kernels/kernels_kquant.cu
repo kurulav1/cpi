@@ -58,6 +58,7 @@ KQuantTuning g_kq_tune = []() {
   t.mmq_q6k_nt = env_int("CPI_KQUANT_MMQ_Q6K_NT", t.mmq_q6k_nt);
   t.mmq_unpack = env_int("CPI_KQUANT_MMQ_UNPACK", t.mmq_unpack);
   t.mmq_m2_nt = env_int("CPI_KQUANT_MMQ_M2NT", t.mmq_m2_nt);
+  t.mmq_q6k_pf = env_int("CPI_KQUANT_MMQ_Q6K_PF", t.mmq_q6k_pf);
   t.matvec_vecx = env_int("CPI_KQUANT_MATVEC_VECX", t.matvec_vecx);
   return t;
 }();
@@ -1979,7 +1980,14 @@ __global__ void kquant_mmq_finalize_kernel(float* __restrict__ partial, __half* 
 // that traffic, and shrinking the M tile to what a batch<=32 call actually
 // uses buys the shared memory to double N: BM=32/NT=4 is a 32x128 tile in the
 // same 48 KB that BM=64/NT=4 spends on 64x64.
-template <int NT, int BM, int MODE>
+// PF (ROUND 12): register-prefetch of the next super-block's raw ql/qh/scale
+// bytes, the same replacement of latency-hiding that made the Q4_K unpacked
+// body win -- the loads for sb+1 issue before sb's mma loop and retire behind
+// it, instead of the mma loop waiting out synchronous staging at the top of
+// each iteration. Only instantiated for the BM=64 dynamic-shared shape
+// (batch 33..64, occupancy 1, no co-resident block to hide staging); BM=32
+// keeps the ROUND-8-tuned synchronous body unchanged.
+template <int NT, int BM, int MODE, bool PF = false>
 __device__ __forceinline__ void kquant_mmq_q6k_process_tile(
     std::int8_t (&As)[BM][256], std::int8_t (&Bs)[(128 / BM) * NT * 8][256],
     float (&Bsc)[(128 / BM) * NT * 8][16], const std::uint8_t* __restrict__ w,
@@ -1989,6 +1997,7 @@ __device__ __forceinline__ void kquant_mmq_q6k_process_tile(
   constexpr int kMT = BM / 16;      // m-tiles, one warp group each
   constexpr int kNH = 8 / kMT;      // warp groups across N
   constexpr int kMmqBN = kNH * NT * 8;
+  constexpr int kPfIter = (kMmqBN * 8) / 256;  // weight staging passes
   const int tid = static_cast<int>(threadIdx.x);
   const int warp = tid >> 5, lane = tid & 31;
   const int g = lane >> 2, t = lane & 3, mt = warp % kMT, nhalf = warp / kMT;
@@ -2004,6 +2013,78 @@ __device__ __forceinline__ void kquant_mmq_q6k_process_tile(
 #pragma unroll
     for (int j = 0; j < 4; ++j) facc[i][j] = 0.0f;
 
+  // PF staging registers: raw ql/qh words plus the pre-folded d*scale pair per
+  // pass. Unused (and eliminated) when PF is false.
+  std::uint32_t pql[PF ? kPfIter : 1][4], pqh[PF ? kPfIter : 1][4];
+  float psc[PF ? kPfIter : 1][2];
+  const auto prefetch = [&](int sb) {
+#pragma unroll
+    for (int i = 0; i < kPfIter; ++i) {
+      const int u = tid + i * 256;
+      const int r = u >> 3, c = (u & 7) << 4;
+      const int wrow = blockNrow + r;
+      const std::uint8_t* p =
+          (wrow < rows) ? w + static_cast<std::size_t>(wrow) * row_bytes +
+                              static_cast<std::size_t>(sb) * model::kquant::kQ6KResidentBytes
+                        : nullptr;
+      const int n = c >> 6, l0 = c & 31;
+      const std::uint16_t* qlp = reinterpret_cast<const std::uint16_t*>(p + c);
+      const std::uint16_t* qhp = reinterpret_cast<const std::uint16_t*>(p + 128 + (n << 5) + l0);
+#pragma unroll
+      for (int g2 = 0; g2 < 4; ++g2) {
+        pql[i][g2] = 0u;
+        pqh[i][g2] = 0u;
+        if (p != nullptr) {
+          pql[i][g2] = static_cast<std::uint32_t>(qlp[2 * g2]) |
+                       (static_cast<std::uint32_t>(qlp[2 * g2 + 1]) << 16);
+          pqh[i][g2] = static_cast<std::uint32_t>(qhp[2 * g2]) |
+                       (static_cast<std::uint32_t>(qhp[2 * g2 + 1]) << 16);
+        }
+      }
+      float d = 0.0f;
+      if (p != nullptr) {
+        std::uint16_t dbits;
+        memcpy(&dbits, p + 208, 2);
+        d = half_bits_to_float(dbits);
+      }
+      const int j0 = (u & 7) << 1;
+      psc[i][0] = (p != nullptr)
+                      ? d * static_cast<float>(*reinterpret_cast<const std::int8_t*>(p + 192 + j0))
+                      : 0.0f;
+      psc[i][1] = (p != nullptr)
+                      ? d * static_cast<float>(
+                                *reinterpret_cast<const std::int8_t*>(p + 192 + j0 + 1))
+                      : 0.0f;
+    }
+  };
+  // Registers -> shared: arithmetic-identical to the synchronous staging loop
+  // below (same whole-word shifts, same __vsubss4 recentering, same swizzles).
+  const auto unpack_store = [&]() {
+#pragma unroll
+    for (int i = 0; i < kPfIter; ++i) {
+      const int u = tid + i * 256;
+      const int r = u >> 3, c = (u & 7) << 4;
+      const int n = c >> 6, h = (c >> 5) & 1, l0 = c & 31;
+      const int off_lo = (n << 7) + (h << 5) + l0;
+      const int sl = 2 * h, sh = 4 + 2 * h;
+#pragma unroll
+      for (int g2 = 0; g2 < 4; ++g2) {
+        const std::uint32_t ql32 = pql[i][g2], qh32 = pqh[i][g2];
+        const std::uint32_t lo_u = (ql32 & 0x0F0F0F0Fu) | (((qh32 >> sl) & 0x03030303u) << 4);
+        const std::uint32_t hi_u =
+            ((ql32 >> 4) & 0x0F0F0F0Fu) | (((qh32 >> sh) & 0x03030303u) << 4);
+        *reinterpret_cast<int*>(&Bs[r][mmq_swz(r, off_lo + 4 * g2)]) =
+            __vsubss4(static_cast<int>(lo_u), 0x20202020);
+        *reinterpret_cast<int*>(&Bs[r][mmq_swz(r, off_lo + 64 + 4 * g2)]) =
+            __vsubss4(static_cast<int>(hi_u), 0x20202020);
+      }
+      const int j0 = (u & 7) << 1;
+      Bsc[r][mmq_swz_sc(r, j0)] = psc[i][0];
+      Bsc[r][mmq_swz_sc(r, j0 + 1)] = psc[i][1];
+    }
+  };
+
+  if (PF) prefetch(kb0_start);
   for (int sb = kb0_start; sb < kb0_stop; ++sb) {
     const int k0 = sb << 8;
 
@@ -2018,6 +2099,11 @@ __device__ __forceinline__ void kquant_mmq_q6k_process_tile(
       *reinterpret_cast<uint4*>(&As[r][mmq_swz(r, c)]) = v;
     }
 
+    if (PF) {
+      unpack_store();
+      __syncthreads();
+      if (sb + 1 < kb0_stop) prefetch(sb + 1);
+    } else {
     // Weights: eight threads a row, each unpacking a 16-byte run of ql into
     // sixteen low and sixteen high values. A 16-byte run never crosses the
     // 32-byte or 64-byte boundaries that move l0, h and n, so those are constant
@@ -2092,6 +2178,7 @@ __device__ __forceinline__ void kquant_mmq_q6k_process_tile(
       }
     }
     __syncthreads();
+    }
 
     const int arow = 16 * mt;
     const int m_a = arow + g, m_b = arow + g + 8;
@@ -2218,7 +2305,7 @@ __global__ __launch_bounds__(256) void kquant_mmq_q6k_kernel(
 // to its tmp slot, and kquant_mmq_q6k_streamk_fixup_kernel folds those into y.
 // Unlike the atomicAdd split, the result is deterministic: the fixup adds
 // partials in a fixed order.
-template <int NT, int BM>
+template <int NT, int BM, bool PF = false>
 __global__ __launch_bounds__(256) void kquant_mmq_q6k_streamk_kernel(
     const std::uint8_t* __restrict__ w, const std::int8_t* __restrict__ xq,
     const float* __restrict__ as, __half* __restrict__ y, float* __restrict__ tmp, int rows,
@@ -2246,8 +2333,9 @@ __global__ __launch_bounds__(256) void kquant_mmq_q6k_streamk_kernel(
   std::int64_t want = kb0_start + (kbc_stop - kbc);
   int kb0_stop = want < nsb ? static_cast<int>(want) : nsb;
   while (kbc < kbc_stop && kb0_stop == nsb) {
-    kquant_mmq_q6k_process_tile<NT, BM, 0>(As, Bs, Bsc, w, xq, as, y, tmp, rows, cols, batch, ldy,
-                                           static_cast<int>(kbc / nsb), kb0_start, kb0_stop);
+    kquant_mmq_q6k_process_tile<NT, BM, 0, PF>(As, Bs, Bsc, w, xq, as, y, tmp, rows, cols, batch,
+                                               ldy, static_cast<int>(kbc / nsb), kb0_start,
+                                               kb0_stop);
     kbc += nsb - kb0_start;  // advance to the next tile boundary
     kb0_start = 0;
     want = kbc_stop - kbc;
@@ -2256,8 +2344,9 @@ __global__ __launch_bounds__(256) void kquant_mmq_q6k_streamk_kernel(
   if (kbc >= kbc_stop) return;
   // Trailing piece that ends mid-tile: park it in the fixup buffer. Writing y
   // here would race with the block that owns this tile's k-end.
-  kquant_mmq_q6k_process_tile<NT, BM, 2>(As, Bs, Bsc, w, xq, as, y, tmp, rows, cols, batch, ldy,
-                                         static_cast<int>(kbc / nsb), kb0_start, kb0_stop);
+  kquant_mmq_q6k_process_tile<NT, BM, 2, PF>(As, Bs, Bsc, w, xq, as, y, tmp, rows, cols, batch,
+                                             ldy, static_cast<int>(kbc / nsb), kb0_start,
+                                             kb0_stop);
 #endif
 }
 
@@ -2463,21 +2552,21 @@ void launch_kquant_mmq_q6k_streamk(const std::uint8_t* w, const std::int8_t* xq,
     nblocks = nty;  // no scratch: block boundaries land on tile boundaries
     fixup = false;
   }
-#define CPI_MMQ_Q6K_SK(N, M)                                                                     \
+#define CPI_MMQ_Q6K_SK(N, M, P)                                                                  \
   do {                                                                                           \
     constexpr unsigned kSmemB = sizeof(Q6kSmemLayout<N, M>) > 48u * 1024u                        \
                                     ? static_cast<unsigned>(sizeof(Q6kSmemLayout<N, M>))         \
                                     : 0u;                                                        \
     if (kSmemB > 0) {                                                                            \
       static const bool attr_once = []() {                                                       \
-        return cudaFuncSetAttribute(kquant_mmq_q6k_streamk_kernel<N, M>,                         \
+        return cudaFuncSetAttribute(kquant_mmq_q6k_streamk_kernel<N, M, P>,                      \
                                     cudaFuncAttributeMaxDynamicSharedMemorySize,                 \
                                     static_cast<int>(sizeof(Q6kSmemLayout<N, M>))) ==            \
                cudaSuccess;                                                                      \
       }();                                                                                       \
       (void)attr_once;                                                                           \
     }                                                                                            \
-    kquant_mmq_q6k_streamk_kernel<N, M>                                                          \
+    kquant_mmq_q6k_streamk_kernel<N, M, P>                                                       \
         <<<static_cast<unsigned>(nblocks), 256, kSmemB, stream>>>(w, xq, xs, y, g_mmq_fixup,     \
                                                                   rows, cols, batch, ldy);       \
     if (fixup) {                                                                                 \
@@ -2488,17 +2577,22 @@ void launch_kquant_mmq_q6k_streamk(const std::uint8_t* w, const std::int8_t* xq,
   } while (0)
   if (bm == 32) {
     if (nt_sel == 8) {
-      CPI_MMQ_Q6K_SK(8, 32);
+      CPI_MMQ_Q6K_SK(8, 32, false);
     } else if (nt_sel == 4) {
-      CPI_MMQ_Q6K_SK(4, 32);
+      CPI_MMQ_Q6K_SK(4, 32, false);
     } else if (nt_sel == 1) {
-      CPI_MMQ_Q6K_SK(1, 32);
+      CPI_MMQ_Q6K_SK(1, 32, false);
     } else {
-      CPI_MMQ_Q6K_SK(2, 32);
+      CPI_MMQ_Q6K_SK(2, 32, false);
     }
   } else {
     // One shape above batch 32: 64x128 in dynamic shared, occupancy 1.
-    CPI_MMQ_Q6K_SK(8, 64);
+    // CPI_KQUANT_MMQ_Q6K_PF selects the register-prefetch staging (ROUND 12).
+    if (g_kq_tune.mmq_q6k_pf != 0) {
+      CPI_MMQ_Q6K_SK(8, 64, true);
+    } else {
+      CPI_MMQ_Q6K_SK(8, 64, false);
+    }
   }
 #undef CPI_MMQ_Q6K_SK
 }

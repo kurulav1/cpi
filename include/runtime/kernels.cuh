@@ -1319,6 +1319,11 @@ struct KQuantTuning {
   // hides staging latency well enough that occupancy 1 stops mattering, the
   // opposite of the unpipelined ROUND 4/6 verdicts.
   int mmq_m2_nt = 4;
+  // Register-prefetch staging for the Q6_K 64x128 dynamic-shared shape (batch
+  // 33..64): the next super-block's raw ql/qh/scale bytes load into registers
+  // before the current mma loop, replacing the latency-hiding the occupancy-1
+  // launch cannot get from a co-resident block. BM=32 shapes are untouched.
+  int mmq_q6k_pf = 1;
   int matvec_wpr = 8;    // warps cooperating on one row in the matvec
   // int8 activations + dp4a in the matvec. Changes numerics -- this is the same
   // trade llama.cpp's MMVQ makes by default -- but greedy decoding stayed
