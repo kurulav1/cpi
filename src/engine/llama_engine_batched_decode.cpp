@@ -123,16 +123,42 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
     seq_lens[b] = positions[b] + 1;
     if (seq_lens[b] > max_seq) max_seq = seq_lens[b];
   }
-  ensure_batch_state_buffers(batch, max_blocks);
+  // Round the sequence bound up to a bucket (rationale at the split-K scratch
+  // below); every graph-shaping quantity derives from bucket_seq, not max_seq.
+  const int kSeqBucket = 512;
+  const int bucket_seq =
+      std::min(options_.max_context, ((max_seq + kSeqBucket - 1) / kSeqBucket) * kSeqBucket);
+  const int chunks = (bucket_seq + bs - 1) / bs;
+  // The block table's DEVICE stride is bucketed too. The caller's max_blocks grows
+  // by one whenever the deepest sequence crosses a paged-block boundary -- every
+  // `bs` decode steps -- and a graph keyed on it re-captured each time: ~30 ms of
+  // cudaGraphInstantiate, ~1.0 ms/step averaged at B=8..32 (nsys b8host/b32host,
+  // 2026-08-12, half the measured GPU idle). Staging rows at ceil(bucket_seq/bs)
+  // makes the stride move only when bucket_seq moves, which re-captures anyway.
+  // A row's tail past the caller's max_blocks is stale garbage; that is safe
+  // because every consumer bounds its block-table walk by the device-side
+  // seq_lens (the same guard the bucket mechanism itself relies on).
+  const int table_stride = chunks;
+  ensure_batch_state_buffers(batch, table_stride);
   CUDA_CHECK(cudaMemcpyAsync(d_token_id_, tokens.data(), batch * sizeof(int),
                              cudaMemcpyHostToDevice, compute_stream_));
   CUDA_CHECK(cudaMemcpyAsync(d_batch_positions_, positions.data(), batch * sizeof(int),
                              cudaMemcpyHostToDevice, compute_stream_));
   CUDA_CHECK(cudaMemcpyAsync(d_batch_seq_lens_, seq_lens.data(), batch * sizeof(int),
                              cudaMemcpyHostToDevice, compute_stream_));
-  CUDA_CHECK(cudaMemcpyAsync(d_batch_block_tables_, block_tables_flat.data(),
-                             static_cast<std::size_t>(batch) * max_blocks * sizeof(int),
-                             cudaMemcpyHostToDevice, compute_stream_));
+  if (max_blocks == table_stride) {
+    CUDA_CHECK(cudaMemcpyAsync(d_batch_block_tables_, block_tables_flat.data(),
+                               static_cast<std::size_t>(batch) * max_blocks * sizeof(int),
+                               cudaMemcpyHostToDevice, compute_stream_));
+  } else {
+    const int width = std::min(max_blocks, table_stride);
+    CUDA_CHECK(cudaMemcpy2DAsync(d_batch_block_tables_,
+                                 static_cast<std::size_t>(table_stride) * sizeof(int),
+                                 block_tables_flat.data(),
+                                 static_cast<std::size_t>(max_blocks) * sizeof(int),
+                                 static_cast<std::size_t>(width) * sizeof(int), batch,
+                                 cudaMemcpyHostToDevice, compute_stream_));
+  }
   if (kv_quality) {
     if (kv_slots.empty()) {
       CUDA_CHECK(cudaMemsetAsync(d_batch_kv_slots_, 0, batch * sizeof(int), compute_stream_));
@@ -143,18 +169,14 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
   }
 
   // Split-K scratch for the batched attention: [batch*heads*chunks] stats and
-  // [batch*heads*chunks*head_dim] partial outputs. Chunks bounded by max_seq.
+  // [batch*heads*chunks*head_dim] partial outputs. Chunks bounded by bucket_seq.
   // Persistent (grown on demand); allocating/freeing per step would stall the
   // pipeline with synchronizing cudaMalloc/cudaFree on every decode step.
-  // Round the length up to a bucket. Every grid dimension and scratch size below
-  // derives from this rather than from the true max_seq, which is what lets a
-  // captured graph stay valid as sequences grow: within a bucket the shapes do
-  // not move, and the kernels already guard per sequence off the device-side
-  // seq_lens. Crossing a bucket boundary re-captures.
-  const int kSeqBucket = 512;
-  const int bucket_seq =
-      std::min(options_.max_context, ((max_seq + kSeqBucket - 1) / kSeqBucket) * kSeqBucket);
-  const int chunks = (bucket_seq + bs - 1) / bs;
+  // Every grid dimension and scratch size below derives from bucket_seq rather
+  // than from the true max_seq, which is what lets a captured graph stay valid
+  // as sequences grow: within a bucket the shapes do not move, and the kernels
+  // already guard per sequence off the device-side seq_lens. Crossing a bucket
+  // boundary re-captures.
   const std::size_t stat_elems = static_cast<std::size_t>(batch) * cfg.num_heads * chunks;
   if (stat_elems > d_bs_stat_cap_) {
     if (d_bs_scratch_m_) cudaFree(d_bs_scratch_m_);
@@ -258,13 +280,13 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
       const int* slot_ids = kv_quality ? d_batch_kv_slots_ : nullptr;
       kernels::launch_store_kv_batched_paged_quant(
           static_cast<const __half*>(d_prefill_k_), static_cast<const __half*>(d_prefill_v_), kq,
-          vq, ksc, vsc, d_batch_block_tables_, d_batch_positions_, max_blocks, batch,
+          vq, ksc, vsc, d_batch_block_tables_, d_batch_positions_, table_stride, batch,
           cfg.num_kv_heads, head_dim, bs, kv_quant_kbits_, kv_quant_vbits_, kv_quant_rot_,
           compute_stream_, slot_ids, sink_k, sink_v, ring_k, ring_v, kv_quant_sink_,
           kv_quant_win_);
       kernels::launch_attention_step_batched_paged_quant(
           static_cast<const __half*>(d_prefill_q_), kq, vq, ksc, vsc, d_batch_block_tables_,
-          d_batch_seq_lens_, max_blocks, bucket_seq, static_cast<__half*>(d_att_), batch,
+          d_batch_seq_lens_, table_stride, bucket_seq, static_cast<__half*>(d_att_), batch,
           cfg.num_heads, cfg.num_kv_heads, head_dim, bs, kv_quant_kbits_, kv_quant_vbits_,
           kv_quant_rot_, compute_stream_, scratch_m, scratch_l, scratch_o, chunks, slot_ids,
           sink_k, sink_v, ring_k, ring_v, kv_quant_sink_, kv_quant_win_);
@@ -276,11 +298,11 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
       kernels::launch_store_kv_batched_paged(
           k_pool, v_pool, static_cast<const __half*>(d_prefill_k_),
           static_cast<const __half*>(d_prefill_v_), d_batch_block_tables_, d_batch_positions_,
-          max_blocks, batch, kv_hidden, bs, compute_stream_);
+          table_stride, batch, kv_hidden, bs, compute_stream_);
 
       kernels::launch_attention_step_batched_paged(
           static_cast<const __half*>(d_prefill_q_), k_pool, v_pool, d_batch_block_tables_,
-          d_batch_seq_lens_, max_blocks, bucket_seq, static_cast<__half*>(d_att_), batch,
+          d_batch_seq_lens_, table_stride, bucket_seq, static_cast<__half*>(d_att_), batch,
           cfg.num_heads, cfg.num_kv_heads, head_dim, bs, compute_stream_, scratch_m, scratch_l,
           scratch_o, chunks);
     }
@@ -352,7 +374,7 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
   }
 
   if (batch_graph_exec_ == nullptr || batch_graph_batch_ != batch ||
-      batch_graph_blocks_ != max_blocks || batch_graph_bucket_ != bucket_seq) {
+      batch_graph_blocks_ != table_stride || batch_graph_bucket_ != bucket_seq) {
     reset_batch_graph();
     // Warm once outside capture: first touch of a lazily loaded kernel module
     // inside a capture is one of the ways this fails opaquely.
@@ -369,7 +391,7 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
     CUDA_CHECK(cudaGraphDestroy(graph));
     batch_graph_exec_ = static_cast<void*>(exec);
     batch_graph_batch_ = batch;
-    batch_graph_blocks_ = max_blocks;
+    batch_graph_blocks_ = table_stride;
     batch_graph_bucket_ = bucket_seq;
   }
   CUDA_CHECK(cudaGraphLaunch(static_cast<cudaGraphExec_t>(batch_graph_exec_), compute_stream_));
