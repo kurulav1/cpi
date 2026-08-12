@@ -2058,6 +2058,26 @@ bool ensure_mmq_fixup(std::size_t elems) {
   return true;
 }
 
+// FALSIFIED (2026-08-12, round 9, the last structural llama.cpp difference):
+// Programmatic Dependent Launch for the batched MMQ chain. A launch helper here
+// used cudaLaunchKernelEx with cudaLaunchAttributeProgrammaticStreamSerialization
+// (sm_90+ checked once, CPI_KQUANT_PDL knob) on quantize_q8_1_groups_kernel,
+// both stream-K MMQ kernels, the async kernel, and the fixup/finalize kernels;
+// consumers called cudaGridDependencySynchronize() at the top of the body and
+// producers cudaTriggerProgrammaticLaunchCompletion() after their last store --
+// llama.cpp's exact shape (their common.cuh, GGML_CUDA_PDL). All gates passed
+// (unit test, batched-check with defaults / knob off / CPI_BATCH_GRAPH=0: the
+// attribute IS captured and preserved in the batched decode graph) and it was
+// a LOSS at every batch: interleaved binary-pair medians 1729.1 -> 1724.5
+// tok/s at B=32 (-0.27%), 747.7 -> 734.6 at B=8 (-1.75%), 1964.2 -> 1953.1 at
+// B=64 (-0.57%). Mechanism: PDL buys launch/prologue latency overlap, and this
+// chain already runs inside a replayed CUDA graph where that latency is
+// amortized -- the ~1.6-1.8 ms/step GPU idle it was meant to attack is the
+// same on both engines, so it was never llama.cpp's edge here. The device-side
+// waits/triggers are not free either (the B=8 loss is real work per launch at
+// the smallest grids). Do not retry PDL on the graphed decode path; if it is
+// ever retried, it belongs on an UNGRAPHED path with measured launch gaps.
+
 // Grid for the stream-K Q6_K MMQ: one wave -- SM count times this kernel's
 // measured occupancy -- so all blocks run concurrently and the kbc ranges
 // partition the work exactly once. Cached after the first call; the queries
