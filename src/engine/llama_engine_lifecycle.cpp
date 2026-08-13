@@ -14,6 +14,7 @@
 
 #include "common.hpp"
 #include "llama_engine_internal.hpp"
+#include "model/gguf_kquant.hpp"
 #include "runtime/kernels.cuh"
 #include "runtime/cuda_utils.cuh"
 #include "runtime/system_info.hpp"
@@ -124,8 +125,38 @@ void LlamaEngine::load_static_weights() {
   }
   const std::size_t emb_bytes = weights_.tensor_bytes(emb_name);
   CUDA_CHECK(cudaMalloc(&d_tok_embeddings_, emb_bytes));
-  CUDA_CHECK(cudaMemcpy(d_tok_embeddings_, weights_.tensor_data(emb_name), emb_bytes,
-                        cudaMemcpyHostToDevice));
+  // A quantized GGUF embedding table used to take tensor_data(), which
+  // dequantizes on the host into a table-sized vector and copies that, pageable
+  // (~630 ms of an 8B warm load, most of static-load). Ship the packed blocks
+  // through the staging ring and expand them on the device instead: a quarter
+  // of the bytes across the bus and no host-side expansion. The embedding table
+  // carries no RoPE permute, so the blocks are usable as stored.
+  bool emb_loaded = false;
+  if (weights_.is_gguf() && weights_.gguf() != nullptr) {
+    const auto pk = weights_.gguf()->packed_kquant(emb_name);
+    const std::size_t emb_elems = emb_bytes / sizeof(__half);
+    if (pk.valid() && pk.permute_heads <= 0 &&
+        static_cast<std::size_t>(pk.rows) * static_cast<std::size_t>(pk.cols) == emb_elems &&
+        emb_elems % model::kquant::kSuperBlock == 0) {
+      void* d_packed = nullptr;
+      if (cudaMalloc(&d_packed, pk.bytes) == cudaSuccess) {
+        if (staged_h2d(d_packed, pk.data, pk.bytes)) {
+          kernels::launch_dequant_kquant(static_cast<const std::uint8_t*>(d_packed),
+                                         static_cast<kernels::KQuantType>(pk.kind),
+                                         emb_elems / model::kquant::kSuperBlock,
+                                         static_cast<__half*>(d_tok_embeddings_),
+                                         transfer_stream_);
+          CUDA_CHECK(cudaStreamSynchronize(transfer_stream_));
+          emb_loaded = true;
+        }
+        cudaFree(d_packed);
+      }
+    }
+  }
+  if (!emb_loaded) {
+    CUDA_CHECK(cudaMemcpy(d_tok_embeddings_, weights_.tensor_data(emb_name), emb_bytes,
+                          cudaMemcpyHostToDevice));
+  }
 
   const std::string norm_name = "norm.weight";
   if (!weights_.has_tensor(norm_name)) {
