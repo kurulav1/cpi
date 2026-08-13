@@ -57,12 +57,17 @@ bool LlamaEngine::can_use_greedy_decode_graph() const {
   // this threshold, skip the graph so decode uses the host-launched path whose
   // grid is min(scratch_chunks, ceil(seq_len/32)), i.e. scales with filled tokens.
   constexpr int kGreedyGraphMaxContext = 32768;
+  // QK-norm models and decoupled-head_dim geometry (attn_q_hidden_ != hidden,
+  // e.g. Qwen3's 16 heads of 128 on a 1024 hidden) are graphed: the capture
+  // bodies use the same attn_* dims as the non-graph decode and record the
+  // per-head Q/K RMSNorm between the QKV bias and RoPE. Both had been excluded
+  // since the stages landed, which left Qwen3-0.6B decoding un-graphed at a
+  // sixth of the smaller Qwen2.5-0.5B's rate.
   return cached_layer_count_ == cfg.num_layers && !options_.paged_kv_cache &&
          options_.max_context <= kGreedyGraphMaxContext &&
          !options_.paged_blocks &&  // paged decode uses the non-graph split-K block-gather path
          !options_.profile_decode_phases && !kv_int4_enabled_ && !tq3_enabled_ && !cfg.is_moe() &&
-         !cfg.use_layernorm && !cfg.has_qk_norm && !cfg.scale_embeddings &&
-         (attn_q_hidden_ <= 0 || attn_q_hidden_ == cfg.hidden_size) && !has_any_layer_norm_bias_ &&
+         !cfg.use_layernorm && !cfg.scale_embeddings && !has_any_layer_norm_bias_ &&
          !has_any_layer_output_bias_ && !weights_.has_tensor("norm.bias") &&
          !weights_.has_tensor("output.bias") && !cfg.uses_non_full_attention();
 }
@@ -107,8 +112,12 @@ void LlamaEngine::init_greedy_decode_graph() {
   const float norm_eps = cfg.norm_eps > 0.0f ? cfg.norm_eps : 1e-5f;
   const int hidden = cfg.hidden_size;
   const int inter = cfg.intermediate_size;
-  const int head_dim = cfg.hidden_size / cfg.num_heads;
-  const int kv_hidden = cfg.num_kv_heads * head_dim;
+  // Same geometry the non-graph decode uses: head_dim can be decoupled from
+  // hidden/num_heads (Qwen3), so the Q width and the wo input width are
+  // q_hidden, not hidden.
+  const int head_dim = attn_head_dim_ > 0 ? attn_head_dim_ : (cfg.hidden_size / cfg.num_heads);
+  const int q_hidden = attn_q_hidden_ > 0 ? attn_q_hidden_ : hidden;
+  const int kv_hidden = attn_kv_hidden_ > 0 ? attn_kv_hidden_ : (cfg.num_kv_heads * head_dim);
   const bool can_use_dp4a_decode = ((hidden & 3) == 0) && ((inter & 3) == 0);
   const auto apply_qprod_residual = [&](const uint32_t* row_bits, const half* residual_scales,
                                         const half* rotated_x, half* y, int out_features) {
@@ -133,7 +142,7 @@ void LlamaEngine::init_greedy_decode_graph() {
       if (tq.wqkv) {
         kernels::launch_tq3_gemv_f16(
             tq.wqkv, d_tq3_codebook_, tq.s_wqkv, static_cast<const __half*>(d_x_tq3_),
-            static_cast<__half*>(d_q_), hidden + 2 * kv_hidden, hidden, compute_stream_);
+            static_cast<__half*>(d_q_), q_hidden + 2 * kv_hidden, hidden, compute_stream_);
       }
       if (tq.wo) {
         kernels::launch_tq3_gemv_f16(tq.wo, d_tq3_codebook_, tq.s_wo,
@@ -153,14 +162,14 @@ void LlamaEngine::init_greedy_decode_graph() {
     } else if (!cached_int8_proj_enabled_) {
       if (resident_custom_qkv_) {
         if (!packed_qkv_matvec(lw, d_x_norm_, d_q_, compute_stream_)) {
-          resident_projection_half(lw.wqkv, d_x_norm_, d_q_, hidden + 2 * kv_hidden, hidden,
+          resident_projection_half(lw.wqkv, d_x_norm_, d_q_, q_hidden + 2 * kv_hidden, hidden,
                                    resident_qkv_warps_, resident_qkv_tile_pairs_,
                                    resident_qkv_rows_per_warp_);
         }
       } else if (!packed_qkv_matvec(lw, d_x_norm_, d_q_, compute_stream_)) {
         detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
                                                 lt_workspace_bytes_, compute_stream_, lw.wqkv,
-                                                d_x_norm_, d_q_, hidden + 2 * kv_hidden, hidden, 1,
+                                                d_x_norm_, d_q_, q_hidden + 2 * kv_hidden, hidden, 1,
                                                 CUDA_R_16F);
       }
       if (lw.wo_packed.active()) {
@@ -172,12 +181,12 @@ void LlamaEngine::init_greedy_decode_graph() {
                                       static_cast<__half*>(d_ff3_), lw.wo_packed.rows,
                                       lw.wo_packed.cols, compute_stream_);
       } else if (resident_custom_wo_) {
-        resident_projection_half(lw.wo, d_att_, d_ff3_, hidden, hidden, resident_wo_warps_,
+        resident_projection_half(lw.wo, d_att_, d_ff3_, hidden, q_hidden, resident_wo_warps_,
                                  resident_wo_tile_pairs_, resident_wo_rows_per_warp_);
       } else {
         detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
                                                 lt_workspace_bytes_, compute_stream_, lw.wo, d_att_,
-                                                d_ff3_, hidden, hidden, 1, CUDA_R_16F);
+                                                d_ff3_, hidden, q_hidden, 1, CUDA_R_16F);
       }
     }
     if (!tq3_enabled_) {
@@ -297,9 +306,9 @@ void LlamaEngine::init_greedy_decode_graph() {
                                            tq3_block_size_, compute_stream_);
       kernels::launch_tq3_gemv_f16(tq->wqkv, d_tq3_codebook_, tq->s_wqkv,
                                    static_cast<const __half*>(d_x_tq3_), static_cast<__half*>(d_q_),
-                                   hidden + 2 * kv_hidden, hidden, compute_stream_);
+                                   q_hidden + 2 * kv_hidden, hidden, compute_stream_);
       apply_qprod_residual(tq->r_wqkv, tq->rs_wqkv, static_cast<const __half*>(d_x_tq3_),
-                           static_cast<__half*>(d_q_), hidden + 2 * kv_hidden);
+                           static_cast<__half*>(d_q_), q_hidden + 2 * kv_hidden);
     } else if (cached_int8_proj_enabled_ && lw_i8 && lw_i8->wqkv) {
       kernels::launch_quantize_rowwise_fp16_to_int8(
           static_cast<const __half*>(d_x_norm_), static_cast<std::int8_t*>(d_prefill_i8_),
@@ -308,29 +317,41 @@ void LlamaEngine::init_greedy_decode_graph() {
         kernels::launch_weight_only_int4_matvec_dp4a(
             lw_i8->wqkv, lw_i8->s_wqkv, static_cast<const std::int8_t*>(d_prefill_i8_),
             static_cast<const float*>(d_prefill_i8_scales_), static_cast<__half*>(d_q_),
-            hidden + 2 * kv_hidden, hidden, compute_stream_, resident_int8_qkv_warps_,
+            q_hidden + 2 * kv_hidden, hidden, compute_stream_, resident_int8_qkv_warps_,
             resident_int8_qkv_tile_packed4_, resident_int8_qkv_warps_per_row_);
       } else {
         kernels::launch_weight_only_int8_matvec_dp4a(
             lw_i8->wqkv, lw_i8->s_wqkv, static_cast<const std::int8_t*>(d_prefill_i8_),
             static_cast<const float*>(d_prefill_i8_scales_), static_cast<__half*>(d_q_),
-            hidden + 2 * kv_hidden, hidden, compute_stream_, resident_int8_qkv_warps_,
+            q_hidden + 2 * kv_hidden, hidden, compute_stream_, resident_int8_qkv_warps_,
             resident_int8_qkv_tile_packed4_, resident_int8_qkv_warps_per_row_);
       }
     } else if (resident_custom_qkv_) {
       if (!packed_qkv_matvec(*lw, d_x_norm_, d_q_, compute_stream_, xnorm_q8)) {
-        resident_projection_half(lw->wqkv, d_x_norm_, d_q_, hidden + 2 * kv_hidden, hidden,
+        resident_projection_half(lw->wqkv, d_x_norm_, d_q_, q_hidden + 2 * kv_hidden, hidden,
                                  resident_qkv_warps_, resident_qkv_tile_pairs_);
       }
     } else if (!packed_qkv_matvec(*lw, d_x_norm_, d_q_, compute_stream_, xnorm_q8)) {
       detail::dispatch_linear_rowmajor_weight(
           cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,
-          lw->wqkv, d_x_norm_, d_q_, hidden + 2 * kv_hidden, hidden, 1, CUDA_R_16F);
+          lw->wqkv, d_x_norm_, d_q_, q_hidden + 2 * kv_hidden, hidden, 1, CUDA_R_16F);
     }
 
     if (lw->bqkv) {
       kernels::launch_add_inplace(static_cast<__half*>(d_q_), static_cast<const __half*>(lw->bqkv),
-                                  hidden + 2 * kv_hidden, compute_stream_);
+                                  q_hidden + 2 * kv_hidden, compute_stream_);
+    }
+
+    // Per-head Q/K RMSNorm (Qwen3-style QK-norm), same stage and eps as the
+    // non-graph decode. A fixed-shape kernel launch with no host branching, so
+    // it captures cleanly.
+    if (lw->q_norm && lw->k_norm) {
+      kernels::launch_rmsnorm(static_cast<const __half*>(d_q_),
+                              static_cast<const __half*>(lw->q_norm), static_cast<__half*>(d_q_),
+                              cfg.num_heads, head_dim, cfg.norm_eps, compute_stream_);
+      kernels::launch_rmsnorm(static_cast<const __half*>(d_k_),
+                              static_cast<const __half*>(lw->k_norm), static_cast<__half*>(d_k_),
+                              cfg.num_kv_heads, head_dim, cfg.norm_eps, compute_stream_);
     }
 
     kernels::launch_rope_inplace_device_pos(
@@ -364,18 +385,18 @@ void LlamaEngine::init_greedy_decode_graph() {
     } else if (cached_int8_proj_enabled_ && lw_i8 && lw_i8->wo) {
       kernels::launch_quantize_rowwise_fp16_to_int8(
           static_cast<const __half*>(d_att_), static_cast<std::int8_t*>(d_prefill_i8_),
-          static_cast<float*>(d_prefill_i8_scales_), 1, hidden, compute_stream_);
+          static_cast<float*>(d_prefill_i8_scales_), 1, q_hidden, compute_stream_);
       if (lw_i8->proj_int4) {
         kernels::launch_weight_only_int4_matvec_dp4a(
             lw_i8->wo, lw_i8->s_wo, static_cast<const std::int8_t*>(d_prefill_i8_),
             static_cast<const float*>(d_prefill_i8_scales_), static_cast<__half*>(d_ff3_), hidden,
-            hidden, compute_stream_, resident_int8_wo_warps_, resident_int8_wo_tile_packed4_,
+            q_hidden, compute_stream_, resident_int8_wo_warps_, resident_int8_wo_tile_packed4_,
             resident_int8_wo_warps_per_row_);
       } else {
         kernels::launch_weight_only_int8_matvec_dp4a(
             lw_i8->wo, lw_i8->s_wo, static_cast<const std::int8_t*>(d_prefill_i8_),
             static_cast<const float*>(d_prefill_i8_scales_), static_cast<__half*>(d_ff3_), hidden,
-            hidden, compute_stream_, resident_int8_wo_warps_, resident_int8_wo_tile_packed4_,
+            q_hidden, compute_stream_, resident_int8_wo_warps_, resident_int8_wo_tile_packed4_,
             resident_int8_wo_warps_per_row_);
       }
     } else if (lw->wo_packed.active()) {
@@ -401,13 +422,13 @@ void LlamaEngine::init_greedy_decode_graph() {
     } else if (resident_custom_wo_) {
       // Residual add folded into this projection's epilogue, so the shared add_inplace
       // below is skipped. At batch 1 a kernel costs a fixed ~1.7 us whatever it does.
-      resident_projection_half_residual(lw->wo, d_att_, d_x_, hidden, hidden, resident_wo_warps_,
+      resident_projection_half_residual(lw->wo, d_att_, d_x_, hidden, q_hidden, resident_wo_warps_,
                                         resident_wo_tile_pairs_, resident_wo_rows_per_warp_);
       fused_residual = true;
     } else {
       detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
                                               lt_workspace_bytes_, compute_stream_, lw->wo, d_att_,
-                                              d_ff3_, hidden, hidden, 1, CUDA_R_16F);
+                                              d_ff3_, hidden, q_hidden, 1, CUDA_R_16F);
     }
 
     if (!fused_residual) {
@@ -599,8 +620,10 @@ void LlamaEngine::init_logits_decode_graph() {
   const float norm_eps = cfg.norm_eps > 0.0f ? cfg.norm_eps : 1e-5f;
   const int hidden = cfg.hidden_size;
   const int inter = cfg.intermediate_size;
-  const int head_dim = cfg.hidden_size / cfg.num_heads;
-  const int kv_hidden = cfg.num_kv_heads * head_dim;
+  // Same attn geometry note as the greedy graph above.
+  const int head_dim = attn_head_dim_ > 0 ? attn_head_dim_ : (cfg.hidden_size / cfg.num_heads);
+  const int q_hidden = attn_q_hidden_ > 0 ? attn_q_hidden_ : hidden;
+  const int kv_hidden = attn_kv_hidden_ > 0 ? attn_kv_hidden_ : (cfg.num_kv_heads * head_dim);
   const bool can_use_dp4a_decode = ((hidden & 3) == 0) && ((inter & 3) == 0);
   const auto apply_qprod_residual = [&](const uint32_t* row_bits, const half* residual_scales,
                                         const half* rotated_x, half* y, int out_features) {
@@ -624,7 +647,7 @@ void LlamaEngine::init_logits_decode_graph() {
       if (tq.wqkv) {
         kernels::launch_tq3_gemv_f16(
             tq.wqkv, d_tq3_codebook_, tq.s_wqkv, static_cast<const __half*>(d_x_tq3_),
-            static_cast<__half*>(d_q_), hidden + 2 * kv_hidden, hidden, compute_stream_);
+            static_cast<__half*>(d_q_), q_hidden + 2 * kv_hidden, hidden, compute_stream_);
       }
       if (tq.wo) {
         kernels::launch_tq3_gemv_f16(tq.wo, d_tq3_codebook_, tq.s_wo,
@@ -644,14 +667,14 @@ void LlamaEngine::init_logits_decode_graph() {
     } else if (!cached_int8_proj_enabled_) {
       if (resident_custom_qkv_) {
         if (!packed_qkv_matvec(lw, d_x_norm_, d_q_, compute_stream_)) {
-          resident_projection_half(lw.wqkv, d_x_norm_, d_q_, hidden + 2 * kv_hidden, hidden,
+          resident_projection_half(lw.wqkv, d_x_norm_, d_q_, q_hidden + 2 * kv_hidden, hidden,
                                    resident_qkv_warps_, resident_qkv_tile_pairs_,
                                    resident_qkv_rows_per_warp_);
         }
       } else if (!packed_qkv_matvec(lw, d_x_norm_, d_q_, compute_stream_)) {
         detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
                                                 lt_workspace_bytes_, compute_stream_, lw.wqkv,
-                                                d_x_norm_, d_q_, hidden + 2 * kv_hidden, hidden, 1,
+                                                d_x_norm_, d_q_, q_hidden + 2 * kv_hidden, hidden, 1,
                                                 CUDA_R_16F);
       }
       if (lw.wo_packed.active()) {
@@ -663,12 +686,12 @@ void LlamaEngine::init_logits_decode_graph() {
                                       static_cast<__half*>(d_ff3_), lw.wo_packed.rows,
                                       lw.wo_packed.cols, compute_stream_);
       } else if (resident_custom_wo_) {
-        resident_projection_half(lw.wo, d_att_, d_ff3_, hidden, hidden, resident_wo_warps_,
+        resident_projection_half(lw.wo, d_att_, d_ff3_, hidden, q_hidden, resident_wo_warps_,
                                  resident_wo_tile_pairs_, resident_wo_rows_per_warp_);
       } else {
         detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
                                                 lt_workspace_bytes_, compute_stream_, lw.wo, d_att_,
-                                                d_ff3_, hidden, hidden, 1, CUDA_R_16F);
+                                                d_ff3_, hidden, q_hidden, 1, CUDA_R_16F);
       }
     }
     if (!tq3_enabled_) {
@@ -782,9 +805,9 @@ void LlamaEngine::init_logits_decode_graph() {
                                            tq3_block_size_, compute_stream_);
       kernels::launch_tq3_gemv_f16(tq->wqkv, d_tq3_codebook_, tq->s_wqkv,
                                    static_cast<const __half*>(d_x_tq3_), static_cast<__half*>(d_q_),
-                                   hidden + 2 * kv_hidden, hidden, compute_stream_);
+                                   q_hidden + 2 * kv_hidden, hidden, compute_stream_);
       apply_qprod_residual(tq->r_wqkv, tq->rs_wqkv, static_cast<const __half*>(d_x_tq3_),
-                           static_cast<__half*>(d_q_), hidden + 2 * kv_hidden);
+                           static_cast<__half*>(d_q_), q_hidden + 2 * kv_hidden);
     } else if (cached_int8_proj_enabled_ && lw_i8 && lw_i8->wqkv) {
       kernels::launch_quantize_rowwise_fp16_to_int8(
           static_cast<const __half*>(d_x_norm_), static_cast<std::int8_t*>(d_prefill_i8_),
@@ -793,29 +816,41 @@ void LlamaEngine::init_logits_decode_graph() {
         kernels::launch_weight_only_int4_matvec_dp4a(
             lw_i8->wqkv, lw_i8->s_wqkv, static_cast<const std::int8_t*>(d_prefill_i8_),
             static_cast<const float*>(d_prefill_i8_scales_), static_cast<__half*>(d_q_),
-            hidden + 2 * kv_hidden, hidden, compute_stream_, resident_int8_qkv_warps_,
+            q_hidden + 2 * kv_hidden, hidden, compute_stream_, resident_int8_qkv_warps_,
             resident_int8_qkv_tile_packed4_, resident_int8_qkv_warps_per_row_);
       } else {
         kernels::launch_weight_only_int8_matvec_dp4a(
             lw_i8->wqkv, lw_i8->s_wqkv, static_cast<const std::int8_t*>(d_prefill_i8_),
             static_cast<const float*>(d_prefill_i8_scales_), static_cast<__half*>(d_q_),
-            hidden + 2 * kv_hidden, hidden, compute_stream_, resident_int8_qkv_warps_,
+            q_hidden + 2 * kv_hidden, hidden, compute_stream_, resident_int8_qkv_warps_,
             resident_int8_qkv_tile_packed4_, resident_int8_qkv_warps_per_row_);
       }
     } else if (resident_custom_qkv_) {
       if (!packed_qkv_matvec(*lw, d_x_norm_, d_q_, compute_stream_, xnorm_q8)) {
-        resident_projection_half(lw->wqkv, d_x_norm_, d_q_, hidden + 2 * kv_hidden, hidden,
+        resident_projection_half(lw->wqkv, d_x_norm_, d_q_, q_hidden + 2 * kv_hidden, hidden,
                                  resident_qkv_warps_, resident_qkv_tile_pairs_);
       }
     } else if (!packed_qkv_matvec(*lw, d_x_norm_, d_q_, compute_stream_, xnorm_q8)) {
       detail::dispatch_linear_rowmajor_weight(
           cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,
-          lw->wqkv, d_x_norm_, d_q_, hidden + 2 * kv_hidden, hidden, 1, CUDA_R_16F);
+          lw->wqkv, d_x_norm_, d_q_, q_hidden + 2 * kv_hidden, hidden, 1, CUDA_R_16F);
     }
 
     if (lw->bqkv) {
       kernels::launch_add_inplace(static_cast<__half*>(d_q_), static_cast<const __half*>(lw->bqkv),
-                                  hidden + 2 * kv_hidden, compute_stream_);
+                                  q_hidden + 2 * kv_hidden, compute_stream_);
+    }
+
+    // Per-head Q/K RMSNorm (Qwen3-style QK-norm), same stage and eps as the
+    // non-graph decode. A fixed-shape kernel launch with no host branching, so
+    // it captures cleanly.
+    if (lw->q_norm && lw->k_norm) {
+      kernels::launch_rmsnorm(static_cast<const __half*>(d_q_),
+                              static_cast<const __half*>(lw->q_norm), static_cast<__half*>(d_q_),
+                              cfg.num_heads, head_dim, cfg.norm_eps, compute_stream_);
+      kernels::launch_rmsnorm(static_cast<const __half*>(d_k_),
+                              static_cast<const __half*>(lw->k_norm), static_cast<__half*>(d_k_),
+                              cfg.num_kv_heads, head_dim, cfg.norm_eps, compute_stream_);
     }
 
     kernels::launch_rope_inplace_device_pos(
@@ -849,18 +884,18 @@ void LlamaEngine::init_logits_decode_graph() {
     } else if (cached_int8_proj_enabled_ && lw_i8 && lw_i8->wo) {
       kernels::launch_quantize_rowwise_fp16_to_int8(
           static_cast<const __half*>(d_att_), static_cast<std::int8_t*>(d_prefill_i8_),
-          static_cast<float*>(d_prefill_i8_scales_), 1, hidden, compute_stream_);
+          static_cast<float*>(d_prefill_i8_scales_), 1, q_hidden, compute_stream_);
       if (lw_i8->proj_int4) {
         kernels::launch_weight_only_int4_matvec_dp4a(
             lw_i8->wo, lw_i8->s_wo, static_cast<const std::int8_t*>(d_prefill_i8_),
             static_cast<const float*>(d_prefill_i8_scales_), static_cast<__half*>(d_ff3_), hidden,
-            hidden, compute_stream_, resident_int8_wo_warps_, resident_int8_wo_tile_packed4_,
+            q_hidden, compute_stream_, resident_int8_wo_warps_, resident_int8_wo_tile_packed4_,
             resident_int8_wo_warps_per_row_);
       } else {
         kernels::launch_weight_only_int8_matvec_dp4a(
             lw_i8->wo, lw_i8->s_wo, static_cast<const std::int8_t*>(d_prefill_i8_),
             static_cast<const float*>(d_prefill_i8_scales_), static_cast<__half*>(d_ff3_), hidden,
-            hidden, compute_stream_, resident_int8_wo_warps_, resident_int8_wo_tile_packed4_,
+            q_hidden, compute_stream_, resident_int8_wo_warps_, resident_int8_wo_tile_packed4_,
             resident_int8_wo_warps_per_row_);
       }
     } else if (lw->wo_packed.active()) {
@@ -886,13 +921,13 @@ void LlamaEngine::init_logits_decode_graph() {
     } else if (resident_custom_wo_) {
       // Residual add folded into this projection's epilogue, so the shared add_inplace
       // below is skipped. At batch 1 a kernel costs a fixed ~1.7 us whatever it does.
-      resident_projection_half_residual(lw->wo, d_att_, d_x_, hidden, hidden, resident_wo_warps_,
+      resident_projection_half_residual(lw->wo, d_att_, d_x_, hidden, q_hidden, resident_wo_warps_,
                                         resident_wo_tile_pairs_, resident_wo_rows_per_warp_);
       fused_residual = true;
     } else {
       detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
                                               lt_workspace_bytes_, compute_stream_, lw->wo, d_att_,
-                                              d_ff3_, hidden, hidden, 1, CUDA_R_16F);
+                                              d_ff3_, hidden, q_hidden, 1, CUDA_R_16F);
     }
 
     if (!fused_residual) {
