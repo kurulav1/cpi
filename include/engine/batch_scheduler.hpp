@@ -194,6 +194,11 @@ public:
   bool cancel(const std::string& id);
   int active() const;
 
+  // The context window requests must fit. Exposed so the transports (batch
+  // worker) can clamp an over-long prompt with a warning before admission
+  // instead of learning the limit from an admit failure.
+  int max_context() const { return opts_.max_context; }
+
   // Drop the shared-prefix cache. The caller must do this whenever the KV cache is wiped
   // underneath the scheduler (reset_kv_cache): the cached entries hold refcounted blocks whose
   // contents the wipe invalidates, and nothing about the block ids themselves would reveal

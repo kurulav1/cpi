@@ -164,7 +164,12 @@ void execute_engine_modes(const RunExecutionOptions& options, const std::vector<
           }
         }
 
-        const std::vector<int> req_prompt_tokens = tokenizer->encode(req_prompt, req_add_bos);
+        std::vector<int> req_prompt_tokens = tokenizer->encode(req_prompt, req_add_bos);
+        // Over-long requests used to surface as an engine error event; fit
+        // them with the shared clamp so the client gets an answer and stderr
+        // says what was dropped.
+        app::main_helpers::clamp_prompt_to_context(req_prompt_tokens, options.max_context,
+                                                   tokenizer->bos_id());
 
         // Grammar-constrained decoding: if the request carries a structural
         // `json_schema` (the tool's `parameters`), compile it to a grammar and

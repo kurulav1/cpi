@@ -61,6 +61,10 @@ bool BatchWorker::submit(const std::string& id, const std::string& prompt,
     return false;
   }
   if (in.tokens.empty()) return fail("prompt encoded to zero tokens");
+  // Same over-long-prompt clamp as the one-shot CLI and the interactive
+  // worker: fit the prompt (keeping BOS plus the newest tokens) and warn on
+  // stderr, rather than surfacing a scheduler admit failure to the client.
+  main_helpers::clamp_prompt_to_context(in.tokens, sched_.max_context(), tokenizer_.bos_id());
 
   in.params.max_new_tokens = std::max(1, ov.max_new >= 0 ? ov.max_new : defaults_.max_new);
   in.params.temperature = std::max(0.0f, ov.temp >= 0.0f ? ov.temp : defaults_.temp);

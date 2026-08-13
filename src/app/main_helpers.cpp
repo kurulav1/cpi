@@ -233,6 +233,24 @@ std::string join_ints(const std::vector<int>& values, std::size_t limit) {
   return ss.str();
 }
 
+bool clamp_prompt_to_context(std::vector<int>& tokens, int max_context, int bos_id) {
+  const int limit = max_context - 1;  // one slot must remain for the first generated token
+  const int total = static_cast<int>(tokens.size());
+  if (limit < 1 || total <= limit) return false;
+  const bool keep_bos = bos_id >= 0 && tokens.front() == bos_id && limit >= 2;
+  std::vector<int> kept;
+  kept.reserve(static_cast<std::size_t>(limit));
+  if (keep_bos) kept.push_back(tokens.front());
+  const int tail = limit - static_cast<int>(kept.size());
+  kept.insert(kept.end(), tokens.end() - tail, tokens.end());
+  tokens = std::move(kept);
+  std::fprintf(stderr,
+               "[context] prompt has %d tokens but the context window fits %d: kept the newest %d "
+               "and dropped %d; pass --max-context N (or CPI_MAX_CONTEXT) to raise the limit.\n",
+               total, limit, static_cast<int>(tokens.size()), total - limit);
+  return true;
+}
+
 std::string json_get_string(const std::string& json, const std::string& key) {
   const std::size_t v = json_find_key(json, key);
   if (v == std::string::npos) {

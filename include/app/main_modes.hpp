@@ -29,6 +29,9 @@ struct RunExecutionOptions {
   bool force_no_bos = false;
   int max_new = 16;
   float temp = 0.8f;
+  // The engine's context window; interactive requests are tokenized here, so
+  // the over-long-prompt clamp (clamp_prompt_to_context) needs it too.
+  int max_context = 2048;
   int inspect_next_topk = 0;
   int trace_steps = 0;
   int benchmark_reps = 1;

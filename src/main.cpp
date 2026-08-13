@@ -474,6 +474,15 @@ int main(int argc, char** argv) {
       prompt_tokens = parse_tokens(cli.token_csv);
     }
 
+    // A prompt the KV cache cannot seat used to be a fatal error deep in the
+    // engine. Fit it (keeping the BOS and the newest tokens) with a loud
+    // stderr line instead; the numbers and the --max-context hint are printed
+    // by the helper. Runs before any engine is constructed, so every engine
+    // and mode below (chat, --benchmark, the check modes) sees a prompt that
+    // fits.
+    app::main_helpers::clamp_prompt_to_context(prompt_tokens, cli.opts.max_context,
+                                               use_tokenizer ? tokenizer.bos_id() : -1);
+
     // --- Engine initialization: auto-detect GPU, fall back to CPU ---
 #if CPI_HAS_CUDA
     int cuda_device_count = 0;
@@ -568,6 +577,7 @@ int main(int argc, char** argv) {
     run_opts.force_no_bos = cli.force_no_bos;
     run_opts.max_new = cli.max_new;
     run_opts.temp = cli.temp;
+    run_opts.max_context = cli.opts.max_context;
     run_opts.inspect_next_topk = cli.inspect_next_topk;
     run_opts.trace_steps = cli.trace_steps;
     run_opts.benchmark_reps = cli.benchmark_reps;

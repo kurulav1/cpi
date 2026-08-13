@@ -29,6 +29,18 @@ private:
 std::vector<int> parse_tokens(const std::string& csv);
 std::string join_ints(const std::vector<int>& values, std::size_t limit = 0);
 
+// Fits an over-long prompt into the engine's context window instead of letting
+// the request die deep in the engine, and says so on stderr (prompt size, kept
+// size, and that --max-context raises the limit). The engine allocates KV for
+// exactly max_context positions and rejects a prompt that meets or exceeds it,
+// so the largest usable prompt is max_context - 1 tokens. Keeps a leading BOS
+// (bos_id, when it is the first token) plus the newest tokens, which preserves
+// a chat template's trailing assistant header; the drop comes out of the middle
+// of what remains. Returns true when tokens were dropped. Shared by the
+// one-shot CLI, the interactive stdin worker, and the batch worker so no
+// transport truncates silently and no two warnings drift apart.
+bool clamp_prompt_to_context(std::vector<int>& tokens, int max_context, int bos_id);
+
 std::string json_get_string(const std::string& json, const std::string& key);
 // Returns the raw JSON text of a key's value (object, array, string, or scalar),
 // brace/bracket-balanced and string-aware. Use for nested values like
