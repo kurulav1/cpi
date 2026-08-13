@@ -449,6 +449,15 @@ ParsedArgs parse_args(int argc, char** argv) {
     }
   }
 
+  // The batched-decode check only exists on the paged path, so it used to die
+  // with a fatal "requires --paged-blocks" when the flag was missing. A check
+  // run that fails on a missing prerequisite flag helps nobody; imply the flag
+  // and say so.
+  if (args.batched_check > 0 && !args.opts.paged_blocks) {
+    args.opts.paged_blocks = true;
+    std::fprintf(stderr, "[cli] --batched-check implies --paged-blocks; enabling it.\n");
+  }
+
   apply_simple_mode_defaults(&args);
   validate_args(args);
   return args;
