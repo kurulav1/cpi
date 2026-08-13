@@ -675,6 +675,8 @@ LlamaEngine::~LlamaEngine() {
   free_ptr(d_norm_out_);
   free_ptr(d_norm_out_bias_);
   free_ptr(d_attn_scores_);
+  free_ptr(d_paged_gather_kv_);
+  paged_gather_bytes_ = 0;
   if (d_gemm_ptrs_) {
     cudaFree(d_gemm_ptrs_);
     d_gemm_ptrs_ = nullptr;

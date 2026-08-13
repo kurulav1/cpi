@@ -779,6 +779,11 @@ private:
   // Tensor-core prefill attention (see prefill_attention_tensorcore).
   void* d_attn_scores_ = nullptr;  // [heads][chunk][keys] score matrix, fp16.
   std::size_t attn_scores_bytes_ = 0;
+  // Contiguous K/V staging for paged single-stream prefill: the tensor-core
+  // attention needs plain [pos, kv_hidden] K/V, so the block pool is gathered
+  // here once per layer per chunk (K at the base, V at the row-count offset).
+  void* d_paged_gather_kv_ = nullptr;
+  std::size_t paged_gather_bytes_ = 0;
   void** d_gemm_ptrs_ = nullptr;        // device pointer arrays for cublasGemmBatchedEx (6 x heads)
   std::size_t gemm_ptrs_capacity_ = 0;  // pointers, not bytes
   float* d_argmax_part_val_ = nullptr;  // Per-block partials for the two-phase greedy argmax.

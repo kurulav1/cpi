@@ -424,10 +424,44 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
         kernels::launch_store_kv_paged(k_layer, v_layer, static_cast<const __half*>(d_prefill_k_),
                                        static_cast<const __half*>(d_prefill_v_), d_block_table_,
                                        base_pos, rows, kv_hidden, bs, compute_stream_);
-        kernels::launch_attention_prefill_paged(
-            static_cast<const __half*>(d_prefill_q_), k_layer, v_layer, d_block_table_,
-            static_cast<__half*>(d_att_), rows, base_pos, cfg.num_heads, cfg.num_kv_heads,
-            head_dim, bs, compute_stream_);
+        // The scalar block-table kernel below walks every key for every query
+        // row, so a single-stream paged prefill scaled quadratically with the
+        // prompt (4.35 s at a 6.2k prompt vs 0.49 s non-paged; 74.5 s at 26k).
+        // Gathering the pool into contiguous K/V is one linear pass per layer
+        // per chunk, after which the same tensor-core attention as the
+        // non-paged path handles the quadratic part. Falls back to the scalar
+        // kernel when the gather scratch or the TC path is unavailable.
+        const int total_keys = base_pos + rows;
+        bool tc_done = false;
+        const std::size_t gather_need = 2 * static_cast<std::size_t>(total_keys) * kv_row_bytes;
+        if (gather_need > paged_gather_bytes_) {
+          // A 4096-row granule so a growing prefill reallocates rarely.
+          const std::size_t granule = 2 * std::size_t{4096} * kv_row_bytes;
+          const std::size_t want = ((gather_need + granule - 1) / granule) * granule;
+          if (d_paged_gather_kv_) {
+            cudaFree(d_paged_gather_kv_);
+            d_paged_gather_kv_ = nullptr;
+            paged_gather_bytes_ = 0;
+          }
+          if (cudaMalloc(&d_paged_gather_kv_, want) == cudaSuccess) {
+            paged_gather_bytes_ = want;
+          }
+        }
+        if (d_paged_gather_kv_ != nullptr && gather_need <= paged_gather_bytes_) {
+          auto* k_gather = static_cast<__half*>(d_paged_gather_kv_);
+          auto* v_gather = k_gather + static_cast<std::size_t>(total_keys) * kv_hidden;
+          kernels::launch_gather_kv_paged(k_layer, v_layer, k_gather, v_gather, d_block_table_,
+                                          total_keys, kv_hidden, bs, compute_stream_);
+          tc_done = prefill_attention_tensorcore(d_prefill_q_, k_gather, v_gather, d_att_, rows,
+                                                 base_pos, cfg.num_heads, cfg.num_kv_heads,
+                                                 head_dim, q_hidden);
+        }
+        if (!tc_done) {
+          kernels::launch_attention_prefill_paged(
+              static_cast<const __half*>(d_prefill_q_), k_layer, v_layer, d_block_table_,
+              static_cast<__half*>(d_att_), rows, base_pos, cfg.num_heads, cfg.num_kv_heads,
+              head_dim, bs, compute_stream_);
+        }
       }
     } else {
       // Store K/V into the cache. On the in-place path these read straight out of the fused QKV

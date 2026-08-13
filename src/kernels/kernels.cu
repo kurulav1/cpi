@@ -1038,6 +1038,26 @@ __global__ void store_kv_paged_kernel(half* k_pool, half* v_pool, const half* k_
   }
 }
 
+// Gather the first `total` logical KV rows out of the block pool into contiguous
+// [total, kv_hidden] buffers; the inverse of store_kv_paged_kernel. Exists so the
+// single-stream paged prefill can hand the tensor-core attention the plain layout
+// it needs instead of falling to the scalar block-table kernel.
+__global__ void gather_kv_paged_kernel(const half* k_pool, const half* v_pool, half* k_dst,
+                                       half* v_dst, const int* __restrict__ block_table,
+                                       int total, int kv_hidden, int block_size) {
+  const int row = blockIdx.x;
+  if (row >= total) return;
+  const int phys = block_table[row / block_size] * block_size + (row % block_size);
+  const half* ks = k_pool + static_cast<std::size_t>(phys) * kv_hidden;
+  const half* vs = v_pool + static_cast<std::size_t>(phys) * kv_hidden;
+  half* kd = k_dst + static_cast<std::size_t>(row) * kv_hidden;
+  half* vd = v_dst + static_cast<std::size_t>(row) * kv_hidden;
+  for (int d = threadIdx.x; d < kv_hidden; d += blockDim.x) {
+    kd[d] = ks[d];
+    vd[d] = vs[d];
+  }
+}
+
 // Batched decode KV scatter (P2): one token per sequence, each to its own block
 // table at its own position. row = sequence; positions[row] + block_tables[row].
 __global__ void store_kv_batched_paged_kernel(half* k_pool, half* v_pool, const half* k_src,
@@ -1813,6 +1833,15 @@ void launch_attention_prefill_paged(const half* q, const half* k_pool, const hal
         q, k_pool, v_pool, block_table, out, num_tokens, start_position, num_heads, num_kv_heads,
         head_dim, block_size);
   }
+}
+
+// Gather paged KV into contiguous buffers for the tensor-core prefill attention.
+void launch_gather_kv_paged(const half* k_pool, const half* v_pool, half* k_dst, half* v_dst,
+                            const int* block_table, int total, int kv_hidden, int block_size,
+                            cudaStream_t stream) {
+  if (total <= 0) return;
+  gather_kv_paged_kernel<<<total, 128, 0, stream>>>(k_pool, v_pool, k_dst, v_dst, block_table,
+                                                    total, kv_hidden, block_size);
 }
 
 // Scatter freshly-projected prefill KV rows into the block pool at paged positions.

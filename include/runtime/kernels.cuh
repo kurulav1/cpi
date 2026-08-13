@@ -545,6 +545,12 @@ void launch_attention_prefill_paged(const half* q, const half* k_pool, const hal
                                     const int* block_table, half* out, int num_tokens,
                                     int start_position, int num_heads, int num_kv_heads,
                                     int head_dim, int block_size, cudaStream_t stream);
+// Gather the first `total` logical KV rows from the block pool into contiguous
+// [total, kv_hidden] K/V buffers (inverse of the store below), so the paged
+// single-stream prefill can run the tensor-core attention.
+void launch_gather_kv_paged(const half* k_pool, const half* v_pool, half* k_dst, half* v_dst,
+                            const int* block_table, int total, int kv_hidden, int block_size,
+                            cudaStream_t stream);
 void launch_store_kv_paged(half* k_pool, half* v_pool, const half* k_src, const half* v_src,
                            const int* block_table, int base_pos, int rows, int kv_hidden,
                            int block_size, cudaStream_t stream);
