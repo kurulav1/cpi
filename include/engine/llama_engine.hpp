@@ -890,6 +890,23 @@ private:
   int* d_eagle_row_off_ = nullptr;     // [rows] per-row depth (device, constant)
   unsigned int* d_eagle_anc_mask_ = nullptr;  // [rows] ancestor bitmasks (device, constant)
   int* d_eagle_scatter_ = nullptr;     // [8] accepted-row indices for the KV scatter
+  // Batched draft levels: one forward per tree depth instead of one per node.
+  // Row capacity 4 (widest level), node-scratch capacity 16 forwarded nodes.
+  __half* d_eagle_bcat_ = nullptr;     // [4, 2*hidden] level fc inputs
+  __half* d_eagle_bx_ = nullptr;       // [4, hidden] level hidden / residual
+  __half* d_eagle_btmp_ = nullptr;     // [4, hidden]
+  __half* d_eagle_bnorm_ = nullptr;    // [4, hidden]
+  __half* d_eagle_bq_ = nullptr;       // [4, q_hidden]
+  __half* d_eagle_batt_ = nullptr;     // [4, q_hidden]
+  __half* d_eagle_bgate_ = nullptr;    // [4, inter]
+  __half* d_eagle_bup_ = nullptr;      // [4, inter]
+  __half* d_eagle_scrk_ = nullptr;     // [16, kv_hidden] drafted-node K (forward order)
+  __half* d_eagle_scrv_ = nullptr;     // [16, kv_hidden]
+  int* d_eagle_lvl_tok_ = nullptr;     // [16] per-row dtok slot of the input token
+  int* d_eagle_lvl_feat_ = nullptr;    // [16] per-row stash row of the input feature
+  unsigned int* d_eagle_lvl_mask_ = nullptr;  // [16] per-row draft-scratch ancestor mask
+  int* d_eagle_lvl_dep_ = nullptr;     // [16] per-row depth (rope offset)
+  void eagle_tree_level(int B, int row0, int n_scr);
   void eagle_tree_verify_forward(int K);
   std::vector<int> eagle_tree_generate(const std::vector<int>& prompt_tokens, int max_new_tokens,
                                        const std::function<bool(int)>& on_token);

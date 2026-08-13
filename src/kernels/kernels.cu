@@ -647,6 +647,24 @@ __global__ void mask_logit_kernel(float* logits, const int* __restrict__ index) 
 }
 
 // EAGLE tree scatter: after the verdict walk, copy the accepted rows' K/V from
+// Batched EAGLE draft fc input: row r of the level is the pair
+// [embed(dtoks[tok_idx[r]]) | stash[feat_idx[r]]], gathered in one launch
+// (replaces a per-row embedding-lookup + memcpy pair).
+__global__ void eagle_cat_gather_kernel(const half* __restrict__ embedding,
+                                        const int* __restrict__ dtoks,
+                                        const int* __restrict__ tok_idx,
+                                        const int* __restrict__ feat_idx,
+                                        const half* __restrict__ stash, half* cat, int hidden) {
+  const int r = blockIdx.y;
+  const std::size_t tok_row = static_cast<std::size_t>(dtoks[tok_idx[r]]) * hidden;
+  const std::size_t feat_row = static_cast<std::size_t>(feat_idx[r]) * hidden;
+  half* dst = cat + static_cast<std::size_t>(r) * 2 * hidden;
+  for (int d = blockIdx.x * blockDim.x + threadIdx.x; d < hidden; d += gridDim.x * blockDim.x) {
+    dst[d] = embedding[tok_row + d];
+    dst[hidden + d] = stash[feat_row + d];
+  }
+}
+
 // the per-layer verify scratch into the real cache at base..base+n-1, all
 // layers in one launch (replaces a per-(layer,row) async-memcpy storm).
 __global__ void eagle_tree_scatter_kernel(const half* __restrict__ k_scr,
@@ -1701,6 +1719,14 @@ void launch_rope_inplace_batched_offsets_device_pos(half* q, half* k, int num_to
 
 void launch_mask_logit(float* logits, const int* index, cudaStream_t stream) {
   mask_logit_kernel<<<1, 1, 0, stream>>>(logits, index);
+}
+
+void launch_eagle_cat_gather(const half* embedding, const int* dtoks, const int* tok_idx,
+                             const int* feat_idx, const half* stash, half* cat, int rows,
+                             int hidden, cudaStream_t stream) {
+  const dim3 grid(4, rows);
+  eagle_cat_gather_kernel<<<grid, 256, 0, stream>>>(embedding, dtoks, tok_idx, feat_idx, stash,
+                                                    cat, hidden);
 }
 
 void launch_eagle_tree_scatter(const half* k_scr, const half* v_scr, half* k_cache, half* v_cache,

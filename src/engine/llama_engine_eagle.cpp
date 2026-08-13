@@ -134,17 +134,41 @@ bool LlamaEngine::eagle_load() {
   }
   eagle_tree_ = std::getenv("CPI_EAGLE_TREE") != nullptr;
   if (eagle_tree_) {
-    // Static tree: 10 nodes, 11 verify rows (see llama_engine_eagle_tree.cpp).
-    constexpr int kRows = 11;
+    // Static tree shapes up to 16 nodes / 17 verify rows / 4-wide levels (see
+    // llama_engine_eagle_tree.cpp); buffers sized for the largest shape.
+    constexpr int kMaxRows = 17;
+    constexpr int kMaxLvlRows = 16;
+    constexpr int kMaxB = 4;
     CUDA_CHECK(cudaMalloc(&d_eagle_tree_h_,
-                          static_cast<std::size_t>(1 + kRows - 1) * H * sizeof(__half)));
+                          static_cast<std::size_t>(kMaxRows) * H * sizeof(__half)));
     const std::size_t scratch =
-        static_cast<std::size_t>(cfg.num_layers) * kRows * kv_hidden * sizeof(__half);
+        static_cast<std::size_t>(cfg.num_layers) * kMaxRows * kv_hidden * sizeof(__half);
     CUDA_CHECK(cudaMalloc(&d_eagle_tree_k_, scratch));
     CUDA_CHECK(cudaMalloc(&d_eagle_tree_v_, scratch));
-    CUDA_CHECK(cudaMalloc(&d_eagle_row_off_, kRows * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_eagle_anc_mask_, kRows * sizeof(unsigned int)));
+    CUDA_CHECK(cudaMalloc(&d_eagle_row_off_, kMaxRows * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_eagle_anc_mask_, kMaxRows * sizeof(unsigned int)));
     CUDA_CHECK(cudaMalloc(&d_eagle_scatter_, 8 * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_eagle_bcat_,
+                          static_cast<std::size_t>(kMaxB) * 2 * H * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&d_eagle_bx_, static_cast<std::size_t>(kMaxB) * H * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&d_eagle_btmp_, static_cast<std::size_t>(kMaxB) * H * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&d_eagle_bnorm_, static_cast<std::size_t>(kMaxB) * H * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&d_eagle_bq_,
+                          static_cast<std::size_t>(kMaxB) * q_hidden * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&d_eagle_batt_,
+                          static_cast<std::size_t>(kMaxB) * q_hidden * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&d_eagle_bgate_,
+                          static_cast<std::size_t>(kMaxB) * inter * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&d_eagle_bup_,
+                          static_cast<std::size_t>(kMaxB) * inter * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&d_eagle_scrk_,
+                          static_cast<std::size_t>(kMaxLvlRows) * kv_hidden * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&d_eagle_scrv_,
+                          static_cast<std::size_t>(kMaxLvlRows) * kv_hidden * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&d_eagle_lvl_tok_, kMaxLvlRows * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_eagle_lvl_feat_, kMaxLvlRows * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_eagle_lvl_mask_, kMaxLvlRows * sizeof(unsigned int)));
+    CUDA_CHECK(cudaMalloc(&d_eagle_lvl_dep_, kMaxLvlRows * sizeof(int)));
   }
   eagle_enabled_ = true;
   if (options_.verbose) {
@@ -190,6 +214,20 @@ void LlamaEngine::eagle_free() {
   freep(d_eagle_row_off_);
   freep(d_eagle_anc_mask_);
   freep(d_eagle_scatter_);
+  freep(d_eagle_bcat_);
+  freep(d_eagle_bx_);
+  freep(d_eagle_btmp_);
+  freep(d_eagle_bnorm_);
+  freep(d_eagle_bq_);
+  freep(d_eagle_batt_);
+  freep(d_eagle_bgate_);
+  freep(d_eagle_bup_);
+  freep(d_eagle_scrk_);
+  freep(d_eagle_scrv_);
+  freep(d_eagle_lvl_tok_);
+  freep(d_eagle_lvl_feat_);
+  freep(d_eagle_lvl_mask_);
+  freep(d_eagle_lvl_dep_);
   if (eagle_vgraph_exec_) {
     cudaGraphExecDestroy(eagle_vgraph_exec_);
     eagle_vgraph_exec_ = nullptr;

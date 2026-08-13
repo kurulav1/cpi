@@ -3,25 +3,32 @@
 // The chain line is capped at ~2.2 tokens/round by acceptance decay
 // (69/43/48/39% down a single path); a static draft tree spends the same
 // verify weight-read on branches so a wrong top-1 guess no longer ends the
-// round. Tree shape (10 nodes, from the measured per-depth acceptance):
+// round.
 //
-//   root ── n0 ── n4 ── n7 ── n9        depth: n0..n3=1, n4..n6=2,
-//     │      └─ n5 ── n8                       n7,n8=3, n9=4
-//     ├─ n1 ── n6
-//     ├─ n2
-//     └─ n3
+// Draft side (v2): one BATCHED forward per tree depth instead of one DFS
+// forward per node. Level rows share a rope position (base + depth), their
+// K/V go to a per-node scratch in forward order, and attention is the same
+// ancestor-bitmask tree kernel the verify uses (cache prefix at constant
+// length base, in-batch scratch columns as one virtual chunk). That drops
+// the draft from one weight-read per expanded node to one per depth, which
+// is what makes wider trees affordable.
 //
-// Verify row r>=1 carries node r-1; row 0 carries cur. Sibling rows share a
-// rope position (base + depth), so verify K/V cannot go through the
-// sequential cache store: rows land in per-layer scratch, attention takes an
-// ancestor bitmask per row (launch_attention_tree_masked), and the accepted
-// path's rows are scattered into the real cache after the verdict walk.
+// Verify side: rows land in per-layer scratch (siblings share a position so
+// the sequential cache store cannot hold them), attention takes an ancestor
+// bitmask per row, and the accepted path's rows are scattered into the real
+// cache after the verdict walk.
 //
-// Draft-side DFS needs no new attention: expanding depth-first and writing
-// each node's K/V at draft-cache slot (pos-1)+depth keeps exactly the
-// ancestor path live below every node's attention length; stale sibling
-// entries sit beyond it and are never read. Each forward's output hidden is
-// stashed per node so a later sibling can branch from its parent's feature.
+// Two static shapes, chosen by CPI_EAGLE_TREE_SHAPE (16 default, 10 = the v1
+// shape). Shape 16 (from the measured per-depth continue rates 90/66/54%):
+//
+//   root ── n0 ── n4 ── n11 ── n15      root top-4, n0 top-3, n1 top-2,
+//     │      │      └─ n12              n2/n3 top-1, n4 top-2, n5/n7 top-1,
+//     │      ├─ n5 ── n13              n11 top-1. 16 nodes, 17 verify rows,
+//     │      └─ n6                      level widths 4/3/1.
+//     ├─ n1 ── n7 ── n14
+//     │      └─ n8
+//     ├─ n2 ── n9
+//     └─ n3 ── n10
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -39,47 +46,168 @@ namespace engine {
 
 namespace {
 
-constexpr int kRows = 11;   // cur + 10 tree nodes
-constexpr int kNodes = 10;
-
-// Per-row depth (row 0 = cur) and ancestor bitmask (bit j = verify row j
-// visible; own bit set; row 0 visible to all).
-constexpr int kRowDepth[kRows] = {0, 1, 1, 1, 1, 2, 2, 2, 3, 3, 4};
-constexpr unsigned int kAncMask[kRows] = {1u,   3u,   5u,  9u,  17u, 35u,
-                                          67u,  133u, 291u, 579u, 1315u};
-
-// Verdict walk: children (verify rows) of each verify row.
-constexpr int kChildRows[kRows][4] = {{1, 2, 3, 4}, {5, 6}, {7}, {}, {}, {8},
-                                      {9},          {},     {},  {10}, {}};
-constexpr int kChildCount[kRows] = {4, 2, 1, 0, 0, 1, 1, 0, 0, 1, 0};
-
-// DFS draft schedule. Each forward runs one node (or the root catch-up pair)
-// through the draft layer and extracts its top-n_child tokens into the
-// consecutive d_eagle_dtoks_ slots first_child.. (argmax, then mask+argmax).
-// stash slots: 0 = root's output hidden, node i's output at slot i+1.
-struct DraftFwd {
-  int stash_src;    // -1: root catch-up (feature = cur's true feature)
-  int tok_node;     // node whose drafted token is the input (-1: cur)
-  int depth;        // draft-cache slot = (pos-1) + depth
-  int first_child;  // first child node index (consecutive)
-  int n_child;
-  int stash_dst;
+// A static tree shape: verify tables (rows = cur + nodes, node i on row i+1)
+// plus the batched draft-level tables. Level rows are concatenated across
+// levels in forward order; a row's draft-scratch column and its stash slot
+// (1 + index; slot 0 is the root's output) both equal its concatenated index.
+struct TreeShape {
+  int rows;                     // verify rows (1 + nodes)
+  int nodes;
+  int root_children;            // root's top-n (dtok slots 0..n-1)
+  const int* row_depth;         // [rows] verify row depth (row 0 = 0)
+  const unsigned int* anc_mask; // [rows] verify ancestor bitmask (self incl)
+  const int (*child_rows)[4];   // [rows] verdict-walk children (verify rows)
+  const int* child_count;       // [rows]
+  int n_levels;                 // batched draft levels (depth 1..n_levels)
+  const int* lvl_b;             // [n_levels] level width
+  int total_lvl_rows;
+  const int* lvl_tok;           // [total] dtok slot of the row's input token
+  const int* lvl_feat;          // [total] stash row of the row's input feature
+  const unsigned int* lvl_mask; // [total] draft-scratch ancestor mask (self incl)
+  const int* lvl_dep;           // [total] row depth (rope offset)
+  const int (*lvl_child)[4];    // [total] children dtok slots
+  const int* lvl_child_n;       // [total]
 };
-constexpr DraftFwd kDraft[6] = {
-    {-1, -1, 0, 0, 4, 0},  // root: top-4 -> n0..n3
-    {0, 0, 1, 4, 2, 1},    // n0: top-2 -> n4, n5
-    {1, 4, 2, 7, 1, 5},    // n4 -> n7
-    {5, 7, 3, 9, 1, 8},    // n7 -> n9
-    {1, 5, 2, 8, 1, 6},    // n5 -> n8
-    {0, 1, 1, 6, 1, 2},    // n1 -> n6
-};
+
+// Shape 10 (v1): root top-4, n0 top-2, n1/n4/n5/n7 top-1. Levels 2/2/1.
+constexpr int k10RowDepth[11] = {0, 1, 1, 1, 1, 2, 2, 2, 3, 3, 4};
+constexpr unsigned int k10AncMask[11] = {1u,  3u,   5u,   9u,  17u, 35u,
+                                         67u, 133u, 291u, 579u, 1315u};
+constexpr int k10ChildRows[11][4] = {{1, 2, 3, 4}, {5, 6}, {7}, {}, {}, {8},
+                                     {9},          {},     {},  {10}, {}};
+constexpr int k10ChildCount[11] = {4, 2, 1, 0, 0, 1, 1, 0, 0, 1, 0};
+constexpr int k10LvlB[3] = {2, 2, 1};
+// Level rows: n0, n1 | n4, n5 | n7.
+constexpr int k10LvlTok[5] = {0, 1, 4, 5, 7};
+constexpr int k10LvlFeat[5] = {0, 0, 1, 1, 3};
+constexpr unsigned int k10LvlMask[5] = {1u, 2u, 5u, 9u, 21u};
+constexpr int k10LvlDep[5] = {1, 1, 2, 2, 3};
+constexpr int k10LvlChild[5][4] = {{4, 5}, {6}, {7}, {8}, {9}};
+constexpr int k10LvlChildN[5] = {2, 1, 1, 1, 1};
+
+// Shape 16: node order n0..n3 (depth 1), n4..n6 from n0, n7/n8 from n1, n9
+// from n2, n10 from n3 (depth 2), n11/n12 from n4, n13 from n5, n14 from n7
+// (depth 3), n15 from n11 (depth 4).
+constexpr int k16RowDepth[17] = {0, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 4};
+constexpr unsigned int k16AncMask[17] = {
+    1u,    3u,    5u,     9u,     17u,   35u,   67u,   131u, 261u,
+    517u,  1033u, 2065u,  4131u,  8227u, 16451u, 33029u, 69667u};
+constexpr int k16ChildRows[17][4] = {{1, 2, 3, 4}, {5, 6, 7}, {8, 9}, {10}, {11},
+                                     {12, 13},     {14},      {},     {15}, {},
+                                     {},           {},        {16},   {},   {},
+                                     {},           {}};
+constexpr int k16ChildCount[17] = {4, 3, 2, 1, 1, 2, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0};
+constexpr int k16LvlB[3] = {4, 3, 1};
+// Level rows: n0, n1, n2, n3 | n4, n5, n7 | n11.
+constexpr int k16LvlTok[8] = {0, 1, 2, 3, 4, 5, 7, 11};
+constexpr int k16LvlFeat[8] = {0, 0, 0, 0, 1, 1, 2, 5};
+constexpr unsigned int k16LvlMask[8] = {1u, 2u, 4u, 8u, 17u, 33u, 66u, 145u};
+constexpr int k16LvlDep[8] = {1, 1, 1, 1, 2, 2, 2, 3};
+constexpr int k16LvlChild[8][4] = {{4, 5, 6}, {7, 8}, {9},  {10},
+                                   {11, 12},  {13},   {14}, {15}};
+constexpr int k16LvlChildN[8] = {3, 2, 1, 1, 2, 1, 1, 1};
+
+constexpr TreeShape kShape10 = {11, 10, 4, k10RowDepth, k10AncMask, k10ChildRows,
+                                k10ChildCount, 3, k10LvlB, 5, k10LvlTok, k10LvlFeat,
+                                k10LvlMask, k10LvlDep, k10LvlChild, k10LvlChildN};
+constexpr TreeShape kShape16 = {17, 16, 4, k16RowDepth, k16AncMask, k16ChildRows,
+                                k16ChildCount, 3, k16LvlB, 8, k16LvlTok, k16LvlFeat,
+                                k16LvlMask, k16LvlDep, k16LvlChild, k16LvlChildN};
+
+const TreeShape& tree_shape() {
+  static const TreeShape* shape = [] {
+    const char* env = std::getenv("CPI_EAGLE_TREE_SHAPE");
+    if (env && std::atoi(env) == 10) return &kShape10;
+    return &kShape16;
+  }();
+  return *shape;
+}
 
 }  // namespace
+
+// One batched draft-level forward: rows row0..row0+B-1 of the shape's
+// concatenated level tables, all at the same depth. Input tokens come from
+// d_eagle_dtoks_ via lvl_tok, features from the stash via lvl_feat; K/V land
+// at draft-scratch columns row0..row0+B-1 (their concatenated indices), and
+// each row's top-n children go to their static dtok slots (the caller drives
+// that part; this function leaves per-row logits in d_batch_logits_ and the
+// output hiddens in the stash at rows 1+row0..).
+void LlamaEngine::eagle_tree_level(int B, int row0, int n_scr) {
+  const auto& cfg = weights_.config();
+  const int H = cfg.hidden_size;
+  const int head_dim = attn_head_dim_ > 0 ? attn_head_dim_ : (H / cfg.num_heads);
+  const int q_hidden = attn_q_hidden_ > 0 ? attn_q_hidden_ : H;
+  const int kv_hidden = attn_kv_hidden_ > 0 ? attn_kv_hidden_ : (cfg.num_kv_heads * head_dim);
+  const int inter = cfg.intermediate_size;
+  auto s = compute_stream_;
+
+  kernels::launch_eagle_cat_gather(static_cast<const __half*>(d_tok_embeddings_), d_eagle_dtoks_,
+                                   d_eagle_lvl_tok_ + row0, d_eagle_lvl_feat_ + row0,
+                                   d_eagle_tree_h_, d_eagle_bcat_, B, H, s);
+  detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
+                                          lt_workspace_bytes_, s, d_eagle_fc_, d_eagle_bcat_,
+                                          d_eagle_bx_, H, 2 * H, B, CUDA_R_16F);
+  // No pre-attention norm (EAGLE removes layer 0's input_layernorm).
+  detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
+                                          lt_workspace_bytes_, s, d_eagle_wq_, d_eagle_bx_,
+                                          d_eagle_bq_, q_hidden, H, B, CUDA_R_16F);
+  __half* k_dst = d_eagle_scrk_ + static_cast<std::size_t>(row0) * kv_hidden;
+  __half* v_dst = d_eagle_scrv_ + static_cast<std::size_t>(row0) * kv_hidden;
+  detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
+                                          lt_workspace_bytes_, s, d_eagle_wk_, d_eagle_bx_, k_dst,
+                                          kv_hidden, H, B, CUDA_R_16F);
+  detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
+                                          lt_workspace_bytes_, s, d_eagle_wv_, d_eagle_bx_, v_dst,
+                                          kv_hidden, H, B, CUDA_R_16F);
+  kernels::launch_rope_inplace_batched_offsets_device_pos(
+      d_eagle_bq_, k_dst, B, cfg.num_heads, cfg.num_kv_heads, head_dim, d_eagle_pos_,
+      d_eagle_lvl_dep_ + row0, d_rope_cos_, d_rope_sin_, q_hidden, kv_hidden, s);
+  kernels::launch_attention_tree_split(
+      d_eagle_bq_, d_eagle_kcache_, d_eagle_vcache_, d_eagle_scrk_, d_eagle_scrv_, d_eagle_batt_,
+      d_eagle_pos_, d_eagle_lvl_mask_ + row0, B, n_scr, cfg.num_heads, cfg.num_kv_heads, head_dim,
+      d_eagle_mt_m_, d_eagle_mt_l_, d_eagle_mt_o_, 32, eagle_mt_chunks_, s);
+  detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
+                                          lt_workspace_bytes_, s, d_eagle_wo_, d_eagle_batt_,
+                                          d_eagle_btmp_, H, q_hidden, B, CUDA_R_16F);
+  kernels::launch_add_inplace(d_eagle_bx_, d_eagle_btmp_, B * H, s);
+  kernels::launch_rmsnorm(d_eagle_bx_, static_cast<const __half*>(d_eagle_pnorm_), d_eagle_bnorm_,
+                          B, H, cfg.norm_eps, s);
+  detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
+                                          lt_workspace_bytes_, s, d_eagle_w1_, d_eagle_bnorm_,
+                                          d_eagle_bgate_, inter, H, B, CUDA_R_16F);
+  detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
+                                          lt_workspace_bytes_, s, d_eagle_w3_, d_eagle_bnorm_,
+                                          d_eagle_bup_, inter, H, B, CUDA_R_16F);
+  kernels::launch_silu_mul(d_eagle_bgate_, d_eagle_bup_, d_eagle_bgate_, B * inter, s);
+  detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
+                                          lt_workspace_bytes_, s, d_eagle_w2_, d_eagle_bgate_,
+                                          d_eagle_btmp_, H, inter, B, CUDA_R_16F);
+  kernels::launch_add_inplace(d_eagle_bx_, d_eagle_btmp_, B * H, s);
+  // Stash the level's output hiddens (slot = 1 + concatenated row index).
+  CUDA_CHECK(cudaMemcpyAsync(d_eagle_tree_h_ + static_cast<std::size_t>(1 + row0) * H,
+                             d_eagle_bx_, static_cast<std::size_t>(B) * H * sizeof(__half),
+                             cudaMemcpyDeviceToDevice, s));
+  // Shared lm_head over the RAW draft hiddens, one batched pass; per-row
+  // logits land in d_batch_logits_ for the caller's top-n extraction.
+  if (B > d_batch_logits_cap_) {
+    if (d_batch_logits_) cudaFree(d_batch_logits_);
+    CUDA_CHECK(cudaMalloc(&d_batch_logits_,
+                          static_cast<std::size_t>(B) * cfg.vocab_size * sizeof(float)));
+    d_batch_logits_cap_ = B;
+  }
+  const void* head_src = lm_head_packed_.active()
+                             ? dequant_packed_for_gemm(lm_head_packed_, s)
+                             : static_cast<const void*>(d_lm_head_);
+  detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
+                                          lt_workspace_bytes_, s, const_cast<void*>(head_src),
+                                          d_eagle_bx_, d_batch_logits_, cfg.vocab_size, H, B,
+                                          CUDA_R_32F);
+}
 
 // Verify body: eagle_verify_forward with three swaps -- per-row depth rope
 // offsets, K/V to per-layer scratch instead of the sequential cache store,
 // and ancestor-masked attention. Same fixed shapes, graph-safe by
-// construction (not captured yet; measured eager first).
+// construction.
 void LlamaEngine::eagle_tree_verify_forward(int K) {
   const auto& cfg = weights_.config();
   const int hidden = cfg.hidden_size;
@@ -95,7 +223,7 @@ void LlamaEngine::eagle_tree_verify_forward(int K) {
   const std::size_t ff_row_bytes = static_cast<std::size_t>(inter) * sizeof(__half);
   const std::size_t ff13_stride_bytes = static_cast<std::size_t>(2 * inter) * sizeof(__half);
   const std::size_t scratch_layer =
-      static_cast<std::size_t>(kRows) * static_cast<std::size_t>(kv_hidden);
+      static_cast<std::size_t>(K) * static_cast<std::size_t>(kv_hidden);
   auto* qkv_base = static_cast<const __half*>(d_qkv_);
   auto* ff13_base = static_cast<const __half*>(d_ff13_);
 
@@ -134,7 +262,7 @@ void LlamaEngine::eagle_tree_verify_forward(int K) {
         static_cast<const __half*>(d_v_cache_) + static_cast<std::size_t>(layer) * layer_stride;
     kernels::launch_attention_tree_split(
         static_cast<const __half*>(d_prefill_q_), k_layer, v_layer, k_scr, v_scr,
-        static_cast<__half*>(d_att_), d_eagle_pos_, d_eagle_anc_mask_, K, cfg.num_heads,
+        static_cast<__half*>(d_att_), d_eagle_pos_, d_eagle_anc_mask_, K, K, cfg.num_heads,
         cfg.num_kv_heads, head_dim, d_eagle_mt_m_, d_eagle_mt_l_, d_eagle_mt_o_, 32,
         eagle_mt_chunks_, s);
     // A packed k-quant weight has no fp16 copy for cuBLAS; expand it into the
@@ -201,6 +329,9 @@ std::vector<int> LlamaEngine::eagle_tree_generate(const std::vector<int>& prompt
       layer_cache_[0].q_norm != nullptr) {
     return eagle_generate(prompt_tokens, max_new_tokens, on_token);
   }
+  const TreeShape& shape = tree_shape();
+  const int kRows = shape.rows;
+  const int kNodes = shape.nodes;
   const int H = cfg.hidden_size;
   const int head_dim = attn_head_dim_ > 0 ? attn_head_dim_ : (H / cfg.num_heads);
   const int kv_hidden = attn_kv_hidden_ > 0 ? attn_kv_hidden_ : (cfg.num_kv_heads * head_dim);
@@ -209,10 +340,19 @@ std::vector<int> LlamaEngine::eagle_tree_generate(const std::vector<int>& prompt
   std::vector<int> out;
   out.reserve(static_cast<std::size_t>(max_new_tokens));
 
-  CUDA_CHECK(cudaMemcpyAsync(d_eagle_row_off_, kRowDepth, kRows * sizeof(int),
+  CUDA_CHECK(cudaMemcpyAsync(d_eagle_row_off_, shape.row_depth, kRows * sizeof(int),
                              cudaMemcpyHostToDevice, s));
-  CUDA_CHECK(cudaMemcpyAsync(d_eagle_anc_mask_, kAncMask, kRows * sizeof(unsigned int),
+  CUDA_CHECK(cudaMemcpyAsync(d_eagle_anc_mask_, shape.anc_mask, kRows * sizeof(unsigned int),
                              cudaMemcpyHostToDevice, s));
+  CUDA_CHECK(cudaMemcpyAsync(d_eagle_lvl_tok_, shape.lvl_tok,
+                             shape.total_lvl_rows * sizeof(int), cudaMemcpyHostToDevice, s));
+  CUDA_CHECK(cudaMemcpyAsync(d_eagle_lvl_feat_, shape.lvl_feat,
+                             shape.total_lvl_rows * sizeof(int), cudaMemcpyHostToDevice, s));
+  CUDA_CHECK(cudaMemcpyAsync(d_eagle_lvl_mask_, shape.lvl_mask,
+                             shape.total_lvl_rows * sizeof(unsigned int), cudaMemcpyHostToDevice,
+                             s));
+  CUDA_CHECK(cudaMemcpyAsync(d_eagle_lvl_dep_, shape.lvl_dep,
+                             shape.total_lvl_rows * sizeof(int), cudaMemcpyHostToDevice, s));
 
   int pos = static_cast<int>(prompt_tokens.size()) - 1;
   int cur = prompt_tokens.back();
@@ -244,8 +384,8 @@ std::vector<int> LlamaEngine::eagle_tree_generate(const std::vector<int>& prompt
   int cur_feat_row = 0;
   int scatter_rows[8];    // function-scope: async H2D source must outlive the copy
 
-  // Room guard: the round writes draft-cache pairs up to (pos-1)+4 and cache
-  // slots up to pos+5 (acc <= 5 plus bonus).
+  // Room guard: the round writes the root catch-up pair at pos-1 and cache
+  // slots up to pos + acc + 1 (acc <= max depth plus bonus).
   while (!stop && static_cast<int>(out.size()) < max_new_tokens && pos + 6 < max_ctx) {
     const auto tr0 = pclock::now();
     const int base = pos - 1 - heal_count;
@@ -260,27 +400,47 @@ std::vector<int> LlamaEngine::eagle_tree_generate(const std::vector<int>& prompt
       t_heal += psec(tr0, tp);
     }
 
-    // DFS tree draft: each forward stashes its output hidden, then top-n
-    // tokens chain device-side into consecutive d_eagle_dtoks_ slots.
-    for (const DraftFwd& f : kDraft) {
-      const __half* feat =
-          (f.stash_src < 0)
-              ? d_eagle_feats_ + static_cast<std::size_t>(cur_feat_row) * H
-              : d_eagle_tree_h_ + static_cast<std::size_t>(f.stash_src) * H;
-      const int* tok_dev = (f.tok_node < 0) ? nullptr : d_eagle_dtoks_ + f.tok_node;
-      eagle_step(feat, tok_dev, cur, (pos - 1) + f.depth, /*want_token=*/true,
-                 d_eagle_dtoks_ + f.first_child);
-      CUDA_CHECK(cudaMemcpyAsync(d_eagle_tree_h_ + static_cast<std::size_t>(f.stash_dst) * H,
-                                 d_eagle_x_, static_cast<std::size_t>(H) * sizeof(__half),
-                                 cudaMemcpyDeviceToDevice, s));
-      for (int r = 1; r < f.n_child; ++r) {
-        kernels::launch_mask_logit(d_eagle_logits_, d_eagle_dtoks_ + f.first_child + r - 1, s);
-        kernels::launch_argmax_float(d_eagle_logits_, cfg.vocab_size,
-                                     d_eagle_dtoks_ + f.first_child + r, s, d_argmax_part_val_,
-                                     d_argmax_part_idx_, argmax_parts_);
+    // Both the draft levels and the verify read the base position from
+    // d_eagle_pos_ (draft-cache prefix length == committed cache length).
+    CUDA_CHECK(cudaMemcpyAsync(d_eagle_pos_, &pos, sizeof(int), cudaMemcpyHostToDevice, s));
+
+    // Root catch-up: cur's pair through the draft layer (into the draft
+    // cache at pos-1), output hidden to stash slot 0, top-n to dtoks 0..n-1.
+    eagle_step(d_eagle_feats_ + static_cast<std::size_t>(cur_feat_row) * H, nullptr, cur, pos - 1,
+               /*want_token=*/true, d_eagle_dtoks_);
+    CUDA_CHECK(cudaMemcpyAsync(d_eagle_tree_h_, d_eagle_x_,
+                               static_cast<std::size_t>(H) * sizeof(__half),
+                               cudaMemcpyDeviceToDevice, s));
+    for (int r = 1; r < shape.root_children; ++r) {
+      kernels::launch_mask_logit(d_eagle_logits_, d_eagle_dtoks_ + r - 1, s);
+      kernels::launch_argmax_float(d_eagle_logits_, cfg.vocab_size, d_eagle_dtoks_ + r, s,
+                                   d_argmax_part_val_, d_argmax_part_idx_, argmax_parts_);
+    }
+    // Batched levels: one forward per depth; each row's top-n children are
+    // extracted from its d_batch_logits_ row into their static dtok slots.
+    {
+      int row0 = 0;
+      for (int lvl = 0; lvl < shape.n_levels; ++lvl) {
+        const int B = shape.lvl_b[lvl];
+        eagle_tree_level(B, row0, shape.total_lvl_rows);
+        for (int r = 0; r < B; ++r) {
+          float* logits =
+              d_batch_logits_ + static_cast<std::size_t>(r) * static_cast<std::size_t>(cfg.vocab_size);
+          const int nc = shape.lvl_child_n[row0 + r];
+          for (int c = 0; c < nc; ++c) {
+            if (c > 0) {
+              kernels::launch_mask_logit(logits, d_eagle_dtoks_ + shape.lvl_child[row0 + r][c - 1],
+                                         s);
+            }
+            kernels::launch_argmax_float(logits, cfg.vocab_size,
+                                         d_eagle_dtoks_ + shape.lvl_child[row0 + r][c], s,
+                                         d_argmax_part_val_, d_argmax_part_idx_, argmax_parts_);
+          }
+        }
+        row0 += B;
       }
     }
-    int drafts[kNodes];
+    int drafts[16];
     CUDA_CHECK(cudaMemcpyAsync(drafts, d_eagle_dtoks_, kNodes * sizeof(int),
                                cudaMemcpyDeviceToHost, s));
     CUDA_CHECK(cudaStreamSynchronize(s));
@@ -288,11 +448,10 @@ std::vector<int> LlamaEngine::eagle_tree_generate(const std::vector<int>& prompt
     auto td = pclock::now();
     if (prof) t_draft += psec(tp, td);
 
-    // Verify: row 0 = cur (host), rows 1..10 = the drafted tree (device).
+    // Verify: row 0 = cur (host), rows 1..kNodes = the drafted tree (device).
     CUDA_CHECK(cudaMemcpyAsync(d_token_id_, &cur, sizeof(int), cudaMemcpyHostToDevice, s));
     CUDA_CHECK(cudaMemcpyAsync(d_token_id_ + 1, d_eagle_dtoks_, kNodes * sizeof(int),
                                cudaMemcpyDeviceToDevice, s));
-    CUDA_CHECK(cudaMemcpyAsync(d_eagle_pos_, &pos, sizeof(int), cudaMemcpyHostToDevice, s));
     // Capture once, replay per round (same trick as the chain's graphed
     // verify; the tree body is fixed-shape with all round-varying state read
     // from device memory, and the eligibility check at function entry already
@@ -322,7 +481,7 @@ std::vector<int> LlamaEngine::eagle_tree_generate(const std::vector<int>& prompt
     } else {
       CUDA_CHECK(cudaGraphLaunch(eagle_vgraph_exec_, s));
     }
-    int verdict[kRows];
+    int verdict[17];
     CUDA_CHECK(cudaMemcpyAsync(verdict, d_eagle_verdict_, kRows * sizeof(int),
                                cudaMemcpyDeviceToHost, s));
     CUDA_CHECK(cudaStreamSynchronize(s));
@@ -336,16 +495,16 @@ std::vector<int> LlamaEngine::eagle_tree_generate(const std::vector<int>& prompt
     while (acc < 8) {
       const int want = verdict[row];
       int next_row = -1;
-      for (int c = 0; c < kChildCount[row]; ++c) {
-        const int cr = kChildRows[row][c];
+      for (int c = 0; c < shape.child_count[row]; ++c) {
+        const int cr = shape.child_rows[row][c];
         if (drafts[cr - 1] == want) {
           next_row = cr;
           break;
         }
       }
-      ++depth_try[kRowDepth[row]];
+      ++depth_try[shape.row_depth[row]];
       if (next_row < 0) break;
-      ++depth_ok[kRowDepth[row]];
+      ++depth_ok[shape.row_depth[row]];
       path[acc++] = next_row;
       row = next_row;
     }

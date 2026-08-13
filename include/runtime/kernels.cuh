@@ -242,12 +242,14 @@ void launch_attention_tree_masked(const half* q, const half* k_cache, const half
 // constant per-row length *cache_len, the masked in-batch columns become one virtual
 // chunk at slot ceil(cache_len/chunk_size), and the reduce merges both. scratch_chunks
 // must include the +1 spare slot for the virtual chunk.
+// scr_cols is the in-batch scratch column count; the verify passes
+// scr_cols == rows, the batched draft levels a wider node scratch.
 void launch_attention_tree_split(const half* q, const half* k_cache, const half* v_cache,
                                  const half* k_scratch, const half* v_scratch, half* out,
                                  const int* cache_len, const unsigned int* anc_mask, int rows,
-                                 int num_heads, int num_kv_heads, int head_dim, float* scratch_m,
-                                 float* scratch_l, float* scratch_o, int chunk_size,
-                                 int scratch_chunks, cudaStream_t stream);
+                                 int scr_cols, int num_heads, int num_kv_heads, int head_dim,
+                                 float* scratch_m, float* scratch_l, float* scratch_o,
+                                 int chunk_size, int scratch_chunks, cudaStream_t stream);
 
 // launch_rmsnorm_add_scale
 //
@@ -336,6 +338,12 @@ void launch_rope_inplace_batched_offsets_device_pos(half* q, half* k, int num_to
 // logits[*index] = -inf (device-read index): chains argmax -> mask -> argmax for
 // device-side top-k extraction with no host sync; graph-capturable.
 void launch_mask_logit(float* logits, const int* index, cudaStream_t stream);
+
+// Batched EAGLE draft fc input gather: cat row r = [embed(dtoks[tok_idx[r]]) |
+// stash[feat_idx[r]]], for rows level rows in one launch.
+void launch_eagle_cat_gather(const half* embedding, const int* dtoks, const int* tok_idx,
+                             const int* feat_idx, const half* stash, half* cat, int rows,
+                             int hidden, cudaStream_t stream);
 
 // EAGLE tree scatter: copy accepted verify rows' K/V (indices rows_idx[0..n)) from the
 // per-layer [scr_rows, kv_hidden] scratch into every layer's cache at base..base+n-1.
