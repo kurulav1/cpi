@@ -4,7 +4,7 @@
 // the whole point of native k-quant support. The reference here dequantizes on
 // the host (that implementation is gated against an fp16 oracle elsewhere) and
 // accumulates in fp32, so a disagreement means the in-kernel unpack or the
-// accumulation is wrong -- not that the weights differ.
+// accumulation is wrong, not that the weights differ.
 //
 // Tolerance rather than bit-exactness: the kernel accumulates in a different
 // order (block reduction) than a serial host dot, so the two agree to fp32
@@ -131,7 +131,7 @@ void run_case(const Case& c, int rows, int cols) {
 
 }  // namespace
 
-// Real weights: the same projection multiplied two ways -- once from the packed
+// Real weights: the same projection multiplied two ways, once from the packed
 // blocks by the kernel, once from the fp16 the loader produces. This is the last
 // unknown before residency: synthetic blocks prove the arithmetic, only a real
 // tensor proves the layout assumptions (row/col order, block-per-row stride)
@@ -210,7 +210,7 @@ void run_real(const std::string& gguf_path, bool bandwidth) {
     cudaMemcpy(y.data(), d_y, y.size() * sizeof(__half), cudaMemcpyDeviceToHost);
     // Batched form against the same fp16 reference, at a batch on each side of
     // the kernel's BMAX tile so both the single-tile and multi-tile paths run.
-    // Batch element 0 reuses x, so its expected answer is `ref` -- a batched
+    // Batch element 0 reuses x, so its expected answer is `ref`; a batched
     // kernel that silently ignored the batch index would still match there,
     // which is why the other elements get their own activations.
     // 64 = the MMQ M-tile edge: the engine's batch band now runs to 64, and a
@@ -256,7 +256,7 @@ void run_real(const std::string& gguf_path, bool bandwidth) {
         std::printf("  %-28s fp32 matmul declined batch %d (cutoff)\n", name.c_str(), bsz);
       }
       // dp4a form of the same product. Activations go through int8, so this is
-      // checked to a percent rather than to fp16 rounding -- the point is that
+      // checked to a percent rather than to fp16 rounding; the point is that
       // the integer path computes the same thing, not that it is bit-equal.
       if (pk.cols % 32 == 0) {  // Q6_K enters for the MMQ check below; dp4a is skipped
         std::int8_t* d_q = nullptr;
@@ -320,7 +320,7 @@ void run_real(const std::string& gguf_path, bool bandwidth) {
       cudaFree(d_yb);
     }
     // Achieved bandwidth at the real shape. A matvec reads its weight exactly
-    // once, so bytes/time is the number to compare against the card's peak --
+    // once, so bytes/time is the number to compare against the card's peak,
     // and it says which shape is worth tuning rather than which is biggest.
     // Uses the full tensor, not the 32-row correctness slice.
     double gbps = 0.0;
@@ -353,7 +353,7 @@ void run_real(const std::string& gguf_path, bool bandwidth) {
         cudaEventDestroy(t1);
       }
 
-      // WARNING: the GB/s reported here is an L2 number for anything that fits
+      // Warning: the GB/s reported here is an L2 number for anything that fits
       // in cache, which on this part is everything in this model. The 5090 has
       // roughly 96-128 MB of L2; w2 is 48 MB and w13 is 33, so thirty
       // back-to-back iterations over one weight are served from L2 and never
@@ -361,12 +361,12 @@ void run_real(const std::string& gguf_path, bool bandwidth) {
       // read "1416 GB/s" here while the same kernel averages 102.7 us in the
       // engine, where each weight is read once per step from memory.
       //
-      // Use this to compare KERNEL VARIANTS on one shape -- that comparison is
-      // still fair, both variants get the same cache -- and never to conclude
+      // Use this to compare kernel variants on one shape (that comparison is
+      // still fair, both variants get the same cache) and never to conclude
       // anything about achieved bandwidth or to compare across shapes.
       //
       // Same for the batched tensor-core path. The matvec bench above is
-      // launch-overhead bound and cannot be used to tune anything -- every shape
+      // launch-overhead bound and cannot be used to tune anything; every shape
       // came out at 18-26 us regardless of size. MMQ is not: at a real shape it
       // runs 80-140 us a call, so launch cost is a few percent and bytes/time is
       // a signal you can iterate a kernel against. That matters because the

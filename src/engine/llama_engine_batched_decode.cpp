@@ -129,9 +129,9 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
   const int bucket_seq =
       std::min(options_.max_context, ((max_seq + kSeqBucket - 1) / kSeqBucket) * kSeqBucket);
   const int chunks = (bucket_seq + bs - 1) / bs;
-  // The block table's DEVICE stride is bucketed too. The caller's max_blocks grows
-  // by one whenever the deepest sequence crosses a paged-block boundary -- every
-  // `bs` decode steps -- and a graph keyed on it re-captured each time: ~30 ms of
+  // The block table's device stride is bucketed too. The caller's max_blocks
+  // grows by one whenever the deepest sequence crosses a paged-block boundary
+  // (every `bs` decode steps) and a graph keyed on it re-captured each time: ~30 ms of
   // cudaGraphInstantiate, ~1.0 ms/step averaged at B=8..32 (nsys b8host/b32host,
   // 2026-08-12, half the measured GPU idle). Staging rows at ceil(bucket_seq/bs)
   // makes the stride move only when bucket_seq moves, which re-captures anyway.
@@ -363,7 +363,7 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
 
   // CPI_BATCH_GRAPH=0 disables. The batched path has no graph today and nsys says
   // it costs: at B=32 the GPU kernel sum is 18.7 ms a step against 23.0 ms of
-  // wall, so about 4.3 ms -- 19% -- is host-side gap between roughly 400 launches.
+  // wall, so about 4.3 ms (19%) is host-side gap between roughly 400 launches.
   static const bool graph_on = [] {
     const char* e = std::getenv("CPI_BATCH_GRAPH");
     return !(e && *e == '0');
@@ -438,7 +438,7 @@ void LlamaEngine::batched_lm_head(int batch, int hidden, int vocab) {
   }
   // The LM head is the one packed weight that never attempted the tensor-core
   // path: it went straight to dequant-and-cuBLAS, expanding 431 MB of Q6_K into
-  // ~1.05 GB of fp16 that cuBLAS then reads back -- over 2 GB of traffic a step
+  // ~1.05 GB of fp16 that cuBLAS then reads back, over 2 GB of traffic a step
   // for a weight MMQ reads once. nsys had that expansion at ~1.8 ms of a 14.6 ms
   // step at B=32, and the layer weights stopped using this path once MMQ took
   // them (matmul_declined is 0).
@@ -1114,7 +1114,7 @@ std::vector<std::vector<int>> LlamaEngine::run_batch(const std::vector<BatchRequ
 // Per-box search over the k-quant kernel knobs.
 //
 // Every parameter in these kernels that was chosen by reasoning turned out
-// wrong on measurement -- warps per row, the batched cutoff, the mma tile width,
+// wrong on measurement: warps per row, the batched cutoff, the mma tile width,
 // twice. What settled each of them was a paired comparison in one process. This
 // automates exactly that, and the shape is lifted from PlanCudaEngine::autotune,
 // which already learned the same lessons:
@@ -1136,7 +1136,7 @@ void LlamaEngine::tune_kquant_knobs(int batch, int steps) {
   }
   const std::vector<int> prompt(8, 1);
   // batch==1 tunes the single-stream path, which goes through the matvec and the
-  // decode graph rather than run_batch -- the batched harness never touches the
+  // decode graph rather than run_batch; the batched harness never touches the
   // matvec, so tuning its warps-per-row through it would measure nothing.
   const bool single = batch <= 1;
   auto time_batch = [&](int reps) {
@@ -1226,7 +1226,7 @@ void LlamaEngine::run_batch_bench(const std::vector<int>& prompt, int max_new) {
   std::printf(
       // The argument to --batch-bench is max_new, not a batch size: the batch
       // sizes are the fixed sweep below. At a small max_new every row is
-      // dominated by its prefill and the decode numbers are meaningless -- 4
+      // dominated by its prefill and the decode numbers are meaningless; 4
       // tokens per sequence reports roughly a quarter of what 32 does. Use 32
       // or more, and mind that B*(prompt+max_new) has to fit max_context or the
       // larger batches are silently skipped.
@@ -1238,7 +1238,7 @@ void LlamaEngine::run_batch_bench(const std::vector<int>& prompt, int max_new) {
   // profile of this bench: a trace of the default sweep spends 40% in the
   // batch-1 matvec and 10.9% in the single-sequence paged attention, and the
   // batched kernels do not reach the top ten. Anything measuring the batched
-  // step -- nsys, ncu, a debugger -- wants this on, or it is measuring the
+  // step (nsys, ncu, a debugger) wants this on, or it is measuring the
   // baseline instead.
   static const int only_b = [] {
     const char* e = std::getenv("CPI_BATCH_ONLY");

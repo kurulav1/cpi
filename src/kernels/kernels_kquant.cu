@@ -28,7 +28,7 @@ namespace kernels {
 // Per-box tuning knobs for the k-quant kernels.
 //
 // These were `static const` reads of one env var each, which meant a value could
-// only be chosen before the process started -- fine for a manual sweep, useless
+// only be chosen before the process started: fine for a manual sweep, useless
 // for a tuner that has to re-time an incumbent against a candidate inside one
 // run. Every wrong call in this kernel's history came from comparing numbers
 // taken in different processes, where thermal drift is larger than the effect.
@@ -108,7 +108,7 @@ __device__ __forceinline__ void scale_min_from_hdr(int idx, std::uint32_t y, std
 }
 
 // One warp per super-block, each lane taking a 4-byte slice of the quantized
-// payload -- 8 values, written as two 8-byte stores.
+// payload: 8 values, written as two 8-byte stores.
 //
 // This replaced a per-element version that re-decoded the 6-bit scale fields and
 // reloaded d/dmin for every weight, the same cost the matvec used to pay. It
@@ -120,7 +120,7 @@ __device__ __forceinline__ void scale_min_from_hdr(int idx, std::uint32_t y, std
 // host reference that kquant_dequant_test gates against.
 // This lane's eight weights from one super-block, as values, plus where they sit
 // inside the block. Shared by the dequant kernel and the batched matmul so the
-// two cannot drift -- the matmul is trustworthy because this is the arithmetic
+// two cannot drift; the matmul is trustworthy because this is the arithmetic
 // kquant_dequant_test gates bit-for-bit against the host.
 template <KQuantType TYPE>
 __device__ __forceinline__ void kq_block_values(const std::uint8_t* __restrict__ p, int lane,
@@ -303,7 +303,7 @@ __device__ __forceinline__ float kquant_value(const std::uint8_t* p, KQuantType 
 
 // y = W x with W still packed: one row per thread block, the row's super-blocks
 // unpacked on the fly and multiplied into x. This is the point of the whole
-// exercise -- the weight never exists as fp16 anywhere, so a Q4_K_M model is
+// exercise: the weight never exists as fp16 anywhere, so a Q4_K_M model is
 // resident at its file size instead of ~3x it.
 // Decodes one (scale, min) pair straight out of the header registers. The 12
 // scale bytes arrive as part of a single 16-byte load, so indexing them through
@@ -406,7 +406,7 @@ __device__ __forceinline__ float kq_block_dot(const std::uint8_t* __restrict__ p
 
 // Vector-load packed matvec. The scalar kernel was bound by load-instruction
 // issue rather than bandwidth: it fetched one byte of qs, one half of x and the
-// scale bytes separately for EVERY weight, roughly four loads per element.
+// scale bytes separately for every weight, roughly four loads per element.
 //
 // A warp owns one super-block and each lane takes a 4-byte slice of its
 // quantized payload, which is 8 weights (4 low nibbles, 4 high nibbles). Those
@@ -414,8 +414,8 @@ __device__ __forceinline__ float kq_block_dot(const std::uint8_t* __restrict__ p
 // apply once per run rather than once per weight, and the whole 16-byte header
 // (d, dmin and all 12 scale bytes) arrives in one load.
 //
-// ROWS rows share each load of x, which is otherwise re-read once per row and
-// accounts for half the remaining load instructions.
+// Multiple rows share each load of x, which is otherwise re-read once per row
+// and accounts for half the remaining load instructions.
 //
 // Q6_K blocks are 210 bytes, so consecutive blocks are only 2-byte aligned and
 // it uses uint16 pairs where the others use uint32.
@@ -514,7 +514,7 @@ __global__ void kquant_matvec_vec_kernel(const std::uint8_t* __restrict__ w,
 // Per-type packed matvec. The generic kernel above re-derives everything for
 // every weight: it branches on the runtime type, reloads d/dmin, and re-decodes
 // the packed 6-bit scale nibbles once per element. Since the block is exactly
-// one super-block wide, a thread handles the SAME offset inside every
+// one super-block wide, a thread handles the same offset inside every
 // super-block down the row, so all of that index math is loop-invariant and
 // hoists out. What remains in the loop is the three loads that actually differ
 // per super-block: the fp16 scale pair, the thread's own scale byte(s), and its
@@ -722,7 +722,7 @@ __global__ void kquant_matmul_kernel(const std::uint8_t* __restrict__ w,
       // The bound is BMAX, a compile-time constant, with the tail masked rather
       // than shortening the loop. A runtime bound leaves the compiler unable to
       // prove the index range, so acc[] lands in local memory and every
-      // accumulate becomes a load-modify-store -- which measured as roughly 2%
+      // accumulate becomes a load-modify-store, which measured as roughly 2%
       // of fp32 peak.
 #pragma unroll
       for (int t = 0; t < BMAX; ++t) {
@@ -910,17 +910,17 @@ __global__ void kquant_matmul_dp4a_kernel(const std::uint8_t* __restrict__ w,
 }
 
 
-// Q4_K matmul on int8 tensor cores -- the MMQ shape, adapted from
+// Q4_K matmul on int8 tensor cores: the MMQ shape, adapted from
 // moe_int4_grouped_mma_kernel.
 //
 // Everything above this in the file multiplies packed weights with scalar FMAs,
 // which is why cuBLAS on an expanded weight kept winning above a batch of about
 // eight: it has tensor cores and they do not. This one keeps the weight packed
-// AND uses them, so it should beat both.
+// and uses them, so it should beat both.
 //
 // Two things make Q4_K fit the MoE kernel's tiling almost unchanged. A 32-column
-// group of one row is a contiguous 32-byte run of qs -- low nibbles when the
-// group index is even, high when odd -- because a super-block's 256 weights are
+// group of one row is a contiguous 32-byte run of qs, low nibbles when the
+// group index is even and high when odd, because a super-block's 256 weights are
 // laid out as four 32-byte runs each supplying a low and a high group. And the
 // scale index inside the block is just (group % 8).
 //
@@ -934,14 +934,14 @@ __global__ void kquant_matmul_dp4a_kernel(const std::uint8_t* __restrict__ w,
 namespace {
 // M tile is fixed by the batch range this path serves. NT is the number of
 // 8-wide n-tiles each warp-half owns, so BN = 2 * NT * 8: NT=4 gives a 64-wide
-// output tile, NT=2 gives 32. NT is the register knob -- each n-tile carries 4
+// output tile, NT=2 gives 32. NT is the register knob: each n-tile carries 4
 // accumulators, and at NT=4 the kernel needed 128 registers per thread, which
 // capped it at 2 blocks/SM and 33% theoretical occupancy.
 constexpr int kMmqBM = 64;
 
 // 16-byte-granular XOR swizzle for the MMQ shared tiles. Tile rows are 256 B =
 // exactly 64 banks x 4 B, so unswizzled, the 8 rows a fragment load touches
-// all start on the SAME bank and every ld.shared serializes ~8-way -- the cost
+// all start on the same bank and every ld.shared serializes ~8-way, the cost
 // no prior falsification touched (stores are fewer, mma count was ruled out,
 // and it is invisible to DRAM counters). XOR-ing bits 4..6 of the column with
 // the low row bits rotates each row's chunks across banks at zero memory cost
@@ -951,7 +951,7 @@ __device__ __forceinline__ int mmq_swz(int r, int c) { return c ^ ((r & 7) << 4)
 
 // Same idea for the Q6_K scale tile, whose rows are 64 B = 16 words: the four
 // Bsc loads in the mma epilogue come from rows nbase + 2t (+1), i.e. a 32-word
-// stride across the thread quad -- same bank four ways. XOR-ing the float
+// stride across the thread quad, the same bank four ways. XOR-ing the float
 // index with row bits 1..2 spreads the quad across four bank groups; rows na
 // (even) and na+1 share an offset, so a thread's own pair stays adjacent.
 __device__ __forceinline__ int mmq_swz_sc(int r, int j) { return j ^ (((r >> 1) & 3) << 2); }
@@ -974,8 +974,8 @@ __device__ __forceinline__ void ldsm_x2(int& r0, int& r1, const void* p) {
 }
 
 // Tile-set layout for the Q6_K stream-K kernel, host-visible so the launcher
-// can size the dynamic-shared launch. The 64-batch x 128-row shape is 56 KB --
-// past the 48 KB static limit -- which is exactly why Q6_K used to decline
+// can size the dynamic-shared launch. The 64-batch x 128-row shape is 56 KB,
+// past the 48 KB static limit, which is exactly why Q6_K used to decline
 // batches above 32 and fall back to dequant+cuBLAS.
 template <int NT, int BM>
 struct Q6kSmemLayout {
@@ -1012,7 +1012,7 @@ struct MmqSmem<true, T> {
 // instructions each. Widening to 256 amortises it 8x.
 //
 // An earlier attempt at this was slower, because widening the tile is only half
-// the change -- the staging has to stay fully parallel and vectorized. Here every
+// the change: the staging has to stay fully parallel and vectorized. Here every
 // thread moves 16 bytes at a time with uint4 loads and stores:
 //   As: 64 rows x 256 bytes = 1024 uint4 units, 4 per thread.
 //   Bs: each row's 256 weights come from 128 bytes of qs, so 32 rows is 256
@@ -1171,7 +1171,7 @@ __global__ __launch_bounds__(256) void kquant_mmq_q4k_kernel(
 //
 // cp.async can only copy bytes, which forces the useful change: the nibble
 // unpack moves out of staging and into the fragment build. Shared now holds the
-// RAW super-block -- 128 bytes of qs per row instead of 256 unpacked -- and the
+// raw super-block, 128 bytes of qs per row instead of 256 unpacked, and the
 // b-fragment does `word & 0x0F0F0F0F` on the way to the mma. That halves the
 // weight tile as a side effect, which is what makes double buffering fit in
 // static shared memory.
@@ -1181,37 +1181,37 @@ __global__ __launch_bounds__(256) void kquant_mmq_q4k_kernel(
 // SPLITK divides the super-block loop across gridDim.y. The loop is the whole
 // cost: a block walks every super-block serially, each stage a
 // __pipeline_wait_prior and a __syncthreads, and the microbenchmark shows the
-// kernel does not care how many bytes it reads -- w13 has 3.5x wq's weight and
+// kernel does not care how many bytes it reads: w13 has 3.5x wq's weight and
 // takes the same time, both at nsb=16, i.e. ~1.8 us per iteration at B=8. More
 // blocks does not help either (w13's 448 are no faster per call than wk's 16),
 // because the chain is inside a block. So shorten the chain and multiply the
 // blocks. Partials go to a float scratch via atomicAdd and a finalize pass folds
 // them into y.
 //
-// Note this is NOT the split-K that failed for the matvec: there a 4096-wide row
+// Note this is not the split-K that failed for the matvec: there a 4096-wide row
 // was 16 super-blocks and one block already consumed all 16 across its warps, so
 // chunking only idled warps. Here one block walks all 16 in sequence.
 //
-// M2 serves batch 33..64 in ONE pass over the staged weights: two 32-row batch
+// M2 serves batch 33..64 in one pass over the staged weights: two 32-row batch
 // halves share every Bq fragment (the mma loop keeps the weight fragment in
 // registers and issues it against both halves), so the weight is read once
 // where the pre-M2 alternative was re-dequantizing the entire model to fp16
-// every step -- the audit's 11.1 ms/step of dequant at B=64. M2 forces the
+// every step, the audit's 11.1 ms/step of dequant at B=64. M2 forces the
 // single-buffered activation panel (both halves staged = 16 KB) and NT=2.
 //
-// FALSIFIED HERE (2026-08-12, #6 for this kernel family): folding the 6-bit
+// Falsified here (2026-08-12, #6 for this kernel family): folding the 6-bit
 // scale headers into a pre-decoded float2 (d*sc, dmin*m) shared tile at stage
 // time, llama.cpp-style, replacing the per-(group, n-tile) in-loop decode.
-// Bit-identical, gated, and SLOWER: 1508.6 -> 1426.9 tok/s at B=32 and 621.6
+// Bit-identical, gated, and slower: 1508.6 -> 1426.9 tok/s at B=32 and 621.6
 // -> 539.7 at B=8, interleaved same-binary-pair medians. The in-loop decode
 // pipelines behind the mma for free; a synchronous fold serializes at the
-// tile boundary. Same verdict as the earlier decode-into-shared attempt --
-// scale handling is NOT this kernel's bottleneck, stop trying to hoist it.
+// tile boundary. Same verdict as the earlier decode-into-shared attempt:
+// scale handling is not this kernel's bottleneck, stop trying to hoist it.
 // One (row-tile, k-range) piece of the Q4_K async MMQ: primes the cp.async
 // pipeline at kb0_start, walks super-blocks [kb0_start, kb0_stop) of row tile
-// `tile_it`, and runs the MODE epilogue -- the same factoring e83d0d2 gave the
+// `tile_it`, and runs the MODE epilogue, the same factoring e83d0d2 gave the
 // Q6_K kernel so a stream-K launch can walk several pieces per block. The
-// double-buffered weight pipeline is STATEFUL across the super-block loop, so
+// double-buffered weight pipeline is stateful across the super-block loop, so
 // each piece re-primes it (stage(kb0_start)) exactly like the old kernel did
 // for sb_lo; by the end of a piece __pipeline_wait_prior(0) has drained it, so
 // pieces do not interact. MODE:
@@ -1219,7 +1219,7 @@ __global__ __launch_bounds__(256) void kquant_mmq_q4k_kernel(
 //   1  atomicAdd into the batch x rows float scratch (the pre-stream-K
 //      split-K, kept behind CPI_KQUANT_MMQ_STREAMK=0).
 //   2  store raw float partials to this block's stream-K fixup slot,
-//      aux[blockIdx.x][m][n_local] -- the [bidx][32][BN] layout the shared
+//      aux[blockIdx.x][m][n_local], the [bidx][32][BN] layout the shared
 //      Q6_K fixup kernel expects at BM=32.
 template <int NT, bool M2, int MODE>
 __device__ __forceinline__ void kquant_mmq_q4k_process_tile(
@@ -1235,7 +1235,7 @@ __device__ __forceinline__ void kquant_mmq_q4k_process_tile(
   // Warps split across the M and N tiles, and the split has to follow kBM: with
   // 16 rows per m-tile, kBM=32 leaves only two m-tiles, so the other warps must
   // go to N. Keeping the 64-row mapping here left warps 4..7 with every row out
-  // of range -- half the block computing nothing, which is exactly the factor
+  // of range: half the block computing nothing, which is exactly the factor
   // between this kernel's 33% theoretical and 17% achieved occupancy.
   constexpr int kMT = kBM / 16;   // m-tiles per block
   constexpr int kNH = 8 / kMT;    // warps left for the n dimension
@@ -1281,7 +1281,7 @@ __device__ __forceinline__ void kquant_mmq_q4k_process_tile(
         }
       }
     }
-    // Weights: kBN rows x 128 B of qs, 8 uint4 per row. Swizzled like As --
+    // Weights: kBN rows x 128 B of qs, 8 uint4 per row. Swizzled like As:
     // Bq rows are 128 B (exactly one bank wrap), so unswizzled fragment loads
     // serialize the same way.
 #pragma unroll
@@ -1342,7 +1342,7 @@ __device__ __forceinline__ void kquant_mmq_q4k_process_tile(
         const bool ok_a = m_a < batch, ok_b = m_b < batch;
         // Unguarded ldmatrix: rows past the batch hold zeros (sync staging) or
         // stale bytes (cp.async staging), and either way the products below
-        // are zeroed by as/gs = 0 -- an int8 mma cannot produce NaN.
+        // are zeroed by as/gs = 0; an int8 mma cannot produce NaN.
         {
           const int ar = 32 * mh + arow + (lane & 15);
           const int ac = co + ((lane >> 4) << 4);
@@ -1372,7 +1372,7 @@ __device__ __forceinline__ void kquant_mmq_q4k_process_tile(
         const std::uint32_t w1 = static_cast<std::uint32_t>(wi1);
         const int b0 = static_cast<int>(hi_nib ? ((w0 >> 4) & 0x0F0F0F0Fu) : (w0 & 0x0F0F0F0Fu));
         const int b1 = static_cast<int>(hi_nib ? ((w1 >> 4) & 0x0F0F0F0Fu) : (w1 & 0x0F0F0F0Fu));
-        // Scales for the two output rows this thread accumulates -- shared by
+        // Scales for the two output rows this thread accumulates, shared by
         // both batch halves, so decoded once per n-tile.
         const int na = nbase + 2 * t, nb = nbase + 2 * t + 1;
         const uint4 ha = *reinterpret_cast<const uint4*>(&Hd[buf][na][0]);
@@ -1443,7 +1443,7 @@ __global__ __launch_bounds__(256) void kquant_mmq_q4k_async_kernel(
   constexpr int kBMT = M2 ? 64 : 32;
   constexpr int kBN = 4 * NT * 8;
   // At NT>=4 (kBN=128, the audit's restaging fix) the double-buffered tile set
-  // no longer fits 48 KB static shared, so the ACTIVATION panel drops to a
+  // no longer fits 48 KB static shared, so the activation panel drops to a
   // single buffer staged with plain loads: it is the small, L2-hot side (8 KB
   // a tile against Bq's 16), and the whole point of the wide tile is that this
   // panel is re-read less often per weight byte. Weights and headers keep the
@@ -1467,11 +1467,11 @@ __global__ __launch_bounds__(256) void kquant_mmq_q4k_async_kernel(
 #endif
 }
 
-// Stream-K for the Q4_K async MMQ -- the same kbc walk as
+// Stream-K for the Q4_K async MMQ: the same kbc walk as
 // kquant_mmq_q6k_streamk_kernel over the flat (row-tile, super-block) units,
 // replacing the atomicAdd split-K + finalize (~440 us/step in the 2026-08-12
 // audit) with a deterministic fixup. Batch <= 32 only: the warp split is fixed
-// 2x4 (kBM=32), so kBN = 4*NT*8 -- identical to the Q6_K layout at BM=32,
+// 2x4 (kBM=32), so kBN = 4*NT*8, identical to the Q6_K layout at BM=32,
 // which is what lets the fixup kernel be shared instead of cloned.
 template <int NT>
 __global__ __launch_bounds__(256) void kquant_mmq_q4k_streamk_kernel(
@@ -1518,18 +1518,18 @@ __global__ __launch_bounds__(256) void kquant_mmq_q4k_streamk_kernel(
 #endif
 }
 
-// ROUND 11 (2026-08-12): the llama.cpp-shaped Q4_K MMQ body -- unpack AND fold
-// at STAGING, lean mma loop. ncu (ROUND 10) showed the async kernel above
+// Round 11 (2026-08-12): the llama.cpp-shaped Q4_K MMQ body, unpack and fold
+// at staging, lean mma loop. ncu (round 10) showed the async kernel above
 // executes 2.34x llama.cpp's warp-instructions per byte (ALU 3.4x) at
-// IDENTICAL occupancy and issue rate, stalling LESS on memory and still losing
-// 1.6x -- the per-fragment nibble unpack + scale-header decode in the mma loop
-// IS the duration at the 2-warps-per-scheduler floor. STEP 0 of this round
+// identical occupancy and issue rate, stalling less on memory and still losing
+// 1.6x: the per-fragment nibble unpack + scale-header decode in the mma loop
+// is the duration at the 2-warps-per-scheduler floor. Step 0 of this round
 // profiled the Q6_K kernel (which already unpacks at staging) against llama's
 // mul_mat_q<Q6_K> on the same 48.5 MB shape: also issue-bound (duration ratio
-// 1.65x == instruction ratio 1.67x, staging shared-store counts EQUAL), its
-// residual excess sitting in the mma loop. So this kernel moves BOTH the
+// 1.65x == instruction ratio 1.67x, staging shared-store counts equal), its
+// residual excess sitting in the mma loop. So this kernel moves both the
 // unpack and the scale fold out of the loop, which then runs only
-// ldsm + one m16n8k32 + two ld.shared.64 scale loads + 8 FFMA per fragment --
+// ldsm + one m16n8k32 + two ld.shared.64 scale loads + 8 FFMA per fragment,
 // leaner than Q6_K's (whose per-16 scales force a dual mma).
 //
 // Numerics: Bs holds raw nibbles 0..15 exactly as the async kernel's masked
@@ -1537,15 +1537,15 @@ __global__ __launch_bounds__(256) void kquant_mmq_q4k_streamk_kernel(
 // (d*sc, dmin*m) products are the same fp32 multiplies the in-loop decode
 // produced, so the output is bit-identical to the async kernel's.
 //
-// Falsification #6 (pre-folded float2 tile, -5.4% @32) is NOT retried here:
-// that version folded scales in a SECOND synchronous pass while the weight
-// staging stayed cp.async raw -- pure added latency at the tile boundary.
+// Falsification #6 (pre-folded float2 tile, -5.4% @32) is not retried here:
+// that version folded scales in a second synchronous pass while the weight
+// staging stayed cp.async raw, pure added latency at the tile boundary.
 // Here the fold rides the unpack pass that must exist anyway, and the unpack
 // pass replaces (not augments) the cp.async staging.
 // M2 doubles the activation panel to 64 rows (two 32-row batch halves) while
 // the weight tile stays 4*NT*8 rows: the mma loop replays each staged weight
-// fragment against both halves, so batch 33..64 reads the weights ONCE -- the
-// ROUND 2 dual-half pattern on the unpacked body. At NT=2 the M2 tile set is
+// fragment against both halves, so batch 33..64 reads the weights once, the
+// round 2 dual-half pattern on the unpacked body. At NT=2 the M2 tile set is
 // 36 KB static (As 16K + Bs 16K + Bsdm 4K), leaving room for 2 blocks/SM.
 template <int NT, bool M2 = false>
 struct Q4kSmemLayout {
@@ -1555,7 +1555,7 @@ struct Q4kSmemLayout {
 };
 
 // Scale-tile swizzle: the epilogue's float2 loads hit rows nbase + 2t (+1) at
-// gi fixed -- a 128-byte stride across the thread quad, i.e. the same bank
+// gi fixed, a 128-byte stride across the thread quad, i.e. the same bank
 // pair four ways. XOR-ing the group index with row bits 1..2 spreads the quad
 // over four bank pairs; na (even) and na+1 share the offset so a thread's own
 // pair of rows keeps one index.
@@ -1591,20 +1591,20 @@ __device__ __forceinline__ void kquant_mmq_q4k_process_tile_unpacked(
 #pragma unroll
       for (int j = 0; j < 4; ++j) facc[m][i][j] = 0.0f;
 
-  // Raw super-block prefetch, in REGISTERS: the synchronous unpack-at-staging
+  // Raw super-block prefetch, in registers: the synchronous unpack-at-staging
   // variant of this kernel exposed the global load latency the async kernel
   // hides with cp.async (long_scoreboard 1.6 -> 4.6 cyc/issue, -9.8% end to
-  // end), so the loads for super-block sb+1 issue BEFORE sb's mma loop and
+  // end), so the loads for super-block sb+1 issue before sb's mma loop and
   // retire behind it. Eight threads a row: one 16-byte qs chunk and, since a
   // row has exactly eight 32-wide scale groups, one header copy each (8x
   // redundant per row, L1 broadcasts it).
   // NT=8's register budget cannot hold both prefetch arrays: pq[8]+ph[8] is 64
   // registers and the natural allocation spills (255 regs, 251k spill-loads on
-  // the w13 launch, +7% instructions over NT=4 for LESS memory work). The
-  // header line is provably L1/L2-resident by unpack time -- the pq prefetch
-  // for the same super-block touched its sectors one full mma loop earlier
-  // (chunk 0's load shares the header's 128B line, or the previous
-  // super-block's qs covered the straddled sector) -- so at NT>=8 the header
+  // the w13 launch, +7% instructions over NT=4 for less memory work). The
+  // header line is provably L1/L2-resident by unpack time, since the pq
+  // prefetch for the same super-block touched its sectors one full mma loop
+  // earlier (chunk 0's load shares the header's 128B line, or the previous
+  // super-block's qs covered the straddled sector), so at NT>=8 the header
   // is re-loaded synchronously in unpack_store instead of prefetched.
   constexpr bool kPfHdr = NT < 8;
   uint4 pq[kWIter], ph[kPfHdr ? kWIter : 1];
@@ -1626,7 +1626,7 @@ __device__ __forceinline__ void kquant_mmq_q4k_process_tile_unpacked(
     }
   };
   // Unpack the prefetched registers into the shared tiles. The nibble unpack
-  // that used to run per (fragment, n-tile, warp) in the mma loop runs ONCE
+  // that used to run per (fragment, n-tile, warp) in the mma loop runs once
   // per byte here, in words; the header decode that used to run per
   // (group, n-tile, warp) runs once per (row, group).
   const auto unpack_store = [&](int sb) {
@@ -1675,7 +1675,7 @@ __device__ __forceinline__ void kquant_mmq_q4k_process_tile_unpacked(
     // leading barrier: the previous iteration's trailing __syncthreads means
     // every warp is done multiplying from As before any warp overwrites it.
     // Left synchronous: the async kernel's NT>=4 shape stages its panel the
-    // same way and measured long_scoreboard 1.6 -- it is the small, L2-hot
+    // same way and measured long_scoreboard 1.6; it is the small, L2-hot
     // side.
 #pragma unroll
     for (int i = 0; i < kBMT / 16; ++i) {
@@ -1700,7 +1700,7 @@ __device__ __forceinline__ void kquant_mmq_q4k_process_tile_unpacked(
       // each staged weight fragment against both halves without touching
       // shared again (the M2 pattern: weights read once).
       // Unguarded ldmatrix: rows past the batch hold zeros, and either way the
-      // products below are zeroed by as/gs = 0 -- an int8 mma cannot NaN.
+      // products below are zeroed by as/gs = 0; an int8 mma cannot NaN.
       int a0[kMH], a1[kMH], a2[kMH], a3[kMH];
       float as_a[kMH], as_b[kMH], gs_a[kMH], gs_b[kMH];
 #pragma unroll
@@ -1717,7 +1717,7 @@ __device__ __forceinline__ void kquant_mmq_q4k_process_tile_unpacked(
         gs_a[mh] = ok_a ? gsum[static_cast<std::size_t>(m_a) * Kg + kg] : 0.0f;
         gs_b[mh] = ok_b ? gsum[static_cast<std::size_t>(m_b) * Kg + kg] : 0.0f;
       }
-      // All B fragments and scales for this k-group load BEFORE any mma: with
+      // All B fragments and scales for this k-group load before any mma: with
       // the in-loop unpack gone there are no spare instructions to hide the
       // ldsm latency behind (short_scoreboard 3.2 on the synchronous variant),
       // so the loop supplies memory-level parallelism instead. Adjacent
@@ -1796,10 +1796,10 @@ __device__ __forceinline__ void kquant_mmq_q4k_process_tile_unpacked(
 // BM=32 serves both), selected by CPI_KQUANT_MMQ_UNPACK.
 // minBlocksPerMultiprocessor 2 at NT<=2: the natural allocation was 139
 // registers, and 139 > 128 halves occupancy against the async kernel's 2
-// blocks/SM at the same shape -- measured -6.0% at B=8 (774 vs 813) with
+// blocks/SM at the same shape: measured -6.0% at B=8 (774 vs 813) with
 // long_scoreboard healthy, i.e. pure warp shortage. NT=4's 48 KB tile is
 // occupancy-1 by shared memory anyway, so it keeps the relaxed bound.
-// (minBlocks 2 at NT=4 as well was tried: 1890.7 vs 1907.1 base at B=32 --
+// (minBlocks 2 at NT=4 as well was tried: 1890.7 vs 1907.1 base at B=32;
 // the 128-register cap costs more than the second block buys at a 48 KB tile.)
 template <int NT, bool M2 = false>
 __global__ __launch_bounds__(256, NT <= 2 ? 2 : 1) void kquant_mmq_q4k_streamk_unpacked_kernel(
@@ -1854,26 +1854,26 @@ __global__ void kquant_mmq_finalize_kernel(float* __restrict__ partial, __half* 
 
 // Q4_K on int8 tensor cores. Same activation preparation as the dp4a path; the
 // difference is the inner product runs on mma instead of scalar FMAs. sm_80+
-// only -- the caller checks compute capability.
-// FALSIFIED TWICE MORE, and the second one closes off the compute theories.
+// only; the caller checks compute capability.
+// Falsified twice more, and the second one closes off the compute theories.
 //
-// (a) llama.cpp does NOT use cp.async for Q6_K either. Its load_tiles_q6_K uses
-// plain loads and unpacks 6-bit into int8 in shared at staging time -- the same
+// (a) llama.cpp does not use cp.async for Q6_K either. Its load_tiles_q6_K uses
+// plain loads and unpacks 6-bit into int8 in shared at staging time, the same
 // shape as the kernel below, down to the __vsubss4(x, 0x20202020) centering. So
 // the 210-byte alignment wall is not what separates the two, and the aligned
 // repack is not the lever it looked like.
 //
 // (b) The mma decomposition is not the bottleneck either. llama.cpp issues its
-// two mma over DISJOINT k-ranges with full b fragments and scales each
+// two mma over disjoint k-ranges with full b fragments and scales each
 // accumulator afterwards, where this kernel issues two over the same range with
-// half of b zeroed -- nominally a 2x waste. Rewriting it to two m16n8k16 over
-// disjoint ranges is numerically exact and bought NOTHING: w2 34.0 -> 34.5 us,
+// half of b zeroed, nominally a 2x waste. Rewriting it to two m16n8k16 over
+// disjoint ranges is numerically exact and bought nothing: w2 34.0 -> 34.5 us,
 // wv 28.3 -> 35.9, i.e. worse. Halving the tensor-core work changed nothing, so
 // this kernel is not mma-bound. Reverted.
 //
 // What that leaves is the DRAM access pattern, and the staging below is the
 // suspect. Each thread takes a contiguous 16-byte chunk at offset 16*t and reads
-// it as eight uint16 -- two-byte loads are forced, because a 210-byte block
+// it as eight uint16; two-byte loads are forced because a 210-byte block
 // stride leaves p only 2-byte aligned. At any one instruction the warp is then
 // reading 16*t + 2*k: two bytes per thread at a sixteen-byte stride, so a 32-byte
 // sector serves two lanes and roughly seven eighths of every fetch is discarded.
@@ -1883,9 +1883,9 @@ __global__ void kquant_mmq_finalize_kernel(float* __restrict__ partial, __half* 
 // cache-resident, but ~138 GB/s against its ~495 in the engine. llama.cpp's
 // equivalent runs ~33.9 us a call where this one runs ~102.7.
 //
-// FALSIFIED as well. Staging the raw block into shared first with consecutive
-// lanes on consecutive halfwords -- perfectly coalesced global reads, unpack
-// moved to a second pass off shared -- is numerically identical and SLOWER:
+// Falsified as well. Staging the raw block into shared first with consecutive
+// lanes on consecutive halfwords (perfectly coalesced global reads, unpack
+// moved to a second pass off shared) is numerically identical and slower:
 // defaults 1507 -> 1497 tok/s and Q6_K-MMQ 1462 -> 1427 at B=32.
 //
 // The reason is that the strided pattern was never costing DRAM bandwidth. At
@@ -1895,7 +1895,7 @@ __global__ void kquant_mmq_finalize_kernel(float* __restrict__ partial, __half* 
 // its __syncthreads cost more than that. Strided-within-a-warp is a bandwidth
 // problem only when the lines are not revisited.
 //
-// STREAM-K IS NOW TRIED (the last structural difference llama.cpp's profile
+// Stream-K is now tried (the last structural difference llama.cpp's profile
 // showed): the decomposition below plus its fixup kernel, exactly the
 // mul_mat_q / mul_mat_q_stream_k_fixup shape. Engine kernel-time per step at
 // B=32 (nsys, graph-trace=node, per shape):
@@ -1903,24 +1903,24 @@ __global__ void kquant_mmq_finalize_kernel(float* __restrict__ partial, __half* 
 //                    fixup); NT=2 was ~142, so the tile-shape verdict below
 //                    flipped under this launch.
 //   wv (1024x4096):  dequant+cuBLAS ~13 us -> stream-K NT=4 28.9, of which
-//                    15.5 is fixup -- 16 tiles x 16 super-blocks split ~16 ways
+//                    15.5 is fixup: 16 tiles x 16 super-blocks split ~16 ways
 //                    means the reconciliation costs more than the matmul.
 //   LM head (128256): 1245.6 -> 956.2 us from NT=4 alone (data-parallel branch,
-//                    no fixup); this one runs force_q6k in EVERY batched
+//                    no fixup); this one runs force_q6k in every batched
 //                    config, so it is a win independent of mmq_q6k.
 // Net: layer weights at parity with dequant-and-cuBLAS (w2's win pays for wv's
 // fixup), ~1% of a batched step won on the head. The remaining per-call gap to
 // llama.cpp's 33.9 us is no longer decomposition: with the launch structure
-// matched, what differs is the kernel body -- the staging unpack writes Bs one
-// BYTE at a time (32 shared byte-stores per thread per super-block) where
+// matched, what differs is the kernel body. The staging unpack writes Bs one
+// byte at a time (32 shared byte-stores per thread per super-block) where
 // llama.cpp packs int words, and that is the one cost falsification has not
-// touched (the coalescing experiment restaged the GLOBAL reads, not the shared
+// touched (the coalescing experiment restaged the global reads, not the shared
 // stores).
 //
-// Q6_K CANNOT USE THE ASYNC STAGING
-// STYLE THAT MAKES THE Q4_K MMQ FAST. cp.async requires natural 4/8/16-byte
-// alignment on its source, and a Q6_K block is 210 bytes -- not a multiple of 4,
-// let alone 16 -- so p shifts alignment every block. Q4_K's 144-byte blocks are a
+// Q6_K cannot use the async staging style that makes the Q4_K MMQ fast.
+// cp.async requires natural 4/8/16-byte
+// alignment on its source, and a Q6_K block is 210 bytes, not a multiple of 4,
+// let alone 16, so p shifts alignment every block. Q4_K's 144-byte blocks are a
 // multiple of 16, which is exactly why its async kernel works. Writing the async
 // version anyway produced worst_rel 1.0 and out-of-bounds writes that corrupted
 // unrelated Q4_K results; the same alignment wall forced uint16 loads in the
@@ -1929,26 +1929,26 @@ __global__ void kquant_mmq_finalize_kernel(float* __restrict__ partial, __half* 
 // That matters because async staging is worth 22.8% on Q4_K (forcing it to the
 // scalar-staging kernel costs 1259 -> 972 tok/s), and it is the largest known
 // term in Q6_K MMQ being ~2.5x Q4_K per byte. So closing that gap needs Q6_K
-// REPACKED to an aligned stride (224 or 256 bytes a block), which is a converter
-// change, not a kernel one -- and note the reason is alignment, not the per-16
+// repacked to an aligned stride (224 or 256 bytes a block), which is a converter
+// change, not a kernel one; the reason is alignment, not the per-16
 // scale grouping that an earlier note blamed.
 //
-// Q6_K on the tensor cores. STILL OFF BY DEFAULT for layer weights, but the
+// Q6_K on the tensor cores. Still off by default for layer weights, but the
 // story moved: with stream-K + NT=4 it is break-even against dequant-and-cuBLAS
 // at B=32 (interleaved medians 1613.9 vs 1613.2 tok/s) and -4.2% at B=8 (was
 // -9.5%). The force_q6k LM head keeps using this path in every batched config
 // and got 19% faster per call from NT=4 alone. CPI_KQUANT_MMQ_Q6K=1 turns the
 // layer path on.
 //
-// Q6_K is a quarter of a Q4_K_M by bytes -- ffn_down
-// for most layers plus wv -- and it was the reason a batched step still expanded
+// Q6_K is a quarter of a Q4_K_M by bytes (ffn_down
+// for most layers plus wv), and it was the reason a batched step still expanded
 // weights to fp16: with no MMQ path it fell to dequant-and-cuBLAS, which nsys put
 // at 15.3% of batched time even with MMQ forced on everywhere else.
 //
 // Two things make this simpler than the Q4_K kernel rather than harder:
 //
 //   - Q6_K values are q-32 with q in 0..63, so they land in -32..31 and fit int8
-//     directly. There is no -dmin*m term, so no group sums and no correction --
+//     directly. There is no -dmin*m term, so no group sums and no correction:
 //     the mma result is the dot product already.
 //   - The scale for element e is exactly scales[e>>4], once the layout is worked
 //     through: the per-16 index the reference unpack builds from n, h and l0
@@ -1958,28 +1958,28 @@ __global__ void kquant_mmq_finalize_kernel(float* __restrict__ partial, __half* 
 // The one real obstacle is that a scale per 16 does not line up with
 // mma.m16n8k32, which accumulates 32 k at once. So each 32-k step issues two
 // mma, one per 16-k half, with the other half of the b fragment zeroed. That
-// doubles the mma count at unchanged memory traffic -- an acceptable trade for a
+// doubles the mma count at unchanged memory traffic, an acceptable trade for a
 // kernel measured at ~426 GB/s, i.e. bound by the weight read rather than the
 // tensor cores.
-// FALSIFIED (2026-08-12, round 8, the last named structural difference vs
+// Falsified (2026-08-12, round 8, the last named structural difference vs
 // llama.cpp's Q6_K MMQ): the register-resident int8-scale epilogue. Bsc
-// restaged as RAW packed scales (int Bsc_i[BN][4], four int8 per int, plus
-// float Bd[BN] for the super-block d), mma loop restructured nt-OUTER so a row
+// restaged as raw packed scales (int Bsc_i[BN][4], four int8 per int, plus
+// float Bd[BN] for the super-block d), mma loop restructured nt-outer so a row
 // pair's 8 packed-scale ints + 2 d floats load once per (nt, super-block) and
-// the epilogue becomes facc += as * (d * float(c0*sc_lo + d0*sc_hi)) --
+// the epilogue becomes facc += as * (d * float(c0*sc_lo + d0*sc_hi)):
 // integer multiply-adds against register scales replacing the four
 // conflicted-ish Bsc float loads and two float multiplies per mma pair, with
 // the a-fragment ldmatrix.x4 moving inside the nt loop (NT x more ldsm) as
 // the trade. Numerics held exactly (worst_rel identical to all printed
-// digits, both gates PASS) and registers went DOWN (152 -> 142 on the NT=4
-// BM=32 workhorse, no spills, the tile back under 48 KB static) -- and it is
-// SLOWER: 1710.5 -> 1653.0 tok/s at B=32 (-3.4%) and 740.4 -> 726.6 at B=8
+// digits, both gates PASS) and registers went down (152 -> 142 on the NT=4
+// BM=32 workhorse, no spills, the tile back under 48 KB static), and it is
+// slower: 1710.5 -> 1653.0 tok/s at B=32 (-3.4%) and 740.4 -> 726.6 at B=8
 // (-1.9%), interleaved binary-pair medians. Third confirmation (after the
 // pre-folded float2 tile, #6, and the neutral Bsc swizzle) that scale
-// handling pipelines behind the mma for free here and is NOT the bottleneck;
+// handling pipelines behind the mma for free here and is not the bottleneck;
 // the NT x extra a-fragment ldsm traffic costs real time. With the k16-mma
 // decomposition and staging shape also falsified above, llama.cpp's remaining
-// Q6_K edge is NOT explained by any single named kernel-body difference we
+// Q6_K edge is not explained by any single named kernel-body difference we
 // can port; PDL launch overlap is the one structural item left untried.
 //
 // One (row-tile, k-range) piece of the Q6_K MMQ: stages the activation and
@@ -1987,7 +1987,7 @@ __global__ void kquant_mmq_finalize_kernel(float* __restrict__ partial, __half* 
 // and runs them through the mma. Factored out of the kernel so the stream-K
 // launch below can walk several pieces per block. MODE picks the epilogue:
 //   0  write the accumulators to y. Used when the piece reaches the tile's
-//      k-END -- under stream-K exactly one piece per tile does, and the
+//      k-end; under stream-K exactly one piece per tile does, and the
 //      earlier pieces arrive through the fixup pass.
 //   1  atomicAdd into the batch x rows float scratch (the pre-stream-K
 //      split-K, kept for CPI_KQUANT_MMQ_STREAMK=0).
@@ -1996,18 +1996,18 @@ __global__ void kquant_mmq_finalize_kernel(float* __restrict__ partial, __half* 
 //
 // BM is the M (batch) tile: 16 rows per m-tile warp group, so BM=64 splits the
 // 8 warps 4x2 over MxN and BM=32 splits them 2x4. The BM=32 shape exists
-// because the audit's dominant matmul cost was ACTIVATION RESTAGING: every
+// because the audit's dominant matmul cost was activation restaging: every
 // block re-stages the whole batch panel, so tile-N width is the divisor on
 // that traffic, and shrinking the M tile to what a batch<=32 call actually
 // uses buys the shared memory to double N: BM=32/NT=4 is a 32x128 tile in the
 // same 48 KB that BM=64/NT=4 spends on 64x64.
-// PF (ROUND 12): register-prefetch of the next super-block's raw ql/qh/scale
+// PF (round 12): register-prefetch of the next super-block's raw ql/qh/scale
 // bytes, the same replacement of latency-hiding that made the Q4_K unpacked
-// body win -- the loads for sb+1 issue before sb's mma loop and retire behind
+// body win: the loads for sb+1 issue before sb's mma loop and retire behind
 // it, instead of the mma loop waiting out synchronous staging at the top of
 // each iteration. Only instantiated for the BM=64 dynamic-shared shape
 // (batch 33..64, occupancy 1, no co-resident block to hide staging); BM=32
-// keeps the ROUND-8-tuned synchronous body unchanged.
+// keeps the round-8-tuned synchronous body unchanged.
 template <int NT, int BM, int MODE, bool PF = false>
 __device__ __forceinline__ void kquant_mmq_q6k_process_tile(
     std::int8_t (&As)[BM][256], std::int8_t (&Bs)[(128 / BM) * NT * 8][256],
@@ -2131,8 +2131,8 @@ __device__ __forceinline__ void kquant_mmq_q6k_process_tile(
     // across the run and the matching qh bytes are contiguous too.
     //
     // The loop, not `if (r < kMmqBN)`: 256 threads cover 32 rows a pass, so
-    // NT=4's 64-row tile needs two. The old guard silently staged HALF the
-    // tile at NT=4 -- rows 32..63 multiplied stale shared memory -- and the
+    // NT=4's 64-row tile needs two. The old guard silently staged half the
+    // tile at NT=4 (rows 32..63 multiplied stale shared memory), and the
     // rows<=32 unit-test slice masked it via the gn<rows store guard, which is
     // how ebbe5f2 recorded NT=4 as "numerically correct". --batched-check is
     // what caught it.
@@ -2148,9 +2148,9 @@ __device__ __forceinline__ void kquant_mmq_q6k_process_tile(
         const int n = c >> 6, h = (c >> 5) & 1, l0 = c & 31;
         const int off_lo = (n << 7) + (h << 5) + l0;
         const int sl = 2 * h, sh = 4 + 2 * h;
-        // Read the run as uint16 pairs -- a 210-byte block leaves p only 2-byte
-        // aligned so wider loads are out (llama.cpp pays the same get_int_b2
-        // tax) -- but UNPACK IN WORDS, NOT BYTES. The old loop computed each
+        // Read the run as uint16 pairs, since a 210-byte block leaves p only
+        // 2-byte aligned so wider loads are out (llama.cpp pays the same
+        // get_int_b2 tax), but unpack in words, not bytes. The old loop computed each
         // value separately and issued a byte-wide shared store per weight: 32
         // st.b8 and ~96 per-byte ALU ops per 16-byte run. The audit's head A/B
         // put this kernel at 379 GB/s against llama.cpp's 1317 on identical
@@ -2281,7 +2281,7 @@ __device__ __forceinline__ void kquant_mmq_q6k_process_tile(
 }
 
 // Q6_K MMQ, one row tile per blockIdx.x. SPLITK chunks the super-block loop
-// across blockIdx.y with atomicAdd partials -- the pre-stream-K split, kept
+// across blockIdx.y with atomicAdd partials, the pre-stream-K split kept
 // behind CPI_KQUANT_MMQ_STREAMK=0.
 template <int NT, bool SPLITK>
 __global__ __launch_bounds__(256) void kquant_mmq_q6k_kernel(
@@ -2314,10 +2314,10 @@ __global__ __launch_bounds__(256) void kquant_mmq_q6k_kernel(
 #endif
 }
 
-// Stream-K for the Q6_K MMQ -- the decomposition llama.cpp's mul_mat_q uses,
+// Stream-K for the Q6_K MMQ: the decomposition llama.cpp's mul_mat_q uses,
 // which its profile shows beating both CPI paths on this exact shape. The work
 // space is the flat sequence of (row-tile, super-block) units with the tile
-// index varying slowest; each block of a FIXED grid takes the contiguous slice
+// index varying slowest; each block of a fixed grid takes the contiguous slice
 // [kbc, kbc_stop). The grid no longer has to divide the tile count, so the
 // last-wave imbalance and the serial per-block super-block chain both
 // disappear: every block finishes within one super-block of its peers. A piece
@@ -2376,8 +2376,8 @@ __global__ __launch_bounds__(256) void kquant_mmq_q6k_streamk_kernel(
 // k-prefix sits in the tmp slots of the blocks just before it, so walk
 // backwards summing them and fold the total into y. Exactly one fixup block
 // touches a given tile, so plain loads and stores suffice; blocks with nothing
-// to reconcile exit in a few instructions. Must be launched with the SAME grid
-// size as the stream-K kernel -- the kbc arithmetic has to reproduce its
+// to reconcile exit in a few instructions. Must be launched with the same grid
+// size as the stream-K kernel; the kbc arithmetic has to reproduce its
 // partitioning exactly.
 template <int NT, int BM>
 __global__ void kquant_mmq_q6k_streamk_fixup_kernel(__half* __restrict__ y,
@@ -2396,7 +2396,7 @@ __global__ void kquant_mmq_q6k_streamk_fixup_kernel(__half* __restrict__ y,
   if (kbc0 % nsb == 0) return;    // block started at a tile boundary: its write was complete
   const std::int64_t it = kbc0 / nsb;
   // Block never reached its first tile's k-end, so it wrote tmp, not y; the
-  // block that DID write that tile's end runs the reconciliation instead.
+  // block that did write that tile's end runs the reconciliation instead.
   if (it == kbc0_stop / nsb && kbc0_stop % nsb != 0) return;
 
   float sum[kElems];
@@ -2453,7 +2453,7 @@ bool ensure_mmq_partial(std::size_t elems) {
 }
 
 // Stream-K fixup buffer: one tile of raw float partials per block. Separate
-// from g_mmq_partial -- that scratch must stay zeroed between calls (the
+// from g_mmq_partial: that scratch must stay zeroed between calls (the
 // atomicAdd path accumulates into it), while this one is plain-stored every
 // launch and never needs zeroing. Sharing them would break the finalize
 // kernel's leaves-it-zeroed invariant.
@@ -2471,28 +2471,28 @@ bool ensure_mmq_fixup(std::size_t elems) {
   return true;
 }
 
-// FALSIFIED (2026-08-12, round 9, the last structural llama.cpp difference):
+// Falsified (2026-08-12, round 9, the last structural llama.cpp difference):
 // Programmatic Dependent Launch for the batched MMQ chain. A launch helper here
 // used cudaLaunchKernelEx with cudaLaunchAttributeProgrammaticStreamSerialization
 // (sm_90+ checked once, CPI_KQUANT_PDL knob) on quantize_q8_1_groups_kernel,
 // both stream-K MMQ kernels, the async kernel, and the fixup/finalize kernels;
 // consumers called cudaGridDependencySynchronize() at the top of the body and
-// producers cudaTriggerProgrammaticLaunchCompletion() after their last store --
+// producers cudaTriggerProgrammaticLaunchCompletion() after their last store,
 // llama.cpp's exact shape (their common.cuh, GGML_CUDA_PDL). All gates passed
 // (unit test, batched-check with defaults / knob off / CPI_BATCH_GRAPH=0: the
-// attribute IS captured and preserved in the batched decode graph) and it was
-// a LOSS at every batch: interleaved binary-pair medians 1729.1 -> 1724.5
+// attribute is captured and preserved in the batched decode graph) and it was
+// a loss at every batch: interleaved binary-pair medians 1729.1 -> 1724.5
 // tok/s at B=32 (-0.27%), 747.7 -> 734.6 at B=8 (-1.75%), 1964.2 -> 1953.1 at
 // B=64 (-0.57%). Mechanism: PDL buys launch/prologue latency overlap, and this
 // chain already runs inside a replayed CUDA graph where that latency is
-// amortized -- the ~1.6-1.8 ms/step GPU idle it was meant to attack is the
+// amortized; the ~1.6-1.8 ms/step GPU idle it was meant to attack is the
 // same on both engines, so it was never llama.cpp's edge here. The device-side
 // waits/triggers are not free either (the B=8 loss is real work per launch at
 // the smallest grids). Do not retry PDL on the graphed decode path; if it is
-// ever retried, it belongs on an UNGRAPHED path with measured launch gaps.
+// ever retried, it belongs on an ungraphed path with measured launch gaps.
 
-// Grid for the stream-K Q6_K MMQ: one wave -- SM count times this kernel's
-// measured occupancy -- so all blocks run concurrently and the kbc ranges
+// Grid for the stream-K Q6_K MMQ: one wave (SM count times this kernel's
+// measured occupancy), so all blocks run concurrently and the kbc ranges
 // partition the work exactly once. Cached after the first call; the queries
 // are device-attribute reads, not stream work, so they are capture-safe.
 int q6k_streamk_grid(int nt_sel, int bm) {
@@ -2532,27 +2532,27 @@ int q6k_streamk_grid(int nt_sel, int bm) {
 }
 
 // Stream-K launch for the Q6_K MMQ. Returns false only when the fixup scratch
-// cannot be allocated AND a fallback is impossible; in practice it degrades to
+// cannot be allocated and a fallback is impossible; in practice it degrades to
 // exact one-tile-per-block tiling, which needs no scratch.
 void launch_kquant_mmq_q6k_streamk(const std::uint8_t* w, const std::int8_t* xq, const float* xs,
                                    half* y, int rows, int cols, int batch, int ldy,
                                    cudaStream_t stream) {
   // Batches that fit half the M tile take the 32x128 shape in static shared;
-  // larger batches take 64x128 in 56 KB of dynamic shared at occupancy 1 --
-  // the N width is what divides activation restaging, so it stays 128.
+  // larger batches take 64x128 in 56 KB of dynamic shared at occupancy 1.
+  // The N width is what divides activation restaging, so it stays 128.
   const int bm = batch <= 32 ? 32 : 64;
-  // NT=8 at BM=32 is the 32x256 tile in 88 KB of dynamic shared (occupancy 1)
-  // -- the next step on the width/occupancy frontier, opt-in via
+  // NT=8 at BM=32 is the 32x256 tile in 88 KB of dynamic shared (occupancy 1),
+  // the next step on the width/occupancy frontier, opt-in via
   // CPI_KQUANT_MMQ_Q6K_NT=8.
   int nt_sel =
       bm == 64 ? 8
                : (g_kq_tune.mmq_q6k_nt >= 8
                       ? 8
                       : (g_kq_tune.mmq_q6k_nt >= 4 ? 4 : (g_kq_tune.mmq_q6k_nt <= 1 ? 1 : 2)));
-  // Small-grid starvation fix (ROUND 13): wv (1024x4096) at NT=4 is 8 tiles x
+  // Small-grid starvation fix (round 13): wv (1024x4096) at NT=4 is 8 tiles x
   // 16 super-blocks = 128 work units, and the two-units-per-block floor caps
-  // the grid at 64 blocks on a 170-SM part -- ncu at B=8 read 196 GB/s with
-  // top stall no_instruction 4.35 cyc/issue, i.e. block starvation (ROUND 10).
+  // the grid at 64 blocks on a 170-SM part; ncu at B=8 read 196 GB/s with
+  // top stall no_instruction 4.35 cyc/issue, i.e. block starvation (round 10).
   // Narrowing the tile multiplies the units: drop NT while even two-unit
   // blocks cannot fill one wave. Shapes with enough units (w2, the LM head)
   // break immediately and keep their measured NT.
@@ -2613,8 +2613,8 @@ void launch_kquant_mmq_q6k_streamk(const std::uint8_t* w, const std::int8_t* xq,
     }                                                                                            \
   } while (0)
   if (bm == 32) {
-    // ROUND 13: the PF register-prefetch staging extended to the BM=32 shapes
-    // (ROUND 12 shipped it BM=64-only). The body is BM-generic; the same
+    // Round 13: the PF register-prefetch staging extended to the BM=32 shapes
+    // (round 12 shipped it BM=64-only). The body is BM-generic; the same
     // CPI_KQUANT_MMQ_Q6K_PF knob selects it here.
     if (g_kq_tune.mmq_q6k_pf != 0) {
       if (nt_sel == 8) {
@@ -2637,7 +2637,7 @@ void launch_kquant_mmq_q6k_streamk(const std::uint8_t* w, const std::int8_t* xq,
     }
   } else {
     // One shape above batch 32: 64x128 in dynamic shared, occupancy 1.
-    // CPI_KQUANT_MMQ_Q6K_PF selects the register-prefetch staging (ROUND 12).
+    // CPI_KQUANT_MMQ_Q6K_PF selects the register-prefetch staging (round 12).
     if (g_kq_tune.mmq_q6k_pf != 0) {
       CPI_MMQ_Q6K_SK(8, 64, true);
     } else {
@@ -2701,13 +2701,13 @@ void launch_kquant_mmq_q4k_streamk(const std::uint8_t* w, const std::int8_t* xq,
   if (nt_sel >= 8 && (m2 || g_kq_tune.mmq_unpack == 0)) nt_sel = 4;
   const int bn = 4 * nt_sel * 8;
   // The unpacked body ships in the wide-tile shape only (auto-ANT picks NT=4
-  // above batch 16): at B=8 it measured -1.7% against the async kernel at BOTH
-  // NT (804 vs 818 tok/s interleaved, occupancy already fixed to 2 blocks/SM)
-  // -- the async kernel is memory-healthy there (54% DRAM, 917 GB/s, ROUND 10)
-  // and the staging trade only pays where the mma loop dominates. The M2
-  // dual-half shape (batch 33..64, NT=2, unpacked body only -- the caller
+  // above batch 16): at B=8 it measured -1.7% against the async kernel at both
+  // NT (804 vs 818 tok/s interleaved, occupancy already fixed to 2 blocks/SM),
+  // because the async kernel is memory-healthy there (54% DRAM, 917 GB/s,
+  // round 10) and the staging trade only pays where the mma loop dominates.
+  // The M2 dual-half shape (batch 33..64, NT=2, unpacked body only; the caller
   // routes CPI_KQUANT_MMQ_UNPACK=0 to the split-K async kernel) is where the
-  // mma loop dominates MOST: every staged fragment replays against two batch
+  // mma loop dominates most: every staged fragment replays against two batch
   // halves.
   // CPI_KQUANT_MMQ_UNPACK=2 forces the unpacked body at every NT (the default
   // gates it to the wide tile, where the mma loop dominates).
@@ -2752,7 +2752,7 @@ void launch_kquant_mmq_q4k_streamk(const std::uint8_t* w, const std::int8_t* xq,
       return;
     }
     // Fixup: Q6_K's at (NT=4, BM=64) is the exact [bidx][64][64] layout the M2
-    // MODE-2 epilogue stores -- kMmqBN = (128/64)*4*8 = 64 = this kernel's kBN.
+    // MODE-2 epilogue stores: kMmqBN = (128/64)*4*8 = 64 = this kernel's kBN.
     kquant_mmq_q4k_streamk_unpacked_kernel<2, true>
         <<<static_cast<unsigned>(nblocks), 256, 0, stream>>>(w, xq, xs, xsum, y, g_mmq_fixup,
                                                              rows, cols, batch, ldy);
@@ -2766,20 +2766,20 @@ void launch_kquant_mmq_q4k_streamk(const std::uint8_t* w, const std::int8_t* xq,
   if (nt_sel >= 8) {
     // 32x256 unpacked tile in 88 KB dynamic shared, occupancy 1
     // (CPI_KQUANT_MMQ_ANT=8, kept opt-in for reproducibility).
-    // FALSIFIED at B=32 (ROUND 13): the ROUND 12 occupancy-1 reversal does NOT
-    // extend to BM=32 -- widening N scales the REGISTER state (prefetch
+    // Falsified at B=32 (round 13): the round 12 occupancy-1 reversal does not
+    // extend to BM=32. Widening N scales the register state (prefetch
     // buffers + fragments + scales are all per-NT) where the M2 win widened M,
     // which only scales facc. Interleaved config medians vs the NT=4 default:
     //   - full prefetch (pq[8]+ph[8]): 1805.6 vs 2007.0 tok/s (-10.0%); ncu
     //     w13: 255 regs, 251k spill-loads, +7% instructions (3.39e7 vs 3.17e7)
-    //     for LESS memory work (gloads -40%, ldsm -17%), lg_throttle appears.
+    //     for less memory work (gloads -40%, ldsm -17%), lg_throttle appears.
     //   - header-slimmed prefetch (kPfHdr=false, below): 1871.9 vs 2017.9
     //     (-7.2%); instructions back to parity (3.19e7) but still 255 regs +
-    //     150k spill-loads, short_scoreboard 1.19 vs 0.73 -- equal instructions
+    //     150k spill-loads, short_scoreboard 1.19 vs 0.73, equal instructions
     //     at worse per-issue latency on the same 2-warps/scheduler floor.
-    // The symmetric occupancy test also FALSIFIED: NT=2 unpacked at B=32
-    // (28 KB tile, minBlocks=2, occupancy 2+ WITH prefetch, via ANT=2 +
-    // UNPACK=2): 1912.3 vs 1999.9 (-4.4%) -- doubled As restaging costs more
+    // The symmetric occupancy test also falsified: NT=2 unpacked at B=32
+    // (28 KB tile, minBlocks=2, occupancy 2+ with prefetch, via ANT=2 +
+    // UNPACK=2): 1912.3 vs 1999.9 (-4.4%); doubled As restaging costs more
     // than the extra blocks hide. B=32's 32x128 occ-1 shape is a measured
     // optimum among {64-wide occ-2, 128-wide occ-1, 256-wide occ-1}.
     using Smem = Q4kSmemLayout<8, false>;
@@ -2825,9 +2825,9 @@ void launch_kquant_mmq_q4k_streamk(const std::uint8_t* w, const std::int8_t* xq,
 #undef CPI_MMQ_Q4K_SK
 }
 
-// The decline conditions of launch_kquant_mmq, checkable WITHOUT launching.
+// The decline conditions of launch_kquant_mmq, checkable without launching.
 // packed_qkv_matmul is all-or-nothing across q/k/v: probing by launching meant
-// a layer whose wv declines had already run -- and then discarded -- the fused
+// a layer whose wv declines had already run, and then discarded, the fused
 // wq+wk MMQ, every layer, every step (~430 us/step at B=32 in the audit).
 bool kquant_mmq_accepts(KQuantType type, int batch, int cols, bool force_q6k) {
   if (type != KQuantType::Q4_K && type != KQuantType::Q6_K) return false;
@@ -2843,12 +2843,12 @@ bool launch_kquant_mmq(const std::uint8_t* w, KQuantType type, const half* x, ha
                        int cols, int batch, int ldy, std::int8_t* xq, float* xs, float* xsum,
                        cudaStream_t stream, bool reuse_x, bool force_q6k) {
   // force_q6k is for callers whose alternative is dequant-and-cuBLAS rather than
-  // a good kernel -- the LM head. For layer weights Q6_K MMQ is gated by mmq_q6k.
+  // a good kernel: the LM head. For layer weights Q6_K MMQ is gated by mmq_q6k.
   if (!kquant_mmq_accepts(type, batch, cols, force_q6k)) return false;
   const int groups_per_row = cols >> 5;
   const int total_groups = batch * groups_per_row;
   // The activation is quantized per call, and at batch the q, k and v
-  // projections all read the same one -- so it was being done three times a
+  // projections all read the same one, so it was being done three times a
   // layer. The microbenchmark shows why that matters: Q4_K MMQ takes about the
   // same 41 us for 2.4 MB as for 9.4, i.e. a large per-call fixed cost, and this
   // is a big part of it. Same redundancy the single-stream path had; the caller
@@ -2876,7 +2876,7 @@ bool launch_kquant_mmq(const std::uint8_t* w, KQuantType type, const half* x, ha
     }
     const bool us6 = sp6 > 1 && ensure_mmq_partial(static_cast<std::size_t>(batch) * rows);
     const dim3 g6(static_cast<unsigned>(bb6), us6 ? static_cast<unsigned>(sp6) : 1u);
-    // NT sets the N tile (2*NT*8 columns a block) and so the grid. Under THIS
+    // NT sets the N tile (2*NT*8 columns a block) and so the grid. Under this
     // launch NT=2 measured best (ebbe5f2); the stream-K launch above flipped
     // that to NT=4, which is why the two paths read separate knobs.
 #define CPI_MMQ_Q6K(N)                                                                         do {                                                                                           const dim3 gg(static_cast<unsigned>((rows + (2 * (N) * 8) - 1) / (2 * (N) * 8)),                            us6 ? static_cast<unsigned>(sp6) : 1u);                                        if (us6) {                                                                                     kquant_mmq_q6k_kernel<N, true>                                                                    <<<gg, 256, 0, stream>>>(w, xq, xs, y, g_mmq_partial, rows, cols, batch, ldy);            kquant_mmq_finalize_kernel<<<(rows + 255) / 256, 256, 0, stream>>>(g_mmq_partial, y,                                                                             rows, batch, ldy);        } else {                                                                                        kquant_mmq_q6k_kernel<N, false>                                                                    <<<gg, 256, 0, stream>>>(w, xq, xs, y, nullptr, rows, cols, batch, ldy);                }                                                                                           } while (0)
@@ -2899,7 +2899,7 @@ bool launch_kquant_mmq(const std::uint8_t* w, KQuantType type, const half* x, ha
     // NT=2 (64-wide output tile) measured better than NT=1 at every batch this
     // path serves: 475.2/690.7/938.9 against 429.0/664.6/823.8 at B=8/16/32 in
     // one run. It halves the grid, and for a 4096-row matrix that is 64 blocks
-    // against 170 SMs -- so the extra work per block outweighs filling the GPU,
+    // against 170 SMs, so the extra work per block outweighs filling the GPU,
     // which is the opposite of what the block count suggests. Measure, do not
     // reason from grid size here.
     // Batch 33..64 takes the dual-half M2 shape: NT=2 (the wide-N tile's shared
@@ -2909,7 +2909,7 @@ bool launch_kquant_mmq(const std::uint8_t* w, KQuantType type, const half* x, ha
     const int ant =
         m2 ? 2 : (g_kq_tune.mmq_async_nt > 0 ? g_kq_tune.mmq_async_nt : (batch > 16 ? 4 : 2));
     // Stream-K replaces the atomicAdd split-K + finalize. Batch 33..64 takes
-    // the M2 dual-half UNPACKED stream-K kernel (ROUND 12); with
+    // the M2 dual-half unpacked stream-K kernel (round 12); with
     // CPI_KQUANT_MMQ_UNPACK=0 it falls back to the split-K async M2 body
     // below, and CPI_KQUANT_MMQ_STREAMK=0 restores the split everywhere.
     if (g_kq_tune.mmq_streamk != 0 && (!m2 || g_kq_tune.mmq_unpack != 0)) {
@@ -2996,7 +2996,7 @@ bool launch_kquant_matmul(const std::uint8_t* w, KQuantType type, const half* x,
                           int cols, int batch, int ldy, cudaStream_t stream) {
   // This kernel is the mat-vec shape widened by a batch tile: warps split one
   // row and reduce partial products. llama.cpp uses that shape (MMVQ) only for
-  // small batches and switches to MMQ above -- activations quantized to q8_1,
+  // small batches and switches to MMQ above: activations quantized to q8_1,
   // weight tiles staged in shared memory, int8 tensor cores. CPI has no MMQ
   // equivalent, so past the crossover the expanded-weight cuBLAS GEMM is the
   // better answer: it at least gets fp16 tensor cores.
@@ -3031,7 +3031,7 @@ bool launch_kquant_matmul(const std::uint8_t* w, KQuantType type, const half* x,
 // float unpacking.
 //
 // Profiling the fp16-activation matvec on w13 put compute at 62.8% against DRAM
-// at 56.8% -- it is arithmetic-limited, and the arithmetic is converting each
+// at 56.8%: it is arithmetic-limited, and the arithmetic is converting each
 // 4-bit weight to float and multiplying. Four low nibbles of a 4-byte slice are
 // already four int8 lanes (`qw & 0x0F0F0F0F`), so one dp4a replaces four
 // convert-and-multiply pairs, and a second against 0x01010101 gives the group
@@ -3042,7 +3042,7 @@ bool launch_kquant_matmul(const std::uint8_t* w, KQuantType type, const half* x,
 // of saved arithmetic. The same idea lost in the batched matmul, where the
 // quantization happened per weight rather than per activation.
 //
-// It does change numerics -- int8 activations are what llama.cpp's MMVQ uses,
+// It does change numerics: int8 activations are what llama.cpp's MMVQ uses,
 // and it is why decode stops being bit-identical to the fp16 path. Opt-in.
 template <KQuantType TYPE, int WPR, bool ACC>
 __global__ void kquant_matvec_dp4a_kernel(const std::uint8_t* __restrict__ w,
@@ -3067,9 +3067,9 @@ __global__ void kquant_matvec_dp4a_kernel(const std::uint8_t* __restrict__ w,
   const int off_lo = (j << 6) + (t << 2);
   const int off_hi = off_lo + 32;
 
-  // The activation scales are NOT staged in shared. Tried it: one per 32 inputs
+  // The activation scales are not staged in shared. Tried it: one per 32 inputs
   // is 512 B for a 4096-wide matvec, so every block already finds them in L1,
-  // and with eight warps per row a block covers a single output row -- the
+  // and with eight warps per row a block covers a single output row, so the
   // staging pass and its __syncthreads are then paid per row to save loads that
   // were already free. Cost 3 points against llama.cpp.
   float acc = 0.0f;
@@ -3131,7 +3131,7 @@ __global__ void kquant_matvec_dp4a_kernel(const std::uint8_t* __restrict__ w,
 //
 // The dot was never the cost. Per super-block a lane ran two
 // scale_min_from_hdr decodes (~12 bit ops) and ~13 float ops to apply them,
-// against four dp4a -- the scale handling is roughly six times the dot. Both
+// against four dp4a: the scale handling is roughly six times the dot. Both
 // halves of an 8-byte slice land in the same pair of 32-groups, so their dots
 // can be summed as integers first and scaled once, which halves the scale work
 // and the qs load instructions for identical bytes moved.
@@ -3231,18 +3231,18 @@ __global__ void kquant_matvec_dp4a16_kernel(const std::uint8_t* __restrict__ w,
 // which said the scale work really was the limiter; this halves what is left.
 //
 // Eight lanes now cover a super-block and a warp covers four, so this wants four
-// warps per row rather than eight -- four warps x four super-blocks is exactly a
+// warps per row rather than eight: four warps x four super-blocks is exactly a
 // 4096-wide row. At WPR=8 half the block would find nothing to do. Two rows per
 // block keeps the same warps in flight.
 // Split-K does not apply here, though the shape of the problem invites it. A
 // per-shape microbenchmark showed the narrow projections at a fraction of the
-// MLP matrices' throughput -- wk at 102 GB/s against w1's 1684 -- which reads as
+// MLP matrices' throughput (wk at 102 GB/s against w1's 1684), which reads as
 // a starved GPU wanting more blocks. Two things were wrong with that. The bench
 // launches outside a graph, and on Windows the per-launch cost dominates: every
 // shape came out at 18-26 us regardless of size, so it was measuring launch
 // overhead, not bandwidth. And a 4096-wide row is only 16 super-blocks, which
 // one block already consumes entirely (4 warps x 4 each), so there is no column
-// depth left to split -- chunking it just idles three warps in four. Measured
+// depth left to split; chunking it just idles three warps in four. Measured
 // end to end it cost 8.8%: 220.5 against 241.9 tok/s. Use nsys, not that bench,
 // to decide anything about this kernel.
 template <KQuantType TYPE, int WPR, bool ACC, bool GSUM, bool VECX>
@@ -3290,7 +3290,7 @@ __global__ void kquant_matvec_dp4a32_kernel(const std::uint8_t* __restrict__ w,
     if (TYPE == KQuantType::Q5_K) hw = *reinterpret_cast<const uint4*>(p + 16 + (t << 4));
 
     const int xbase = sb * static_cast<int>(kSuperBlock);
-    // The four xl a lane wants are at off_lo + 0,4,8,12 -- sixteen contiguous
+    // The four xl a lane wants are at off_lo + 0,4,8,12: sixteen contiguous
     // bytes, and off_lo is a multiple of sixteen. Reading them as one int4
     // instead of four ints is the same traffic in a quarter of the load
     // instructions, which is what is left to win here now that the dot is not
@@ -3325,7 +3325,7 @@ __global__ void kquant_matvec_dp4a32_kernel(const std::uint8_t* __restrict__ w,
 
     // The -dmin*m term wants sum(x) over the whole group, not over this lane's
     // half of it, and the quantizer already wrote exactly that per group. Half
-    // the dp4a here used to recompute it against 0x01010101 -- once per row, for
+    // the dp4a here used to recompute it against 0x01010101, once per row, for
     // a quantity that does not depend on the row. The two lanes sharing a run
     // split the group between them, so letting t == 0 carry the entire
     // correction sums to the same value.
@@ -3357,8 +3357,8 @@ __global__ void kquant_matvec_dp4a32_kernel(const std::uint8_t* __restrict__ w,
   }
 }
 
-// Q6_K on the integer path. Q6_K is a quarter of a Q4_K_M model by bytes --
-// ffn_down for over half the layers, plus the output head -- and it was taking
+// Q6_K on the integer path. Q6_K is a quarter of a Q4_K_M model by bytes
+// (ffn_down for over half the layers, plus the output head), and it was taking
 // the fp16-activation matvec while everything else moved to dp4a.
 //
 // The reason it was excluded was that Q6_K carries a scale per 16 weights, not
@@ -3369,7 +3369,7 @@ __global__ void kquant_matvec_dp4a32_kernel(const std::uint8_t* __restrict__ w,
 // likewise constant, since off_lo advances inside a 32-aligned run.
 //
 // Blocks are 210 bytes, so p is only 2-byte aligned and the slice has to be read
-// as uint16 pairs rather than a uint2 -- the same reason kq_block_values does.
+// as uint16 pairs rather than a uint2, for the same reason kq_block_values does.
 //
 // Values are (q - 32) with q in 0..63, so the correction term is 32*sum(x)
 // against Q4_K's dmin*m*sum(x); the shape of the arithmetic is identical.
@@ -3441,7 +3441,7 @@ __global__ void kquant_matvec_dp4a_q6k_kernel(const std::uint8_t* __restrict__ w
       sum_hi = __dp4a(xh, 0x01010101, sum_hi);
     }
 
-    // The group-sum shortcut the Q4_K kernel uses does NOT work here, and the
+    // The group-sum shortcut the Q4_K kernel uses does not work here, and the
     // gate says so loudly (worst_rel 2.8). It needs one weight scale across the
     // lanes sharing an activation group, and Q6_K carries a scale per 16 weights
     // where the group is 32: the four lanes covering a group split across two
@@ -3477,17 +3477,17 @@ std::int8_t* g_dp4a_xq = nullptr;
 // that knows x is unchanged can skip re-quantizing it. -1 means nothing valid.
 int g_dp4a_ready_cols = -1;
 float* g_dp4a_xs = nullptr;
-// The quantizer writes a scale AND a group sum. The matvec only needs the
-// scale -- it derives its own partial sums with dp4a -- but the sum still needs
-// somewhere to land: aliasing it onto the scale buffer silently overwrote every
-// scale and produced fluent garbage.
+// The quantizer writes a scale and a group sum. The matvec only needs the
+// scale, since it derives its own partial sums with dp4a, but the sum still
+// needs somewhere to land: aliasing it onto the scale buffer silently overwrote
+// every scale and produced fluent garbage.
 float* g_dp4a_sum = nullptr;
 int g_dp4a_cols = 0;
 
-// Must be reserved BEFORE any capture: cudaMalloc inside a captured stream is
+// Must be reserved before any capture: cudaMalloc inside a captured stream is
 // rejected, and this scratch is sized from a kernel that the decode graph
 // captures. Reserving lazily crashed capture with "operation failed due to a
-// previous error during capture" -- the same trap the GEMM scratch hit.
+// previous error during capture", the same trap the GEMM scratch hit.
 bool g_capture_active = false;
 
 bool ensure_dp4a_scratch(int cols) {
@@ -3522,7 +3522,7 @@ bool try_dp4a_matvec(const std::uint8_t* w, KQuantType type, const half* x, half
   // fuse them into a packed triple because wv is Q6_K where wq and wk are Q4_K.
   // Quantizing it once per group of sharers rather than once per projection is
   // two fewer kernels per layer, 64 fewer per token. The caller is the only
-  // thing that knows x is unchanged, so it has to say so -- keying on the
+  // thing that knows x is unchanged, so it has to say so; keying on the
   // pointer would silently reuse across layers that share a residual buffer.
   const bool have_x = g_dp4a_ready_cols == cols && g_kq_tune.matvec_share_x;
   if (!(reuse && have_x)) {
@@ -3590,7 +3590,7 @@ static void launch_kquant_matvec_impl(const std::uint8_t* w, KQuantType type, co
   // Flat 8, measured end to end: 222.0 tok/s against 220.5 / 218.7 / 210.9 for
   // 8 / 4 / 1 in an earlier sweep. Two shape-aware rules were tried and both
   // lost (205.4 and 216.8) even though isolated per-shape benchmarks favoured
-  // them -- a matvec measured alone owns the whole GPU and a warm L2, which is
+  // them: a matvec measured alone owns the whole GPU and a warm L2, which is
   // nothing like running back to back inside the decode graph. Only end-to-end
   // numbers decide this.
   int wpr = forced;
@@ -3654,7 +3654,7 @@ void launch_kquant_matvec_residual(const std::uint8_t* w, KQuantType type, const
 }
 
 // The LM head stays on fp16 activations deliberately. It is 7.5% of a decode
-// step on its own -- 202 launches of ~296 us for 431 MB of Q6_K -- so it looked
+// step on its own, 202 launches of ~296 us for 431 MB of Q6_K, so it looked
 // like the last easy dp4a win. Wiring it through the integer path (templating
 // the kernels on output type, since this one writes fp32 logits) works and is
 // gate-clean, but nsys put the kernel at 291 us against 296: 1.6% of the kernel,

@@ -277,8 +277,8 @@ namespace detail_mmq {
 // kernel: batch 33..64 stages each weight tile once and replays it against
 // both 32-row batch halves, which beat the re-dequantize-everything fallback
 // by 9.9% at B=64 (1727 vs 1571 tok/s, interleaved). The extension attempt
-// BEFORE that kernel existed lost 7% -- above batch 32 the only MMQ was the
-// single-buffered kernel, weaker than even 3x-traffic dequant -- so if this
+// before that kernel existed lost 7% (above batch 32 the only MMQ was the
+// single-buffered kernel, weaker than even 3x-traffic dequant), so if this
 // band moves again, re-measure both edges. Q6_K caps itself at batch 32
 // inside kquant_mmq_accepts (its wide tile does not fit shared above that).
 // CPI_KQUANT_MMQ_MAX_BATCH re-pins.
@@ -314,7 +314,7 @@ inline bool dp4a_on() {
   }();
   return on;
 }
-// Mirrors packed_matmul's routing without launching: would SOME packed path
+// Mirrors packed_matmul's routing without launching: would some packed path
 // take this (weight, batch)? Used by the all-or-nothing QKV so a layer whose
 // wv must decline never pays for a wq+wk launch it is about to discard.
 inline bool would_accept(bool active, int kind, int cols, int batch) {
@@ -347,15 +347,15 @@ bool LlamaEngine::packed_matmul(const PackedWeight& w, const void* x, void* y, i
                                   static_cast<__half*>(y) + row0, w.rows, w.cols, stream, reuse_x);
     return true;
   }
-  // Int8 tensor cores (CPI_KQUANT_MMQ=1). Correct, gated, and still SLOWER than
+  // Int8 tensor cores (CPI_KQUANT_MMQ=1). Correct, gated, and still slower than
   // expand-and-cuBLAS: 535 against 738 tok/s at B=32. It keeps the weight packed
-  // and does reach the hardware cuBLAS wins on, so the architecture is right --
+  // and does reach the hardware cuBLAS wins on, so the architecture is right;
   // what is missing is tuning. Two known costs: the M tile is a fixed 64 rows,
   // so a batch of 2 computes 62 rows of padding, and the staging/occupancy work
   // llama.cpp carries per-architecture tile configs for is simply absent here.
   // MMQ is on by default now, but only across the batch range where it actually
   // wins. It keeps the weight packed, so it avoids expanding the whole matrix to
-  // fp16 every step -- w13 alone is 235 MB of fp16 per layer per step -- but its
+  // fp16 every step (w13 alone is 235 MB of fp16 per layer per step), but its
   // fixed 64-row M tile means small batches compute mostly padding, and at large
   // batches cuBLAS's tiling pulls ahead again. Measured against expand-and-cuBLAS
   // on an 8B Q4_K_M, batched decode tok/s:
@@ -380,10 +380,10 @@ bool LlamaEngine::packed_matmul(const PackedWeight& w, const void* x, void* y, i
     return true;
   }
 
-  // dp4a form, opt-in (CPI_KQUANT_DP4A=1) and currently NOT profitable.
+  // dp4a form, opt-in (CPI_KQUANT_DP4A=1) and currently not profitable.
   //
-  // The kernel is correct -- kquant_matvec_test gates it to 0.7% against the
-  // fp16 reference -- and the integer dots are genuinely cheaper. What sinks it
+  // The kernel is correct (kquant_matvec_test gates it to 0.7% against the
+  // fp16 reference) and the integer dots are genuinely cheaper. What sinks it
   // is the plumbing around it: activations are quantized inside this call, so
   // the same d_x_norm_ is re-quantized for qkv and again for w13, and a batched
   // step pays 32 layers x 4 weights of extra launches and traffic. Measured at
@@ -428,10 +428,10 @@ bool LlamaEngine::packed_qkv_matmul(const LayerDeviceWeights& lw, const void* x,
   if (!lw.wq_packed.active() || !lw.wv_packed.active()) return false;
   const int rows_q = lw.wq_packed.rows;
   const int rows_k = lw.wk_packed.active() ? lw.wk_packed.rows : 0;
-  // Decline BEFORE launching anything. Probing by launching cost ~430 us/step
+  // Decline before launching anything. Probing by launching cost ~430 us/step
   // at B=32: wq+wk (Q4_K) ran its MMQ, then wv (Q6_K, gated off) declined, the
   // whole projection fell back to dequant+cuBLAS, and the finished MMQ output
-  // was overwritten -- every split-QKV layer, every step (2026-08-12 audit).
+  // was overwritten, every split-QKV layer, every step (2026-08-12 audit).
   if (!detail_mmq::would_accept(true, lw.wq_packed.kind, lw.wq_packed.cols, batch) ||
       (rows_k > 0 && !detail_mmq::would_accept(true, lw.wk_packed.kind, lw.wk_packed.cols, batch)) ||
       !detail_mmq::would_accept(true, lw.wv_packed.kind, lw.wv_packed.cols, batch)) {

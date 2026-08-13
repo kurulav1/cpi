@@ -28,7 +28,7 @@ inline bool fuse_att_q8() {
 namespace {
 // rmsnorm that also leaves the q8_1 activation the integer matvec wants, so the
 // consumer can skip its own quantize pass. `allow` is false where the consumer
-// reads something other than the value we just normalised -- the TQ3 path
+// reads something other than the value we just normalised; the TQ3 path
 // rotates a copy first, so the scratch would describe the wrong vector.
 inline bool norm_maybe_q8(const __half* x, const __half* w, __half* y, int cols, float eps,
                           cudaStream_t stream, bool allow) {
@@ -382,7 +382,7 @@ void LlamaEngine::init_greedy_decode_graph() {
       // Residual folded into the epilogue when no bias sits between them, which
       // is what the fp16 path does; otherwise the bias needs its own buffer.
       ++packed_matvec_calls_;
-      // The bias BUFFER is always allocated and zero-filled, so testing the
+      // The bias buffer is always allocated and zero-filled, so testing the
       // pointer never fuses. What matters is whether the model actually carries
       // attention.bo.
       const bool fuse = !has_any_layer_output_bias_;
@@ -867,7 +867,7 @@ void LlamaEngine::init_logits_decode_graph() {
       // Residual folded into the epilogue when no bias sits between them, which
       // is what the fp16 path does; otherwise the bias needs its own buffer.
       ++packed_matvec_calls_;
-      // The bias BUFFER is always allocated and zero-filled, so testing the
+      // The bias buffer is always allocated and zero-filled, so testing the
       // pointer never fuses. What matters is whether the model actually carries
       // attention.bo.
       const bool fuse = !has_any_layer_output_bias_;
@@ -1113,10 +1113,10 @@ bool LlamaEngine::decode_next_token_device_topk(int token, int position, float t
                                       d_topk_val_ + (k - 1), d_cand_idx_, d_cand_val_,
                                       d_cand_count_, kCandCapacity, compute_stream_);
   CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
-  // FALSIFIED (2026-08-12): replacing the three blocking cudaMemcpy readbacks below
-  // with cudaMemcpyAsync into pinned buffers queued before ONE sync measured SLOWER,
+  // Falsified (2026-08-12): replacing the three blocking cudaMemcpy readbacks below
+  // with cudaMemcpyAsync into pinned buffers queued before one sync measured slower,
   // not faster: interleaved single-stream pairs -0.9/-2.9/-3.5% (242.8 -> 236.5
-  // median decode tok/s), and nsys showed the sampler-tail GPU idle GREW (gather->D2H
+  // median decode tok/s), and nsys showed the sampler-tail GPU idle grew (gather->D2H
   // gap 39 -> 54us, last-D2H -> next-H2D 80 -> 96us; idle 283 -> 332us/step). On this
   // WDDM box a tiny blocking D2H evidently takes a cheap immediate-readback path,
   // while a queued DMA + sync pays scheduler latency per hop. Do not retry the

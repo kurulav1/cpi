@@ -1255,7 +1255,7 @@ void launch_half_gemv_glu(const half* wg, const half* wu, const half* x, half* y
 //
 // Device-side ggml k-quant dequantization: `blocks` 256-weight super-blocks in, fp16
 // out. The packed blocks are uploaded as-is, so the host never materializes the fp16
-// copy. Gated against the host reference by kquant_dequant_test -- a mistake in this
+// copy. Gated against the host reference by kquant_dequant_test; a mistake in this
 // arithmetic reads as slightly-wrong weights, not as a failure.
 enum class KQuantType { Q4_K, Q5_K, Q6_K };
 void launch_dequant_kquant(const std::uint8_t* blocks_in, KQuantType type, std::size_t blocks,
@@ -1263,12 +1263,12 @@ void launch_dequant_kquant(const std::uint8_t* blocks_in, KQuantType type, std::
 
 // launch_kquant_matvec
 //
-// y[rows] = W[rows, cols] * x[cols] with W left PACKED: the super-blocks are unpacked
+// y[rows] = W[rows, cols] * x[cols] with W left packed: the super-blocks are unpacked
 // inside the kernel, so the weight never exists as fp16 and a quantized model stays
 // resident at its file size. cols must be a multiple of 256. Gated by
 // kquant_matvec_test against a host dequant + fp32 dot.
 // Per-box tuning knobs for the k-quant kernels. Runtime-settable so a tuner can
-// re-time an incumbent against a candidate inside a single process -- comparing
+// re-time an incumbent against a candidate inside a single process; comparing
 // across processes loses the effect in thermal drift.
 struct KQuantTuning {
   int mm_max = 8;        // largest batch the register-tile matmul takes
@@ -1279,13 +1279,13 @@ struct KQuantTuning {
   // B=16 is a wash. Auto picks 4 above batch 16, 2 at or below.
   int mmq_async_nt = 0;
   int mmq_async = 1;
-  // Q6_K on the tensor cores. ON since the 32x128 stream-K tile: interleaved
+  // Q6_K on the tensor cores. On since the 32x128 stream-K tile: interleaved
   // medians vs the dequant+cuBLAS fallback, 2026-08-12 evening session:
-  // B=8 +2.6% (621 vs 606), B=32 +0.9% (1449 vs 1435). The flip from LOSES to
-  // WINS was activation-restaging (tile width), not staging instruction shape.
+  // B=8 +2.6% (621 vs 606), B=32 +0.9% (1449 vs 1435). The flip from losing to
+  // winning was activation-restaging (tile width), not staging instruction shape.
   int mmq_q6k = 1;
   // Split the MMQ super-block loop across blocks. That loop is the kernel's
-  // cost -- w13 has 3.5x wq's weight bytes and takes the same time -- so
+  // cost (w13 has 3.5x wq's weight bytes and takes the same time), so
   // shortening the per-block chain is the lever, not more rows per block.
   int mmq_splitk = 1;
   int mmq_split_target = 340;  // ~2 blocks per SM on this part     // use the cp.async kernel when the batch fits
@@ -1300,14 +1300,14 @@ struct KQuantTuning {
   // mmq_nt because the right default flipped when stream-K landed: under the
   // one-tile-per-block launch NT=2 measured best (ebbe5f2), but with stream-K
   // NT=4 takes w2 from ~142 to ~119 us a call and the force_q6k LM head from
-  // 1246 to 956 us -- the wider tile halves the activation re-staging per
+  // 1246 to 956 us. The wider tile halves the activation re-staging per
   // output byte, and stream-K's balanced kbc ranges remove the grid-shrink
   // penalty that used to make wide tiles lose.
   int mmq_q6k_nt = 4;
-  // Unpack-at-staging body for the Q4_K stream-K MMQ (ROUND 11): nibbles
+  // Unpack-at-staging body for the Q4_K stream-K MMQ (round 11): nibbles
   // expanded to an int8 tile and (d*sc, dmin*m) folded to a float2 tile in the
   // staging pass, so the mma loop is ldsm + mma + a 64-bit scale load per
-  // fragment -- llama.cpp's structure, replacing the per-fragment unpack +
+  // fragment, llama.cpp's structure, replacing the per-fragment unpack +
   // header decode that made the async kernel execute 2.34x llama's
   // instructions per byte. 0 restores the cp.async raw-staging kernel.
   int mmq_unpack = 1;
@@ -1315,9 +1315,9 @@ struct KQuantTuning {
   // 36 KB static shared at occupancy 2; 4 = 64x128 in 56 KB dynamic shared at
   // occupancy 1 (halves activation restaging, loses the co-resident block).
   // 4 wins: 2455.8 vs 2302.9 tok/s at B=64 (+6.6%) and 2187 vs 2091 at B=48
-  // (+4.6%), interleaved same-binary config medians -- the register-prefetch
+  // (+4.6%), interleaved same-binary config medians. The register-prefetch
   // hides staging latency well enough that occupancy 1 stops mattering, the
-  // opposite of the unpipelined ROUND 4/6 verdicts.
+  // opposite of the unpipelined round 4/6 verdicts.
   int mmq_m2_nt = 4;
   // Register-prefetch staging for the Q6_K 64x128 dynamic-shared shape (batch
   // 33..64): the next super-block's raw ql/qh/scale bytes load into registers
@@ -1325,13 +1325,13 @@ struct KQuantTuning {
   // launch cannot get from a co-resident block. BM=32 shapes are untouched.
   int mmq_q6k_pf = 1;
   int matvec_wpr = 8;    // warps cooperating on one row in the matvec
-  // int8 activations + dp4a in the matvec. Changes numerics -- this is the same
-  // trade llama.cpp's MMVQ makes by default -- but greedy decoding stayed
+  // int8 activations + dp4a in the matvec. Changes numerics (this is the same
+  // trade llama.cpp's MMVQ makes by default), but greedy decoding stayed
   // token-identical to the fp16-activation path over 267 tokens of code
   // generation, and it is worth ~7% (222 -> 238 tok/s on an 8B Q4_K_M).
   int matvec_dp4a = 1;
   // Bytes of qs each lane takes, as 0 = 4, 1 = 8, 2 = 16. One scale decode
-  // covers the whole slice, and scale handling -- not the dot -- was the
+  // covers the whole slice, and scale handling, not the dot, was the
   // matvec's limiter: 4 -> 8 -> 16 bytes ran 90.0 -> 94.3 -> 96.4% of llama.cpp.
   int matvec_dp4a16 = 2;
   // Q6_K on the integer path too. Its scales are per 16 weights rather than 32,
@@ -1352,7 +1352,7 @@ void set_kquant_tuning(const KQuantTuning& t);
 KQuantTuning get_kquant_tuning();
 
 // Batched form: y[b, n] = sum_k x[b, k] * W[n, k], W left packed. x is
-// [batch, cols] and y is [batch, rows], both row-major -- the layout the fp16
+// [batch, cols] and y is [batch, rows], both row-major, the layout the fp16
 // GEMM path already produces. Returns false when the batch is outside the range
 // this is worth doing for, which is the caller's cue to expand and use cuBLAS.
 bool launch_kquant_matmul(const std::uint8_t* w, KQuantType type, const half* x, half* y, int rows,
@@ -1360,14 +1360,14 @@ bool launch_kquant_matmul(const std::uint8_t* w, KQuantType type, const half* x,
 
 // dp4a form: activations are quantized to int8 with a scale and sum per
 // 32-group (llama.cpp's q8_1 idea) and the inner loop becomes integer dots.
-// Q4_K/Q5_K only -- Q6_K's per-16 scales do not line up with those groups.
+// Q4_K/Q5_K only; Q6_K's per-16 scales do not line up with those groups.
 // xq/xs/xsum are caller-owned scratch sized batch*cols, batch*cols/32, same.
 bool launch_kquant_matmul_dp4a(const std::uint8_t* w, KQuantType type, const half* x, half* y,
                                int rows, int cols, int batch, int ldy, std::int8_t* xq, float* xs,
                                float* xsum, cudaStream_t stream);
 
 // Q4_K on int8 tensor cores (mma.m16n8k32.s8, sm_80+): the weight stays packed
-// AND the inner product runs on tensor cores, which is what the expand-and-cuBLAS
+// and the inner product runs on tensor cores, which is what the expand-and-cuBLAS
 // fallback was winning on. Batch must fit one M tile (64). Same scratch as above.
 // reuse_x: the caller has already had this exact activation quantized into
 // xq/xs/xsum by an immediately preceding call of the same width, as q/k/v do.
@@ -1375,7 +1375,7 @@ bool launch_kquant_mmq(const std::uint8_t* w, KQuantType type, const half* x, ha
                        int cols, int batch, int ldy, std::int8_t* xq, float* xs, float* xsum,
                        cudaStream_t stream, bool reuse_x = false, bool force_q6k = false);
 // Whether launch_kquant_mmq would take this shape, without launching anything.
-// Lets an all-or-nothing caller (packed_qkv_matmul) decline BEFORE paying for
+// Lets an all-or-nothing caller (packed_qkv_matmul) decline before paying for
 // the parts that would succeed.
 bool kquant_mmq_accepts(KQuantType type, int batch, int cols, bool force_q6k = false);
 
@@ -1385,7 +1385,7 @@ bool kquant_mmq_accepts(KQuantType type, int batch, int cols, bool force_q6k = f
 // ── Graph-capture safety ─────────────────────────────────────────────────────
 //
 // Allocating inside a captured stream is rejected, but CUDA reports it as
-// "operation failed due to a previous error during capture" at the END of
+// "operation failed due to a previous error during capture" at the end of
 // capture, naming nothing. That turns a one-line bug into an afternoon, and it
 // has cost this codebase two of them.
 //
