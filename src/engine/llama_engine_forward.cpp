@@ -169,7 +169,6 @@ bool LlamaEngine::prefill_attention_tensorcore(const void* q, const void* k_laye
   // 256, not 128: halves the number of chunk iterations (each carries a pointer-array copy
   // and three launches) and gives the GEMMs twice the n dimension to work with.
   constexpr int kChunk = 256;
-  const int keys = base_pos + rows;  // this chunk's KV is already stored; the mask does the rest
   const int group = num_heads / num_kv_heads;
   // q_stride comes from the caller: num_heads*head_dim for a split Q buffer, or the full
   // fused QKV row stride when Q is read in place.
@@ -202,6 +201,14 @@ bool LlamaEngine::prefill_attention_tensorcore(const void* q, const void* k_laye
 
   for (int c0 = 0; c0 < rows; c0 += kChunk) {
     const int chunk = std::min(kChunk, rows - c0);
+    // Keys this query chunk can actually see. The last query in the chunk is at absolute
+    // position base_pos + c0 + chunk - 1, so nothing beyond base_pos + c0 + chunk is ever
+    // unmasked. The whole prefill used to pass base_pos + rows here for every chunk, which at
+    // 2048 rows computed 16384 chunk-key columns where 9216 are reachable: 44% of the Q.K^T
+    // GEMM, of the softmax and of the P.V GEMM was producing entries the causal mask then set
+    // to zero. Trimming is exact rather than an approximation; the dropped columns are the ones
+    // softmax writes as zero and P.V multiplies by zero.
+    const int keys = base_pos + c0 + chunk;
 
     // Pointer arrays are built on device, on this stream. Staging them from the host into a
     // reused pinned buffer was a race; this function runs once per layer, so the next layer
