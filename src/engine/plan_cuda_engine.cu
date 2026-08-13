@@ -5097,6 +5097,15 @@ std::vector<int> PlanCudaEngine::generate_stream(const std::vector<int>& prompt,
   // and depends on the draft policy (3-gram vs 6-gram give different output). It can cascade into
   // repetition loops. Making it lossless requires reconciling the verify and decode kernel numerics
   // (prefill-parity-class work); see memory:cpi-cuda-spec-decode. Until then this is experimental.
+  //
+  // Audited 2026-08-13 (Gemma-4 E2B int4): the T=16 verify's model mechanics are correct -- the
+  // mt device-pos attention applies the per-token sliding window (k_start = seq_len - window in
+  // both the stats and reduce kernels), the seq rope takes each op's own cos/sin tables (dual
+  // rope), and acceptance requires verdict == draft exactly. Spec matched plain greedy on all
+  // 256-token gate prompts including the historical failing one; at 1024 tokens it forks about
+  // once per 500-1000 tokens on prose/code (isolated near-tie flips, coherent continuations, no
+  // repetition loop reproduced). Repetitive speedup 1.34x retained. The residual divergence is
+  // the kernel-family rounding above, so the warning stays.
   const char* spec_env = std::getenv("CPI_CUDA_SPEC");
   const int spec_k = spec_env ? std::min(std::atoi(spec_env), 15) : 0;
   if (spec_k >= 1) {
