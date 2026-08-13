@@ -35,6 +35,7 @@ MMapFile& MMapFile::operator=(MMapFile&& other) noexcept {
   close();
   data_ = other.data_;
   size_ = other.size_;
+  prefetch_thread_ = std::move(other.prefetch_thread_);
 #ifdef _WIN32
   file_handle_ = other.file_handle_;
   mapping_handle_ = other.mapping_handle_;
@@ -142,12 +143,25 @@ void MMapFile::prefetch() const {
     }
   }
 #ifdef _WIN32
-  // PrefetchVirtualMemory asynchronously reads the pages into the working set.
-  // Available since Windows 8. Fails silently if the API is unavailable.
-  WIN32_MEMORY_RANGE_ENTRY entry;
-  entry.VirtualAddress = const_cast<std::byte*>(data_);
-  entry.NumberOfBytes = size_;
-  PrefetchVirtualMemory(GetCurrentProcess(), 1, &entry, 0);
+  // PrefetchVirtualMemory reads the pages into the working set. Available since
+  // Windows 8. Fails silently if the API is unavailable. The call is far from
+  // instant: for a multi-GB file already in the file cache it spends ~50 ms/GB
+  // inserting pages before returning (~250 ms of an 8B warm load, all of it in
+  // open()), and the load loop was measured to run at the same speed whether or
+  // not those insertions happened. The hint's value is the disk read-ahead it
+  // starts on a cold cache, not its completion, so it runs on a background
+  // thread; close() joins it before the mapping goes away.
+  if (prefetch_thread_.joinable()) {
+    return;  // one in-flight hint per mapping is enough
+  }
+  const std::byte* base = data_;
+  const std::size_t bytes = size_;
+  prefetch_thread_ = std::thread([base, bytes]() {
+    WIN32_MEMORY_RANGE_ENTRY entry;
+    entry.VirtualAddress = const_cast<std::byte*>(base);
+    entry.NumberOfBytes = bytes;
+    PrefetchVirtualMemory(GetCurrentProcess(), 1, &entry, 0);
+  });
 #else
   // MADV_WILLNEED tells the kernel to read-ahead the mapped region
   // into the page cache. The call returns immediately.
@@ -156,6 +170,9 @@ void MMapFile::prefetch() const {
 }
 
 void MMapFile::close() {
+  if (prefetch_thread_.joinable()) {
+    prefetch_thread_.join();  // the hint references the mapping; let it finish first
+  }
 #ifdef _WIN32
   if (data_) {
     UnmapViewOfFile(data_);

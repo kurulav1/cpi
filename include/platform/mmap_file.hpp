@@ -17,6 +17,7 @@
 #include <cstddef>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 namespace platform {
 
@@ -64,14 +65,16 @@ public:
   }
 
   // Hint to the OS to prefetch the entire mapped region into the page cache.
-  // Non-blocking: the OS services the hint asynchronously. Best called immediately
-  // after open() so disk I/O overlaps with GPU/CPU setup work.
-  // No-op if the mapping is not valid.
+  // Best called immediately after open() so disk I/O overlaps with GPU/CPU
+  // setup work. The Windows hint call itself is not free (it inserts pages
+  // into the working set before returning), so it runs on a background thread
+  // that close() joins. No-op if the mapping is not valid.
   void prefetch() const;
 
 private:
   const std::byte* data_ = nullptr;  // base address of the mapped view
   std::size_t size_ = 0;             // byte length of the mapped view
+  mutable std::thread prefetch_thread_;  // in-flight prefetch hint, joined by close()
 
 #ifdef _WIN32
   // Windows requires two HANDLEs: one for the file, one for the mapping object.
