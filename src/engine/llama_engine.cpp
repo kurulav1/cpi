@@ -605,6 +605,7 @@ void LlamaEngine::maybe_add_half_bias(void* out, const void* bias, int rows, int
 }
 
 LlamaEngine::~LlamaEngine() {
+  free_load_staging();
   destroy_greedy_decode_graph();
   destroy_logits_decode_graph();
   for (auto& plan : lt_plan_cache_) {
@@ -1333,6 +1334,9 @@ void LlamaEngine::initialize(const EngineOptions& options) {
     init_greedy_decode_graph();
     init_logits_decode_graph();
   });
+
+  // The pinned staging ring only serves load-time uploads; give the 128 MB back.
+  free_load_staging();
 
   // Reclaim streaming staging when every layer is resident. The streaming decode double-buffer
   // (streaming_layer_weights_[2] / _i8_[2]) is only used for layers >= cached_layer_count_, so once

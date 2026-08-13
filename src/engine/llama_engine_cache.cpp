@@ -127,6 +127,106 @@ bool LlamaEngine::tq_cached_preflight_layers(int layers, std::string* reason) co
   return true;
 }
 
+// Load-time H2D staging ring; see the header comment. Two pinned buffers so the
+// host memcpy into one overlaps the DMA out of the other; the per-buffer event
+// keeps a buffer from being rewritten while its copy is still in flight.
+bool LlamaEngine::staged_h2d(void* dst, const void* src, std::size_t bytes) {
+  constexpr std::size_t kChunk = std::size_t{64} << 20;  // 2 x 64 MB, bounded
+  constexpr std::size_t kMinStaged = std::size_t{1} << 20;
+  static const bool disabled = []() {
+    const char* env = std::getenv("CPI_LOAD_PINNED_RING");
+    return env != nullptr && env[0] == '0';
+  }();
+  if (bytes >= kMinStaged && !disabled && !load_staging_failed_ &&
+      load_staging_buf_[0] == nullptr) {
+    for (int i = 0; i < 2 && !load_staging_failed_; ++i) {
+      cudaEvent_t ev = nullptr;
+      if (cudaHostAlloc(&load_staging_buf_[i], kChunk, cudaHostAllocDefault) != cudaSuccess ||
+          cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) {
+        load_staging_failed_ = true;  // stay on the plain copy rather than fail the load
+        cudaGetLastError();
+      }
+      load_staging_ev_[i] = ev;
+    }
+    if (load_staging_failed_) {
+      free_load_staging();
+    }
+  }
+  if (bytes < kMinStaged || disabled || load_staging_failed_) {
+    // Synchronous on purpose: callers may free `src` on return.
+    return cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice) == cudaSuccess;
+  }
+  const auto* s = static_cast<const std::uint8_t*>(src);
+  auto* d = static_cast<std::uint8_t*>(dst);
+  int slot = 0;
+  for (std::size_t off = 0; off < bytes; off += kChunk, slot ^= 1) {
+    const std::size_t n = std::min(kChunk, bytes - off);
+    auto ev = static_cast<cudaEvent_t>(load_staging_ev_[slot]);
+    const auto tw0 = std::chrono::steady_clock::now();
+    if (cudaEventSynchronize(ev) != cudaSuccess) return false;
+    const auto tm0 = std::chrono::steady_clock::now();
+    // The single-threaded copy out of the mapping runs at ~3.8 GB/s here and is
+    // soft-fault bound, not bandwidth bound: every 4 KB page of a fresh mapping
+    // pays a page-table fill even when the file cache already holds the data.
+    // Faulting on several threads scales that work with cores.
+    const std::size_t kSlice = std::size_t{4} << 20;
+    const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+    const unsigned want = static_cast<unsigned>((n + kSlice - 1) / kSlice);
+    static const unsigned cap = []() {
+      const char* env = std::getenv("CPI_LOAD_FAULT_THREADS");
+      const int v = env != nullptr ? std::atoi(env) : 0;
+      return v > 0 ? static_cast<unsigned>(v) : 16u;
+    }();
+    const unsigned nt = std::min({hw, want, cap});
+    if (nt <= 1) {
+      std::memcpy(load_staging_buf_[slot], s + off, n);
+    } else {
+      const std::size_t per = (n + nt - 1) / nt;
+      std::vector<std::thread> workers;
+      workers.reserve(nt);
+      for (unsigned t = 0; t < nt; ++t) {
+        const std::size_t b = t * per;
+        if (b >= n) break;
+        const std::size_t e = std::min(n, b + per);
+        workers.emplace_back([this, slot, s, off, b, e]() {
+          std::memcpy(static_cast<std::uint8_t*>(load_staging_buf_[slot]) + b, s + off + b, e - b);
+        });
+      }
+      for (auto& w : workers) w.join();
+    }
+    const auto tm1 = std::chrono::steady_clock::now();
+    load_staging_wait_ms_ += std::chrono::duration<double, std::milli>(tm0 - tw0).count();
+    load_staging_memcpy_ms_ += std::chrono::duration<double, std::milli>(tm1 - tm0).count();
+    load_staging_bytes_ += n;
+    if (cudaMemcpyAsync(d + off, load_staging_buf_[slot], n, cudaMemcpyHostToDevice,
+                        transfer_stream_) != cudaSuccess) {
+      return false;
+    }
+    if (cudaEventRecord(ev, transfer_stream_) != cudaSuccess) return false;
+  }
+  return true;
+}
+
+void LlamaEngine::free_load_staging() {
+  if (load_staging_bytes_ > 0 && std::getenv("CPI_STARTUP_PROFILE") != nullptr) {
+    std::cout << "[startup]   staged_h2d bytes_mb=" << (load_staging_bytes_ >> 20)
+              << " memcpy_ms=" << load_staging_memcpy_ms_
+              << " dma_wait_ms=" << load_staging_wait_ms_ << "\n";
+    load_staging_bytes_ = 0;
+  }
+  for (int i = 0; i < 2; ++i) {
+    if (load_staging_ev_[i] != nullptr) {
+      cudaEventSynchronize(static_cast<cudaEvent_t>(load_staging_ev_[i]));
+      cudaEventDestroy(static_cast<cudaEvent_t>(load_staging_ev_[i]));
+      load_staging_ev_[i] = nullptr;
+    }
+    if (load_staging_buf_[i] != nullptr) {
+      cudaFreeHost(load_staging_buf_[i]);
+      load_staging_buf_[i] = nullptr;
+    }
+  }
+}
+
 // Uploads one packed tensor into `dst`, undoing the converter's Q/K row
 // interleave on the way when the container reports one. The un-permute moves
 // whole rows and a packed row is a contiguous run of super-blocks, so it is a
@@ -135,8 +235,7 @@ bool LlamaEngine::tq_cached_preflight_layers(int layers, std::string* reason) co
 bool LlamaEngine::upload_packed_rows(const model::GgufLoader::PackedTensor& pk, void* dst) {
   const std::size_t row_bytes = pk.bytes / static_cast<std::size_t>(pk.rows);
   if (pk.permute_heads <= 0 || pk.rows % pk.permute_heads != 0) {
-    return cudaMemcpyAsync(dst, pk.data, pk.bytes, cudaMemcpyHostToDevice, transfer_stream_) ==
-           cudaSuccess;
+    return staged_h2d(dst, pk.data, pk.bytes);
   }
   const int hd = pk.rows / pk.permute_heads;  // rows per head
   const int hh = hd / 2;
@@ -149,8 +248,8 @@ bool LlamaEngine::upload_packed_rows(const model::GgufLoader::PackedTensor& pk, 
                   src + (static_cast<std::size_t>(h * hd + src_row) * row_bytes), row_bytes);
     }
   }
-  // Synchronous: tmp is a local buffer and must not outlive the copy.
-  return cudaMemcpy(dst, tmp.data(), pk.bytes, cudaMemcpyHostToDevice) == cudaSuccess;
+  // staged_h2d consumes tmp before returning, so the local buffer may die here.
+  return staged_h2d(dst, tmp.data(), pk.bytes);
 }
 
 // CPI fuses Q, K and V into one matrix; a GGUF stores them apart. Concatenating

@@ -698,6 +698,25 @@ private:
 
   bool upload_packed_rows(const model::GgufLoader::PackedTensor& pk, void* dst);
 
+  // Load-time H2D through a small pinned ring. cudaMemcpyAsync from the pageable
+  // GGUF mapping moves ~3 GB/s on Windows because the driver stages every chunk
+  // through its own tiny pinned buffer; hand-staging through two 64 MB pinned
+  // buffers (host memcpy into one while the other DMAs) runs the same bytes at
+  // an order of magnitude faster on a warm cache. The source is fully consumed
+  // by the time this returns, so callers may free it; the device copy may still
+  // be in flight on transfer_stream_. Falls back to a synchronous copy when the
+  // pinned allocation is unavailable. Startup-scoped: free_load_staging()
+  // releases the ring once the model is resident.
+  bool staged_h2d(void* dst, const void* src, std::size_t bytes);
+  void free_load_staging();
+  void* load_staging_buf_[2] = {nullptr, nullptr};
+  void* load_staging_ev_[2] = {nullptr, nullptr};
+  bool load_staging_failed_ = false;
+  // CPI_STARTUP_PROFILE accounting for the ring: where the staged time goes.
+  double load_staging_memcpy_ms_ = 0.0;
+  double load_staging_wait_ms_ = 0.0;
+  std::size_t load_staging_bytes_ = 0;
+
   // Single-token QKV straight off the packed blocks. False when this layer kept
   // its fp16 fused matrix, which is the caller's cue to run the old path.
   // x_pre_quantized: the rmsnorm that produced x_norm already wrote its q8_1
