@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -411,21 +412,39 @@ void GgufLoader::open(const std::string& path) {
   // A quantized file that silently costs fp16 residency is a surprise worth
   // spending one line on: the download is small, the resident model is not,
   // and the flag that fixes it also makes decode faster (fewer weight bytes
-  // per token). Only printed when the file actually carries quantized weights.
+  // per token). Only printed when the file actually carries quantized weights,
+  // and only when the packed k-quant route is inactive: with CPI_KQUANT_PACKED
+  // set the weights stay packed, so that advice would be wrong for the run and
+  // a single accurate line replaces it. Once per process, not per open: the
+  // config probe and the tokenizer extraction each open the file again, and
+  // three copies of one hint read as three problems.
   bool quantized = false;
+  bool kquant = false;
   for (const auto& [cpi_name, gguf_name] : cpi_to_gguf_) {
     (void)cpi_name;
     const GgmlType t = tensors_.at(gguf_name).type;
-    if (t != GgmlType::F32 && t != GgmlType::F16 && t != GgmlType::BF16) {
-      quantized = true;
+    if (t == GgmlType::F32 || t == GgmlType::F16 || t == GgmlType::BF16) continue;
+    quantized = true;
+    if (t == GgmlType::Q4_K || t == GgmlType::Q5_K || t == GgmlType::Q6_K) {
+      kquant = true;
       break;
     }
   }
-  if (quantized) {
-    std::fprintf(stderr,
-                 "[gguf] quantized weights are dequantized to fp16 at load, so this model is "
-                 "resident at its fp16 size. Pass --weight-quant int4 (or int8) to keep it packed "
-                 "on the GPU: less VRAM, and faster decode.\n");
+  static bool residency_hint_printed = false;
+  if (quantized && !residency_hint_printed) {
+    residency_hint_printed = true;
+    // Same activation condition as the engine's packed stagers (a non-zero
+    // CPI_KQUANT_PACKED mask over k-quant tensors this reader can serve packed).
+    const char* packed_env = std::getenv("CPI_KQUANT_PACKED");
+    const bool packed_active = kquant && packed_env != nullptr && std::atoi(packed_env) != 0;
+    if (packed_active) {
+      std::fprintf(stderr, "[gguf] packed k-quant weights resident (CPI_KQUANT_PACKED)\n");
+    } else {
+      std::fprintf(stderr,
+                   "[gguf] quantized weights are dequantized to fp16 at load, so this model is "
+                   "resident at its fp16 size. Pass --weight-quant int4 (or int8) to keep it packed "
+                   "on the GPU: less VRAM, and faster decode.\n");
+    }
   }
 }
 
