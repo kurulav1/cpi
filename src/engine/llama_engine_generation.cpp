@@ -182,6 +182,14 @@ void LlamaEngine::prefill_prompt(const std::vector<int>& prompt_tokens, int star
    * Process prompt tokens in small fp16 chunks so we can reuse larger GEMMs
    * and batched attention without changing the exact decode path.
    */
+  // Falsified: spreading the prompt evenly over ceil(rows / chunk) chunks instead of filling
+  // each chunk and leaving a remainder. The motivation was real: a chunk expands the whole
+  // packed model to fp16 once regardless of its row count, so a 2051-token prompt splits
+  // 2048 + 3 and pays about 20 ms for its last three tokens. Splitting it 1026 + 1025 instead
+  // measured slower at every length: -1.9% at 2051 tokens and -5.0% at 4057 (interleaved binary
+  // pairs, medians of 3, generated text identical either way). A chunk whose row count is a
+  // clean multiple of the cuBLAS tile is worth more than the tail chunk costs, so the remainder
+  // form stays. If this is retried, keep every chunk row count a multiple of 256.
   for (int chunk_start = std::max(0, start_pos); chunk_start < prompt_count;
        chunk_start += prefill_chunk_size_) {
     enforce_host_resource_limits("prefill.chunk_begin");

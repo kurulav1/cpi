@@ -1270,11 +1270,18 @@ void LlamaEngine::initialize(const EngineOptions& options) {
 
     std::size_t free_bytes = 0, total_bytes = 0;
     cudaMemGetInfo(&free_bytes, &total_bytes);
-    // Spend at most 512 MB, and never more than 5% of what is actually free.
-    const std::size_t budget = std::min<std::size_t>(std::size_t{512} << 20, free_bytes / 20);
+    // Spend at most 768 MB, and never more than 5% of what is actually free.
+    //
+    // The ceiling used to be 2048 tokens on a 512 MB budget. Raising it to 4096 is worth more
+    // than the row count suggests, because a chunk costs more than its rows: with packed
+    // k-quant weights every chunk expands the whole model to fp16 once, about 11.6 ms on an 8B
+    // Q4_K_M regardless of how many rows it then multiplies. Halving the chunk count on a
+    // 4057-token prompt measured prefill 14793 -> 15848 tok/s (+7.1%) for +168 MiB of peak
+    // VRAM. The free-memory clamp still keeps small cards where they were.
+    const std::size_t budget = std::min<std::size_t>(std::size_t{768} << 20, free_bytes / 20);
     const std::size_t fits = (per_token > 0) ? (budget / per_token) : 2048;
     prefill_chunk_target =
-        static_cast<int>(std::min<std::size_t>(2048, std::max<std::size_t>(256, fits)));
+        static_cast<int>(std::min<std::size_t>(4096, std::max<std::size_t>(256, fits)));
   }
   prefill_chunk_size_ = std::max(1, std::min(options_.max_context, prefill_chunk_target));
   if (options_.verbose) {
