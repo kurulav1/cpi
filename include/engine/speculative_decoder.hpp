@@ -18,6 +18,7 @@ struct SpeculativeStats {
   // equalled the target's token (a width-2 tree would have recovered there).
   int mismatch_rounds = 0;
   int tree2_recoveries = 0;
+  int prefill_reused = 0;  // prompt tokens whose KV was already resident
 
   double accept_rate() const {
     return drafted > 0 ? static_cast<double>(accepted) / drafted : 0.0;
@@ -68,10 +69,35 @@ public:
     // Prime both caches with the prompt. prefill_prompt processes the first P-1
     // tokens (positions [0, P-2]); the last prompt token is consumed at position
     // P-1 by the first decode/verify step, exactly mirroring generate_stream.
-    draft_.reset_kv_cache();
-    target_.reset_kv_cache();
-    draft_.prefill_prompt(prompt_tokens);
-    target_.prefill_prompt(prompt_tokens);
+    //
+    // Prefix reuse across calls. Without it a server would re-prefill the whole
+    // conversation on every turn, which costs far more than speculation saves:
+    // an agent resends its entire history each turn, so by a few turns in the
+    // prefill dwarfs the generation. Both engines are kept in lockstep at the
+    // same reuse point, since the draft's KV must describe the same prefix as
+    // the target's for its proposals to be worth anything.
+    //
+    // A shared prefix is only safe if the previous generation left both caches
+    // holding exactly `resident_` at positions [0, resident_.size()); every
+    // emitted token below is appended there, so it stays true by construction.
+    int reuse = 0;
+    if (reuse_prefix_) {
+      // Cap at P-1: the last prompt token must remain for the first decode step.
+      const int cap = std::min(static_cast<int>(resident_.size()),
+                               static_cast<int>(prompt_tokens.size()) - 1);
+      while (reuse < cap && prompt_tokens[static_cast<std::size_t>(reuse)] ==
+                                resident_[static_cast<std::size_t>(reuse)]) {
+        ++reuse;
+      }
+    }
+    if (reuse == 0) {
+      draft_.reset_kv_cache();
+      target_.reset_kv_cache();
+    }
+    draft_.prefill_prompt(prompt_tokens, reuse);
+    target_.prefill_prompt(prompt_tokens, reuse);
+    stats_.prefill_reused = reuse;
+    resident_.assign(prompt_tokens.begin(), prompt_tokens.end());
 
     int pos = static_cast<int>(prompt_tokens.size()) - 1;  // position of `last`
     int last = prompt_tokens.back();                       // token consumed at `pos`
@@ -81,6 +107,9 @@ public:
 
     auto emit = [&](int token) -> bool {
       out.push_back(token);
+      // Track what the caches now hold so the next call can reuse this turn's
+      // output as part of its prefix (an agent's next prompt begins with it).
+      resident_.push_back(token);
       ++generated;
       stats_.emitted += 1;
       if (on_token && !on_token(token)) {
@@ -187,11 +216,24 @@ public:
     return stats_;
   }
 
+  // Reuse KV across generate() calls when the next prompt extends the last one.
+  // Off by default: one-shot CLI runs gain nothing, and a caller that mutates
+  // engine state between calls (or drives several conversations through one
+  // decoder) would silently reuse a prefix that is no longer resident. The
+  // serial HTTP path turns it on because its requests are one conversation
+  // arriving in order, serialized behind a lock.
+  void set_reuse_prefix(bool on) {
+    reuse_prefix_ = on;
+    if (!on) resident_.clear();
+  }
+
 private:
   EngineT& draft_;
   EngineT& target_;
   int k_;
   SpeculativeStats stats_;
+  bool reuse_prefix_ = false;
+  std::vector<int> resident_;  // tokens both caches currently hold
 };
 
 }  // namespace engine

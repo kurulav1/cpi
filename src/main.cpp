@@ -981,6 +981,54 @@ int main(int argc, char** argv) {
 
           engine::SpeculativeDecoder spec(draft_eng, target_eng, cli.spec_tokens);
           const int eos = cli.opts.eos_token_id;
+
+          // --serve with a draft model: the continuous batcher cannot verify K
+          // tokens for a row yet (that needs a ragged batched verify), so this
+          // serves through the serial transport instead, one request at a time.
+          // That is the single-user desktop case exactly, and it is the only way
+          // speculation reaches the HTTP API at all today. Prefix reuse is turned
+          // on because these requests are one conversation arriving in order.
+          if (cli.serve_http) {
+            if (!use_tokenizer) throw std::runtime_error("--serve requires --tokenizer");
+            // CPI_SPEC_NO_PREFIX_REUSE=1 forces a full reset + prefill per request.
+            // Reuse is the whole reason serving speculatively is affordable, so the
+            // switch exists to isolate it: any output difference that survives with
+            // reuse off is not the reuse bookkeeping.
+            spec.set_reuse_prefix(std::getenv("CPI_SPEC_NO_PREFIX_REUSE") == nullptr);
+            app::main_modes::HttpServeOptions so;
+            so.host = cli.serve_host;
+            so.port = cli.serve_port;
+            so.model_name = std::filesystem::path(cli.opts.model_path).filename().string();
+            so.chat_template = cli.chat_template;
+            so.stop_texts = cli.stop_texts;
+            so.add_bos = !cli.force_no_bos;
+            so.max_new = cli.max_new;
+            so.temp = cli.temp;
+            so.api_key = cli.serve_api_key;
+            if (so.api_key.empty()) {
+              if (const char* env_key = std::getenv("CPI_API_KEY")) so.api_key = env_key;
+            }
+            so.eos_token_id = eos;
+            app::main_modes::run_http_server_serial(
+                [&spec, &target_eng, eos](const std::vector<int>& p, int max_new, float temperature,
+                                          const std::function<bool(int)>& on_token,
+                                          const engine::GenerationConstraints* constraints) {
+                  // Speculation verifies K drafts with one device argmax per
+                  // position, which a logit mask cannot reach, and it is greedy
+                  // by construction. Sampled or grammar-constrained requests
+                  // therefore fall back to the plain target path, which honours
+                  // both; unconstrained greedy requests get the fast path.
+                  if ((constraints != nullptr && constraints->grammar != nullptr) ||
+                      temperature > 0.0f) {
+                    return target_eng.generate_stream(p, max_new, temperature, on_token,
+                                                      constraints);
+                  }
+                  return spec.generate(p, max_new, eos, on_token);
+                },
+                tokenizer, so);
+            break;
+          }
+
           app::main_modes::execute_engine_modes(
               run_opts, prompt_tokens, stop_token_ids, cli.stop_texts,
               use_tokenizer ? &tokenizer : nullptr,
