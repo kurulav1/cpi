@@ -139,6 +139,21 @@ inline float hsum256(__m256 v) {
 #define CPU_ENGINE_HAVE_F16C 1
 #endif
 
+// Software prefetch distance for the decode GEMV, in fp16 elements; 0 leaves
+// the stream entirely to the hardware prefetcher. Read once, because this sits
+// in the innermost loop of every decode step.
+//
+// Swept on Zen 5 at 0 / 160 / 512 / 1024 / 2048 / 4096 elements: 18.8 / 18.7 /
+// 18.6 / 18.5 / 19.0 / 18.5 tok/s, every interval overlapping. The distance is
+// NOT a lever here, and neither is the prefetch itself, since disabling it
+// entirely measures the same. These are pure sequential streams and the
+// hardware prefetcher has already recognised them. Kept as a knob because the
+// answer is per-microarchitecture, not because 160 is special.
+static const int kPfDist = [] {
+  const char* e = std::getenv("CPI_CPU_GEMV_PF");
+  return e ? std::atoi(e) : 160;
+}();
+
 // gemv_fp16_impl: y[0..M) = W[M×N] * x[N]
 //
 // W  : row-major FP16 weight matrix, [M rows × N cols]
@@ -172,8 +187,16 @@ static void gemv_fp16_impl(const uint16_t* CPI_RESTRICT W, const float* CPI_REST
       // V6: prefetch ~20 iterations (160 fp16 elements = 320 bytes) ahead.
       // Only issue on the first two rows to avoid overfilling the prefetch
       // buffer; the remaining rows benefit from hardware prefetcher.
-      prefetch_r(r0 + j + 160);
-      prefetch_r(r1 + j + 160);
+      //
+      // CPI_CPU_GEMV_PF tunes the distance in fp16 elements (0 disables the
+      // software prefetch entirely and leaves it to the hardware prefetcher).
+      // 320 bytes only covers a few cache lines, which is far less than a DRAM
+      // access is in flight for at this bandwidth, so the distance is worth
+      // sweeping rather than assuming.
+      if (kPfDist > 0) {
+        prefetch_r(r0 + j + kPfDist);
+        prefetch_r(r1 + j + kPfDist);
+      }
 
       // Load input slice (FP32, 8 elements = 32 bytes).
       const __m256 xv = _mm256_loadu_ps(x + j);
@@ -366,6 +389,13 @@ void CpuLlamaEngine::gemv_fp16(const uint16_t* W, const float* x, float* y, int 
   const int M4 = (M + 3) & ~3;
   const int N8 = (N + 7) & ~7;
 
+  // No AVX-512 tier here, unlike gemm_fp16, and that is a measured decision
+  // rather than an omission. A 512-bit version of this kernel (8 rows per
+  // block, 32 zmm accumulators) was built and measured on Zen 5: 17.6 tok/s
+  // against the AVX2 kernel's 17.8 on Llama-3.2-1B, i.e. no better, and worse
+  // with static scheduling. Decode GEMV is bound by weight bandwidth, not by
+  // instruction throughput, so widening the arithmetic cannot help; the AVX2
+  // kernel already issues loads faster than DRAM can answer them.
   if (M4 == M && N8 == N) {
     // Common case: dimensions are already aligned.
     gemv_fp16_impl(W, x, y, M, N);

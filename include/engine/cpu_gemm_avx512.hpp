@@ -12,5 +12,12 @@ namespace detail {
 bool gemm_fp16_avx512_compiled();
 void gemm_fp16_avx512(const std::uint16_t* W, const float* X, float* Y, int M, int N, int B);
 
+// There is deliberately no AVX-512 GEMV here for decode. One was written and
+// measured on Zen 5 and it was not faster than the AVX2 kernel in cpu_engine.cpp
+// (17.6 vs 17.8 tok/s on Llama-3.2-1B): decode reads each weight exactly once,
+// so it is bound by DRAM bandwidth and not by how wide the arithmetic is.
+// Prefill is different, which is why the GEMM above earns its width: it reuses
+// a weight block across the token dimension.
+
 }  // namespace detail
 }  // namespace engine
