@@ -29,7 +29,7 @@ BatchWorker::~BatchWorker() = default;
 
 void BatchWorker::emit(BatchEvent::Type type, const std::string& id, const std::string& text,
                        const std::string& finish_reason, const std::string& error, int generated,
-                       double elapsed_ms, double tok_per_s) {
+                       double elapsed_ms, double tok_per_s, int prompt_tokens) {
   if (!sink_) return;
   BatchEvent e;
   e.type = type;
@@ -38,6 +38,7 @@ void BatchWorker::emit(BatchEvent::Type type, const std::string& id, const std::
   e.finish_reason = finish_reason;
   e.error = error;
   e.generated = generated;
+  e.prompt_tokens = prompt_tokens;
   e.elapsed_ms = elapsed_ms;
   e.tok_per_s = tok_per_s;
   sink_(e);
@@ -134,6 +135,7 @@ void BatchWorker::run() {
     std::vector<int> ids;
     std::string prev_text;
     std::chrono::steady_clock::time_point t0;
+    int prompt_tokens = 0;  // reported back as usage.prompt_tokens
   };
   std::unordered_map<std::string, DetokState> detok;
   // StreamParams.grammar is a non-owning pointer that must outlive the request,
@@ -238,6 +240,7 @@ void BatchWorker::run() {
         sched_.admit(in.id, in.tokens, in.params);
         DetokState st;
         st.t0 = std::chrono::steady_clock::now();
+        st.prompt_tokens = static_cast<int>(in.tokens.size());
         detok[in.id] = std::move(st);
         resume[in.id] =
             ResumeInfo{in.tokens, in.params, in.params.max_new_tokens, in.params.min_new_tokens, 0};
@@ -259,7 +262,7 @@ void BatchWorker::run() {
         const int done_so_far = static_cast<int>(dit->second.ids.size());
         if (++rit->second.retries > kMaxResumeRetries) {
           emit(BatchEvent::Type::Done, rid, dit->second.prev_text, "preempted", "", done_so_far,
-               0.0, 0.0);
+               0.0, 0.0, dit->second.prompt_tokens);
           grammars.erase(rid);
           detok.erase(dit);
           resume.erase(rit);
@@ -318,7 +321,8 @@ void BatchWorker::run() {
                               std::chrono::steady_clock::now() - it->second.t0)
                               .count();
         const double tps = ms > 0.0 ? (gen * 1000.0 / ms) : 0.0;
-        emit(BatchEvent::Type::Done, e.id, it->second.prev_text, reason, "", gen, ms, tps);
+        emit(BatchEvent::Type::Done, e.id, it->second.prev_text, reason, "", gen, ms, tps,
+             it->second.prompt_tokens);
         detok.erase(it);
         grammars.erase(e.id);
         resume.erase(e.id);

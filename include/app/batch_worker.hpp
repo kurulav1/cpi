@@ -67,6 +67,7 @@ struct BatchEvent {
   std::string finish_reason;  // Done only
   std::string error;          // Error only
   int generated = 0;
+  int prompt_tokens = 0;  // tokens the request's prompt encoded to
   double elapsed_ms = 0.0;
   double tok_per_s = 0.0;
 };
@@ -117,7 +118,7 @@ class BatchWorker {
 
   void emit(BatchEvent::Type type, const std::string& id, const std::string& text,
             const std::string& finish_reason, const std::string& error, int generated,
-            double elapsed_ms, double tok_per_s);
+            double elapsed_ms, double tok_per_s, int prompt_tokens = 0);
 
   engine::BatchScheduler& sched_;
   model::Tokenizer& tokenizer_;

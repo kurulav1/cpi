@@ -68,8 +68,19 @@ struct Pending {
   std::string full_text;      // everything so far
   std::string finish_reason;
   std::string error;
+  int prompt_tokens = 0;
+  int completion_tokens = 0;
   bool done = false;
 };
+
+// OpenAI's usage object. Clients and dashboards read token counts from here to
+// bill, budget context, and decide when to compact a conversation; responses
+// used to carry none at all, so callers had to re-tokenize to find out.
+std::string usage_json(int prompt_tokens, int completion_tokens) {
+  return ",\"usage\":{\"prompt_tokens\":" + std::to_string(prompt_tokens) +
+         ",\"completion_tokens\":" + std::to_string(completion_tokens) +
+         ",\"total_tokens\":" + std::to_string(prompt_tokens + completion_tokens) + "}";
+}
 
 // Base64 decoder for data: image URLs. Hand-rolled, per policy; skips
 // whitespace, stops at padding, and returns false on any other stray byte
@@ -423,6 +434,8 @@ void run_http_server(engine::BatchScheduler& sched, model::Tokenizer& tokenizer,
         case BatchEvent::Type::Done:
           p->full_text = e.text;
           p->finish_reason = e.finish_reason;
+          p->prompt_tokens = e.prompt_tokens;
+          p->completion_tokens = e.generated;
           p->done = true;
           break;
         case BatchEvent::Type::Error:
@@ -649,12 +662,16 @@ void run_http_server(engine::BatchScheduler& sched, model::Tokenizer& tokenizer,
     std::string text;
     std::string finish;
     std::string error;
+    int prompt_tokens = 0;
+    int completion_tokens = 0;
     {
       std::unique_lock<std::mutex> lk(pending->mu);
       pending->cv.wait(lk, [&]() { return pending->done; });
       text = pending->full_text;
       finish = pending->finish_reason;
       error = pending->error;
+      prompt_tokens = pending->prompt_tokens;
+      completion_tokens = pending->completion_tokens;
     }
     unregister();
     if (!error.empty()) {
@@ -662,14 +679,15 @@ void run_http_server(engine::BatchScheduler& sched, model::Tokenizer& tokenizer,
       return;
     }
     const std::string reason = finish == "length" ? "length" : "stop";
+    const std::string usage = usage_json(prompt_tokens, completion_tokens);
     const std::string payload =
         chat ? ("{\"id\":\"" + id + "\",\"object\":\"chat.completion\",\"created\":" + created +
                 ",\"model\":\"" + json_escape(model_name) +
                 "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"" +
-                json_escape(text) + "\"},\"finish_reason\":\"" + reason + "\"}]}")
+                json_escape(text) + "\"},\"finish_reason\":\"" + reason + "\"}]" + usage + "}")
              : ("{\"id\":\"" + id + "\",\"object\":\"text_completion\",\"created\":" + created +
                 ",\"model\":\"" + json_escape(model_name) + "\",\"choices\":[{\"index\":0,\"text\":\"" +
-                json_escape(text) + "\",\"finish_reason\":\"" + reason + "\"}]}");
+                json_escape(text) + "\",\"finish_reason\":\"" + reason + "\"}]" + usage + "}");
     res.send(200, "application/json", payload);
   };
 
@@ -904,10 +922,12 @@ void run_http_server_serial(GenerateStreamFn generate, model::Tokenizer& tokeniz
 
     std::string error;
     bool hit_stop = false;
+    int prompt_token_count = 0;
     {
       std::lock_guard<std::mutex> lk(engine_mu);
       try {
         const std::vector<int> base = tokenizer.encode(prompt, opts.add_bos);
+        prompt_token_count = static_cast<int>(base.size());
         if (!image_path.empty()) {
           // Vision generation is not incremental in these engines; one answer.
           const std::vector<int> outs = opts.multimodal(base, image_path, max_new, temp, nullptr);
@@ -1002,16 +1022,18 @@ void run_http_server_serial(GenerateStreamFn generate, model::Tokenizer& tokeniz
       res.sse("[DONE]");
       return;
     }
+    const std::string usage = usage_json(prompt_token_count, static_cast<int>(ids.size()));
     res.send(200, "application/json",
              chat ? ("{\"id\":\"" + id + "\",\"object\":\"chat.completion\",\"created\":" +
                      created + ",\"model\":\"" + json_escape(model_name) +
                      "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\","
                      "\"content\":\"" +
-                     json_escape(full_text) + "\"},\"finish_reason\":\"" + reason + "\"}]}")
+                     json_escape(full_text) + "\"},\"finish_reason\":\"" + reason + "\"}]" +
+                     usage + "}")
                   : ("{\"id\":\"" + id + "\",\"object\":\"text_completion\",\"created\":" +
                      created + ",\"model\":\"" + json_escape(model_name) +
                      "\",\"choices\":[{\"index\":0,\"text\":\"" + json_escape(full_text) +
-                     "\",\"finish_reason\":\"" + reason + "\"}]}"));
+                     "\",\"finish_reason\":\"" + reason + "\"}]" + usage + "}"));
   };
 
   // No embedder on this path (it would need its own model load); the route
