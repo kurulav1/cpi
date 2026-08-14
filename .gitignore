@@ -137,3 +137,6 @@ node_modules/
 # A PowerShell hashtable interpolated into a redirect target lands here as a
 # literal filename. It has been committed by accident once; never again.
 System.Collections.Hashtable
+
+# nsys stats exports
+/prof_*
