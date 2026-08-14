@@ -332,7 +332,19 @@ std::vector<int> Tokenizer::encode(const std::string& text, bool add_bos) const 
     if (!tok) {
       throw std::runtime_error("hf bpe tokenizer is not loaded");
     }
-    return tok->encode(text, add_bos);
+    std::vector<int> ids = tok->encode(text, add_bos);
+    // A chat template that spells its own BOS (llama3 and llama4 both open with
+    // <|begin_of_text|>) would otherwise get a second one prepended here, and
+    // 128000 128000 is not a sequence these models were trained on. Measured on
+    // Llama-3.1-8B: the duplicate changed greedy output on 3 of 6 prompts, one
+    // of them from the very first token, so this is a quality bug and not just
+    // a wasted context slot. Drop the duplicate rather than the template's copy,
+    // which keeps the prompt text and its tokenization in agreement.
+    if (add_bos && bos_id_ >= 0 && ids.size() >= 2 && ids[0] == bos_id_ &&
+        ids[1] == bos_id_) {
+      ids.erase(ids.begin());
+    }
+    return ids;
   }
 
 #ifdef CPI_HAS_SENTENCEPIECE
