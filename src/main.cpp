@@ -393,7 +393,12 @@ int main(int argc, char** argv) {
         // markers are not in the model's token set, which degenerates
         // generation far worse than plain completion does.
       }
-      if (!cli.interactive_mode && cli.stop_texts.empty()) {
+      // The batched transports (--interactive-batch, --serve) set interactive_mode
+      // to reuse the interactive setup, but they are not the REPL: each request is
+      // one templated turn and must stop at the turn marker. Without these the
+      // server runs every request to max_tokens, emitting the end-of-turn token and
+      // then hallucinating the next speaker's turn.
+      if ((!cli.interactive_mode || cli.interactive_batch) && cli.stop_texts.empty()) {
         cli.stop_texts = default_stop_texts_for_template(cli.chat_template);
       }
       if (!tokenizer_from_gguf) {
