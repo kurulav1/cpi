@@ -1735,51 +1735,87 @@ __global__ void attention_step_chunk_stats_batched_kernel(
     chunk_o[static_cast<std::size_t>(chunk_index) * head_dim + d] = acc[jo];
 }
 
+// Maximum warps the reduce's shared staging is sized for; the launcher fixes
+// blockDim at 4 warps, this leaves headroom without renegotiating the layout.
+constexpr int kReduceMaxWarps = 8;
+
 __global__ void attention_step_chunk_reduce_batched_kernel(const float* chunk_m,
                                                            const float* chunk_l,
                                                            const float* chunk_o, half* out,
                                                            const int* __restrict__ seq_lens,
                                                            int num_heads, int head_dim,
                                                            int chunk_size, int scratch_chunks) {
-  __shared__ float scale_shared[3];
+  // Parallel split-K merge. The previous form walked every chunk serially with
+  // two block barriers per chunk: a pure latency chain that cost ~96 us per
+  // call at 8k context (250 chunks, 32 grid blocks), which put served decode
+  // at depth ~3 ms/step behind the contiguous path. The (m, l, o) online
+  // softmax merge is associative, so each warp now merges a strided subset of
+  // chunks with no block-wide barrier, and warp 0 combines the warp partials
+  // after a single __syncthreads.
   const int b = blockIdx.y;
   const int head = blockIdx.x;
-  const int tid = threadIdx.x;
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int nwarps = blockDim.x >> 5;
   const int chunk_count = (seq_lens[b] + chunk_size - 1) / chunk_size;
-  // One accumulator per head_dim element this thread owns: head_dim can exceed
-  // blockDim (256 with 128 threads), so a scalar acc would conflate the strided
-  // output dims. Unlike the non-batched split-K reduce (head_dim==128 gated),
-  // this kernel runs at any head_dim, so the array is required for correctness.
-  float acc[kAccPerThread];
+  const std::size_t hb = (static_cast<std::size_t>(b) * num_heads + head) * scratch_chunks;
+
+  // Per-lane slice of the output vector: lane d strides by warp width, so the
+  // accumulator covers head_dim up to kTiledMaxHeadDim.
+  constexpr int kLaneAcc = kTiledMaxHeadDim / 32;
+  float acc[kLaneAcc];
 #pragma unroll
-  for (int i = 0; i < kAccPerThread; ++i) acc[i] = 0.0f;
-  float running_m = neg_inf<float>(), running_l = 0.0f;
-  for (int chunk = 0; chunk < chunk_count; ++chunk) {
-    if (tid == 0) {
-      const int idx = (b * num_heads + head) * scratch_chunks + chunk;
-      const float cm = chunk_m[idx], cl = chunk_l[idx];
-      const float new_m = fmaxf(running_m, cm);
-      const float alpha = (running_l == 0.0f) ? 0.0f : expf(running_m - new_m);
-      const float beta = (cl == 0.0f) ? 0.0f : expf(cm - new_m);
-      running_l = running_l * alpha + cl * beta;
-      running_m = new_m;
-      scale_shared[0] = alpha;
-      scale_shared[1] = beta;
-      scale_shared[2] = running_l;
-    }
-    __syncthreads();
-    const float alpha = scale_shared[0], beta = scale_shared[1];
-    const std::size_t base =
-        (static_cast<std::size_t>(b * num_heads + head) * scratch_chunks + chunk) * head_dim;
+  for (int i = 0; i < kLaneAcc; ++i) acc[i] = 0.0f;
+  float m = neg_inf<float>(), l = 0.0f;
+  for (int c = warp; c < chunk_count; c += nwarps) {
+    // Uniform per-warp loads: every lane reads the same address, one broadcast
+    // transaction each.
+    const float cm = chunk_m[hb + c];
+    const float cl = chunk_l[hb + c];
+    const float new_m = fmaxf(m, cm);
+    const float alpha = (l == 0.0f) ? 0.0f : expf(m - new_m);
+    const float beta = (cl == 0.0f) ? 0.0f : expf(cm - new_m);
+    const std::size_t base = (hb + c) * head_dim;
     int j = 0;
-    for (int d = tid; d < head_dim; d += blockDim.x, ++j)
+    for (int d = lane; d < head_dim; d += 32, ++j)
       acc[j] = acc[j] * alpha + chunk_o[base + d] * beta;
-    __syncthreads();
+    l = l * alpha + cl * beta;
+    m = new_m;
   }
-  const float inv_l = 1.0f / fmaxf(scale_shared[2], 1e-8f);
-  half* out_seq = out + (static_cast<std::size_t>(b) * num_heads + head) * head_dim;
-  int j = 0;
-  for (int d = tid; d < head_dim; d += blockDim.x, ++j) out_seq[d] = __float2half(acc[j] * inv_l);
+
+  __shared__ float warp_m[kReduceMaxWarps], warp_l[kReduceMaxWarps];
+  __shared__ float warp_o[kReduceMaxWarps][kTiledMaxHeadDim];
+  if (lane == 0) {
+    warp_m[warp] = m;
+    warp_l[warp] = l;
+  }
+  int js = 0;
+  for (int d = lane; d < head_dim; d += 32, ++js) warp_o[warp][d] = acc[js];
+  __syncthreads();
+
+  if (warp == 0) {
+    float fm = neg_inf<float>(), fl = 0.0f;
+    float facc[kLaneAcc];
+#pragma unroll
+    for (int i = 0; i < kLaneAcc; ++i) facc[i] = 0.0f;
+    // A warp whose subset was empty contributes (m=-inf, l=0); the guards below
+    // make it a no-op, so short sequences with fewer chunks than warps are fine.
+    for (int w = 0; w < nwarps; ++w) {
+      const float cm = warp_m[w], cl = warp_l[w];
+      const float new_m = fmaxf(fm, cm);
+      const float alpha = (fl == 0.0f) ? 0.0f : expf(fm - new_m);
+      const float beta = (cl == 0.0f) ? 0.0f : expf(cm - new_m);
+      int j = 0;
+      for (int d = lane; d < head_dim; d += 32, ++j)
+        facc[j] = facc[j] * alpha + warp_o[w][d] * beta;
+      fl = fl * alpha + cl * beta;
+      fm = new_m;
+    }
+    const float inv_l = 1.0f / fmaxf(fl, 1e-8f);
+    half* out_seq = out + (static_cast<std::size_t>(b) * num_heads + head) * head_dim;
+    int j = 0;
+    for (int d = lane; d < head_dim; d += 32, ++j) out_seq[d] = __float2half(facc[j] * inv_l);
+  }
 }
 
 // Batched + paged GQA-shared variant of split-K pass 1. grid = (num_kv_heads,
