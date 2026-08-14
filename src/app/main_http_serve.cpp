@@ -8,6 +8,7 @@
 //
 // Endpoints: GET /health, GET /v1/models, POST /v1/completions,
 // POST /v1/chat/completions (both with "stream": true for SSE).
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -19,10 +20,15 @@
 #include <string>
 #include <vector>
 
+#include <memory>
+
 #include "app/batch_worker.hpp"
 #include "app/main_helpers.hpp"
 #include "app/main_modes.hpp"
 #include "engine/batch_scheduler.hpp"
+#include "grammar/grammar.hpp"
+#include "grammar/grammar_sampler.hpp"
+#include "grammar/json_schema_to_grammar.hpp"
 #include "model/tokenizer.hpp"
 #include "model/wordpiece_tokenizer.hpp"
 #include "net/http_server.hpp"
@@ -796,6 +802,43 @@ void run_http_server_serial(GenerateStreamFn generate, model::Tokenizer& tokeniz
         std::max(1, json_get_int(body, "max_tokens", json_get_int(body, "max_new", opts.max_new)));
     const float temp = std::max(0.0f, json_get_float(body, "temperature", opts.temp));
     const bool stream = json_get_bool(body, "stream", false);
+
+    // Schema-constrained decoding, same request forms the batched path accepts.
+    // This transport used to pass no constraints at all, so a client that asked
+    // for JSON matching a schema silently got unconstrained prose back.
+    std::string json_schema = json_get_raw_value(body, "json_schema");
+    if (json_schema.empty()) {
+      const std::string rf = json_get_raw_value(body, "response_format");
+      if (!rf.empty()) json_schema = json_get_raw_value(rf, "json_schema");
+    }
+    // Per-request stops on top of the server's template defaults. Without these
+    // the model emits its end-of-turn marker and keeps going, inventing the next
+    // speaker's turn until it hits max_tokens.
+    //
+    // Split by how they can actually be detected. A marker like <|eot_id|> is a
+    // single special token that DECODES TO NOTHING, so searching the decoded text
+    // for its spelling never matches; it has to be caught by token id. Ordinary
+    // multi-token stop strings only exist in the text, so they are matched there.
+    std::vector<std::string> stop_texts;
+    std::vector<int> stop_ids;
+    for (const auto& s : opts.stop_texts) {
+      if (s.empty()) continue;
+      const auto t = tokenizer.encode(s, /*add_bos=*/false);
+      if (t.size() == 1) {
+        stop_ids.push_back(t[0]);
+      } else {
+        stop_texts.push_back(s);
+      }
+    }
+    for (const auto& s : json_get_string_array(body, "stop")) {
+      if (s.empty()) continue;
+      const auto t = tokenizer.encode(s, /*add_bos=*/false);
+      if (t.size() == 1) {
+        stop_ids.push_back(t[0]);
+      } else {
+        stop_texts.push_back(s);
+      }
+    }
     const std::string id = (chat ? "chatcmpl-" : "cmpl-") + std::to_string(
                                std::chrono::steady_clock::now().time_since_epoch().count() % 100000);
     const std::string created = iso_created();
@@ -860,6 +903,7 @@ void run_http_server_serial(GenerateStreamFn generate, model::Tokenizer& tokeniz
     };
 
     std::string error;
+    bool hit_stop = false;
     {
       std::lock_guard<std::mutex> lk(engine_mu);
       try {
@@ -869,20 +913,60 @@ void run_http_server_serial(GenerateStreamFn generate, model::Tokenizer& tokeniz
           const std::vector<int> outs = opts.multimodal(base, image_path, max_new, temp, nullptr);
           emit_delta(app::main_helpers::sanitize_stream_text(tokenizer.decode(outs)));
         } else {
-          generate(base, max_new, temp, [&](int token) {
-            ids.push_back(token);
-            const std::string decoded =
-                app::main_helpers::sanitize_stream_text(tokenizer.decode(ids));
-            if (decoded.size() > prev_text.size()) {
-              const std::string delta = decoded.substr(prev_text.size());
-              prev_text = decoded;
-              if (!emit_delta(delta)) {
-                client_gone = true;
-                return false;  // stop generating for a client that hung up
-              }
+          // Build the grammar here rather than in the caller: the sampler must
+          // outlive the generate call, and every serial engine wants the same one.
+          std::unique_ptr<grammar::GrammarSampler> sampler;
+          engine::GenerationConstraints constraints;
+          if (!json_schema.empty()) {
+            try {
+              grammar::Grammar g =
+                  grammar::Grammar::parse(grammar::json_schema_to_grammar(json_schema));
+              sampler = std::make_unique<grammar::GrammarSampler>(
+                  std::move(g), tokenizer.token_pieces(), tokenizer.eos_id());
+              constraints.grammar = sampler.get();
+            } catch (const std::exception& e) {
+              error = std::string("invalid json_schema: ") + e.what();
             }
-            return true;
-          }, /*constraints=*/nullptr);
+          }
+          if (error.empty()) {
+            generate(base, max_new, temp, [&](int token) {
+              if (std::find(stop_ids.begin(), stop_ids.end(), token) != stop_ids.end()) {
+                hit_stop = true;
+                return false;  // never emit the marker itself
+              }
+              ids.push_back(token);
+              const std::string decoded =
+                  app::main_helpers::sanitize_stream_text(tokenizer.decode(ids));
+              if (decoded.size() > prev_text.size()) {
+                std::string delta = decoded.substr(prev_text.size());
+                // Stop-text check against the whole text so far: a marker split
+                // across two decode steps still matches, and the part of the
+                // delta before it is still emitted.
+                const std::string candidate = prev_text + delta;
+                std::size_t cut = std::string::npos;
+                for (const auto& s : stop_texts) {
+                  if (s.empty()) continue;
+                  const std::size_t at = candidate.find(s, prev_text.size() > s.size()
+                                                               ? prev_text.size() - s.size()
+                                                               : 0);
+                  if (at != std::string::npos && at < cut) cut = at;
+                }
+                if (cut != std::string::npos) {
+                  if (cut > prev_text.size()) {
+                    emit_delta(candidate.substr(prev_text.size(), cut - prev_text.size()));
+                  }
+                  hit_stop = true;
+                  return false;
+                }
+                prev_text = decoded;
+                if (!emit_delta(delta)) {
+                  client_gone = true;
+                  return false;  // stop generating for a client that hung up
+                }
+              }
+              return true;
+            }, sampler ? &constraints : nullptr);
+          }
         }
       } catch (const std::exception& e) {
         error = e.what();
@@ -903,7 +987,8 @@ void run_http_server_serial(GenerateStreamFn generate, model::Tokenizer& tokeniz
       }
       return;
     }
-    const std::string reason = static_cast<int>(ids.size()) >= max_new ? "length" : "stop";
+    const std::string reason =
+        (!hit_stop && static_cast<int>(ids.size()) >= max_new) ? "length" : "stop";
     if (stream) {
       res.sse(chat ? ("{\"id\":\"" + id +
                       "\",\"object\":\"chat.completion.chunk\",\"created\":" + created +
