@@ -209,6 +209,19 @@ public:
       }
     }
 
+    // Trim the resident record to what the caches actually hold. `last` is the
+    // most recent emitted token and its K/V is deliberately NOT written yet:
+    // both branches above leave it to be consumed as verify_in[0] next round.
+    // Positions [0, pos) are backed by real K/V; position pos holds either
+    // nothing or a rejected draft's K/V from an earlier round. Claiming it would
+    // let the next call skip prefilling a position whose K/V is wrong, which
+    // corrupts exactly one token of context and is invisible until it lands
+    // somewhere that matters. Truncating is always safe: under-claiming only
+    // costs a little reuse, over-claiming is a correctness bug.
+    if (reuse_prefix_ && static_cast<int>(resident_.size()) > pos && pos >= 0) {
+      resident_.resize(static_cast<std::size_t>(pos));
+    }
+
     return out;
   }
 
