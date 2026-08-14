@@ -612,49 +612,75 @@ __global__ void attention_prefill_paged_quant_kernel(
 }
 
 // Pass-2 reduce across a sequence's chunks (local clone of the fp16 batched
-// reduce; float scratch only, format-independent).
+// reduce; float scratch only, format-independent). Warp-parallel like its fp16
+// twin in kernels_attention_decode.cu: the serial per-chunk walk with two block
+// barriers was a latency chain (~96 us at 8k context), and the online-softmax
+// merge is associative, so each warp merges a strided subset barrier-free and
+// warp 0 combines the warp partials.
+constexpr int kPqReduceMaxWarps = 8;
+
 __global__ void pq_chunk_reduce_batched_kernel(const float* chunk_m, const float* chunk_l,
                                                const float* chunk_o, half* out,
                                                const int* __restrict__ seq_lens, int num_heads,
                                                int head_dim, int chunk_size, int scratch_chunks) {
-  __shared__ float scale_shared[3];
   const int b = blockIdx.y;
   const int head = blockIdx.x;
-  const int tid = threadIdx.x;
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int nwarps = blockDim.x >> 5;
   const int chunk_count = (seq_lens[b] + chunk_size - 1) / chunk_size;
-  float acc[kAccPerThread];
+  const std::size_t hb = (static_cast<std::size_t>(b) * num_heads + head) * scratch_chunks;
+
+  constexpr int kLaneAcc = kTiledMaxHeadDim / 32;
+  float acc[kLaneAcc];
 #pragma unroll
-  for (int i = 0; i < kAccPerThread; ++i) acc[i] = 0.0f;
-  float running_m = kPqNegInf, running_l = 0.0f;
-  for (int chunk = 0; chunk < chunk_count; ++chunk) {
-    if (tid == 0) {
-      const int idx = (b * num_heads + head) * scratch_chunks + chunk;
-      const float cm = chunk_m[idx], cl = chunk_l[idx];
-      const float new_m = fmaxf(running_m, cm);
-      const float alpha = (running_l == 0.0f) ? 0.0f : expf(running_m - new_m);
-      const float beta = (cl == 0.0f) ? 0.0f : expf(cm - new_m);
-      running_l = running_l * alpha + cl * beta;
-      running_m = new_m;
-      scale_shared[0] = alpha;
-      scale_shared[1] = beta;
-      scale_shared[2] = running_l;
-    }
-    __syncthreads();
-    const float alpha = scale_shared[0], beta = scale_shared[1];
-    const std::size_t base =
-        (static_cast<std::size_t>(b * num_heads + head) * scratch_chunks + chunk) *
-        static_cast<std::size_t>(head_dim);
+  for (int i = 0; i < kLaneAcc; ++i) acc[i] = 0.0f;
+  float m = kPqNegInf, l = 0.0f;
+  for (int c = warp; c < chunk_count; c += nwarps) {
+    const float cm = chunk_m[hb + c];
+    const float cl = chunk_l[hb + c];
+    const float new_m = fmaxf(m, cm);
+    const float alpha = (l == 0.0f) ? 0.0f : expf(m - new_m);
+    const float beta = (cl == 0.0f) ? 0.0f : expf(cm - new_m);
+    const std::size_t base = (hb + c) * static_cast<std::size_t>(head_dim);
     int j = 0;
-    for (int d = tid; d < head_dim; d += blockDim.x, ++j) {
+    for (int d = lane; d < head_dim; d += 32, ++j)
       acc[j] = acc[j] * alpha + chunk_o[base + d] * beta;
-    }
-    __syncthreads();
+    l = l * alpha + cl * beta;
+    m = new_m;
   }
-  const float inv_l = 1.0f / fmaxf(scale_shared[2], 1e-8f);
-  half* out_seq = out + (static_cast<std::size_t>(b) * num_heads + head) * head_dim;
-  int j = 0;
-  for (int d = tid; d < head_dim; d += blockDim.x, ++j) {
-    out_seq[d] = __float2half(acc[j] * inv_l);
+
+  __shared__ float warp_m[kPqReduceMaxWarps], warp_l[kPqReduceMaxWarps];
+  __shared__ float warp_o[kPqReduceMaxWarps][kTiledMaxHeadDim];
+  if (lane == 0) {
+    warp_m[warp] = m;
+    warp_l[warp] = l;
+  }
+  int js = 0;
+  for (int d = lane; d < head_dim; d += 32, ++js) warp_o[warp][d] = acc[js];
+  __syncthreads();
+
+  if (warp == 0) {
+    float fm = kPqNegInf, fl = 0.0f;
+    float facc[kLaneAcc];
+#pragma unroll
+    for (int i = 0; i < kLaneAcc; ++i) facc[i] = 0.0f;
+    // An empty warp's partial is (m=-inf, l=0); the guards make it a no-op.
+    for (int w = 0; w < nwarps; ++w) {
+      const float cm = warp_m[w], cl = warp_l[w];
+      const float new_m = fmaxf(fm, cm);
+      const float alpha = (fl == 0.0f) ? 0.0f : expf(fm - new_m);
+      const float beta = (cl == 0.0f) ? 0.0f : expf(cm - new_m);
+      int j = 0;
+      for (int d = lane; d < head_dim; d += 32, ++j)
+        facc[j] = facc[j] * alpha + warp_o[w][d] * beta;
+      fl = fl * alpha + cl * beta;
+      fm = new_m;
+    }
+    const float inv_l = 1.0f / fmaxf(fl, 1e-8f);
+    half* out_seq = out + (static_cast<std::size_t>(b) * num_heads + head) * head_dim;
+    int j = 0;
+    for (int d = lane; d < head_dim; d += 32, ++j) out_seq[d] = __float2half(facc[j] * inv_l);
   }
 }
 
