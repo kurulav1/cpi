@@ -1,4 +1,4 @@
-// Linear-attention (delta-net) kernels -- the Qwen3.5 family.
+// Linear-attention (delta-net) kernels: the Qwen3.5 family.
 //
 // These are the Metal side of the six ops the CUDA plan engine already runs: SplitHeadHalves,
 // SigmoidGate, LinearConv1d, RepeatLinearHeads, MulVec and LinearAttentionStep. The arithmetic
@@ -94,7 +94,7 @@ kernel void cpi_mul_vec(device const half* in [[buffer(0)]], device const half* 
 //
 // conv_state is [channels][kernel_size-1] fp32 and holds this channel's previous inputs oldest
 // first. One thread per channel: the whole window is that thread's own, so the shift is a private
-// read-modify-write and needs no barrier -- but it also means this kernel must run exactly once
+// read-modify-write and needs no barrier; but it also means this kernel must run exactly once
 // per token, since replaying it would advance the history twice.
 kernel void cpi_linear_conv1d_silu(device const half* conv_weight [[buffer(0)]],
                                    device float* conv_state [[buffer(1)]],
@@ -159,7 +159,7 @@ kernel void cpi_repeat_linear_heads(device const half* qkv_mix [[buffer(0)]],
 // The state is [key_head_dim][value_head_dim] fp32 per head, read and written in place, so this
 // kernel is likewise once-per-token. Reductions use simd_sum across the threadgroup's simdgroups
 // rather than the CUDA tree reduction; the arithmetic is otherwise identical, including the fp32
-// accumulation and the 1e-6 inside the q/k normalisers (which is NOT rms_eps -- that one applies
+// accumulation and the 1e-6 inside the q/k normalisers (which is NOT rms_eps; that one applies
 // only to the output norm).
 #define LIN_ATTN_TG 256
 #define LIN_ATTN_MAXDIM 256
@@ -173,7 +173,7 @@ kernel void cpi_linear_attention_step(device const half* q [[buffer(0)]],
                                       // half, not float: the .ll2c container casts every weight
                                       // to fp16, so there is no f32 source to read these from.
                                       // CUDA reads them as f32 straight from safetensors, so the
-                                      // two backends differ here by fp16 rounding on a_log -- it
+                                      // two backends differ here by fp16 rounding on a_log; it
                                       // feeds exp(-exp(a_log)*softplus(..)), so watch this first
                                       // if a layer diverges by a small constant factor.
                                       device const half* norm_weight [[buffer(6)]],

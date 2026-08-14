@@ -1,25 +1,25 @@
-// cpu_engine.cpp -- CPU inference engine for LLaMA-family models.
+// cpu_engine.cpp: CPU inference engine for LLaMA-family models.
 //
 // Optimization techniques applied:
 //
-//      -- AVX2 256-bit vector arithmetic (8 FP32 values per SIMD lane).
+//      - AVX2 256-bit vector arithmetic (8 FP32 values per SIMD lane).
 //        Weights are stored as FP16 in the .ll2c file; the F16C instruction
 //        _mm256_cvtph_ps converts 8 half-precision values to 8 single-
 //        precision values in one instruction, keeping conversion overhead
 //        close to zero.
 //
-//      -- 4-output register blocking: each OpenMP thread processes four
+//      - 4-output register blocking: each OpenMP thread processes four
 //        consecutive output rows of the weight matrix per inner-loop trip,
 //        loading the same 8-element slice of the input vector once and
 //        multiplying it against four rows.  This quadruples arithmetic
 //        intensity relative to one-row-at-a-time traversal.
 //
-//      -- _mm_prefetch hints issued 20 iterations ahead inside the FP16
+//      - _mm_prefetch hints issued 20 iterations ahead inside the FP16
 //        weight stream.  At 2 bytes per FP16 element, 20×8 = 160 elements
 //        = 320 bytes ≈ 5 cache lines are prefetched per row per iteration,
 //        hiding DRAM-to-L1 latency for the dominant memory-bound GEMV.
 //
-//     -- #pragma omp parallel for with dynamic scheduling partitions the
+//     - #pragma omp parallel for with dynamic scheduling partitions the
 //        output-row dimension across all available hardware threads, giving
 //        near-linear scaling on multi-core CPUs.
 

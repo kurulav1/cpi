@@ -5,8 +5,8 @@
 //      mapping. A break here throws or reports an obviously wrong shape.
 //   2. Values: every supported tensor type is dequantized and compared against
 //      an independently computed reference for the same bytes. A break here is
-//      silent -- the model still runs and just answers slightly (or entirely)
-//      wrong -- so it needs numbers, not a smoke test.
+//      silent: the model still runs and just answers slightly (or entirely)
+//      wrong, so it needs numbers, not a smoke test.
 //
 // Usage: gguf_loader_test <model.gguf> [--compare <model.ll2c>]
 // With --compare it additionally checks the fp16 tensors against the same
@@ -159,8 +159,8 @@ int main(int argc, char** argv) {
   if (!compare_path.empty()) {
     std::printf("comparing against %s\n", compare_path.c_str());
     // The oracle may be a .ll2c or another GGUF of the same model. A second
-    // GGUF is the stronger check for quantized files -- the same weights at two
-    // bit widths -- so it is read through GgufLoader directly rather than
+    // GGUF is the stronger check for quantized files (the same weights at two
+    // bit widths), so it is read through GgufLoader directly rather than
     // through WeightLoader, which refuses unmapped architectures by design.
     model::WeightLoader w;
     model::GgufLoader wg;

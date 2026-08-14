@@ -981,7 +981,7 @@ private:
   cudaGraphExec_t greedy_decode_graph_exec_ = nullptr;  // Executable instance of the decode graph.
   // How many packed k-quant matvecs actually launched. There are several layer
   // bodies (two captured into CUDA graphs, one not), so "the output did not
-  // change" cannot on its own tell you the packed path ran -- it did not, once.
+  // change" cannot on its own tell you the packed path ran (it did not, once).
   std::uint64_t packed_matvec_calls_ = 0;
   std::uint64_t packed_matmul_calls_ = 0;
   std::uint64_t packed_matmul_declined_ = 0;

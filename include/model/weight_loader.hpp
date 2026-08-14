@@ -71,7 +71,7 @@ public:
   // True when this loader is backed by a GGUF rather than a .ll2c container.
   // Callers that need the embedded tokenizer ask through here.
   // Device-side fill for containers that can do it (a GGUF's quantized blocks
-  // unpack on the GPU). False means "not handled" -- the caller uses
+  // unpack on the GPU). False means "not handled": the caller uses
   // tensor_data() as before. Keeping the decision here rather than at every
   // upload site is what lets one seam serve all of them.
   [[nodiscard]] bool fill_device_fp16(const std::string& name, void* dst, void* stream) const {

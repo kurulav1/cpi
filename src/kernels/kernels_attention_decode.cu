@@ -645,11 +645,11 @@ __global__ void attention_step_chunk_reduce_any_mt_device_pos_kernel(
 }
 
 // Tree-verify split-K twins: like the mt twins above, but every row's CACHE
-// length is exactly *position (the committed prefix -- in-batch causality is
+// length is exactly *position (the committed prefix; in-batch causality is
 // an ancestor bitmask, not position order), and the in-batch scratch columns
 // form one extra virtual chunk at index ceil(cache_len/chunk_size), merged by
 // the tree reduce below. Restores the split-K parallelism the one-block-per-
-// (row,head) tree kernel gives up (latency-bound at depth -- the decode
+// (row,head) tree kernel gives up (latency-bound at depth: the decode
 // attention coarsening trap, again).
 template <int WarpsPerBlock>
 __global__ void attention_tree_chunk_stats_kernel(const half* q, const half* k_cache,
@@ -704,7 +704,7 @@ __global__ void attention_tree_inbatch_stats_kernel(const half* q, const half* k
   __syncthreads();
 
   // One warp per admitted column (scr_cols <= 32 so one pass of warps covers
-  // all columns for blockDim >= 32 * ceil(scr_cols/warps) -- loop to be safe).
+  // all columns for blockDim >= 32 * ceil(scr_cols/warps); loop to be safe).
   for (int j = warp_id; j < scr_cols; j += blockDim.x / warpSize) {
     float score = neg_inf<float>();
     if ((mask >> j) & 1u) {
@@ -943,7 +943,7 @@ __global__ void attention_step_chunk_reduce_device_pos_kernel(
   // Merge the per-chunk softmax stats in two parallel reductions rather than by
   // walking chunks in an online loop. The online form made thread 0 do a
   // dependent global load per chunk with two __syncthreads around it, so the
-  // kernel cost a latency chain as deep as the chunk count -- 2643 ns for seven
+  // kernel cost a latency chain as deep as the chunk count: 2643 ns for seven
   // chunks. Taking the global max first turns the rest into independent work:
   // every weight is exp(m_c - m) <= 1, which is the same stability the online
   // rescaling was buying.
@@ -986,7 +986,7 @@ __global__ void attention_step_chunk_reduce_device_pos_kernel(
   // launch a separate quantize over what was just written. This is the last of
   // the four per-layer quantize calls. head_dim is a multiple of 32 and tid maps
   // one-to-one onto the head's elements, so a 32-value group is exactly one warp
-  // -- the cleanest of the three producers. Threads that dropped out above did so
+  // (the cleanest of the three producers). Threads that dropped out above did so
   // in whole warps, for the same reason, so the shuffles below are safe.
   if (q8 == nullptr) return;
   const float v = __half2float(r);
@@ -1425,8 +1425,8 @@ __global__ void attention_step_chunk_stats_gqa_split_device_pos_kernel(
 // The intent was that short context "stays at G=1", but it cannot. G is fixed
 // when the decode graph is captured, and capture only knows max_context, so
 // scratch_chunks is always large and G always lands at the cap. At a 215-token
-// context that leaves ONE coarse chunk per KV head holding data -- eight blocks
-// on a 170-SM part -- each walking seven sub-chunks serially, every one a
+// context that leaves one coarse chunk per KV head holding data: eight blocks
+// on a 170-SM part, each walking seven sub-chunks serially, every one a
 // dependent global-to-shared load behind a __syncthreads. nsys shows the cost is
 // almost entirely that chain rather than the KV traffic: 8525 ns at a mean
 // context of ~75 against 8838 ns at ~600, so eight times the context costs 3.7%
@@ -1940,10 +1940,10 @@ void launch_attention_step_batched_paged(const half* q, const half* k_pool, cons
                                          float* scratch_l, float* scratch_o, int scratch_chunks) {
   constexpr int warps = 4;
   constexpr int threads = warps * 32;
-  // Sizing the grid from a host-side max_seq_len is the ONE thing keeping this
+  // Sizing the grid from a host-side max_seq_len is the one thing keeping this
   // path out of a CUDA graph: capture freezes grid dimensions, so a grid that
   // depends on runtime length cannot be captured. Everything else here is
-  // already device-side -- seq_lens and block_tables are device pointers, the
+  // already device-side: seq_lens and block_tables are device pointers, the
   // kernel reads seq_lens[b] itself and guards `chunk_start >= seq_len`, and the
   // reduce derives its per-sequence chunk count from seq_lens too.
   //
@@ -1952,7 +1952,7 @@ void launch_attention_step_batched_paged(const half* q, const half* k_pool, cons
   // so max-sizing it multiplies by the batch as well: at B=32 with a short
   // context that is ~65k blocks, nearly all of which exist only to hit the guard
   // and return. Measured against the length-dependent grid at B=1/8/32/64:
-  // +7.6 / -0.4 / -9.3 / +3.2%, medians of three -- noisy, but the loss at 32 has
+  // +7.6 / -0.4 / -9.3 / +3.2%, medians of three; noisy, but the loss at 32 has
   // a mechanism behind it and the wins do not.
   //
   // So one always-max graph is the wrong shape for this path. What fits is
@@ -2299,7 +2299,7 @@ void launch_store_kv_seq_device_pos(const half* k, const half* v, half* k_cache,
 // [0, *cache_len) plus the in-batch scratch rows their ancestor bitmask admits
 // (bit j of anc_mask[row] = scratch row j visible; a row's own bit is set).
 // Draft siblings share a position, so in-batch K/V cannot go through the
-// sequential cache-store path -- they live in a [rows, kv_hidden] scratch and
+// sequential cache-store path; they live in a [rows, kv_hidden] scratch and
 // causality is the mask, not position order. One block per (head, row): with
 // rows x heads blocks (e.g. 11 x 32) the grid fills the GPU without the
 // split-K machinery, and the tiled main loop matches attention_step_kernel's.

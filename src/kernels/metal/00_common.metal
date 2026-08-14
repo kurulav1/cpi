@@ -2,7 +2,7 @@
 //
 // These mirror the CUDA kernels op-for-op (see include/runtime/kernels.cuh); the
 // op-plan IR in include/engine/op_plan.hpp is what both backends execute, so the
-// semantics here must match the CUDA ones exactly -- same normalisation, same RoPE
+// semantics here must match the CUDA ones exactly: same normalisation, same RoPE
 // convention, same causal masking. Numerics are NOT bit-identical across backends
 // (different accumulation order), so correctness is judged against the CPU
 // reference engine, not against CUDA bit-for-bit.
@@ -48,7 +48,7 @@ struct NormParams {
 };
 
 // True LayerNorm: subtracts the mean and scales by weight, then adds bias. RMSNorm does
-// neither, so this cannot be folded into NormParams -- a bias pointer has nowhere to go there.
+// neither, so this cannot be folded into NormParams: a bias pointer has nowhere to go there.
 struct LayerNormParams {
   uint rows;
   uint cols;
@@ -109,8 +109,8 @@ struct RopeParams {
   // is invisible at position 0, because the angle is zero there.
   uint rotary_dim;
   // M-RoPE: the rotary lanes are split between three position axes (t, h, w), with
-  // mrope_section giving how many lanes each takes -- [11, 11, 10] on Qwen3.5, summing to
-  // rotary_dim/2. Zero means plain 1-D rope, where every lane reads the same scalar position.
+  // mrope_section giving how many lanes each takes ([11, 11, 10] on Qwen3.5, summing to
+  // rotary_dim/2). Zero means plain 1-D rope, where every lane reads the same scalar position.
   //
   // For pure text tokens t == h == w, so M-RoPE reduces exactly to 1-D rope. That is what makes
   // this safe to switch on for a whole sequence rather than per token.
@@ -183,7 +183,7 @@ struct EmbedQuantParams {
 };
 
 // ---------------------------------------------------------------------------
-// RMSNorm -- one threadgroup per row. x is cached in registers only when it
+// RMSNorm: one threadgroup per row. x is cached in registers only when it
 // fits; otherwise re-read. Reduction is fp32 in threadgroup memory.
 // ---------------------------------------------------------------------------
 

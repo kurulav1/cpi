@@ -1246,7 +1246,7 @@ void LlamaEngine::initialize(const EngineOptions& options) {
   // A batched decode step ends in a stream sync to read the sampled tokens back,
   // and the next step cannot start until the host has them. On Windows that wake
   // is a WDDM scheduling event, and its latency lands squarely in the gap that
-  // nsys shows between steps -- about 4.3 ms a step at B=32, most of which the
+  // nsys shows between steps: about 4.3 ms a step at B=32, most of which the
   // CUDA graph did not recover because it is not launch overhead. Spinning
   // instead of blocking trades a busy core for a faster wake.
   //

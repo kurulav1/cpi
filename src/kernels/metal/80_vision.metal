@@ -1,4 +1,4 @@
-// Vision-tower kernels -- the Gemma 4 image path.
+// Vision-tower kernels: the Gemma 4 image path.
 //
 // The Metal side of the four ops the CUDA plan engine already runs: PatchEmbed, Rope2D,
 // AvgPoolPatches and Standardize. The arithmetic mirrors kernels_vision.cu, including which
@@ -7,7 +7,7 @@
 //
 // Padding patches are the thread running through all of these: a patch whose position is negative
 // is padding, and it must contribute nothing. PatchEmbed zeroes it, AvgPoolPatches skips it in the
-// average. Getting that wrong does not crash -- it quietly mixes padding into real cells.
+// average. Getting that wrong does not crash; it quietly mixes padding into real cells.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -46,7 +46,7 @@ struct VisStdParams {
 //
 // The position table is [2, pos_table_size, hidden]: the x coordinate indexes plane 0, y plane 1,
 // and the two are summed. (HF one-hots the coordinates into the table and sums; a gather is the
-// same thing without materialising the one-hot.) Gemma applies no mean/std normalisation here --
+// same thing without materialising the one-hot.) Gemma applies no mean/std normalisation here;
 // it rescales [0,1] to [-1,1] inline, which is the 2*(p-0.5).
 kernel void cpi_patch_embed(device const half* proj [[buffer(0)]],
                             device const float* pixels [[buffer(1)]],
@@ -80,7 +80,7 @@ kernel void cpi_patch_embed(device const half* proj [[buffer(0)]],
 }
 
 // 2-D RoPE: the head splits in half, the first half rotated by the x coordinate and the second by
-// y. Within each half the pairs are (j, j + pairs_per_half), NOT adjacent elements -- the same
+// y. Within each half the pairs are (j, j + pairs_per_half), NOT adjacent elements: the same
 // split-halves convention the 1-D RoPE uses, so a head_dim not divisible by 4 has no valid pairing
 // and the caller must not dispatch this.
 kernel void cpi_rope_2d_inplace(device half* x [[buffer(0)]], device const int* pos_x [[buffer(1)]],
@@ -115,14 +115,14 @@ kernel void cpi_rope_2d_inplace(device half* x [[buffer(0)]], device const int* 
 }
 
 // Average the patches falling in each k x k cell, then apply a gain. The divisor is k*k, NOT the
-// number of patches actually found -- padding patches are skipped but do not shrink the divisor,
+// number of patches actually found: padding patches are skipped but do not shrink the divisor,
 // which is what makes a partially-filled edge cell scale correctly.
 //
 // The cell index is computed in signed arithmetic, matching the CUDA kernel. That is deliberate
 // and it is what makes the padding guard load-bearing: in signed division -1/k is 0, so an
 // unguarded padding patch lands in cell 0 and quietly corrupts it. Casting to unsigned first would
 // send it to a cell index no real cell can equal, which hides the bug AND makes the guard
-// untestable -- removing it would then change nothing, so no check could ever catch its loss.
+// untestable: removing it would then change nothing, so no check could ever catch its loss.
 kernel void cpi_avg_pool_patches(device const half* in [[buffer(0)]],
                                  device const int* pos_x [[buffer(1)]],
                                  device const int* pos_y [[buffer(2)]],

@@ -119,7 +119,7 @@ public:
     // Non-zero for Q/K, which the converter stored with its RoPE row
     // interleave. The un-permute moves whole rows, and a packed row is a
     // contiguous run of super-blocks, so a consumer can undo it on the packed
-    // bytes -- see WeightLoader users of this field.
+    // bytes; see WeightLoader users of this field.
     int permute_heads = 0;
     [[nodiscard]] bool valid() const {
       return data != nullptr && kind >= 0;
@@ -146,7 +146,7 @@ private:
     Q8_0 = 8,
     Q8_1 = 9,
     // "k-quants": 256-element super-blocks carrying quantized per-sub-block
-    // scales. Not optional in practice -- even a file named Q4_0 ships k-quant
+    // scales. Not optional in practice: even a file named Q4_0 ships k-quant
     // tensors for its embedding and output matrices.
     Q2_K = 10,
     Q3_K = 11,

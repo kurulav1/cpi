@@ -35,7 +35,7 @@ constexpr std::size_t kQ6KBlockBytes = 210;  // ql[128] + qh[64] + scales[16] + 
 //
 // They should not stay the same. 210 is not a multiple of 4, so a resident block
 // pointer changes alignment from one block to the next, which makes cp.async
-// illegal -- and cp.async staging is what makes the Q4_K MMQ kernel fast (forcing
+// illegal, and cp.async staging is what makes the Q4_K MMQ kernel fast (forcing
 // it onto scalar staging costs 22.8%). Q6_K is stuck without it: it runs ~138
 // GB/s against Q4_K MMQ's ~495, which is why Q6_K matmuls are about 55% of a
 // batched step for 25% of the weights, and why dequant-and-cuBLAS still beats

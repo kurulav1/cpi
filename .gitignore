@@ -123,6 +123,10 @@ RELEASE_CHECKLIST.md
 /nsys*.bat
 /ncu*.bat
 
+# Session scratch outputs and local-only notes
+/scratch_*
+*.local.md
+
 # IDE state
 .vscode/
 .idea/

@@ -96,7 +96,6 @@ def main():
     with torch.no_grad():
         attn_out, _ = attn(hidden_states=hidden, position_embeddings=freqs_cis, attention_mask=mask)
 
-    scaling = float(attn.attention_scaling) if hasattr(attn, "attention_scaling") else 1.0
     print("attn_out", tuple(attn_out.shape), "mean", float(attn_out.mean()))
     print("rotary.attention_scaling (mscale) =", float(rotary.attention_scaling))
     print("softmax scaling =", attn.scaling)

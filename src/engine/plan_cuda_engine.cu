@@ -5098,7 +5098,7 @@ std::vector<int> PlanCudaEngine::generate_stream(const std::vector<int>& prompt,
   // repetition loops. Making it lossless requires reconciling the verify and decode kernel numerics
   // (prefill-parity-class work); see memory:cpi-cuda-spec-decode. Until then this is experimental.
   //
-  // Audited 2026-08-13 (Gemma-4 E2B int4): the T=16 verify's model mechanics are correct -- the
+  // Audited 2026-08-13 (Gemma-4 E2B int4): the T=16 verify's model mechanics are correct; the
   // mt device-pos attention applies the per-token sliding window (k_start = seq_len - window in
   // both the stats and reduce kernels), the seq rope takes each op's own cos/sin tables (dual
   // rope), and acceptance requires verdict == draft exactly. Spec matched plain greedy on all

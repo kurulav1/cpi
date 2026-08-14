@@ -29,7 +29,7 @@ namespace {
 // so this stays off until every matrix has been through that.
 // Bit per matrix: 1 = w2, 2 = wo, 4 = w13, 8 = lm head, 16 = fused qkv.
 // One at a time is how the earlier
-// unpacking bugs were caught -- a wrong unpack reads as fluent text, not a
+// unpacking bugs were caught: a wrong unpack reads as fluent text, not a
 // crash, so each matrix needs its own A/B against the fp16 path.
 // Whether a tensor will be served packed, answerable before allocation so the
 // fp16 buffer can be skipped rather than allocated and left unread.
@@ -230,7 +230,7 @@ void LlamaEngine::free_load_staging() {
 // Uploads one packed tensor into `dst`, undoing the converter's Q/K row
 // interleave on the way when the container reports one. The un-permute moves
 // whole rows and a packed row is a contiguous run of super-blocks, so it is a
-// gather of row-sized byte runs -- the same reordering the host unpacker does,
+// gather of row-sized byte runs: the same reordering the host unpacker does,
 // applied to the blocks instead of to fp16.
 bool LlamaEngine::upload_packed_rows(const model::GgufLoader::PackedTensor& pk, void* dst) {
   const std::size_t row_bytes = pk.bytes / static_cast<std::size_t>(pk.rows);
@@ -254,7 +254,7 @@ bool LlamaEngine::upload_packed_rows(const model::GgufLoader::PackedTensor& pk, 
 
 // CPI fuses Q, K and V into one matrix; a GGUF stores them apart. Concatenating
 // their packed rows is legal whenever the three share a quant type, which
-// Q4_K_M does not always do -- it puts Q6_K in some layers' attn_v. When they
+// Q4_K_M does not always do (it puts Q6_K in some layers' attn_v). When they
 // disagree the fp16 path keeps the layer.
 void LlamaEngine::stage_packed_triple(const std::string& a, const std::string& b,
                                       const std::string& c, PackedWeight* out, int mask_bit) {
@@ -1057,7 +1057,7 @@ void LlamaEngine::init_layer_cache() {
       }
       // Packed k-quant residency (CPI_KQUANT_PACKED=1): keep the container's own
       // blocks on the device so decode can multiply them directly. Staged
-      // alongside the fp16 copy for now -- correctness first; dropping the fp16
+      // alongside the fp16 copy for now, correctness first; dropping the fp16
       // allocation is the step that actually saves the memory.
       stage_packed_triple(p + ".attention.wq", p + ".attention.wk", p + ".attention.wv",
                           &lw.wqkv_packed, 16);
@@ -1307,7 +1307,7 @@ void LlamaEngine::init_layer_cache() {
 
   // Size the prefill scratch now rather than on the first prompt. A packed
   // weight has no fp16 form for cuBLAS, so prefill expands the largest of them
-  // into this buffer -- and growing it there costs a stream sync plus a
+  // into this buffer, and growing it there costs a stream sync plus a
   // few-hundred-MB cudaMalloc on the very request whose latency matters most.
   // Steady-state prefill is unaffected; this is purely first-token latency.
   if (built > 0 && !layer_cache_.empty()) {

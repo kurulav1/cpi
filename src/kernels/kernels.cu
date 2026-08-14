@@ -1448,8 +1448,8 @@ void launch_rmsnorm_quant_perm8(const half* x, const half* w, half* y, std::int8
 // stops paying for a separate quantize pass over the same 4096 values.
 //
 // The quantizer is a ~770 ns kernel and there are four per layer, which is about
-// the floor for a kernel this size -- silu_mul next door costs 695 ns for
-// comparable work. Nothing was going to make it cheaper, so the only lever left
+// the floor for a kernel this size (silu_mul next door costs 695 ns for
+// comparable work). Nothing was going to make it cheaper, so the only lever left
 // was not launching it. Two of the four read an rmsnorm output directly.
 //
 // Group layout: 32 values per group, i.e. four int4 vectors, and thread t owns

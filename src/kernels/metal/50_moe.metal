@@ -7,7 +7,7 @@ struct MoeRouterParams {
 // Softmax over experts, then top-k, then renormalise over the picked ones.
 //
 // One thread does all of it, exactly as the CUDA kernel does. Not laziness: experts is 8 and
-// top_k is 2, so this is a handful of FLOPs -- and the selection is a sequential
+// top_k is 2, so this is a handful of FLOPs, and the selection is a sequential
 // argmax-without-replacement whose tie-breaking must match CUDA's, or the two backends pick
 // different experts and diverge. `p > best_p` (strict) means the lowest index wins a tie;
 // parallelising the reduction would quietly change that.

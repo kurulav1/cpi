@@ -204,9 +204,9 @@ void LlamaEngine::eagle_tree_level(int B, int row0, int n_scr) {
                                           CUDA_R_32F);
 }
 
-// Verify body: eagle_verify_forward with three swaps -- per-row depth rope
+// Verify body: eagle_verify_forward with three swaps (per-row depth rope
 // offsets, K/V to per-layer scratch instead of the sequential cache store,
-// and ancestor-masked attention. Same fixed shapes, graph-safe by
+// and ancestor-masked attention). Same fixed shapes, graph-safe by
 // construction.
 void LlamaEngine::eagle_tree_verify_forward(int K) {
   const auto& cfg = weights_.config();

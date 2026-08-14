@@ -1,10 +1,10 @@
-// BERT-family embedding encoder -- the two kernels the rest of the tower does NOT already have.
+// BERT-family embedding encoder: the two kernels the rest of the tower does NOT already have.
 // The rest maps onto kernels the Qwen3.5 vision tower already needed:
 //
 //   CUDA embed_kernel          -> cpi_bert_embed          (here)
 //   CUDA layernorm_kernel      -> cpi_layernorm + cpi_add_inplace for the residual
 //   CUDA add_bias_kernel       -> cpi_gemm_f16 applies its own bias
-//   CUDA gelu_kernel           -> cpi_gelu_erf  (see the note below -- NOT cpi_gelu)
+//   CUDA gelu_kernel           -> cpi_gelu_erf  (see the note below; NOT cpi_gelu)
 //   CUDA attention_kernel      -> cpi_attention_bidirectional, written for the vision tower
 //   CUDA pool_normalize_kernel -> cpi_bert_pool_normalize (here)
 
@@ -26,7 +26,7 @@ struct BertPoolParams {
 
 // out[t][d] = word[token[t]][d] + pos[t][d] + type[type_id][d]
 //
-// Position embeddings are absolute and looked up by index, not rotary -- BERT's
+// Position embeddings are absolute and looked up by index, not rotary: BERT's
 // position_embedding_type is "absolute" and the table is a learned [max_pos][H]. Feeding a rotary
 // path here would be silently wrong rather than an error.
 //

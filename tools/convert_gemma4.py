@@ -113,7 +113,7 @@ def main():
         "num_kv_shared_layers": tc.get("num_kv_shared_layers", 0),
         "use_double_wide_mlp": bool(tc.get("use_double_wide_mlp", False)),
         # MoE (26B-A4B): dense-MLP + top-k experts, summed. Not yet loaded/run by
-        # the engine (needs int4 + expert streaming -- the fp16 experts exceed VRAM).
+        # the engine (needs int4 + expert streaming; the fp16 experts exceed VRAM).
         "enable_moe_block": bool(tc.get("enable_moe_block", False)),
         "num_experts": tc.get("num_experts") or 0,
         "top_k_experts": tc.get("top_k_experts") or 0,
@@ -162,7 +162,7 @@ def main():
     for L in range(nl):
         for t in per_layer:
             hf_name = PREFIX + f"layers.{L}.{t}"
-            # attention_k_eq_v full layers have no v_proj -- skip if absent.
+            # attention_k_eq_v full layers have no v_proj; skip if absent.
             if t == "self_attn.v_proj.weight" and hf_name not in hdr:
                 continue
             exports[f"layers.{L}.{t}"] = f"layers.{L}.{t}"
@@ -182,7 +182,7 @@ def main():
     cfg["first_shared_layer"] = first_shared
 
     # Pass 1: compute fp16 byte offsets from shapes without loading data (a 12B
-    # text tower is ~23GB -- buffering all tensors in RAM blows up the pagefile).
+    # text tower is ~23GB; buffering all tensors in RAM blows up the pagefile).
     out_hdr = {}
     offset = 0
     order = []
@@ -238,7 +238,7 @@ def main():
                 f.write(f"CFGJSON {k} {json.dumps(v)}\n")
             else:
                 f.write(f"CFG {k} {v}\n")
-        # Reasoning ("thinking") descriptor -- SHIPS with the model so the runtime
+        # Reasoning ("thinking") descriptor: SHIPS with the model so the runtime
         # carries no per-model knowledge (it just reads this). Gemma 4 enables
         # thinking with a <|think|> system turn and delimits the reasoning block in
         # its output with the special tokens <|channel> … <channel|>, which the

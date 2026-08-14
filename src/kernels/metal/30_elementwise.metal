@@ -19,24 +19,24 @@ kernel void cpi_rope(
   uint pos;
   if (p.mrope_t != 0u || p.mrope_h != 0u || p.mrope_w != 0u) {
     // M-RoPE: pick this lane's axis, then read that axis's position for this token. The buffer
-    // is [3][tokens] -- t, then h, then w.
+    // is [3][tokens]: t, then h, then w.
     //
     // The layout is interleaved, not chunked: [T,H,W,T,H,W,...], not [TTT...HHH...WWW]. Qwen3.5
     // sets mrope_interleaved=true and transformers' apply_interleaved_mrope builds it as "start
-    // from T everywhere, then overwrite stride-3 slots" --
+    // from T everywhere, then overwrite stride-3 slots":
     //
     //     freqs_t = freqs[0]
     //     for dim, offset in ((1,1), (2,2)):
     //         freqs_t[..., offset : mrope_section[dim]*3 : 3] = freqs[dim, ..., ...]
     //
     // so H takes lanes 1,4,7,... below section[1]*3 and W takes 2,5,8,... below section[2]*3,
-    // and every lane neither claims stays T. For [11,11,10] that is 11 T, 11 H, 10 W -- the same
+    // and every lane neither claims stays T. For [11,11,10] that is 11 T, 11 H, 10 W, the same
     // counts the chunked reading gives, which is why the section values look interchangeable and
     // are not.
     //
     // This was chunked, and nothing caught it. Both M-RoPE gates are blind to the lane mapping:
     // mrope_reduces_to_1d feeds t == h == w, where every mapping produces identical output
-    // bit-for-bit, and mrope_splits_axes only asserts the result differs from 1-D rope -- which a
+    // bit-for-bit, and mrope_splits_axes only asserts the result differs from 1-D rope, which a
     // wrong mapping does just as well as a right one. Same shape as the position-0 rotary trap.
     //
     // A model with mrope_interleaved=false would need the chunked rule back, behind a flag.
@@ -123,7 +123,7 @@ kernel void cpi_silu_mul(
 // Do not write this as 0.5 * x * (1 + tanh(inner)).
 //
 // Metal's tanh overflows. It evaluates as (exp(2z) - 1) / (exp(2z) + 1), and exp(2z)
-// exceeds fp32 for z beyond ~44, giving inf/inf = NaN -- where CUDA's tanhf saturates
+// exceeds fp32 for z beyond ~44, giving inf/inf = NaN, where CUDA's tanhf saturates
 // to 1 and is fine. Gemma reaches z ~ 62 on ordinary activations, so this produced NaN
 // on real inputs, for some tokens and not others (it depends on the gate value). Llama
 // never hit it because SwiGLU uses a sigmoid, which is naturally safe.
@@ -144,7 +144,7 @@ kernel void cpi_gelu_mul(
   const float gelu = x / (1.0f + exp(-2.0f * inner));  // == 0.5*x*(1 + tanh(inner))
   // p.scale (0 means 1) divides the product before it is stored, and the plan multiplies the same
   // factor back after the following down-projection. That projection is linear, so the round trip
-  // is exact -- and with a power of two the scaling is a pure exponent shift, so it costs no
+  // is exact, and with a power of two the scaling is a pure exponent shift, so it costs no
   // mantissa bits either. Nothing is approximated here.
   //
   // It exists because Gemma 4's norm gains are large (7-47 in E2B): activations reach ~165 into
@@ -152,7 +152,7 @@ kernel void cpi_gelu_mul(
   // it finite but lossy, and the loss compounded into repetition over long generations. The clamp
   // stays as a backstop, a no-op for values that fit, so no existing model's arithmetic changes.
   // in2 may be a window of a wider row than out's. Flat indexing is only correct when the two
-  // strides match, which is why an aux_offset plan used to be forced to one token at a time --
+  // strides match, which is why an aux_offset plan used to be forced to one token at a time;
   // this makes it correct for a whole prefill chunk instead.
   uint bidx = gid;
   if (p.row_len != 0u) {
@@ -263,11 +263,11 @@ kernel void cpi_kv_store(
 //
 // The decode kernel below takes one threadgroup per (query token, head), and each of those
 // walks the whole KV cache itself. Across a prompt that is O(T^2) of device traffic, and on
-// the 8B it measured ~80 GB at ~73 GB/s -- genuinely bandwidth-bound, and 23% of prefill.
+// the 8B it measured ~80 GB at ~73 GB/s: genuinely bandwidth-bound, and 23% of prefill.
 //
 // A query block fixes it: the block of keys a threadgroup pulls in now serves Q_BLOCK
 // queries instead of one, so the same answer costs Q_BLOCK times less traffic. The keys and
-// values are re-read once per query within the block, but that is an L1 hit -- a key block
+// values are re-read once per query within the block, but that is an L1 hit: a key block
 // is a few KB and the reuse is immediate.
 //
 // Each query keeps its own online-softmax state (running max, running sum), because each
@@ -275,7 +275,7 @@ kernel void cpi_kv_store(
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Plain (ungated) GELU, tanh approximation -- gelu_pytorch_tanh.
+// Plain (ungated) GELU, tanh approximation: gelu_pytorch_tanh.
 //
 // The vision MLP is fc1 -> gelu -> fc2, not a gated GeGLU, so cpi_gelu_mul does not fit.
 // Same sigmoid formulation as that kernel and for the same reason: writing this as
@@ -296,7 +296,7 @@ kernel void cpi_gelu(
 // ---------------------------------------------------------------------------
 // RoPE for a vision tower, from precomputed per-token cos/sin tables.
 //
-// The rotation itself is the same rotate_half pairing cpi_rope uses -- (i, i+head_dim/2) --
+// The rotation itself is the same rotate_half pairing cpi_rope uses, (i, i+head_dim/2),
 // but the angles are not derivable from a scalar position: each patch has a (row, column),
 // and the frequency vector is [row_freqs | col_freqs] rather than one geometric series. So the
 // table is built on the host (tokens * head_dim/2 floats, once per image) and read here.
@@ -335,10 +335,10 @@ kernel void cpi_rope_vision(
 //
 // NOT interchangeable with cpi_gelu above. The vision tower uses both: its blocks specify
 // hidden_act = "gelu_pytorch_tanh", but the patch merger constructs a bare nn.GELU(), whose
-// default is approximate='none'. The two differ by up to ~4e-4 -- small, systematic, and
+// default is approximate='none'. The two differ by up to ~4e-4: small, systematic, and
 // exactly the kind of thing that gets absorbed into a loosened tolerance instead of fixed.
 // ---------------------------------------------------------------------------
-// metal_stdlib has no erf (nor erfc), so this is Abramowitz & Stegun 7.1.26 -- max absolute
+// metal_stdlib has no erf (nor erfc), so this is Abramowitz & Stegun 7.1.26: max absolute
 // error 1.5e-7, which is four orders below fp16's resolution and two below the 4e-4 gap
 // between exact and tanh GELU that this exists to close.
 inline float cpi_erf(float x) {

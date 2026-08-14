@@ -46,7 +46,7 @@ SPEC = re.compile(r"accept_rate=([0-9.]+) tokens_per_round=([0-9.]+)")
 
 def run(bin_path, args, mutex):
     env = dict(os.environ, CPI_INSTANCE_MUTEX=mutex)
-    # Resolve the binary to an absolute path -- a relative path is not reliably
+    # Resolve the binary to an absolute path: a relative path is not reliably
     # found by subprocess on Windows.
     bin_path = os.path.abspath(bin_path)
     p = subprocess.run([bin_path, *args], env=env, capture_output=True, text=True, timeout=400)

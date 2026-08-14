@@ -166,7 +166,7 @@ def main():
         handles.append(layer.self_attn.register_forward_hook(mkattn(i)))
 
     # ---- run ----
-    # use_cache=True so KV sharing (num_kv_shared_layers) is ACTIVE -- this is the
+    # use_cache=True so KV sharing (num_kv_shared_layers) is ACTIVE; this is the
     # intended inference behavior. With use_cache=False, past_key_values is None
     # and HF skips sharing (each layer computes its own K/V), a different graph.
     with torch.no_grad():

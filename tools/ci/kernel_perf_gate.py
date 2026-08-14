@@ -34,17 +34,17 @@ BASELINE = Path(__file__).resolve().parent / "kernel_perf_baseline.json"
 # Per-bench regression tolerance (max fractional GB/s drop before failing).
 #
 # int4_gemv is rock-stable run-to-run on this box (never false-flagged across four
-# independent best-of-3 windows), so it gets a tight, meaningful gate -- it is also
+# independent best-of-3 windows), so it gets a tight, meaningful gate; it is also
 # the load-bearing decode signal (weight-streaming GEMVs dominate decode time).
 #
 # attention_decode is different: its high-batch/long-context shapes have a ~40-45%
 # run-to-run NOISE FLOOR here (one shape swung -32/-39/-41/-45% across windows that
-# changed nothing). The cause is cross-window thermal/clock drift -- best-of-N absorbs
+# changed nothing). The cause is cross-window thermal/clock drift: best-of-N absorbs
 # drift within a window but not the temperature difference between a baseline capture
 # and a gate run minutes later. On a consumer WDDM GPU that floor is irreducible for a
 # wall-clock-throttled microbench, so the attention gate is deliberately coarse: it
 # only catches GROSS regressions (fallback kernel / wrong head_dim path / disabled
-# coarsening -- all 2-10x cliffs), not subtle ones. For a tight attention signal, run
+# coarsening, all 2-10x cliffs), not subtle ones. For a tight attention signal, run
 # the microbench standalone on an idle, thermally-steady GPU and eyeball %-of-roofline.
 DEFAULT_TOL = {"int4_gemv": 0.12, "attention_decode": 0.50}
 

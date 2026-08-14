@@ -721,7 +721,7 @@ void LlamaEngine::reset_kv_cache() {
     // >= seq_len - win_n of the owning sequence's slot, all of which that sequence's
     // own prefill + decode freshly wrote (prefix adoption is disabled under this
     // tier). At batched slot counts these buffers are ~GB-scale, and this reset runs
-    // per generation on the single-sequence path -- clearing them was measured at
+    // per generation on the single-sequence path; clearing them was measured at
     // ~180ms/reset (the B=48/64 batch-bench collapse).
     return;
   }

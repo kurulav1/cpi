@@ -2002,7 +2002,7 @@ void launch_weight_only_int4_matvec_dual_dp4a(const int8_t* w_a_packed, const fl
 //
 // Layout is the one pack_rowwise_int8_to_int4 writes: sequential column pairs,
 // low nibble first, signed two's complement, one scale per row. NOT the op-plan
-// engine's packing -- launch_dequant_int4_grouped reads a different one, and
+// engine's packing: launch_dequant_int4_grouped reads a different one, and
 // feeding these bytes to it runs fast and produces garbage.
 __global__ void dequant_rowwise_int4_to_fp16_kernel(const std::int8_t* __restrict__ packed,
                                                     const float* __restrict__ scales,

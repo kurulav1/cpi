@@ -103,8 +103,8 @@ kernel void cpi_add_rmsnorm(
 // One simdgroup per output row; each lane strides the row, fp32 accumulate.
 //
 // The weights are read 128 bits at a time (uint4 = 8 halves), not one half at a
-// time. A decode GEMV is pure bandwidth -- it touches every weight exactly once and
-// never reuses one -- so the load width is the kernel. Reading 16-bit scalars leaves
+// time. A decode GEMV is pure bandwidth (it touches every weight exactly once and
+// never reuses one), so the load width is the kernel. Reading 16-bit scalars leaves
 // most of each memory transaction unused and cannot keep enough requests in flight to
 // cover DRAM latency. The same mistake, and the same fix, as the CUDA backend.
 //
@@ -149,7 +149,7 @@ kernel void cpi_gemv_f16(
   // activation is loaded once for all of them. An fp16 square GEMV is half activation
   // re-reads by traffic on the one-row shape (row = in_dim halfs, activation = in_dim halfs),
   // so this cuts total traffic up to 1.6x. The executor passes 64-thread threadgroups under
-  // the same predicate (tokens == 1, in_dim % 8 == 0) -- keep them in lockstep.
+  // the same predicate (tokens == 1, in_dim % 8 == 0); keep them in lockstep.
   if (p.tokens == 1u && (p.in_dim & 7u) == 0u) {
     const uint r0 = (gid * simds_per_tg + simd_id) * 4u;
     if (r0 >= p.out_dim) return;
@@ -235,7 +235,7 @@ kernel void cpi_lm_head(
   const uint lane         = lid % 32u;
 
   // The LM head is the biggest single read of a decode step (vocab x hidden), so the load
-  // width matters most here -- and so does the four-rows-per-simdgroup shape: the head is
+  // width matters most here, and so does the four-rows-per-simdgroup shape: the head is
   // always a single token, and one-row-per-simdgroup re-reads the whole activation once per
   // vocab row. Executor passes 64-thread threadgroups under the same predicate.
   if ((p.in_dim & 7u) == 0u) {
@@ -277,13 +277,13 @@ kernel void cpi_lm_head(
 //
 // The fp32 accumulators are load-bearing and measured to be so. The Qwen3.5 vision tower's
 // last block holds outliers around 1657 (its rows are otherwise ~unit scale), and 1657^2 is
-// 2.7e6 -- past fp16's 65504. Swapping the variance accumulator to half makes metal_smoke's
+// 2.7e6, past fp16's 65504. Swapping the variance accumulator to half makes metal_smoke's
 // layernorm case go from max_abs 0.0005 to 1.21, so that test genuinely pins this.
 //
 // The two passes are defensive, not required by this model. The one-pass identity
 // var = E[x^2] - E[x]^2 cancels catastrophically only when |mean| >> stddev, and these
 // activations are near zero-mean (max |mean|/stddev across the tower is 0.5), so both forms
-// agree here -- verified by patching the kernel to the one-pass form and seeing the test
+// agree here; verified by patching the kernel to the one-pass form and seeing the test
 // pass unchanged. Kept anyway: the second pass re-reads a row that is already in cache, and
 // nothing guarantees the next checkpoint's activations stay centred.
 // ---------------------------------------------------------------------------

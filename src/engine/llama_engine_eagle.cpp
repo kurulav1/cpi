@@ -497,7 +497,7 @@ std::vector<int> LlamaEngine::eagle_generate(const std::vector<int>& prompt_toke
 
   // CPI_EAGLE_PROF=1: wall-clock the round's phases (each phase boundary gets a
   // stream sync while profiling, so the numbers are attribution, not exact
-  // production timings -- the perturbation is a few syncs/round).
+  // production timings; the perturbation is a few syncs/round).
   static const bool prof = std::getenv("CPI_EAGLE_PROF") != nullptr;
   double t_heal = 0.0, t_draft = 0.0, t_verify = 0.0, t_round = 0.0;
   using pclock = std::chrono::steady_clock;
