@@ -194,17 +194,15 @@ static const int kPfDist = [] {
 // ROWS stays a template parameter so the pointers and accumulators live in
 // registers, and stays switchable via CPI_CPU_GEMV_ROWS because the balance is
 // per-microarchitecture.
-// Rows handed to a thread at a time. This is the same lever as ROWS above seen
-// from the other side: with ROWS=1 the chunk size IS the length of each thread's
-// contiguous walk through the weight matrix, so bigger chunks mean longer
-// uninterrupted DRAM runs. Swept on Zen 5 (1B fp16, medians of 3):
-//   dynamic,16 18.59   dynamic,32 19.33   dynamic,64 20.01   dynamic,128 19.56
-//   dynamic,256 19.43  static 20.10       guided 18.82
-// static edges it but is statistically tied with dynamic,64 and is rigid: one
-// slow core strands the rest, which on a desktop sharing the CPU with other
-// processes, and on a chip whose two CCDs are not identical (only one carries
-// the 3D V-Cache), is a real risk for no measured gain. Note static was the
-// WORST option back when blocks were 8 rows wide; contiguity is why it wins now.
+// Rows handed to a thread at a time, and so the length of each contiguous walk
+// when ROWS is 1. Paired and warmed on Llama-3.2-1B against the previous 16:
+//   rows=4 chunk=16  18.59 (baseline)
+//   rows=1 chunk=16  19.18  +0.65, faster in 5/5 paired reps
+//   rows=4 chunk=64  18.55  +0.06, faster in 3/5  <- chunk alone does nothing
+//   rows=1 chunk=64  19.65  +0.99, faster in 5/5 paired reps
+// The chunk only matters in combination with ROWS=1, which is the tell that both
+// knobs are the same underlying effect: how long a run of consecutive weight
+// bytes a thread gets before it jumps somewhere else.
 static const int kGemvChunk = [] {
   const char* e = std::getenv("CPI_CPU_GEMV_CHUNK");
   const int v = e ? std::atoi(e) : 64;
@@ -241,12 +239,50 @@ static void gemv_fp16_rows(const uint16_t* CPI_RESTRICT W, const float* CPI_REST
   }
 }
 
-// Rows per block; 1 is the shipped shape (see above). A/B lever only.
+// Rows per block; 1 is the shipped shape. See the note below for why, and for
+// the harness that has to be used to re-measure it.
 static const int kGemvRows = [] {
   const char* e = std::getenv("CPI_CPU_GEMV_ROWS");
   const int v = e ? std::atoi(e) : 1;
   return (v == 1 || v == 2 || v == 4 || v == 8) ? v : 1;
 }();
+
+// Why ONE row per block, when register blocking is the usual advice.
+//
+// Decode reads every weight exactly once, so it is bound by DRAM rather than by
+// arithmetic, and what sets its rate is how the reads look to the memory
+// controller. A block of R rows touches R addresses N*2 bytes apart: R
+// concurrent streams per thread, all competing for DRAM row buffers. With R=1
+// and a chunked schedule each thread instead walks many CONSECUTIVE rows, and
+// because the matrix is row-major that is one long contiguous run. Register
+// blocking is right for the GEMM in cpu_gemm_avx512.cpp, which reuses a weight
+// block across tokens; there is no such reuse here.
+//
+// Paired against R=4, warmed, interleaved, medians of 3, whole-model decode:
+//   Qwen2.5-0.5B   (widest N  4864) 42.18 -> 45.25  +7.3%   3/3 reps
+//   Llama-3.2-1B   (widest N  8192) 18.54 -> 19.37  +4.5%   3/3 reps
+//   Qwen2.5-Coder-3B (N 11008)       7.65 ->  8.05  +5.3%   3/3 reps
+//   Llama-3.1-8B   (widest N 14336)  3.36 ->  3.50  +4.1%   3/3 reps
+//
+// FALSIFIED along the way: that x reuse should make wide blocks win at large N.
+// R=1 re-reads x once per row, so at N=14336 it re-reads 56 KB against a 48 KB
+// L1, and the arithmetic says that traffic (235 MB per GEMV) should swamp the
+// weights (117 MB). It does not; R=1 still wins there. The x re-reads are served
+// by L2, which has bandwidth to spare, while the weight stream is the actual
+// bottleneck.
+//
+// HOW TO RE-MEASURE THIS, because two earlier harnesses both got it wrong in
+// opposite directions. The slope method (time N=24 and N=120, divide the
+// difference) only subtracts prefill if both runs decode at the same rate, and
+// the first run of a model also pages its weights in, so whichever
+// configuration is measured FIRST comes out inflated. One harness measured R=1
+// first and "proved" it best; another measured R=4 first and "proved" R=1 a 25%
+// regression on the 8B. Warm every arm before timing, interleave the arms
+// A/B/A/B so machine drift cancels in the pair, and report how many paired reps
+// agree rather than a ratio of medians.
+static inline int gemv_rows_for(int) {
+  return kGemvRows;
+}
 #endif
 
 static void gemv_fp16_impl(const uint16_t* CPI_RESTRICT W, const float* CPI_RESTRICT x,
@@ -254,7 +290,7 @@ static void gemv_fp16_impl(const uint16_t* CPI_RESTRICT W, const float* CPI_REST
 #if defined(__AVX2__) && defined(CPU_ENGINE_HAVE_F16C)
   // ROWS=1 divides any M, so it is always safe; the wider blocks only run when
   // they divide M evenly, otherwise a block would read past the last row.
-  switch (kGemvRows) {
+  switch (gemv_rows_for(N)) {
     case 2:
       if ((M & 1) == 0) {
         gemv_fp16_rows<2>(W, x, y, M, N);
