@@ -194,10 +194,27 @@ static const int kPfDist = [] {
 // ROWS stays a template parameter so the pointers and accumulators live in
 // registers, and stays switchable via CPI_CPU_GEMV_ROWS because the balance is
 // per-microarchitecture.
+// Rows handed to a thread at a time. This is the same lever as ROWS above seen
+// from the other side: with ROWS=1 the chunk size IS the length of each thread's
+// contiguous walk through the weight matrix, so bigger chunks mean longer
+// uninterrupted DRAM runs. Swept on Zen 5 (1B fp16, medians of 3):
+//   dynamic,16 18.59   dynamic,32 19.33   dynamic,64 20.01   dynamic,128 19.56
+//   dynamic,256 19.43  static 20.10       guided 18.82
+// static edges it but is statistically tied with dynamic,64 and is rigid: one
+// slow core strands the rest, which on a desktop sharing the CPU with other
+// processes, and on a chip whose two CCDs are not identical (only one carries
+// the 3D V-Cache), is a real risk for no measured gain. Note static was the
+// WORST option back when blocks were 8 rows wide; contiguity is why it wins now.
+static const int kGemvChunk = [] {
+  const char* e = std::getenv("CPI_CPU_GEMV_CHUNK");
+  const int v = e ? std::atoi(e) : 64;
+  return v > 0 ? v : 64;
+}();
+
 template <int ROWS>
 static void gemv_fp16_rows(const uint16_t* CPI_RESTRICT W, const float* CPI_RESTRICT x,
                            float* CPI_RESTRICT y, int M, int N) {
-#pragma omp parallel for schedule(dynamic, 16)
+#pragma omp parallel for schedule(dynamic, kGemvChunk)
   for (int i = 0; i < M; i += ROWS) {
     __m256 acc[ROWS];
     const uint16_t* r[ROWS];
