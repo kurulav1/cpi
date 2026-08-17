@@ -166,59 +166,100 @@ static const int kPfDist = [] {
 //
 // Requires M to be a multiple of 4 and N to be a multiple of 8.
 // The caller (gemv_fp16) pads if necessary.
+#if defined(__AVX2__) && defined(CPU_ENGINE_HAVE_F16C)
+// Decode GEMV, ROWS output rows per block.
+//
+// ROWS=1 is the default, and that is the opposite of what register blocking
+// usually wants. Decode reads every weight exactly once, so it is bound by DRAM
+// and not by arithmetic, and the thing that decides its rate is how the reads
+// look to the memory controller. A block of R rows touches R addresses that are
+// N*2 bytes apart, i.e. R concurrent streams per thread and R x threads open
+// streams competing for DRAM row buffers. With ROWS=1 and dynamic,16
+// scheduling, each thread instead walks 16 CONSECUTIVE rows, and since the
+// matrix is row-major that is one long contiguous run.
+//
+// Measured on Zen 5, Llama-3.2-1B fp16, 8 pinned threads, medians of 3:
+//   ROWS=1  19.19 tok/s (47.4 GB/s)   ROWS=2  18.63 (46.0)
+//   ROWS=4  18.28 tok/s (45.2)        ROWS=8  17.88 (44.2)
+// Monotonic in stream count, and worth 5% end to end. It also removes the need
+// for thread pinning: with the streams fixed, 8 pinned threads measure no
+// better than the default pool, so the earlier +3% from OMP_PROC_BIND was
+// mostly just fewer threads opening fewer streams.
+//
+// This is also why the weights are NOT repacked. Interleaving rows to get one
+// contiguous stream was the obvious next step, and it would have cost a second
+// copy of every weight in RAM; row-major layout already provides exactly that
+// stream as long as the kernel stops striding across it.
+//
+// ROWS stays a template parameter so the pointers and accumulators live in
+// registers, and stays switchable via CPI_CPU_GEMV_ROWS because the balance is
+// per-microarchitecture.
+template <int ROWS>
+static void gemv_fp16_rows(const uint16_t* CPI_RESTRICT W, const float* CPI_RESTRICT x,
+                           float* CPI_RESTRICT y, int M, int N) {
+#pragma omp parallel for schedule(dynamic, 16)
+  for (int i = 0; i < M; i += ROWS) {
+    __m256 acc[ROWS];
+    const uint16_t* r[ROWS];
+#pragma unroll
+    for (int k = 0; k < ROWS; ++k) {
+      acc[k] = _mm256_setzero_ps();
+      r[k] = W + static_cast<std::ptrdiff_t>(i + k) * N;
+    }
+    for (int j = 0; j < N; j += 8) {
+      if (kPfDist > 0) {
+        prefetch_r(r[0] + j + kPfDist);
+        if (ROWS > 1) prefetch_r(r[1] + j + kPfDist);
+      }
+      const __m256 xv = _mm256_loadu_ps(x + j);
+#pragma unroll
+      for (int k = 0; k < ROWS; ++k) {
+        acc[k] = _mm256_fmadd_ps(
+            _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(r[k] + j))), xv,
+            acc[k]);
+      }
+    }
+#pragma unroll
+    for (int k = 0; k < ROWS; ++k) y[i + k] = hsum256(acc[k]);
+  }
+}
+
+// Rows per block; 1 is the shipped shape (see above). A/B lever only.
+static const int kGemvRows = [] {
+  const char* e = std::getenv("CPI_CPU_GEMV_ROWS");
+  const int v = e ? std::atoi(e) : 1;
+  return (v == 1 || v == 2 || v == 4 || v == 8) ? v : 1;
+}();
+#endif
+
 static void gemv_fp16_impl(const uint16_t* CPI_RESTRICT W, const float* CPI_RESTRICT x,
                            float* CPI_RESTRICT y, int M, int N) {
 #if defined(__AVX2__) && defined(CPU_ENGINE_HAVE_F16C)
-// --- AVX2 + F16C fast path ---
-// Outer loop parallelised over output rows in blocks of 4.
-#pragma omp parallel for schedule(dynamic, 16)
-  for (int i = 0; i < M; i += 4) {
-    __m256 acc0 = _mm256_setzero_ps();
-    __m256 acc1 = _mm256_setzero_ps();
-    __m256 acc2 = _mm256_setzero_ps();
-    __m256 acc3 = _mm256_setzero_ps();
-
-    const uint16_t* r0 = W + static_cast<std::ptrdiff_t>(i + 0) * N;
-    const uint16_t* r1 = W + static_cast<std::ptrdiff_t>(i + 1) * N;
-    const uint16_t* r2 = W + static_cast<std::ptrdiff_t>(i + 2) * N;
-    const uint16_t* r3 = W + static_cast<std::ptrdiff_t>(i + 3) * N;
-
-    for (int j = 0; j < N; j += 8) {
-      // V6: prefetch ~20 iterations (160 fp16 elements = 320 bytes) ahead.
-      // Only issue on the first two rows to avoid overfilling the prefetch
-      // buffer; the remaining rows benefit from hardware prefetcher.
-      //
-      // CPI_CPU_GEMV_PF tunes the distance in fp16 elements (0 disables the
-      // software prefetch entirely and leaves it to the hardware prefetcher).
-      // 320 bytes only covers a few cache lines, which is far less than a DRAM
-      // access is in flight for at this bandwidth, so the distance is worth
-      // sweeping rather than assuming.
-      if (kPfDist > 0) {
-        prefetch_r(r0 + j + kPfDist);
-        prefetch_r(r1 + j + kPfDist);
+  // ROWS=1 divides any M, so it is always safe; the wider blocks only run when
+  // they divide M evenly, otherwise a block would read past the last row.
+  switch (kGemvRows) {
+    case 2:
+      if ((M & 1) == 0) {
+        gemv_fp16_rows<2>(W, x, y, M, N);
+        return;
       }
-
-      // Load input slice (FP32, 8 elements = 32 bytes).
-      const __m256 xv = _mm256_loadu_ps(x + j);
-
-      // Load 8×FP16 per row, convert to FP32, fused-multiply-add.
-      // _mm256_cvtph_ps takes a 128-bit register of 8 fp16 and returns
-      // a 256-bit register of 8 fp32: one instruction, no precision loss.
-      acc0 = _mm256_fmadd_ps(
-          _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(r0 + j))), xv, acc0);
-      acc1 = _mm256_fmadd_ps(
-          _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(r1 + j))), xv, acc1);
-      acc2 = _mm256_fmadd_ps(
-          _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(r2 + j))), xv, acc2);
-      acc3 = _mm256_fmadd_ps(
-          _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(r3 + j))), xv, acc3);
-    }
-
-    y[i + 0] = hsum256(acc0);
-    y[i + 1] = hsum256(acc1);
-    y[i + 2] = hsum256(acc2);
-    y[i + 3] = hsum256(acc3);
+      break;
+    case 4:
+      if ((M & 3) == 0) {
+        gemv_fp16_rows<4>(W, x, y, M, N);
+        return;
+      }
+      break;
+    case 8:
+      if ((M & 7) == 0) {
+        gemv_fp16_rows<8>(W, x, y, M, N);
+        return;
+      }
+      break;
+    default:
+      break;
   }
+  gemv_fp16_rows<1>(W, x, y, M, N);
 
 #elif defined(__AVX__)
 // --- AVX path (FP32 weights only, no F16C) ---
