@@ -145,6 +145,25 @@ void print_usage(std::ostream& os) {
         "[--no-bos] [--eos-token n] [--no-loop-guard] "
         "[--weight-quant none|int8|int4] "
         "[--paged-kv-cache] [--web] [--interactive] [--simple]\n";
+  // The flat usage line above lists tuning knobs but had grown to hide the
+  // features people actually come here for: a user running --help could not
+  // discover the API server, CPU execution, vision or speculative decoding
+  // at all. Those get named sections rather than twenty more entries on a
+  // line that is already unreadable.
+  os << "\nBackends:\n"
+        "  --cpu                    force the CPU engine (default: CUDA/Metal when present)\n"
+        "\nServing:\n"
+        "  --serve                  OpenAI-compatible HTTP API (implies --interactive-batch)\n"
+        "  --port n / --host addr   listen address for --serve\n"
+        "  --api-key key            require this key on API requests\n"
+        "  --interactive-batch      continuous batching over stdin JSON lines\n"
+        "  --paged-blocks           paged KV cache; required by the serving paths\n"
+        "\nSpeculative decoding:\n"
+        "  --draft-model path       small same-tokenizer model to draft with\n"
+        "  --spec-tokens k          tokens drafted per verify round\n"
+        "\nMultimodal:\n"
+        "  --image path.png         one image plus --prompt (models with a vision tower)\n"
+        "\nSee README.md for the full flag list and for model preparation.\n";
 }
 
 void apply_simple_mode_defaults(ParsedArgs* args) {
@@ -462,6 +481,20 @@ ParsedArgs parse_args(int argc, char** argv) {
   if (args.batched_check > 0 && !args.opts.paged_blocks) {
     args.opts.paged_blocks = true;
     std::fprintf(stderr, "[cli] --batched-check implies --paged-blocks; enabling it.\n");
+  }
+  // Same for the serving transports. Without the pool, admitting a request dies
+  // inside the scheduler with "stream_admit requires --paged-blocks", which names
+  // an internal function and leaves the user to guess the flag. --serve has no
+  // reason to run without a paged pool, so it asks for one itself.
+  // Excluding the speculative server on purpose: --serve with --draft-model runs
+  // the SERIAL transport on a contiguous cache, and its cross-request prefix
+  // reuse is gated on !paged_blocks, so implying the flag here would silently
+  // turn that reuse off and make every turn re-prefill the whole conversation.
+  if ((args.serve_http || args.interactive_batch) && args.draft_model_path.empty() &&
+      !args.opts.paged_blocks) {
+    args.opts.paged_blocks = true;
+    std::fprintf(stderr,
+                 "[cli] --serve/--interactive-batch imply --paged-blocks; enabling it.\n");
   }
 
   apply_simple_mode_defaults(&args);
