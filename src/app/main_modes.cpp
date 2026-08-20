@@ -660,7 +660,15 @@ void execute_engine_modes(const RunExecutionOptions& options, const std::vector<
       }
     }
     if (options.simple_mode) {
-      std::cout << final_text << "\n";
+      // The streaming display thread above already wrote this answer to stdout
+      // token by token, so printing final_text unconditionally emitted the whole
+      // thing twice. Stream when there is a stream, and print the text here only
+      // when nothing else did: the benchmark path and the no-tokenizer path.
+      if (repeated_benchmark || !options.use_tokenizer) {
+        std::cout << final_text << "\n";
+      } else {
+        std::cout << "\n";
+      }
     } else if (!options.quiet_output) {
       std::cout << "Decoded text:\n" << final_text << "\n";
     }

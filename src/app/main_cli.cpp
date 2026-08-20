@@ -168,8 +168,14 @@ void apply_simple_mode_defaults(ParsedArgs* args) {
     args->opts.gpu_cache_all = true;
   }
   if (!args->weight_quant_set) {
+    // Must match --weight-quant int8 exactly, including prefer_lowbit_cache.
+    // Setting only the first two left the resident cache holding fp16 layers
+    // while the decode path read the int8 streaming buffers, which reached
+    // cuBLAS as a mismatched GEMM and aborted the run with a bare CUBLAS
+    // error 7. It only showed on CUDA; the CPU engine ignores both fields.
     args->opts.int8_streaming = true;
     args->opts.streaming_quant_bits = 8;
+    args->opts.prefer_lowbit_cache = true;
   }
   args->opts.enable_host_resource_limits = false;
   if (!args->chat_template_set && args->chat_template.empty()) {

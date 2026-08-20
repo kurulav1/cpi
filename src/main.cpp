@@ -422,10 +422,11 @@ int main(int argc, char** argv) {
         } else if ((cli.chat_template == "tinyllama" || cli.chat_template == "tinyllama-chatml") &&
                    std::filesystem::path(cli.tokenizer_path).extension() == ".json") {
           info_out << "[tokenizer] using native tokenizer.json BPE path\n";
-        } else if (cli.chat_template == "llama4" &&
+        } else if (!tokenizer_from_gguf && cli.chat_template == "llama4" &&
                    std::filesystem::path(cli.tokenizer_path).extension() != ".json") {
           info_out << "[warn] Llama4 is expected to use a HuggingFace tokenizer.json tokenizer.\n";
-        } else if ((cli.chat_template == "llama3" || cli.chat_template == "phi3" ||
+        } else if (!tokenizer_from_gguf &&
+                   (cli.chat_template == "llama3" || cli.chat_template == "phi3" ||
                     cli.chat_template == "qwen2" || cli.chat_template == "qwen3_5") &&
                    std::filesystem::path(cli.tokenizer_path).extension() != ".json") {
           info_out << "[warn] " << cli.chat_template
