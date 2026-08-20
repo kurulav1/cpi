@@ -268,12 +268,21 @@ Tagged releases attach prebuilt `cpi` binaries (see the repository's Releases pa
 | ----- | -------- | ------- |
 | `cpi-linux-x64-cpu` | Linux x64 | CPU |
 | `cpi-windows-x64-cpu` | Windows x64 | CPU |
+| `cpi-linux-arm64-cpu` | Linux arm64 | CPU |
+| `cpi-linux-x64-cuda` | Linux x64 | CUDA GPU + CPU |
+| `cpi-windows-x64-cuda` | Windows x64 | CUDA GPU + CPU |
 | `cpi-macos-arm64-metal` | macOS (Apple Silicon) | Metal GPU + CPU |
 
 Unpack and check the build with `cpi --version`. The macOS archive bundles the Metal
 shader sources next to the binary; launch it with the included `./run.sh` (which sets
-`CPI_METAL_SOURCE` for you) or set that variable by hand. CUDA is not shipped as a binary (it is
-GPU-architecture and driver specific) -- build it from source per [Build Modes](#build-modes).
+`CPI_METAL_SOURCE` for you) or set that variable by hand.
+The CUDA assets are built for Turing through Blackwell (sm_75/80/86/89/90/120) and bundle
+cudart and cuBLAS, which a driver install does not provide; on Linux launch them through the
+included `./run.sh` so those libraries resolve. Only the two x64 CPU assets are guaranteed to
+be present: the arm64, CUDA and macOS jobs are best-effort on hosted runners, so a missing
+asset means that build did not run rather than that the platform is unsupported. For a GPU
+outside that architecture list, or for the smallest binary for your own card, build from
+source per [Build Modes](#build-modes).
 
 ### Prerequisites
 

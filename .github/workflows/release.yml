@@ -107,9 +107,118 @@ jobs:
           name: ${{ env.ASSET }}
           path: pkg/*.tar.gz
 
+  build-linux-arm64:
+    name: Build CPU binary (linux arm64)
+    runs-on: ubuntu-24.04-arm
+    # Best-effort like macOS: a runner-label or toolchain change here must not stop the
+    # x64 assets shipping. The x86 SIMD paths compile out on aarch64 and the engine falls
+    # back to its scalar kernels, so this is a correctness build, not a fast one.
+    continue-on-error: true
+    env:
+      ASSET: cpi-linux-arm64-cpu
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (CPU-only)
+        run: >
+          cmake -S . -B build
+          -DCPI_ENABLE_CUDA=OFF
+          -DCPI_ENABLE_SENTENCEPIECE=OFF
+          -DCMAKE_BUILD_TYPE=Release
+      - name: Build cpi
+        run: cmake --build build --config Release --target cpi -j
+      - name: Stage package
+        shell: bash
+        run: |
+          mkdir -p "pkg/$ASSET"
+          cp build/cpi "pkg/$ASSET/"
+          cp README.md LICENSE NOTICE "pkg/$ASSET/" 2>/dev/null || true
+      - name: Archive
+        shell: bash
+        run: cd pkg && tar -czf "$ASSET.tar.gz" "$ASSET"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ASSET }}
+          path: pkg/*.tar.gz
+
+  build-cuda:
+    name: Build CUDA binary (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset: cpi-linux-x64-cuda
+            bin: build/cpi
+          - os: windows-latest
+            asset: cpi-windows-x64-cuda
+            bin: build/Release/cpi.exe
+    runs-on: ${{ matrix.os }}
+    # Best-effort: this installs a multi-gigabyte toolkit and compiles every kernel for
+    # six architectures, so it is the most likely job to hit a runner disk or time limit.
+    # The release publishes with or without it.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          cuda: "12.6.0"
+          method: network
+          # Only what nvcc and the engine link against; the full toolkit does not fit
+          # comfortably in the hosted runners' free space.
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "thrust"]'
+      - name: Configure (CUDA, multi-arch)
+        run: >
+          cmake -S . -B build
+          -DCPI_ENABLE_CUDA=ON
+          -DCPI_ENABLE_SENTENCEPIECE=OFF
+          -DCMAKE_BUILD_TYPE=Release
+          "-DCMAKE_CUDA_ARCHITECTURES=75;80;86;89;90;120"
+      - name: Build cpi
+        run: cmake --build build --config Release --target cpi -j
+      - name: Stage package
+        shell: bash
+        run: |
+          DEST="pkg/${{ matrix.asset }}"
+          mkdir -p "$DEST"
+          cp "${{ matrix.bin }}" "$DEST/"
+          cp README.md LICENSE NOTICE "$DEST/" 2>/dev/null || true
+          # cudart and cuBLAS are toolkit components, not driver components: someone with
+          # an NVIDIA driver still does not have them, so the binary cannot start without
+          # these sitting beside it.
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "$CUDA_PATH"/bin/cudart64_*.dll "$DEST/" 2>/dev/null || true
+            cp "$CUDA_PATH"/bin/cublas64_*.dll "$DEST/" 2>/dev/null || true
+            cp "$CUDA_PATH"/bin/cublasLt64_*.dll "$DEST/" 2>/dev/null || true
+          else
+            cp -P "$CUDA_PATH"/lib64/libcudart.so.* "$DEST/" 2>/dev/null || true
+            cp -P "$CUDA_PATH"/lib64/libcublas.so.* "$DEST/" 2>/dev/null || true
+            cp -P "$CUDA_PATH"/lib64/libcublasLt.so.* "$DEST/" 2>/dev/null || true
+            # Let the binary find them next to itself rather than needing LD_LIBRARY_PATH.
+            SH="$DEST/run.sh"
+            echo '#!/bin/bash' > "$SH"
+            echo 'DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"' >> "$SH"
+            echo 'export LD_LIBRARY_PATH="$DIR:$LD_LIBRARY_PATH"' >> "$SH"
+            echo 'exec "$DIR/cpi" "$@"' >> "$SH"
+            chmod +x "$DEST/run.sh" "$DEST/cpi"
+          fi
+      - name: Archive
+        shell: bash
+        run: |
+          cd pkg
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a "${{ matrix.asset }}.zip" "${{ matrix.asset }}" >/dev/null
+          else
+            tar -czf "${{ matrix.asset }}.tar.gz" "${{ matrix.asset }}"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: pkg/${{ matrix.asset }}.*
+
   release:
     name: Publish release
-    needs: [build-binaries, build-macos-metal]
+    needs: [build-binaries, build-macos-metal, build-linux-arm64, build-cuda]
     # Publish as long as the CPU binaries built; the macOS job is best-effort (see above).
     if: ${{ always() && needs.build-binaries.result == 'success' }}
     runs-on: ubuntu-latest
@@ -133,7 +242,15 @@ jobs:
             |---|---|---|
             | `cpi-linux-x64-cpu` | Linux x64 | CPU |
             | `cpi-windows-x64-cpu` | Windows x64 | CPU |
+            | `cpi-linux-arm64-cpu` | Linux arm64 | CPU |
+            | `cpi-linux-x64-cuda` | Linux x64 | CUDA GPU + CPU |
+            | `cpi-windows-x64-cuda` | Windows x64 | CUDA GPU + CPU |
             | `cpi-macos-arm64-metal` | macOS (Apple Silicon) | Metal GPU + CPU |
+
+            The x64 CPU assets always ship. The arm64, CUDA and macOS ones are
+            best-effort on hosted runners and are attached only when their job
+            succeeded, so a missing asset means that build did not run, not that
+            the platform is unsupported.
 
             Verify a build with `cpi --version`.
 
@@ -153,8 +270,15 @@ jobs:
             may prompt Gatekeeper on an unsigned binary -- allow it in System Settings › Privacy.
 
             ### GPU (CUDA) builds
-            CUDA binaries are GPU-architecture and driver specific, so they are not
-            shipped here. Build from source with a CUDA toolkit present:
+            The CUDA assets are compiled for Turing through Blackwell
+            (sm_75/80/86/89/90/120), covering RTX 20xx through RTX 50xx plus A100 and
+            H100. They need an NVIDIA driver but not a CUDA toolkit: cudart and cuBLAS
+            ship inside the archive, since those are toolkit components a driver install
+            does not provide. On Linux launch via the bundled ./run.sh so they resolve
+            next to the binary.
+
+            For a GPU outside that list, or for the smallest binary for your own card,
+            build from source with a CUDA toolkit present:
 
             ```
             cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
