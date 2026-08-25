@@ -469,15 +469,20 @@ target_link_libraries(ll2c_to_cpi PRIVATE cpi_engine)
 # big enough to be a real model.
 # Device k-quant dequant vs the host reference. Needs CUDA; takes an optional
 # .gguf so it can run on real blocks rather than only synthetic ones.
-add_executable(kquant_dequant_test src/tests/kquant_dequant_test.cu)
-target_include_directories(kquant_dequant_test PRIVATE include)
-target_link_libraries(kquant_dequant_test PRIVATE cpi_engine)
-add_test(NAME kquant_dequant_test COMMAND kquant_dequant_test)
+# CUDA-only: both are .cu and exercise device kernels. They sat outside the guard,
+# so a CPU-only configure still created the targets and registered the tests while
+# producing no executables, and ctest failed every CPU-only CI job with "Not Run".
+if(CPI_ENABLE_CUDA)
+  add_executable(kquant_dequant_test src/tests/kquant_dequant_test.cu)
+  target_include_directories(kquant_dequant_test PRIVATE include)
+  target_link_libraries(kquant_dequant_test PRIVATE cpi_engine)
+  add_test(NAME kquant_dequant_test COMMAND kquant_dequant_test)
 
-add_executable(kquant_matvec_test src/tests/kquant_matvec_test.cu)
-target_include_directories(kquant_matvec_test PRIVATE include)
-target_link_libraries(kquant_matvec_test PRIVATE cpi_engine)
-add_test(NAME kquant_matvec_test COMMAND kquant_matvec_test)
+  add_executable(kquant_matvec_test src/tests/kquant_matvec_test.cu)
+  target_include_directories(kquant_matvec_test PRIVATE include)
+  target_link_libraries(kquant_matvec_test PRIVATE cpi_engine)
+  add_test(NAME kquant_matvec_test COMMAND kquant_matvec_test)
+endif()
 
 add_executable(gguf_loader_test src/tests/gguf_loader_test.cpp)
 target_include_directories(gguf_loader_test PRIVATE include)

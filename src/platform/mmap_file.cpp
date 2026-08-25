@@ -9,6 +9,10 @@
 #include <Windows.h>
 #else
 #include <fcntl.h>
+#ifdef __APPLE__
+#include <mach/mach.h>
+#include <mach/mach_host.h>
+#endif
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -116,6 +120,22 @@ static std::size_t available_physical_ram() {
   MEMORYSTATUSEX ms;
   ms.dwLength = sizeof(ms);
   return GlobalMemoryStatusEx(&ms) ? static_cast<std::size_t>(ms.ullAvailPhys) : 0;
+#elif defined(__APPLE__)
+  // _SC_AVPHYS_PAGES is a glibc extension and does not exist on BSD, which is what
+  // broke every macOS release build. The equivalent there is the Mach VM statistics:
+  // free plus inactive pages, since inactive pages are reclaimable and counting only
+  // free ones would make a healthy machine look nearly out of memory.
+  vm_size_t page_size = 0;
+  if (host_page_size(mach_host_self(), &page_size) != KERN_SUCCESS) {
+    return 0;
+  }
+  vm_statistics64_data_t vm{};
+  mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+  if (host_statistics64(mach_host_self(), HOST_VM_INFO64, reinterpret_cast<host_info64_t>(&vm),
+                        &count) != KERN_SUCCESS) {
+    return 0;
+  }
+  return static_cast<std::size_t>(vm.free_count + vm.inactive_count) * page_size;
 #else
   const long pages = sysconf(_SC_AVPHYS_PAGES);
   const long page_size = sysconf(_SC_PAGESIZE);
