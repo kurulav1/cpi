@@ -25,6 +25,12 @@ include(CTest)
 enable_testing()
 
 option(CPI_ENABLE_CUDA "Enable CUDA GPU inference and tools" ON)
+# Turns the graceful "no toolkit -> CPU-only" fallback below into a hard error.
+# That fallback is right for a developer without CUDA and wrong for a job whose
+# entire purpose is a CUDA binary: v0.3.0-rc1 shipped a 385 MB asset named
+# cpi-windows-x64-cuda that reported "backends: cpu", because the toolkit was not
+# usable, CMake degraded silently, and the build went green.
+option(CPI_REQUIRE_CUDA "Fail configure if CUDA was requested but is unavailable" OFF)
 # Metal is the Apple Silicon backend. Defaults ON only on Apple, and is the exact
 # analogue of CPI_ENABLE_CUDA: the two are independent, and a machine
 # with neither still gets the portable CPU engines.
@@ -66,10 +72,18 @@ if(CPI_ENABLE_CUDA)
 
     find_package(CUDAToolkit QUIET)
     if(NOT CUDAToolkit_FOUND)
+      if(CPI_REQUIRE_CUDA)
+        message(FATAL_ERROR "CPI_REQUIRE_CUDA=ON but CUDAToolkit was not found.")
+      endif()
       message(WARNING "CUDAToolkit was not found; falling back to a CPU-only build. Set CPI_ENABLE_CUDA=OFF to silence this warning.")
       set(CPI_ENABLE_CUDA OFF)
     endif()
   else()
+    if(CPI_REQUIRE_CUDA)
+      message(FATAL_ERROR "CPI_REQUIRE_CUDA=ON but no CUDA compiler was found. CMAKE_CUDA_COMPILER "
+                        "detection failed; the log above has the reason, commonly an "
+                        "MSVC/nvcc version mismatch.")
+    endif()
     message(WARNING "A CUDA compiler was not found; falling back to a CPU-only build. Set CPI_ENABLE_CUDA=OFF to silence this warning.")
     set(CPI_ENABLE_CUDA OFF)
   endif()
