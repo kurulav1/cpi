@@ -233,7 +233,7 @@ jobs:
             bin: build/cpi
           - os: windows-latest
             asset: cpi-windows-x64-cuda
-            bin: build/Release/cpi.exe
+            bin: build/cpi.exe   # Ninja is single-config: no Release/ subdirectory
     runs-on: ${{ matrix.os }}
     # Best-effort: this installs a multi-gigabyte toolkit and compiles every kernel for
     # six architectures, so it is the most likely job to hit a runner disk or time limit.
@@ -244,11 +244,16 @@ jobs:
       - name: Install CUDA toolkit
         uses: Jimver/cuda-toolkit@v0.2.19
         with:
-          cuda: "12.6.0"
+          # 13.x, not 12.6. The runner ships Visual Studio 18 2026 with MSVC 19.51,
+          # which no 12.x toolkit knows about; the dev box builds this repo with CUDA
+          # 13.2 against that same compiler generation, so this is the combination
+          # with evidence behind it. Sub-packages are gone too: pinning that list is
+          # what made the Linux install step fail outright in rc2.
+          cuda: "13.0.0"
           method: network
-          # Only what nvcc and the engine link against; the full toolkit does not fit
-          # comfortably in the hosted runners' free space.
-          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "thrust"]'
+      - name: Install Ninja
+        shell: bash
+        run: pip install ninja
       - name: Report the CUDA toolchain
         # rc1 built a CPU-only binary and called it cpi-windows-x64-cuda. The
         # configure now fails instead of degrading, but a failure only helps if the
@@ -266,16 +271,27 @@ jobs:
           else
             gcc --version | head -1 || true
           fi
-      - name: Configure (CUDA, multi-arch)
-        run: >
-          cmake -S . -B build
-          -DCPI_ENABLE_CUDA=ON
-          -DCPI_REQUIRE_CUDA=ON
-          -DCPI_ENABLE_SENTENCEPIECE=OFF
-          -DCMAKE_BUILD_TYPE=Release
-          "-DCMAKE_CUDA_ARCHITECTURES=75;80;86;89;90;120"
-      - name: Build cpi
-        run: cmake --build build --config Release --target cpi -j
+      - name: Configure and build (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -e
+          cmake -S . -B build -G Ninja -DCPI_ENABLE_CUDA=ON -DCPI_REQUIRE_CUDA=ON -DCPI_ENABLE_SENTENCEPIECE=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_COMPILER="$CUDA_PATH/bin/nvcc" "-DCMAKE_CUDA_ARCHITECTURES=75;80;86;89;90;120"
+          cmake --build build --target cpi -j
+      - name: Configure and build (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        # rc2 failed here with "Looking for a CUDA compiler - NOTFOUND". The default
+        # Windows generator is Visual Studio, which reaches CUDA only through MSBuild
+        # integration files the toolkit drops into the VS tree, and none of those exist
+        # for the runner's VS 18 2026. Ninja invokes nvcc directly and skips the whole
+        # mechanism; it does not set up the MSVC environment though, so vcvars runs
+        # first and vswhere finds whichever VS the runner happens to have.
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath`) do set "VSPATH=%%i"
+          call "%VSPATH%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          cmake -S . -B build -G Ninja -DCPI_ENABLE_CUDA=ON -DCPI_REQUIRE_CUDA=ON -DCPI_ENABLE_SENTENCEPIECE=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_COMPILER="%CUDA_PATH%\bin\nvcc.exe" "-DCMAKE_CUDA_ARCHITECTURES=75;80;86;89;90;120" || exit /b 1
+          cmake --build build --target cpi -j || exit /b 1
       - name: Smoke test the binary
         # Runs what was just built and checks WHAT IT SAYS. v0.3.0-rc1 published a
         # cpi-windows-x64-cuda asset that reported "backends: cpu": CMake had fallen
