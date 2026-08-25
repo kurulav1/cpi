@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(cpi VERSION 0.2.0 LANGUAGES CXX)
+project(cpi VERSION 0.3.0 LANGUAGES CXX)
 
 # Stamp the build with the project version (and the short git SHA when available) so
 # `cpi --version` reports exactly what was built. CPI_GIT_SHA is best-effort:

@@ -40,6 +40,12 @@ jobs:
           -DCMAKE_BUILD_TYPE=Release
       - name: Build cpi
         run: cmake --build build --config Release --target cpi -j
+      - name: Smoke test the binary
+        # This workflow used to build, package and publish without ever running
+        # what it shipped. A released binary that cannot start is the failure
+        # users hit first, and this project has shipped one before.
+        shell: bash
+        run: '"${{ matrix.bin }}" --version'
       - name: Stage package
         shell: bash
         run: |
@@ -80,6 +86,12 @@ jobs:
           -DCMAKE_BUILD_TYPE=Release
       - name: Build cpi
         run: cmake --build build --config Release --target cpi -j
+      - name: Smoke test the binary (informational)
+        # Recorded, not enforced: these jobs are best-effort, and on a runner
+        # with no GPU a failure cannot be told apart from a missing device.
+        continue-on-error: true
+        shell: bash
+        run: build/cpi --version
       - name: Stage package
         shell: bash
         run: |
@@ -126,6 +138,12 @@ jobs:
           -DCMAKE_BUILD_TYPE=Release
       - name: Build cpi
         run: cmake --build build --config Release --target cpi -j
+      - name: Smoke test the binary (informational)
+        # Recorded, not enforced: these jobs are best-effort, and on a runner
+        # with no GPU a failure cannot be told apart from a missing device.
+        continue-on-error: true
+        shell: bash
+        run: build/cpi --version
       - name: Stage package
         shell: bash
         run: |
@@ -176,6 +194,12 @@ jobs:
           "-DCMAKE_CUDA_ARCHITECTURES=75;80;86;89;90;120"
       - name: Build cpi
         run: cmake --build build --config Release --target cpi -j
+      - name: Smoke test the binary (informational)
+        # Recorded, not enforced: these jobs are best-effort, and on a runner
+        # with no GPU a failure cannot be told apart from a missing device.
+        continue-on-error: true
+        shell: bash
+        run: '"${{ matrix.bin }}" --version'
       - name: Stage package
         shell: bash
         run: |
@@ -232,6 +256,10 @@ jobs:
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           generate_release_notes: true
+          # Any tag carrying a suffix (v0.3.0-rc1) publishes as a prerelease, so a
+          # dry run of the asset matrix cannot present itself to users as the
+          # current version.
+          prerelease: ${{ contains(github.event.inputs.tag || github.ref_name, '-') }}
           files: dist/*
           body: |
             ## CPI ${{ github.event.inputs.tag || github.ref_name }}
