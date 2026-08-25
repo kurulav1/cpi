@@ -222,88 +222,51 @@ jobs:
           name: ${{ env.ASSET }}
           path: pkg/*.tar.gz
 
-  build-cuda:
-    name: Build CUDA binary (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            asset: cpi-linux-x64-cuda
-            bin: build/cpi
-          - os: windows-latest
-            asset: cpi-windows-x64-cuda
-            bin: build/cpi.exe   # Ninja is single-config: no Release/ subdirectory
-    runs-on: ${{ matrix.os }}
-    # Best-effort: this installs a multi-gigabyte toolkit and compiles every kernel for
-    # six architectures, so it is the most likely job to hit a runner disk or time limit.
-    # The release publishes with or without it.
+  build-cuda-windows:
+    name: Build CUDA binary (windows)
+    # windows-2022, NOT windows-latest. The latest image is win25-vs2026 with MSVC
+    # 19.51, and CUDA 12.6 refuses it outright: "unsupported Microsoft Visual Studio
+    # version! Only the versions between 2017 and 2022 (inclusive) are supported".
+    # -allow-unsupported-compiler does not rescue it either, CMake retried with the
+    # flag and the compile still failed. 12.6.2 is the newest the installer action
+    # offers, so the fix is the older runner rather than a newer toolkit.
+    runs-on: windows-2022
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - name: Install CUDA toolkit
         uses: Jimver/cuda-toolkit@v0.2.19
         with:
-          # 12.6.2, back from a bad guess. rc3 moved this to 13.0.0 on the theory that
-          # the runner's MSVC 19.51 needs a newer toolkit, and the action does not know
-          # that version at all: both jobs then failed one step EARLIER than rc2, at
-          # install. 12.6.2 is a version this project already relies on (ci.yml pulls
-          # nvidia/cuda:12.6.2-devel-ubuntu24.04). The host-compiler mismatch is handled
-          # at the compiler instead, below.
           cuda: "12.6.2"
           method: network
       - name: Install Ninja
         shell: bash
         run: pip install ninja
       - name: Report the CUDA toolchain
-        # rc1 built a CPU-only binary and called it cpi-windows-x64-cuda. The
-        # configure now fails instead of degrading, but a failure only helps if the
-        # log says WHY, so the toolchain states itself before CMake looks at it. The
-        # usual culprit is an MSVC newer than the toolkit supports.
         continue-on-error: true
         shell: bash
         run: |
           echo "CUDA_PATH=$CUDA_PATH"
-          which nvcc || echo "nvcc not on PATH"
-          nvcc --version || true
+          nvcc --version || echo "nvcc not on PATH"
           cmake --version | head -1
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            cl 2>&1 | head -2 || echo "cl not on PATH"
-          else
-            gcc --version | head -1 || true
-          fi
-      - name: Configure and build (Linux)
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          set -e
-          cmake -S . -B build -G Ninja -DCPI_ENABLE_CUDA=ON -DCPI_REQUIRE_CUDA=ON -DCPI_ENABLE_SENTENCEPIECE=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_COMPILER="$CUDA_PATH/bin/nvcc" "-DCMAKE_CUDA_ARCHITECTURES=75;80;86;89;90;120"
-          cmake --build build --target cpi -j
-      - name: Configure and build (Windows)
-        if: runner.os == 'Windows'
+      - name: Configure and build
         shell: cmd
-        # -allow-unsupported-compiler because nvcc 12.6 refuses MSVC 19.51 on a version
-        # check alone. The smoke step asserts the binary reports the cuda backend, so a
-        # build this flag lets through but that is actually broken cannot reach a release.
-        # rc2 failed here with "Looking for a CUDA compiler - NOTFOUND". The default
-        # Windows generator is Visual Studio, which reaches CUDA only through MSBuild
-        # integration files the toolkit drops into the VS tree, and none of those exist
-        # for the runner's VS 18 2026. Ninja invokes nvcc directly and skips the whole
-        # mechanism; it does not set up the MSVC environment though, so vcvars runs
-        # first and vswhere finds whichever VS the runner happens to have.
+        # Ninja rather than the Visual Studio generator: the VS generator reaches CUDA
+        # only through MSBuild integration files the toolkit drops into the VS tree, and
+        # it found nothing that way. Ninja calls nvcc directly but does not set up the
+        # MSVC environment, so vcvars runs first.
         run: |
           for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath`) do set "VSPATH=%%i"
           call "%VSPATH%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
-          cmake -S . -B build -G Ninja -DCPI_ENABLE_CUDA=ON -DCPI_REQUIRE_CUDA=ON -DCPI_ENABLE_SENTENCEPIECE=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler -DCMAKE_CUDA_COMPILER="%CUDA_PATH%\bin\nvcc.exe" "-DCMAKE_CUDA_ARCHITECTURES=75;80;86;89;90;120" || exit /b 1
+          cmake -S . -B build -G Ninja -DCPI_ENABLE_CUDA=ON -DCPI_REQUIRE_CUDA=ON -DCPI_ENABLE_SENTENCEPIECE=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_COMPILER="%CUDA_PATH%\bin\nvcc.exe" "-DCMAKE_CUDA_ARCHITECTURES=75;80;86;89;90;120" || exit /b 1
           cmake --build build --target cpi -j || exit /b 1
       - name: Smoke test the binary
-        # Runs what was just built and checks WHAT IT SAYS. v0.3.0-rc1 published a
-        # cpi-windows-x64-cuda asset that reported "backends: cpu": CMake had fallen
-        # back to a CPU-only build, the job stayed green, and a bare --version call
-        # would have passed. Asserting the backend is what makes this a gate.
+        # Asserts what the binary SAYS. v0.3.0-rc1 shipped a 385 MB asset named
+        # cpi-windows-x64-cuda that reported "backends: cpu", and a bare --version
+        # call passed it.
         shell: bash
         run: |
-          OUT=$("${{ matrix.bin }}" --version)
+          OUT=$(build/cpi.exe --version)
           echo "$OUT"
           echo "$OUT" | grep -q "cuda" || {
             echo "::error::binary does not report the cuda backend; not publishing it"
@@ -312,46 +275,76 @@ jobs:
       - name: Stage package
         shell: bash
         run: |
-          DEST="pkg/${{ matrix.asset }}"
+          DEST=pkg/cpi-windows-x64-cuda
           mkdir -p "$DEST"
-          cp "${{ matrix.bin }}" "$DEST/"
+          cp build/cpi.exe "$DEST/"
           cp README.md LICENSE NOTICE "$DEST/" 2>/dev/null || true
           # cudart and cuBLAS are toolkit components, not driver components: someone with
-          # an NVIDIA driver still does not have them, so the binary cannot start without
-          # these sitting beside it.
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            cp "$CUDA_PATH"/bin/cudart64_*.dll "$DEST/" 2>/dev/null || true
-            cp "$CUDA_PATH"/bin/cublas64_*.dll "$DEST/" 2>/dev/null || true
-            cp "$CUDA_PATH"/bin/cublasLt64_*.dll "$DEST/" 2>/dev/null || true
-          else
-            cp -P "$CUDA_PATH"/lib64/libcudart.so.* "$DEST/" 2>/dev/null || true
-            cp -P "$CUDA_PATH"/lib64/libcublas.so.* "$DEST/" 2>/dev/null || true
-            cp -P "$CUDA_PATH"/lib64/libcublasLt.so.* "$DEST/" 2>/dev/null || true
-            # Let the binary find them next to itself rather than needing LD_LIBRARY_PATH.
-            SH="$DEST/run.sh"
-            echo '#!/bin/bash' > "$SH"
-            echo 'DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"' >> "$SH"
-            echo 'export LD_LIBRARY_PATH="$DIR:$LD_LIBRARY_PATH"' >> "$SH"
-            echo 'exec "$DIR/cpi" "$@"' >> "$SH"
-            chmod +x "$DEST/run.sh" "$DEST/cpi"
-          fi
+          # an NVIDIA driver still does not have them.
+          cp "$CUDA_PATH"/bin/cudart64_*.dll "$DEST/" 2>/dev/null || true
+          cp "$CUDA_PATH"/bin/cublas64_*.dll "$DEST/" 2>/dev/null || true
+          cp "$CUDA_PATH"/bin/cublasLt64_*.dll "$DEST/" 2>/dev/null || true
       - name: Archive
         shell: bash
-        run: |
-          cd pkg
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            7z a "${{ matrix.asset }}.zip" "${{ matrix.asset }}" >/dev/null
-          else
-            tar -czf "${{ matrix.asset }}.tar.gz" "${{ matrix.asset }}"
-          fi
+        run: cd pkg && 7z a cpi-windows-x64-cuda.zip cpi-windows-x64-cuda >/dev/null
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.asset }}
-          path: pkg/${{ matrix.asset }}.*
+          name: cpi-windows-x64-cuda
+          path: pkg/cpi-windows-x64-cuda.zip
+
+  build-cuda-linux:
+    name: Build CUDA binary (linux)
+    runs-on: ubuntu-latest
+    # The toolkit installer action failed outright on ubuntu in rc2 through rc4. This
+    # uses the official CUDA image instead, which is the same approach ci.yml already
+    # builds the CUDA path with, so it is the option with evidence rather than another
+    # installer guess. nvcc and cuBLAS are in the image; no GPU is needed to compile.
+    container: nvidia/cuda:12.6.2-devel-ubuntu24.04
+    continue-on-error: true
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends cmake g++ ninja-build git ca-certificates
+      - uses: actions/checkout@v4
+      - name: Configure and build
+        run: |
+          set -e
+          cmake -S . -B build -G Ninja -DCPI_ENABLE_CUDA=ON -DCPI_REQUIRE_CUDA=ON -DCPI_ENABLE_SENTENCEPIECE=OFF -DCMAKE_BUILD_TYPE=Release "-DCMAKE_CUDA_ARCHITECTURES=75;80;86;89;90;120"
+          cmake --build build --target cpi -j
+      - name: Smoke test the binary
+        run: |
+          OUT=$(build/cpi --version)
+          echo "$OUT"
+          echo "$OUT" | grep -q "cuda" || {
+            echo "::error::binary does not report the cuda backend; not publishing it"
+            exit 1
+          }
+      - name: Stage package
+        run: |
+          DEST=pkg/cpi-linux-x64-cuda
+          mkdir -p "$DEST"
+          cp build/cpi "$DEST/"
+          cp README.md LICENSE NOTICE "$DEST/" 2>/dev/null || true
+          for lib in libcudart.so libcublas.so libcublasLt.so; do
+            find /usr/local/cuda/lib64 -maxdepth 1 -name "$lib.*" -exec cp -P {} "$DEST/" \; 2>/dev/null || true
+          done
+          SH="$DEST/run.sh"
+          echo '#!/bin/bash' > "$SH"
+          echo 'DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"' >> "$SH"
+          echo 'export LD_LIBRARY_PATH="$DIR:$LD_LIBRARY_PATH"' >> "$SH"
+          echo 'exec "$DIR/cpi" "$@"' >> "$SH"
+          chmod +x "$SH" "$DEST/cpi"
+      - name: Archive
+        run: cd pkg && tar -czf cpi-linux-x64-cuda.tar.gz cpi-linux-x64-cuda
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cpi-linux-x64-cuda
+          path: pkg/cpi-linux-x64-cuda.tar.gz
 
   release:
     name: Publish release
-    needs: [build-binaries, build-macos-metal, build-linux-arm64, build-cuda]
+    needs: [build-binaries, build-macos-metal, build-linux-arm64, build-cuda-windows, build-cuda-linux]
     # Publish as long as the CPU binaries built; the macOS job is best-effort (see above).
     if: ${{ always() && needs.build-binaries.result == 'success' }}
     runs-on: ubuntu-latest
