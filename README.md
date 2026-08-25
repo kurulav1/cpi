@@ -57,13 +57,15 @@ Tagged releases attach prebuilt `cpi` binaries (see the repository's Releases pa
 Unpack and check the build with `cpi --version`. The macOS archive bundles the Metal
 shader sources next to the binary; launch it with the included `./run.sh` (which sets
 `CPI_METAL_SOURCE` for you) or set that variable by hand.
-The CUDA assets are built for Turing through Blackwell (sm_75/80/86/89/90/120) and bundle
-cudart and cuBLAS, which a driver install does not provide; on Linux launch them through the
-included `./run.sh` so those libraries resolve. Only the two x64 CPU assets are guaranteed to
-be present: the arm64, CUDA and macOS jobs are best-effort on hosted runners, so a missing
-asset means that build did not run rather than that the platform is unsupported. For a GPU
-outside that architecture list, or for the smallest binary for your own card, build from
-source per [Build Modes](#build-modes).
+The Linux CUDA asset covers Turing through Blackwell (sm_75/80/86/89/90/120), i.e. RTX 20xx
+through RTX 50xx plus A100 and H100. The Windows one stops at Hopper and does **not** cover
+RTX 50xx: sm_120 requires CUDA 12.8 and the Windows CI installer only offers up to 12.6.2, so
+on a Blackwell card under Windows, build from source. Both bundle cudart and cuBLAS, which a
+driver install does not provide; on Linux launch them through the included `./run.sh` so those
+libraries resolve. Only the two x64 CPU assets are guaranteed to be present: the arm64, CUDA and
+macOS jobs are best-effort on hosted runners, so a missing asset means that build did not run
+rather than that the platform is unsupported. For the smallest binary for your own card, build
+from source per [Build Modes](#build-modes).
 
 ### Prerequisites
 
