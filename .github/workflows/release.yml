@@ -244,12 +244,13 @@ jobs:
       - name: Install CUDA toolkit
         uses: Jimver/cuda-toolkit@v0.2.19
         with:
-          # 13.x, not 12.6. The runner ships Visual Studio 18 2026 with MSVC 19.51,
-          # which no 12.x toolkit knows about; the dev box builds this repo with CUDA
-          # 13.2 against that same compiler generation, so this is the combination
-          # with evidence behind it. Sub-packages are gone too: pinning that list is
-          # what made the Linux install step fail outright in rc2.
-          cuda: "13.0.0"
+          # 12.6.2, back from a bad guess. rc3 moved this to 13.0.0 on the theory that
+          # the runner's MSVC 19.51 needs a newer toolkit, and the action does not know
+          # that version at all: both jobs then failed one step EARLIER than rc2, at
+          # install. 12.6.2 is a version this project already relies on (ci.yml pulls
+          # nvidia/cuda:12.6.2-devel-ubuntu24.04). The host-compiler mismatch is handled
+          # at the compiler instead, below.
+          cuda: "12.6.2"
           method: network
       - name: Install Ninja
         shell: bash
@@ -281,6 +282,9 @@ jobs:
       - name: Configure and build (Windows)
         if: runner.os == 'Windows'
         shell: cmd
+        # -allow-unsupported-compiler because nvcc 12.6 refuses MSVC 19.51 on a version
+        # check alone. The smoke step asserts the binary reports the cuda backend, so a
+        # build this flag lets through but that is actually broken cannot reach a release.
         # rc2 failed here with "Looking for a CUDA compiler - NOTFOUND". The default
         # Windows generator is Visual Studio, which reaches CUDA only through MSBuild
         # integration files the toolkit drops into the VS tree, and none of those exist
@@ -290,7 +294,7 @@ jobs:
         run: |
           for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath`) do set "VSPATH=%%i"
           call "%VSPATH%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
-          cmake -S . -B build -G Ninja -DCPI_ENABLE_CUDA=ON -DCPI_REQUIRE_CUDA=ON -DCPI_ENABLE_SENTENCEPIECE=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_COMPILER="%CUDA_PATH%\bin\nvcc.exe" "-DCMAKE_CUDA_ARCHITECTURES=75;80;86;89;90;120" || exit /b 1
+          cmake -S . -B build -G Ninja -DCPI_ENABLE_CUDA=ON -DCPI_REQUIRE_CUDA=ON -DCPI_ENABLE_SENTENCEPIECE=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler -DCMAKE_CUDA_COMPILER="%CUDA_PATH%\bin\nvcc.exe" "-DCMAKE_CUDA_ARCHITECTURES=75;80;86;89;90;120" || exit /b 1
           cmake --build build --target cpi -j || exit /b 1
       - name: Smoke test the binary
         # Runs what was just built and checks WHAT IT SAYS. v0.3.0-rc1 published a
