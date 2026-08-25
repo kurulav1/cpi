@@ -144,7 +144,7 @@ void print_usage(std::ostream& os) {
         "[--allow-legacy-chat-tokenizer] "
         "[--no-bos] [--eos-token n] [--no-loop-guard] "
         "[--weight-quant none|int8|int4] "
-        "[--paged-kv-cache] [--web] [--interactive] [--simple]\n";
+        "[--paged-kv-cache] [--web] [--interactive] [--simple] [--quiet]\n";
   // The flat usage line above lists tuning knobs but had grown to hide the
   // features people actually come here for: a user running --help could not
   // discover the API server, CPU execution, vision or speculative decoding
@@ -152,6 +152,8 @@ void print_usage(std::ostream& os) {
   // line that is already unreadable.
   os << "\nBackends:\n"
         "  --cpu                    force the CPU engine (default: CUDA/Metal when present)\n"
+        "\nOutput:\n"
+        "  --quiet, -q              print only what the model generated\n"
         "\nServing:\n"
         "  --serve                  OpenAI-compatible HTTP API (implies --interactive-batch)\n"
         "  --port n / --host addr   listen address for --serve\n"
@@ -461,6 +463,9 @@ ParsedArgs parse_args(int argc, char** argv) {
       args.serve_api_key = need_val("--api-key");
     } else if (arg == "--embed-model") {
       args.serve_embed_model = need_val("--embed-model");
+    } else if (arg == "--quiet" || arg == "-q") {
+      args.quiet_mode = true;
+      args.opts.verbose = false;
     } else if (arg == "--simple") {
       args.simple_mode = true;
     } else if (arg == "--draft-model") {

@@ -335,7 +335,7 @@ int main(int argc, char** argv) {
   }
 
   try {
-    const bool quiet_output = cli.web_mode || cli.simple_mode;
+    const bool quiet_output = cli.web_mode || cli.simple_mode || cli.quiet_mode;
     cli.opts.verbose = !quiet_output;
     cli.opts.profile_decode_phases = cli.benchmark_phases || cli.runtime_metrics;
 

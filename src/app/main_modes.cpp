@@ -671,6 +671,10 @@ void execute_engine_modes(const RunExecutionOptions& options, const std::vector<
       }
     } else if (!options.quiet_output) {
       std::cout << "Decoded text:\n" << final_text << "\n";
+    } else {
+      // Quiet: the text has already streamed to stdout, but nothing has ended the
+      // line, so a piped or redirected run came back without a trailing newline.
+      std::cout << "\n";
     }
   }
 

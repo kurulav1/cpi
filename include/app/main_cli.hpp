@@ -44,6 +44,10 @@ struct ParsedArgs {
   bool web_mode = false;
   bool interactive_mode = false;
   bool simple_mode = false;
+  // Output only what the model generated. Distinct from simple_mode, which also
+  // changes how the model is RUN (cache policy, quantization, stop handling);
+  // this only changes what is printed.
+  bool quiet_mode = false;
   bool force_cpu = false;
   int benchmark_reps = 1;
   int benchmark_warmup = 0;
