@@ -2034,7 +2034,7 @@ export default function App() {
             )}
             {!health.ready && (
               <div className="notice notice-info">
-                Set <code>CPI_BIN</code>, <code>LLAMA_MODEL_DIRS</code>, and <code>LLAMA_TOKENIZER_PATH</code> in <code>web/.env</code>.
+                Set <code>CPI_BIN</code>, <code>CPI_MODEL_DIRS</code>, and <code>CPI_TOKENIZER_PATH</code> in <code>web/.env</code>.
               </div>
             )}
 
