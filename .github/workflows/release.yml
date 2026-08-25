@@ -33,11 +33,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Configure (CPU-only)
-        run: >
-          cmake -S . -B build
-          -DCPI_ENABLE_CUDA=OFF
-          -DCPI_ENABLE_SENTENCEPIECE=OFF
-          -DCMAKE_BUILD_TYPE=Release
+        shell: bash
+        # -rpath $ORIGIN so a Linux binary looks beside itself for its runtime
+        # libraries. v0.3.0-rc1 shipped cpi-linux-x64-cpu that would not start on a
+        # stock Ubuntu 24.04 at all: ldd reported "libgomp.so.1 => not found", the
+        # GNU OpenMP runtime the CPU kernels link. Bundling it (below) only helps if
+        # the loader will look next to the binary, which is what this does. Harmless
+        # on Windows, where the loader already searches the exe directory.
+        run: |
+          EXTRA=""
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            EXTRA="-DCMAKE_EXE_LINKER_FLAGS=-Wl,-rpath,'\$ORIGIN'"
+          fi
+          cmake -S . -B build -DCPI_ENABLE_CUDA=OFF -DCPI_ENABLE_SENTENCEPIECE=OFF -DCMAKE_BUILD_TYPE=Release $EXTRA
       - name: Build cpi
         run: cmake --build build --config Release --target cpi -j
       - name: Smoke test the binary
@@ -52,6 +60,37 @@ jobs:
           mkdir -p pkg/${{ matrix.asset }}
           cp "${{ matrix.bin }}" pkg/${{ matrix.asset }}/
           cp README.md LICENSE NOTICE pkg/${{ matrix.asset }}/ 2>/dev/null || true
+          # Ship the GNU OpenMP runtime beside the binary on Linux. A stock Ubuntu
+          # 24.04 does not have libgomp.so.1, so rc1's asset died on startup with
+          # "cannot open shared object file" before printing anything.
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            for lib in $(ldd "${{ matrix.bin }}" | awk '/libgomp/ {print $3}'); do
+              [ -e "$lib" ] && cp -L "$lib" pkg/${{ matrix.asset }}/
+            done
+          fi
+      - name: Check the packaged binary resolves (Linux)
+        # The real test of a portable binary: every dependency resolves from inside
+        # the package, with nothing from the build machine on the path. rc1 would
+        # have failed here instead of shipping.
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cd pkg/${{ matrix.asset }}
+          ldd ./cpi || true
+          # Two separate checks. "not found" catches the general case, but NOT the one
+          # that shipped: the build machine has libgomp installed, so ldd resolves it
+          # there from /usr/lib and looks fine. What matters is whether the library
+          # travelled with the package, so that is asserted directly.
+          if ldd ./cpi | grep -q "not found"; then
+            echo "::error::packaged binary has unresolved libraries; not publishing it"
+            ldd ./cpi | grep "not found"
+            exit 1
+          fi
+          if ldd ./cpi | grep -q libgomp && [ ! -e libgomp.so.1 ]; then
+            echo "::error::binary needs libgomp but it was not bundled; it would not start on a stock Ubuntu"
+            exit 1
+          fi
+          ./cpi --version
       - name: Archive
         shell: bash
         run: |
@@ -138,11 +177,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Configure (CPU-only)
-        run: >
-          cmake -S . -B build
-          -DCPI_ENABLE_CUDA=OFF
-          -DCPI_ENABLE_SENTENCEPIECE=OFF
-          -DCMAKE_BUILD_TYPE=Release
+        shell: bash
+        # rpath $ORIGIN for the same reason as the x64 job: libgomp travels with
+        # the package and the loader has to look beside the binary to find it.
+        run: |
+          cmake -S . -B build -DCPI_ENABLE_CUDA=OFF -DCPI_ENABLE_SENTENCEPIECE=OFF -DCMAKE_BUILD_TYPE=Release "-DCMAKE_EXE_LINKER_FLAGS=-Wl,-rpath,'\$ORIGIN'"
       - name: Build cpi
         run: cmake --build build --config Release --target cpi -j
       - name: Smoke test the binary
@@ -158,6 +197,23 @@ jobs:
           mkdir -p "pkg/$ASSET"
           cp build/cpi "pkg/$ASSET/"
           cp README.md LICENSE NOTICE "pkg/$ASSET/" 2>/dev/null || true
+          for lib in $(ldd build/cpi | awk '/libgomp/ {print $3}'); do
+            [ -e "$lib" ] && cp -L "$lib" "pkg/$ASSET/"
+          done
+      - name: Check the packaged binary resolves
+        shell: bash
+        run: |
+          cd "pkg/$ASSET"
+          ldd ./cpi || true
+          if ldd ./cpi | grep -q "not found"; then
+            echo "::error::packaged binary has unresolved libraries; not publishing it"
+            exit 1
+          fi
+          if ldd ./cpi | grep -q libgomp && [ ! -e libgomp.so.1 ]; then
+            echo "::error::binary needs libgomp but it was not bundled"
+            exit 1
+          fi
+          ./cpi --version
       - name: Archive
         shell: bash
         run: cd pkg && tar -czf "$ASSET.tar.gz" "$ASSET"
