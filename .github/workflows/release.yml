@@ -249,6 +249,23 @@ jobs:
           # Only what nvcc and the engine link against; the full toolkit does not fit
           # comfortably in the hosted runners' free space.
           sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "thrust"]'
+      - name: Report the CUDA toolchain
+        # rc1 built a CPU-only binary and called it cpi-windows-x64-cuda. The
+        # configure now fails instead of degrading, but a failure only helps if the
+        # log says WHY, so the toolchain states itself before CMake looks at it. The
+        # usual culprit is an MSVC newer than the toolkit supports.
+        continue-on-error: true
+        shell: bash
+        run: |
+          echo "CUDA_PATH=$CUDA_PATH"
+          which nvcc || echo "nvcc not on PATH"
+          nvcc --version || true
+          cmake --version | head -1
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cl 2>&1 | head -2 || echo "cl not on PATH"
+          else
+            gcc --version | head -1 || true
+          fi
       - name: Configure (CUDA, multi-arch)
         run: >
           cmake -S . -B build
