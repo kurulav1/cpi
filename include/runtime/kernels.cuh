@@ -21,6 +21,11 @@
 
 #pragma once
 
+// INFINITY is used in default arguments below. nvcc and MSVC happen to pull it in
+// transitively, so this header compiled fine everywhere it was tried; GCC compiling
+// a plain .cpp that includes it does not, which broke every Linux CUDA build.
+#include <cmath>
+
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
