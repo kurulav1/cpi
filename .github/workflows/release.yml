@@ -401,14 +401,14 @@ jobs:
             may prompt Gatekeeper on an unsigned binary -- allow it in System Settings › Privacy.
 
             ### GPU (CUDA) builds
-            The Linux CUDA asset covers Turing through Blackwell
-            (sm_75/80/86/89/90/120): RTX 20xx through RTX 50xx, plus A100 and H100. The
-            Windows one stops at Hopper (sm_75/80/86/89/90) and does NOT cover RTX 50xx,
-            because sm_120 needs CUDA 12.8 and the Windows CI installer only offers up to
-            12.6.2. On a Blackwell card under Windows, build from source. Both need an
-            NVIDIA driver but not a CUDA toolkit: cudart and cuBLAS ship inside the
-            archive, since a driver install does not provide them. On Linux launch through
-            the bundled ./run.sh so they resolve next to the binary.
+            The Linux CUDA asset is compiled for Turing through Blackwell
+            (sm_75/80/86/89/90/120). The Windows one stops at Hopper (sm_75-90), since
+            sm_120 needs CUDA 12.8 and the Windows CI installer only offers 12.6.2. It
+            still RUNS on an RTX 50xx: the build embeds compute_90 PTX and the driver
+            JIT-compiles it forward (measured 344 tok/s on a 5090, against 18 tok/s for
+            the same binary on CPU). The cost is a one-time JIT at first load; build from
+            source for native SASS. Both bundle cudart and cuBLAS, which a driver install
+            does not provide; on Linux launch through the bundled ./run.sh.
 
             For a GPU outside that list, or for the smallest binary for your own card,
             build from source with a CUDA toolkit present:
