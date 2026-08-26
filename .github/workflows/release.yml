@@ -1,9 +1,10 @@
 name: Release
 
-# Cut a GitHub Release on a version tag (vX.Y.Z). Attaches portable CPU-only
-# binaries per OS. CUDA builds are intentionally NOT shipped as binaries: they
-# are GPU-architecture and driver specific, so the release notes point users to
-# a from-source CUDA build instead.
+# Cut a GitHub Release on a version tag (vX.Y.Z). Attaches portable binaries per
+# OS: CPU for linux x64/arm64, windows and macos (Metal), plus CUDA for windows
+# and linux x64. Every packaged Linux binary carries its own runtime libraries
+# and is gated on them being present, because an asset that only runs on the
+# machine that built it is worse than no asset.
 on:
   push:
     tags: ["v*"]
@@ -309,9 +310,14 @@ jobs:
           apt-get install -y --no-install-recommends cmake g++ ninja-build git ca-certificates
       - uses: actions/checkout@v4
       - name: Configure and build
+        # -rpath $ORIGIN for the same reason as the CPU jobs: the CUDA runtime
+        # libraries are bundled below, and bundling only helps if the loader looks
+        # next to the binary. Without it the binary carries the container's own
+        # /usr/local/cuda-12.8/targets path, which exists on no user's machine.
         run: |
           set -e
-          cmake -S . -B build -G Ninja -DCPI_ENABLE_CUDA=ON -DCPI_REQUIRE_CUDA=ON -DCPI_ENABLE_SENTENCEPIECE=OFF -DCMAKE_BUILD_TYPE=Release "-DCMAKE_CUDA_ARCHITECTURES=75;80;86;89;90;120"
+          EXTRA="-DCMAKE_EXE_LINKER_FLAGS=-Wl,-rpath,'\$ORIGIN'"
+          cmake -S . -B build -G Ninja -DCPI_ENABLE_CUDA=ON -DCPI_REQUIRE_CUDA=ON -DCPI_ENABLE_SENTENCEPIECE=OFF -DCMAKE_BUILD_TYPE=Release "-DCMAKE_CUDA_ARCHITECTURES=75;80;86;89;90;120" $EXTRA
           cmake --build build --target cpi -j
       - name: Smoke test the binary
         run: |
@@ -327,8 +333,19 @@ jobs:
           mkdir -p "$DEST"
           cp build/cpi "$DEST/"
           cp README.md LICENSE NOTICE "$DEST/" 2>/dev/null || true
-          for lib in libcudart.so libcublas.so libcublasLt.so; do
-            find /usr/local/cuda/lib64 -maxdepth 1 -name "$lib.*" -exec cp -P {} "$DEST/" \; 2>/dev/null || true
+          # Ask the binary what it needs rather than globbing a directory, which is
+          # what the CPU jobs do and what this job got wrong. The previous version
+          # globbed /usr/local/cuda/lib64: that is a symlink in these images, find
+          # does not descend into a symlinked start directory without -L, so it
+          # matched nothing, every cp was skipped, and "|| true" swallowed the
+          # silence. v0.3.0-rc7 shipped a tarball with no libraries in it at all,
+          # which died on a stock Ubuntu with "libcudart.so.12: cannot open shared
+          # object file". cp -L because these are symlinks to versioned files, and
+          # cp -P would have copied them as dangling links even on a match.
+          # libgomp is in the list too: the CUDA build links it just like the CPU
+          # build does, and it is absent from a stock Ubuntu 24.04.
+          for lib in $(ldd build/cpi | awk '/libcudart|libcublasLt|libcublas|libgomp/ {print $3}'); do
+            [ -e "$lib" ] && cp -L "$lib" "$DEST/"
           done
           SH="$DEST/run.sh"
           echo '#!/bin/bash' > "$SH"
@@ -336,6 +353,27 @@ jobs:
           echo 'export LD_LIBRARY_PATH="$DIR:$LD_LIBRARY_PATH"' >> "$SH"
           echo 'exec "$DIR/cpi" "$@"' >> "$SH"
           chmod +x "$SH" "$DEST/cpi"
+      - name: Check the packaged binary resolves
+        # This job smoke-tests build/cpi inside the CUDA container, where all four
+        # runtime libraries exist system-wide, so that test passes whether or not
+        # anything was packaged. It cannot see the failure a user would hit. The
+        # per-library assertion below can: it asks whether the library travelled
+        # with the package, not whether the build machine happens to have it.
+        run: |
+          cd pkg/cpi-linux-x64-cuda
+          ldd ./cpi || true
+          if ldd ./cpi | grep -q "not found"; then
+            echo "::error::packaged binary has unresolved libraries; not publishing it"
+            ldd ./cpi | grep "not found"
+            exit 1
+          fi
+          for so in libcudart.so.12 libcublas.so.12 libcublasLt.so.12 libgomp.so.1; do
+            if ldd ./cpi | grep -q "$so" && [ ! -e "$so" ]; then
+              echo "::error::binary needs $so but it was not bundled; it would not start outside this container"
+              exit 1
+            fi
+          done
+          ./cpi --version
       - name: Archive
         run: cd pkg && tar -czf cpi-linux-x64-cuda.tar.gz cpi-linux-x64-cuda
       - uses: actions/upload-artifact@v4
