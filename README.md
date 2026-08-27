@@ -764,6 +764,31 @@ python tools/perplexity.py --model-dir artifacts/model/hf --all-modes
 python tools/bench_report.py --patch-benchmarks
 ```
 
+## Acknowledgements
+
+CPI has no third-party runtime dependencies and every kernel, tokenizer and container reader in it
+was written for this repository. It does not follow that it owes nothing to prior work, and this
+section says what it owes.
+
+**[llama.cpp](https://github.com/ggml-org/llama.cpp)** (MIT), by a distance the largest debt:
+
+- **GGUF**, its container format. CPI reads it so the published local-model ecosystem works without
+  a conversion step. Reading a format is not deriving from an implementation, but the format is
+  theirs and the interoperability is the point.
+- **The k-quant block formats** (Q2_K through Q6_K) and the flat quants, likewise read directly.
+- **The GBNF grammar language**, and the parser and stack-matcher design behind
+  `src/grammar/`. The header there records the lineage.
+- Several kernel ideas, credited at the line that uses them: the stream-K decomposition for the
+  Q6_K MMQ, the q8_1 grouping for integer dot products, and the Q4_0-style group quantization that
+  the grouped-int4 MLP path follows.
+
+Also, without which none of this loads: **safetensors** and the **tokenizer.json** format from
+Hugging Face, **SentencePiece** for the model families that predate it, and the papers behind the
+techniques implemented here, including EAGLE for speculative decoding and DeepSeek's MLA.
+
+Prior art is what made a from-scratch implementation possible at all: a format to target and a
+correct implementation to check against is most of what a reimplementation needs.
+
 ## Notes
 
 - CPU-only builds skip CUDA tools such as `cuda_bandwidth_bench` and `moe_kernel_parity_test`.
