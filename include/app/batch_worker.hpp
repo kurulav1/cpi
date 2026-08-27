@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "engine/batch_scheduler.hpp"
+#include "grammar/grammar_sampler.hpp"
 #include "model/tokenizer.hpp"
 
 namespace grammar {
@@ -122,6 +123,10 @@ private:
 
   engine::BatchScheduler& sched_;
   model::Tokenizer& tokenizer_;
+  // Shared by every grammar-constrained request this worker admits. Decoding the
+  // whole vocabulary costs ~26 ms and depends only on the tokenizer, so it is
+  // built once here rather than per request.
+  std::shared_ptr<const grammar::TokenTables> token_tables_;
   BatchDefaults defaults_;
   Sink sink_;
 

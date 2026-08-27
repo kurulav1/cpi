@@ -22,6 +22,7 @@ BatchWorker::BatchWorker(engine::BatchScheduler& sched, model::Tokenizer& tokeni
                          BatchDefaults defaults, Sink sink)
     : sched_(sched),
       tokenizer_(tokenizer),
+      token_tables_(grammar::build_token_tables(tokenizer.token_pieces())),
       defaults_(std::move(defaults)),
       sink_(std::move(sink)) {}
 
@@ -229,7 +230,7 @@ void BatchWorker::run() {
             grammar::Grammar g =
                 grammar::Grammar::parse(grammar::json_schema_to_grammar(in.json_schema));
             auto sampler = std::make_unique<grammar::GrammarSampler>(
-                std::move(g), tokenizer_.token_pieces(), tokenizer_.eos_id());
+                std::move(g), tokenizer_.token_pieces(), tokenizer_.eos_id(), token_tables_);
             in.params.grammar = sampler.get();
             grammars[in.id] = std::move(sampler);
           } catch (const std::exception& ge) {

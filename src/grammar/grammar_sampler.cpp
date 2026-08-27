@@ -108,8 +108,27 @@ constexpr std::size_t kMaxCachedMasks = 64;
 
 }  // namespace
 
+std::shared_ptr<const TokenTables> build_token_tables(
+    const std::vector<std::string>& token_pieces) {
+  auto tables = std::make_shared<TokenTables>();
+  const std::size_t vocab = token_pieces.size();
+  tables->cps.resize(vocab);
+  tables->simple.assign(vocab, 0);
+  for (std::size_t t = 0; t < vocab; ++t) {
+    if (token_pieces[t].empty()) {
+      continue;  // special tokens are handled without codepoints
+    }
+    if (grammar::decode_simple_codepoints(token_pieces[t], tables->cps[t])) {
+      tables->simple[t] = 1;
+    } else {
+      tables->cps[t].clear();
+    }
+  }
+  return tables;
+}
+
 GrammarSampler::GrammarSampler(Grammar grammar, const std::vector<std::string>& token_pieces,
-                               int eos_token_id)
+                               int eos_token_id, std::shared_ptr<const TokenTables> tables)
     : grammar_(std::move(grammar)),
       token_pieces_(token_pieces),
       eos_token_id_(eos_token_id),
@@ -122,23 +141,9 @@ GrammarSampler::GrammarSampler(Grammar grammar, const std::vector<std::string>& 
   if (const char* mc = std::getenv("CPI_GRAMMAR_MASK_CACHE")) {
     mask_cache_enabled_ = !(mc[0] == '0' && mc[1] == 0);
   }
-  cache_ = std::make_unique<MaskCache>(grammar_);
   const auto ctor_t0 = std::chrono::steady_clock::now();
-  // Precompute each token's codepoints once so masking avoids re-decoding the
-  // whole vocabulary on every decode step.
-  const std::size_t vocab = token_pieces_.size();
-  token_cps_.resize(vocab);
-  token_simple_.assign(vocab, 0);
-  for (std::size_t t = 0; t < vocab; ++t) {
-    if (token_pieces_[t].empty()) {
-      continue;  // special tokens are handled without codepoints
-    }
-    if (grammar::decode_simple_codepoints(token_pieces_[t], token_cps_[t])) {
-      token_simple_[t] = 1;
-    } else {
-      token_cps_[t].clear();
-    }
-  }
+  tables_ = tables ? std::move(tables) : build_token_tables(token_pieces_);
+  cache_ = std::make_unique<MaskCache>(grammar_);
   if (profile_) {
     ctor_ms_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ctor_t0)
                    .count();
@@ -170,9 +175,9 @@ bool GrammarSampler::token_allowed(int start, bool terminable, bool partial_pend
   }
   // Fast path: simple (whole-codepoint) token and no pending partial UTF-8; walk
   // its codepoints through the memoized transitions.
-  if (!partial_pending && token_simple_[t] && !token_cps_[t].empty()) {
+  if (!partial_pending && tables_->simple[t] && !tables_->cps[t].empty()) {
     int s = start;
-    for (const std::uint32_t cp : token_cps_[t]) {
+    for (const std::uint32_t cp : tables_->cps[t]) {
       if (s < 0) {
         break;
       }

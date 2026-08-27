@@ -783,6 +783,12 @@ void run_http_server(engine::BatchScheduler& sched, model::Tokenizer& tokenizer,
 void run_http_server_serial(GenerateStreamFn generate, model::Tokenizer& tokenizer,
                             const HttpServeOptions& opts) {
   const std::string model_name = opts.model_name;
+  // Built once per server, not once per request. This decodes the whole
+  // vocabulary (~26 ms at Gemma's 262144 tokens) and depends only on the
+  // tokenizer, so every schema request used to repeat identical work before
+  // generating its first token.
+  const std::shared_ptr<const grammar::TokenTables> token_tables =
+      grammar::build_token_tables(tokenizer.token_pieces());
   // One request at a time: these engines have no paged pool to interleave with,
   // so concurrency is queueing rather than batching. Stated in the startup log
   // so nobody benchmarks this expecting the batched path's numbers.
@@ -942,7 +948,7 @@ void run_http_server_serial(GenerateStreamFn generate, model::Tokenizer& tokeniz
               grammar::Grammar g =
                   grammar::Grammar::parse(grammar::json_schema_to_grammar(json_schema));
               sampler = std::make_unique<grammar::GrammarSampler>(
-                  std::move(g), tokenizer.token_pieces(), tokenizer.eos_id());
+                  std::move(g), tokenizer.token_pieces(), tokenizer.eos_id(), token_tables);
               constraints.grammar = sampler.get();
             } catch (const std::exception& e) {
               error = std::string("invalid json_schema: ") + e.what();
