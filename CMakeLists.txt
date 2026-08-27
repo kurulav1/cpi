@@ -499,6 +499,13 @@ target_include_directories(probe_model_test PRIVATE include)
 target_link_libraries(probe_model_test PRIVATE cpi_engine)
 add_test(NAME probe_model_test COMMAND probe_model_test)
 
+# The response_format.json_schema unwrap. Compiles main_helpers.cpp directly for the same reason
+# probe_model_test does: the helper lives in the executables, not in llama_engine. CPU-only.
+add_executable(json_schema_unwrap_test src/tests/json_schema_unwrap_test.cpp src/app/main_helpers.cpp)
+target_include_directories(json_schema_unwrap_test PRIVATE include)
+target_link_libraries(json_schema_unwrap_test PRIVATE cpi_engine)
+add_test(NAME json_schema_unwrap_test COMMAND json_schema_unwrap_test)
+
 add_executable(qwen2vl_preproc_test src/tests/qwen2vl_preproc_test.cpp)
 target_include_directories(qwen2vl_preproc_test PRIVATE include)
 target_link_libraries(qwen2vl_preproc_test PRIVATE cpi_engine)

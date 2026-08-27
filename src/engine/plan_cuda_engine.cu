@@ -28,6 +28,7 @@
 #include "engine/moe_grouped.hpp"
 #include "engine/plan_cuda_engine.hpp"
 #include "engine/sampling.hpp"
+#include "grammar/grammar_sampler.hpp"
 #include "model/json_mini.hpp"
 #include "runtime/kernels.cuh"
 
@@ -5081,7 +5082,7 @@ std::vector<int> PlanCudaEngine::generate_stream(const std::vector<int>& prompt,
   // Delegate the prefill+decode+sample+stop loop to the shared driver (which
   // reuses the canonical sampler); this engine only supplies step()/logits().
   // Incremental: positions advance monotonically so the KV-share sources stay
-  // populated. (Grammar constraints aren't supported by this fork engine.)
+  // populated.
   runtime::DecodeParams p;
   p.max_new_tokens = max_new;
   p.temperature = temperature;
@@ -5092,6 +5093,17 @@ std::vector<int> PlanCudaEngine::generate_stream(const std::vector<int>& prompt,
   // Honour a caller-supplied seed so temperature>0 generation is reproducible
   // (this engine previously ignored it, unlike the other engines).
   p.seed = constraints ? constraints->seed : -1;
+  // Grammar constraints. Everything needed was already in place: sample() above
+  // vetoes both device fast paths when a mask is present, and the driver's
+  // default sample() applies the mask before sampling. Only these two hooks were
+  // missing, so a json_schema request to --serve on this engine produced
+  // unconstrained output with no error: the grammar was compiled, passed in, and
+  // dropped. GrammarSampler is owned by the caller for the call's duration.
+  if (constraints != nullptr && constraints->grammar != nullptr) {
+    grammar::GrammarSampler* g = constraints->grammar;
+    p.grammar_mask = [g](std::vector<float>& logits) { g->apply_mask(logits); };
+    p.grammar_accept = [g](int token) { g->accept(token); };
+  }
   // Contract: generate_stream returns prompt+generated. main_modes strips
   // prompt_tokens.size(), and only when the result is longer than the prompt, so
   // returning generated-only silently produced an empty final "Decoded text".

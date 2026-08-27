@@ -266,6 +266,12 @@ std::string json_get_string(const std::string& json, const std::string& key) {
   return json_read_string(json, p);
 }
 
+std::string unwrap_json_schema(const std::string& raw) {
+  if (raw.empty()) return raw;
+  const std::string inner = json_get_raw_value(raw, "schema");
+  return inner.empty() ? raw : inner;
+}
+
 std::string json_get_raw_value(const std::string& json, const std::string& key) {
   const std::size_t v = json_find_key(json, key);
   if (v == std::string::npos) {

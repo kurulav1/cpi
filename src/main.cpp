@@ -715,8 +715,8 @@ int main(int argc, char** argv) {
           app::main_modes::run_http_server_serial(
               [&plan_eng](const std::vector<int>& prompt, int max_new, float temp,
                           const std::function<bool(int)>& on_token,
-                          const engine::GenerationConstraints*) {
-                return plan_eng.generate_stream(prompt, max_new, temp, on_token);
+                          const engine::GenerationConstraints* constraints) {
+                return plan_eng.generate_stream(prompt, max_new, temp, on_token, constraints);
               },
               tokenizer, so);
           break;

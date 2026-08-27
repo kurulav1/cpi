@@ -46,6 +46,18 @@ std::string json_get_string(const std::string& json, const std::string& key);
 // brace/bracket-balanced and string-aware. Use for nested values like
 // `json_schema` that json_get_string (scalars only) cannot extract. Empty if absent.
 std::string json_get_raw_value(const std::string& json, const std::string& key);
+
+// Reduce a response_format.json_schema value to the JSON Schema itself.
+//
+// OpenAI nests it one level deeper than it looks:
+//   response_format.json_schema = {"name":..., "strict":..., "schema":{...}}
+// Passing that wrapper to the grammar converter yields a permissive any-JSON
+// grammar, because it has neither "type" nor "properties". Returns the value of a
+// top-level "schema" key when there is one, and the input unchanged otherwise, so
+// the bare CPI form still works. A JSON Schema spells its own metadata key
+// "$schema", never "schema", so the two forms cannot be confused.
+std::string unwrap_json_schema(const std::string& raw);
+
 int json_get_int(const std::string& json, const std::string& key, int def);
 float json_get_float(const std::string& json, const std::string& key, float def);
 bool json_get_bool(const std::string& json, const std::string& key, bool def);

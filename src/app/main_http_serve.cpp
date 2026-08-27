@@ -55,6 +55,7 @@ using app::main_helpers::json_get_int;
 using app::main_helpers::json_get_raw_value;
 using app::main_helpers::json_get_string;
 using app::main_helpers::json_get_string_array;
+using app::main_helpers::unwrap_json_schema;
 
 namespace {
 
@@ -494,6 +495,7 @@ void run_http_server(engine::BatchScheduler& sched, model::Tokenizer& tokenizer,
       const std::string rf = json_get_raw_value(body, "response_format");
       if (!rf.empty()) ov.json_schema = json_get_raw_value(rf, "json_schema");
     }
+    ov.json_schema = unwrap_json_schema(ov.json_schema);
 
     const bool stream = json_get_bool(body, "stream", false);
     const std::string id = (chat ? "chatcmpl-" : "cmpl-") + std::to_string(next_id.fetch_add(1));
@@ -825,6 +827,7 @@ void run_http_server_serial(GenerateStreamFn generate, model::Tokenizer& tokeniz
       const std::string rf = json_get_raw_value(body, "response_format");
       if (!rf.empty()) json_schema = json_get_raw_value(rf, "json_schema");
     }
+    json_schema = unwrap_json_schema(json_schema);
     // Per-request stops on top of the server's template defaults. Without these
     // the model emits its end-of-turn marker and keeps going, inventing the next
     // speaker's turn until it hits max_tokens.

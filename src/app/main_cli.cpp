@@ -129,7 +129,7 @@ void print_usage(std::ostream& os) {
         "[--vram-safety-margin-mb n] "
         "[--top-k n] [--top-p p] [--repeat-penalty r] [--no-repeat-ngram n] [--rope-theta f] "
         "[--stop-text text] [--chat-template "
-        "tinyllama|tinyllama-chatml|llama2|llama3|mistral|phi3|qwen2|qwen3_5|llama4] "
+        "tinyllama|tinyllama-chatml|llama2|llama3|mistral|phi3|qwen2|qwen3_5|llama4|gemma] "
         "[--dump-tokenizer-meta] [--dump-prompt-tokens] [--inspect-next-topk n] "
         "[--trace-steps n] [--sentence-stop] [--benchmark] [--benchmark-reps n] "
         "[--benchmark-warmup n] "
@@ -495,6 +495,26 @@ ParsedArgs parse_args(int argc, char** argv) {
       !args.opts.paged_blocks) {
     args.opts.paged_blocks = true;
     std::fprintf(stderr, "[cli] --serve/--interactive-batch imply --paged-blocks; enabling it.\n");
+  }
+
+  // Pick a chat template for the serving paths when the user did not name one.
+  // guess_chat_template_from_model_path already existed and already knew every
+  // family, but it was only ever called from apply_simple_mode_defaults, so
+  // --serve never got it. Serving Gemma 4 without --chat-template sent the raw
+  // text to a model that expects turn markers, and /v1/chat/completions answered
+  // every request with a single newline: no error, no warning, nothing in the log
+  // to suggest a template was missing. /v1/completions was unaffected, which made
+  // it look like an engine bug rather than a prompt-construction one.
+  //
+  // Only for the serving transports, and only when the flag was not given. A bare
+  // CLI run stays raw, which is what --benchmark and the parity harnesses expect.
+  if ((args.serve_http || args.interactive_batch) && !args.chat_template_set &&
+      args.chat_template.empty()) {
+    args.chat_template = main_helpers::guess_chat_template_from_model_path(args.opts.model_path);
+    if (!args.chat_template.empty()) {
+      std::fprintf(stderr, "[cli] chat template not given; using '%s' (from the model path).\n",
+                   args.chat_template.c_str());
+    }
   }
 
   apply_simple_mode_defaults(&args);
