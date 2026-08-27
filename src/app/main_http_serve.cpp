@@ -59,6 +59,25 @@ using app::main_helpers::unwrap_json_schema;
 
 namespace {
 
+// Cuts `text` at the first stop string it contains, returning true when it cut.
+//
+// The batched worker turns only SINGLE-token stop strings into stop ids and, by
+// its own comment, leaves multi-token ones "the transport's problem". The serial
+// transport does that matching; this one never did, so a multi-token stop was
+// accepted and then silently ignored. A stop like "\n\nUser:" is ordinary in
+// OpenAI clients and did nothing here.
+bool cut_at_stop(std::string& text, const std::vector<std::string>& stops) {
+  std::size_t cut = std::string::npos;
+  for (const auto& stop : stops) {
+    if (stop.empty()) continue;
+    const std::size_t at = text.find(stop);
+    if (at != std::string::npos && at < cut) cut = at;
+  }
+  if (cut == std::string::npos) return false;
+  text.erase(cut);
+  return true;
+}
+
 // A per-request mailbox. The worker thread pushes deltas in; the connection
 // thread pops them out and writes SSE frames (or accumulates the full text).
 struct Pending {
@@ -606,6 +625,15 @@ void run_http_server(engine::BatchScheduler& sched, model::Tokenizer& tokenizer,
                 "\"finish_reason\":null}]}");
       }
       std::string finish;
+      // A streaming server cannot emit text that might turn out to be the start of
+      // a stop string, so the last (longest stop - 1) bytes are withheld until the
+      // next chunk decides them. Matching emitted + chunk is not enough: by the
+      // time the whole stop is visible, its first bytes have already gone out. A
+      // request stopping at "11 12 13" streamed "11 12 " before cutting.
+      std::string held;
+      std::size_t max_stop = 0;
+      for (const auto& st : ov.stop_texts) max_stop = std::max(max_stop, st.size());
+      bool stop_cut = false;
       while (true) {
         std::string chunk;
         bool finished = false;
@@ -623,6 +651,24 @@ void run_http_server(engine::BatchScheduler& sched, model::Tokenizer& tokenizer,
             res.sse("[DONE]");
             unregister();
             return;
+          }
+        }
+        if (!ov.stop_texts.empty() && (!chunk.empty() || finished)) {
+          held += chunk;
+          std::string candidate = held;
+          if (cut_at_stop(candidate, ov.stop_texts)) {
+            chunk = candidate;  // everything before the stop, nothing after
+            held.clear();
+            stop_cut = true;
+            finished = true;
+          } else if (finished) {
+            chunk.swap(held);  // no stop and no more tokens: release the tail
+          } else {
+            // Any stop ending in the new data starts at most (len - 1) bytes
+            // before it, so retaining that much is enough to catch every split.
+            const std::size_t keep = std::min(held.size(), max_stop > 0 ? max_stop - 1 : 0);
+            chunk = held.substr(0, held.size() - keep);
+            held.erase(0, held.size() - keep);
           }
         }
         if (!chunk.empty()) {
@@ -645,7 +691,8 @@ void run_http_server(engine::BatchScheduler& sched, model::Tokenizer& tokenizer,
         }
         if (finished) break;
       }
-      const std::string reason = finish.empty() ? "stop" : (finish == "length" ? "length" : "stop");
+      const std::string reason =
+          (stop_cut || finish.empty()) ? "stop" : (finish == "length" ? "length" : "stop");
       res.sse(chat ? ("{\"id\":\"" + id + "\",\"object\":\"chat.completion.chunk\",\"created\":" +
                       created + ",\"model\":\"" + json_escape(model_name) +
                       "\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"" + reason +
@@ -679,7 +726,11 @@ void run_http_server(engine::BatchScheduler& sched, model::Tokenizer& tokenizer,
       res.send(500, "application/json", error_json(error, "server_error"));
       return;
     }
-    const std::string reason = finish == "length" ? "length" : "stop";
+    // Multi-token stop strings are matched here, on the decoded text, which is the
+    // only place they can be seen. A cut also decides the reason: the request
+    // ended because the caller asked it to, whatever the worker reported.
+    const bool cut = cut_at_stop(text, ov.stop_texts);
+    const std::string reason = (!cut && finish == "length") ? "length" : "stop";
     const std::string usage = usage_json(prompt_tokens, completion_tokens);
     const std::string payload =
         chat ? ("{\"id\":\"" + id + "\",\"object\":\"chat.completion\",\"created\":" + created +

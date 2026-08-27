@@ -148,21 +148,33 @@ def main():
     check("min_new holds generation past the floor", n_floor >= floor, "tokens=%d" % n_floor)
 
     print("stop reaches the sampler")
-    # A multi-token stop string on purpose. CPI matches a stop that encodes to a
-    # SINGLE token by token id, not as text, because a marker like <|eot_id|>
-    # decodes to nothing and can only be caught by id. That is deliberate, but it
-    # diverges from OpenAI, where stop is a plain substring: asking to stop at
-    # "four" does not stop inside "fourteen", because the token there is a
-    # different one. The first version of this check used "four" and failed
-    # against a correct server, which is the kind of ambiguity a contract test
-    # must not carry.
+    # Calibrate the stop string against what this model actually said. An earlier
+    # version asked it to stop at "fourteen" and failed against a correct server
+    # that happened to count in digits: the check encoded an assumption about the
+    # model, not about CPI. A harness other people run against arbitrary models
+    # cannot assume anything about the content of a reply.
+    #
+    # The phrase is taken from the middle and is several words long on purpose.
+    # CPI matches a stop that encodes to a SINGLE token by token id rather than as
+    # text, because a marker like <|eot_id|> decodes to nothing and can only be
+    # caught by id. That is deliberate, and it diverges from OpenAI, where stop is
+    # a plain substring: "four" does not stop inside "fourteen", since the token
+    # there is a different one. A multi-word phrase is unambiguously text-matched.
     counting = "Count from one to twenty, separated by spaces."
     unstopped = text_of(post(url, chat(counting)))
-    stopped = text_of(post(url, chat(counting, stop=["fourteen"])))
-    check("stop is honoured at all", "fourteen" in unstopped, repr(unstopped[:80]))
-    check("a stop string truncates the reply", "fourteen" not in stopped, repr(stopped[:80]))
-    check("the truncated reply is shorter", len(stopped) < len(unstopped),
-          "%d vs %d" % (len(stopped), len(unstopped)))
+    words = unstopped.split()
+    if len(words) < 8:
+        check("stop: model gave too little output to calibrate against", False,
+              repr(unstopped[:60]))
+    else:
+        mid = len(words) // 2
+        phrase = " ".join(words[mid:mid + 3])
+        stopped = text_of(post(url, chat(counting, stop=[phrase])))
+        check("the calibration phrase is present unstopped", phrase in unstopped, repr(phrase))
+        check("a stop string truncates the reply", phrase not in stopped,
+              "%r still in %r" % (phrase, stopped[-60:]))
+        check("the truncated reply is shorter", len(stopped) < len(unstopped),
+              "%d vs %d" % (len(stopped), len(unstopped)))
 
     print("")
     if FAILURES:
