@@ -10,24 +10,24 @@
 #include <vector>
 
 #if defined(_WIN32)
-#  ifndef WIN32_LEAN_AND_MEAN
-#    define WIN32_LEAN_AND_MEAN
-#  endif
-#  include <winsock2.h>
-#  include <ws2tcpip.h>
-#  pragma comment(lib, "ws2_32.lib")
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib, "ws2_32.lib")
 using socket_t = SOCKET;
 static constexpr socket_t kInvalidSocket = INVALID_SOCKET;
-#  define CPI_CLOSESOCKET closesocket
+#define CPI_CLOSESOCKET closesocket
 #else
-#  include <arpa/inet.h>
-#  include <netinet/in.h>
-#  include <netinet/tcp.h>
-#  include <sys/socket.h>
-#  include <unistd.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#include <unistd.h>
 using socket_t = int;
 static constexpr socket_t kInvalidSocket = -1;
-#  define CPI_CLOSESOCKET ::close
+#define CPI_CLOSESOCKET ::close
 #endif
 
 namespace net {
@@ -66,7 +66,8 @@ std::string trim(const std::string& s) {
   std::size_t b = 0;
   std::size_t e = s.size();
   while (b < e && (s[b] == ' ' || s[b] == '\t' || s[b] == '\r' || s[b] == '\n')) ++b;
-  while (e > b && (s[e - 1] == ' ' || s[e - 1] == '\t' || s[e - 1] == '\r' || s[e - 1] == '\n')) --e;
+  while (e > b && (s[e - 1] == ' ' || s[e - 1] == '\t' || s[e - 1] == '\r' || s[e - 1] == '\n'))
+    --e;
   return s.substr(b, e - b);
 }
 

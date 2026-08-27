@@ -17,7 +17,7 @@ struct PatchGrid {
   std::vector<float> pixels;  // [num_patches, 3 * patch^2], channel INNERMOST, in [0,1]
   std::vector<int> pos_x;     // patch grid coords; -1 marks a padding patch
   std::vector<int> pos_y;
-  int num_patches = 0;   // including padding
+  int num_patches = 0;  // including padding
   // What the ENCODER emits: padded_patches / pooling^2 (HF's output_length).
   int soft_tokens = 0;
   // What the text STREAM reserves: the live grid only, (grid_w/k) * (grid_h/k). The

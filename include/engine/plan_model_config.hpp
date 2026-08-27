@@ -66,13 +66,13 @@ struct PlanModelConfig {
 
   // ── DeepSeek-V2 (MLA latent attention + fine-grained MoE) ──
   // MLA geometry: query is a direct proj when q_lora_rank == 0 (V2-Lite) else down/up through it.
-  int q_lora_rank = 0;             // query LoRA rank (0 = direct q_proj)
-  int kv_lora_rank = 0;            // cached KV latent width
-  int qk_nope_head_dim = 0;        // per-head non-rope q/k dim
-  int qk_rope_head_dim = 0;        // per-head decoupled-rope q/k dim (k side shared across heads)
-  int v_head_dim = 0;              // per-head value dim (may differ from qk head dim)
-  int n_shared_experts = 0;        // always-on shared experts (added to the routed output)
-  int first_k_dense_replace = 0;   // first N layers are a dense MLP; layers >= N are MoE
+  int q_lora_rank = 0;            // query LoRA rank (0 = direct q_proj)
+  int kv_lora_rank = 0;           // cached KV latent width
+  int qk_nope_head_dim = 0;       // per-head non-rope q/k dim
+  int qk_rope_head_dim = 0;       // per-head decoupled-rope q/k dim (k side shared across heads)
+  int v_head_dim = 0;             // per-head value dim (may differ from qk head dim)
+  int n_shared_experts = 0;       // always-on shared experts (added to the routed output)
+  int first_k_dense_replace = 0;  // first N layers are a dense MLP; layers >= N are MoE
   float routed_scaling_factor = 1.0f;
   // YARN rope parameters, used to build inv_freq + the attention (mscale) scaling at load.
   float yarn_factor = 1.0f, yarn_mscale = 1.0f, yarn_beta_fast = 32.0f, yarn_beta_slow = 1.0f;

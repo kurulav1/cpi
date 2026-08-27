@@ -83,8 +83,8 @@ public:
     int reuse = 0;
     if (reuse_prefix_) {
       // Cap at P-1: the last prompt token must remain for the first decode step.
-      const int cap = std::min(static_cast<int>(resident_.size()),
-                               static_cast<int>(prompt_tokens.size()) - 1);
+      const int cap =
+          std::min(static_cast<int>(resident_.size()), static_cast<int>(prompt_tokens.size()) - 1);
       while (reuse < cap && prompt_tokens[static_cast<std::size_t>(reuse)] ==
                                 resident_[static_cast<std::size_t>(reuse)]) {
         ++reuse;

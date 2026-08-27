@@ -79,8 +79,8 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
     const auto [attn_start, attn_seq_len] = attention_bounds(layer, position);
     const std::size_t k_row = static_cast<std::size_t>(head_dim * kv_quant_kbits_ / 8);
     const std::size_t v_row = static_cast<std::size_t>(head_dim * kv_quant_vbits_ / 8);
-    const std::size_t token_heads = static_cast<std::size_t>(kv_capacity_tokens_) *
-                                    static_cast<std::size_t>(cfg.num_kv_heads);
+    const std::size_t token_heads =
+        static_cast<std::size_t>(kv_capacity_tokens_) * static_cast<std::size_t>(cfg.num_kv_heads);
     auto* kq = d_k_cache_i4_ + static_cast<std::size_t>(layer) * token_heads * k_row;
     auto* vq = d_v_cache_i4_ + static_cast<std::size_t>(layer) * token_heads * v_row;
     auto* ks = d_k_scales_ + static_cast<std::size_t>(layer) * token_heads;
@@ -88,22 +88,20 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
     // Per-layer sink/ring bases. The side buffers are [layers, slots, n, kv_heads,
     // head_dim]; the contiguous cache always runs at slots == 1 and the paged
     // single-sequence path uses slot 0, so the layer base is also the slot-0 base.
-    const std::size_t sink_stride = static_cast<std::size_t>(kv_quality_slots_) *
-                                    static_cast<std::size_t>(kv_quant_sink_) *
-                                    static_cast<std::size_t>(cfg.num_kv_heads) *
-                                    static_cast<std::size_t>(head_dim);
-    const std::size_t ring_stride = static_cast<std::size_t>(kv_quality_slots_) *
-                                    static_cast<std::size_t>(kv_quant_win_) *
-                                    static_cast<std::size_t>(cfg.num_kv_heads) *
-                                    static_cast<std::size_t>(head_dim);
-    auto* sink_k = d_kv_sink_k_ ? d_kv_sink_k_ + static_cast<std::size_t>(layer) * sink_stride
-                                : nullptr;
-    auto* sink_v = d_kv_sink_v_ ? d_kv_sink_v_ + static_cast<std::size_t>(layer) * sink_stride
-                                : nullptr;
-    auto* ring_k = d_kv_ring_k_ ? d_kv_ring_k_ + static_cast<std::size_t>(layer) * ring_stride
-                                : nullptr;
-    auto* ring_v = d_kv_ring_v_ ? d_kv_ring_v_ + static_cast<std::size_t>(layer) * ring_stride
-                                : nullptr;
+    const std::size_t sink_stride =
+        static_cast<std::size_t>(kv_quality_slots_) * static_cast<std::size_t>(kv_quant_sink_) *
+        static_cast<std::size_t>(cfg.num_kv_heads) * static_cast<std::size_t>(head_dim);
+    const std::size_t ring_stride =
+        static_cast<std::size_t>(kv_quality_slots_) * static_cast<std::size_t>(kv_quant_win_) *
+        static_cast<std::size_t>(cfg.num_kv_heads) * static_cast<std::size_t>(head_dim);
+    auto* sink_k =
+        d_kv_sink_k_ ? d_kv_sink_k_ + static_cast<std::size_t>(layer) * sink_stride : nullptr;
+    auto* sink_v =
+        d_kv_sink_v_ ? d_kv_sink_v_ + static_cast<std::size_t>(layer) * sink_stride : nullptr;
+    auto* ring_k =
+        d_kv_ring_k_ ? d_kv_ring_k_ + static_cast<std::size_t>(layer) * ring_stride : nullptr;
+    auto* ring_v =
+        d_kv_ring_v_ ? d_kv_ring_v_ + static_cast<std::size_t>(layer) * ring_stride : nullptr;
     if (options_.paged_blocks) {
       // Paged quantized pool: store through the single-sequence block table and
       // run the batched-paged quant attention at batch 1 with quality slot 0
@@ -111,44 +109,41 @@ void LlamaEngine::forward_decode_layers(int token, int position) {
       // the same fp16 sink/window quality tier as the contiguous cache.
       ensure_batch_state_buffers(1, 1);
       const int seq_len_h = position + 1;
-      CUDA_CHECK(cudaMemcpyAsync(d_batch_positions_, &position, sizeof(int),
-                                 cudaMemcpyHostToDevice, compute_stream_));
-      CUDA_CHECK(cudaMemcpyAsync(d_batch_seq_lens_, &seq_len_h, sizeof(int),
-                                 cudaMemcpyHostToDevice, compute_stream_));
+      CUDA_CHECK(cudaMemcpyAsync(d_batch_positions_, &position, sizeof(int), cudaMemcpyHostToDevice,
+                                 compute_stream_));
+      CUDA_CHECK(cudaMemcpyAsync(d_batch_seq_lens_, &seq_len_h, sizeof(int), cudaMemcpyHostToDevice,
+                                 compute_stream_));
       CUDA_CHECK(cudaMemsetAsync(d_batch_kv_slots_, 0, sizeof(int), compute_stream_));
       const int bs = options_.paged_block_size > 0 ? options_.paged_block_size : 32;
       kernels::launch_store_kv_paged_quant(
-          static_cast<const __half*>(d_k_), static_cast<const __half*>(d_v_), kv_hidden, kq, vq,
-          ks, vs, d_block_table_, position, 1, cfg.num_kv_heads, head_dim, bs, kv_quant_kbits_,
+          static_cast<const __half*>(d_k_), static_cast<const __half*>(d_v_), kv_hidden, kq, vq, ks,
+          vs, d_block_table_, position, 1, cfg.num_kv_heads, head_dim, bs, kv_quant_kbits_,
           kv_quant_vbits_, kv_quant_rot_, compute_stream_, sink_k, sink_v, ring_k, ring_v,
           kv_quant_sink_, kv_quant_win_);
       kernels::launch_attention_step_batched_paged_quant(
           static_cast<const __half*>(d_q_), kq, vq, ks, vs, d_block_table_, d_batch_seq_lens_, 0,
-          seq_len_h, static_cast<__half*>(d_att_), 1, cfg.num_heads, cfg.num_kv_heads, head_dim,
-          bs, kv_quant_kbits_, kv_quant_vbits_, kv_quant_rot_, compute_stream_, d_attn_chunk_m_,
-          d_attn_chunk_l_, d_attn_chunk_o_, attn_chunk_capacity_, d_batch_kv_slots_, sink_k,
-          sink_v, ring_k, ring_v, kv_quant_sink_, kv_quant_win_);
+          seq_len_h, static_cast<__half*>(d_att_), 1, cfg.num_heads, cfg.num_kv_heads, head_dim, bs,
+          kv_quant_kbits_, kv_quant_vbits_, kv_quant_rot_, compute_stream_, d_attn_chunk_m_,
+          d_attn_chunk_l_, d_attn_chunk_o_, attn_chunk_capacity_, d_batch_kv_slots_, sink_k, sink_v,
+          ring_k, ring_v, kv_quant_sink_, kv_quant_win_);
       return;
     }
     kernels::launch_store_kv_quant(
-        static_cast<const __half*>(d_k_), static_cast<const __half*>(d_v_), kq, vq, ks, vs,
-        sink_k, sink_v, ring_k, ring_v, kv_quant_sink_, kv_quant_win_, position,
-        cfg.num_kv_heads, head_dim, kv_capacity_tokens_, kv_quant_kbits_, kv_quant_vbits_,
-        kv_quant_rot_, compute_stream_);
+        static_cast<const __half*>(d_k_), static_cast<const __half*>(d_v_), kq, vq, ks, vs, sink_k,
+        sink_v, ring_k, ring_v, kv_quant_sink_, kv_quant_win_, position, cfg.num_kv_heads, head_dim,
+        kv_capacity_tokens_, kv_quant_kbits_, kv_quant_vbits_, kv_quant_rot_, compute_stream_);
     const std::size_t head_off =
         static_cast<std::size_t>(attn_start) * static_cast<std::size_t>(cfg.num_kv_heads);
     kernels::launch_attention_step_quant(
         static_cast<const __half*>(d_q_), kq + head_off * k_row, vq + head_off * v_row,
-        ks + head_off, vs + head_off, sink_k, sink_v, ring_k, ring_v, kv_quant_sink_,
-        kv_quant_win_, attn_start, static_cast<__half*>(d_att_), attn_seq_len, cfg.num_heads,
-        cfg.num_kv_heads, head_dim, kv_quant_kbits_, kv_quant_vbits_, kv_quant_rot_,
-        compute_stream_, d_attn_chunk_m_, d_attn_chunk_l_, d_attn_chunk_o_, attn_chunk_capacity_,
-        !options_.disable_split_attention);
+        ks + head_off, vs + head_off, sink_k, sink_v, ring_k, ring_v, kv_quant_sink_, kv_quant_win_,
+        attn_start, static_cast<__half*>(d_att_), attn_seq_len, cfg.num_heads, cfg.num_kv_heads,
+        head_dim, kv_quant_kbits_, kv_quant_vbits_, kv_quant_rot_, compute_stream_, d_attn_chunk_m_,
+        d_attn_chunk_l_, d_attn_chunk_o_, attn_chunk_capacity_, !options_.disable_split_attention);
   };
   if (cfg.is_moe()) {
     const int experts = std::max(1, cfg.num_local_experts);
-    const int top_k =
-        std::max(1, std::min(cfg.effective_experts_per_tok(), experts));
+    const int top_k = std::max(1, std::min(cfg.effective_experts_per_tok(), experts));
     const int expert_inter = cfg.effective_expert_intermediate_size() > 0
                                  ? cfg.effective_expert_intermediate_size()
                                  : inter;

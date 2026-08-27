@@ -34,7 +34,7 @@ struct HttpRequest {
 // Per-connection writer. A handler either sends one complete response, or opens
 // an SSE stream and pushes events until the client leaves.
 class HttpResponder {
- public:
+public:
   explicit HttpResponder(std::intptr_t socket);
   ~HttpResponder();
 
@@ -58,7 +58,7 @@ class HttpResponder {
     return sse_open_;
   }
 
- private:
+private:
   bool write_all(const char* data, std::size_t len);
 
   std::intptr_t sock_;
@@ -70,7 +70,7 @@ class HttpResponder {
 using HttpHandler = std::function<void(const HttpRequest&, HttpResponder&)>;
 
 class HttpServer {
- public:
+public:
   HttpServer();
   ~HttpServer();
 
@@ -91,7 +91,7 @@ class HttpServer {
     return port_;
   }
 
- private:
+private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
   int port_ = 0;

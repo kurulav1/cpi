@@ -16,7 +16,8 @@
 
 namespace {
 
-// Host mirror of moe_router_sigmoid_topk_kernel. Takes the same half-rounded logits the device sees.
+// Host mirror of moe_router_sigmoid_topk_kernel. Takes the same half-rounded logits the device
+// sees.
 void ref_router(const std::vector<float>& g_in, int experts, int top_k, int n_group, int topk_group,
                 std::vector<int>& idx, std::vector<float>& w) {
   std::vector<float> gate(experts);
@@ -126,7 +127,8 @@ int run_case(const char* name, int experts, int top_k, int n_group, int topk_gro
   cudaMalloc(&didx, top_k * sizeof(int));
   cudaMalloc(&dw, top_k * sizeof(float));
   cudaMemcpy(dl, lh.data(), experts * sizeof(half), cudaMemcpyHostToDevice);
-  kernels::launch_moe_router_sigmoid_topk(dl, experts, top_k, n_group, topk_group, didx, dw, nullptr);
+  kernels::launch_moe_router_sigmoid_topk(dl, experts, top_k, n_group, topk_group, didx, dw,
+                                          nullptr);
   if (cudaDeviceSynchronize() != cudaSuccess) {
     std::printf("FAIL[%s]: kernel launch\n", name);
     return 1;
@@ -177,13 +179,14 @@ int run_case(const char* name, int experts, int top_k, int n_group, int topk_gro
     std::sort(sorted.rbegin(), sorted.rend());
     const float cutoff = sorted[std::min(topk_group, n_group) - 1];
     for (int k = 0; k < top_k; ++k)
-      if (hw[k] > 0 && gscore[hidx[k]/gsize] < cutoff) {
+      if (hw[k] > 0 && gscore[hidx[k] / gsize] < cutoff) {
         std::printf("FAIL[%s]: picked expert %d in a non-top group\n", name, hidx[k]);
         fail = 1;
       }
   }
-  if (!fail) std::printf("PASS[%s]: E=%d k=%d n_group=%d topk_group=%d\n", name, experts, top_k,
-                         n_group, topk_group);
+  if (!fail)
+    std::printf("PASS[%s]: E=%d k=%d n_group=%d topk_group=%d\n", name, experts, top_k, n_group,
+                topk_group);
   return fail;
 }
 
@@ -192,8 +195,8 @@ int run_case(const char* name, int experts, int top_k, int n_group, int topk_gro
 int main() {
   std::mt19937 rng(11);
   int fail = 0;
-  fail |= run_case("flat-top16", 256, 16, 1, 0, rng);          // sigmoid, flat, above top-8 cap
-  fail |= run_case("k3-grouped", 256, 16, 8, 4, rng);          // grouped node-limited (8 groups, top 4)
-  fail |= run_case("k3-896", 896, 16, 8, 4, rng);              // K3 scale (896 experts / top-16)
+  fail |= run_case("flat-top16", 256, 16, 1, 0, rng);  // sigmoid, flat, above top-8 cap
+  fail |= run_case("k3-grouped", 256, 16, 8, 4, rng);  // grouped node-limited (8 groups, top 4)
+  fail |= run_case("k3-896", 896, 16, 8, 4, rng);      // K3 scale (896 experts / top-16)
   return fail;
 }

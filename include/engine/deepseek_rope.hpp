@@ -3,10 +3,11 @@
 // DeepSeek-V2 YARN RoPE frequencies, matching transformers' yarn rope init exactly (verified in
 // deepseek_rope_test against the model's dumped inv_freq to ~1e-8). MLA applies INTERLEAVED-complex
 // rope on the qk_rope_head_dim slice using these inv_freq, scaling the rotated vectors by
-// attention_scaling (the yarn mscale). For V2-Lite attention_scaling == 1.0 (the mscale ratio cancels
-// because mscale == mscale_all_dim); this helper returns it generally.
+// attention_scaling (the yarn mscale). For V2-Lite attention_scaling == 1.0 (the mscale ratio
+// cancels because mscale == mscale_all_dim); this helper returns it generally.
 //
-// Header-only host math so the loader (and a standalone test) can build the rope table without CUDA.
+// Header-only host math so the loader (and a standalone test) can build the rope table without
+// CUDA.
 
 #include <cmath>
 #include <vector>
@@ -14,12 +15,12 @@
 namespace engine {
 
 struct YarnRope {
-  std::vector<float> inv_freq;    // [qk_rope_head_dim/2]
+  std::vector<float> inv_freq;     // [qk_rope_head_dim/2]
   float attention_scaling = 1.0f;  // multiplies the rotated q_pe/k_pe (yarn mscale)
 };
 
-// Compute the yarn-interpolated inverse frequencies for `rope_dim` (= qk_rope_head_dim) under a scale
-// `factor`, ramping between beta_fast/beta_slow rotations against `orig_max_pos`. Mirrors
+// Compute the yarn-interpolated inverse frequencies for `rope_dim` (= qk_rope_head_dim) under a
+// scale `factor`, ramping between beta_fast/beta_slow rotations against `orig_max_pos`. Mirrors
 // transformers _compute_yarn_parameters + _yarn_get_mscale.
 inline YarnRope deepseek_yarn_rope(int rope_dim, float base, float factor, float beta_fast,
                                    float beta_slow, int orig_max_pos, float mscale,
@@ -48,7 +49,8 @@ inline YarnRope deepseek_yarn_rope(int rope_dim, float base, float factor, float
     out.inv_freq[i] = inv_interp * (1.0f - extrap_factor) + inv_extrap * extrap_factor;
   }
 
-  // yarn mscale: DeepSeek uses the RATIO get_mscale(factor,mscale)/get_mscale(factor,mscale_all_dim).
+  // yarn mscale: DeepSeek uses the RATIO
+  // get_mscale(factor,mscale)/get_mscale(factor,mscale_all_dim).
   auto get_mscale = [&](float m) {
     return factor <= 1.0f ? 1.0f : (0.1f * m * std::log(factor) + 1.0f);
   };

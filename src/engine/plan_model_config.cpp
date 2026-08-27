@@ -24,7 +24,8 @@ PlanModelConfig parse_gemma4_text_config(const std::string& config_json) {
   c.head_dim_sliding = c.head_dim;
   c.head_dim_full = mini::json_get_int(tc, "global_head_dim", c.head_dim);
   c.num_kv_heads_sliding = mini::json_get_int(tc, "num_key_value_heads", 1);
-  c.num_kv_heads_full = mini::json_get_int(tc, "num_global_key_value_heads", c.num_kv_heads_sliding);
+  c.num_kv_heads_full =
+      mini::json_get_int(tc, "num_global_key_value_heads", c.num_kv_heads_sliding);
   c.num_kv_heads = c.num_kv_heads_sliding;
   c.hidden_size_per_layer_input = mini::json_get_int(tc, "hidden_size_per_layer_input", 0);
   c.num_kv_shared_layers = mini::json_get_int(tc, "num_kv_shared_layers", 0);

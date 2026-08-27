@@ -206,13 +206,13 @@ private:
     std::int8_t* w2 = nullptr;  // Device INT8 down-projection weight matrix.
     std::int8_t* w3 = nullptr;  // Device INT8 up-projection weight matrix.
     bool mlp_int4 = false;      // True when w1/w2/w3 are packed INT4 (two signed nibbles per byte).
-    int mlp_group = 0;          // >0: s_w1/s_w2/s_w3 hold one scale per group of N input columns
-                                // (group-wise int4). 0: one scale per row (legacy). Self-describing
-                                // so streaming (per-row) and resident (grouped) buffers can't confuse
-                                // a consumer.
-    float* s_w1 = nullptr;      // Device dequantisation scales for w1 ([rows] or [rows,n_groups]).
-    float* s_w2 = nullptr;      // Device per-row dequantisation scales for w2.
-    float* s_w3 = nullptr;      // Device per-row dequantisation scales for w3.
+    // >0: s_w1/s_w2/s_w3 hold one scale per group of N input columns (group-wise int4).
+    // 0: one scale per row (legacy). Self-describing, so streaming (per-row) and resident
+    // (grouped) buffers cannot confuse a consumer.
+    int mlp_group = 0;
+    float* s_w1 = nullptr;  // Device dequantisation scales for w1 ([rows] or [rows,n_groups]).
+    float* s_w2 = nullptr;  // Device per-row dequantisation scales for w2.
+    float* s_w3 = nullptr;  // Device per-row dequantisation scales for w3.
     // Projection weights quantised at layer-cache init time (null when unused).
     std::int8_t* wqkv = nullptr;  // Device INT8 fused QKV weight matrix.
     bool proj_int4 = false;     // True when wqkv/wo are packed INT4 (two signed nibbles per byte).
@@ -675,8 +675,8 @@ private:
   void* d_ff13_ = nullptr;       // Fused gate+up (w1/w3) MLP output buffer.
   void* d_ff1_ = nullptr;        // Gate activation buffer (SwiGLU first operand).
   void* d_ff2_ = nullptr;        // Post-down-projection MLP output buffer.
-  void* d_prefill_ff1_ = nullptr;         // Prefill-sized gate activation buffer.
-  void* d_prefill_ff2_ = nullptr;         // Prefill-sized down-projection output buffer.
+  void* d_prefill_ff1_ = nullptr;  // Prefill-sized gate activation buffer.
+  void* d_prefill_ff2_ = nullptr;  // Prefill-sized down-projection output buffer.
   // Prefill scratch for the dequantize-then-GEMM path: one weight matrix at a
   // time in fp16, so a prompt chunk reaches the tensor-core GEMM instead of the
   // batched matvec kernels (decode-shaped, ~20x off at prefill row counts).
@@ -689,8 +689,8 @@ private:
 
   // Same, for a matrix CPI keeps fused that the container stores as two
   // row-blocks. Declines unless both halves are packed the same way.
-  void stage_packed_pair(const std::string& first, const std::string& second,
-                         PackedWeight* out, int mask_bit);
+  void stage_packed_pair(const std::string& first, const std::string& second, PackedWeight* out,
+                         int mask_bit);
 
   // Same for a matrix the container stores as three row-blocks (Q, K, V).
   void stage_packed_triple(const std::string& a, const std::string& b, const std::string& c,
@@ -771,8 +771,9 @@ private:
                                       int rows, int cols, int group);
   std::int8_t* d_prefill_i8_ = nullptr;   // INT8 quantised activations for prefill INT8 path.
   float* d_prefill_i8_scales_ = nullptr;  // Per-row scales accompanying d_prefill_i8_.
-  float* d_prefill_perm8_scales_ = nullptr;  // Per-group(32) scales for the perm8-g32 activation
-                                             // quant feeding grouped int4 dp4a MLP. [rows, cols/32].
+  float* d_prefill_perm8_scales_ =
+      nullptr;                // Per-group(32) scales for the perm8-g32 activation
+                              // quant feeding grouped int4 dp4a MLP. [rows, cols/32].
   void* d_ff3_ = nullptr;     // Up-projection (w3) output buffer (SwiGLU second operand).
   void* d_logits_ = nullptr;  // Raw logit vector output from the LM head.
   int* d_argmax_ = nullptr;   // Single-element device buffer for the argmax result.
@@ -836,45 +837,45 @@ private:
   // existing verify_tokens batched verify accepts/rejects.
   bool eagle_enabled_ = false;
   int eagle_k_ = 4;
-  void* d_eagle_fc_ = nullptr;        // [hidden, 2*hidden]
-  void* d_eagle_wq_ = nullptr;        // [q_hidden, hidden]
-  void* d_eagle_wk_ = nullptr;        // [kv_hidden, hidden]
+  void* d_eagle_fc_ = nullptr;  // [hidden, 2*hidden]
+  void* d_eagle_wq_ = nullptr;  // [q_hidden, hidden]
+  void* d_eagle_wk_ = nullptr;  // [kv_hidden, hidden]
   void* d_eagle_wv_ = nullptr;
-  void* d_eagle_wo_ = nullptr;        // [hidden, q_hidden]
-  void* d_eagle_w1_ = nullptr;        // [inter, hidden]
+  void* d_eagle_wo_ = nullptr;  // [hidden, q_hidden]
+  void* d_eagle_w1_ = nullptr;  // [inter, hidden]
   void* d_eagle_w3_ = nullptr;
   void* d_eagle_w2_ = nullptr;        // [hidden, inter]
   void* d_eagle_pnorm_ = nullptr;     // [hidden]
   __half* d_eagle_kcache_ = nullptr;  // draft KV [max_ctx pairs, kv_hidden]
   __half* d_eagle_vcache_ = nullptr;
-  float* d_eagle_cos_ = nullptr;      // plain-theta rope tables (draft head has no rope scaling)
+  float* d_eagle_cos_ = nullptr;  // plain-theta rope tables (draft head has no rope scaling)
   float* d_eagle_sin_ = nullptr;
-  __half* d_eagle_cat_ = nullptr;     // [2*hidden] fc input
-  __half* d_eagle_x_ = nullptr;       // [hidden] draft hidden / residual / output feature
-  __half* d_eagle_tmp_ = nullptr;     // [hidden]
-  __half* d_eagle_norm_ = nullptr;    // [hidden]
-  __half* d_eagle_q_ = nullptr;       // [q_hidden]
-  __half* d_eagle_kv_ = nullptr;      // [2*kv_hidden] (k then v)
-  __half* d_eagle_att_ = nullptr;     // [q_hidden]
-  __half* d_eagle_gate_ = nullptr;    // [inter]
-  __half* d_eagle_up_ = nullptr;      // [inter]
-  __half* d_eagle_feats_ = nullptr;   // [max verify rows, hidden] true features from verify
-  float* d_eagle_logits_ = nullptr;   // [vocab]
-  int* d_eagle_tok_ = nullptr;        // [1]
-  int* d_eagle_dtoks_ = nullptr;      // [16] device-side chained draft tokens
+  __half* d_eagle_cat_ = nullptr;    // [2*hidden] fc input
+  __half* d_eagle_x_ = nullptr;      // [hidden] draft hidden / residual / output feature
+  __half* d_eagle_tmp_ = nullptr;    // [hidden]
+  __half* d_eagle_norm_ = nullptr;   // [hidden]
+  __half* d_eagle_q_ = nullptr;      // [q_hidden]
+  __half* d_eagle_kv_ = nullptr;     // [2*kv_hidden] (k then v)
+  __half* d_eagle_att_ = nullptr;    // [q_hidden]
+  __half* d_eagle_gate_ = nullptr;   // [inter]
+  __half* d_eagle_up_ = nullptr;     // [inter]
+  __half* d_eagle_feats_ = nullptr;  // [max verify rows, hidden] true features from verify
+  float* d_eagle_logits_ = nullptr;  // [vocab]
+  int* d_eagle_tok_ = nullptr;       // [1]
+  int* d_eagle_dtoks_ = nullptr;     // [16] device-side chained draft tokens
   // Graphed verify: a fixed-K, device-position replica of the verify forward
   // captured once and replayed per round (the eager verify's ~700 small
   // launches cost ~2ms/round).
-  int* d_eagle_pos_ = nullptr;        // [1] device base position for the verify
-  int* d_eagle_verdict_ = nullptr;    // [17] per-row argmax outputs
-  float* d_eagle_mt_m_ = nullptr;     // mt split-K scratch [K, heads, chunks]
+  int* d_eagle_pos_ = nullptr;      // [1] device base position for the verify
+  int* d_eagle_verdict_ = nullptr;  // [17] per-row argmax outputs
+  float* d_eagle_mt_m_ = nullptr;   // mt split-K scratch [K, heads, chunks]
   float* d_eagle_mt_l_ = nullptr;
-  float* d_eagle_mt_o_ = nullptr;     // [K, heads, chunks, head_dim]
+  float* d_eagle_mt_o_ = nullptr;  // [K, heads, chunks, head_dim]
   int eagle_mt_chunks_ = 0;
   cudaGraph_t eagle_vgraph_ = nullptr;
   cudaGraphExec_t eagle_vgraph_exec_ = nullptr;
-  int eagle_vgraph_k_ = 0;            // K the graph was captured for (0 = none)
-  void eagle_verify_forward(int K);   // graph-safe verify body (device pos)
+  int eagle_vgraph_k_ = 0;           // K the graph was captured for (0 = none)
+  void eagle_verify_forward(int K);  // graph-safe verify body (device pos)
   bool eagle_verify_graphed(const std::vector<int>& batch, int start_pos,
                             std::vector<int>& out_argmax);
   // ── EAGLE tree drafting (CPI_EAGLE_TREE=1, on top of CPI_EAGLE) ──
@@ -884,34 +885,34 @@ private:
   // per-layer scratch and attention uses ancestor bitmasks; the accepted path's
   // rows are scattered into the real cache after the verdict walk.
   bool eagle_tree_ = false;
-  __half* d_eagle_tree_h_ = nullptr;   // [1 + nodes, hidden] stashed draft hiddens (DFS)
-  __half* d_eagle_tree_k_ = nullptr;   // [num_layers, rows, kv_hidden] verify K scratch
-  __half* d_eagle_tree_v_ = nullptr;   // [num_layers, rows, kv_hidden] verify V scratch
-  int* d_eagle_row_off_ = nullptr;     // [rows] per-row depth (device, constant)
+  __half* d_eagle_tree_h_ = nullptr;          // [1 + nodes, hidden] stashed draft hiddens (DFS)
+  __half* d_eagle_tree_k_ = nullptr;          // [num_layers, rows, kv_hidden] verify K scratch
+  __half* d_eagle_tree_v_ = nullptr;          // [num_layers, rows, kv_hidden] verify V scratch
+  int* d_eagle_row_off_ = nullptr;            // [rows] per-row depth (device, constant)
   unsigned int* d_eagle_anc_mask_ = nullptr;  // [rows] ancestor bitmasks (device, constant)
-  int* d_eagle_scatter_ = nullptr;     // [8] accepted-row indices for the KV scatter
+  int* d_eagle_scatter_ = nullptr;            // [8] accepted-row indices for the KV scatter
   // Batched draft levels: one forward per tree depth instead of one per node.
   // Row capacity 4 (widest level), node-scratch capacity 16 forwarded nodes.
-  __half* d_eagle_bcat_ = nullptr;     // [4, 2*hidden] level fc inputs
-  __half* d_eagle_bx_ = nullptr;       // [4, hidden] level hidden / residual
-  __half* d_eagle_btmp_ = nullptr;     // [4, hidden]
-  __half* d_eagle_bnorm_ = nullptr;    // [4, hidden]
-  __half* d_eagle_bq_ = nullptr;       // [4, q_hidden]
-  __half* d_eagle_batt_ = nullptr;     // [4, q_hidden]
-  __half* d_eagle_bgate_ = nullptr;    // [4, inter]
-  __half* d_eagle_bup_ = nullptr;      // [4, inter]
-  __half* d_eagle_scrk_ = nullptr;     // [16, kv_hidden] drafted-node K (forward order)
-  __half* d_eagle_scrv_ = nullptr;     // [16, kv_hidden]
-  int* d_eagle_lvl_tok_ = nullptr;     // [16] per-row dtok slot of the input token
-  int* d_eagle_lvl_feat_ = nullptr;    // [16] per-row stash row of the input feature
+  __half* d_eagle_bcat_ = nullptr;            // [4, 2*hidden] level fc inputs
+  __half* d_eagle_bx_ = nullptr;              // [4, hidden] level hidden / residual
+  __half* d_eagle_btmp_ = nullptr;            // [4, hidden]
+  __half* d_eagle_bnorm_ = nullptr;           // [4, hidden]
+  __half* d_eagle_bq_ = nullptr;              // [4, q_hidden]
+  __half* d_eagle_batt_ = nullptr;            // [4, q_hidden]
+  __half* d_eagle_bgate_ = nullptr;           // [4, inter]
+  __half* d_eagle_bup_ = nullptr;             // [4, inter]
+  __half* d_eagle_scrk_ = nullptr;            // [16, kv_hidden] drafted-node K (forward order)
+  __half* d_eagle_scrv_ = nullptr;            // [16, kv_hidden]
+  int* d_eagle_lvl_tok_ = nullptr;            // [16] per-row dtok slot of the input token
+  int* d_eagle_lvl_feat_ = nullptr;           // [16] per-row stash row of the input feature
   unsigned int* d_eagle_lvl_mask_ = nullptr;  // [16] per-row draft-scratch ancestor mask
-  int* d_eagle_lvl_dep_ = nullptr;     // [16] per-row depth (rope offset)
+  int* d_eagle_lvl_dep_ = nullptr;            // [16] per-row depth (rope offset)
   void eagle_tree_level(int B, int row0, int n_scr);
   void eagle_tree_verify_forward(int K);
   std::vector<int> eagle_tree_generate(const std::vector<int>& prompt_tokens, int max_new_tokens,
                                        const std::function<bool(int)>& on_token);
-  bool eagle_tried_ = false;          // lazy one-shot load attempt
-  bool eagle_load();                  // returns false (and disables) on any mismatch
+  bool eagle_tried_ = false;  // lazy one-shot load attempt
+  bool eagle_load();          // returns false (and disables) on any mismatch
   void eagle_free();
   // Runs one (feature, token) pair through the draft layer at pair row
   // `pair_idx`. The input token comes from token_dev (device int, chained
@@ -1060,9 +1061,10 @@ private:
   int resident_mlp_w2_warps_ = 4;            // Warps-per-block for the w2 INT8 MLP kernel.
   int resident_mlp_w2_tile_packed4_ = 128;   // Packed-4 tile count for the w2 INT8 kernel.
   int resident_mlp_w2_warps_per_row_ = 1;    // Warps per output row in the w2 INT8 kernel.
-  int mlp_quant_group_ = 0;  // CPI_MLP_INT4_GROUP: group-wise int4 MLP weight-scale granularity
-                             // (0 = per-row legacy; 128 = llama.cpp Q4_0-style). Resident cache only.
-  int resident_int8_qkv_warps_ = 8;          // Warps-per-block for the INT8 QKV dp4a kernel.
+  int mlp_quant_group_ =
+      0;  // CPI_MLP_INT4_GROUP: group-wise int4 MLP weight-scale granularity
+          // (0 = per-row legacy; 128 = llama.cpp Q4_0-style). Resident cache only.
+  int resident_int8_qkv_warps_ = 8;           // Warps-per-block for the INT8 QKV dp4a kernel.
   int resident_int8_qkv_tile_packed4_ = 256;  // Packed-4 tile count for the INT8 QKV kernel.
   int resident_int8_qkv_warps_per_row_ = 2;   // Warps per output row in the INT8 QKV kernel.
   int resident_int8_wo_warps_ = 8;            // Warps-per-block for the INT8 wo dp4a kernel.

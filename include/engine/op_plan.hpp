@@ -119,10 +119,11 @@ enum class OpKind : std::uint8_t {
                    // cols = hidden, in_dim = moe_inter, heads = top_k
 
   // ── DeepSeek-V2 MLA (Multi-head Latent Attention) ──
-  MlaAssembleRope,  // assemble per-head K=[k_nope|roped shared k_pe] (from MlaKvb + MlaCkv's k_pe) and
-                    // V=[v|zeros] into Slot::K/Slot::V, and interleaved-rope Slot::Q's q_pe in place.
-                    // heads=nh, head_dim=qk_nope+qk_rope, key_head_dim=qk_nope, value_head_dim=v_head,
-                    // rotary_dim=qk_rope, in_dim=kv_lora, scale=attention_scaling, aux_ptr=inv_freq.
+  MlaAssembleRope,  // assemble per-head K=[k_nope|roped shared k_pe] (from MlaKvb + MlaCkv's k_pe)
+                    // and V=[v|zeros] into Slot::K/Slot::V, and interleaved-rope Slot::Q's q_pe in
+                    // place. heads=nh, head_dim=qk_nope+qk_rope, key_head_dim=qk_nope,
+                    // value_head_dim=v_head, rotary_dim=qk_rope, in_dim=kv_lora,
+                    // scale=attention_scaling, aux_ptr=inv_freq.
   // Absorbed-MLA decode: attend over the 576-dim latent cache instead of the
   // materialized per-head K/V (~9x less attention bandwidth at depth). Prefill
   // keeps the materialized path; these ops run alongside it.
@@ -219,8 +220,8 @@ struct Op {
   // Mixtral). DeepSeek-V2-Lite sets norm_topk_prob=false, so it emits this false to keep the raw
   // top-k softmax weights.
   bool moe_renorm = true;
-  int rotary_dim = 0;        // Rope: >0 rotates only the first rotary_dim of each
-                             // head (partial RoPE) and pairs Q (in) with K (in2)
+  int rotary_dim = 0;  // Rope: >0 rotates only the first rotary_dim of each
+                       // head (partial RoPE) and pairs Q (in) with K (in2)
   // Delta-net geometry + its extra weights. The recurrence needs a float RMS-norm
   // weight, a float A_log, and an fp16 dt_bias alongside the usual projections.
   int num_k_heads = 0;

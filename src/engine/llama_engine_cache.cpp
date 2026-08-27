@@ -69,7 +69,6 @@ int kquant_packed_mask() {
 }
 }  // namespace
 
-
 namespace {
 
 std::size_t bytes_for_matrix(int rows, int cols) {
@@ -302,8 +301,7 @@ void LlamaEngine::stage_packed_pair(const std::string& first, const std::string&
   out->cols = a.cols;
 }
 
-void LlamaEngine::stage_packed_weight(const std::string& name, PackedWeight* out,
-                                      int mask_bit) {
+void LlamaEngine::stage_packed_weight(const std::string& name, PackedWeight* out, int mask_bit) {
   if ((kquant_packed_mask() & mask_bit) == 0) return;
   if (out == nullptr || !weights_.is_gguf() || weights_.gguf() == nullptr) return;
   const auto pk = weights_.gguf()->packed_kquant(name);
@@ -358,11 +356,10 @@ void LlamaEngine::init_layer_cache() {
   const bool model_fp16_mlp = weights_.has_tensor("layers.0.feed_forward.w1") &&
                               !has_packed_int4_tensor(weights_, "layers.0.feed_forward.w1") &&
                               !has_packed_int8_tensor(weights_, "layers.0.feed_forward.w1");
-  const int mlp_gq =
-      (mlp_quant_group_ >= 32 && (mlp_quant_group_ % 32) == 0 && (hidden % 32) == 0 &&
-       (inter % 32) == 0 && model_fp16_mlp)
-          ? mlp_quant_group_
-          : 0;
+  const int mlp_gq = (mlp_quant_group_ >= 32 && (mlp_quant_group_ % 32) == 0 &&
+                      (hidden % 32) == 0 && (inter % 32) == 0 && model_fp16_mlp)
+                         ? mlp_quant_group_
+                         : 0;
   cached_int8_mlp_enabled_ = false;
   const std::size_t fp16_attention_bytes =
       bytes_for_matrix(q_hidden, hidden) + bytes_for_matrix(hidden, q_hidden) +
@@ -762,8 +759,9 @@ void LlamaEngine::init_layer_cache() {
     lw_i8.mlp_int4 = use_cached_int4;
     lw_i8.mlp_group = use_cached_int4 ? mlp_gq : 0;
     // Group counts along each MLP matrix's input dimension (1 when per-row).
-    const int mlp_ng_hidden = kernels::quant_group_count(hidden, lw_i8.mlp_group);  // w1, w3 [.,hidden]
-    const int mlp_ng_inter = kernels::quant_group_count(inter, lw_i8.mlp_group);    // w2 [.,inter]
+    const int mlp_ng_hidden =
+        kernels::quant_group_count(hidden, lw_i8.mlp_group);  // w1, w3 [.,hidden]
+    const int mlp_ng_inter = kernels::quant_group_count(inter, lw_i8.mlp_group);  // w2 [.,inter]
     // TQ3 path owns wqkv/wo/w13 via packed weights. Otherwise, only cache
     // projection weights in low-bit form when low-bit streaming was requested.
     const bool use_proj_int8 = !tq3_enabled_ && lowbit_streaming_enabled(options_);
@@ -827,20 +825,20 @@ void LlamaEngine::init_layer_cache() {
     const cudaError_t a7 = use_cached_int8 ? cudaMalloc(&lw_i8.w2, w2_bytes) : cudaSuccess;
     const cudaError_t a8 = use_cached_int8 ? cudaMalloc(&lw_i8.w3, w3_bytes) : cudaSuccess;
     const cudaError_t a9 =
-        use_cached_int8 ? cudaMalloc(&lw_i8.s_w1, static_cast<std::size_t>(inter) *
-                                                      static_cast<std::size_t>(mlp_ng_hidden) *
-                                                      sizeof(float))
-                        : cudaSuccess;
+        use_cached_int8
+            ? cudaMalloc(&lw_i8.s_w1, static_cast<std::size_t>(inter) *
+                                          static_cast<std::size_t>(mlp_ng_hidden) * sizeof(float))
+            : cudaSuccess;
     const cudaError_t a10 =
-        use_cached_int8 ? cudaMalloc(&lw_i8.s_w2, static_cast<std::size_t>(hidden) *
-                                                      static_cast<std::size_t>(mlp_ng_inter) *
-                                                      sizeof(float))
-                        : cudaSuccess;
+        use_cached_int8
+            ? cudaMalloc(&lw_i8.s_w2, static_cast<std::size_t>(hidden) *
+                                          static_cast<std::size_t>(mlp_ng_inter) * sizeof(float))
+            : cudaSuccess;
     const cudaError_t a11 =
-        use_cached_int8 ? cudaMalloc(&lw_i8.s_w3, static_cast<std::size_t>(inter) *
-                                                      static_cast<std::size_t>(mlp_ng_hidden) *
-                                                      sizeof(float))
-                        : cudaSuccess;
+        use_cached_int8
+            ? cudaMalloc(&lw_i8.s_w3, static_cast<std::size_t>(inter) *
+                                          static_cast<std::size_t>(mlp_ng_hidden) * sizeof(float))
+            : cudaSuccess;
     const cudaError_t a12 =
         use_proj_int8
             ? cudaMalloc(&lw_i8.wqkv, use_proj_int4
@@ -1206,8 +1204,9 @@ void LlamaEngine::init_layer_cache() {
 
         if (weights_.has_tensor(name)) {
           std::vector<std::int8_t> q(elems, 0);
-          // Group-wise int4 (mlp_gq>0) narrows each scale to `mlp_gq` columns: rows*n_groups scales.
-          // The int8 values (hence the packed nibbles) keep the same layout, so packing is unchanged.
+          // Group-wise int4 (mlp_gq>0) narrows each scale to `mlp_gq` columns: rows*n_groups
+          // scales. The int8 values (hence the packed nibbles) keep the same layout, so packing is
+          // unchanged.
           const int group = (target_i4 && mlp_gq > 0) ? mlp_gq : 0;
           const int ng = kernels::quant_group_count(cols, group);
           std::vector<float> s(static_cast<std::size_t>(rows) * static_cast<std::size_t>(ng), 0.0f);
@@ -1313,9 +1312,8 @@ void LlamaEngine::init_layer_cache() {
   if (built > 0 && !layer_cache_.empty()) {
     std::size_t widest = 0;
     for (const auto& lw : layer_cache_) {
-      for (const PackedWeight* w :
-           {&lw.wqkv_packed, &lw.wq_packed, &lw.wk_packed, &lw.wv_packed, &lw.wo_packed,
-            &lw.w13_packed, &lw.w2_packed}) {
+      for (const PackedWeight* w : {&lw.wqkv_packed, &lw.wq_packed, &lw.wk_packed, &lw.wv_packed,
+                                    &lw.wo_packed, &lw.w13_packed, &lw.w2_packed}) {
         if (!w->active()) continue;
         widest = std::max(widest, static_cast<std::size_t>(w->rows) *
                                       static_cast<std::size_t>(w->cols) * sizeof(__half));

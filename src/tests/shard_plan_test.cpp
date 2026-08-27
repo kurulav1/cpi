@@ -1,10 +1,11 @@
-// Invariants for the shard-fit planner (engine/shard_plan.hpp); pure host arithmetic, no GPU. Checks
-// that the sharding divisors actually divide the footprint the way TP/EP/PP claim, and that the fit
-// scan only returns configs that fit and are ordered by world size. Complements the empirical
-// validation (the planner reproduces the known single-GPU footprints of real models at world=1).
-#include <cstdio>
-
+// Invariants for the shard-fit planner (engine/shard_plan.hpp); pure host arithmetic, no GPU.
+// Checks that the sharding divisors actually divide the footprint the way TP/EP/PP claim, and that
+// the fit scan only returns configs that fit and are ordered by world size. Complements the
+// empirical validation (the planner reproduces the known single-GPU footprints of real models at
+// world=1).
 #include "engine/shard_plan.hpp"
+
+#include <cstdio>
 
 namespace {
 int failures = 0;
@@ -71,7 +72,8 @@ int main() {
     // Uneven: 32 layers over pp=5 -> ceil(32/5)=7 on the heaviest stage.
     engine::PlanConfig p5 = base_cfg();
     p5.pp = 5;
-    check(estimate_footprint(dense, p5).layers_on_rank == 7, "pp=5 heaviest rank owns ceil(32/5)=7");
+    check(estimate_footprint(dense, p5).layers_on_rank == 7,
+          "pp=5 heaviest rank owns ceil(32/5)=7");
   }
 
   // --- EP halves the expert weights on a MoE model ---
@@ -90,7 +92,8 @@ int main() {
   // --- fit scan: every returned config fits the budget and results are world-sorted ---
   {
     const std::size_t budget = std::size_t(24) * 1024 * 1024 * 1024;  // 24 GB
-    const auto opts = engine::scan_fit(dense, engine::Quant::FP16, engine::Quant::FP16, 8192, 1, budget);
+    const auto opts =
+        engine::scan_fit(dense, engine::Quant::FP16, engine::Quant::FP16, 8192, 1, budget);
     bool all_fit = true, sorted = true;
     for (std::size_t i = 0; i < opts.size(); ++i) {
       if (opts[i].per_rank_bytes > budget) all_fit = false;

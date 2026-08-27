@@ -100,10 +100,9 @@ __global__ void silu_mul_kernel(const half* gate, const half* up, half* out, int
 // float it was rounded from, so it sees exactly what a separate pass over `out`
 // would have seen.
 __global__ void silu_mul_half2_q8_1_kernel(const half2* __restrict__ gate,
-                                           const half2* __restrict__ up,
-                                           half2* __restrict__ out, std::int8_t* __restrict__ q,
-                                           float* __restrict__ xs, float* __restrict__ gsum,
-                                           int n2) {
+                                           const half2* __restrict__ up, half2* __restrict__ out,
+                                           std::int8_t* __restrict__ q, float* __restrict__ xs,
+                                           float* __restrict__ gsum, int n2) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   const half2 g2 = gate[i];
   const half2 u2 = up[i];
@@ -542,11 +541,13 @@ __global__ void moe_router_topk_softmax_kernel(const half* logits, int experts, 
   moe_route_token(logits, experts, top_k, topk_idx, topk_prob, per_expert_scale, renorm, probs);
 }
 
-// Sequence prefill: route all T tokens in one launch (one block per token) instead of T single-block
-// launches. The per-token loop was ~16.5k tiny latency-bound launches = the top prefill cost.
+// Sequence prefill: route all T tokens in one launch (one block per token) instead of T
+// single-block launches. The per-token loop was ~16.5k tiny latency-bound launches = the top
+// prefill cost.
 __global__ void moe_router_topk_softmax_seq_kernel(const half* logits, int experts, int top_k,
                                                    int* topk_idx, float* topk_prob,
-                                                   const half* per_expert_scale, bool renorm, int T) {
+                                                   const half* per_expert_scale, bool renorm,
+                                                   int T) {
   extern __shared__ float probs[];
   const int t = blockIdx.x;
   if (t >= T || threadIdx.x != 0) return;
@@ -568,8 +569,7 @@ __global__ void moe_router_sigmoid_topk_kernel(const half* logits, int experts, 
   if (threadIdx.x != 0) return;
   if (experts <= 0 || top_k <= 0) return;
 
-  for (int e = 0; e < experts; ++e)
-    gate[e] = 1.0f / (1.0f + expf(-__half2float(logits[e])));
+  for (int e = 0; e < experts; ++e) gate[e] = 1.0f / (1.0f + expf(-__half2float(logits[e])));
 
   constexpr int kMaxTopK = 32;
   constexpr int kMaxGroups = 64;
@@ -1173,8 +1173,7 @@ void launch_gated_glu_interleaved(const half* ff13, half* out, int inter, int to
                                                                 gelu ? 1 : 0);
 }
 
-bool launch_silu_mul_q8_1(const half* gate, const half* up, half* out, int n,
-                          cudaStream_t stream) {
+bool launch_silu_mul_q8_1(const half* gate, const half* up, half* out, int n, cudaStream_t stream) {
   constexpr int threads = 256;
   const bool aligned =
       ((reinterpret_cast<std::uintptr_t>(gate) | reinterpret_cast<std::uintptr_t>(up) |

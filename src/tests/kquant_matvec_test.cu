@@ -268,8 +268,9 @@ void run_real(const std::string& gguf_path, bool bandwidth) {
         cudaMalloc(&d_sum, static_cast<std::size_t>(bsz) * groups * sizeof(float));
         cudaMemset(d_yb, 0, static_cast<std::size_t>(bsz) * rows * sizeof(__half));
         const bool ok = pk.kind != 2 && kernels::launch_kquant_matmul_dp4a(
-            d_w, static_cast<kernels::KQuantType>(pk.kind), d_xb, d_yb, rows, pk.cols, bsz,
-            /*ldy=*/rows, d_q, d_s, d_sum, nullptr);
+                                            d_w, static_cast<kernels::KQuantType>(pk.kind), d_xb,
+                                            d_yb, rows, pk.cols, bsz,
+                                            /*ldy=*/rows, d_q, d_s, d_sum, nullptr);
         cudaDeviceSynchronize();
         if (ok) {
           std::vector<__half> yq(static_cast<std::size_t>(bsz) * rows);
@@ -393,9 +394,9 @@ void run_real(const std::string& gguf_path, bool bandwidth) {
           cudaMemcpy(mx, hx.data(), hx.size() * sizeof(__half), cudaMemcpyHostToDevice);
           bool ok_mmq = true;
           for (int it = 0; it < 3; ++it) {
-            ok_mmq = kernels::launch_kquant_mmq(d_full, static_cast<kernels::KQuantType>(pk.kind),
-                                                mx, my, rows, pk.cols, B, rows, mq, ms, msum,
-                                                nullptr);
+            ok_mmq =
+                kernels::launch_kquant_mmq(d_full, static_cast<kernels::KQuantType>(pk.kind), mx,
+                                           my, rows, pk.cols, B, rows, mq, ms, msum, nullptr);
           }
           cudaDeviceSynchronize();
           if (ok_mmq) {
@@ -468,8 +469,8 @@ int main(int argc, char** argv) {
   };
   std::printf("kquant_matvec_test: packed matvec vs host dequant + fp32 dot\n");
   for (const Case& c : cases) {
-    run_case(c, 8, 512);      // several rows, two super-blocks each
-    run_case(c, 64, 4096);    // a realistic projection shape
+    run_case(c, 8, 512);    // several rows, two super-blocks each
+    run_case(c, 64, 4096);  // a realistic projection shape
   }
   if (argc > 1) {
     std::printf("kquant_matvec_test: real weights from %s\n", argv[1]);

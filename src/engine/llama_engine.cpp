@@ -1259,9 +1259,9 @@ void LlamaEngine::initialize(const EngineOptions& options) {
   CUDA_CHECK(cudaSetDevice(0));
   // Prefill chunk = tokens per batched prefill pass. With attention on the tensor cores, prefill
   // is host-API-call bound, not GPU-bound, so doubling the chunk halves the passes and API traffic;
-  // bigger is better. Chunking is exact (output unchanged for any size). Cost is VRAM: every prefill
-  // activation buffer scales with the chunk, so size it from a memory budget, not a fixed constant
-  // that would hurt small-VRAM GPUs.
+  // bigger is better. Chunking is exact (output unchanged for any size). Cost is VRAM: every
+  // prefill activation buffer scales with the chunk, so size it from a memory budget, not a fixed
+  // constant that would hurt small-VRAM GPUs.
   int prefill_chunk_target = env_int_or_default("CPI_PREFILL_CHUNK_SIZE", 0);
   if (prefill_chunk_target <= 0) {
     const int kv_dim = cfg.num_kv_heads * (cfg.hidden_size / std::max(1, cfg.num_heads));

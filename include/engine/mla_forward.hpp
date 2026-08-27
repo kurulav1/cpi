@@ -1,14 +1,15 @@
 #pragma once
 
 // Reusable Multi-head Latent Attention (MLA) forward, the DeepSeek-V2/V3/R1 attention, promoted out
-// of mla_attention_test so it can be composed into a decoder stack (deepseek_mla_stack_test) and, once
-// a native-MLA checkpoint is in hand, wired into the engine. fp32, "naive reconstruction" form: cache
-// the low-rank latent c_KV + the shared decoupled RoPE key k_R, up-project per-head K/V each step. See
-// mla_attention_test for the standalone device-vs-oracle correctness proof (max rel ~1.9e-7).
+// of mla_attention_test so it can be composed into a decoder stack (deepseek_mla_stack_test) and,
+// once a native-MLA checkpoint is in hand, wired into the engine. fp32, "naive reconstruction"
+// form: cache the low-rank latent c_KV + the shared decoupled RoPE key k_R, up-project per-head K/V
+// each step. See mla_attention_test for the standalone device-vs-oracle correctness proof (max rel
+// ~1.9e-7).
 //
-// Provides both a device path (small hand-rolled kernels) and an independent host path, so a caller can
-// oracle one against the other. Scratch is allocated per call (verification/prototype code, not the
-// hot path). Layouts are row-major; weights are [out, in] (y_n = dot(row, weight_n)).
+// Provides both a device path (small hand-rolled kernels) and an independent host path, so a caller
+// can oracle one against the other. Scratch is allocated per call (verification/prototype code, not
+// the hot path). Layouts are row-major; weights are [out, in] (y_n = dot(row, weight_n)).
 
 #include <cuda_runtime.h>
 
@@ -19,19 +20,21 @@
 namespace engine {
 
 struct MLADims {
-  int H = 0;         // hidden size
-  int nh = 0;        // attention heads
-  int q_lora = 0;    // query down-projection rank
-  int kv_lora = 0;   // KV down-projection rank (the cached latent width)
-  int qk_nope = 0;   // per-head non-rope query/key dim
-  int qk_rope = 0;   // per-head decoupled-rope query/key dim (k side shared across heads)
-  int v_head = 0;    // per-head value dim
+  int H = 0;        // hidden size
+  int nh = 0;       // attention heads
+  int q_lora = 0;   // query down-projection rank
+  int kv_lora = 0;  // KV down-projection rank (the cached latent width)
+  int qk_nope = 0;  // per-head non-rope query/key dim
+  int qk_rope = 0;  // per-head decoupled-rope query/key dim (k side shared across heads)
+  int v_head = 0;   // per-head value dim
   float rope_theta = 10000.0f;
-  int hd() const { return qk_nope + qk_rope; }
+  int hd() const {
+    return qk_nope + qk_rope;
+  }
 };
 
-// Device pointers for the device path, host pointers for the host path; same struct, caller supplies
-// the right memory space.
+// Device pointers for the device path, host pointers for the host path; same struct, caller
+// supplies the right memory space.
 struct MLAWeights {
   const float* WDQ = nullptr;   // [q_lora, H]
   const float* WUQ = nullptr;   // [nh*hd, q_lora]
@@ -163,8 +166,8 @@ inline void mla_prefill(const MLADims& m, const MLAWeights& w, const float* d_hi
   const int rk = T * (m.qk_rope / 2);
   rope_kernel<<<(rk + 127) / 128, 128>>>(kR, T, m.qk_rope, 0, m.qk_rope, 1, m.rope_theta);
   const float scale = 1.0f / std::sqrt((float)hd);
-  attn_kernel<<<(T * m.nh + 63) / 64, 64>>>(q, knope, kR, v, outh, T, m.nh, hd, m.qk_nope, m.qk_rope,
-                                            m.v_head, scale);
+  attn_kernel<<<(T * m.nh + 63) / 64, 64>>>(q, knope, kR, v, outh, T, m.nh, hd, m.qk_nope,
+                                            m.qk_rope, m.v_head, scale);
   mm_wt(outh, w.WO, d_out, T, m.H, m.nh * m.v_head);
 
   cudaFree(cQ);
@@ -182,8 +185,8 @@ inline void mla_prefill_host(const MLADims& m, const MLAWeights& w, const float*
   using namespace mla_detail;
   const int hd = m.hd();
   std::vector<float> cQ((size_t)T * m.q_lora), q((size_t)T * m.nh * hd), cKV((size_t)T * m.kv_lora),
-      kR((size_t)T * m.qk_rope), knope((size_t)T * m.nh * m.qk_nope), v((size_t)T * m.nh * m.v_head),
-      outh((size_t)T * m.nh * m.v_head, 0.0f);
+      kR((size_t)T * m.qk_rope), knope((size_t)T * m.nh * m.qk_nope),
+      v((size_t)T * m.nh * m.v_head), outh((size_t)T * m.nh * m.v_head, 0.0f);
   mm_host(h_hidden, w.WDQ, cQ.data(), T, m.q_lora, m.H);
   mm_host(cQ.data(), w.WUQ, q.data(), T, m.nh * hd, m.q_lora);
   mm_host(h_hidden, w.WDKV, cKV.data(), T, m.kv_lora, m.H);

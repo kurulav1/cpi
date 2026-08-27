@@ -158,8 +158,8 @@ __global__ void persistent_decode_kernel(const PersistOp* __restrict__ ops, int 
         const float4* inv4 = reinterpret_cast<const float4*>(op.in);
         const int oct = op.in_dim / 8;
         for (int r = gwarp; r < op.rows; r += gwarps) {
-          const float4* w4 = reinterpret_cast<const float4*>(
-              op.weight + static_cast<std::size_t>(r) * op.in_dim);
+          const float4* w4 =
+              reinterpret_cast<const float4*>(op.weight + static_cast<std::size_t>(r) * op.in_dim);
           float acc = 0.0f;
           for (int p = lane; p < oct; p += 32) {
             const float4 aw = w4[p];
@@ -182,8 +182,8 @@ __global__ void persistent_decode_kernel(const PersistOp* __restrict__ ops, int 
         const float4* inv4 = reinterpret_cast<const float4*>(op.in);
         const int oct = op.in_dim / 8;
         for (int r = gwarp; r < op.rows; r += gwarps) {
-          const float4* w4 = reinterpret_cast<const float4*>(
-              op.weight + static_cast<std::size_t>(r) * op.in_dim);
+          const float4* w4 =
+              reinterpret_cast<const float4*>(op.weight + static_cast<std::size_t>(r) * op.in_dim);
           float acc = 0.0f;
           for (int p = lane; p < oct; p += 32) {
             const float4 aw = w4[p];
@@ -215,8 +215,7 @@ __global__ void persistent_decode_kernel(const PersistOp* __restrict__ ops, int 
         // One BLOCK per (head, chunk) work item, items grid-strided. Mirrors
         // attention_step_chunk_stats_core's math at 8 keys per tile (kWarps warps).
         const int seq_len = pos_ptr[0] + 1;
-        const int k_start =
-            (op.window > 0 && seq_len > op.window) ? seq_len - op.window : 0;
+        const int k_start = (op.window > 0 && seq_len > op.window) ? seq_len - op.window : 0;
         half* q_sh = reinterpret_cast<half*>(smem_raw);
         float* score_sh = reinterpret_cast<float*>(q_sh + op.head_dim);
         float* beta_sh = score_sh + kWarps;
@@ -330,8 +329,7 @@ __global__ void persistent_decode_kernel(const PersistOp* __restrict__ ops, int 
       }
       case PersistOp::kAttnReduce: {
         const int seq_len = pos_ptr[0] + 1;
-        const int k_start =
-            (op.window > 0 && seq_len > op.window) ? seq_len - op.window : 0;
+        const int k_start = (op.window > 0 && seq_len > op.window) ? seq_len - op.window : 0;
         float* scale_sh = reinterpret_cast<float*>(smem_raw);  // [alpha, beta, running_l]
         const int first_chunk = k_start / op.chunk_size;
         const int chunk_count = (seq_len + op.chunk_size - 1) / op.chunk_size;
@@ -355,9 +353,8 @@ __global__ void persistent_decode_kernel(const PersistOp* __restrict__ ops, int 
             __syncthreads();
             const float alpha = scale_sh[0];
             const float beta = scale_sh[1];
-            const std::size_t base =
-                (static_cast<std::size_t>(head) * op.chunks + chunk) *
-                static_cast<std::size_t>(op.head_dim);
+            const std::size_t base = (static_cast<std::size_t>(head) * op.chunks + chunk) *
+                                     static_cast<std::size_t>(op.head_dim);
             int j = 0;
             for (int d = tid; d < op.head_dim; d += kThreads, ++j) {
               const float merged = (j == 0 ? acc0 : acc1) * alpha + op.so[base + d] * beta;
@@ -403,14 +400,13 @@ bool launch_persistent_decode(const PersistOp* ops, int n_ops, const int* tok, c
   const int* tok_arg = tok;
   const int* pos_arg = pos;
   void* args[] = {&ops_arg, &n_arg, &tok_arg, &pos_arg};
-  const cudaError_t err = cudaLaunchCooperativeKernel(
-      reinterpret_cast<void*>(persistent_decode_kernel), dim3(blocks), dim3(kThreads), args, 0,
-      stream);
+  const cudaError_t err =
+      cudaLaunchCooperativeKernel(reinterpret_cast<void*>(persistent_decode_kernel), dim3(blocks),
+                                  dim3(kThreads), args, 0, stream);
   if (err != cudaSuccess) {
     static bool warned = false;
     if (!warned) {
-      std::fprintf(stderr, "[persistent] cooperative launch failed: %s\n",
-                   cudaGetErrorString(err));
+      std::fprintf(stderr, "[persistent] cooperative launch failed: %s\n", cudaGetErrorString(err));
       warned = true;
     }
     return false;

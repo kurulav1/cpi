@@ -73,7 +73,7 @@ struct BatchEvent {
 };
 
 class BatchWorker {
- public:
+public:
   using Sink = std::function<void(const BatchEvent&)>;
 
   BatchWorker(engine::BatchScheduler& sched, model::Tokenizer& tokenizer, BatchDefaults defaults,
@@ -108,7 +108,7 @@ class BatchWorker {
   // its reader signals shutdown) and the in-flight work drains.
   void run();
 
- private:
+private:
   struct Incoming {
     std::string id;
     std::vector<int> tokens;

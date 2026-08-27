@@ -1,9 +1,10 @@
 #pragma once
 
-// The one new kernel the in-engine DeepSeek MLA needs: from a single token's projected pieces, assemble
-// the per-head K and V the standard Attention op consumes, and apply the interleaved-complex YARN rope
-// to q_pe and the shared k_pe. Everything else in MLA (the projections, the latent RMSNorm, the
-// attention, o_proj) reuses existing ops. Verified fp16-vs-oracle in deepseek_mla_assemble_test.
+// The one new kernel the in-engine DeepSeek MLA needs: from a single token's projected pieces,
+// assemble the per-head K and V the standard Attention op consumes, and apply the
+// interleaved-complex YARN rope to q_pe and the shared k_pe. Everything else in MLA (the
+// projections, the latent RMSNorm, the attention, o_proj) reuses existing ops. Verified
+// fp16-vs-oracle in deepseek_mla_assemble_test.
 //
 // One token at absolute `position`. Layouts (fp16 slots, per head h):
 //   Q   [nh*qkhd]  in/out : [q_nope(qk_nope) | q_pe(qk_rope)]; q_pe is roped in place.
@@ -63,12 +64,14 @@ __global__ inline void mla_assemble_rope_kernel(__half* Q, const __half* kvb, co
 
 // High-occupancy variant: one block per head (blockDim threads) instead of one thread per head. The
 // original kernel put all of a head's work (128 sin/cos transcendentals + 320 copies) on a single
-// thread and launched only nh(=16) threads total (one warp on one SM). Here each head's block computes
-// the per-pair cos/sin once into shared memory (q_pe and k_pe rope share the same angles) and spreads
-// the copies/rotations across its threads. Same math as the T==1 kernel above (verified vs the oracle).
-__global__ inline void mla_assemble_rope_fast_kernel(__half* Q, const __half* kvb, const __half* ckv,
-                                                     __half* K, __half* V, const float* inv_freq, int nh,
-                                                     int qk_nope, int qk_rope, int v_head, int kv_lora,
+// thread and launched only nh(=16) threads total (one warp on one SM). Here each head's block
+// computes the per-pair cos/sin once into shared memory (q_pe and k_pe rope share the same angles)
+// and spreads the copies/rotations across its threads. Same math as the T==1 kernel above (verified
+// vs the oracle).
+__global__ inline void mla_assemble_rope_fast_kernel(__half* Q, const __half* kvb,
+                                                     const __half* ckv, __half* K, __half* V,
+                                                     const float* inv_freq, int nh, int qk_nope,
+                                                     int qk_rope, int v_head, int kv_lora,
                                                      int position, const int* d_position,
                                                      float attn_scaling) {
   const int h = blockIdx.x;
@@ -124,9 +127,9 @@ inline void launch_mla_assemble_rope(__half* Q, const __half* kvb, const __half*
     return e && e[0] == '1';
   }();
   if (slow) {
-    mla_assemble_rope_kernel<<<(nh + 63) / 64, 64, 0, stream>>>(
-        Q, kvb, ckv, K, V, inv_freq, nh, qk_nope, qk_rope, v_head, kv_lora, position, d_position,
-        attn_scaling);
+    mla_assemble_rope_kernel<<<(nh + 63) / 64, 64, 0, stream>>>(Q, kvb, ckv, K, V, inv_freq, nh,
+                                                                qk_nope, qk_rope, v_head, kv_lora,
+                                                                position, d_position, attn_scaling);
     return;
   }
   const int half = qk_rope / 2;
@@ -135,10 +138,11 @@ inline void launch_mla_assemble_rope(__half* Q, const __half* kvb, const __half*
       attn_scaling);
 }
 
-// Batched (T>1) variant for sequence prefill: one thread per (token t, head h). Token t is at absolute
-// position start_position + t; its slices are Q/K/V[t*nh*qkhd..], kvb[t*nh*kvh..], ckv[t*kva..]. Same
-// per-head assembly + interleaved rope as the T==1 kernel. Foundational piece for batched DeepSeek
-// prefill (the MoE grouped-GEMM + seq-prefill enable are the remaining pieces).
+// Batched (T>1) variant for sequence prefill: one thread per (token t, head h). Token t is at
+// absolute position start_position + t; its slices are Q/K/V[t*nh*qkhd..], kvb[t*nh*kvh..],
+// ckv[t*kva..]. Same per-head assembly + interleaved rope as the T==1 kernel. Foundational piece
+// for batched DeepSeek prefill (the MoE grouped-GEMM + seq-prefill enable are the remaining
+// pieces).
 __global__ inline void mla_assemble_rope_seq_kernel(__half* Q, const __half* kvb, const __half* ckv,
                                                     __half* K, __half* V, const float* inv_freq,
                                                     int nh, int qk_nope, int qk_rope, int v_head,

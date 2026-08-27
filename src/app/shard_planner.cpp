@@ -1,8 +1,8 @@
 // shard_planner; pre-deployment "will it fit, on how many GPUs" report. Reads a model's config.json
 // (or takes dims on the command line), then prints the EXACT per-rank VRAM footprint for a chosen
-// tensor/pipeline/expert split and scans for the minimum world size that fits a target GPU. Pure host
-// arithmetic (no GPU, no cluster); validate it by checking world=1 reproduces the known single-GPU
-// footprints. See engine/shard_plan.hpp for the byte model.
+// tensor/pipeline/expert split and scans for the minimum world size that fits a target GPU. Pure
+// host arithmetic (no GPU, no cluster); validate it by checking world=1 reproduces the known
+// single-GPU footprints. See engine/shard_plan.hpp for the byte model.
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -93,7 +93,8 @@ int main(int argc, char** argv) {
     d.hidden = json_get_int(j, "hidden_size", 0);
     d.num_layers = json_get_int(j, "num_hidden_layers", json_get_int(j, "num_layers", 0));
     d.num_heads = json_get_int(j, "num_attention_heads", json_get_int(j, "num_heads", 0));
-    d.num_kv_heads = json_get_int(j, "num_key_value_heads", json_get_int(j, "num_kv_heads", d.num_heads));
+    d.num_kv_heads =
+        json_get_int(j, "num_key_value_heads", json_get_int(j, "num_kv_heads", d.num_heads));
     d.head_dim = json_get_int(j, "head_dim", d.num_heads > 0 ? d.hidden / d.num_heads : 0);
     d.intermediate = json_get_int(j, "intermediate_size", 0);
     d.vocab = json_get_int(j, "vocab_size", 0);
@@ -141,18 +142,22 @@ int main(int argc, char** argv) {
   const std::size_t budget = static_cast<std::size_t>(gpu_gb * 1024.0 * 1024.0 * 1024.0);
 
   std::printf("Model: %s\n", d.name.c_str());
-  std::printf("  hidden=%d layers=%d heads=%d kv_heads=%d head_dim=%d inter=%d vocab=%d\n", d.hidden,
-              d.num_layers, d.num_heads, d.num_kv_heads, d.head_dim, d.intermediate, d.vocab);
+  std::printf("  hidden=%d layers=%d heads=%d kv_heads=%d head_dim=%d inter=%d vocab=%d\n",
+              d.hidden, d.num_layers, d.num_heads, d.num_kv_heads, d.head_dim, d.intermediate,
+              d.vocab);
   if (d.is_moe())
     std::printf("  MoE: experts=%d expert_inter=%d\n", d.num_experts, d.expert_intermediate);
-  std::printf("  weight_quant=%s kv_quant=%s seq=%d batch=%d\n", engine::quant_name(pc.weight_quant),
-              engine::quant_name(pc.kv_quant), pc.seq_len, pc.batch);
+  std::printf("  weight_quant=%s kv_quant=%s seq=%d batch=%d\n",
+              engine::quant_name(pc.weight_quant), engine::quant_name(pc.kv_quant), pc.seq_len,
+              pc.batch);
 
   const engine::Footprint f = estimate_footprint(d, pc);
-  std::printf("\nPer-rank footprint at tp=%d pp=%d ep=%d (world=%d), %d layers on the heaviest rank:\n",
-              pc.tp, pc.pp, pc.ep, pc.world(), f.layers_on_rank);
+  std::printf(
+      "\nPer-rank footprint at tp=%d pp=%d ep=%d (world=%d), %d layers on the heaviest rank:\n",
+      pc.tp, pc.pp, pc.ep, pc.world(), f.layers_on_rank);
   std::printf("  embedding    %s\n", humize(f.embedding).c_str());
-  std::printf("  lm head      %s%s\n", humize(f.head).c_str(), d.tie_embeddings ? "  (tied -> 0)" : "");
+  std::printf("  lm head      %s%s\n", humize(f.head).c_str(),
+              d.tie_embeddings ? "  (tied -> 0)" : "");
   std::printf("  attention    %s\n", humize(f.attn).c_str());
   if (f.dense_mlp) std::printf("  dense MLP    %s\n", humize(f.dense_mlp).c_str());
   if (f.experts) std::printf("  experts      %s\n", humize(f.experts).c_str());
@@ -165,18 +170,21 @@ int main(int argc, char** argv) {
   std::printf("  fits %.0f GB GPU? %s\n", gpu_gb, f.total() <= budget ? "YES" : "NO");
 
   // Minimum-world scan.
-  const auto opts =
-      engine::scan_fit(d, pc.weight_quant, pc.kv_quant, pc.seq_len, pc.batch, budget);
-  std::printf("\nMinimum world size to fit %.0f GB/GPU (weight_quant=%s, kv=%s, seq=%d, batch=%d):\n",
-              gpu_gb, engine::quant_name(pc.weight_quant), engine::quant_name(pc.kv_quant),
-              pc.seq_len, pc.batch);
+  const auto opts = engine::scan_fit(d, pc.weight_quant, pc.kv_quant, pc.seq_len, pc.batch, budget);
+  std::printf(
+      "\nMinimum world size to fit %.0f GB/GPU (weight_quant=%s, kv=%s, seq=%d, batch=%d):\n",
+      gpu_gb, engine::quant_name(pc.weight_quant), engine::quant_name(pc.kv_quant), pc.seq_len,
+      pc.batch);
   if (opts.empty()) {
-    std::printf("  no tp/pp/ep split up to 64x fits -- lower seq/batch, quantise further, or raise GPU mem.\n");
+    std::printf(
+        "  no tp/pp/ep split up to 64x fits -- lower seq/batch, quantise further, or raise GPU "
+        "mem.\n");
   } else {
     const int best_world = opts.front().world();
     int shown = 0;
     for (const auto& o : opts) {
-      if (o.world() > best_world && shown >= 1) break;  // show the smallest world + its variants only
+      if (o.world() > best_world && shown >= 1)
+        break;  // show the smallest world + its variants only
       std::printf("  world=%2d  tp=%d pp=%d ep=%d  ->  %s / rank\n", o.world(), o.tp, o.pp, o.ep,
                   humize(o.per_rank_bytes).c_str());
       ++shown;

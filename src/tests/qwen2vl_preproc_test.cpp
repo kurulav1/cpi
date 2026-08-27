@@ -95,10 +95,10 @@ int main(int argc, char** argv) {
               got.grid_w, got.pixels.size() / (3 * temporal * patch * patch),
               3 * temporal * patch * patch);
 
-  const std::vector<float> ref = read_f32(dir + "/" +
-                                          engine::mini::json_get_string(
-                                              engine::mini::json_extract_object(man, "pixel_values"),
-                                              "file"));
+  const std::vector<float> ref =
+      read_f32(dir + "/" +
+               engine::mini::json_get_string(engine::mini::json_extract_object(man, "pixel_values"),
+                                             "file"));
   if (ref.size() != got.pixels.size()) {
     std::printf("  %-22s ours %zu vs oracle %zu floats  FAIL\n", "PREPROC_SHAPE", got.pixels.size(),
                 ref.size());

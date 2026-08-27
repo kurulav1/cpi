@@ -87,7 +87,8 @@ void compare(const TypeInfo& t, const std::vector<std::uint8_t>& bytes, std::siz
               blocks, mismatches, max_abs);
   if (mismatches != 0) {
     std::printf("         first at %zu: device %.6f vs host %.6f\n", first_bad,
-                static_cast<double>(h2f(dev[first_bad])), static_cast<double>(h2f(host[first_bad])));
+                static_cast<double>(h2f(dev[first_bad])),
+                static_cast<double>(h2f(host[first_bad])));
   }
   // Bit-exact is the requirement: both sides run the same arithmetic in fp32 and
   // round once at the end, so anything else means the unpacking differs.

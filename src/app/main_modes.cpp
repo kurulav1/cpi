@@ -231,8 +231,8 @@ void execute_engine_modes(const RunExecutionOptions& options, const std::vector<
               done_now = stream_done.load();
             }
 
-            const std::string decoded = sanitize_stream_text(
-                tokenizer->decode(snapshot, req_keep_special.empty() ? nullptr : &req_keep_special));
+            const std::string decoded = sanitize_stream_text(tokenizer->decode(
+                snapshot, req_keep_special.empty() ? nullptr : &req_keep_special));
             if (decoded.size() > prev_decoded_local.size()) {
               const std::string delta = decoded.substr(prev_decoded_local.size());
               if (!delta.empty()) {
@@ -253,50 +253,50 @@ void execute_engine_modes(const RunExecutionOptions& options, const std::vector<
         int emitted_count = 0;
         try {
           const auto on_token = [&](int tok) -> bool {
-                // Until min_new tokens are produced, don't honour stop conditions
-                // either (the engine also masks EOS); keeps greedy from truncating early.
-                const bool may_stop = emitted_count >= req_min_new;
-                if (may_stop && std::find(req_stop_ids.begin(), req_stop_ids.end(), tok) !=
-                                    req_stop_ids.end()) {
-                  return false;
-                }
-                if (may_stop && sentence_stop_hit.load()) {
-                  return false;
-                }
-                int token_index = 0;
-                {
-                  std::lock_guard<std::mutex> lk(stream_mu);
-                  generated_ids.push_back(tok);
-                  token_index = static_cast<int>(generated_ids.size());
-                }
-                ++emitted_count;
-                stream_cv.notify_one();
-                const auto& stats = last_benchmark_stats();
-                const double token_router_ms =
-                    std::max(0.0, stats.decode_moe_router_ms - prev_moe_router_ms);
-                const double token_expert_ms =
-                    std::max(0.0, stats.decode_moe_expert_ms - prev_moe_expert_ms);
-                const double token_merge_ms =
-                    std::max(0.0, stats.decode_moe_merge_ms - prev_moe_merge_ms);
-                prev_moe_router_ms = stats.decode_moe_router_ms;
-                prev_moe_expert_ms = stats.decode_moe_expert_ms;
-                prev_moe_merge_ms = stats.decode_moe_merge_ms;
-                std::ostringstream metrics_extra;
-                metrics_extra << "\"metrics\":{"
-                              << "\"token_index\":" << token_index << ",\"moe_quant_mode\":\""
-                              << json_escape(stats.moe_quant_mode) << "\""
-                              << ",\"moe_router_ms\":" << std::fixed << std::setprecision(4)
-                              << token_router_ms << ",\"moe_expert_ms\":" << std::fixed
-                              << std::setprecision(4) << token_expert_ms
-                              << ",\"moe_merge_ms\":" << std::fixed << std::setprecision(4)
-                              << token_merge_ms;
-                append_moe_selected_json(metrics_extra, stats);
-                metrics_extra << "}";
-                write_event("metrics", req_id, metrics_extra.str());
-                if (may_stop && sentence_stop_hit.load()) {
-                  return false;
-                }
-                return true;
+            // Until min_new tokens are produced, don't honour stop conditions
+            // either (the engine also masks EOS); keeps greedy from truncating early.
+            const bool may_stop = emitted_count >= req_min_new;
+            if (may_stop &&
+                std::find(req_stop_ids.begin(), req_stop_ids.end(), tok) != req_stop_ids.end()) {
+              return false;
+            }
+            if (may_stop && sentence_stop_hit.load()) {
+              return false;
+            }
+            int token_index = 0;
+            {
+              std::lock_guard<std::mutex> lk(stream_mu);
+              generated_ids.push_back(tok);
+              token_index = static_cast<int>(generated_ids.size());
+            }
+            ++emitted_count;
+            stream_cv.notify_one();
+            const auto& stats = last_benchmark_stats();
+            const double token_router_ms =
+                std::max(0.0, stats.decode_moe_router_ms - prev_moe_router_ms);
+            const double token_expert_ms =
+                std::max(0.0, stats.decode_moe_expert_ms - prev_moe_expert_ms);
+            const double token_merge_ms =
+                std::max(0.0, stats.decode_moe_merge_ms - prev_moe_merge_ms);
+            prev_moe_router_ms = stats.decode_moe_router_ms;
+            prev_moe_expert_ms = stats.decode_moe_expert_ms;
+            prev_moe_merge_ms = stats.decode_moe_merge_ms;
+            std::ostringstream metrics_extra;
+            metrics_extra << "\"metrics\":{"
+                          << "\"token_index\":" << token_index << ",\"moe_quant_mode\":\""
+                          << json_escape(stats.moe_quant_mode) << "\""
+                          << ",\"moe_router_ms\":" << std::fixed << std::setprecision(4)
+                          << token_router_ms << ",\"moe_expert_ms\":" << std::fixed
+                          << std::setprecision(4) << token_expert_ms
+                          << ",\"moe_merge_ms\":" << std::fixed << std::setprecision(4)
+                          << token_merge_ms;
+            append_moe_selected_json(metrics_extra, stats);
+            metrics_extra << "}";
+            write_event("metrics", req_id, metrics_extra.str());
+            if (may_stop && sentence_stop_hit.load()) {
+              return false;
+            }
+            return true;
           };
           if (!req_image.empty()) {
             if (!generate_multimodal)

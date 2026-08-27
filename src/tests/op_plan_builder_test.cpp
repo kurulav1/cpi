@@ -389,9 +389,9 @@ int main() {
     expect(mlp_width(4) == 256, "gemma4: shared layer MLP is double-wide");
 
     // Per-layer output gain, in order.
-    expect(pg.layers[3].ops.back().kind == OpKind::ScaleCopy &&
-               pg.layers[3].ops.back().scale == 4.0f,
-           "gemma4: layer ends with its own scalar gain");
+    expect(
+        pg.layers[3].ops.back().kind == OpKind::ScaleCopy && pg.layers[3].ops.back().scale == 4.0f,
+        "gemma4: layer ends with its own scalar gain");
 
     // ---- the 12B / MoE shape: no PLE at all ----
     Gemma4Geometry g12 = gg;

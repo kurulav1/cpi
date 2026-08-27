@@ -34,8 +34,7 @@ struct Result {
   std::vector<float> logits;
 };
 
-Result run(const std::string& model, int quant_bits, const std::vector<int>& prompt,
-           bool batched) {
+Result run(const std::string& model, int quant_bits, const std::vector<int>& prompt, bool batched) {
   engine::PlanCudaEngine eng;
   if (quant_bits != 0) {
     engine::EngineOptions opt;
@@ -123,8 +122,8 @@ int main(int argc, char** argv) {
     // flips the argmax, which stays the hard gate.
     const Cfg cfgs[] = {{"fp16", 0, 0.5f}, {"int4", 4, 4.0f}, {"int8", 8, 1.0f}};
     for (const Cfg& c : cfgs) {
-      ok &= check((std::string(c.tag) + "/short").c_str(),
-                  run(model, c.bits, short_p, false), run(model, c.bits, short_p, true), c.tol);
+      ok &= check((std::string(c.tag) + "/short").c_str(), run(model, c.bits, short_p, false),
+                  run(model, c.bits, short_p, true), c.tol);
       ok &= check((std::string(c.tag) + "/long").c_str(), run(model, c.bits, long_p, false),
                   run(model, c.bits, long_p, true), c.tol);
     }

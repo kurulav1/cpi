@@ -57,14 +57,14 @@ void gemm_fp16_avx512(const std::uint16_t* W, const float* X, float* Y, int M, i
       __m512 a30 = _mm512_setzero_ps(), a31 = _mm512_setzero_ps();
       __m512 a32 = _mm512_setzero_ps(), a33 = _mm512_setzero_ps();
       for (int j = 0; j < N; j += 16) {
-        const __m512 w0 = _mm512_cvtph_ps(
-            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(r0 + j)));
-        const __m512 w1 = _mm512_cvtph_ps(
-            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(r1 + j)));
-        const __m512 w2 = _mm512_cvtph_ps(
-            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(r2 + j)));
-        const __m512 w3 = _mm512_cvtph_ps(
-            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(r3 + j)));
+        const __m512 w0 =
+            _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(r0 + j)));
+        const __m512 w1 =
+            _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(r1 + j)));
+        const __m512 w2 =
+            _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(r2 + j)));
+        const __m512 w3 =
+            _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(r3 + j)));
         const __m512 v0 = _mm512_loadu_ps(x0 + j);
         const __m512 v1 = _mm512_loadu_ps(x1 + j);
         const __m512 v2 = _mm512_loadu_ps(x2 + j);
@@ -113,18 +113,14 @@ void gemm_fp16_avx512(const std::uint16_t* W, const float* X, float* Y, int M, i
       __m512 a2 = _mm512_setzero_ps(), a3 = _mm512_setzero_ps();
       for (int j = 0; j < N; j += 16) {
         const __m512 xv = _mm512_loadu_ps(xb + j);
-        a0 = _mm512_fmadd_ps(_mm512_cvtph_ps(_mm256_loadu_si256(
-                                 reinterpret_cast<const __m256i*>(r0 + j))),
-                             xv, a0);
-        a1 = _mm512_fmadd_ps(_mm512_cvtph_ps(_mm256_loadu_si256(
-                                 reinterpret_cast<const __m256i*>(r1 + j))),
-                             xv, a1);
-        a2 = _mm512_fmadd_ps(_mm512_cvtph_ps(_mm256_loadu_si256(
-                                 reinterpret_cast<const __m256i*>(r2 + j))),
-                             xv, a2);
-        a3 = _mm512_fmadd_ps(_mm512_cvtph_ps(_mm256_loadu_si256(
-                                 reinterpret_cast<const __m256i*>(r3 + j))),
-                             xv, a3);
+        a0 = _mm512_fmadd_ps(
+            _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(r0 + j))), xv, a0);
+        a1 = _mm512_fmadd_ps(
+            _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(r1 + j))), xv, a1);
+        a2 = _mm512_fmadd_ps(
+            _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(r2 + j))), xv, a2);
+        a3 = _mm512_fmadd_ps(
+            _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(r3 + j))), xv, a3);
       }
       float* yb = Y + static_cast<std::ptrdiff_t>(b) * M + i;
       yb[0] = _mm512_reduce_add_ps(a0);

@@ -1,8 +1,9 @@
 // Verifies expert-parallel MoE on a single GPU: shard the experts across N ranks, run the real MoE
-// kernels (gate_up_geglu + down_accum) on each rank's expert sub-matrix with dispatched local indices
-// + masked weights, sum the per-rank outputs, and check the result matches the all-local MoE. Brick 3
-// of multi-GPU prep; the per-rank sum is the all_to_all-combine seam that becomes a collective on a
-// real cluster. Single token, fp16 experts.
+// kernels (gate_up_geglu + down_accum) on each rank's expert sub-matrix with dispatched local
+// indices
+// + masked weights, sum the per-rank outputs, and check the result matches the all-local MoE. Brick
+// 3 of multi-GPU prep; the per-rank sum is the all_to_all-combine seam that becomes a collective on
+// a real cluster. Single token, fp16 experts.
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -19,7 +20,8 @@ namespace {
 
 constexpr int E = 8, H = 16, MI = 8, TK = 4;
 
-// gate_up_geglu + down_accum over `n_experts` fp16 experts. gate_up = [n*2*MI, H], down = [n*H, MI].
+// gate_up_geglu + down_accum over `n_experts` fp16 experts. gate_up = [n*2*MI, H], down = [n*H,
+// MI].
 void run_moe(const half* gate_up, const half* down, const half* x, const int* idx, const float* w,
              half* inter, half* y) {
   kernels::launch_moe_gate_up_geglu(gate_up, nullptr, 0, 0, x, idx, inter, MI, H, TK, 0);
@@ -61,8 +63,8 @@ int main() {
   cudaMemcpy(y_full.data(), dY, H * sizeof(half), cudaMemcpyDeviceToHost);
 
   int fail = 0;
-  // ws=3 uneven split; ws=8 is one expert per rank (finest split); ws=12 > E exercises the degenerate
-  // path where the trailing ranks own an empty range and must contribute exactly zero.
+  // ws=3 uneven split; ws=8 is one expert per rank (finest split); ws=12 > E exercises the
+  // degenerate path where the trailing ranks own an empty range and must contribute exactly zero.
   for (int ws : {2, 3, 4, 8, 12}) {
     std::vector<float> y_ep(H, 0.0f);
     for (int r = 0; r < ws; ++r) {
@@ -78,7 +80,8 @@ int main() {
       cudaDeviceSynchronize();
       std::vector<half> y_r(H);
       cudaMemcpy(y_r.data(), dY, H * sizeof(half), cudaMemcpyDeviceToHost);
-      for (int i = 0; i < H; ++i) y_ep[i] += __half2float(y_r[i]);  // all_to_all combine (local sum)
+      for (int i = 0; i < H; ++i)
+        y_ep[i] += __half2float(y_r[i]);  // all_to_all combine (local sum)
     }
     float maxabs = 0, denom = 1e-6f;
     for (int i = 0; i < H; ++i) {

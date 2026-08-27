@@ -200,7 +200,8 @@ void RowParallelLinear::forward(const std::vector<const void*>& shard_inputs_fp1
                                 void* d_output_fp16, cudaStream_t stream) {
   constexpr float alpha = 1.0f;
   constexpr float beta = 0.0f;
-  const std::size_t count = static_cast<std::size_t>(out_features_) * static_cast<std::size_t>(batch);
+  const std::size_t count =
+      static_cast<std::size_t>(out_features_) * static_cast<std::size_t>(batch);
   const std::size_t out_bytes = count * sizeof(__half);
 
   for (std::size_t r = 0; r < contexts_.size(); ++r) {
@@ -213,10 +214,11 @@ void RowParallelLinear::forward(const std::vector<const void*>& shard_inputs_fp1
     }
     CUDA_CHECK(cudaMalloc(&ctx.d_partial, out_bytes));
     // partial[out, batch] = W_r[out, in_r] * x_r[in_r, batch] (column-major, N/N).
-    CUBLAS_CHECK(cublasGemmEx(ctx.handle, CUBLAS_OP_N, CUBLAS_OP_N, out_features_, batch, ctx.in_rows,
-                              &alpha, ctx.d_weight, CUDA_R_16F, out_features_, shard_inputs_fp16[r],
-                              CUDA_R_16F, ctx.in_rows, &beta, ctx.d_partial, CUDA_R_16F,
-                              out_features_, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    CUBLAS_CHECK(cublasGemmEx(ctx.handle, CUBLAS_OP_N, CUBLAS_OP_N, out_features_, batch,
+                              ctx.in_rows, &alpha, ctx.d_weight, CUDA_R_16F, out_features_,
+                              shard_inputs_fp16[r], CUDA_R_16F, ctx.in_rows, &beta, ctx.d_partial,
+                              CUDA_R_16F, out_features_, CUBLAS_COMPUTE_32F,
+                              CUBLAS_GEMM_DEFAULT_TENSOR_OP));
   }
 
   // all-REDUCE (sum) the partials -> d_output. On a single GPU every partial lives on device 0, so

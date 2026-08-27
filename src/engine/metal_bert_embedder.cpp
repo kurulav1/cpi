@@ -83,7 +83,8 @@ void MetalBertEmbedder::linear(const runtime::MetalBuffer& w, const runtime::Met
                 4, &p, sizeof(p));
 }
 
-void MetalBertEmbedder::layernorm_residual(runtime::MetalBuffer& src, runtime::MetalBuffer& residual,
+void MetalBertEmbedder::layernorm_residual(runtime::MetalBuffer& src,
+                                           runtime::MetalBuffer& residual,
                                            const runtime::MetalBuffer& w,
                                            const runtime::MetalBuffer& b, runtime::MetalBuffer& out,
                                            int rows, int cols) {
@@ -189,7 +190,8 @@ std::vector<float> MetalBertEmbedder::embed(const std::vector<int>& token_ids) {
 
   {
     auto* dst = static_cast<std::int32_t*>(tokens_.contents());
-    for (int i = 0; i < L; ++i) dst[i] = static_cast<std::int32_t>(token_ids[static_cast<std::size_t>(i)]);
+    for (int i = 0; i < L; ++i)
+      dst[i] = static_cast<std::int32_t>(token_ids[static_cast<std::size_t>(i)]);
   }
 
   // ---- embeddings: word + position + token_type, then LayerNorm ----
@@ -204,8 +206,8 @@ std::vector<float> MetalBertEmbedder::embed(const std::vector<int>& token_ids) {
     LayerNormParams p{static_cast<std::uint32_t>(L), static_cast<std::uint32_t>(H),
                       cfg_.layer_norm_eps, 1u};
     const void* bufs[] = {tmp_.handle(), emb_ln_w_.handle(), emb_ln_b_.handle(), x_.handle()};
-    ctx_.dispatch("cpi_layernorm", runtime::MetalContext::Grid::Groups,
-                  static_cast<std::size_t>(L), 256, bufs, nullptr, 4, &p, sizeof(p));
+    ctx_.dispatch("cpi_layernorm", runtime::MetalContext::Grid::Groups, static_cast<std::size_t>(L),
+                  256, bufs, nullptr, 4, &p, sizeof(p));
   }
 
   for (int l = 0; l < cfg_.num_layers; ++l) {

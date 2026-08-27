@@ -1,7 +1,5 @@
 #include "model/tokenizer.hpp"
 
-#include "model/gguf_loader.hpp"
-
 #include <algorithm>
 #include <cstdlib>
 #include <filesystem>
@@ -10,6 +8,7 @@
 #include <sstream>
 #include <stdexcept>
 
+#include "model/gguf_loader.hpp"
 #include "model/hf_bpe_tokenizer.hpp"
 
 #ifdef CPI_HAS_SENTENCEPIECE
@@ -340,8 +339,7 @@ std::vector<int> Tokenizer::encode(const std::string& text, bool add_bos) const 
     // of them from the very first token, so this is a quality bug and not just
     // a wasted context slot. Drop the duplicate rather than the template's copy,
     // which keeps the prompt text and its tokenization in agreement.
-    if (add_bos && bos_id_ >= 0 && ids.size() >= 2 && ids[0] == bos_id_ &&
-        ids[1] == bos_id_) {
+    if (add_bos && bos_id_ >= 0 && ids.size() >= 2 && ids[0] == bos_id_ && ids[1] == bos_id_) {
       ids.erase(ids.begin());
     }
     return ids;

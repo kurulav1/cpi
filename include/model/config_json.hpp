@@ -29,57 +29,57 @@
 namespace model {
 
 // X(member, json_key, kind); kind is one of I (int32), F (float), B (bool).
-#define CPI_CONFIG_FIELDS(X)                                                  \
-  X(vocab_size, "vocab_size", I)                                              \
-  X(hidden_size, "hidden_size", I)                                            \
-  X(intermediate_size, "intermediate_size", I)                                \
-  X(num_layers, "num_layers", I)                                              \
-  X(num_heads, "num_heads", I)                                                \
-  X(num_kv_heads, "num_kv_heads", I)                                          \
-  X(max_seq_len, "max_seq_len", I)                                            \
-  X(tensor_parallel, "tensor_parallel", I)                                    \
-  X(rope_theta, "rope_theta", F)                                              \
-  X(norm_eps, "norm_eps", F)                                                  \
-  X(sliding_window, "sliding_window", I)                                      \
-  X(has_qkv_bias, "has_qkv_bias", B)                                          \
-  X(has_qk_norm, "has_qk_norm", B)                                            \
-  X(mlp_gelu, "mlp_gelu", B)                                                  \
-  X(scale_embeddings, "scale_embeddings", B)                                  \
-  X(attn_output_gate, "attn_output_gate", B)                                  \
-  X(use_layernorm, "use_layernorm", B)                                        \
-  X(tie_word_embeddings, "tie_word_embeddings", B)                            \
-  X(num_local_experts, "num_local_experts", I)                                \
-  X(num_experts_per_tok, "num_experts_per_tok", I)                            \
-  X(expert_intermediate_size, "expert_intermediate_size", I)                  \
-  X(partial_rotary_factor, "partial_rotary_factor", F)                        \
-  X(linear_num_key_heads, "linear_num_key_heads", I)                          \
-  X(linear_num_value_heads, "linear_num_value_heads", I)                      \
-  X(linear_key_head_dim, "linear_key_head_dim", I)                            \
-  X(linear_value_head_dim, "linear_value_head_dim", I)                        \
-  X(linear_conv_kernel_dim, "linear_conv_kernel_dim", I)                      \
-  X(vision_depth, "vision_depth", I)                                          \
-  X(vision_hidden_size, "vision_hidden_size", I)                              \
-  X(vision_num_heads, "vision_num_heads", I)                                  \
-  X(vision_intermediate_size, "vision_intermediate_size", I)                  \
-  X(vision_patch_size, "vision_patch_size", I)                                \
-  X(vision_temporal_patch_size, "vision_temporal_patch_size", I)              \
-  X(vision_in_channels, "vision_in_channels", I)                              \
-  X(vision_spatial_merge_size, "vision_spatial_merge_size", I)                \
-  X(vision_num_position_embeddings, "vision_num_position_embeddings", I)      \
-  X(vision_out_hidden_size, "vision_out_hidden_size", I)                       \
-  X(hidden_size_per_layer_input, "hidden_size_per_layer_input", I)             \
-  X(vocab_size_per_layer_input, "vocab_size_per_layer_input", I)               \
-  X(num_kv_shared_layers, "num_kv_shared_layers", I)                           \
-  X(first_shared_layer, "first_shared_layer", I)                               \
-  X(head_dim_sliding, "head_dim_sliding", I)                                   \
-  X(head_dim_full, "head_dim_full", I)                                         \
-  X(num_kv_heads_sliding, "num_kv_heads_sliding", I)                           \
-  X(num_kv_heads_full, "num_kv_heads_full", I)                                 \
-  X(rope_theta_sliding, "rope_theta_sliding", F)                               \
-  X(rope_theta_full, "rope_theta_full", F)                                     \
-  X(partial_rotary_full, "partial_rotary_full", F)                             \
-  X(use_double_wide_mlp, "use_double_wide_mlp", B)                             \
-  X(attention_k_eq_v, "attention_k_eq_v", B)                                   \
+#define CPI_CONFIG_FIELDS(X)                                             \
+  X(vocab_size, "vocab_size", I)                                         \
+  X(hidden_size, "hidden_size", I)                                       \
+  X(intermediate_size, "intermediate_size", I)                           \
+  X(num_layers, "num_layers", I)                                         \
+  X(num_heads, "num_heads", I)                                           \
+  X(num_kv_heads, "num_kv_heads", I)                                     \
+  X(max_seq_len, "max_seq_len", I)                                       \
+  X(tensor_parallel, "tensor_parallel", I)                               \
+  X(rope_theta, "rope_theta", F)                                         \
+  X(norm_eps, "norm_eps", F)                                             \
+  X(sliding_window, "sliding_window", I)                                 \
+  X(has_qkv_bias, "has_qkv_bias", B)                                     \
+  X(has_qk_norm, "has_qk_norm", B)                                       \
+  X(mlp_gelu, "mlp_gelu", B)                                             \
+  X(scale_embeddings, "scale_embeddings", B)                             \
+  X(attn_output_gate, "attn_output_gate", B)                             \
+  X(use_layernorm, "use_layernorm", B)                                   \
+  X(tie_word_embeddings, "tie_word_embeddings", B)                       \
+  X(num_local_experts, "num_local_experts", I)                           \
+  X(num_experts_per_tok, "num_experts_per_tok", I)                       \
+  X(expert_intermediate_size, "expert_intermediate_size", I)             \
+  X(partial_rotary_factor, "partial_rotary_factor", F)                   \
+  X(linear_num_key_heads, "linear_num_key_heads", I)                     \
+  X(linear_num_value_heads, "linear_num_value_heads", I)                 \
+  X(linear_key_head_dim, "linear_key_head_dim", I)                       \
+  X(linear_value_head_dim, "linear_value_head_dim", I)                   \
+  X(linear_conv_kernel_dim, "linear_conv_kernel_dim", I)                 \
+  X(vision_depth, "vision_depth", I)                                     \
+  X(vision_hidden_size, "vision_hidden_size", I)                         \
+  X(vision_num_heads, "vision_num_heads", I)                             \
+  X(vision_intermediate_size, "vision_intermediate_size", I)             \
+  X(vision_patch_size, "vision_patch_size", I)                           \
+  X(vision_temporal_patch_size, "vision_temporal_patch_size", I)         \
+  X(vision_in_channels, "vision_in_channels", I)                         \
+  X(vision_spatial_merge_size, "vision_spatial_merge_size", I)           \
+  X(vision_num_position_embeddings, "vision_num_position_embeddings", I) \
+  X(vision_out_hidden_size, "vision_out_hidden_size", I)                 \
+  X(hidden_size_per_layer_input, "hidden_size_per_layer_input", I)       \
+  X(vocab_size_per_layer_input, "vocab_size_per_layer_input", I)         \
+  X(num_kv_shared_layers, "num_kv_shared_layers", I)                     \
+  X(first_shared_layer, "first_shared_layer", I)                         \
+  X(head_dim_sliding, "head_dim_sliding", I)                             \
+  X(head_dim_full, "head_dim_full", I)                                   \
+  X(num_kv_heads_sliding, "num_kv_heads_sliding", I)                     \
+  X(num_kv_heads_full, "num_kv_heads_full", I)                           \
+  X(rope_theta_sliding, "rope_theta_sliding", F)                         \
+  X(rope_theta_full, "rope_theta_full", F)                               \
+  X(partial_rotary_full, "partial_rotary_full", F)                       \
+  X(use_double_wide_mlp, "use_double_wide_mlp", B)                       \
+  X(attention_k_eq_v, "attention_k_eq_v", B)                             \
   X(final_logit_softcapping, "final_logit_softcapping", F)
 
 // Serializes to a flat JSON object. Values are strings, because safetensors' `__metadata__` is
@@ -140,20 +140,20 @@ inline LlamaConfig config_from_json(const std::string& j) {
   // json_get_int/float read a NUMBER; these are quoted strings, so pull the string and convert.
   auto get_str = [&](const char* k) { return engine::mini::json_get_string(j, k); };
 
-#define CPI_READ_I(member, key, kind)                    \
-  {                                                      \
-    const std::string v = get_str(key);                  \
-    if (!v.empty()) c.member = std::stoi(v);             \
+#define CPI_READ_I(member, key, kind)        \
+  {                                          \
+    const std::string v = get_str(key);      \
+    if (!v.empty()) c.member = std::stoi(v); \
   }
-#define CPI_READ_F(member, key, kind)                    \
-  {                                                      \
-    const std::string v = get_str(key);                  \
-    if (!v.empty()) c.member = std::stof(v);             \
+#define CPI_READ_F(member, key, kind)        \
+  {                                          \
+    const std::string v = get_str(key);      \
+    if (!v.empty()) c.member = std::stof(v); \
   }
-#define CPI_READ_B(member, key, kind)                    \
-  {                                                      \
-    const std::string v = get_str(key);                  \
-    if (!v.empty()) c.member = (v != "0");               \
+#define CPI_READ_B(member, key, kind)      \
+  {                                        \
+    const std::string v = get_str(key);    \
+    if (!v.empty()) c.member = (v != "0"); \
   }
 #define CPI_READ(member, key, kind) CPI_READ_##kind(member, key, kind)
   CPI_CONFIG_FIELDS(CPI_READ)

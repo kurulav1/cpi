@@ -104,7 +104,7 @@ struct LlamaConfig {
   // sigmoid(gate) before the output projection. Without this flag the doubled q_proj reads
   // as a head_dim twice the real one, which converts cleanly and computes nonsense.
   bool attn_output_gate = false;
-  bool use_layernorm = false;       // Use true LayerNorm (mean+variance) instead of RMSNorm.
+  bool use_layernorm = false;  // Use true LayerNorm (mean+variance) instead of RMSNorm.
   bool tie_word_embeddings =
       false;  // lm_head shares weights with tok_embeddings (some Phi variants).
   std::int32_t num_local_experts = 0;  // Number of MoE experts per layer (0 = dense FFN).

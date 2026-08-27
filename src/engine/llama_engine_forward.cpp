@@ -350,8 +350,8 @@ bool LlamaEngine::packed_matmul(const PackedWeight& w, const void* x, void* y, i
     ++packed_matmul_calls_;
     kernels::launch_kquant_matvec(static_cast<const std::uint8_t*>(w.data),
                                   static_cast<kernels::KQuantType>(w.kind),
-                                  static_cast<const __half*>(x),
-                                  static_cast<__half*>(y) + row0, w.rows, w.cols, stream, reuse_x);
+                                  static_cast<const __half*>(x), static_cast<__half*>(y) + row0,
+                                  w.rows, w.cols, stream, reuse_x);
     return true;
   }
   // Int8 tensor cores (CPI_KQUANT_MMQ=1). Correct, gated, and still slower than
@@ -375,14 +375,12 @@ bool LlamaEngine::packed_matmul(const PackedWeight& w, const void* x, void* y, i
   const bool mmq_on = detail_mmq::band_allows(batch);
   // kind 0 is Q4_K, kind 2 is Q6_K; both have an MMQ path now, which is what
   // stops ffn_down and wv falling back to expand-and-cuBLAS.
-  if (mmq_on && detail_mmq::mma_ok() && batch >= 2 && batch <= 64 &&
-      (w.kind == 0 || w.kind == 2) && w.cols % 256 == 0 &&
-      ensure_q8_scratch(batch, w.cols) &&
-      kernels::launch_kquant_mmq(static_cast<const std::uint8_t*>(w.data),
-                                 static_cast<kernels::KQuantType>(w.kind),
-                                 static_cast<const __half*>(x), static_cast<__half*>(y) + row0,
-                                 w.rows, w.cols, batch, ldy, d_q8_x_, d_q8_scale_, d_q8_sum_,
-                                 stream, reuse_x)) {
+  if (mmq_on && detail_mmq::mma_ok() && batch >= 2 && batch <= 64 && (w.kind == 0 || w.kind == 2) &&
+      w.cols % 256 == 0 && ensure_q8_scratch(batch, w.cols) &&
+      kernels::launch_kquant_mmq(
+          static_cast<const std::uint8_t*>(w.data), static_cast<kernels::KQuantType>(w.kind),
+          static_cast<const __half*>(x), static_cast<__half*>(y) + row0, w.rows, w.cols, batch, ldy,
+          d_q8_x_, d_q8_scale_, d_q8_sum_, stream, reuse_x)) {
     ++packed_matmul_calls_;
     return true;
   }
@@ -440,7 +438,8 @@ bool LlamaEngine::packed_qkv_matmul(const LayerDeviceWeights& lw, const void* x,
   // whole projection fell back to dequant+cuBLAS, and the finished MMQ output
   // was overwritten, every split-QKV layer, every step (2026-08-12 audit).
   if (!detail_mmq::would_accept(true, lw.wq_packed.kind, lw.wq_packed.cols, batch) ||
-      (rows_k > 0 && !detail_mmq::would_accept(true, lw.wk_packed.kind, lw.wk_packed.cols, batch)) ||
+      (rows_k > 0 &&
+       !detail_mmq::would_accept(true, lw.wk_packed.kind, lw.wk_packed.cols, batch)) ||
       !detail_mmq::would_accept(true, lw.wv_packed.kind, lw.wv_packed.cols, batch)) {
     return false;
   }
@@ -459,11 +458,10 @@ bool LlamaEngine::packed_qkv_matvec(const LayerDeviceWeights& lw, const void* x_
   // into one packed matrix because wv is Q6_K where wq and wk are Q4_K.
   const auto run = [&](const PackedWeight& w, int row_offset, bool reuse = false) {
     ++packed_matvec_calls_;
-    kernels::launch_kquant_matvec(static_cast<const std::uint8_t*>(w.data),
-                                  static_cast<kernels::KQuantType>(w.kind),
-                                  static_cast<const __half*>(x_norm),
-                                  static_cast<__half*>(qkv) + row_offset, w.rows, w.cols, stream,
-                                  reuse);
+    kernels::launch_kquant_matvec(
+        static_cast<const std::uint8_t*>(w.data), static_cast<kernels::KQuantType>(w.kind),
+        static_cast<const __half*>(x_norm), static_cast<__half*>(qkv) + row_offset, w.rows, w.cols,
+        stream, reuse);
   };
   if (lw.wqkv_packed.active()) {
     run(lw.wqkv_packed, 0, x_pre_quantized);
@@ -491,8 +489,8 @@ void LlamaEngine::project_lm_head_logits(const __half* x_norm, float* logits) {
   if (lm_head_packed_.active()) {
     ++packed_matvec_calls_;
     kernels::launch_kquant_matvec_f32(static_cast<const std::uint8_t*>(lm_head_packed_.data),
-                                      static_cast<kernels::KQuantType>(lm_head_packed_.kind), x_norm,
-                                      logits, lm_head_packed_.rows, lm_head_packed_.cols,
+                                      static_cast<kernels::KQuantType>(lm_head_packed_.kind),
+                                      x_norm, logits, lm_head_packed_.rows, lm_head_packed_.cols,
                                       compute_stream_);
   } else if (lm_head_int8_ && d_lm_head_i8_ != nullptr) {
     kernels::launch_weight_only_int8_gemv_f32(d_lm_head_i8_, d_lm_head_i8_scales_, x_norm, logits,

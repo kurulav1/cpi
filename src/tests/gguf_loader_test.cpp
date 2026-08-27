@@ -11,13 +11,14 @@
 // Usage: gguf_loader_test <model.gguf> [--compare <model.ll2c>]
 // With --compare it additionally checks the fp16 tensors against the same
 // model's .ll2c container, which is the real oracle for the Q/K un-permutation.
+#include "model/gguf_loader.hpp"
+
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
 
-#include "model/gguf_loader.hpp"
 #include "model/weight_loader.hpp"
 
 namespace {
@@ -122,8 +123,8 @@ int main(int argc, char** argv) {
   // tensors, and asserting otherwise would report a name-mapping gap as a
   // reader failure.
   const std::string arch = g.metadata_string("general.architecture");
-  const bool mapped_arch = arch == "llama" || arch == "qwen2" || arch == "gemma" ||
-                           arch == "gemma2" || arch == "gemma4";
+  const bool mapped_arch =
+      arch == "llama" || arch == "qwen2" || arch == "gemma" || arch == "gemma2" || arch == "gemma4";
   if (mapped_arch) {
     check(static_cast<int>(g.tensor_names().size()) >= c.num_layers * 7,
           "tensor count consistent with layer count");
@@ -141,8 +142,8 @@ int main(int argc, char** argv) {
   // Values: dequantize a few tensors and sanity-check their distributions.
   // Real transformer weights are roughly zero-mean with a small RMS; a broken
   // dequant shows up immediately as a shifted mean or an absurd magnitude.
-  for (const char* name : {"layers.0.attention.wq", "layers.0.feed_forward.w2",
-                           "layers.0.attention_norm.weight"}) {
+  for (const char* name :
+       {"layers.0.attention.wq", "layers.0.feed_forward.w2", "layers.0.attention_norm.weight"}) {
     if (!g.has_tensor(name)) continue;
     const auto* h = reinterpret_cast<const std::uint16_t*>(g.tensor_data(name));
     const std::size_t n = g.tensor_bytes(name) / sizeof(std::uint16_t);
@@ -190,11 +191,11 @@ int main(int argc, char** argv) {
           "geometry matches the .ll2c oracle");
 
     int compared = 0;
-    for (const char* name : {"tok_embeddings.weight", "layers.0.attention_norm.weight",
-                             "layers.0.attention.wq", "layers.0.attention.wk",
-                             "layers.0.attention.wv", "layers.0.attention.wo",
-                             "layers.0.feed_forward.w1", "layers.0.feed_forward.w2",
-                             "layers.1.attention.wq", "norm.weight"}) {
+    for (const char* name :
+         {"tok_embeddings.weight", "layers.0.attention_norm.weight", "layers.0.attention.wq",
+          "layers.0.attention.wk", "layers.0.attention.wv", "layers.0.attention.wo",
+          "layers.0.feed_forward.w1", "layers.0.feed_forward.w2", "layers.1.attention.wq",
+          "norm.weight"}) {
       if (!g.has_tensor(name) || !oracle_has(name)) continue;
       const std::size_t gb = g.tensor_bytes(name);
       const std::size_t wb = oracle_bytes(name);
@@ -217,7 +218,8 @@ int main(int argc, char** argv) {
         sum_abs += d;
       }
       const double mean_abs = n ? sum_abs / static_cast<double>(n) : 0.0;
-      const double exact_pct = n ? 100.0 * static_cast<double>(exact) / static_cast<double>(n) : 0.0;
+      const double exact_pct =
+          n ? 100.0 * static_cast<double>(exact) / static_cast<double>(n) : 0.0;
       std::printf("  %-32s exact=%6.2f%% max|d|=%.6f mean|d|=%.6f\n", name, exact_pct, max_abs,
                   mean_abs);
       // An fp16 GGUF of the same checkpoint should be bit-identical; a

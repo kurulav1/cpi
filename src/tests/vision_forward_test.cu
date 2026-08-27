@@ -48,8 +48,7 @@ int main(int argc, char** argv) {
   const auto pixels = read_n<float>(f, static_cast<std::size_t>(patches) * patch_dim);
   const auto pos_x = read_n<int>(f, patches);
   const auto pos_y = read_n<int>(f, patches);
-  const auto expect =
-      read_n<float>(f, static_cast<std::size_t>(out_tokens) * text_hidden);
+  const auto expect = read_n<float>(f, static_cast<std::size_t>(out_tokens) * text_hidden);
 
   engine::PlanCudaEngine eng;
   eng.open(model, 4096);
@@ -72,7 +71,9 @@ int main(int argc, char** argv) {
       for (int i = 0; i < cols; ++i) {
         const double x = a[static_cast<std::size_t>(t) * cols + i];
         const double y = b[static_cast<std::size_t>(t) * cols + i];
-        dot += x * y; na += x * x; nb += y * y;
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
       }
       worst = std::min(worst, dot / (std::sqrt(na) * std::sqrt(nb) + 1e-12));
     }
@@ -99,12 +100,13 @@ int main(int argc, char** argv) {
       int qh[2];
       qf.read(reinterpret_cast<char*>(qh), sizeof(qh));
       const auto exp_q = read_n<float>(qf, static_cast<std::size_t>(qh[0]) * qh[1]);
-      const int qstage = std::getenv("CPI_VISION_QSTAGE")
-                             ? std::atoi(std::getenv("CPI_VISION_QSTAGE")) : -8;
+      const int qstage =
+          std::getenv("CPI_VISION_QSTAGE") ? std::atoi(std::getenv("CPI_VISION_QSTAGE")) : -8;
       const auto got_q = eng.encode_image_stage(pixels, pos_x, pos_y, qstage);
-      std::printf("  Q after 2-D RoPE  : worst cosine %.6f  (ours %.4f %.4f %.4f | hf %.4f %.4f %.4f)\n",
-                  cosine(got_q, exp_q, qh[0], qh[1]), got_q[0], got_q[1], got_q[2], exp_q[0],
-                  exp_q[1], exp_q[2]);
+      std::printf(
+          "  Q after 2-D RoPE  : worst cosine %.6f  (ours %.4f %.4f %.4f | hf %.4f %.4f %.4f)\n",
+          cosine(got_q, exp_q, qh[0], qh[1]), got_q[0], got_q[1], got_q[2], exp_q[0], exp_q[1],
+          exp_q[2]);
     }
   }
 

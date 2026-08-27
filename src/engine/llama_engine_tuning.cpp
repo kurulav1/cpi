@@ -121,10 +121,10 @@ void LlamaEngine::resident_projection_half_residual(const void* w, const void* x
                                                     int out_features, int in_features,
                                                     int warps_per_block, int tile_pairs,
                                                     int rows_per_warp) {
-  kernels::launch_rowmajor_half_gemv_f16(
-      static_cast<const __half*>(w), static_cast<const __half*>(x), nullptr, out_features,
-      in_features, compute_stream_, warps_per_block, tile_pairs, rows_per_warp,
-      static_cast<__half*>(residual));
+  kernels::launch_rowmajor_half_gemv_f16(static_cast<const __half*>(w),
+                                         static_cast<const __half*>(x), nullptr, out_features,
+                                         in_features, compute_stream_, warps_per_block, tile_pairs,
+                                         rows_per_warp, static_cast<__half*>(residual));
 }
 
 void LlamaEngine::resident_projection_float(const void* w, const void* x, void* y, int out_features,
@@ -168,9 +168,9 @@ void LlamaEngine::mlp_int4_grouped_dp4a(const std::int8_t* w, const float* scale
 void LlamaEngine::resident_int8_mlp_w13(const LayerDeviceInt8Weights& lw_i8, int inter,
                                         int hidden) {
   if (lw_i8.mlp_int4 && lw_i8.mlp_group > 0) {
-    // Group-wise int4 via perm8 dp4a: quantize the fp16 FFN-norm activation (d_x_norm_) to perm8-g32
-    // once, then two grouped dp4a GEMVs (w1, w3) share it. Overwrites the caller's rowwise
-    // d_prefill_i8_ (that quant is then dead, harmless; same stream, d_x_norm_ unmodified).
+    // Group-wise int4 via perm8 dp4a: quantize the fp16 FFN-norm activation (d_x_norm_) to
+    // perm8-g32 once, then two grouped dp4a GEMVs (w1, w3) share it. Overwrites the caller's
+    // rowwise d_prefill_i8_ (that quant is then dead, harmless; same stream, d_x_norm_ unmodified).
     kernels::launch_quantize_fp16_to_int8_perm8_g32(
         static_cast<const __half*>(d_x_norm_), static_cast<std::int8_t*>(d_prefill_i8_),
         static_cast<float*>(d_prefill_perm8_scales_), hidden, compute_stream_);
@@ -223,8 +223,8 @@ void LlamaEngine::tune_resident_projection_backends() {
   resident_custom_qkv_ = false;
   // With the projections packed there is no fp16 buffer to benchmark and no
   // choice of backend to make; the packed matvec is the only implementation.
-  if (!layer_cache_.empty() && (layer_cache_.front().wqkv_packed.active() ||
-                                layer_cache_.front().wq_packed.active())) {
+  if (!layer_cache_.empty() &&
+      (layer_cache_.front().wqkv_packed.active() || layer_cache_.front().wq_packed.active())) {
     return;
   }
   resident_custom_wo_ = false;

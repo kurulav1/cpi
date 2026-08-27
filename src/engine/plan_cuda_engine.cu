@@ -21,12 +21,12 @@
 #include <string>
 #include <utility>
 
-#include "engine/generation_constraints.hpp"
-#include "engine/plan_cuda_engine.hpp"
 #include "engine/deepseek_rope.hpp"
+#include "engine/generation_constraints.hpp"
 #include "engine/mla_absorb.hpp"
 #include "engine/mla_assemble.hpp"
 #include "engine/moe_grouped.hpp"
+#include "engine/plan_cuda_engine.hpp"
 #include "engine/sampling.hpp"
 #include "model/json_mini.hpp"
 #include "runtime/kernels.cuh"
@@ -597,8 +597,8 @@ void PlanCudaEngine::allocate_buffers() {
   if (cfg_.family == Family::DeepSeekV2) {
     const int H = cfg_.hidden;
     const int nh = cfg_.num_heads;
-    const int qkhd = cfg_.head_dim;                    // qk_nope+qk_rope (V padded to this)
-    const int kvw = nh * qkhd;                         // K/V per-token width
+    const int qkhd = cfg_.head_dim;  // qk_nope+qk_rope (V padded to this)
+    const int kvw = nh * qkhd;       // K/V per-token width
     const int E = cfg_.num_experts, K = cfg_.top_k_experts, MI = cfg_.moe_intermediate_size;
     const int maxinter = std::max(cfg_.intermediate, MI * std::max(1, cfg_.n_shared_experts));
     auto al = [&](__half** p, std::size_t n) { G4_CHECK(cudaMalloc(p, n * sizeof(__half))); };
@@ -623,7 +623,8 @@ void PlanCudaEngine::allocate_buffers() {
     G4_CHECK(cudaMalloc(&d_moe_idx_, static_cast<std::size_t>(K) * sizeof(int)));
     G4_CHECK(cudaMalloc(&d_moe_w_, static_cast<std::size_t>(K) * sizeof(float)));
     // YARN inverse frequencies (filled in open()).
-    G4_CHECK(cudaMalloc(&d_inv_freq_, static_cast<std::size_t>(cfg_.qk_rope_head_dim / 2) * sizeof(float)));
+    G4_CHECK(cudaMalloc(&d_inv_freq_,
+                        static_cast<std::size_t>(cfg_.qk_rope_head_dim / 2) * sizeof(float)));
     // Sampling / logits scratch (same as the other families).
     G4_CHECK(cudaMalloc(&d_logits_, static_cast<std::size_t>(cfg_.vocab) * sizeof(float)));
     G4_CHECK(cudaMalloc(&d_tok_, sizeof(int)));
@@ -643,7 +644,8 @@ void PlanCudaEngine::allocate_buffers() {
     G4_CHECK(cudaMalloc(&d_cand_count_, sizeof(int)));
     std::vector<__half> ones(std::max(qkhd, H), __float2half(1.0f));
     G4_CHECK(cudaMalloc(&d_ones_, ones.size() * sizeof(__half)));
-    G4_CHECK(cudaMemcpy(d_ones_, ones.data(), ones.size() * sizeof(__half), cudaMemcpyHostToDevice));
+    G4_CHECK(
+        cudaMemcpy(d_ones_, ones.data(), ones.size() * sizeof(__half), cudaMemcpyHostToDevice));
     // Split-K decode-attention scratch (head_dim 192 > 128 -> the wide-head path).
     split_any_chunks_ = (max_ctx_ + kSplitAnyChunk - 1) / kSplitAnyChunk;
     const std::size_t split_cells = static_cast<std::size_t>(nh) * split_any_chunks_;
@@ -730,8 +732,8 @@ void PlanCudaEngine::allocate_buffers() {
       G4_CHECK(cudaMalloc(&d_moe_identity_idx_, K * sizeof(int)));
       std::vector<int> ident(K);
       for (std::size_t k = 0; k < K; ++k) ident[k] = static_cast<int>(k);
-      G4_CHECK(cudaMemcpy(d_moe_identity_idx_, ident.data(), K * sizeof(int),
-                          cudaMemcpyHostToDevice));
+      G4_CHECK(
+          cudaMemcpy(d_moe_identity_idx_, ident.data(), K * sizeof(int), cudaMemcpyHostToDevice));
       std::fprintf(stderr, "[moe] expert streaming ON (staging %zu experts/layer)\n", K);
     }
   }
@@ -974,8 +976,7 @@ void PlanCudaEngine::parse_deepseek_config(const std::string& model_dir) {
     cfg_.yarn_mscale = mini::json_get_float(rope, "mscale", 1.0f);
     cfg_.yarn_beta_fast = mini::json_get_float(rope, "beta_fast", 32.0f);
     cfg_.yarn_beta_slow = mini::json_get_float(rope, "beta_slow", 1.0f);
-    cfg_.yarn_original_max_pos =
-        mini::json_get_int(rope, "original_max_position_embeddings", 4096);
+    cfg_.yarn_original_max_pos = mini::json_get_int(rope, "original_max_position_embeddings", 4096);
   }
 
   // All layers use MLA (full-attention kind); layers >= first_k_dense_replace are MoE.
@@ -1004,14 +1005,15 @@ __half* PlanCudaEngine::upload_host_fp16(const std::string& name, const std::vec
 
 // Quantize a host-built fp16 [rows,cols] weight to int4 (group-wise) and register it under `name`.
 // Same quant path as upload_int4 but from a caller buffer; DeepSeek's fused expert matrices are
-// synthesized in host memory (no such tensor exists to read by name). Experts are the memory hog, so
-// they are always int4 regardless of the global weight-quant flag (mirrors the Gemma MoE requirement).
+// synthesized in host memory (no such tensor exists to read by name). Experts are the memory hog,
+// so they are always int4 regardless of the global weight-quant flag (mirrors the Gemma MoE
+// requirement).
 void PlanCudaEngine::fuse_upload_experts_int4(const std::string& name,
                                               const std::vector<__half>& host, int rows, int cols) {
-  // CPI_DS_EXPERT_BITS=8 keeps experts int8 (diagnostic: distinguishes int4 quant drift from a bug).
-  static const int ebits = std::getenv("CPI_DS_EXPERT_BITS")
-                               ? std::atoi(std::getenv("CPI_DS_EXPERT_BITS"))
-                               : 4;
+  // CPI_DS_EXPERT_BITS=8 keeps experts int8 (diagnostic: distinguishes int4 quant drift from a
+  // bug).
+  static const int ebits =
+      std::getenv("CPI_DS_EXPERT_BITS") ? std::atoi(std::getenv("CPI_DS_EXPERT_BITS")) : 4;
   int group = weight_quant_group_;
   if (group > 0 && (group & (group - 1)) != 0) group = 0;
   while (group > 0 && (group > cols || (cols % group) != 0)) group /= 2;
@@ -1031,7 +1033,8 @@ void PlanCudaEngine::fuse_upload_experts_int4(const std::string& name,
     kernels::launch_quantize_groupwise_fp16_to_int8(d_fp16, d_i8, d_scales, rows, cols, group,
                                                     stream_, max_q);
   else
-    kernels::launch_quantize_rowwise_fp16_to_int8(d_fp16, d_i8, d_scales, rows, cols, stream_, max_q);
+    kernels::launch_quantize_rowwise_fp16_to_int8(d_fp16, d_i8, d_scales, rows, cols, stream_,
+                                                  max_q);
   std::int8_t* d_w = d_i8;
   if (ebits == 4) {
     std::int8_t* d_packed = nullptr;
@@ -1063,7 +1066,8 @@ void PlanCudaEngine::load_deepseek_weights() {
   const int kva = cfg_.kv_lora_rank + cfg_.qk_rope_head_dim;     // 576
   const int kvb = nh * (cfg_.qk_nope_head_dim + vhd);            // nh*256
   const int MI = cfg_.moe_intermediate_size;                     // 1408
-  // MLA/dense/shared projections honor --weight-quant int4 (like llama.cpp Q4) to cut decode bandwidth
+  // MLA/dense/shared projections honor --weight-quant int4 (like llama.cpp Q4) to cut decode
+  // bandwidth
   //; the shared expert alone is ~2x the routed experts in fp16 bytes. o_proj stays fp16 (host-built
   // padded tensor). Experts are always int4.
   auto proj = [&](const std::string& nm, int r, int c) {
@@ -1124,8 +1128,8 @@ void PlanCudaEngine::load_deepseek_weights() {
       G4_CHECK(cudaMemcpy(mla_w_ukt_[L], ukt.data(), ukt.size() * sizeof(__half),
                           cudaMemcpyHostToDevice));
       G4_CHECK(cudaMalloc(&mla_w_uv_[L], uv.size() * sizeof(__half)));
-      G4_CHECK(cudaMemcpy(mla_w_uv_[L], uv.data(), uv.size() * sizeof(__half),
-                          cudaMemcpyHostToDevice));
+      G4_CHECK(
+          cudaMemcpy(mla_w_uv_[L], uv.data(), uv.size() * sizeof(__half), cudaMemcpyHostToDevice));
     }
     // o_proj is [H, nh*v_head]; pad to [H, nh*qk] with zero columns per head so the standard
     // Attention op can run at head_dim=qk (V padded to qk) and o_proj still consumes it directly.
@@ -1162,7 +1166,8 @@ void PlanCudaEngine::load_deepseek_weights() {
                   gate_up.begin() + (static_cast<std::size_t>(e) * 2 * MI + MI) * H);
         std::copy(dn.begin(), dn.end(), down.begin() + static_cast<std::size_t>(e) * H * MI);
       }
-      fuse_upload_experts_int4(p + "mlp.experts.gate_up_proj", gate_up, cfg_.num_experts * 2 * MI, H);
+      fuse_upload_experts_int4(p + "mlp.experts.gate_up_proj", gate_up, cfg_.num_experts * 2 * MI,
+                               H);
       fuse_upload_experts_int4(p + "mlp.experts.down_proj", down, cfg_.num_experts * H, MI);
       const int SI = MI * cfg_.n_shared_experts;  // shared-expert SwiGLU intermediate
       proj(p + "mlp.shared_experts.gate_proj.weight", SI, H);
@@ -1178,16 +1183,17 @@ void PlanCudaEngine::load_deepseek_weights() {
 
 // DeepSeek MoE FFN (router softmax-top-k without renorm + fused int4 experts + a shared SwiGLU),
 // all reading Slot::XNorm (= post_attention_layernorm output), accumulating into Slot::X.
-void PlanCudaEngine::append_deepseek_moe_ffn_ops(std::vector<opplan::Op>& ops, const std::string& p) {
+void PlanCudaEngine::append_deepseek_moe_ffn_ops(std::vector<opplan::Op>& ops,
+                                                 const std::string& p) {
   using namespace opplan;
   const int H = cfg_.hidden, E = cfg_.num_experts, K = cfg_.top_k_experts;
   const int MI = cfg_.moe_intermediate_size, SI = MI * std::max(1, cfg_.n_shared_experts);
   auto Wd = [&](const char* t) { return static_cast<const __half*>(dev_[p + t]); };
-  static const int ebits = std::getenv("CPI_DS_EXPERT_BITS")
-                               ? std::atoi(std::getenv("CPI_DS_EXPERT_BITS"))
-                               : 4;
+  static const int ebits =
+      std::getenv("CPI_DS_EXPERT_BITS") ? std::atoi(std::getenv("CPI_DS_EXPERT_BITS")) : 4;
   auto bind_expert = [&](Op& o, const char* t) {
-    const auto q = qdev_.find(p + t);  // fused experts are int4 (or int8 under CPI_DS_EXPERT_BITS=8)
+    const auto q =
+        qdev_.find(p + t);  // fused experts are int4 (or int8 under CPI_DS_EXPERT_BITS=8)
     o.qweight = q->second.packed;
     o.qscales = q->second.scales;
     o.qbits = ebits;
@@ -1275,7 +1281,8 @@ void PlanCudaEngine::append_deepseek_moe_ffn_ops(std::vector<opplan::Op>& ops, c
 
 void PlanCudaEngine::build_deepseek_plan() {
   using namespace opplan;
-  // Wire the decode slot pointers (build_plan does this for the Gemma path; DeepSeek needs its own).
+  // Wire the decode slot pointers (build_plan does this for the Gemma path; DeepSeek needs its
+  // own).
   slot_ptr_[static_cast<int>(Slot::X)] = d_x_;
   slot_ptr_[static_cast<int>(Slot::XNorm)] = d_x_norm_;
   slot_ptr_[static_cast<int>(Slot::Q)] = d_q_;
@@ -1301,7 +1308,8 @@ void PlanCudaEngine::build_deepseek_plan() {
   const int kva = cfg_.kv_lora_rank + cfg_.qk_rope_head_dim;
   const int kvb = nh * (cfg_.qk_nope_head_dim + cfg_.v_head_dim);
   if (cfg_.q_lora_rank > 0)
-    throw std::runtime_error("DeepSeek q_lora_rank>0 (q-LoRA) not wired yet; V2-Lite is direct q_proj");
+    throw std::runtime_error(
+        "DeepSeek q_lora_rank>0 (q-LoRA) not wired yet; V2-Lite is direct q_proj");
 
   {
     Op e;
@@ -1721,8 +1729,8 @@ void PlanCudaEngine::open(const std::string& cpi_path, int max_context) {
       return;
     }
     if (mt.rfind("deepseek_v2", 0) == 0) {
-      // DeepSeek-V2 (MLA latent attention + fine-grained MoE). Weights are HF-native under "model.".
-      // WIP bring-up: config parse is live; loader/ops/plan land phase by phase (see
+      // DeepSeek-V2 (MLA latent attention + fine-grained MoE). Weights are HF-native under
+      // "model.". WIP bring-up: config parse is live; loader/ops/plan land phase by phase (see
       // cpi-deepseek-v2lite-status memory).
       wprefix_ = "model.";
       parse_deepseek_config(cpi_path);
@@ -1738,8 +1746,8 @@ void PlanCudaEngine::open(const std::string& cpi_path, int max_context) {
       load_deepseek_weights();
       allocate_buffers();
       // int4 decode routes through dp4a with int8 activations, which needs this scratch. The shared
-      // path allocates it only for .cpi/.ll2c (this dir branch returns before it), so without this the
-      // DeepSeek int4 projections silently fell to the slow fp16-activation matvec.
+      // path allocates it only for .cpi/.ll2c (this dir branch returns before it), so without this
+      // the DeepSeek int4 projections silently fell to the slow fp16-activation matvec.
       if (weight_quant_bits_ == 4 && d_act_i8_ == nullptr &&
           std::getenv("CPI_CUDA_NO_DP4A") == nullptr) {
         G4_CHECK(cudaMalloc(&d_act_i8_, std::size_t(16) * 65536));
@@ -1756,10 +1764,11 @@ void PlanCudaEngine::open(const std::string& cpi_path, int max_context) {
       build_deepseek_plan();
       // Batched sequence prefill: MlaAssembleRope has a T>1 kernel and the MoE ops loop the T==1
       // kernels per token (d_moe_idx_seq_), so the whole prompt runs in one pass; the projections,
-      // MLA attention and o_proj batch as GEMMs; only the experts stay matvec. Decode uses CUDA-graph
-      // capture (MlaAssembleRope's device-position variant keeps the graph position-correct on replay;
-      // verified token-identical to eager). Persistent decode stays off unless CPI_CUDA_PERSISTENT.
-      // CPI_DS_NO_SEQ_PREFILL=1 forces the old token-by-token prefill (a correctness escape hatch).
+      // MLA attention and o_proj batch as GEMMs; only the experts stay matvec. Decode uses
+      // CUDA-graph capture (MlaAssembleRope's device-position variant keeps the graph
+      // position-correct on replay; verified token-identical to eager). Persistent decode stays off
+      // unless CPI_CUDA_PERSISTENT. CPI_DS_NO_SEQ_PREFILL=1 forces the old token-by-token prefill
+      // (a correctness escape hatch).
       seq_prefill_ok_ =
           std::getenv("CPI_DS_NO_SEQ_PREFILL") == nullptr && plan_can_sequence_prefill();
       if (seq_prefill_ok_) allocate_sequence_buffers(std::min(max_ctx_, 4096));
@@ -2708,8 +2717,8 @@ bool PlanCudaEngine::grouped_gemm_ex(int m, int k, const std::vector<int>& n_per
   }
   cublasHandle_t h = static_cast<cublasHandle_t>(cublas_);
   cublasSetStream(h, stream_);
-  // Reused member scratch (assign keeps capacity after the first call) so the twice-per-layer prefill
-  // GEMM does not churn the heap.
+  // Reused member scratch (assign keeps capacity after the first call) so the twice-per-layer
+  // prefill GEMM does not churn the heap.
   gg_ta_.assign(G, static_cast<int>(CUBLAS_OP_T));
   gg_tb_.assign(G, static_cast<int>(CUBLAS_OP_N));
   gg_ma_.assign(G, m);
@@ -2727,9 +2736,10 @@ bool PlanCudaEngine::grouped_gemm_ex(int m, int k, const std::vector<int>& n_per
   G4_CHECK(cudaMemcpyAsync(d_gg_C_, C.data(), G * sizeof(void*), cudaMemcpyHostToDevice, stream_));
   const cublasStatus_t st = cublasGemmGroupedBatchedEx(
       h, reinterpret_cast<cublasOperation_t*>(gg_ta_.data()),
-      reinterpret_cast<cublasOperation_t*>(gg_tb_.data()), gg_ma_.data(), gg_na_.data(), gg_ka_.data(),
-      gg_alpha_.data(), d_gg_A_, CUDA_R_16F, gg_lda_.data(), d_gg_B_, CUDA_R_16F, gg_ldb_.data(),
-      gg_beta_.data(), d_gg_C_, CUDA_R_16F, gg_ldc_.data(), G, gg_gs_.data(), CUBLAS_COMPUTE_32F);
+      reinterpret_cast<cublasOperation_t*>(gg_tb_.data()), gg_ma_.data(), gg_na_.data(),
+      gg_ka_.data(), gg_alpha_.data(), d_gg_A_, CUDA_R_16F, gg_lda_.data(), d_gg_B_, CUDA_R_16F,
+      gg_ldb_.data(), gg_beta_.data(), d_gg_C_, CUDA_R_16F, gg_ldc_.data(), G, gg_gs_.data(),
+      CUBLAS_COMPUTE_32F);
   return st == CUBLAS_STATUS_SUCCESS;
 }
 
@@ -2797,20 +2807,20 @@ bool PlanCudaEngine::moe_grouped_gate_up(const opplan::Op& op, __half* xnorm, in
                            cudaMemcpyHostToDevice, stream_));
   engine::launch_moe_gather_rows(xnorm, d_moe_perm_, d_moe_gather_, H, P, stream_);
 
-  // int4-direct path (short prompts): int8-quantize the gathered activations (natural g32), upload the
-  // per-expert offsets, and run one grouped int8-mma GEMM that reads the int4 weights directly into
-  // gate_g/up_g. Skips the dequant-all + fp16 re-read entirely.
+  // int4-direct path (short prompts): int8-quantize the gathered activations (natural g32), upload
+  // the per-expert offsets, and run one grouped int8-mma GEMM that reads the int4 weights directly
+  // into gate_g/up_g. Skips the dequant-all + fp16 re-read entirely.
   if (moe_use_int4_direct(P)) {
     int max_ne = 0;
     for (int e = 0; e < E; ++e) max_ne = std::max(max_ne, off[e + 1] - off[e]);
-    G4_CHECK(cudaMemcpyAsync(d_moe_off_dev_, off.data(), (E + 1) * sizeof(int), cudaMemcpyHostToDevice,
-                             stream_));
-    kernels::launch_quantize_groupwise_fp16_to_int8(d_moe_gather_, d_moe_actq_, d_moe_acts_, P, H, 32,
-                                                    stream_, 127);
+    G4_CHECK(cudaMemcpyAsync(d_moe_off_dev_, off.data(), (E + 1) * sizeof(int),
+                             cudaMemcpyHostToDevice, stream_));
+    kernels::launch_quantize_groupwise_fp16_to_int8(d_moe_gather_, d_moe_actq_, d_moe_acts_, P, H,
+                                                    32, stream_, 127);
     kernels::launch_moe_int4_grouped_mma(
         d_moe_actq_, d_moe_acts_, static_cast<const std::int8_t*>(op.qweight),
-        static_cast<const float*>(op.qscales), d_moe_off_dev_, d_moe_gate_g_, d_moe_up_g_, E, 2 * MI, H,
-        max_ne, group, /*split=*/MI, /*lo_width=*/MI, /*hi_width=*/MI, stream_);
+        static_cast<const float*>(op.qscales), d_moe_off_dev_, d_moe_gate_g_, d_moe_up_g_, E,
+        2 * MI, H, max_ne, group, /*split=*/MI, /*lo_width=*/MI, /*hi_width=*/MI, stream_);
     kernels::launch_silu_mul(d_moe_gate_g_, d_moe_up_g_, d_moe_gate_g_, P * MI, stream_);
     moe_grouped_total_ = P;
     return true;
@@ -2863,17 +2873,17 @@ bool PlanCudaEngine::moe_grouped_down(const opplan::Op& op, __half* moe_out, int
     // (same P -> same path). split=H, no hi output (down is not fused).
     int max_ne = 0;
     for (int e = 0; e < E; ++e) max_ne = std::max(max_ne, off[e + 1] - off[e]);
-    kernels::launch_quantize_groupwise_fp16_to_int8(d_moe_gate_g_, d_moe_actq_, d_moe_acts_, P, MI, 32,
-                                                    stream_, 127);
+    kernels::launch_quantize_groupwise_fp16_to_int8(d_moe_gate_g_, d_moe_actq_, d_moe_acts_, P, MI,
+                                                    32, stream_, 127);
     kernels::launch_moe_int4_grouped_mma(
         d_moe_actq_, d_moe_acts_, static_cast<const std::int8_t*>(op.qweight),
-        static_cast<const float*>(op.qscales), d_moe_off_dev_, d_moe_outg_, nullptr, E, H, MI, max_ne,
-        group, /*split=*/H, /*lo_width=*/H, /*hi_width=*/0, stream_);
+        static_cast<const float*>(op.qscales), d_moe_off_dev_, d_moe_outg_, nullptr, E, H, MI,
+        max_ne, group, /*split=*/H, /*lo_width=*/H, /*hi_width=*/0, stream_);
   } else {
     // Dequant all experts' [E*H, MI] down in one launch, then one grouped GEMM (one group/expert).
     kernels::launch_dequant_int4_grouped(static_cast<const std::int8_t*>(op.qweight),
-                                         static_cast<const float*>(op.qscales), d_moe_dqw_, E * H, MI,
-                                         group, stream_);
+                                         static_cast<const float*>(op.qscales), d_moe_dqw_, E * H,
+                                         MI, group, stream_);
     std::vector<int>& ng_list = gg_ng_;
     std::vector<const void*>& A = gg_pa_;
     std::vector<const void*>& B = gg_pb_;
@@ -2894,8 +2904,8 @@ bool PlanCudaEngine::moe_grouped_down(const opplan::Op& op, __half* moe_out, int
   }
   // Scatter each grouped row's weighted output back to its source token (fp32 accumulate; a token
   // receives top_k contributions from different experts), then convert to fp16 MoeOut.
-  G4_CHECK(cudaMemsetAsync(d_moe_out_f32_, 0, static_cast<std::size_t>(T) * H * sizeof(float),
-                           stream_));
+  G4_CHECK(
+      cudaMemsetAsync(d_moe_out_f32_, 0, static_cast<std::size_t>(T) * H * sizeof(float), stream_));
   engine::launch_moe_scatter_accum(d_moe_outg_, d_moe_perm_, d_moe_rweight_, d_moe_out_f32_, H, P,
                                    stream_);
   engine::launch_moe_f32_to_f16(d_moe_out_f32_, moe_out, static_cast<std::size_t>(T) * H, stream_);
@@ -3433,11 +3443,12 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
         }
         if (seq) {
           // Sequence prefill: loop the (verified) T==1 scalar kernel per token, reading token t's
-          // routing slot and writing its [top_k*MI] inter block. Experts stay matvec; the win is that
-          // the projections/attention around the MoE batch as GEMMs.
+          // routing slot and writing its [top_k*MI] inter block. Experts stay matvec; the win is
+          // that the projections/attention around the MoE batch as GEMMs.
           for (int t = 0; t < T; ++t)
             kernels::launch_moe_gate_up_geglu(
-                op.qbits ? static_cast<const void*>(op.qweight) : static_cast<const void*>(op.weight),
+                op.qbits ? static_cast<const void*>(op.qweight)
+                         : static_cast<const void*>(op.weight),
                 QS(op.qscales), op.qbits, op.qgroup,
                 S(op.in) + static_cast<std::size_t>(t) * op.in_dim,
                 d_moe_idx_seq_ + static_cast<std::size_t>(t) * op.heads,
@@ -3456,8 +3467,8 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
           kernels::launch_quantize_fp16_to_int8_perm8_g32(S(op.in), d_act_i8_, d_act_qs_, op.in_dim,
                                                           stream_);
           kernels::launch_moe_gate_up_geglu_dp4a(op.qweight, QS(op.qscales), d_act_i8_, d_act_qs_,
-                                                 d_moe_idx_, S(op.out), op.cols, op.in_dim, op.heads,
-                                                 op.qgroup, stream_, op.mlp_gelu);
+                                                 d_moe_idx_, S(op.out), op.cols, op.in_dim,
+                                                 op.heads, op.qgroup, stream_, op.mlp_gelu);
         } else {
           kernels::launch_moe_gate_up_geglu(
               op.qbits ? static_cast<const void*>(op.qweight) : static_cast<const void*>(op.weight),
@@ -3474,7 +3485,8 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
           // inter block + its routing slot, accumulates into token t's output row.
           for (int t = 0; t < T; ++t)
             kernels::launch_moe_down_accum(
-                op.qbits ? static_cast<const void*>(op.qweight) : static_cast<const void*>(op.weight),
+                op.qbits ? static_cast<const void*>(op.qweight)
+                         : static_cast<const void*>(op.weight),
                 QS(op.qscales), op.qbits, op.qgroup,
                 S(op.in) + static_cast<std::size_t>(t) * op.heads * op.in_dim,
                 d_moe_idx_seq_ + static_cast<std::size_t>(t) * op.heads,
@@ -3487,11 +3499,12 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
           stage_moe_experts(op.qweight, QS(op.qscales), op.cols, op.in_dim, op.qgroup,
                             d_moe_stage_dn_, d_moe_stage_dn_s_);
           kernels::launch_moe_down_accum(d_moe_stage_dn_, d_moe_stage_dn_s_, op.qbits, op.qgroup,
-                                         S(op.in), d_moe_identity_idx_, d_moe_w_, S(op.out), op.cols,
-                                         op.in_dim, op.heads, stream_);
+                                         S(op.in), d_moe_identity_idx_, d_moe_w_, S(op.out),
+                                         op.cols, op.in_dim, op.heads, stream_);
         } else if (!seq && op.qbits == 4 && op.qgroup > 0 && (op.qgroup % 32) == 0 &&
                    (op.in_dim % 32) == 0 && d_act_i8_ != nullptr) {
-          // dp4a: quantise the top_k per-expert inter vectors (op.heads rows x op.in_dim), then dot.
+          // dp4a: quantise the top_k per-expert inter vectors (op.heads rows x op.in_dim), then
+          // dot.
           kernels::launch_quantize_fp16_to_int8_perm8_g32_mt(S(op.in), d_act_i8_, d_act_qs_,
                                                              op.in_dim, op.heads, stream_);
           kernels::launch_moe_down_accum_dp4a(op.qweight, QS(op.qscales), d_act_i8_, d_act_qs_,
@@ -3500,13 +3513,12 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
         } else {
           kernels::launch_moe_down_accum(
               op.qbits ? static_cast<const void*>(op.qweight) : static_cast<const void*>(op.weight),
-              QS(op.qscales), op.qbits, op.qgroup, S(op.in), d_moe_idx_, d_moe_w_, S(op.out), op.cols,
-              op.in_dim, op.heads, stream_);
+              QS(op.qscales), op.qbits, op.qgroup, S(op.in), d_moe_idx_, d_moe_w_, S(op.out),
+              op.cols, op.in_dim, op.heads, stream_);
         }
         break;
       case OpKind::MlaLatStore: {
-        const int* dpos =
-            (device_pos_mode_ || spec_seq_device_pos_) ? d_position_ : nullptr;
+        const int* dpos = (device_pos_mode_ || spec_seq_device_pos_) ? d_position_ : nullptr;
         if (!seq && op.aux_ptr != nullptr) {
           // Latent-only decode: assemble was skipped, so rope q_pe/k_pe here
           // and write the latent row straight from the kv_a outputs.
@@ -3519,9 +3531,9 @@ void PlanCudaEngine::execute_ops(const opplan::Op* ops, std::size_t n, int layer
         // Append [latent | roped k_pe] rows to the latent cache (k_pe gathered
         // from the assembled K); seq prefill, spec seq, and dual-write decode.
         const int rows = seq ? T : 1;
-        engine::launch_mla_lat_store(S(Slot::MlaLatent), S(Slot::K), caches_lat_[layer],
-                                     op.in_dim, op.key_head_dim, op.rotary_dim, op.head_dim,
-                                     op.heads, rows, position, dpos, max_ctx_, stream_);
+        engine::launch_mla_lat_store(S(Slot::MlaLatent), S(Slot::K), caches_lat_[layer], op.in_dim,
+                                     op.key_head_dim, op.rotary_dim, op.head_dim, op.heads, rows,
+                                     position, dpos, max_ctx_, stream_);
         break;
       }
       case OpKind::MlaQAbsorb: {
@@ -4034,11 +4046,12 @@ void PlanCudaEngine::build_qwen35_plan() {
 void PlanCudaEngine::run_layer(int layer, int position) {
   const std::vector<opplan::Op>& ops = plan_.layers[layer].ops;
   execute_ops(ops.data(), ops.size(), layer, position);
-  // Debug: CPI_DS_DUMP=<file> dumps Slot::X (post-layer hidden) at position CPI_DS_DUMP_POS to compare
-  // against the HF golden trace, layer by layer (localises the first divergent op).
+  // Debug: CPI_DS_DUMP=<file> dumps Slot::X (post-layer hidden) at position CPI_DS_DUMP_POS to
+  // compare against the HF golden trace, layer by layer (localises the first divergent op).
   static const char* dsdump = std::getenv("CPI_DS_DUMP");
   if (dsdump) {
-    static const int dpos = std::getenv("CPI_DS_DUMP_POS") ? std::atoi(std::getenv("CPI_DS_DUMP_POS")) : 0;
+    static const int dpos =
+        std::getenv("CPI_DS_DUMP_POS") ? std::atoi(std::getenv("CPI_DS_DUMP_POS")) : 0;
     if (position == dpos) {
       G4_CHECK(cudaStreamSynchronize(stream_));
       std::vector<__half> h(cfg_.hidden);
@@ -4113,8 +4126,8 @@ void PlanCudaEngine::allocate_sequence_buffers(int max_tokens) {
     G4_CHECK(cudaMalloc(&d_moe_w_seq_, static_cast<std::size_t>(max_tokens) * K * sizeof(float)));
     G4_CHECK(cudaMalloc(&d_seq_tokens_, static_cast<std::size_t>(max_tokens) * sizeof(int)));
     G4_CHECK(cudaMalloc(&d_seq_limits_, static_cast<std::size_t>(max_tokens) * sizeof(int)));
-    // Grouped-GEMM MoE scratch (default on; CPI_DS_NO_MOE_GROUPED=1 opts out to the per-token loop).
-    // ~370 MB at max_tokens=4096 (gather/outg [P,H] + gate_g/up_g [P,MI] + out_f32 [T,H]).
+    // Grouped-GEMM MoE scratch (default on; CPI_DS_NO_MOE_GROUPED=1 opts out to the per-token
+    // loop). ~370 MB at max_tokens=4096 (gather/outg [P,H] + gate_g/up_g [P,MI] + out_f32 [T,H]).
     if (std::getenv("CPI_DS_NO_MOE_GROUPED") == nullptr) {
       const std::size_t P = static_cast<std::size_t>(max_tokens) * K;
       G4_CHECK(cudaMalloc(&d_moe_gather_, P * H * sizeof(__half)));
@@ -4129,7 +4142,8 @@ void PlanCudaEngine::allocate_sequence_buffers(int max_tokens) {
       G4_CHECK(cudaMalloc(&d_gg_C_, static_cast<std::size_t>(2) * E * sizeof(void*)));
       G4_CHECK(cudaMalloc(&d_moe_perm_, P * sizeof(int)));
       G4_CHECK(cudaMalloc(&d_moe_rweight_, P * sizeof(float)));
-      G4_CHECK(cudaMalloc(&d_moe_out_f32_, static_cast<std::size_t>(max_tokens) * H * sizeof(float)));
+      G4_CHECK(
+          cudaMalloc(&d_moe_out_f32_, static_cast<std::size_t>(max_tokens) * H * sizeof(float)));
       // int4-direct path (short-prompt): int8 activations [P,H] + per-32-group scales [P,H/32].
       // H is the wider of {H (gate_up act), MI (down act)}, so one buffer serves both.
       G4_CHECK(cudaMalloc(&d_moe_actq_, P * H));
@@ -5093,10 +5107,11 @@ std::vector<int> PlanCudaEngine::generate_stream(const std::vector<int>& prompt,
   //
   // Known-non-lossless (2026-08): the intended invariant, output identical to plain greedy, does
   // not hold. The batched verify uses the seq/mt kernels while the nd==0 fallback uses the decode
-  // kernels; the two round differently on near-ties, so the emitted stream diverges from plain greedy
-  // and depends on the draft policy (3-gram vs 6-gram give different output). It can cascade into
-  // repetition loops. Making it lossless requires reconciling the verify and decode kernel numerics
-  // (prefill-parity-class work); see memory:cpi-cuda-spec-decode. Until then this is experimental.
+  // kernels; the two round differently on near-ties, so the emitted stream diverges from plain
+  // greedy and depends on the draft policy (3-gram vs 6-gram give different output). It can cascade
+  // into repetition loops. Making it lossless requires reconciling the verify and decode kernel
+  // numerics (prefill-parity-class work); see memory:cpi-cuda-spec-decode. Until then this is
+  // experimental.
   //
   // Audited 2026-08-13 (Gemma-4 E2B int4): the T=16 verify's model mechanics are correct; the
   // mt device-pos attention applies the per-token sliding window (k_start = seq_len - window in

@@ -18,8 +18,8 @@
 #include <cstring>
 #include <filesystem>
 #include <stdexcept>
-#include <unordered_map>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "engine/plan_metal_engine.hpp"
@@ -33,8 +33,12 @@ namespace {
 
 // Was a local copy that truncated and flushed subnormals; see include/runtime/fp16.hpp for what
 // that cost and metal_fp16_test for the gate.
-inline std::uint16_t f32_to_f16_bits(float f) { return cpi::f32_to_f16(f); }
-inline float f16_bits_to_f32(std::uint16_t h) { return cpi::f16_to_f32(h); }
+inline std::uint16_t f32_to_f16_bits(float f) {
+  return cpi::f32_to_f16(f);
+}
+inline float f16_bits_to_f32(std::uint16_t h) {
+  return cpi::f16_to_f32(h);
+}
 
 struct GemvParams {
   std::uint32_t out_dim, in_dim, tokens, has_bias;
@@ -124,8 +128,8 @@ std::vector<float> interpolate_pos_embed(const float* table, int side, int h, in
 // The frequency vector is [row_freqs | col_freqs], each head_dim/4 long; not one geometric
 // series over head_dim/2; and the tokens are enumerated in the same merge-unit-major order
 // the position table uses.
-void build_rope_tables(int h, int w, int head_dim, int merge, float theta,
-                       std::vector<float>& cosb, std::vector<float>& sinb) {
+void build_rope_tables(int h, int w, int head_dim, int merge, float theta, std::vector<float>& cosb,
+                       std::vector<float>& sinb) {
   const int half = head_dim / 2;
   const int quarter = head_dim / 4;
   cosb.assign(static_cast<std::size_t>(h) * w * half, 0.0f);
@@ -140,8 +144,10 @@ void build_rope_tables(int h, int w, int head_dim, int merge, float theta,
           for (int j = 0; j < quarter; ++j) {
             const float inv =
                 1.0f / std::pow(theta, static_cast<float>(2 * j) / static_cast<float>(half));
-            cosb[static_cast<std::size_t>(idx) * half + j] = std::cos(static_cast<float>(row) * inv);
-            sinb[static_cast<std::size_t>(idx) * half + j] = std::sin(static_cast<float>(row) * inv);
+            cosb[static_cast<std::size_t>(idx) * half + j] =
+                std::cos(static_cast<float>(row) * inv);
+            sinb[static_cast<std::size_t>(idx) * half + j] =
+                std::sin(static_cast<float>(row) * inv);
             cosb[static_cast<std::size_t>(idx) * half + quarter + j] =
                 std::cos(static_cast<float>(col) * inv);
             sinb[static_cast<std::size_t>(idx) * half + quarter + j] =
@@ -236,8 +242,8 @@ std::vector<float> PlanMetalEngine::encode_image(const std::vector<float>& patch
   }
   const int merge = c.vision_spatial_merge_size;
   if (grid_h % merge != 0 || grid_w % merge != 0) {
-    throw std::runtime_error("patch grid must be a whole number of " + std::to_string(merge) +
-                             "x" + std::to_string(merge) + " merge units in both axes");
+    throw std::runtime_error("patch grid must be a whole number of " + std::to_string(merge) + "x" +
+                             std::to_string(merge) + " merge units in both axes");
   }
   const int hidden = c.vision_hidden_size;
   const int heads = c.vision_num_heads;
@@ -246,8 +252,8 @@ std::vector<float> PlanMetalEngine::encode_image(const std::vector<float>& patch
   const int tokens = grid_h * grid_w;
   const int patch_dim = c.vision_in_channels * c.vision_temporal_patch_size * c.vision_patch_size *
                         c.vision_patch_size;
-  const int side = static_cast<int>(std::lround(std::sqrt(
-      static_cast<double>(c.vision_num_position_embeddings))));
+  const int side = static_cast<int>(
+      std::lround(std::sqrt(static_cast<double>(c.vision_num_position_embeddings))));
   const int inter_m = hidden * merge * merge;
   const int out_hidden = c.vision_out_hidden_size;
   const int soft = tokens / (merge * merge);
@@ -270,15 +276,14 @@ std::vector<float> PlanMetalEngine::encode_image(const std::vector<float>& patch
   // use, it allocates a Metal buffer and memcpys into it, and doing that while a compute
   // encoder is open is not something the encoder's already-queued work is ordered against.
   // Touching them all up front also keeps the twelve blocks free of upload stalls.
-  std::vector<std::string> names = {"patch_embed.weight", "patch_embed.bias", "pos_embed.weight",
-                                    "merger.norm.weight", "merger.norm.bias", "merger.fc1.weight",
+  std::vector<std::string> names = {"patch_embed.weight", "patch_embed.bias",  "pos_embed.weight",
+                                    "merger.norm.weight", "merger.norm.bias",  "merger.fc1.weight",
                                     "merger.fc1.bias",    "merger.fc2.weight", "merger.fc2.bias"};
   for (int L = 0; L < c.vision_depth; ++L) {
     const std::string B = "blocks." + std::to_string(L) + ".";
     for (const char* t : {"norm1.weight", "norm1.bias", "norm2.weight", "norm2.bias",
-                          "attn.qkv.weight", "attn.qkv.bias", "attn.proj.weight",
-                          "attn.proj.bias", "mlp.fc1.weight", "mlp.fc1.bias", "mlp.fc2.weight",
-                          "mlp.fc2.bias"}) {
+                          "attn.qkv.weight", "attn.qkv.bias", "attn.proj.weight", "attn.proj.bias",
+                          "mlp.fc1.weight", "mlp.fc1.bias", "mlp.fc2.weight", "mlp.fc2.bias"}) {
       names.push_back(B + t);
     }
   }
@@ -320,8 +325,7 @@ std::vector<float> PlanMetalEngine::encode_image(const std::vector<float>& patch
     //
     // The position table is the one vision tensor the CPU has to read, because the resample is
     // done host-side; everything else stays on the GPU as a handle.
-    const auto* tab = reinterpret_cast<const std::uint16_t*>(
-        raw_data("vision.pos_embed.weight"));
+    const auto* tab = reinterpret_cast<const std::uint16_t*>(raw_data("vision.pos_embed.weight"));
     std::vector<float> tab32(static_cast<std::size_t>(c.vision_num_position_embeddings) * hidden);
     for (std::size_t i = 0; i < tab32.size(); ++i) tab32[i] = f16_bits_to_f32(tab[i]);
     const std::vector<float> pos =
@@ -508,8 +512,8 @@ void PlanMetalEngine::init_gemma_vision(const std::string& model_dir) {
     std::vector<float> cs(static_cast<std::size_t>(max_pos) * pairs), ss(cs.size());
     for (int p = 0; p < max_pos; ++p) {
       for (int j = 0; j < pairs; ++j) {
-        const float inv = std::pow(v.rope_theta,
-                                   -static_cast<float>(2 * j) / static_cast<float>(spatial_dim));
+        const float inv =
+            std::pow(v.rope_theta, -static_cast<float>(2 * j) / static_cast<float>(spatial_dim));
         const float ang = static_cast<float>(p) * inv;
         cs[static_cast<std::size_t>(p) * pairs + j] = std::cos(ang);
         ss[static_cast<std::size_t>(p) * pairs + j] = std::sin(ang);
@@ -551,9 +555,9 @@ void PlanMetalEngine::init_gemma_vision(const std::string& model_dir) {
   gvis_posx_buf_ = ctx_.alloc(static_cast<std::size_t>(P) * sizeof(std::int32_t));
   gvis_posy_buf_ = ctx_.alloc(static_cast<std::size_t>(P) * sizeof(std::int32_t));
   // clip_in staging: the widest gemv input is the MLP down-projection's (intermediate).
-  gvis_clamp_buf_ = ctx_.alloc(static_cast<std::size_t>(P) *
-                               static_cast<std::size_t>(std::max(H, v.intermediate)) *
-                               sizeof(std::uint16_t));
+  gvis_clamp_buf_ =
+      ctx_.alloc(static_cast<std::size_t>(P) *
+                 static_cast<std::size_t>(std::max(H, v.intermediate)) * sizeof(std::uint16_t));
   {
     std::vector<std::uint16_t> ones(static_cast<std::size_t>(H), cpi::f32_to_f16(1.0f));
     gvis_ones_buf_ = ctx_.alloc_from(ones.data(), ones.size() * sizeof(std::uint16_t));
@@ -607,12 +611,11 @@ std::vector<float> PlanMetalEngine::encode_image(const std::vector<float>& pixel
       struct VisPoolParams {
         std::uint32_t tokens, hidden, k, cells_x, out_tokens;
         float gain;
-      } p{static_cast<std::uint32_t>(P),       static_cast<std::uint32_t>(H),
-          static_cast<std::uint32_t>(k),       static_cast<std::uint32_t>(cells_x),
-          static_cast<std::uint32_t>(out_tokens),
-          std::sqrt(static_cast<float>(H))};
-      const void* bufs[] = {slot(opplan::Slot::X), gvis_posx_buf_.handle(),
-                            gvis_posy_buf_.handle(), slot(opplan::Slot::XNorm)};
+      } p{static_cast<std::uint32_t>(P),          static_cast<std::uint32_t>(H),
+          static_cast<std::uint32_t>(k),          static_cast<std::uint32_t>(cells_x),
+          static_cast<std::uint32_t>(out_tokens), std::sqrt(static_cast<float>(H))};
+      const void* bufs[] = {slot(opplan::Slot::X), gvis_posx_buf_.handle(), gvis_posy_buf_.handle(),
+                            slot(opplan::Slot::XNorm)};
       ctx_.dispatch("cpi_avg_pool_patches", runtime::MetalContext::Grid::Threads,
                     static_cast<std::size_t>(out_tokens) * static_cast<std::size_t>(H), 256, bufs,
                     nullptr, 4, &p, sizeof(p));
@@ -638,10 +641,8 @@ std::vector<float> PlanMetalEngine::encode_image(const std::vector<float>& pixel
       const void* bufs[] = {w, slot(opplan::Slot::XNorm), slot(opplan::Slot::Tmp), w};
       // text hidden is a multiple of kGemmFBM on every Gemma 4 (E2B: 1536) and the vision hidden
       // a multiple of 32, so the blocked GEMM's geometry holds; its store masks the token tail.
-      const std::size_t tiles =
-          static_cast<std::size_t>((out_tokens + kGemmBN - 1) / kGemmBN);
-      const std::size_t groups =
-          (static_cast<std::size_t>(cfg_.hidden_size) / kGemmFBM) * tiles;
+      const std::size_t tiles = static_cast<std::size_t>((out_tokens + kGemmBN - 1) / kGemmBN);
+      const std::size_t groups = (static_cast<std::size_t>(cfg_.hidden_size) / kGemmFBM) * tiles;
       ctx_.dispatch("cpi_gemm_f16", runtime::MetalContext::Grid::Groups, groups, kGemmTG, bufs,
                     nullptr, 4, &p, sizeof(p));
     }
@@ -688,10 +689,10 @@ std::vector<int> PlanMetalEngine::generate_multimodal(const std::vector<int>& to
           // straddling a chunk boundary would attend over unwritten cache. Prompts are far
           // below one chunk today; splitting chunks at span edges is the fix if that changes.
           if (lim > pos + chunk) {
-            throw std::runtime_error("bidirectional image span straddles a prefill chunk "
-                                     "boundary (limit " +
-                                     std::to_string(lim) + " > chunk end " +
-                                     std::to_string(pos + chunk) + ")");
+            throw std::runtime_error(
+                "bidirectional image span straddles a prefill chunk "
+                "boundary (limit " +
+                std::to_string(lim) + " > chunk end " + std::to_string(pos + chunk) + ")");
           }
           dst[t] = lim;
         }

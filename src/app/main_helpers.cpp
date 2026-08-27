@@ -1,6 +1,4 @@
 #include "app/main_helpers.hpp"
-#include "model/config_json.hpp"
-#include "model/safetensors_loader.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -12,6 +10,8 @@
 #include <sstream>
 #include <stdexcept>
 
+#include "model/config_json.hpp"
+#include "model/safetensors_loader.hpp"
 #include "model/weight_loader.hpp"
 
 #ifdef _WIN32
@@ -863,8 +863,7 @@ std::string infer_safetensors_model_family(const std::string& path) {
 
 ModelProbe probe_model(const std::string& model_path) {
   ModelProbe p;
-  p.is_cpi = model_path.size() > 4 &&
-             model_path.compare(model_path.size() - 4, 4, ".cpi") == 0;
+  p.is_cpi = model_path.size() > 4 && model_path.compare(model_path.size() - 4, 4, ".cpi") == 0;
   // A .cpi is a self-contained file, not a safetensors dir; skip the dir probes.
   p.is_safetensors_dir = !p.is_cpi && is_safetensors_model_dir(model_path);
   p.safetensors_family = p.is_cpi ? "" : infer_safetensors_model_family(model_path);
@@ -934,11 +933,11 @@ EngineChoice resolve_engine(const ModelProbe& probe, bool cuda_available, bool m
     case ModelFamilyKind::Gemma4:
       // Gemma 4 on Metal is on by default, same shape as Qwen3.5 below. Batched and
       // token-by-token prefill produce the same token stream (CPI_METAL_SEQ_AUX bisects), and
-      // text, quant and the vision tower are all verified on Apple Silicon against the CUDA backend.
+      // text, quant and the vision tower are all verified on Apple Silicon against the CUDA
+      // backend.
       if (use_gpu) return EngineChoice::PlanCuda;
       if (use_metal) return EngineChoice::Gemma4Metal;
-      throw std::runtime_error(
-          "Gemma 4 currently requires a GPU (a CUDA device or Apple Silicon)");
+      throw std::runtime_error("Gemma 4 currently requires a GPU (a CUDA device or Apple Silicon)");
     case ModelFamilyKind::Qwen35:
       // Metal runs Qwen3.5 as a shared op plan, verified token-identical to the CPU reference.
       // This branch has to exist for the probe fix above to be safe: teaching the probe to

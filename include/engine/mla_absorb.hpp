@@ -25,8 +25,8 @@ namespace engine {
 // qk_nope (it is identical in every head's row). lat rows are [kv_lora],
 // K rows are [nh*qkhd].
 __global__ inline void mla_lat_store_kernel(const __half* lat, const __half* K, __half* cache,
-                                            int kv_lora, int qk_nope, int qk_rope, int qkhd,
-                                            int nh, int T, int position, const int* d_position,
+                                            int kv_lora, int qk_nope, int qk_rope, int qkhd, int nh,
+                                            int T, int position, const int* d_position,
                                             int max_ctx) {
   const int r = blockIdx.x;
   if (r >= T) return;
@@ -45,8 +45,8 @@ __global__ inline void mla_lat_store_kernel(const __half* lat, const __half* K, 
 inline void launch_mla_lat_store(const __half* lat, const __half* K, __half* cache, int kv_lora,
                                  int qk_nope, int qk_rope, int qkhd, int nh, int T, int position,
                                  const int* d_position, int max_ctx, cudaStream_t stream) {
-  mla_lat_store_kernel<<<T, 192, 0, stream>>>(lat, K, cache, kv_lora, qk_nope, qk_rope, qkhd, nh,
-                                              T, position, d_position, max_ctx);
+  mla_lat_store_kernel<<<T, 192, 0, stream>>>(lat, K, cache, kv_lora, qk_nope, qk_rope, qkhd, nh, T,
+                                              position, d_position, max_ctx);
 }
 
 // Latent-only decode front end: replaces kv_b GEMV + assemble + materialized
@@ -57,12 +57,11 @@ inline void launch_mla_lat_store(const __half* lat, const __half* K, __half* cac
 // folded into both roped operands) so the absorbed scores are unchanged.
 // Grid: nh+1 blocks (block h ropes head h's q_pe; block nh handles k_pe and
 // the cache row).
-__global__ inline void mla_rope_q_store_lat_kernel(__half* Q, const __half* ckv,
-                                                   const __half* lat, __half* cache,
-                                                   const float* inv_freq, int nh, int qk_nope,
-                                                   int qk_rope, int qkhd, int kv_lora,
-                                                   int position, const int* d_position,
-                                                   int max_ctx, float attn_scaling) {
+__global__ inline void mla_rope_q_store_lat_kernel(__half* Q, const __half* ckv, const __half* lat,
+                                                   __half* cache, const float* inv_freq, int nh,
+                                                   int qk_nope, int qk_rope, int qkhd, int kv_lora,
+                                                   int position, const int* d_position, int max_ctx,
+                                                   float attn_scaling) {
   const int h = blockIdx.x;
   const int tid = threadIdx.x;
   if (d_position) position = *d_position;
@@ -100,10 +99,10 @@ __global__ inline void mla_rope_q_store_lat_kernel(__half* Q, const __half* ckv,
 }
 
 inline void launch_mla_rope_q_store_lat(__half* Q, const __half* ckv, const __half* lat,
-                                        __half* cache, const float* inv_freq, int nh,
-                                        int qk_nope, int qk_rope, int qkhd, int kv_lora,
-                                        int position, const int* d_position, int max_ctx,
-                                        float attn_scaling, cudaStream_t stream) {
+                                        __half* cache, const float* inv_freq, int nh, int qk_nope,
+                                        int qk_rope, int qkhd, int kv_lora, int position,
+                                        const int* d_position, int max_ctx, float attn_scaling,
+                                        cudaStream_t stream) {
   const size_t smem = static_cast<size_t>(qk_rope / 2) * sizeof(float2);
   mla_rope_q_store_lat_kernel<<<nh + 1, 64, smem, stream>>>(
       Q, ckv, lat, cache, inv_freq, nh, qk_nope, qk_rope, qkhd, kv_lora, position, d_position,
@@ -167,8 +166,8 @@ __global__ inline void mla_absorbed_attn_stats_kernel(const __half* q_abs, const
   const int chunk_end = min(chunk_start + chunk_size, seq_len);
 
   extern __shared__ float smem[];
-  float* q_sh = smem;                // [kdim] (read as float2 pairs when scoring)
-  float* score_sh = q_sh + kdim;     // [chunk_size]
+  float* q_sh = smem;             // [kdim] (read as float2 pairs when scoring)
+  float* score_sh = q_sh + kdim;  // [chunk_size]
 
   const int tid = threadIdx.x;
   const int warp_id = tid / 32;
@@ -191,8 +190,7 @@ __global__ inline void mla_absorbed_attn_stats_kernel(const __half* q_abs, const
       const float2 v = __half22float2(row2[p]);
       partial += qv.x * v.x + qv.y * v.y;
     }
-    for (int off = 16; off > 0; off >>= 1)
-      partial += __shfl_down_sync(0xffffffffu, partial, off);
+    for (int off = 16; off > 0; off >>= 1) partial += __shfl_down_sync(0xffffffffu, partial, off);
     if (lane == 0) score_sh[t - chunk_start] = partial * scale;
   }
   __syncthreads();
@@ -278,8 +276,7 @@ __global__ inline void mla_v_decompress_kernel(const __half* out_lat, const __ha
   }
   const __half2* w2 =
       reinterpret_cast<const __half2*>(w_uv + (static_cast<size_t>(h) * v_head + d) * vdim);
-  const __half2* l2 =
-      reinterpret_cast<const __half2*>(out_lat + static_cast<size_t>(h) * vdim);
+  const __half2* l2 = reinterpret_cast<const __half2*>(out_lat + static_cast<size_t>(h) * vdim);
   float a = 0.0f;
   for (int p = lane; p < vdim / 2; p += 32) {
     const float2 wv = __half22float2(w2[p]);
@@ -291,15 +288,14 @@ __global__ inline void mla_v_decompress_kernel(const __half* out_lat, const __ha
 }
 
 inline void launch_mla_absorbed_attention(const __half* q_abs, const __half* cache,
-                                          const __half* w_uv, __half* out_lat, __half* att,
-                                          int nh, int kdim, int vdim, int v_head, int qkhd,
-                                          float scale, int seq_len, const int* d_position,
-                                          float* sm, float* sl, float* so, int scratch_chunks,
-                                          bool fixed_grid, cudaStream_t stream) {
+                                          const __half* w_uv, __half* out_lat, __half* att, int nh,
+                                          int kdim, int vdim, int v_head, int qkhd, float scale,
+                                          int seq_len, const int* d_position, float* sm, float* sl,
+                                          float* so, int scratch_chunks, bool fixed_grid,
+                                          cudaStream_t stream) {
   constexpr int kChunk = 32;
   const int chunks =
-      fixed_grid ? scratch_chunks
-                 : min(scratch_chunks, (seq_len + kChunk - 1) / kChunk);
+      fixed_grid ? scratch_chunks : min(scratch_chunks, (seq_len + kChunk - 1) / kChunk);
   const dim3 grid(nh, chunks > 0 ? chunks : 1);
   const size_t smem = (static_cast<size_t>(kdim) + kChunk) * sizeof(float);
   mla_absorbed_attn_stats_kernel<<<grid, 256, smem, stream>>>(

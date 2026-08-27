@@ -571,9 +571,8 @@ void Qwen35CpuEngine::load_weight_pointers() {
   // lm_head.weight, so the output projection IS the embedding table; same [vocab, hidden]
   // shape, so it aliases directly. Requiring the tensor unconditionally made every such
   // checkpoint fail to load with "missing tensor: lm_head.weight".
-  lm_head_ = weights_.has_tensor("lm_head.weight")
-                 ? require_bf16_tensor(weights_, "lm_head.weight")
-                 : tok_embeddings_;
+  lm_head_ = weights_.has_tensor("lm_head.weight") ? require_bf16_tensor(weights_, "lm_head.weight")
+                                                   : tok_embeddings_;
 
   layers_.resize(static_cast<std::size_t>(cfg_.num_layers));
   for (int layer = 0; layer < cfg_.num_layers; ++layer) {
@@ -935,7 +934,6 @@ void Qwen35CpuEngine::run_mlp_layer(int layer) {
     x_[static_cast<std::size_t>(i)] += x_norm_[static_cast<std::size_t>(i)];
   }
 }
-
 
 void Qwen35CpuEngine::forward_token(int token, int position) {
   const std::uint16_t* emb_row = tok_embeddings_ + static_cast<std::size_t>(token) *

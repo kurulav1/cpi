@@ -72,8 +72,8 @@ public:
   void prefetch() const;
 
 private:
-  const std::byte* data_ = nullptr;  // base address of the mapped view
-  std::size_t size_ = 0;             // byte length of the mapped view
+  const std::byte* data_ = nullptr;      // base address of the mapped view
+  std::size_t size_ = 0;                 // byte length of the mapped view
   mutable std::thread prefetch_thread_;  // in-flight prefetch hint, joined by close()
 
 #ifdef _WIN32

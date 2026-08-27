@@ -51,30 +51,28 @@ namespace {
 // levels in forward order; a row's draft-scratch column and its stash slot
 // (1 + index; slot 0 is the root's output) both equal its concatenated index.
 struct TreeShape {
-  int rows;                     // verify rows (1 + nodes)
+  int rows;  // verify rows (1 + nodes)
   int nodes;
-  int root_children;            // root's top-n (dtok slots 0..n-1)
-  const int* row_depth;         // [rows] verify row depth (row 0 = 0)
-  const unsigned int* anc_mask; // [rows] verify ancestor bitmask (self incl)
-  const int (*child_rows)[4];   // [rows] verdict-walk children (verify rows)
-  const int* child_count;       // [rows]
-  int n_levels;                 // batched draft levels (depth 1..n_levels)
-  const int* lvl_b;             // [n_levels] level width
+  int root_children;             // root's top-n (dtok slots 0..n-1)
+  const int* row_depth;          // [rows] verify row depth (row 0 = 0)
+  const unsigned int* anc_mask;  // [rows] verify ancestor bitmask (self incl)
+  const int (*child_rows)[4];    // [rows] verdict-walk children (verify rows)
+  const int* child_count;        // [rows]
+  int n_levels;                  // batched draft levels (depth 1..n_levels)
+  const int* lvl_b;              // [n_levels] level width
   int total_lvl_rows;
-  const int* lvl_tok;           // [total] dtok slot of the row's input token
-  const int* lvl_feat;          // [total] stash row of the row's input feature
-  const unsigned int* lvl_mask; // [total] draft-scratch ancestor mask (self incl)
-  const int* lvl_dep;           // [total] row depth (rope offset)
-  const int (*lvl_child)[4];    // [total] children dtok slots
-  const int* lvl_child_n;       // [total]
+  const int* lvl_tok;            // [total] dtok slot of the row's input token
+  const int* lvl_feat;           // [total] stash row of the row's input feature
+  const unsigned int* lvl_mask;  // [total] draft-scratch ancestor mask (self incl)
+  const int* lvl_dep;            // [total] row depth (rope offset)
+  const int (*lvl_child)[4];     // [total] children dtok slots
+  const int* lvl_child_n;        // [total]
 };
 
 // Shape 10 (v1): root top-4, n0 top-2, n1/n4/n5/n7 top-1. Levels 2/2/1.
 constexpr int k10RowDepth[11] = {0, 1, 1, 1, 1, 2, 2, 2, 3, 3, 4};
-constexpr unsigned int k10AncMask[11] = {1u,  3u,   5u,   9u,  17u, 35u,
-                                         67u, 133u, 291u, 579u, 1315u};
-constexpr int k10ChildRows[11][4] = {{1, 2, 3, 4}, {5, 6}, {7}, {}, {}, {8},
-                                     {9},          {},     {},  {10}, {}};
+constexpr unsigned int k10AncMask[11] = {1u, 3u, 5u, 9u, 17u, 35u, 67u, 133u, 291u, 579u, 1315u};
+constexpr int k10ChildRows[11][4] = {{1, 2, 3, 4}, {5, 6}, {7}, {}, {}, {8}, {9}, {}, {}, {10}, {}};
 constexpr int k10ChildCount[11] = {4, 2, 1, 0, 0, 1, 1, 0, 0, 1, 0};
 constexpr int k10LvlB[3] = {2, 2, 1};
 // Level rows: n0, n1 | n4, n5 | n7.
@@ -89,13 +87,12 @@ constexpr int k10LvlChildN[5] = {2, 1, 1, 1, 1};
 // from n2, n10 from n3 (depth 2), n11/n12 from n4, n13 from n5, n14 from n7
 // (depth 3), n15 from n11 (depth 4).
 constexpr int k16RowDepth[17] = {0, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 4};
-constexpr unsigned int k16AncMask[17] = {
-    1u,    3u,    5u,     9u,     17u,   35u,   67u,   131u, 261u,
-    517u,  1033u, 2065u,  4131u,  8227u, 16451u, 33029u, 69667u};
-constexpr int k16ChildRows[17][4] = {{1, 2, 3, 4}, {5, 6, 7}, {8, 9}, {10}, {11},
-                                     {12, 13},     {14},      {},     {15}, {},
-                                     {},           {},        {16},   {},   {},
-                                     {},           {}};
+constexpr unsigned int k16AncMask[17] = {1u,    3u,    5u,     9u,     17u,   35u,
+                                         67u,   131u,  261u,   517u,   1033u, 2065u,
+                                         4131u, 8227u, 16451u, 33029u, 69667u};
+constexpr int k16ChildRows[17][4] = {{1, 2, 3, 4}, {5, 6, 7}, {8, 9}, {10}, {11}, {12, 13},
+                                     {14},         {},        {15},   {},   {},   {},
+                                     {16},         {},        {},     {},   {}};
 constexpr int k16ChildCount[17] = {4, 3, 2, 1, 1, 2, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0};
 constexpr int k16LvlB[3] = {4, 3, 1};
 // Level rows: n0, n1, n2, n3 | n4, n5, n7 | n11.
@@ -103,16 +100,15 @@ constexpr int k16LvlTok[8] = {0, 1, 2, 3, 4, 5, 7, 11};
 constexpr int k16LvlFeat[8] = {0, 0, 0, 0, 1, 1, 2, 5};
 constexpr unsigned int k16LvlMask[8] = {1u, 2u, 4u, 8u, 17u, 33u, 66u, 145u};
 constexpr int k16LvlDep[8] = {1, 1, 1, 1, 2, 2, 2, 3};
-constexpr int k16LvlChild[8][4] = {{4, 5, 6}, {7, 8}, {9},  {10},
-                                   {11, 12},  {13},   {14}, {15}};
+constexpr int k16LvlChild[8][4] = {{4, 5, 6}, {7, 8}, {9}, {10}, {11, 12}, {13}, {14}, {15}};
 constexpr int k16LvlChildN[8] = {3, 2, 1, 1, 2, 1, 1, 1};
 
-constexpr TreeShape kShape10 = {11, 10, 4, k10RowDepth, k10AncMask, k10ChildRows,
-                                k10ChildCount, 3, k10LvlB, 5, k10LvlTok, k10LvlFeat,
-                                k10LvlMask, k10LvlDep, k10LvlChild, k10LvlChildN};
-constexpr TreeShape kShape16 = {17, 16, 4, k16RowDepth, k16AncMask, k16ChildRows,
-                                k16ChildCount, 3, k16LvlB, 8, k16LvlTok, k16LvlFeat,
-                                k16LvlMask, k16LvlDep, k16LvlChild, k16LvlChildN};
+constexpr TreeShape kShape10 = {
+    11,      10, 4,         k10RowDepth, k10AncMask, k10ChildRows, k10ChildCount, 3,
+    k10LvlB, 5,  k10LvlTok, k10LvlFeat,  k10LvlMask, k10LvlDep,    k10LvlChild,   k10LvlChildN};
+constexpr TreeShape kShape16 = {
+    17,      16, 4,         k16RowDepth, k16AncMask, k16ChildRows, k16ChildCount, 3,
+    k16LvlB, 8,  k16LvlTok, k16LvlFeat,  k16LvlMask, k16LvlDep,    k16LvlChild,   k16LvlChildN};
 
 const TreeShape& tree_shape() {
   static const TreeShape* shape = [] {
@@ -184,24 +180,22 @@ void LlamaEngine::eagle_tree_level(int B, int row0, int n_scr) {
                                           d_eagle_btmp_, H, inter, B, CUDA_R_16F);
   kernels::launch_add_inplace(d_eagle_bx_, d_eagle_btmp_, B * H, s);
   // Stash the level's output hiddens (slot = 1 + concatenated row index).
-  CUDA_CHECK(cudaMemcpyAsync(d_eagle_tree_h_ + static_cast<std::size_t>(1 + row0) * H,
-                             d_eagle_bx_, static_cast<std::size_t>(B) * H * sizeof(__half),
+  CUDA_CHECK(cudaMemcpyAsync(d_eagle_tree_h_ + static_cast<std::size_t>(1 + row0) * H, d_eagle_bx_,
+                             static_cast<std::size_t>(B) * H * sizeof(__half),
                              cudaMemcpyDeviceToDevice, s));
   // Shared lm_head over the RAW draft hiddens, one batched pass; per-row
   // logits land in d_batch_logits_ for the caller's top-n extraction.
   if (B > d_batch_logits_cap_) {
     if (d_batch_logits_) cudaFree(d_batch_logits_);
-    CUDA_CHECK(cudaMalloc(&d_batch_logits_,
-                          static_cast<std::size_t>(B) * cfg.vocab_size * sizeof(float)));
+    CUDA_CHECK(
+        cudaMalloc(&d_batch_logits_, static_cast<std::size_t>(B) * cfg.vocab_size * sizeof(float)));
     d_batch_logits_cap_ = B;
   }
-  const void* head_src = lm_head_packed_.active()
-                             ? dequant_packed_for_gemm(lm_head_packed_, s)
-                             : static_cast<const void*>(d_lm_head_);
-  detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
-                                          lt_workspace_bytes_, s, const_cast<void*>(head_src),
-                                          d_eagle_bx_, d_batch_logits_, cfg.vocab_size, H, B,
-                                          CUDA_R_32F);
+  const void* head_src = lm_head_packed_.active() ? dequant_packed_for_gemm(lm_head_packed_, s)
+                                                  : static_cast<const void*>(d_lm_head_);
+  detail::dispatch_linear_rowmajor_weight(
+      cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, s,
+      const_cast<void*>(head_src), d_eagle_bx_, d_batch_logits_, cfg.vocab_size, H, B, CUDA_R_32F);
 }
 
 // Verify body: eagle_verify_forward with three swaps (per-row depth rope
@@ -234,14 +228,14 @@ void LlamaEngine::eagle_tree_verify_forward(int K) {
     launch_norm(d_x_, lw->norm_att, lw->norm_att_bias, d_x_norm_, K, hidden);
     const void* qkv_src = dequant_packed_qkv_for_gemm(*lw, s);
     if (qkv_src == nullptr) qkv_src = lw->wqkv;
-    detail::dispatch_linear_rowmajor_weight(
-        cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, s,
-        const_cast<void*>(qkv_src),
-        d_x_norm_, d_qkv_, q_hidden + 2 * kv_hidden, hidden, K, CUDA_R_16F);
-    CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_q_, q_row_bytes, qkv_base, qkv_stride_bytes,
-                                 q_row_bytes, K, cudaMemcpyDeviceToDevice, s));
-    CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_k_, kv_row_bytes, qkv_base + q_hidden,
-                                 qkv_stride_bytes, kv_row_bytes, K, cudaMemcpyDeviceToDevice, s));
+    detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
+                                            lt_workspace_bytes_, s, const_cast<void*>(qkv_src),
+                                            d_x_norm_, d_qkv_, q_hidden + 2 * kv_hidden, hidden, K,
+                                            CUDA_R_16F);
+    CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_q_, q_row_bytes, qkv_base, qkv_stride_bytes, q_row_bytes,
+                                 K, cudaMemcpyDeviceToDevice, s));
+    CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_k_, kv_row_bytes, qkv_base + q_hidden, qkv_stride_bytes,
+                                 kv_row_bytes, K, cudaMemcpyDeviceToDevice, s));
     CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_v_, kv_row_bytes, qkv_base + q_hidden + kv_hidden,
                                  qkv_stride_bytes, kv_row_bytes, K, cudaMemcpyDeviceToDevice, s));
     kernels::launch_rope_inplace_batched_offsets_device_pos(
@@ -260,48 +254,45 @@ void LlamaEngine::eagle_tree_verify_forward(int K) {
         static_cast<const __half*>(d_k_cache_) + static_cast<std::size_t>(layer) * layer_stride;
     auto* v_layer =
         static_cast<const __half*>(d_v_cache_) + static_cast<std::size_t>(layer) * layer_stride;
-    kernels::launch_attention_tree_split(
-        static_cast<const __half*>(d_prefill_q_), k_layer, v_layer, k_scr, v_scr,
-        static_cast<__half*>(d_att_), d_eagle_pos_, d_eagle_anc_mask_, K, K, cfg.num_heads,
-        cfg.num_kv_heads, head_dim, d_eagle_mt_m_, d_eagle_mt_l_, d_eagle_mt_o_, 32,
-        eagle_mt_chunks_, s);
+    kernels::launch_attention_tree_split(static_cast<const __half*>(d_prefill_q_), k_layer, v_layer,
+                                         k_scr, v_scr, static_cast<__half*>(d_att_), d_eagle_pos_,
+                                         d_eagle_anc_mask_, K, K, cfg.num_heads, cfg.num_kv_heads,
+                                         head_dim, d_eagle_mt_m_, d_eagle_mt_l_, d_eagle_mt_o_, 32,
+                                         eagle_mt_chunks_, s);
     // A packed k-quant weight has no fp16 copy for cuBLAS; expand it into the
     // shared prefill scratch. Same stream as the GEMM, so the expansion is
     // ordered before the read and before the next weight overwrites it.
-    const void* wo_src = lw->wo_packed.active()
-                              ? dequant_packed_for_gemm(lw->wo_packed, s)
-                              : static_cast<const void*>(lw->wo);
+    const void* wo_src = lw->wo_packed.active() ? dequant_packed_for_gemm(lw->wo_packed, s)
+                                                : static_cast<const void*>(lw->wo);
     detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
-                                            lt_workspace_bytes_, s, const_cast<void*>(wo_src), d_att_, d_ff3_, hidden,
-                                            q_hidden, K, CUDA_R_16F);
+                                            lt_workspace_bytes_, s, const_cast<void*>(wo_src),
+                                            d_att_, d_ff3_, hidden, q_hidden, K, CUDA_R_16F);
     kernels::launch_add_inplace(static_cast<__half*>(d_x_), static_cast<const __half*>(d_ff3_),
                                 K * hidden, s);
     launch_norm(d_x_, lw->norm_ffn, lw->norm_ffn_bias, d_x_norm_, K, hidden);
     // A packed k-quant weight has no fp16 copy for cuBLAS; expand it into the
     // shared prefill scratch. Same stream as the GEMM, so the expansion is
     // ordered before the read and before the next weight overwrites it.
-    const void* w13_src = lw->w13_packed.active()
-                              ? dequant_packed_for_gemm(lw->w13_packed, s)
-                              : static_cast<const void*>(lw->w13);
-    detail::dispatch_linear_rowmajor_weight(
-        cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, s, const_cast<void*>(w13_src),
-        d_x_norm_, d_ff13_, 2 * inter, hidden, K, CUDA_R_16F);
+    const void* w13_src = lw->w13_packed.active() ? dequant_packed_for_gemm(lw->w13_packed, s)
+                                                  : static_cast<const void*>(lw->w13);
+    detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
+                                            lt_workspace_bytes_, s, const_cast<void*>(w13_src),
+                                            d_x_norm_, d_ff13_, 2 * inter, hidden, K, CUDA_R_16F);
     CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_ff1_, ff_row_bytes, ff13_base, ff13_stride_bytes,
                                  ff_row_bytes, K, cudaMemcpyDeviceToDevice, s));
-    CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_ff2_, ff_row_bytes, ff13_base + inter,
-                                 ff13_stride_bytes, ff_row_bytes, K, cudaMemcpyDeviceToDevice, s));
+    CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_ff2_, ff_row_bytes, ff13_base + inter, ff13_stride_bytes,
+                                 ff_row_bytes, K, cudaMemcpyDeviceToDevice, s));
     detail::launch_gated_glu(cfg.mlp_gelu, static_cast<const __half*>(d_prefill_ff1_),
                              static_cast<const __half*>(d_prefill_ff2_),
                              static_cast<__half*>(d_prefill_ff2_), K * inter, s);
     // A packed k-quant weight has no fp16 copy for cuBLAS; expand it into the
     // shared prefill scratch. Same stream as the GEMM, so the expansion is
     // ordered before the read and before the next weight overwrites it.
-    const void* w2_src = lw->w2_packed.active()
-                              ? dequant_packed_for_gemm(lw->w2_packed, s)
-                              : static_cast<const void*>(lw->w2);
+    const void* w2_src = lw->w2_packed.active() ? dequant_packed_for_gemm(lw->w2_packed, s)
+                                                : static_cast<const void*>(lw->w2);
     detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
-                                            lt_workspace_bytes_, s, const_cast<void*>(w2_src), d_prefill_ff2_, d_ff3_,
-                                            hidden, inter, K, CUDA_R_16F);
+                                            lt_workspace_bytes_, s, const_cast<void*>(w2_src),
+                                            d_prefill_ff2_, d_ff3_, hidden, inter, K, CUDA_R_16F);
     kernels::launch_add_inplace(static_cast<__half*>(d_x_), static_cast<const __half*>(d_ff3_),
                                 K * hidden, s);
   }
@@ -344,15 +335,15 @@ std::vector<int> LlamaEngine::eagle_tree_generate(const std::vector<int>& prompt
                              cudaMemcpyHostToDevice, s));
   CUDA_CHECK(cudaMemcpyAsync(d_eagle_anc_mask_, shape.anc_mask, kRows * sizeof(unsigned int),
                              cudaMemcpyHostToDevice, s));
-  CUDA_CHECK(cudaMemcpyAsync(d_eagle_lvl_tok_, shape.lvl_tok,
-                             shape.total_lvl_rows * sizeof(int), cudaMemcpyHostToDevice, s));
-  CUDA_CHECK(cudaMemcpyAsync(d_eagle_lvl_feat_, shape.lvl_feat,
-                             shape.total_lvl_rows * sizeof(int), cudaMemcpyHostToDevice, s));
+  CUDA_CHECK(cudaMemcpyAsync(d_eagle_lvl_tok_, shape.lvl_tok, shape.total_lvl_rows * sizeof(int),
+                             cudaMemcpyHostToDevice, s));
+  CUDA_CHECK(cudaMemcpyAsync(d_eagle_lvl_feat_, shape.lvl_feat, shape.total_lvl_rows * sizeof(int),
+                             cudaMemcpyHostToDevice, s));
   CUDA_CHECK(cudaMemcpyAsync(d_eagle_lvl_mask_, shape.lvl_mask,
                              shape.total_lvl_rows * sizeof(unsigned int), cudaMemcpyHostToDevice,
                              s));
-  CUDA_CHECK(cudaMemcpyAsync(d_eagle_lvl_dep_, shape.lvl_dep,
-                             shape.total_lvl_rows * sizeof(int), cudaMemcpyHostToDevice, s));
+  CUDA_CHECK(cudaMemcpyAsync(d_eagle_lvl_dep_, shape.lvl_dep, shape.total_lvl_rows * sizeof(int),
+                             cudaMemcpyHostToDevice, s));
 
   int pos = static_cast<int>(prompt_tokens.size()) - 1;
   int cur = prompt_tokens.back();
@@ -370,8 +361,8 @@ std::vector<int> LlamaEngine::eagle_tree_generate(const std::vector<int>& prompt
 
   int next = decode_next_token(cur, pos, 0.0f, dummy_hist);
   CUDA_CHECK(cudaMemcpyAsync(d_eagle_feats_, d_x_norm_,
-                             static_cast<std::size_t>(H) * sizeof(__half),
-                             cudaMemcpyDeviceToDevice, s));
+                             static_cast<std::size_t>(H) * sizeof(__half), cudaMemcpyDeviceToDevice,
+                             s));
   out.push_back(next);
   bool stop = false;
   if (on_token && !on_token(next)) stop = true;
@@ -382,7 +373,7 @@ std::vector<int> LlamaEngine::eagle_tree_generate(const std::vector<int>& prompt
   int heal_tokens[8];
   int heal_feat_rows[8];  // verify row whose feature produced each healed pair
   int cur_feat_row = 0;
-  int scatter_rows[8];    // function-scope: async H2D source must outlive the copy
+  int scatter_rows[8];  // function-scope: async H2D source must outlive the copy
 
   // Room guard: the round writes the root catch-up pair at pos-1 and cache
   // slots up to pos + acc + 1 (acc <= max depth plus bonus).
@@ -424,8 +415,8 @@ std::vector<int> LlamaEngine::eagle_tree_generate(const std::vector<int>& prompt
         const int B = shape.lvl_b[lvl];
         eagle_tree_level(B, row0, shape.total_lvl_rows);
         for (int r = 0; r < B; ++r) {
-          float* logits =
-              d_batch_logits_ + static_cast<std::size_t>(r) * static_cast<std::size_t>(cfg.vocab_size);
+          float* logits = d_batch_logits_ +
+                          static_cast<std::size_t>(r) * static_cast<std::size_t>(cfg.vocab_size);
           const int nc = shape.lvl_child_n[row0 + r];
           for (int c = 0; c < nc; ++c) {
             if (c > 0) {
@@ -441,8 +432,8 @@ std::vector<int> LlamaEngine::eagle_tree_generate(const std::vector<int>& prompt
       }
     }
     int drafts[16];
-    CUDA_CHECK(cudaMemcpyAsync(drafts, d_eagle_dtoks_, kNodes * sizeof(int),
-                               cudaMemcpyDeviceToHost, s));
+    CUDA_CHECK(
+        cudaMemcpyAsync(drafts, d_eagle_dtoks_, kNodes * sizeof(int), cudaMemcpyDeviceToHost, s));
     CUDA_CHECK(cudaStreamSynchronize(s));
     drafted += kNodes;
     auto td = pclock::now();
@@ -482,8 +473,8 @@ std::vector<int> LlamaEngine::eagle_tree_generate(const std::vector<int>& prompt
       CUDA_CHECK(cudaGraphLaunch(eagle_vgraph_exec_, s));
     }
     int verdict[17];
-    CUDA_CHECK(cudaMemcpyAsync(verdict, d_eagle_verdict_, kRows * sizeof(int),
-                               cudaMemcpyDeviceToHost, s));
+    CUDA_CHECK(
+        cudaMemcpyAsync(verdict, d_eagle_verdict_, kRows * sizeof(int), cudaMemcpyDeviceToHost, s));
     CUDA_CHECK(cudaStreamSynchronize(s));
     ++verifies;
     if (prof) t_vfwd += psec(td, pclock::now());
@@ -563,8 +554,7 @@ std::vector<int> LlamaEngine::eagle_tree_generate(const std::vector<int>& prompt
                  "[eagle-prof] tree rounds=%d avg_ms: heal=%.2f draft=%.2f verify=%.2f "
                  "(fwd=%.2f scatter=%.2f) round=%.2f (tokens/round=%.2f -> %.1f tok/s in-loop)\n",
                  verifies, t_heal / n, t_draft / n, t_verify / n, t_vfwd / n, t_scatter / n,
-                 t_round / n, (accepted + verifies) / n,
-                 1000.0 * (accepted + verifies) / t_round);
+                 t_round / n, (accepted + verifies) / n, 1000.0 * (accepted + verifies) / t_round);
   }
   if (std::getenv("CPI_EAGLE_STATS")) {
     std::fprintf(stderr, "[eagle] tree verifies=%d drafted=%d accepted=%d tokens=%zu\n", verifies,

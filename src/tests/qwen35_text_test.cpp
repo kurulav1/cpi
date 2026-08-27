@@ -1,6 +1,7 @@
 // Qwen3.5's text stack against a HuggingFace logits oracle.
 //
-//   ./qwen35_text_test <model.ll2c> <oracle_dir>     (oracle_dir = tools/qwen35_text_oracle.py --out)
+//   ./qwen35_text_test <model.ll2c> <oracle_dir>     (oracle_dir = tools/qwen35_text_oracle.py
+//   --out)
 //
 // This exists because Qwen3.5 had no text gate. "Text is done and verified" was a comparison
 // somebody ran by hand once; nothing in src/tests would catch a regression, and metal_decode_test
@@ -34,8 +35,8 @@ namespace {
 int failures = 0;
 
 // must match TOKENS in tools/qwen35_text_oracle.py.
-const std::vector<int> kTokens = {3838, 374, 419, 30, 358, 1079, 264,
-                                  4128, 1614, 13, 6771, 752, 3291, 498};
+const std::vector<int> kTokens = {3838, 374,  419, 30,   358, 1079, 264,
+                                  4128, 1614, 13,  6771, 752, 3291, 498};
 
 std::vector<float> read_f32(const std::string& path) {
   std::FILE* f = std::fopen(path.c_str(), "rb");
@@ -103,8 +104,7 @@ int main(int argc, char** argv) {
   const std::vector<std::vector<float>> no_embeds(head.size());
   eng.prefill_multimodal(head, no_embeds);
 
-  const std::vector<float>& lg =
-      eng.forward_token(kTokens.back(), static_cast<int>(head.size()));
+  const std::vector<float>& lg = eng.forward_token(kTokens.back(), static_cast<int>(head.size()));
 
   if (lg.size() != ref.size()) {
     std::printf("  %-22s size %zu vs oracle %zu  FAIL\n", "TEXT_LOGITS", lg.size(), ref.size());
@@ -114,7 +114,10 @@ int main(int argc, char** argv) {
   // Mean-centre both: a constant offset across every logit changes neither softmax nor argmax,
   // so counting it as error would report a difference that cannot affect any output.
   double mg = 0.0, mr = 0.0;
-  for (std::size_t j = 0; j < lg.size(); ++j) { mg += lg[j]; mr += ref[j]; }
+  for (std::size_t j = 0; j < lg.size(); ++j) {
+    mg += lg[j];
+    mr += ref[j];
+  }
   mg /= static_cast<double>(lg.size());
   mr /= static_cast<double>(ref.size());
 
@@ -124,8 +127,7 @@ int main(int argc, char** argv) {
   int arg_g = 0, arg_r = 0;
   for (std::size_t j = 0; j < lg.size(); ++j) {
     if (!std::isfinite(lg[j])) ++nonfinite;
-    const float d =
-        std::fabs((lg[j] - static_cast<float>(mg)) - (ref[j] - static_cast<float>(mr)));
+    const float d = std::fabs((lg[j] - static_cast<float>(mg)) - (ref[j] - static_cast<float>(mr)));
     mx = std::max(mx, d);
     sum += d;
     if (lg[j] > lg[static_cast<std::size_t>(arg_g)]) arg_g = static_cast<int>(j);
@@ -176,7 +178,10 @@ int main(int argc, char** argv) {
   const std::vector<int> want = {15, 60, 283, 220, 15, 26, 198, 262};
   int match = 0;
   for (std::size_t i = 0; i < want.size() && i < got.size(); ++i) {
-    if (got[i] == want[i]) ++match; else break;
+    if (got[i] == want[i])
+      ++match;
+    else
+      break;
   }
   std::printf("      metal : ");
   for (int v : got) std::printf("%d ", v);

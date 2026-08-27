@@ -1,12 +1,14 @@
-// Verifies Multi-head Latent Attention (MLA, the DeepSeek-V2/V3/R1 attention) on-device against a host
-// fp32 oracle; isolated, model-blocked groundwork for native DeepSeek-V3/R1 (full checkpoints don't
-// fit this box), the same way the MXFP4 and DeepSeek-router bricks were landed. The MLA forward itself
-// lives in engine/mla_forward.hpp (reused by deepseek_mla_stack_test); this test exercises a single
-// layer and cross-checks the header's device path against its independent host path.
+// Verifies Multi-head Latent Attention (MLA, the DeepSeek-V2/V3/R1 attention) on-device against a
+// host fp32 oracle; isolated, model-blocked groundwork for native DeepSeek-V3/R1 (full checkpoints
+// don't fit this box), the same way the MXFP4 and DeepSeek-router bricks were landed. The MLA
+// forward itself lives in engine/mla_forward.hpp (reused by deepseek_mla_stack_test); this test
+// exercises a single layer and cross-checks the header's device path against its independent host
+// path.
 //
-// MLA compresses K and V into a shared low-rank latent c_KV (dim kv_lora_rank) plus a small decoupled
-// RoPE key k_R shared across heads; per-head keys/values are RECONSTRUCTED from that latent, so the KV
-// cache stores only (kv_lora_rank + qk_rope) numbers per token instead of the full per-head K,V.
+// MLA compresses K and V into a shared low-rank latent c_KV (dim kv_lora_rank) plus a small
+// decoupled RoPE key k_R shared across heads; per-head keys/values are RECONSTRUCTED from that
+// latent, so the KV cache stores only (kv_lora_rank + qk_rope) numbers per token instead of the
+// full per-head K,V.
 #include <cuda_runtime.h>
 
 #include <cmath>
@@ -26,7 +28,7 @@ float* dev(const std::vector<float>& h) {
 }  // namespace
 
 int main() {
-  engine::MLADims m{/*H*/ 128, /*nh*/ 4, /*q_lora*/ 24, /*kv_lora*/ 32,
+  engine::MLADims m{/*H*/ 128,      /*nh*/ 4,      /*q_lora*/ 24, /*kv_lora*/ 32,
                     /*qk_nope*/ 16, /*qk_rope*/ 8, /*v_head*/ 16};
   const int T = 5, hd = m.hd();
   std::mt19937 rng(7);
@@ -37,9 +39,10 @@ int main() {
     return v;
   };
   const auto hid = rnd(T * m.H);
-  const auto WDQ = rnd(m.q_lora * m.H), WUQ = rnd(m.nh * hd * m.q_lora), WDKV = rnd(m.kv_lora * m.H),
-             WKR = rnd(m.qk_rope * m.H), WUK = rnd(m.nh * m.qk_nope * m.kv_lora),
-             WUV = rnd(m.nh * m.v_head * m.kv_lora), WO = rnd(m.H * m.nh * m.v_head);
+  const auto WDQ = rnd(m.q_lora * m.H), WUQ = rnd(m.nh * hd * m.q_lora),
+             WDKV = rnd(m.kv_lora * m.H), WKR = rnd(m.qk_rope * m.H),
+             WUK = rnd(m.nh * m.qk_nope * m.kv_lora), WUV = rnd(m.nh * m.v_head * m.kv_lora),
+             WO = rnd(m.H * m.nh * m.v_head);
 
   // Host oracle via the header's independent host path.
   engine::MLAWeights hw{WDQ.data(), WUQ.data(), WDKV.data(), WKR.data(),
@@ -65,8 +68,9 @@ int main() {
   }
   const float rel = maxabs / denom;
   const bool pass = rel < 1e-4f;
-  std::printf("%s[MLA prefill]: device vs fp32 oracle, T=%d heads=%d qk=%d(+%d rope) v=%d, max rel %.2e\n",
-              pass ? "PASS" : "FAIL", T, m.nh, m.qk_nope, m.qk_rope, m.v_head, rel);
+  std::printf(
+      "%s[MLA prefill]: device vs fp32 oracle, T=%d heads=%d qk=%d(+%d rope) v=%d, max rel %.2e\n",
+      pass ? "PASS" : "FAIL", T, m.nh, m.qk_nope, m.qk_rope, m.v_head, rel);
 
   const int mla_cache = m.kv_lora + m.qk_rope;
   const int full_cache = m.nh * (hd + m.v_head);

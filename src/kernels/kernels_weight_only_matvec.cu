@@ -67,8 +67,7 @@ __device__ __forceinline__ int unpack_int4x4(std::uint8_t b0, std::uint8_t b1) {
 __device__ __forceinline__ int load_packed_int4x4(const int8_t* row_packed, int packed4_index) {
   const int byte_index = packed4_index * 2;
   if ((reinterpret_cast<std::uintptr_t>(row_packed) & 1u) == 0u) {
-    const std::uint16_t pair =
-        reinterpret_cast<const std::uint16_t*>(row_packed)[packed4_index];
+    const std::uint16_t pair = reinterpret_cast<const std::uint16_t*>(row_packed)[packed4_index];
     return unpack_int4x4(static_cast<std::uint8_t>(pair & 0xFFu),
                          static_cast<std::uint8_t>((pair >> 8) & 0xFFu));
   }
@@ -112,7 +111,8 @@ __global__ void weight_only_int8_gemv_f32_kernel(const int8_t* __restrict__ w,
       const float2 a = __half22float2(xh0[j]);
       acc += static_cast<float>(wb[j * 2 + 0]) * a.x + static_cast<float>(wb[j * 2 + 1]) * a.y;
       const float2 b = __half22float2(xh1[j]);
-      acc += static_cast<float>(wb[8 + j * 2 + 0]) * b.x + static_cast<float>(wb[8 + j * 2 + 1]) * b.y;
+      acc +=
+          static_cast<float>(wb[8 + j * 2 + 0]) * b.x + static_cast<float>(wb[8 + j * 2 + 1]) * b.y;
     }
   }
   for (int c = vecs * 16 + lane; c < in_features; c += warpSize) {
@@ -570,9 +570,8 @@ __global__ void weight_only_int4_matvec_grouped_dp4a_wide_kernel(
         // the kernel was 78% long-scoreboard stalled, largely on x-read L1TEX slots.
         const uint4 xa = reinterpret_cast<const uint4*>(xq)[2 * c];
         const uint4 xb = reinterpret_cast<const uint4*>(xq)[2 * c + 1];
-        const int xv[8] = {static_cast<int>(xa.x), static_cast<int>(xa.y),
-                           static_cast<int>(xa.z), static_cast<int>(xa.w),
-                           static_cast<int>(xb.x), static_cast<int>(xb.y),
+        const int xv[8] = {static_cast<int>(xa.x), static_cast<int>(xa.y), static_cast<int>(xa.z),
+                           static_cast<int>(xa.w), static_cast<int>(xb.x), static_cast<int>(xb.y),
                            static_cast<int>(xb.z), static_cast<int>(xb.w)};
         int gacc = 0;
 #pragma unroll
@@ -631,8 +630,8 @@ __global__ void weight_only_int4_matvec_grouped_dp4a_cat_kernel(
   }
   const int lane = threadIdx.x & (warpSize - 1);
   const int packed_cols = in_features / 2;
-  const uint4* wrow = reinterpret_cast<const uint4*>(
-      w + static_cast<std::size_t>(r) * static_cast<std::size_t>(packed_cols));
+  const uint4* wrow = reinterpret_cast<const uint4*>(w + static_cast<std::size_t>(r) *
+                                                             static_cast<std::size_t>(packed_cols));
   const float* row_s = s + static_cast<std::size_t>(r) * static_cast<std::size_t>(n_groups);
   const int* xw = reinterpret_cast<const int*>(xq);
 
@@ -659,9 +658,8 @@ __global__ void weight_only_int4_matvec_grouped_dp4a_cat_kernel(
         // the kernel was 78% long-scoreboard stalled, largely on x-read L1TEX slots.
         const uint4 xa = reinterpret_cast<const uint4*>(xq)[2 * c];
         const uint4 xb = reinterpret_cast<const uint4*>(xq)[2 * c + 1];
-        const int xv[8] = {static_cast<int>(xa.x), static_cast<int>(xa.y),
-                           static_cast<int>(xa.z), static_cast<int>(xa.w),
-                           static_cast<int>(xb.x), static_cast<int>(xb.y),
+        const int xv[8] = {static_cast<int>(xa.x), static_cast<int>(xa.y), static_cast<int>(xa.z),
+                           static_cast<int>(xa.w), static_cast<int>(xb.x), static_cast<int>(xb.y),
                            static_cast<int>(xb.z), static_cast<int>(xb.w)};
         int gacc = 0;
 #pragma unroll
@@ -697,9 +695,8 @@ __device__ __forceinline__ float glu_gelu_tanh_f32(float x) {
 template <int RowsPerBlock>
 __global__ void weight_only_int4_matvec_grouped_dp4a_glu_kernel(
     const int8_t* __restrict__ wg, const float* __restrict__ sg, const int8_t* __restrict__ wu,
-    const float* __restrict__ su, const int8_t* __restrict__ xq,
-    const float* __restrict__ x_scale, half* __restrict__ y, int out_features, int in_features,
-    int group_shift, int n_groups) {
+    const float* __restrict__ su, const int8_t* __restrict__ xq, const float* __restrict__ x_scale,
+    half* __restrict__ y, int out_features, int in_features, int group_shift, int n_groups) {
   __shared__ float pair_acc[2 * RowsPerBlock];
   const int warp_id = threadIdx.x / warpSize;
   const int lane = threadIdx.x & (warpSize - 1);
@@ -734,9 +731,8 @@ __global__ void weight_only_int4_matvec_grouped_dp4a_glu_kernel(
         if (c < chunks) {
           const uint4 xa = reinterpret_cast<const uint4*>(xq)[2 * c];
           const uint4 xb = reinterpret_cast<const uint4*>(xq)[2 * c + 1];
-          const int xv[8] = {static_cast<int>(xa.x), static_cast<int>(xa.y),
-                             static_cast<int>(xa.z), static_cast<int>(xa.w),
-                             static_cast<int>(xb.x), static_cast<int>(xb.y),
+          const int xv[8] = {static_cast<int>(xa.x), static_cast<int>(xa.y), static_cast<int>(xa.z),
+                             static_cast<int>(xa.w), static_cast<int>(xb.x), static_cast<int>(xb.y),
                              static_cast<int>(xb.z), static_cast<int>(xb.w)};
           const unsigned* wu4 = reinterpret_cast<const unsigned*>(&wbuf[u]);
           int gacc = 0;
@@ -746,8 +742,7 @@ __global__ void weight_only_int4_matvec_grouped_dp4a_glu_kernel(
             const int wlo =
                 __vsubss4(static_cast<int>((word & 0x0F0F0F0Fu) ^ 0x08080808u), 0x08080808);
             const int whi =
-                __vsubss4(static_cast<int>(((word >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u),
-                          0x08080808);
+                __vsubss4(static_cast<int>(((word >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u), 0x08080808);
             gacc = __dp4a(wlo, xv[2 * i], gacc);
             gacc = __dp4a(whi, xv[2 * i + 1], gacc);
           }
@@ -808,9 +803,8 @@ __global__ void weight_only_int4_matvec_grouped_dp4a_f32_kernel(
       if (c < chunks) {
         const uint4 xa = reinterpret_cast<const uint4*>(xq)[2 * c];
         const uint4 xb = reinterpret_cast<const uint4*>(xq)[2 * c + 1];
-        const int xv[8] = {static_cast<int>(xa.x), static_cast<int>(xa.y),
-                           static_cast<int>(xa.z), static_cast<int>(xa.w),
-                           static_cast<int>(xb.x), static_cast<int>(xb.y),
+        const int xv[8] = {static_cast<int>(xa.x), static_cast<int>(xa.y), static_cast<int>(xa.z),
+                           static_cast<int>(xa.w), static_cast<int>(xb.x), static_cast<int>(xb.y),
                            static_cast<int>(xb.z), static_cast<int>(xb.w)};
         const unsigned* wu = reinterpret_cast<const unsigned*>(&wbuf[u]);
         int gacc = 0;
@@ -842,9 +836,8 @@ __global__ void weight_only_int8_matvec_glu_kernel(const int8_t* __restrict__ wg
                                                    const float* __restrict__ sg,
                                                    const int8_t* __restrict__ wu,
                                                    const float* __restrict__ su,
-                                                   const half* __restrict__ x,
-                                                   half* __restrict__ y, int out_features,
-                                                   int in_features) {
+                                                   const half* __restrict__ x, half* __restrict__ y,
+                                                   int out_features, int in_features) {
   __shared__ float pair_acc[2 * RowsPerBlock];
   const int warp_id = threadIdx.x / warpSize;
   const int lane = threadIdx.x & (warpSize - 1);
@@ -855,8 +848,8 @@ __global__ void weight_only_int8_matvec_glu_kernel(const int8_t* __restrict__ wg
   if (row < out_features) {
     const int8_t* w = is_up ? wu : wg;
     const float* sc = is_up ? su : sg;
-    const int4* wrow = reinterpret_cast<const int4*>(
-        w + static_cast<std::size_t>(row) * static_cast<std::size_t>(in_features));
+    const int4* wrow = reinterpret_cast<const int4*>(w + static_cast<std::size_t>(row) *
+                                                             static_cast<std::size_t>(in_features));
     const half2* x2 = reinterpret_cast<const half2*>(x);
     const int chunks = in_features / 16;
     constexpr int kUnroll = 4;
@@ -877,8 +870,7 @@ __global__ void weight_only_int8_matvec_glu_kernel(const int8_t* __restrict__ wg
 #pragma unroll
           for (int i = 0; i < 8; ++i) {
             const float2 xv = __half22float2(x2[c * 8 + i]);
-            acc += static_cast<float>(wb[2 * i]) * xv.x +
-                   static_cast<float>(wb[2 * i + 1]) * xv.y;
+            acc += static_cast<float>(wb[2 * i]) * xv.x + static_cast<float>(wb[2 * i + 1]) * xv.y;
           }
         }
       }
@@ -947,8 +939,8 @@ __global__ void weight_only_int4_matvec_grouped_dp4a_mt_kernel(
         for (int i = 0; i < 4; ++i) {
           const unsigned word = wu[i];
           wlo[i] = __vsubss4(static_cast<int>((word & 0x0F0F0F0Fu) ^ 0x08080808u), 0x08080808);
-          whi[i] = __vsubss4(static_cast<int>(((word >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u),
-                             0x08080808);
+          whi[i] =
+              __vsubss4(static_cast<int>(((word >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u), 0x08080808);
         }
         for (int t = 0; t < tokens; ++t) {
           // x for the chunk as two 128-bit loads per token, matching the wide kernel;
@@ -997,8 +989,8 @@ __global__ void weight_only_int8_matvec_wide_kernel(const int8_t* __restrict__ w
     return;
   }
   const int lane = threadIdx.x & (warpSize - 1);
-  const int4* wrow = reinterpret_cast<const int4*>(
-      w + static_cast<std::size_t>(row) * static_cast<std::size_t>(in_features));
+  const int4* wrow = reinterpret_cast<const int4*>(w + static_cast<std::size_t>(row) *
+                                                           static_cast<std::size_t>(in_features));
   const half2* x2 = reinterpret_cast<const half2*>(x);
 
   const int chunks = in_features / 16;  // 16 weights per 16-byte chunk
@@ -1370,9 +1362,8 @@ __global__ void weight_only_int4_matvec_dual_dp4a_tiled_kernel(
 }  // namespace
 
 // Host launch wrappers for weight-only int8/int4 matvec kernels.
-void launch_weight_only_int8_gemv_f32(const int8_t* w, const float* scales, const half* x,
-                                      float* y, int out_features, int in_features,
-                                      cudaStream_t stream) {
+void launch_weight_only_int8_gemv_f32(const int8_t* w, const float* scales, const half* x, float* y,
+                                      int out_features, int in_features, cudaStream_t stream) {
   constexpr int kWarps = 4;
   const int blocks = (out_features + kWarps - 1) / kWarps;
   weight_only_int8_gemv_f32_kernel<kWarps>
@@ -1454,9 +1445,9 @@ void launch_weight_only_int4_matvec_grouped_dp4a(const int8_t* w_packed, const f
           w_packed, scales, xq, x_scale, y, out_features, in_features, shift, n_groups);
       return;
     default:
-      weight_only_int4_matvec_grouped_dp4a_wide_kernel<4><<<(out_features + 3) / 4, 4 * 32, 0,
-                                                            stream>>>(
-          w_packed, scales, xq, x_scale, y, out_features, in_features, shift, n_groups);
+      weight_only_int4_matvec_grouped_dp4a_wide_kernel<4>
+          <<<(out_features + 3) / 4, 4 * 32, 0, stream>>>(
+              w_packed, scales, xq, x_scale, y, out_features, in_features, shift, n_groups);
       return;
   }
 }
@@ -1474,27 +1465,28 @@ void launch_weight_only_int4_matvec_grouped_dp4a_cat(
   const int blocks = (total + warps - 1) / warps;
   switch (warps) {
     case 2:
-      weight_only_int4_matvec_grouped_dp4a_cat_kernel<2><<<blocks, 2 * 32, 0, stream>>>(
-          w0, s0, y0, n0, w1, s1, y1, n1, w2, s2, y2, n2, xq, x_scale, in_features, shift,
-          n_groups);
+      weight_only_int4_matvec_grouped_dp4a_cat_kernel<2>
+          <<<blocks, 2 * 32, 0, stream>>>(w0, s0, y0, n0, w1, s1, y1, n1, w2, s2, y2, n2, xq,
+                                          x_scale, in_features, shift, n_groups);
       return;
     case 8:
-      weight_only_int4_matvec_grouped_dp4a_cat_kernel<8><<<blocks, 8 * 32, 0, stream>>>(
-          w0, s0, y0, n0, w1, s1, y1, n1, w2, s2, y2, n2, xq, x_scale, in_features, shift,
-          n_groups);
+      weight_only_int4_matvec_grouped_dp4a_cat_kernel<8>
+          <<<blocks, 8 * 32, 0, stream>>>(w0, s0, y0, n0, w1, s1, y1, n1, w2, s2, y2, n2, xq,
+                                          x_scale, in_features, shift, n_groups);
       return;
     default:
-      weight_only_int4_matvec_grouped_dp4a_cat_kernel<4><<<(total + 3) / 4, 4 * 32, 0, stream>>>(
-          w0, s0, y0, n0, w1, s1, y1, n1, w2, s2, y2, n2, xq, x_scale, in_features, shift,
-          n_groups);
+      weight_only_int4_matvec_grouped_dp4a_cat_kernel<4>
+          <<<(total + 3) / 4, 4 * 32, 0, stream>>>(w0, s0, y0, n0, w1, s1, y1, n1, w2, s2, y2, n2,
+                                                   xq, x_scale, in_features, shift, n_groups);
       return;
   }
 }
 
-void launch_weight_only_int4_matvec_grouped_dp4a_glu(
-    const std::int8_t* wg, const float* sg, const std::int8_t* wu, const float* su,
-    const std::int8_t* xq, const float* x_scale, half* y, int out_features, int in_features,
-    int group, cudaStream_t stream, int warps) {
+void launch_weight_only_int4_matvec_grouped_dp4a_glu(const std::int8_t* wg, const float* sg,
+                                                     const std::int8_t* wu, const float* su,
+                                                     const std::int8_t* xq, const float* x_scale,
+                                                     half* y, int out_features, int in_features,
+                                                     int group, cudaStream_t stream, int warps) {
   const int shift = group_shift_of(group);
   if (shift < 0 || (group % 32) != 0 || (in_features % 32) != 0) {
     return;  // caller gates
@@ -1512,9 +1504,9 @@ void launch_weight_only_int4_matvec_grouped_dp4a_glu(
           wg, sg, wu, su, xq, x_scale, y, out_features, in_features, shift, n_groups);
       return;
     default:
-      weight_only_int4_matvec_grouped_dp4a_glu_kernel<4><<<(out_features + 3) / 4, 4 * 64, 0,
-                                                           stream>>>(
-          wg, sg, wu, su, xq, x_scale, y, out_features, in_features, shift, n_groups);
+      weight_only_int4_matvec_grouped_dp4a_glu_kernel<4>
+          <<<(out_features + 3) / 4, 4 * 64, 0, stream>>>(
+              wg, sg, wu, su, xq, x_scale, y, out_features, in_features, shift, n_groups);
       return;
   }
 }
@@ -1544,8 +1536,8 @@ void launch_weight_only_int8_matvec_glu(const std::int8_t* wg, const float* sg,
   }
   constexpr int kRows = 4;
   const int blocks = (out_features + kRows - 1) / kRows;
-  weight_only_int8_matvec_glu_kernel<kRows><<<blocks, kRows * 64, 0, stream>>>(
-      wg, sg, wu, su, x, y, out_features, in_features);
+  weight_only_int8_matvec_glu_kernel<kRows>
+      <<<blocks, kRows * 64, 0, stream>>>(wg, sg, wu, su, x, y, out_features, in_features);
 }
 
 // Dequantize a whole packed matrix back to fp16. Prefill-only: sequence mode runs the
@@ -1593,8 +1585,8 @@ __device__ __forceinline__ float e2m1_to_float(unsigned nib) {
   return (nib & 0x8u) ? -v : v;
 }
 __global__ void dequant_mxfp4_kernel(const std::uint8_t* __restrict__ packed,
-                                     const std::uint8_t* __restrict__ scales, half* __restrict__ out,
-                                     int rows, int cols) {
+                                     const std::uint8_t* __restrict__ scales,
+                                     half* __restrict__ out, int rows, int cols) {
   const int row = blockIdx.x;
   if (row >= rows) return;
   const int nblk = cols >> 5;  // cols / 32
@@ -1651,12 +1643,9 @@ void launch_weight_only_int4_matvec_grouped_dp4a_mt(const std::int8_t* w_packed,
   }
 }
 
-void launch_weight_only_int4_matvec_grouped_dp4a_mt_f32(const std::int8_t* w_packed,
-                                                        const float* scales, const std::int8_t* xq,
-                                                        const float* x_scales, float* y,
-                                                        int out_features, int in_features,
-                                                        int group, int tokens,
-                                                        cudaStream_t stream) {
+void launch_weight_only_int4_matvec_grouped_dp4a_mt_f32(
+    const std::int8_t* w_packed, const float* scales, const std::int8_t* xq, const float* x_scales,
+    float* y, int out_features, int in_features, int group, int tokens, cudaStream_t stream) {
   const int shift = group_shift_of(group);
   if (shift < 0 || (group % 32) != 0 || (in_features % 32) != 0 || tokens < 1 || tokens > 16) {
     return;  // caller gates
@@ -1993,7 +1982,6 @@ void launch_weight_only_int4_matvec_dual_dp4a(const int8_t* w_a_packed, const fl
     launch_split(std::integral_constant<int, 4>{}, std::integral_constant<int, 128>{});
   }
 }
-
 
 // Whole-matrix dequant to fp16 in LlamaEngine's cached low-bit layout, so a
 // prefill chunk can run a quantized weight through the tensor-core GEMM instead

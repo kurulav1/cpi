@@ -70,8 +70,7 @@ void LlamaEngine::require_batched_supported() const {
 int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
                                              const std::vector<int>& positions,
                                              const std::vector<int>& block_tables_flat,
-                                             int max_blocks,
-                                             const std::vector<int>& kv_slots) {
+                                             int max_blocks, const std::vector<int>& kv_slots) {
   const auto& cfg = weights_.config();
   const int batch = static_cast<int>(tokens.size());
   if (batch == 0) return 0;
@@ -152,12 +151,11 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
                                cudaMemcpyHostToDevice, compute_stream_));
   } else {
     const int width = std::min(max_blocks, table_stride);
-    CUDA_CHECK(cudaMemcpy2DAsync(d_batch_block_tables_,
-                                 static_cast<std::size_t>(table_stride) * sizeof(int),
-                                 block_tables_flat.data(),
-                                 static_cast<std::size_t>(max_blocks) * sizeof(int),
-                                 static_cast<std::size_t>(width) * sizeof(int), batch,
-                                 cudaMemcpyHostToDevice, compute_stream_));
+    CUDA_CHECK(cudaMemcpy2DAsync(
+        d_batch_block_tables_, static_cast<std::size_t>(table_stride) * sizeof(int),
+        block_tables_flat.data(), static_cast<std::size_t>(max_blocks) * sizeof(int),
+        static_cast<std::size_t>(width) * sizeof(int), batch, cudaMemcpyHostToDevice,
+        compute_stream_));
   }
   if (kv_quality) {
     if (kv_slots.empty()) {
@@ -196,169 +194,176 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
   // addresses capture would bake in, and the scratch grows on demand. Everything
   // below is pure device work on stable pointers.
   const auto run_compute = [&]() {
+    kernels::launch_embedding_lookup(static_cast<const __half*>(d_tok_embeddings_), d_token_id_,
+                                     static_cast<__half*>(d_x_), batch, hidden, compute_stream_);
+    if (cfg.scale_embeddings)  // Gemma: scale token embeddings by sqrt(hidden)
+      kernels::launch_scale_copy(static_cast<__half*>(d_x_), static_cast<const __half*>(d_x_),
+                                 batch * hidden, std::sqrt(static_cast<float>(hidden)),
+                                 compute_stream_);
 
-  kernels::launch_embedding_lookup(static_cast<const __half*>(d_tok_embeddings_), d_token_id_,
-                                   static_cast<__half*>(d_x_), batch, hidden, compute_stream_);
-  if (cfg.scale_embeddings)  // Gemma: scale token embeddings by sqrt(hidden)
-    kernels::launch_scale_copy(static_cast<__half*>(d_x_), static_cast<const __half*>(d_x_),
-                               batch * hidden, std::sqrt(static_cast<float>(hidden)),
-                               compute_stream_);
+    for (int layer = 0; layer < cfg.num_layers; ++layer) {
+      const LayerDeviceWeights* lw = &layer_cache_[static_cast<std::size_t>(layer)];
 
-  for (int layer = 0; layer < cfg.num_layers; ++layer) {
-    const LayerDeviceWeights* lw = &layer_cache_[static_cast<std::size_t>(layer)];
+      // --- Attention block ---
+      launch_norm(d_x_, lw->norm_att, lw->norm_att_bias, d_x_norm_, batch, hidden);
 
-    // --- Attention block ---
-    launch_norm(d_x_, lw->norm_att, lw->norm_att_bias, d_x_norm_, batch, hidden);
+      // Straight off the packed blocks when the batch is small enough to be worth
+      // it; otherwise expand once and let cuBLAS have it.
+      if (!packed_qkv_matmul(*lw, d_x_norm_, d_qkv_, batch, q_hidden + 2 * kv_hidden,
+                             compute_stream_)) {
+        const void* qkv_src = dequant_packed_qkv_for_gemm(*lw, compute_stream_);
+        if (qkv_src == nullptr) qkv_src = lw->wqkv;
+        detail::dispatch_linear_rowmajor_weight(
+            cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_,
+            compute_stream_, const_cast<void*>(qkv_src), d_x_norm_, d_qkv_,
+            q_hidden + 2 * kv_hidden, hidden, batch, CUDA_R_16F);
+      }
 
-    // Straight off the packed blocks when the batch is small enough to be worth
-    // it; otherwise expand once and let cuBLAS have it.
-    if (!packed_qkv_matmul(*lw, d_x_norm_, d_qkv_, batch, q_hidden + 2 * kv_hidden,
-                           compute_stream_)) {
-      const void* qkv_src = dequant_packed_qkv_for_gemm(*lw, compute_stream_);
-      if (qkv_src == nullptr) qkv_src = lw->wqkv;
-      detail::dispatch_linear_rowmajor_weight(
-          cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,
-          const_cast<void*>(qkv_src), d_x_norm_, d_qkv_, q_hidden + 2 * kv_hidden, hidden, batch,
-          CUDA_R_16F);
+      CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_q_, q_row_bytes, qkv_base, qkv_stride_bytes,
+                                   q_row_bytes, batch, cudaMemcpyDeviceToDevice, compute_stream_));
+      CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_k_, kv_row_bytes, qkv_base + q_hidden,
+                                   qkv_stride_bytes, kv_row_bytes, batch, cudaMemcpyDeviceToDevice,
+                                   compute_stream_));
+      CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_v_, kv_row_bytes, qkv_base + q_hidden + kv_hidden,
+                                   qkv_stride_bytes, kv_row_bytes, batch, cudaMemcpyDeviceToDevice,
+                                   compute_stream_));
+
+      if (lw->bqkv) {
+        const auto* bqkv_half = static_cast<const __half*>(lw->bqkv);
+        kernels::launch_add_bias_broadcast(static_cast<__half*>(d_prefill_q_), bqkv_half, batch,
+                                           q_hidden, compute_stream_);
+        kernels::launch_add_bias_broadcast(static_cast<__half*>(d_prefill_k_), bqkv_half + q_hidden,
+                                           batch, kv_hidden, compute_stream_);
+        kernels::launch_add_bias_broadcast(static_cast<__half*>(d_prefill_v_),
+                                           bqkv_half + q_hidden + kv_hidden, batch, kv_hidden,
+                                           compute_stream_);
+      }
+
+      if (lw->q_norm && lw->k_norm) {
+        // Qwen3 per-head RMSNorm on Q and K (batch rows × heads), pre-RoPE.
+        kernels::launch_rmsnorm(static_cast<const __half*>(d_prefill_q_),
+                                static_cast<const __half*>(lw->q_norm),
+                                static_cast<__half*>(d_prefill_q_), batch * cfg.num_heads, head_dim,
+                                cfg.norm_eps, compute_stream_);
+        kernels::launch_rmsnorm(static_cast<const __half*>(d_prefill_k_),
+                                static_cast<const __half*>(lw->k_norm),
+                                static_cast<__half*>(d_prefill_k_), batch * cfg.num_kv_heads,
+                                head_dim, cfg.norm_eps, compute_stream_);
+      }
+
+      kernels::launch_rope_inplace_perpos(static_cast<__half*>(d_prefill_q_),
+                                          static_cast<__half*>(d_prefill_k_), batch, cfg.num_heads,
+                                          cfg.num_kv_heads, head_dim, d_batch_positions_,
+                                          d_rope_cos_, d_rope_sin_, compute_stream_);
+
+      if (kv_int4_enabled_) {
+        const std::size_t k_row = static_cast<std::size_t>(head_dim * kv_quant_kbits_ / 8);
+        const std::size_t v_row = static_cast<std::size_t>(head_dim * kv_quant_vbits_ / 8);
+        const std::size_t token_heads = static_cast<std::size_t>(kv_capacity_tokens_) *
+                                        static_cast<std::size_t>(cfg.num_kv_heads);
+        auto* kq = d_k_cache_i4_ + static_cast<std::size_t>(layer) * token_heads * k_row;
+        auto* vq = d_v_cache_i4_ + static_cast<std::size_t>(layer) * token_heads * v_row;
+        auto* ksc = d_k_scales_ + static_cast<std::size_t>(layer) * token_heads;
+        auto* vsc = d_v_scales_ + static_cast<std::size_t>(layer) * token_heads;
+        // Layer bases of the per-slot fp16 sink/ring quality buffers (kernels add
+        // each row's slot offset from d_batch_kv_slots_).
+        const std::size_t sink_lstride = static_cast<std::size_t>(kv_quality_slots_) *
+                                         kv_quant_sink_ * cfg.num_kv_heads * head_dim;
+        const std::size_t ring_lstride = static_cast<std::size_t>(kv_quality_slots_) *
+                                         kv_quant_win_ * cfg.num_kv_heads * head_dim;
+        auto* sink_k = (kv_quality && d_kv_sink_k_) ? d_kv_sink_k_ + layer * sink_lstride : nullptr;
+        auto* sink_v = (kv_quality && d_kv_sink_v_) ? d_kv_sink_v_ + layer * sink_lstride : nullptr;
+        auto* ring_k = (kv_quality && d_kv_ring_k_) ? d_kv_ring_k_ + layer * ring_lstride : nullptr;
+        auto* ring_v = (kv_quality && d_kv_ring_v_) ? d_kv_ring_v_ + layer * ring_lstride : nullptr;
+        const int* slot_ids = kv_quality ? d_batch_kv_slots_ : nullptr;
+        kernels::launch_store_kv_batched_paged_quant(
+            static_cast<const __half*>(d_prefill_k_), static_cast<const __half*>(d_prefill_v_), kq,
+            vq, ksc, vsc, d_batch_block_tables_, d_batch_positions_, table_stride, batch,
+            cfg.num_kv_heads, head_dim, bs, kv_quant_kbits_, kv_quant_vbits_, kv_quant_rot_,
+            compute_stream_, slot_ids, sink_k, sink_v, ring_k, ring_v, kv_quant_sink_,
+            kv_quant_win_);
+        kernels::launch_attention_step_batched_paged_quant(
+            static_cast<const __half*>(d_prefill_q_), kq, vq, ksc, vsc, d_batch_block_tables_,
+            d_batch_seq_lens_, table_stride, bucket_seq, static_cast<__half*>(d_att_), batch,
+            cfg.num_heads, cfg.num_kv_heads, head_dim, bs, kv_quant_kbits_, kv_quant_vbits_,
+            kv_quant_rot_, compute_stream_, scratch_m, scratch_l, scratch_o, chunks, slot_ids,
+            sink_k, sink_v, ring_k, ring_v, kv_quant_sink_, kv_quant_win_);
+      } else {
+        auto* k_pool =
+            static_cast<__half*>(d_k_cache_) + static_cast<std::size_t>(layer) * layer_stride;
+        auto* v_pool =
+            static_cast<__half*>(d_v_cache_) + static_cast<std::size_t>(layer) * layer_stride;
+        kernels::launch_store_kv_batched_paged(
+            k_pool, v_pool, static_cast<const __half*>(d_prefill_k_),
+            static_cast<const __half*>(d_prefill_v_), d_batch_block_tables_, d_batch_positions_,
+            table_stride, batch, kv_hidden, bs, compute_stream_);
+
+        kernels::launch_attention_step_batched_paged(
+            static_cast<const __half*>(d_prefill_q_), k_pool, v_pool, d_batch_block_tables_,
+            d_batch_seq_lens_, table_stride, bucket_seq, static_cast<__half*>(d_att_), batch,
+            cfg.num_heads, cfg.num_kv_heads, head_dim, bs, compute_stream_, scratch_m, scratch_l,
+            scratch_o, chunks);
+      }
+
+      // A packed k-quant weight has no fp16 copy for cuBLAS; expand it into the
+      // shared prefill scratch. Same stream as the GEMM, so the expansion is
+      // ordered before the read and before the next weight overwrites it.
+      if (!packed_matmul(lw->wo_packed, d_att_, d_ff3_, batch, hidden, 0, compute_stream_)) {
+        const void* wo_src = lw->wo_packed.active()
+                                 ? dequant_packed_for_gemm(lw->wo_packed, compute_stream_)
+                                 : static_cast<const void*>(lw->wo);
+        detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
+                                                lt_workspace_bytes_, compute_stream_,
+                                                const_cast<void*>(wo_src), d_att_, d_ff3_, hidden,
+                                                q_hidden, batch, CUDA_R_16F);
+      }
+      maybe_add_half_bias(d_ff3_, lw->bo, batch, hidden);
+      kernels::launch_add_inplace(static_cast<__half*>(d_x_), static_cast<const __half*>(d_ff3_),
+                                  batch * hidden, compute_stream_);
+
+      // --- FFN block ---
+      launch_norm(d_x_, lw->norm_ffn, lw->norm_ffn_bias, d_x_norm_, batch, hidden);
+
+      // A packed k-quant weight has no fp16 copy for cuBLAS; expand it into the
+      // shared prefill scratch. Same stream as the GEMM, so the expansion is
+      // ordered before the read and before the next weight overwrites it.
+      if (!packed_matmul(lw->w13_packed, d_x_norm_, d_ff13_, batch, 2 * inter, 0,
+                         compute_stream_)) {
+        const void* w13_src = lw->w13_packed.active()
+                                  ? dequant_packed_for_gemm(lw->w13_packed, compute_stream_)
+                                  : static_cast<const void*>(lw->w13);
+        detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
+                                                lt_workspace_bytes_, compute_stream_,
+                                                const_cast<void*>(w13_src), d_x_norm_, d_ff13_,
+                                                2 * inter, hidden, batch, CUDA_R_16F);
+      }
+      CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_ff1_, ff_row_bytes, ff13_base, ff13_stride_bytes,
+                                   ff_row_bytes, batch, cudaMemcpyDeviceToDevice, compute_stream_));
+      CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_ff2_, ff_row_bytes, ff13_base + inter,
+                                   ff13_stride_bytes, ff_row_bytes, batch, cudaMemcpyDeviceToDevice,
+                                   compute_stream_));
+      detail::launch_gated_glu(
+          weights_.config().mlp_gelu, static_cast<const __half*>(d_prefill_ff1_),
+          static_cast<const __half*>(d_prefill_ff2_), static_cast<__half*>(d_prefill_ff2_),
+          batch * inter, compute_stream_);
+      // A packed k-quant weight has no fp16 copy for cuBLAS; expand it into the
+      // shared prefill scratch. Same stream as the GEMM, so the expansion is
+      // ordered before the read and before the next weight overwrites it.
+      if (!packed_matmul(lw->w2_packed, d_prefill_ff2_, d_ff3_, batch, hidden, 0,
+                         compute_stream_)) {
+        const void* w2_src = lw->w2_packed.active()
+                                 ? dequant_packed_for_gemm(lw->w2_packed, compute_stream_)
+                                 : static_cast<const void*>(lw->w2);
+        detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
+                                                lt_workspace_bytes_, compute_stream_,
+                                                const_cast<void*>(w2_src), d_prefill_ff2_, d_ff3_,
+                                                hidden, inter, batch, CUDA_R_16F);
+      }
+      kernels::launch_add_inplace(static_cast<__half*>(d_x_), static_cast<const __half*>(d_ff3_),
+                                  batch * hidden, compute_stream_);
     }
 
-    CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_q_, q_row_bytes, qkv_base, qkv_stride_bytes, q_row_bytes,
-                                 batch, cudaMemcpyDeviceToDevice, compute_stream_));
-    CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_k_, kv_row_bytes, qkv_base + q_hidden, qkv_stride_bytes,
-                                 kv_row_bytes, batch, cudaMemcpyDeviceToDevice, compute_stream_));
-    CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_v_, kv_row_bytes, qkv_base + q_hidden + kv_hidden,
-                                 qkv_stride_bytes, kv_row_bytes, batch, cudaMemcpyDeviceToDevice,
-                                 compute_stream_));
-
-    if (lw->bqkv) {
-      const auto* bqkv_half = static_cast<const __half*>(lw->bqkv);
-      kernels::launch_add_bias_broadcast(static_cast<__half*>(d_prefill_q_), bqkv_half, batch,
-                                         q_hidden, compute_stream_);
-      kernels::launch_add_bias_broadcast(static_cast<__half*>(d_prefill_k_), bqkv_half + q_hidden,
-                                         batch, kv_hidden, compute_stream_);
-      kernels::launch_add_bias_broadcast(static_cast<__half*>(d_prefill_v_),
-                                         bqkv_half + q_hidden + kv_hidden, batch, kv_hidden,
-                                         compute_stream_);
-    }
-
-    if (lw->q_norm && lw->k_norm) {
-      // Qwen3 per-head RMSNorm on Q and K (batch rows × heads), pre-RoPE.
-      kernels::launch_rmsnorm(static_cast<const __half*>(d_prefill_q_),
-                              static_cast<const __half*>(lw->q_norm),
-                              static_cast<__half*>(d_prefill_q_), batch * cfg.num_heads, head_dim,
-                              cfg.norm_eps, compute_stream_);
-      kernels::launch_rmsnorm(static_cast<const __half*>(d_prefill_k_),
-                              static_cast<const __half*>(lw->k_norm),
-                              static_cast<__half*>(d_prefill_k_), batch * cfg.num_kv_heads,
-                              head_dim, cfg.norm_eps, compute_stream_);
-    }
-
-    kernels::launch_rope_inplace_perpos(static_cast<__half*>(d_prefill_q_),
-                                        static_cast<__half*>(d_prefill_k_), batch, cfg.num_heads,
-                                        cfg.num_kv_heads, head_dim, d_batch_positions_, d_rope_cos_,
-                                        d_rope_sin_, compute_stream_);
-
-    if (kv_int4_enabled_) {
-      const std::size_t k_row = static_cast<std::size_t>(head_dim * kv_quant_kbits_ / 8);
-      const std::size_t v_row = static_cast<std::size_t>(head_dim * kv_quant_vbits_ / 8);
-      const std::size_t token_heads = static_cast<std::size_t>(kv_capacity_tokens_) *
-                                      static_cast<std::size_t>(cfg.num_kv_heads);
-      auto* kq = d_k_cache_i4_ + static_cast<std::size_t>(layer) * token_heads * k_row;
-      auto* vq = d_v_cache_i4_ + static_cast<std::size_t>(layer) * token_heads * v_row;
-      auto* ksc = d_k_scales_ + static_cast<std::size_t>(layer) * token_heads;
-      auto* vsc = d_v_scales_ + static_cast<std::size_t>(layer) * token_heads;
-      // Layer bases of the per-slot fp16 sink/ring quality buffers (kernels add
-      // each row's slot offset from d_batch_kv_slots_).
-      const std::size_t sink_lstride = static_cast<std::size_t>(kv_quality_slots_) *
-                                       kv_quant_sink_ * cfg.num_kv_heads * head_dim;
-      const std::size_t ring_lstride = static_cast<std::size_t>(kv_quality_slots_) *
-                                       kv_quant_win_ * cfg.num_kv_heads * head_dim;
-      auto* sink_k = (kv_quality && d_kv_sink_k_) ? d_kv_sink_k_ + layer * sink_lstride : nullptr;
-      auto* sink_v = (kv_quality && d_kv_sink_v_) ? d_kv_sink_v_ + layer * sink_lstride : nullptr;
-      auto* ring_k = (kv_quality && d_kv_ring_k_) ? d_kv_ring_k_ + layer * ring_lstride : nullptr;
-      auto* ring_v = (kv_quality && d_kv_ring_v_) ? d_kv_ring_v_ + layer * ring_lstride : nullptr;
-      const int* slot_ids = kv_quality ? d_batch_kv_slots_ : nullptr;
-      kernels::launch_store_kv_batched_paged_quant(
-          static_cast<const __half*>(d_prefill_k_), static_cast<const __half*>(d_prefill_v_), kq,
-          vq, ksc, vsc, d_batch_block_tables_, d_batch_positions_, table_stride, batch,
-          cfg.num_kv_heads, head_dim, bs, kv_quant_kbits_, kv_quant_vbits_, kv_quant_rot_,
-          compute_stream_, slot_ids, sink_k, sink_v, ring_k, ring_v, kv_quant_sink_,
-          kv_quant_win_);
-      kernels::launch_attention_step_batched_paged_quant(
-          static_cast<const __half*>(d_prefill_q_), kq, vq, ksc, vsc, d_batch_block_tables_,
-          d_batch_seq_lens_, table_stride, bucket_seq, static_cast<__half*>(d_att_), batch,
-          cfg.num_heads, cfg.num_kv_heads, head_dim, bs, kv_quant_kbits_, kv_quant_vbits_,
-          kv_quant_rot_, compute_stream_, scratch_m, scratch_l, scratch_o, chunks, slot_ids,
-          sink_k, sink_v, ring_k, ring_v, kv_quant_sink_, kv_quant_win_);
-    } else {
-      auto* k_pool =
-          static_cast<__half*>(d_k_cache_) + static_cast<std::size_t>(layer) * layer_stride;
-      auto* v_pool =
-          static_cast<__half*>(d_v_cache_) + static_cast<std::size_t>(layer) * layer_stride;
-      kernels::launch_store_kv_batched_paged(
-          k_pool, v_pool, static_cast<const __half*>(d_prefill_k_),
-          static_cast<const __half*>(d_prefill_v_), d_batch_block_tables_, d_batch_positions_,
-          table_stride, batch, kv_hidden, bs, compute_stream_);
-
-      kernels::launch_attention_step_batched_paged(
-          static_cast<const __half*>(d_prefill_q_), k_pool, v_pool, d_batch_block_tables_,
-          d_batch_seq_lens_, table_stride, bucket_seq, static_cast<__half*>(d_att_), batch,
-          cfg.num_heads, cfg.num_kv_heads, head_dim, bs, compute_stream_, scratch_m, scratch_l,
-          scratch_o, chunks);
-    }
-
-    // A packed k-quant weight has no fp16 copy for cuBLAS; expand it into the
-    // shared prefill scratch. Same stream as the GEMM, so the expansion is
-    // ordered before the read and before the next weight overwrites it.
-    if (!packed_matmul(lw->wo_packed, d_att_, d_ff3_, batch, hidden, 0, compute_stream_)) {
-      const void* wo_src = lw->wo_packed.active()
-                               ? dequant_packed_for_gemm(lw->wo_packed, compute_stream_)
-                               : static_cast<const void*>(lw->wo);
-      detail::dispatch_linear_rowmajor_weight(
-          cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,
-          const_cast<void*>(wo_src), d_att_, d_ff3_, hidden, q_hidden, batch, CUDA_R_16F);
-    }
-    maybe_add_half_bias(d_ff3_, lw->bo, batch, hidden);
-    kernels::launch_add_inplace(static_cast<__half*>(d_x_), static_cast<const __half*>(d_ff3_),
-                                batch * hidden, compute_stream_);
-
-    // --- FFN block ---
-    launch_norm(d_x_, lw->norm_ffn, lw->norm_ffn_bias, d_x_norm_, batch, hidden);
-
-    // A packed k-quant weight has no fp16 copy for cuBLAS; expand it into the
-    // shared prefill scratch. Same stream as the GEMM, so the expansion is
-    // ordered before the read and before the next weight overwrites it.
-    if (!packed_matmul(lw->w13_packed, d_x_norm_, d_ff13_, batch, 2 * inter, 0, compute_stream_)) {
-      const void* w13_src = lw->w13_packed.active()
-                                ? dequant_packed_for_gemm(lw->w13_packed, compute_stream_)
-                                : static_cast<const void*>(lw->w13);
-      detail::dispatch_linear_rowmajor_weight(
-          cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,
-          const_cast<void*>(w13_src), d_x_norm_, d_ff13_, 2 * inter, hidden, batch, CUDA_R_16F);
-    }
-    CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_ff1_, ff_row_bytes, ff13_base, ff13_stride_bytes,
-                                 ff_row_bytes, batch, cudaMemcpyDeviceToDevice, compute_stream_));
-    CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_ff2_, ff_row_bytes, ff13_base + inter, ff13_stride_bytes,
-                                 ff_row_bytes, batch, cudaMemcpyDeviceToDevice, compute_stream_));
-    detail::launch_gated_glu(weights_.config().mlp_gelu, static_cast<const __half*>(d_prefill_ff1_),
-                             static_cast<const __half*>(d_prefill_ff2_),
-                             static_cast<__half*>(d_prefill_ff2_), batch * inter, compute_stream_);
-    // A packed k-quant weight has no fp16 copy for cuBLAS; expand it into the
-    // shared prefill scratch. Same stream as the GEMM, so the expansion is
-    // ordered before the read and before the next weight overwrites it.
-    if (!packed_matmul(lw->w2_packed, d_prefill_ff2_, d_ff3_, batch, hidden, 0, compute_stream_)) {
-      const void* w2_src = lw->w2_packed.active()
-                               ? dequant_packed_for_gemm(lw->w2_packed, compute_stream_)
-                               : static_cast<const void*>(lw->w2);
-      detail::dispatch_linear_rowmajor_weight(
-          cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,
-          const_cast<void*>(w2_src), d_prefill_ff2_, d_ff3_, hidden, inter, batch, CUDA_R_16F);
-    }
-    kernels::launch_add_inplace(static_cast<__half*>(d_x_), static_cast<const __half*>(d_ff3_),
-                                batch * hidden, compute_stream_);
-  }
-
-  launch_norm(d_x_, d_norm_out_, d_norm_out_bias_, d_x_norm_, batch, hidden);
+    launch_norm(d_x_, d_norm_out_, d_norm_out_bias_, d_x_norm_, batch, hidden);
   };  // run_compute
 
   // CPI_BATCH_GRAPH=0 disables. The batched path has no graph today and nsys says
@@ -466,9 +471,9 @@ void LlamaEngine::batched_lm_head(int batch, int hidden, int vocab) {
     const void* head_src = lm_head_packed_.active()
                                ? dequant_packed_for_gemm(lm_head_packed_, compute_stream_)
                                : static_cast<const void*>(d_lm_head_);
-  detail::dispatch_linear_rowmajor_weight(
-      cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,
-      const_cast<void*>(head_src), d_x_norm_, d_batch_logits_, vocab, hidden, batch, CUDA_R_32F);
+    detail::dispatch_linear_rowmajor_weight(
+        cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,
+        const_cast<void*>(head_src), d_x_norm_, d_batch_logits_, vocab, hidden, batch, CUDA_R_32F);
   }
   if (d_lm_head_bias_) {
     for (int b = 0; b < batch; ++b) {
@@ -552,8 +557,7 @@ void LlamaEngine::decode_step_batched_logits(const std::vector<int>& tokens,
 bool LlamaEngine::decode_step_batched_topk(
     const std::vector<int>& tokens, const std::vector<int>& positions,
     const std::vector<int>& block_tables_flat, int max_blocks, const BatchTopkParams& sp,
-    std::vector<std::vector<detail::SampleCandidate>>& out_cand,
-    const std::vector<int>& kv_slots) {
+    std::vector<std::vector<detail::SampleCandidate>>& out_cand, const std::vector<int>& kv_slots) {
   // must match llama_engine_graph.cpp: the shared d_topk_/d_cand_ buffers are sized to these.
   constexpr int kMaxDeviceTopK = 1024;
   constexpr int kCandCapacity = 4096;
@@ -1398,8 +1402,8 @@ void LlamaEngine::ensure_kv_quality_slots(int min_slots) {
     const std::size_t old_layer = static_cast<std::size_t>(kv_quality_slots_) * slot_elems;
     const std::size_t new_layer = static_cast<std::size_t>(new_slots) * slot_elems;
     __half* nb = nullptr;
-    CUDA_CHECK(cudaMalloc(&nb, static_cast<std::size_t>(cfg.num_layers) * new_layer *
-                                   sizeof(__half)));
+    CUDA_CHECK(
+        cudaMalloc(&nb, static_cast<std::size_t>(cfg.num_layers) * new_layer * sizeof(__half)));
     // No memset of the new region: reads never touch a slot position the owning
     // sequence didn't itself write (see the reset_kv_cache note in lifecycle.cpp).
     for (int l = 0; l < cfg.num_layers; ++l) {
@@ -1415,9 +1419,8 @@ void LlamaEngine::ensure_kv_quality_slots(int min_slots) {
   grow(d_kv_ring_v_, kv_quant_win_);
   if (options_.verbose) {
     std::printf("[engine] kv quality slots %d -> %d (%.1f MB)\n", kv_quality_slots_, new_slots,
-                static_cast<double>(cfg.num_layers) * new_slots *
-                    (kv_quant_sink_ + kv_quant_win_) * kv_hidden * 2 * sizeof(__half) /
-                    (1024.0 * 1024.0));
+                static_cast<double>(cfg.num_layers) * new_slots * (kv_quant_sink_ + kv_quant_win_) *
+                    kv_hidden * 2 * sizeof(__half) / (1024.0 * 1024.0));
   }
   kv_quality_slots_ = new_slots;
 }

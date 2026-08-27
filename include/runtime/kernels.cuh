@@ -24,11 +24,10 @@
 // INFINITY is used in default arguments below. nvcc and MSVC happen to pull it in
 // transitively, so this header compiled fine everywhere it was tried; GCC compiling
 // a plain .cpp that includes it does not, which broke every Linux CUDA build.
-#include <cmath>
-
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <cmath>
 #include <cstdint>
 
 namespace kernels {
@@ -354,8 +353,7 @@ void launch_eagle_cat_gather(const half* embedding, const int* dtoks, const int*
 // per-layer [scr_rows, kv_hidden] scratch into every layer's cache at base..base+n-1.
 void launch_eagle_tree_scatter(const half* k_scr, const half* v_scr, half* k_cache, half* v_cache,
                                const int* rows_idx, int n, int base, int kv_hidden, int scr_rows,
-                               int num_layers, std::size_t cache_layer_stride,
-                               cudaStream_t stream);
+                               int num_layers, std::size_t cache_layer_stride, cudaStream_t stream);
 
 void launch_rope_inplace_batched(half* q, half* k, int num_tokens, int num_heads_q, int num_heads_k,
                                  int head_dim, int start_position, const float* cos_table,
@@ -702,7 +700,8 @@ void launch_moe_router_topk_softmax(const half* logits, int experts, int top_k, 
                                     float* topk_prob, cudaStream_t stream,
                                     const half* per_expert_scale = nullptr, bool renorm = true);
 
-// Sequence prefill: route all T tokens (logits [T, experts]) in one launch -> topk_idx/prob [T, top_k].
+// Sequence prefill: route all T tokens (logits [T, experts]) in one launch -> topk_idx/prob [T,
+// top_k].
 void launch_moe_router_topk_softmax_seq(const half* logits, int experts, int top_k, int* topk_idx,
                                         float* topk_prob, int T, cudaStream_t stream,
                                         const half* per_expert_scale = nullptr, bool renorm = true);
@@ -742,16 +741,17 @@ void launch_moe_gate_up_geglu(const void* w, const float* scales, int qbits, int
                               const half* x, const int* topk_idx, half* inter_out, int inter,
                               int hidden, int top_k, cudaStream_t stream, bool use_gelu = true);
 
-// dp4a int4 variant: `xq`/`x_scale` = the perm8-int8 quantised activation (quantise the fp16 input once
-// with launch_quantize_fp16_to_int8_perm8_g32). group must be a power of two, multiple of 32, dividing
-// hidden. Decode (batch-1) only.
+// dp4a int4 variant: `xq`/`x_scale` = the perm8-int8 quantised activation (quantise the fp16 input
+// once with launch_quantize_fp16_to_int8_perm8_g32). group must be a power of two, multiple of 32,
+// dividing hidden. Decode (batch-1) only.
 void launch_moe_gate_up_geglu_dp4a(const void* wg, const float* sg, const std::int8_t* xq,
                                    const float* x_scale, const int* topk_idx, half* inter_out,
                                    int inter, int hidden, int top_k, int group, cudaStream_t stream,
                                    bool use_gelu = true);
 
-// dp4a int4 down-accum: xq_all/xs_all = the top_k per-expert inter vectors, mt-quantised to perm8-int8
-// (launch_quantize_fp16_to_int8_perm8_g32_mt with rows=top_k, cols=inter). Decode (batch-1) only.
+// dp4a int4 down-accum: xq_all/xs_all = the top_k per-expert inter vectors, mt-quantised to
+// perm8-int8 (launch_quantize_fp16_to_int8_perm8_g32_mt with rows=top_k, cols=inter). Decode
+// (batch-1) only.
 void launch_moe_down_accum_dp4a(const void* wd, const float* sd, const std::int8_t* xq_all,
                                 const float* xs_all, const int* topk_idx, const float* topk_weight,
                                 half* y, int hidden, int inter, int top_k, int group,
@@ -761,10 +761,11 @@ void launch_moe_down_accum(const void* w, const float* scales, int qbits, int gr
                            const half* inter_in, const int* topk_idx, const float* topk_weight,
                            half* y, int hidden, int inter, int top_k, cudaStream_t stream);
 
-// int4-direct grouped MoE GEMM on int8 tensor cores: reads int4 expert weights directly (no dequant),
-// int8 activations (natural per-32-group scales). off[] is device-resident (grid.z = expert). The
-// fused gate_up output splits at column `split` into out_lo (gate) / out_hi (up); down passes split=N
-// and out_hi=nullptr. Skips the dequant-all fixed cost that dominates short-prompt MoE prefill.
+// int4-direct grouped MoE GEMM on int8 tensor cores: reads int4 expert weights directly (no
+// dequant), int8 activations (natural per-32-group scales). off[] is device-resident (grid.z =
+// expert). The fused gate_up output splits at column `split` into out_lo (gate) / out_hi (up); down
+// passes split=N and out_hi=nullptr. Skips the dequant-all fixed cost that dominates short-prompt
+// MoE prefill.
 void launch_moe_int4_grouped_mma(const std::int8_t* xq, const float* as, const std::int8_t* wpacked,
                                  const float* ws, const int* off, half* out_lo, half* out_hi, int E,
                                  int N, int K, int max_ne, int group, int split, int lo_width,
@@ -1290,8 +1291,8 @@ void launch_dequant_kquant(const std::uint8_t* blocks_in, KQuantType type, std::
 // re-time an incumbent against a candidate inside a single process; comparing
 // across processes loses the effect in thermal drift.
 struct KQuantTuning {
-  int mm_max = 8;        // largest batch the register-tile matmul takes
-  int mmq_nt = 2;        // n-tiles per warp-half, single-buffered mma kernel
+  int mm_max = 8;  // largest batch the register-tile matmul takes
+  int mmq_nt = 2;  // n-tiles per warp-half, single-buffered mma kernel
   // Double-buffered Q4_K kernel's n-tile. 0 = auto: the 32x128 tile (ANT=4,
   // activation panel single-buffered to fit shared) wins +2-4% at B=32 by
   // halving panel restaging, but loses ~3% at B=8 where the grid shrink bites;
@@ -1307,7 +1308,8 @@ struct KQuantTuning {
   // cost (w13 has 3.5x wq's weight bytes and takes the same time), so
   // shortening the per-block chain is the lever, not more rows per block.
   int mmq_splitk = 1;
-  int mmq_split_target = 340;  // ~2 blocks per SM on this part     // use the cp.async kernel when the batch fits
+  int mmq_split_target =
+      340;  // ~2 blocks per SM on this part     // use the cp.async kernel when the batch fits
   // llama.cpp's stream-K decomposition for the Q6_K MMQ: a fixed grid walks a
   // contiguous range of (row-tile, super-block) work units, pieces that reach a
   // tile's k-end write y directly, each block's trailing partial piece goes to a
@@ -1343,7 +1345,7 @@ struct KQuantTuning {
   // before the current mma loop, replacing the latency-hiding the occupancy-1
   // launch cannot get from a co-resident block. BM=32 shapes are untouched.
   int mmq_q6k_pf = 1;
-  int matvec_wpr = 8;    // warps cooperating on one row in the matvec
+  int matvec_wpr = 8;  // warps cooperating on one row in the matvec
   // int8 activations + dp4a in the matvec. Changes numerics (this is the same
   // trade llama.cpp's MMVQ makes by default), but greedy decoding stayed
   // token-identical to the fp16-activation path over 267 tokens of code
@@ -1430,8 +1432,7 @@ bool acquire_kquant_q8_1_scratch(int cols, std::int8_t** xq, float** xs, float**
 
 // silu_mul that also writes the q8_1 activation for the down projection. False
 // means nothing was written and the caller should run the plain gated GLU.
-bool launch_silu_mul_q8_1(const half* gate, const half* up, half* out, int n,
-                          cudaStream_t stream);
+bool launch_silu_mul_q8_1(const half* gate, const half* up, half* out, int n, cudaStream_t stream);
 
 // rmsnorm that also writes the q8_1 activation. Decode only (one row). Returns
 // false if the q8_1 scratch was unavailable and nothing was written.
@@ -1690,10 +1691,10 @@ void launch_attention_step_int4(const half* q, const int8_t* k_cache_i4, const i
 // cached token the (possibly offset) cache pointers refer to. Pass nulls and
 // zeros to disable.
 void launch_store_kv_quant(const half* k, const half* v, int8_t* k_cache, int8_t* v_cache,
-                           half* k_scales, half* v_scales, half* k_sink, half* v_sink,
-                           half* k_ring, half* v_ring, int sink_n, int win_n, int position,
-                           int num_kv_heads, int head_dim, int max_context, int k_bits,
-                           int v_bits, bool rotate_k, cudaStream_t stream);
+                           half* k_scales, half* v_scales, half* k_sink, half* v_sink, half* k_ring,
+                           half* v_ring, int sink_n, int win_n, int position, int num_kv_heads,
+                           int head_dim, int max_context, int k_bits, int v_bits, bool rotate_k,
+                           cudaStream_t stream);
 
 void launch_attention_step_quant(const half* q, const int8_t* k_cache, const int8_t* v_cache,
                                  const half* k_scales, const half* v_scales, const half* k_sink,
@@ -1739,34 +1740,29 @@ void launch_store_kv_paged_quant(const half* k_src, const half* v_src, int src_s
 void launch_store_kv_batched_paged_quant(const half* k_src, const half* v_src, int8_t* k_pool,
                                          int8_t* v_pool, half* k_scales, half* v_scales,
                                          const int* block_tables, const int* positions,
-                                         int max_blocks, int batch, int num_kv_heads,
-                                         int head_dim, int block_size, int k_bits, int v_bits,
-                                         bool rotate_k, cudaStream_t stream,
-                                         const int* slot_ids = nullptr, half* k_sink = nullptr,
-                                         half* v_sink = nullptr, half* k_ring = nullptr,
-                                         half* v_ring = nullptr, int sink_n = 0, int win_n = 0);
+                                         int max_blocks, int batch, int num_kv_heads, int head_dim,
+                                         int block_size, int k_bits, int v_bits, bool rotate_k,
+                                         cudaStream_t stream, const int* slot_ids = nullptr,
+                                         half* k_sink = nullptr, half* v_sink = nullptr,
+                                         half* k_ring = nullptr, half* v_ring = nullptr,
+                                         int sink_n = 0, int win_n = 0);
 
 // Chunked prefill attention over the quantized paged pool (causal, gather via
 // the block table); the quant sibling of launch_attention_prefill_paged.
 // k_src/v_src (the chunk's own fp16 K/V, row stride src_stride halves) and
 // the slot-resolved fp16 sink buffers enable exact reads for this chunk's
 // positions and the sink; pass nulls for pure quantized reads.
-void launch_attention_prefill_paged_quant(const half* q, const int8_t* k_pool,
-                                          const int8_t* v_pool, const half* k_scales,
-                                          const half* v_scales, const int* block_table,
-                                          half* out, int num_tokens, int start_position,
-                                          int num_heads, int num_kv_heads, int head_dim,
-                                          int block_size, int k_bits, int v_bits, bool rotate_k,
-                                          cudaStream_t stream, const half* k_src = nullptr,
-                                          const half* v_src = nullptr, int src_stride = 0,
-                                          const half* k_sink = nullptr,
-                                          const half* v_sink = nullptr, int sink_n = 0);
+void launch_attention_prefill_paged_quant(
+    const half* q, const int8_t* k_pool, const int8_t* v_pool, const half* k_scales,
+    const half* v_scales, const int* block_table, half* out, int num_tokens, int start_position,
+    int num_heads, int num_kv_heads, int head_dim, int block_size, int k_bits, int v_bits,
+    bool rotate_k, cudaStream_t stream, const half* k_src = nullptr, const half* v_src = nullptr,
+    int src_stride = 0, const half* k_sink = nullptr, const half* v_sink = nullptr, int sink_n = 0);
 
 // Eligibility for the quantized batched paged attention (GQA-shared tier is
 // the only implementation): head_dim 128, real GQA group, block_size <= 32,
 // group_size * 32 >= head_dim (Q rotation needs one thread per element).
-bool paged_quant_attention_supported(int num_heads, int num_kv_heads, int head_dim,
-                                     int block_size);
+bool paged_quant_attention_supported(int num_heads, int num_kv_heads, int head_dim, int block_size);
 
 // Batched split-K decode attention over the quantized paged pool (GQA-shared,
 // one grid block per (kv_head, paged block, sequence)). Scratch layout and

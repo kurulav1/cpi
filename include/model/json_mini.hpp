@@ -11,10 +11,10 @@
 // CPU-only builds; which is where the vision work needs it. Guarded so a CUDA build keeps
 // the intrinsic (bit-for-bit unchanged) and everything else gets the portable path.
 #if defined(__has_include)
-#  if __has_include(<cuda_fp16.h>)
-#    include <cuda_fp16.h>
-#    define CPI_JSON_MINI_HAS_CUDA_FP16 1
-#  endif
+#if __has_include(<cuda_fp16.h>)
+#include <cuda_fp16.h>
+#define CPI_JSON_MINI_HAS_CUDA_FP16 1
+#endif
 #endif
 
 #include <cctype>
@@ -68,7 +68,7 @@ inline std::uint16_t float_to_half_bits(float value) {
 
   std::uint32_t mantissa;
   std::int32_t shift;
-  if (exp < -14) {          // subnormal half: shift in the implicit leading 1
+  if (exp < -14) {  // subnormal half: shift in the implicit leading 1
     mantissa = man | 0x800000u;
     shift = -exp - 14 + 13;
   } else {
@@ -205,7 +205,7 @@ inline std::string json_extract_object(const std::string& json, const std::strin
 }
 
 inline std::string json_get_string(const std::string& json, const std::string& key,
-                            const std::string& def = "") {
+                                   const std::string& def = "") {
   std::size_t pos = json_find_key(json, key);
   if (pos == std::string::npos) return def;
   skip_ws(json, pos);
@@ -259,7 +259,8 @@ inline float json_get_float(const std::string& json, const std::string& key, flo
   }
 }
 
-inline std::vector<std::string> json_get_string_array(const std::string& json, const std::string& key) {
+inline std::vector<std::string> json_get_string_array(const std::string& json,
+                                                      const std::string& key) {
   std::size_t pos = json_find_key(json, key);
   if (pos == std::string::npos) return {};
   skip_ws(json, pos);
@@ -280,14 +281,15 @@ inline std::vector<std::string> json_get_string_array(const std::string& json, c
 }
 
 inline const std::uint16_t* require_bf16_tensor(const model::SafetensorsLoader& loader,
-                                         const std::string& name) {
+                                                const std::string& name) {
   if (!loader.has_tensor(name)) {
     throw std::runtime_error("missing tensor: " + name);
   }
   return reinterpret_cast<const std::uint16_t*>(loader.tensor_ptr(name));
 }
 
-inline const float* require_f32_tensor(const model::SafetensorsLoader& loader, const std::string& name) {
+inline const float* require_f32_tensor(const model::SafetensorsLoader& loader,
+                                       const std::string& name) {
   if (!loader.has_tensor(name)) {
     throw std::runtime_error("missing tensor: " + name);
   }

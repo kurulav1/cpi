@@ -30,7 +30,9 @@ namespace {
 // local copy is how this test came to round differently from the code it gates; the kernels
 // convert with Metal's half(), which is IEEE, so a truncating harness charges the shader for its
 // own error. include/runtime/fp16.hpp, gated by metal_fp16_test.
-inline std::uint16_t f32_to_f16(float f) { return cpi::f32_to_f16(f); }
+inline std::uint16_t f32_to_f16(float f) {
+  return cpi::f32_to_f16(f);
+}
 // Quant scales are stored fp16 on the GPU (see plan_metal_engine's quantizer). The kernels
 // read half*, so the smoke harness must upload f16 scales and use the f16-rounded value in
 // its reference dequant, or every quant case reads f32 bytes as half and diverges.
@@ -39,7 +41,9 @@ inline std::vector<std::uint16_t> scales_to_f16(const std::vector<float>& s) {
   for (std::size_t i = 0; i < s.size(); ++i) out[i] = cpi::f32_to_f16(s[i]);
   return out;
 }
-inline float f16_to_f32(std::uint16_t h) { return cpi::f16_to_f32(h); }
+inline float f16_to_f32(std::uint16_t h) {
+  return cpi::f16_to_f32(h);
+}
 
 struct Result {
   double max_abs = 0.0;
@@ -210,8 +214,8 @@ int main() {
 
   // ---- GEMM (fp16), the multi-token prefill path -------------------------
   // must match GEMM_FBM / GEMM_BN in cpi_kernels.metal (and kGemmFBM / kGemmBN in the engine).
-  constexpr std::uint32_t kSmokeGemmFBM = 64;   // rows per threadgroup
-  constexpr std::uint32_t kSmokeGemmBN = 32;    // tokens per tile
+  constexpr std::uint32_t kSmokeGemmFBM = 64;  // rows per threadgroup
+  constexpr std::uint32_t kSmokeGemmBN = 32;   // tokens per tile
   // This kernel had no check of its own: it was benchmarked heavily and gated only
   // indirectly, through end-to-end goldens. A prefill chunk and a token-at-a-time run
   // disagreed on Metal, and the split fell exactly on the GEMV/GEMM boundary, so the
@@ -451,12 +455,11 @@ int main() {
     struct QCP {
       std::uint32_t n0, n1, n2, in_dim, tokens, bits, group, groups, has_bias;
     } p{out_dim, 0, 0, in_dim, 1, static_cast<std::uint32_t>(bits), group, groups_n, 0};
-    const void* bufs[] = {bx.handle(), bg.handle(), bsg.handle(),
+    const void* bufs[] = {bx.handle(), bg.handle(),  bsg.handle(),
                           bu.handle(), bsu.handle(), bo.handle()};
     const std::size_t pairs_per_tg = 4;  // 256 threads = 8 simds, half gate half up
     ctx.dispatch("cpi_gemv_quant_glu", runtime::MetalContext::Grid::Groups,
-                 (out_dim + pairs_per_tg - 1) / pairs_per_tg, 256, bufs, nullptr, 6, &p,
-                 sizeof(p));
+                 (out_dim + pairs_per_tg - 1) / pairs_per_tg, 256, bufs, nullptr, 6, &p, sizeof(p));
     ctx.commit_and_wait();
     std::vector<float> want(out_dim), got(out_dim);
     for (std::uint32_t r = 0; r < out_dim; ++r) {
@@ -528,7 +531,7 @@ int main() {
       auto bx = ctx.alloc_from(A.data(), A.size() * 2);
       auto bo = ctx.alloc(static_cast<std::size_t>(T) * out_dim * 2);
       const auto sc16 = scales_to_f16(scales);
-    auto bs = ctx.alloc_from(sc16.data(), sc16.size() * sizeof(std::uint16_t));
+      auto bs = ctx.alloc_from(sc16.data(), sc16.size() * sizeof(std::uint16_t));
 
       struct QP {
         std::uint32_t out_dim, in_dim, tokens, bits, group, groups, has_bias;
@@ -592,15 +595,15 @@ int main() {
     // against a populated cache, which is the shape it actually runs in (one query, many keys,
     // several KEY_BLOCK iterations with a running max).
     const Case cases[] = {
-        {"decode hd64 @pos40", 4, 2, 64, 1, 0, 40},      // 41 keys: 2 key blocks
-        {"decode hd128 @pos40", 4, 4, 128, 1, 0, 40},    // no GQA
-        {"decode hd256 @pos40", 4, 2, 256, 1, 0, 40},    // Gemma's head_dim
+        {"decode hd64 @pos40", 4, 2, 64, 1, 0, 40},         // 41 keys: 2 key blocks
+        {"decode hd128 @pos40", 4, 4, 128, 1, 0, 40},       // no GQA
+        {"decode hd256 @pos40", 4, 2, 256, 1, 0, 40},       // Gemma's head_dim
         {"decode hd64 @pos40 win16", 4, 2, 64, 1, 16, 40},  // windowed decode
         {"decode hd128 T=4 @pos20", 4, 4, 128, 4, 0, 20},   // still decode: T < 8
         {"prefill_mm hd64 T=8", 4, 2, 64, 8, 0, 0},         // exactly one query block
         {"prefill_mm hd128 T=16", 8, 2, 128, 16, 0, 0},
-        {"prefill_mm hd128 T=33", 4, 2, 128, 33, 0, 0},     // partial query block (4x8 + 1)
-        {"prefill_mm hd64 window16", 4, 2, 64, 33, 16, 0},  // sliding window
+        {"prefill_mm hd128 T=33", 4, 2, 128, 33, 0, 0},      // partial query block (4x8 + 1)
+        {"prefill_mm hd64 window16", 4, 2, 64, 33, 16, 0},   // sliding window
         {"prefill scalar hd256 T=16", 4, 2, 256, 16, 0, 0},  // Gemma's head_dim
         {"prefill scalar hd256 T=33", 4, 1, 256, 33, 0, 0},  // MQA + partial block
     };
@@ -652,8 +655,8 @@ int main() {
                      c.heads * blocks, 256, mmbufs, nullptr, 6, &p, sizeof(p));
       } else if (T >= kQBlockSmoke) {
         const std::size_t blocks = (T + kQBlockSmoke - 1) / kQBlockSmoke;
-        ctx.dispatch("cpi_attention_prefill", runtime::MetalContext::Grid::Groups,
-                     c.heads * blocks, 256, bufs, nullptr, 6, &p, sizeof(p));
+        ctx.dispatch("cpi_attention_prefill", runtime::MetalContext::Grid::Groups, c.heads * blocks,
+                     256, bufs, nullptr, 6, &p, sizeof(p));
       } else {
         ctx.dispatch("cpi_attention_decode", runtime::MetalContext::Grid::Groups, c.heads * T, 256,
                      bufs, nullptr, 6, &p, sizeof(p));
@@ -673,7 +676,8 @@ int main() {
           for (std::uint32_t j = start; j <= pos; ++j) {
             float d = 0.0f;
             for (std::uint32_t i = 0; i < hd; ++i) {
-              d += f16_to_f32(q[t * q_dim + h * hd + i]) * f16_to_f32(kc[j * kv_dim + kvh * hd + i]);
+              d +=
+                  f16_to_f32(q[t * q_dim + h * hd + i]) * f16_to_f32(kc[j * kv_dim + kvh * hd + i]);
             }
             d *= scale;
             sc.push_back(d);
@@ -756,7 +760,10 @@ int main() {
       }
     const auto* o1 = static_cast<const std::uint16_t*>(b1.contents());
     const auto* o2 = static_cast<const std::uint16_t*>(b2.contents());
-    for (std::uint32_t i = 0; i < n; ++i) { g1[i] = f16_to_f32(o1[i]); g2[i] = f16_to_f32(o2[i]); }
+    for (std::uint32_t i = 0; i < n; ++i) {
+      g1[i] = f16_to_f32(o1[i]);
+      g2[i] = f16_to_f32(o2[i]);
+    }
     check("split_halves", compare(g1, w1), 0.001);
     check("split_halves.2", compare(g2, w2), 0.001);
   }
@@ -792,8 +799,7 @@ int main() {
                  sizeof(p));
     ctx.commit_and_wait();
     std::vector<float> want(n), got(n);
-    for (std::uint32_t i = 0; i < n; ++i)
-      want[i] = f16_to_f32(in[i]) * f16_to_f32(vec[i]) * scale;
+    for (std::uint32_t i = 0; i < n; ++i) want[i] = f16_to_f32(in[i]) * f16_to_f32(vec[i]) * scale;
     const auto* o = static_cast<const std::uint16_t*>(bo.contents());
     for (std::uint32_t i = 0; i < n; ++i) got[i] = f16_to_f32(o[i]);
     check("mul_vec", compare(got, want), 0.002);
@@ -817,7 +823,8 @@ int main() {
       for (std::uint32_t c = 0; c < ch; ++c) {
         const float input = f16_to_f32(xin[c]);
         float acc = f16_to_f32(wt[c * ks + ks - 1]) * input;
-        for (std::uint32_t j = 0; j < sl; ++j) acc += f16_to_f32(wt[c * ks + j]) * state[c * sl + j];
+        for (std::uint32_t j = 0; j < sl; ++j)
+          acc += f16_to_f32(wt[c * ks + j]) * state[c * sl + j];
         for (std::uint32_t j = 0; j + 1 < sl; ++j) state[c * sl + j] = state[c * sl + j + 1];
         state[c * sl + sl - 1] = input;
         o[c] = siluf(acc);
@@ -854,7 +861,8 @@ int main() {
     std::vector<std::uint16_t> mix(kh * kdim * 2 + vh * vdim);
     for (auto& v : mix) v = f32_to_f16(dist(rng));
     auto bm = ctx.alloc_from(mix.data(), mix.size() * 2);
-    auto bq = ctx.alloc(vh * kdim * 2), bk = ctx.alloc(vh * kdim * 2), bv = ctx.alloc(vh * vdim * 2);
+    auto bq = ctx.alloc(vh * kdim * 2), bk = ctx.alloc(vh * kdim * 2),
+         bv = ctx.alloc(vh * vdim * 2);
     LinRepeatParams p{kh, rep_n, kdim, vdim};
     const void* bufs[] = {bm.handle(), bq.handle(), bk.handle(), bv.handle()};
     const std::size_t width = std::max(kdim, vdim);
@@ -870,8 +878,7 @@ int main() {
           wk[vhh * kdim + d] = f16_to_f32(mix[kh * kdim + h * kdim + d]);
         }
         for (std::uint32_t d = 0; d < vdim; ++d)
-          wv[vhh * vdim + d] =
-              f16_to_f32(mix[kh * 2 * kdim + (h * rep_n + r) * vdim + d]);
+          wv[vhh * vdim + d] = f16_to_f32(mix[kh * 2 * kdim + (h * rep_n + r) * vdim + d]);
       }
     auto pull = [&](const runtime::MetalBuffer& b, std::size_t n) {
       std::vector<float> o(n);
@@ -894,60 +901,69 @@ int main() {
     auto fill = [&](std::vector<std::uint16_t>& x, float s) {
       for (auto& e : x) e = f32_to_f16(dist(rng) * s);
     };
-    fill(q, 1.0f); fill(k, 1.0f); fill(v, 1.0f); fill(z, 1.0f);
-    fill(av, 1.0f); fill(bv2, 1.0f); fill(dtb, 0.5f);
+    fill(q, 1.0f);
+    fill(k, 1.0f);
+    fill(v, 1.0f);
+    fill(z, 1.0f);
+    fill(av, 1.0f);
+    fill(bv2, 1.0f);
+    fill(dtb, 0.5f);
     for (auto& e : nw) e = f32_to_f16(dist(rng));
     for (auto& e : alog) e = f32_to_f16(dist(rng) * 0.5f);
     for (auto& e : st) e = dist(rng) * 0.1f;
 
-    auto bq2 = ctx.alloc_from(q.data(), q.size()*2), bk2 = ctx.alloc_from(k.data(), k.size()*2);
-    auto bv3 = ctx.alloc_from(v.data(), v.size()*2), bz = ctx.alloc_from(z.data(), z.size()*2);
-    auto ba = ctx.alloc_from(av.data(), av.size()*2), bb = ctx.alloc_from(bv2.data(), bv2.size()*2);
-    auto bnw = ctx.alloc_from(nw.data(), nw.size()*2), bal = ctx.alloc_from(alog.data(), alog.size()*2);
-    auto bdt = ctx.alloc_from(dtb.data(), dtb.size()*2), bst2 = ctx.alloc_from(st.data(), st.size()*4);
+    auto bq2 = ctx.alloc_from(q.data(), q.size() * 2), bk2 = ctx.alloc_from(k.data(), k.size() * 2);
+    auto bv3 = ctx.alloc_from(v.data(), v.size() * 2), bz = ctx.alloc_from(z.data(), z.size() * 2);
+    auto ba = ctx.alloc_from(av.data(), av.size() * 2),
+         bb = ctx.alloc_from(bv2.data(), bv2.size() * 2);
+    auto bnw = ctx.alloc_from(nw.data(), nw.size() * 2),
+         bal = ctx.alloc_from(alog.data(), alog.size() * 2);
+    auto bdt = ctx.alloc_from(dtb.data(), dtb.size() * 2),
+         bst2 = ctx.alloc_from(st.data(), st.size() * 4);
     auto bo2 = ctx.alloc(H * vdim * 2);
     LinAttnParams p{kdim, vdim, eps};
-    const void* bufs[] = {bq2.handle(), bk2.handle(), bv3.handle(), bz.handle(), ba.handle(),
-                          bb.handle(), bnw.handle(), bal.handle(), bdt.handle(), bst2.handle(),
-                          bo2.handle()};
+    const void* bufs[] = {bq2.handle(), bk2.handle(),  bv3.handle(), bz.handle(),
+                          ba.handle(),  bb.handle(),   bnw.handle(), bal.handle(),
+                          bdt.handle(), bst2.handle(), bo2.handle()};
     auto ref = [&](std::vector<float>& state) {
       std::vector<float> out(H * vdim);
       for (std::uint32_t h = 0; h < H; ++h) {
         float qss = 0, kss = 0;
         for (std::uint32_t i = 0; i < kdim; ++i) {
-          qss += f16_to_f32(q[h*kdim+i]) * f16_to_f32(q[h*kdim+i]);
-          kss += f16_to_f32(k[h*kdim+i]) * f16_to_f32(k[h*kdim+i]);
+          qss += f16_to_f32(q[h * kdim + i]) * f16_to_f32(q[h * kdim + i]);
+          kss += f16_to_f32(k[h * kdim + i]) * f16_to_f32(k[h * kdim + i]);
         }
-        const float qn = 1.0f/std::sqrt(qss+1e-6f)/std::sqrt((float)kdim);
-        const float kn = 1.0f/std::sqrt(kss+1e-6f);
+        const float qn = 1.0f / std::sqrt(qss + 1e-6f) / std::sqrt((float)kdim);
+        const float kn = 1.0f / std::sqrt(kss + 1e-6f);
         const float beta = sigmoidf(f16_to_f32(bv2[h]));
         const float decay = std::exp(-std::exp(f16_to_f32(alog[h])) *
                                      softplusf(f16_to_f32(av[h]) + f16_to_f32(dtb[h])));
         std::vector<float> qs(kdim), ks(kdim);
         for (std::uint32_t i = 0; i < kdim; ++i) {
-          qs[i] = f16_to_f32(q[h*kdim+i]) * qn;
-          ks[i] = f16_to_f32(k[h*kdim+i]) * kn;
+          qs[i] = f16_to_f32(q[h * kdim + i]) * qn;
+          ks[i] = f16_to_f32(k[h * kdim + i]) * kn;
         }
-        float* S = state.data() + h*ss;
+        float* S = state.data() + h * ss;
         for (std::uint32_t i = 0; i < ss; ++i) S[i] *= decay;
         std::vector<float> delta(vdim);
         for (std::uint32_t d = 0; d < vdim; ++d) {
           float m = 0;
-          for (std::uint32_t c = 0; c < kdim; ++c) m += S[c*vdim+d] * ks[c];
-          delta[d] = (f16_to_f32(v[h*vdim+d]) - m) * beta;
+          for (std::uint32_t c = 0; c < kdim; ++c) m += S[c * vdim + d] * ks[c];
+          delta[d] = (f16_to_f32(v[h * vdim + d]) - m) * beta;
         }
         for (std::uint32_t c = 0; c < kdim; ++c)
-          for (std::uint32_t d = 0; d < vdim; ++d) S[c*vdim+d] += ks[c] * delta[d];
+          for (std::uint32_t d = 0; d < vdim; ++d) S[c * vdim + d] += ks[c] * delta[d];
         std::vector<float> o(vdim);
         float oss = 0;
         for (std::uint32_t d = 0; d < vdim; ++d) {
           float sum = 0;
-          for (std::uint32_t c = 0; c < kdim; ++c) sum += S[c*vdim+d] * qs[c];
-          o[d] = sum; oss += sum*sum;
+          for (std::uint32_t c = 0; c < kdim; ++c) sum += S[c * vdim + d] * qs[c];
+          o[d] = sum;
+          oss += sum * sum;
         }
-        const float inv = 1.0f/std::sqrt(oss/(float)vdim + eps);
+        const float inv = 1.0f / std::sqrt(oss / (float)vdim + eps);
         for (std::uint32_t d = 0; d < vdim; ++d)
-          out[h*vdim+d] = o[d]*inv*f16_to_f32(nw[d])*siluf(f16_to_f32(z[h*vdim+d]));
+          out[h * vdim + d] = o[d] * inv * f16_to_f32(nw[d]) * siluf(f16_to_f32(z[h * vdim + d]));
       }
       return out;
     };
@@ -959,7 +975,7 @@ int main() {
       ctx.commit_and_wait();
       std::vector<float> got(H * vdim);
       const auto* o = static_cast<const std::uint16_t*>(bo2.contents());
-      for (std::uint32_t i = 0; i < H*vdim; ++i) got[i] = f16_to_f32(o[i]);
+      for (std::uint32_t i = 0; i < H * vdim; ++i) got[i] = f16_to_f32(o[i]);
       check(step == 0 ? "lin_attn_step" : "lin_attn_step.t2", compare(got, want), 0.02);
     }
   }
@@ -977,33 +993,41 @@ int main() {
     for (auto& v : proj) v = f32_to_f16(dist(rng) * 0.3f);
     for (auto& v : ptab) v = f32_to_f16(dist(rng) * 0.3f);
     for (auto& v : pix) v = 0.5f + dist(rng) * 0.5f;
-    for (std::uint32_t t = 0; t < tok; ++t) { px[t] = t % 4; py[t] = t / 4; }
-    px[5] = -1; py[6] = -1;  // two padding patches, one per coordinate
+    for (std::uint32_t t = 0; t < tok; ++t) {
+      px[t] = t % 4;
+      py[t] = t / 4;
+    }
+    px[5] = -1;
+    py[6] = -1;  // two padding patches, one per coordinate
 
-    auto bp = ctx.alloc_from(proj.data(), proj.size()*2);
-    auto bpix = ctx.alloc_from(pix.data(), pix.size()*4);
-    auto bt = ctx.alloc_from(ptab.data(), ptab.size()*2);
-    auto bx = ctx.alloc_from(px.data(), px.size()*4), by = ctx.alloc_from(py.data(), py.size()*4);
+    auto bp = ctx.alloc_from(proj.data(), proj.size() * 2);
+    auto bpix = ctx.alloc_from(pix.data(), pix.size() * 4);
+    auto bt = ctx.alloc_from(ptab.data(), ptab.size() * 2);
+    auto bx = ctx.alloc_from(px.data(), px.size() * 4),
+         by = ctx.alloc_from(py.data(), py.size() * 4);
     auto bo = ctx.alloc(tok * hid * 2);
     VisPatchParams p{hid, pdim, pts, tok};
-    const void* bufs[] = {bp.handle(), bpix.handle(), bt.handle(), bx.handle(), by.handle(),
-                          bo.handle()};
+    const void* bufs[] = {bp.handle(), bpix.handle(), bt.handle(),
+                          bx.handle(), by.handle(),   bo.handle()};
     ctx.dispatch("cpi_patch_embed", runtime::MetalContext::Grid::Threads, tok * hid, 256, bufs,
                  nullptr, 6, &p, sizeof(p));
     ctx.commit_and_wait();
     std::vector<float> want(tok * hid), got(tok * hid);
     for (std::uint32_t t = 0; t < tok; ++t)
       for (std::uint32_t h = 0; h < hid; ++h) {
-        if (px[t] < 0 || py[t] < 0) { want[t*hid+h] = 0.0f; continue; }
+        if (px[t] < 0 || py[t] < 0) {
+          want[t * hid + h] = 0.0f;
+          continue;
+        }
         float acc = 0.0f;
         for (std::uint32_t k = 0; k < pdim; ++k)
-          acc += f16_to_f32(proj[h*pdim+k]) * (2.0f * (pix[t*pdim+k] - 0.5f));
-        acc += f16_to_f32(ptab[(std::size_t)px[t]*hid + h]);
-        acc += f16_to_f32(ptab[(std::size_t)pts*hid + (std::size_t)py[t]*hid + h]);
-        want[t*hid+h] = acc;
+          acc += f16_to_f32(proj[h * pdim + k]) * (2.0f * (pix[t * pdim + k] - 0.5f));
+        acc += f16_to_f32(ptab[(std::size_t)px[t] * hid + h]);
+        acc += f16_to_f32(ptab[(std::size_t)pts * hid + (std::size_t)py[t] * hid + h]);
+        want[t * hid + h] = acc;
       }
     const auto* o = static_cast<const std::uint16_t*>(bo.contents());
-    for (std::uint32_t i = 0; i < tok*hid; ++i) got[i] = f16_to_f32(o[i]);
+    for (std::uint32_t i = 0; i < tok * hid; ++i) got[i] = f16_to_f32(o[i]);
     check("patch_embed", compare(got, want), 0.02);
   }
   {
@@ -1012,17 +1036,25 @@ int main() {
     std::vector<float> ct(64 * hp), st(64 * hp);
     std::vector<std::int32_t> px(tok), py(tok);
     for (auto& v : x) v = f32_to_f16(dist(rng));
-    for (std::size_t i = 0; i < ct.size(); ++i) { ct[i] = std::cos(0.1f*i); st[i] = std::sin(0.1f*i); }
-    for (std::uint32_t t = 0; t < tok; ++t) { px[t] = t; py[t] = (t*2) % 5; }
+    for (std::size_t i = 0; i < ct.size(); ++i) {
+      ct[i] = std::cos(0.1f * i);
+      st[i] = std::sin(0.1f * i);
+    }
+    for (std::uint32_t t = 0; t < tok; ++t) {
+      px[t] = t;
+      py[t] = (t * 2) % 5;
+    }
     const std::vector<std::uint16_t> x0 = x;
 
-    auto bx = ctx.alloc_from(x.data(), x.size()*2);
-    auto bpx = ctx.alloc_from(px.data(), px.size()*4), bpy = ctx.alloc_from(py.data(), py.size()*4);
-    auto bc = ctx.alloc_from(ct.data(), ct.size()*4), bs = ctx.alloc_from(st.data(), st.size()*4);
+    auto bx = ctx.alloc_from(x.data(), x.size() * 2);
+    auto bpx = ctx.alloc_from(px.data(), px.size() * 4),
+         bpy = ctx.alloc_from(py.data(), py.size() * 4);
+    auto bc = ctx.alloc_from(ct.data(), ct.size() * 4),
+         bs = ctx.alloc_from(st.data(), st.size() * 4);
     VisRope2DParams p{heads, hd, hp, tok};
     const void* bufs[] = {bx.handle(), bpx.handle(), bpy.handle(), bc.handle(), bs.handle()};
-    ctx.dispatch("cpi_rope_2d_inplace", runtime::MetalContext::Grid::Threads,
-                 tok * heads * 2 * hp, 256, bufs, nullptr, 5, &p, sizeof(p));
+    ctx.dispatch("cpi_rope_2d_inplace", runtime::MetalContext::Grid::Threads, tok * heads * 2 * hp,
+                 256, bufs, nullptr, 5, &p, sizeof(p));
     ctx.commit_and_wait();
     std::vector<float> want(x.size()), got(x.size());
     for (std::size_t i = 0; i < x0.size(); ++i) want[i] = f16_to_f32(x0[i]);
@@ -1030,14 +1062,14 @@ int main() {
       for (std::uint32_t hh = 0; hh < heads; ++hh)
         for (std::uint32_t a = 0; a < 2; ++a)
           for (std::uint32_t j = 0; j < hp; ++j) {
-            const std::size_t row = ((std::size_t)t*heads + hh)*hd;
-            const std::uint32_t base = a * (hd/2);
+            const std::size_t row = ((std::size_t)t * heads + hh) * hd;
+            const std::uint32_t base = a * (hd / 2);
             const std::int32_t pos = a == 0 ? px[t] : py[t];
-            const float c = ct[(std::size_t)pos*hp + j], sn = st[(std::size_t)pos*hp + j];
+            const float c = ct[(std::size_t)pos * hp + j], sn = st[(std::size_t)pos * hp + j];
             const float v0 = f16_to_f32(x0[row + base + j]);
             const float v1 = f16_to_f32(x0[row + base + j + hp]);
-            want[row + base + j] = v0*c - v1*sn;
-            want[row + base + j + hp] = v1*c + v0*sn;
+            want[row + base + j] = v0 * c - v1 * sn;
+            want[row + base + j + hp] = v1 * c + v0 * sn;
           }
     const auto* o = static_cast<const std::uint16_t*>(bx.contents());
     for (std::size_t i = 0; i < got.size(); ++i) got[i] = f16_to_f32(o[i]);
@@ -1049,30 +1081,35 @@ int main() {
     std::vector<std::uint16_t> in(tok * hid);
     std::vector<std::int32_t> px(tok), py(tok);
     for (auto& v : in) v = f32_to_f16(dist(rng));
-    for (std::uint32_t t = 0; t < tok; ++t) { px[t] = t % 4; py[t] = (t / 4) % 4; }
-    px[3] = -1; py[9] = -1;  // padding must be skipped but must not shrink the divisor
+    for (std::uint32_t t = 0; t < tok; ++t) {
+      px[t] = t % 4;
+      py[t] = (t / 4) % 4;
+    }
+    px[3] = -1;
+    py[9] = -1;  // padding must be skipped but must not shrink the divisor
 
-    auto bi = ctx.alloc_from(in.data(), in.size()*2);
-    auto bpx = ctx.alloc_from(px.data(), px.size()*4), bpy = ctx.alloc_from(py.data(), py.size()*4);
+    auto bi = ctx.alloc_from(in.data(), in.size() * 2);
+    auto bpx = ctx.alloc_from(px.data(), px.size() * 4),
+         bpy = ctx.alloc_from(py.data(), py.size() * 4);
     auto bo = ctx.alloc(outt * hid * 2);
     VisPoolParams p{tok, hid, k, cx, outt, gain};
     const void* bufs[] = {bi.handle(), bpx.handle(), bpy.handle(), bo.handle()};
     ctx.dispatch("cpi_avg_pool_patches", runtime::MetalContext::Grid::Threads, outt * hid, 256,
                  bufs, nullptr, 4, &p, sizeof(p));
     ctx.commit_and_wait();
-    std::vector<float> want(outt*hid), got(outt*hid);
+    std::vector<float> want(outt * hid), got(outt * hid);
     for (std::uint32_t cell = 0; cell < outt; ++cell)
       for (std::uint32_t h = 0; h < hid; ++h) {
         float acc = 0.0f;
         for (std::uint32_t t = 0; t < tok; ++t) {
           if (px[t] < 0 || py[t] < 0) continue;
-          const std::uint32_t c = ((std::uint32_t)px[t]/k) + cx*((std::uint32_t)py[t]/k);
-          if (c == cell) acc += f16_to_f32(in[(std::size_t)t*hid + h]);
+          const std::uint32_t c = ((std::uint32_t)px[t] / k) + cx * ((std::uint32_t)py[t] / k);
+          if (c == cell) acc += f16_to_f32(in[(std::size_t)t * hid + h]);
         }
-        want[cell*hid+h] = acc / float(k*k) * gain;
+        want[cell * hid + h] = acc / float(k * k) * gain;
       }
     const auto* o = static_cast<const std::uint16_t*>(bo.contents());
-    for (std::uint32_t i = 0; i < outt*hid; ++i) got[i] = f16_to_f32(o[i]);
+    for (std::uint32_t i = 0; i < outt * hid; ++i) got[i] = f16_to_f32(o[i]);
     check("avg_pool", compare(got, want), 0.01);
   }
   {
@@ -1082,8 +1119,8 @@ int main() {
     for (auto& v : bias) v = f32_to_f16(dist(rng) * 0.5f);
     for (auto& v : scl) v = f32_to_f16(0.5f + dist(rng) * 0.25f);
     const std::vector<std::uint16_t> x0 = x;
-    auto bx = ctx.alloc_from(x.data(), n*2);
-    auto bb = ctx.alloc_from(bias.data(), hid*2), bsc = ctx.alloc_from(scl.data(), hid*2);
+    auto bx = ctx.alloc_from(x.data(), n * 2);
+    auto bb = ctx.alloc_from(bias.data(), hid * 2), bsc = ctx.alloc_from(scl.data(), hid * 2);
     VisStdParams p{n, hid};
     const void* bufs[] = {bx.handle(), bb.handle(), bsc.handle()};
     ctx.dispatch("cpi_standardize", runtime::MetalContext::Grid::Threads, n, 256, bufs, nullptr, 3,
@@ -1128,8 +1165,8 @@ int main() {
     auto bo = ctx.alloc(n * 2);
     LayerNormParams p{rows, cols, 1e-6f, 1u};
     const void* bufs[] = {bx.handle(), bw.handle(), bbias.handle(), bo.handle()};
-    ctx.dispatch("cpi_layernorm", runtime::MetalContext::Grid::Groups, rows, 256, bufs, nullptr,
-                 4, &p, sizeof(p));
+    ctx.dispatch("cpi_layernorm", runtime::MetalContext::Grid::Groups, rows, 256, bufs, nullptr, 4,
+                 &p, sizeof(p));
     ctx.commit_and_wait();
     std::vector<float> want(n), got(n);
     for (std::uint32_t r = 0; r < rows; ++r) {
@@ -1144,9 +1181,9 @@ int main() {
       var /= double(cols);
       const double inv = 1.0 / std::sqrt(var + 1e-6);
       for (std::uint32_t c = 0; c < cols; ++c) {
-        want[r * cols + c] =
-            static_cast<float>((static_cast<double>(f16_to_f32(x[r * cols + c])) - mean) * inv *
-                                   f16_to_f32(w[c]) + f16_to_f32(bs[c]));
+        want[r * cols + c] = static_cast<float>(
+            (static_cast<double>(f16_to_f32(x[r * cols + c])) - mean) * inv * f16_to_f32(w[c]) +
+            f16_to_f32(bs[c]));
       }
     }
     const auto* o = static_cast<const std::uint16_t*>(bo.contents());
@@ -1172,8 +1209,8 @@ int main() {
     const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
     BiAttnParams p{tokens, heads, hd, scale, 0u};
     const void* bufs[] = {bq.handle(), bk.handle(), bv.handle(), bo.handle()};
-    ctx.dispatch("cpi_attention_bidirectional", runtime::MetalContext::Grid::Groups,
-                 tokens * heads, 64, bufs, nullptr, 4, &p, sizeof(p));
+    ctx.dispatch("cpi_attention_bidirectional", runtime::MetalContext::Grid::Groups, tokens * heads,
+                 64, bufs, nullptr, 4, &p, sizeof(p));
     ctx.commit_and_wait();
 
     std::vector<float> want(n), got(n);
@@ -1191,11 +1228,13 @@ int main() {
           mx = std::max(mx, sc[j]);
         }
         double sum = 0.0;
-        for (std::uint32_t j = 0; j < tokens; ++j) { sc[j] = std::exp(sc[j] - mx); sum += sc[j]; }
+        for (std::uint32_t j = 0; j < tokens; ++j) {
+          sc[j] = std::exp(sc[j] - mx);
+          sum += sc[j];
+        }
         for (std::uint32_t e = 0; e < hd; ++e) {
           double a = 0.0;
-          for (std::uint32_t j = 0; j < tokens; ++j)
-            a += sc[j] * f16_to_f32(v[j * dim + off + e]);
+          for (std::uint32_t j = 0; j < tokens; ++j) a += sc[j] * f16_to_f32(v[j * dim + off + e]);
           want[t * dim + off + e] = static_cast<float>(a / sum);
         }
       }
@@ -1224,11 +1263,15 @@ int main() {
       auto bx = ctx.alloc_from(x.data(), n * 2);
       auto bp = ctx.alloc_from(pos.data(), pos.size() * sizeof(std::int32_t));
       RopeParams p{heads, head_dim, 0u, tokens, 1000000.0f, 1u, 0u, 0u, rot, 0u, 0u, 0u};
-      if (mrope) { p.mrope_t = 11; p.mrope_h = 11; p.mrope_w = 10; }
+      if (mrope) {
+        p.mrope_t = 11;
+        p.mrope_h = 11;
+        p.mrope_w = 10;
+      }
       const void* bufs[] = {bx.handle(), bp.handle()};
       ctx.dispatch("cpi_rope", runtime::MetalContext::Grid::Threads,
-                   static_cast<std::size_t>(heads) * (rot / 2) * tokens, 256, bufs, nullptr, 2,
-                   &p, sizeof(p));
+                   static_cast<std::size_t>(heads) * (rot / 2) * tokens, 256, bufs, nullptr, 2, &p,
+                   sizeof(p));
       ctx.commit_and_wait();
       const auto* o2 = static_cast<const std::uint16_t*>(bx.contents());
       return std::vector<std::uint16_t>(o2, o2 + n);
@@ -1257,7 +1300,7 @@ int main() {
     // Genuinely 3-axis: an image-like layout where h and w differ from t.
     std::vector<std::int32_t> split(3 * tokens);
     for (std::uint32_t t = 0; t < tokens; ++t) {
-      split[t] = 1;                                       // t: constant across an image span
+      split[t] = 1;  // t: constant across an image span
       split[tokens + t] = static_cast<std::int32_t>(1 + t / 2);
       split[2 * tokens + t] = static_cast<std::int32_t>(1 + t % 2);
     }

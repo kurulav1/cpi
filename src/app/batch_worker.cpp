@@ -44,8 +44,8 @@ void BatchWorker::emit(BatchEvent::Type type, const std::string& id, const std::
   sink_(e);
 }
 
-bool BatchWorker::submit(const std::string& id, const std::string& prompt,
-                         const BatchOverrides& ov, std::string* error) {
+bool BatchWorker::submit(const std::string& id, const std::string& prompt, const BatchOverrides& ov,
+                         std::string* error) {
   const auto fail = [&](const char* msg) {
     if (error) *error = msg;
     return false;

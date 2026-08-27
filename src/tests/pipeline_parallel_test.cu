@@ -1,10 +1,10 @@
 // Verifies pipeline-parallel layer partitioning ON A SINGLE GPU: split a stack of L transformer-ish
 // layers into P contiguous stages (all on device 0), run them stage by stage passing the activation
 // across each stage boundary through a FRESH device buffer (the local stand-in for the cross-rank
-// point-to-point send), and check the final activation matches the unsharded (P=1) forward. Brick 4 of
-// multi-GPU prep; the stage handoff is the seam that becomes a P2P transfer on a real cluster. The
-// per-layer op is a distinct fp16 GEMV (matmuls don't commute, so a dropped/reordered layer or a
-// mis-wired handoff changes the result). Decode case (batch=1).
+// point-to-point send), and check the final activation matches the unsharded (P=1) forward. Brick 4
+// of multi-GPU prep; the stage handoff is the seam that becomes a P2P transfer on a real cluster.
+// The per-layer op is a distinct fp16 GEMV (matmuls don't commute, so a dropped/reordered layer or
+// a mis-wired handoff changes the result). Decode case (batch=1).
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -24,15 +24,15 @@ constexpr int L = 6;   // layers in the stack
 // y[H] = W[H,H] @ x[H], column-major W (ld = H), fp16 in/out, fp32 accumulate.
 void gemv(cublasHandle_t handle, const half* dW, const half* dX, half* dY) {
   const float alpha = 1.0f, beta = 0.0f;
-  cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, H, 1, H, &alpha, dW, CUDA_R_16F, H, dX, CUDA_R_16F, H,
-               &beta, dY, CUDA_R_16F, H, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+  cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, H, 1, H, &alpha, dW, CUDA_R_16F, H, dX, CUDA_R_16F,
+               H, &beta, dY, CUDA_R_16F, H, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
 }
 
-// Run layers [lo, hi) in order, reading dIn and writing dOut (may alias distinct buffers). Ping-pongs
-// through dTmp so each layer's output feeds the next. lo == hi copies dIn -> dOut unchanged (identity
-// stage). Returns nothing; dOut holds the stage output.
-void run_layers(cublasHandle_t handle, const std::vector<half*>& dW, int lo, int hi, const half* dIn,
-                half* dOut, half* dTmp) {
+// Run layers [lo, hi) in order, reading dIn and writing dOut (may alias distinct buffers).
+// Ping-pongs through dTmp so each layer's output feeds the next. lo == hi copies dIn -> dOut
+// unchanged (identity stage). Returns nothing; dOut holds the stage output.
+void run_layers(cublasHandle_t handle, const std::vector<half*>& dW, int lo, int hi,
+                const half* dIn, half* dOut, half* dTmp) {
   if (lo >= hi) {  // empty stage: pass the activation through untouched
     cudaMemcpy(dOut, dIn, H * sizeof(half), cudaMemcpyDeviceToDevice);
     return;
@@ -81,7 +81,8 @@ int main() {
   cudaMemcpy(ref.data(), dA, H * sizeof(half), cudaMemcpyDeviceToHost);
 
   int fail = 0;
-  // P=6 -> one layer per stage; P=7 -> a stage with no layers (identity handoff); P=4 -> uneven split.
+  // P=6 -> one layer per stage; P=7 -> a stage with no layers (identity handoff); P=4 -> uneven
+  // split.
   for (int P : {2, 3, 4, 6, 7}) {
     // Activation flows rank 0 -> 1 -> ... -> P-1. Each boundary copies into a FRESH buffer (dA<->dB
     // ping-pong) to model the cross-rank send and catch any pointer/size handoff bug.
@@ -105,8 +106,9 @@ int main() {
       denom = std::max(denom, std::fabs(fa));
     }
     const float rel = maxabs / denom;
-    // Same device ops in the same order as the reference, so this is bit-exact; a tiny epsilon guards
-    // only against a stray non-determinism. Any real partition/handoff bug moves rel far past this.
+    // Same device ops in the same order as the reference, so this is bit-exact; a tiny epsilon
+    // guards only against a stray non-determinism. Any real partition/handoff bug moves rel far
+    // past this.
     const bool pass = rel < 1e-3f;
     // Verify the owner lookup is the exact inverse of the stage split for every layer.
     int owner_ok = 1;

@@ -113,10 +113,9 @@ bool LlamaEngine::eagle_load() {
   CUDA_CHECK(cudaMalloc(&d_eagle_att_, static_cast<std::size_t>(q_hidden) * sizeof(__half)));
   CUDA_CHECK(cudaMalloc(&d_eagle_gate_, static_cast<std::size_t>(inter) * sizeof(__half)));
   CUDA_CHECK(cudaMalloc(&d_eagle_up_, static_cast<std::size_t>(inter) * sizeof(__half)));
-  CUDA_CHECK(cudaMalloc(&d_eagle_feats_,
-                        static_cast<std::size_t>(17) * H * sizeof(__half)));
-  CUDA_CHECK(cudaMalloc(&d_eagle_logits_,
-                        static_cast<std::size_t>(cfg.vocab_size) * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&d_eagle_feats_, static_cast<std::size_t>(17) * H * sizeof(__half)));
+  CUDA_CHECK(
+      cudaMalloc(&d_eagle_logits_, static_cast<std::size_t>(cfg.vocab_size) * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_eagle_tok_, sizeof(int)));
   CUDA_CHECK(cudaMalloc(&d_eagle_dtoks_, 16 * sizeof(int)));
   CUDA_CHECK(cudaMalloc(&d_eagle_pos_, sizeof(int)));
@@ -139,8 +138,8 @@ bool LlamaEngine::eagle_load() {
     constexpr int kMaxRows = 17;
     constexpr int kMaxLvlRows = 16;
     constexpr int kMaxB = 4;
-    CUDA_CHECK(cudaMalloc(&d_eagle_tree_h_,
-                          static_cast<std::size_t>(kMaxRows) * H * sizeof(__half)));
+    CUDA_CHECK(
+        cudaMalloc(&d_eagle_tree_h_, static_cast<std::size_t>(kMaxRows) * H * sizeof(__half)));
     const std::size_t scratch =
         static_cast<std::size_t>(cfg.num_layers) * kMaxRows * kv_hidden * sizeof(__half);
     CUDA_CHECK(cudaMalloc(&d_eagle_tree_k_, scratch));
@@ -148,19 +147,18 @@ bool LlamaEngine::eagle_load() {
     CUDA_CHECK(cudaMalloc(&d_eagle_row_off_, kMaxRows * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_eagle_anc_mask_, kMaxRows * sizeof(unsigned int)));
     CUDA_CHECK(cudaMalloc(&d_eagle_scatter_, 8 * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_eagle_bcat_,
-                          static_cast<std::size_t>(kMaxB) * 2 * H * sizeof(__half)));
+    CUDA_CHECK(
+        cudaMalloc(&d_eagle_bcat_, static_cast<std::size_t>(kMaxB) * 2 * H * sizeof(__half)));
     CUDA_CHECK(cudaMalloc(&d_eagle_bx_, static_cast<std::size_t>(kMaxB) * H * sizeof(__half)));
     CUDA_CHECK(cudaMalloc(&d_eagle_btmp_, static_cast<std::size_t>(kMaxB) * H * sizeof(__half)));
     CUDA_CHECK(cudaMalloc(&d_eagle_bnorm_, static_cast<std::size_t>(kMaxB) * H * sizeof(__half)));
-    CUDA_CHECK(cudaMalloc(&d_eagle_bq_,
-                          static_cast<std::size_t>(kMaxB) * q_hidden * sizeof(__half)));
-    CUDA_CHECK(cudaMalloc(&d_eagle_batt_,
-                          static_cast<std::size_t>(kMaxB) * q_hidden * sizeof(__half)));
-    CUDA_CHECK(cudaMalloc(&d_eagle_bgate_,
-                          static_cast<std::size_t>(kMaxB) * inter * sizeof(__half)));
-    CUDA_CHECK(cudaMalloc(&d_eagle_bup_,
-                          static_cast<std::size_t>(kMaxB) * inter * sizeof(__half)));
+    CUDA_CHECK(
+        cudaMalloc(&d_eagle_bq_, static_cast<std::size_t>(kMaxB) * q_hidden * sizeof(__half)));
+    CUDA_CHECK(
+        cudaMalloc(&d_eagle_batt_, static_cast<std::size_t>(kMaxB) * q_hidden * sizeof(__half)));
+    CUDA_CHECK(
+        cudaMalloc(&d_eagle_bgate_, static_cast<std::size_t>(kMaxB) * inter * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&d_eagle_bup_, static_cast<std::size_t>(kMaxB) * inter * sizeof(__half)));
     CUDA_CHECK(cudaMalloc(&d_eagle_scrk_,
                           static_cast<std::size_t>(kMaxLvlRows) * kv_hidden * sizeof(__half)));
     CUDA_CHECK(cudaMalloc(&d_eagle_scrv_,
@@ -261,10 +259,11 @@ void LlamaEngine::eagle_step(const __half* feature, const int* token_dev, int to
   }
   kernels::launch_embedding_lookup(static_cast<const __half*>(d_tok_embeddings_), tok_ptr,
                                    d_eagle_cat_, 1, H, s);
-  CUDA_CHECK(cudaMemcpyAsync(d_eagle_cat_ + H, feature, static_cast<std::size_t>(H) * sizeof(__half),
-                             cudaMemcpyDeviceToDevice, s));
-  kernels::launch_gemv_splitk_f16(static_cast<const __half*>(d_eagle_fc_), d_eagle_cat_,
-                                  d_eagle_x_, H, 2 * H, s);
+  CUDA_CHECK(cudaMemcpyAsync(d_eagle_cat_ + H, feature,
+                             static_cast<std::size_t>(H) * sizeof(__half), cudaMemcpyDeviceToDevice,
+                             s));
+  kernels::launch_gemv_splitk_f16(static_cast<const __half*>(d_eagle_fc_), d_eagle_cat_, d_eagle_x_,
+                                  H, 2 * H, s);
   // No pre-attention norm (EAGLE removes layer 0's input_layernorm).
   kernels::launch_gemv_splitk_f16(static_cast<const __half*>(d_eagle_wq_), d_eagle_x_, d_eagle_q_,
                                   q_hidden, H, s);
@@ -277,10 +276,9 @@ void LlamaEngine::eagle_step(const __half* feature, const int* token_dev, int to
   CUDA_CHECK(cudaMemcpyAsync(d_eagle_kcache_ + static_cast<std::size_t>(pair_idx) * kv_hidden,
                              d_eagle_kv_, static_cast<std::size_t>(kv_hidden) * sizeof(__half),
                              cudaMemcpyDeviceToDevice, s));
-  CUDA_CHECK(cudaMemcpyAsync(d_eagle_vcache_ + static_cast<std::size_t>(pair_idx) * kv_hidden,
-                             d_eagle_kv_ + kv_hidden,
-                             static_cast<std::size_t>(kv_hidden) * sizeof(__half),
-                             cudaMemcpyDeviceToDevice, s));
+  CUDA_CHECK(cudaMemcpyAsync(
+      d_eagle_vcache_ + static_cast<std::size_t>(pair_idx) * kv_hidden, d_eagle_kv_ + kv_hidden,
+      static_cast<std::size_t>(kv_hidden) * sizeof(__half), cudaMemcpyDeviceToDevice, s));
   kernels::launch_attention_step(d_eagle_q_, d_eagle_kcache_, d_eagle_vcache_, d_eagle_att_,
                                  pair_idx + 1, cfg.num_heads, cfg.num_kv_heads, head_dim, s,
                                  d_attn_chunk_m_, d_attn_chunk_l_, d_attn_chunk_o_,
@@ -302,9 +300,8 @@ void LlamaEngine::eagle_step(const __half* feature, const int* token_dev, int to
   if (!want_token) return;
   // Shared lm_head over the RAW draft hidden, then partitioned device argmax
   // straight into the chained-token slot; no host sync.
-  const void* head_src = lm_head_packed_.active()
-                             ? dequant_packed_for_gemm(lm_head_packed_, s)
-                             : static_cast<const void*>(d_lm_head_);
+  const void* head_src = lm_head_packed_.active() ? dequant_packed_for_gemm(lm_head_packed_, s)
+                                                  : static_cast<const void*>(d_lm_head_);
   kernels::launch_rowmajor_half_gemv_f32(static_cast<const __half*>(head_src), d_eagle_x_,
                                          d_eagle_logits_, cfg.vocab_size, H, s);
   kernels::launch_argmax_float(d_eagle_logits_, cfg.vocab_size, dtok_out, s, d_argmax_part_val_,
@@ -353,28 +350,26 @@ void LlamaEngine::eagle_verify_forward(int K) {
     launch_norm(d_x_, lw->norm_att, lw->norm_att_bias, d_x_norm_, K, hidden);
     const void* qkv_src = dequant_packed_qkv_for_gemm(*lw, s);
     if (qkv_src == nullptr) qkv_src = lw->wqkv;
-    detail::dispatch_linear_rowmajor_weight(
-        cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, s,
-        const_cast<void*>(qkv_src),
-        d_x_norm_, d_qkv_, q_hidden + 2 * kv_hidden, hidden, K, CUDA_R_16F);
-    CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_q_, q_row_bytes, qkv_base, qkv_stride_bytes,
-                                 q_row_bytes, K, cudaMemcpyDeviceToDevice, s));
-    CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_k_, kv_row_bytes, qkv_base + q_hidden,
-                                 qkv_stride_bytes, kv_row_bytes, K, cudaMemcpyDeviceToDevice, s));
+    detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
+                                            lt_workspace_bytes_, s, const_cast<void*>(qkv_src),
+                                            d_x_norm_, d_qkv_, q_hidden + 2 * kv_hidden, hidden, K,
+                                            CUDA_R_16F);
+    CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_q_, q_row_bytes, qkv_base, qkv_stride_bytes, q_row_bytes,
+                                 K, cudaMemcpyDeviceToDevice, s));
+    CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_k_, kv_row_bytes, qkv_base + q_hidden, qkv_stride_bytes,
+                                 kv_row_bytes, K, cudaMemcpyDeviceToDevice, s));
     CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_v_, kv_row_bytes, qkv_base + q_hidden + kv_hidden,
                                  qkv_stride_bytes, kv_row_bytes, K, cudaMemcpyDeviceToDevice, s));
     kernels::launch_rope_inplace_batched_strided_device_pos(
         static_cast<__half*>(d_prefill_q_), static_cast<__half*>(d_prefill_k_), K, cfg.num_heads,
-        cfg.num_kv_heads, head_dim, d_eagle_pos_, d_rope_cos_, d_rope_sin_, q_hidden, kv_hidden,
-        s);
+        cfg.num_kv_heads, head_dim, d_eagle_pos_, d_rope_cos_, d_rope_sin_, q_hidden, kv_hidden, s);
     auto* k_layer =
         static_cast<__half*>(d_k_cache_) + static_cast<std::size_t>(layer) * layer_stride;
     auto* v_layer =
         static_cast<__half*>(d_v_cache_) + static_cast<std::size_t>(layer) * layer_stride;
-    kernels::launch_store_kv_seq_device_pos(static_cast<const __half*>(d_prefill_k_),
-                                            static_cast<const __half*>(d_prefill_v_), k_layer,
-                                            v_layer, d_eagle_pos_, kv_hidden, K,
-                                            kv_capacity_tokens_, s);
+    kernels::launch_store_kv_seq_device_pos(
+        static_cast<const __half*>(d_prefill_k_), static_cast<const __half*>(d_prefill_v_), k_layer,
+        v_layer, d_eagle_pos_, kv_hidden, K, kv_capacity_tokens_, s);
     kernels::launch_attention_split_any_mt_device_pos(
         static_cast<const __half*>(d_prefill_q_), k_layer, v_layer, static_cast<__half*>(d_att_),
         d_eagle_pos_, K, /*window=*/0, cfg.num_heads, cfg.num_kv_heads, head_dim, d_eagle_mt_m_,
@@ -382,40 +377,37 @@ void LlamaEngine::eagle_verify_forward(int K) {
     // A packed k-quant weight has no fp16 copy for cuBLAS; expand it into the
     // shared prefill scratch. Same stream as the GEMM, so the expansion is
     // ordered before the read and before the next weight overwrites it.
-    const void* wo_src = lw->wo_packed.active()
-                              ? dequant_packed_for_gemm(lw->wo_packed, s)
-                              : static_cast<const void*>(lw->wo);
+    const void* wo_src = lw->wo_packed.active() ? dequant_packed_for_gemm(lw->wo_packed, s)
+                                                : static_cast<const void*>(lw->wo);
     detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
-                                            lt_workspace_bytes_, s, const_cast<void*>(wo_src), d_att_, d_ff3_, hidden,
-                                            q_hidden, K, CUDA_R_16F);
+                                            lt_workspace_bytes_, s, const_cast<void*>(wo_src),
+                                            d_att_, d_ff3_, hidden, q_hidden, K, CUDA_R_16F);
     kernels::launch_add_inplace(static_cast<__half*>(d_x_), static_cast<const __half*>(d_ff3_),
                                 K * hidden, s);
     launch_norm(d_x_, lw->norm_ffn, lw->norm_ffn_bias, d_x_norm_, K, hidden);
     // A packed k-quant weight has no fp16 copy for cuBLAS; expand it into the
     // shared prefill scratch. Same stream as the GEMM, so the expansion is
     // ordered before the read and before the next weight overwrites it.
-    const void* w13_src = lw->w13_packed.active()
-                              ? dequant_packed_for_gemm(lw->w13_packed, s)
-                              : static_cast<const void*>(lw->w13);
-    detail::dispatch_linear_rowmajor_weight(
-        cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, s, const_cast<void*>(w13_src),
-        d_x_norm_, d_ff13_, 2 * inter, hidden, K, CUDA_R_16F);
+    const void* w13_src = lw->w13_packed.active() ? dequant_packed_for_gemm(lw->w13_packed, s)
+                                                  : static_cast<const void*>(lw->w13);
+    detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
+                                            lt_workspace_bytes_, s, const_cast<void*>(w13_src),
+                                            d_x_norm_, d_ff13_, 2 * inter, hidden, K, CUDA_R_16F);
     CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_ff1_, ff_row_bytes, ff13_base, ff13_stride_bytes,
                                  ff_row_bytes, K, cudaMemcpyDeviceToDevice, s));
-    CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_ff2_, ff_row_bytes, ff13_base + inter,
-                                 ff13_stride_bytes, ff_row_bytes, K, cudaMemcpyDeviceToDevice, s));
+    CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_ff2_, ff_row_bytes, ff13_base + inter, ff13_stride_bytes,
+                                 ff_row_bytes, K, cudaMemcpyDeviceToDevice, s));
     detail::launch_gated_glu(cfg.mlp_gelu, static_cast<const __half*>(d_prefill_ff1_),
                              static_cast<const __half*>(d_prefill_ff2_),
                              static_cast<__half*>(d_prefill_ff2_), K * inter, s);
     // A packed k-quant weight has no fp16 copy for cuBLAS; expand it into the
     // shared prefill scratch. Same stream as the GEMM, so the expansion is
     // ordered before the read and before the next weight overwrites it.
-    const void* w2_src = lw->w2_packed.active()
-                              ? dequant_packed_for_gemm(lw->w2_packed, s)
-                              : static_cast<const void*>(lw->w2);
+    const void* w2_src = lw->w2_packed.active() ? dequant_packed_for_gemm(lw->w2_packed, s)
+                                                : static_cast<const void*>(lw->w2);
     detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
-                                            lt_workspace_bytes_, s, const_cast<void*>(w2_src), d_prefill_ff2_, d_ff3_,
-                                            hidden, inter, K, CUDA_R_16F);
+                                            lt_workspace_bytes_, s, const_cast<void*>(w2_src),
+                                            d_prefill_ff2_, d_ff3_, hidden, inter, K, CUDA_R_16F);
     kernels::launch_add_inplace(static_cast<__half*>(d_x_), static_cast<const __half*>(d_ff3_),
                                 K * hidden, s);
   }
@@ -441,14 +433,14 @@ bool LlamaEngine::eagle_verify_graphed(const std::vector<int>& batch, int start_
   // Graph eligibility: pure fp16-resident weights, no qkv bias / qk-norm
   // stages (the forward above omits them), contiguous fp16 KV.
   if (cached_layer_count_ != cfg.num_layers || cached_int8_proj_enabled_ || kv_int4_enabled_ ||
-      layer_cache_.empty() || layer_cache_[0].bqkv != nullptr || layer_cache_[0].q_norm != nullptr) {
+      layer_cache_.empty() || layer_cache_[0].bqkv != nullptr ||
+      layer_cache_[0].q_norm != nullptr) {
     return false;
   }
   auto s = compute_stream_;
   CUDA_CHECK(cudaMemcpyAsync(d_token_id_, batch.data(), static_cast<std::size_t>(K) * sizeof(int),
                              cudaMemcpyHostToDevice, s));
-  CUDA_CHECK(
-      cudaMemcpyAsync(d_eagle_pos_, &start_pos, sizeof(int), cudaMemcpyHostToDevice, s));
+  CUDA_CHECK(cudaMemcpyAsync(d_eagle_pos_, &start_pos, sizeof(int), cudaMemcpyHostToDevice, s));
   if (eagle_vgraph_k_ != K) {
     if (eagle_vgraph_exec_) {
       cudaGraphExecDestroy(eagle_vgraph_exec_);
@@ -473,8 +465,7 @@ bool LlamaEngine::eagle_verify_graphed(const std::vector<int>& batch, int start_
   CUDA_CHECK(cudaGraphLaunch(eagle_vgraph_exec_, s));
   out_argmax.resize(static_cast<std::size_t>(K));
   CUDA_CHECK(cudaMemcpyAsync(out_argmax.data(), d_eagle_verdict_,
-                             static_cast<std::size_t>(K) * sizeof(int), cudaMemcpyDeviceToHost,
-                             s));
+                             static_cast<std::size_t>(K) * sizeof(int), cudaMemcpyDeviceToHost, s));
   CUDA_CHECK(cudaStreamSynchronize(s));
   return true;
 }
@@ -509,17 +500,17 @@ std::vector<int> LlamaEngine::eagle_generate(const std::vector<int>& prompt_toke
   // final-norm hidden of position pos) lands in d_x_norm_.
   int next = decode_next_token(cur, pos, 0.0f, dummy_hist);
   CUDA_CHECK(cudaMemcpyAsync(d_eagle_feats_, d_x_norm_,
-                             static_cast<std::size_t>(H) * sizeof(__half),
-                             cudaMemcpyDeviceToDevice, s));
+                             static_cast<std::size_t>(H) * sizeof(__half), cudaMemcpyDeviceToDevice,
+                             s));
   out.push_back(next);
   bool stop = false;
   if (on_token && !on_token(next)) stop = true;
   if (!stop && options_.eos_token_id >= 0 && next == options_.eos_token_id) stop = true;
   cur = next;
   ++pos;
-  int heal_count = 0;           // accepted pairs to re-run with true features
-  int heal_tokens[17];          // their input tokens (batch[j+1])
-  int cur_feat_row = 0;         // d_eagle_feats_ row holding cur's producing feature
+  int heal_count = 0;    // accepted pairs to re-run with true features
+  int heal_tokens[17];   // their input tokens (batch[j+1])
+  int cur_feat_row = 0;  // d_eagle_feats_ row holding cur's producing feature
 
   while (!stop && static_cast<int>(out.size()) < max_new_tokens && pos < max_ctx - 1) {
     const auto tr0 = pclock::now();

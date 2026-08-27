@@ -21,13 +21,13 @@ namespace runtime {
 
 struct DecodeParams {
   int max_new_tokens = 256;
-  float temperature = 0.0f;      // <= 0 => greedy
+  float temperature = 0.0f;  // <= 0 => greedy
   int top_k = 0;
   float top_p = 1.0f;
   float repetition_penalty = 1.0f;
   int no_repeat_ngram_size = 0;
-  int seed = -1;                 // >= 0 reseeds the sampler RNG
-  bool include_prompt = false;   // return prompt+generated (vs generated only)
+  int seed = -1;                // >= 0 reseeds the sampler RNG
+  bool include_prompt = false;  // return prompt+generated (vs generated only)
   // Optional grammar hooks (kept as std::function so the driver doesn't depend on
   // the grammar module). mask: set disallowed logits to -inf; accept: advance the
   // grammar state by the chosen token.
@@ -41,7 +41,7 @@ struct DecodeParams {
 // the rest have defaults matching the simplest engine (single EOS, host-side
 // sampling, no persistent state).
 class SequenceModel {
- public:
+public:
   virtual ~SequenceModel() = default;
   virtual int vocab() const = 0;
   virtual int eos_id() const = 0;
@@ -53,9 +53,11 @@ class SequenceModel {
   virtual std::vector<float>& logits() = 0;
 
   // --- optional hooks (defaults keep the simple single-flight behavior) ---
-  virtual void reset_state() {}                                  // clear KV/recurrent state
-  virtual void synchronize() {}                                  // block until pending work done
-  virtual bool is_stop(int token) const { return token == eos_id(); }  // dual-EOS engines override
+  virtual void reset_state() {}  // clear KV/recurrent state
+  virtual void synchronize() {}  // block until pending work done
+  virtual bool is_stop(int token) const {
+    return token == eos_id();
+  }  // dual-EOS engines override
   // Sample the next token from the current step's logits. Default: shared host
   // sampler (+ optional grammar mask). Engines with a device-argmax greedy fast
   // path override this to keep it.
@@ -74,8 +76,8 @@ class SequenceModel {
 // (return false to stop), stop on EOS or when the context is full. Returns the
 // newly generated token ids (prompt excluded). Fills *stats when non-null.
 std::vector<int> run_decode(SequenceModel& model, const std::vector<int>& prompt,
-                            const DecodeParams& params,
-                            const std::function<bool(int)>& on_token, BenchmarkStats* stats);
+                            const DecodeParams& params, const std::function<bool(int)>& on_token,
+                            BenchmarkStats* stats);
 
 }  // namespace runtime
 }  // namespace engine

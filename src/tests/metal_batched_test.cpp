@@ -122,9 +122,10 @@ int main(int argc, char** argv) {
     }
     const auto top = eng.inspect_next_logits(prompt, 1);
     const int got = top.empty() ? -1 : top[0].first;
-    std::printf("  [xcheck] contiguous CHUNK prefill (T=%zu, uses the GEMM) top-1 = %d ; "
-                "token-at-a-time reference argmax = %d  -> %s\n",
-                prompt.size(), got, ref_argmax, got == ref_argmax ? "AGREE" : "DISAGREE");
+    std::printf(
+        "  [xcheck] contiguous CHUNK prefill (T=%zu, uses the GEMM) top-1 = %d ; "
+        "token-at-a-time reference argmax = %d  -> %s\n",
+        prompt.size(), got, ref_argmax, got == ref_argmax ? "AGREE" : "DISAGREE");
   }
 
   // The identity block table: logical block i -> physical block i.
@@ -173,10 +174,10 @@ int main(int argc, char** argv) {
       const bool ok0 = d0.argmax_a == d0.argmax_b && d0.max_abs < kCrossKernelTol;
       const bool ok1 = d1.argmax_a == d1.argmax_b && d1.max_abs < kCrossKernelTol;
       const bool okr = dr.max_abs == 0.0f;  // identical inputs, identical kernel: exact
-      std::printf("  %s  N=2 row0 vs single: max|d|=%.3g argmax %d vs %d\n",
-                  ok0 ? "PASS" : "FAIL", d0.max_abs, d0.argmax_a, d0.argmax_b);
-      std::printf("  %s  N=2 row1 vs single: max|d|=%.3g argmax %d vs %d\n",
-                  ok1 ? "PASS" : "FAIL", d1.max_abs, d1.argmax_a, d1.argmax_b);
+      std::printf("  %s  N=2 row0 vs single: max|d|=%.3g argmax %d vs %d\n", ok0 ? "PASS" : "FAIL",
+                  d0.max_abs, d0.argmax_a, d0.argmax_b);
+      std::printf("  %s  N=2 row1 vs single: max|d|=%.3g argmax %d vs %d\n", ok1 ? "PASS" : "FAIL",
+                  d1.max_abs, d1.argmax_a, d1.argmax_b);
       std::printf("  %s  N=2 row0 vs row1 (must be exact): max|d|=%.3g\n", okr ? "PASS" : "FAIL",
                   dr.max_abs);
       if (!ok0 || !ok1 || !okr) ++failures;
@@ -234,8 +235,8 @@ int main(int argc, char** argv) {
       std::vector<int> hist(prompt.begin(), prompt.begin() + L);
       eng.prefill_paged(hist, 0, ident2);
       std::vector<std::vector<float>> out;
-      eng.decode_step_batched_logits({prompt[static_cast<std::size_t>(L)]}, {L}, ident2,
-                                     max_blocks, out);
+      eng.decode_step_batched_logits({prompt[static_cast<std::size_t>(L)]}, {L}, ident2, max_blocks,
+                                     out);
       const Diff d = compare(rL, out[0]);
       const bool ok = d.argmax_a == d.argmax_b && d.max_abs < kCrossKernelTol;
       std::printf("  %s  paged prefill chunk T=%-2d : max|d|=%.3g argmax %d vs %d\n",
@@ -327,17 +328,20 @@ int main(int argc, char** argv) {
     for (int rep = 0; rep < 3; ++rep) {  // best-of-3, interleaved
       auto t0 = std::chrono::steady_clock::now();
       eng.inspect_next_logits(longp, 1);
-      contig_ms = std::min(contig_ms, std::chrono::duration<double, std::milli>(
-                                          std::chrono::steady_clock::now() - t0).count());
+      contig_ms = std::min(
+          contig_ms,
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
       auto t1 = std::chrono::steady_clock::now();
       eng.prefill_paged(longp, 0, tbl);
-      paged_ms = std::min(paged_ms, std::chrono::duration<double, std::milli>(
-                                        std::chrono::steady_clock::now() - t1).count());
+      paged_ms = std::min(
+          paged_ms,
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count());
     }
-    std::printf("\n  [timing] prefill %zu tok | contiguous %.0f ms | paged %.0f ms  -> %.2fx"
-                "   (paged takes the query-block kernel when block_size %% KEY_BLOCK == 0 and"
-                " there is no window; otherwise the O(T^2) decode kernel)\n",
-                longp.size(), contig_ms, paged_ms, paged_ms / contig_ms);
+    std::printf(
+        "\n  [timing] prefill %zu tok | contiguous %.0f ms | paged %.0f ms  -> %.2fx"
+        "   (paged takes the query-block kernel when block_size %% KEY_BLOCK == 0 and"
+        " there is no window; otherwise the O(T^2) decode kernel)\n",
+        longp.size(), contig_ms, paged_ms, paged_ms / contig_ms);
   }
   if (failures != 0) {
     std::printf("\n[metal_batched] FAIL\n");

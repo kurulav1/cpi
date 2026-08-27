@@ -19,7 +19,7 @@ namespace image {
 namespace {
 
 class BitReader {
- public:
+public:
   BitReader(const std::uint8_t* data, std::size_t size) : data_(data), size_(size) {}
 
   // DEFLATE stores bits LSB-first within each byte.
@@ -57,7 +57,7 @@ class BitReader {
     return p;
   }
 
- private:
+private:
   const std::uint8_t* data_;
   std::size_t size_;
   std::size_t byte_pos_ = 0;
@@ -68,7 +68,7 @@ class BitReader {
 // one bit at a time, comparing against the first code of each length; simple, and fast
 // enough that image decode is nowhere near the bottleneck.
 class Huffman {
- public:
+public:
   explicit Huffman(const std::vector<int>& lengths) {
     int max_len = 0;
     for (int l : lengths) max_len = std::max(max_len, l);
@@ -82,8 +82,8 @@ class Huffman {
     // symbols sorted by (length, symbol)
     std::vector<int> offsets(static_cast<std::size_t>(max_len) + 2, 0);
     for (int l = 1; l <= max_len; ++l) {
-      offsets[static_cast<std::size_t>(l) + 1] = offsets[static_cast<std::size_t>(l)] +
-                                                 counts_[static_cast<std::size_t>(l)];
+      offsets[static_cast<std::size_t>(l) + 1] =
+          offsets[static_cast<std::size_t>(l)] + counts_[static_cast<std::size_t>(l)];
     }
     symbols_.assign(static_cast<std::size_t>(offsets[static_cast<std::size_t>(max_len) + 1]), 0);
     for (std::size_t s = 0; s < lengths.size(); ++s) {
@@ -111,20 +111,20 @@ class Huffman {
     throw std::runtime_error("png: invalid Huffman code");
   }
 
- private:
+private:
   std::vector<int> counts_;
   std::vector<int> symbols_;
   int max_len_ = 0;
 };
 
 // RFC 1951 §3.2.5
-constexpr int kLengthBase[29] = {3,  4,  5,  6,  7,  8,  9,  10,  11,  13,  15,  17,  19,  23, 27,
-                                 31, 35, 43, 51, 59, 67, 83, 99,  115, 131, 163, 195, 227, 258};
+constexpr int kLengthBase[29] = {3,  4,  5,  6,  7,  8,  9,  10, 11,  13,  15,  17,  19,  23, 27,
+                                 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258};
 constexpr int kLengthExtra[29] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2,
                                   2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0};
-constexpr int kDistBase[30] = {1,    2,    3,    4,    5,    7,     9,     13,    17,   25,
-                               33,   49,   65,   97,   129,  193,   257,   385,   513,  769,
-                               1025, 1537, 2049, 3073, 4097, 6145,  8193,  12289, 16385, 24577};
+constexpr int kDistBase[30] = {1,    2,    3,    4,    5,    7,    9,    13,    17,    25,
+                               33,   49,   65,   97,   129,  193,  257,  385,   513,   769,
+                               1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577};
 constexpr int kDistExtra[30] = {0, 0, 0, 0, 1, 1, 2, 2,  3,  3,  4,  4,  5,  5,  6,
                                 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13};
 
@@ -139,8 +139,7 @@ void inflate_block(BitReader& br, const Huffman& lit, const Huffman& dist,
     } else {
       const int li = sym - 257;
       if (li >= 29) throw std::runtime_error("png: bad length symbol");
-      const int length =
-          kLengthBase[li] + static_cast<int>(br.read_bits(kLengthExtra[li]));
+      const int length = kLengthBase[li] + static_cast<int>(br.read_bits(kLengthExtra[li]));
       const int di = dist.decode(br);
       if (di >= 30) throw std::runtime_error("png: bad distance symbol");
       const int distance = kDistBase[di] + static_cast<int>(br.read_bits(kDistExtra[di]));
@@ -227,7 +226,8 @@ std::vector<std::uint8_t> inflate(const std::uint8_t* data, std::size_t size) {
     if (type == 0) {  // stored
       br.align_to_byte();
       const std::uint8_t* hdr = br.raw(4);
-      const std::size_t len = static_cast<std::size_t>(hdr[0]) | (static_cast<std::size_t>(hdr[1]) << 8);
+      const std::size_t len =
+          static_cast<std::size_t>(hdr[0]) | (static_cast<std::size_t>(hdr[1]) << 8);
       const std::uint8_t* payload = br.raw(len);
       out.insert(out.end(), payload, payload + len);
     } else if (type == 1) {
@@ -299,12 +299,23 @@ Image decode_png(const std::vector<std::uint8_t>& bytes) {
 
   int channels = 0;
   switch (color_type) {
-    case 0: channels = 1; break;  // grey
-    case 2: channels = 3; break;  // RGB
-    case 3: channels = 1; break;  // palette index
-    case 4: channels = 2; break;  // grey + alpha
-    case 6: channels = 4; break;  // RGBA
-    default: throw std::runtime_error("png: unsupported colour type");
+    case 0:
+      channels = 1;
+      break;  // grey
+    case 2:
+      channels = 3;
+      break;  // RGB
+    case 3:
+      channels = 1;
+      break;  // palette index
+    case 4:
+      channels = 2;
+      break;  // grey + alpha
+    case 6:
+      channels = 4;
+      break;  // RGBA
+    default:
+      throw std::runtime_error("png: unsupported colour type");
   }
   if (color_type == 3 && palette.size() < 3)
     throw std::runtime_error("png: palette image with no PLTE");
@@ -325,21 +336,30 @@ Image decode_png(const std::vector<std::uint8_t>& bytes) {
     const std::uint8_t* up = y > 0 ? &lines[static_cast<std::size_t>(y - 1) * stride] : nullptr;
 
     for (std::size_t i = 0; i < stride; ++i) {
-      const int a = i >= static_cast<std::size_t>(channels)
-                        ? cur[i - static_cast<std::size_t>(channels)]
-                        : 0;
+      const int a =
+          i >= static_cast<std::size_t>(channels) ? cur[i - static_cast<std::size_t>(channels)] : 0;
       const int b = up ? up[i] : 0;
       const int c = (up && i >= static_cast<std::size_t>(channels))
                         ? up[i - static_cast<std::size_t>(channels)]
                         : 0;
       int value = in[i];
       switch (filter) {
-        case 0: break;                                   // None
-        case 1: value += a; break;                       // Sub
-        case 2: value += b; break;                       // Up
-        case 3: value += (a + b) / 2; break;             // Average
-        case 4: value += paeth(a, b, c); break;          // Paeth
-        default: throw std::runtime_error("png: unknown scanline filter");
+        case 0:
+          break;  // None
+        case 1:
+          value += a;
+          break;  // Sub
+        case 2:
+          value += b;
+          break;  // Up
+        case 3:
+          value += (a + b) / 2;
+          break;  // Average
+        case 4:
+          value += paeth(a, b, c);
+          break;  // Paeth
+        default:
+          throw std::runtime_error("png: unknown scanline filter");
       }
       cur[i] = static_cast<std::uint8_t>(value & 0xff);
     }
@@ -352,8 +372,8 @@ Image decode_png(const std::vector<std::uint8_t>& bytes) {
   img.rgb.resize(static_cast<std::size_t>(width) * height * 3);
   for (int y = 0; y < height; ++y) {
     for (int x = 0; x < width; ++x) {
-      const std::uint8_t* px = &lines[static_cast<std::size_t>(y) * stride +
-                                      static_cast<std::size_t>(x) * channels];
+      const std::uint8_t* px =
+          &lines[static_cast<std::size_t>(y) * stride + static_cast<std::size_t>(x) * channels];
       std::uint8_t* out = &img.rgb[(static_cast<std::size_t>(y) * width + x) * 3];
       switch (color_type) {
         case 0:
@@ -368,7 +388,8 @@ Image decode_png(const std::vector<std::uint8_t>& bytes) {
           break;
         case 3: {
           const std::size_t idx = static_cast<std::size_t>(px[0]) * 3;
-          if (idx + 2 >= palette.size()) throw std::runtime_error("png: palette index out of range");
+          if (idx + 2 >= palette.size())
+            throw std::runtime_error("png: palette index out of range");
           out[0] = palette[idx];
           out[1] = palette[idx + 1];
           out[2] = palette[idx + 2];

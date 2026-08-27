@@ -38,7 +38,6 @@ inline bool norm_maybe_q8(const __half* x, const __half* w, __half* y, int cols,
 }
 }  // namespace
 
-
 bool LlamaEngine::can_use_greedy_decode_graph() const {
   // Greedy decode CUDA graph. Verified byte-identical to the non-graph path for
   // fp16, int8 and int4 once the RMSNorm eps was sourced from the model config
@@ -169,17 +168,16 @@ void LlamaEngine::init_greedy_decode_graph() {
       } else if (!packed_qkv_matvec(lw, d_x_norm_, d_q_, compute_stream_)) {
         detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
                                                 lt_workspace_bytes_, compute_stream_, lw.wqkv,
-                                                d_x_norm_, d_q_, q_hidden + 2 * kv_hidden, hidden, 1,
-                                                CUDA_R_16F);
+                                                d_x_norm_, d_q_, q_hidden + 2 * kv_hidden, hidden,
+                                                1, CUDA_R_16F);
       }
       if (lw.wo_packed.active()) {
         // Warm what capture will actually record. A packed matrix has no fp16
         // buffer, so warming the fp16 kernel would hand cuBLAS a null pointer.
-        kernels::launch_kquant_matvec(static_cast<const std::uint8_t*>(lw.wo_packed.data),
-                                      static_cast<kernels::KQuantType>(lw.wo_packed.kind),
-                                      static_cast<const __half*>(d_att_),
-                                      static_cast<__half*>(d_ff3_), lw.wo_packed.rows,
-                                      lw.wo_packed.cols, compute_stream_);
+        kernels::launch_kquant_matvec(
+            static_cast<const std::uint8_t*>(lw.wo_packed.data),
+            static_cast<kernels::KQuantType>(lw.wo_packed.kind), static_cast<const __half*>(d_att_),
+            static_cast<__half*>(d_ff3_), lw.wo_packed.rows, lw.wo_packed.cols, compute_stream_);
       } else if (resident_custom_wo_) {
         resident_projection_half(lw.wo, d_att_, d_ff3_, hidden, q_hidden, resident_wo_warps_,
                                  resident_wo_tile_pairs_, resident_wo_rows_per_warp_);
@@ -411,13 +409,12 @@ void LlamaEngine::init_greedy_decode_graph() {
       // the ternary deduce it.
       using MatvecFn = void (*)(const std::uint8_t*, kernels::KQuantType, const __half*, __half*,
                                 int, int, cudaStream_t, bool);
-      const MatvecFn launch = fuse ? &kernels::launch_kquant_matvec_residual
-                                   : &kernels::launch_kquant_matvec;
+      const MatvecFn launch =
+          fuse ? &kernels::launch_kquant_matvec_residual : &kernels::launch_kquant_matvec;
       launch(static_cast<const std::uint8_t*>(lw->wo_packed.data),
              static_cast<kernels::KQuantType>(lw->wo_packed.kind),
-             static_cast<const __half*>(d_att_),
-             static_cast<__half*>(fuse ? d_x_ : d_ff3_), lw->wo_packed.rows, lw->wo_packed.cols,
-             compute_stream_, att_q8);
+             static_cast<const __half*>(d_att_), static_cast<__half*>(fuse ? d_x_ : d_ff3_),
+             lw->wo_packed.rows, lw->wo_packed.cols, compute_stream_, att_q8);
       fused_residual = fuse;
     } else if (resident_custom_wo_) {
       // Residual add folded into this projection's epilogue, so the shared add_inplace
@@ -516,14 +513,12 @@ void LlamaEngine::init_greedy_decode_graph() {
       if (!weights_.config().mlp_gelu && !tq && lw->w2_packed.active()) {
         ff_q8 = kernels::launch_silu_mul_q8_1(static_cast<const __half*>(d_ff1_),
                                               static_cast<const __half*>(d_ff2_),
-                                              static_cast<__half*>(d_ff2_), inter,
-                                              compute_stream_);
+                                              static_cast<__half*>(d_ff2_), inter, compute_stream_);
       }
       if (!ff_q8) {
-        detail::launch_gated_glu(weights_.config().mlp_gelu,
-                                 static_cast<const __half*>(d_ff1_),
-                                 static_cast<const __half*>(d_ff2_),
-                                 static_cast<__half*>(d_ff2_), inter, compute_stream_);
+        detail::launch_gated_glu(weights_.config().mlp_gelu, static_cast<const __half*>(d_ff1_),
+                                 static_cast<const __half*>(d_ff2_), static_cast<__half*>(d_ff2_),
+                                 inter, compute_stream_);
       }
     }
 
@@ -551,11 +546,11 @@ void LlamaEngine::init_greedy_decode_graph() {
       // Same fusion for the down projection; nothing sits between it and the
       // residual add.
       ++packed_matvec_calls_;
-      kernels::launch_kquant_matvec_residual(
-          static_cast<const std::uint8_t*>(lw->w2_packed.data),
-          static_cast<kernels::KQuantType>(lw->w2_packed.kind),
-          static_cast<const __half*>(d_ff2_), static_cast<__half*>(d_x_), lw->w2_packed.rows,
-          lw->w2_packed.cols, compute_stream_, ff_q8);
+      kernels::launch_kquant_matvec_residual(static_cast<const std::uint8_t*>(lw->w2_packed.data),
+                                             static_cast<kernels::KQuantType>(lw->w2_packed.kind),
+                                             static_cast<const __half*>(d_ff2_),
+                                             static_cast<__half*>(d_x_), lw->w2_packed.rows,
+                                             lw->w2_packed.cols, compute_stream_, ff_q8);
       fused_residual = true;
     } else {
       // Residual add folded into the down-projection's epilogue.
@@ -674,17 +669,16 @@ void LlamaEngine::init_logits_decode_graph() {
       } else if (!packed_qkv_matvec(lw, d_x_norm_, d_q_, compute_stream_)) {
         detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
                                                 lt_workspace_bytes_, compute_stream_, lw.wqkv,
-                                                d_x_norm_, d_q_, q_hidden + 2 * kv_hidden, hidden, 1,
-                                                CUDA_R_16F);
+                                                d_x_norm_, d_q_, q_hidden + 2 * kv_hidden, hidden,
+                                                1, CUDA_R_16F);
       }
       if (lw.wo_packed.active()) {
         // Warm what capture will actually record. A packed matrix has no fp16
         // buffer, so warming the fp16 kernel would hand cuBLAS a null pointer.
-        kernels::launch_kquant_matvec(static_cast<const std::uint8_t*>(lw.wo_packed.data),
-                                      static_cast<kernels::KQuantType>(lw.wo_packed.kind),
-                                      static_cast<const __half*>(d_att_),
-                                      static_cast<__half*>(d_ff3_), lw.wo_packed.rows,
-                                      lw.wo_packed.cols, compute_stream_);
+        kernels::launch_kquant_matvec(
+            static_cast<const std::uint8_t*>(lw.wo_packed.data),
+            static_cast<kernels::KQuantType>(lw.wo_packed.kind), static_cast<const __half*>(d_att_),
+            static_cast<__half*>(d_ff3_), lw.wo_packed.rows, lw.wo_packed.cols, compute_stream_);
       } else if (resident_custom_wo_) {
         resident_projection_half(lw.wo, d_att_, d_ff3_, hidden, q_hidden, resident_wo_warps_,
                                  resident_wo_tile_pairs_, resident_wo_rows_per_warp_);
@@ -910,13 +904,12 @@ void LlamaEngine::init_logits_decode_graph() {
       // the ternary deduce it.
       using MatvecFn = void (*)(const std::uint8_t*, kernels::KQuantType, const __half*, __half*,
                                 int, int, cudaStream_t, bool);
-      const MatvecFn launch = fuse ? &kernels::launch_kquant_matvec_residual
-                                   : &kernels::launch_kquant_matvec;
+      const MatvecFn launch =
+          fuse ? &kernels::launch_kquant_matvec_residual : &kernels::launch_kquant_matvec;
       launch(static_cast<const std::uint8_t*>(lw->wo_packed.data),
              static_cast<kernels::KQuantType>(lw->wo_packed.kind),
-             static_cast<const __half*>(d_att_),
-             static_cast<__half*>(fuse ? d_x_ : d_ff3_), lw->wo_packed.rows, lw->wo_packed.cols,
-             compute_stream_, att_q8);
+             static_cast<const __half*>(d_att_), static_cast<__half*>(fuse ? d_x_ : d_ff3_),
+             lw->wo_packed.rows, lw->wo_packed.cols, compute_stream_, att_q8);
       fused_residual = fuse;
     } else if (resident_custom_wo_) {
       // Residual add folded into this projection's epilogue, so the shared add_inplace
@@ -993,14 +986,12 @@ void LlamaEngine::init_logits_decode_graph() {
       if (!weights_.config().mlp_gelu && !tq && lw->w2_packed.active()) {
         ff_q8 = kernels::launch_silu_mul_q8_1(static_cast<const __half*>(d_ff1_),
                                               static_cast<const __half*>(d_ff2_),
-                                              static_cast<__half*>(d_ff2_), inter,
-                                              compute_stream_);
+                                              static_cast<__half*>(d_ff2_), inter, compute_stream_);
       }
       if (!ff_q8) {
-        detail::launch_gated_glu(weights_.config().mlp_gelu,
-                                 static_cast<const __half*>(d_ff1_),
-                                 static_cast<const __half*>(d_ff2_),
-                                 static_cast<__half*>(d_ff2_), inter, compute_stream_);
+        detail::launch_gated_glu(weights_.config().mlp_gelu, static_cast<const __half*>(d_ff1_),
+                                 static_cast<const __half*>(d_ff2_), static_cast<__half*>(d_ff2_),
+                                 inter, compute_stream_);
       }
     }
 
@@ -1026,11 +1017,11 @@ void LlamaEngine::init_logits_decode_graph() {
       // Same fusion for the down projection; nothing sits between it and the
       // residual add.
       ++packed_matvec_calls_;
-      kernels::launch_kquant_matvec_residual(
-          static_cast<const std::uint8_t*>(lw->w2_packed.data),
-          static_cast<kernels::KQuantType>(lw->w2_packed.kind),
-          static_cast<const __half*>(d_ff2_), static_cast<__half*>(d_x_), lw->w2_packed.rows,
-          lw->w2_packed.cols, compute_stream_, ff_q8);
+      kernels::launch_kquant_matvec_residual(static_cast<const std::uint8_t*>(lw->w2_packed.data),
+                                             static_cast<kernels::KQuantType>(lw->w2_packed.kind),
+                                             static_cast<const __half*>(d_ff2_),
+                                             static_cast<__half*>(d_x_), lw->w2_packed.rows,
+                                             lw->w2_packed.cols, compute_stream_, ff_q8);
       fused_residual = true;
     } else {
       // Residual add folded into the down-projection's epilogue.

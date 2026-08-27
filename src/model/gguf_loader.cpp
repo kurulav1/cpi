@@ -1,8 +1,6 @@
 // GGUF reader. See gguf_loader.hpp for scope and the two caveats.
 #include "model/gguf_loader.hpp"
 
-#include "model/gguf_kquant.hpp"
-
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -11,13 +9,14 @@
 #include <sstream>
 #include <stdexcept>
 
+#include "model/gguf_kquant.hpp"
 #include "model/json_mini.hpp"
 
 #if CPI_HAS_CUDA
-#  include <cuda_fp16.h>
-#  include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
 
-#  include "runtime/kernels.cuh"
+#include "runtime/kernels.cuh"
 #endif
 
 namespace model {
@@ -440,10 +439,11 @@ void GgufLoader::open(const std::string& path) {
     if (packed_active) {
       std::fprintf(stderr, "[gguf] packed k-quant weights resident (CPI_KQUANT_PACKED)\n");
     } else {
-      std::fprintf(stderr,
-                   "[gguf] quantized weights are dequantized to fp16 at load, so this model is "
-                   "resident at its fp16 size. Pass --weight-quant int4 (or int8) to keep it packed "
-                   "on the GPU: less VRAM, and faster decode.\n");
+      std::fprintf(
+          stderr,
+          "[gguf] quantized weights are dequantized to fp16 at load, so this model is "
+          "resident at its fp16 size. Pass --weight-quant int4 (or int8) to keep it packed "
+          "on the GPU: less VRAM, and faster decode.\n");
     }
   }
 }
@@ -929,7 +929,8 @@ const std::byte* GgufLoader::materialize(const std::string& cpi_name,
         const float d = half_to_float(dh);
         const auto* q = reinterpret_cast<const std::int8_t*>(p + 2);
         for (std::size_t i = 0; i < kBlock; ++i) {
-          half[static_cast<std::size_t>(b) * kBlock + i] = float_to_half(d * static_cast<float>(q[i]));
+          half[static_cast<std::size_t>(b) * kBlock + i] =
+              float_to_half(d * static_cast<float>(q[i]));
         }
       }
       break;
@@ -1016,19 +1017,24 @@ const std::byte* GgufLoader::materialize(const std::string& cpi_name,
       break;
     }
     case GgmlType::Q4_K:
-      kquant::dequant_q4_k(reinterpret_cast<const std::uint8_t*>(src), n / kquant::kSuperBlock, half.data());
+      kquant::dequant_q4_k(reinterpret_cast<const std::uint8_t*>(src), n / kquant::kSuperBlock,
+                           half.data());
       break;
     case GgmlType::Q5_K:
-      kquant::dequant_q5_k(reinterpret_cast<const std::uint8_t*>(src), n / kquant::kSuperBlock, half.data());
+      kquant::dequant_q5_k(reinterpret_cast<const std::uint8_t*>(src), n / kquant::kSuperBlock,
+                           half.data());
       break;
     case GgmlType::Q6_K:
-      kquant::dequant_q6_k(reinterpret_cast<const std::uint8_t*>(src), n / kquant::kSuperBlock, half.data());
+      kquant::dequant_q6_k(reinterpret_cast<const std::uint8_t*>(src), n / kquant::kSuperBlock,
+                           half.data());
       break;
     case GgmlType::Q2_K:
-      kquant::dequant_q2_k(reinterpret_cast<const std::uint8_t*>(src), n / kquant::kSuperBlock, half.data());
+      kquant::dequant_q2_k(reinterpret_cast<const std::uint8_t*>(src), n / kquant::kSuperBlock,
+                           half.data());
       break;
     case GgmlType::Q3_K:
-      kquant::dequant_q3_k(reinterpret_cast<const std::uint8_t*>(src), n / kquant::kSuperBlock, half.data());
+      kquant::dequant_q3_k(reinterpret_cast<const std::uint8_t*>(src), n / kquant::kSuperBlock,
+                           half.data());
       break;
     default:
       throw std::runtime_error("gguf: unsupported tensor type at materialize time");

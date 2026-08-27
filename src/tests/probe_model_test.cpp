@@ -61,8 +61,7 @@ const char* kGemma4Metadata =
 
 int main() {
   namespace mh = app::main_helpers;
-  const std::filesystem::path dir =
-      std::filesystem::temp_directory_path() / "cpi_probe_model_test";
+  const std::filesystem::path dir = std::filesystem::temp_directory_path() / "cpi_probe_model_test";
   std::filesystem::create_directories(dir);
 
   // 1. A Gemma 4 container. Has metadata, but not OUR metadata -> must stay Gemma 4.
@@ -104,8 +103,7 @@ int main() {
   const model::LlamaConfig defaulted = model::config_from_json(kGemma4Metadata);
   check(defaulted.hidden_size == 4096,
         "CONTROL: foreign metadata parses to DEFAULT hidden_size 4096");
-  check(defaulted.hidden_size > 0,
-        "CONTROL: so the old `hidden_size > 0` test was always true");
+  check(defaulted.hidden_size > 0, "CONTROL: so the old `hidden_size > 0` test was always true");
   check(defaulted.model_family != model::ModelFamily::Qwen3_5,
         "CONTROL: and model_family stayed unset");
 

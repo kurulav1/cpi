@@ -568,13 +568,10 @@ __global__ void rope_inplace_batched_kernel(half* q, half* k, int num_tokens, in
 
 // Device-position twin: the base position is read on the device, which makes a
 // fixed-shape batched forward (the EAGLE graphed verify) graph-capturable.
-__global__ void rope_inplace_batched_device_pos_kernel(half* q, half* k, int num_tokens,
-                                                       int num_heads_q, int num_heads_k,
-                                                       int head_dim,
-                                                       const int* __restrict__ start_position,
-                                                       const float* cos_table,
-                                                       const float* sin_table, int q_row_stride,
-                                                       int k_row_stride) {
+__global__ void rope_inplace_batched_device_pos_kernel(
+    half* q, half* k, int num_tokens, int num_heads_q, int num_heads_k, int head_dim,
+    const int* __restrict__ start_position, const float* cos_table, const float* sin_table,
+    int q_row_stride, int k_row_stride) {
   const int head = blockIdx.x;
   const int token = blockIdx.y;
   const int pair = threadIdx.x;
@@ -609,8 +606,8 @@ __global__ void rope_inplace_batched_device_pos_kernel(half* q, half* k, int num
 // the device (constant per static tree shape) to stay graph-capturable.
 __global__ void rope_inplace_batched_offsets_device_pos_kernel(
     half* q, half* k, int num_tokens, int num_heads_q, int num_heads_k, int head_dim,
-    const int* __restrict__ start_position, const int* __restrict__ row_off,
-    const float* cos_table, const float* sin_table, int q_row_stride, int k_row_stride) {
+    const int* __restrict__ start_position, const int* __restrict__ row_off, const float* cos_table,
+    const float* sin_table, int q_row_stride, int k_row_stride) {
   const int head = blockIdx.x;
   const int token = blockIdx.y;
   const int pair = threadIdx.x;
@@ -675,8 +672,8 @@ __global__ void eagle_tree_scatter_kernel(const half* __restrict__ k_scr,
   const int layer = blockIdx.x;
   const int j = blockIdx.y;
   if (j >= n) return;
-  const std::size_t src =
-      (static_cast<std::size_t>(layer) * scr_rows + rows_idx[j]) * static_cast<std::size_t>(kv_hidden);
+  const std::size_t src = (static_cast<std::size_t>(layer) * scr_rows + rows_idx[j]) *
+                          static_cast<std::size_t>(kv_hidden);
   const std::size_t dst = static_cast<std::size_t>(layer) * cache_layer_stride +
                           static_cast<std::size_t>(base + j) * static_cast<std::size_t>(kv_hidden);
   for (int d = threadIdx.x; d < kv_hidden; d += blockDim.x) {
@@ -1061,8 +1058,8 @@ __global__ void store_kv_paged_kernel(half* k_pool, half* v_pool, const half* k_
 // single-stream paged prefill can hand the tensor-core attention the plain layout
 // it needs instead of falling to the scalar block-table kernel.
 __global__ void gather_kv_paged_kernel(const half* k_pool, const half* v_pool, half* k_dst,
-                                       half* v_dst, const int* __restrict__ block_table,
-                                       int total, int kv_hidden, int block_size) {
+                                       half* v_dst, const int* __restrict__ block_table, int total,
+                                       int kv_hidden, int block_size) {
   const int row = blockIdx.x;
   if (row >= total) return;
   const int phys = block_table[row / block_size] * block_size + (row % block_size);
@@ -1183,8 +1180,7 @@ __global__ void rmsnorm_seq_strided_kernel(const half* __restrict__ x, const hal
   constexpr int kMaxVecs = 8;
   const int tid = threadIdx.x;
   const int vecs = cols / 8;
-  const int4* x4 =
-      reinterpret_cast<const int4*>(x + static_cast<std::size_t>(row) * in_stride);
+  const int4* x4 = reinterpret_cast<const int4*>(x + static_cast<std::size_t>(row) * in_stride);
   int4 buf[kMaxVecs];
   float acc = 0.0f;
   int n = 0;
@@ -1459,8 +1455,8 @@ void launch_rmsnorm_quant_perm8(const half* x, const half* w, half* y, std::int8
 template <int Threads>
 __global__ void rmsnorm_fast_q8_1_kernel(const half* __restrict__ x, const half* __restrict__ w,
                                          half* __restrict__ y, std::int8_t* __restrict__ xq,
-                                         float* __restrict__ xs, float* __restrict__ gsum,
-                                         int cols, float eps) {
+                                         float* __restrict__ xs, float* __restrict__ gsum, int cols,
+                                         float eps) {
   constexpr int kMaxVecs = 8;
   const int tid = threadIdx.x;
   const int vecs = cols / 8;
@@ -1725,8 +1721,8 @@ void launch_eagle_cat_gather(const half* embedding, const int* dtoks, const int*
                              const int* feat_idx, const half* stash, half* cat, int rows,
                              int hidden, cudaStream_t stream) {
   const dim3 grid(4, rows);
-  eagle_cat_gather_kernel<<<grid, 256, 0, stream>>>(embedding, dtoks, tok_idx, feat_idx, stash,
-                                                    cat, hidden);
+  eagle_cat_gather_kernel<<<grid, 256, 0, stream>>>(embedding, dtoks, tok_idx, feat_idx, stash, cat,
+                                                    hidden);
 }
 
 void launch_eagle_tree_scatter(const half* k_scr, const half* v_scr, half* k_cache, half* v_cache,
@@ -1734,9 +1730,8 @@ void launch_eagle_tree_scatter(const half* k_scr, const half* v_scr, half* k_cac
                                int num_layers, std::size_t cache_layer_stride,
                                cudaStream_t stream) {
   const dim3 grid(num_layers, n);
-  eagle_tree_scatter_kernel<<<grid, 256, 0, stream>>>(k_scr, v_scr, k_cache, v_cache, rows_idx, n,
-                                                      base, kv_hidden, scr_rows,
-                                                      cache_layer_stride);
+  eagle_tree_scatter_kernel<<<grid, 256, 0, stream>>>(
+      k_scr, v_scr, k_cache, v_cache, rows_idx, n, base, kv_hidden, scr_rows, cache_layer_stride);
 }
 
 void launch_rope_inplace_batched(half* q, half* k, int num_tokens, int num_heads_q, int num_heads_k,

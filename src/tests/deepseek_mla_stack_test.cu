@@ -1,6 +1,6 @@
-// Composes the reusable MLA op (engine/mla_forward.hpp) into a small multi-layer DeepSeek-style decoder
-// stack and verifies the whole forward on-device against a host oracle. This is the "wire MLA toward a
-// DeepSeek-arch config" step: structurally a real DeepSeek decoder; pre-norm layers of
+// Composes the reusable MLA op (engine/mla_forward.hpp) into a small multi-layer DeepSeek-style
+// decoder stack and verifies the whole forward on-device against a host oracle. This is the "wire
+// MLA toward a DeepSeek-arch config" step: structurally a real DeepSeek decoder; pre-norm layers of
 //   h += MLA(RMSNorm(h));  h += SwiGLU-MLP(RMSNorm(h))
 //; on a small synthetic config with random weights (a native-MLA checkpoint like DeepSeek-V2-Lite
 // isn't available locally). It proves the MLA op composes correctly across residual layers with
@@ -49,7 +49,9 @@ void rmsnorm_host(const std::vector<float>& x, const std::vector<float>& w, std:
     for (int d = 0; d < H; ++d) y[t * H + d] = x[t * H + d] * inv * w[d];
   }
 }
-float silu(float v) { return v / (1.0f + std::exp(-v)); }
+float silu(float v) {
+  return v / (1.0f + std::exp(-v));
+}
 
 float* dev(const std::vector<float>& h) {
   float* d = nullptr;
@@ -65,7 +67,7 @@ struct LayerH {  // host weights for one layer
 }  // namespace
 
 int main() {
-  engine::MLADims m{/*H*/ 96, /*nh*/ 4, /*q_lora*/ 24, /*kv_lora*/ 32,
+  engine::MLADims m{/*H*/ 96,       /*nh*/ 4,      /*q_lora*/ 24, /*kv_lora*/ 32,
                     /*qk_nope*/ 16, /*qk_rope*/ 8, /*v_head*/ 16};
   const int T = 5, L = 3, ffn = 192, hd = m.hd();
   const float eps = 1e-6f;
@@ -165,7 +167,8 @@ int main() {
   }
   const float rel = maxabs / denom;
   const bool pass = rel < 1e-4f;
-  std::printf("%s[DeepSeek MLA stack]: %d layers (MLA+SwiGLU, pre-norm) device vs oracle, max rel %.2e\n",
-              pass ? "PASS" : "FAIL", L, rel);
+  std::printf(
+      "%s[DeepSeek MLA stack]: %d layers (MLA+SwiGLU, pre-norm) device vs oracle, max rel %.2e\n",
+      pass ? "PASS" : "FAIL", L, rel);
   return pass ? 0 : 1;
 }

@@ -1,7 +1,8 @@
 // Verifies RowParallelLinear on a single GPU: split a weight by INPUT columns across N simulated
 // ranks (all on device 0), run each rank's partial GEMM over its input slice, all-reduce (sum) the
-// partials, and check the result matches the unsharded (world=1) forward. Brick 2 of multi-GPU prep;
-// only the cross-device all-reduce (ncclAllReduce) then needs a real cluster. Decode case (batch=1).
+// partials, and check the result matches the unsharded (world=1) forward. Brick 2 of multi-GPU
+// prep; only the cross-device all-reduce (ncclAllReduce) then needs a real cluster. Decode case
+// (batch=1).
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 

@@ -144,7 +144,8 @@ void quantize_groupwise_to_int8(const __half* src, int rows, int cols, int group
 #endif
   for (int row = 0; row < rows; ++row) {
     const std::size_t row_off = static_cast<std::size_t>(row) * static_cast<std::size_t>(cols);
-    const std::size_t scale_row = static_cast<std::size_t>(row) * static_cast<std::size_t>(n_groups);
+    const std::size_t scale_row =
+        static_cast<std::size_t>(row) * static_cast<std::size_t>(n_groups);
     for (int g = 0; g < n_groups; ++g) {
       const int c0 = g * group;
       const int c1 = std::min(cols, c0 + group);
@@ -161,7 +162,8 @@ void quantize_groupwise_to_int8(const __half* src, int rows, int cols, int group
       for (int col = c0; col < c1; ++col) {
         const float q = __half2float(src[row_off + static_cast<std::size_t>(col)]) / scale;
         const float clamped = std::max(-max_q_f, std::min(max_q_f, q));
-        dst[row_off + static_cast<std::size_t>(col)] = static_cast<std::int8_t>(std::lrint(clamped));
+        dst[row_off + static_cast<std::size_t>(col)] =
+            static_cast<std::int8_t>(std::lrint(clamped));
       }
     }
   }

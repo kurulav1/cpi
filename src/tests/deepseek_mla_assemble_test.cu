@@ -1,6 +1,7 @@
-// Verifies the MlaAssembleRope kernel (engine/mla_assemble.hpp) fp16-on-device vs an fp32 host oracle:
-// assemble per-head K = [k_nope | roped shared k_pe] and V = [v | zeros], and rope q_pe in place. This
-// is the one new kernel the in-engine DeepSeek MLA adds; everything else reuses existing ops.
+// Verifies the MlaAssembleRope kernel (engine/mla_assemble.hpp) fp16-on-device vs an fp32 host
+// oracle: assemble per-head K = [k_nope | roped shared k_pe] and V = [v | zeros], and rope q_pe in
+// place. This is the one new kernel the in-engine DeepSeek MLA adds; everything else reuses
+// existing ops.
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -52,7 +53,8 @@ int main() {
     for (int a = 0; a < qk_nope; ++a) Ko[h * qkhd + a] = __half2float(kvb[h * kvh + a]);
     for (int p = 0; p < half; ++p) {
       const float ang = position * inv_freq[p], c = std::cos(ang), s = std::sin(ang);
-      const float x0 = __half2float(ckv[kv_lora + 2 * p]), x1 = __half2float(ckv[kv_lora + 2 * p + 1]);
+      const float x0 = __half2float(ckv[kv_lora + 2 * p]),
+                  x1 = __half2float(ckv[kv_lora + 2 * p + 1]);
       Ko[h * qkhd + qk_nope + 2 * p] = scaling * (x0 * c - x1 * s);
       Ko[h * qkhd + qk_nope + 2 * p + 1] = scaling * (x0 * s + x1 * c);
     }
@@ -115,7 +117,7 @@ int main() {
   cudaMemcpy(Vs.data(), dVs, Vs.size() * sizeof(__half), cudaMemcpyDeviceToHost);
   cudaMemcpy(Qsd.data(), dQs, Qsd.size() * sizeof(__half), cudaMemcpyDeviceToHost);
   float seqrel = 0, seqden = 1e-4f;
-  const int off = (position) * nh * qkhd;  // seq token index == position (start=0)
+  const int off = (position)*nh * qkhd;  // seq token index == position (start=0)
   for (int i = 0; i < nh * qkhd; ++i) {
     seqrel = std::max(seqrel, std::fabs(__half2float(Kd[i]) - __half2float(Ks[off + i])));
     seqrel = std::max(seqrel, std::fabs(__half2float(Vd[i]) - __half2float(Vs[off + i])));

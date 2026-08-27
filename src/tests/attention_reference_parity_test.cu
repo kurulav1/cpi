@@ -88,9 +88,8 @@ int main() {
   const Config configs[] = {
       {8, 8, 64, "MHA hd64"},         {8, 8, 128, "MHA hd128"},      {8, 8, 256, "MHA hd256"},
       {32, 8, 128, "Llama3.1 hd128"}, {28, 4, 128, "Qwen2.5 hd128"}, {16, 4, 256, "Qwen3.5 hd256"},
-      {16, 4, 64, "GQA hd64"},        {16, 4, 256, "GQA4x hd256"},
-      {8, 1, 256, "MQA hd256"},       {8, 1, 128, "MQA hd128"},
-      {8, 1, 512, "MQA hd512"},       {16, 8, 512, "GQA hd512"},
+      {16, 4, 64, "GQA hd64"},        {16, 4, 256, "GQA4x hd256"},   {8, 1, 256, "MQA hd256"},
+      {8, 1, 128, "MQA hd128"},       {8, 1, 512, "MQA hd512"},      {16, 8, 512, "GQA hd512"},
   };
   // Long sequences exercise the coarsened split (blocks_per_chunk > 1) and the
   // reduce combining multiple coarse chunks, on both host and graph (dpos) paths.

@@ -12,10 +12,10 @@
 // Every scalar gets a distinct value. Filling them with 1s would let a writer that emits the
 // wrong field pass, since every wrong answer would still be 1.
 
+#include "model/config_json.hpp"
+
 #include <cstdio>
 #include <string>
-
-#include "model/config_json.hpp"
 
 namespace {
 
@@ -60,16 +60,16 @@ int main() {
   const model::LlamaConfig out = model::config_from_json(json);
 
   int checked = 0;
-#define CPI_CMP_I(member, key, kind)                                              \
-  check(key, out.member == in.member,                                             \
+#define CPI_CMP_I(member, key, kind)                                                 \
+  check(key, out.member == in.member,                                                \
         "got " + std::to_string(out.member) + " want " + std::to_string(in.member)); \
   ++checked;
-#define CPI_CMP_F(member, key, kind)                                              \
-  check(key, out.member == in.member,                                             \
+#define CPI_CMP_F(member, key, kind)                                                 \
+  check(key, out.member == in.member,                                                \
         "got " + std::to_string(out.member) + " want " + std::to_string(in.member)); \
   ++checked;
-#define CPI_CMP_B(member, key, kind)                                              \
-  check(key, out.member == in.member,                                             \
+#define CPI_CMP_B(member, key, kind)                                                          \
+  check(key, out.member == in.member,                                                         \
         std::string("got ") + (out.member ? "1" : "0") + " want " + (in.member ? "1" : "0")); \
   ++checked;
 #define CPI_CMP(member, key, kind) CPI_CMP_##kind(member, key, kind)
@@ -81,8 +81,8 @@ int main() {
 
   check("dtype", out.dtype == in.dtype, "got '" + out.dtype + "'");
   check("model_family", out.model_family == in.model_family);
-  check("layer_attention_kinds.size", out.layer_attention_kinds.size() ==
-                                          in.layer_attention_kinds.size());
+  check("layer_attention_kinds.size",
+        out.layer_attention_kinds.size() == in.layer_attention_kinds.size());
   bool kinds_ok = out.layer_attention_kinds.size() == in.layer_attention_kinds.size();
   for (std::size_t i = 0; kinds_ok && i < in.layer_attention_kinds.size(); ++i) {
     kinds_ok = out.layer_attention_kinds[i] == in.layer_attention_kinds[i];

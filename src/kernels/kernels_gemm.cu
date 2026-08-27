@@ -29,13 +29,13 @@ __device__ __forceinline__ float warp_sum_f(float v) {
   return v;
 }
 
-
 constexpr int kTile = 32;
 
-__global__ void rowmajor_half_gemm_f16_kernel(const half* __restrict__ w, const half* __restrict__ x,
-                                             half* __restrict__ y, int out_features, int in_features,
-                                             int tokens, float in_min, float in_max, float out_min,
-                                             float out_max) {
+__global__ void rowmajor_half_gemm_f16_kernel(const half* __restrict__ w,
+                                              const half* __restrict__ x, half* __restrict__ y,
+                                              int out_features, int in_features, int tokens,
+                                              float in_min, float in_max, float out_min,
+                                              float out_max) {
   // +1 column of padding: the compute step reads Ws down a column, which would
   // otherwise hit the same shared-memory bank for every thread in a warp.
   __shared__ half Xs[kTile][kTile + 1];
@@ -54,12 +54,12 @@ __global__ void rowmajor_half_gemm_f16_kernel(const half* __restrict__ w, const 
     const int xt = blockIdx.y * kTile + ty;
     // Clipped projections clamp the ACTIVATION as it is read. Defaults are +-inf, so
     // this is a no-op for every model that does not use them.
-    Xs[ty][tx] = (xt < tokens && kx < in_features)
-                     ? __float2half(fminf(fmaxf(__half2float(
-                                              x[static_cast<std::size_t>(xt) * in_features + kx]),
-                                          in_min),
-                                      in_max))
-                     : __float2half(0.0f);
+    Xs[ty][tx] =
+        (xt < tokens && kx < in_features)
+            ? __float2half(fminf(
+                  fmaxf(__half2float(x[static_cast<std::size_t>(xt) * in_features + kx]), in_min),
+                  in_max))
+            : __float2half(0.0f);
     const int wm = blockIdx.x * kTile + ty;
     Ws[ty][tx] = (wm < out_features && kx < in_features)
                      ? w[static_cast<std::size_t>(wm) * in_features + kx]
@@ -121,8 +121,6 @@ void launch_gelu_mul_strided(const half* a, const half* b, half* out, int n, int
   gelu_mul_strided_kernel<<<grid, kThreads, 0, stream>>>(a, b, out, n, tokens, b_stride);
 }
 
-
-
 // Fused SwiGLU projection: gate-GEMV + up-GEMV + silu_mul in one kernel.
 //
 //   out[i] = silu( dot(w_gate[i], x) ) * dot(w_up[i], x)
@@ -145,8 +143,7 @@ __global__ void swiglu_gemv_f16_kernel(const half* __restrict__ w_gate,
   const int row = blockIdx.x * WarpsPerBlock + warp_id;
 
   const bool active = row < inter;
-  const half* g_row =
-      active ? w_gate + static_cast<std::size_t>(row) * in_features : nullptr;
+  const half* g_row = active ? w_gate + static_cast<std::size_t>(row) * in_features : nullptr;
   const half* u_row = active ? w_up + static_cast<std::size_t>(row) * in_features : nullptr;
 
   float gacc = 0.0f, uacc = 0.0f;
@@ -199,8 +196,6 @@ void launch_swiglu_gemv_f16(const half* w_gate, const half* w_up, const half* x,
   swiglu_gemv_f16_kernel<kWarps, kTile>
       <<<blocks, kWarps * 32, 0, stream>>>(w_gate, w_up, x, out, inter, in_features);
 }
-
-
 
 // Split-K GEMV: one BLOCK per output row, W warps each covering a slice of the input,
 // reduced in shared memory.

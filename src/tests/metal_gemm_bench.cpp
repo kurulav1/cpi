@@ -16,12 +16,12 @@
 //
 //   metal_gemm_bench [tokens] [reps]
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
-#include <cstring>
 #include <cstdlib>
-#include <algorithm>
+#include <cstring>
 #include <random>
 #include <string>
 #include <vector>
@@ -33,8 +33,12 @@ namespace {
 
 // Shared with the engine. This one is a bench, so its accuracy column was never load-bearing
 // which is exactly why a private, differently-rounding copy could sit here unnoticed.
-inline std::uint16_t f32_to_f16(float f) { return cpi::f32_to_f16(f); }
-inline float f16_to_f32(std::uint16_t h) { return cpi::f16_to_f32(h); }
+inline std::uint16_t f32_to_f16(float f) {
+  return cpi::f32_to_f16(f);
+}
+inline float f16_to_f32(std::uint16_t h) {
+  return cpi::f16_to_f32(h);
+}
 
 // must match the shader / engine. The whole bug was a copy of these drifting, so they are
 // stated once and everything below derives from them.
@@ -172,9 +176,9 @@ int main(int argc, char** argv) {
                      nullptr, 4, &p, sizeof(p));
       }
       ctx.commit_and_wait();
-      ms = std::min(ms, std::chrono::duration<double, std::milli>(
-                            std::chrono::steady_clock::now() - t0)
-                            .count());
+      ms = std::min(
+          ms,
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
     }
 
     // CPI_METAL_GPUTRACE=<path> captures one dispatch of this shape into a .gputrace for

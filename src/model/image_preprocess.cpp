@@ -83,14 +83,13 @@ void resample_axis(const std::vector<std::uint8_t>& src, std::vector<std::uint8_
         std::int64_t acc = static_cast<std::int64_t>(1) << (kPrecisionBits - 1);  // rounding
         for (int k = lo; k < hi; ++k) {
           const std::size_t idx =
-              horizontal
-                  ? (static_cast<std::size_t>(j) * src_len + k) * channels + c
-                  : (static_cast<std::size_t>(k) * other_len + j) * channels + c;
+              horizontal ? (static_cast<std::size_t>(j) * src_len + k) * channels + c
+                         : (static_cast<std::size_t>(k) * other_len + j) * channels + c;
           acc += static_cast<std::int64_t>(src[idx]) * kk[static_cast<std::size_t>(k - lo)];
         }
-        const std::size_t out =
-            horizontal ? (static_cast<std::size_t>(j) * dst_len + i) * channels + c
-                       : (static_cast<std::size_t>(i) * other_len + j) * channels + c;
+        const std::size_t out = horizontal
+                                    ? (static_cast<std::size_t>(j) * dst_len + i) * channels + c
+                                    : (static_cast<std::size_t>(i) * other_len + j) * channels + c;
         dst[out] = clip8(acc);
       }
     }
@@ -240,8 +239,7 @@ Qwen2VLPatches qwen2vl_preprocess(const Image& img, int patch_size, int temporal
                 for (int x = 0; x < patch_size; ++x) {
                   const int sy = patch_row * patch_size + y;
                   const int sx = patch_col * patch_size + x;
-                  const std::uint8_t v =
-                      r.rgb[(static_cast<std::size_t>(sy) * rw + sx) * 3 + c];
+                  const std::uint8_t v = r.rgb[(static_cast<std::size_t>(sy) * rw + sx) * 3 + c];
                   const float norm = (static_cast<float>(v) / 255.0f - mean[c]) / std[c];
                   const std::size_t idx =
                       ((static_cast<std::size_t>(c) * temporal_patch_size + tp) * patch_size + y) *

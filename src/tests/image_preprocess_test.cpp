@@ -10,14 +10,14 @@
 //    ([y][x][channel], channel innermost); getting that transposed would feed the
 //    encoder a scrambled image while looking perfectly plausible.
 
+#include "model/image_preprocess.hpp"
+
 #include <cmath>
 #include <cstdio>
 #include <fstream>
 #include <sstream>
 #include <string>
 #include <vector>
-
-#include "model/image_preprocess.hpp"
 
 namespace {
 

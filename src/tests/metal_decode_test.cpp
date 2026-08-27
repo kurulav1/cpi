@@ -251,9 +251,10 @@ int main(int argc, char** argv) {
       // Metal sees the reference's tokens, not its own, and has to predict the reference's next
       // one. A tie then excuses only the position it happens at, and a confident disagreement
       // anywhere is a failure no later luck can hide.
-      std::printf("\n  Metal diverges from CUDA at token %zu of %zu (metal=%d cuda=%d)"
-                  " -- re-checking every position against the golden prefix\n",
-                  agree, n, m_out[agree], golden[agree]);
+      std::printf(
+          "\n  Metal diverges from CUDA at token %zu of %zu (metal=%d cuda=%d)"
+          " -- re-checking every position against the golden prefix\n",
+          agree, n, m_out[agree], golden[agree]);
 
       std::vector<int> ctx = prompt;
       ctx.insert(ctx.end(), golden.begin(), golden.begin() + static_cast<long>(n));
@@ -279,9 +280,10 @@ int main(int argc, char** argv) {
         break;
       }
       if (golden_ok) {
-        std::printf("    -> every position matches the golden given the golden prefix"
-                    " (%zu tie%s). PASS.\n",
-                    ties, ties == 1 ? "" : "s");
+        std::printf(
+            "    -> every position matches the golden given the golden prefix"
+            " (%zu tie%s). PASS.\n",
+            ties, ties == 1 ? "" : "s");
       }
     }
   }

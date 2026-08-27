@@ -1,7 +1,7 @@
-// Verifies LocalCollective::all_reduce_sum_fp16 on a single GPU: N per-rank buffers (rank r holds the
-// constant r+1) reduce so every rank ends with sum(1..N). This is the collective seam the tensor- and
-// expert-parallel combines route through; the LocalCollective is verifiable here, NcclCollective is the
-// deferred cluster impl.
+// Verifies LocalCollective::all_reduce_sum_fp16 on a single GPU: N per-rank buffers (rank r holds
+// the constant r+1) reduce so every rank ends with sum(1..N). This is the collective seam the
+// tensor- and expert-parallel combines route through; the LocalCollective is verifiable here,
+// NcclCollective is the deferred cluster impl.
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 

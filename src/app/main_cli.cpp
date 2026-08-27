@@ -79,21 +79,19 @@ T parse_env_or_default(const char* name, const T& default_value, ParseFn&& parse
 void init_options_from_env(engine::EngineOptions* opts) {
   opts->max_context = parse_env_or_default("CPI_MAX_CONTEXT", opts->max_context,
                                            [](const char* v) { return std::stoi(v); });
-  opts->top_k = parse_env_or_default("CPI_TOP_K", opts->top_k,
-                                     [](const char* v) { return std::stoi(v); });
-  opts->top_p = parse_env_or_default("CPI_TOP_P", opts->top_p,
-                                     [](const char* v) { return std::stof(v); });
-  opts->repetition_penalty =
-      parse_env_or_default("CPI_REPEAT_PENALTY", opts->repetition_penalty,
-                           [](const char* v) { return std::stof(v); });
+  opts->top_k =
+      parse_env_or_default("CPI_TOP_K", opts->top_k, [](const char* v) { return std::stoi(v); });
+  opts->top_p =
+      parse_env_or_default("CPI_TOP_P", opts->top_p, [](const char* v) { return std::stof(v); });
+  opts->repetition_penalty = parse_env_or_default("CPI_REPEAT_PENALTY", opts->repetition_penalty,
+                                                  [](const char* v) { return std::stof(v); });
   opts->no_repeat_ngram_size =
       parse_env_or_default("CPI_NO_REPEAT_NGRAM", opts->no_repeat_ngram_size,
                            [](const char* v) { return std::stoi(v); });
   opts->eos_token_id = parse_env_or_default("CPI_EOS_TOKEN_ID", opts->eos_token_id,
                                             [](const char* v) { return std::stoi(v); });
-  opts->gpu_cache_layers =
-      parse_env_or_default("CPI_GPU_CACHE_LAYERS", opts->gpu_cache_layers,
-                           [](const char* v) { return std::stoi(v); });
+  opts->gpu_cache_layers = parse_env_or_default("CPI_GPU_CACHE_LAYERS", opts->gpu_cache_layers,
+                                                [](const char* v) { return std::stoi(v); });
   opts->gpu_cache_limit_mb = static_cast<std::size_t>(parse_env_or_default(
       "CPI_GPU_CACHE_LIMIT_MB", static_cast<unsigned long long>(opts->gpu_cache_limit_mb),
       [](const char* v) { return std::stoull(v); }));
@@ -175,9 +173,8 @@ void apply_simple_mode_defaults(ParsedArgs* args) {
   const int simple_default_max_new =
       parse_env_or_default("CPI_SIMPLE_MAX_NEW", kSimpleModeDefaultMaxNewTokens,
                            [](const char* v) { return std::stoi(v); });
-  const float simple_default_temp =
-      parse_env_or_default("CPI_SIMPLE_TEMP", kSimpleModeDefaultTemperature,
-                           [](const char* v) { return std::stof(v); });
+  const float simple_default_temp = parse_env_or_default(
+      "CPI_SIMPLE_TEMP", kSimpleModeDefaultTemperature, [](const char* v) { return std::stof(v); });
 
   if (!args->max_new_set) {
     args->max_new = simple_default_max_new;
@@ -289,8 +286,7 @@ ParsedArgs parse_args(int argc, char** argv) {
       const std::string path = need_val("--prompt-file");
       std::ifstream pf(path, std::ios::binary);
       if (!pf) throw std::runtime_error("--prompt-file: cannot open " + path);
-      args.prompt_text.assign(std::istreambuf_iterator<char>(pf),
-                              std::istreambuf_iterator<char>());
+      args.prompt_text.assign(std::istreambuf_iterator<char>(pf), std::istreambuf_iterator<char>());
     } else if (arg == "--tokenizer") {
       args.tokenizer_path = need_val("--tokenizer");
       args.tokenizer_set = true;
@@ -498,8 +494,7 @@ ParsedArgs parse_args(int argc, char** argv) {
   if ((args.serve_http || args.interactive_batch) && args.draft_model_path.empty() &&
       !args.opts.paged_blocks) {
     args.opts.paged_blocks = true;
-    std::fprintf(stderr,
-                 "[cli] --serve/--interactive-batch imply --paged-blocks; enabling it.\n");
+    std::fprintf(stderr, "[cli] --serve/--interactive-batch imply --paged-blocks; enabling it.\n");
   }
 
   apply_simple_mode_defaults(&args);

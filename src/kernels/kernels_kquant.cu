@@ -12,13 +12,12 @@
 // gated against an fp16 oracle. A silent mistake here reads as slightly wrong
 // weights, never as a crash, so the test is the point.
 #include <cuda_fp16.h>
+#include <cuda_pipeline.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-
-#include <cuda_pipeline.h>
 
 #include "model/gguf_kquant.hpp"
 #include "runtime/kernels.cuh"
@@ -64,8 +63,12 @@ KQuantTuning g_kq_tune = []() {
 }();
 }  // namespace
 
-void set_kquant_tuning(const KQuantTuning& t) { g_kq_tune = t; }
-KQuantTuning get_kquant_tuning() { return g_kq_tune; }
+void set_kquant_tuning(const KQuantTuning& t) {
+  g_kq_tune = t;
+}
+KQuantTuning get_kquant_tuning() {
+  return g_kq_tune;
+}
 
 namespace {
 
@@ -340,7 +343,8 @@ __device__ __forceinline__ float kq_block_dot(const std::uint8_t* __restrict__ p
         (static_cast<std::uint32_t>(*reinterpret_cast<const std::uint16_t*>(qhp + 2)) << 16);
 
     const int sbase = 192 + (n << 3) + (l0 >> 4);
-    const float scl = static_cast<float>(*reinterpret_cast<const std::int8_t*>(p + sbase + (h << 1)));
+    const float scl =
+        static_cast<float>(*reinterpret_cast<const std::int8_t*>(p + sbase + (h << 1)));
     const float sch =
         static_cast<float>(*reinterpret_cast<const std::int8_t*>(p + sbase + ((2 + h) << 1)));
     std::uint16_t dbits;
@@ -419,10 +423,18 @@ __device__ __forceinline__ float kq_block_dot(const std::uint8_t* __restrict__ p
 //
 // Q6_K blocks are 210 bytes, so consecutive blocks are only 2-byte aligned and
 // it uses uint16 pairs where the others use uint32.
-__device__ __forceinline__ void store_out(__half* p, float v) { *p = __float2half(v); }
-__device__ __forceinline__ float load_out(const __half* p) { return __half2float(*p); }
-__device__ __forceinline__ float load_out(const float* p) { return *p; }
-__device__ __forceinline__ void store_out(float* p, float v) { *p = v; }
+__device__ __forceinline__ void store_out(__half* p, float v) {
+  *p = __float2half(v);
+}
+__device__ __forceinline__ float load_out(const __half* p) {
+  return __half2float(*p);
+}
+__device__ __forceinline__ float load_out(const float* p) {
+  return *p;
+}
+__device__ __forceinline__ void store_out(float* p, float v) {
+  *p = v;
+}
 
 // WPR warps cooperate on one row, so a block covers 8/WPR rows.
 //
@@ -468,8 +480,8 @@ __global__ void kquant_matvec_vec_kernel(const std::uint8_t* __restrict__ w,
 
   float acc = 0.0f;
   if (row < rows) {
-    const std::uint8_t* p = w + static_cast<std::size_t>(row) * row_bytes +
-                            static_cast<std::size_t>(sub) * block_bytes;
+    const std::uint8_t* p =
+        w + static_cast<std::size_t>(row) * row_bytes + static_cast<std::size_t>(sub) * block_bytes;
     // Two super-blocks per iteration so both sets of loads are in flight before
     // either is consumed. Profiling put 59% of warp stalls on memory scoreboard
     // dependencies at 90% occupancy and only 48% DRAM utilisation, which is a
@@ -578,8 +590,9 @@ __global__ void kquant_matvec_fast_kernel(const std::uint8_t* __restrict__ w,
     if (TYPE == KQuantType::Q6_K) {
       std::uint16_t dh;
       memcpy(&dh, p + 208, 2);
-      const int q = static_cast<int>(hi_nibble ? (__ldg(p + off_a) >> 4) : (__ldg(p + off_a) & 0x0F)) |
-                    (((__ldg(p + off_b) >> shift) & 3) << 4);
+      const int q =
+          static_cast<int>(hi_nibble ? (__ldg(p + off_a) >> 4) : (__ldg(p + off_a) & 0x0F)) |
+          (((__ldg(p + off_b) >> shift) & 3) << 4);
       const auto sc = static_cast<const std::int8_t>(__ldg(p + scale_idx));
       v = half_bits_to_float(dh) * static_cast<float>(sc) * static_cast<float>(q - 32);
     } else {
@@ -620,8 +633,7 @@ __global__ void kquant_matvec_kernel(const std::uint8_t* __restrict__ w, KQuantT
   const int row = blockIdx.x;
   if (row >= rows) return;
   const int blocks_per_row = cols / static_cast<int>(kSuperBlock);
-  const std::uint8_t* row_base =
-      w + static_cast<std::size_t>(row) * blocks_per_row * block_bytes;
+  const std::uint8_t* row_base = w + static_cast<std::size_t>(row) * blocks_per_row * block_bytes;
 
   float acc = 0.0f;
   for (int b = 0; b < blocks_per_row; ++b) {
@@ -655,13 +667,16 @@ void launch_dequant_kquant(const std::uint8_t* blocks_in, KQuantType type, std::
   const unsigned grid = static_cast<unsigned>((blocks + 7) / 8);
   switch (type) {
     case KQuantType::Q4_K:
-      dequant_kquant_vec_kernel<KQuantType::Q4_K><<<grid, kThreads, 0, stream>>>(blocks_in, out, blocks);
+      dequant_kquant_vec_kernel<KQuantType::Q4_K>
+          <<<grid, kThreads, 0, stream>>>(blocks_in, out, blocks);
       break;
     case KQuantType::Q5_K:
-      dequant_kquant_vec_kernel<KQuantType::Q5_K><<<grid, kThreads, 0, stream>>>(blocks_in, out, blocks);
+      dequant_kquant_vec_kernel<KQuantType::Q5_K>
+          <<<grid, kThreads, 0, stream>>>(blocks_in, out, blocks);
       break;
     case KQuantType::Q6_K:
-      dequant_kquant_vec_kernel<KQuantType::Q6_K><<<grid, kThreads, 0, stream>>>(blocks_in, out, blocks);
+      dequant_kquant_vec_kernel<KQuantType::Q6_K>
+          <<<grid, kThreads, 0, stream>>>(blocks_in, out, blocks);
       break;
   }
 }
@@ -727,8 +742,8 @@ __global__ void kquant_matmul_kernel(const std::uint8_t* __restrict__ w,
 #pragma unroll
       for (int t = 0; t < BMAX; ++t) {
         if (t >= bn) continue;
-        const __half* xb = x + static_cast<std::size_t>(b0 + t) * static_cast<std::size_t>(cols) +
-                           xbase;
+        const __half* xb =
+            x + static_cast<std::size_t>(b0 + t) * static_cast<std::size_t>(cols) + xbase;
         float2 a1;
         float2 h1;
         const float2 a0 = load_x4(xb + off_lo, &a1);
@@ -770,9 +785,10 @@ __global__ void kquant_matmul_kernel(const std::uint8_t* __restrict__ w,
 // keeps it out of the inner loop.
 //
 // One warp per group: 32 lanes, one element each.
-__global__ void quantize_q8_1_groups_kernel(const __half* __restrict__ x, std::int8_t* __restrict__ q,
-                                            float* __restrict__ scale, float* __restrict__ gsum,
-                                            int cols, int groups_per_row) {
+__global__ void quantize_q8_1_groups_kernel(const __half* __restrict__ x,
+                                            std::int8_t* __restrict__ q, float* __restrict__ scale,
+                                            float* __restrict__ gsum, int cols,
+                                            int groups_per_row) {
   const int warp = static_cast<int>(threadIdx.x) >> 5;
   const int lane = static_cast<int>(threadIdx.x) & 31;
   const int g = blockIdx.x * (blockDim.x >> 5) + warp;
@@ -879,10 +895,9 @@ __global__ void kquant_matmul_dp4a_kernel(const std::uint8_t* __restrict__ w,
         const int sum_hi = __dp4a(xh, 0x01010101, 0);
         const float slo = xs[grow + gbase + 2 * j];
         const float shi = xs[grow + gbase + 2 * j + 1];
-        acc[t] += slo * (d * sc0 * static_cast<float>(dot_lo) -
-                         dmin * m0 * static_cast<float>(sum_lo)) +
-                  shi * (d * sc1 * static_cast<float>(dot_hi) -
-                         dmin * m1 * static_cast<float>(sum_hi));
+        acc[t] +=
+            slo * (d * sc0 * static_cast<float>(dot_lo) - dmin * m0 * static_cast<float>(sum_lo)) +
+            shi * (d * sc1 * static_cast<float>(dot_hi) - dmin * m1 * static_cast<float>(sum_hi));
       }
       p += block_bytes * kWarps;
     }
@@ -908,7 +923,6 @@ __global__ void kquant_matmul_dp4a_kernel(const std::uint8_t* __restrict__ w,
   }
   (void)xsum;
 }
-
 
 // Q4_K matmul on int8 tensor cores: the MMQ shape, adapted from
 // moe_int4_grouped_mma_kernel.
@@ -947,14 +961,18 @@ constexpr int kMmqBM = 64;
 // the low row bits rotates each row's chunks across banks at zero memory cost
 // (llama.cpp buys the same property by padding its sram stride to %8==4).
 // Bits 0..3 are untouched, so 4- and 16-byte alignment survive.
-__device__ __forceinline__ int mmq_swz(int r, int c) { return c ^ ((r & 7) << 4); }
+__device__ __forceinline__ int mmq_swz(int r, int c) {
+  return c ^ ((r & 7) << 4);
+}
 
 // Same idea for the Q6_K scale tile, whose rows are 64 B = 16 words: the four
 // Bsc loads in the mma epilogue come from rows nbase + 2t (+1), i.e. a 32-word
 // stride across the thread quad, the same bank four ways. XOR-ing the float
 // index with row bits 1..2 spreads the quad across four bank groups; rows na
 // (even) and na+1 share an offset, so a thread's own pair stays adjacent.
-__device__ __forceinline__ int mmq_swz_sc(int r, int j) { return j ^ (((r >> 1) & 3) << 2); }
+__device__ __forceinline__ int mmq_swz_sc(int r, int j) {
+  return j ^ (((r >> 1) & 3) << 2);
+}
 
 // ldmatrix fragment loads: one instruction replaces four (x4) or two (x2)
 // address computations + ld.shared, with the PTX-defined per-thread fragment
@@ -1019,12 +1037,22 @@ struct MmqSmem<true, T> {
 //       uint4 units, 1 per thread, expanding to two 16-byte runs (the low and
 //       high nibbles of a 16-byte chunk land 32 columns apart).
 template <int NT>
-__global__ __launch_bounds__(256) void kquant_mmq_q4k_kernel(
-    const std::uint8_t* __restrict__ w, const std::int8_t* __restrict__ xq,
-    const float* __restrict__ as, const float* __restrict__ gsum, __half* __restrict__ y, int rows,
-    int cols, int batch, int ldy) {
+__global__ __launch_bounds__(256) void kquant_mmq_q4k_kernel(const std::uint8_t* __restrict__ w,
+                                                             const std::int8_t* __restrict__ xq,
+                                                             const float* __restrict__ as,
+                                                             const float* __restrict__ gsum,
+                                                             __half* __restrict__ y, int rows,
+                                                             int cols, int batch, int ldy) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800)
-  (void)w; (void)xq; (void)as; (void)gsum; (void)y; (void)rows; (void)cols; (void)batch; (void)ldy;
+  (void)w;
+  (void)xq;
+  (void)as;
+  (void)gsum;
+  (void)y;
+  (void)rows;
+  (void)cols;
+  (void)batch;
+  (void)ldy;
 #else
   constexpr int kMmqBN = 2 * NT * 8;
   const int tid = static_cast<int>(threadIdx.x);
@@ -1056,7 +1084,8 @@ __global__ __launch_bounds__(256) void kquant_mmq_q4k_kernel(
       const int u = tid + i * 256;
       const int r = u >> 4, c = (u & 15) << 4;
       uint4 v = make_uint4(0, 0, 0, 0);
-      if (r < batch) v = *reinterpret_cast<const uint4*>(xq + static_cast<std::size_t>(r) * cols + k0 + c);
+      if (r < batch)
+        v = *reinterpret_cast<const uint4*>(xq + static_cast<std::size_t>(r) * cols + k0 + c);
       *reinterpret_cast<uint4*>(&As[r][c]) = v;
     }
 
@@ -1230,15 +1259,15 @@ __device__ __forceinline__ void kquant_mmq_q4k_process_tile(
     float* __restrict__ aux, int rows, int cols, int batch, int ldy, int tile_it, int kb0_start,
     int kb0_stop) {
   constexpr int kBM = 32;
-  constexpr int kMH = M2 ? 2 : 1;    // batch halves per pass
-  constexpr int kBMT = 32 * kMH;     // activation rows staged
+  constexpr int kMH = M2 ? 2 : 1;  // batch halves per pass
+  constexpr int kBMT = 32 * kMH;   // activation rows staged
   // Warps split across the M and N tiles, and the split has to follow kBM: with
   // 16 rows per m-tile, kBM=32 leaves only two m-tiles, so the other warps must
   // go to N. Keeping the 64-row mapping here left warps 4..7 with every row out
   // of range: half the block computing nothing, which is exactly the factor
   // between this kernel's 33% theoretical and 17% achieved occupancy.
-  constexpr int kMT = kBM / 16;   // m-tiles per block
-  constexpr int kNH = 8 / kMT;    // warps left for the n dimension
+  constexpr int kMT = kBM / 16;  // m-tiles per block
+  constexpr int kNH = 8 / kMT;   // warps left for the n dimension
   constexpr int kBN = kNH * NT * 8;
   constexpr int kAsBufs = (NT >= 4 || M2) ? 1 : 2;
   const int tid = static_cast<int>(threadIdx.x);
@@ -1247,8 +1276,7 @@ __device__ __forceinline__ void kquant_mmq_q4k_process_tile(
   const int blockNrow = tile_it * kBN;
   const int Kg = cols >> 5;
   const int nsb = cols >> 8;
-  const std::size_t row_bytes =
-      static_cast<std::size_t>(nsb) * model::kquant::kQ4KBlockBytes;
+  const std::size_t row_bytes = static_cast<std::size_t>(nsb) * model::kquant::kQ4KBlockBytes;
 
   // Synchronous activation stage for the single-buffer shape. Safe without an
   // extra barrier: the previous iteration's trailing __syncthreads means every
@@ -1392,10 +1420,14 @@ __device__ __forceinline__ void kquant_mmq_q4k_process_tile(
               "{%8,%9}, {%0,%1,%2,%3};\n"
               : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
               : "r"(a0[mh]), "r"(a1[mh]), "r"(a2[mh]), "r"(a3[mh]), "r"(b0), "r"(b1));
-          facc[mh][nt][0] += static_cast<float>(c0) * as_a[mh] * (da * sca) - (dmina * ma) * gs_a[mh];
-          facc[mh][nt][1] += static_cast<float>(c1) * as_a[mh] * (db * scb) - (dminb * mb) * gs_a[mh];
-          facc[mh][nt][2] += static_cast<float>(c2) * as_b[mh] * (da * sca) - (dmina * ma) * gs_b[mh];
-          facc[mh][nt][3] += static_cast<float>(c3) * as_b[mh] * (db * scb) - (dminb * mb) * gs_b[mh];
+          facc[mh][nt][0] +=
+              static_cast<float>(c0) * as_a[mh] * (da * sca) - (dmina * ma) * gs_a[mh];
+          facc[mh][nt][1] +=
+              static_cast<float>(c1) * as_a[mh] * (db * scb) - (dminb * mb) * gs_a[mh];
+          facc[mh][nt][2] +=
+              static_cast<float>(c2) * as_b[mh] * (da * sca) - (dmina * ma) * gs_b[mh];
+          facc[mh][nt][3] +=
+              static_cast<float>(c3) * as_b[mh] * (db * scb) - (dminb * mb) * gs_b[mh];
         }
       }
     }
@@ -1438,7 +1470,15 @@ __global__ __launch_bounds__(256) void kquant_mmq_q4k_async_kernel(
     const float* __restrict__ as, const float* __restrict__ gsum, __half* __restrict__ y,
     float* __restrict__ partial, int rows, int cols, int batch, int ldy) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800)
-  (void)w; (void)xq; (void)as; (void)gsum; (void)y; (void)rows; (void)cols; (void)batch; (void)ldy;
+  (void)w;
+  (void)xq;
+  (void)as;
+  (void)gsum;
+  (void)y;
+  (void)rows;
+  (void)cols;
+  (void)batch;
+  (void)ldy;
 #else
   constexpr int kBMT = M2 ? 64 : 32;
   constexpr int kBN = 4 * NT * 8;
@@ -1461,8 +1501,8 @@ __global__ __launch_bounds__(256) void kquant_mmq_q4k_async_kernel(
     sb_hi = min(sb_lo + chunk, nsb);
     if (sb_lo >= sb_hi) return;
   }
-  kquant_mmq_q4k_process_tile<NT, M2, SPLITK ? 1 : 0>(As, Bq, Hd, w, xq, as, gsum, y, partial,
-                                                      rows, cols, batch, ldy,
+  kquant_mmq_q4k_process_tile<NT, M2, SPLITK ? 1 : 0>(As, Bq, Hd, w, xq, as, gsum, y, partial, rows,
+                                                      cols, batch, ldy,
                                                       static_cast<int>(blockIdx.x), sb_lo, sb_hi);
 #endif
 }
@@ -1479,8 +1519,16 @@ __global__ __launch_bounds__(256) void kquant_mmq_q4k_streamk_kernel(
     const float* __restrict__ as, const float* __restrict__ gsum, __half* __restrict__ y,
     float* __restrict__ tmp, int rows, int cols, int batch, int ldy) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800)
-  (void)w; (void)xq; (void)as; (void)gsum; (void)y; (void)tmp; (void)rows; (void)cols;
-  (void)batch; (void)ldy;
+  (void)w;
+  (void)xq;
+  (void)as;
+  (void)gsum;
+  (void)y;
+  (void)tmp;
+  (void)rows;
+  (void)cols;
+  (void)batch;
+  (void)ldy;
 #else
   constexpr int kBN = 4 * NT * 8;
   constexpr int kAsBufs = NT >= 4 ? 1 : 2;
@@ -1512,9 +1560,8 @@ __global__ __launch_bounds__(256) void kquant_mmq_q4k_streamk_kernel(
   if (kbc >= kbc_stop) return;
   // Trailing piece that ends mid-tile: park it in the fixup buffer. Writing y
   // here would race with the block that owns this tile's k-end.
-  kquant_mmq_q4k_process_tile<NT, false, 2>(As, Bq, Hd, w, xq, as, gsum, y, tmp, rows, cols,
-                                            batch, ldy, static_cast<int>(kbc / nsb), kb0_start,
-                                            kb0_stop);
+  kquant_mmq_q4k_process_tile<NT, false, 2>(As, Bq, Hd, w, xq, as, gsum, y, tmp, rows, cols, batch,
+                                            ldy, static_cast<int>(kbc / nsb), kb0_start, kb0_stop);
 #endif
 }
 
@@ -1550,8 +1597,8 @@ __global__ __launch_bounds__(256) void kquant_mmq_q4k_streamk_kernel(
 template <int NT, bool M2 = false>
 struct Q4kSmemLayout {
   std::int8_t As[M2 ? 64 : 32][256];
-  std::int8_t Bs[4 * NT * 8][256];   // raw nibble values 0..15
-  float2 Bsdm[4 * NT * 8][8];        // (d*sc, dmin*m) per 32-group
+  std::int8_t Bs[4 * NT * 8][256];  // raw nibble values 0..15
+  float2 Bsdm[4 * NT * 8][8];       // (d*sc, dmin*m) per 32-group
 };
 
 // Scale-tile swizzle: the epilogue's float2 loads hit rows nbase + 2t (+1) at
@@ -1559,7 +1606,9 @@ struct Q4kSmemLayout {
 // pair four ways. XOR-ing the group index with row bits 1..2 spreads the quad
 // over four bank pairs; na (even) and na+1 share the offset so a thread's own
 // pair of rows keeps one index.
-__device__ __forceinline__ int mmq_swz_dm(int r, int j) { return j ^ ((r >> 1) & 3); }
+__device__ __forceinline__ int mmq_swz_dm(int r, int j) {
+  return j ^ ((r >> 1) & 3);
+}
 
 template <int NT, bool M2, int MODE>
 __device__ __forceinline__ void kquant_mmq_q4k_process_tile_unpacked(
@@ -1568,7 +1617,7 @@ __device__ __forceinline__ void kquant_mmq_q4k_process_tile_unpacked(
     const float* __restrict__ gsum, __half* __restrict__ y, float* __restrict__ aux, int rows,
     int cols, int batch, int ldy, int tile_it, int kb0_start, int kb0_stop) {
   constexpr int kBN = 4 * NT * 8;
-  constexpr int kWIter = NT;  // weight staging passes: kBN * 8 / 256
+  constexpr int kWIter = NT;       // weight staging passes: kBN * 8 / 256
   constexpr int kMH = M2 ? 2 : 1;  // batch halves per pass
   constexpr int kBMT = 32 * kMH;   // activation rows staged
   auto& As = sm->As;
@@ -1580,8 +1629,7 @@ __device__ __forceinline__ void kquant_mmq_q4k_process_tile_unpacked(
   const int blockNrow = tile_it * kBN;
   const int Kg = cols >> 5;
   const int nsb = cols >> 8;
-  const std::size_t row_bytes =
-      static_cast<std::size_t>(nsb) * model::kquant::kQ4KBlockBytes;
+  const std::size_t row_bytes = static_cast<std::size_t>(nsb) * model::kquant::kQ4KBlockBytes;
 
   float facc[kMH][NT][4];
 #pragma unroll
@@ -1655,9 +1703,9 @@ __device__ __forceinline__ void kquant_mmq_q4k_process_tile_unpacked(
         const int wrow = blockNrow + r;
         h = make_uint4(0, 0, 0, 0);
         if (wrow < rows) {
-          h = *reinterpret_cast<const uint4*>(
-              w + static_cast<std::size_t>(wrow) * row_bytes +
-              static_cast<std::size_t>(sb) * model::kquant::kQ4KBlockBytes);
+          h = *reinterpret_cast<const uint4*>(w + static_cast<std::size_t>(wrow) * row_bytes +
+                                              static_cast<std::size_t>(sb) *
+                                                  model::kquant::kQ4KBlockBytes);
         }
       }
       float sc, m;
@@ -1724,8 +1772,8 @@ __device__ __forceinline__ void kquant_mmq_q4k_process_tile_unpacked(
       // n-tiles pair into one ldmatrix.x4 (lanes 16..31 address the second
       // tile's rows), halving the fragment-load instruction count.
       int b0[NT < 2 ? 2 : NT], b1[NT < 2 ? 2 : NT];  // >=2: the pair branch
-      float2 sa[NT], sn[NT];                          // indexes nt+1 even when
-                                                      // NT=1 compiles it out
+      float2 sa[NT], sn[NT];                         // indexes nt+1 even when
+                                                     // NT=1 compiles it out
 
 #pragma unroll
       for (int nt = 0; nt < NT; nt += 2) {
@@ -1807,8 +1855,16 @@ __global__ __launch_bounds__(256, NT <= 2 ? 2 : 1) void kquant_mmq_q4k_streamk_u
     const float* __restrict__ as, const float* __restrict__ gsum, __half* __restrict__ y,
     float* __restrict__ tmp, int rows, int cols, int batch, int ldy) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800)
-  (void)w; (void)xq; (void)as; (void)gsum; (void)y; (void)tmp; (void)rows; (void)cols;
-  (void)batch; (void)ldy;
+  (void)w;
+  (void)xq;
+  (void)as;
+  (void)gsum;
+  (void)y;
+  (void)tmp;
+  (void)rows;
+  (void)cols;
+  (void)batch;
+  (void)ldy;
 #else
   constexpr int kBN = 4 * NT * 8;
   using Smem = Q4kSmemLayout<NT, M2>;
@@ -1825,9 +1881,9 @@ __global__ __launch_bounds__(256, NT <= 2 ? 2 : 1) void kquant_mmq_q4k_streamk_u
   std::int64_t want = kb0_start + (kbc_stop - kbc);
   int kb0_stop = want < nsb ? static_cast<int>(want) : nsb;
   while (kbc < kbc_stop && kb0_stop == nsb) {
-    kquant_mmq_q4k_process_tile_unpacked<NT, M2, 0>(sm, w, xq, as, gsum, y, tmp, rows, cols,
-                                                    batch, ldy, static_cast<int>(kbc / nsb),
-                                                    kb0_start, kb0_stop);
+    kquant_mmq_q4k_process_tile_unpacked<NT, M2, 0>(sm, w, xq, as, gsum, y, tmp, rows, cols, batch,
+                                                    ldy, static_cast<int>(kbc / nsb), kb0_start,
+                                                    kb0_stop);
     kbc += nsb - kb0_start;
     kb0_start = 0;
     want = kbc_stop - kbc;
@@ -2015,8 +2071,8 @@ __device__ __forceinline__ void kquant_mmq_q6k_process_tile(
     const std::int8_t* __restrict__ xq, const float* __restrict__ as, __half* __restrict__ y,
     float* __restrict__ aux, int rows, int cols, int batch, int ldy, int tile_it, int kb0_start,
     int kb0_stop) {
-  constexpr int kMT = BM / 16;      // m-tiles, one warp group each
-  constexpr int kNH = 8 / kMT;      // warp groups across N
+  constexpr int kMT = BM / 16;  // m-tiles, one warp group each
+  constexpr int kNH = 8 / kMT;  // warp groups across N
   constexpr int kMmqBN = kNH * NT * 8;
   constexpr int kPfIter = (kMmqBN * 8) / 256;  // weight staging passes
   const int tid = static_cast<int>(threadIdx.x);
@@ -2072,10 +2128,10 @@ __device__ __forceinline__ void kquant_mmq_q6k_process_tile(
       psc[i][0] = (p != nullptr)
                       ? d * static_cast<float>(*reinterpret_cast<const std::int8_t*>(p + 192 + j0))
                       : 0.0f;
-      psc[i][1] = (p != nullptr)
-                      ? d * static_cast<float>(
-                                *reinterpret_cast<const std::int8_t*>(p + 192 + j0 + 1))
-                      : 0.0f;
+      psc[i][1] =
+          (p != nullptr)
+              ? d * static_cast<float>(*reinterpret_cast<const std::int8_t*>(p + 192 + j0 + 1))
+              : 0.0f;
     }
   };
   // Registers -> shared: arithmetic-identical to the synchronous staging loop
@@ -2125,80 +2181,79 @@ __device__ __forceinline__ void kquant_mmq_q6k_process_tile(
       __syncthreads();
       if (sb + 1 < kb0_stop) prefetch(sb + 1);
     } else {
-    // Weights: eight threads a row, each unpacking a 16-byte run of ql into
-    // sixteen low and sixteen high values. A 16-byte run never crosses the
-    // 32-byte or 64-byte boundaries that move l0, h and n, so those are constant
-    // across the run and the matching qh bytes are contiguous too.
-    //
-    // The loop, not `if (r < kMmqBN)`: 256 threads cover 32 rows a pass, so
-    // NT=4's 64-row tile needs two. The old guard silently staged half the
-    // tile at NT=4 (rows 32..63 multiplied stale shared memory), and the
-    // rows<=32 unit-test slice masked it via the gn<rows store guard, which is
-    // how ebbe5f2 recorded NT=4 as "numerically correct". --batched-check is
-    // what caught it.
+      // Weights: eight threads a row, each unpacking a 16-byte run of ql into
+      // sixteen low and sixteen high values. A 16-byte run never crosses the
+      // 32-byte or 64-byte boundaries that move l0, h and n, so those are constant
+      // across the run and the matching qh bytes are contiguous too.
+      //
+      // The loop, not `if (r < kMmqBN)`: 256 threads cover 32 rows a pass, so
+      // NT=4's 64-row tile needs two. The old guard silently staged half the
+      // tile at NT=4 (rows 32..63 multiplied stale shared memory), and the
+      // rows<=32 unit-test slice masked it via the gn<rows store guard, which is
+      // how ebbe5f2 recorded NT=4 as "numerically correct". --batched-check is
+      // what caught it.
 #pragma unroll
-    for (int u = tid; u < kMmqBN * 8; u += 256) {
-      {
-        const int r = u >> 3, c = (u & 7) << 4;
-        const int wrow = blockNrow + r;
-        const std::uint8_t* p =
-            (wrow < rows) ? w + static_cast<std::size_t>(wrow) * row_bytes +
-                                static_cast<std::size_t>(sb) * model::kquant::kQ6KResidentBytes
-                          : nullptr;
-        const int n = c >> 6, h = (c >> 5) & 1, l0 = c & 31;
-        const int off_lo = (n << 7) + (h << 5) + l0;
-        const int sl = 2 * h, sh = 4 + 2 * h;
-        // Read the run as uint16 pairs, since a 210-byte block leaves p only
-        // 2-byte aligned so wider loads are out (llama.cpp pays the same
-        // get_int_b2 tax), but unpack in words, not bytes. The old loop computed each
-        // value separately and issued a byte-wide shared store per weight: 32
-        // st.b8 and ~96 per-byte ALU ops per 16-byte run. The audit's head A/B
-        // put this kernel at 379 GB/s against llama.cpp's 1317 on identical
-        // bytes with staging as the only untested difference; their
-        // load_tiles_q6_K assembles four recentered values per int in
-        // registers (__vsubss4) and stores words. Same here: the whole-word
-        // shifts keep each byte lane's 2 qh bits and 4 ql bits in place (the
-        // cross-byte spill of >> lands above the per-lane mask), so this is
-        // arithmetic-identical to the byte loop, at 8 st.b32 and ~16 word ops.
-        const std::uint16_t* qlp = reinterpret_cast<const std::uint16_t*>(p + c);
-        const std::uint16_t* qhp =
-            reinterpret_cast<const std::uint16_t*>(p + 128 + (n << 5) + l0);
+      for (int u = tid; u < kMmqBN * 8; u += 256) {
+        {
+          const int r = u >> 3, c = (u & 7) << 4;
+          const int wrow = blockNrow + r;
+          const std::uint8_t* p =
+              (wrow < rows) ? w + static_cast<std::size_t>(wrow) * row_bytes +
+                                  static_cast<std::size_t>(sb) * model::kquant::kQ6KResidentBytes
+                            : nullptr;
+          const int n = c >> 6, h = (c >> 5) & 1, l0 = c & 31;
+          const int off_lo = (n << 7) + (h << 5) + l0;
+          const int sl = 2 * h, sh = 4 + 2 * h;
+          // Read the run as uint16 pairs, since a 210-byte block leaves p only
+          // 2-byte aligned so wider loads are out (llama.cpp pays the same
+          // get_int_b2 tax), but unpack in words, not bytes. The old loop computed each
+          // value separately and issued a byte-wide shared store per weight: 32
+          // st.b8 and ~96 per-byte ALU ops per 16-byte run. The audit's head A/B
+          // put this kernel at 379 GB/s against llama.cpp's 1317 on identical
+          // bytes with staging as the only untested difference; their
+          // load_tiles_q6_K assembles four recentered values per int in
+          // registers (__vsubss4) and stores words. Same here: the whole-word
+          // shifts keep each byte lane's 2 qh bits and 4 ql bits in place (the
+          // cross-byte spill of >> lands above the per-lane mask), so this is
+          // arithmetic-identical to the byte loop, at 8 st.b32 and ~16 word ops.
+          const std::uint16_t* qlp = reinterpret_cast<const std::uint16_t*>(p + c);
+          const std::uint16_t* qhp =
+              reinterpret_cast<const std::uint16_t*>(p + 128 + (n << 5) + l0);
 #pragma unroll
-        for (int g2 = 0; g2 < 4; ++g2) {
-          std::uint32_t ql32 = 0u;
-          std::uint32_t qh32 = 0u;
-          if (p != nullptr) {
-            ql32 = static_cast<std::uint32_t>(qlp[2 * g2]) |
-                   (static_cast<std::uint32_t>(qlp[2 * g2 + 1]) << 16);
-            qh32 = static_cast<std::uint32_t>(qhp[2 * g2]) |
-                   (static_cast<std::uint32_t>(qhp[2 * g2 + 1]) << 16);
+          for (int g2 = 0; g2 < 4; ++g2) {
+            std::uint32_t ql32 = 0u;
+            std::uint32_t qh32 = 0u;
+            if (p != nullptr) {
+              ql32 = static_cast<std::uint32_t>(qlp[2 * g2]) |
+                     (static_cast<std::uint32_t>(qlp[2 * g2 + 1]) << 16);
+              qh32 = static_cast<std::uint32_t>(qhp[2 * g2]) |
+                     (static_cast<std::uint32_t>(qhp[2 * g2 + 1]) << 16);
+            }
+            const std::uint32_t lo_u = (ql32 & 0x0F0F0F0Fu) | (((qh32 >> sl) & 0x03030303u) << 4);
+            const std::uint32_t hi_u =
+                ((ql32 >> 4) & 0x0F0F0F0Fu) | (((qh32 >> sh) & 0x03030303u) << 4);
+            const int lo = __vsubss4(static_cast<int>(lo_u), 0x20202020);
+            const int hi = __vsubss4(static_cast<int>(hi_u), 0x20202020);
+            *reinterpret_cast<int*>(&Bs[r][mmq_swz(r, off_lo + 4 * g2)]) = lo;
+            *reinterpret_cast<int*>(&Bs[r][mmq_swz(r, off_lo + 64 + 4 * g2)]) = hi;
           }
-          const std::uint32_t lo_u =
-              (ql32 & 0x0F0F0F0Fu) | (((qh32 >> sl) & 0x03030303u) << 4);
-          const std::uint32_t hi_u =
-              ((ql32 >> 4) & 0x0F0F0F0Fu) | (((qh32 >> sh) & 0x03030303u) << 4);
-          const int lo = __vsubss4(static_cast<int>(lo_u), 0x20202020);
-          const int hi = __vsubss4(static_cast<int>(hi_u), 0x20202020);
-          *reinterpret_cast<int*>(&Bs[r][mmq_swz(r, off_lo + 4 * g2)]) = lo;
-          *reinterpret_cast<int*>(&Bs[r][mmq_swz(r, off_lo + 64 + 4 * g2)]) = hi;
-        }
-        // Two of the sixteen scale groups per pass.
-        float d = 0.0f;
-        if (p != nullptr) {
-          std::uint16_t dbits;
-          memcpy(&dbits, p + 208, 2);
-          d = half_bits_to_float(dbits);
-        }
-        const int j0 = (u & 7) << 1;
-        for (int j = j0; j < j0 + 2; ++j) {
-          Bsc[r][mmq_swz_sc(r, j)] =
-              (p != nullptr)
-                  ? d * static_cast<float>(*reinterpret_cast<const std::int8_t*>(p + 192 + j))
-                  : 0.0f;
+          // Two of the sixteen scale groups per pass.
+          float d = 0.0f;
+          if (p != nullptr) {
+            std::uint16_t dbits;
+            memcpy(&dbits, p + 208, 2);
+            d = half_bits_to_float(dbits);
+          }
+          const int j0 = (u & 7) << 1;
+          for (int j = j0; j < j0 + 2; ++j) {
+            Bsc[r][mmq_swz_sc(r, j)] =
+                (p != nullptr)
+                    ? d * static_cast<float>(*reinterpret_cast<const std::int8_t*>(p + 192 + j))
+                    : 0.0f;
+          }
         }
       }
-    }
-    __syncthreads();
+      __syncthreads();
     }
 
     const int arow = 16 * mt;
@@ -2244,14 +2299,14 @@ __device__ __forceinline__ void kquant_mmq_q6k_process_tile(
         const int na = nbase + 2 * t, nb = nbase + 2 * t + 1;
         // na is even and nb = na + 1, so both share one swizzle offset.
         const int jl = mmq_swz_sc(na, gi << 1), jh = jl + 1;
-        facc[nt][0] += as_a * (static_cast<float>(c0) * Bsc[na][jl] +
-                               static_cast<float>(d0) * Bsc[na][jh]);
-        facc[nt][1] += as_a * (static_cast<float>(c1) * Bsc[nb][jl] +
-                               static_cast<float>(d1) * Bsc[nb][jh]);
-        facc[nt][2] += as_b * (static_cast<float>(c2) * Bsc[na][jl] +
-                               static_cast<float>(d2) * Bsc[na][jh]);
-        facc[nt][3] += as_b * (static_cast<float>(c3) * Bsc[nb][jl] +
-                               static_cast<float>(d3) * Bsc[nb][jh]);
+        facc[nt][0] +=
+            as_a * (static_cast<float>(c0) * Bsc[na][jl] + static_cast<float>(d0) * Bsc[na][jh]);
+        facc[nt][1] +=
+            as_a * (static_cast<float>(c1) * Bsc[nb][jl] + static_cast<float>(d1) * Bsc[nb][jh]);
+        facc[nt][2] +=
+            as_b * (static_cast<float>(c2) * Bsc[na][jl] + static_cast<float>(d2) * Bsc[na][jh]);
+        facc[nt][3] +=
+            as_b * (static_cast<float>(c3) * Bsc[nb][jl] + static_cast<float>(d3) * Bsc[nb][jh]);
       }
     }
     __syncthreads();
@@ -2284,12 +2339,21 @@ __device__ __forceinline__ void kquant_mmq_q6k_process_tile(
 // across blockIdx.y with atomicAdd partials, the pre-stream-K split kept
 // behind CPI_KQUANT_MMQ_STREAMK=0.
 template <int NT, bool SPLITK>
-__global__ __launch_bounds__(256) void kquant_mmq_q6k_kernel(
-    const std::uint8_t* __restrict__ w, const std::int8_t* __restrict__ xq,
-    const float* __restrict__ as, __half* __restrict__ y, float* __restrict__ partial, int rows,
-    int cols, int batch, int ldy) {
+__global__ __launch_bounds__(256) void kquant_mmq_q6k_kernel(const std::uint8_t* __restrict__ w,
+                                                             const std::int8_t* __restrict__ xq,
+                                                             const float* __restrict__ as,
+                                                             __half* __restrict__ y,
+                                                             float* __restrict__ partial, int rows,
+                                                             int cols, int batch, int ldy) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800)
-  (void)w; (void)xq; (void)as; (void)y; (void)partial; (void)rows; (void)cols; (void)batch;
+  (void)w;
+  (void)xq;
+  (void)as;
+  (void)y;
+  (void)partial;
+  (void)rows;
+  (void)cols;
+  (void)batch;
   (void)ldy;
 #else
   constexpr int kMmqBN = 2 * NT * 8;
@@ -2302,15 +2366,15 @@ __global__ __launch_bounds__(256) void kquant_mmq_q6k_kernel(
   if (SPLITK) {
     // Same lever that took 26% off the Q4_K kernel: the super-block loop is
     // serial per block and there are too few blocks to hide it.
-    const int chunk = (blocks_per_row + static_cast<int>(gridDim.y) - 1) / static_cast<int>(gridDim.y);
+    const int chunk =
+        (blocks_per_row + static_cast<int>(gridDim.y) - 1) / static_cast<int>(gridDim.y);
     sb_lo = static_cast<int>(blockIdx.y) * chunk;
     sb_hi = min(sb_lo + chunk, blocks_per_row);
     if (sb_lo >= sb_hi) return;
   }
-  kquant_mmq_q6k_process_tile<NT, kMmqBM, SPLITK ? 1 : 0>(As, Bs, Bsc, w, xq, as, y, partial, rows,
-                                                          cols, batch, ldy,
-                                                          static_cast<int>(blockIdx.x), sb_lo,
-                                                          sb_hi);
+  kquant_mmq_q6k_process_tile<NT, kMmqBM, SPLITK ? 1 : 0>(
+      As, Bs, Bsc, w, xq, as, y, partial, rows, cols, batch, ldy, static_cast<int>(blockIdx.x),
+      sb_lo, sb_hi);
 #endif
 }
 
@@ -2332,7 +2396,15 @@ __global__ __launch_bounds__(256) void kquant_mmq_q6k_streamk_kernel(
     const float* __restrict__ as, __half* __restrict__ y, float* __restrict__ tmp, int rows,
     int cols, int batch, int ldy) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800)
-  (void)w; (void)xq; (void)as; (void)y; (void)tmp; (void)rows; (void)cols; (void)batch; (void)ldy;
+  (void)w;
+  (void)xq;
+  (void)as;
+  (void)y;
+  (void)tmp;
+  (void)rows;
+  (void)cols;
+  (void)batch;
+  (void)ldy;
 #else
   constexpr int kMmqBN = (128 / BM) * NT * 8;
   using Smem = Q6kSmemLayout<NT, BM>;
@@ -2365,9 +2437,8 @@ __global__ __launch_bounds__(256) void kquant_mmq_q6k_streamk_kernel(
   if (kbc >= kbc_stop) return;
   // Trailing piece that ends mid-tile: park it in the fixup buffer. Writing y
   // here would race with the block that owns this tile's k-end.
-  kquant_mmq_q6k_process_tile<NT, BM, 2, PF>(As, Bs, Bsc, w, xq, as, y, tmp, rows, cols, batch,
-                                             ldy, static_cast<int>(kbc / nsb), kb0_start,
-                                             kb0_stop);
+  kquant_mmq_q6k_process_tile<NT, BM, 2, PF>(As, Bs, Bsc, w, xq, as, y, tmp, rows, cols, batch, ldy,
+                                             static_cast<int>(kbc / nsb), kb0_start, kb0_stop);
 #endif
 }
 
@@ -2518,13 +2589,19 @@ int q6k_streamk_grid(int nt_sel, int bm) {
       err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&o, kern, 256, 0);
     };
     if (j == 0) {
-      if (i == 2) query(kquant_mmq_q6k_streamk_kernel<4, 32>);
-      else if (i == 0) query(kquant_mmq_q6k_streamk_kernel<1, 32>);
-      else query(kquant_mmq_q6k_streamk_kernel<2, 32>);
+      if (i == 2)
+        query(kquant_mmq_q6k_streamk_kernel<4, 32>);
+      else if (i == 0)
+        query(kquant_mmq_q6k_streamk_kernel<1, 32>);
+      else
+        query(kquant_mmq_q6k_streamk_kernel<2, 32>);
     } else {
-      if (i == 2) query(kquant_mmq_q6k_streamk_kernel<4, 64>);
-      else if (i == 0) query(kquant_mmq_q6k_streamk_kernel<1, 64>);
-      else query(kquant_mmq_q6k_streamk_kernel<2, 64>);
+      if (i == 2)
+        query(kquant_mmq_q6k_streamk_kernel<4, 64>);
+      else if (i == 0)
+        query(kquant_mmq_q6k_streamk_kernel<1, 64>);
+      else
+        query(kquant_mmq_q6k_streamk_kernel<2, 64>);
     }
     occ[i][j] = (err == cudaSuccess && o > 0) ? o : 1;
   }
@@ -2544,11 +2621,11 @@ void launch_kquant_mmq_q6k_streamk(const std::uint8_t* w, const std::int8_t* xq,
   // NT=8 at BM=32 is the 32x256 tile in 88 KB of dynamic shared (occupancy 1),
   // the next step on the width/occupancy frontier, opt-in via
   // CPI_KQUANT_MMQ_Q6K_NT=8.
-  int nt_sel =
-      bm == 64 ? 8
-               : (g_kq_tune.mmq_q6k_nt >= 8
-                      ? 8
-                      : (g_kq_tune.mmq_q6k_nt >= 4 ? 4 : (g_kq_tune.mmq_q6k_nt <= 1 ? 1 : 2)));
+  int nt_sel = bm == 64
+                   ? 8
+                   : (g_kq_tune.mmq_q6k_nt >= 8
+                          ? 8
+                          : (g_kq_tune.mmq_q6k_nt >= 4 ? 4 : (g_kq_tune.mmq_q6k_nt <= 1 ? 1 : 2)));
   // Small-grid starvation fix (round 13): wv (1024x4096) at NT=4 is 8 tiles x
   // 16 super-blocks = 128 work units, and the two-units-per-block floor caps
   // the grid at 64 blocks on a 170-SM part; ncu at B=8 read 196 GB/s with
@@ -2559,8 +2636,7 @@ void launch_kquant_mmq_q6k_streamk(const std::uint8_t* w, const std::int8_t* xq,
   if (bm == 32) {
     while (nt_sel > 1) {
       const int bnq = 4 * nt_sel * 8;
-      const std::int64_t tq =
-          static_cast<std::int64_t>((rows + bnq - 1) / bnq) * (cols >> 8);
+      const std::int64_t tq = static_cast<std::int64_t>((rows + bnq - 1) / bnq) * (cols >> 8);
       if (tq / 2 >= q6k_streamk_grid(nt_sel, bm)) break;
       nt_sel >>= 1;
     }
@@ -2569,8 +2645,7 @@ void launch_kquant_mmq_q6k_streamk(const std::uint8_t* w, const std::int8_t* xq,
   const int nty = (rows + bn - 1) / bn;
   const int nsb = cols >> 8;
   const std::int64_t total = static_cast<std::int64_t>(nty) * nsb;
-  int nblocks =
-      g_kq_tune.mmq_streamk > 1 ? g_kq_tune.mmq_streamk : q6k_streamk_grid(nt_sel, bm);
+  int nblocks = g_kq_tune.mmq_streamk > 1 ? g_kq_tune.mmq_streamk : q6k_streamk_grid(nt_sel, bm);
   // llama.cpp's shortcut: when whole tiles already fill the waves >=90%
   // (the LM head's tiles, for instance), plain one-tile-per-block is the
   // same work with no fixup pass.
@@ -2589,28 +2664,27 @@ void launch_kquant_mmq_q6k_streamk(const std::uint8_t* w, const std::int8_t* xq,
     nblocks = nty;  // no scratch: block boundaries land on tile boundaries
     fixup = false;
   }
-#define CPI_MMQ_Q6K_SK(N, M, P)                                                                  \
-  do {                                                                                           \
-    constexpr unsigned kSmemB = sizeof(Q6kSmemLayout<N, M>) > 48u * 1024u                        \
-                                    ? static_cast<unsigned>(sizeof(Q6kSmemLayout<N, M>))         \
-                                    : 0u;                                                        \
-    if (kSmemB > 0) {                                                                            \
-      static const bool attr_once = []() {                                                       \
-        return cudaFuncSetAttribute(kquant_mmq_q6k_streamk_kernel<N, M, P>,                      \
-                                    cudaFuncAttributeMaxDynamicSharedMemorySize,                 \
-                                    static_cast<int>(sizeof(Q6kSmemLayout<N, M>))) ==            \
-               cudaSuccess;                                                                      \
-      }();                                                                                       \
-      (void)attr_once;                                                                           \
-    }                                                                                            \
-    kquant_mmq_q6k_streamk_kernel<N, M, P>                                                       \
-        <<<static_cast<unsigned>(nblocks), 256, kSmemB, stream>>>(w, xq, xs, y, g_mmq_fixup,     \
-                                                                  rows, cols, batch, ldy);       \
-    if (fixup) {                                                                                 \
-      kquant_mmq_q6k_streamk_fixup_kernel<N, M>                                                  \
-          <<<static_cast<unsigned>(nblocks), 256, 0, stream>>>(y, g_mmq_fixup, rows, cols,       \
-                                                               batch, ldy);                      \
-    }                                                                                            \
+#define CPI_MMQ_Q6K_SK(N, M, P)                                                                    \
+  do {                                                                                             \
+    constexpr unsigned kSmemB = sizeof(Q6kSmemLayout<N, M>) > 48u * 1024u                          \
+                                    ? static_cast<unsigned>(sizeof(Q6kSmemLayout<N, M>))           \
+                                    : 0u;                                                          \
+    if (kSmemB > 0) {                                                                              \
+      static const bool attr_once = []() {                                                         \
+        return cudaFuncSetAttribute(kquant_mmq_q6k_streamk_kernel<N, M, P>,                        \
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize,                   \
+                                    static_cast<int>(sizeof(Q6kSmemLayout<N, M>))) == cudaSuccess; \
+      }();                                                                                         \
+      (void)attr_once;                                                                             \
+    }                                                                                              \
+    kquant_mmq_q6k_streamk_kernel<N, M, P>                                                         \
+        <<<static_cast<unsigned>(nblocks), 256, kSmemB, stream>>>(w, xq, xs, y, g_mmq_fixup, rows, \
+                                                                  cols, batch, ldy);               \
+    if (fixup) {                                                                                   \
+      kquant_mmq_q6k_streamk_fixup_kernel<N, M>                                                    \
+          <<<static_cast<unsigned>(nblocks), 256, 0, stream>>>(y, g_mmq_fixup, rows, cols, batch,  \
+                                                               ldy);                               \
+    }                                                                                              \
   } while (0)
   if (bm == 32) {
     // Round 13: the PF register-prefetch staging extended to the BM=32 shapes
@@ -2674,13 +2748,19 @@ int q4k_streamk_grid(int nt_sel, bool unpack, bool m2 = false) {
       query(kquant_mmq_q4k_streamk_unpacked_kernel<2, true>);
     } else if (unpack) {
       if (nt_sel >= 8) return nsm;  // 32x256 dynamic-shared: occupancy 1 by construction
-      if (i == 2) query(kquant_mmq_q4k_streamk_unpacked_kernel<4>);
-      else if (i == 0) query(kquant_mmq_q4k_streamk_unpacked_kernel<1>);
-      else query(kquant_mmq_q4k_streamk_unpacked_kernel<2>);
+      if (i == 2)
+        query(kquant_mmq_q4k_streamk_unpacked_kernel<4>);
+      else if (i == 0)
+        query(kquant_mmq_q4k_streamk_unpacked_kernel<1>);
+      else
+        query(kquant_mmq_q4k_streamk_unpacked_kernel<2>);
     } else {
-      if (i == 2) query(kquant_mmq_q4k_streamk_kernel<4>);
-      else if (i == 0) query(kquant_mmq_q4k_streamk_kernel<1>);
-      else query(kquant_mmq_q4k_streamk_kernel<2>);
+      if (i == 2)
+        query(kquant_mmq_q4k_streamk_kernel<4>);
+      else if (i == 0)
+        query(kquant_mmq_q4k_streamk_kernel<1>);
+      else
+        query(kquant_mmq_q4k_streamk_kernel<2>);
     }
     occ[u][i] = (err == cudaSuccess && o > 0) ? o : 1;
   }
@@ -2746,16 +2826,16 @@ void launch_kquant_mmq_q4k_streamk(const std::uint8_t* w, const std::int8_t* xq,
               w, xq, xs, xsum, y, g_mmq_fixup, rows, cols, batch, ldy);
       if (fixup) {
         kquant_mmq_q6k_streamk_fixup_kernel<8, 64>
-            <<<static_cast<unsigned>(nblocks), 256, 0, stream>>>(y, g_mmq_fixup, rows, cols,
-                                                                 batch, ldy);
+            <<<static_cast<unsigned>(nblocks), 256, 0, stream>>>(y, g_mmq_fixup, rows, cols, batch,
+                                                                 ldy);
       }
       return;
     }
     // Fixup: Q6_K's at (NT=4, BM=64) is the exact [bidx][64][64] layout the M2
     // MODE-2 epilogue stores: kMmqBN = (128/64)*4*8 = 64 = this kernel's kBN.
     kquant_mmq_q4k_streamk_unpacked_kernel<2, true>
-        <<<static_cast<unsigned>(nblocks), 256, 0, stream>>>(w, xq, xs, xsum, y, g_mmq_fixup,
-                                                             rows, cols, batch, ldy);
+        <<<static_cast<unsigned>(nblocks), 256, 0, stream>>>(w, xq, xs, xsum, y, g_mmq_fixup, rows,
+                                                             cols, batch, ldy);
     if (fixup) {
       kquant_mmq_q6k_streamk_fixup_kernel<4, 64>
           <<<static_cast<unsigned>(nblocks), 256, 0, stream>>>(y, g_mmq_fixup, rows, cols, batch,
@@ -2799,21 +2879,21 @@ void launch_kquant_mmq_q4k_streamk(const std::uint8_t* w, const std::int8_t* xq,
     }
     return;
   }
-#define CPI_MMQ_Q4K_SK(N)                                                                        \
-  do {                                                                                           \
-    if (unpack) {                                                                                \
-      kquant_mmq_q4k_streamk_unpacked_kernel<N>                                                  \
-          <<<static_cast<unsigned>(nblocks), 256, 0, stream>>>(w, xq, xs, xsum, y, g_mmq_fixup,  \
-                                                               rows, cols, batch, ldy);          \
-    } else {                                                                                     \
-      kquant_mmq_q4k_streamk_kernel<N><<<static_cast<unsigned>(nblocks), 256, 0, stream>>>(      \
-          w, xq, xs, xsum, y, g_mmq_fixup, rows, cols, batch, ldy);                              \
-    }                                                                                            \
-    if (fixup) {                                                                                 \
-      kquant_mmq_q6k_streamk_fixup_kernel<N, 32>                                                 \
-          <<<static_cast<unsigned>(nblocks), 256, 0, stream>>>(y, g_mmq_fixup, rows, cols,       \
-                                                               batch, ldy);                      \
-    }                                                                                            \
+#define CPI_MMQ_Q4K_SK(N)                                                                         \
+  do {                                                                                            \
+    if (unpack) {                                                                                 \
+      kquant_mmq_q4k_streamk_unpacked_kernel<N>                                                   \
+          <<<static_cast<unsigned>(nblocks), 256, 0, stream>>>(w, xq, xs, xsum, y, g_mmq_fixup,   \
+                                                               rows, cols, batch, ldy);           \
+    } else {                                                                                      \
+      kquant_mmq_q4k_streamk_kernel<N><<<static_cast<unsigned>(nblocks), 256, 0, stream>>>(       \
+          w, xq, xs, xsum, y, g_mmq_fixup, rows, cols, batch, ldy);                               \
+    }                                                                                             \
+    if (fixup) {                                                                                  \
+      kquant_mmq_q6k_streamk_fixup_kernel<N, 32>                                                  \
+          <<<static_cast<unsigned>(nblocks), 256, 0, stream>>>(y, g_mmq_fixup, rows, cols, batch, \
+                                                               ldy);                              \
+    }                                                                                             \
   } while (0)
   if (nt_sel >= 4) {
     CPI_MMQ_Q4K_SK(4);
@@ -2855,7 +2935,7 @@ bool launch_kquant_mmq(const std::uint8_t* w, KQuantType type, const half* x, ha
   // is the only thing that knows x is unchanged, so it has to say so.
   if (!reuse_x) {
     quantize_q8_1_groups_kernel<<<(total_groups + 7) / 8, 256, 0, stream>>>(x, xq, xs, xsum, cols,
-                                                                           groups_per_row);
+                                                                            groups_per_row);
   }
   if (type == KQuantType::Q6_K) {
     // Q6_K needs no group sums: its values are (q-32), which is already signed,
@@ -2879,7 +2959,20 @@ bool launch_kquant_mmq(const std::uint8_t* w, KQuantType type, const half* x, ha
     // NT sets the N tile (2*NT*8 columns a block) and so the grid. Under this
     // launch NT=2 measured best (ebbe5f2); the stream-K launch above flipped
     // that to NT=4, which is why the two paths read separate knobs.
-#define CPI_MMQ_Q6K(N)                                                                         do {                                                                                           const dim3 gg(static_cast<unsigned>((rows + (2 * (N) * 8) - 1) / (2 * (N) * 8)),                            us6 ? static_cast<unsigned>(sp6) : 1u);                                        if (us6) {                                                                                     kquant_mmq_q6k_kernel<N, true>                                                                    <<<gg, 256, 0, stream>>>(w, xq, xs, y, g_mmq_partial, rows, cols, batch, ldy);            kquant_mmq_finalize_kernel<<<(rows + 255) / 256, 256, 0, stream>>>(g_mmq_partial, y,                                                                             rows, batch, ldy);        } else {                                                                                        kquant_mmq_q6k_kernel<N, false>                                                                    <<<gg, 256, 0, stream>>>(w, xq, xs, y, nullptr, rows, cols, batch, ldy);                }                                                                                           } while (0)
+#define CPI_MMQ_Q6K(N)                                                                           \
+  do {                                                                                           \
+    const dim3 gg(static_cast<unsigned>((rows + (2 * (N) * 8) - 1) / (2 * (N) * 8)),             \
+                  us6 ? static_cast<unsigned>(sp6) : 1u);                                        \
+    if (us6) {                                                                                   \
+      kquant_mmq_q6k_kernel<N, true>                                                             \
+          <<<gg, 256, 0, stream>>>(w, xq, xs, y, g_mmq_partial, rows, cols, batch, ldy);         \
+      kquant_mmq_finalize_kernel<<<(rows + 255) / 256, 256, 0, stream>>>(g_mmq_partial, y, rows, \
+                                                                         batch, ldy);            \
+    } else {                                                                                     \
+      kquant_mmq_q6k_kernel<N, false>                                                            \
+          <<<gg, 256, 0, stream>>>(w, xq, xs, y, nullptr, rows, cols, batch, ldy);               \
+    }                                                                                            \
+  } while (0)
     if (g_kq_tune.mmq_q6k_nt >= 4) {
       CPI_MMQ_Q6K(4);
     } else if (g_kq_tune.mmq_q6k_nt <= 1) {
@@ -2915,12 +3008,11 @@ bool launch_kquant_mmq(const std::uint8_t* w, KQuantType type, const half* x, ha
     if (g_kq_tune.mmq_streamk != 0 && (!m2 || g_kq_tune.mmq_unpack != 0)) {
       const int sk_nt = m2 ? (g_kq_tune.mmq_m2_nt >= 4 ? 4 : 2)
                            : (ant >= 8 ? 8 : (ant >= 4 ? 4 : (ant <= 1 ? 1 : 2)));
-      launch_kquant_mmq_q4k_streamk(w, xq, xs, xsum, y, rows, cols, batch, ldy, sk_nt, m2,
-                                    stream);
+      launch_kquant_mmq_q4k_streamk(w, xq, xs, xsum, y, rows, cols, batch, ldy, sk_nt, m2, stream);
       return true;
     }
-    const int base_blocks = ant >= 4 ? (rows + 127) / 128
-                                     : (ant >= 2 ? (rows + 63) / 64 : (rows + 31) / 32);
+    const int base_blocks =
+        ant >= 4 ? (rows + 127) / 128 : (ant >= 2 ? (rows + 63) / 64 : (rows + 31) / 32);
     const int nsb = cols >> 8;
     // Enough blocks to cover the SMs, but never so few super-blocks per block
     // that the pipeline has nothing to overlap.
@@ -2929,32 +3021,50 @@ bool launch_kquant_mmq(const std::uint8_t* w, KQuantType type, const half* x, ha
       split = (g_kq_tune.mmq_split_target + base_blocks - 1) / base_blocks;
       split = min(split, max(1, nsb / 2));
     }
-    const bool use_split =
-        split > 1 && ensure_mmq_partial(static_cast<std::size_t>(batch) * rows);
-    const dim3 grid(static_cast<unsigned>(base_blocks), use_split ? static_cast<unsigned>(split) : 1u);
-#define CPI_MMQ_ASYNC(N, S, M)                                                                 kquant_mmq_q4k_async_kernel<N, S, M>                                                             <<<grid, 256, 0, stream>>>(w, xq, xs, xsum, y, g_mmq_partial, rows, cols, batch, ldy)
+    const bool use_split = split > 1 && ensure_mmq_partial(static_cast<std::size_t>(batch) * rows);
+    const dim3 grid(static_cast<unsigned>(base_blocks),
+                    use_split ? static_cast<unsigned>(split) : 1u);
+#define CPI_MMQ_ASYNC(N, S, M)         \
+  kquant_mmq_q4k_async_kernel<N, S, M> \
+      <<<grid, 256, 0, stream>>>(w, xq, xs, xsum, y, g_mmq_partial, rows, cols, batch, ldy)
     if (m2) {
-      if (use_split) { CPI_MMQ_ASYNC(2, true, true); } else { CPI_MMQ_ASYNC(2, false, true); }
+      if (use_split) {
+        CPI_MMQ_ASYNC(2, true, true);
+      } else {
+        CPI_MMQ_ASYNC(2, false, true);
+      }
     } else if (ant >= 4) {
-      if (use_split) { CPI_MMQ_ASYNC(4, true, false); } else { CPI_MMQ_ASYNC(4, false, false); }
+      if (use_split) {
+        CPI_MMQ_ASYNC(4, true, false);
+      } else {
+        CPI_MMQ_ASYNC(4, false, false);
+      }
     } else if (ant >= 2) {
-      if (use_split) { CPI_MMQ_ASYNC(2, true, false); } else { CPI_MMQ_ASYNC(2, false, false); }
+      if (use_split) {
+        CPI_MMQ_ASYNC(2, true, false);
+      } else {
+        CPI_MMQ_ASYNC(2, false, false);
+      }
     } else {
-      if (use_split) { CPI_MMQ_ASYNC(1, true, false); } else { CPI_MMQ_ASYNC(1, false, false); }
+      if (use_split) {
+        CPI_MMQ_ASYNC(1, true, false);
+      } else {
+        CPI_MMQ_ASYNC(1, false, false);
+      }
     }
 #undef CPI_MMQ_ASYNC
     if (use_split) {
       kquant_mmq_finalize_kernel<<<(rows + 255) / 256, 256, 0, stream>>>(g_mmq_partial, y, rows,
-                                                                        batch, ldy);
+                                                                         batch, ldy);
     }
     return true;
   }
   if (nt >= 4) {
-    kquant_mmq_q4k_kernel<4><<<(rows + 63) / 64, 256, 0, stream>>>(w, xq, xs, xsum, y, rows, cols,
-                                                                   batch, ldy);
+    kquant_mmq_q4k_kernel<4>
+        <<<(rows + 63) / 64, 256, 0, stream>>>(w, xq, xs, xsum, y, rows, cols, batch, ldy);
   } else {
-    kquant_mmq_q4k_kernel<2><<<(rows + 31) / 32, 256, 0, stream>>>(w, xq, xs, xsum, y, rows, cols,
-                                                                   batch, ldy);
+    kquant_mmq_q4k_kernel<2>
+        <<<(rows + 31) / 32, 256, 0, stream>>>(w, xq, xs, xsum, y, rows, cols, batch, ldy);
   }
   return true;
 }
@@ -3003,20 +3113,20 @@ bool launch_kquant_matmul(const std::uint8_t* w, KQuantType type, const half* x,
   const int max_batch = g_kq_tune.mm_max;
   if (batch < 2 || batch > max_batch) return false;
   constexpr int kThreads = 256;
-#define CPI_KQ_MM(BM)                                                             \
-  switch (type) {                                                                 \
-    case KQuantType::Q4_K:                                                        \
-      kquant_matmul_kernel<KQuantType::Q4_K, BM>                                  \
-          <<<rows, kThreads, 0, stream>>>(w, x, y, rows, cols, batch, ldy);            \
-      return true;                                                                \
-    case KQuantType::Q5_K:                                                        \
-      kquant_matmul_kernel<KQuantType::Q5_K, BM>                                  \
-          <<<rows, kThreads, 0, stream>>>(w, x, y, rows, cols, batch, ldy);            \
-      return true;                                                                \
-    case KQuantType::Q6_K:                                                        \
-      kquant_matmul_kernel<KQuantType::Q6_K, BM>                                  \
-          <<<rows, kThreads, 0, stream>>>(w, x, y, rows, cols, batch, ldy);            \
-      return true;                                                                \
+#define CPI_KQ_MM(BM)                                                       \
+  switch (type) {                                                           \
+    case KQuantType::Q4_K:                                                  \
+      kquant_matmul_kernel<KQuantType::Q4_K, BM>                            \
+          <<<rows, kThreads, 0, stream>>>(w, x, y, rows, cols, batch, ldy); \
+      return true;                                                          \
+    case KQuantType::Q5_K:                                                  \
+      kquant_matmul_kernel<KQuantType::Q5_K, BM>                            \
+          <<<rows, kThreads, 0, stream>>>(w, x, y, rows, cols, batch, ldy); \
+      return true;                                                          \
+    case KQuantType::Q6_K:                                                  \
+      kquant_matmul_kernel<KQuantType::Q6_K, BM>                            \
+          <<<rows, kThreads, 0, stream>>>(w, x, y, rows, cols, batch, ldy); \
+      return true;                                                          \
   }
   if (batch <= 4) {
     CPI_KQ_MM(4)
@@ -3102,10 +3212,10 @@ __global__ void kquant_matvec_dp4a_kernel(const std::uint8_t* __restrict__ w,
     const int sum_hi = __dp4a(xh, 0x01010101, 0);
     // Per-lane partial sums: the group scale is uniform across the run, so
     // applying it here is the same arithmetic as applying it per weight.
-    acc += xs[gbase + 2 * j] * (d * sc0 * static_cast<float>(dot_lo) -
-                                dmin * m0 * static_cast<float>(sum_lo)) +
-           xs[gbase + 2 * j + 1] * (d * sc1 * static_cast<float>(dot_hi) -
-                                    dmin * m1 * static_cast<float>(sum_hi));
+    acc += xs[gbase + 2 * j] *
+               (d * sc0 * static_cast<float>(dot_lo) - dmin * m0 * static_cast<float>(sum_lo)) +
+           xs[gbase + 2 * j + 1] *
+               (d * sc1 * static_cast<float>(dot_hi) - dmin * m1 * static_cast<float>(sum_hi));
     p += block_bytes * WPR;
   }
 
@@ -3153,10 +3263,10 @@ __global__ void kquant_matvec_dp4a16_kernel(const std::uint8_t* __restrict__ w,
   const std::size_t block_bytes =
       TYPE == KQuantType::Q4_K ? model::kquant::kQ4KBlockBytes : model::kquant::kQ5KBlockBytes;
 
-  const int sb_off = lane >> 4;   // which of the warp's two super-blocks
-  const int r = lane & 15;        // which 8-byte slice of the 128-byte qs
-  const int j = r >> 2;           // 32-byte run, i.e. scale-group pair (2j, 2j+1)
-  const int t = r & 3;            // slice within the run
+  const int sb_off = lane >> 4;  // which of the warp's two super-blocks
+  const int r = lane & 15;       // which 8-byte slice of the 128-byte qs
+  const int j = r >> 2;          // 32-byte run, i.e. scale-group pair (2j, 2j+1)
+  const int t = r & 3;           // slice within the run
   const int off_lo = (j << 6) + (t << 3);
   const int off_hi = off_lo + 32;
   const int qoff = (TYPE == KQuantType::Q4_K) ? 16 : 48;
@@ -3203,10 +3313,10 @@ __global__ void kquant_matvec_dp4a16_kernel(const std::uint8_t* __restrict__ w,
     // Both slices sit in the same two groups, so the scales apply once to the
     // summed integer dots rather than once per four weights.
     const int gbase = sb << 3;
-    acc += xs[gbase + 2 * j] * (d * sc0 * static_cast<float>(dot_lo) -
-                                dmin * m0 * static_cast<float>(sum_lo)) +
-           xs[gbase + 2 * j + 1] * (d * sc1 * static_cast<float>(dot_hi) -
-                                    dmin * m1 * static_cast<float>(sum_hi));
+    acc += xs[gbase + 2 * j] *
+               (d * sc0 * static_cast<float>(dot_lo) - dmin * m0 * static_cast<float>(sum_lo)) +
+           xs[gbase + 2 * j + 1] *
+               (d * sc1 * static_cast<float>(dot_hi) - dmin * m1 * static_cast<float>(sum_hi));
   }
 
 #pragma unroll
@@ -3337,10 +3447,10 @@ __global__ void kquant_matvec_dp4a32_kernel(const std::uint8_t* __restrict__ w,
         acc -= dmin * (m0 * gsum[gbase + 2 * j] + m1 * gsum[gbase + 2 * j + 1]);
       }
     } else {
-      acc += xs[gbase + 2 * j] * (d * sc0 * static_cast<float>(dot_lo) -
-                                  dmin * m0 * static_cast<float>(sum_lo)) +
-             xs[gbase + 2 * j + 1] * (d * sc1 * static_cast<float>(dot_hi) -
-                                      dmin * m1 * static_cast<float>(sum_hi));
+      acc += xs[gbase + 2 * j] *
+                 (d * sc0 * static_cast<float>(dot_lo) - dmin * m0 * static_cast<float>(sum_lo)) +
+             xs[gbase + 2 * j + 1] *
+                 (d * sc1 * static_cast<float>(dot_hi) - dmin * m1 * static_cast<float>(sum_hi));
     }
   }
 
@@ -3376,8 +3486,8 @@ __global__ void kquant_matvec_dp4a32_kernel(const std::uint8_t* __restrict__ w,
 template <int WPR, bool ACC>
 __global__ void kquant_matvec_dp4a_q6k_kernel(const std::uint8_t* __restrict__ w,
                                               const std::int8_t* __restrict__ xq,
-                                              const float* __restrict__ xs,
-                                              __half* __restrict__ y, int rows, int cols) {
+                                              const float* __restrict__ xs, __half* __restrict__ y,
+                                              int rows, int cols) {
   constexpr int kWarps = 8;
   constexpr int kRowsPerBlock = kWarps / WPR;
   const int lane = static_cast<int>(threadIdx.x) & 31;
@@ -3388,7 +3498,7 @@ __global__ void kquant_matvec_dp4a_q6k_kernel(const std::uint8_t* __restrict__ w
   const int blocks_per_row = cols / static_cast<int>(kSuperBlock);
   constexpr std::size_t block_bytes = model::kquant::kQ6KResidentBytes;
 
-  const int sb_off = lane >> 4;  // which of the warp's two super-blocks
+  const int sb_off = lane >> 4;     // which of the warp's two super-blocks
   const int b0 = (lane & 15) << 3;  // 8-byte slice of the 128-byte ql
   const int n = b0 >> 6;
   const int h = (b0 >> 5) & 1;
@@ -3414,8 +3524,7 @@ __global__ void kquant_matvec_dp4a_q6k_kernel(const std::uint8_t* __restrict__ w
     const float sch = static_cast<float>(*reinterpret_cast<const std::int8_t*>(p + sbase + sh));
 
     const std::uint16_t* qlp = reinterpret_cast<const std::uint16_t*>(p + b0);
-    const std::uint16_t* qhp =
-        reinterpret_cast<const std::uint16_t*>(p + 128 + (n << 5) + l0);
+    const std::uint16_t* qhp = reinterpret_cast<const std::uint16_t*>(p + 128 + (n << 5) + l0);
 
     const int xbase = sb * static_cast<int>(kSuperBlock);
     // Eight contiguous activation bytes per half, off_lo being a multiple of
@@ -3429,10 +3538,9 @@ __global__ void kquant_matvec_dp4a_q6k_kernel(const std::uint8_t* __restrict__ w
                                  (static_cast<std::uint32_t>(qlp[2 * k + 1]) << 16);
       const std::uint32_t hword = static_cast<std::uint32_t>(qhp[2 * k]) |
                                   (static_cast<std::uint32_t>(qhp[2 * k + 1]) << 16);
-      const int qlo = static_cast<int>((word & 0x0F0F0F0Fu) |
-                                       (((hword >> sl) & 0x03030303u) << 4));
-      const int qhi = static_cast<int>(((word >> 4) & 0x0F0F0F0Fu) |
-                                       (((hword >> sh) & 0x03030303u) << 4));
+      const int qlo = static_cast<int>((word & 0x0F0F0F0Fu) | (((hword >> sl) & 0x03030303u) << 4));
+      const int qhi =
+          static_cast<int>(((word >> 4) & 0x0F0F0F0Fu) | (((hword >> sh) & 0x03030303u) << 4));
       const int xl = k == 0 ? xl2.x : xl2.y;
       const int xh = k == 0 ? xh2.x : xh2.y;
       dot_lo = __dp4a(qlo, xl, dot_lo);
@@ -3464,9 +3572,6 @@ __global__ void kquant_matvec_dp4a_q6k_kernel(const std::uint8_t* __restrict__ w
     y[row] = __float2half(ACC ? total + __half2float(y[row]) : total);
   }
 }
-
-
-
 
 namespace {
 // Scratch for the int8 activation form, grown to the widest matvec seen. Kept
@@ -3541,8 +3646,15 @@ bool try_dp4a_matvec(const std::uint8_t* w, KQuantType type, const half* x, half
     // Four warps per row: four warps x four super-blocks covers a 4096-wide row
     // exactly, so widening the slice does not idle half the block.
     const dim3 grid32(static_cast<unsigned>((rows + 1) / 2));
-#define CPI_KQ_MV32(T, G, V)                                                                kquant_matvec_dp4a32_kernel<T, 4, ACC, G, V>                                                  <<<grid32, kThreads, 0, stream>>>(w, g_dp4a_xq, g_dp4a_xs, g_dp4a_sum, y, rows, cols)
-#define CPI_KQ_MV32_G(T, G)                                                                 if (g_kq_tune.matvec_vecx) {                                                                CPI_KQ_MV32(T, G, true);                                                                } else {                                                                                    CPI_KQ_MV32(T, G, false);                                                               }
+#define CPI_KQ_MV32(T, G, V)                   \
+  kquant_matvec_dp4a32_kernel<T, 4, ACC, G, V> \
+      <<<grid32, kThreads, 0, stream>>>(w, g_dp4a_xq, g_dp4a_xs, g_dp4a_sum, y, rows, cols)
+#define CPI_KQ_MV32_G(T, G)    \
+  if (g_kq_tune.matvec_vecx) { \
+    CPI_KQ_MV32(T, G, true);   \
+  } else {                     \
+    CPI_KQ_MV32(T, G, false);  \
+  }
     if (type == KQuantType::Q4_K) {
       if (g_kq_tune.matvec_gsum) {
         CPI_KQ_MV32_G(KQuantType::Q4_K, true)
@@ -3578,8 +3690,8 @@ bool try_dp4a_matvec(const std::uint8_t* w, KQuantType type, const half* x, half
 }  // namespace
 
 template <typename OutT, bool ACC>
-static void launch_kquant_matvec_impl(const std::uint8_t* w, KQuantType type, const half* x, OutT* y,
-                                      int rows, int cols, cudaStream_t stream) {
+static void launch_kquant_matvec_impl(const std::uint8_t* w, KQuantType type, const half* x,
+                                      OutT* y, int rows, int cols, cudaStream_t stream) {
   constexpr int kThreads = 256;  // 8 warps
   // Warps per row. Short matrices need several or the grid cannot fill the GPU;
   // tall ones do better with one warp per row and no shared reduction.
@@ -3598,7 +3710,21 @@ static void launch_kquant_matvec_impl(const std::uint8_t* w, KQuantType type, co
   const int rows_per_block = 8 / wpr;
   const int grid = (rows + rows_per_block - 1) / rows_per_block;
 
-#define CPI_KQ_DISPATCH(WPRV)                                     switch (type) {                                                   case KQuantType::Q4_K:                                            kquant_matvec_vec_kernel<KQuantType::Q4_K, WPRV, OutT, ACC>              <<<grid, kThreads, 0, stream>>>(w, x, y, rows, cols);       return;                                                       case KQuantType::Q5_K:                                            kquant_matvec_vec_kernel<KQuantType::Q5_K, WPRV, OutT, ACC>              <<<grid, kThreads, 0, stream>>>(w, x, y, rows, cols);       return;                                                       case KQuantType::Q6_K:                                            kquant_matvec_vec_kernel<KQuantType::Q6_K, WPRV, OutT, ACC>              <<<grid, kThreads, 0, stream>>>(w, x, y, rows, cols);       return;                                                     }
+#define CPI_KQ_DISPATCH(WPRV)                                     \
+  switch (type) {                                                 \
+    case KQuantType::Q4_K:                                        \
+      kquant_matvec_vec_kernel<KQuantType::Q4_K, WPRV, OutT, ACC> \
+          <<<grid, kThreads, 0, stream>>>(w, x, y, rows, cols);   \
+      return;                                                     \
+    case KQuantType::Q5_K:                                        \
+      kquant_matvec_vec_kernel<KQuantType::Q5_K, WPRV, OutT, ACC> \
+          <<<grid, kThreads, 0, stream>>>(w, x, y, rows, cols);   \
+      return;                                                     \
+    case KQuantType::Q6_K:                                        \
+      kquant_matvec_vec_kernel<KQuantType::Q6_K, WPRV, OutT, ACC> \
+          <<<grid, kThreads, 0, stream>>>(w, x, y, rows, cols);   \
+      return;                                                     \
+  }
 
   if (wpr >= 8) {
     CPI_KQ_DISPATCH(8)
@@ -3612,8 +3738,12 @@ static void launch_kquant_matvec_impl(const std::uint8_t* w, KQuantType type, co
 #undef CPI_KQ_DISPATCH
 }
 
-void set_capture_active(bool active) { g_capture_active = active; }
-bool capture_active() { return g_capture_active; }
+void set_capture_active(bool active) {
+  g_capture_active = active;
+}
+bool capture_active() {
+  return g_capture_active;
+}
 
 bool capture_guard(const char* what) {
   if (!g_capture_active) return false;
@@ -3628,7 +3758,9 @@ bool capture_guard(const char* what) {
   return true;
 }
 
-void reserve_kquant_dp4a_scratch(int cols) { ensure_dp4a_scratch(cols); }
+void reserve_kquant_dp4a_scratch(int cols) {
+  ensure_dp4a_scratch(cols);
+}
 
 bool acquire_kquant_q8_1_scratch(int cols, std::int8_t** xq, float** xs, float** gsum) {
   if (g_kq_tune.matvec_dp4a == 0 || cols % 256 != 0 || !ensure_dp4a_scratch(cols)) return false;

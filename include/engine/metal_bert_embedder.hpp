@@ -53,10 +53,10 @@ public:
 private:
   struct LayerWeights {
     runtime::MetalBuffer q_w, q_b, k_w, k_b, v_w, v_b;
-    runtime::MetalBuffer o_w, o_b;                // attention output dense
+    runtime::MetalBuffer o_w, o_b;  // attention output dense
     runtime::MetalBuffer attn_ln_w, attn_ln_b;
-    runtime::MetalBuffer inter_w, inter_b;        // [I,H], [I]
-    runtime::MetalBuffer out_w, out_b;            // [H,I], [H]
+    runtime::MetalBuffer inter_w, inter_b;  // [I,H], [I]
+    runtime::MetalBuffer out_w, out_b;      // [H,I], [H]
     runtime::MetalBuffer out_ln_w, out_ln_b;
   };
 

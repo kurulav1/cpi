@@ -17,16 +17,16 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <vector>
 
-#include "model/json_mini.hpp"
 #include "engine/plan_metal_engine.hpp"
-#include "runtime/fp16.hpp"
-#include <filesystem>
 #include "model/config_json.hpp"
+#include "model/json_mini.hpp"
 #include "model/safetensors_loader.hpp"
 #include "model/weight_loader.hpp"
+#include "runtime/fp16.hpp"
 #include "runtime/metal_context.hpp"
 
 namespace {
@@ -43,7 +43,8 @@ std::vector<float> read_f32(const std::string& path) {
   const long bytes = std::ftell(f);
   std::fseek(f, 0, SEEK_SET);
   std::vector<float> v(static_cast<std::size_t>(bytes) / sizeof(float));
-  if (std::fread(v.data(), 1, static_cast<std::size_t>(bytes), f) != static_cast<std::size_t>(bytes)) {
+  if (std::fread(v.data(), 1, static_cast<std::size_t>(bytes), f) !=
+      static_cast<std::size_t>(bytes)) {
     std::fprintf(stderr, "short read on %s\n", path.c_str());
     std::exit(2);
   }
@@ -70,8 +71,12 @@ std::string read_text(const std::string& path) {
 // with numpy's IEEE rounding. Truncating made END_TO_END look better than it was; 0.00257
 // against 0.00383 with a correct converter; and that flattering 1.49x was half the apparent
 // engine-vs-harness gap. See include/runtime/fp16.hpp.
-inline std::uint16_t f32_to_f16(float f) { return cpi::f32_to_f16(f); }
-inline float f16_to_f32(std::uint16_t h) { return cpi::f16_to_f32(h); }
+inline std::uint16_t f32_to_f16(float f) {
+  return cpi::f32_to_f16(f);
+}
+inline float f16_to_f32(std::uint16_t h) {
+  return cpi::f16_to_f32(h);
+}
 
 // Reports max and mean absolute error. Both, because a mean alone hides a single wrong element
 // among thousands of right ones; which is what an off-by-one in a permutation looks like.
@@ -230,8 +235,7 @@ struct BlockDebug {
 std::vector<float> run_vision_block(runtime::MetalContext& ctx, const std::vector<float>& x_in,
                                     const VisionBlockWeights& w, const std::vector<float>& cosb,
                                     const std::vector<float>& sinb, int tokens, int hidden,
-                                    int heads, int head_dim, int inter,
-                                    BlockDebug* dbg = nullptr) {
+                                    int heads, int head_dim, int inter, BlockDebug* dbg = nullptr) {
   const std::size_t n = static_cast<std::size_t>(tokens) * hidden;
   auto gemm = [&](runtime::MetalBuffer& bw, runtime::MetalBuffer& bin, runtime::MetalBuffer& bout,
                   runtime::MetalBuffer& bbias, int out_dim, int in_dim) {
@@ -251,7 +255,7 @@ std::vector<float> run_vision_block(runtime::MetalContext& ctx, const std::vecto
     return v;
   };
   auto hx = to_f16(x_in);
-  auto bx = ctx.alloc_from(hx.data(), hx.size() * 2);       // residual stream
+  auto bx = ctx.alloc_from(hx.data(), hx.size() * 2);  // residual stream
   auto bnorm = ctx.alloc(n * 2);
   auto bqkv = ctx.alloc(n * 3 * 2);
   auto battn = ctx.alloc(n * 2);
@@ -281,8 +285,8 @@ std::vector<float> run_vision_block(runtime::MetalContext& ctx, const std::vecto
 
   // ---- attention half ----
   {
-    LayerNormParams p{static_cast<std::uint32_t>(tokens), static_cast<std::uint32_t>(hidden),
-                      1e-6f, 1u};
+    LayerNormParams p{static_cast<std::uint32_t>(tokens), static_cast<std::uint32_t>(hidden), 1e-6f,
+                      1u};
     const void* bufs[] = {bx.handle(), bn1w.handle(), bn1b.handle(), bnorm.handle()};
     ctx.dispatch("cpi_layernorm", runtime::MetalContext::Grid::Groups,
                  static_cast<std::size_t>(tokens), 256, bufs, nullptr, 4, &p, sizeof(p));
@@ -335,8 +339,8 @@ std::vector<float> run_vision_block(runtime::MetalContext& ctx, const std::vecto
 
   // ---- MLP half ----
   {
-    LayerNormParams p{static_cast<std::uint32_t>(tokens), static_cast<std::uint32_t>(hidden),
-                      1e-6f, 1u};
+    LayerNormParams p{static_cast<std::uint32_t>(tokens), static_cast<std::uint32_t>(hidden), 1e-6f,
+                      1u};
     const void* bufs[] = {bx.handle(), bn2w.handle(), bn2b.handle(), bnorm.handle()};
     ctx.dispatch("cpi_layernorm", runtime::MetalContext::Grid::Groups,
                  static_cast<std::size_t>(tokens), 256, bufs, nullptr, 4, &p, sizeof(p));
@@ -358,7 +362,7 @@ std::vector<float> run_vision_block(runtime::MetalContext& ctx, const std::vecto
 
   ctx.commit_and_wait();
   if (dbg != nullptr) {
-    dbg->norm2 = grab(bnorm, n);          // norm2 overwrote norm1 in the same buffer
+    dbg->norm2 = grab(bnorm, n);  // norm2 overwrote norm1 in the same buffer
     dbg->inter = grab(binter, static_cast<std::size_t>(tokens) * inter);
   }
   return grab(bx, n);
@@ -386,8 +390,8 @@ std::vector<float> run_merger(runtime::MetalContext& ctx, const std::vector<floa
   auto b2w = up(read_f32(mp + "linear_fc2_weight.f32"));
   auto b2b = up(read_f32(mp + "linear_fc2_bias.f32"));
   {
-    LayerNormParams p{static_cast<std::uint32_t>(tokens), static_cast<std::uint32_t>(hidden),
-                      1e-6f, 1u};
+    LayerNormParams p{static_cast<std::uint32_t>(tokens), static_cast<std::uint32_t>(hidden), 1e-6f,
+                      1u};
     const void* bufs[] = {bx.handle(), bnw.handle(), bnb.handle(), bn.handle()};
     ctx.dispatch("cpi_layernorm", runtime::MetalContext::Grid::Groups,
                  static_cast<std::size_t>(tokens), 256, bufs, nullptr, 4, &p, sizeof(p));
@@ -425,8 +429,8 @@ std::vector<float> run_merger(runtime::MetalContext& ctx, const std::vector<floa
 // series over head_dim/2. And the per-token (row, col) must be enumerated in the same
 // merge-unit-major order the position table uses, or the rotation is applied to the wrong
 // patches while still looking like a well-formed rotation.
-void build_vision_rope(int h, int w, int head_dim, int merge, float theta,
-                       std::vector<float>& cosb, std::vector<float>& sinb) {
+void build_vision_rope(int h, int w, int head_dim, int merge, float theta, std::vector<float>& cosb,
+                       std::vector<float>& sinb) {
   const int half = head_dim / 2;
   const int quarter = head_dim / 4;
   const int tokens = h * w;
@@ -440,8 +444,8 @@ void build_vision_rope(int h, int w, int head_dim, int merge, float theta,
           const int row = bh * merge + mi;
           const int col = bw * merge + mj;
           for (int j = 0; j < quarter; ++j) {
-            const float inv = 1.0f / std::pow(theta, static_cast<float>(2 * j) /
-                                                         static_cast<float>(half));
+            const float inv =
+                1.0f / std::pow(theta, static_cast<float>(2 * j) / static_cast<float>(half));
             const float ar = static_cast<float>(row) * inv;
             const float ac = static_cast<float>(col) * inv;
             cosb[static_cast<std::size_t>(idx) * half + j] = std::cos(ar);
@@ -505,7 +509,7 @@ int main(int argc, char** argv) {
   const std::vector<float> b_proj = read_f32(dir + "/weights/patch_embed_proj_bias.f32");
   const std::vector<float> pos_tab = read_f32(dir + "/weights/pos_embed_weight.f32");
 
-  std::vector<float> our_patch_embed;   // filled by stage 1, consumed by the end-to-end run
+  std::vector<float> our_patch_embed;  // filled by stage 1, consumed by the end-to-end run
   std::vector<float> our_sum;
 
   // ---- stage 1: patch embed ----
@@ -535,14 +539,15 @@ int main(int argc, char** argv) {
     // Looser than the smoke kernels: this is a 1536-deep fp16 dot product against an fp32
     // reference, so the tolerance has to cover honest accumulation error.
     std::printf("    got[0..3] = %.4f %.4f %.4f %.4f\n", got[0], got[1], got[2], got[3]);
-    std::printf("    want[0..3]= %.4f %.4f %.4f %.4f\n", want_pe[0], want_pe[1],
-                want_pe[2], want_pe[3]);
+    std::printf("    want[0..3]= %.4f %.4f %.4f %.4f\n", want_pe[0], want_pe[1], want_pe[2],
+                want_pe[3]);
     our_patch_embed = got;
     check("patch_embed", got, want_pe, 0.05f);
   }
 
   // ---- stage 2: interpolated position table (host) ----
-  const std::vector<float> pos = interpolate_pos_embed(pos_tab, side, grid_h, grid_w, hidden, merge);
+  const std::vector<float> pos =
+      interpolate_pos_embed(pos_tab, side, grid_h, grid_w, hidden, merge);
   check("pos_embed", pos, want_pos, 1e-4f);
 
   // ---- stage 3: their sum ----
@@ -582,21 +587,20 @@ int main(int argc, char** argv) {
     const std::string wp = dir + "/weights/blocks_0_";
 
     std::vector<float> h_x = want_sum;  // block input (oracle's, to isolate block 0)
-    VisionBlockWeights bw{read_f32(wp + "norm1_weight.f32"),  read_f32(wp + "norm1_bias.f32"),
-                          read_f32(wp + "attn_qkv_weight.f32"), read_f32(wp + "attn_qkv_bias.f32"),
-                          read_f32(wp + "attn_proj_weight.f32"), read_f32(wp + "attn_proj_bias.f32"),
-                          read_f32(wp + "norm2_weight.f32"),  read_f32(wp + "norm2_bias.f32"),
-                          read_f32(wp + "mlp_linear_fc1_weight.f32"),
-                          read_f32(wp + "mlp_linear_fc1_bias.f32"),
-                          read_f32(wp + "mlp_linear_fc2_weight.f32"),
-                          read_f32(wp + "mlp_linear_fc2_bias.f32")};
+    VisionBlockWeights bw{
+        read_f32(wp + "norm1_weight.f32"),          read_f32(wp + "norm1_bias.f32"),
+        read_f32(wp + "attn_qkv_weight.f32"),       read_f32(wp + "attn_qkv_bias.f32"),
+        read_f32(wp + "attn_proj_weight.f32"),      read_f32(wp + "attn_proj_bias.f32"),
+        read_f32(wp + "norm2_weight.f32"),          read_f32(wp + "norm2_bias.f32"),
+        read_f32(wp + "mlp_linear_fc1_weight.f32"), read_f32(wp + "mlp_linear_fc1_bias.f32"),
+        read_f32(wp + "mlp_linear_fc2_weight.f32"), read_f32(wp + "mlp_linear_fc2_bias.f32")};
 
     std::vector<float> cosb, sinb;
     build_vision_rope(grid_h, grid_w, head_dim, merge, 10000.0f, cosb, sinb);
 
     BlockDebug dbg;
-    const std::vector<float> got = run_vision_block(ctx, h_x, bw, cosb, sinb, tokens, hidden,
-                                                    heads, head_dim, inter, &dbg);
+    const std::vector<float> got =
+        run_vision_block(ctx, h_x, bw, cosb, sinb, tokens, hidden, heads, head_dim, inter, &dbg);
     check("b0_norm1", dbg.norm1, read_f32(dir + "/sub_b0_norm1.f32"), 0.05f);
     check("b0_qkv", dbg.qkv_preroped, read_f32(dir + "/sub_b0_qkv.f32"), 0.05f);
     check("b0_attn", dbg.attn_out, read_f32(dir + "/sub_b0_attn.f32"), 0.05f);
@@ -612,22 +616,21 @@ int main(int argc, char** argv) {
     std::vector<float> cur = got;
     for (int L = 1; L < depth; ++L) {
       const std::string p2 = dir + "/weights/blocks_" + std::to_string(L) + "_";
-      VisionBlockWeights bl{read_f32(p2 + "norm1_weight.f32"),  read_f32(p2 + "norm1_bias.f32"),
-                            read_f32(p2 + "attn_qkv_weight.f32"), read_f32(p2 + "attn_qkv_bias.f32"),
-                            read_f32(p2 + "attn_proj_weight.f32"),
-                            read_f32(p2 + "attn_proj_bias.f32"),
-                            read_f32(p2 + "norm2_weight.f32"),  read_f32(p2 + "norm2_bias.f32"),
-                            read_f32(p2 + "mlp_linear_fc1_weight.f32"),
-                            read_f32(p2 + "mlp_linear_fc1_bias.f32"),
-                            read_f32(p2 + "mlp_linear_fc2_weight.f32"),
-                            read_f32(p2 + "mlp_linear_fc2_bias.f32")};
+      VisionBlockWeights bl{
+          read_f32(p2 + "norm1_weight.f32"),          read_f32(p2 + "norm1_bias.f32"),
+          read_f32(p2 + "attn_qkv_weight.f32"),       read_f32(p2 + "attn_qkv_bias.f32"),
+          read_f32(p2 + "attn_proj_weight.f32"),      read_f32(p2 + "attn_proj_bias.f32"),
+          read_f32(p2 + "norm2_weight.f32"),          read_f32(p2 + "norm2_bias.f32"),
+          read_f32(p2 + "mlp_linear_fc1_weight.f32"), read_f32(p2 + "mlp_linear_fc1_bias.f32"),
+          read_f32(p2 + "mlp_linear_fc2_weight.f32"), read_f32(p2 + "mlp_linear_fc2_bias.f32")};
       cur = run_vision_block(ctx, cur, bl, cosb, sinb, tokens, hidden, heads, head_dim, inter);
       // Per-block relative error, reported not gated. Smooth growth is fp16 accumulation; a
       // jump at one block is a bug in that block. Absolute error alone cannot tell them apart
       // once the activations span three orders of magnitude across the stack.
-      const std::vector<float> ref = read_f32(dir + "/stage_" +
-          (L + 4 < 10 ? std::string("0") : std::string("")) + std::to_string(L + 4) +
-          "_block_" + (L < 10 ? std::string("0") : std::string("")) + std::to_string(L) + ".f32");
+      const std::vector<float> ref =
+          read_f32(dir + "/stage_" + (L + 4 < 10 ? std::string("0") : std::string("")) +
+                   std::to_string(L + 4) + "_block_" +
+                   (L < 10 ? std::string("0") : std::string("")) + std::to_string(L) + ".f32");
       float mx = 0.0f, ref_mx = 0.0f;
       for (std::size_t i = 0; i < cur.size(); ++i) {
         mx = std::max(mx, std::fabs(cur[i] - ref[i]));
@@ -674,7 +677,7 @@ int main(int argc, char** argv) {
   // patches are already in merge-unit-major order, so four consecutive rows are one unit
   // regrouping [tokens][768] as [tokens/4][3072] is a reinterpretation of the same buffer.
   {
-    const int inter_m = hidden * merge * merge;               // 3072
+    const int inter_m = hidden * merge * merge;  // 3072
     const int out_hidden = engine::mini::json_get_int(geo, "out_hidden_size");
     const int soft = tokens / (merge * merge);
     const std::vector<float> want = read_f32(dir + "/stage_16_merger.f32");
@@ -703,19 +706,17 @@ int main(int argc, char** argv) {
     std::vector<float> cur = our_sum;
     for (int L = 0; L < depth; ++L) {
       const std::string bp = dir + "/weights/blocks_" + std::to_string(L) + "_";
-      VisionBlockWeights bl{read_f32(bp + "norm1_weight.f32"),  read_f32(bp + "norm1_bias.f32"),
-                            read_f32(bp + "attn_qkv_weight.f32"), read_f32(bp + "attn_qkv_bias.f32"),
-                            read_f32(bp + "attn_proj_weight.f32"),
-                            read_f32(bp + "attn_proj_bias.f32"),
-                            read_f32(bp + "norm2_weight.f32"),  read_f32(bp + "norm2_bias.f32"),
-                            read_f32(bp + "mlp_linear_fc1_weight.f32"),
-                            read_f32(bp + "mlp_linear_fc1_bias.f32"),
-                            read_f32(bp + "mlp_linear_fc2_weight.f32"),
-                            read_f32(bp + "mlp_linear_fc2_bias.f32")};
+      VisionBlockWeights bl{
+          read_f32(bp + "norm1_weight.f32"),          read_f32(bp + "norm1_bias.f32"),
+          read_f32(bp + "attn_qkv_weight.f32"),       read_f32(bp + "attn_qkv_bias.f32"),
+          read_f32(bp + "attn_proj_weight.f32"),      read_f32(bp + "attn_proj_bias.f32"),
+          read_f32(bp + "norm2_weight.f32"),          read_f32(bp + "norm2_bias.f32"),
+          read_f32(bp + "mlp_linear_fc1_weight.f32"), read_f32(bp + "mlp_linear_fc1_bias.f32"),
+          read_f32(bp + "mlp_linear_fc2_weight.f32"), read_f32(bp + "mlp_linear_fc2_bias.f32")};
       cur = run_vision_block(ctx, cur, bl, cosb, sinb, tokens, hidden, heads, head_dim, inter);
     }
-    const std::vector<float> got = run_merger(ctx, cur, dir, tokens, hidden, merge, inter_m,
-                                              out_hidden, soft);
+    const std::vector<float> got =
+        run_merger(ctx, cur, dir, tokens, hidden, merge, inter_m, out_hidden, soft);
     const std::vector<float> want = read_f32(dir + "/stage_16_merger.f32");
     float mx = 0.0f, ref_mx = 0.0f;
     for (std::size_t i = 0; i < got.size(); ++i) {
@@ -728,8 +729,8 @@ int main(int argc, char** argv) {
     }
     const float rel = (nan_e != 0) ? 1e9f : mx / (ref_mx + 1e-9f);
     const bool ok = rel <= 0.02f;
-    std::printf("  %-22s rel=%.5f  max_abs=%.4f  |ref|max=%.2f  tol_rel=0.020  %s\n",
-                "END_TO_END", rel, mx, ref_mx, ok ? "PASS" : "FAIL");
+    std::printf("  %-22s rel=%.5f  max_abs=%.4f  |ref|max=%.2f  tol_rel=0.020  %s\n", "END_TO_END",
+                rel, mx, ref_mx, ok ? "PASS" : "FAIL");
     if (!ok) ++failures;
   }
 
@@ -776,7 +777,8 @@ int main(int argc, char** argv) {
     } else if (c.vision_depth != engine::mini::json_get_int(geo, "depth") ||
                c.vision_hidden_size != hidden ||
                c.vision_out_hidden_size != engine::mini::json_get_int(geo, "out_hidden_size")) {
-      std::printf("  %-22s container geometry disagrees with the oracle  FAIL\n", "container_tower");
+      std::printf("  %-22s container geometry disagrees with the oracle  FAIL\n",
+                  "container_tower");
       ++failures;
     } else {
       // The container stores fp16; the oracle dumps fp32. Compare the weights directly rather
@@ -848,10 +850,10 @@ int main(int argc, char** argv) {
         const bool sized = soft.size() == want16.size() && nan_s == 0;
         const float rel = (nan_s != 0) ? 1e9f : mx / (ref_mx + 1e-9f);
         const bool ok2 = sized && rel <= 0.02f;
-        std::printf("      engine soft: %zu floats (want %zu); first= %.4f %.4f %.4f | "
-                    "oracle= %.4f %.4f %.4f\n",
-                    soft.size(), want16.size(), soft[0], soft[1], soft[2], want16[0], want16[1],
-                    want16[2]);
+        std::printf(
+            "      engine soft: %zu floats (want %zu); first= %.4f %.4f %.4f | "
+            "oracle= %.4f %.4f %.4f\n",
+            soft.size(), want16.size(), soft[0], soft[1], soft[2], want16[0], want16[1], want16[2]);
         std::printf("  %-22s rel=%.8f  max_abs=%.6f  %s\n", "ENGINE_encode_image", rel, mx,
                     ok2 ? "PASS" : "FAIL");
         if (!ok2) ++failures;
@@ -901,7 +903,10 @@ int main(int argc, char** argv) {
       const std::vector<float>& lg = eng.forward_token(next, static_cast<int>(toks.size()) + i);
       int best = 0;
       for (std::size_t j = 0; j < lg.size(); ++j) {
-        if (!std::isfinite(lg[j])) { finite = false; break; }
+        if (!std::isfinite(lg[j])) {
+          finite = false;
+          break;
+        }
         if (lg[j] > lg[static_cast<std::size_t>(best)]) best = static_cast<int>(j);
       }
       if (!finite) break;
@@ -920,13 +925,13 @@ int main(int argc, char** argv) {
       eng2.open(argv[2], 512);
       const std::vector<std::vector<float>> none(toks.size());
       eng2.prefill_multimodal(toks, none);
-      const std::vector<float>& plain = eng2.forward_token(toks.back(),
-                                                           static_cast<int>(toks.size()));
+      const std::vector<float>& plain =
+          eng2.forward_token(toks.back(), static_cast<int>(toks.size()));
       engine::PlanMetalEngine eng3;
       eng3.open(argv[2], 512);
       eng3.prefill_multimodal(toks, embeds);
-      const std::vector<float>& with = eng3.forward_token(toks.back(),
-                                                          static_cast<int>(toks.size()));
+      const std::vector<float>& with =
+          eng3.forward_token(toks.back(), static_cast<int>(toks.size()));
       double diff = 0.0;
       const std::size_t m = std::min(plain.size(), with.size());
       for (std::size_t i = 0; i < m; ++i) {
@@ -950,9 +955,12 @@ int main(int argc, char** argv) {
     for (int i = 0; i < 16; ++i) toks.push_back(IMG);
     toks.push_back(248054);
     for (int i = 0; i < 4; ++i) toks.push_back(3838 + i);
-    const std::vector<std::int32_t> want_t = {0, 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, 5,6,7,8,9};
-    const std::vector<std::int32_t> want_h = {0, 1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4, 5,6,7,8,9};
-    const std::vector<std::int32_t> want_w = {0, 1,2,3,4,1,2,3,4,1,2,3,4,1,2,3,4, 5,6,7,8,9};
+    const std::vector<std::int32_t> want_t = {0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                                              1, 1, 1, 1, 1, 1, 5, 6, 7, 8, 9};
+    const std::vector<std::int32_t> want_h = {0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3,
+                                              3, 3, 4, 4, 4, 4, 5, 6, 7, 8, 9};
+    const std::vector<std::int32_t> want_w = {0, 1, 2, 3, 4, 1, 2, 3, 4, 1, 2,
+                                              3, 4, 1, 2, 3, 4, 5, 6, 7, 8, 9};
 
     const std::vector<std::int32_t> got = engine::build_mrope_positions(toks, IMG, 4, 4);
     const int n = static_cast<int>(toks.size());
@@ -1086,15 +1094,18 @@ int main(int argc, char** argv) {
             // across every logit is invisible to softmax and to argmax, so it is not an error.
             // Centre both on their own mean before differencing.
             double mg = 0.0, mr = 0.0;
-            for (std::size_t j = 0; j < lg.size(); ++j) { mg += lg[j]; mr += ref[j]; }
+            for (std::size_t j = 0; j < lg.size(); ++j) {
+              mg += lg[j];
+              mr += ref[j];
+            }
             mg /= static_cast<double>(lg.size());
             mr /= static_cast<double>(ref.size());
             float mx = 0.0f;
             double sum = 0.0;
             int arg_g = 0, arg_r = 0;
             for (std::size_t j = 0; j < lg.size(); ++j) {
-              const float d = std::fabs((lg[j] - static_cast<float>(mg)) -
-                                        (ref[j] - static_cast<float>(mr)));
+              const float d =
+                  std::fabs((lg[j] - static_cast<float>(mg)) - (ref[j] - static_cast<float>(mr)));
               mx = std::max(mx, d);
               sum += d;
               if (lg[j] > lg[static_cast<std::size_t>(arg_g)]) arg_g = static_cast<int>(j);
@@ -1104,8 +1115,10 @@ int main(int argc, char** argv) {
             // them is already drifting here, the divergence is not born at step 5.
             const float g35 = lg[3160] - lg[3878];
             const float r35 = ref[3160] - ref[3878];
-            std::printf("      argmax ours=%d oracle=%d | logit(3160)-logit(3878): ours=%+.4f "
-                        "oracle=%+.4f  drift=%+.4f\n", arg_g, arg_r, g35, r35, g35 - r35);
+            std::printf(
+                "      argmax ours=%d oracle=%d | logit(3160)-logit(3878): ours=%+.4f "
+                "oracle=%+.4f  drift=%+.4f\n",
+                arg_g, arg_r, g35, r35, g35 - r35);
             // Tolerance 0.30 on the mean. The behavioural gate is MULTIMODAL_stream below, which
             // is token-identical to the fp32 reference over 8 steps; this is the drift tripwire
             // on top of it. It is set above the text-only control's 0.12 on purpose: this prompt
@@ -1138,8 +1151,7 @@ int main(int argc, char** argv) {
         if (lg[j] > lg[static_cast<std::size_t>(second)]) second = static_cast<int>(j);
       }
       std::printf("      step %d: top1=%d (%.4f)  top2=%d (%.4f)  margin=%.4f\n", i, best,
-                  lg[static_cast<std::size_t>(best)], second,
-                  lg[static_cast<std::size_t>(second)],
+                  lg[static_cast<std::size_t>(best)], second, lg[static_cast<std::size_t>(second)],
                   lg[static_cast<std::size_t>(best)] - lg[static_cast<std::size_t>(second)]);
       got.push_back(best);
       next = best;
@@ -1147,7 +1159,10 @@ int main(int argc, char** argv) {
     const std::vector<int> want = {198, 760, 2099, 4774, 264, 3160, 5072, 314};
     int match = 0;
     for (std::size_t i = 0; i < want.size() && i < got.size(); ++i) {
-      if (got[i] == want[i]) ++match; else break;
+      if (got[i] == want[i])
+        ++match;
+      else
+        break;
     }
     std::printf("      metal : ");
     for (int v : got) std::printf("%d ", v);

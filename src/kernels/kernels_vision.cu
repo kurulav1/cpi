@@ -61,9 +61,10 @@ __global__ void rope_2d_inplace_kernel(half* x, const int* pos_x, const int* pos
 // Grid: (hidden/threads, tokens) is awkward for a dot product, so: one block per
 // (token, out-channel-tile), each thread reducing over patch_dim.
 __global__ void patch_embed_kernel(const half* __restrict__ proj, const float* __restrict__ pixels,
-                                   const half* __restrict__ pos_table, const int* __restrict__ pos_x,
-                                   const int* __restrict__ pos_y, half* __restrict__ out,
-                                   int hidden, int patch_dim, int pos_table_size) {
+                                   const half* __restrict__ pos_table,
+                                   const int* __restrict__ pos_x, const int* __restrict__ pos_y,
+                                   half* __restrict__ out, int hidden, int patch_dim,
+                                   int pos_table_size) {
   const int token = blockIdx.y;
   const int h = blockIdx.x * blockDim.x + threadIdx.x;
   if (h >= hidden) {
@@ -137,9 +138,9 @@ __global__ void standardize_kernel(half* x, const half* bias, const half* scale,
 
 }  // namespace
 
-void launch_rope_2d_inplace(half* x, const int* pos_x, const int* pos_y, int num_heads, int head_dim,
-                            int tokens, const float* cos_table, const float* sin_table,
-                            cudaStream_t stream) {
+void launch_rope_2d_inplace(half* x, const int* pos_x, const int* pos_y, int num_heads,
+                            int head_dim, int tokens, const float* cos_table,
+                            const float* sin_table, cudaStream_t stream) {
   if (head_dim % 4 != 0) {
     return;  // needs two halves, each an even number of rotated pairs
   }
@@ -242,10 +243,9 @@ __global__ void rope_seq_table_device_pos_kernel(half* x, int num_heads, int hea
   x[row + i1] = __float2half(v1 * c + v0 * s);
 }
 
-void launch_rope_seq_table_device_pos(half* x, int num_heads, int head_dim,
-                                      const int* position_ptr, int tokens, const float* cos_table,
-                                      const float* sin_table, int rotary_dim,
-                                      cudaStream_t stream) {
+void launch_rope_seq_table_device_pos(half* x, int num_heads, int head_dim, const int* position_ptr,
+                                      int tokens, const float* cos_table, const float* sin_table,
+                                      int rotary_dim, cudaStream_t stream) {
   const int rot = rotary_dim > 0 ? rotary_dim : head_dim;
   const dim3 grid(static_cast<unsigned>(num_heads), static_cast<unsigned>(tokens));
   rope_seq_table_device_pos_kernel<<<grid, rot / 2, 0, stream>>>(

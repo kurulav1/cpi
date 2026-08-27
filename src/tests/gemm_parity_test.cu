@@ -16,13 +16,13 @@
 
 #include "runtime/kernels.cuh"
 
-#define CK(call)                                                                       \
-  do {                                                                                 \
-    cudaError_t e = (call);                                                            \
-    if (e != cudaSuccess) {                                                            \
-      std::printf("CUDA error %s at line %d\n", cudaGetErrorString(e), __LINE__);      \
-      return 1;                                                                        \
-    }                                                                                  \
+#define CK(call)                                                                  \
+  do {                                                                            \
+    cudaError_t e = (call);                                                       \
+    if (e != cudaSuccess) {                                                       \
+      std::printf("CUDA error %s at line %d\n", cudaGetErrorString(e), __LINE__); \
+      return 1;                                                                   \
+    }                                                                             \
   } while (0)
 
 namespace {
@@ -35,12 +35,12 @@ struct Shape {
 
 int main() {
   const Shape shapes[] = {
-      {1, 64, 64},      // single token: the decode shape
-      {2, 32, 32},      // exactly one tile
-      {17, 48, 80},     // every dim ragged
-      {64, 768, 768},   // Gemma 4 E2B vision hidden
-      {196, 3072, 768}, // vision MLP up-projection, a real patch count
-      {33, 1152, 4304}, // 26B vision down-projection shape, ragged tokens
+      {1, 64, 64},       // single token: the decode shape
+      {2, 32, 32},       // exactly one tile
+      {17, 48, 80},      // every dim ragged
+      {64, 768, 768},    // Gemma 4 E2B vision hidden
+      {196, 3072, 768},  // vision MLP up-projection, a real patch count
+      {33, 1152, 4304},  // 26B vision down-projection shape, ragged tokens
   };
 
   std::mt19937 rng(1234);
@@ -82,8 +82,10 @@ int main() {
       for (int m = 0; m < s.out_features; ++m) {
         double ref = 0.0;
         for (int k = 0; k < s.in_features; ++k) {
-          ref += static_cast<double>(__half2float(hw[static_cast<std::size_t>(m) * s.in_features + k])) *
-                 static_cast<double>(__half2float(hx[static_cast<std::size_t>(t) * s.in_features + k]));
+          ref += static_cast<double>(
+                     __half2float(hw[static_cast<std::size_t>(m) * s.in_features + k])) *
+                 static_cast<double>(
+                     __half2float(hx[static_cast<std::size_t>(t) * s.in_features + k]));
         }
         const std::size_t i = static_cast<std::size_t>(t) * s.out_features + m;
         const double got = __half2float(hy[i]);

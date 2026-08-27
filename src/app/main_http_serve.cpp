@@ -11,16 +11,15 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <filesystem>
-#include <fstream>
 #include <condition_variable>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
 #include <vector>
-
-#include <memory>
 
 #include "app/batch_worker.hpp"
 #include "app/main_helpers.hpp"
@@ -37,12 +36,12 @@
 // present, else Metal. Without either, /v1/embeddings reports unavailable
 // rather than failing the build (a CPU-only cpi still serves chat).
 #if CPI_HAS_CUDA
-#  include "engine/bert_embedder.hpp"
-#  define CPI_SERVE_HAS_EMBEDDER 1
+#include "engine/bert_embedder.hpp"
+#define CPI_SERVE_HAS_EMBEDDER 1
 using ServeEmbedder = engine::BertEmbedder;
 #elif defined(CPI_ENABLE_METAL)
-#  include "engine/metal_bert_embedder.hpp"
-#  define CPI_SERVE_HAS_EMBEDDER 1
+#include "engine/metal_bert_embedder.hpp"
+#define CPI_SERVE_HAS_EMBEDDER 1
 using ServeEmbedder = engine::MetalBertEmbedder;
 #endif
 
@@ -64,8 +63,8 @@ namespace {
 struct Pending {
   std::mutex mu;
   std::condition_variable cv;
-  std::string pending_text;   // delta text not yet written by the connection
-  std::string full_text;      // everything so far
+  std::string pending_text;  // delta text not yet written by the connection
+  std::string full_text;     // everything so far
   std::string finish_reason;
   std::string error;
   int prompt_tokens = 0;
@@ -314,9 +313,10 @@ std::string bearer_token(const net::HttpRequest& req) {
   std::string h = req.header("authorization");
   const std::string prefix = "Bearer ";
   if (h.size() > prefix.size() &&
-      std::equal(prefix.begin(), prefix.end(), h.begin(),
-                 [](char x, char y) { return std::tolower(static_cast<unsigned char>(x)) ==
-                                             std::tolower(static_cast<unsigned char>(y)); })) {
+      std::equal(prefix.begin(), prefix.end(), h.begin(), [](char x, char y) {
+        return std::tolower(static_cast<unsigned char>(x)) ==
+               std::tolower(static_cast<unsigned char>(y));
+      })) {
     return h.substr(prefix.size());
   }
   return std::string();
@@ -352,10 +352,10 @@ void serve_routes(const HttpServeOptions& opts, const std::string& model_name, c
           return;
         }
         if (!opts.api_key.empty() && !token_matches(bearer_token(req), opts.api_key)) {
-          res.send(401, "application/json",
-                   error_json("missing or invalid Authorization bearer token",
-                              "invalid_request_error"),
-                   "WWW-Authenticate: Bearer\r\n");
+          res.send(
+              401, "application/json",
+              error_json("missing or invalid Authorization bearer token", "invalid_request_error"),
+              "WWW-Authenticate: Bearer\r\n");
           return;
         }
         if (req.path == "/v1/embeddings") {
@@ -483,8 +483,8 @@ void run_http_server(engine::BatchScheduler& sched, model::Tokenizer& tokenizer,
     ov.temp = json_get_float(body, "temperature", -1.0f);
     ov.top_p = json_get_float(body, "top_p", -1.0f);
     ov.top_k = json_get_int(body, "top_k", -1);
-    ov.repeat_penalty = json_get_float(body, "repetition_penalty",
-                                       json_get_float(body, "repeat_penalty", -1.0f));
+    ov.repeat_penalty =
+        json_get_float(body, "repetition_penalty", json_get_float(body, "repeat_penalty", -1.0f));
     ov.no_repeat_ngram = json_get_int(body, "no_repeat_ngram", -1);
     ov.stop_texts = json_get_string_array(body, "stop");
     // response_format: {"type":"json_schema","json_schema":{...}} and the plain
@@ -496,8 +496,7 @@ void run_http_server(engine::BatchScheduler& sched, model::Tokenizer& tokenizer,
     }
 
     const bool stream = json_get_bool(body, "stream", false);
-    const std::string id =
-        (chat ? "chatcmpl-" : "cmpl-") + std::to_string(next_id.fetch_add(1));
+    const std::string id = (chat ? "chatcmpl-" : "cmpl-") + std::to_string(next_id.fetch_add(1));
 
     // Vision requests take a different engine entry point than the batch
     // scheduler, so they run as an exclusive task on the worker thread. Only the
@@ -537,8 +536,7 @@ void run_http_server(engine::BatchScheduler& sched, model::Tokenizer& tokenizer,
       const std::vector<int> base = tokenizer.encode(prompt, defaults.add_bos);
       worker.run_exclusive([&]() {
         try {
-          const std::vector<int> outs =
-              opts.multimodal(base, image_path, max_new, temp, nullptr);
+          const std::vector<int> outs = opts.multimodal(base, image_path, max_new, temp, nullptr);
           text = app::main_helpers::sanitize_stream_text(tokenizer.decode(outs));
         } catch (const std::exception& e) {
           vision_error = e.what();
@@ -608,9 +606,8 @@ void run_http_server(engine::BatchScheduler& sched, model::Tokenizer& tokenizer,
         bool finished = false;
         {
           std::unique_lock<std::mutex> lk(pending->mu);
-          pending->cv.wait_for(lk, std::chrono::milliseconds(200), [&]() {
-            return !pending->pending_text.empty() || pending->done;
-          });
+          pending->cv.wait_for(lk, std::chrono::milliseconds(200),
+                               [&]() { return !pending->pending_text.empty() || pending->done; });
           chunk.swap(pending->pending_text);
           finished = pending->done;
           finish = pending->finish_reason;
@@ -629,10 +626,10 @@ void run_http_server(engine::BatchScheduler& sched, model::Tokenizer& tokenizer,
                       created + ",\"model\":\"" + json_escape(model_name) +
                       "\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"" +
                       json_escape(chunk) + "\"},\"finish_reason\":null}]}")
-                   : ("{\"id\":\"" + id + "\",\"object\":\"text_completion\",\"created\":" +
-                      created + ",\"model\":\"" + json_escape(model_name) +
-                      "\",\"choices\":[{\"index\":0,\"text\":\"" + json_escape(chunk) +
-                      "\",\"finish_reason\":null}]}");
+                   : ("{\"id\":\"" + id +
+                      "\",\"object\":\"text_completion\",\"created\":" + created + ",\"model\":\"" +
+                      json_escape(model_name) + "\",\"choices\":[{\"index\":0,\"text\":\"" +
+                      json_escape(chunk) + "\",\"finish_reason\":null}]}");
           // A failed write means the client hung up: cancel so its KV blocks go
           // back to the pool instead of decoding into a closed socket.
           if (!res.sse(payload)) {
@@ -644,9 +641,8 @@ void run_http_server(engine::BatchScheduler& sched, model::Tokenizer& tokenizer,
         if (finished) break;
       }
       const std::string reason = finish.empty() ? "stop" : (finish == "length" ? "length" : "stop");
-      res.sse(chat ? ("{\"id\":\"" + id +
-                      "\",\"object\":\"chat.completion.chunk\",\"created\":" + created +
-                      ",\"model\":\"" + json_escape(model_name) +
+      res.sse(chat ? ("{\"id\":\"" + id + "\",\"object\":\"chat.completion.chunk\",\"created\":" +
+                      created + ",\"model\":\"" + json_escape(model_name) +
                       "\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"" + reason +
                       "\"}]}")
                    : ("{\"id\":\"" + id + "\",\"object\":\"text_completion\",\"created\":" +
@@ -686,8 +682,9 @@ void run_http_server(engine::BatchScheduler& sched, model::Tokenizer& tokenizer,
                 "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"" +
                 json_escape(text) + "\"},\"finish_reason\":\"" + reason + "\"}]" + usage + "}")
              : ("{\"id\":\"" + id + "\",\"object\":\"text_completion\",\"created\":" + created +
-                ",\"model\":\"" + json_escape(model_name) + "\",\"choices\":[{\"index\":0,\"text\":\"" +
-                json_escape(text) + "\",\"finish_reason\":\"" + reason + "\"}]" + usage + "}");
+                ",\"model\":\"" + json_escape(model_name) +
+                "\",\"choices\":[{\"index\":0,\"text\":\"" + json_escape(text) +
+                "\",\"finish_reason\":\"" + reason + "\"}]" + usage + "}");
     res.send(200, "application/json", payload);
   };
 
@@ -722,9 +719,8 @@ void run_http_server(engine::BatchScheduler& sched, model::Tokenizer& tokenizer,
   const auto handle_embeddings = [&](const net::HttpRequest& req, net::HttpResponder& res) {
     if (!embed_ready) {
       const std::string why =
-          embed_error.empty()
-              ? std::string("no embedding model loaded (pass --embed-model <dir>)")
-              : embed_error;
+          embed_error.empty() ? std::string("no embedding model loaded (pass --embed-model <dir>)")
+                              : embed_error;
       res.send(503, "application/json", error_json(why, "server_error"));
       return;
     }
@@ -857,8 +853,9 @@ void run_http_server_serial(GenerateStreamFn generate, model::Tokenizer& tokeniz
         stop_texts.push_back(s);
       }
     }
-    const std::string id = (chat ? "chatcmpl-" : "cmpl-") + std::to_string(
-                               std::chrono::steady_clock::now().time_since_epoch().count() % 100000);
+    const std::string id =
+        (chat ? "chatcmpl-" : "cmpl-") +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count() % 100000);
     const std::string created = iso_created();
 
     std::string image_path;
@@ -949,43 +946,45 @@ void run_http_server_serial(GenerateStreamFn generate, model::Tokenizer& tokeniz
             }
           }
           if (error.empty()) {
-            generate(base, max_new, temp, [&](int token) {
-              if (std::find(stop_ids.begin(), stop_ids.end(), token) != stop_ids.end()) {
-                hit_stop = true;
-                return false;  // never emit the marker itself
-              }
-              ids.push_back(token);
-              const std::string decoded =
-                  app::main_helpers::sanitize_stream_text(tokenizer.decode(ids));
-              if (decoded.size() > prev_text.size()) {
-                std::string delta = decoded.substr(prev_text.size());
-                // Stop-text check against the whole text so far: a marker split
-                // across two decode steps still matches, and the part of the
-                // delta before it is still emitted.
-                const std::string candidate = prev_text + delta;
-                std::size_t cut = std::string::npos;
-                for (const auto& s : stop_texts) {
-                  if (s.empty()) continue;
-                  const std::size_t at = candidate.find(s, prev_text.size() > s.size()
-                                                               ? prev_text.size() - s.size()
-                                                               : 0);
-                  if (at != std::string::npos && at < cut) cut = at;
-                }
-                if (cut != std::string::npos) {
-                  if (cut > prev_text.size()) {
-                    emit_delta(candidate.substr(prev_text.size(), cut - prev_text.size()));
+            generate(
+                base, max_new, temp,
+                [&](int token) {
+                  if (std::find(stop_ids.begin(), stop_ids.end(), token) != stop_ids.end()) {
+                    hit_stop = true;
+                    return false;  // never emit the marker itself
                   }
-                  hit_stop = true;
-                  return false;
-                }
-                prev_text = decoded;
-                if (!emit_delta(delta)) {
-                  client_gone = true;
-                  return false;  // stop generating for a client that hung up
-                }
-              }
-              return true;
-            }, sampler ? &constraints : nullptr);
+                  ids.push_back(token);
+                  const std::string decoded =
+                      app::main_helpers::sanitize_stream_text(tokenizer.decode(ids));
+                  if (decoded.size() > prev_text.size()) {
+                    std::string delta = decoded.substr(prev_text.size());
+                    // Stop-text check against the whole text so far: a marker split
+                    // across two decode steps still matches, and the part of the
+                    // delta before it is still emitted.
+                    const std::string candidate = prev_text + delta;
+                    std::size_t cut = std::string::npos;
+                    for (const auto& s : stop_texts) {
+                      if (s.empty()) continue;
+                      const std::size_t at = candidate.find(
+                          s, prev_text.size() > s.size() ? prev_text.size() - s.size() : 0);
+                      if (at != std::string::npos && at < cut) cut = at;
+                    }
+                    if (cut != std::string::npos) {
+                      if (cut > prev_text.size()) {
+                        emit_delta(candidate.substr(prev_text.size(), cut - prev_text.size()));
+                      }
+                      hit_stop = true;
+                      return false;
+                    }
+                    prev_text = decoded;
+                    if (!emit_delta(delta)) {
+                      client_gone = true;
+                      return false;  // stop generating for a client that hung up
+                    }
+                  }
+                  return true;
+                },
+                sampler ? &constraints : nullptr);
           }
         }
       } catch (const std::exception& e) {
@@ -1010,9 +1009,8 @@ void run_http_server_serial(GenerateStreamFn generate, model::Tokenizer& tokeniz
     const std::string reason =
         (!hit_stop && static_cast<int>(ids.size()) >= max_new) ? "length" : "stop";
     if (stream) {
-      res.sse(chat ? ("{\"id\":\"" + id +
-                      "\",\"object\":\"chat.completion.chunk\",\"created\":" + created +
-                      ",\"model\":\"" + json_escape(model_name) +
+      res.sse(chat ? ("{\"id\":\"" + id + "\",\"object\":\"chat.completion.chunk\",\"created\":" +
+                      created + ",\"model\":\"" + json_escape(model_name) +
                       "\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"" + reason +
                       "\"}]}")
                    : ("{\"id\":\"" + id + "\",\"object\":\"text_completion\",\"created\":" +
@@ -1023,17 +1021,17 @@ void run_http_server_serial(GenerateStreamFn generate, model::Tokenizer& tokeniz
       return;
     }
     const std::string usage = usage_json(prompt_token_count, static_cast<int>(ids.size()));
-    res.send(200, "application/json",
-             chat ? ("{\"id\":\"" + id + "\",\"object\":\"chat.completion\",\"created\":" +
-                     created + ",\"model\":\"" + json_escape(model_name) +
-                     "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\","
-                     "\"content\":\"" +
-                     json_escape(full_text) + "\"},\"finish_reason\":\"" + reason + "\"}]" +
-                     usage + "}")
-                  : ("{\"id\":\"" + id + "\",\"object\":\"text_completion\",\"created\":" +
-                     created + ",\"model\":\"" + json_escape(model_name) +
-                     "\",\"choices\":[{\"index\":0,\"text\":\"" + json_escape(full_text) +
-                     "\",\"finish_reason\":\"" + reason + "\"}]" + usage + "}"));
+    res.send(
+        200, "application/json",
+        chat ? ("{\"id\":\"" + id + "\",\"object\":\"chat.completion\",\"created\":" + created +
+                ",\"model\":\"" + json_escape(model_name) +
+                "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\","
+                "\"content\":\"" +
+                json_escape(full_text) + "\"},\"finish_reason\":\"" + reason + "\"}]" + usage + "}")
+             : ("{\"id\":\"" + id + "\",\"object\":\"text_completion\",\"created\":" + created +
+                ",\"model\":\"" + json_escape(model_name) +
+                "\",\"choices\":[{\"index\":0,\"text\":\"" + json_escape(full_text) +
+                "\",\"finish_reason\":\"" + reason + "\"}]" + usage + "}"));
   };
 
   // No embedder on this path (it would need its own model load); the route

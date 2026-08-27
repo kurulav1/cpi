@@ -16,13 +16,13 @@
 // has no __dp4a equivalent, so the int4/int8 paths need a different kernel and are
 // deliberately out of scope here.
 
+#include <chrono>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <unordered_map>
-#include <chrono>
-#include <map>
 #include <utility>
 #include <vector>
 
@@ -315,7 +315,7 @@ public:
 private:
   void execute_ops(const std::vector<opplan::Op>& ops, int layer, int position, int tokens);
 
- public:
+public:
   // CPI_METAL_PROFILE=1 accumulates GPU time by op kind; dump_profile() prints the split.
   void dump_profile() const;
 
@@ -325,7 +325,7 @@ private:
   // sum is larger than a real pass.
   void dump_gpu_profile();
 
- private:
+private:
   void profile_tick(const char* name);
   std::map<std::string, double> profile_ms_;
   std::chrono::steady_clock::time_point profile_last_{};
@@ -387,8 +387,8 @@ private:
   runtime::MetalBuffer batch_seqlen_buf_;  // int32[B]  ; each row's own length
   runtime::MetalBuffer batch_bt_buf_;      // int32[B * max_blocks]
   runtime::MetalBuffer batch_logits_buf_;  // float[B * vocab]
-  int batch_cap_ = 0;        // rows the scratch is sized for
-  int batch_bt_elems_ = 0;   // elements the block-table buffer is sized for
+  int batch_cap_ = 0;                      // rows the scratch is sized for
+  int batch_bt_elems_ = 0;                 // elements the block-table buffer is sized for
 
   // Non-null only while decode_step_batched_logits is running: it tells execute_ops to take
   // the per-row / paged variants of rope, KV store and attention. Everything else in the
@@ -469,11 +469,11 @@ private:
   // ExecCtx carries a different slot array for the tower.
   std::vector<runtime::MetalBuffer> vslots_;
   bool vision_pass_ = false;
-  int gvis_max_patches_ = 0;  // what vslots_ / the pixel buffers are sized for
-  runtime::MetalBuffer gvis_pix_buf_;    // float[P][patch_dim]
-  runtime::MetalBuffer gvis_posx_buf_;   // int32[P]
-  runtime::MetalBuffer gvis_posy_buf_;   // int32[P]
-  runtime::MetalBuffer gvis_rope_cos_;   // float[4096][head_dim/4]
+  int gvis_max_patches_ = 0;            // what vslots_ / the pixel buffers are sized for
+  runtime::MetalBuffer gvis_pix_buf_;   // float[P][patch_dim]
+  runtime::MetalBuffer gvis_posx_buf_;  // int32[P]
+  runtime::MetalBuffer gvis_posy_buf_;  // int32[P]
+  runtime::MetalBuffer gvis_rope_cos_;  // float[4096][head_dim/4]
   runtime::MetalBuffer gvis_rope_sin_;
   runtime::MetalBuffer gvis_clamp_buf_;  // clip_in staging, so the input slot is never mutated
   runtime::MetalBuffer gvis_ones_buf_;   // fp16 ones for the projector's weightless rms
@@ -520,7 +520,7 @@ private:
   runtime::MetalBuffer verify_amax_val_;  // float[max_prefill * parts]
   runtime::MetalBuffer verify_amax_idx_;  // int32[max_prefill * parts]
   runtime::MetalBuffer verify_argmax_;    // int32[max_prefill]
-  runtime::MetalBuffer chain_ring_;   // int32[kChainBlock]; chained decode's per-block tokens
+  runtime::MetalBuffer chain_ring_;       // int32[kChainBlock]; chained decode's per-block tokens
 
   std::vector<float> logits_;
   double prefill_ms_ = 0.0;

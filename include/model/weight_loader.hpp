@@ -10,12 +10,11 @@
 // is embedded in the header and is exposed through config().
 
 #include <cstddef>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
-
-#include <memory>
 
 #include "model/gguf_loader.hpp"
 #include "model/llama_config.hpp"

@@ -51,7 +51,8 @@ void quantize_mxfp4(const float* W, int rows, int cols, std::vector<std::uint8_t
       for (int c = b * 32; c < std::min(cols, (b + 1) * 32); ++c) {
         std::uint8_t nib = nearest_e2m1(W[(size_t)r * cols + c] * inv);
         size_t pi = (size_t)r * ((cols + 1) / 2) + (c >> 1);
-        packed[pi] = (c & 1) ? (packed[pi] & 0x0f) | (nib << 4) : (packed[pi] & 0xf0) | (nib & 0x0f);
+        packed[pi] =
+            (c & 1) ? (packed[pi] & 0x0f) | (nib << 4) : (packed[pi] & 0xf0) | (nib & 0x0f);
       }
     }
   }
@@ -70,8 +71,7 @@ int main() {
   int fail = 0;
 
   // (1) OCP value set.
-  const float spec[16] = {0,      0.5f,  1,  1.5f,  2,  3,  4,  6,
-                          -0.0f, -0.5f, -1, -1.5f, -2, -3, -4, -6};
+  const float spec[16] = {0, 0.5f, 1, 1.5f, 2, 3, 4, 6, -0.0f, -0.5f, -1, -1.5f, -2, -3, -4, -6};
   for (int n = 0; n < 16; ++n)
     if (e2m1((std::uint8_t)n) != spec[n]) {
       std::printf("FAIL: E2M1[%d]=%g expected %g\n", n, e2m1((std::uint8_t)n), spec[n]);

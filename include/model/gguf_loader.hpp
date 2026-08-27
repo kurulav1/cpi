@@ -102,8 +102,7 @@ public:
   // device route (fp16 already, or a type without a device kernel), leaving the
   // caller on the host path. `stream` is a cudaStream_t, opaque here so the
   // header stays CUDA-free for the CPU and Metal builds.
-  [[nodiscard]] bool fill_device_fp16(const std::string& cpi_name, void* dst,
-                                      void* stream) const;
+  [[nodiscard]] bool fill_device_fp16(const std::string& cpi_name, void* dst, void* stream) const;
 
   // A tensor still in its packed k-quant form, for the paths that consume blocks
   // directly instead of an fp16 expansion (that is the point of keeping a

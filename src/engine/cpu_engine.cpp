@@ -25,8 +25,6 @@
 
 #include "engine/cpu_engine.hpp"
 
-#include "engine/cpu_gemm_avx512.hpp"
-
 #include <algorithm>
 #include <cassert>
 #include <chrono>
@@ -41,6 +39,7 @@
 #include <vector>
 
 #include "common.hpp"
+#include "engine/cpu_gemm_avx512.hpp"
 #include "grammar/grammar_sampler.hpp"
 
 // SIMD headers, included unconditionally; individual code paths are
@@ -643,8 +642,8 @@ void CpuLlamaEngine::gemm_fp16(const uint16_t* W, const float* X, float* Y, int 
   }
   // Odd geometry: fall back to the padded per-token GEMV (correctness path).
   for (int b = 0; b < B; ++b) {
-    gemv_fp16(W, X + static_cast<std::ptrdiff_t>(b) * N,
-              Y + static_cast<std::ptrdiff_t>(b) * M, M, N);
+    gemv_fp16(W, X + static_cast<std::ptrdiff_t>(b) * N, Y + static_cast<std::ptrdiff_t>(b) * M, M,
+              N);
   }
 }
 
@@ -851,9 +850,7 @@ void CpuLlamaEngine::mlp_moe(int layer) {
   const int I = cfg_.effective_expert_intermediate_size() > 0
                     ? cfg_.effective_expert_intermediate_size()
                     : cfg_.intermediate_size;
-  const int top_k =
-      std::max(1, std::min(cfg_.effective_experts_per_tok(),
-                           cfg_.num_local_experts));
+  const int top_k = std::max(1, std::min(cfg_.effective_experts_per_tok(), cfg_.num_local_experts));
 
   auto gemv_any = [&](const uint16_t* w_fp16, const float* w_fp32, float* out, int M, int N,
                       const float* in) {
@@ -1072,8 +1069,7 @@ void CpuLlamaEngine::forward_prompt_chunk(const int* tokens, int base_pos, int c
 
   const float emb_scale = cfg_.scale_embeddings ? std::sqrt(static_cast<float>(H)) : 1.0f;
   for (int b = 0; b < B; ++b) {
-    const uint16_t* emb_row =
-        tok_embeddings_ + static_cast<std::ptrdiff_t>(tokens[b]) * H;
+    const uint16_t* emb_row = tok_embeddings_ + static_cast<std::ptrdiff_t>(tokens[b]) * H;
     float* xr = xb_.data() + static_cast<std::ptrdiff_t>(b) * H;
     for (int i = 0; i < H; ++i) xr[i] = fp16_to_fp32(emb_row[i]) * emb_scale;
   }
@@ -1129,9 +1125,8 @@ void CpuLlamaEngine::forward_prompt_chunk(const int* tokens, int base_pos, int c
       const int full_seq_len = base_pos + b + 1;
       const int attn_seq_len = (window > 0) ? std::min(window, full_seq_len) : full_seq_len;
       const int attn_start = full_seq_len - attn_seq_len;
-      const float* q_h =
-          qb_.data() + static_cast<std::ptrdiff_t>(b) * q_dim_ +
-          static_cast<std::ptrdiff_t>(h) * head_dim_;
+      const float* q_h = qb_.data() + static_cast<std::ptrdiff_t>(b) * q_dim_ +
+                         static_cast<std::ptrdiff_t>(h) * head_dim_;
 
       thread_local std::vector<float> sc;
       sc.resize(static_cast<std::size_t>(attn_seq_len));
@@ -1143,7 +1138,8 @@ void CpuLlamaEngine::forward_prompt_chunk(const int* tokens, int base_pos, int c
         sc[static_cast<std::size_t>(t)] = dot * scale;
       }
       float max_s = sc[0];
-      for (int t = 1; t < attn_seq_len; ++t) max_s = std::max(max_s, sc[static_cast<std::size_t>(t)]);
+      for (int t = 1; t < attn_seq_len; ++t)
+        max_s = std::max(max_s, sc[static_cast<std::size_t>(t)]);
       float sum_exp = 0.f;
       for (int t = 0; t < attn_seq_len; ++t) {
         sc[static_cast<std::size_t>(t)] = std::exp(sc[static_cast<std::size_t>(t)] - max_s);
@@ -1612,7 +1608,8 @@ std::vector<int> CpuLlamaEngine::generate_stream(const std::vector<int>& prompt_
     }
   } grammar_scope{&active_grammar_};
 
-  const int eos_id = options_.eos_token_id;  // from config/--eos-token (was hardcoded to Llama2's 2)
+  const int eos_id =
+      options_.eos_token_id;  // from config/--eos-token (was hardcoded to Llama2's 2)
   const int max_ctx = options_.max_context;
   const int top_k = options_.top_k;
   const float rep_p = options_.repetition_penalty;

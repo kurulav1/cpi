@@ -9,9 +9,9 @@
 
 #include "common.hpp"
 #include "engine/llama_engine.hpp"
-#include "model/gguf_kquant.hpp"
 #include "grammar/grammar_sampler.hpp"
 #include "llama_engine_internal.hpp"
+#include "model/gguf_kquant.hpp"
 #include "runtime/cuda_utils.cuh"
 #include "runtime/kernels.cuh"
 
@@ -101,17 +101,15 @@ const void* LlamaEngine::dequant_packed_qkv_for_gemm(const LayerDeviceWeights& l
   for (const auto* w : parts) {
     if (!w->active()) continue;
     const std::size_t n = static_cast<std::size_t>(w->rows) * static_cast<std::size_t>(w->cols);
-    kernels::launch_dequant_kquant(static_cast<const std::uint8_t*>(w->data),
-                                   static_cast<kernels::KQuantType>(w->kind),
-                                   n / model::kquant::kSuperBlock,
-                                   static_cast<__half*>(d_prefill_wdq_) + off, stream);
+    kernels::launch_dequant_kquant(
+        static_cast<const std::uint8_t*>(w->data), static_cast<kernels::KQuantType>(w->kind),
+        n / model::kquant::kSuperBlock, static_cast<__half*>(d_prefill_wdq_) + off, stream);
     off += n;
   }
   return d_prefill_wdq_;
 }
 
-const void* LlamaEngine::dequant_packed_for_gemm(const PackedWeight& w,
-                                                 cudaStream_t stream) {
+const void* LlamaEngine::dequant_packed_for_gemm(const PackedWeight& w, cudaStream_t stream) {
   if (!w.active()) return nullptr;
   const std::size_t need =
       static_cast<std::size_t>(w.rows) * static_cast<std::size_t>(w.cols) * sizeof(__half);
@@ -129,11 +127,11 @@ const void* LlamaEngine::dequant_packed_for_gemm(const PackedWeight& w,
   // The kernel counts SUPER-BLOCKS, not elements: one thread block per 256
   // weights. Passing the element count launches 256x the grid and writes far
   // past the scratch, which surfaces as an unrelated cuBLAS internal error.
-  kernels::launch_dequant_kquant(static_cast<const std::uint8_t*>(w.data),
-                                 static_cast<kernels::KQuantType>(w.kind),
-                                 (static_cast<std::size_t>(w.rows) *
-                                  static_cast<std::size_t>(w.cols)) / model::kquant::kSuperBlock,
-                                 static_cast<__half*>(d_prefill_wdq_), stream);
+  kernels::launch_dequant_kquant(
+      static_cast<const std::uint8_t*>(w.data), static_cast<kernels::KQuantType>(w.kind),
+      (static_cast<std::size_t>(w.rows) * static_cast<std::size_t>(w.cols)) /
+          model::kquant::kSuperBlock,
+      static_cast<__half*>(d_prefill_wdq_), stream);
   return d_prefill_wdq_;
 }
 
@@ -245,7 +243,8 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
                                    static_cast<__half*>(d_x_), rows, hidden, compute_stream_);
   if (cfg.scale_embeddings)  // Gemma: scale token embeddings by sqrt(hidden)
     kernels::launch_scale_copy(static_cast<__half*>(d_x_), static_cast<const __half*>(d_x_),
-                               rows * hidden, std::sqrt(static_cast<float>(hidden)), compute_stream_);
+                               rows * hidden, std::sqrt(static_cast<float>(hidden)),
+                               compute_stream_);
 
   const auto run_layer = [&](int layer, const LayerDeviceWeights* lw,
                              const LayerDeviceInt8Weights* lw_i8) {
@@ -271,10 +270,10 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
                                       q_hidden + 2 * kv_hidden, hidden, 0)
             : nullptr;
     if (wqkv_dq != nullptr) {
-      detail::dispatch_linear_rowmajor_weight(
-          cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,
-          const_cast<void*>(wqkv_dq), d_x_norm_, d_qkv_, q_hidden + 2 * kv_hidden, hidden, rows,
-          CUDA_R_16F);
+      detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
+                                              lt_workspace_bytes_, compute_stream_,
+                                              const_cast<void*>(wqkv_dq), d_x_norm_, d_qkv_,
+                                              q_hidden + 2 * kv_hidden, hidden, rows, CUDA_R_16F);
     } else if (lowbit_proj && can_use_dp4a_proj) {
       kernels::launch_quantize_rowwise_fp16_to_int8(static_cast<const __half*>(d_x_norm_),
                                                     d_prefill_i8_, d_prefill_i8_scales_, rows,
@@ -301,10 +300,10 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
     } else {
       const void* qkv_src = dequant_packed_qkv_for_gemm(*lw, compute_stream_);
       if (qkv_src == nullptr) qkv_src = lw->wqkv;
-      detail::dispatch_linear_rowmajor_weight(
-          cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,
-          const_cast<void*>(qkv_src), d_x_norm_, d_qkv_, q_hidden + 2 * kv_hidden, hidden, rows,
-          CUDA_R_16F);
+      detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
+                                              lt_workspace_bytes_, compute_stream_,
+                                              const_cast<void*>(qkv_src), d_x_norm_, d_qkv_,
+                                              q_hidden + 2 * kv_hidden, hidden, rows, CUDA_R_16F);
     }
     maybe_add_half_bias(d_ff3_, lw->bo, rows, hidden);
 
@@ -325,8 +324,8 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
     //   - QK-norm (Qwen3): launch_rmsnorm treats its input as contiguous [rows*heads, head_dim],
     //     which K inside the strided QKV buffer is not; it would normalise the wrong slices.
     //   - paged blocks: launch_store_kv_paged requires contiguous K/V.
-    const bool fused_kv = !(lw->q_norm && lw->k_norm) &&
-                          !(options_.paged_blocks && d_block_table_ != nullptr);
+    const bool fused_kv =
+        !(lw->q_norm && lw->k_norm) && !(options_.paged_blocks && d_block_table_ != nullptr);
     auto* qkv_rw = static_cast<__half*>(d_qkv_);
     const int qkv_row = q_hidden + 2 * kv_hidden;
 
@@ -361,21 +360,21 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
     if (lw->q_norm && lw->k_norm) {
       // Qwen3: per-head RMSNorm on Q and K, pre-RoPE. Only reachable on the split path.
       kernels::launch_rmsnorm(static_cast<const __half*>(d_prefill_q_),
-                                     static_cast<const __half*>(lw->q_norm),
-                                     static_cast<__half*>(d_prefill_q_), rows * cfg.num_heads,
-                                     head_dim, cfg.norm_eps, compute_stream_);
+                              static_cast<const __half*>(lw->q_norm),
+                              static_cast<__half*>(d_prefill_q_), rows * cfg.num_heads, head_dim,
+                              cfg.norm_eps, compute_stream_);
       kernels::launch_rmsnorm(static_cast<const __half*>(d_prefill_k_),
-                                     static_cast<const __half*>(lw->k_norm),
-                                     static_cast<__half*>(d_prefill_k_), rows * cfg.num_kv_heads,
-                                     head_dim, cfg.norm_eps, compute_stream_);
+                              static_cast<const __half*>(lw->k_norm),
+                              static_cast<__half*>(d_prefill_k_), rows * cfg.num_kv_heads, head_dim,
+                              cfg.norm_eps, compute_stream_);
     }
 
     // Q is contiguous (its copy stayed); K lives in the fused buffer. Independent strides.
     kernels::launch_rope_inplace_batched_strided(
-        static_cast<__half*>(d_prefill_q_), fused_kv ? (qkv_rw + q_hidden)
-                                                     : static_cast<__half*>(d_prefill_k_),
-        rows, cfg.num_heads, cfg.num_kv_heads, head_dim, base_pos, d_rope_cos_, d_rope_sin_,
-        q_hidden, fused_kv ? qkv_row : kv_hidden, compute_stream_);
+        static_cast<__half*>(d_prefill_q_),
+        fused_kv ? (qkv_rw + q_hidden) : static_cast<__half*>(d_prefill_k_), rows, cfg.num_heads,
+        cfg.num_kv_heads, head_dim, base_pos, d_rope_cos_, d_rope_sin_, q_hidden,
+        fused_kv ? qkv_row : kv_hidden, compute_stream_);
 
     auto* k_layer =
         static_cast<__half*>(d_k_cache_) + static_cast<std::size_t>(layer) * layer_stride;
@@ -400,11 +399,9 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
         const std::size_t sink_n_elems = static_cast<std::size_t>(kv_quant_sink_) * kv_hidden;
         const std::size_t ring_n_elems = static_cast<std::size_t>(kv_quant_win_) * kv_hidden;
         const std::size_t sink_off =
-            (static_cast<std::size_t>(layer) * kv_quality_slots_ + prefill_kv_slot_) *
-            sink_n_elems;
+            (static_cast<std::size_t>(layer) * kv_quality_slots_ + prefill_kv_slot_) * sink_n_elems;
         const std::size_t ring_off =
-            (static_cast<std::size_t>(layer) * kv_quality_slots_ + prefill_kv_slot_) *
-            ring_n_elems;
+            (static_cast<std::size_t>(layer) * kv_quality_slots_ + prefill_kv_slot_) * ring_n_elems;
         auto* sink_k = d_kv_sink_k_ ? d_kv_sink_k_ + sink_off : nullptr;
         auto* sink_v = d_kv_sink_v_ ? d_kv_sink_v_ + sink_off : nullptr;
         auto* ring_k = d_kv_ring_k_ ? d_kv_ring_k_ + ring_off : nullptr;
@@ -416,8 +413,8 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
             ring_k, ring_v, kv_quant_sink_, kv_quant_win_);
         kernels::launch_attention_prefill_paged_quant(
             static_cast<const __half*>(d_prefill_q_), kq, vq, ks, vs, d_block_table_,
-            static_cast<__half*>(d_att_), rows, base_pos, cfg.num_heads, cfg.num_kv_heads,
-            head_dim, bs, kv_quant_kbits_, kv_quant_vbits_, kv_quant_rot_, compute_stream_,
+            static_cast<__half*>(d_att_), rows, base_pos, cfg.num_heads, cfg.num_kv_heads, head_dim,
+            bs, kv_quant_kbits_, kv_quant_vbits_, kv_quant_rot_, compute_stream_,
             static_cast<const __half*>(d_prefill_k_), static_cast<const __half*>(d_prefill_v_),
             kv_hidden, sink_k, sink_v, kv_quant_sink_);
       } else {
@@ -452,9 +449,9 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
           auto* v_gather = k_gather + static_cast<std::size_t>(total_keys) * kv_hidden;
           kernels::launch_gather_kv_paged(k_layer, v_layer, k_gather, v_gather, d_block_table_,
                                           total_keys, kv_hidden, bs, compute_stream_);
-          tc_done = prefill_attention_tensorcore(d_prefill_q_, k_gather, v_gather, d_att_, rows,
-                                                 base_pos, cfg.num_heads, cfg.num_kv_heads,
-                                                 head_dim, q_hidden);
+          tc_done =
+              prefill_attention_tensorcore(d_prefill_q_, k_gather, v_gather, d_att_, rows, base_pos,
+                                           cfg.num_heads, cfg.num_kv_heads, head_dim, q_hidden);
         }
         if (!tc_done) {
           kernels::launch_attention_prefill_paged(
@@ -496,14 +493,15 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
       }
     }
 
-    const void* wo_dq = (lowbit_proj && wgemm_rows_ok && (wgemm_mask & 2))
-                            ? dequant_weight_for_gemm(lw_i8->wo, lw_i8->s_wo, lw_i8->proj_int4,
-                                                      hidden, q_hidden, 0)
-                            : nullptr;
+    const void* wo_dq =
+        (lowbit_proj && wgemm_rows_ok && (wgemm_mask & 2))
+            ? dequant_weight_for_gemm(lw_i8->wo, lw_i8->s_wo, lw_i8->proj_int4, hidden, q_hidden, 0)
+            : nullptr;
     // A packed k-quant weight has no fp16 copy to hand cuBLAS, so it expands
     // into the same scratch the low-bit path uses. Brick 5 comes out of this:
     // prefill needs no new GEMM, only a different way to fill the scratch.
-    const void* wo_src = wo_dq != nullptr ? wo_dq : dequant_packed_for_gemm(lw->wo_packed, compute_stream_);
+    const void* wo_src =
+        wo_dq != nullptr ? wo_dq : dequant_packed_for_gemm(lw->wo_packed, compute_stream_);
     if (wo_src != nullptr) {
       detail::dispatch_linear_rowmajor_weight(
           cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,
@@ -603,8 +601,9 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
             static_cast<__half*>(d_prefill_ff2_), rows, inter, hidden, compute_stream_);
       }
     } else {
-      const void* w13_src = lw->w13_packed.active() ? dequant_packed_for_gemm(lw->w13_packed, compute_stream_)
-                                                    : static_cast<const void*>(lw->w13);
+      const void* w13_src = lw->w13_packed.active()
+                                ? dequant_packed_for_gemm(lw->w13_packed, compute_stream_)
+                                : static_cast<const void*>(lw->w13);
       detail::dispatch_linear_rowmajor_weight(
           cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,
           const_cast<void*>(w13_src), d_x_norm_, d_ff13_, 2 * inter, hidden, rows, CUDA_R_16F);
@@ -620,17 +619,18 @@ void LlamaEngine::run_batched_chunk(int rows, int base_pos) {
     // GEMMs and still need this. Folding it into the fp16 branch would compile, run, and
     // silently skip the activation for int8/int4.
     if (!fused_glu) {
-      detail::launch_gated_glu(
-          weights_.config().mlp_gelu, static_cast<const __half*>(d_prefill_ff1_),
-          static_cast<const __half*>(d_prefill_ff2_), static_cast<__half*>(d_prefill_ff2_),
-          rows * inter, compute_stream_);
+      detail::launch_gated_glu(weights_.config().mlp_gelu,
+                               static_cast<const __half*>(d_prefill_ff1_),
+                               static_cast<const __half*>(d_prefill_ff2_),
+                               static_cast<__half*>(d_prefill_ff2_), rows * inter, compute_stream_);
     }
 
     const void* w2_dq = (lowbit_mlp && wgemm_rows_ok && (wgemm_mask & 8))
                             ? dequant_weight_for_gemm(lw_i8->w2, lw_i8->s_w2, lw_i8->mlp_int4,
                                                       hidden, inter, lw_i8->mlp_group)
                             : nullptr;
-    const void* w2_src = w2_dq != nullptr ? w2_dq : dequant_packed_for_gemm(lw->w2_packed, compute_stream_);
+    const void* w2_src =
+        w2_dq != nullptr ? w2_dq : dequant_packed_for_gemm(lw->w2_packed, compute_stream_);
     if (w2_src != nullptr) {
       detail::dispatch_linear_rowmajor_weight(
           cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,
@@ -755,8 +755,8 @@ std::vector<int> LlamaEngine::generate_stream(const std::vector<int>& prompt_tok
   // any buffer, leaving at least one slot for a generated token.
   if (static_cast<int>(prompt_tokens.size()) >= options_.max_context) {
     CPI_THROW("prompt length " + std::to_string(prompt_tokens.size()) +
-                       " exceeds the model context window " + std::to_string(options_.max_context) +
-                       " (reduce the prompt or raise --max-context / LLAMA_MAX_CONTEXT)");
+              " exceeds the model context window " + std::to_string(options_.max_context) +
+              " (reduce the prompt or raise --max-context / LLAMA_MAX_CONTEXT)");
   }
 
   // Bind the per-request grammar for the duration of this call; cleared on exit.
@@ -798,7 +798,7 @@ std::vector<int> LlamaEngine::generate_stream(const std::vector<int>& prompt_tok
   const bool prefix_cacheable =
       !options_.disable_prefix_reuse &&                      // benchmarking wants a real prefill
       !options_.paged_kv_cache && !options_.paged_blocks &&  // paged: each request gets its own
-      !kv_int4_enabled_ && !tq3_enabled_ &&             // block table, so prior KV isn't at the
+      !kv_int4_enabled_ && !tq3_enabled_ &&               // block table, so prior KV isn't at the
       !cfg.is_moe() && !cfg.uses_non_full_attention() &&  // same physical blocks (paged
       !eagle_enabled_;                                    // shared-prefix is a later phase)
   int reuse = 0;
@@ -892,10 +892,10 @@ std::vector<int> LlamaEngine::generate_stream(const std::vector<int>& prompt_tok
   // same batched-path eligibility verify_tokens needs. The draft cache was fed
   // during prefill (see prefill_prompt); the loop verifies chains of k drafts.
   const bool eagle_eligible =
-      eagle_enabled_ && temperature <= 0.0f && active_grammar_ == nullptr &&
-      min_new_tokens == 0 && !options_.paged_kv_cache && prefill_chunk_size_ > 1 &&
-      !(cached_int8_proj_enabled_ && cached_layer_count_ != cfg.num_layers) &&
-      !kv_int4_enabled_ && !tq3_enabled_ && !cfg.is_moe() && !cfg.uses_non_full_attention() &&
+      eagle_enabled_ && temperature <= 0.0f && active_grammar_ == nullptr && min_new_tokens == 0 &&
+      !options_.paged_kv_cache && prefill_chunk_size_ > 1 &&
+      !(cached_int8_proj_enabled_ && cached_layer_count_ != cfg.num_layers) && !kv_int4_enabled_ &&
+      !tq3_enabled_ && !cfg.is_moe() && !cfg.uses_non_full_attention() &&
       eagle_k_ + 1 <= prefill_chunk_size_ && reuse == 0;
   if (eagle_eligible) {
     const auto eagle_decode_start = std::chrono::steady_clock::now();

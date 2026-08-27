@@ -249,8 +249,8 @@ bool BatchScheduler::step(std::vector<StreamEvent>& events) {
       }
     }
     if (eligible) {
-      used_topk =
-          backend_->decode_batched_topk(toks, poss, flat, max_blocks, slots, sp, batch_cand_scratch_);
+      used_topk = backend_->decode_batched_topk(toks, poss, flat, max_blocks, slots, sp,
+                                                batch_cand_scratch_);
     }
   }
 
@@ -294,8 +294,8 @@ bool BatchScheduler::step(std::vector<StreamEvent>& events) {
       ap.blocked.push_back(block_eos ? opts_.eos_token_id : -1);
     }
     if (eligible) {
-      used_argmax =
-          backend_->decode_batched_argmax(toks, poss, flat, max_blocks, slots, ap, batch_argmax_out_);
+      used_argmax = backend_->decode_batched_argmax(toks, poss, flat, max_blocks, slots, ap,
+                                                    batch_argmax_out_);
     }
   }
 

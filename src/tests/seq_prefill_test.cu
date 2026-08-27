@@ -105,8 +105,7 @@ int main(int argc, char** argv) {
   // prefill kernel forgets its per-token k_start.
   failures += run_case(model, "beyond window", 700);
 
-  std::printf("\n%s\n", failures == 0
-                            ? "PARITY OK (sequence prefill == token-by-token prefill)"
-                            : "PARITY FAILED");
+  std::printf("\n%s\n", failures == 0 ? "PARITY OK (sequence prefill == token-by-token prefill)"
+                                      : "PARITY FAILED");
   return failures == 0 ? 0 : 1;
 }

@@ -78,15 +78,16 @@ public:
   RowParallelLinear() = default;
   ~RowParallelLinear();
 
-  // shard_weights_fp16[r] = W[:, in_slice_r] as column-major [out_features, in_r] (ld = out_features).
-  // The greedy split covers all input columns even when in_features is not divisible by world_size.
-  // devices: optional rank->device map (see TensorParallelLinear); all-zeros = single-GPU verify.
+  // shard_weights_fp16[r] = W[:, in_slice_r] as column-major [out_features, in_r] (ld =
+  // out_features). The greedy split covers all input columns even when in_features is not divisible
+  // by world_size. devices: optional rank->device map (see TensorParallelLinear); all-zeros =
+  // single-GPU verify.
   void initialize(int world_size, int in_features, int out_features,
                   const std::vector<const void*>& shard_weights_fp16,
                   const std::vector<int>& devices = {});
 
-  // shard_inputs_fp16[r] = device pointer to x_r, column-major [in_r, batch] (ld = in_r). Writes the
-  // reduced [out_features, batch] result to d_output_fp16 on the primary device.
+  // shard_inputs_fp16[r] = device pointer to x_r, column-major [in_r, batch] (ld = in_r). Writes
+  // the reduced [out_features, batch] result to d_output_fp16 on the primary device.
   void forward(const std::vector<const void*>& shard_inputs_fp16, int batch, void* d_output_fp16,
                cudaStream_t stream);
 

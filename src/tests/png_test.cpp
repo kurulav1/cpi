@@ -9,12 +9,12 @@
 // Huffman blocks, stored (uncompressed) blocks, overlapping LZ77 back-references, all
 // five scanline filters, and every supported colour type.
 
+#include "model/png.hpp"
+
 #include <cstdio>
 #include <fstream>
 #include <string>
 #include <vector>
-
-#include "model/png.hpp"
 
 namespace {
 

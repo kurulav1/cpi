@@ -274,8 +274,7 @@ bool LlamaEngine::run_parity_check(const std::vector<int>& prompt_tokens) {
         const float g = ff1[static_cast<std::size_t>(i)];
         const float act =
             cfg.mlp_gelu
-                ? 0.5f * g *
-                      (1.0f + std::tanh(0.7978845608028654f * (g + 0.044715f * g * g * g)))
+                ? 0.5f * g * (1.0f + std::tanh(0.7978845608028654f * (g + 0.044715f * g * g * g)))
                 : g / (1.0f + std::exp(-g));
         ff2[static_cast<std::size_t>(i)] *= act;
       }

@@ -101,8 +101,8 @@ double bench_splitk(const __half* w, const __half* x, __half* y, int out, int in
 
 // Times the kernel inside a CUDA graph; which is what decode actually runs, and which
 // excludes the per-launch driver overhead that stream timing folds into the result.
-double bench_graph(const __half* w, const __half* x, float* y, int out, int in, int warps,
-                   int tile, int rows, int reps) {
+double bench_graph(const __half* w, const __half* x, float* y, int out, int in, int warps, int tile,
+                   int rows, int reps) {
   constexpr int kChain = 50;
   cudaStream_t s;
   cudaStreamCreate(&s);
@@ -138,10 +138,8 @@ double bench_graph(const __half* w, const __half* x, float* y, int out, int in, 
 int main() {
   // Qwen2.5-0.5B: hidden 896, inter 4864, kv_hidden 128, vocab 151936, 24 layers.
   const Shape shapes[] = {
-      {"LM head", 151936, 896, 1},
-      {"w13 (gate+up)", 9728, 896, 24},
-      {"w2 (down)", 896, 4864, 24},
-      {"wqkv", 1152, 896, 24},
+      {"LM head", 151936, 896, 1},  {"w13 (gate+up)", 9728, 896, 24},
+      {"w2 (down)", 896, 4864, 24}, {"wqkv", 1152, 896, 24},
       {"wo", 896, 896, 24},
   };
   const double kPeak = peak_gbs();  // GB/s, queried from the active device
@@ -180,7 +178,8 @@ int main() {
     double g = 1e9;
     for (int warps : {4, 8, 16})
       for (int tile : {128, 256})
-        for (int rows : {1, 2}) g = std::min(g, bench_graph(w, x, y, s.out, s.in, warps, tile, rows, 20));
+        for (int rows : {1, 2})
+          g = std::min(g, bench_graph(w, x, y, s.out, s.in, warps, tile, rows, 20));
 
     const double gbs = bytes / (g / 1e3) / 1e9;
     const double per_tok = g * s.per_token;
@@ -240,11 +239,10 @@ int main() {
       return static_cast<double>(ms) / (kReps * kChain) * 1e3;  // us
     };
 
-    const double t_norm = time_graph(
-        [&] { kernels::launch_rmsnorm(x, wt, y, 1, kHidden, 1e-6f, s); });
-    const double t_rope = time_graph([&] {
-      kernels::launch_rope_inplace_table(q, q, kHeads, kKv, kHeadDim, 100, ct, st, s);
-    });
+    const double t_norm =
+        time_graph([&] { kernels::launch_rmsnorm(x, wt, y, 1, kHidden, 1e-6f, s); });
+    const double t_rope = time_graph(
+        [&] { kernels::launch_rope_inplace_table(q, q, kHeads, kKv, kHeadDim, 100, ct, st, s); });
     // Attention needs the same split-K scratch the engine gives it; without it the kernel
     // silently drops to the fallback path and the timing is meaningless.
     constexpr int kChunks = 64;
@@ -259,15 +257,26 @@ int main() {
 
     std::printf("\n  Non-GEMV decode kernels, in-graph, Qwen2.5-0.5B shapes (seq=%d):\n\n", kSeq);
     std::printf("  %-22s %10s %6s %12s\n", "kernel", "us each", "xN", "us/token");
-    std::printf("  %-22s %10.2f %6d %12.1f\n", "rmsnorm", t_norm, 2 * kLayers, t_norm * 2 * kLayers);
+    std::printf("  %-22s %10.2f %6d %12.1f\n", "rmsnorm", t_norm, 2 * kLayers,
+                t_norm * 2 * kLayers);
     std::printf("  %-22s %10.2f %6d %12.1f\n", "rope", t_rope, kLayers, t_rope * kLayers);
     std::printf("  %-22s %10.2f %6d %12.1f\n", "attention_step", t_attn, kLayers, t_attn * kLayers);
     std::printf("  %-22s %10s %6s %12.1f\n", "TOTAL (these only)", "", "",
                 (t_norm * 2 + t_rope + t_attn) * kLayers);
 
     cudaStreamDestroy(s);
-    cudaFree(x); cudaFree(wt); cudaFree(y); cudaFree(q); cudaFree(kc); cudaFree(vc);
-    cudaFree(ao); cudaFree(ct); cudaFree(st); cudaFree(sm); cudaFree(sl); cudaFree(so);
+    cudaFree(x);
+    cudaFree(wt);
+    cudaFree(y);
+    cudaFree(q);
+    cudaFree(kc);
+    cudaFree(vc);
+    cudaFree(ao);
+    cudaFree(ct);
+    cudaFree(st);
+    cudaFree(sm);
+    cudaFree(sl);
+    cudaFree(so);
   }
 
   // ---------------------------------------------------------------------------------
@@ -306,8 +315,7 @@ int main() {
       cudaStreamSynchronize(s);
     }
     auto t1 = std::chrono::high_resolution_clock::now();
-    const double per_sync =
-        std::chrono::duration<double, std::milli>(t1 - t0).count() / kLaunches;
+    const double per_sync = std::chrono::duration<double, std::milli>(t1 - t0).count() / kLaunches;
 
     // (2) launch back-to-back, sync once at the end.
     t0 = std::chrono::high_resolution_clock::now();

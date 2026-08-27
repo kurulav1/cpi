@@ -407,8 +407,7 @@ void HfBpeTokenizer::load(const std::string& path) {
               bos_id_ = id;
             } else if (content == "<s>") {
               if (bos_id_ < 0) bos_id_ = id;
-            } else if (content == "<eos>" || content == "<|end_of_text|>" ||
-                       content == "<|eot|>" ||
+            } else if (content == "<eos>" || content == "<|end_of_text|>" || content == "<|eot|>" ||
                        content ==
                            "<\xEF\xBD\x9C"
                            "end\xE2\x96\x81of\xE2\x96\x81sentence\xEF\xBD\x9C>") {
@@ -763,7 +762,8 @@ void HfBpeTokenizer::load_from_vocab(const std::string& model,
     return id >= 0 && static_cast<std::size_t>(id) < id_to_piece_.size();
   };
   for (const int id : {bos_id_, eos_id_, unk_id_}) {
-    if (known(id) && std::find(special_ids_.begin(), special_ids_.end(), id) == special_ids_.end()) {
+    if (known(id) &&
+        std::find(special_ids_.begin(), special_ids_.end(), id) == special_ids_.end()) {
       special_ids_.push_back(id);
       added_tokens_.emplace_back(id_to_piece_[static_cast<std::size_t>(id)], id);
     }
@@ -1135,10 +1135,16 @@ std::string HfBpeTokenizer::decode(const std::vector<int>& ids,
   for (int id : ids) {
     const auto vit = visible.find(id);
     if (vit != visible.end()) {
-      if (!run.empty()) { out += decode_run(run); run.clear(); }
+      if (!run.empty()) {
+        out += decode_run(run);
+        run.clear();
+      }
       out += vit->second;
     } else if (special.count(id)) {
-      if (!run.empty()) { out += decode_run(run); run.clear(); }
+      if (!run.empty()) {
+        out += decode_run(run);
+        run.clear();
+      }
     } else {
       run.push_back(id);
     }

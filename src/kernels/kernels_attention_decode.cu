@@ -672,13 +672,10 @@ __global__ void attention_tree_chunk_stats_kernel(const half* q, const half* k_c
 // slot after the last cache chunk. scr_cols is the scratch column count; the
 // verify passes scr_cols == rows (its scratch is the batch itself) while the
 // batched draft levels attend a wider node scratch than their own row count.
-__global__ void attention_tree_inbatch_stats_kernel(const half* q, const half* k_scratch,
-                                                    const half* v_scratch, float* chunk_m,
-                                                    float* chunk_l, float* chunk_o,
-                                                    const int* position_ptr,
-                                                    const unsigned int* anc_mask, int scr_cols,
-                                                    int num_heads, int num_kv_heads, int head_dim,
-                                                    int chunk_size, int scratch_chunks) {
+__global__ void attention_tree_inbatch_stats_kernel(
+    const half* q, const half* k_scratch, const half* v_scratch, float* chunk_m, float* chunk_l,
+    float* chunk_o, const int* position_ptr, const unsigned int* anc_mask, int scr_cols,
+    int num_heads, int num_kv_heads, int head_dim, int chunk_size, int scratch_chunks) {
   const int head = blockIdx.x;
   const int row = blockIdx.y;
   const int tid = threadIdx.x;
@@ -695,11 +692,12 @@ __global__ void attention_tree_inbatch_stats_kernel(const half* q, const half* k
   const int slot = (cache_len + chunk_size - 1) / chunk_size;
 
   extern __shared__ float smem[];
-  float* q_shared = smem;                    // [head_dim]
-  float* score_shared = q_shared + head_dim; // [rows]
+  float* q_shared = smem;                     // [head_dim]
+  float* score_shared = q_shared + head_dim;  // [rows]
 
   for (int d = tid; d < head_dim; d += blockDim.x) {
-    q_shared[d] = __half2float(q[(static_cast<std::size_t>(row) * num_heads + head) * head_dim + d]);
+    q_shared[d] =
+        __half2float(q[(static_cast<std::size_t>(row) * num_heads + head) * head_dim + d]);
   }
   __syncthreads();
 
@@ -739,9 +737,8 @@ __global__ void attention_tree_inbatch_stats_kernel(const half* q, const half* k
     for (int j = 0; j < scr_cols; ++j) {
       if ((mask >> j) & 1u) {
         o += score_shared[j] *
-             __half2float(v_scratch[(static_cast<std::size_t>(j) * kv_heads_safe + kv_head) *
-                                        head_dim +
-                                    d]);
+             __half2float(
+                 v_scratch[(static_cast<std::size_t>(j) * kv_heads_safe + kv_head) * head_dim + d]);
       }
     }
     chunk_o[(scr + slot) * head_dim + d] = o;
@@ -937,8 +934,8 @@ __global__ void attention_step_chunk_reduce_device_pos_kernel(
   const int head = blockIdx.x;
   const int tid = threadIdx.x;
   const int chunk_count = (seq_len + chunk_size - 1) / chunk_size;
-  const std::size_t head_base = static_cast<std::size_t>(head) *
-                                static_cast<std::size_t>(scratch_chunks);
+  const std::size_t head_base =
+      static_cast<std::size_t>(head) * static_cast<std::size_t>(scratch_chunks);
 
   // Merge the per-chunk softmax stats in two parallel reductions rather than by
   // walking chunks in an online loop. The online form made thread 0 do a
@@ -2000,9 +1997,9 @@ void launch_attention_step_batched_paged(const half* q, const half* k_pool, cons
     const char* e = std::getenv("CPI_ATTN_FIXED_GRID");
     return e && *e == '1';
   }();
-  const int total_blocks =
-      fixed_grid ? scratch_chunks
-                 : min(scratch_chunks, (max_seq_len + block_size - 1) / block_size);
+  const int total_blocks = fixed_grid
+                               ? scratch_chunks
+                               : min(scratch_chunks, (max_seq_len + block_size - 1) / block_size);
 
   // GQA-shared path: one block per (KV head, chunk, sequence) with group_size
   // warps sharing each KV tile, cutting KV traffic by group_size. Requires a real
@@ -2072,7 +2069,8 @@ void launch_attention_step_device_pos(const half* q, const half* k_cache, const 
                                       half* out, const int* position, int num_heads,
                                       int num_kv_heads, int head_dim, cudaStream_t stream,
                                       float* scratch_m, float* scratch_l, float* scratch_o,
-                                      int scratch_chunks, bool allow_split, int window, bool* emitted_q8) {
+                                      int scratch_chunks, bool allow_split, int window,
+                                      bool* emitted_q8) {
   // Cached once: getenv on every launch (per layer, per token) is needless work and, more to the
   // point, is not required to be thread-safe against a concurrent setenv in a threaded server.
   static const bool force_fallback = [] {
@@ -2348,10 +2346,10 @@ __global__ void attention_tree_masked_kernel(
     const int* __restrict__ cache_len_ptr, const unsigned int* __restrict__ anc_mask, int rows,
     int num_heads, int num_kv_heads, int head_dim, int q_row_stride) {
   extern __shared__ float smem[];
-  float* q_shared = smem;                              // [head_dim]
-  float* score_shared = q_shared + head_dim;           // [WarpsPerBlock]
-  float* beta_shared = score_shared + WarpsPerBlock;   // [WarpsPerBlock]
-  float* stats_shared = beta_shared + WarpsPerBlock;   // [running_m, running_l, tile_m, tile_l]
+  float* q_shared = smem;                             // [head_dim]
+  float* score_shared = q_shared + head_dim;          // [WarpsPerBlock]
+  float* beta_shared = score_shared + WarpsPerBlock;  // [WarpsPerBlock]
+  float* stats_shared = beta_shared + WarpsPerBlock;  // [running_m, running_l, tile_m, tile_l]
   half* v_tile = reinterpret_cast<half*>(stats_shared + 4);  // [WarpsPerBlock, head_dim]
 
   const int head = blockIdx.x;

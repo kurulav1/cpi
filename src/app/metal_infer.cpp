@@ -128,8 +128,10 @@ int main(int argc, char** argv) {
   const auto t1 = std::chrono::steady_clock::now();
   if (capturing) {
     eng.end_gputrace();
-    std::fprintf(stderr, "[metal] capture written: %s (timings above are NOT valid under a\n"
-                         "        capture -- it serialises and instruments everything)\n", gt);
+    std::fprintf(stderr,
+                 "[metal] capture written: %s (timings above are NOT valid under a\n"
+                 "        capture -- it serialises and instruments everything)\n",
+                 gt);
   }
   const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
@@ -147,10 +149,9 @@ int main(int argc, char** argv) {
   const double busy = eng.gpu_busy_ms();
   std::fprintf(stderr,
                "[perf] gpu-busy: %.0f ms of %.0f wall (%.0f%%), %llu dispatches, %llu cmdbufs\n",
-               busy, ms, 100.0 * busy / ms,
-               static_cast<unsigned long long>(eng.dispatch_count()),
+               busy, ms, 100.0 * busy / ms, static_cast<unsigned long long>(eng.dispatch_count()),
                static_cast<unsigned long long>(eng.cmdbuf_count()));
-  eng.dump_profile();  // no-op unless CPI_METAL_PROFILE is set
+  eng.dump_profile();      // no-op unless CPI_METAL_PROFILE is set
   eng.dump_gpu_profile();  // no-op unless CPI_METAL_GPUPROFILE is set
   return 0;
 }

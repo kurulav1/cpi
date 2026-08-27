@@ -57,10 +57,9 @@ constexpr float kPqNegInf = -3.402823466e+38F;
 // (absolute < sink_n) and recent tokens (absolute >= seq_end - win_n) read the
 // fp16 side buffers written by the store kernels instead of the quantized
 // pool. `sink`/`ring` are already slot-resolved.
-__device__ __forceinline__ const half* pq_fp16_source(const half* sink, const half* ring,
-                                                      int t_abs, int seq_end_abs, int sink_n,
-                                                      int win_n, int num_kv_heads, int kv_head,
-                                                      int head_dim) {
+__device__ __forceinline__ const half* pq_fp16_source(const half* sink, const half* ring, int t_abs,
+                                                      int seq_end_abs, int sink_n, int win_n,
+                                                      int num_kv_heads, int kv_head, int head_dim) {
   if (t_abs < sink_n && sink != nullptr) {
     return sink + (t_abs * num_kv_heads + kv_head) * head_dim;
   }
@@ -191,10 +190,10 @@ template <int HeadDim, int KBits, int VBits, bool RotK>
 __global__ void attention_step_gqa_batched_paged_quant_kernel(
     const half* q, const int8_t* k_pool, const int8_t* v_pool, const half* k_scales,
     const half* v_scales, const int* __restrict__ block_tables, const int* __restrict__ seq_lens,
-    int max_blocks, float* chunk_m, float* chunk_l, float* chunk_o, int num_heads,
-    int num_kv_heads, int group_size, int block_size, int scratch_chunks,
-    const int* __restrict__ slot_ids, const half* k_sink, const half* v_sink, const half* k_ring,
-    const half* v_ring, int sink_n, int win_n) {
+    int max_blocks, float* chunk_m, float* chunk_l, float* chunk_o, int num_heads, int num_kv_heads,
+    int group_size, int block_size, int scratch_chunks, const int* __restrict__ slot_ids,
+    const half* k_sink, const half* v_sink, const half* k_ring, const half* v_ring, int sink_n,
+    int win_n) {
   const int b = blockIdx.z;
   const int seq_len = seq_lens[b];
   const int kv_head = blockIdx.x;
@@ -265,9 +264,8 @@ __global__ void attention_step_gqa_batched_paged_quant_kernel(
   // at shallow depths every tile is inside the window, so this keeps the
   // quality tier from costing anything there). A tile straddling the sink /
   // window boundary takes the stage-then-overlay path.
-  const bool tile_has_fp16 =
-      (seq_k_sink != nullptr && tok0 < sink_n) ||
-      (seq_k_ring != nullptr && tok0 + tile_tokens > seq_len - win_n);
+  const bool tile_has_fp16 = (seq_k_sink != nullptr && tok0 < sink_n) ||
+                             (seq_k_ring != nullptr && tok0 + tile_tokens > seq_len - win_n);
   const int fp16_from = (seq_k_ring != nullptr) ? max(0, seq_len - win_n) : 0x7fffffff;
   const bool tile_full_fp16 =
       (seq_k_sink != nullptr && tok0 + tile_tokens <= sink_n) || (tok0 >= fp16_from);
@@ -277,8 +275,8 @@ __global__ void attention_step_gqa_batched_paged_quant_kernel(
   // from the pool (scales hoisted to shared once per tile; rows load as
   // 16-byte segments) and overlay any fp16 rows afterwards.
   if (!tile_full_fp16 && tid < tile_tokens) {
-    sc_sh[tid] = __half2float(
-        k_scales[static_cast<std::size_t>(phys_row0 + tid) * num_kv_heads + kv_head]);
+    sc_sh[tid] =
+        __half2float(k_scales[static_cast<std::size_t>(phys_row0 + tid) * num_kv_heads + kv_head]);
   }
   __syncthreads();
   if (tile_full_fp16) {
@@ -353,8 +351,7 @@ __global__ void attention_step_gqa_batched_paged_quant_kernel(
   float tile_m = score;
 #pragma unroll
   for (int o = 16; o > 0; o >>= 1) tile_m = fmaxf(tile_m, __shfl_xor_sync(0xffffffffu, tile_m, o));
-  const float weight =
-      (lane < tile_tokens && warp_id < group_size) ? expf(score - tile_m) : 0.0f;
+  const float weight = (lane < tile_tokens && warp_id < group_size) ? expf(score - tile_m) : 0.0f;
   float tile_l = weight;
 #pragma unroll
   for (int o = 16; o > 0; o >>= 1) tile_l += __shfl_xor_sync(0xffffffffu, tile_l, o);
@@ -363,8 +360,8 @@ __global__ void attention_step_gqa_batched_paged_quant_kernel(
 
   // Phase 2: stage the V tile the same way, then weighted sum per head.
   if (!tile_full_fp16 && tid < tile_tokens) {
-    sc_sh[tid] = __half2float(
-        v_scales[static_cast<std::size_t>(phys_row0 + tid) * num_kv_heads + kv_head]);
+    sc_sh[tid] =
+        __half2float(v_scales[static_cast<std::size_t>(phys_row0 + tid) * num_kv_heads + kv_head]);
   }
   __syncthreads();
   if (tile_full_fp16) {
@@ -526,8 +523,7 @@ __global__ void attention_prefill_paged_quant_kernel(
         kf = k_sink + (t * num_kv_heads + kv_head) * head_dim;
         qf = q_shared;
       } else if (k_src != nullptr && t >= start_position) {
-        kf = k_src + static_cast<std::size_t>(t - start_position) * src_stride +
-             kv_head * head_dim;
+        kf = k_src + static_cast<std::size_t>(t - start_position) * src_stride + kv_head * head_dim;
         qf = q_raw;
       }
       float partial = 0.0f;
@@ -698,10 +694,10 @@ void launch_store_kv_paged_quant(const half* k_src, const half* v_src, int src_s
   const dim3 grid(rows, num_kv_heads);
   const dim3 block(head_dim);
   rotate_k = rotate_k && head_dim == 128;
-#define CPI_PQ_STORE(KB, VB, RK)                                                              \
-  store_kv_paged_quant_kernel<KB, VB, RK><<<grid, block, smem, stream>>>(                     \
-      k_src, v_src, src_stride, k_pool, v_pool, k_scales, v_scales, block_table, base_pos,    \
-      rows, num_kv_heads, head_dim, block_size, k_sink, v_sink, k_ring, v_ring, sink_n, win_n)
+#define CPI_PQ_STORE(KB, VB, RK)                                                                 \
+  store_kv_paged_quant_kernel<KB, VB, RK><<<grid, block, smem, stream>>>(                        \
+      k_src, v_src, src_stride, k_pool, v_pool, k_scales, v_scales, block_table, base_pos, rows, \
+      num_kv_heads, head_dim, block_size, k_sink, v_sink, k_ring, v_ring, sink_n, win_n)
   if (k_bits == 4 && v_bits == 4 && rotate_k) {
     CPI_PQ_STORE(4, 4, true);
   } else if (k_bits == 4 && v_bits == 4) {
@@ -717,22 +713,22 @@ void launch_store_kv_paged_quant(const half* k_src, const half* v_src, int src_s
 void launch_store_kv_batched_paged_quant(const half* k_src, const half* v_src, int8_t* k_pool,
                                          int8_t* v_pool, half* k_scales, half* v_scales,
                                          const int* block_tables, const int* positions,
-                                         int max_blocks, int batch, int num_kv_heads,
-                                         int head_dim, int block_size, int k_bits, int v_bits,
-                                         bool rotate_k, cudaStream_t stream, const int* slot_ids,
-                                         half* k_sink, half* v_sink, half* k_ring, half* v_ring,
-                                         int sink_n, int win_n) {
+                                         int max_blocks, int batch, int num_kv_heads, int head_dim,
+                                         int block_size, int k_bits, int v_bits, bool rotate_k,
+                                         cudaStream_t stream, const int* slot_ids, half* k_sink,
+                                         half* v_sink, half* k_ring, half* v_ring, int sink_n,
+                                         int win_n) {
   const int num_warps = head_dim / 32;
   const std::size_t smem =
       static_cast<std::size_t>(2 * head_dim + 2 * num_warps + 2) * sizeof(float);
   const dim3 grid(batch, num_kv_heads);
   const dim3 block(head_dim);
   rotate_k = rotate_k && head_dim == 128;
-#define CPI_PQ_BSTORE(KB, VB, RK)                                                             \
-  store_kv_batched_paged_quant_kernel<KB, VB, RK><<<grid, block, smem, stream>>>(             \
-      k_src, v_src, k_pool, v_pool, k_scales, v_scales, block_tables, positions, max_blocks,  \
-      batch, num_kv_heads, head_dim, block_size, slot_ids, k_sink, v_sink, k_ring, v_ring,    \
-      sink_n, win_n)
+#define CPI_PQ_BSTORE(KB, VB, RK)                                                                  \
+  store_kv_batched_paged_quant_kernel<KB, VB, RK><<<grid, block, smem, stream>>>(                  \
+      k_src, v_src, k_pool, v_pool, k_scales, v_scales, block_tables, positions, max_blocks,       \
+      batch, num_kv_heads, head_dim, block_size, slot_ids, k_sink, v_sink, k_ring, v_ring, sink_n, \
+      win_n)
   if (k_bits == 4 && v_bits == 4 && rotate_k) {
     CPI_PQ_BSTORE(4, 4, true);
   } else if (k_bits == 4 && v_bits == 4) {
@@ -745,13 +741,12 @@ void launch_store_kv_batched_paged_quant(const half* k_src, const half* v_src, i
 #undef CPI_PQ_BSTORE
 }
 
-void launch_attention_prefill_paged_quant(const half* q, const int8_t* k_pool,
-                                          const int8_t* v_pool, const half* k_scales,
-                                          const half* v_scales, const int* block_table,
-                                          half* out, int num_tokens, int start_position,
-                                          int num_heads, int num_kv_heads, int head_dim,
-                                          int block_size, int k_bits, int v_bits, bool rotate_k,
-                                          cudaStream_t stream, const half* k_src,
+void launch_attention_prefill_paged_quant(const half* q, const int8_t* k_pool, const int8_t* v_pool,
+                                          const half* k_scales, const half* v_scales,
+                                          const int* block_table, half* out, int num_tokens,
+                                          int start_position, int num_heads, int num_kv_heads,
+                                          int head_dim, int block_size, int k_bits, int v_bits,
+                                          bool rotate_k, cudaStream_t stream, const half* k_src,
                                           const half* v_src, int src_stride, const half* k_sink,
                                           const half* v_sink, int sink_n) {
   constexpr int warps = 4;
@@ -764,11 +759,11 @@ void launch_attention_prefill_paged_quant(const half* q, const int8_t* k_pool,
     smem += static_cast<std::size_t>(head_dim) * sizeof(half);   // unrotated q copy
   }
   const dim3 grid(num_heads, num_tokens);
-#define CPI_PQ_PREFILL(KB, VB, RK)                                                            \
-  attention_prefill_paged_quant_kernel<warps, KB, VB, RK><<<grid, threads, smem, stream>>>(   \
-      q, k_pool, v_pool, k_scales, v_scales, block_table, out, num_tokens, start_position,    \
-      num_heads, num_kv_heads, head_dim, block_size, k_src, v_src, src_stride, k_sink,        \
-      v_sink, sink_n)
+#define CPI_PQ_PREFILL(KB, VB, RK)                                                             \
+  attention_prefill_paged_quant_kernel<warps, KB, VB, RK><<<grid, threads, smem, stream>>>(    \
+      q, k_pool, v_pool, k_scales, v_scales, block_table, out, num_tokens, start_position,     \
+      num_heads, num_kv_heads, head_dim, block_size, k_src, v_src, src_stride, k_sink, v_sink, \
+      sink_n)
   if (k_bits == 4 && v_bits == 4 && rot) {
     CPI_PQ_PREFILL(4, 4, true);
   } else if (k_bits == 4 && v_bits == 4) {
@@ -794,28 +789,26 @@ void launch_attention_step_batched_paged_quant(
     const half* v_scales, const int* block_tables, const int* seq_lens, int max_blocks,
     int max_seq_len, half* out, int batch, int num_heads, int num_kv_heads, int head_dim,
     int block_size, int k_bits, int v_bits, bool rotate_k, cudaStream_t stream, float* scratch_m,
-    float* scratch_l, float* scratch_o, int scratch_chunks, const int* slot_ids,
-    const half* k_sink, const half* v_sink, const half* k_ring, const half* v_ring, int sink_n,
-    int win_n) {
+    float* scratch_l, float* scratch_o, int scratch_chunks, const int* slot_ids, const half* k_sink,
+    const half* v_sink, const half* k_ring, const half* v_ring, int sink_n, int win_n) {
   const int group_size = num_heads / num_kv_heads;
   const int total_blocks = min(scratch_chunks, (max_seq_len + block_size - 1) / block_size);
   const int threads_g = group_size * 32;
   const bool rot = rotate_k && head_dim == 128 && threads_g >= head_dim;
-  std::size_t smem = (static_cast<std::size_t>(group_size) * head_dim +
-                      static_cast<std::size_t>(block_size) * head_dim) *
-                         sizeof(half) +
-                     (static_cast<std::size_t>(group_size) * block_size + block_size) *
-                         sizeof(float);
+  std::size_t smem =
+      (static_cast<std::size_t>(group_size) * head_dim +
+       static_cast<std::size_t>(block_size) * head_dim) *
+          sizeof(half) +
+      (static_cast<std::size_t>(group_size) * block_size + block_size) * sizeof(float);
   if (rot) smem += static_cast<std::size_t>(head_dim) * sizeof(float);
   const dim3 grid(num_kv_heads, total_blocks, batch);
 
-#define CPI_PQ_ATTN(KB, VB, RK)                                                                \
-  attention_step_gqa_batched_paged_quant_kernel<128, KB, VB, RK>                               \
-      <<<grid, threads_g, smem, stream>>>(q, k_pool, v_pool, k_scales, v_scales, block_tables, \
-                                          seq_lens, max_blocks, scratch_m, scratch_l,          \
-                                          scratch_o, num_heads, num_kv_heads, group_size,      \
-                                          block_size, scratch_chunks, slot_ids, k_sink,        \
-                                          v_sink, k_ring, v_ring, sink_n, win_n)
+#define CPI_PQ_ATTN(KB, VB, RK)                                                                  \
+  attention_step_gqa_batched_paged_quant_kernel<128, KB, VB, RK>                                 \
+      <<<grid, threads_g, smem, stream>>>(                                                       \
+          q, k_pool, v_pool, k_scales, v_scales, block_tables, seq_lens, max_blocks, scratch_m,  \
+          scratch_l, scratch_o, num_heads, num_kv_heads, group_size, block_size, scratch_chunks, \
+          slot_ids, k_sink, v_sink, k_ring, v_ring, sink_n, win_n)
   if (k_bits == 4 && v_bits == 4 && rot) {
     CPI_PQ_ATTN(4, 4, true);
   } else if (k_bits == 4 && v_bits == 4) {

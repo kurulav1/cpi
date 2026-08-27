@@ -1,11 +1,12 @@
-// TEST-DRIVEN validation of the DeepSeek MLA op (engine/mla_deepseek.hpp) against a real DeepSeek-V2-
-// Lite layer: tools/deepseek_mla_oracle.py runs transformers' DeepseekV2Attention on layer 0's actual
-// weights and dumps {hidden, weights, inv_freq, attn_out}; this loads that dump, runs mla_prefill_
-// deepseek on the same real weights + input, and checks the output matches HF. This is the end-to-end
-// proof that CPI's MLA == real DeepSeek MLA on real weights (not just self-consistent on toy configs).
+// TEST-DRIVEN validation of the DeepSeek MLA op (engine/mla_deepseek.hpp) against a real
+// DeepSeek-V2- Lite layer: tools/deepseek_mla_oracle.py runs transformers' DeepseekV2Attention on
+// layer 0's actual weights and dumps {hidden, weights, inv_freq, attn_out}; this loads that dump,
+// runs mla_prefill_ deepseek on the same real weights + input, and checks the output matches HF.
+// This is the end-to-end proof that CPI's MLA == real DeepSeek MLA on real weights (not just
+// self-consistent on toy configs).
 //
-// Reads <artifact>.dims (whitespace scalars) + <artifact>.bin (fp32 tensors in a fixed order). Pass the
-// artifact stem as argv[1]; defaults to artifacts/deepseek_mla_ref (repo-root relative).
+// Reads <artifact>.dims (whitespace scalars) + <artifact>.bin (fp32 tensors in a fixed order). Pass
+// the artifact stem as argv[1]; defaults to artifacts/deepseek_mla_ref (repo-root relative).
 #include <cuda_runtime.h>
 
 #include <cmath>
@@ -44,8 +45,7 @@ int main(int argc, char** argv) {
                n_qproj = (size_t)m.nh * QKHD * m.H, n_kva = (size_t)KVA * m.H,
                n_kvaln = (size_t)m.kv_lora, n_kvb = (size_t)m.nh * KVH * m.kv_lora,
                n_oproj = (size_t)m.H * m.nh * m.v_head, n_invfreq = (size_t)m.qk_rope / 2;
-  const size_t total =
-      n_hidden + n_attn + n_qproj + n_kva + n_kvaln + n_kvb + n_oproj + n_invfreq;
+  const size_t total = n_hidden + n_attn + n_qproj + n_kva + n_kvaln + n_kvb + n_oproj + n_invfreq;
 
   std::ifstream bf(stem + ".bin", std::ios::binary);
   std::vector<float> buf(total);
@@ -99,11 +99,13 @@ int main(int argc, char** argv) {
     denom = std::max(denom, std::fabs(attn_ref[i]));
   }
   const float rel = maxabs / denom;
-  // fp32 throughout, but the reconstruction path accumulates over 2048-wide GEMVs, so allow a modest
-  // fp32 tolerance. A structural mismatch (wrong rope convention, missing norm, etc.) would be >>1e-2.
+  // fp32 throughout, but the reconstruction path accumulates over 2048-wide GEMVs, so allow a
+  // modest fp32 tolerance. A structural mismatch (wrong rope convention, missing norm, etc.) would
+  // be >>1e-2.
   const bool pass = rel < 5e-4f;
-  std::printf("%s[DeepSeek-V2-Lite MLA, layer 0]: CPI op vs transformers HF, seq=%d heads=%d "
-              "qk=%d+%d v=%d, max rel %.2e\n",
-              pass ? "PASS" : "FAIL", seq, m.nh, m.qk_nope, m.qk_rope, m.v_head, rel);
+  std::printf(
+      "%s[DeepSeek-V2-Lite MLA, layer 0]: CPI op vs transformers HF, seq=%d heads=%d "
+      "qk=%d+%d v=%d, max rel %.2e\n",
+      pass ? "PASS" : "FAIL", seq, m.nh, m.qk_nope, m.qk_rope, m.v_head, rel);
   return pass ? 0 : 1;
 }

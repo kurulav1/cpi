@@ -2,17 +2,20 @@
 
 // Ring all-reduce over real TCP sockets; the transport-logic prototype for a future multi-node
 // collective (the layer NcclCollective replaces on a real cluster; see collective.hpp). Unlike the
-// single-process LocalCollective (one address space, buffers copied device-to-device), this exercises
-// the DISTRIBUTED control flow that only appears when ranks are genuinely separate endpoints:
+// single-process LocalCollective (one address space, buffers copied device-to-device), this
+// exercises the DISTRIBUTED control flow that only appears when ranks are genuinely separate
+// endpoints:
 //   * ring connection setup (each rank listens, connects to its successor, accepts its predecessor)
 //     with connect-retry; the handshake-ordering / deadlock surface,
 //   * the two-phase ring algorithm (scatter-reduce then all-gather, 2*(world-1) steps),
-//   * byte-level send/recv with partial-IO loops (a short read/write is normal on a stream socket and
+//   * byte-level send/recv with partial-IO loops (a short read/write is normal on a stream socket
+//   and
 //     is the classic transport bug a single-process test can never surface).
 //
 // Ranks may be separate processes or threads; they share no state and talk only over 127.0.0.1
-// sockets, so the isolation that matters for correctness holds either way. Portable over Winsock and
-// BSD sockets. Header-only (inline); it is verification/prototype infrastructure, not on the hot path.
+// sockets, so the isolation that matters for correctness holds either way. Portable over Winsock
+// and BSD sockets. Header-only (inline); it is verification/prototype infrastructure, not on the
+// hot path.
 
 #include <chrono>
 #include <cstdint>
@@ -39,7 +42,9 @@ namespace engine {
 #if defined(_WIN32)
 using socket_t = SOCKET;
 inline constexpr socket_t kInvalidSocket = INVALID_SOCKET;
-inline void close_socket(socket_t s) { closesocket(s); }
+inline void close_socket(socket_t s) {
+  closesocket(s);
+}
 inline void socket_startup() {
   static std::once_flag once;
   std::call_once(once, [] {
@@ -50,11 +55,14 @@ inline void socket_startup() {
 #else
 using socket_t = int;
 inline constexpr socket_t kInvalidSocket = -1;
-inline void close_socket(socket_t s) { ::close(s); }
+inline void close_socket(socket_t s) {
+  ::close(s);
+}
 inline void socket_startup() {}
 #endif
 
-// Write exactly n bytes, looping over short writes (a stream socket may accept fewer than requested).
+// Write exactly n bytes, looping over short writes (a stream socket may accept fewer than
+// requested).
 inline void send_all(socket_t s, const void* buf, std::size_t n) {
   const char* p = static_cast<const char*>(buf);
   std::size_t sent = 0;
@@ -65,8 +73,8 @@ inline void send_all(socket_t s, const void* buf, std::size_t n) {
   }
 }
 
-// Read exactly n bytes, looping over short reads (a single recv may return fewer than requested, or a
-// message may span several TCP segments; handling this is the whole point of the exercise).
+// Read exactly n bytes, looping over short reads (a single recv may return fewer than requested, or
+// a message may span several TCP segments; handling this is the whole point of the exercise).
 inline void recv_all(socket_t s, void* buf, std::size_t n) {
   char* p = static_cast<char*>(buf);
   std::size_t got = 0;
@@ -77,9 +85,9 @@ inline void recv_all(socket_t s, void* buf, std::size_t n) {
   }
 }
 
-// A rank's two ring links: a socket to its successor (send) and from its predecessor (recv). Connecting
-// the ring is where handshake ordering bites; every rank listens first, then connect-retries its
-// successor (whose listener may not be up yet), then accepts its predecessor.
+// A rank's two ring links: a socket to its successor (send) and from its predecessor (recv).
+// Connecting the ring is where handshake ordering bites; every rank listens first, then
+// connect-retries its successor (whose listener may not be up yet), then accepts its predecessor.
 class SocketRing {
 public:
   // rank in [0, world); every rank uses base_port + rank as its listen port on 127.0.0.1.
@@ -134,14 +142,14 @@ public:
   SocketRing(const SocketRing&) = delete;
   SocketRing& operator=(const SocketRing&) = delete;
 
-  // In-place ring all-reduce (sum) of `count` floats. On return every rank holds the elementwise sum
-  // over all ranks' inputs. Classic two-phase ring: scatter-reduce leaves block (rank+1) fully reduced
-  // on each rank, then all-gather rotates the reduced blocks around the ring.
+  // In-place ring all-reduce (sum) of `count` floats. On return every rank holds the elementwise
+  // sum over all ranks' inputs. Classic two-phase ring: scatter-reduce leaves block (rank+1) fully
+  // reduced on each rank, then all-gather rotates the reduced blocks around the ring.
   void all_reduce_sum(float* data, int count) {
     if (world_ <= 1) return;
 
-    // Balanced block split (floor/ceil), same partition policy as the TP/EP/PP shards. Block b spans
-    // the same [off,off+len) on every rank, so neighbours agree on each step's transfer size.
+    // Balanced block split (floor/ceil), same partition policy as the TP/EP/PP shards. Block b
+    // spans the same [off,off+len) on every rank, so neighbours agree on each step's transfer size.
     std::vector<int> off(world_), len(world_);
     int rem = count, o = 0;
     for (int b = 0; b < world_; ++b) {
@@ -155,16 +163,16 @@ public:
     for (int b = 0; b < world_; ++b) tmp.resize(std::max<int>(tmp.size(), len[b]));
 
     // Phase 1; scatter-reduce: world-1 steps. Send one block to the successor while receiving the
-    // predecessor's block and accumulating it. Send-then-recv is deadlock-free here because each block
-    // is far smaller than the socket send buffer, so send() returns before recv() is posted.
+    // predecessor's block and accumulating it. Send-then-recv is deadlock-free here because each
+    // block is far smaller than the socket send buffer, so send() returns before recv() is posted.
     for (int step = 0; step < world_ - 1; ++step) {
       const int send_b = (rank_ - step + 2 * world_) % world_;
       const int recv_b = (rank_ - step - 1 + 2 * world_) % world_;
       exchange_add(data + off[send_b], len[send_b], data + off[recv_b], len[recv_b], tmp.data());
     }
 
-    // Phase 2; all-gather: world-1 steps. Rotate the fully-reduced blocks so every rank ends with all
-    // of them. Received block overwrites (it is already the final sum), it is not accumulated.
+    // Phase 2; all-gather: world-1 steps. Rotate the fully-reduced blocks so every rank ends with
+    // all of them. Received block overwrites (it is already the final sum), it is not accumulated.
     for (int step = 0; step < world_ - 1; ++step) {
       const int send_b = (rank_ - step + 1 + 2 * world_) % world_;
       const int recv_b = (rank_ - step + 2 * world_) % world_;
@@ -172,18 +180,24 @@ public:
     }
   }
 
-  int rank() const { return rank_; }
-  int world() const { return world_; }
+  int rank() const {
+    return rank_;
+  }
+  int world() const {
+    return world_;
+  }
 
 private:
   // Send send_buf to successor, recv predecessor's block into tmp, ADD tmp into recv_buf.
-  void exchange_add(const float* send_buf, int send_len, float* recv_buf, int recv_len, float* tmp) {
+  void exchange_add(const float* send_buf, int send_len, float* recv_buf, int recv_len,
+                    float* tmp) {
     send_all(send_sock_, send_buf, static_cast<std::size_t>(send_len) * sizeof(float));
     recv_all(recv_sock_, tmp, static_cast<std::size_t>(recv_len) * sizeof(float));
     for (int i = 0; i < recv_len; ++i) recv_buf[i] += tmp[i];
   }
   // Send send_buf to successor, recv predecessor's block into tmp, OVERWRITE recv_buf with it.
-  void exchange_copy(const float* send_buf, int send_len, float* recv_buf, int recv_len, float* tmp) {
+  void exchange_copy(const float* send_buf, int send_len, float* recv_buf, int recv_len,
+                     float* tmp) {
     send_all(send_sock_, send_buf, static_cast<std::size_t>(send_len) * sizeof(float));
     recv_all(recv_sock_, tmp, static_cast<std::size_t>(recv_len) * sizeof(float));
     std::memcpy(recv_buf, tmp, static_cast<std::size_t>(recv_len) * sizeof(float));

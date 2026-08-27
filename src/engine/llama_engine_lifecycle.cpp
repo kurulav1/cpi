@@ -15,8 +15,8 @@
 #include "common.hpp"
 #include "llama_engine_internal.hpp"
 #include "model/gguf_kquant.hpp"
-#include "runtime/kernels.cuh"
 #include "runtime/cuda_utils.cuh"
+#include "runtime/kernels.cuh"
 #include "runtime/system_info.hpp"
 namespace engine {
 namespace {
@@ -144,8 +144,7 @@ void LlamaEngine::load_static_weights() {
           kernels::launch_dequant_kquant(static_cast<const std::uint8_t*>(d_packed),
                                          static_cast<kernels::KQuantType>(pk.kind),
                                          emb_elems / model::kquant::kSuperBlock,
-                                         static_cast<__half*>(d_tok_embeddings_),
-                                         transfer_stream_);
+                                         static_cast<__half*>(d_tok_embeddings_), transfer_stream_);
           CUDA_CHECK(cudaStreamSynchronize(transfer_stream_));
           emb_loaded = true;
         }
@@ -315,13 +314,23 @@ void LlamaEngine::allocate_runtime_buffers() {
   if (const char* env = std::getenv("CPI_KV_QUANT")) {
     const std::string mode(env);
     if (mode == "4" || mode == "44") {
-      kv_quant_kbits_ = 4; kv_quant_vbits_ = 4; kv_quant_rot_ = true; kv_int4_enabled_ = true;
+      kv_quant_kbits_ = 4;
+      kv_quant_vbits_ = 4;
+      kv_quant_rot_ = true;
+      kv_int4_enabled_ = true;
     } else if (mode == "4nr") {
-      kv_quant_kbits_ = 4; kv_quant_vbits_ = 4; kv_quant_rot_ = false; kv_int4_enabled_ = true;
+      kv_quant_kbits_ = 4;
+      kv_quant_vbits_ = 4;
+      kv_quant_rot_ = false;
+      kv_int4_enabled_ = true;
     } else if (mode == "84") {
-      kv_quant_kbits_ = 8; kv_quant_vbits_ = 4; kv_int4_enabled_ = true;
+      kv_quant_kbits_ = 8;
+      kv_quant_vbits_ = 4;
+      kv_int4_enabled_ = true;
     } else if (mode == "8" || mode == "88") {
-      kv_quant_kbits_ = 8; kv_quant_vbits_ = 8; kv_int4_enabled_ = true;
+      kv_quant_kbits_ = 8;
+      kv_quant_vbits_ = 8;
+      kv_int4_enabled_ = true;
     } else if (mode != "0" && mode != "off") {
       CPI_THROW("CPI_KV_QUANT must be one of 4, 4nr, 84, 8, off");
     }
@@ -382,10 +391,10 @@ void LlamaEngine::allocate_runtime_buffers() {
       &d_prefill_i8_, static_cast<std::size_t>(rows) * static_cast<std::size_t>(max_lowbit_cols)));
   CUDA_CHECK(cudaMalloc(&d_prefill_i8_scales_, static_cast<std::size_t>(rows) * sizeof(float)));
   // Per-group(32) activation scales for the perm8-g32 quant feeding the grouped int4 dp4a MLP.
-  CUDA_CHECK(cudaMalloc(
-      &d_prefill_perm8_scales_, static_cast<std::size_t>(rows) *
-                                    ((static_cast<std::size_t>(max_lowbit_cols) + 31) / 32) *
-                                    sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&d_prefill_perm8_scales_,
+                        static_cast<std::size_t>(rows) *
+                            ((static_cast<std::size_t>(max_lowbit_cols) + 31) / 32) *
+                            sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_ff3_, bytes_for_matrix(rows, hidden)));
   CUDA_CHECK(cudaMalloc(&d_logits_, static_cast<std::size_t>(cfg.vocab_size) * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_argmax_, sizeof(int)));
@@ -465,8 +474,8 @@ void LlamaEngine::allocate_runtime_buffers() {
     kv_capacity_tokens_ = ((kv_capacity_tokens_ + bs - 1) / bs) * bs;  // whole blocks
     const int num_blocks = kv_capacity_tokens_ / bs;
     if (options_.verbose) {
-      std::cout << "[engine] kv_pool_tokens=" << kv_capacity_tokens_ << " (max_context="
-                << options_.max_context << ", " << num_blocks << " blocks)\n";
+      std::cout << "[engine] kv_pool_tokens=" << kv_capacity_tokens_
+                << " (max_context=" << options_.max_context << ", " << num_blocks << " blocks)\n";
     }
     block_alloc_ = std::make_unique<BlockAllocator>(num_blocks);
     seq_blocks_ = std::make_unique<SequenceBlockTable>(block_alloc_.get(), bs);
@@ -548,8 +557,7 @@ void LlamaEngine::allocate_runtime_buffers() {
 
   if (cfg.is_moe()) {
     const int experts = std::max(1, cfg.num_local_experts);
-    const int top_k =
-        std::max(1, std::min(cfg.effective_experts_per_tok(), experts));
+    const int top_k = std::max(1, std::min(cfg.effective_experts_per_tok(), experts));
     const std::size_t expert_w13_bytes =
         static_cast<std::size_t>(expert_inter) * static_cast<std::size_t>(hidden) * sizeof(__half);
     const std::size_t expert_w2_bytes =

@@ -139,7 +139,9 @@ public:
   // It puts each dispatch in its OWN encoder to bracket it, which serialises work that normally
   // overlaps. Kernel times are therefore honest individually and their sum exceeds a real pass.
   void enable_gpu_profile(bool on);
-  bool gpu_profile_enabled() const { return gpu_profile_; }
+  bool gpu_profile_enabled() const {
+    return gpu_profile_;
+  }
   // kernel name -> (total GPU nanoseconds, dispatch count). Valid after commit_and_wait().
   const std::vector<std::pair<std::string, std::pair<std::uint64_t, std::uint64_t>>>&
   gpu_profile_results();
@@ -199,11 +201,11 @@ public:
   void end_gputrace();
 
 private:
-  void* device_ = nullptr;     // id<MTLDevice>
-  void* queue_ = nullptr;      // id<MTLCommandQueue>
-  void* library_ = nullptr;    // id<MTLLibrary>
-  void* cmdbuf_ = nullptr;     // id<MTLCommandBuffer>, lazily opened
-  void* encoder_ = nullptr;    // id<MTLComputeCommandEncoder>, reused across dispatches
+  void* device_ = nullptr;   // id<MTLDevice>
+  void* queue_ = nullptr;    // id<MTLCommandQueue>
+  void* library_ = nullptr;  // id<MTLLibrary>
+  void* cmdbuf_ = nullptr;   // id<MTLCommandBuffer>, lazily opened
+  void* encoder_ = nullptr;  // id<MTLComputeCommandEncoder>, reused across dispatches
   // commit_async()'d buffers not yet waited on (each retained id<MTLCommandBuffer>).
   std::vector<void*> in_flight_;
   void* pipelines_ = nullptr;  // NSMutableDictionary name -> MTLComputePipelineState
