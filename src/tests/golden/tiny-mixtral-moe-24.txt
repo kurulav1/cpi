@@ -4,7 +4,7 @@
 #
 # tiny-mixtral is the checkpoint the CUDA MoE regression already uses: 2 layers, hidden 1024,
 # 8 experts, top-2 routing, expert_inter 3584, head_dim 32, sliding window 4096. Its weights are
-# random, so the text is gibberish -- deliberately. This gates KERNELS, not quality: the router
+# random, so the text is gibberish; deliberately. This gates KERNELS, not quality: the router
 # picking the same experts and the expert FFNs accumulating in the same order is exactly what a
 # token-for-token match proves, and random weights make a routing bug MORE visible, not less
 # (no linguistic prior can paper over a wrong expert).

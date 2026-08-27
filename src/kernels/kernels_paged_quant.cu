@@ -260,7 +260,7 @@ __global__ void attention_step_gqa_batched_paged_quant_kernel(
   }
   // Whether any token in this tile takes the fp16 override (sink or window),
   // and whether the whole tile does (then the quant stage is skipped entirely
-  // and the tile stages straight from fp16, which is cheaper than dequant --
+  // and the tile stages straight from fp16, which is cheaper than dequant;
   // at shallow depths every tile is inside the window, so this keeps the
   // quality tier from costing anything there). A tile straddling the sink /
   // window boundary takes the stage-then-overlay path.

@@ -14,8 +14,8 @@ For each configuration the script records:
   - peak VRAM (nvidia-smi, polled in a background thread)
 
 Outputs:
-  docs/results/sweep_<model>_<timestamp>.json  – machine-readable
-  docs/results/sweep_<model>_<timestamp>.md    – Markdown table
+  docs/results/sweep_<model>_<timestamp>.json  - machine-readable
+  docs/results/sweep_<model>_<timestamp>.md    - Markdown table
 
 Usage:
   # Minimal: fp16 CUDA across four context sizes
@@ -59,7 +59,7 @@ RESULTS_DIR = REPO_ROOT / "docs" / "results"
 
 def _rel(p) -> str:
     """Repo-root-relative path (forward slashes) for portable, non-leaky result
-    metadata — avoids baking an absolute C:\\Users\\<name>\\... path into committed
+    metadata ;  avoids baking an absolute C:\\Users\\<name>\\... path into committed
     JSON. Falls back to the absolute string if the path is outside the repo."""
     try:
         return str(Path(p).resolve().relative_to(REPO_ROOT)).replace("\\", "/")
@@ -349,7 +349,7 @@ def _run_one(
 
 def _render_table(runs: list[dict], model_name: str) -> str:
     lines: list[str] = [
-        f"## Throughput & Memory — {model_name}",
+        f"## Throughput & Memory ;  {model_name}",
         "",
         "| Path | Context | Quant | Decode tok/s | Prefill ms | Decode ms | Peak RAM MB | Peak VRAM MB |",
         "|------|--------:|------:|-------------:|-----------:|----------:|------------:|-------------:|",
@@ -359,18 +359,18 @@ def _render_table(runs: list[dict], model_name: str) -> str:
             path_label = "CPU" if r.get("force_cpu") else "CUDA"
             lines.append(
                 f"| {path_label} | {r.get('context_length', '?'):,} | {r.get('quant_mode', '?')} "
-                f"| — | — | — | — | — | _{r.get('status', 'error')}_ |"
+                f"| ;  | ;  | ;  | ;  | ;  | _{r.get('status', 'error')}_ |"
             )
             continue
         path_label = "CPU" if r["force_cpu"] else "CUDA"
         dtps = r["decode_tok_per_s"]
-        dtps_s = f"{dtps:.2f}" if math.isfinite(dtps) else "—"
+        dtps_s = f"{dtps:.2f}" if math.isfinite(dtps) else "; "
         pfms = r["prefill_ms"]
-        pfms_s = f"{pfms:.1f}" if math.isfinite(pfms) else "—"
+        pfms_s = f"{pfms:.1f}" if math.isfinite(pfms) else "; "
         dcms = r["decode_ms"]
-        dcms_s = f"{dcms:.1f}" if math.isfinite(dcms) else "—"
-        ram = f"{r['peak_rss_mb']:.0f}" if r.get("peak_rss_mb") is not None else "—"
-        vram = f"{r['peak_vram_mb']:.0f}" if r.get("peak_vram_mb") is not None else "—"
+        dcms_s = f"{dcms:.1f}" if math.isfinite(dcms) else "; "
+        ram = f"{r['peak_rss_mb']:.0f}" if r.get("peak_rss_mb") is not None else "; "
+        vram = f"{r['peak_vram_mb']:.0f}" if r.get("peak_vram_mb") is not None else "; "
         lines.append(
             f"| {path_label} | {r['context_length']:,} | {r['quant_mode']} "
             f"| {dtps_s} | {pfms_s} | {dcms_s} | {ram} | {vram} |"
@@ -394,7 +394,7 @@ def _render_speedup_table(runs: list[dict], model_name: str) -> str:
         return ""
 
     lines = [
-        f"## Quantization Speedup — {model_name}",
+        f"## Quantization Speedup ;  {model_name}",
         "",
         "Speedup = quant decode tok/s ÷ fp16 decode tok/s for same path + context.",
         "",
@@ -408,12 +408,12 @@ def _render_speedup_table(runs: list[dict], model_name: str) -> str:
         int4 = qmap.get("int4", math.nan)
 
         def fmt_tok(v: float) -> str:
-            return f"{v:.2f}" if math.isfinite(v) else "—"
+            return f"{v:.2f}" if math.isfinite(v) else "; "
 
         def fmt_speedup(v: float, base: float) -> str:
             if math.isfinite(v) and math.isfinite(base) and base > 0:
                 return f"**×{v/base:.2f}**"
-            return "—"
+            return "; "
 
         lines.append(
             f"| {path_label} | {ctx:,} | {fmt_tok(fp16)} | {fmt_tok(int8)} | {fmt_speedup(int8, fp16)} "
@@ -575,7 +575,7 @@ def main() -> int:
 
     # Markdown report
     md_parts = [
-        f"# CPI Benchmark Sweep — {model_name}",
+        f"# CPI Benchmark Sweep ;  {model_name}",
         "",
         f"**Date:** {timestamp}  ",
         f"**Host:** {os.environ.get('CPI_BENCH_HOST', 'redacted')}  ",

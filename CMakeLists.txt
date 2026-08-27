@@ -161,7 +161,7 @@ set(CPI_ENGINE_SOURCES
   # Paged KV bookkeeping (allocator + block tables) and the continuous-batching
   # scheduler. Both are pure host logic with no GPU in them: the scheduler reaches a
   # backend through exactly two virtual calls. paged_kv.cpp used to sit in the CUDA
-  # block, and that placement was the only reason continuous batching was CUDA-only --
+  # block, and that placement was the only reason continuous batching was CUDA-only;
   # where the code lived, not what it needed.
   src/engine/paged_kv.cpp
   src/engine/batch_scheduler.cpp
@@ -254,13 +254,13 @@ if(CPI_ENABLE_METAL)
   )
 
   # Exposed as a compile macro (PUBLIC, so cpi sees it) so the main binary can
-  # conditionally wire the Metal engine into its dispatch -- mirrors CPI_HAS_CUDA.
+  # conditionally wire the Metal engine into its dispatch; mirrors CPI_HAS_CUDA.
   target_compile_definitions(cpi_engine PUBLIC CPI_ENABLE_METAL=1)
 
   # The shaders are split into family files (00_common.metal, 10_dense.metal, ...) under this
   # directory. CPI_METAL_SOURCE is the DIRECTORY: the runtime loader concatenates its *.metal in
   # filename order (the numeric prefixes are the dependency order), and the offline metallib rule
-  # below cats the same files the same way. One place defines the order -- the filenames.
+  # below cats the same files the same way. One place defines the order; the filenames.
   set(CPI_METAL_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/metal)
   set(CPI_METAL_SRC ${CPI_METAL_DIR})
   file(GLOB CPI_METAL_PARTS ${CPI_METAL_DIR}/[0-9][0-9]_*.metal)
@@ -272,7 +272,7 @@ if(CPI_ENABLE_METAL)
   #
   # So the metallib is OPTIONAL. When the toolchain is present we precompile, which
   # is faster to start and type-checks at build time. When it is not, the engine
-  # compiles the MSL from source at runtime via newLibraryWithSource -- that needs
+  # compiles the MSL from source at runtime via newLibraryWithSource; that needs
   # only the Metal framework, which every Mac has. CPI_METAL_SOURCE points at it.
   execute_process(
     COMMAND xcrun -sdk macosx metal --version
@@ -288,7 +288,7 @@ if(CPI_ENABLE_METAL)
       OUTPUT ${CPI_METALLIB}
       # Concatenate the family files (sorted) into one translation unit, then compile. The
       # offline `metal` compiler could resolve #include, but the runtime loader cannot, so the
-      # files carry no includes and both paths just concatenate -- same bytes, one source of order.
+      # files carry no includes and both paths just concatenate; same bytes, one source of order.
       COMMAND ${CMAKE_COMMAND} -DOUT=${CPI_METAL_COMBINED} "-DPARTS=${CPI_METAL_PARTS}"
               -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/concat_metal.cmake
       COMMAND xcrun -sdk macosx metal -Werror -c ${CPI_METAL_COMBINED} -o ${CPI_METAL_AIR}
@@ -385,7 +385,7 @@ add_executable(cpi
 target_link_libraries(cpi PRIVATE cpi_engine)
 
 # shard_planner: pre-deployment "will it fit, on how many GPUs" report for a model + tp/pp/ep split.
-# Pure host arithmetic over header-only shard_plan.hpp -- no GPU, no cluster, no engine link -- so it
+# Pure host arithmetic over header-only shard_plan.hpp; no GPU, no cluster, no engine link, so it
 # builds on any platform. Part of the multi-GPU/HPC prep track (see include/engine/shard_plan.hpp).
 add_executable(shard_planner src/app/shard_planner.cpp)
 target_include_directories(shard_planner PRIVATE include)
@@ -407,7 +407,7 @@ if(NOT DEFINED CPI_NO_LEGACY_ALIAS)
   endif()
 endif()
 
-# cpi_embed: embedding worker (BERT-family encoder). Needs a GPU backend -- CUDA or Metal.
+# cpi_embed: embedding worker (BERT-family encoder). Needs a GPU backend; CUDA or Metal.
 #
 # Was CUDA-only, which is what left embeddings, RAG and folder-search dead on Apple Silicon: the
 # target simply did not exist, so the Node server resolved cpi_embed from a CUDA build dir, found
@@ -432,7 +432,7 @@ add_executable(grammar_test
 target_include_directories(grammar_test PRIVATE include)
 add_test(NAME grammar_test COMMAND grammar_test)
 
-# Plan-builder test. CUDA-free and GPU-free, so it runs in CI on every platform --
+# Plan-builder test. CUDA-free and GPU-free, so it runs in CI on every platform;
 # it is the one part of the Metal bring-up that can be verified without a Mac.
 add_executable(op_plan_builder_test
   src/tests/op_plan_builder_test.cpp
@@ -448,14 +448,14 @@ add_test(NAME op_plan_builder_test COMMAND op_plan_builder_test)
 # IEEE binary16 conversions. Header-only maths with no Metal and no GPU, so it is registered
 # OUTSIDE the Metal block deliberately: the converters it gates feed every Metal weight upload,
 # but the bug they carried (truncation instead of round-to-nearest, subnormals flushed to zero)
-# is arithmetic and can be caught anywhere -- including on CI and on Windows, where none of the
+# is arithmetic and can be caught anywhere; including on CI and on Windows, where none of the
 # Metal targets build. Optional args: a vals/expect fixture pair generated by numpy.
 add_executable(metal_fp16_test src/tests/metal_fp16_test.cpp)
 target_include_directories(metal_fp16_test PRIVATE include)
 add_test(NAME metal_fp16_test COMMAND metal_fp16_test)
 
 # Qwen2-VL / Qwen3.5 image preprocessing vs the HuggingFace processor. Pure CPU (no Metal, no
-# CUDA), so it lives OUTSIDE the backend guards and builds anywhere -- unlike image_preprocess_test,
+# CUDA), so it lives OUTSIDE the backend guards and builds anywhere; unlike image_preprocess_test,
 # which is stranded under the CUDA guard and so never built on a Mac. No add_test: it needs an
 # oracle dump from a torch/torchvision run that CI does not have.
 # Repack a .ll2c into a .cpi (safetensors + JSON __metadata__). CPU-only, no backend needed.
@@ -512,11 +512,11 @@ target_link_libraries(qwen2vl_preproc_test PRIVATE cpi_engine)
 
 # Metal kernel smoke test: runs each shader against a CPU reference. On a machine
 # with no Metal GPU (any VM, including GitHub's macOS runners) it reports SKIP and
-# passes -- so a green run here proves it COMPILES AND LINKS, never that the
+# passes, so a green run here proves it COMPILES AND LINKS, never that the
 # kernels are correct. Only real Apple Silicon can prove that.
 if(CPI_ENABLE_METAL)
   # Text generation on Apple Silicon. Separate from cpi, whose engine dispatch
-  # is templated over the CUDA engines -- keeping this standalone means the Metal path
+  # is templated over the CUDA engines; keeping this standalone means the Metal path
   # has no CUDA anywhere in its dependency graph.
   add_executable(metal_infer src/app/metal_infer.cpp)
   target_link_libraries(metal_infer PRIVATE cpi_engine)
@@ -530,7 +530,7 @@ if(CPI_ENABLE_METAL)
 
   # Qwen3.5's text stack vs a HuggingFace logits oracle. No add_test: it needs both a container
   # and an oracle dump from a torch run, neither of which the Mac can produce. It is also the
-  # control for metal_vision_test's FIRST_STEP_LOGITS -- see the file header.
+  # control for metal_vision_test's FIRST_STEP_LOGITS; see the file header.
   add_executable(qwen35_text_test src/tests/qwen35_text_test.cpp)
   target_link_libraries(qwen35_text_test PRIVATE cpi_engine)
   target_include_directories(qwen35_text_test PRIVATE include)
@@ -720,7 +720,7 @@ if(CPI_ENABLE_CUDA)
   )
   add_test(NAME collective_test COMMAND collective_test)
 
-  # Multi-GPU prep brick 4: pipeline-parallel layer partitioning verified on ONE GPU -- a stack of
+  # Multi-GPU prep brick 4: pipeline-parallel layer partitioning verified on ONE GPU; a stack of
   # layers split into P contiguous stages, activation handed across each stage boundary, vs unsharded.
   add_executable(pipeline_parallel_test
     src/tests/pipeline_parallel_test.cu
@@ -733,7 +733,7 @@ if(CPI_ENABLE_CUDA)
   )
   add_test(NAME pipeline_parallel_test COMMAND pipeline_parallel_test)
 
-  # Multi-GPU prep brick 5: the multi-PROCESS collective prototype -- ring all-reduce over real TCP
+  # Multi-GPU prep brick 5: the multi-PROCESS collective prototype; ring all-reduce over real TCP
   # sockets (ranks as threads, each a genuine 127.0.0.1 endpoint), the distributed control flow that a
   # single-process test can't reach. Host-only (no CUDA); the transport NcclCollective replaces.
   add_executable(socket_ring_allreduce_test
@@ -750,7 +750,7 @@ if(CPI_ENABLE_CUDA)
   target_include_directories(shard_plan_test PRIVATE include)
   add_test(NAME shard_plan_test COMMAND shard_plan_test)
 
-  # DeepSeek-style Multi-head Latent Attention (MLA) verified on-device vs an fp32 oracle -- isolated
+  # DeepSeek-style Multi-head Latent Attention (MLA) verified on-device vs an fp32 oracle; isolated
   # groundwork for native DeepSeek-V3/R1 (full checkpoints are model-blocked on this box).
   add_executable(mla_attention_test
     src/tests/mla_attention_test.cu
@@ -777,7 +777,7 @@ if(CPI_ENABLE_CUDA)
   add_test(NAME kda_attention_test COMMAND kda_attention_test)
 
   # DeepSeek MLA composed into a multi-layer decoder stack (MLA + SwiGLU, pre-norm, residuals) verified
-  # device vs oracle -- the "wire MLA toward a DeepSeek-arch config" step (synthetic weights; a native-
+  # device vs oracle; the "wire MLA toward a DeepSeek-arch config" step (synthetic weights; a native-
   # MLA checkpoint is the only remaining end-to-end gate).
   add_executable(deepseek_mla_stack_test
     src/tests/deepseek_mla_stack_test.cu
@@ -1061,7 +1061,7 @@ endif()
 
 if(CLANG_TIDY_EXE)
   add_custom_target(tidy
-    COMMAND ${CLANG_TIDY_EXE} ${CPI_ENGINE_SOURCES} -- -I${CMAKE_SOURCE_DIR}/include
+    COMMAND ${CLANG_TIDY_EXE} ${CPI_ENGINE_SOURCES}; -I${CMAKE_SOURCE_DIR}/include
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     COMMENT "Running clang-tidy (standalone mode)"
   )

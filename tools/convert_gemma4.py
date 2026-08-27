@@ -79,7 +79,7 @@ def main():
     head_dim_full = (q_norm_dim(full_idxs[0]) if full_idxs else head_dim_sliding) \
         or tc.get("global_head_dim") or tc["head_dim"]
 
-    # num_kv_heads can differ per layer type (12B: sliding GQA-8, full MQA-1) --
+    # num_kv_heads can differ per layer type (12B: sliding GQA-8, full MQA-1);
     # derive from k_proj rows / head_dim. attention_k_eq_v (12B full layers) means
     # V shares the K projection: no v_proj tensor, V = weightless_vnorm(k_proj(x)).
     def k_proj_rows(L):

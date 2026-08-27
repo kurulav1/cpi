@@ -71,7 +71,7 @@ jobs:
           $md = [System.Text.StringBuilder]::new()
           [void]$md.AppendLine("## MoE Regression Gate")
           if ($null -eq $result) {
-            [void]$md.AppendLine("> Gate result JSON not found — the gate step may have failed before writing output.")
+            [void]$md.AppendLine("> Gate result JSON not found ;  the gate step may have failed before writing output.")
           } else {
             $overall = if ($result.failed) { ":x: **FAILED**" } else { ":white_check_mark: **PASSED**" }
             [void]$md.AppendLine($overall)
@@ -83,8 +83,8 @@ jobs:
             foreach ($mode in @("fp16", "int8", "int4")) {
               $m = $result.models.$mode
               if ($null -ne $m) {
-                $dtps = if ($null -ne $m.bench.decode_tok_per_s) { "{0:F2}" -f $m.bench.decode_tok_per_s } else { "—" }
-                $pfms = if ($null -ne $m.bench.prefill_ms) { "{0:F1}" -f $m.bench.prefill_ms } else { "—" }
+                $dtps = if ($null -ne $m.bench.decode_tok_per_s) { "{0:F2}" -f $m.bench.decode_tok_per_s } else { "; " }
+                $pfms = if ($null -ne $m.bench.prefill_ms) { "{0:F1}" -f $m.bench.prefill_ms } else { "; " }
                 [void]$md.AppendLine("| $mode | $dtps | $pfms |")
               }
             }

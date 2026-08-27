@@ -7,7 +7,7 @@ kind: Kustomization
 # path, and resources.
 #
 # This is the compute-mesh-managed path. cpi's richer standalone stack (../inference-deployment.yaml
-# plus kserve/ and observability/) is independent and untouched -- use whichever fits the target.
+# plus kserve/ and observability/) is independent and untouched; use whichever fits the target.
 #
 # References the sibling compute-mesh checkout by relative path (matches cpt's convention).
 namespace: cpi-serving

@@ -1,7 +1,7 @@
-// Regression tests for generated-text normalization — guards the decoder-halt
+// Regression tests for generated-text normalization ;  guards the decoder-halt
 // bug where an ungated "drop trailing incomplete tail" heuristic truncated
 // healthy output at the last '.'/'?'/'!' (breaking ternaries, quoted ".",
-// em-dashes — common in code/DSL output).
+// em-dashes ;  common in code/DSL output).
 //
 // Run: node web/server/text_normalize.test.mjs
 
@@ -27,13 +27,13 @@ check(normalizeGeneratedChatText('X then "." then DONE', "qwen2") === 'X then ".
 check(normalizeGeneratedChatText('display=display=="0"?$item:display~$item', "qwen2")
         === 'display=display=="0"?$item:display~$item',
       "DSL ternary handler preserved");
-check(normalizeGeneratedChatText("foo — bar then DONE", "qwen2") === "foo — bar then DONE",
+check(normalizeGeneratedChatText("foo ;  bar then DONE", "qwen2") === "foo ;  bar then DONE",
       "em-dash content not truncated");
 check(normalizeGeneratedChatText("result = x > 0.5 ? hi : lo", "llama3")
         === "result = x > 0.5 ? hi : lo",
       "decimal + ternary on llama3 preserved");
 
-// Controls (no terminator) — unchanged.
+// Controls (no terminator) ;  unchanged.
 check(normalizeGeneratedChatText("alpha bravo charlie then DONE", "qwen2")
         === "alpha bravo charlie then DONE",
       "R4 control: plain text preserved");

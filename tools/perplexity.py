@@ -54,7 +54,7 @@ RESULTS_DIR = REPO_ROOT / "docs" / "results"
 
 def _rel(p) -> str:
     """Repo-root-relative path (forward slashes) for portable, non-leaky result
-    metadata -- avoids baking an absolute C:\\Users\\<name>\\... path into committed
+    metadata; avoids baking an absolute C:\\Users\\<name>\\... path into committed
     JSON. Falls back to the absolute string if the path is outside the repo."""
     try:
         return str(Path(p).resolve().relative_to(REPO_ROOT)).replace("\\", "/")

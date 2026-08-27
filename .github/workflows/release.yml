@@ -108,7 +108,7 @@ jobs:
 
   build-macos-metal:
     name: Build macOS Metal binary
-    runs-on: macos-14  # Apple Silicon (arm64) runner -- Metal backend on by default
+    runs-on: macos-14  # Apple Silicon (arm64) runner; Metal backend on by default
     # The hosted macos-14 runner's Xcode/clang can fail to build where real Apple Silicon
     # (newer toolchain) succeeds, so this must not block the release: CPU binaries still ship,
     # and the macOS asset is attached only when the runner build succeeds.
@@ -470,7 +470,7 @@ jobs:
             ### macOS (Metal)
             The macOS asset is attached only when the hosted CI runner could build it; its Xcode
             can lag real Apple Silicon. If it is missing, build from source (it compiles cleanly on
-            current Apple Silicon) -- see [Build Modes](https://github.com/kurulav1/cpi#build-modes).
+            current Apple Silicon); see [Build Modes](https://github.com/kurulav1/cpi#build-modes).
 
             The Metal backend compiles its shaders at runtime, so the archive bundles the
             `.metal` sources next to the binary. Use the included launcher:
@@ -480,7 +480,7 @@ jobs:
             ```
 
             (or run `cpi` directly with `CPI_METAL_SOURCE=./metal` set). First launch
-            may prompt Gatekeeper on an unsigned binary -- allow it in System Settings › Privacy.
+            may prompt Gatekeeper on an unsigned binary; allow it in System Settings › Privacy.
 
             ### GPU (CUDA) builds
             The Linux CUDA asset is compiled for Turing through Blackwell

@@ -860,7 +860,7 @@ int main(int argc, char** argv) {
       }
     }
   } else {
-    std::printf("      (no container given -- pass one as argv[2] to gate the conversion)\n");
+    std::printf("      (no container given: pass one as argv[2] to gate the conversion)\n");
   }
 
   // ---- the splice: soft tokens standing in for placeholder tokens ----

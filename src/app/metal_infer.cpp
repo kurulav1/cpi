@@ -130,7 +130,7 @@ int main(int argc, char** argv) {
     eng.end_gputrace();
     std::fprintf(stderr,
                  "[metal] capture written: %s (timings above are NOT valid under a\n"
-                 "        capture -- it serialises and instruments everything)\n",
+                 "        capture: it serialises and instruments everything)\n",
                  gt);
   }
   const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();

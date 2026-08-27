@@ -45,7 +45,7 @@ jobs:
     name: clang-format
     runs-on: ubuntu-latest
     # Enforced: the whole tree was swept with clang-format 19.1.7, so changed
-    # files must stay formatted. Pin the exact version -- clang-format output can
+    # files must stay formatted. Pin the exact version; clang-format output can
     # differ across major versions.
     steps:
       - uses: actions/checkout@v4
@@ -74,21 +74,21 @@ jobs:
   metal:
     name: Build Metal backend (compile-only)
     runs-on: macos-14
-    # GitHub's macOS runners are VMs with NO GPU -- MTLCreateSystemDefaultDevice()
+    # GitHub's macOS runners are VMs with NO GPU; MTLCreateSystemDefaultDevice()
     # returns nil there, so Metal kernels cannot be RUN in CI, and metal_smoke
     # reports SKIP. A green job here means the shaders type-check, the Objective-C++
     # bridge compiles, and everything links. It does NOT mean the kernels are
-    # correct: that needs real Apple Silicon -- see metal-gpu.yml, which runs
+    # correct: that needs real Apple Silicon; see metal-gpu.yml, which runs
     # tools/metal_verify.sh on a self-hosted runner that has an actual Metal device.
     #
-    # Worth having anyway -- `metal` is an offline compiler, so without this the
+    # Worth having anyway; `metal` is an offline compiler, so without this the
     # shaders would be written entirely blind from a Windows box.
     steps:
       - uses: actions/checkout@v4
       - name: Check kernel buffer bindings
         # The params block must be each kernel's LAST binding, because dispatch()
         # binds it at index n_buffers. Getting that wrong compiles cleanly and only
-        # shows up as garbage on real hardware -- `metal -Werror` cannot catch it,
+        # shows up as garbage on real hardware; `metal -Werror` cannot catch it,
         # so it is checked statically.
         run: python3 tools/check_metal_bindings.py
       - name: Configure (Metal on, CUDA off)
@@ -110,10 +110,10 @@ jobs:
           echo "::error::toolchain: $(clang --version | head -1)"
           grep -E 'error:' /tmp/build.log | head -25 | while IFS= read -r l; do echo "::error::$l"; done
           exit 0
-      - name: Test (metal_smoke SKIPs -- no GPU in the runner)
+      - name: Test (metal_smoke SKIPs; no GPU in the runner)
         run: ctest --test-dir build -C Release --output-on-failure
       # Runs the real gate's script here too, where every check SKIPs. That proves only
-      # that the script itself still runs -- the checks it performs need a GPU and happen
+      # that the script itself still runs; the checks it performs need a GPU and happen
       # in metal-gpu.yml. Cheap insurance against the gate rotting unnoticed.
       - name: Smoke the Metal gate script (every check SKIPs here)
         run: ./tools/metal_verify.sh --build build
@@ -124,7 +124,7 @@ jobs:
       fail-fast: false
       matrix:
         # macos-14 is Apple Silicon (arm64). It is the only non-x86 target in CI,
-        # so it is what keeps the CPU engines' scalar fallbacks honest -- the AVX2
+        # so it is what keeps the CPU engines' scalar fallbacks honest; the AVX2
         # paths compile out there, and nothing else would catch a stray intrinsic.
         # Apple clang ships no OpenMP; the build degrades to single-threaded.
         os: [ubuntu-latest, windows-latest, macos-14]

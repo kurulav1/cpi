@@ -35,7 +35,7 @@ int main(int argc, char** argv) {
 
   std::ifstream f(blob, std::ios::binary);
   if (!f) {
-    std::printf("cannot open %s -- run tools/gemma4_vision_oracle.py first\n", blob.c_str());
+    std::printf("cannot open %s: run tools/gemma4_vision_oracle.py first\n", blob.c_str());
     return 2;
   }
   int header[5];

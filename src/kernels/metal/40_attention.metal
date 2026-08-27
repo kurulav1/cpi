@@ -37,7 +37,7 @@
 #define QMM_QT 2
 #define QMM_KT 2
 #if (QMM_BLOCK % (8 * QMM_QT)) != 0
-#error "QMM_BLOCK must be a multiple of 8*QMM_QT -- otherwise the register tile reads past q_sh"
+#error "QMM_BLOCK must be a multiple of 8*QMM_QT: otherwise the register tile reads past q_sh"
 #endif
 
 // RCA instrumentation for the prefill attention kernel. 0 = normal. Each bit replaces one phase

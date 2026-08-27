@@ -1,7 +1,7 @@
 // Minimal, dependency-free Prometheus metrics for the CPI server.
 // Exposed at GET /metrics in the standard text exposition format so a
 // Prometheus-compatible scraper (VictoriaMetrics / vmagent) can collect them and
-// KEDA can autoscale on them. Kept tiny on purpose -- no prom-client dependency.
+// KEDA can autoscale on them. Kept tiny on purpose; no prom-client dependency.
 
 const reqTotal = new Map(); // "route|status" -> count
 const durSum = new Map(); // route -> total seconds

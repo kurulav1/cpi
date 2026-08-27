@@ -69,10 +69,10 @@ def _fmt_float(v: Any, decimals: int = 2, suffix: str = "") -> str:
     try:
         f = float(v)
         if not math.isfinite(f):
-            return "—"
+            return "; "
         return f"{f:.{decimals}f}{suffix}"
     except (TypeError, ValueError):
-        return "—"
+        return "; "
 
 
 def _speedup(a: Any, b: Any) -> str:
@@ -83,18 +83,18 @@ def _speedup(a: Any, b: Any) -> str:
             return f"**×{ratio:.2f}**"
     except (TypeError, ValueError):
         pass
-    return "—"
+    return "; "
 
 
 def _render_sweep(doc: dict) -> str:
     model = doc.get("model_name", "unknown")
     ts = doc.get("timestamp", "")
-    gpu = doc.get("gpu", "—")
-    cpu = doc.get("cpu", "—")
+    gpu = doc.get("gpu", "; ")
+    cpu = doc.get("cpu", "; ")
     runs = [r for r in doc.get("runs", []) if r.get("status") == "ok"]
 
     if not runs:
-        return f"### {model} sweep — no successful runs\n"
+        return f"### {model} sweep ;  no successful runs\n"
 
     lines = [
         f"### Sweep: {model}",
@@ -159,14 +159,14 @@ def _render_sweep(doc: dict) -> str:
 def _render_ppl(doc: dict) -> str:
     model = doc.get("model_name", "unknown")
     ts = doc.get("timestamp", "")
-    corpus = doc.get("corpus", "—")
-    stride = doc.get("stride", "—")
-    max_len = doc.get("max_length", "—")
-    gpu = doc.get("gpu", "—")
+    corpus = doc.get("corpus", "; ")
+    stride = doc.get("stride", "; ")
+    max_len = doc.get("max_length", "; ")
+    gpu = doc.get("gpu", "; ")
     results = doc.get("results", {})
 
     if not results:
-        return f"### {model} perplexity — no results\n"
+        return f"### {model} perplexity ;  no results\n"
 
     lines = [
         f"### Perplexity: {model}",
@@ -182,7 +182,7 @@ def _render_ppl(doc: dict) -> str:
         if r is None:
             continue
         if "error" in r:
-            lines.append(f"| {mode} | ERROR | — | — | — | — |")
+            lines.append(f"| {mode} | ERROR | ;  | ;  | ;  | ;  |")
             continue
         ppl_delta = ""
         if mode != "fp16" and "fp16" in results and "ppl" in results["fp16"]:

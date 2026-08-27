@@ -957,7 +957,7 @@ EngineChoice resolve_engine(const ModelProbe& probe, bool cuda_available, bool m
       // cause. Say what is actually wrong instead.
       if (!probe.is_safetensors_dir) {
         throw std::runtime_error(
-            "Qwen3.5 on CPU needs the HuggingFace model directory, not a .ll2c container -- "
+            "Qwen3.5 on CPU needs the HuggingFace model directory, not a .ll2c container: "
             "the CPU reference engine reads config.json and safetensors directly. Point it at "
             "the model directory, or drop --cpu to use the GPU engine, which does read .ll2c.");
       }

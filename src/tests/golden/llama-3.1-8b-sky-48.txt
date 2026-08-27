@@ -1,7 +1,7 @@
 # Golden greedy stream for Llama-3.1-8B-Instruct, from the CUDA backend.
 #
 # A FOURTH model family, and the plainest one: no QKV bias, no QK-norm, SwiGLU,
-# rope_theta = 500000. Nothing exotic -- which is exactly why it is worth testing. It
+# rope_theta = 500000. Nothing exotic; which is exactly why it is worth testing. It
 # was assumed to work because it shares the uniform-geometry path, and an assumption is
 # not a result.
 #

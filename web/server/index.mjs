@@ -56,7 +56,7 @@ app.get("/metrics", (_req, res) => {
   res.send(obsMetrics.render());
 });
 
-// -- admin-surface auth --
+//; admin-surface auth;
 // The admin surface can download models to arbitrary dirs, launch quant jobs and
 // walk the host filesystem, so it is never served to a non-local client without
 // auth. Three layers: the server binds loopback by default (config.host); these
@@ -118,7 +118,7 @@ app.use((req, res, next) => {
   });
 });
 
-// -- public-demo hardening (only when getRuntimeConfig().demoMode is on) --
+//; public-demo hardening (only when getRuntimeConfig().demoMode is on);
 // Demo mode refuses the admin surface for everyone (token or not) and
 // rate-limits generation per IP. Generation size is clamped at the handlers,
 // since it is a request field not a route.
@@ -181,10 +181,10 @@ app.get("/openapi.yaml", (_req, res) => {
 
 // Kubernetes probes. Registered before the SPA catch-all so they aren't shadowed.
 // Liveness: the process is up and serving HTTP (do NOT gate on the model, so a slow
-// model load never triggers a liveness kill -- the startupProbe covers that window).
+// model load never triggers a liveness kill; the startupProbe covers that window).
 app.get("/healthz/live", (_req, res) => res.status(200).send("ok"));
 // Readiness: the model is actually loaded/warmed into the worker. Gating traffic on
-// this is what makes serving production-grade -- the Service never routes to a cold
+// this is what makes serving production-grade; the Service never routes to a cold
 // pod, so clients never see cold-start latency or 503s during scale-up / rollouts.
 app.get("/healthz/ready", (_req, res) => {
   const warm = Boolean(interactiveWorker && interactiveWorker.ready) && getRuntimeConfig().ready;
@@ -963,7 +963,7 @@ function buildCliArgs(config, body) {
   const longFormMode = isTruthyFlag(body.longFormMode);
   // Reasoning ("thinking") mode: the model emits a reasoning block before its
   // answer, which the stream splitter separates out. Driven by the descriptor the
-  // model ships (profile.reasoning, read from its manifest / cpi.json sidecar) --
+  // model ships (profile.reasoning, read from its manifest / cpi.json sidecar);
   // "always" reasons unconditionally, "optional" honours the request flag, "none"
   // never reasons. Reasoning is a property of the model, not of the template.
   const reasoningCap = selectedProfile?.reasoning ?? {
@@ -1672,7 +1672,7 @@ function batchWorkerEnabled() {
 // The surviving rule is per-family, not per-engine: a recurrent/delta-net model (qwen3_5) carries
 // per-sequence state the batched scheduler does not multiplex, and MoE/streamed-weight profiles
 // have their own reasons. That lives in NON_BATCH_FAMILIES/profileBatchable in config.mjs, which
-// is what actually enforces it -- a NON_CPI_ENGINE_FAMILIES alias sat here unused.
+// is what actually enforces it; a NON_CPI_ENGINE_FAMILIES alias sat here unused.
 
 function isBatchCompatible(cliConfig) {
   const p = cliConfig.profile || {};
@@ -1750,7 +1750,7 @@ async function getBatchWorker(config, cliConfig) {
   // Respawning (profile change, or a dead worker): force-kill the old process and
   // wait for it to fully exit before launching the new one, so its single-instance
   // mutex + GPU memory are released (otherwise the new worker dies with exit
-  // code 3 -- "another instance is already running").
+  // code 3; "another instance is already running").
   if (batchWorker) {
     const old = batchWorker;
     batchWorker = null;
@@ -1761,7 +1761,7 @@ async function getBatchWorker(config, cliConfig) {
   // The batched path is always fully GPU-resident (--gpu-cache-all), so the host
   // RAM it "uses" is mostly the reclaimable mmap of the weights. The host
   // memory/CPU throttle would otherwise fire (weights push system RAM past the
-  // 85% default) and sleep between decode steps -- a ~10x decode slowdown for no
+  // 85% default) and sleep between decode steps; a ~10x decode slowdown for no
   // real benefit. Lift host resource limits for the batch worker.
   const args = toBatchArgs(buildInteractiveLaunchArgs(config, { ...cliConfig, noResourceLimits: true }));
   batchWorker = createBatchWorker({
@@ -1832,7 +1832,7 @@ async function warmupProfileWorker(config, profileId, options = {}) {
 }
 
 // Startup warm for the default (batch) path. Warms the batch worker rather than
-// the single-flight engine so only one copy of the model resides in VRAM -- both
+// the single-flight engine so only one copy of the model resides in VRAM; both
 // would be ~2x and OOM large models. Non-batchable default profiles (qwen3_5,
 // quantized, MoE, grammar-only, …) fall back to warming single-flight. Uses the
 // same buildWorkerCliConfig as the single-flight warm so the worker key matches
@@ -2229,7 +2229,7 @@ function guardReady(config, res) {
 
 // Map a worker error message to an OpenAI-style status/type/code. A prompt that
 // exceeds the model context window is a client error (400 context_length_exceeded),
-// not a server fault -- the engine now rejects it with a clear message instead of
+// not a server fault; the engine now rejects it with a clear message instead of
 // crashing (see llama_engine generate_stream bounds guard). Over-capacity is 503.
 function classifyWorkerError(msg) {
   const m = String(msg || "");
@@ -2246,7 +2246,7 @@ function classifyWorkerError(msg) {
 // The interactive worker, `activeRequest`, and `worker.pending` are all single-
 // slot, so at most one generation may run at a time. Every generation funnels
 // through runGeneration, which acquires a slot here; concurrent requests queue
-// FIFO and run serially (correct -- latency stacks) instead of racing into the
+// FIFO and run serially (correct; latency stacks) instead of racing into the
 // worker and clobbering each other's response slot (the old check-then-act
 // guardOpenAiIdle let two idle-arriving requests both pass). Bounded depth gives
 // backpressure: past the cap, acquisition rejects and the route returns 503.
@@ -2355,7 +2355,7 @@ async function guardOpenAiIdle(
   // Serialization + backpressure now live in the single-flight engine queue
   // (acquireEngineSlot in runGeneration): concurrent requests queue FIFO and run
   // one at a time; past the depth cap, acquisition rejects and the route returns
-  // 503. So there is no idle-wait / engine_busy 409 here -- admit and let the
+  // 503. So there is no idle-wait / engine_busy 409 here; admit and let the
   // queue order it. (waitForIdleMs is retained in the signature but unused.)
   void waitForIdleMs;
   return true;
@@ -3287,7 +3287,7 @@ app.post("/v1/embeddings", async (req, res) => {
     sendOpenAiError(
       res,
       503,
-      `embeddings unavailable -- cpi_embed not found at ${status.binary}. ` +
+      `embeddings unavailable; cpi_embed not found at ${status.binary}. ` +
         "Build CPI's CUDA target or set EMBED_BIN; the embed worker must be started.",
       { type: "server_error", code: "embeddings_unavailable" }
     );
@@ -3991,7 +3991,7 @@ app.listen(runtimeConfig.port, runtimeConfig.host, () => {
       console.log("[cpi] non-loopback bind: admin endpoints require the configured bearer token");
     } else {
       console.warn(
-        "[cpi] WARNING: bound to a non-loopback interface with no adminToken -- the inference " +
+        "[cpi] WARNING: bound to a non-loopback interface with no adminToken: the inference " +
           "API is reachable from the network; admin endpoints will refuse non-local clients. " +
           "Set CPI_ADMIN_TOKEN to use them remotely, or bind host=127.0.0.1."
       );
@@ -4011,7 +4011,7 @@ app.listen(runtimeConfig.port, runtimeConfig.host, () => {
       ? warmupBatchWorker(runtimeConfig, { maxContext: runtimeConfig.maxContext })
       : warmupProfileWorker(runtimeConfig);
     warmStart
-      .then(() => console.log("[cpi] model warm -- readiness will pass"))
+      .then(() => console.log("[cpi] model warm: readiness will pass"))
       .catch((err) => console.warn(`[cpi] startup warm failed: ${err?.message || String(err)}`));
   }
   const emb = embedStatus(runtimeConfig);
@@ -4019,7 +4019,7 @@ app.listen(runtimeConfig.port, runtimeConfig.host, () => {
     console.log(`[cpi] embeddings: enabled (bge-small) bin=${emb.binary}`);
   } else {
     console.log(
-      `[cpi] embeddings: DISABLED (cpi_embed not found at ${emb.binary}) -- RAG/folder-search will 503. ` +
+      `[cpi] embeddings: DISABLED (cpi_embed not found at ${emb.binary}); RAG/folder-search will 503. ` +
         "Build the CUDA target or set EMBED_BIN."
     );
   }

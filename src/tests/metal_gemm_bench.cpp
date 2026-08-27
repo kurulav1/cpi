@@ -232,8 +232,8 @@ int main(int argc, char** argv) {
 
     const double flop = 2.0 * T * s.out_dim * s.in_dim * reps;
     if (worst > 0.2) {
-      std::printf("  %-20s  WRONG (max|d|=%.3g over 128 spot checks) -- no timing reported\n",
-                  s.name, worst);
+      std::printf("  %-20s  WRONG (max|d|=%.3g over 128 spot checks): no timing reported\n", s.name,
+                  worst);
       ++failures;
       continue;
     }

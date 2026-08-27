@@ -14,7 +14,7 @@ For background on the system being benchmarked, see [research.md](research.md).
 cmake --preset cpu-release
 cmake --build --preset cpu-release
 
-# 2. Throughput sweep (fp16, context 128–4096)
+# 2. Throughput sweep (fp16, context 128-4096)
 python tools/bench_sweep.py `
     --model artifacts/mymodel.ll2c `
     --tokenizer artifacts/mymodel/hf/tokenizer.json `
@@ -42,7 +42,7 @@ doesn't is not comparable and should not be quoted.
 
 1. **Interleave the runs.** The GPU throttles over a session (boost clocks
    drift ±6% within minutes on the reference box). Run A, B, A, B in one
-   sitting -- never compare numbers taken in different sessions.
+   sitting; never compare numbers taken in different sessions.
 2. **Mind the timer scope.** `llama-bench` excludes sampling from its tok/s;
    CPI's `--benchmark` includes it. Reported ratios leave this in (it slightly
    flatters llama.cpp on decode); if you need it out, measure the sampler
@@ -230,22 +230,22 @@ python tools/ci/kernel_perf_gate.py            # gate; nonzero exit on regressio
 
 - Each shape is measured **best-of-N** (`--repeat`, default 3); the max over
   runs is the least clock/thermal/contention-perturbed estimate.
-- **Run with the GPU idle** (stop the web server) -- a co-resident model adds
+- **Run with the GPU idle** (stop the web server); a co-resident model adds
   contention/clock noise that inflates false positives.
 - Per-bench tolerance: `int4_gemv` 12% (rock-stable across independent
-  windows -- a real, tight gate, and the load-bearing decode signal),
+  windows; a real, tight gate, and the load-bearing decode signal),
   `attention_decode` 50% (a **coarse** gate). The attention microbench has a
   ~40-45% run-to-run *noise floor* on a consumer WDDM GPU: best-of-N absorbs
   drift within a capture window but not the GPU-temperature difference between a
   baseline and a gate run minutes later. So the attention gate catches only
-  gross (2-10x) regressions -- a fallback kernel, wrong head_dim path, disabled
+  gross (2-10x) regressions; a fallback kernel, wrong head_dim path, disabled
   coarsening; for a tight attention signal, run the microbench standalone on an
   idle, thermally-steady GPU and read %-of-roofline directly. Override the
   tolerance for all benches with `--tolerance`.
 
 The refactors that share the sampler and decode loop across engines touch only
-host-side orchestration -- the CUDA kernels and the LlamaEngine forward are
-byte-identical -- so these kernel numbers are unchanged by construction; the gate
+host-side orchestration; the CUDA kernels and the LlamaEngine forward are
+byte-identical, so these kernel numbers are unchanged by construction; the gate
 is what keeps them that way going forward.
 
 ---
@@ -286,10 +286,10 @@ Date: 20260524T200838Z &nbsp;|&nbsp; GPU: NVIDIA GeForce RTX 5090 &nbsp;|&nbsp; 
 
 | Path | Context | fp16 tok/s | int8 tok/s | int8 speedup | int4 tok/s | int4 speedup |
 |------|--------:|-----------:|-----------:|-------------:|-----------:|-------------:|
-| CUDA | 128 | 58.27 | -- | -- | -- | -- |
-| CUDA | 512 | 58.05 | -- | -- | -- | -- |
-| CUDA | 2,048 | 58.66 | -- | -- | -- | -- |
-| CUDA | 4,096 | 58.02 | -- | -- | -- | -- |
+| CUDA | 128 | 58.27 |; |; |; |; |
+| CUDA | 512 | 58.05 |; |; |; |; |
+| CUDA | 2,048 | 58.66 |; |; |; |; |
+| CUDA | 4,096 | 58.02 |; |; |; |; |
 
 ### Sweep: Llama-3.1-8B-Instruct
 

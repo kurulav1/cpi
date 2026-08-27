@@ -253,7 +253,7 @@ int main(int argc, char** argv) {
       // anywhere is a failure no later luck can hide.
       std::printf(
           "\n  Metal diverges from CUDA at token %zu of %zu (metal=%d cuda=%d)"
-          " -- re-checking every position against the golden prefix\n",
+          ": re-checking every position against the golden prefix\n",
           agree, n, m_out[agree], golden[agree]);
 
       std::vector<int> ctx = prompt;

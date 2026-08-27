@@ -142,7 +142,7 @@ const DEFAULT_RUNTIME = Object.freeze({
   adminToken: "",
   // "admin" (default): the token guards only the admin surface; inference is
   // open. "all": the token is required on every /api and /v1 route except
-  // /api/health -- for exposing the server where unauthenticated compute is
+  // /api/health; for exposing the server where unauthenticated compute is
   // not acceptable. "all" requires adminToken to be set (enforced at startup).
   authScope: "admin",
   template: "tinyllama",
@@ -585,7 +585,7 @@ function buildQuantState(modelPath, extraArgs, { isSafetensorsDir = false, famil
   // Engines that quantize weights at load (--weight-quant), needing no LL2C conversion.
   // That is the plan executor's capability, not one model's: it serves Gemma 4 (from a
   // .cpi container or a safetensors directory) and Qwen3.5 alike. Keying this on
-  // "qwen3_5 + safetensors" reported Gemma as having no quantized variants at all --
+  // "qwen3_5 + safetensors" reported Gemma as having no quantized variants at all;
   // while we run it at int8/int4 daily.
   const isCpi = String(modelPath || "").toLowerCase().endsWith(".cpi");
   const nativeRuntimeQuant =
@@ -1056,7 +1056,7 @@ function inferProfileFamily(modelPath, hfConfig) {
     return "qwen";
   }
   // DeepSeek-V2 (native MLA + fine-grained MoE) runs natively on the op-plan engine
-  // from the safetensors dir -- its own family, like gemma4/qwen3_5/llama4.
+  // from the safetensors dir; its own family, like gemma4/qwen3_5/llama4.
   if (modelType.includes("deepseek_v2") || rootModelType.includes("deepseek_v2")) {
     return "deepseek_v2";
   }
@@ -1102,7 +1102,7 @@ function inferTemplate(modelPath, tokenizerPath, fallbackTemplate, hfConfig, hfT
   }
 
   // Qwen3 dense runs on LlamaEngine (batch-compatible) and uses the "qwen3"
-  // template -- ChatML with a thinking toggle (off by default). Force it here,
+  // template; ChatML with a thinking toggle (off by default). Force it here,
   // before the chat_template sniff below, which would misread Qwen3's <think>
   // template as the qwen3_5 (mixed-attention fork) template.
   const mt = String(hfConfig?.modelType || "").toLowerCase();
@@ -1113,7 +1113,7 @@ function inferTemplate(modelPath, tokenizerPath, fallbackTemplate, hfConfig, hfT
   }
 
   // DeepSeek-V2 (native MLA + fine-grained MoE, e.g. DeepSeek-V2-Lite) uses a plain
-  // User:/Assistant: text template with the U+FF5C sentence tokens -- distinct from
+  // User:/Assistant: text template with the U+FF5C sentence tokens; distinct from
   // DeepSeek-R1's <｜User｜>/<｜Assistant｜> reasoning format. Key on model_type so it
   // doesn't fall through to the llama4 safetensors default below.
   if (mt.includes("deepseek_v2") || rmt.includes("deepseek_v2")) {
@@ -1210,7 +1210,7 @@ function scoreTokenizerCandidate(modelPath, tokenizerPath) {
       score += 32;
     }
   } else if (family === "llama3") {
-    // LLaMA-3 uses tiktoken/BPE (tokenizer.json) -- .model files are invalid
+    // LLaMA-3 uses tiktoken/BPE (tokenizer.json); .model files are invalid
     if (tokenizerExt === ".json") score += 40;
     if (tokenizerExt === ".model") score -= 50;
     if (
@@ -1245,7 +1245,7 @@ function chooseTokenizer(modelPath, tokenizerCandidates, preferredTokenizerPath)
     // Honor an explicitly-configured tokenizer only when it plausibly belongs to
     // this model. Otherwise (e.g. CPI_TOKENIZER_PATH left pointing at the default
     // model's tokenizer while CPI_MODEL_PATH names a different-family model) it
-    // would force the wrong chat template + stop tokens onto the model -- which
+    // would force the wrong chat template + stop tokens onto the model; which
     // silently breaks stopping (the model runs to max_new and spills special-token
     // text). In that case fall through to scoring the co-located candidates.
     const modelDir = isSafetensorsModelDir(modelPath) ? modelPath : path.dirname(modelPath);
@@ -1312,7 +1312,7 @@ function discoverSafetensorsModelDirs(scanRoots) {
 }
 
 // A model's reasoning ("thinking") capability is a descriptor that ships with the
-// model -- the core holds no per-model knowledge and never names a model. It is read
+// model; the core holds no per-model knowledge and never names a model. It is read
 // from, in order:
 //   1. a .cpi model's sibling .manifest, line:  CFGJSON reasoning {…}
 //   2. a `cpi.json` sidecar in the model's directory:  { "reasoning": {…} }
@@ -1330,7 +1330,7 @@ function discoverSafetensorsModelDirs(scanRoots) {
 //            (Gemma's <|channel> tokens are `special` and dropped by default; Qwen's
 //            </think> is non-special text and survives, so it needs none).
 // primeOn/primeOff are appended to the chat descriptor's generationPrompt (a
-// reasoning model's <think> opener) -- so the prime lives with reasoning, not in
+// reasoning model's <think> opener), so the prime lives with reasoning, not in
 // the chat template.
 const NO_REASONING = {
   mode: "none", enable: "", open: "", close: "", markers: [], primeOn: "", primeOff: ""
@@ -1380,7 +1380,7 @@ export function readModelReasoning(modelPath) {
 }
 
 // Does this model ship a vision tower? Read from the model itself (config.json's
-// vision_config), not from its name -- same principle as reasoning and chat: the model
+// vision_config), not from its name; same principle as reasoning and chat: the model
 // declares its capabilities, the core just reads them.
 //
 // Only a HuggingFace safetensors directory can carry one today; a .cpi container's
@@ -1396,7 +1396,7 @@ export function readModelVision(modelPath) {
     const v = cfg?.vision_config;
     if (!v || !v.hidden_size || !v.patch_size) return null;
     // A vision_config alone is not enough: the capability must be one the engine can
-    // actually run. Only the Gemma 4 vision tower is implemented today -- Qwen3.5 also
+    // actually run. Only the Gemma 4 vision tower is implemented today; Qwen3.5 also
     // ships a vision_config, and reporting it as supported would offer an attach button
     // that then fails at generation time.
     const arch = String(
@@ -1422,14 +1422,14 @@ export function readModelChat(modelPath) {
 }
 
 // Families that run on their own engine rather than LlamaEngine's batched path.
-// (Shared with index.mjs's isBatchCompatible, which adds the request-level checks --
+// (Shared with index.mjs's isBatchCompatible, which adds the request-level checks;
 // thinking, runtime quantization, images. One source of truth for the profile-level part.)
 export const NON_BATCH_FAMILIES = new Set(["qwen3_5", "llama4", "cpt_gpt", "gemma4", "deepseek_v2"]);
 
 // Can this model ever use continuous batching? Request-level reasons to fall back to
 // single-flight (thinking, images, runtime quant) are checked separately.
-// Which GPU backend cpi will pick. The server had no notion of this -- the only
-// platform test in it was `process.platform === "win32"` -- so every backend-specific rule was
+// Which GPU backend cpi will pick. The server had no notion of this; the only
+// platform test in it was `process.platform === "win32"`, so every backend-specific rule was
 // written for CUDA and silently applied to Apple Silicon as well.
 //
 // Apple Silicon implies Metal: there is no CUDA on darwin/arm64, and main.cpp's resolve_engine
@@ -1451,7 +1451,7 @@ export function profileBatchable(profile) {
 }
 
 // What this model can and cannot do, as data. The UI renders it directly rather than
-// re-deriving the rules -- capabilities live in one place, next to the code that enforces
+// re-deriving the rules; capabilities live in one place, next to the code that enforces
 // them.
 export function profileCapabilities(profile) {
   const reasoningMode = profile?.reasoning?.mode ?? "none";
@@ -1497,7 +1497,7 @@ function buildProfile(modelPath, tokenizerPath, baseConfig, source = "discovered
   const isSafetensorsDir = isSafetensorsModelDir(modelPath);
   const supportsCptGpt = isSafetensorsDir && family === "cpt_gpt";
   // Gemma 4 loads natively from a safetensors directory now (that is also the only
-  // container that still carries its vision tower -- the .cpi converter strips it), so it
+  // container that still carries its vision tower; the .cpi converter strips it), so it
   // no longer "needs conversion".
   const supportsNativeSafetensors =
     isSafetensorsDir &&

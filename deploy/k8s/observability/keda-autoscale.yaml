@@ -3,7 +3,7 @@
 # Signal = aggregate request rate (cpi_http_requests_total). CPI is single-stream:
 # it serves one generation at a time and returns 409 engine_busy on concurrent
 # requests (no continuous batching). So the load signal that matters is *demand
-# rate* -- when requests arrive faster than one replica can drain them, add
+# rate*; when requests arrive faster than one replica can drain them, add
 # replicas and let the Service spread them. (The most precise signal would be the
 # 409 backpressure rate, rate(cpi_http_requests_total{status="409"}); request
 # rate is the simpler proxy used here.)
@@ -36,7 +36,7 @@ spec:
   # CPI's /v1/completions waits-for-idle on a busy worker (it does not fast-reject);
   # concurrent generations therefore pile up as in-flight (1 generating + N waiting).
   # So in-flight count == queue depth == the true saturation signal. (Verified: 8
-  # concurrent generations -> ok=29, busy409=0 over 45s -- they queued, not rejected.)
+  # concurrent generations -> ok=29, busy409=0 over 45s; they queued, not rejected.)
   triggers:
     # Primary: queue depth / concurrency. Target ~1 in-flight per replica: when more
     # than one request is outstanding, a single-stream replica is already saturated.

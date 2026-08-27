@@ -204,7 +204,7 @@ def main() -> None:
             attn_layer = i
             break
     if attn_layer is None:
-        raise ValueError("no layer has attention.wq -- cannot infer the attention geometry")
+        raise ValueError("no layer has attention.wq: cannot infer the attention geometry")
     # bit 6: q_proj emits [q|gate] per head, so its rows are 2*heads*head_dim. Halve before
     # inferring head_dim, or the k/v check fails on a perfectly well-formed container.
     attn_output_gate = bool(locals().get("flags", 0) & 64)

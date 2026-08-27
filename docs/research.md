@@ -4,8 +4,8 @@
 
 CPI is a local LLM inference engine designed around two goals: portability and
 performance. It provides a single binary (`cpi`) that runs on any x86
-machine -- falling back to a multithreaded CPU path when no CUDA device is
-present -- and a CUDA path that leverages custom kernels and post-training
+machine; falling back to a multithreaded CPU path when no CUDA device is
+present, and a CUDA path that leverages custom kernels and post-training
 quantization to push decode throughput on consumer and datacenter GPUs. A
 Node.js API layer exposes an OpenAI-compatible REST interface, enabling
 drop-in integration with standard tooling. A React web UI and Python-based
@@ -18,8 +18,8 @@ conversion/evaluation tools complete the pipeline.
 Most open-source LLM inference stacks require either a GPU (vLLM, TensorRT-LLM)
 or accept substantial CPU performance penalties as a side-effect of portability
 (llama.cpp). CPI takes a different approach: it maintains **two separate,
-optimized code paths** -- one targeting AVX2/AVX-512 CPU execution and one
-targeting NVIDIA CUDA -- selected automatically at runtime based on available
+optimized code paths**; one targeting AVX2/AVX-512 CPU execution and one
+targeting NVIDIA CUDA; selected automatically at runtime based on available
 hardware. This means the same model artifact and binary can be deployed on a
 laptop or a datacenter node without reconfiguration.
 
@@ -67,7 +67,7 @@ Why the split, honestly:
   executor, and pretending otherwise would be spin.
 - **The CPU engines are oracles, not products.** They are simple, independently
   derived implementations used to gate the GPU paths. Folding them into the IR
-  would make them share the executor's bugs, which defeats their purpose -- a
+  would make them share the executor's bugs, which defeats their purpose; a
   parity oracle that inherits the engine's mistake once made a real GPU fix
   look like a regression here.
 - **`Llama4CudaEngine` predates op-plan MoE** and exists for per-layer expert
@@ -87,7 +87,7 @@ instantiates the appropriate engine class.
 
 `.ll2c` is a compact binary container for model tensors. Unlike GGUF it carries
 all quantization variants in a single file: an fp16 base plus optional appended
-int8 and int4 weight tables. The header (V1–V5) encodes architecture
+int8 and int4 weight tables. The header (V1-V5) encodes architecture
 hyperparameters (hidden size, number of layers, RoPE theta, MoE topology) so
 the runtime does not need a separate config file.
 
@@ -112,11 +112,11 @@ hand-rolled against its own kernel infrastructure.
 
 **Custom CUDA kernels** (`src/kernels/`):
 
-- `kernels_weight_only_matvec.cu` -- weight-dequant + fp16 GEMM for MLP layers
-- `kernels_attention_decode.cu` -- fused multi-head attention for decode (cached KV)
-- `kernels_attention_decode_int4.cu` -- int4 KV-cache variant
-- `kernels_turboquant.cu` -- packing/unpacking helpers
-- `kernels_ops_matvec.cu` -- general-purpose fp16 matmul
+- `kernels_weight_only_matvec.cu`; weight-dequant + fp16 GEMM for MLP layers
+- `kernels_attention_decode.cu`; fused multi-head attention for decode (cached KV)
+- `kernels_attention_decode_int4.cu`; int4 KV-cache variant
+- `kernels_turboquant.cu`; packing/unpacking helpers
+- `kernels_ops_matvec.cu`; general-purpose fp16 matmul
 
 ### KV Cache
 
@@ -156,22 +156,22 @@ This is the recommended path for architecture experimentation.
 
 ## Key Technical Contributions
 
-1. **Unified CPU/CUDA binary** -- single build artifact, hardware-adaptive at
+1. **Unified CPU/CUDA binary**; single build artifact, hardware-adaptive at
    runtime, no separate CPU and GPU distributions.
 
-2. **`.ll2c` multi-quantization container** -- fp16 + int8 + int4 in one file
+2. **`.ll2c` multi-quantization container**; fp16 + int8 + int4 in one file
    with a versioned header; eliminates the need to manage separate model files
    per quantization level.
 
-3. **Warm interactive worker protocol** -- NDJSON over stdin/stdout turns a
+3. **Warm interactive worker protocol**; NDJSON over stdin/stdout turns a
    CLI inference binary into a stateful streaming server without any IPC
    framework dependency.
 
-4. **Resource-limit safety valves** -- the server monitors host CPU and RAM
+4. **Resource-limit safety valves**; the server monitors host CPU and RAM
    during generation and aborts runaway runs, making it safe to deploy on
    shared hardware.
 
-5. **CPT architecture support** -- a Python-level plugin path lets new
+5. **CPT architecture support**; a Python-level plugin path lets new
    architectures be served immediately through the REST API before a native
    C++ engine is written.
 
@@ -196,25 +196,25 @@ This is the recommended path for architecture experimentation.
 
 ## Related Work
 
-- **llama.cpp** ([Gerganov 2023](https://github.com/ggerganov/llama.cpp)) --
+- **llama.cpp** ([Gerganov 2023](https://github.com/ggerganov/llama.cpp));
   the dominant CPU-focused inference stack. CPI targets a different tradeoff:
   native CUDA kernels over cross-platform GGML, and a first-class HTTP server
   over a CLI-centric workflow.
 
-- **vLLM** ([Kwon et al. 2023](https://arxiv.org/abs/2309.06180)) -- paged KV
+- **vLLM** ([Kwon et al. 2023](https://arxiv.org/abs/2309.06180)); paged KV
   cache and continuous batching for high-throughput multi-user serving. CPI
   targets single-user local deployment rather than multi-tenant throughput.
 
-- **TensorRT-LLM** (NVIDIA 2023) -- production GPU inference with extensive
+- **TensorRT-LLM** (NVIDIA 2023); production GPU inference with extensive
   quantization support. Requires NVIDIA hardware and a complex build environment;
   CPI prioritizes portability and simplicity.
 
-- **GPTQ** ([Frantar et al. 2022](https://arxiv.org/abs/2210.17323)) -- the
+- **GPTQ** ([Frantar et al. 2022](https://arxiv.org/abs/2210.17323)); the
   weight quantization algorithm CPI's int4 path is conceptually related to.
   CPI uses a simpler MSE-based calibration without the full GPTQ Hessian
   computation.
 
-- **AWQ** ([Lin et al. 2023](https://arxiv.org/abs/2306.00978)) -- activation-
+- **AWQ** ([Lin et al. 2023](https://arxiv.org/abs/2306.00978)); activation-
   aware weight quantization. CPI's quantization does not yet incorporate
   activation-aware scaling.
 

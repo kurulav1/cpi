@@ -3,7 +3,7 @@
 
 Why this exists: convert_hf_to_bins.py + pack_ll2c.py each buffer the *entire*
 model in RAM (the `extracted` / `blobs_by_name` dicts) and write a full fp16
-intermediate. For a 32B model that is ~65 GB of RAM and ~65 GB of extra disk --
+intermediate. For a 32B model that is ~65 GB of RAM and ~65 GB of extra disk;
 impossible on a 32 GB / disk-tight machine. This tool processes one tensor at a
 time and writes the final container in a single pass, so peak RAM is ~one
 tensor and peak disk is HF + the (smaller) output, with no fp16 intermediate.
@@ -15,7 +15,7 @@ to running those two tools with --emit-streaming-int4 --omit-fp16-layer-tensors.
 MLP weights (feed_forward.w1/w2/w3) are packed to int4 + per-row fp32 scales;
 the fp16 copies are omitted. Everything else (embeddings, attention, norms,
 lm_head, biases) is stored fp16, exactly as the engine's int4 streaming path
-expects -- it quantizes the fp16 attention projections at load time.
+expects; it quantizes the fp16 attention projections at load time.
 """
 
 import argparse

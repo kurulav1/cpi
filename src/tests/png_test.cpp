@@ -47,7 +47,7 @@ int main(int argc, char** argv) {
     const auto png_bytes = read_file(png);
     const auto expect = read_file(raw);
     if (png_bytes.empty() || expect.empty()) {
-      std::printf("  [skip] %-14s (fixture missing -- run tools/make_png_fixtures.py)\n", c.first);
+      std::printf("  [skip] %-14s (fixture missing: run tools/make_png_fixtures.py)\n", c.first);
       continue;
     }
     ++ran;
@@ -78,7 +78,7 @@ int main(int argc, char** argv) {
   }
 
   if (ran == 0) {
-    std::printf("\nno fixtures found -- run: python tools/make_png_fixtures.py\n");
+    std::printf("\nno fixtures found: run: python tools/make_png_fixtures.py\n");
     return 2;
   }
   std::printf("\n%s\n", failures == 0

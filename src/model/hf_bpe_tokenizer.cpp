@@ -859,7 +859,7 @@ std::string HfBpeTokenizer::merge_key(const std::string& left, const std::string
 }
 
 // Splits `text` into individual UTF-8 code-point strings.  Each element of the
-// returned vector holds exactly one Unicode code point (1–4 bytes).
+// returned vector holds exactly one Unicode code point (1-4 bytes).
 //
 // The function examines the high bits of each leading byte to determine the
 // code point width according to the UTF-8 encoding rules.  If the leading byte

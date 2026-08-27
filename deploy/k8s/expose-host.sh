@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Publish in-cluster services to the Windows host via tiny socat proxy containers on
 # the kind docker network. Survives Docker/session restarts (--restart unless-stopped)
-# and reconnects per-connection (fork) -- no kubectl port-forward to keep alive.
+# and reconnects per-connection (fork); no kubectl port-forward to keep alive.
 export PATH="$HOME/.local/bin:$PATH"
 export DOCKER_CONFIG=/tmp/dockercfg; mkdir -p "$DOCKER_CONFIG"; echo '{}' > "$DOCKER_CONFIG/config.json"
 

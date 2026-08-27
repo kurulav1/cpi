@@ -3,7 +3,7 @@
 # THIS GOLDEN EXISTS FOR ITS PROMPT LENGTH, NOT ITS OUTPUT.
 #
 # Every other golden here has a 10-12 token prompt. That is below kGemmMinTokens (16), the
-# point at which the Metal backend's prefill switches from the GEMV to cpi_gemm_f16 -- so no
+# point at which the Metal backend's prefill switches from the GEMV to cpi_gemm_f16, so no
 # golden in this directory had ever executed that kernel. It was, meanwhile, the most heavily
 # benchmarked kernel in the engine.
 #
@@ -13,7 +13,7 @@
 # a kernel that skips half its writes is not slower, it is faster.
 #
 # So: 86 tokens. Above the threshold, and deliberately NOT a multiple of GEMM_BN (64), so the
-# prefill covers a full tile plus a 22-token remainder -- the padded partial tile is where the
+# prefill covers a full tile plus a 22-token remainder; the padded partial tile is where the
 # masking and the bounds checks actually get tested.
 #
 # If you add goldens, note that the number in the filename is the GENERATED length; the prompt

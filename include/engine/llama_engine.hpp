@@ -754,7 +754,7 @@ private:
                      cudaStream_t stream, bool reuse_x = false);
 
   // A captured batched decode step. The graph is only valid for the shapes that
-  // fixed its grids, so it is keyed on them and re-captured when any changes --
+  // fixed its grids, so it is keyed on them and re-captured when any changes;
   // batch size above all, which moves every grid in the step. Held as void* so
   // the header does not need the CUDA graph types.
   void* batch_graph_exec_ = nullptr;

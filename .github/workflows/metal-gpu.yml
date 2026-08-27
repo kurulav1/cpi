@@ -4,13 +4,13 @@
 # MTLCreateSystemDefaultDevice() returns nil, so the kernels there are type-checked and
 # linked but never executed. This workflow is the one that actually runs them.
 #
-# It needs a self-hosted runner with a Metal device. Note that "VM" is not the blocker --
+# It needs a self-hosted runner with a Metal device. Note that "VM" is not the blocker;
 # GPU-less is. Tart (https://tart.run) VMs expose a real paravirtual MTLDevice, so a
 # Tart-based ephemeral runner works and is the recommended setup; a plugged-in Mac mini
 # with the runner agent works too.
 #
 # Inert until a runner exists. A job that targets a self-hosted label with no matching
-# runner does not fail -- it queues forever and hangs every PR. So this is gated on a repo
+# runner does not fail; it queues forever and hangs every PR. So this is gated on a repo
 # variable: it is skipped entirely until you set HAS_METAL_RUNNER=true
 # (Settings -> Secrets and variables -> Actions -> Variables). Until then this file costs
 # nothing and blocks nothing.
@@ -21,7 +21,7 @@
 #   1. Register the runner with labels: self-hosted, macOS, ARM64, metal-gpu
 #   2. Put the .ll2c checkpoints somewhere on it and point METAL_MODELS_DIR at them.
 #      Goldens whose checkpoint is missing are skipped loudly, so a runner with only the
-#      small models is still worth having -- it just covers less.
+#      small models is still worth having; it just covers less.
 #   3. Set the HAS_METAL_RUNNER variable to true.
 
 name: Metal GPU
@@ -47,12 +47,12 @@ jobs:
     name: Metal kernels on real hardware
     # Two conditions, and the second is a security control, not a nicety.
     #
-    # HAS_METAL_RUNNER: a job targeting an absent self-hosted label does not fail -- it
+    # HAS_METAL_RUNNER: a job targeting an absent self-hosted label does not fail; it
     # queues forever and hangs every PR. So this file stays inert until the hardware exists.
     #
     # The fork check: this repository is public, and a self-hosted runner executes whatever
     # the workflow says on your machine. Without this, anyone could fork the repo, open a PR
-    # touching CMakeLists.txt (or this file), and run arbitrary code on the Mac -- as the
+    # touching CMakeLists.txt (or this file), and run arbitrary code on the Mac; as the
     # user who owns it, inside your network. GitHub's own guidance is to not put self-hosted
     # runners on public repos for exactly this reason. Restricting to PRs whose head is this
     # same repository means fork PRs never reach the runner; your own branches still do.
@@ -86,7 +86,7 @@ jobs:
       - name: Verify Metal kernels
         # --require-gpu: this runner exists to exercise the GPU, so a missing Metal device
         # is a misconfigured host, not a skip. Without it the job would go green having
-        # verified nothing -- the exact failure mode this workflow exists to prevent.
+        # verified nothing; the exact failure mode this workflow exists to prevent.
         run: ./tools/metal_verify.sh --build build --require-gpu --models "${METAL_MODELS_DIR:-$HOME}"
         env:
           METAL_MODELS_DIR: ${{ vars.METAL_MODELS_DIR }}

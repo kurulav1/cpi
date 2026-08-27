@@ -85,7 +85,7 @@ def main() -> int:
             if name.startswith(prefix):
                 visual[name[len(prefix):]] = tensor.to(torch.float32)
     if not visual:
-        raise SystemExit("no %s* tensors found -- is this a multimodal checkpoint?" % prefix)
+        raise SystemExit("no %s* tensors found: is this a multimodal checkpoint?" % prefix)
 
     torch.set_grad_enabled(False)
     model = Qwen3_5VisionModel(cfg).to(torch.float32).eval()

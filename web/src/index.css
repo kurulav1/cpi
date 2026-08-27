@@ -318,7 +318,7 @@ body {
   box-shadow: var(--shadow-soft);
 }
 
-/* Assistant text -- no bubble */
+/* Assistant text; no bubble */
 .msg-asst-text {
   font-size: 0.9rem;
   line-height: 1.8;
@@ -614,7 +614,7 @@ body {
   box-shadow: 0 10px 26px rgba(34, 102, 165, 0.35);
 }
 :root[data-theme="light"] .btn-primary {
-  /* Softer gradient for light mode -- the saturated blue→magenta→red reads harsh
+  /* Softer gradient for light mode; the saturated blue→magenta→red reads harsh
      on white, so use a gentler blue→orchid→coral with a lighter shadow. */
   background: linear-gradient(135deg, #5f78ea 0%, #a06cce 50%, #ef7e63 100%);
   box-shadow: 0 8px 20px rgba(52, 120, 170, 0.16);
@@ -1102,7 +1102,7 @@ input[type="range"] { width: 100%; accent-color: var(--accent); cursor: pointer;
   border-color: var(--border);
   background: var(--green-bg);
 }
-/* NOT supported: shown, not hidden -- the absence is the information. */
+/* NOT supported: shown, not hidden; the absence is the information. */
 .caps-off {
   color: var(--muted, var(--text));
   border-color: var(--border);
@@ -1177,7 +1177,7 @@ input[type="range"] { width: 100%; accent-color: var(--accent); cursor: pointer;
   flex-direction: column;
   border: 1px solid var(--border-2, var(--border));
   border-radius: 12px;
-  /* --surface is translucent by design, so the panel needs its own glass blur --
+  /* --surface is translucent by design, so the panel needs its own glass blur;
      without it the chat shows straight through and both become unreadable. */
   background: var(--surface);
   backdrop-filter: blur(16px);
@@ -1321,7 +1321,7 @@ input[type="range"] { width: 100%; accent-color: var(--accent); cursor: pointer;
   35%           { opacity: 1;    transform: translateY(-2px); }
 }
 
-/* A slow sweep across the header while thinking -- motion without noise. */
+/* A slow sweep across the header while thinking; motion without noise. */
 .reasoning-active .reasoning-toggle {
   background-image: linear-gradient(
     90deg,

@@ -70,8 +70,7 @@ int main() {
   std::mt19937 rng(1);
   std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
 
-  std::printf("decode-attention bench (peak %.0f GB/s) -- effective KV-read bandwidth\n",
-              peak_gbs());
+  std::printf("decode-attention bench (peak %.0f GB/s): effective KV-read bandwidth\n", peak_gbs());
   std::printf("%-12s %-5s %-6s %-9s  %-10s  %s\n", "model", "B", "ctx", "ms/step", "GB/s", "%peak");
   std::printf("--------------------------------------------------------------------\n");
 

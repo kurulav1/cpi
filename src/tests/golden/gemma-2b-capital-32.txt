@@ -3,7 +3,7 @@
 # A THIRD model family on Metal, and the one that proves the seam: Gemma needs GeGLU
 # instead of SwiGLU, an embedding scale of sqrt(hidden), and RMSNorm weights stored as
 # (w - 1) so the norm scales by (1 + w). All three were ALREADY Metal kernels
-# (cpi_gelu_mul, cpi_scale_copy, weight_offset) -- the only thing missing was letting the
+# (cpi_gelu_mul, cpi_scale_copy, weight_offset); the only thing missing was letting the
 # builder emit them. A new model should be a config, not a fork.
 #
 # Prompt: "The capital of France is"

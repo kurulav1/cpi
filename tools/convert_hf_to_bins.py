@@ -654,7 +654,7 @@ def main() -> None:
         print(f"[info] qwen3.5: {n_lin} linear-attention + {len(kinds) - n_lin} full-attention "
               f"layers")
         if n_vis or n_mtp:
-            print(f"[warn] skipping {n_vis} vision-tower and {n_mtp} MTP tensors -- this "
+            print(f"[warn] skipping {n_vis} vision-tower and {n_mtp} MTP tensors: this "
                   f"conversion produces the TEXT model only")
 
     # Surface known-but-currently-ignored tensors to make conversion behavior explicit.

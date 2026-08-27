@@ -6,12 +6,12 @@ the same model plans and are held to token-identical output by cross-backend gat
 runtime dependencies beyond the vendor toolkits: every decode kernel, attention kernel, quant
 format, tokenizer, and container reader is in this repo. The one exception worth naming is that
 large prefill/batch GEMMs on CUDA go through cuBLAS/cuBLASLt (part of the CUDA toolkit the build
-already requires) -- hand-rolling a competitive fp16 tensor-core GEMM buys no user-visible win.
+already requires); hand-rolling a competitive fp16 tensor-core GEMM buys no user-visible win.
 Everything decode-side, and everything on Metal, is hand-rolled.
 
 Running a model takes one command and no conversion step: see [Quick Start](#quick-start).
-Measured throughput against llama.cpp is in [Benchmarks](#benchmarks), further down because
-it is evidence rather than instructions.
+Measured throughput is in [Benchmarks](#benchmarks), further down because it is evidence
+rather than instructions.
 
 ## Highlights
 
@@ -26,8 +26,8 @@ it is evidence rather than instructions.
 - Continuous batching with a paged KV cache for concurrent multi-user serving (default;
   VRAM-sized pool, shared-prefix reuse)
 - KV-cache quantization (`CPI_KV_QUANT`): K8V4 conservative or KV4 with a QuaRot-style
-  rotation, both with an fp16 sink + recent-window quality tier -- 2.6–3.9× more KV pool in the
-  same VRAM, needle-retrieval-gated at 8k–30k context, and at/above fp16 throughput in the
+  rotation, both with an fp16 sink + recent-window quality tier; 2.6-3.9× more KV pool in the
+  same VRAM, needle-retrieval-gated at 8k-30k context, and at/above fp16 throughput in the
   deep-and-concurrent regime it exists for
 - Speculative decoding (`--draft-model`), lossless with respect to the target's own output;
   prompt-lookup speculation needs no draft model at all (`CPI_CUDA_SPEC` / `CPI_METAL_SPEC`)
@@ -127,7 +127,7 @@ starts as fast as CPI's own container and decodes at the same speed (measured 91
 an 8B, with generation **token-identical** to the same checkpoint's `.ll2c`).
 
 One thing to know before pointing a quantized file at it: CPI **dequantizes to fp16 at load**, so
-by default a 4.6 GB Q4_K_M is resident at the fp16 footprint -- the download shrinks, the model in
+by default a 4.6 GB Q4_K_M is resident at the fp16 footprint; the download shrinks, the model in
 VRAM does not. Adding `--weight-quant int4` re-packs it on the GPU and is worth it on both axes,
 measured on an 8B Q4_K_M:
 
@@ -139,13 +139,13 @@ measured on an 8B Q4_K_M:
 The speedup is the same reason quantization helps anywhere: decode is bandwidth-bound, so fewer
 weight bytes per token is directly faster. The cost is a second quantization on top of the file's
 own (output stays coherent, but it is not the GGUF's exact numerics). Loading the file's blocks
-straight into CPI's packed format -- no fp16 round trip, no double quantization -- is the next step
+straight into CPI's packed format; no fp16 round trip, no double quantization; is the next step
 on this path. Dequantization is multi-threaded meanwhile: an 8B Q4_K_M starts in ~13 s against
 ~7 s for F16.
 
 Architectures are mapped conservatively: `llama` (verified against a `.ll2c` of the same checkpoint,
 bit-exact weights and identical output) and `qwen2`. Anything else is **refused with an
-explanation** rather than loaded under the wrong conventions -- an unmapped architecture still has
+explanation** rather than loaded under the wrong conventions; an unmapped architecture still has
 recognisable tensor names, so the failure mode being avoided is confident nonsense, not a crash.
 Gemma, Gemma 4 and DeepSeek-V2 GGUFs need their norm and config conventions mapped first; convert
 those to `.ll2c`/`.cpi` meanwhile.
@@ -368,13 +368,13 @@ something next to the token count that produced them.
 
 | Model | Weights | Decode (tok/s) | Notes |
 | ----- | ------- | -------------- | ----- |
-| Qwen2.5-0.5B | fp16 | 88 @ depth 16, 80 @ depth 2048 | 85-92% of llama.cpp at every depth |
-| Qwen2.5-0.5B | int4 | 172 @ depth 16, 142 @ depth 2048 | 77-86% of llama.cpp |
+| Qwen2.5-0.5B | fp16 | 88 @ depth 16, 80 @ depth 2048 | 85-92% of the reference at every depth |
+| Qwen2.5-0.5B | int4 | 172 @ depth 16, 142 @ depth 2048 | 77-86% of the reference |
 | Gemma 4 E2B | fp16 (BF16 HF dir, no conversion) | 13.9 | at the bandwidth roofline; batched prefill ~3.4 s for a 1250-token prompt |
 | Llama-3.1-8B | int8 | 8.8 | token-identical to the CUDA fp16 reference |
 | Llama-3.1-8B | int4 | 13.7 | |
 
-Prefill at 2048-token prompts is at parity with llama.cpp (93–108% across the gated models,
+Prefill at 2048-token prompts is at parity with llama.cpp (93-108% across the gated models,
 2026-07-22 sweep); short prompts remain behind (down to ~50% at ~130 tokens), because the GEMM
 carries a fixed per-pass weight-read cost that long prompts amortize and short ones don't. The
 GEMM itself measures at its hardware ceiling; the full investigation (including the dead ends
@@ -448,25 +448,25 @@ Useful environment variables:
 
 The server runs on port `3001` by default. The full contract is defined in an **OpenAPI 3.1**
 document at [`docs/openapi.yaml`](docs/openapi.yaml), also served live at
-`GET /openapi.yaml` -- point any OpenAPI viewer or client generator at it.
+`GET /openapi.yaml`; point any OpenAPI viewer or client generator at it.
 
 There are two namespaces: **`/api/*`** (CPI-native, error envelope `{ "error": "..." }`) and
 **`/v1/*`** (OpenAI-compatible, so existing OpenAI clients work by changing the base URL).
 
 **Exposure model.** The server binds `127.0.0.1` by default (`host` in `web/config.json` or
-`CPI_HOST`). The admin surface -- model hub downloads, quant jobs, and the filesystem pickers --
+`CPI_HOST`). The admin surface; model hub downloads, quant jobs, and the filesystem pickers;
 additionally refuses any non-localhost client unless you set a bearer token (`adminToken` /
 `CPI_ADMIN_TOKEN`) and send `Authorization: Bearer <token>`; when a token is set it is required
 from localhost too. So exposing the server (`host: 0.0.0.0`, or `npm run dev:lan` for the dev UI)
 shares inference only, never disk access, unless you deliberately configure a token.
 
 In **Docker** this bites by design: the image sets `CPI_HOST=0.0.0.0` (the port mapping needs it),
-and even your own browser on the host reaches the container through the docker bridge -- a
-non-loopback peer -- so the hub/quant/picker UI returns 403 until you set `CPI_ADMIN_TOKEN`
+and even your own browser on the host reaches the container through the docker bridge; a
+non-loopback peer, so the hub/quant/picker UI returns 403 until you set `CPI_ADMIN_TOKEN`
 (the `start_docker` scripts pass it through if exported). Inference works without it. All of this
 is verified by running the container: health open, admin 403 bare / 401 wrong-token / 200 with
 the token, and OpenAI-compatible chat served end-to-end. The same image runs CPU-only on hosts
-without a GPU (automatic fallback -- but note Docker Desktop's WSL2 backend injects the GPU even
+without a GPU (automatic fallback, but note Docker Desktop's WSL2 backend injects the GPU even
 without `--gpus`; force CPU with `-e CUDA_VISIBLE_DEVICES=-1`, and set `OMP_NUM_THREADS` to the
 physical core count, since SMT oversubscription under WSL2 measured 2.4× slower).
 
@@ -497,7 +497,7 @@ curl -X POST http://localhost:3001/api/generate \
   -d '{"messages":[{"role":"user","content":"What is CUDA?"}]}'
 ```
 
-OpenAI-compatible chat (drop-in for OpenAI SDKs -- set the base URL to `http://localhost:3001/v1`):
+OpenAI-compatible chat (drop-in for OpenAI SDKs; set the base URL to `http://localhost:3001/v1`):
 
 ```bash
 curl -X POST http://localhost:3001/v1/chat/completions \
@@ -506,7 +506,7 @@ curl -X POST http://localhost:3001/v1/chat/completions \
 ```
 
 Download and convert a model over the API (the same pipeline as `tools/hf_download.py`, async with
-a job id -- poll progress on `GET /api/hub/status/{jobId}`):
+a job id; poll progress on `GET /api/hub/status/{jobId}`):
 
 ```bash
 curl -X POST http://localhost:3001/api/hub/download \
@@ -565,10 +565,10 @@ Peak VRAM is total GPU memory during the run (includes ~1 GB desktop compositor)
 omitted: its int4 weights dequantize past the 32 GB of system RAM (out-of-memory). See
 [docs/benchmarks.md](docs/benchmarks.md) for methodology and the full context × quant sweep.
 
-CPU prefill is batched (chunked cache-blocked GEMM -- weights stream from RAM once per 256-token
+CPU prefill is batched (chunked cache-blocked GEMM; weights stream from RAM once per 256-token
 chunk instead of once per token, with an AVX-512 tier behind a runtime CPUID check): ~92 tok/s on
 the 8B and ~1180 tok/s on the 0.5B at a ~640-token prompt, a ~30× win over the old token-by-token
-prefill. Against llama.cpp's CPU backend (build `b4aa7dd47`, zen4 kernels, GPU hidden -- note
+prefill. Against the reference CPU backend (build `b4aa7dd47`, zen4 kernels, GPU hidden; note
 `-ngl 0` alone is not a CPU benchmark: with a CUDA build present, llama.cpp still runs prompt
 processing on the GPU) on the same box and weights, CPI CPU decode is within
 ~90% (3.15 vs 3.49 tok/s, both bandwidth-bound) and CPU prefill reaches ~50% (llama.cpp's mature
@@ -584,25 +584,25 @@ session, so numbers taken minutes apart are not comparable.
 
 Provenance: all numbers are self-reported from the single reference machine above; each table
 states when its rows were measured and any row carried from an earlier pass says so. Timer scopes
-differ between the tools -- `llama-bench` excludes sampling, CPI's `--benchmark` includes it -- which
-flatters llama.cpp by a small margin on decode; the ratios below leave that in rather than adjust
-for it. A fresh 2026-08-05 re-run against llama.cpp build `1269cb1` (`-fa 1`, warm, interleaved)
-put the 8B at decode **99%** (82.2 vs 83.2 tok/s), prefill@512 **133%**, prefill@2048 **106%** --
+differ between the tools: `llama-bench` excludes sampling, CPI's `--benchmark` includes it, which
+flatters the reference by a small margin on decode; the ratios below leave that in rather than
+adjust for it. A fresh 2026-08-05 re-run against build `1269cb1` (`-fa 1`, warm, interleaved)
+put the 8B at decode **99%** (82.2 vs 83.2 tok/s), prefill@512 **133%**, prefill@2048 **106%**,
 consistent with the table's earlier rows.
 
-**Where the comparison lives.** The llama.cpp side is not vendored: binaries and GGUFs sit under
+**Where the comparison lives.** The reference side is not vendored: binaries and GGUFs sit under
 `artifacts/llamacpp/`, which is gitignored, so none of the numbers here reproduce until you put them
-there. `artifacts/llamacpp/bin/` holds an upstream CUDA build -- `llama-bench`,
-`llama-batched-bench`, `ggml-cuda.dll` and friends, currently build `b4aa7dd47` (10085) -- and the
+there. `artifacts/llamacpp/bin/` holds an upstream CUDA build (`llama-bench`,
+`llama-batched-bench`, `ggml-cuda.dll` and friends, currently build `b4aa7dd47` (10085)), and the
 weights sit alongside it, e.g. `artifacts/llamacpp/llama31-8b-Q4_K_M.gguf` at 4.58 GB.
 
 **Batched decode needs more care than single-stream**, because the two tools do not measure the same
 thing. CPI's `--batch-bench` includes the batch prefill where `llama-batched-bench`'s `S_TG` column
-is decode-only, and CPI's bench prompt is 3 tokens, so comparing it against llama.cpp at its usual
+is decode-only, and CPI's bench prompt is 3 tokens, so comparing it against the reference at its usual
 `-npp 64` flatters CPI by roughly twofold on context depth. To compare like with like: run CPI at two
 step counts (`--batch-bench 24` and `96`, with `CPI_BATCH_ONLY=<B>` and `--max-context 32768`) and
-solve `total = prefill + n*step` for the slope -- the intercept is not prefill, it also absorbs
-first-step graph capture; run llama.cpp at matched depth (`-npp 8 -ntg 96 -npl <B>`); and take
+solve `total = prefill + n*step` for the slope; the intercept is not prefill, it also absorbs
+first-step graph capture; run the reference at matched depth (`-npp 8 -ntg 96 -npl <B>`); and take
 medians of three, since that bench carries about 10% run-to-run noise.
 
 **Same file, both engines.** Since CPI reads GGUF directly, the two engines can now be pointed at
@@ -610,13 +610,13 @@ the byte-identical file rather than at two conversions of one checkpoint. Llama-
 5090, interleaved, decode of 128 tokens after a 133-token prompt (`llama-bench -n 128` against
 CPI's `[bench] decode_tok_per_s`, both decode-only):
 
-| File | llama.cpp | CPI | CPI / llama.cpp |
+| File | reference | CPI | ratio |
 | ---- | --------- | --- | --------------- |
 | `llama31-8b-F16.gguf` | 94.3 tok/s | 94.3 tok/s | **100%** |
 | `llama31-8b-Q4_K_M.gguf` | 248.3 tok/s | 210.3 tok/s | **85%** |
 
 The F16 row is the honest apples-to-apples case: identical bytes, identical arithmetic, parity. The
-Q4_K_M row is not like-for-like -- llama.cpp runs k-quant blocks natively, while CPI dequantizes and
+Q4_K_M row is not like-for-like: the reference runs k-quant blocks natively, while CPI dequantizes and
 re-packs into its own int4 (`--weight-quant int4`), which costs a second quantization and leaves it
 at 4.6 GB on disk but 12.5 GB resident. Loading those blocks natively is the open work; the gap is
 the size of the prize.
@@ -625,7 +625,7 @@ One weakness the same measurement exposes: CPI's **int4 prefill is much slower t
 prefill** (375 vs 2145 tok/s on a 133-token prompt), so quantized runs pay at prompt ingestion what
 they win at decode. Long-prompt workloads should measure both phases before choosing.
 
-| Model | Test | llama.cpp | CPI | CPI / llama.cpp |
+| Model | Test | reference | CPI | ratio |
 | ----- | ---- | --------- | --- | --------------- |
 | Qwen2.5-0.5B | decode 256 | 820 tok/s | 851 tok/s | **104%** |
 | Qwen2.5-0.5B | prefill 1024 | 53,252 tok/s | 117,884 tok/s | **221%** |
@@ -661,7 +661,7 @@ same RTX 5090. The "1 req" column is the identical engine at batch 1.
 The 8B row is re-measured on the current **device-argmax** greedy path (the default). Before the
 device argmax, the same greedy path shipped the full logit block and reached 1795 tok/s at batch 64
 (still selectable with `CPI_BATCH_ARGMAX=0`); the older 1457 predates the v2 pinned-staging + scratch
-reuse. The other rows predate the device-argmax path and were not re-measured on this pass -- they
+reuse. The other rows predate the device-argmax path and were not re-measured on this pass; they
 would rise similarly.
 
 Notes:
@@ -669,17 +669,17 @@ Notes:
 - **Larger, compute-bound models batch better**: the 8B reaches ~31× aggregate and is still climbing
   at batch 64, while the tiny 0.5B plateaus near ~7× (its slim compute can't hide per-step overhead).
 - **Smaller vocabularies batch better** (on the full-logits path): shipping a `[batch × vocab]` logit
-  block each step is why the 32k-vocab models (Llama-2, TinyLlama) outscale the 128–152k-vocab ones in
+  block each step is why the 32k-vocab models (Llama-2, TinyLlama) outscale the 128-152k-vocab ones in
   the rows above. The device top-k / argmax paths keep that block off the bus, so the effect now shows
   up only in the LM-head GEMV compute (which still scales with vocab), not the transfer.
 - **No single-request penalty on real models**: the batch-1 slowdown (batched GEMM vs the tuned
-  single-token kernel) is a small-model artifact and vanishes by 7–8B (~1.0×).
+  single-token kernel) is a small-model artifact and vanishes by 7-8B (~1.0×).
 - **Sampling (temperature > 0) decides on device too.** Top-k / top-p and the repetition penalty
   are applied to the batched logits on the GPU, so only ~k candidates per row cross to the host
   instead of the full `[batch × vocab]` block. Two baselines at Llama-3.1-8B batch 64 (top-k 40),
   because the honest comparison depends on whether the host still has its own fast path:
   - **vs the host's own top-k shortcut** (no penalty): 815 → 1918 tok/s, **2.35×**.
-  - **at repetition penalty 1.05** (the served default): 453 → 1973 tok/s, **4.36×** -- but part of
+  - **at repetition penalty 1.05** (the served default): 453 → 1973 tok/s, **4.36×**, but part of
     that ratio is the host *losing* its shortcut, not the device winning: `sample_from_logits`
     disables its top-k fast path for penalty > 1 and falls back to a full-vocabulary softmax + sort,
     while the device applies the penalty *before* the top-k and keeps the fast path.
@@ -690,8 +690,8 @@ Notes:
 - **Greedy (temperature ≤ 0) also decides on device.** A batched argmax returns one winner id per
   row (B ints) instead of the full logit block; the repetition penalty and the min-tokens EOS
   suppression are applied on the GPU first, so the winner matches the host token-for-token. This is
-  a smaller win than sampling -- greedy's host work was already a single argmax scan, so only the
-  bus transfer is saved -- but still lifts Llama-3.1-8B batch 64 from **1795 to 2469 tok/s** (1.38×).
+  a smaller win than sampling; greedy's host work was already a single argmax scan, so only the
+  bus transfer is saved, but still lifts Llama-3.1-8B batch 64 from **1795 to 2469 tok/s** (1.38×).
   Selectable with `CPI_BATCH_ARGMAX=0`.
 - **Shared-prefix reuse**: concurrent requests that share a leading prefix (a common system prompt, a
   multi-turn chat) adopt each other's cached KV blocks instead of re-prefilling. A small per-worker LRU
@@ -707,7 +707,7 @@ Notes:
   tokens), with an fp16 sink + recent-window tier keeping retrieval quality (needle-exact at 8k and
   30k). Throughput matches fp16 batching at shallow depth and passes it where aggregate KV reads
   dominate (measured crossover: 1024-deep sequences at batch 64). Prefix reuse is disabled under
-  the quality tier -- each sequence's fp16 window is its own.
+  the quality tier; each sequence's fp16 window is its own.
 - **Default on the web server** for supported models (opt out with `CPI_BATCH_WORKER=0`); requires
   fp16-resident weights (`--gpu-cache-all`) + paged KV (`--paged-blocks`) and full-attention models.
   Quantized / MoE / streaming models (e.g. the 32B int4) fall back to single-request serving.
@@ -725,7 +725,7 @@ with `--tokens-file`, fp16 resident, RTX 5090).
 | Llama-3.1-8B-Instruct | ~86 | ~81 | ~75 | ~65 | ~60 | ~49 |
 
 Decode stays flat to a few thousand tokens, then falls as attention over the KV cache dominates each
-step; at 32K it's ~1.4–1.75× slower than at 512. Decode attention is GQA-aware (each K/V entry is
+step; at 32K it's ~1.4-1.75× slower than at 512. Decode attention is GQA-aware (each K/V entry is
 read from HBM once per KV head and shared across its query-head group, not re-read per query head) and
 splits the KV sequence across the SMs FlashDecoding-style: at long context each grid block streams
 several KV blocks under a running online softmax, so the memory system stays saturated instead of
@@ -739,7 +739,7 @@ to amortize it over. (Contexts past ~4K need
 Correctness note for long contexts: Llama-3.1's usable window past its 8192 base relies on
 llama3-style rope scaling, which is **opt-in**: set `CPI_ROPE_SCALING=llama3` (parameters
 overridable via `CPI_ROPE_SCALING_PARAMS=factor,low,high,orig_max`). Without it, retrieval
-degrades beyond ~8K even though decode runs fine -- the throughput rows above are unaffected,
+degrades beyond ~8K even though decode runs fine; the throughput rows above are unaffected,
 but quality at 16K/32K needs the flag.
 
 ## Research & Benchmarking

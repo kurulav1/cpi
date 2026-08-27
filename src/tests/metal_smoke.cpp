@@ -160,7 +160,7 @@ int main() {
 
   if (!ctx.available()) {
     std::printf("[metal_smoke] SKIP: %s\n", ctx.last_error().c_str());
-    std::printf("[metal_smoke] (expected inside a VM -- GitHub's macOS runners have no GPU)\n");
+    std::printf("[metal_smoke] (expected inside a VM: GitHub's macOS runners have no GPU)\n");
     return 0;
   }
   std::printf("[metal_smoke] device: %s\n", ctx.device_name().c_str());

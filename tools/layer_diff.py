@@ -69,7 +69,7 @@ def main() -> int:
     ref_dir, test_dir = Path(args.ref_dir), Path(args.test_dir)
     refs = sorted(ref_dir.glob("layer_*.f32"))
     if not refs:
-        print(f"no dumps in {ref_dir} -- was CPI_Q35_DUMP set?")
+        print(f"no dumps in {ref_dir}: was CPI_Q35_DUMP set?")
         return 1
 
     # ONSET, not tolerance. Divergence grows as it propagates, so the first layer to exceed a

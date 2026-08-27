@@ -57,7 +57,7 @@ __global__ void hadamard_rotate_fp16_kernel(half* __restrict__ x, const int8_t* 
 // Weight-only 3-bit TQ3 GEMV.  Each warp handles one output row.
 //
 // Template params:
-//   WarpsPerBlock – warps per block; one warp per output row.
+//   WarpsPerBlock - warps per block; one warp per output row.
 //
 // Shared memory: in_features half values (x loaded once per block) plus
 //   8 floats for the codebook.

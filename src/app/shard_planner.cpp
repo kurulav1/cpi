@@ -177,7 +177,7 @@ int main(int argc, char** argv) {
       pc.batch);
   if (opts.empty()) {
     std::printf(
-        "  no tp/pp/ep split up to 64x fits -- lower seq/batch, quantise further, or raise GPU "
+        "  no tp/pp/ep split up to 64x fits: lower seq/batch, quantise further, or raise GPU "
         "mem.\n");
   } else {
     const int best_world = opts.front().world();

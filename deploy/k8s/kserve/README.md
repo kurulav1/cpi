@@ -19,7 +19,7 @@ the serving lifecycle around the CPI engine.
 
 The plain `kind-inference-gpu.yaml` + KEDA stack works, but you own every object.
 KServe gives a **model-centric abstraction**: a `ServingRuntime` describes *how to
-run an engine*, an `InferenceService` requests *a model* -- and KServe builds the
+run an engine*, an `InferenceService` requests *a model*, and KServe builds the
 Deployment/Service/HPA/route, canary rollouts, and a model-status lifecycle. CPI
 plugs in as a **custom runtime** (its own image + the `ll2c` format) while KServe
 owns orchestration. This is the path to model-registry-style multi-model serving.
@@ -28,8 +28,8 @@ owns orchestration. This is the path to model-registry-style multi-model serving
 
 | File | What |
 |---|---|
-| `cpi-servingruntime.yaml` | `ServingRuntime cpi-llama` -- the CPI image as a serving container for the `ll2c` format (GPU via the WSL2 `/dev/dxg` + `/usr/lib/wsl` bind-mount, `ldconfig` before start) |
-| `cpi-inferenceservice.yaml` | `InferenceService cpi` -- requests an `ll2c` model on the `cpi-llama` runtime, RawDeployment, HPA 1→3 |
+| `cpi-servingruntime.yaml` | `ServingRuntime cpi-llama`; the CPI image as a serving container for the `ll2c` format (GPU via the WSL2 `/dev/dxg` + `/usr/lib/wsl` bind-mount, `ldconfig` before start) |
+| `cpi-inferenceservice.yaml` | `InferenceService cpi`; requests an `ll2c` model on the `cpi-llama` runtime, RawDeployment, HPA 1→3 |
 
 ## Deploy
 
@@ -59,13 +59,13 @@ Routed cpi-predictor.default.svc → /v1/completions → coherent GPU output
 
 ## Notes & caveats
 
-- **RawDeployment** (not Serverless) is used so we don't need Knative/Istio -- right
+- **RawDeployment** (not Serverless) is used so we don't need Knative/Istio; right
   for kind, and gives a plain Deployment/Service/HPA you can inspect.
-- **No `storageUri`** -- the `cpi-llama` runtime mounts the model from the node
+- **No `storageUri`**; the `cpi-llama` runtime mounts the model from the node
   (hostPath). On a real cluster set `storageUri: s3://…` (or `pvc://…`) and KServe's
   storage-initializer stages it to `/mnt/models`.
 - **Autoscaling here is KServe's default CPU HPA.** That's the wrong signal for a
-  single-stream LLM (see `../observability/` -- queue depth is correct). To use the
+  single-stream LLM (see `../observability/`; queue depth is correct). To use the
   queue-depth signal under KServe, either annotate the ISVC for an external metric
   or keep KEDA scaling the `cpi-predictor` Deployment KServe creates.
 - The GPU bind-mount block is a **WSL2/Docker-Desktop** workaround; on a real GPU

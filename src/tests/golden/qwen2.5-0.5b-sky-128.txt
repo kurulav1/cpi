@@ -5,13 +5,13 @@
 # reproduces it token-for-token.
 #
 # HISTORY WORTH KEEPING: the CPU engine used to disagree with both GPU backends here, and
-# that was first written off as "the fp16/fp32 activation gap". It was not -- CpuLlamaEngine
+# that was first written off as "the fp16/fp32 activation gap". It was not; CpuLlamaEngine
 # had rope_theta hardcoded to 10000 and was rotating Q/K by the wrong angle for every model
 # that does not use that base (Qwen2.5, Qwen3, Llama 3). The new backend was right and the
 # ORACLE was broken. With that fixed, CPU, CUDA and Metal all agree token-for-token.
 #
 # A REAL prompt, decoded 128 tokens deep. The short junk-prompt golden proves the ops are
-# wired up; this one exercises what that one cannot -- the KV cache and the attention loop
+# wired up; this one exercises what that one cannot; the KV cache and the attention loop
 # across depth, where a stride or a window bug only shows up far from position 0.
 #
 

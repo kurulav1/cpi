@@ -1,8 +1,8 @@
 // Parity gate for "chat template as data".
 //
-// Renders every migratable template two ways -- through its legacy hand-written
+// Renders every migratable template two ways; through its legacy hand-written
 // formatter, and through the generic renderChat() driven by a declarative chat
-// descriptor -- and requires the prompts to be BYTE-IDENTICAL. This is what makes
+// descriptor, and requires the prompts to be BYTE-IDENTICAL. This is what makes
 // retiring the per-model formatters safe: a mismatch here is a prompt-format
 // regression, which silently degrades every reply.
 //
@@ -49,6 +49,6 @@ for (const [template, chat] of Object.entries(CHAT_SPECS)) {
   }
 }
 console.log(failures === 0
-  ? `\nPARITY OK -- all ${Object.keys(CHAT_SPECS).length} templates render byte-identically from data`
-  : `\nPARITY FAILED -- ${failures} mismatches`);
+  ? `\nPARITY OK; all ${Object.keys(CHAT_SPECS).length} templates render byte-identically from data`
+  : `\nPARITY FAILED; ${failures} mismatches`);
 process.exit(failures === 0 ? 0 : 1);

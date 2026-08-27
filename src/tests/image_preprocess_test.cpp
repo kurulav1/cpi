@@ -41,7 +41,7 @@ int main(int argc, char** argv) {
 
   std::ifstream index(dir + "/index.txt");
   if (!index) {
-    std::printf("no fixtures -- run: python tools/make_resize_fixtures.py\n");
+    std::printf("no fixtures: run: python tools/make_resize_fixtures.py\n");
     return 2;
   }
 

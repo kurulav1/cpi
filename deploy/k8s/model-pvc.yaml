@@ -1,5 +1,5 @@
 # Persistent model storage. The model used to live on the node's /tmp/cpt-models,
-# which in kind is a tmpfs (RAM) -- so every node/Docker restart wiped it and the
+# which in kind is a tmpfs (RAM), so every node/Docker restart wiped it and the
 # 6.8 GB model had to be re-seeded. This PVC uses the default `standard` (local-path)
 # StorageClass, which stores data under /var (ext4, persistent across restarts), so
 # the model survives Docker Desktop / node restarts with no re-seed.

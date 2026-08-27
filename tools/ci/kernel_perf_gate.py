@@ -11,13 +11,13 @@ per-kernel perf regression check.
   python tools/ci/kernel_perf_gate.py               # gate against the baseline
 
 Notes:
-- Run with the GPU otherwise idle (stop the web server) -- a co-resident model
+- Run with the GPU otherwise idle (stop the web server); a co-resident model
   adds contention/clock noise (~8-10%) that inflates false positives.
 - The metric is GB/s (higher is better); the gate flags drops below baseline.
 - Each shape is measured best-of-N (--repeat, default 3): the max over runs is
   the least clock/thermal/contention-perturbed estimate, so it is reproducible
   run-to-run. Single-shot benching swings 40%+ on the high-batch/long-context
-  attention shapes -- best-of-N is what makes the tolerance meaningful.
+  attention shapes; best-of-N is what makes the tolerance meaningful.
 """
 from __future__ import annotations
 
@@ -94,7 +94,7 @@ def measure(repeat: int) -> dict[str, dict[str, float]]:
                 if cur is None or gbs > cur:
                     best[bench][key] = gbs
     if not best["int4_gemv"] or not best["attention_decode"]:
-        sys.exit("[kernel_perf_gate] parsed no rows -- bench output format changed?")
+        sys.exit("[kernel_perf_gate] parsed no rows: bench output format changed?")
     return best
 
 
@@ -114,7 +114,7 @@ def main() -> int:
         return 0
 
     if not BASELINE.exists():
-        sys.exit(f"[kernel_perf_gate] no baseline at {BASELINE} -- run with --update first")
+        sys.exit(f"[kernel_perf_gate] no baseline at {BASELINE}: run with --update first")
     base = json.loads(BASELINE.read_text(encoding="utf-8"))
 
     regressions = []

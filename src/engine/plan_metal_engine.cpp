@@ -867,7 +867,7 @@ void PlanMetalEngine::open(const std::string& weights_path, int max_context, int
       cfg_ = model::config_from_json(st_.metadata_json());
     } else {
       throw std::runtime_error("safetensors container has no __metadata__ config block: " +
-                               weights_path + " -- repack it with ll2c_to_cpi, which writes one.");
+                               weights_path + ": repack it with ll2c_to_cpi, which writes one.");
     }
   } else {
     weights_.open(weights_path);
@@ -1330,7 +1330,7 @@ void PlanMetalEngine::execute_ops(const std::vector<opplan::Op>& ops, int layer,
         throw std::runtime_error(msg);
       }
     }
-    std::fprintf(stderr, "[metal] ABLATION ACTIVE -- output is deliberately WRONG (%s)\n", e);
+    std::fprintf(stderr, "[metal] ABLATION ACTIVE: output is deliberately WRONG (%s)\n", e);
     return out;
   }();
 
@@ -2471,7 +2471,7 @@ void PlanMetalEngine::dump_gpu_profile() {
       stderr,
       "[metal gpu-profile] true GPU ns per kernel, from the device timestamp counters.\n"
       "  Each dispatch gets its own encoder to bracket it, which SERIALISES work a real\n"
-      "  pass overlaps -- rows are honest individually, the sum exceeds a real pass.\n"
+      "  pass overlaps: rows are honest individually, the sum exceeds a real pass.\n"
       "  Limiters/occupancy are NOT reachable from the Metal API here; those need Xcode.\n");
   std::fprintf(stderr, "  %-34s %12s %10s %9s\n", "kernel", "gpu_ms", "calls", "share");
   for (const auto& r : rows) {
@@ -2494,12 +2494,12 @@ void PlanMetalEngine::dump_profile() const {
       "[metal profile] ⚠ READ THIS BEFORE BELIEVING THE TABLE.\n"
       "  These are HOST times around a commit-and-wait PER OP, not GPU times. Every op pays a\n"
       "  full command-buffer round trip it does not pay in a real pass, which is a fixed cost,\n"
-      "  so the SMALL ops are inflated most -- the exact ops one profiles to find. Below, the\n"
+      "  so the SMALL ops are inflated most: the exact ops one profiles to find. Below, the\n"
       "  total comes to ~%.0f ms for a pass that really runs in ~190: it is ~3x, concentrated\n"
       "  in the cheap rows. It once put the non-GEMM ops at 34%%; deleting them showed ~3.5%%,\n"
       "  and a fusion plan was built on the difference.\n"
       "  It cannot be fixed here: honest per-op GPU timing needs counter sampling at dispatch\n"
-      "  boundaries, and Apple Silicon (M4/AGXG16G) does not support it -- asking crashes the\n"
+      "  boundaries, and Apple Silicon (M4/AGXG16G) does not support it: asking crashes the\n"
       "  driver. Use this ONLY to compare an op against ITSELF across a change.\n"
       "  To ask what an op COSTS, delete it: CPI_METAL_ABLATE=<OpKind>[,<OpKind>] and time the\n"
       "  pass. No attribution error survives that.\n",

@@ -1,7 +1,7 @@
 # Standing up the Metal GPU runner
 
 `.github/workflows/metal-gpu.yml` is the only thing that runs CPI's Metal kernels against a
-reference. It is **inert until you give it a runner** -- this is how.
+reference. It is **inert until you give it a runner**; this is how.
 
 
 ## ⚠ Read this first: THIS REPOSITORY IS PUBLIC
@@ -9,7 +9,7 @@ reference. It is **inert until you give it a runner** -- this is how.
 A self-hosted runner executes whatever a workflow tells it to, on your machine, as the user
 that owns it, inside your network. On a **public** repo that is a live remote-code-execution
 path: anyone can fork it, open a pull request that edits `CMakeLists.txt` (or the workflow
-itself), and have your Mac run it. GitHub's own guidance is blunt about this -- self-hosted
+itself), and have your Mac run it. GitHub's own guidance is blunt about this; self-hosted
 runners are recommended for private repositories only.
 
 `metal-gpu.yml` therefore refuses to run for pull requests that come from a fork:
@@ -22,7 +22,7 @@ if: >-
 ```
 
 Fork PRs never reach the runner; pushes to `main`, your own branches, and manual dispatch do.
-**Do not relax this** to give fork PRs coverage -- that is the whole exposure. Also worth doing,
+**Do not relax this** to give fork PRs coverage; that is the whole exposure. Also worth doing,
 belt and braces:
 
 - Settings → Actions → General → **Fork pull request workflows**: require approval for **all**
@@ -34,7 +34,7 @@ belt and braces:
 
 If you would rather not accept any of this, the honest alternative is to keep running
 `tools/metal_verify.sh --require-gpu` by hand (last section) and skip the runner. That is a
-real position -- it just means the checks only run when someone remembers.
+real position; it just means the checks only run when someone remembers.
 ## Why it matters more than it looks
 
 The `metal` job in `ci.yml` is compile-only, and not by oversight: GitHub's macOS runners are
@@ -43,7 +43,7 @@ reports SKIP. A green macOS CI means the shaders type-check and link. It has nev
 kernel is correct.
 
 That gap is not hypothetical. `cpi_gemm_f16` was dispatched with half the threads its tile
-needed for weeks -- every fp16 prompt of ≥16 tokens decoded from a corrupted prefill -- while CI
+needed for weeks; every fp16 prompt of ≥16 tokens decoded from a corrupted prefill; while CI
 stayed green, because no gate in the repo executed that kernel. It was caught by hand, on a
 rented Mac, by accident. See the GEMM note in the README.
 
@@ -52,12 +52,12 @@ A CUDA-side refactor can break Metal with nothing on either side going red.
 
 ## What you need
 
-One Apple Silicon machine that stays on, with a Metal device. "VM" is not the blocker --
+One Apple Silicon machine that stays on, with a Metal device. "VM" is not the blocker;
 GPU-less is:
 
-- **Tart** (<https://tart.run>) -- macOS VMs on Apple Silicon that expose a real paravirtual
+- **Tart** (<https://tart.run>); macOS VMs on Apple Silicon that expose a real paravirtual
   `MTLDevice`. Ephemeral per-job runners, so a bad job cannot poison the next one. Recommended.
-- **A Mac mini with the runner agent** -- simplest, and fine. State persists between jobs, so
+- **A Mac mini with the runner agent**; simplest, and fine. State persists between jobs, so
   a wedged build directory is yours to clean.
 
 A rented Apple Silicon Mac works for a session but is not a runner: the moment it lapses, Metal
@@ -65,7 +65,7 @@ is unguarded again.
 
 ## Setup
 
-1. **Register the runner** with these labels -- the workflow targets all four:
+1. **Register the runner** with these labels; the workflow targets all four:
 
    ```
    self-hosted, macOS, ARM64, metal-gpu
@@ -83,7 +83,7 @@ is unguarded again.
    ```
 
 3. **Put checkpoints somewhere** and point `METAL_MODELS_DIR` at them (repo variable). Goldens
-   whose `.ll2c` is missing are skipped **loudly** -- the run still passes but says what it did
+   whose `.ll2c` is missing are skipped **loudly**; the run still passes but says what it did
    not cover. A runner with only Qwen2.5-0.5B is worth having; it just covers less.
 
    The gate looks for: `qwen.ll2c` (or `Qwen2.5-0.5B-Instruct.ll2c`), `Qwen3-0.6B.ll2c`,
@@ -98,7 +98,7 @@ is unguarded again.
 
 ## Why the job is gated on a variable
 
-Because a job targeting a self-hosted label with no matching runner **does not fail -- it queues
+Because a job targeting a self-hosted label with no matching runner **does not fail; it queues
 forever and hangs every PR**. The variable makes the workflow cost nothing and block nothing
 until the hardware exists. Do not replace it with a `runs-on` guess.
 
@@ -106,7 +106,7 @@ until the hardware exists. Do not replace it with a `runs-on` guess.
 
 The job passes `--require-gpu` to `tools/metal_verify.sh`, which turns "no Metal device" from a
 skip into a failure. On a runner whose entire purpose is to exercise the GPU, a missing device
-is a misconfigured host -- and a job that goes green having verified nothing is worse than one
+is a misconfigured host, and a job that goes green having verified nothing is worse than one
 that goes red. That is not a theoretical concern either: CMake once forced `-mavx2` on arm64,
 GitHub's older clang silently ignored the unsupported flag, and CI passed while real hardware
 (clang 21) errored.
@@ -127,7 +127,7 @@ That is the exact blind spot that hid the original bug, reproduced on demand.
 
 ## Running it by hand
 
-The same gate, no CI required -- this is what to run on any Mac before trusting a change:
+The same gate, no CI required; this is what to run on any Mac before trusting a change:
 
 ```sh
 cmake -S . -B build -DCPI_ENABLE_CUDA=OFF -DCPI_ENABLE_METAL=ON

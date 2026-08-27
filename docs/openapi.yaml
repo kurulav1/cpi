@@ -3,17 +3,17 @@ info:
   title: CPI HTTP API
   version: 0.1.0
   description: |
-    HTTP API for CPI (Cross-Platform Inference) -- the Node server in `web/` that fronts the
+    HTTP API for CPI (Cross-Platform Inference); the Node server in `web/` that fronts the
     `cpi` engine. Two namespaces:
 
-    - **`/api/*`** -- CPI-native endpoints: inference, model management (Hugging Face download +
+    - **`/api/*`**; CPI-native endpoints: inference, model management (Hugging Face download +
       quantization), health. Error envelope: `{ "error": "<message>" }`.
-    - **`/v1/*`** -- OpenAI-compatible endpoints (chat, completions, embeddings, responses, models),
+    - **`/v1/*`**; OpenAI-compatible endpoints (chat, completions, embeddings, responses, models),
       usable with existing OpenAI clients by pointing the base URL here. Error envelope:
       `{ "error": { "message", "type", "code", "param" } }`.
 
     Bodies are JSON (`Content-Type: application/json`, 4 MB cap). No authentication and no CORS
-    middleware are applied -- run it behind your own gateway if exposing it beyond localhost.
+    middleware are applied; run it behind your own gateway if exposing it beyond localhost.
 
     ### Streaming
     Three different streaming shapes are used; OpenAPI cannot fully model event streams, so the
@@ -341,7 +341,7 @@ paths:
       tags: [OpenAI]
       summary: Chat completions (OpenAI)
       description: |
-        OpenAI chat completions -- the drop-in endpoint for OpenAI SDKs. Set `stream: true` for an SSE
+        OpenAI chat completions; the drop-in endpoint for OpenAI SDKs. Set `stream: true` for an SSE
         stream of `chat.completion.chunk` objects terminated by `data: [DONE]`. Supports `tools` /
         `tool_choice` (tool calls are emitted in the final chunk) and `response_format`.
       requestBody:
@@ -595,7 +595,7 @@ paths:
                   outputPath: { type: string }
         "400": { $ref: "#/components/responses/ApiError" }
         "409":
-          description: Conflict -- already packed, a conversion is running, or the output exists.
+          description: Conflict; already packed, a conversion is running, or the output exists.
           content:
             application/json:
               schema:

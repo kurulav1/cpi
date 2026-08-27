@@ -209,7 +209,7 @@ int main(int argc, char** argv) {
       std::printf("  FAIL  negative control: expected 1 row, got %zu\n", out.size());
     }
     if (!differs) {
-      std::printf("        (the block table is being IGNORED -- the gather indexes by raw\n");
+      std::printf("        (the block table is being IGNORED: the gather indexes by raw\n");
       std::printf("         position, so the identity-table passes above proved nothing)\n");
       ++failures;
     }
