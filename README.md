@@ -115,6 +115,12 @@ cpi model.gguf --prompt "Hello" --gpu-cache-all
 `--tokenizer` is optional for a GGUF: the container carries its own vocabulary and merges, and CPI
 uses them (verified token-identical to the matching `tokenizer.json`). Pass one anyway to override.
 
+It is optional for the other formats too. Without the flag, CPI looks for `tokenizer.json` or
+`tokenizer.model` beside the model and under `hf/`, and for a `.ll2c` it also checks sibling
+directories whose name matches the model's, which is where a Hugging Face checkout of the same
+checkpoint usually sits. It prints which file it chose. Pass `--tokenizer` when the guess is wrong
+or the tokenizer lives somewhere unrelated.
+
 Tensor types: F32, F16, BF16, the flat quants (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0) and the k-quants
 (Q2_K/Q3_K/Q4_K/Q5_K/Q6_K). fp16 tensors are served straight from the mapping, so an F16 GGUF
 starts as fast as CPI's own container and decodes at the same speed (measured 91 tok/s either way on
@@ -226,7 +232,11 @@ This starts:
 
 ## Preparing Models
 
-Easiest: download from Hugging Face and convert to `.ll2c` in one step (auto-discovered afterwards):
+**A GGUF needs none of this.** If the architecture is one CPI maps (`llama`, `qwen2`), download the
+file and run it: no conversion, no `--tokenizer`, no intermediate directory. See
+[Run a GGUF](#run-a-gguf). Everything below is for the other families, and for CPI's own container.
+
+Download from Hugging Face and convert to `.ll2c` in one step (auto-discovered afterwards):
 
 ```bash
 python tools/hf_download.py download Qwen/Qwen2.5-Coder-7B-Instruct

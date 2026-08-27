@@ -421,7 +421,51 @@ jobs:
             succeeded, so a missing asset means that build did not run, not that
             the platform is unsupported.
 
-            Verify a build with `cpi --version`.
+            Verify a build with `cpi --version`. It prints the backends actually
+            compiled in, e.g. `backends: cpu, cuda`.
+
+            ### Getting a model
+
+            Quickest path, no conversion and no extra files. Download any GGUF of a
+            supported architecture and point `cpi` at it:
+
+            ```
+            cpi model.gguf --serve
+            ```
+
+            That is the whole setup. The GGUF carries its own tokenizer, and the chat
+            template is picked from the filename, so an OpenAI-compatible API is
+            listening on port 8080 with no other flags. Drop `--serve` and pass
+            `--prompt "..."` for a one-shot completion.
+
+            A quantized GGUF is **dequantized to fp16 at load**, so the download
+            shrinks but the resident model does not. Add `--weight-quant int4` to keep
+            it packed: on an 8B Q4_K_M that is 20.7 GB down to 12.5 GB, and decode goes
+            up rather than down (74 to 134 tok/s), because decode is bandwidth-bound.
+
+            Models outside the GGUF-mapped architectures below convert to CPI's own
+            container first; see [Preparing
+            Models](https://github.com/kurulav1/cpi#preparing-models).
+
+            ### Supported models
+
+            | Family | Direct from GGUF | Via `.ll2c` / `.cpi` |
+            |---|---|---|
+            | Llama 2 / 3 / 3.1 / 3.2 | yes, verified | yes |
+            | Qwen2 / Qwen2.5 | yes | yes |
+            | Qwen3 dense, Qwen3.5 | no | yes |
+            | Mistral, Mixtral (MoE) | no | yes |
+            | Phi-3 | no | yes |
+            | Gemma 1 | no | yes |
+            | Gemma 4 (incl. vision, MoE) | no | yes |
+            | DeepSeek-V2 (MLA + MoE) | no | yes |
+
+            An unmapped GGUF architecture is **refused with an explanation**, not loaded
+            under the wrong conventions. That is deliberate: the tensor names still look
+            recognisable, so the failure being avoided is confident nonsense rather than
+            a crash. Gemma's `(1+w)` norms, Gemma 4's per-layer embeddings and
+            DeepSeek's MLA projections each need mapping before their GGUFs can be
+            trusted.
 
             ### macOS (Metal)
             The macOS asset is attached only when the hosted CI runner could build it; its Xcode
@@ -432,7 +476,7 @@ jobs:
             `.metal` sources next to the binary. Use the included launcher:
 
             ```
-            ./run.sh model.cpi --tokenizer tokenizer.json --prompt "..." --weight-quant int4
+            ./run.sh model.gguf --prompt "..." --weight-quant int4
             ```
 
             (or run `cpi` directly with `CPI_METAL_SOURCE=./metal` set). First launch

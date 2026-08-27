@@ -363,14 +363,19 @@ int main(int argc, char** argv) {
         }
       }
       if (cli.tokenizer_path.empty() && !tokenizer_from_gguf) {
-        if (cli.simple_mode) {
-          cli.tokenizer_path = auto_detect_tokenizer_path(cli.opts.model_path);
-          if (cli.tokenizer_path.empty()) {
-            throw std::runtime_error(
-                "could not auto-detect tokenizer; pass --tokenizer explicitly");
-          }
+        // Try to find one before demanding it. auto_detect_tokenizer_path already
+        // looked beside the model and under hf/, which is where a Hugging Face
+        // checkout keeps it, but it was only ever called in simple mode. So
+        // pointing cpi at a model directory that contains tokenizer.json still
+        // failed with "--tokenizer is required", with the file sitting right
+        // there. Same gating as the chat template, which was fixed the same way.
+        cli.tokenizer_path = auto_detect_tokenizer_path(cli.opts.model_path);
+        if (!cli.tokenizer_path.empty()) {
+          info_out << "[info] tokenizer not given; using " << cli.tokenizer_path << "\n";
         } else {
-          throw std::runtime_error("--tokenizer is required when using --prompt or --interactive");
+          throw std::runtime_error(
+              "no tokenizer found beside the model (looked for tokenizer.json and "
+              "tokenizer.model, also under hf/); pass --tokenizer explicitly");
         }
       }
       if (!cli.interactive_mode && cli.chat_template.empty() && is_llama4_safetensors &&
