@@ -1059,9 +1059,38 @@ std::vector<int> LlamaEngine::spec_lookup_generate(const std::vector<int>& promp
 
   // Local, like the Metal loop: the backoff is a property of this generation, and
   // carrying it between requests would let one unlucky run mute the next.
-  float spec_acc_ewma_ = 1.0f;
+  //
+  // The break-even point is measured here rather than assumed. A verify replaces
+  // (accepted + 1) decode steps, so it pays exactly when
+  //
+  //   C_verify < (accepted + 1) * C_decode,  i.e.  accepted > C_verify/C_decode - 1
+  //
+  // Both costs are timed below. A fixed acceptance-fraction cutoff cannot express
+  // that ratio: carrying Metal's 0.35 over cost a 1B list-repeat run 36% with the
+  // guard never tripping, because 56% acceptance was "good" by that rule while the
+  // ratio on a graph-accelerated CUDA decode demanded far more.
+  float spec_acc_tokens = 8.0f;  // EWMA of tokens accepted per verify
+  // Minimum, not average. Warmup only ever inflates a timing (first-call
+  // allocation, cuBLAS setup), so the floor is the robust estimate of steady
+  // state and it converges as soon as one clean sample lands. Averaging was worse
+  // than useless here: on a 1B the first verify reads 31-55 ms against a 13 ms
+  // steady state, and a mean over two cold samples put break-even at 15-28
+  // accepted tokens, unreachable at k=8. The backoff then quit before the third
+  // verify, which is exactly when the estimate would have become correct, turning
+  // a measured 1.20x win into a 5% loss.
+  double min_decode_ms = 0.0;
+  double min_verify_ms = 0.0;
+  int verify_samples = 0;
   int spec_cooldown_ = 0;
   int spec_backoff_ = 0;
+  const auto timed = [](const auto& fn) {
+    const auto t0 = std::chrono::steady_clock::now();
+    fn();
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  };
+  const auto keep_min = [](double& best, double sample) {
+    if (best == 0.0 || sample < best) best = sample;
+  };
   int pos = static_cast<int>(prompt_tokens.size());
   int cur = decode_next_token(prompt_tokens.back(), pos - 1, 0.0f, out);
   bool stop = !record(cur);
@@ -1071,7 +1100,9 @@ std::vector<int> LlamaEngine::spec_lookup_generate(const std::vector<int>& promp
     const int nd = spec_cooldown_ > 0 ? 0 : engine::prompt_lookup_draft(history, 6, room, drafts);
     if (spec_cooldown_ > 0) --spec_cooldown_;
     if (nd <= 0) {
-      cur = decode_next_token(cur, pos, 0.0f, out);
+      int next = 0;
+      keep_min(min_decode_ms, timed([&] { next = decode_next_token(cur, pos, 0.0f, out); }));
+      cur = next;
       ++pos;
       if (!record(cur)) break;
       continue;
@@ -1081,20 +1112,37 @@ std::vector<int> LlamaEngine::spec_lookup_generate(const std::vector<int>& promp
     batch.push_back(cur);
     for (int i = 0; i < nd; ++i) batch.push_back(drafts[i]);
     std::vector<int> verdict;
-    verify_tokens(batch, pos, verdict);  // writes KV pos..pos+nd, returns nd+1 argmaxes
+    // writes KV pos..pos+nd, returns nd+1 argmaxes
+    keep_min(min_verify_ms, timed([&] { verify_tokens(batch, pos, verdict); }));
+    ++verify_samples;
     ++verifies;
     drafted += nd;
     int a = 0;
     while (a < nd && verdict[a] == drafts[a]) ++a;
     accepted += a;
-    spec_acc_ewma_ =
-        0.7f * spec_acc_ewma_ + 0.3f * (static_cast<float>(a) / static_cast<float>(nd));
+    spec_acc_tokens = 0.7f * spec_acc_tokens + 0.3f * static_cast<float>(a);
+    // Tokens this verify had to accept to have been worth running. Until a plain
+    // decode has been timed, require at least one: the weakest true statement is
+    // that a verify accepting nothing is always a loss.
+    // The first verify carries one-time setup (buffer allocation, cuBLAS warmup)
+    // and reads several times its steady-state cost. Backing off on that single
+    // sample would mean never learning the real ratio, which is the cold-start
+    // bias that has produced phantom results in this repo before. Until a second
+    // sample exists, apply only the weakest true rule: a verify that accepts
+    // nothing is a loss.
+    const double need =
+        (verify_samples >= 2 && min_decode_ms > 0.0) ? (min_verify_ms / min_decode_ms) - 1.0 : 1.0;
     // A verify that lands nothing is decisive on its own; waiting for the average
     // to sag just buys more full-price misses.
-    if (a == 0 || spec_acc_ewma_ < 0.35f) {
+    // CPI_SPEC_NO_BACKOFF=1 keeps speculating regardless, which is the only way to
+    // measure a steady-state verify cost: with the backoff on, a model that trips
+    // it runs one or two verifies and every sample is still carrying first-call
+    // setup. Diagnostic only; it makes a losing configuration lose fully.
+    static const bool no_backoff = std::getenv("CPI_SPEC_NO_BACKOFF") != nullptr;
+    if (!no_backoff && (a == 0 || static_cast<double>(spec_acc_tokens) < need)) {
       spec_backoff_ = (spec_backoff_ == 0) ? 32 : std::min(spec_backoff_ * 2, 2048);
       spec_cooldown_ = spec_backoff_;
-      spec_acc_ewma_ = 0.6f;  // neutral restart: one good probe re-enables it
+      spec_acc_tokens = static_cast<float>(need) + 1.0f;  // restart just above break-even
       ++backoffs;
     } else if (a == nd) {
       spec_backoff_ = 0;  // drafting is paying again; forget the penalty
@@ -1113,10 +1161,13 @@ std::vector<int> LlamaEngine::spec_lookup_generate(const std::vector<int>& promp
   }
   if (std::getenv("CPI_SPEC_STATS")) {
     std::fprintf(
-        stderr, "[spec] verifies=%d drafted=%d accepted=%d (%.1f%%) backoffs=%d tokens=%zu",
+        stderr,
+        "[spec] verifies=%d drafted=%d accepted=%d (%.1f%%) backoffs=%d tokens=%zu decode_ms=%.2f "
+        "verify_ms=%.2f need=%.2f",
         verifies, drafted, accepted,
         drafted ? 100.0 * static_cast<double>(accepted) / static_cast<double>(drafted) : 0.0,
-        backoffs, out.size());
+        backoffs, out.size(), min_decode_ms, min_verify_ms,
+        min_decode_ms > 0.0 ? (min_verify_ms / min_decode_ms) - 1.0 : -1.0);
     std::fprintf(stderr, "%s", "\n");
   }
   return out;
