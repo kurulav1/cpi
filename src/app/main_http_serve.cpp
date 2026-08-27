@@ -488,6 +488,9 @@ void run_http_server(engine::BatchScheduler& sched, model::Tokenizer& tokenizer,
         json_get_float(body, "repetition_penalty", json_get_float(body, "repeat_penalty", -1.0f));
     ov.no_repeat_ngram = json_get_int(body, "no_repeat_ngram", -1);
     ov.stop_texts = json_get_string_array(body, "stop");
+    // Suppress EOS until this many tokens are generated. The scheduler has
+    // implemented it per row all along; this is the first path that fills it in.
+    ov.min_new = std::max(0, json_get_int(body, "min_new", 0));
     // response_format: {"type":"json_schema","json_schema":{...}} and the plain
     // CPI form {"json_schema":{...}} both reach the same grammar path.
     ov.json_schema = json_get_raw_value(body, "json_schema");
@@ -943,6 +946,13 @@ void run_http_server_serial(GenerateStreamFn generate, model::Tokenizer& tokeniz
           // outlive the generate call, and every serial engine wants the same one.
           std::unique_ptr<grammar::GrammarSampler> sampler;
           engine::GenerationConstraints constraints;
+          // Both of these reach the stdin transport (main_modes) and the batch
+          // scheduler implements min_new per row, but neither was ever parsed
+          // here, so over HTTP the fields were unreachable: a request could ask
+          // for them and the server would quietly generate as if it had not.
+          constraints.min_new_tokens = std::max(0, json_get_int(body, "min_new", 0));
+          constraints.seed = json_get_int(body, "seed", -1);
+          constraints.stop_token_ids = &stop_ids;
           if (!json_schema.empty()) {
             try {
               grammar::Grammar g =
@@ -993,7 +1003,11 @@ void run_http_server_serial(GenerateStreamFn generate, model::Tokenizer& tokeniz
                   }
                   return true;
                 },
-                sampler ? &constraints : nullptr);
+                // Always passed. A null grammar is fine, and constraints also
+                // carry seed and min_new_tokens, so gating on the sampler meant
+                // those two silently did nothing unless the same request also
+                // asked for a json_schema. main_modes already does it this way.
+                &constraints);
           }
         }
       } catch (const std::exception& e) {

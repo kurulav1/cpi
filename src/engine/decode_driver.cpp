@@ -1,6 +1,8 @@
 #include "engine/decode_driver.hpp"
 
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 
 #include "engine/sampling.hpp"
@@ -62,8 +64,12 @@ std::vector<int> run_decode(SequenceModel& model, const std::vector<int>& prompt
     out.push_back(next);
     history.push_back(next);
     if (stats) stats->generated_tokens++;
-    if (on_token && !on_token(next)) break;
-    if (model.is_stop(next)) break;
+    // on_token still runs for its side effects (streaming); only its request to
+    // stop is deferred while below the floor.
+    const bool below_floor = static_cast<int>(out.size()) < params.min_new_tokens;
+    const bool caller_stop = on_token && !on_token(next);
+    if (caller_stop && !below_floor) break;
+    if (model.is_stop(next) && !below_floor) break;
     model.step(next, pos, /*want_logits=*/true);
     ++pos;
   }

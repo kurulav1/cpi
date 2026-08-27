@@ -5,6 +5,8 @@
 // engine headers (including the CUDA ones) stay cheap to include. Engines that
 // actually apply the grammar include "grammar/grammar_sampler.hpp" in their .cpp.
 
+#include <vector>
+
 namespace grammar {
 class GrammarSampler;
 }
@@ -29,6 +31,15 @@ struct GenerationConstraints {
   // repeated/round-number run (e.g. "revenue":4000000) and truncates the output.
   // 0 disables (default).
   int min_new_tokens = 0;
+
+  // Token ids the transport treats as end-of-turn, e.g. a chat template's turn
+  // marker. Needed only for min_new_tokens: the engine's own eos_token_id is not
+  // the whole story, because a template marker is a different id that the
+  // transport detects itself. Without these, holding the loop open past a stop
+  // just makes the model emit the marker over and over while the transport
+  // filters every one, spending the whole floor on nothing. Owned by the caller
+  // for the duration of the generate_stream call; may be null.
+  const std::vector<int>* stop_token_ids = nullptr;
 };
 
 }  // namespace engine

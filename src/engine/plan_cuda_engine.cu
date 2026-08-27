@@ -15,7 +15,9 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <map>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -5099,10 +5101,44 @@ std::vector<int> PlanCudaEngine::generate_stream(const std::vector<int>& prompt,
   // missing, so a json_schema request to --serve on this engine produced
   // unconstrained output with no error: the grammar was compiled, passed in, and
   // dropped. GrammarSampler is owned by the caller for the call's duration.
-  if (constraints != nullptr && constraints->grammar != nullptr) {
-    grammar::GrammarSampler* g = constraints->grammar;
-    p.grammar_mask = [g](std::vector<float>& logits) { g->apply_mask(logits); };
-    p.grammar_accept = [g](int token) { g->accept(token); };
+  grammar::GrammarSampler* g = constraints != nullptr ? constraints->grammar : nullptr;
+  const int min_new = constraints != nullptr ? constraints->min_new_tokens : 0;
+  p.min_new_tokens = min_new;
+  if (g != nullptr || min_new > 0) {
+    // Both ride the same hook. Setting grammar_mask also forces the host-logits
+    // path, because sample() above vetoes the device fast paths when it is set,
+    // and editing logits before sampling is exactly what both features need.
+    const int eos = cfg_.eos_token_id;
+    auto emitted = std::make_shared<int>(0);
+    const std::vector<int>* stop_ids =
+        constraints != nullptr ? constraints->stop_token_ids : nullptr;
+    p.grammar_mask = [g, min_new, eos, emitted, stop_ids](std::vector<float>& logits) {
+      if (g != nullptr) g->apply_mask(logits);
+      // Block EOS so decoding cannot stop before min_new_tokens. Skipped when a
+      // grammar is active, matching LlamaEngine: a completed grammar may permit
+      // only EOS, so masking it there would leave no legal token at all. The
+      // grammar manages its own termination and takes precedence.
+      if (g == nullptr && min_new > 0 && *emitted < min_new) {
+        const float neg_inf = -std::numeric_limits<float>::infinity();
+        if (eos >= 0 && static_cast<std::size_t>(eos) < logits.size()) {
+          logits[static_cast<std::size_t>(eos)] = neg_inf;
+        }
+        // The transport's markers too. Masking only eos leaves the model free to
+        // emit a turn marker instead, which the transport filters, so the floor
+        // is spent emitting an invisible token repeatedly.
+        if (stop_ids != nullptr) {
+          for (const int sid : *stop_ids) {
+            if (sid >= 0 && static_cast<std::size_t>(sid) < logits.size()) {
+              logits[static_cast<std::size_t>(sid)] = neg_inf;
+            }
+          }
+        }
+      }
+    };
+    p.grammar_accept = [g, emitted](int token) {
+      if (g != nullptr) g->accept(token);
+      ++*emitted;
+    };
   }
   // Contract: generate_stream returns prompt+generated. main_modes strips
   // prompt_tokens.size(), and only when the result is longer than the prompt, so

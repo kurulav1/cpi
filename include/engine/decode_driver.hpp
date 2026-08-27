@@ -26,7 +26,12 @@ struct DecodeParams {
   float top_p = 1.0f;
   float repetition_penalty = 1.0f;
   int no_repeat_ngram_size = 0;
-  int seed = -1;                // >= 0 reseeds the sampler RNG
+  int seed = -1;  // >= 0 reseeds the sampler RNG
+  // Below this many generated tokens, neither a stop token nor the on_token
+  // callback may end the loop. Masking the EOS logit alone is not enough: a chat
+  // template's turn marker is a different id, is detected by the transport rather
+  // than by is_stop, and ends generation through on_token returning false.
+  int min_new_tokens = 0;
   bool include_prompt = false;  // return prompt+generated (vs generated only)
   // Optional grammar hooks (kept as std::function so the driver doesn't depend on
   // the grammar module). mask: set disallowed logits to -inf; accept: advance the
