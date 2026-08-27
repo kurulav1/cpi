@@ -350,7 +350,18 @@ private:
 
   // --- primitive rules (added on demand) ---
   void ensure_ws() {
-    define("ws", "[ \\t\\n]*");
+    // Bounded, not "[ \\t\\n]*". Unbounded whitespace let greedy decoding hang: the
+    // mask keeps every whitespace token legal forever, so when the model's top
+    // logit at some position is a newline it emits newlines until max_tokens and
+    // never reaches the value. A json_schema request then burns its whole budget
+    // producing nothing, with a 200 and no error. Observed on Gemma 4 E2B: a
+    // seven-field object returned 160 tokens of "\\n \\n \\n". A two-field object
+    // happened to escape only because its top logit was "{".
+    //
+    // Four characters is enough for a newline plus indentation, and the grammar
+    // only constrains generation, so bounding it cannot make any JSON value
+    // unreachable. The parser has no {m,n} operator, hence the nested groups.
+    define("ws", "([ \\t\\n] ([ \\t\\n] ([ \\t\\n] [ \\t\\n]?)?)?)?");
   }
   std::string ensure_boolean() {
     return define("boolean", "\"true\" | \"false\"");
