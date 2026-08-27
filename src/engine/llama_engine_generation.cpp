@@ -915,8 +915,29 @@ std::vector<int> LlamaEngine::generate_stream(const std::vector<int>& prompt_tok
   // it does not fire.
   const char* spec_env = std::getenv("CPI_SPEC");
   const int spec_k = spec_env != nullptr ? std::min(std::atoi(spec_env), 15) : 0;
-  if (spec_k >= 1 && temperature <= 0.0f && active_grammar_ == nullptr && min_new_tokens == 0 &&
-      batched_verify_available() && spec_k + 1 <= prefill_chunk_size_ && reuse == 0) {
+  // A grammar no longer disqualifies speculation: spec_lookup_generate masks the
+  // verified rows on the host. min_new_tokens still does, because its EOS
+  // suppression lives on the single-token sampling path.
+  if (spec_k >= 1) {
+    static bool warned = false;
+    if (!warned) {
+      warned = true;
+      // Not guaranteed bit-identical to plain decoding. The batched verify and the
+      // single-token decode reach the logits through different kernels, so at a
+      // near-tie they can pick different winners. Observed once here: under a JSON
+      // grammar the two paths chose '"}' and '" }', both grammar-legal and
+      // separated by a hair. Five non-grammar runs came back byte-identical, which
+      // is evidence that it is rare, not that it cannot happen. CPI_CUDA_SPEC
+      // carries the same caveat for the same reason.
+      std::fprintf(stderr,
+                   "[warn] CPI_SPEC speculation can differ from plain decoding at near-ties "
+                   "(different kernels reach the logits); unset it if you need bit-identical "
+                   "output.%s",
+                   "\n");
+    }
+  }
+  if (spec_k >= 1 && temperature <= 0.0f && min_new_tokens == 0 && batched_verify_available() &&
+      spec_k + 1 <= prefill_chunk_size_ && reuse == 0) {
     const auto spec_decode_start = std::chrono::steady_clock::now();
     const std::vector<int> gen =
         spec_lookup_generate(prompt_tokens, max_new_tokens, spec_k, on_token);
@@ -1054,6 +1075,11 @@ std::vector<int> LlamaEngine::spec_lookup_generate(const std::vector<int>& promp
     if (options_.loop_guard && detail::dispatch_has_degenerate_tail(out, prompt_tokens.size())) {
       return false;
     }
+    // The same order as the main loop: EOS is recorded and streamed, then ends
+    // generation. Leaving this out let speculation run past EOS and emit tokens
+    // the non-speculative path never would, which the losslessness check caught
+    // as two extra tokens under a grammar.
+    if (options_.eos_token_id >= 0 && tok == options_.eos_token_id) return false;
     return true;
   };
 
@@ -1104,6 +1130,9 @@ std::vector<int> LlamaEngine::spec_lookup_generate(const std::vector<int>& promp
       keep_min(min_decode_ms, timed([&] { next = decode_next_token(cur, pos, 0.0f, out); }));
       cur = next;
       ++pos;
+      // decode_next_token applies the mask itself (llama_engine_sampling.cpp);
+      // advancing the grammar is the caller's job, exactly as in the main loop.
+      if (active_grammar_ != nullptr) active_grammar_->accept(cur);
       if (!record(cur)) break;
       continue;
     }
@@ -1112,13 +1141,67 @@ std::vector<int> LlamaEngine::spec_lookup_generate(const std::vector<int>& promp
     batch.push_back(cur);
     for (int i = 0; i < nd; ++i) batch.push_back(drafts[i]);
     std::vector<int> verdict;
-    // writes KV pos..pos+nd, returns nd+1 argmaxes
-    keep_min(min_verify_ms, timed([&] { verify_tokens(batch, pos, verdict); }));
-    ++verify_samples;
-    ++verifies;
-    drafted += nd;
     int a = 0;
-    while (a < nd && verdict[a] == drafts[a]) ++a;
+    int bonus = -1;
+    bool grammar_dead = false;
+    if (active_grammar_ != nullptr) {
+      // A grammar decides the winner, so the device argmax cannot: it does not
+      // know which tokens are forbidden. Bring the rows back and mask on the host.
+      //
+      // Masks are built lazily, one row at a time, and the sampler advances only
+      // by tokens that are actually accepted. That is why no snapshot or rollback
+      // is needed: row i's mask is computed from the state after drafts[0..i-1],
+      // which is the true state exactly when row i is reached, and the walk stops
+      // at the first mismatch. It also means the grammar costs one mask per
+      // emitted token, the same as decoding without speculation.
+      const int vocab = weights_.config().vocab_size;
+      float* rows = nullptr;
+      keep_min(min_verify_ms, timed([&] { rows = verify_tokens_logits(batch, pos); }));
+      ++verify_samples;
+      ++verifies;
+      drafted += nd;
+      // Reuse the engine's sampler rather than taking a plain argmax. At
+      // temperature 0 dispatch_sample_from_logits still applies the repetition
+      // penalty and the no-repeat-ngram rule, so a bare argmax is a different
+      // decision function: it produced a 1.52x speedup whose output did not match
+      // the non-speculative path, which is a wrong answer arriving sooner.
+      //
+      // The history must be what the non-speculative decoder would have seen at
+      // that position, i.e. the tokens emitted so far plus the drafts already
+      // accepted in this round, so it is extended as the walk advances.
+      std::vector<int> hist = out;
+      std::vector<float> row_buf;
+      for (int i = 0; i <= nd; ++i) {
+        const float* row = rows + static_cast<std::size_t>(i) * static_cast<std::size_t>(vocab);
+        row_buf.assign(row, row + vocab);
+        active_grammar_->apply_mask(row_buf);
+        const int best = detail::dispatch_sample_from_logits(
+            row_buf, 0.0f, options_.top_k, options_.top_p, options_.repetition_penalty,
+            options_.no_repeat_ngram_size, hist);
+        if (best < 0 ||
+            row_buf[static_cast<std::size_t>(best)] == -std::numeric_limits<float>::infinity()) {
+          grammar_dead = true;  // every token forbidden; stop rather than emit one
+          break;
+        }
+        if (i < nd && best == drafts[i]) {
+          active_grammar_->accept(best);
+          hist.push_back(best);
+          ++a;
+          continue;
+        }
+        bonus = best;
+        break;
+      }
+    } else {
+      // writes KV pos..pos+nd, returns nd+1 argmaxes
+      keep_min(min_verify_ms, timed([&] { verify_tokens(batch, pos, verdict); }));
+      ++verify_samples;
+      ++verifies;
+      drafted += nd;
+      while (a < nd && verdict[a] == drafts[a]) ++a;
+      bonus = verdict[a];
+    }
+    if (grammar_dead) break;
     accepted += a;
     spec_acc_tokens = 0.7f * spec_acc_tokens + 0.3f * static_cast<float>(a);
     // Tokens this verify had to accept to have been worth running. Until a plain
@@ -1156,7 +1239,8 @@ std::vector<int> LlamaEngine::spec_lookup_generate(const std::vector<int>& promp
       }
     }
     if (!cont) break;
-    cur = verdict[a];  // the verify's own next token, not yet forwarded
+    cur = bonus;  // the verify's own next token, not yet forwarded
+    if (active_grammar_ != nullptr) active_grammar_->accept(cur);
     if (!record(cur)) break;
   }
   if (std::getenv("CPI_SPEC_STATS")) {
@@ -1181,15 +1265,14 @@ bool LlamaEngine::batched_verify_available() const {
          !cfg.is_moe() && !cfg.uses_non_full_attention();
 }
 
-void LlamaEngine::verify_tokens(const std::vector<int>& tokens, int start_pos,
-                                std::vector<int>& out_argmax) {
+// Shared forward for both verify entry points: runs the K tokens through every
+// layer at positions [start_pos, start_pos+K), writing their K/V, and leaves
+// d_batch_logits_ holding [K][vocab]. Split out so the argmax-returning and
+// logits-returning verifies cannot drift apart.
+void LlamaEngine::run_verify_forward(const std::vector<int>& tokens, int start_pos) {
   const bool all_layers_cached = cached_layer_count_ == weights_.config().num_layers;
   const auto& cfg = weights_.config();
   const int K = static_cast<int>(tokens.size());
-  out_argmax.assign(static_cast<std::size_t>(K), 0);
-  if (K == 0) {
-    return;
-  }
 
   // Verify needs the same batched full-attention path as prefill; the scratch
   // buffers are sized for prefill_chunk_size_ rows.
@@ -1222,6 +1305,18 @@ void LlamaEngine::verify_tokens(const std::vector<int>& tokens, int start_pos,
   // layer projections, which already run through the batched cuBLAS path. Then a
   // per-row device argmax (only K ints cross the bus).
   batched_lm_head(K, hidden, cfg.vocab_size);
+}
+
+void LlamaEngine::verify_tokens(const std::vector<int>& tokens, int start_pos,
+                                std::vector<int>& out_argmax) {
+  const auto& cfg = weights_.config();
+  const int K = static_cast<int>(tokens.size());
+  out_argmax.assign(static_cast<std::size_t>(K), 0);
+  if (K == 0) {
+    return;
+  }
+  run_verify_forward(tokens, start_pos);
+  // Per-row device argmax; only K ints cross the bus.
   for (int i = 0; i < K; ++i) {
     kernels::launch_argmax_float(
         d_batch_logits_ + static_cast<std::size_t>(i) * static_cast<std::size_t>(cfg.vocab_size),
@@ -1231,6 +1326,29 @@ void LlamaEngine::verify_tokens(const std::vector<int>& tokens, int start_pos,
                                cudaMemcpyDeviceToHost, compute_stream_));
   }
   CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
+}
+
+float* LlamaEngine::verify_tokens_logits(const std::vector<int>& tokens, int start_pos) {
+  const auto& cfg = weights_.config();
+  const int K = static_cast<int>(tokens.size());
+  if (K == 0) {
+    return nullptr;
+  }
+  run_verify_forward(tokens, start_pos);
+  // The whole [K][vocab] block comes back, because a grammar decides the winner
+  // and the device argmax cannot know what the grammar forbids. K x vocab x 4
+  // bytes is ~4 MB at K=8 on a 128k vocab, against a verify that costs several
+  // milliseconds, so the transfer is not what decides whether this pays.
+  const std::size_t need = static_cast<std::size_t>(K) * static_cast<std::size_t>(cfg.vocab_size);
+  if (static_cast<int>(K) > h_verify_logits_cap_) {
+    if (h_verify_logits_) CUDA_CHECK(cudaFreeHost(h_verify_logits_));
+    CUDA_CHECK(cudaHostAlloc(&h_verify_logits_, need * sizeof(float), cudaHostAllocDefault));
+    h_verify_logits_cap_ = K;
+  }
+  CUDA_CHECK(cudaMemcpyAsync(h_verify_logits_, d_batch_logits_, need * sizeof(float),
+                             cudaMemcpyDeviceToHost, compute_stream_));
+  CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
+  return h_verify_logits_;
 }
 
 }  // namespace engine

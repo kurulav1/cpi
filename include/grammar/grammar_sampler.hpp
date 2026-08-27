@@ -66,6 +66,11 @@ public:
   // here; special tokens (empty piece) are always masked except EOS.
   void apply_mask(std::vector<float>& logits) const;
 
+  // Same, over a raw row. Speculative verification masks rows of a [K][vocab]
+  // block in place, and copying each row into a vector first would cost more than
+  // the masking does.
+  void apply_mask(float* logits, std::size_t n) const;
+
   // Advances the grammar by `token_id`. Returns true when the grammar has
   // reached a complete value after this token (the caller may stop). Accepting
   // EOS returns true without consuming bytes.

@@ -293,6 +293,12 @@ private:
   // path; K must be <= prefill_chunk_size_.
   void verify_tokens(const std::vector<int>& tokens, int start_pos, std::vector<int>& out_argmax);
 
+  // Same forward, but hands back the full [K][vocab] logits in a pinned host
+  // buffer owned by the engine (valid until the next call). Needed when a grammar
+  // decides the winner, which the device argmax cannot do because it does not
+  // know what the grammar forbids.
+  float* verify_tokens_logits(const std::vector<int>& tokens, int start_pos);
+
   // Whether verify_tokens can run at all. verify_tokens throws on these
   // conditions and the EAGLE gate re-listed them inline, so a condition added in
   // one place could silently not reach the other. One predicate, three callers.
@@ -596,8 +602,11 @@ private:
   // Project all `batch` rows of d_x_norm_ through the LM head into d_batch_logits_
   // ([batch][vocab], float) in one GEMM. Lazily (re)allocates d_batch_logits_.
   void batched_lm_head(int batch, int hidden, int vocab);
-  float* d_batch_logits_ = nullptr;  // [max_batch * vocab] float LM-head output
-  int d_batch_logits_cap_ = 0;       // capacity in rows
+  void run_verify_forward(const std::vector<int>& tokens, int start_pos);
+  float* h_verify_logits_ = nullptr;  // pinned [K * vocab] staging for verify_tokens_logits
+  int h_verify_logits_cap_ = 0;       // capacity in rows
+  float* d_batch_logits_ = nullptr;   // [max_batch * vocab] float LM-head output
+  int d_batch_logits_cap_ = 0;        // capacity in rows
   // Persistent pinned host mirror for the [batch][vocab] D2H copy. Pinned so the copy
   // runs at full PCIe bandwidth and can be async; reused so no ~batch*vocab alloc per
   // decode step. Grown on demand alongside d_batch_logits_.

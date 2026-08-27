@@ -200,12 +200,16 @@ void GrammarSampler::build_bitmask(int start, bool terminable, std::size_t vocab
 }
 
 void GrammarSampler::apply_mask(std::vector<float>& logits) const {
+  apply_mask(logits.data(), logits.size());
+}
+
+void GrammarSampler::apply_mask(float* logits, std::size_t vocab_n) const {
   const auto mask_t0 =
       profile_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
   const float neg_inf = -std::numeric_limits<float>::infinity();
   const bool terminable = state_.can_terminate();
   const bool partial_pending = state_.has_partial();
-  const std::size_t vocab = logits.size();
+  const std::size_t vocab = vocab_n;
 
   // Cached path. A pending partial UTF-8 sequence is excluded: the legal set then
   // depends on the carried bytes as well as the stack-set, which the state id does
