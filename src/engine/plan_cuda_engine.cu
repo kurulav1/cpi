@@ -29,6 +29,7 @@
 #include "engine/mla_assemble.hpp"
 #include "engine/moe_grouped.hpp"
 #include "engine/plan_cuda_engine.hpp"
+#include "engine/prompt_lookup.hpp"
 #include "engine/sampling.hpp"
 #include "grammar/grammar_sampler.hpp"
 #include "model/json_mini.hpp"
@@ -5057,25 +5058,6 @@ void PlanCudaEngine::verify_greedy(const int* tokens, int k, int pos, int* out_a
 
 // Prompt-lookup draft: find the most recent earlier occurrence of the last `ng` tokens
 // and propose the tokens that followed it.
-static int lookup_draft(const std::vector<int>& hist, int ng, int k, int* out) {
-  const int n = static_cast<int>(hist.size());
-  if (n < ng + 1) return 0;
-  for (int start = n - ng - 1; start >= 0; --start) {
-    bool match = true;
-    for (int j = 0; j < ng; ++j) {
-      if (hist[start + j] != hist[n - ng + j]) {
-        match = false;
-        break;
-      }
-    }
-    if (match) {
-      int c = 0;
-      for (int j = start + ng; j < n && c < k; ++j) out[c++] = hist[j];
-      return c;
-    }
-  }
-  return 0;
-}
 
 std::vector<int> PlanCudaEngine::generate_stream(const std::vector<int>& prompt, int max_new,
                                                  float temperature,
@@ -5219,7 +5201,12 @@ std::vector<int> PlanCudaEngine::generate_stream(const std::vector<int>& prompt,
     while (!stop && stats_.generated_tokens < p.max_new_tokens && pos < max_ctx) {
       int drafts[16];
       const int room = max_ctx - pos - 1;  // verify writes KV rows pos..pos+nd
-      const int nd = room >= 1 ? lookup_draft(history, 3, std::min(spec_k, room), drafts) : 0;
+      // Still a 3-gram here. Metal measured 6 as clearly better (it took Gemma
+      // from -17% to neutral and left Qwen unchanged), but that was never
+      // re-measured on this engine, so changing it blind would be swapping one
+      // unmeasured number for another. Worth a measurement, not an assumption.
+      const int nd =
+          room >= 1 ? engine::prompt_lookup_draft(history, 3, std::min(spec_k, room), drafts) : 0;
       if (nd <= 0) {
         step(cur, pos, /*want_logits=*/true);
         ++pos;

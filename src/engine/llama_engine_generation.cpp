@@ -9,6 +9,7 @@
 
 #include "common.hpp"
 #include "engine/llama_engine.hpp"
+#include "engine/prompt_lookup.hpp"
 #include "grammar/grammar_sampler.hpp"
 #include "llama_engine_internal.hpp"
 #include "model/gguf_kquant.hpp"
@@ -891,12 +892,9 @@ std::vector<int> LlamaEngine::generate_stream(const std::vector<int>& prompt_tok
   // EAGLE chain-speculative decode: greedy only, no grammar/min-tokens, and the
   // same batched-path eligibility verify_tokens needs. The draft cache was fed
   // during prefill (see prefill_prompt); the loop verifies chains of k drafts.
-  const bool eagle_eligible =
-      eagle_enabled_ && temperature <= 0.0f && active_grammar_ == nullptr && min_new_tokens == 0 &&
-      !options_.paged_kv_cache && prefill_chunk_size_ > 1 &&
-      !(cached_int8_proj_enabled_ && cached_layer_count_ != cfg.num_layers) && !kv_int4_enabled_ &&
-      !tq3_enabled_ && !cfg.is_moe() && !cfg.uses_non_full_attention() &&
-      eagle_k_ + 1 <= prefill_chunk_size_ && reuse == 0;
+  const bool eagle_eligible = eagle_enabled_ && temperature <= 0.0f && active_grammar_ == nullptr &&
+                              min_new_tokens == 0 && batched_verify_available() &&
+                              eagle_k_ + 1 <= prefill_chunk_size_ && reuse == 0;
   if (eagle_eligible) {
     const auto eagle_decode_start = std::chrono::steady_clock::now();
     const std::vector<int> gen = eagle_tree_
@@ -906,6 +904,26 @@ std::vector<int> LlamaEngine::generate_stream(const std::vector<int>& prompt_tok
     CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
     last_benchmark_stats_.decode_ms = std::chrono::duration<double, std::milli>(
                                           std::chrono::steady_clock::now() - eagle_decode_start)
+                                          .count();
+    last_benchmark_stats_.generated_tokens = static_cast<int>(gen.size());
+    return out;
+  }
+
+  // Prompt-lookup speculation (CPI_SPEC=<k>). Same eligibility as EAGLE, minus
+  // the draft head: greedy only, no grammar, no min_new floor, and the batched
+  // verify path. Unlike EAGLE it needs no extra weights, so it costs nothing when
+  // it does not fire.
+  const char* spec_env = std::getenv("CPI_SPEC");
+  const int spec_k = spec_env != nullptr ? std::min(std::atoi(spec_env), 15) : 0;
+  if (spec_k >= 1 && temperature <= 0.0f && active_grammar_ == nullptr && min_new_tokens == 0 &&
+      batched_verify_available() && spec_k + 1 <= prefill_chunk_size_ && reuse == 0) {
+    const auto spec_decode_start = std::chrono::steady_clock::now();
+    const std::vector<int> gen =
+        spec_lookup_generate(prompt_tokens, max_new_tokens, spec_k, on_token);
+    out.insert(out.end(), gen.begin(), gen.end());
+    CUDA_CHECK(cudaStreamSynchronize(compute_stream_));
+    last_benchmark_stats_.decode_ms = std::chrono::duration<double, std::milli>(
+                                          std::chrono::steady_clock::now() - spec_decode_start)
                                           .count();
     last_benchmark_stats_.generated_tokens = static_cast<int>(gen.size());
     return out;
@@ -1015,8 +1033,106 @@ std::vector<std::pair<int, float>> LlamaEngine::inspect_next_logits(
   return out;
 }
 
+std::vector<int> LlamaEngine::spec_lookup_generate(const std::vector<int>& prompt_tokens,
+                                                   int max_new_tokens, int spec_k,
+                                                   const std::function<bool(int)>& on_token) {
+  // Mirrors the Metal engine's loop, including its tuning, which was measured
+  // there: a 6-gram (see prompt_lookup.hpp) and an exponential backoff when
+  // drafting stops paying. Acceptance is a property of the model and the text
+  // together, so blind speculation is a regression on models that do not repeat.
+  const int cap = std::min(spec_k, std::max(1, prefill_chunk_size_ - 1));
+  std::vector<int> out;
+  std::vector<int> history = prompt_tokens;
+  int verifies = 0, drafted = 0, accepted = 0, backoffs = 0;
+
+  // Append, stream, and test the stop conditions. False ends the loop.
+  const auto record = [&](int tok) -> bool {
+    out.push_back(tok);
+    history.push_back(tok);
+    if (on_token && !on_token(tok)) return false;
+    if (static_cast<int>(out.size()) >= max_new_tokens) return false;
+    if (options_.loop_guard && detail::dispatch_has_degenerate_tail(out, prompt_tokens.size())) {
+      return false;
+    }
+    return true;
+  };
+
+  // Local, like the Metal loop: the backoff is a property of this generation, and
+  // carrying it between requests would let one unlucky run mute the next.
+  float spec_acc_ewma_ = 1.0f;
+  int spec_cooldown_ = 0;
+  int spec_backoff_ = 0;
+  int pos = static_cast<int>(prompt_tokens.size());
+  int cur = decode_next_token(prompt_tokens.back(), pos - 1, 0.0f, out);
+  bool stop = !record(cur);
+  while (!stop && pos + 1 < options_.max_context) {
+    int drafts[16];
+    const int room = std::min(cap, std::min(16, options_.max_context - pos - 1));
+    const int nd = spec_cooldown_ > 0 ? 0 : engine::prompt_lookup_draft(history, 6, room, drafts);
+    if (spec_cooldown_ > 0) --spec_cooldown_;
+    if (nd <= 0) {
+      cur = decode_next_token(cur, pos, 0.0f, out);
+      ++pos;
+      if (!record(cur)) break;
+      continue;
+    }
+    std::vector<int> batch;
+    batch.reserve(static_cast<std::size_t>(nd) + 1);
+    batch.push_back(cur);
+    for (int i = 0; i < nd; ++i) batch.push_back(drafts[i]);
+    std::vector<int> verdict;
+    verify_tokens(batch, pos, verdict);  // writes KV pos..pos+nd, returns nd+1 argmaxes
+    ++verifies;
+    drafted += nd;
+    int a = 0;
+    while (a < nd && verdict[a] == drafts[a]) ++a;
+    accepted += a;
+    spec_acc_ewma_ =
+        0.7f * spec_acc_ewma_ + 0.3f * (static_cast<float>(a) / static_cast<float>(nd));
+    // A verify that lands nothing is decisive on its own; waiting for the average
+    // to sag just buys more full-price misses.
+    if (a == 0 || spec_acc_ewma_ < 0.35f) {
+      spec_backoff_ = (spec_backoff_ == 0) ? 32 : std::min(spec_backoff_ * 2, 2048);
+      spec_cooldown_ = spec_backoff_;
+      spec_acc_ewma_ = 0.6f;  // neutral restart: one good probe re-enables it
+      ++backoffs;
+    } else if (a == nd) {
+      spec_backoff_ = 0;  // drafting is paying again; forget the penalty
+    }
+    pos += a + 1;  // KV correct through the a-th accepted draft; rejected rows go stale
+    bool cont = true;
+    for (int i = 0; i < a; ++i) {
+      if (!record(drafts[i])) {
+        cont = false;
+        break;
+      }
+    }
+    if (!cont) break;
+    cur = verdict[a];  // the verify's own next token, not yet forwarded
+    if (!record(cur)) break;
+  }
+  if (std::getenv("CPI_SPEC_STATS")) {
+    std::fprintf(
+        stderr, "[spec] verifies=%d drafted=%d accepted=%d (%.1f%%) backoffs=%d tokens=%zu",
+        verifies, drafted, accepted,
+        drafted ? 100.0 * static_cast<double>(accepted) / static_cast<double>(drafted) : 0.0,
+        backoffs, out.size());
+    std::fprintf(stderr, "%s", "\n");
+  }
+  return out;
+}
+
+bool LlamaEngine::batched_verify_available() const {
+  const auto& cfg = weights_.config();
+  const bool all_layers_cached = cached_layer_count_ == cfg.num_layers;
+  return !options_.paged_kv_cache && prefill_chunk_size_ > 1 &&
+         !(cached_int8_proj_enabled_ && !all_layers_cached) && !kv_int4_enabled_ && !tq3_enabled_ &&
+         !cfg.is_moe() && !cfg.uses_non_full_attention();
+}
+
 void LlamaEngine::verify_tokens(const std::vector<int>& tokens, int start_pos,
                                 std::vector<int>& out_argmax) {
+  const bool all_layers_cached = cached_layer_count_ == weights_.config().num_layers;
   const auto& cfg = weights_.config();
   const int K = static_cast<int>(tokens.size());
   out_argmax.assign(static_cast<std::size_t>(K), 0);
@@ -1026,10 +1142,7 @@ void LlamaEngine::verify_tokens(const std::vector<int>& tokens, int start_pos,
 
   // Verify needs the same batched full-attention path as prefill; the scratch
   // buffers are sized for prefill_chunk_size_ rows.
-  const bool all_layers_cached = cached_layer_count_ == cfg.num_layers;
-  if (options_.paged_kv_cache || prefill_chunk_size_ <= 1 ||
-      (cached_int8_proj_enabled_ && !all_layers_cached) || kv_int4_enabled_ || tq3_enabled_ ||
-      cfg.is_moe() || cfg.uses_non_full_attention()) {
+  if (!batched_verify_available()) {
     CPI_THROW("verify_tokens requires the batched full-attention path");
   }
   if (K > prefill_chunk_size_) {

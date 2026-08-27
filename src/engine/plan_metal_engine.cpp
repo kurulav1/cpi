@@ -19,6 +19,7 @@
 
 #include "engine/generation_constraints.hpp"
 #include "engine/plan_model_config.hpp"
+#include "engine/prompt_lookup.hpp"
 #include "engine/sampling.hpp"
 #include "grammar/grammar_sampler.hpp"
 #include "model/config_json.hpp"
@@ -3426,25 +3427,6 @@ std::vector<std::pair<int, float>> PlanMetalEngine::inspect_next_logits(
 // Prompt-lookup draft: the most recent earlier occurrence of the last `ng` tokens predicts the
 // tokens that followed it. No draft model; the context is the draft source, which is why this
 // wins on structured/repetitive output (code, JSON, quoting) and is neutral on free prose.
-static int metal_lookup_draft(const std::vector<int>& hist, int ng, int k, int* out) {
-  const int n = static_cast<int>(hist.size());
-  if (n < ng + 1 || k <= 0) return 0;
-  for (int start = n - ng - 1; start >= 0; --start) {
-    bool match = true;
-    for (int j = 0; j < ng; ++j) {
-      if (hist[start + j] != hist[n - ng + j]) {
-        match = false;
-        break;
-      }
-    }
-    if (match) {
-      int c = 0;
-      for (int j = start + ng; j < n && c < k; ++j) out[c++] = hist[j];
-      return c;
-    }
-  }
-  return 0;
-}
 
 std::vector<int> PlanMetalEngine::generate_spec_lookup(const std::vector<int>& prompt, int max_new,
                                                        int spec_k,
@@ -3494,7 +3476,7 @@ std::vector<int> PlanMetalEngine::generate_spec_lookup(const std::vector<int>& p
     // costs a full verify (~10 decode steps on Gemma, whose batched path barely amortises
     // weights). Requiring a longer match took Gemma from -17% to neutral while leaving Qwen's
     // 1.76x untouched; precision matters far more than recall when a miss is this expensive.
-    const int nd = spec_cooldown > 0 ? 0 : metal_lookup_draft(history, 6, room, drafts);
+    const int nd = spec_cooldown > 0 ? 0 : engine::prompt_lookup_draft(history, 6, room, drafts);
     if (spec_cooldown > 0) --spec_cooldown;
     if (nd <= 0) {
       cur = decode_next_token(cur, pos, 0.0f, history);

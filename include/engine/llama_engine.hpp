@@ -293,6 +293,19 @@ private:
   // path; K must be <= prefill_chunk_size_.
   void verify_tokens(const std::vector<int>& tokens, int start_pos, std::vector<int>& out_argmax);
 
+  // Whether verify_tokens can run at all. verify_tokens throws on these
+  // conditions and the EAGLE gate re-listed them inline, so a condition added in
+  // one place could silently not reach the other. One predicate, three callers.
+  bool batched_verify_available() const;
+
+  // Prompt-lookup speculative decode (CPI_SPEC=<k>). Drafts the continuation that
+  // followed the last occurrence of the trailing n-gram, then checks the whole
+  // draft in one batched verify. No draft model and no extra weights, so a miss
+  // costs only the verify it triggered. Assumes the prompt is already prefilled,
+  // like the EAGLE entry points beside it.
+  std::vector<int> spec_lookup_generate(const std::vector<int>& prompt_tokens, int max_new_tokens,
+                                        int spec_k, const std::function<bool(int)>& on_token);
+
   // Returns true if the greedy-decode CUDA graph can be used for the current
   // engine state (e.g. all layers cached, temperature == 0 implied by caller).
   bool can_use_greedy_decode_graph() const;
