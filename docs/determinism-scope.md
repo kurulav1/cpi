@@ -13,9 +13,10 @@ cpi <model> --prompt "The capital of France is" --verify-determinism 64 --gpu-ca
 
 It is not a separate code path: it calls `generate()` exactly as a request does,
 because a verifier that decoded differently from the engine would attest to
-nothing. `tools/determinism_matrix.sh` runs the single-sequence table below;
-`tools/determinism_batch.sh` covers batch size, which a single-sequence verifier
-cannot see.
+nothing. `tools/determinism_matrix.sh` runs the single-sequence table below,
+`tools/determinism_batch.sh` covers batch size (which a single-sequence verifier
+cannot see), and `tools/determinism_version.sh` compares today's build against an
+older one.
 
 ## Holds
 
@@ -102,10 +103,38 @@ It does mean `--serve` cannot currently run quantised weights at all.
 
 Deterministic, on one machine and backend, for a given model and settings:
 repeated runs, container format, paging, GPU cache policy, context size, position
-within a batch, and batch size.
+within a batch, batch size, and build version back to the start of the project.
 
 Not deterministic across: weight quantisation, and KV quantisation once
 generation is long enough to read quantised KV.
+
+## Across versions
+
+Today's build reproduces the token stream of the oldest build that can run the
+model at all: commit `7c883b3` (2026-05-24), which is 817 commits back and the
+seventh commit in the repository. Identical output on six configurations,
+`tools/determinism_version.sh`:
+
+| config | result |
+| --- | --- |
+| 64 tokens, `--gpu-cache-all` | identical |
+| 64 tokens, no GPU cache | identical |
+| 256 tokens, `--gpu-cache-all` | identical |
+| 256 tokens, no GPU cache | identical |
+| 256 tokens, prose prompt | identical |
+| 64 tokens, code prompt | identical |
+
+So version stability already exists here rather than needing to be established;
+what it needs is gating, so that it keeps holding.
+
+Two limits on that claim. It is one model family, because the comparison has to
+use a container both builds read: GGUF support landed mid-history, so the test
+runs on `.ll2c`, and only one `.ll2c` checkpoint is on hand. And `--paged-kv-cache`
+could not be compared at all, because the old build fails it with a missing
+tensor at layer 16 of a 16-layer model. That is an old bug fixed since, not a
+divergence, and it is listed because a config the old build cannot run says
+nothing about whether the two agree on it. A row that produced no tokens on both
+sides would have compared equal and looked like a pass.
 
 ## Not yet measured
 
@@ -114,9 +143,6 @@ generation is long enough to read quantised KV.
   NVIDIA SKU for an hour would settle it.
 - **Across backends.** Metal is unverified: no Apple Silicon was available. CPU
   against CUDA is untested here.
-- **Across versions.** Whether today's build agrees with one from six months ago
-  is unknown, and it decides whether version stability already exists or has to
-  start being gated now. This one needs no hardware.
 
 Until those are run the honest statement is the narrow one: same machine, same
 build, same settings, and the exclusions above.
