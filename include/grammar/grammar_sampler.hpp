@@ -36,6 +36,19 @@ class MaskCache;
 struct TokenTables {
   std::vector<std::vector<std::uint32_t>> cps;
   std::vector<char> simple;
+
+  // Simple tokens grouped by the codepoint they start with, so a state that
+  // forbids that codepoint skips every token beginning with it in one lookup
+  // instead of walking each in turn.
+  //
+  // This is what a mask costs. Building one used to test all 128256 tokens
+  // against the DFA even though nearly all of them die on their first codepoint,
+  // and a vocabulary that size has only a few thousand distinct first
+  // codepoints. In a restrictive state, inside a literal like "add", exactly one
+  // bucket survives.
+  std::vector<std::uint32_t> first_cps;    // distinct first codepoints
+  std::vector<std::vector<int>> buckets;   // token ids, parallel to first_cps
+  std::vector<int> non_simple;             // ids that need the would_accept path
 };
 
 // Builds the tables for `token_pieces`. Callers that serve many requests from one
@@ -114,6 +127,9 @@ private:
   mutable std::uint64_t mask_calls_ = 0;
   mutable double mask_ms_ = 0.0;
   mutable double mask_ms_max_ = 0.0;
+  // Split out so the phases of a mask build can be attributed instead of guessed.
+  mutable double slow_ms_ = 0.0;
+  mutable std::uint64_t builds_ = 0;
 };
 
 }  // namespace grammar

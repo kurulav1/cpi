@@ -36,6 +36,23 @@ public:
     return id;
   }
 
+  // Whether `cp` is acceptable from state `id`, without working out which state
+  // it leads to.
+  //
+  // That distinction is most of the cost of a mask. transition() has to walk the
+  // grammar, canonicalize the resulting stack set, build its key and intern it;
+  // this only tests the elements on top of each stack. Since a mask rejects the
+  // large majority of the codepoints it tries, testing first and computing the
+  // successor only for survivors avoids nearly all of that work.
+  bool accepts(int id, std::uint32_t cp) const {
+    for (const Stack& stack : states_[static_cast<std::size_t>(id)]) {
+      if (!stack.empty() && char_set_accepts(stack.back(), cp)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   // Returns the next state id for consuming `cp` from state `id`, or -1 if the
   // codepoint is rejected. Computed once per (id, cp) and cached.
   int transition(int id, std::uint32_t cp) {
@@ -95,16 +112,25 @@ public:
 
   detail::TransitionMemo memo;
   std::unordered_map<std::uint64_t, std::vector<std::uint32_t>> masks;
+  // Reused when a state cannot be cached, so the bucketed build still runs
+  // instead of falling back to the whole-vocabulary walk.
+  std::vector<std::uint32_t> scratch;
+  std::size_t mask_bytes = 0;  // what `masks` holds, against kMaxCachedMaskBytes
   std::size_t vocab = 0;
 };
 
 namespace {
 
-// Bounds the cache at 64 masks. Gemma's 262144-token vocabulary is 32 KB per
-// mask, so this caps a sampler at 2 MB, and samplers are per request. A grammar
-// with more live states than this still works: the overflow states fall back to
-// the uncached walk rather than evicting.
-constexpr std::size_t kMaxCachedMasks = 64;
+// Bound the cache by memory rather than by a mask count, because the two differ
+// by 16x across the vocabularies in use: a mask is 16 KB at Llama-3's 128256
+// tokens and 32 KB at Gemma's 262144.
+//
+// 64 masks was far too few. A tool-calling request made 154 mask calls and 150 of
+// them had to rebuild, because once the cache filled nothing could enter it, so
+// states that recurred paid full price every time. 16 MB holds a thousand masks
+// at the smaller vocabulary, which covers a schema's live states with room spare,
+// and it is per request, so it is released when the request ends.
+constexpr std::size_t kMaxCachedMaskBytes = 16u * 1024u * 1024u;
 
 }  // namespace
 
@@ -123,6 +149,29 @@ std::shared_ptr<const TokenTables> build_token_tables(
     } else {
       tables->cps[t].clear();
     }
+  }
+
+  // Group the simple tokens by first codepoint. A mask can then reject a whole
+  // bucket with one DFA transition rather than testing each token in it, which is
+  // most of the work: a 128k vocabulary has only a few thousand distinct first
+  // codepoints, and a state inside a string literal admits one of them.
+  std::unordered_map<std::uint32_t, std::size_t> slot;
+  for (std::size_t t = 0; t < vocab; ++t) {
+    if (token_pieces[t].empty()) {
+      continue;
+    }
+    if (!tables->simple[t] || tables->cps[t].empty()) {
+      tables->non_simple.push_back(static_cast<int>(t));
+      continue;
+    }
+    const std::uint32_t head = tables->cps[t][0];
+    auto it = slot.find(head);
+    if (it == slot.end()) {
+      it = slot.emplace(head, tables->first_cps.size()).first;
+      tables->first_cps.push_back(head);
+      tables->buckets.emplace_back();
+    }
+    tables->buckets[it->second].push_back(static_cast<int>(t));
   }
   return tables;
 }
@@ -156,10 +205,10 @@ GrammarSampler::~GrammarSampler() {
   // a fixed cost every schema request pays, separate from the per-token masking.
   std::fprintf(stderr,
                "[grammar] vocab=%zu ctor_ms=%.2f mask_calls=%llu mask_ms_total=%.2f "
-               "mask_ms_avg=%.3f mask_ms_max=%.3f\n",
+               "mask_ms_avg=%.3f mask_ms_max=%.3f builds=%llu slow_ms=%.2f\n",
                token_pieces_.size(), ctor_ms_, static_cast<unsigned long long>(mask_calls_),
                mask_ms_, mask_calls_ ? mask_ms_ / static_cast<double>(mask_calls_) : 0.0,
-               mask_ms_max_);
+               mask_ms_max_, static_cast<unsigned long long>(builds_), slow_ms_);
 }
 
 bool GrammarSampler::token_allowed(int start, bool terminable, bool partial_pending,
@@ -192,10 +241,62 @@ bool GrammarSampler::token_allowed(int start, bool terminable, bool partial_pend
 void GrammarSampler::build_bitmask(int start, bool terminable, std::size_t vocab,
                                    std::vector<std::uint32_t>& out) const {
   out.assign((vocab + 31) / 32, 0u);
-  for (std::size_t t = 0; t < vocab; ++t) {
-    if (token_allowed(start, terminable, /*partial_pending=*/false, t)) {
+  const auto allow = [&out, vocab](std::size_t t) {
+    if (t < vocab) {
       out[t >> 5] |= (1u << (t & 31));
     }
+  };
+
+  // EOS is legal exactly where the grammar may stop.
+  if (eos_token_id_ >= 0) {
+    if (terminable) {
+      allow(static_cast<std::size_t>(eos_token_id_));
+    }
+  }
+
+  // One transition per distinct first codepoint decides a whole bucket. This is
+  // the difference between testing 128256 tokens and testing the few thousand
+  // that could possibly continue: in a restrictive state nearly every bucket dies
+  // on that single lookup, and the tokens inside it are never touched.
+  for (std::size_t b = 0; b < tables_->first_cps.size(); ++b) {
+    // Cheap test first. Most buckets are rejected, and asking transition()
+    // directly would build and intern a successor state for each one before
+    // discovering it was dead.
+    if (!cache_->memo.accepts(start, tables_->first_cps[b])) {
+      continue;
+    }
+    const int after_first = cache_->memo.transition(start, tables_->first_cps[b]);
+    if (after_first < 0) {
+      continue;  // no token starting with this codepoint can continue
+    }
+    for (const int id : tables_->buckets[b]) {
+      const std::vector<std::uint32_t>& cps = tables_->cps[static_cast<std::size_t>(id)];
+      int s = after_first;
+      for (std::size_t k = 1; k < cps.size() && s >= 0; ++k) {
+        s = cache_->memo.transition(s, cps[k]);
+      }
+      if (s >= 0) {
+        allow(static_cast<std::size_t>(id));
+      }
+    }
+  }
+
+  // Tokens that are not whole codepoints (mid-sequence or invalid bytes) cannot
+  // be bucketed by a first codepoint, so they keep the byte-level check. There
+  // are a thousand or so of them against a 128k vocabulary.
+  const auto slow_t0 =
+      profile_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+  for (const int id : tables_->non_simple) {
+    if (static_cast<std::size_t>(id) < token_pieces_.size() &&
+        state_.would_accept(token_pieces_[static_cast<std::size_t>(id)])) {
+      allow(static_cast<std::size_t>(id));
+    }
+  }
+  if (profile_) {
+    slow_ms_ +=
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - slow_t0)
+            .count();
+    ++builds_;
   }
 }
 
@@ -221,13 +322,30 @@ void GrammarSampler::apply_mask(float* logits, std::size_t vocab_n) const {
       const std::uint64_t key =
           (static_cast<std::uint64_t>(start) << 1) | (terminable ? 1ull : 0ull);
       auto it = cache_->masks.find(key);
-      if (it == cache_->masks.end() && cache_->masks.size() < kMaxCachedMasks) {
+      const std::size_t mask_bytes = ((vocab + 31) / 32) * sizeof(std::uint32_t);
+      if (it == cache_->masks.end() && cache_->mask_bytes + mask_bytes <= kMaxCachedMaskBytes) {
         std::vector<std::uint32_t> bits;
         build_bitmask(start, terminable, vocab, bits);
+        cache_->mask_bytes += mask_bytes;
         it = cache_->masks.emplace(key, std::move(bits)).first;
       }
+      // Past the cache limit, build into scratch and apply it without storing.
+      //
+      // This used to fall through to the whole-vocabulary walk, which is the
+      // slowest path there is, so exceeding the cap did not merely stop saving
+      // work: it switched algorithms. Measured on a tool-calling request, 165
+      // mask calls produced 64 builds, the cap exactly, and the remaining calls
+      // took the walk. The bucketed build is the same result at a fraction of the
+      // cost, so it is what runs whether or not the mask can be kept.
+      const std::vector<std::uint32_t>* bits_ptr = nullptr;
       if (it != cache_->masks.end()) {
-        const std::vector<std::uint32_t>& bits = it->second;
+        bits_ptr = &it->second;
+      } else {
+        build_bitmask(start, terminable, vocab, cache_->scratch);
+        bits_ptr = &cache_->scratch;
+      }
+      {
+        const std::vector<std::uint32_t>& bits = *bits_ptr;
         const std::size_t words = bits.size();
         for (std::size_t w = 0; w < words; ++w) {
           const std::uint32_t word = bits[w];

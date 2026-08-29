@@ -153,15 +153,19 @@ def validate(value, schema, path="args"):
     return out
 
 
-def call(url, prompt, timeout, max_tokens):
+def call(url, prompt, timeout, max_tokens, use_tools=True):
     body = {
         "model": "cpi",
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "temperature": 0,
-        "tools": TOOLS,
-        "tool_choice": "required",
     }
+    # --no-tools sends the same prompts with no grammar at all. Subtracting that
+    # run from the constrained one attributes wall time to generation plus HTTP
+    # versus grammar work, without guessing where to put a timer.
+    if use_tools:
+        body["tools"] = TOOLS
+        body["tool_choice"] = "required"
     req = urllib.request.Request(
         url + "/v1/chat/completions",
         data=json.dumps(body).encode("utf-8"),
@@ -181,12 +185,18 @@ def main():
     # and a cap that is too low shows up as truncation rather than a defect.
     ap.add_argument("--max-tokens", type=int, default=400)
     ap.add_argument("--transcript", default="")
+    ap.add_argument("--no-tools", action="store_true",
+                    help="send the prompts unconstrained; for timing decomposition")
     args = ap.parse_args()
     url = args.url.rstrip("/")
 
     order = ["ok", "truncated", "no_tool_call", "unknown_tool", "arguments_not_json",
              "schema_violation", "http_error"]
     counts = dict((k, 0) for k in order)
+    # Wall time is only comparable per token: an unconstrained reply is prose of a
+    # different length, so a raw A/B between constrained and free running compares
+    # two different amounts of work.
+    total_completion_tokens = 0
     examples = {}
     transcript = open(args.transcript, "w", encoding="utf-8") if args.transcript else None
     t0 = time.time()
@@ -194,12 +204,13 @@ def main():
     for i in range(args.n):
         prompt = make_prompt(i)
         try:
-            reply = call(url, prompt, args.timeout, args.max_tokens)
+            reply = call(url, prompt, args.timeout, args.max_tokens, not args.no_tools)
         except Exception as e:  # transport, HTTP status, malformed envelope
             counts["http_error"] += 1
             examples.setdefault("http_error", str(e)[:160])
             continue
 
+        total_completion_tokens += int(reply.get("usage", {}).get("completion_tokens", 0) or 0)
         choice = reply.get("choices", [{}])[0]
         msg = choice.get("message", {})
         calls = msg.get("tool_calls") or []
@@ -208,6 +219,12 @@ def main():
         if choice.get("finish_reason") == "length":
             counts["truncated"] += 1
             examples.setdefault("truncated", repr(msg.get("content"))[:120])
+            continue
+        if args.no_tools:
+            counts["ok"] += 1  # timing run: content is expected, not a tool call
+            if (i + 1) % 50 == 0:
+                print("  %d/%d  %.2f calls/s" % (i + 1, args.n,
+                                                 (i + 1) / max(time.time() - t0, 1e-9)), flush=True)
             continue
         if not calls:
             counts["no_tool_call"] += 1
@@ -251,6 +268,10 @@ def main():
     print("")
     print("conformance against %s" % url)
     print("  calls          %d in %.1fs" % (args.n, elapsed))
+    print("  tokens         %d generated, %.2f ms/token, %.1f tok/s"
+          % (total_completion_tokens,
+             1000.0 * elapsed / max(total_completion_tokens, 1),
+             total_completion_tokens / max(elapsed, 1e-9)))
     for k in order:
         line = "  %-18s %d" % (k, counts[k])
         if k in examples:

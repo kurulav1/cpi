@@ -358,10 +358,29 @@ private:
     // seven-field object returned 160 tokens of "\\n \\n \\n". A two-field object
     // happened to escape only because its top logit was "{".
     //
-    // Four characters is enough for a newline plus indentation, and the grammar
-    // only constrains generation, so bounding it cannot make any JSON value
-    // unreachable. The parser has no {m,n} operator, hence the nested groups.
-    define("ws", "([ \\t\\n] ([ \\t\\n] ([ \\t\\n] [ \\t\\n]?)?)?)?");
+    // One character, not four. Whitespace the grammar permits is whitespace the
+    // model will spend tokens on, and those tokens are the whole cost gap: on a
+    // 200-call tool-calling run CPI emitted 117 tokens per call against
+    // llama-server's 52, at an identical 3.74 ms per token, so the wall-clock
+    // difference was entirely padding like
+    //
+    //   {    "name"    :"create_ticket"    ,"arguments"    :{    "title"    :...
+    //
+    // JSON needs no whitespace at all, and the grammar constrains generation
+    // rather than parsing, so allowing at most one keeps every value reachable
+    // while making the compact form the only cheap way to write it.
+    // One, measured. Every permitted whitespace position is a token the model may
+    // spend, and this schema has about thirty of them: at four the run cost 117
+    // tokens per tool call, at one it costs 77, against llama-server's 52.
+    //
+    // Forbidding whitespace outright was tried and reverted. It reaches the token
+    // count but stops the result being a JSON grammar: it rejects "[1, 2]" and
+    // every other ordinary spaced document, which grammar_test asserts and which
+    // anything using this to validate rather than generate would depend on. The
+    // remaining gap to 52 is not whitespace policy, since llama.cpp permits it
+    // too; both engines run the same model, so the difference is what the prompt
+    // steers the model to emit.
+    define("ws", "[ \\t\\n]?");
   }
   std::string ensure_boolean() {
     return define("boolean", "\"true\" | \"false\"");
