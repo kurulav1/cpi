@@ -1050,6 +1050,32 @@ EngineChoice resolve_engine(const ModelProbe& probe, bool cuda_available, bool m
   }
 }
 
+const char* engine_choice_name(EngineChoice choice) {
+  switch (choice) {
+    case EngineChoice::LlamaCuda:
+      return "llama-cuda";
+    case EngineChoice::LlamaMetal:
+      return "llama-metal";
+    case EngineChoice::LlamaCpu:
+      return "llama-cpu";
+    case EngineChoice::PlanCuda:
+      return "plan-cuda";
+    case EngineChoice::Qwen35Cuda:
+      return "qwen35-cuda";
+    case EngineChoice::Qwen35Metal:
+      return "qwen35-metal";
+    case EngineChoice::Qwen35Cpu:
+      return "qwen35-cpu";
+    case EngineChoice::Gemma4Metal:
+      return "gemma4-metal";
+    case EngineChoice::Llama4Cuda:
+      return "llama4-cuda";
+    case EngineChoice::Llama4Cpu:
+      return "llama4-cpu";
+  }
+  return "unknown";
+}
+
 std::string guess_chat_template_from_model_path(const std::string& model_path) {
   const std::string name = to_lower_copy(model_path);
   if (name.find("gemma") != std::string::npos || name.find(".cpi") != std::string::npos) {

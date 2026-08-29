@@ -627,13 +627,7 @@ int main(int argc, char** argv) {
         std::printf(
             "[verify] backend=%s model=%s quant=%s kv_bits=%d paged=%d gpu_cache_all=%d "
             "ctx=%d temp=0 prompt_tokens=%zu\n",
-#if CPI_HAS_CUDA
-            "cuda",
-#elif defined(CPI_HAS_METAL) && CPI_HAS_METAL
-            "metal",
-#else
-            "cpu",
-#endif
+            app::main_helpers::engine_choice_name(engine_choice),
             std::filesystem::path(cli.opts.model_path).filename().string().c_str(),
             cli.opts.int8_streaming ? (cli.opts.streaming_quant_bits == 4 ? "int4" : "int8")
                                     : "none",

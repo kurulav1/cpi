@@ -124,4 +124,10 @@ enum class EngineChoice {
 EngineChoice resolve_engine(const ModelProbe& probe, bool cuda_available, bool metal_available,
                             bool force_cpu);
 
+// Name of the engine that actually ran, for output that has to attribute a
+// result to a backend. This has to come from the runtime choice: a build-time
+// #if reports what the binary can do, not what it did, so a CUDA build printing
+// "cuda" would label a --cpu run as CUDA and make the two compare equal.
+const char* engine_choice_name(EngineChoice choice);
+
 }  // namespace app::main_helpers

@@ -15,8 +15,8 @@ It is not a separate code path: it calls `generate()` exactly as a request does,
 because a verifier that decoded differently from the engine would attest to
 nothing. `tools/determinism_matrix.sh` runs the single-sequence table below,
 `tools/determinism_batch.sh` covers batch size (which a single-sequence verifier
-cannot see), and `tools/determinism_version.sh` compares today's build against an
-older one.
+cannot see), `tools/determinism_backend.sh` compares CPU against CUDA, and
+`tools/determinism_version.sh` compares today's build against an older one.
 
 ## Holds
 
@@ -101,9 +101,10 @@ It does mean `--serve` cannot currently run quantised weights at all.
 
 ## Therefore
 
-Deterministic, on one machine and backend, for a given model and settings:
-repeated runs, container format, paging, GPU cache policy, context size, position
-within a batch, batch size, and build version back to the start of the project.
+Deterministic, on one machine, for a given model and settings: repeated runs,
+container format, paging, GPU cache policy, context size, position within a
+batch, batch size, build version back to the start of the project, and CPU
+against CUDA.
 
 Not deterministic across: weight quantisation, and KV quantisation once
 generation is long enough to read quantised KV.
@@ -136,13 +137,48 @@ divergence, and it is listed because a config the old build cannot run says
 nothing about whether the two agree on it. A row that produced no tokens on both
 sides would have compared equal and looked like a pass.
 
+## Across backends: CPU against CUDA
+
+The CPU engine produces the same tokens as CUDA. Nine configurations, three
+prompts, lengths to 2048 tokens, all identical (`tools/determinism_backend.sh`):
+
+| config | result |
+| --- | --- |
+| 64, 256, 512, 1024 tokens | identical |
+| 2048 tokens, `--max-context 4096` | identical |
+| prose prompt, code prompt, 512 tokens | identical |
+| `--paged-kv-cache`, `--max-context 8192` | identical |
+
+This was the axis most likely to break, and the reason it was worth running
+before renting anything: different reduction orders, different accumulate
+precision, no cuBLAS at all. It holds anyway. Greedy decoding only needs the
+ordering of the logits to survive, not their exact values, so numeric
+differences have to reach a near-tie before they can change a token.
+
+One boundary, and it is a stopping rule rather than arithmetic. Generating into
+the context limit, the CPU engine stops a few tokens earlier than CUDA: at
+`--max-context 2048` and 2048 requested tokens, CUDA emitted 2048 and the CPU
+2043. The CPU stream is an exact prefix of the CUDA one, so every token both
+engines produced agrees; they disagree about when to stop. Raising the context
+past the requested length makes the same run identical, which is how the two
+were told apart. The script reports that case as `PREFIX ONLY` rather than as a
+divergence, because a shorter run that agrees everywhere is a different defect
+from one that computes different numbers.
+
+The first attempt at this measurement returned matching hashes from two runs
+that had both used CUDA, because the `[verify] backend=` field was a compile-time
+`#if`: a CUDA build reported `cuda` whichever engine ran. The field whose only
+job is to attribute a mismatch was reporting what the binary could do rather than
+what it did. It now reports the engine resolved at runtime, and the script fails
+outright if the two runs do not name different engines.
+
 ## Not yet measured
 
 - **Across machines.** Every row above is one RTX 5090. Cross-machine
   determinism is the claim worth making and it is untested. Renting a second
   NVIDIA SKU for an hour would settle it.
-- **Across backends.** Metal is unverified: no Apple Silicon was available. CPU
-  against CUDA is untested here.
+- **Across backends, Metal.** Unverified: no Apple Silicon was available. CPU
+  against CUDA is measured above; Metal is the remaining backend.
 
 Until those are run the honest statement is the narrow one: same machine, same
 build, same settings, and the exclusions above.
