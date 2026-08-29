@@ -415,6 +415,33 @@ private:
       return define(fresh(hint + "-enum"), def);
     }
 
+    // anyOf / oneOf: alternation over the branches. Needed for tool calling, where
+    // a request offering N tools is a union of N call shapes, and common in
+    // ordinary schemas for nullable or polymorphic fields.
+    //
+    // oneOf is treated as anyOf. GBNF cannot express "matches exactly one branch",
+    // and the difference only shows when branches overlap, where this accepts a
+    // value that satisfies two of them. That is a wider grammar, never one that
+    // admits something no branch allows.
+    for (const char* alt_key : {"anyOf", "oneOf"}) {
+      const JsonValue* alts = schema.find(alt_key);
+      if (alts == nullptr) {
+        continue;
+      }
+      if (alts->type != JsonValue::Type::Array || alts->arr.empty()) {
+        throw std::runtime_error(std::string("json schema: '") + alt_key +
+                                 "' must be a non-empty array");
+      }
+      std::string def;
+      for (std::size_t k = 0; k < alts->arr.size(); ++k) {
+        if (k) {
+          def += " | ";
+        }
+        def += visit(alts->arr[k], hint + "-" + std::to_string(k));
+      }
+      return define(fresh(std::string(hint) + "-alt"), def);
+    }
+
     const JsonValue* type = schema.find("type");
     if (type == nullptr) {
       return ensure_value();

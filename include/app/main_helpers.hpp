@@ -62,6 +62,11 @@ int json_get_int(const std::string& json, const std::string& key, int def);
 float json_get_float(const std::string& json, const std::string& key, float def);
 bool json_get_bool(const std::string& json, const std::string& key, bool def);
 std::vector<std::string> json_get_string_array(const std::string& json, const std::string& key);
+
+// Splits the array at `key` into its raw elements, nesting preserved, so an array
+// of objects (OpenAI's `tools`) can be walked. Returns empty when the key is
+// missing or is not an array.
+std::vector<std::string> json_get_raw_array(const std::string& json, const std::string& key);
 std::string json_escape(const std::string& s);
 
 std::string build_chat_prompt(const std::string& chat_template, const std::string& prompt_text,

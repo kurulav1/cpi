@@ -587,6 +587,13 @@ add_executable(tokenizer_pieces_test
 target_include_directories(tokenizer_pieces_test PRIVATE include)
 add_test(NAME tokenizer_pieces_test COMMAND tokenizer_pieces_test)
 
+# The grammar's byte table must equal what decode() emits, per token. Needs a real GGUF, so it
+# SKIPs without one; pass a path in CPI_TEST_GGUF to make it run.
+add_executable(gguf_pieces_test src/tests/gguf_pieces_test.cpp)
+target_include_directories(gguf_pieces_test PRIVATE include)
+target_link_libraries(gguf_pieces_test PRIVATE cpi_engine)
+add_test(NAME gguf_pieces_test COMMAND gguf_pieces_test)
+
 # Paged-KV allocator/block-table test (CUDA-free host logic; P3 Phase 1).
 add_executable(paged_kv_test
   src/tests/paged_kv_test.cpp

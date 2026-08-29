@@ -47,6 +47,11 @@ using Rule = std::vector<Element>;
 struct PartialUtf8 {
   std::uint32_t value = 0;
   int n_remain = -1;
+  // Length of the sequence being assembled. Needed to reject overlong forms once
+  // the scalar is complete, which cannot be decided from the value alone: 0xC1
+  // 0xA4 decodes to U+0064, indistinguishable from a plain 'd' unless the decoder
+  // knows it arrived in two bytes.
+  int n_total = 0;
 };
 
 // Immutable compiled grammar.

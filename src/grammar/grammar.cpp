@@ -27,6 +27,21 @@ std::pair<std::vector<std::uint32_t>, PartialUtf8> decode_utf8(const std::string
   // 0 entries mark continuation bytes (invalid as a lead byte).
   static const int lookup[16] = {1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 2, 2, 3, 4};
 
+  // A scalar must arrive in its shortest form. Without this, an overlong sequence
+  // decodes to a legal codepoint and satisfies the grammar, while the bytes that
+  // actually reach the output are invalid UTF-8. That is how a JSON enum limited
+  // to "add" produced "aÁ¤d": 0xC1 0xA4 is an overlong 'd', accepted as
+  // U+0064 by the matcher and written to the wire as two bytes no parser accepts.
+  // Surrogates and anything past U+10FFFF are not scalars either.
+  const auto valid_scalar = [](std::uint32_t v, int len) {
+    if (v > 0x10FFFFu) return false;
+    if (v >= 0xD800u && v <= 0xDFFFu) return false;
+    if (len == 2) return v >= 0x80u;
+    if (len == 3) return v >= 0x800u;
+    if (len == 4) return v >= 0x10000u;
+    return true;
+  };
+
   std::vector<std::uint32_t> code_points;
   code_points.reserve(src.size() + 1);
 
@@ -38,13 +53,16 @@ std::pair<std::vector<std::uint32_t>, PartialUtf8> decode_utf8(const std::string
   while (i < src.size() && n_remain > 0) {
     const std::uint8_t next_byte = static_cast<std::uint8_t>(src[i]);
     if ((next_byte >> 6) != 2) {  // not a continuation byte
-      return {{0}, PartialUtf8{0, -1}};
+      return {{0}, PartialUtf8{0, -1, 0}};
     }
     value = (value << 6) + (next_byte & 0x3F);
     ++i;
     --n_remain;
   }
   if (partial_start.n_remain > 0 && n_remain == 0) {
+    if (!valid_scalar(value, partial_start.n_total)) {
+      return {{0}, PartialUtf8{0, -1, 0}};
+    }
     code_points.push_back(value);
   }
 
@@ -54,26 +72,37 @@ std::pair<std::vector<std::uint32_t>, PartialUtf8> decode_utf8(const std::string
     const std::uint8_t highbits = first_byte >> 4;
     n_remain = lookup[highbits] - 1;
     if (n_remain < 0) {  // invalid lead byte
-      return {{0}, PartialUtf8{0, -1}};
+      return {{0}, PartialUtf8{0, -1, 0}};
     }
+    // 0xC0 and 0xC1 can only ever begin an overlong two-byte form, and anything
+    // above 0xF4 exceeds U+10FFFF. Neither can start a valid sequence.
+    if (first_byte == 0xC0u || first_byte == 0xC1u || first_byte > 0xF4u) {
+      return {{0}, PartialUtf8{0, -1, 0}};
+    }
+    const int seq_len = lookup[highbits];
     const std::uint8_t mask = static_cast<std::uint8_t>((1 << (7 - n_remain)) - 1);
     value = first_byte & mask;
     ++i;
     while (i < src.size() && n_remain > 0) {
       const std::uint8_t next_byte = static_cast<std::uint8_t>(src[i]);
       if ((next_byte >> 6) != 2) {
-        return {{0}, PartialUtf8{0, -1}};
+        return {{0}, PartialUtf8{0, -1, 0}};
       }
       value = (value << 6) + (next_byte & 0x3F);
       ++i;
       --n_remain;
     }
     if (n_remain == 0) {
+      if (!valid_scalar(value, seq_len)) {
+        return {{0}, PartialUtf8{0, -1, 0}};
+      }
       code_points.push_back(value);
+    } else {
+      return {code_points, PartialUtf8{value, n_remain, seq_len}};
     }
   }
 
-  return {code_points, PartialUtf8{value, n_remain}};
+  return {code_points, PartialUtf8{value, n_remain, 0}};
 }
 
 // ----------------------------------------------------------------------------

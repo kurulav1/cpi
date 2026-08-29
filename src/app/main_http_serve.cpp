@@ -54,6 +54,7 @@ using app::main_helpers::json_get_float;
 using app::main_helpers::json_get_int;
 using app::main_helpers::json_get_raw_value;
 using app::main_helpers::json_get_string;
+using app::main_helpers::json_get_raw_array;
 using app::main_helpers::json_get_string_array;
 using app::main_helpers::unwrap_json_schema;
 
@@ -66,6 +67,101 @@ namespace {
 // transport does that matching; this one never did, so a multi-token stop was
 // accepted and then silently ignored. A stop like "\n\nUser:" is ordinary in
 // OpenAI clients and did nothing here.
+// Compiles OpenAI `tools` + `tool_choice` into a JSON schema the grammar sampler
+// can enforce, so a requested tool call cannot come back malformed.
+//
+// The shape is a union over the allowed tools:
+//   {"anyOf":[{"type":"object",
+//              "properties":{"name":{"enum":["<tool>"]},"arguments":<parameters>},
+//              "required":["name","arguments"]}, ...]}
+//
+// tool_choice decides which tools are in the union:
+//   "none"                    no constraint, tools ignored
+//   "auto" (default)          no constraint; the model may answer in prose, which
+//                             is what the parameter means, so there is nothing to
+//                             enforce and nothing is claimed
+//   "required"                the union of every offered tool
+//   {"type":"function",...}    that one tool alone
+//
+// Returns an empty string when nothing should be constrained. Sets *err (and
+// returns empty) when the request is malformed, so the caller can answer 400
+// rather than generate something unconstrained.
+std::string tool_choice_schema(const std::string& body, std::string* err) {
+  const std::vector<std::string> tools = json_get_raw_array(body, "tools");
+  if (tools.empty()) {
+    return "";
+  }
+  std::string choice_raw = json_get_raw_value(body, "tool_choice");
+  std::string mode = "auto";
+  std::string only;
+  if (!choice_raw.empty()) {
+    if (choice_raw.front() == '"') {
+      mode = json_get_string(body, "tool_choice");
+    } else {
+      // {"type":"function","function":{"name":"..."}}
+      mode = "function";
+      const std::string fn = json_get_raw_value(choice_raw, "function");
+      only = json_get_string(fn.empty() ? choice_raw : fn, "name");
+      if (only.empty()) {
+        if (err) *err = "tool_choice names no function";
+        return "";
+      }
+    }
+  }
+  if (mode == "none" || mode == "auto") {
+    return "";
+  }
+  if (mode != "required" && mode != "function") {
+    if (err) *err = "unsupported tool_choice '" + mode + "'";
+    return "";
+  }
+
+  std::string branches;
+  int used = 0;
+  for (const std::string& tool : tools) {
+    const std::string fn = json_get_raw_value(tool, "function");
+    const std::string src = fn.empty() ? tool : fn;
+    const std::string name = json_get_string(src, "name");
+    if (name.empty()) {
+      if (err) *err = "a tool entry has no function name";
+      return "";
+    }
+    if (mode == "function" && name != only) {
+      continue;
+    }
+    std::string params = json_get_raw_value(src, "parameters");
+    if (params.empty()) {
+      params = R"({"type":"object","properties":{}})";
+    }
+    if (used++) {
+      branches += ",";
+    }
+    branches += R"({"type":"object","properties":{"name":{"enum":[")" + name +
+                R"("]},"arguments":)" + params +
+                R"(},"required":["name","arguments"]})";
+  }
+  if (used == 0) {
+    if (err) *err = "tool_choice names a function that is not in tools: '" + only + "'";
+    return "";
+  }
+  return R"({"anyOf":[)" + branches + "]}";
+}
+
+// Rewrites a grammar-constrained {"name":...,"arguments":...} reply into an
+// OpenAI tool_calls message body. `text` is the model's output.
+std::string tool_calls_json(const std::string& id, const std::string& text) {
+  const std::string name = json_get_string(text, "name");
+  std::string args = json_get_raw_value(text, "arguments");
+  if (args.empty()) {
+    args = "{}";
+  }
+  // `arguments` is a STRING in the OpenAI shape, not an object, so the JSON the
+  // model produced is escaped into one.
+  return R"("content":null,"tool_calls":[{"id":"call_)" + id + R"(","type":"function",)" +
+         R"("function":{"name":")" + json_escape(name) + R"(","arguments":")" + json_escape(args) +
+         R"("}}])";
+}
+
 bool cut_at_stop(std::string& text, const std::vector<std::string>& stops) {
   std::size_t cut = std::string::npos;
   for (const auto& stop : stops) {
@@ -519,6 +615,24 @@ void run_http_server(engine::BatchScheduler& sched, model::Tokenizer& tokenizer,
     }
     ov.json_schema = unwrap_json_schema(ov.json_schema);
 
+    // tools/tool_choice compile to the same grammar the schema path uses, so a
+    // required tool call is enforced by the sampler rather than hoped for. A
+    // malformed tools block is a 400: the alternative is generating something
+    // unconstrained and letting the caller discover it by parsing.
+    bool tool_mode = false;
+    {
+      std::string tool_err;
+      const std::string tool_schema = tool_choice_schema(body, &tool_err);
+      if (!tool_err.empty()) {
+        res.send(400, "application/json", error_json(tool_err, "invalid_request_error"));
+        return;
+      }
+      if (!tool_schema.empty()) {
+        ov.json_schema = tool_schema;
+        tool_mode = true;
+      }
+    }
+
     const bool stream = json_get_bool(body, "stream", false);
     const std::string id = (chat ? "chatcmpl-" : "cmpl-") + std::to_string(next_id.fetch_add(1));
 
@@ -732,11 +846,18 @@ void run_http_server(engine::BatchScheduler& sched, model::Tokenizer& tokenizer,
     const bool cut = cut_at_stop(text, ov.stop_texts);
     const std::string reason = (!cut && finish == "length") ? "length" : "stop";
     const std::string usage = usage_json(prompt_tokens, completion_tokens);
+    // A tool call comes back as tool_calls with finish_reason tool_calls, which is
+    // what an OpenAI client dispatches on; the raw JSON is never handed over as
+    // message content.
+    const std::string message_body =
+        tool_mode ? tool_calls_json(id, text)
+                  : ("\"content\":\"" + json_escape(text) + "\"");
+    const std::string chat_reason = tool_mode ? "tool_calls" : reason;
     const std::string payload =
         chat ? ("{\"id\":\"" + id + "\",\"object\":\"chat.completion\",\"created\":" + created +
                 ",\"model\":\"" + json_escape(model_name) +
-                "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"" +
-                json_escape(text) + "\"},\"finish_reason\":\"" + reason + "\"}]" + usage + "}")
+                "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\"," +
+                message_body + "},\"finish_reason\":\"" + chat_reason + "\"}]" + usage + "}")
              : ("{\"id\":\"" + id + "\",\"object\":\"text_completion\",\"created\":" + created +
                 ",\"model\":\"" + json_escape(model_name) +
                 "\",\"choices\":[{\"index\":0,\"text\":\"" + json_escape(text) +

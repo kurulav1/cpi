@@ -101,11 +101,62 @@ void test_schema_object() {
   check(!feed_bytes(g, R"({"title":"hi"})"), "schema: rejects missing required prop (no count)");
 }
 
+void test_schema_anyof() {
+  // Tool calling is why this exists: a request offering N tools compiles to a
+  // union of N call shapes, and without anyOf that union cannot be expressed.
+  const std::string schema =
+      R"({"anyOf":[
+        {"type":"object","properties":{"name":{"enum":["get_weather"]},
+          "arguments":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}},
+         "required":["name","arguments"]},
+        {"type":"object","properties":{"name":{"enum":["add"]},
+          "arguments":{"type":"object","properties":{"a":{"type":"number"}},"required":["a"]}},
+         "required":["name","arguments"]}]})";
+  grammar::Grammar g = grammar::Grammar::parse(grammar::json_schema_to_grammar(schema));
+  check(feed_and_complete(g, R"({"name": "get_weather", "arguments": {"city": "Paris"}})"),
+        "anyOf: accepts the first branch");
+  check(feed_and_complete(g, R"({"name": "add", "arguments": {"a": 2}})"),
+        "anyOf: accepts the second branch");
+  check(!feed_bytes(g, R"({"name": "delete_all")"), "anyOf: rejects a name outside the union");
+  check(!feed_bytes(g, R"({"name": "add", "arguments": {"a": "two")"),
+        "anyOf: rejects a branch with the wrong argument type");
+}
+
 void test_schema_enum() {
   const std::string schema = R"({"enum": ["red", "green", "blue"]})";
   grammar::Grammar g = grammar::Grammar::parse(grammar::json_schema_to_grammar(schema));
   check(feed_and_complete(g, "\"green\""), "enum: accepts a member");
   check(!feed_bytes(g, "\"purple\""), "enum: rejects a non-member");
+}
+
+void test_overlong_utf8_rejected() {
+  // 0xC1 0xA4 is an overlong encoding of 'd' (U+0064). A decoder that accepts it
+  // reports the grammar satisfied while the bytes on the wire are invalid UTF-8,
+  // so an enum limited to "add" emitted "aÁ¤d" and no JSON parser could
+  // read it back. The shortest form is the only legal one.
+  grammar::Grammar g =
+      grammar::Grammar::parse(grammar::json_schema_to_grammar(R"({"enum":["add"]})"));
+  check(feed_and_complete(g, "\"add\""), "overlong: the plain form is accepted");
+
+  grammar::GrammarState st(g);
+  check(st.accept_bytes("\""), "overlong: opening quote");
+  check(st.accept_bytes("a"), "overlong: first literal byte");
+  check(!st.accept_bytes(std::string("Á¤")), "overlong: two-byte 'd' is rejected");
+
+  // The same sequence split across calls must also be rejected, since that is how
+  // it arrives when the two bytes come from different tokens.
+  grammar::GrammarState split(g);
+  check(split.accept_bytes("\""), "overlong split: opening quote");
+  check(split.accept_bytes("a"), "overlong split: first literal byte");
+  const bool lead_ok = split.accept_bytes(std::string(1, static_cast<char>(0xC1)));
+  const bool tail_ok = lead_ok && split.accept_bytes(std::string(1, static_cast<char>(0xA4)));
+  check(!(lead_ok && tail_ok), "overlong split: rejected across two calls");
+
+  // A legitimate multi-byte codepoint still works: U+00E9 as C3 A9 in a string.
+  grammar::Grammar gs =
+      grammar::Grammar::parse(grammar::json_schema_to_grammar(R"({"type":"string"})"));
+  check(feed_and_complete(gs, std::string("\"") + "Ã©" + "\""),
+        "overlong: a valid two-byte codepoint is still accepted");
 }
 
 void test_partial_utf8() {
@@ -245,6 +296,8 @@ int main() {
   test_handwritten_gbnf();
   test_schema_object();
   test_schema_enum();
+  test_schema_anyof();
+  test_overlong_utf8_rejected();
   test_partial_utf8();
   test_grammar_sampler_mask();
   test_mask_fastpath_parity();

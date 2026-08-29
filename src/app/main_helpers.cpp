@@ -266,6 +266,57 @@ std::string json_get_string(const std::string& json, const std::string& key) {
   return json_read_string(json, p);
 }
 
+std::vector<std::string> json_get_raw_array(const std::string& json, const std::string& key) {
+  std::vector<std::string> out;
+  const std::string raw = json_get_raw_value(json, key);
+  if (raw.size() < 2 || raw.front() != '[') {
+    return out;
+  }
+  int depth = 0;
+  bool in_str = false;
+  bool esc = false;
+  std::size_t start = std::string::npos;
+  for (std::size_t i = 0; i < raw.size(); ++i) {
+    const char c = raw[i];
+    if (in_str) {
+      if (esc) {
+        esc = false;
+      } else if (c == '\\') {
+        esc = true;
+      } else if (c == '"') {
+        in_str = false;
+      }
+      continue;
+    }
+    if (c == '"') {
+      in_str = true;
+      if (depth == 1 && start == std::string::npos) start = i;
+      continue;
+    }
+    if (c == '[' || c == '{') {
+      ++depth;
+      if (depth == 2 && start == std::string::npos) start = i;
+      continue;
+    }
+    if (c == ']' || c == '}') {
+      --depth;
+      if (depth == 1 && start != std::string::npos) {
+        out.push_back(raw.substr(start, i - start + 1));
+        start = std::string::npos;
+      }
+      continue;
+    }
+    if (depth == 1 && c == ',') {
+      start = std::string::npos;
+      continue;
+    }
+    if (depth == 1 && start == std::string::npos && !std::isspace(static_cast<unsigned char>(c))) {
+      start = i;
+    }
+  }
+  return out;
+}
+
 std::string unwrap_json_schema(const std::string& raw) {
   if (raw.empty()) return raw;
   const std::string inner = json_get_raw_value(raw, "schema");
