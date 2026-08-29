@@ -38,6 +38,25 @@ namespace engine {
 // case (lw->wqkv/wo/w13/w2 fp16, non-paged single-token path otherwise). Reject
 // anything else with a clear message instead of dereferencing null fp16 weights
 // (int8/int4 keep their weights in layer_cache_i8_, MoE/TQ3 use other caches).
+int LlamaEngine::det_gemm_rows(int batch) const {
+  static const bool on = [] {
+    const char* e = std::getenv("CPI_DET_BATCH");
+    return e == nullptr || e[0] != '0';
+  }();
+  return (on && batch > 0 && batch < 2) ? 2 : batch;
+}
+
+void LlamaEngine::det_zero_pad(void* x, int batch, int rows, int cols) {
+  if (rows <= batch || x == nullptr || cols <= 0) {
+    return;
+  }
+  // The padding columns are computed and discarded; zeroing them keeps the extra
+  // work well-defined rather than reading whatever the buffer held.
+  CUDA_CHECK(cudaMemsetAsync(static_cast<__half*>(x) + static_cast<std::size_t>(batch) * cols, 0,
+                             static_cast<std::size_t>(rows - batch) * cols * sizeof(__half),
+                             compute_stream_));
+}
+
 void LlamaEngine::require_batched_supported() const {
   const auto& cfg = weights_.config();
   const char* why = nullptr;
@@ -74,6 +93,10 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
   const auto& cfg = weights_.config();
   const int batch = static_cast<int>(tokens.size());
   if (batch == 0) return 0;
+  // Projection width, held at a minimum so cuBLAS picks the same kernel whether
+  // one sequence is live or several. Everything else below uses `batch`: only the
+  // GEMM shape is padded, and the extra column's output is never read.
+  const int det_rows = det_gemm_rows(batch);
   if (static_cast<int>(positions.size()) != batch ||
       static_cast<int>(block_tables_flat.size()) != batch * max_blocks) {
     throw std::runtime_error("decode_step_batched: ragged tokens/positions/block_tables");
@@ -209,6 +232,7 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
 
       // Straight off the packed blocks when the batch is small enough to be worth
       // it; otherwise expand once and let cuBLAS have it.
+      det_zero_pad(d_x_norm_, batch, det_rows, hidden);
       if (!packed_qkv_matmul(*lw, d_x_norm_, d_qkv_, batch, q_hidden + 2 * kv_hidden,
                              compute_stream_)) {
         const void* qkv_src = dequant_packed_qkv_for_gemm(*lw, compute_stream_);
@@ -216,7 +240,7 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
         detail::dispatch_linear_rowmajor_weight(
             cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_,
             compute_stream_, const_cast<void*>(qkv_src), d_x_norm_, d_qkv_,
-            q_hidden + 2 * kv_hidden, hidden, batch, CUDA_R_16F);
+            q_hidden + 2 * kv_hidden, hidden, det_rows, CUDA_R_16F);
       }
 
       CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_q_, q_row_bytes, qkv_base, qkv_stride_bytes,
@@ -308,6 +332,7 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
       // A packed k-quant weight has no fp16 copy for cuBLAS; expand it into the
       // shared prefill scratch. Same stream as the GEMM, so the expansion is
       // ordered before the read and before the next weight overwrites it.
+      det_zero_pad(d_att_, batch, det_rows, q_hidden);
       if (!packed_matmul(lw->wo_packed, d_att_, d_ff3_, batch, hidden, 0, compute_stream_)) {
         const void* wo_src = lw->wo_packed.active()
                                  ? dequant_packed_for_gemm(lw->wo_packed, compute_stream_)
@@ -315,7 +340,7 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
         detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
                                                 lt_workspace_bytes_, compute_stream_,
                                                 const_cast<void*>(wo_src), d_att_, d_ff3_, hidden,
-                                                q_hidden, batch, CUDA_R_16F);
+                                                q_hidden, det_rows, CUDA_R_16F);
       }
       maybe_add_half_bias(d_ff3_, lw->bo, batch, hidden);
       kernels::launch_add_inplace(static_cast<__half*>(d_x_), static_cast<const __half*>(d_ff3_),
@@ -327,6 +352,7 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
       // A packed k-quant weight has no fp16 copy for cuBLAS; expand it into the
       // shared prefill scratch. Same stream as the GEMM, so the expansion is
       // ordered before the read and before the next weight overwrites it.
+      det_zero_pad(d_x_norm_, batch, det_rows, hidden);
       if (!packed_matmul(lw->w13_packed, d_x_norm_, d_ff13_, batch, 2 * inter, 0,
                          compute_stream_)) {
         const void* w13_src = lw->w13_packed.active()
@@ -335,7 +361,7 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
         detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
                                                 lt_workspace_bytes_, compute_stream_,
                                                 const_cast<void*>(w13_src), d_x_norm_, d_ff13_,
-                                                2 * inter, hidden, batch, CUDA_R_16F);
+                                                2 * inter, hidden, det_rows, CUDA_R_16F);
       }
       CUDA_CHECK(cudaMemcpy2DAsync(d_prefill_ff1_, ff_row_bytes, ff13_base, ff13_stride_bytes,
                                    ff_row_bytes, batch, cudaMemcpyDeviceToDevice, compute_stream_));
@@ -349,6 +375,7 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
       // A packed k-quant weight has no fp16 copy for cuBLAS; expand it into the
       // shared prefill scratch. Same stream as the GEMM, so the expansion is
       // ordered before the read and before the next weight overwrites it.
+      det_zero_pad(d_prefill_ff2_, batch, det_rows, inter);
       if (!packed_matmul(lw->w2_packed, d_prefill_ff2_, d_ff3_, batch, hidden, 0,
                          compute_stream_)) {
         const void* w2_src = lw->w2_packed.active()
@@ -357,7 +384,7 @@ int LlamaEngine::decode_step_batched_forward(const std::vector<int>& tokens,
         detail::dispatch_linear_rowmajor_weight(cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_,
                                                 lt_workspace_bytes_, compute_stream_,
                                                 const_cast<void*>(w2_src), d_prefill_ff2_, d_ff3_,
-                                                hidden, inter, batch, CUDA_R_16F);
+                                                hidden, inter, det_rows, CUDA_R_16F);
       }
       kernels::launch_add_inplace(static_cast<__half*>(d_x_), static_cast<const __half*>(d_ff3_),
                                   batch * hidden, compute_stream_);
@@ -435,12 +462,14 @@ bool LlamaEngine::ensure_batch_logits_half(std::size_t elems) {
 }
 
 void LlamaEngine::batched_lm_head(int batch, int hidden, int vocab) {
-  if (batch > d_batch_logits_cap_) {
+  const int det_rows = det_gemm_rows(batch);
+  if (det_rows > d_batch_logits_cap_) {
     if (d_batch_logits_) cudaFree(d_batch_logits_);
     CUDA_CHECK(
-        cudaMalloc(&d_batch_logits_, static_cast<std::size_t>(batch) * vocab * sizeof(float)));
-    d_batch_logits_cap_ = batch;
+        cudaMalloc(&d_batch_logits_, static_cast<std::size_t>(det_rows) * vocab * sizeof(float)));
+    d_batch_logits_cap_ = det_rows;
   }
+  det_zero_pad(d_x_norm_, batch, det_rows, hidden);
   // The LM head is the one packed weight that never attempted the tensor-core
   // path: it went straight to dequant-and-cuBLAS, expanding 431 MB of Q6_K into
   // ~1.05 GB of fp16 that cuBLAS then reads back, over 2 GB of traffic a step
@@ -473,7 +502,8 @@ void LlamaEngine::batched_lm_head(int batch, int hidden, int vocab) {
                                : static_cast<const void*>(d_lm_head_);
     detail::dispatch_linear_rowmajor_weight(
         cublas_, cublas_lt_, &lt_plan_cache_, lt_workspace_, lt_workspace_bytes_, compute_stream_,
-        const_cast<void*>(head_src), d_x_norm_, d_batch_logits_, vocab, hidden, batch, CUDA_R_32F);
+        const_cast<void*>(head_src), d_x_norm_, d_batch_logits_, vocab, hidden, det_rows,
+        CUDA_R_32F);
   }
   if (d_lm_head_bias_) {
     for (int b = 0; b < batch; ++b) {

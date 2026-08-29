@@ -602,6 +602,16 @@ private:
   // Project all `batch` rows of d_x_norm_ through the LM head into d_batch_logits_
   // ([batch][vocab], float) in one GEMM. Lazily (re)allocates d_batch_logits_.
   void batched_lm_head(int batch, int hidden, int vocab);
+  // cuBLAS chooses a different kernel for a single column than for several, so a
+  // request decoded alone and the same request decoded beside others round
+  // differently on near-ties and can diverge. Measured: batch 1 produced a
+  // different continuation, while batches of 2, 3, 5 and 8 were byte-identical to
+  // each other. Padding the projections to a fixed minimum width makes the kernel
+  // choice independent of how many sequences happen to be in flight.
+  // CPI_DET_BATCH=0 turns it off, to price it.
+  int det_gemm_rows(int batch) const;
+  void det_zero_pad(void* x, int batch, int rows, int cols);
+
   void run_verify_forward(const std::vector<int>& tokens, int start_pos);
   float* h_verify_logits_ = nullptr;  // pinned [K * vocab] staging for verify_tokens_logits
   int h_verify_logits_cap_ = 0;       // capacity in rows
