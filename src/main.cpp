@@ -596,6 +596,57 @@ int main(int argc, char** argv) {
 
     auto run_with_engine = [&](auto& eng) {
       eng.initialize(cli.opts);
+      if (cli.verify_determinism > 0) {
+        // Greedy decode, then a hash of the token ids. Comparing that hash is the
+        // whole mechanism: same model and settings on another machine, backend or
+        // build should print the same line, and where it does not is the boundary
+        // of what can honestly be claimed.
+        //
+        // Deliberately not a new code path. It runs generate() exactly as a normal
+        // request does, because a verifier that decoded differently from the
+        // engine would attest to nothing.
+        std::vector<int> out = eng.generate(prompt_tokens, cli.verify_determinism, 0.0f);
+        if (out.size() > prompt_tokens.size() &&
+            std::equal(prompt_tokens.begin(), prompt_tokens.end(), out.begin())) {
+          out.erase(out.begin(), out.begin() + static_cast<std::ptrdiff_t>(prompt_tokens.size()));
+        }
+        // FNV-1a over the ids, little-endian, so the hash is reproducible by hand
+        // and by any other tool without agreeing on a library.
+        std::uint64_t h = 1469598103934665603ULL;
+        for (const int id : out) {
+          const std::uint32_t v = static_cast<std::uint32_t>(id);
+          for (int b = 0; b < 4; ++b) {
+            h ^= static_cast<std::uint64_t>((v >> (8 * b)) & 0xFFu);
+            h *= 1099511628211ULL;
+          }
+        }
+        std::printf("[verify] hash=%016llx tokens=%zu\n", static_cast<unsigned long long>(h),
+                    out.size());
+        // Everything that could change the answer, on one line, so a mismatch can
+        // be attributed instead of argued about.
+        std::printf(
+            "[verify] backend=%s model=%s quant=%s kv_bits=%d paged=%d gpu_cache_all=%d "
+            "ctx=%d temp=0 prompt_tokens=%zu\n",
+#if CPI_HAS_CUDA
+            "cuda",
+#elif defined(CPI_HAS_METAL) && CPI_HAS_METAL
+            "metal",
+#else
+            "cpu",
+#endif
+            std::filesystem::path(cli.opts.model_path).filename().string().c_str(),
+            cli.opts.int8_streaming ? (cli.opts.streaming_quant_bits == 4 ? "int4" : "int8")
+                                    : "none",
+            cli.opts.kv_cache_int4 ? 4 : 16, cli.opts.paged_kv_cache ? 1 : 0,
+            cli.opts.gpu_cache_all ? 1 : 0, cli.opts.max_context, prompt_tokens.size());
+        std::printf("[verify] ids=");
+        for (std::size_t k = 0; k < out.size(); ++k) {
+          std::printf("%s%d", k ? "," : "", out[k]);
+        }
+        std::printf("\n");
+        std::cout.flush();
+        std::exit(0);
+      }
 #if CPI_HAS_CUDA
       if constexpr (std::is_same_v<std::decay_t<decltype(eng)>, engine::LlamaEngine>) {
         if (cli.parity_check) {

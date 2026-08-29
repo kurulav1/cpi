@@ -38,6 +38,9 @@ struct ParsedArgs {
   bool allow_legacy_chat_tokenizer = false;
   bool force_no_bos = false;
   bool sentence_stop = false;
+  // >0: decode this many tokens greedily and print a hash of the token ids, then
+  // exit. The point is comparing that hash across machines, backends and builds.
+  int verify_determinism = 0;
   bool benchmark_mode = false;
   bool benchmark_phases = false;
   bool runtime_metrics = false;

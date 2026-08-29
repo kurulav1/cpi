@@ -130,6 +130,7 @@ void print_usage(std::ostream& os) {
         "[--top-k n] [--top-p p] [--repeat-penalty r] [--no-repeat-ngram n] [--rope-theta f] "
         "[--stop-text text] [--chat-template "
         "tinyllama|tinyllama-chatml|llama2|llama3|mistral|phi3|qwen2|qwen3_5|llama4|gemma] "
+        "[--verify-determinism n] "
         "[--dump-tokenizer-meta] [--dump-prompt-tokens] [--inspect-next-topk n] "
         "[--trace-steps n] [--sentence-stop] [--benchmark] [--benchmark-reps n] "
         "[--benchmark-warmup n] "
@@ -351,6 +352,13 @@ ParsedArgs parse_args(int argc, char** argv) {
       args.trace_steps = std::stoi(need_val("--trace-steps"));
     } else if (arg == "--sentence-stop") {
       args.sentence_stop = true;
+    } else if (arg == "--verify-determinism") {
+      // Optional count; 64 tokens is enough to diverge if anything is going to.
+      if (i + 1 < argc && argv[i + 1][0] != '-') {
+        args.verify_determinism = std::stoi(need_val("--verify-determinism"));
+      } else {
+        args.verify_determinism = 64;
+      }
     } else if (arg == "--benchmark") {
       args.benchmark_mode = true;
     } else if (arg == "--benchmark-reps") {
