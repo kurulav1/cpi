@@ -78,6 +78,19 @@ bool BatchWorker::submit(const std::string& id, const std::string& prompt, const
   in.params.no_repeat_ngram_size =
       ov.no_repeat_ngram >= 0 ? ov.no_repeat_ngram : defaults_.no_repeat_ngram;
   in.json_schema = ov.json_schema;
+  // Compile it here, before the request is queued, so an unusable schema is a
+  // synchronous error the caller can act on. Discovering it on the worker thread
+  // leaves no way to answer except to generate something, and what gets generated
+  // is unconstrained text that looks like a normal reply. Parsing is the cheap
+  // half; the per-token tables are shared and built later.
+  if (!in.json_schema.empty()) {
+    try {
+      grammar::Grammar::parse(grammar::json_schema_to_grammar(in.json_schema));
+    } catch (const std::exception& ge) {
+      if (error) *error = std::string("invalid json_schema: ") + ge.what();
+      return false;
+    }
+  }
 
   // Stop handling: the model's EOS plus any single-token stop strings. Multi-token
   // stop strings stay the transport's problem (it sees the decoded text).
@@ -234,8 +247,15 @@ void BatchWorker::run() {
             in.params.grammar = sampler.get();
             grammars[in.id] = std::move(sampler);
           } catch (const std::exception& ge) {
-            std::cerr << "[batch] grammar compile failed for " << in.id << " (" << ge.what()
-                      << "); unconstrained\n";
+            // Fail the request. This used to log and carry on with a null grammar,
+            // so a caller that asked for a schema got a 200 and unconstrained
+            // prose, which is indistinguishable from a model answering badly.
+            // submit() validates the same schema before queueing, so reaching here
+            // means a bug rather than bad input; either way the answer is an
+            // error, never a quiet downgrade.
+            emit(BatchEvent::Type::Error, in.id, "", "",
+                 std::string("grammar compile failed: ") + ge.what(), 0, 0.0, 0.0);
+            continue;
           }
         }
         sched_.admit(in.id, in.tokens, in.params);
