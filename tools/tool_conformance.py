@@ -76,6 +76,16 @@ TOOLS = [
     },
 ]
 
+# A second, longer variant of the same call. Fitting fixed against marginal cost
+# needs two points that differ only in output length, with the kind of work held
+# constant; changing the constraint instead of the length would confound them.
+import copy as _copy
+TOOLS_LONG = _copy.deepcopy(TOOLS)
+_p = TOOLS_LONG[0]["function"]["parameters"]
+for _extra in ("component", "environment", "impact", "workaround", "owner"):
+    _p["properties"][_extra] = {"type": "string"}
+    _p["required"].append(_extra)
+
 TOOL_NAMES = set(t["function"]["name"] for t in TOOLS)
 SCHEMAS = dict((t["function"]["name"], t["function"]["parameters"]) for t in TOOLS)
 
@@ -153,7 +163,7 @@ def validate(value, schema, path="args"):
     return out
 
 
-def call(url, prompt, timeout, max_tokens, use_tools=True):
+def call(url, prompt, timeout, max_tokens, use_tools=True, long_schema=False):
     body = {
         "model": "cpi",
         "messages": [{"role": "user", "content": prompt}],
@@ -164,7 +174,7 @@ def call(url, prompt, timeout, max_tokens, use_tools=True):
     # run from the constrained one attributes wall time to generation plus HTTP
     # versus grammar work, without guessing where to put a timer.
     if use_tools:
-        body["tools"] = TOOLS
+        body["tools"] = TOOLS_LONG if long_schema else TOOLS
         body["tool_choice"] = "required"
     req = urllib.request.Request(
         url + "/v1/chat/completions",
@@ -173,6 +183,42 @@ def call(url, prompt, timeout, max_tokens, use_tools=True):
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
+
+
+# Inference engines that would compete for the GPU. Desktop software holds GPU
+# memory constantly (browsers, chat apps, editors: 36 processes on the box this
+# was written on), so counting GPU users flags nothing useful. What ruins a timing
+# run is a second engine, and those are nameable.
+ENGINE_NAMES = ("cpi", "llama-server", "llama-cli", "ollama", "vllm", "sglang",
+                "text-generation-server", "tabby", "koboldcpp")
+
+
+def competing_engines():
+    """Inference engines currently holding GPU memory.
+
+    A second engine resident on the same GPU inflated a run by an order of
+    magnitude and was caught only because the number was implausible. A 20%
+    contamination would have gone straight into the table, so the run refuses to
+    start instead.
+    """
+    import os
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid,process_name", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=20).stdout
+    except Exception:
+        return []  # no nvidia-smi: nothing to assert against
+    found = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        name = os.path.basename(line.split(",")[-1].strip()).lower()
+        stem = name[:-4] if name.endswith(".exe") else name
+        if stem in ENGINE_NAMES:
+            found.append(line)
+    return found
 
 
 def main():
@@ -185,10 +231,22 @@ def main():
     # and a cap that is too low shows up as truncation rather than a defect.
     ap.add_argument("--max-tokens", type=int, default=400)
     ap.add_argument("--transcript", default="")
+    ap.add_argument("--allow-shared-gpu", action="store_true",
+                    help="measure even though another process holds GPU memory")
+    ap.add_argument("--long", action="store_true",
+                    help="a schema with more required fields, for a second fit point")
     ap.add_argument("--no-tools", action="store_true",
                     help="send the prompts unconstrained; for timing decomposition")
     args = ap.parse_args()
     url = args.url.rstrip("/")
+
+    engines = competing_engines()
+    if len(engines) > 1 and not args.allow_shared_gpu:
+        print("refusing to measure: %d inference engines hold GPU memory" % len(engines))
+        for e in engines:
+            print("   " + e)
+        print("stop the others, or pass --allow-shared-gpu to measure anyway")
+        return 2
 
     order = ["ok", "truncated", "no_tool_call", "unknown_tool", "arguments_not_json",
              "schema_violation", "http_error"]
@@ -204,7 +262,7 @@ def main():
     for i in range(args.n):
         prompt = make_prompt(i)
         try:
-            reply = call(url, prompt, args.timeout, args.max_tokens, not args.no_tools)
+            reply = call(url, prompt, args.timeout, args.max_tokens, not args.no_tools, args.long)
         except Exception as e:  # transport, HTTP status, malformed envelope
             counts["http_error"] += 1
             examples.setdefault("http_error", str(e)[:160])
@@ -248,7 +306,10 @@ def main():
             examples.setdefault("arguments_not_json",
                                 "%s | %s" % (str(e)[:60], repr(raw_args)[:100]))
             continue
-        problems = validate(parsed, SCHEMAS[name])
+        schema = SCHEMAS[name]
+        if args.long and name == "create_ticket":
+            schema = TOOLS_LONG[0]["function"]["parameters"]
+        problems = validate(parsed, schema)
         if problems:
             counts["schema_violation"] += 1
             examples.setdefault("schema_violation", "; ".join(problems)[:160])
