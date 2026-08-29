@@ -1,8 +1,9 @@
 # CPI - Cross-Platform Inference
 
 CPI is a local LLM inference engine with a CLI, REST API, and web UI. It runs on CPU everywhere,
-on NVIDIA GPUs through CUDA, and on Apple Silicon through Metal. The two GPU backends execute
-the same model plans and are held to token-identical output by cross-backend gates. No external
+on NVIDIA GPUs through CUDA, and on Apple Silicon through Metal. The backends execute the same
+model plans and are held to token-identical output by gates you can run yourself: see
+[Determinism](#determinism) for exactly which axes are measured and where they stop. No external
 runtime dependencies beyond the vendor toolkits: every decode kernel, attention kernel, quant
 format, tokenizer, and container reader is in this repo. The one exception worth naming is that
 large prefill/batch GEMMs on CUDA go through cuBLAS/cuBLASLt (part of the CUDA toolkit the build
@@ -15,8 +16,9 @@ rather than instructions.
 
 ## Highlights
 
-- Three backends (CPU, CUDA, Metal) executing one shared op-plan IR; the GPU backends are gated
-  token-identical against each other
+- Three backends (CPU, CUDA, Metal) executing one shared op-plan IR, gated token-identical
+  against each other; CPU against CUDA is verified here to 2048 tokens, and the full scope,
+  including what is not verified, is in [docs/determinism-scope.md](docs/determinism-scope.md)
 - Model families: Llama 2/3/3.1, Mistral, Mixtral, Qwen2/2.5/3, Qwen3.5 (linear attention),
   Gemma, Gemma 4 (per-layer geometry, per-layer embeddings, KV sharing; the 26B-A4B MoE runs
   int4-resident), DeepSeek-V2 (native MLA attention + fine-grained MoE; CUDA), plus BERT-style
@@ -38,6 +40,68 @@ rather than instructions.
   plus the embeddings endpoint, React web UI, and Node API bridge in `web/`
 - Native `tokenizer.json` and SentencePiece tokenizer support
 - Model auto-discovery, one-command Hugging Face download + `.ll2c` conversion
+
+## Determinism
+
+Same machine, same build, same settings: CPI returns the same tokens. That is worth stating
+precisely, because most of the ways to claim it are wider than what has actually been measured.
+
+Verified, greedy, on one RTX 5090, Llama-3.2-1B unless noted:
+
+| axis | result |
+| --- | --- |
+| repeated runs | identical (also Gemma-4-E2B) |
+| GPU cache policy, paging, context size | identical |
+| container format (`.ll2c` against GGUF) | identical |
+| position within a batch | identical |
+| number of sequences in flight (1 to 8) | identical |
+| CPU backend against CUDA, to 2048 tokens | identical |
+| build version, back 817 commits to the 7th commit in the repo | identical |
+
+Not deterministic across weight quantisation (int4 weights are different numbers, so they
+produce different logits) or KV quantisation once generation is long enough to read quantised
+KV. Not yet measured across machines, or against Metal. Two smaller boundaries, both documented
+rather than smoothed over: the CPU engine stops a few tokens earlier than CUDA when generation
+runs into the context limit, and the batched path refuses int8/int4 weights, so `--serve` is
+fp16-only today.
+
+### Run it yourself
+
+Every row above comes from a flag in the binary, not a separate harness. It calls `generate()`
+the way a request does, because a verifier that decoded differently from the engine would
+attest to nothing:
+
+```bash
+cpi <model> --prompt "The capital of France is" --verify-determinism 64 --gpu-cache-all
+[verify] hash=9003b7d09a9eae93 tokens=64
+[verify] backend=llama-cuda model=Llama-3.2-1B-Instruct-F16.gguf quant=none kv_bits=16 paged=0 gpu_cache_all=1 ctx=2048 temp=0 prompt_tokens=6
+[verify] ids=12366,13,578,469,3168,...
+```
+
+The second line is every setting that could change the answer, so a mismatch can be attributed
+instead of argued about. `backend=` is the engine resolved at runtime rather than the one the
+binary was built with, which matters: while this was being written that field was a compile-time
+`#if`, and it labelled a CPU run as CUDA and made the two compare equal.
+
+**If you have a different NVIDIA GPU, this is the one row that cannot be filled in here.** Run
+the command above on `Llama-3.2-1B-Instruct-F16.gguf` and open an issue with the three `[verify]`
+lines. A matching hash from another card turns the cross-machine claim from untested into
+measured; a differing one is more useful still, and the config line says where to start looking.
+
+The scripts behind the other rows:
+
+| script | axis |
+| --- | --- |
+| `tools/determinism_matrix.sh` | settings, containers, model families |
+| `tools/determinism_batch.sh` | batch size |
+| `tools/determinism_backend.sh` | CPU against CUDA |
+| `tools/determinism_version.sh` | this build against an older one |
+
+Each carries its own control, because a determinism test that cannot demonstrate it detects a
+difference is not evidence. `CPI_DET_BATCH=0` restores the pre-fix behaviour so the batch script
+can show itself failing; the backend script aborts unless the two runs report different engines;
+the version and backend scripts report a run that produced no tokens as `BROKEN` rather than
+letting two empty outputs compare equal.
 
 ## Quick Start
 
