@@ -101,6 +101,47 @@ void test_schema_object() {
   check(!feed_bytes(g, R"({"title":"hi"})"), "schema: rejects missing required prop (no count)");
 }
 
+void test_string_rejects_control_chars() {
+  // JSON forbids raw control characters inside a string. The class was [^"\],
+  // which allowed them, so a model could put a literal newline in a title, the
+  // grammar was satisfied, and the reply would not parse: 93 of 1000 tool calls
+  // failed that way before this.
+  grammar::Grammar g =
+      grammar::Grammar::parse(grammar::json_schema_to_grammar(R"({"type":"string"})"));
+  check(feed_and_complete(g, "\"plain text\""), "control chars: ordinary string accepted");
+  check(feed_and_complete(g, "\"escaped \\n newline\""),
+        "control chars: an escaped newline is accepted");
+  check(!feed_bytes(g, std::string("\"bad") + std::string(1, '\n')),
+        "control chars: a raw newline is rejected");
+  check(!feed_bytes(g, std::string("\"bad") + std::string(1, '\t')),
+        "control chars: a raw tab is rejected");
+  check(!feed_bytes(g, std::string("\"bad") + std::string(1, static_cast<char>(0x01))),
+        "control chars: a raw 0x01 is rejected");
+}
+
+void test_schema_array_bounds() {
+  // An unbounded array is a loop a greedy decoder can sit in. Without maxItems a
+  // caller cannot express the bound that stops it, so a tool call with a free
+  // "labels" array ran to max_tokens every time and came back truncated.
+  grammar::Grammar g = grammar::Grammar::parse(grammar::json_schema_to_grammar(
+      R"({"type":"array","items":{"type":"number"},"minItems":1,"maxItems":3})"));
+  check(!feed_bytes(g, "[]"), "array bounds: empty rejected below minItems");
+  check(feed_and_complete(g, "[1]"), "array bounds: one item accepted");
+  check(feed_and_complete(g, "[1, 2]"), "array bounds: two items accepted");
+  check(feed_and_complete(g, "[1, 2, 3]"), "array bounds: three items accepted");
+  check(!feed_bytes(g, "[1, 2, 3, 4"), "array bounds: a fourth item is rejected");
+
+  grammar::Grammar zero = grammar::Grammar::parse(
+      grammar::json_schema_to_grammar(R"({"type":"array","items":{"type":"number"},"maxItems":0})"));
+  check(feed_and_complete(zero, "[]"), "array bounds: maxItems 0 accepts the empty array");
+  check(!feed_bytes(zero, "[1"), "array bounds: maxItems 0 rejects any item");
+
+  grammar::Grammar open = grammar::Grammar::parse(
+      grammar::json_schema_to_grammar(R"({"type":"array","items":{"type":"number"}})"));
+  check(feed_and_complete(open, "[]"), "array bounds: unbounded still accepts empty");
+  check(feed_and_complete(open, "[1, 2, 3, 4, 5]"), "array bounds: unbounded still accepts many");
+}
+
 void test_schema_anyof() {
   // Tool calling is why this exists: a request offering N tools compiles to a
   // union of N call shapes, and without anyOf that union cannot be expressed.
@@ -296,6 +337,8 @@ int main() {
   test_handwritten_gbnf();
   test_schema_object();
   test_schema_enum();
+  test_string_rejects_control_chars();
+  test_schema_array_bounds();
   test_schema_anyof();
   test_overlong_utf8_rejected();
   test_partial_utf8();

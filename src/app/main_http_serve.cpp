@@ -849,10 +849,16 @@ void run_http_server(engine::BatchScheduler& sched, model::Tokenizer& tokenizer,
     // A tool call comes back as tool_calls with finish_reason tool_calls, which is
     // what an OpenAI client dispatches on; the raw JSON is never handed over as
     // message content.
+    // A truncated generation is not a tool call. Reporting one anyway produced a
+    // call with an empty name and finish_reason "tool_calls", which a caller would
+    // dispatch on: the worst shape this can fail in, since it looks successful.
+    // When the reply was cut off, or no name can be read out of it, the raw text
+    // and the real finish_reason go back instead.
+    const bool tool_ok =
+        tool_mode && reason != "length" && !json_get_string(text, "name").empty();
     const std::string message_body =
-        tool_mode ? tool_calls_json(id, text)
-                  : ("\"content\":\"" + json_escape(text) + "\"");
-    const std::string chat_reason = tool_mode ? "tool_calls" : reason;
+        tool_ok ? tool_calls_json(id, text) : ("\"content\":\"" + json_escape(text) + "\"");
+    const std::string chat_reason = tool_ok ? "tool_calls" : reason;
     const std::string payload =
         chat ? ("{\"id\":\"" + id + "\",\"object\":\"chat.completion\",\"created\":" + created +
                 ",\"model\":\"" + json_escape(model_name) +

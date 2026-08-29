@@ -377,7 +377,11 @@ private:
   }
   std::string ensure_string() {
     define("hex", "[0-9a-fA-F]");
-    define("char", "[^\"\\\\] | \"\\\\\" ([\"\\\\/bfnrt] | \"u\" hex hex hex hex)");
+    // JSON forbids raw control characters inside a string; they must be escaped.
+    // The class used to be [^"\], which allowed them, so a model could emit a
+    // literal newline inside a title and the grammar was satisfied while the
+    // result would not parse. 93 of 1000 tool calls came back that way.
+    define("char", "[^\"\\\\\\x00-\\x1F] | \"\\\\\" ([\"\\\\/bfnrt] | \"u\" hex hex hex hex)");
     return define("string", "\"\\\"\" char* \"\\\"\"");
   }
   std::string ensure_value() {
@@ -492,6 +496,21 @@ private:
     throw std::runtime_error("json schema: unsupported type '" + type + "'");
   }
 
+  static std::string repeat(const std::string& unit, int times) {
+    std::string out;
+    for (int i = 0; i < times; ++i) {
+      out += unit;
+    }
+    return out;
+  }
+
+  static double json_number(const JsonValue& v, const char* what) {
+    if (v.type != JsonValue::Type::Number) {
+      throw std::runtime_error(std::string("json schema: '") + what + "' must be a number");
+    }
+    return std::stod(v.text);
+  }
+
   std::string visit_array(const JsonValue& schema, const std::string& hint) {
     ensure_ws();
     std::string item_ref;
@@ -500,8 +519,50 @@ private:
     } else {
       item_ref = ensure_value();
     }
-    const std::string def =
-        "\"[\" ws ( " + item_ref + " ( ws \",\" ws " + item_ref + " )* )? ws \"]\"";
+    // minItems / maxItems, expanded by hand because the GBNF parser has no {m,n}.
+    //
+    // An unbounded array is a loop a greedy decoder can stay in: asked for a tool
+    // call with an unbounded "labels", a 1B model padded it until max_tokens and
+    // the reply was truncated, every time. Without these keywords a caller cannot
+    // express the bound that would stop it, so the runaway is unavoidable rather
+    // than merely possible. Same shape as unbounded whitespace, which hung
+    // json_schema requests before it was bounded.
+    int min_items = 0;
+    int max_items = -1;  // unbounded
+    if (const JsonValue* mn = schema.find("minItems")) {
+      min_items = static_cast<int>(json_number(*mn, "minItems"));
+    }
+    if (const JsonValue* mx = schema.find("maxItems")) {
+      max_items = static_cast<int>(json_number(*mx, "maxItems"));
+    }
+    if (max_items >= 0 && max_items < min_items) {
+      throw std::runtime_error("json schema: maxItems is smaller than minItems");
+    }
+
+    std::string def;
+    if (max_items < 0) {
+      const std::string tail = " ( ws \",\" ws " + item_ref + " )*";
+      def = min_items > 0 ? ("\"[\" ws " + item_ref + repeat(" ws \",\" ws " + item_ref,
+                                                            min_items - 1) +
+                             tail + " ws \"]\"")
+                          : ("\"[\" ws ( " + item_ref + tail + " )? ws \"]\"");
+    } else if (max_items == 0) {
+      def = "\"[\" ws \"]\"";
+    } else {
+      // Required items first, then each further item optional and nested so the
+      // array can stop at any count between min and max.
+      std::string optional_tail;
+      for (int k = std::max(min_items, 1); k < max_items; ++k) {
+        optional_tail += " ( ws \",\" ws " + item_ref;
+      }
+      for (int k = std::max(min_items, 1); k < max_items; ++k) {
+        optional_tail += " )?";
+      }
+      const std::string required =
+          item_ref + repeat(" ws \",\" ws " + item_ref, std::max(min_items, 1) - 1);
+      def = min_items == 0 ? ("\"[\" ws ( " + required + optional_tail + " )? ws \"]\"")
+                           : ("\"[\" ws " + required + optional_tail + " ws \"]\"");
+    }
     return define(fresh(hint + "-array"), def);
   }
 

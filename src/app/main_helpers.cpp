@@ -50,15 +50,26 @@ std::string env_or_default_string(const char* env_key, const char* fallback) {
 }
 
 std::size_t json_find_key(const std::string& json, const std::string& key) {
-  const std::string needle = "\"" + key + "\":";
+  // The key and its colon may be separated by whitespace. JSON allows it and
+  // model-generated JSON uses it freely: a reply reading  "name"  	:  "add"
+  // parsed as having no "name" at all, so a tool call came back with an empty
+  // name and still looked like a successful call.
+  const std::string quoted = "\"" + key + "\"";
   std::size_t p = 0;
   int depth = 0;
   while (p < json.size()) {
     const char c = json[p];
     if (c == '"') {
-      if (depth <= 1 && p + needle.size() <= json.size() &&
-          json.compare(p, needle.size(), needle) == 0) {
-        return p + needle.size();
+      if (depth <= 1 && p + quoted.size() <= json.size() &&
+          json.compare(p, quoted.size(), quoted) == 0) {
+        std::size_t q = p + quoted.size();
+        while (q < json.size() && (json[q] == ' ' || json[q] == '\t' ||
+                                  json[q] == '\n' || json[q] == '\r')) {
+          ++q;
+        }
+        if (q < json.size() && json[q] == ':') {
+          return q + 1;
+        }
       }
       ++p;
       while (p < json.size() && json[p] != '"') {
@@ -257,7 +268,9 @@ std::string json_get_string(const std::string& json, const std::string& key) {
     return "";
   }
   std::size_t p = v;
-  while (p < json.size() && (json[p] == ' ' || json[p] == '\t')) {
+  while (p < json.size() &&
+         (json[p] == ' ' || json[p] == '\t' || json[p] == '\n' ||
+          json[p] == '\r')) {
     ++p;
   }
   if (p >= json.size() || json[p] != '"') {
@@ -329,7 +342,9 @@ std::string json_get_raw_value(const std::string& json, const std::string& key) 
     return "";
   }
   std::size_t p = v;
-  while (p < json.size() && (json[p] == ' ' || json[p] == '\t')) {
+  while (p < json.size() &&
+         (json[p] == ' ' || json[p] == '\t' || json[p] == '\n' ||
+          json[p] == '\r')) {
     ++p;
   }
   if (p >= json.size()) {
@@ -394,7 +409,9 @@ int json_get_int(const std::string& json, const std::string& key, int def) {
     return def;
   }
   std::size_t p = v;
-  while (p < json.size() && (json[p] == ' ' || json[p] == '\t')) {
+  while (p < json.size() &&
+         (json[p] == ' ' || json[p] == '\t' || json[p] == '\n' ||
+          json[p] == '\r')) {
     ++p;
   }
   if (p >= json.size()) {
@@ -413,7 +430,9 @@ float json_get_float(const std::string& json, const std::string& key, float def)
     return def;
   }
   std::size_t p = v;
-  while (p < json.size() && (json[p] == ' ' || json[p] == '\t')) {
+  while (p < json.size() &&
+         (json[p] == ' ' || json[p] == '\t' || json[p] == '\n' ||
+          json[p] == '\r')) {
     ++p;
   }
   if (p >= json.size()) {
@@ -432,7 +451,9 @@ bool json_get_bool(const std::string& json, const std::string& key, bool def) {
     return def;
   }
   std::size_t p = v;
-  while (p < json.size() && (json[p] == ' ' || json[p] == '\t')) {
+  while (p < json.size() &&
+         (json[p] == ' ' || json[p] == '\t' || json[p] == '\n' ||
+          json[p] == '\r')) {
     ++p;
   }
   if (p >= json.size()) {
@@ -453,7 +474,9 @@ std::vector<std::string> json_get_string_array(const std::string& json, const st
     return {};
   }
   std::size_t p = v;
-  while (p < json.size() && (json[p] == ' ' || json[p] == '\t')) {
+  while (p < json.size() &&
+         (json[p] == ' ' || json[p] == '\t' || json[p] == '\n' ||
+          json[p] == '\r')) {
     ++p;
   }
   if (p >= json.size() || json[p] != '[') {
