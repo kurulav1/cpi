@@ -304,9 +304,9 @@ bool BatchScheduler::step(std::vector<StreamEvent>& events) {
   // Common post-sample bookkeeping, shared by both the candidate and full-logits paths.
   auto finish_row = [&](int b, int tok_in) {
     StreamSeq& s = seqs_[static_cast<std::size_t>(b)];
-    // s.generated is this token's zero-based index within the sequence, matching how the
-    // single-sequence loops index theirs, so one CPI_DET_PERTURB value means the same thing
-    // whichever transport is under test.
+    // s.generated is this token's zero-based index among the tokens this sequence has
+    // generated, which is the base every other hook was normalised to, so one
+    // CPI_DET_PERTURB value means the same position whichever transport is under test.
     const int tok = cpi::det::perturb_token(s.generated, tok_in);
     if (s.params.grammar) s.params.grammar->accept(tok);
     s.history.push_back(tok);

@@ -963,8 +963,12 @@ std::vector<int> LlamaEngine::generate_stream(const std::vector<int>& prompt_tok
       std::cout << "[engine] decode_step i=" << i << " pos=" << pos << "\n";
     }
     const auto token_start = std::chrono::steady_clock::now();
-    const int next = cpi::det::perturb_token(static_cast<int>(out.size()),
-                                             decode_next_token(current, pos, temperature, out));
+    // Indexed among GENERATED tokens: out is seeded with the prompt, so its raw size
+    // is not the generation index. Every hook uses the same base so one
+    // CPI_DET_PERTURB value means the same position in every engine.
+    const int next =
+        cpi::det::perturb_token(static_cast<int>(out.size() - prompt_tokens.size()),
+                                decode_next_token(current, pos, temperature, out));
     if (i == 0 && tq3_cached_active && options_.tq_first_token_timeout_ms > 0) {
       const auto token_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                 std::chrono::steady_clock::now() - token_start)

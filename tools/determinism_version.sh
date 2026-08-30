@@ -50,10 +50,26 @@ compare() {
     return
   fi
 
-  if diff -q "$TMP/old.txt" "$TMP/new.txt" >/dev/null; then
-    printf '%-34s identical (%s tokens)\n' "$label" "$(( $(wc -w < "$TMP/old.txt") - 2 ))"
+  # One token per line so a difference can be located rather than just detected.
+  sed 's/^Output tokens: //' "$TMP/old.txt" | tr ' ' '\n' | grep -v '^$' > "$TMP/oi.txt"
+  sed 's/^Output tokens: //' "$TMP/new.txt" | tr ' ' '\n' | grep -v '^$' > "$TMP/ni.txt"
+  local no nn
+  no=$(wc -l < "$TMP/oi.txt"); nn=$(wc -l < "$TMP/ni.txt")
+  if [ "$no" -eq "$nn" ] && diff -q "$TMP/oi.txt" "$TMP/ni.txt" >/dev/null; then
+    printf '%-34s identical (%s tokens)\n' "$label" "$no"
   else
-    printf '%-34s DIFFER\n' "$label"
+    local first
+    first=$(paste "$TMP/oi.txt" "$TMP/ni.txt" | awk '$1!=$2{print NR-1; exit}')
+    if [ -z "$first" ]; then
+      # Same prefix, different length: one build stopped sooner.
+      printf '%-34s DIFFER in length only (old %s, new %s tokens)\n' "$label" "$no" "$nn"
+    else
+      # Position within the printed stream, which includes the prompt. The other
+      # scripts read --verify-determinism, whose ids are generated tokens only, so
+      # the same corruption appears there at a lower index by the prompt length.
+      printf '%-34s DIFFER at output position %s (old %s, new %s tokens)\n' \
+        "$label" "$first" "$no" "$nn"
+    fi
     fail=1
   fi
 }
