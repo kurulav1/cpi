@@ -98,6 +98,12 @@ struct HttpServeOptions {
   // its image silently dropped. Runs on the worker thread (see run_exclusive).
   GenerateMultimodalFn multimodal;
   int eos_token_id = -1;
+  // Everything about this server that could change its answers, in one line, echoed
+  // by /health. A client comparing two servers has to be able to confirm they differ
+  // in the way it thinks they do: a determinism harness that assumes one server is
+  // the CPU build and is wrong compares a config against itself and calls it
+  // agreement. Same reason --verify-determinism prints its settings.
+  std::string runtime_info;
 };
 
 // Serves HTTP until the process is stopped, driving the same BatchWorker (and

@@ -464,7 +464,8 @@ void serve_routes(const HttpServeOptions& opts, const std::string& model_name, c
         // under /v1 requires the bearer token when one is configured.
         if (req.path == "/health" || req.path == "/api/health") {
           res.send(200, "application/json",
-                   "{\"status\":\"ok\",\"model\":\"" + json_escape(model_name) + "\"}");
+                   "{\"status\":\"ok\",\"model\":\"" + json_escape(model_name) +
+                       "\",\"runtime\":\"" + json_escape(opts.runtime_info) + "\"}");
           return;
         }
         if (!opts.api_key.empty() && !token_matches(bearer_token(req), opts.api_key)) {
@@ -1015,6 +1016,27 @@ void run_http_server_serial(GenerateStreamFn generate, model::Tokenizer& tokeniz
       if (!rf.empty()) json_schema = json_get_raw_value(rf, "json_schema");
     }
     json_schema = unwrap_json_schema(json_schema);
+
+    // tools/tool_choice compile to the same grammar the schema path uses. This
+    // transport parsed neither, so a request that asked for a required tool call
+    // got unconstrained prose back with finish_reason "length" and no tool_calls
+    // at all: a 200 that looks like the model simply chose not to call anything.
+    // The batched path had already been fixed for this; serving on the CPU engine
+    // goes through here, so the guarantee has to hold on both.
+    bool tool_mode = false;
+    {
+      std::string tool_err;
+      const std::string tool_schema = tool_choice_schema(body, &tool_err);
+      if (!tool_err.empty()) {
+        res.send(400, "application/json", error_json(tool_err, "invalid_request_error"));
+        return;
+      }
+      if (!tool_schema.empty()) {
+        json_schema = tool_schema;
+        tool_mode = true;
+      }
+    }
+
     // Per-request stops on top of the server's template defaults. Without these
     // the model emits its end-of-turn marker and keeps going, inventing the next
     // speaker's turn until it hits max_tokens.
@@ -1222,13 +1244,22 @@ void run_http_server_serial(GenerateStreamFn generate, model::Tokenizer& tokeniz
       return;
     }
     const std::string usage = usage_json(prompt_token_count, static_cast<int>(ids.size()));
+    // Same shape the batched path returns: tool_calls with finish_reason
+    // "tool_calls", never the raw JSON as message content, and never a tool call
+    // claimed for a reply that was cut off or carries no name. A truncated
+    // generation reported as a tool call is the worst failure available here,
+    // because it looks successful and the caller dispatches on it.
+    const bool tool_ok =
+        tool_mode && reason != "length" && !json_get_string(full_text, "name").empty();
+    const std::string message_body =
+        tool_ok ? tool_calls_json(id, full_text) : ("\"content\":\"" + json_escape(full_text) + "\"");
+    const std::string chat_reason = tool_ok ? "tool_calls" : reason;
     res.send(
         200, "application/json",
         chat ? ("{\"id\":\"" + id + "\",\"object\":\"chat.completion\",\"created\":" + created +
                 ",\"model\":\"" + json_escape(model_name) +
-                "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\","
-                "\"content\":\"" +
-                json_escape(full_text) + "\"},\"finish_reason\":\"" + reason + "\"}]" + usage + "}")
+                "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\"," +
+                message_body + "},\"finish_reason\":\"" + chat_reason + "\"}]" + usage + "}")
              : ("{\"id\":\"" + id + "\",\"object\":\"text_completion\",\"created\":" + created +
                 ",\"model\":\"" + json_escape(model_name) +
                 "\",\"choices\":[{\"index\":0,\"text\":\"" + json_escape(full_text) +

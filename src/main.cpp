@@ -42,6 +42,7 @@
 
 #ifdef _WIN32
 #include <Windows.h>
+#include <sstream>
 #endif
 
 namespace {
@@ -521,6 +522,24 @@ int main(int argc, char** argv) {
     const app::main_helpers::EngineChoice engine_choice = app::main_helpers::resolve_engine(
         model_probe, cuda_available, metal_available, cli.force_cpu);
 
+    // Everything that could change this process's answers, in one line. /health
+    // echoes it so a client comparing two servers can confirm they actually differ
+    // in the way it assumes; the same fields --verify-determinism prints, for the
+    // same reason.
+    const auto runtime_info_line = [&]() {
+      std::ostringstream oss;
+      oss << "backend=" << app::main_helpers::engine_choice_name(engine_choice)
+          << " quant="
+          << (cli.opts.int8_streaming ? (cli.opts.streaming_quant_bits == 4 ? "int4" : "int8")
+                                      : "none")
+          << " kv_bits=" << (cli.opts.kv_cache_int4 ? 4 : 16)
+          << " paged=" << (cli.opts.paged_kv_cache ? 1 : 0)
+          << " paged_blocks=" << (cli.opts.paged_blocks ? 1 : 0)
+          << " gpu_cache_all=" << (cli.opts.gpu_cache_all ? 1 : 0)
+          << " ctx=" << cli.opts.max_context;
+      return oss.str();
+    };
+
     if (!quiet_output) {
       using app::main_helpers::EngineChoice;
       switch (engine_choice) {
@@ -674,6 +693,7 @@ int main(int argc, char** argv) {
             so.host = cli.serve_host;
             so.port = cli.serve_port;
             so.model_name = std::filesystem::path(cli.opts.model_path).filename().string();
+            so.runtime_info = runtime_info_line();
             so.chat_template = cli.chat_template;
             so.stop_texts = cli.stop_texts;
             so.add_bos = !cli.force_no_bos;
@@ -751,6 +771,7 @@ int main(int argc, char** argv) {
           so.host = cli.serve_host;
           so.port = cli.serve_port;
           so.model_name = std::filesystem::path(cli.opts.model_path).filename().string();
+          so.runtime_info = runtime_info_line();
           so.chat_template = cli.chat_template;
           so.stop_texts = cli.stop_texts;
           so.add_bos = !cli.force_no_bos;
@@ -928,6 +949,7 @@ int main(int argc, char** argv) {
             so.host = cli.serve_host;
             so.port = cli.serve_port;
             so.model_name = std::filesystem::path(cli.opts.model_path).filename().string();
+            so.runtime_info = runtime_info_line();
             so.chat_template = cli.chat_template;
             so.stop_texts = cli.stop_texts;
             so.add_bos = !cli.force_no_bos;
@@ -1005,6 +1027,39 @@ int main(int argc, char** argv) {
 #endif
       case EngineChoice::LlamaCpu: {
         engine::CpuLlamaEngine cpu_eng;
+        // --serve was handled only inside the CUDA branches, so asking for it on the
+        // CPU engine printed the chat-template line and exited 0: no server, no
+        // error, nothing to attribute. The serial transport exists for engines with
+        // no batch scheduler, and this is one, so serve through it rather than
+        // silently doing nothing. One request at a time, which is what a CPU engine
+        // could deliver anyway.
+        if (cli.serve_http) {
+          if (!use_tokenizer) throw std::runtime_error("--serve requires --tokenizer");
+          cpu_eng.initialize(cli.opts);
+          app::main_modes::HttpServeOptions so;
+          so.host = cli.serve_host;
+          so.port = cli.serve_port;
+          so.model_name = std::filesystem::path(cli.opts.model_path).filename().string();
+          so.runtime_info = runtime_info_line();
+          so.chat_template = cli.chat_template;
+          so.stop_texts = cli.stop_texts;
+          so.add_bos = !cli.force_no_bos;
+          so.max_new = cli.max_new;
+          so.temp = cli.temp;
+          so.api_key = cli.serve_api_key;
+          if (so.api_key.empty()) {
+            if (const char* env_key = std::getenv("CPI_API_KEY")) so.api_key = env_key;
+          }
+          so.eos_token_id = cli.opts.eos_token_id;
+          app::main_modes::run_http_server_serial(
+              [&cpu_eng](const std::vector<int>& prompt, int max_new, float temp,
+                         const std::function<bool(int)>& on_token,
+                         const engine::GenerationConstraints* constraints) {
+                return cpu_eng.generate_stream(prompt, max_new, temp, on_token, constraints);
+              },
+              tokenizer, so);
+          break;
+        }
         run_with_engine(cpu_eng);
         break;
       }
@@ -1050,6 +1105,7 @@ int main(int argc, char** argv) {
             so.host = cli.serve_host;
             so.port = cli.serve_port;
             so.model_name = std::filesystem::path(cli.opts.model_path).filename().string();
+            so.runtime_info = runtime_info_line();
             so.chat_template = cli.chat_template;
             so.stop_texts = cli.stop_texts;
             so.add_bos = !cli.force_no_bos;
