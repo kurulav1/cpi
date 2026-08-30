@@ -955,6 +955,21 @@ std::vector<int> LlamaEngine::generate_stream(const std::vector<int>& prompt_tok
   int pos = static_cast<int>(prompt_tokens.size()) - 1;
   const auto decode_start = std::chrono::steady_clock::now();
   for (int i = 0; i < max_new_tokens; ++i) {
+    // Stop at the context window. This step forwards a token AT position pos, and the
+    // KV cache and position tables are allocated for exactly options_.max_context
+    // positions (see the prompt-length guard above, and llama_engine_lifecycle.cpp).
+    // Without this the loop ran to max_new_tokens regardless and wrote KV past the
+    // end: with a 6-token prompt and --max-context 2048 it emitted 2048 tokens where
+    // 2043 fit, and everything from the overrun on was degenerate repetition. The
+    // prompt was already guarded against exactly this; decode was not. The
+    // speculative loop below and the op-plan decode driver both already bound it.
+    if (pos >= options_.max_context) {
+      if (options_.verbose) {
+        std::cout << "[engine] stopping: reached the context window (" << options_.max_context
+                  << ")\n";
+      }
+      break;
+    }
     enforce_host_resource_limits("decode.step");
     // Suppress EOS until at least min_new_tokens have been generated, so greedy
     // decoding can't terminate early on a collapsed/repeated-token distribution.

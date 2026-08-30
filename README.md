@@ -60,10 +60,13 @@ Verified, greedy, on one RTX 5090, Llama-3.2-1B unless noted:
 
 Not deterministic across weight quantisation (int4 weights are different numbers, so they
 produce different logits) or KV quantisation once generation is long enough to read quantised
-KV. Not yet measured across machines, or against Metal. Two smaller boundaries, both documented
-rather than smoothed over: the CPU engine stops a few tokens earlier than CUDA when generation
-runs into the context limit, and the batched path refuses int8/int4 weights, so `--serve` is
-fp16-only today.
+KV. Not yet measured across machines, or against Metal. One capability limit worth stating with
+them: the batched path refuses int8/int4 weights, so `--serve` is fp16-only today.
+
+Chasing one of these found a bug rather than a boundary. CPU and CUDA disagreed on how many
+tokens fit in the context, which reads as a harmless stopping rule; it was an unbounded CUDA
+decode loop writing KV past a cache allocated for exactly `max_context` positions, so the tail
+of a long generation was corrupt. Fixed, and generating into the limit is now a test.
 
 ### Run it yourself
 

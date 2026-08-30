@@ -207,6 +207,7 @@ prompts, lengths to 2048 tokens, all identical (`tools/determinism_backend.sh`):
 | 2048 tokens, `--max-context 4096` | identical |
 | prose prompt, code prompt, 512 tokens | identical |
 | `--paged-kv-cache`, `--max-context 8192` | identical |
+| generating into the context limit | identical (2043 tokens) |
 
 This was the axis most likely to break, and the reason it was worth running
 before renting anything: different reduction orders, different accumulate
@@ -214,15 +215,28 @@ precision, no cuBLAS at all. It holds anyway. Greedy decoding only needs the
 ordering of the logits to survive, not their exact values, so numeric
 differences have to reach a near-tie before they can change a token.
 
-One boundary, and it is a stopping rule rather than arithmetic. Generating into
-the context limit, the CPU engine stops a few tokens earlier than CUDA: at
-`--max-context 2048` and 2048 requested tokens, CUDA emitted 2048 and the CPU
-2043. The CPU stream is an exact prefix of the CUDA one, so every token both
-engines produced agrees; they disagree about when to stop. Raising the context
-past the requested length makes the same run identical, which is how the two
-were told apart. The script reports that case as `PREFIX ONLY` rather than as a
-divergence, because a shorter run that agrees everywhere is a different defect
-from one that computes different numbers.
+That last row was a defect, and it was worth chasing rather than excusing.
+Generating into the context limit, CUDA emitted 2048 tokens where the CPU emitted
+2043, and the CPU stream was an exact prefix of the CUDA one. The obvious reading
+is a harmless disagreement about when to stop. It was not.
+
+The KV cache and position tables are allocated for exactly `max_context`
+positions, and the engine already refuses a prompt that would exceed them,
+because doing so "corrupts memory; observed as garbage output on some builds and
+a 0xC0000409 stack-buffer-overrun on others". The decode loop carried no such
+bound: it ran to `max_new_tokens` whatever the window said. With a 6-token prompt
+and `--max-context 2048`, positions 0..2047 hold 2043 generated tokens, and CUDA
+wrote past the end for the rest. Compared against the same generation with room
+to run (`--max-context 4096`), it agrees to generated index 2042 and then leaves
+the rails, ending `... 0 12 220 220 220`.
+
+So the CPU was right and CUDA was overrunning its cache. The same loop's own
+speculative variant bounds this correctly, and so does the op-plan decode driver;
+the single-sequence CUDA path was the one that did not. Bounded now, and both
+engines emit 2043 tokens with the same hash, matching the ctx-4096 reference
+token for token. Two rows in `determinism_backend.sh` generate into the limit to
+keep it that way, and a `PREFIX ONLY` result is treated as a failure rather than
+a footnote.
 
 The first attempt at this measurement returned matching hashes from two runs
 that had both used CUDA, because the `[verify] backend=` field was a compile-time

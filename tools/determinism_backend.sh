@@ -90,13 +90,18 @@ compare "prose"            "Write a short paragraph about the sea." 512
 compare "code"             "def fibonacci(n):" 512
 compare "paged-kv"         "The capital of France is" 256 --paged-kv-cache
 compare "ctx 8192"         "The capital of France is" 256 --max-context 8192
+# Regression: generating INTO the context limit. The CUDA decode loop had no bound
+# here and ran to max_new_tokens regardless, writing KV past the end of a cache
+# allocated for exactly max_context positions; the tail came back as degenerate
+# repetition. The CPU loop stopped correctly, so the two disagreed on length and
+# this showed up as PREFIX ONLY. Both must now emit the same count.
+compare "at the context limit"  "The capital of France is" 2048 --max-context 2048
+compare "limit, longer prompt"  "Write a long detailed essay about the ocean." 2048 --max-context 2048
 
 echo ""
-echo "Known: generating into the context limit is NOT covered above, because the"
-echo "CPU engine stops a few tokens earlier there than CUDA does. Those tokens"
-echo "agree as far as both engines produce them, so it is a stopping-rule"
-echo "difference rather than an arithmetic one. Raise --max-context past the"
-echo "requested length to test arithmetic without that boundary in the way."
+echo "PREFIX ONLY above would mean the engines agree on every token but disagree on"
+echo "how many fit in the context. That was a real defect (an unbounded CUDA decode"
+echo "loop writing KV past the window); the last two rows exist to keep it fixed."
 if [ -n "$SELFTEST" ]; then
   if [ "$fail" -eq 0 ]; then
     echo ""
