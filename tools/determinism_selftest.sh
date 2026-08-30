@@ -107,6 +107,11 @@ if [ "$fail" -ne 0 ]; then
 fi
 echo "Every determinism check has now been shown to both pass and fail."
 echo ""
-echo "Not covered here: determinism_version.sh, which needs an old build in a"
-echo "worktree. Run it with CPI_DET_SELFTEST set once such a build exists."
+echo "Not covered here, both because they need something this script cannot set up:"
+echo "  determinism_version.sh   needs an old build in a worktree."
+echo "  determinism_trace.sh     starts a server per configuration, minutes per run."
+echo "Both take CPI_DET_SELFTEST the same way. For the trace check pass an index"
+echo "inside a long generation (100, not 10): a small index corrupts the short tool"
+echo "calls, breaks their JSON, and yields no trace at all, which is BROKEN rather"
+echo "than a detected difference and proves nothing."
 exit 0

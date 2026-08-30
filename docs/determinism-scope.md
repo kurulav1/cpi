@@ -245,6 +245,68 @@ job is to attribute a mismatch was reporting what the binary could do rather tha
 what it did. It now reports the engine resolved at runtime, and the script fails
 outright if the two runs do not name different engines.
 
+## The same property in the units of an agent loop
+
+Everything above compares token ids. Nobody running an agent thinks in tokens;
+what they need to know is whether the second run calls the same tools, with the
+same arguments, in the same order, over the same number of turns. Token identity
+implies that, so this is not a new property, only the same one stated in the
+units of the thing people are actually afraid of.
+
+`tools/traces/reference_trace.json` pins a fixed loop as data: a system prompt,
+four tool schemas, a deterministic stub for every tool, and a user prompt.
+`tools/verify_trace.py` drives it against a running server and hashes the
+canonical record of what happened; `tools/determinism_trace.sh` runs it across
+configurations. One hash everywhere:
+
+| varied | trace hash |
+| --- | --- |
+| baseline | `c6c5b0b1f2acded0` |
+| the same server, again | identical |
+| five traces in flight at once | identical |
+| `--gpu-cache-all` off | identical |
+| `--max-context 4096` | identical |
+| the CPU engine instead of CUDA | identical |
+
+The trace itself:
+
+```
+turn 0.0  get_weather        {"city":"Paris","unit":"celsius"}
+turn 1.0  convert_currency   {"amount":500,"from_currency":"GBP","to_currency":"EUR"}
+turn 2    final              "I'd be happy to help you with your travel plans..."
+```
+
+This was the first check to exercise grammar state, prefix reuse, growing context
+and the stop rules at once, and it immediately found two things the token-level
+checks could not have.
+
+**`--serve --cpu` started no server.** It printed the chat-template line and
+exited 0: no server, no error, nothing to attribute. Serving was wired only
+inside the CUDA branches of the engine switch. This also means the "CPU agrees
+with CUDA" row above was measured through the CLI and said nothing about the CPU
+serving path, which was not working at all. A row can be true and still be
+narrower than its title.
+
+**The serial transport ignored `tools` and `tool_choice`.** It parsed
+`json_schema` but never compiled a tool schema, so a request demanding a tool
+call came back 200 with unconstrained prose and `finish_reason: "length"`, which
+is indistinguishable from a model that chose not to call anything. The batched
+path had been fixed for this; the serial path, which is what CPU serving uses,
+had not.
+
+Both are fixed, which is why the CPU row above exists at all. Note what the
+guards were worth: the first trace run returned a perfectly reproducible hash of
+a trace containing zero tool calls, because `tool_choice: "auto"` compiles to no
+grammar and a 1B model answers in prose. A stable hash of nothing would have read
+as a clean row.
+
+Two limits. `--serve` refuses int8/int4 weights, so the quantised trace rows do
+not exist rather than being untested. And a `BROKEN` row here flipped to passing
+between runs before the harness learned to wait for the GPU to release its
+memory: killing the process is not the same as getting the VRAM back, and a
+server started too early quietly declines to hold weights resident. That was a
+harness artifact in the costume of a finding.
+
 ## Not yet measured
 
 - **Across machines.** Every row above is one RTX 5090. Cross-machine

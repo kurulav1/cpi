@@ -1,0 +1,118 @@
+{
+  "name": "trip-planning",
+  "comment": [
+    "A fixed multi-turn tool-calling trace. Data, not code, so the thing being",
+    "compared across runs is pinned in the repository rather than constructed",
+    "differently by each caller.",
+    "",
+    "Every tool result is a constant, or a constant plus arguments echoed back.",
+    "Nothing here reads a clock, a random source, a UUID, or the filesystem: a",
+    "stub that varied would make every trace differ and the harness would report",
+    "the stub rather than the engine. verify_trace.py re-evaluates each stub a",
+    "second time and fails if the two answers differ, rather than trusting this",
+    "comment.",
+    "",
+    "Echoing arguments back is deliberate. It makes a result depend on the call",
+    "that produced it, so a divergence in one turn's arguments propagates into",
+    "later turns instead of being absorbed."
+  ],
+  "system": "You are a travel assistant. Use the provided tools to answer. Call one tool at a time.",
+  "user": "I am flying from London to Paris on 2026-03-14. Check the weather in Paris, then convert 500 GBP to EUR.",
+  "max_turns": 6,
+  "max_tokens_per_turn": 160,
+  "min_tool_calls": 2,
+  "_tool_choice": [
+    "The first turn is forced. tool_choice 'auto' compiles to no grammar at all,",
+    "which is the correct OpenAI reading (the model decides), but a 1B model",
+    "decides to write prose and the trace ends up with no actions in it. Forcing",
+    "turn 0 guarantees the loop has something to be deterministic ABOUT, while",
+    "leaving later turns on 'auto' keeps the number of turns a property of the",
+    "model rather than of this file."
+  ],
+  "forced_turns": 2,
+  "tool_choice_first": "required",
+  "tool_choice_rest": "auto",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Current weather for a city.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": { "type": "string", "description": "City name" },
+            "unit": { "type": "string", "enum": ["celsius", "fahrenheit"] }
+          },
+          "required": ["city"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "convert_currency",
+        "description": "Convert an amount between two currencies.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "amount": { "type": "number" },
+            "from_currency": { "type": "string" },
+            "to_currency": { "type": "string" }
+          },
+          "required": ["amount", "from_currency", "to_currency"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "search_flights",
+        "description": "Find flights between two cities on a date.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "origin": { "type": "string" },
+            "destination": { "type": "string" },
+            "date": { "type": "string" }
+          },
+          "required": ["origin", "destination"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "book_hotel",
+        "description": "Reserve a hotel room.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": { "type": "string" },
+            "nights": { "type": "integer" },
+            "guests": { "type": "integer" }
+          },
+          "required": ["city", "nights"]
+        }
+      }
+    }
+  ],
+  "stubs": {
+    "get_weather": {
+      "constant": { "conditions": "overcast", "temperature": 14, "wind_kph": 11 },
+      "echo": ["city", "unit"]
+    },
+    "convert_currency": {
+      "constant": { "rate": 1.17, "converted": 585.0 },
+      "echo": ["amount", "from_currency", "to_currency"]
+    },
+    "search_flights": {
+      "constant": { "flight": "AF1681", "departs": "08:40", "price_gbp": 96 },
+      "echo": ["origin", "destination", "date"]
+    },
+    "book_hotel": {
+      "constant": { "reservation": "CPI-REF-0001", "hotel": "Hotel Trois Rivieres" },
+      "echo": ["city", "nights", "guests"]
+    }
+  }
+}

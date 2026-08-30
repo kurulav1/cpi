@@ -99,6 +99,20 @@ The scripts behind the other rows:
 | `tools/determinism_batch.sh` | batch size |
 | `tools/determinism_backend.sh` | CPU against CUDA |
 | `tools/determinism_version.sh` | this build against an older one |
+| `tools/determinism_trace.sh` | a whole agent loop: same tools, arguments, order, turns |
+| `tools/determinism_selftest.sh` | that each of the above can fail |
+
+Token identity is the underlying property, but an agent loop is what people actually run, so
+there is a check in those units too. `tools/traces/reference_trace.json` pins a multi-turn
+tool-calling loop as data, and the same hash comes back from repeats, from five traces in
+flight at once, from either cache policy, and from the CPU engine as from CUDA:
+
+```
+turn 0.0  get_weather        {"city":"Paris","unit":"celsius"}
+turn 1.0  convert_currency   {"amount":500,"from_currency":"GBP","to_currency":"EUR"}
+turn 2    final              "I'd be happy to help you with your travel plans..."
+[trace] hash=c6c5b0b1f2acded0 turns=3 tool_calls=2 ended=final
+```
 
 Each carries its own control, because a determinism test that cannot demonstrate it detects a
 difference is not evidence. `CPI_DET_BATCH=0` restores the pre-fix behaviour so the batch script
