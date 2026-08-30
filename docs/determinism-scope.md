@@ -300,6 +300,12 @@ a trace containing zero tool calls, because `tool_choice: "auto"` compiles to no
 grammar and a 1B model answers in prose. A stable hash of nothing would have read
 as a clean row.
 
+Like the others, this check has been shown to fail. `CPI_DET_SELFTEST=100`
+corrupts one token of a final answer and the comparison reports `988900bd75c47cb8`
+against the baseline's `c6c5b0b1f2acded0`. The index matters: at 10 the corruption
+lands inside a tool call, destroys its JSON, and no trace comes back at all, which
+the script now reports as `INCONCLUSIVE` rather than counting as detection.
+
 Two limits. `--serve` refuses int8/int4 weights, so the quantised trace rows do
 not exist rather than being untested. And a `BROKEN` row here flipped to passing
 between runs before the harness learned to wait for the GPU to release its
