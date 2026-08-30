@@ -17,6 +17,8 @@ nothing. `tools/determinism_matrix.sh` runs the single-sequence table below,
 `tools/determinism_batch.sh` covers batch size (which a single-sequence verifier
 cannot see), `tools/determinism_backend.sh` compares CPU against CUDA, and
 `tools/determinism_version.sh` compares today's build against an older one.
+`tools/determinism_selftest.sh` runs each of them against a deliberately corrupted
+build and fails if any reports no difference (see "Showing the checks can fail").
 
 ## Holds
 
@@ -108,6 +110,63 @@ against CUDA.
 
 Not deterministic across: weight quantisation, and KV quantisation once
 generation is long enough to read quantised KV.
+
+Worth knowing why it holds, because it says when to doubt it. Greedy decoding
+consumes only the *ordering* of the logits, not their values, so a numeric
+difference has to be large enough to reorder the top of the distribution before
+it can change a token. Most differences are not. That makes the property
+strongest where the model is confident and weakest at high-entropy positions and
+in long generations, where near-ties accumulate: a run that agrees for 512 tokens
+is weaker evidence than the same run agreeing for 2048. Sampling at a non-zero
+temperature is a different question and is not claimed here.
+
+## Showing the checks can fail
+
+Every row above is a script reporting "identical". That is evidence only if the
+script would have said otherwise, and the divergence branch is the branch that
+never runs. When it did finally run here it crashed, on a path-format bug it had
+been carrying unnoticed the whole time.
+
+So the failure case has a switch. `CPI_DET_PERTURB=<step>` replaces the token
+generated at index `<step>` with a different valid one, deterministically, in
+every engine that emits tokens. `tools/determinism_selftest.sh` runs each check
+twice, once against an honest build and once against a corrupted one, and fails
+if a check cannot tell them apart:
+
+```
+1. the perturbation switch itself
+  ok    perturbation changes the stream        56f4e7d7733d0ffa -> c72e427cb8f685fe
+  ok    corrupted runs announce themselves on stderr
+2. each check passes on an honest build        matrix, batch, backend: exit 0
+3. each check FAILS on a build corrupted at token 10
+  ok    matrix / batch / backend all detect it
+4. the batch fix's own control
+  ok    batch check fails without the fix      exit 1
+```
+
+Writing that turned up three things the table had been resting on.
+
+**Two of the four scripts could not fail.** `determinism_matrix.sh` and
+`determinism_batch.sh` printed a table and exited 0 whatever they found, so in CI
+they would have been green while reporting divergence on screen. Both now assert:
+rows are grouped by what must not change the answer, and a group that disagrees
+exits non-zero.
+
+**The perturbation did not reach every engine.** Hooking the CPU engine, the CUDA
+single-sequence loop, speculative decode and the batched scheduler covers the
+Llama paths, but Gemma runs through the shared `decode_driver.cpp`, which had no
+hook. The `gemma-selftest` row would not have been corrupted, that group would
+never have fired, and the run would still have passed on the llama group. The
+self-test now requires *every* group whose row was corrupted to have caught it,
+rather than accepting one failure somewhere.
+
+**The perturbation is at the token, not in a kernel.** A single ULP in the LM head
+is more faithful to a real numeric fault, but whether it flips a token inside 64
+steps depends on hitting a near-tie, so a control built on it can quietly test
+nothing. Corrupting a known index is what lets the check assert *where* the
+divergence was reported. It exercises the comparison plumbing rather than the
+arithmetic, and the arithmetic has its own control: `CPI_DET_BATCH=0` restores the
+cuBLAS N=1 kernel choice, a real divergence that the batch check must fail on.
 
 ## Across versions
 

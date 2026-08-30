@@ -59,6 +59,7 @@
 // OpenMP
 #if defined(_OPENMP)
 #include <omp.h>
+#include "engine/det_perturb.hpp"
 #endif
 
 namespace engine {
@@ -1643,7 +1644,9 @@ std::vector<int> CpuLlamaEngine::generate_stream(const std::vector<int>& prompt_
   // token, then run forward_token on it to get logits for the next step.
   const auto decode_start = std::chrono::steady_clock::now();
   for (int step = 0; step < max_new_tokens; ++step) {
-    const int next = sample_token(temperature, top_k, history, rep_p);
+    const int next =
+        cpi::det::perturb_token(static_cast<int>(output.size()),
+                                sample_token(temperature, top_k, history, rep_p));
     if (active_grammar_ != nullptr) {
       active_grammar_->accept(next);
     }

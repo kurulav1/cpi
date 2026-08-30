@@ -6,6 +6,7 @@
 #include <stdexcept>
 
 #include "engine/sampling.hpp"
+#include "engine/det_perturb.hpp"
 
 namespace engine {
 namespace runtime {
@@ -59,7 +60,8 @@ std::vector<int> run_decode(SequenceModel& model, const std::vector<int>& prompt
   const auto decode_start = clock::now();
   int pos = P;
   for (int s = 0; s < params.max_new_tokens && pos < max_ctx; ++s) {
-    const int next = model.sample(params, history);
+    const int next =
+        cpi::det::perturb_token(static_cast<int>(out.size()), model.sample(params, history));
     if (params.grammar_accept) params.grammar_accept(next);
     out.push_back(next);
     history.push_back(next);

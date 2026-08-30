@@ -20,6 +20,9 @@ set -u
 OLD="${1:?usage: determinism_version.sh <old-bin> <new-bin> <model> <tokenizer>}"
 NEW="${2:?usage: determinism_version.sh <old-bin> <new-bin> <model> <tokenizer>}"
 MODEL="${3:?}"
+# CPI_DET_SELFTEST=<n> corrupts token <n> of the new build only, so this comparison
+# must report divergence. A check that has never failed is not evidence.
+SELFTEST="${CPI_DET_SELFTEST:-}"
 TOK="${4:?}"
 TMP="${TMPDIR:-/tmp}/cpi-version-axis.$$"
 mkdir -p "$TMP"
@@ -31,8 +34,10 @@ compare() {
   local label="$1" prompt="$2" n="$3"; shift 3
   "$OLD" "$MODEL" --tokenizer "$TOK" --prompt "$prompt" --max-new "$n" --temp 0 "$@" \
       2>"$TMP/old.err" | grep '^Output tokens:' > "$TMP/old.txt"
-  "$NEW" "$MODEL" --tokenizer "$TOK" --prompt "$prompt" --max-new "$n" --temp 0 "$@" \
-      2>"$TMP/new.err" | grep '^Output tokens:' > "$TMP/new.txt"
+  # The self-test corrupts today's build only, so this comparison has a
+  # known-different side it is obliged to report.
+  CPI_DET_PERTURB="$SELFTEST" "$NEW" "$MODEL" --tokenizer "$TOK" --prompt "$prompt" \
+      --max-new "$n" --temp 0 "$@" 2>"$TMP/new.err" | grep '^Output tokens:' > "$TMP/new.txt"
 
   # A missing token line is a broken test, not a pass. Say which side broke and
   # why, because "both produced nothing" compares equal and looks like success.
@@ -66,5 +71,16 @@ if [ "$fail" -eq 0 ]; then
   echo "cannot run a config tells you nothing about whether it agrees on one."
 else
   echo "Divergence found: today's build does not reproduce the older stream."
+fi
+if [ -n "$SELFTEST" ]; then
+  if [ "$fail" -eq 0 ]; then
+    echo ""
+    echo "SELF-TEST FAILED: the new build was corrupted at token $SELFTEST and every row"
+    echo "still reported identical, so this comparison detects nothing."
+    exit 1
+  fi
+  echo ""
+  echo "(self-test: the failures above are expected, the new build was corrupted on purpose)"
+  exit 0
 fi
 exit "$fail"

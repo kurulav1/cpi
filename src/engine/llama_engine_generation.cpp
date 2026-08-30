@@ -15,6 +15,7 @@
 #include "model/gguf_kquant.hpp"
 #include "runtime/cuda_utils.cuh"
 #include "runtime/kernels.cuh"
+#include "engine/det_perturb.hpp"
 
 namespace engine {
 
@@ -962,7 +963,8 @@ std::vector<int> LlamaEngine::generate_stream(const std::vector<int>& prompt_tok
       std::cout << "[engine] decode_step i=" << i << " pos=" << pos << "\n";
     }
     const auto token_start = std::chrono::steady_clock::now();
-    const int next = decode_next_token(current, pos, temperature, out);
+    const int next = cpi::det::perturb_token(static_cast<int>(out.size()),
+                                             decode_next_token(current, pos, temperature, out));
     if (i == 0 && tq3_cached_active && options_.tq_first_token_timeout_ms > 0) {
       const auto token_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                 std::chrono::steady_clock::now() - token_start)
@@ -1067,7 +1069,8 @@ std::vector<int> LlamaEngine::spec_lookup_generate(const std::vector<int>& promp
   int verifies = 0, drafted = 0, accepted = 0, backoffs = 0;
 
   // Append, stream, and test the stop conditions. False ends the loop.
-  const auto record = [&](int tok) -> bool {
+  const auto record = [&](int tok_in) -> bool {
+    const int tok = cpi::det::perturb_token(static_cast<int>(out.size()), tok_in);
     out.push_back(tok);
     history.push_back(tok);
     if (on_token && !on_token(tok)) return false;

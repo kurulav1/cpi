@@ -18,6 +18,9 @@ set -u
 MODEL="${1:?usage: determinism_backend.sh <model> <tokenizer> [binary]}"
 TOK="${2:?usage: determinism_backend.sh <model> <tokenizer> [binary]}"
 BIN="${3:-./build-cuda-ninja/cpi.exe}"
+# CPI_DET_SELFTEST=<n> corrupts token <n> of the CPU side only, so this comparison
+# must report divergence. A check that has never failed is not evidence.
+SELFTEST="${CPI_DET_SELFTEST:-}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 fail=0
@@ -43,8 +46,11 @@ compare() {
   local label="$1" prompt="$2" n="$3"; shift 3
   "$BIN" "$MODEL" --tokenizer "$TOK" --prompt "$prompt" --verify-determinism "$n" \
       --gpu-cache-all "$@" 2>/dev/null | grep '^\[verify\] ids=' > "$TMP/g.txt"
-  "$BIN" "$MODEL" --tokenizer "$TOK" --prompt "$prompt" --verify-determinism "$n" \
-      --cpu "$@" 2>/dev/null | grep '^\[verify\] ids=' > "$TMP/c.txt"
+  # The self-test corrupts this side only, giving the comparison a known-different
+  # input it must report. PERTURB is exported empty when not self-testing, and
+  # det_perturb treats empty as absent.
+  CPI_DET_PERTURB="$SELFTEST" "$BIN" "$MODEL" --tokenizer "$TOK" --prompt "$prompt" \
+      --verify-determinism "$n" --cpu "$@" 2>/dev/null | grep '^\[verify\] ids=' > "$TMP/c.txt"
   if [ ! -s "$TMP/g.txt" ] || [ ! -s "$TMP/c.txt" ]; then
     printf '%-26s BROKEN (one side produced no tokens)\n' "$label"
     return
@@ -91,4 +97,15 @@ echo "CPU engine stops a few tokens earlier there than CUDA does. Those tokens"
 echo "agree as far as both engines produce them, so it is a stopping-rule"
 echo "difference rather than an arithmetic one. Raise --max-context past the"
 echo "requested length to test arithmetic without that boundary in the way."
+if [ -n "$SELFTEST" ]; then
+  if [ "$fail" -eq 0 ]; then
+    echo ""
+    echo "SELF-TEST FAILED: the CPU side was corrupted at token $SELFTEST and every row"
+    echo "still reported identical, so this comparison detects nothing."
+    exit 1
+  fi
+  echo ""
+  echo "(self-test: the failures above are expected, the CPU side was corrupted on purpose)"
+  exit 0
+fi
 exit "$fail"

@@ -164,6 +164,7 @@ set(CPI_ENGINE_SOURCES
   # block, and that placement was the only reason continuous batching was CUDA-only;
   # where the code lived, not what it needed.
   src/engine/paged_kv.cpp
+  src/engine/det_perturb.cpp
   src/engine/batch_scheduler.cpp
   src/grammar/grammar.cpp
   src/grammar/json_schema_to_grammar.cpp
