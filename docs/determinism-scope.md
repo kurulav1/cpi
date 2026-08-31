@@ -6,8 +6,7 @@ hash of the token ids plus every setting that could change them:
 ```
 cpi <model> --prompt "The capital of France is" --verify-determinism 64 --gpu-cache-all
 [verify] hash=9003b7d09a9eae93 tokens=64
-[verify] backend=cuda model=Llama-3.2-1B-Instruct-F16.gguf quant=none kv_bits=16 paged=0 \
-         gpu_cache_all=1 ctx=2048 temp=0 prompt_tokens=6
+[verify] backend=llama-cuda model=Llama-3.2-1B-Instruct-F16.gguf quant=none kv_bits=16 paged=0 gpu_cache_all=1 ctx=2048 temp=0 prompt_tokens=6
 [verify] ids=51354,13,578,469,3168,...
 ```
 

@@ -504,6 +504,23 @@ ParsedArgs parse_args(int argc, char** argv) {
     args.opts.paged_blocks = true;
     std::fprintf(stderr, "[cli] --serve/--interactive-batch imply --paged-blocks; enabling it.\n");
   }
+  // And the pool implies resident weights, so ask for those too rather than making
+  // the user discover them. Implying --paged-blocks above without this traded one
+  // unguessable flag for another: the server then died with "batched decode
+  // requires --gpu-cache-all (fully resident weights)", which is the documented
+  // one-line docker command failing at startup on the first thing anyone tries.
+  //
+  // Nothing is papered over by doing this. Requesting the cache does not force it:
+  // the cache policy still decides whether the weights fit the VRAM budget, and a
+  // model that does not fit reaches the same refusal it reached before. What
+  // changes is that a model which DOES fit now just runs.
+  if ((args.serve_http || args.interactive_batch) && args.draft_model_path.empty() &&
+      !args.opts.gpu_cache_all) {
+    args.opts.gpu_cache_all = true;
+    std::fprintf(stderr,
+                 "[cli] --serve/--interactive-batch imply --gpu-cache-all (batched decode needs "
+                 "resident weights); enabling it.\n");
+  }
 
   // Pick a chat template for the serving paths when the user did not name one.
   // guess_chat_template_from_model_path already existed and already knew every

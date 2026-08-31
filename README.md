@@ -157,14 +157,14 @@ downloaded from scratch:
 
 ```bash
 # a model, pulled from scratch
-mkdir -p models && curl -L -o models/Llama-3.2-1B-Instruct-Q4_K_M.gguf   https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf
+mkdir -p models && curl -L -o models/Llama-3.2-1B-Instruct-Q4_K_M.gguf https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf
 
 # serve it
-docker run --rm --gpus all -p 127.0.0.1:8080:8080 -v "$PWD/models:/models"   ghcr.io/kurulav1/cpi:latest /models/Llama-3.2-1B-Instruct-Q4_K_M.gguf   --serve --port 8080 --host 0.0.0.0 --api-key changeme --gpu-cache-all
+docker run --rm --gpus all -p 127.0.0.1:8080:8080 -v "$PWD/models:/models" ghcr.io/kurulav1/cpi:latest /models/Llama-3.2-1B-Instruct-Q4_K_M.gguf --serve --port 8080 --host 0.0.0.0 --api-key changeme
 ```
 
 ```bash
-curl http://127.0.0.1:8080/v1/chat/completions   -H "Authorization: Bearer changeme" -H "Content-Type: application/json"   -d '{"model":"cpi","messages":[{"role":"user","content":"Name three primary colours."}]}'
+curl http://127.0.0.1:8080/v1/chat/completions -H "Authorization: Bearer changeme" -H "Content-Type: application/json" -d '{"model":"cpi","messages":[{"role":"user","content":"Name three primary colours."}]}'
 # {"choices":[{"message":{"role":"assistant","content":"Red, Blue, and Yellow."},...
 ```
 
@@ -172,17 +172,27 @@ Why each flag, since none of them is guessable:
 
 | flag | why it is not optional |
 | --- | --- |
-| `--gpu-cache-all` | `--serve` implies `--paged-blocks`, and batched decode requires fully resident weights. Without it the server exits with `batched decode requires --gpu-cache-all`. |
-| `--host 0.0.0.0` | The default binds loopback *inside the container*, which `-p` cannot reach, so the server starts and is unreachable. |
-| `--api-key` | Binding anything but loopback without one is refused: it would put an unauthenticated API on the network. `-p 127.0.0.1:` keeps the host side loopback-only as well. |
+| `--host 0.0.0.0` | The default binds loopback *inside the container*, which `-p` cannot reach, so the server starts, logs that it is listening, and is unreachable. Defaulting it to all interfaces would expose an API by default, so it stays explicit. |
+| `--api-key` | Binding anything but loopback without one is refused: that would put an unauthenticated API on a network. `-p 127.0.0.1:` keeps the host side loopback-only too. |
+
+`--gpu-cache-all` used to belong in that table and no longer does. `--serve` already implied
+`--paged-blocks`, which needs resident weights, so the server exited at startup on a flag
+nobody could guess; it now implies both and says so on stderr. Asking for the cache does not
+force it, so a model too large for the VRAM budget still gets the same refusal as before.
 
 No tokenizer argument: a GGUF carries its own, and the engine says so at startup. There is no
 Node, npm or web bundle in this image; `cpi:web` is the separate image that carries the UI.
 
-**GGUF support is per architecture, and only llama is verified.** A Qwen2 GGUF currently loads
-and produces fluent-looking nonsense rather than an error, so use `.ll2c` for those until it is
-fixed (see [docs/determinism-scope.md](docs/determinism-scope.md)). Architectures with no
-mapping at all, such as Gemma and DeepSeek-V2, are refused outright with a message saying why,
+The image compiles kernels for Blackwell (`sm_120`) rather than leaving a 50-series card to
+JIT them from PTX. That is worth more than it sounds: `--rm` throws the JIT cache away every
+run, so the cost was paid on *every* invocation, not just the first. Measured on an RTX 5090,
+the same 8-token run took 25.8 s without it and 14.4 s with it.
+
+**GGUF support is per architecture, and only llama is verified.** A Qwen2 GGUF is refused with
+an error naming the reason: it loads and generates fluent nonsense, while the same checkpoint
+via `.ll2c` is correct, so use `.ll2c` for those (see
+[docs/determinism-scope.md](docs/determinism-scope.md)). Architectures with no mapping at all,
+such as Gemma and DeepSeek-V2, are refused the same way, with a message saying why,
 which is the behaviour Qwen2 should have.
 
 ### Prerequisites
