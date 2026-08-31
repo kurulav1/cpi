@@ -313,6 +313,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # A stock ubuntu runner has around 14 GB free, and the CUDA devel base alone is
+      # 14.5 GB before anything is compiled into it. Without this the job dies on disk
+      # partway through, which reads as a flaky build rather than a predictable one.
+      # These three directories are the usual large tenants and nothing here uses them.
+      - name: Free disk space on the runner
+        run: |
+          echo "before:"; df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          echo "after:"; df -h / | tail -1
+
       # ghcr rejects any uppercase in a repository path, and a GitHub owner may have
       # some. Lowercase once here rather than at four interpolation sites.
       - name: Work out the image name and version
