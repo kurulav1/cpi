@@ -16,6 +16,7 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 jobs:
   build-binaries:
@@ -232,7 +233,10 @@ jobs:
     # flag and the compile still failed. 12.6.2 is the newest the installer action
     # offers, so the fix is the older runner rather than a newer toolkit.
     runs-on: windows-2022
-    continue-on-error: true
+    # Also required. It has succeeded on every release to date, so treating it as
+    # optional only means a future breakage ships silently instead of being noticed.
+    # If a runner-image change breaks the MSVC/CUDA pairing documented above, the fix
+    # is to pin the toolchain, not to let the asset vanish from the release.
     steps:
       - uses: actions/checkout@v4
       - name: Install CUDA toolkit
@@ -293,6 +297,92 @@ jobs:
           name: cpi-windows-x64-cuda
           path: pkg/cpi-windows-x64-cuda.zip
 
+  publish-images:
+    name: Publish container images
+    # Needs nothing from the binary jobs: it compiles the engine itself, inside the
+    # image, so it is a genuinely independent build of the same source. It does gate
+    # the release below, so a tag that cannot produce an image does not become a
+    # release that claims one.
+    runs-on: ubuntu-latest
+    # The engine is compiled for seven CUDA targets here, which is the slow part. The
+    # default 6h ceiling is plenty but an unbounded job that wedges is not free.
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # ghcr rejects any uppercase in a repository path, and a GitHub owner may have
+      # some. Lowercase once here rather than at four interpolation sites.
+      - name: Work out the image name and version
+        id: meta
+        run: |
+          echo "image=ghcr.io/$(echo '${{ github.repository_owner }}' | tr 'A-Z' 'a-z')/cpi" >> "$GITHUB_OUTPUT"
+          echo "version=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The engine alone: no Node, no npm, no web assets. This is the image the
+      # one-line docker run in the README uses, and the one that makes the
+      # no-runtime-dependencies claim true of what people actually download.
+      - name: Build and push cpi:cuda
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: cuda
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}
+            ${{ steps.meta.outputs.image }}:cuda
+            ${{ steps.meta.outputs.image }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push cpi:web
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: web
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}-web
+            ${{ steps.meta.outputs.image }}:web
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # A successful push is not evidence the image runs. Pull the tag that was just
+      # published, by digest-free name, and make it do the thing it exists for. The
+      # binary reporting the cuda backend is the specific failure this catches: a
+      # release once shipped a "CUDA" asset whose --version said "backends: cpu",
+      # and a plain smoke test passed it.
+      - name: Smoke-test the published image
+        run: |
+          set -euo pipefail
+          IMAGE="${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}"
+          docker rmi "$IMAGE" 2>/dev/null || true
+          docker pull "$IMAGE"
+          OUT=$(docker run --rm "$IMAGE" --version 2>&1)
+          echo "$OUT"
+          # Empty output from a container that exited 0 is the failure mode to catch;
+          # test the content, not the exit status.
+          test -n "$OUT" || { echo "::error::--version printed nothing"; exit 1; }
+          echo "$OUT" | grep -qi cuda || {
+            echo "::error::the published image does not report a cuda backend"
+            exit 1
+          }
+          # No interpreter has any business being in the engine image.
+          if docker run --rm --entrypoint sh "$IMAGE" -c 'command -v node || command -v python3'; then
+            echo "::error::the cuda image contains an interpreter; it is not minimal"
+            exit 1
+          fi
+          echo "cuda image is minimal and reports the cuda backend"
+
   build-cuda-linux:
     name: Build CUDA binary (linux)
     runs-on: ubuntu-latest
@@ -302,7 +392,10 @@ jobs:
     # only exists from 12.8 on: unlike the Windows job, a container is not limited to
     # whatever the installer action happens to carry, so Linux gets the full range.
     container: nvidia/cuda:12.8.1-devel-ubuntu24.04
-    continue-on-error: true
+    # Required, not best-effort. This is the GPU asset the release table promises and
+    # the one the container image is built from; a release that quietly ships only the
+    # two x64 CPU binaries has failed at the thing most people came for, while
+    # presenting itself as a successful release.
     steps:
       - name: Install build tools
         run: |
@@ -383,9 +476,18 @@ jobs:
 
   release:
     name: Publish release
-    needs: [build-binaries, build-macos-metal, build-linux-arm64, build-cuda-windows, build-cuda-linux]
-    # Publish as long as the CPU binaries built; the macOS job is best-effort (see above).
-    if: ${{ always() && needs.build-binaries.result == 'success' }}
+    needs: [build-binaries, build-macos-metal, build-linux-arm64, build-cuda-windows, build-cuda-linux, publish-images]
+    # The CPU binaries and BOTH CUDA binaries must have built. always() is still here
+    # so the best-effort macOS job cannot block a release, but it used to let every
+    # GPU asset fail and publish anyway, which is how a "release" ends up being two
+    # CPU binaries. Named explicitly rather than relying on job failure to propagate,
+    # because always() suppresses exactly that.
+    if: >-
+      ${{ always() &&
+          needs.build-binaries.result == 'success' &&
+          needs.build-cuda-linux.result == 'success' &&
+          needs.build-cuda-windows.result == 'success' &&
+          needs.publish-images.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4

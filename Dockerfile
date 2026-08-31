@@ -1,6 +1,19 @@
 # syntax=docker/dockerfile:1.7
+#
+# Two targets:
+#   --target cuda  (default)  the engine and nothing else. No Node, no npm, no web/.
+#   --target web              the same engine plus the Node web UI, as before.
+#
+# The point of the split is that the no-dependencies claim should be true of the
+# artifact people download, not only of the source tree. An image that ships a
+# Node runtime to serve a static page does not read as "no runtime dependencies"
+# however the README phrases it.
+#
+# Build:
+#   docker build --target cuda -t cpi:cuda .
+#   docker build --target web  -t cpi:web  .
 
-FROM node:22-bullseye-slim AS web-deps
+FROM node:22-bookworm-slim AS web-deps
 WORKDIR /app/web
 COPY web/package*.json ./
 RUN npm install
@@ -9,7 +22,7 @@ FROM web-deps AS web-build
 COPY web/ ./
 RUN npm run build
 
-FROM nvidia/cuda:12.6.3-devel-ubuntu22.04 AS engine-build
+FROM nvidia/cuda:12.8.1-devel-ubuntu22.04 AS engine-build
 ARG DEBIAN_FRONTEND=noninteractive
 WORKDIR /app
 
@@ -30,22 +43,60 @@ COPY include ./include
 COPY src ./src
 
 # The build host has no GPU, so the CMakeLists default of CMAKE_CUDA_ARCHITECTURES=native
-# can't probe a device and falls back to a low arch lacking __dp4a (needs sm_61+). Pin a
-# real arch list (Turing..Hopper) plus 90-virtual PTX for forward-compat on newer GPUs.
-# Newer-than-Hopper GPUs (e.g. sm_120 Blackwell) run via the 90-virtual PTX: the driver
-# JIT-compiles kernels lazily on first launch (measured ~13 s folded into the first
-# forward for a 0.5B on an RTX 5090; larger models touch more kernels), and --rm
-# containers discard the JIT cache every run. To serve such GPUs without the first-run
-# cost, bump the base images to a CUDA that can target them (12.8+ for Blackwell) and
-# add the -real arch here.
-ARG CUDA_ARCHS="75-real;80-real;86-real;89-real;90-real;90-virtual"
+# cannot probe a device and falls back to a low arch lacking __dp4a (needs sm_61+). Pin a
+# real arch list instead.
+#
+# 120-real is Blackwell (RTX 50-series), and it is compiled rather than left to the
+# 90-virtual PTX on purpose. Without it the driver JIT-compiles kernels lazily on first
+# launch, measured at about 13 s folded into the first forward for a 0.5B on an RTX 5090,
+# and a --rm container throws the JIT cache away every run, so every run pays it. That is
+# the first thing a person trying the one-line docker command would experience, on the
+# card most likely to be running it. Needs a 12.8+ base, which is why the images moved.
+#
+# 90-virtual stays as the forward-compatibility tail for GPUs newer than this list.
+ARG CUDA_ARCHS="75-real;80-real;86-real;89-real;90-real;120-real;90-virtual"
+# Bounded rather than $(nproc). Each .cu is now compiled for seven targets, and nvcc
+# holds a lot of memory per translation unit, so an unbounded -j on a many-core host
+# is a way to get the OOM killer instead of a binary. Raise it with
+# --build-arg BUILD_JOBS=N where there is memory for it.
+ARG BUILD_JOBS=4
 RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+      -DCPI_ENABLE_CUDA=ON -DCPI_REQUIRE_CUDA=ON \
       -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
-    && cmake --build build -j"$(nproc)" --target cpi
+    && cmake --build build -j"${BUILD_JOBS}" --target cpi
 
-FROM node:22-bullseye-slim AS node-runtime
+# ---------------------------------------------------------------------------
+# cpi:cuda -- the engine alone.
+# ---------------------------------------------------------------------------
+FROM nvidia/cuda:12.8.1-runtime-ubuntu22.04 AS cuda
+ARG DEBIAN_FRONTEND=noninteractive
 
-FROM nvidia/cuda:12.6.3-runtime-ubuntu22.04 AS runtime
+# libgomp1 is the OpenMP runtime the CPU paths link against; without it the binary
+# will not start at all. A release once shipped a Linux artifact missing it and died
+# on stock Ubuntu, so it is named here rather than assumed to come with the base.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libgomp1 \
+    libsentencepiece0 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=engine-build /app/build/cpi /usr/local/bin/cpi
+
+# Bind all interfaces: inside a container the server has to, for the host's -p to
+# reach it. What is actually exposed is the -p flag's decision.
+ENV CPI_HOST=0.0.0.0
+EXPOSE 8080
+VOLUME ["/models"]
+
+ENTRYPOINT ["cpi"]
+CMD ["--help"]
+
+# ---------------------------------------------------------------------------
+# cpi:web -- the engine plus the Node web UI.
+# ---------------------------------------------------------------------------
+FROM node:22-bookworm-slim AS node-runtime
+
+FROM nvidia/cuda:12.8.1-runtime-ubuntu22.04 AS web
 ARG DEBIAN_FRONTEND=noninteractive
 ENV NODE_ENV=production
 WORKDIR /app/web
