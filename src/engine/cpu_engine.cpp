@@ -59,8 +59,15 @@
 // OpenMP
 #if defined(_OPENMP)
 #include <omp.h>
-#include "engine/det_perturb.hpp"
 #endif
+
+// Unconditional, and worth saying why it is placed here rather than beside <omp.h>.
+// It was appended after the file's last #include, which happened to sit inside the
+// _OPENMP block above. MSVC and GCC enable OpenMP, so it compiled everywhere it was
+// tested; Apple clang does not, so on macOS the header vanished and every
+// cpi::det:: call became an undeclared identifier. A conditional include block is
+// not a place to append to.
+#include "engine/det_perturb.hpp"
 
 namespace engine {
 namespace {

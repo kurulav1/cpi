@@ -504,6 +504,12 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+          # Only the binary packages. The image job also uploads .dockerbuild
+          # metadata blobs, and without this filter they were both downloaded here
+          # and then attached to the release by `files: dist/*`, as if build
+          # telemetry were something a user should download. Fewer and smaller
+          # downloads too, which is the half of this that touches the flake below.
+          pattern: cpi-*
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
