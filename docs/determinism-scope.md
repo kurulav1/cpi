@@ -31,7 +31,7 @@ model families. Same hash across all of these:
 | `--gpu-cache-all` on and off | Llama-3.2-1B, Gemma-4-E2B |
 | `--paged-kv-cache`, `--paged-blocks` | Llama-3.2-1B |
 | `--max-context` 2048, 4096, 8192 | Llama-3.2-1B |
-| container: `.ll2c` against the GGUF of the same checkpoint | Llama-3.2-1B |
+| container: `.ll2c` against the GGUF of the same checkpoint | Llama-3.2-1B only, see below |
 | position within a batch: first of five against last of five | Llama-3.2-1B |
 | batch size: 1, 2, 3, 5, 8 sequences in flight | Llama-3.2-1B |
 
@@ -39,6 +39,21 @@ Three of those are worth more than the rest. Reading the same weights out of two
 different container formats lands on the same tokens; a request's position in a
 batch does not move its output; and neither does how many other requests are
 being served beside it.
+
+**Container equivalence is verified per model and does not generalise.** That row
+says `.ll2c` and GGUF agree for Llama-3.2-1B. It reads as saying container format
+does not change the answer, which is a larger claim and a false one: the same
+Qwen2.5-0.5B checkpoint is correct from `.ll2c` and generates fluent nonsense from
+GGUF, at F16 and Q8_0 alike. Neither quantisation nor the tokenizer is at fault;
+the qwen2 architecture mapping in the GGUF reader is, and GGUF is now refused for
+qwen2 rather than trusted.
+
+Two things follow. Every container row needs its model named beside it, because a
+container format is a second implementation of what the weights mean and is only as
+good as the architecture mapping it uses. And the axis hides a second variable:
+which container a file is in also decides which ENGINE runs it (a safetensors
+directory reaches Llama4CudaEngine, a `.ll2c` or GGUF reaches LlamaEngine), so
+"same weights, different container" can quietly mean "different engine".
 
 ## Does not hold
 

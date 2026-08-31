@@ -731,16 +731,65 @@ void GgufLoader::build_config() {
   // Anything not known good is therefore refused by name. The cost of being wrong
   // in the other direction (a supported model rejected) is an error message; the
   // cost here is a user believing an answer.
-  if (architecture_ == "llama") {
-    // Verified: bit-exact against a .ll2c of the same checkpoint, and generation
-    // is token-identical. Q/K are un-permuted (see map_names).
-    config_.model_family = ModelFamily::LLaMA3;
-  } else if (architecture_ == "qwen2") {
-    // Same layout as llama minus the Q/K permutation (llama.cpp gives Qwen2 the
-    // NeoX rope convention, which is already CPI's), plus QKV biases.
-    // Implemented from the format, not yet verified against a Qwen2 GGUF.
-    config_.model_family = ModelFamily::Qwen2;
-    config_.has_qkv_bias = true;
+  // Verification is a FIELD here, not a remark in a comment, and that is the whole
+  // point of the table below.
+  //
+  // qwen2 used to be a branch of its own carrying the comment "implemented from the
+  // format, not yet verified against a Qwen2 GGUF", and it was allowed through
+  // regardless, because the code only ever asked "is this architecture mapped?"
+  // while the policy above says "is it known good?". Those two questions agree for
+  // every architecture except one that has been mapped and not checked, which is
+  // exactly the case the policy exists for. It loaded Qwen2.5-0.5B and answered
+  // fluent nonsense at F16 and Q8_0 alike, while the same checkpoint read from a
+  // .ll2c was correct.
+  //
+  // So adding an architecture can no longer enable it. That needs `verified`, which
+  // means someone ran this container against a trusted one of the same checkpoint
+  // and got the same tokens.
+  struct ArchSupport {
+    const char* name;
+    ModelFamily family;
+    bool has_qkv_bias;
+    bool verified;
+    const char* status;
+  };
+  static constexpr ArchSupport kArchs[] = {
+      {"llama", ModelFamily::LLaMA3, false, true,
+       "bit-exact against a .ll2c of the same checkpoint, generation token-identical"},
+      {"qwen2", ModelFamily::Qwen2, true, false,
+       "mapped from the format, and wrong in practice. Qwen2.5-0.5B loads and generates "
+       "fluent nonsense at F16 and Q8_0 alike, while the same checkpoint via .ll2c is "
+       "correct, so it is neither the quantisation nor the tokenizer. The derived config, "
+       "the Q/K permute gating and the QKV biases all check out; the fault is elsewhere in "
+       "the mapping and has not been found yet. Convert to .ll2c meanwhile"},
+  };
+
+  const ArchSupport* arch = nullptr;
+  for (const auto& a : kArchs) {
+    if (architecture_ == a.name) {
+      arch = &a;
+      break;
+    }
+  }
+  std::string verified_list;
+  for (const auto& a : kArchs) {
+    if (a.verified) {
+      if (!verified_list.empty()) verified_list += ", ";
+      verified_list += a.name;
+    }
+  }
+
+  if (arch != nullptr && arch->verified) {
+    config_.model_family = arch->family;
+    config_.has_qkv_bias = arch->has_qkv_bias;
+  } else if (arch != nullptr) {
+    // Mapped but unverified is refused on the same grounds as unmapped, and says so
+    // differently, because "CPI knows this architecture and still will not read it"
+    // needs explaining or it reads as a bug.
+    config_.model_family = ModelFamily::Unknown;
+    unsupported_reason_ = "gguf: architecture '" + architecture_ +
+                          "' is mapped but NOT verified, so it is refused rather than trusted: " +
+                          arch->status + ". Verified today: " + verified_list + ".";
   } else {
     // Recorded rather than thrown: reading an unmapped file is still useful
     // (inspecting it, checking a dequant), and the diagnostics depend on it.
@@ -749,8 +798,9 @@ void GgufLoader::build_config() {
     unsupported_reason_ =
         "gguf: architecture '" + architecture_ +
         "' is not mapped yet. Its tensors would load under the wrong conventions and produce "
-        "confident nonsense rather than an error, so it is refused instead. Supported today: "
-        "llama (verified), qwen2. Gemma/Gemma 4 and DeepSeek-V2 need their config and norm "
+        "confident nonsense rather than an error, so it is refused instead. Verified today: " +
+        verified_list +
+        ". Gemma/Gemma 4 and DeepSeek-V2 need their config and norm "
         "conventions mapped (Gemma's (1+w) norms, Gemma 4's per-layer embeddings, DeepSeek's MLA "
         "projections) before their GGUFs can be trusted; convert those to .ll2c/.cpi meanwhile.";
   }
