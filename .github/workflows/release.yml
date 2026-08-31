@@ -110,10 +110,26 @@ jobs:
   build-macos-metal:
     name: Build macOS Metal binary
     runs-on: macos-14  # Apple Silicon (arm64) runner; Metal backend on by default
-    # The hosted macos-14 runner's Xcode/clang can fail to build where real Apple Silicon
-    # (newer toolchain) succeeds, so this must not block the release: CPU binaries still ship,
-    # and the macOS asset is attached only when the runner build succeeds.
-    continue-on-error: true
+    # NOT continue-on-error any more, and the reason is worth keeping.
+    #
+    # It was tolerant because the hosted runner's Xcode/clang can fail where real
+    # Apple Silicon succeeds, so a toolchain quirk would not stop the CPU binaries
+    # shipping. What that actually bought was silence: a genuine compile regression
+    # (an include appended into an #if defined(_OPENMP) block, which MSVC and GCC
+    # hid because both enable OpenMP) was reported as the expected flake and the
+    # macOS asset simply did not ship.
+    #
+    # There is no Apple hardware in this project, so this job is the ONLY signal
+    # that the code still compiles for macOS at all, and it was configured to be
+    # ignorable. That matters more while the README asks Mac owners to run
+    # --verify-determinism and send back the Metal row: if the binary does not
+    # build, the one route to that missing data closes without a sound.
+    #
+    # So a build failure fails the workflow. If the hosted toolchain genuinely
+    # cannot build valid code, pin a newer Xcode (maxim-lobanov/setup-xcode) or move
+    # the runner image; do not go back to hiding it. The release gate deliberately
+    # does not require this job, so a macOS failure is loud without blocking the
+    # other assets.
     env:
       ASSET: cpi-macos-arm64-metal
     steps:
