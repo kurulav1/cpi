@@ -82,9 +82,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=engine-build /app/build/cpi /usr/local/bin/cpi
 
-# Bind all interfaces: inside a container the server has to, for the host's -p to
-# reach it. What is actually exposed is the -p flag's decision.
-ENV CPI_HOST=0.0.0.0
+# Deliberately no CPI_HOST here. The web image sets it because the Node server reads
+# it; the engine does not read it at all, so setting it in this image would announce
+# a behaviour that does not happen. The bind address is --host on the command line,
+# and binding anything but loopback requires --api-key (the server refuses to expose
+# an unauthenticated API to a network). See the docker run line in the README.
 EXPOSE 8080
 VOLUME ["/models"]
 

@@ -149,6 +149,42 @@ the two x64 CPU assets are guaranteed to be present: the arm64, CUDA and macOS j
 best-effort on hosted runners, so a missing asset means that build did not run rather than that
 the platform is unsupported. See [Build Modes](#build-modes) to build your own.
 
+### Run it in Docker (no build, no checkout)
+
+One command, once you have a GGUF on disk. Every flag below is there because the command
+fails without it, verified by running it on a machine with no repo checkout against a model
+downloaded from scratch:
+
+```bash
+# a model, pulled from scratch
+mkdir -p models && curl -L -o models/Llama-3.2-1B-Instruct-Q4_K_M.gguf   https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf
+
+# serve it
+docker run --rm --gpus all -p 127.0.0.1:8080:8080 -v "$PWD/models:/models"   ghcr.io/kurulav1/cpi:latest /models/Llama-3.2-1B-Instruct-Q4_K_M.gguf   --serve --port 8080 --host 0.0.0.0 --api-key changeme --gpu-cache-all
+```
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions   -H "Authorization: Bearer changeme" -H "Content-Type: application/json"   -d '{"model":"cpi","messages":[{"role":"user","content":"Name three primary colours."}]}'
+# {"choices":[{"message":{"role":"assistant","content":"Red, Blue, and Yellow."},...
+```
+
+Why each flag, since none of them is guessable:
+
+| flag | why it is not optional |
+| --- | --- |
+| `--gpu-cache-all` | `--serve` implies `--paged-blocks`, and batched decode requires fully resident weights. Without it the server exits with `batched decode requires --gpu-cache-all`. |
+| `--host 0.0.0.0` | The default binds loopback *inside the container*, which `-p` cannot reach, so the server starts and is unreachable. |
+| `--api-key` | Binding anything but loopback without one is refused: it would put an unauthenticated API on the network. `-p 127.0.0.1:` keeps the host side loopback-only as well. |
+
+No tokenizer argument: a GGUF carries its own, and the engine says so at startup. There is no
+Node, npm or web bundle in this image; `cpi:web` is the separate image that carries the UI.
+
+**GGUF support is per architecture, and only llama is verified.** A Qwen2 GGUF currently loads
+and produces fluent-looking nonsense rather than an error, so use `.ll2c` for those until it is
+fixed (see [docs/determinism-scope.md](docs/determinism-scope.md)). Architectures with no
+mapping at all, such as Gemma and DeepSeek-V2, are refused outright with a message saying why,
+which is the behaviour Qwen2 should have.
+
 ### Prerequisites
 
 | Tool | Version | Needed for |
