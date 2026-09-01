@@ -22,6 +22,11 @@ struct ParsedArgs {
   std::string token_csv = "1,2,3";
   int max_new = 16;
   float temp = 0.8f;
+  // Whether --temp was actually given. The 0.8 default is a reasonable one for
+  // interactive chat and the wrong one for a server that advertises reproducible
+  // output: a client that sends no temperature (which every agent framework does)
+  // would silently sample. --serve uses greedy unless this says otherwise.
+  bool temp_explicit = false;
   bool parity_check = false;
   int batched_check = 0;           // >0: run decode_step_batched parity gate for this many steps
   int scheduler_check = 0;         // >0: run the batch-scheduler parity gate with this max_new

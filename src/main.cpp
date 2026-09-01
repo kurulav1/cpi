@@ -736,7 +736,7 @@ int main(int argc, char** argv) {
             so.stop_texts = cli.stop_texts;
             so.add_bos = !cli.force_no_bos;
             so.max_new = cli.max_new;
-            so.temp = cli.temp;
+            so.temp = cli.temp_explicit ? cli.temp : 0.0f;
             so.top_k = cli.opts.top_k;
             so.top_p = cli.opts.top_p;
             so.repeat_penalty = cli.opts.repetition_penalty;
@@ -814,7 +814,7 @@ int main(int argc, char** argv) {
           so.stop_texts = cli.stop_texts;
           so.add_bos = !cli.force_no_bos;
           so.max_new = cli.max_new;
-          so.temp = cli.temp;
+          so.temp = cli.temp_explicit ? cli.temp : 0.0f;
           so.api_key = cli.serve_api_key;
           if (so.api_key.empty()) {
             if (const char* env_key = std::getenv("CPI_API_KEY")) so.api_key = env_key;
@@ -992,7 +992,7 @@ int main(int argc, char** argv) {
             so.stop_texts = cli.stop_texts;
             so.add_bos = !cli.force_no_bos;
             so.max_new = cli.max_new;
-            so.temp = cli.temp;
+            so.temp = cli.temp_explicit ? cli.temp : 0.0f;
             so.top_k = cli.opts.top_k;
             so.top_p = cli.opts.top_p;
             so.repeat_penalty = cli.opts.repetition_penalty;
@@ -1083,7 +1083,7 @@ int main(int argc, char** argv) {
           so.stop_texts = cli.stop_texts;
           so.add_bos = !cli.force_no_bos;
           so.max_new = cli.max_new;
-          so.temp = cli.temp;
+          so.temp = cli.temp_explicit ? cli.temp : 0.0f;
           so.api_key = cli.serve_api_key;
           if (so.api_key.empty()) {
             if (const char* env_key = std::getenv("CPI_API_KEY")) so.api_key = env_key;
@@ -1148,7 +1148,7 @@ int main(int argc, char** argv) {
             so.stop_texts = cli.stop_texts;
             so.add_bos = !cli.force_no_bos;
             so.max_new = cli.max_new;
-            so.temp = cli.temp;
+            so.temp = cli.temp_explicit ? cli.temp : 0.0f;
             so.api_key = cli.serve_api_key;
             if (so.api_key.empty()) {
               if (const char* env_key = std::getenv("CPI_API_KEY")) so.api_key = env_key;

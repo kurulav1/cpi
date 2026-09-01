@@ -147,6 +147,84 @@ std::string tool_choice_schema(const std::string& body, std::string* err) {
   return R"({"anyOf":[)" + branches + "]}";
 }
 
+// Renders the tools into text the model can actually read.
+//
+// Until this existed, `tools` was consumed only by tool_choice_schema to build a
+// grammar, and never reached the prompt. The model was being asked to call tools it
+// had not been told about: with tool_choice "required" the grammar forced
+// well-formed JSON for a function it was guessing at (hence invented filenames and
+// arguments), and with "auto", which is what every framework sends, it did not know
+// there were tools at all and narrated a fake tool session instead. A standard agent
+// loop could not run.
+//
+// Deliberately plain text rather than a model-specific tool template. CPI supports
+// several families whose native tool formats differ, and a wrong native format is
+// worse than a neutral one the model can still follow.
+std::string tools_prompt_block(const std::string& body) {
+  const std::vector<std::string> tools = json_get_raw_array(body, "tools");
+  if (tools.empty()) {
+    return "";
+  }
+  std::string out =
+      "You have access to the following tools. To call one, reply with ONLY a JSON "
+      "object of the form {\"name\": \"<tool>\", \"arguments\": {...}} and nothing "
+      "else: no explanation, no code fences, no narration. To answer without calling a "
+      "tool, reply normally with no JSON object.\n\nTools:\n";
+  for (const std::string& tool : tools) {
+    const std::string fn = json_get_raw_value(tool, "function");
+    const std::string src = fn.empty() ? tool : fn;
+    const std::string name = json_get_string(src, "name");
+    if (name.empty()) continue;
+    const std::string desc = json_get_string(src, "description");
+    std::string params = json_get_raw_value(src, "parameters");
+    if (params.empty()) params = R"({"type":"object","properties":{}})";
+    out += "- " + name;
+    if (!desc.empty()) out += ": " + desc;
+    out += "\n  parameters: " + params + "\n";
+  }
+  return out;
+}
+
+// Finds a tool call in unconstrained output.
+//
+// With tool_choice "auto" no grammar is applied, by design: auto means the model
+// decides, and constraining it would remove the choice. So the call has to be
+// recognised after the fact. What comes back is NOT grammar-guaranteed, which is a
+// weaker claim than the constrained path and is recorded as such in the scope doc.
+//
+// Scans for a balanced JSON object carrying both "name" and "arguments", skipping
+// braces inside strings, so a call still parses when the model wraps it in prose or
+// a code fence despite being asked not to.
+std::string find_tool_call_json(const std::string& text) {
+  for (std::size_t start = text.find('{'); start != std::string::npos;
+       start = text.find('{', start + 1)) {
+    int depth = 0;
+    bool in_str = false, esc = false;
+    for (std::size_t i = start; i < text.size(); ++i) {
+      const char c = text[i];
+      if (in_str) {
+        if (esc) esc = false;
+        else if (c == '\\') esc = true;
+        else if (c == '"') in_str = false;
+        continue;
+      }
+      if (c == '"') in_str = true;
+      else if (c == '{') ++depth;
+      else if (c == '}') {
+        if (--depth == 0) {
+          const std::string cand = text.substr(start, i - start + 1);
+          if (!json_get_string(cand, "name").empty() &&
+              !json_get_raw_value(cand, "arguments").empty()) {
+            return cand;
+          }
+          break;  // balanced but not a tool call; try the next opening brace
+        }
+      }
+    }
+  }
+  return "";
+}
+
 // Rewrites a grammar-constrained {"name":...,"arguments":...} reply into an
 // OpenAI tool_calls message body. `text` is the model's output.
 std::string tool_calls_json(const std::string& id, const std::string& text) {
@@ -373,13 +451,43 @@ std::vector<ChatMessage> parse_messages(const std::string& body) {
 // labels ahead of the templated final turn: enough for the common
 // system + alternating turns case without inventing a second template engine.
 std::string chat_prompt_from_messages(const std::vector<ChatMessage>& messages,
-                                      const std::string& chat_template, bool with_image) {
+                                      const std::string& chat_template, bool with_image,
+                                      const std::string& tools_block = "") {
   std::string system_text;
   std::string history;
   std::string last_user;
   for (std::size_t i = 0; i < messages.size(); ++i) {
     const std::string& role = messages[i].role;
     const std::string& content = messages[i].content;
+    // A tool result, and an assistant turn that only called a tool, both carry the
+    // agent loop forward and both used to be dropped here: the role chain handled
+    // system/user/assistant only, and an assistant message with tool_calls has
+    // content:null so it failed the empty check above as well. The model therefore
+    // never saw what it had called or what came back, and could not act on a result
+    // it was never shown. Handled before the empty-content check for that reason.
+    // Note what is NOT rendered: the tool_call_id. Those are minted from a global
+    // counter (chatcmpl-N), the client echoes them back, and putting them in the
+    // prompt made every run's prompt different, so three identical agent runs
+    // produced three different traces. A server-generated id carries no meaning for
+    // the model and every reason to be left out: it is an input that varies for
+    // reasons unrelated to the request.
+    if (role == "tool") {
+      history += "Tool result: " + (content.empty() ? std::string("(empty)") : content) + "\n";
+      continue;
+    }
+    if (role == "assistant") {
+      const std::string calls = json_get_raw_value(messages[i].raw, "tool_calls");
+      if (!calls.empty() && calls != "null") {
+        // Name and arguments only, for the same reason: the raw array carries the id.
+        const std::string fn = json_get_raw_value(calls, "function");
+        const std::string nm = json_get_string(fn.empty() ? calls : fn, "name");
+        std::string ar = json_get_raw_value(fn.empty() ? calls : fn, "arguments");
+        if (ar.empty()) ar = json_get_string(fn.empty() ? calls : fn, "arguments");
+        history += "Assistant called: " + (nm.empty() ? std::string("(tool)") : nm) + "(" + ar +
+                   ")\n";
+        if (content.empty()) continue;
+      }
+    }
     if (content.empty()) continue;
     if (role == "system") {
       if (!system_text.empty()) system_text += "\n";
@@ -393,6 +501,12 @@ std::string chat_prompt_from_messages(const std::vector<ChatMessage>& messages,
     }
   }
   if (last_user.empty() && !messages.empty()) last_user = messages.back().content;
+  // Ahead of the caller's own system prompt: the tool list is a description of the
+  // world the model is acting in, and reads better before the instructions about
+  // how to behave in it.
+  if (!tools_block.empty()) {
+    system_text = tools_block + (system_text.empty() ? "" : "\n" + system_text);
+  }
 
   std::string turn;
   // The vision splice looks for this placeholder in the templated prompt; without
@@ -584,7 +698,8 @@ void run_http_server(engine::BatchScheduler& sched, model::Tokenizer& tokenizer,
         auto found = parse_images(m.raw);
         images.insert(images.end(), found.begin(), found.end());
       }
-      prompt = chat_prompt_from_messages(messages, opts.chat_template, !images.empty());
+      prompt = chat_prompt_from_messages(messages, opts.chat_template, !images.empty(),
+                                         tools_prompt_block(body));
     } else {
       prompt = json_get_string(body, "prompt");
       if (prompt.empty()) {
@@ -855,10 +970,17 @@ void run_http_server(engine::BatchScheduler& sched, model::Tokenizer& tokenizer,
     // dispatch on: the worst shape this can fail in, since it looks successful.
     // When the reply was cut off, or no name can be read out of it, the raw text
     // and the real finish_reason go back instead.
+    // Two ways a tool call can arrive. Under a grammar (tool_choice required or a
+    // named function) the whole reply IS the call. Under "auto" nothing is
+    // constrained, because auto means the model chooses, so the call has to be
+    // recognised in ordinary output. Without the second case a standard agent loop
+    // never gets a tool call at all: frameworks send tools and leave tool_choice
+    // unset, which is auto.
+    const std::string call_json = tool_mode ? text : find_tool_call_json(text);
     const bool tool_ok =
-        tool_mode && reason != "length" && !json_get_string(text, "name").empty();
+        !call_json.empty() && reason != "length" && !json_get_string(call_json, "name").empty();
     const std::string message_body =
-        tool_ok ? tool_calls_json(id, text) : ("\"content\":\"" + json_escape(text) + "\"");
+        tool_ok ? tool_calls_json(id, call_json) : ("\"content\":\"" + json_escape(text) + "\"");
     const std::string chat_reason = tool_ok ? "tool_calls" : reason;
     const std::string payload =
         chat ? ("{\"id\":\"" + id + "\",\"object\":\"chat.completion\",\"created\":" + created +
@@ -992,7 +1114,8 @@ void run_http_server_serial(GenerateStreamFn generate, model::Tokenizer& tokeniz
         auto found = parse_images(m.raw);
         images.insert(images.end(), found.begin(), found.end());
       }
-      prompt = chat_prompt_from_messages(messages, opts.chat_template, !images.empty());
+      prompt = chat_prompt_from_messages(messages, opts.chat_template, !images.empty(),
+                                         tools_prompt_block(body));
     } else {
       prompt = json_get_string(body, "prompt");
       if (prompt.empty()) {
@@ -1249,10 +1372,14 @@ void run_http_server_serial(GenerateStreamFn generate, model::Tokenizer& tokeniz
     // claimed for a reply that was cut off or carries no name. A truncated
     // generation reported as a tool call is the worst failure available here,
     // because it looks successful and the caller dispatches on it.
+    // Same two cases as the batched path: grammar-constrained, or recognised in
+    // unconstrained output because tool_choice was auto.
+    const std::string call_json = tool_mode ? full_text : find_tool_call_json(full_text);
     const bool tool_ok =
-        tool_mode && reason != "length" && !json_get_string(full_text, "name").empty();
+        !call_json.empty() && reason != "length" && !json_get_string(call_json, "name").empty();
     const std::string message_body =
-        tool_ok ? tool_calls_json(id, full_text) : ("\"content\":\"" + json_escape(full_text) + "\"");
+        tool_ok ? tool_calls_json(id, call_json)
+                : ("\"content\":\"" + json_escape(full_text) + "\"");
     const std::string chat_reason = tool_ok ? "tool_calls" : reason;
     res.send(
         200, "application/json",

@@ -305,6 +305,7 @@ ParsedArgs parse_args(int argc, char** argv) {
       args.max_new_set = true;
     } else if (arg == "--temp") {
       args.temp = std::stof(need_val("--temp"));
+      args.temp_explicit = true;
       args.temp_set = true;
     } else if (arg == "--max-context") {
       args.opts.max_context = std::stoi(need_val("--max-context"));
