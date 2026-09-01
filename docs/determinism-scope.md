@@ -32,7 +32,6 @@ as a DIRECTORY is hashed as a manifest of names and sizes, labelled `manifest=`
 rather than `file=`: that catches a different or truncated checkpoint and would not
 catch an edited tensor, which is a weaker claim and is marked as one.
 
-
 It is not a separate code path: it calls `generate()` exactly as a request does,
 because a verifier that decoded differently from the engine would attest to
 nothing. `tools/determinism_matrix.sh` runs the single-sequence table below,
@@ -333,9 +332,18 @@ had not.
 
 Both are fixed, which is why the CPU row above exists at all. Note what the
 guards were worth: the first trace run returned a perfectly reproducible hash of
-a trace containing zero tool calls, because `tool_choice: "auto"` compiles to no
-grammar and a 1B model answers in prose. A stable hash of nothing would have read
+a trace containing zero tool calls, and a stable hash of nothing would have read
 as a clean row.
+
+That zero-call run was the first sighting of a real defect, though it took a real
+framework to recognise it as one. The tools were never rendered into the prompt at
+all, only compiled into a grammar, so the model was being asked to call functions
+it had not been told existed; tool results were dropped from the history for the
+same reason; and nothing looked for a call in unconstrained output. A standard
+agent loop could not run. All three are fixed, and the loop now completes and
+repeats under framework defaults. It is worth recording that this harness did not
+catch it: the reference trace forces its opening turns, which no real framework
+does, so it only ever exercised the configuration where the bug was absent.
 
 Like the others, this check has been shown to fail. `CPI_DET_SELFTEST=100`
 corrupts one token of a final answer and the comparison reports `988900bd75c47cb8`
@@ -343,9 +351,40 @@ against the baseline's `c6c5b0b1f2acded0`. The index matters: at 10 the corrupti
 lands inside a tool call, destroys its JSON, and no trace comes back at all, which
 the script now reports as `INCONCLUSIVE` rather than counting as detection.
 
-Two limits. `--serve` refuses int8/int4 weights, so the quantised trace rows do
-not exist rather than being untested. And a `BROKEN` row here flipped to passing
-between runs before the harness learned to wait for the GPU to release its
+### A tool call arrives one of two ways, and only one is guaranteed
+
+This is the sharpest boundary in the agent path, and it is not about determinism.
+
+When `tool_choice` is `required`, or names a function, the reply is produced under
+a grammar compiled from that tool's JSON schema. The call **cannot** come back
+malformed: the shape is enforced during decoding, not checked afterwards.
+
+When `tool_choice` is `auto` or absent, which is what every agent framework sends,
+nothing is constrained. That is the correct reading of the parameter, since `auto`
+means the model chooses whether to call anything, and a grammar would remove the
+choice. The call is therefore **recognised in ordinary output** afterwards:
+`find_tool_call_json` scans the reply for a balanced JSON object carrying `name`
+and `arguments`.
+
+So on the `auto` path a tool call is parsed, not guaranteed. What follows from
+that, stated plainly because the difference is easy to miss when both paths return
+the same `tool_calls` shape to the client:
+
+- A model that emits no recognisable JSON produces no tool call, and the turn
+  comes back as ordinary content. That is a model outcome, not an error.
+- Arguments are whatever the model wrote. They are valid JSON by construction, since
+  they would not have parsed otherwise, but nothing checks them against the tool's
+  schema. A call with a misspelled field reaches the client intact.
+- The constrained path's guarantee ("a requested tool call cannot come back
+  malformed") applies only where a grammar ran. It does not extend to `auto`.
+
+Determinism is unaffected either way: the same input still produces the same
+tokens, so the same call is parsed out of them. What differs is whether the shape
+was *enforced* or merely *observed*.
+
+Two further limits. `--serve` refuses int8/int4 weights, so the quantised trace
+rows do not exist rather than being untested. And a `BROKEN` row here flipped to
+passing between runs before the harness learned to wait for the GPU to release its
 memory: killing the process is not the same as getting the VRAM back, and a
 server started too early quietly declines to hold weights resident. That was a
 harness artifact in the costume of a finding.
