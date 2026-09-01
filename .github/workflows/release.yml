@@ -363,6 +363,10 @@ jobs:
           context: .
           target: cuda
           push: true
+          # Without this the image reports --version as "unknown": the build context
+          # has no .git for CMake to probe.
+          build-args: |
+            CPI_GIT_SHA=${{ github.sha }}
           tags: |
             ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}
             ${{ steps.meta.outputs.image }}:cuda
@@ -376,6 +380,10 @@ jobs:
           context: .
           target: web
           push: true
+          # Without this the image reports --version as "unknown": the build context
+          # has no .git for CMake to probe.
+          build-args: |
+            CPI_GIT_SHA=${{ github.sha }}
           tags: |
             ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}-web
             ${{ steps.meta.outputs.image }}:web

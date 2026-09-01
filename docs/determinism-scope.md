@@ -1,14 +1,37 @@
 # Determinism: what is verified, and where it stops
 
-Reproduce any row with `--verify-determinism`, which decodes greedily and prints a
-hash of the token ids plus every setting that could change them:
+Reproduce any row with `--verify-determinism`, which decodes greedily and prints
+digests of both sides: what the model was asked, and what it answered.
 
 ```
-cpi <model> --prompt "The capital of France is" --verify-determinism 64 --gpu-cache-all
-[verify] hash=9003b7d09a9eae93 tokens=64
+cpi <model> --tokenizer <tok> --prompt "The capital of France is" --verify-determinism 64 --gpu-cache-all
+[verify] input_hash=90b40b4551408b2e73ffeb9ad0ca98ff
+[verify]   model     Llama-3.2-1B-Instruct-F16.gguf file=7e2a46fe01895b16776ed927aac8f56c bytes=2479595168
+[verify]   tokenizer tokenizer.json                 file=79e3e522635f3171300913bb421464a8
+[verify]   prompt    6 token ids                    sha256=7ee923c120792ad1240a31d85ef1ad65
+[verify]   sampling  sha256=f0e95884c86bf3a453671186b850992d
+[verify]   settings  temp=0 greedy=1 max_new=64 ctx=2048 quant=none kv_bits=16 paged=0 paged_blocks=0 gpu_cache_all=1
+[verify] output_hash=9003b7d09a9eae93 tokens=64
 [verify] backend=llama-cuda model=Llama-3.2-1B-Instruct-F16.gguf quant=none kv_bits=16 paged=0 gpu_cache_all=1 ctx=2048 temp=0 prompt_tokens=6
-[verify] ids=51354,13,578,469,3168,...
+[verify] ids=12366,13,578,469,3168,...
 ```
+
+Both halves are there on purpose. `output_hash` says two runs produced the same
+tokens; `input_hash` says they were asked the same thing. A hash pasted without the
+second is half a claim, because the reader cannot tell which weights file, which
+tokenizer, which prompt or which settings produced it, and those are exactly what
+differs between their machine and yours. When two people compare and disagree, the
+components say which input moved before anyone goes looking for a determinism bug.
+
+The digests are SHA-256, checked against the published vectors in `sha256_test` and
+against `hashlib` on real multi-gigabyte files, so the value printed here is what
+every other tool calls SHA-256. Two details are deliberate. The prompt digest covers
+the token IDS rather than the text, because ids are what the model actually saw and
+the same string tokenizes differently under a different tokenizer. And a model given
+as a DIRECTORY is hashed as a manifest of names and sizes, labelled `manifest=`
+rather than `file=`: that catches a different or truncated checkpoint and would not
+catch an edited tensor, which is a weaker claim and is marked as one.
+
 
 It is not a separate code path: it calls `generate()` exactly as a request does,
 because a verifier that decoded differently from the engine would attest to

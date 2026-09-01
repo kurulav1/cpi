@@ -47,10 +47,10 @@ check() {
 echo "=== 1. the perturbation switch itself ==="
 # Off by default, or every measurement ever taken with this binary is suspect.
 h_clean=$("$BIN" "$MODEL" --tokenizer "$TOK" --prompt "The capital of France is" \
-            --verify-determinism 32 --gpu-cache-all 2>/dev/null | sed -n 's/.*hash=\([0-9a-f]*\).*/\1/p')
+            --verify-determinism 32 --gpu-cache-all 2>/dev/null | sed -n 's/.*output_hash=\([0-9a-f]*\).*/\1/p')
 h_dirty=$(CPI_DET_PERTURB="$STEP" "$BIN" "$MODEL" --tokenizer "$TOK" \
             --prompt "The capital of France is" --verify-determinism 32 --gpu-cache-all \
-            2>/dev/null | sed -n 's/.*hash=\([0-9a-f]*\).*/\1/p')
+            2>/dev/null | sed -n 's/.*output_hash=\([0-9a-f]*\).*/\1/p')
 if [ -z "$h_clean" ] || [ -z "$h_dirty" ]; then
   echo "  FAIL  could not obtain both hashes (${h_clean:-none} / ${h_dirty:-none})"
   fail=$((fail + 1))

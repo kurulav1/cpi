@@ -60,8 +60,15 @@ ARG CUDA_ARCHS="75-real;80-real;86-real;89-real;90-real;120-real;90-virtual"
 # is a way to get the OOM killer instead of a binary. Raise it with
 # --build-arg BUILD_JOBS=N where there is memory for it.
 ARG BUILD_JOBS=4
+# The build context carries no .git, so CMake's git probe resolves to "unknown" and
+# a published binary cannot say which commit produced it. For a project whose output
+# is hashes people paste somewhere, "which build produced this" is the other half of
+# the claim. The CI job passes the tagged commit; a local build that does not bother
+# still reports "unknown", which is honest rather than wrong.
+ARG CPI_GIT_SHA=unknown
 RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
       -DCPI_ENABLE_CUDA=ON -DCPI_REQUIRE_CUDA=ON \
+      -DCPI_GIT_SHA="${CPI_GIT_SHA}" \
       -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
     && cmake --build build -j"${BUILD_JOBS}" --target cpi
 

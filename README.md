@@ -75,20 +75,33 @@ the way a request does, because a verifier that decoded differently from the eng
 attest to nothing:
 
 ```bash
-cpi <model> --prompt "The capital of France is" --verify-determinism 64 --gpu-cache-all
-[verify] hash=9003b7d09a9eae93 tokens=64
+cpi <model> --tokenizer <tok> --prompt "The capital of France is" --verify-determinism 64 --gpu-cache-all
+[verify] input_hash=90b40b4551408b2e73ffeb9ad0ca98ff
+[verify]   model     Llama-3.2-1B-Instruct-F16.gguf file=7e2a46fe01895b16776ed927aac8f56c bytes=2479595168
+[verify]   tokenizer tokenizer.json                 file=79e3e522635f3171300913bb421464a8
+[verify]   prompt    6 token ids                    sha256=7ee923c120792ad1240a31d85ef1ad65
+[verify]   sampling  sha256=f0e95884c86bf3a453671186b850992d
+[verify]   settings  temp=0 greedy=1 max_new=64 ctx=2048 quant=none kv_bits=16 paged=0 paged_blocks=0 gpu_cache_all=1
+[verify] output_hash=9003b7d09a9eae93 tokens=64
 [verify] backend=llama-cuda model=Llama-3.2-1B-Instruct-F16.gguf quant=none kv_bits=16 paged=0 gpu_cache_all=1 ctx=2048 temp=0 prompt_tokens=6
 [verify] ids=12366,13,578,469,3168,...
 ```
 
-The second line is every setting that could change the answer, so a mismatch can be attributed
-instead of argued about. `backend=` is the engine resolved at runtime rather than the one the
-binary was built with, which matters: while this was being written that field was a compile-time
-`#if`, and it labelled a CPU run as CUDA and made the two compare equal.
+
+`output_hash` says two runs produced the same tokens; `input_hash` says they were asked the same
+thing. A hash pasted without the second is half a claim: the reader cannot tell which weights
+file, which tokenizer, which prompt or which settings produced it, and those are exactly what
+differs between their machine and yours. The digests are SHA-256, checked against the published
+vectors and against `hashlib` on real multi-gigabyte files.
+
+`backend=` is the engine resolved at runtime rather than the one the binary was built with, which
+matters: while this was being written that field was a compile-time `#if`, and it labelled a CPU
+run as CUDA and made the two compare equal.
 
 **If you have a different NVIDIA GPU, this is the one row that cannot be filled in here.** Run
-the command above on `Llama-3.2-1B-Instruct-F16.gguf` and open an issue with the three `[verify]`
-lines. A matching hash from another card turns the cross-machine claim from untested into
+the command above on `Llama-3.2-1B-Instruct-F16.gguf` and open an issue with the `[verify]` block.
+The `input_hash` lines are what let anyone confirm you ran the same thing before comparing
+outputs. A matching hash from another card turns the cross-machine claim from untested into
 measured; a differing one is more useful still, and the config line says where to start looking.
 
 The scripts behind the other rows:

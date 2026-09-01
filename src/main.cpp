@@ -43,6 +43,8 @@
 #ifdef _WIN32
 #include <Windows.h>
 #include <sstream>
+
+#include "util/input_digest.hpp"
 #endif
 
 namespace {
@@ -639,8 +641,44 @@ int main(int argc, char** argv) {
             h *= 1099511628211ULL;
           }
         }
-        std::printf("[verify] hash=%016llx tokens=%zu\n", static_cast<unsigned long long>(h),
-                    out.size());
+        // The input side of the claim. An output hash on its own says two runs
+        // agreed; it does not say what they were ASKED, and that is precisely the
+        // part a reader on another machine cannot reconstruct from the output.
+        // Printed before the output so the block reads as "these inputs produced
+        // this output" rather than as an answer with no question attached.
+        {
+          char cfg[512];
+          std::snprintf(cfg, sizeof(cfg),
+                        "temp=0 greedy=1 max_new=%d ctx=%d quant=%s kv_bits=%d "
+                        "paged=%d paged_blocks=%d gpu_cache_all=%d",
+                        cli.verify_determinism, cli.opts.max_context,
+                        cli.opts.int8_streaming
+                            ? (cli.opts.streaming_quant_bits == 4 ? "int4" : "int8")
+                            : "none",
+                        cli.opts.kv_cache_int4 ? 4 : 16, cli.opts.paged_kv_cache ? 1 : 0,
+                        cli.opts.paged_blocks ? 1 : 0, cli.opts.gpu_cache_all ? 1 : 0);
+          const std::string tok_path = use_tokenizer ? cli.tokenizer_path : std::string();
+          const auto dig =
+              cpi::util::compute_input_digest(cli.opts.model_path, tok_path, prompt_tokens, cfg);
+          const std::string model_name =
+              std::filesystem::path(cli.opts.model_path).filename().string();
+          const std::string tok_name =
+              tok_path.empty() ? std::string("(carried in the model)")
+                               : std::filesystem::path(tok_path).filename().string();
+          std::printf("[verify] input_hash=%s\n", dig.aggregate.substr(0, 32).c_str());
+          std::printf("[verify]   model     %-30s %s=%s bytes=%llu\n", model_name.c_str(),
+                      dig.model_kind.c_str(), dig.model.substr(0, 32).c_str(),
+                      static_cast<unsigned long long>(dig.model_bytes));
+          std::printf("[verify]   tokenizer %-30s %s=%s\n", tok_name.c_str(),
+                      dig.tokenizer_kind.c_str(), dig.tokenizer.substr(0, 32).c_str());
+          const std::string ptok = std::to_string(prompt_tokens.size()) + " token ids";
+          std::printf("[verify]   prompt    %-30s sha256=%s\n", ptok.c_str(),
+                      dig.prompt.substr(0, 32).c_str());
+          std::printf("[verify]   sampling  sha256=%s\n", dig.sampling.substr(0, 32).c_str());
+          std::printf("[verify]   settings  %s\n", dig.settings.c_str());
+        }
+        std::printf("[verify] output_hash=%016llx tokens=%zu\n",
+                    static_cast<unsigned long long>(h), out.size());
         // Everything that could change the answer, on one line, so a mismatch can
         // be attributed instead of argued about.
         std::printf(

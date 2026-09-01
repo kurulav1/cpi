@@ -45,7 +45,7 @@ run() {
   esac
   local line
   line=$(CPI_DET_PERTURB="$perturb" "$BIN" "$model" --prompt "$PROMPT" \
-           --verify-determinism "$N" "$@" 2>/dev/null | grep -m1 "hash=")
+           --verify-determinism "$N" "$@" 2>/dev/null | grep -m1 "output_hash=")
   if [ -z "$line" ]; then
     printf '%s\t%s\tFAILED-NO-OUTPUT\n' "$label" "$(basename "$model")" | tee -a "$OUT"
     # A row that produced nothing is a broken test, not a passing one: two empty
@@ -54,7 +54,7 @@ run() {
     return
   fi
   local hash
-  hash=$(printf '%s' "$line" | sed -E 's/.*hash=([0-9a-f]+).*/\1/')
+  hash=$(printf '%s' "$line" | sed -E 's/.*output_hash=([0-9a-f]+).*/\1/')
   printf '%s\t%s\t%s\n' "$label" "$(basename "$model")" "$hash" | tee -a "$OUT"
   if [ "$group" != "-" ]; then
     if [ -z "${HASH[$group]+x}" ]; then

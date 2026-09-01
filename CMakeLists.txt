@@ -4,17 +4,26 @@ project(cpi VERSION 0.4.0 LANGUAGES CXX)
 # Stamp the build with the project version (and the short git SHA when available) so
 # `cpi --version` reports exactly what was built. CPI_GIT_SHA is best-effort:
 # a source archive with no .git resolves to "unknown", which is fine.
-set(CPI_GIT_SHA "unknown")
-find_package(Git QUIET)
-if(Git_FOUND)
-  execute_process(
-    COMMAND ${GIT_EXECUTABLE} rev-parse --short HEAD
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    OUTPUT_VARIABLE CPI_GIT_SHA_OUT
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET)
-  if(CPI_GIT_SHA_OUT)
-    set(CPI_GIT_SHA "${CPI_GIT_SHA_OUT}")
+#
+# -DCPI_GIT_SHA=<sha> wins over the git probe, and exists because the probe cannot
+# work where it matters most. A container build copies the sources in without .git,
+# so every published image reported "unknown" and a binary someone pulled could not
+# say which commit produced it. For a project whose output is hashes people paste
+# somewhere, "which build produced this" is not a nicety: it is the other half of
+# the claim, and the part a reader cannot reconstruct.
+if(NOT DEFINED CPI_GIT_SHA OR CPI_GIT_SHA STREQUAL "")
+  set(CPI_GIT_SHA "unknown")
+  find_package(Git QUIET)
+  if(Git_FOUND)
+    execute_process(
+      COMMAND ${GIT_EXECUTABLE} rev-parse --short HEAD
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+      OUTPUT_VARIABLE CPI_GIT_SHA_OUT
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      ERROR_QUIET)
+    if(CPI_GIT_SHA_OUT)
+      set(CPI_GIT_SHA "${CPI_GIT_SHA_OUT}")
+    endif()
   endif()
 endif()
 add_compile_definitions(CPI_VERSION="${PROJECT_VERSION}" CPI_GIT_SHA="${CPI_GIT_SHA}")
@@ -432,6 +441,14 @@ add_executable(grammar_test
 )
 target_include_directories(grammar_test PRIVATE include)
 add_test(NAME grammar_test COMMAND grammar_test)
+
+# SHA-256 against the published vectors. Header-only and dependency-free, so it
+# runs everywhere. A hand-rolled digest that is subtly wrong is worse than none:
+# it would agree with itself and with nothing else, and a reader comparing our
+# hash against theirs would go hunting a determinism bug that does not exist.
+add_executable(sha256_test src/tests/sha256_test.cpp)
+target_include_directories(sha256_test PRIVATE include)
+add_test(NAME sha256_test COMMAND sha256_test)
 
 # Plan-builder test. CUDA-free and GPU-free, so it runs in CI on every platform;
 # it is the one part of the Metal bring-up that can be verified without a Mac.
